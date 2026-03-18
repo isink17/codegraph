@@ -1,4 +1,4 @@
-module github.com/example/localcodegraph
+module github.com/isink17/codegraph
 
 go 1.26.0
 

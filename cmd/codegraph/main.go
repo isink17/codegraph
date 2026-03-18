@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/example/localcodegraph/internal/cli"
+	"github.com/isink17/codegraph/internal/cli"
 )
 
 func main() {

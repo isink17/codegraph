@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/example/localcodegraph/internal/config"
-	"github.com/example/localcodegraph/internal/platform"
+	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/platform"
 )
 
 type Report struct {

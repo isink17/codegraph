@@ -17,7 +17,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/example/localcodegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 //go:embed schema/*.sql

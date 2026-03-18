@@ -3,8 +3,8 @@ package query
 import (
 	"context"
 
-	"github.com/example/localcodegraph/internal/graph"
-	"github.com/example/localcodegraph/internal/store"
+	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 type Service struct {

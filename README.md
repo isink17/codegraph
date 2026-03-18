@@ -31,10 +31,35 @@ This first substantial milestone includes:
 
 ## Install
 
+Prerequisite: install Go (1.26+ recommended) and ensure `go` is on your `PATH`.
+
+Install Go examples:
+
+```bash
+# macOS (Homebrew)
+brew install go
+
+# Ubuntu/Debian
+sudo apt-get update && sudo apt-get install -y golang-go
+```
+
+```powershell
+# Windows (winget)
+winget install -e --id GoLang.Go
+```
+
 ```bash
 go install github.com/isink17/codegraph/cmd/codegraph@latest
 codegraph install
 ```
+
+If you see `go: command not found`:
+
+- Check installation: `go version`
+- Restart your terminal after installing Go
+- Ensure Go bin is on `PATH`:
+- macOS/Linux common: `/usr/local/go/bin`
+- Windows common: `C:\Program Files\Go\bin`
 
 Then index a repository:
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.1 - 2026-03-18
+
+### Fixes
+
+- Corrected Go module path from `github.com/example/localcodegraph` to `github.com/isink17/codegraph`.
+- Updated internal imports to match the published module path.
+- Updated install docs with actual module path and Go install/PATH troubleshooting guidance.
+
 ## v1.0.0 - 2026-03-18
 
 Initial public release of `codegraph`.

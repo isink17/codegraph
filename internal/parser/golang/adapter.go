@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/example/localcodegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 type Adapter struct{}
