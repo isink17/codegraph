@@ -51,22 +51,30 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
-	RepoID          int64    `json:"repo_id"`
-	ScanID          int64    `json:"scan_id"`
-	FilesSeen       int      `json:"files_seen"`
-	FilesIndexed    int      `json:"files_indexed"`
-	FilesSkipped    int      `json:"files_skipped"`
-	FilesChanged    int      `json:"files_changed"`
-	FilesDeleted    int      `json:"files_deleted"`
-	FilesTotal      int      `json:"files_total,omitempty"`
-	FilesDeletedPct float64  `json:"files_deleted_pct,omitempty"`
-	ParseErrors     int      `json:"parse_errors,omitempty"`
-	ParseSamples    []string `json:"parse_samples,omitempty"`
-	WalkMS          int64    `json:"walk_ms,omitempty"`
-	ParseMS         int64    `json:"parse_ms,omitempty"`
-	WriteMS         int64    `json:"write_ms,omitempty"`
-	ResolveMS       int64    `json:"resolve_ms,omitempty"`
-	DurationMS      int64    `json:"duration_ms"`
+	RepoID           int64                     `json:"repo_id"`
+	ScanID           int64                     `json:"scan_id"`
+	FilesSeen        int                       `json:"files_seen"`
+	FilesIndexed     int                       `json:"files_indexed"`
+	FilesSkipped     int                       `json:"files_skipped"`
+	FilesChanged     int                       `json:"files_changed"`
+	FilesDeleted     int                       `json:"files_deleted"`
+	FilesTotal       int                       `json:"files_total,omitempty"`
+	FilesDeletedPct  float64                   `json:"files_deleted_pct,omitempty"`
+	ParseErrors      int                       `json:"parse_errors,omitempty"`
+	ParseSamples     []string                  `json:"parse_samples,omitempty"`
+	LanguageCoverage map[string]LanguageCounts `json:"language_coverage,omitempty"`
+	WalkMS           int64                     `json:"walk_ms,omitempty"`
+	ParseMS          int64                     `json:"parse_ms,omitempty"`
+	WriteMS          int64                     `json:"write_ms,omitempty"`
+	ResolveMS        int64                     `json:"resolve_ms,omitempty"`
+	DurationMS       int64                     `json:"duration_ms"`
+}
+
+type LanguageCounts struct {
+	Seen        int `json:"seen"`
+	Indexed     int `json:"indexed"`
+	Skipped     int `json:"skipped"`
+	ParseFailed int `json:"parse_failed"`
 }
 
 type ScanRecord struct {

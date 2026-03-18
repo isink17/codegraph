@@ -38,7 +38,7 @@
 - [x] Add MCP tool `supported_languages` with adapter list and file extensions.
 - [x] Expand `graph export` to include edges and symbol metadata in JSON and real edges in DOT output.
 - [x] Support `.gitignore` semantics (including `!` negation) in `.codegraphignore`.
-- [ ] Add per-language indexing coverage stats (files parsed vs skipped vs parse_failed).
+- [x] Add per-language indexing coverage stats (files parsed vs skipped vs parse_failed).
 - [ ] Add optional `--jsonl` streaming output for long-running operations (`index`, `update`, `watch`) for easier client integration.
 
 ## Nice to Haves

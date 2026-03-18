@@ -101,6 +101,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return store.ScanSummary{}, err
 	}
 	summary := store.ScanSummary{RepoID: repo.ID, ScanID: scanID}
+	summary.LanguageCoverage = map[string]store.LanguageCounts{}
 	candidateSet := map[string]struct{}{}
 	if len(opts.Paths) > 0 {
 		for _, path := range opts.Paths {
@@ -264,6 +265,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	for res := range results {
 		parseMS += res.processMS
 		summary.FilesSeen++
+		coverageLanguage := coverageKey(res.task.language)
+		coverage := summary.LanguageCoverage[coverageLanguage]
+		coverage.Seen++
+		summary.LanguageCoverage[coverageLanguage] = coverage
 		if res.err != nil {
 			if runErr == nil {
 				runErr = fmt.Errorf("%s: %w", res.task.rel, res.err)
@@ -277,9 +282,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		switch res.action {
 		case "skip_only":
 			summary.FilesSkipped++
+			coverage := summary.LanguageCoverage[coverageLanguage]
+			coverage.Skipped++
+			summary.LanguageCoverage[coverageLanguage] = coverage
 		case "mark_seen":
 			writeStart := time.Now()
 			markSeenBatch = append(markSeenBatch, res.task.rel)
+			coverage := summary.LanguageCoverage[coverageLanguage]
+			coverage.Skipped++
+			summary.LanguageCoverage[coverageLanguage] = coverage
 			if len(markSeenBatch) < metadataBatchSize {
 				writeMS += time.Since(writeStart).Milliseconds()
 				summary.FilesSkipped++
@@ -300,6 +311,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
 				ContentHash: res.hash,
 			})
+			coverage := summary.LanguageCoverage[coverageLanguage]
+			coverage.Skipped++
+			summary.LanguageCoverage[coverageLanguage] = coverage
 			if len(touchBatch) < metadataBatchSize {
 				writeMS += time.Since(writeStart).Milliseconds()
 				summary.FilesSkipped++
@@ -322,6 +336,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			changedPathSet[res.task.rel] = struct{}{}
 			summary.FilesChanged++
 			summary.FilesIndexed++
+			coverage := summary.LanguageCoverage[coverageLanguage]
+			coverage.Indexed++
+			summary.LanguageCoverage[coverageLanguage] = coverage
 		case "parse_failed":
 			writeStart := time.Now()
 			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
@@ -343,6 +360,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			writeMS += time.Since(writeStart).Milliseconds()
 			summary.FilesSkipped++
+			coverage := summary.LanguageCoverage[coverageLanguage]
+			coverage.Skipped++
+			coverage.ParseFailed++
+			summary.LanguageCoverage[coverageLanguage] = coverage
 		}
 	}
 
@@ -542,6 +563,14 @@ func matchesAny(path string, globs []string) bool {
 		}
 	}
 	return false
+}
+
+func coverageKey(language string) string {
+	normalized := strings.TrimSpace(strings.ToLower(language))
+	if normalized == "" {
+		return "unknown"
+	}
+	return normalized
 }
 
 func matchesIgnore(path string, patterns []string) bool {

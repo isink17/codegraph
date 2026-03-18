@@ -209,6 +209,10 @@ func broken( {
 	if summary.FilesIndexed != 1 {
 		t.Fatalf("FilesIndexed = %d, want 1", summary.FilesIndexed)
 	}
+	cov := summary.LanguageCoverage["go"]
+	if cov.Indexed != 1 || cov.ParseFailed != 1 {
+		t.Fatalf("language coverage for go = %+v, want indexed=1 parse_failed=1", cov)
+	}
 }
 
 func TestCodegraphIgnoreNegationUnignoresInsideSkippedDir(t *testing.T) {
@@ -247,6 +251,38 @@ func Keep() {}
 	}
 	if _, ok := existing[filepath.Clean(filepath.Join("vendor", "skip.go"))]; ok {
 		t.Fatalf("expected vendor/skip.go to be ignored")
+	}
+}
+
+func TestLanguageCoverageIncludesUnknownAndSkipped(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, ".codegraph", "config.json"), `{"max_file_size_bytes":64}`)
+	writeFile(t, filepath.Join(repoRoot, "main.go"), `package main
+func main() {}
+`)
+	writeFile(t, filepath.Join(repoRoot, "large.go"), "package main\n"+strings.Repeat("var X = 1\n", 64))
+	writeFile(t, filepath.Join(repoRoot, "README.md"), strings.Repeat("docs ", 100))
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	idx := New(s, parser.NewRegistry(goparser.New()))
+	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
+	if err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	goCov := summary.LanguageCoverage["go"]
+	if goCov.Seen == 0 || goCov.Indexed == 0 || goCov.Skipped == 0 {
+		t.Fatalf("go coverage = %+v, expected seen/indexed/skipped > 0", goCov)
+	}
+	unknownCov := summary.LanguageCoverage["unknown"]
+	if unknownCov.Seen == 0 {
+		t.Fatalf("unknown coverage = %+v, expected seen > 0", unknownCov)
 	}
 }
 
