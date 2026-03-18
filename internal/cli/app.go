@@ -24,10 +24,15 @@ import (
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
+	"github.com/isink17/codegraph/internal/versioncheck"
 	"github.com/isink17/codegraph/internal/watcher"
 )
 
+var startupVersionCheck = versioncheck.NotifyIfOutdated
+
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	startupVersionCheck(ctx, stderr)
+
 	if len(args) == 0 {
 		printUsage(stdout)
 		return nil

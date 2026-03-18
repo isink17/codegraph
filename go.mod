@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0
+	golang.org/x/mod v0.27.0
 	modernc.org/sqlite v1.39.1
 )
 

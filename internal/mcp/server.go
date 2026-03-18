@@ -14,6 +14,7 @@ import (
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
+	"github.com/isink17/codegraph/internal/version"
 )
 
 type Server struct {
@@ -79,7 +80,7 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 				"protocolVersion": "2024-11-05",
 				"serverInfo": map[string]any{
 					"name":    "codegraph",
-					"version": "0.1.0",
+					"version": version.Current(),
 				},
 				"capabilities": map[string]any{
 					"tools": map[string]any{},
