@@ -42,6 +42,6 @@
 - [x] Add optional `--jsonl` streaming output for long-running operations (`index`, `update`, `watch`) for easier client integration.
 
 ## Nice to Haves
-- [ ] Add `codegraph config` command (`show`, `edit-path`, `validate`) for easier setup.
-- [ ] Add `doctor --fix` mode for non-destructive autofixes (create dirs, suggest PATH export command).
-- [ ] Add a tiny benchmark command that runs store/query/index micro-benchmarks and prints regression deltas.
+- [x] Add `codegraph config` command (`show`, `edit-path`, `validate`) for easier setup.
+- [x] Add `doctor --fix` mode for non-destructive autofixes (create dirs, suggest PATH export command).
+- [x] Add a tiny benchmark command that runs store/query/index micro-benchmarks and prints regression deltas.

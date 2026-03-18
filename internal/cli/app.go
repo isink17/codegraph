@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/appname"
@@ -66,11 +68,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	case "search":
 		return runQueryCommand(ctx, globalCfg, stdout, "search", args[1:])
 	case "doctor":
-		report, err := doctor.Run()
-		if err != nil {
-			return err
-		}
-		return writeJSON(stdout, report)
+		return runDoctor(stdout, args[1:])
+	case "config":
+		return runConfig(globalCfg, stdout, args[1:])
+	case "benchmark":
+		return runBenchmark(ctx, stdout, args[1:])
 	case "serve":
 		return runServe(ctx, globalCfg, stdout, stderr, args[1:])
 	case "watch":
@@ -82,6 +84,124 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runDoctor(stdout io.Writer, args []string) error {
+	fix := false
+	for _, arg := range args {
+		if arg == "--fix" {
+			fix = true
+		}
+	}
+	report, err := doctor.RunWithFix(fix)
+	if err != nil {
+		return err
+	}
+	return writeJSON(stdout, report)
+}
+
+func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: codegraph config <show|edit-path|validate>")
+	}
+	switch args[0] {
+	case "show":
+		path, err := config.ConfigPath()
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{
+			"path":   path,
+			"config": cfg,
+		})
+	case "edit-path":
+		path, err := config.ConfigPath()
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, path)
+		return err
+	case "validate":
+		issues := validateConfig(cfg)
+		path, err := config.ConfigPath()
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{
+			"path":   path,
+			"valid":  len(issues) == 0,
+			"issues": issues,
+		})
+	default:
+		return fmt.Errorf("unknown config subcommand %q", args[0])
+	}
+}
+
+func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
+	count := 1
+	benchtime := "100ms"
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--count":
+			if i+1 < len(args) {
+				if v, err := strconv.Atoi(args[i+1]); err == nil && v > 0 {
+					count = v
+				}
+				i++
+			}
+		case "--benchtime":
+			if i+1 < len(args) {
+				benchtime = args[i+1]
+				i++
+			}
+		}
+	}
+	cmdArgs := []string{
+		"test",
+		"./internal/indexer",
+		"./internal/store",
+		"./internal/mcp",
+		"-run", "^$",
+		"-bench", ".",
+		"-benchmem",
+		"-count", strconv.Itoa(count),
+		"-benchtime", benchtime,
+	}
+	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
+	cmd.Env = append(os.Environ(), "GOCACHE="+filepath.Join(".", ".gocache"))
+	out, err := cmd.CombinedOutput()
+	result := map[string]any{
+		"command":   append([]string{"go"}, cmdArgs...),
+		"count":     count,
+		"benchtime": benchtime,
+		"output":    string(out),
+	}
+	if err != nil {
+		result["ok"] = false
+		result["error"] = err.Error()
+		return writeJSON(stdout, result)
+	}
+	result["ok"] = true
+	return writeJSON(stdout, result)
+}
+
+func validateConfig(cfg config.Config) []string {
+	var issues []string
+	switch strings.ToLower(strings.TrimSpace(cfg.DBPerformanceProfile)) {
+	case "balanced", "durable", "fast":
+	default:
+		issues = append(issues, "db_performance_profile must be one of: balanced, durable, fast")
+	}
+	if strings.TrimSpace(cfg.DBDir) == "" {
+		issues = append(issues, "db_dir must not be empty")
+	}
+	if strings.TrimSpace(cfg.CacheDir) == "" {
+		issues = append(issues, "cache_dir must not be empty")
+	}
+	if cfg.WatchDebounce < 0 {
+		issues = append(issues, "watch_debounce must be >= 0")
+	}
+	return issues
 }
 
 func runInstall(stdout io.Writer) error {
@@ -670,6 +790,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  callees <repo-path> --symbol <name>")
 	fmt.Fprintln(w, "  impact <repo-path> [--symbol <name>] [--file <path>]")
 	fmt.Fprintln(w, "  doctor")
+	fmt.Fprintln(w, "    add --fix for non-destructive autofixes")
+	fmt.Fprintln(w, "  config <show|edit-path|validate>")
+	fmt.Fprintln(w, "  benchmark [--count N] [--benchtime DURATION]")
 	fmt.Fprintln(w, "  graph export <repo-path> [--format json|dot]")
 	fmt.Fprintln(w, "  watch <repo-path>")
 	fmt.Fprintln(w, "    add --jsonl for streaming line-delimited JSON events")

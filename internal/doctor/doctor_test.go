@@ -54,3 +54,21 @@ func TestRunReportsCodegraphMissingFromPath(t *testing.T) {
 		t.Fatalf("Recommendations = empty, want guidance")
 	}
 }
+
+func TestRunWithFixCreatesConfig(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	report, err := RunWithFix(true)
+	if err != nil {
+		t.Fatalf("RunWithFix(true) error = %v", err)
+	}
+	if !report.ConfigExists {
+		t.Fatalf("ConfigExists = false, want true")
+	}
+	if _, err := os.Stat(report.ConfigPath); err != nil {
+		t.Fatalf("config path missing %q: %v", report.ConfigPath, err)
+	}
+	if len(report.AppliedFixes) == 0 {
+		t.Fatalf("AppliedFixes = empty, want at least one fix")
+	}
+}

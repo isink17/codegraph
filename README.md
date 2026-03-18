@@ -29,6 +29,9 @@ This milestone includes:
 - `codegraph serve --repo-root <path>`
 - `codegraph graph export <path>`
 - `codegraph doctor`
+- `codegraph doctor --fix`
+- `codegraph config show|edit-path|validate`
+- `codegraph benchmark [--count N] [--benchtime DURATION]`
 - `codegraph watch <path>`
 - SQLite-backed repository metadata and graph storage
 - Incremental file hashing and file-local graph replacement
@@ -188,6 +191,9 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - `codegraph callees <path> --symbol <name>`
 - `codegraph impact <path> [--symbol <name>] [--file <path>]`
 - `codegraph doctor`
+- `codegraph doctor [--fix]`
+- `codegraph config <show|edit-path|validate>`
+- `codegraph benchmark [--count N] [--benchtime DURATION]`
 - `codegraph graph export <path> --format json|dot`
 - `codegraph watch <path>`
 - `codegraph watch <path> --jsonl` for line-delimited watch lifecycle events and final watch stats

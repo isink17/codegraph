@@ -113,3 +113,48 @@ func main() {}
 		t.Fatalf("first event type = %v, want scan_summary", first["type"])
 	}
 }
+
+func TestRunConfigCommands(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"config", "show"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(config show) error = %v", err)
+	}
+	if !strings.Contains(out.String(), `"config"`) {
+		t.Fatalf("config show output missing config object: %s", out.String())
+	}
+	out.Reset()
+	if err := Run(context.Background(), []string{"config", "edit-path"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(config edit-path) error = %v", err)
+	}
+	if strings.TrimSpace(out.String()) == "" {
+		t.Fatalf("config edit-path output empty")
+	}
+}
+
+func TestRunDoctorFix(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"doctor", "--fix"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(doctor --fix) error = %v", err)
+	}
+	if !strings.Contains(out.String(), `"applied_fixes"`) {
+		t.Fatalf("doctor --fix output missing applied_fixes: %s", out.String())
+	}
+}
