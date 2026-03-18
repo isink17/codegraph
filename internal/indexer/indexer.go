@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/graph"
@@ -45,12 +46,13 @@ type fileTask struct {
 }
 
 type fileResult struct {
-	task     fileTask
-	action   string
-	hash     string
-	parsed   graph.ParsedFile
-	err      error
-	parseErr string
+	task      fileTask
+	action    string
+	hash      string
+	parsed    graph.ParsedFile
+	err       error
+	parseErr  string
+	processMS int64
 }
 
 func New(s *store.Store, registry *parser.Registry) *Indexer {
@@ -137,6 +139,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	tasks := make(chan fileTask, workerCount*2)
 	results := make(chan fileResult, workerCount*2)
 	producerErr := make(chan error, 1)
+	walkStart := time.Now()
 
 	go func() {
 		defer close(tasks)
@@ -252,7 +255,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 
 	var runErr error
+	var parseMS int64
+	var writeMS int64
 	for res := range results {
+		parseMS += res.processMS
 		summary.FilesSeen++
 		if res.err != nil {
 			if runErr == nil {
@@ -268,8 +274,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		case "skip_only":
 			summary.FilesSkipped++
 		case "mark_seen":
+			writeStart := time.Now()
 			markSeenBatch = append(markSeenBatch, res.task.rel)
 			if len(markSeenBatch) < metadataBatchSize {
+				writeMS += time.Since(writeStart).Milliseconds()
 				summary.FilesSkipped++
 				continue
 			}
@@ -277,8 +285,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				runErr = err
 				cancel()
 			}
+			writeMS += time.Since(writeStart).Milliseconds()
 			summary.FilesSkipped++
 		case "touch":
+			writeStart := time.Now()
 			touchBatch = append(touchBatch, store.FileMetadataUpdate{
 				Path:        res.task.rel,
 				Language:    res.task.language,
@@ -287,6 +297,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				ContentHash: res.hash,
 			})
 			if len(touchBatch) < metadataBatchSize {
+				writeMS += time.Since(writeStart).Milliseconds()
 				summary.FilesSkipped++
 				continue
 			}
@@ -294,17 +305,21 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				runErr = err
 				cancel()
 			}
+			writeMS += time.Since(writeStart).Milliseconds()
 			summary.FilesSkipped++
 		case "replace":
+			writeStart := time.Now()
 			if err := i.store.ReplaceFileGraph(ctx, repo.ID, scanID, res.task.rel, res.parsed.Language, res.task.info.Size(), res.task.info.ModTime().UnixNano(), res.hash, res.parsed); err != nil {
 				runErr = err
 				cancel()
 				continue
 			}
+			writeMS += time.Since(writeStart).Milliseconds()
 			changedPathSet[res.task.rel] = struct{}{}
 			summary.FilesChanged++
 			summary.FilesIndexed++
 		case "parse_failed":
+			writeStart := time.Now()
 			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
 				Path:        res.task.rel,
 				Language:    res.task.language,
@@ -322,30 +337,40 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					cancel()
 				}
 			}
+			writeMS += time.Since(writeStart).Milliseconds()
 			summary.FilesSkipped++
 		}
 	}
 
 	if runErr == nil {
+		writeStart := time.Now()
 		if err := flushMarkSeen(); err != nil {
 			runErr = err
 			cancel()
 		}
+		writeMS += time.Since(writeStart).Milliseconds()
 	}
 	if runErr == nil {
+		writeStart := time.Now()
 		if err := flushTouch(); err != nil {
 			runErr = err
 			cancel()
 		}
+		writeMS += time.Since(writeStart).Milliseconds()
 	}
 	if runErr == nil {
+		writeStart := time.Now()
 		if err := flushParseFailed(); err != nil {
 			runErr = err
 			cancel()
 		}
+		writeMS += time.Since(writeStart).Milliseconds()
 	}
 
 	walkErr := <-producerErr
+	summary.WalkMS = time.Since(walkStart).Milliseconds()
+	summary.ParseMS = parseMS
+	summary.WriteMS = writeMS
 	if runErr == nil && walkErr != nil && walkErr != context.Canceled {
 		runErr = walkErr
 	}
@@ -360,6 +385,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, err
 	}
 	summary.FilesDeleted = deleted
+	resolveStart := time.Now()
 	if len(candidateSet) > 0 {
 		changedPaths := make([]string, 0, len(changedPathSet))
 		for path := range changedPathSet {
@@ -375,6 +401,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, err
 		}
 	}
+	summary.ResolveMS = time.Since(resolveStart).Milliseconds()
+	summary.DurationMS = time.Since(started).Milliseconds()
+	summary.FilesTotal = summary.FilesSeen + summary.FilesDeleted
+	if summary.FilesTotal > 0 {
+		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100
+	}
 	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
 		return summary, err
 	}
@@ -383,6 +415,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string) fileResult {
 	result := fileResult{task: task}
+	started := time.Now()
+	defer func() {
+		result.processMS = time.Since(started).Milliseconds()
+	}()
 	hasPrev := prev.Path != ""
 
 	if len(allowedLanguages) > 0 && task.language != "" && !slices.Contains(allowedLanguages, task.language) {

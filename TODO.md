@@ -23,13 +23,13 @@
   - Target: support `fail_fast` (current) and `best_effort` modes with per-file parse error reporting in scan summary.
 
 ## P2
-- [ ] Consolidate duplicated tokenization logic.
+- [x] Consolidate duplicated tokenization logic.
   - Problem: token weight logic is duplicated in Go parser, Python parser, heuristic parser, and store search helpers.
   - Target: centralize into one shared utility package with tests to ensure consistent search behavior.
-- [ ] Improve heuristic adapters with comment/string stripping before regex parse.
+- [x] Improve heuristic adapters with comment/string stripping before regex parse.
   - Problem: symbols/imports can be falsely detected inside comments or string literals.
   - Target: lightweight preprocessor per language family to reduce false positives.
-- [ ] Add `deleted/total` scan percentages and timings in summaries.
+- [x] Add `deleted/total` scan percentages and timings in summaries.
   - Problem: scan summaries expose counts but limited operator insight for tuning.
   - Target: include useful derived metrics and phase timings (walk, parse, write, resolve).
 

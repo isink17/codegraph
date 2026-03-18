@@ -18,6 +18,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/texttoken"
 )
 
 //go:embed schema/*.sql
@@ -50,16 +51,22 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
-	RepoID       int64    `json:"repo_id"`
-	ScanID       int64    `json:"scan_id"`
-	FilesSeen    int      `json:"files_seen"`
-	FilesIndexed int      `json:"files_indexed"`
-	FilesSkipped int      `json:"files_skipped"`
-	FilesChanged int      `json:"files_changed"`
-	FilesDeleted int      `json:"files_deleted"`
-	ParseErrors  int      `json:"parse_errors,omitempty"`
-	ParseSamples []string `json:"parse_samples,omitempty"`
-	DurationMS   int64    `json:"duration_ms"`
+	RepoID          int64    `json:"repo_id"`
+	ScanID          int64    `json:"scan_id"`
+	FilesSeen       int      `json:"files_seen"`
+	FilesIndexed    int      `json:"files_indexed"`
+	FilesSkipped    int      `json:"files_skipped"`
+	FilesChanged    int      `json:"files_changed"`
+	FilesDeleted    int      `json:"files_deleted"`
+	FilesTotal      int      `json:"files_total,omitempty"`
+	FilesDeletedPct float64  `json:"files_deleted_pct,omitempty"`
+	ParseErrors     int      `json:"parse_errors,omitempty"`
+	ParseSamples    []string `json:"parse_samples,omitempty"`
+	WalkMS          int64    `json:"walk_ms,omitempty"`
+	ParseMS         int64    `json:"parse_ms,omitempty"`
+	WriteMS         int64    `json:"write_ms,omitempty"`
+	ResolveMS       int64    `json:"resolve_ms,omitempty"`
+	DurationMS      int64    `json:"duration_ms"`
 }
 
 type ScanRecord struct {
@@ -679,7 +686,7 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 			_ = tx.Rollback()
 			return err
 		}
-		for token, weight := range tokenizeForSearch(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
+		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
 			if _, err := insertSymbolTokenStmt.ExecContext(ctx, symbolID, token, weight); err != nil {
 				_ = tx.Rollback()
 				return err
@@ -1472,7 +1479,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 }
 
 func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
-	tokens := tokenizeForSearch(query)
+	tokens := texttoken.WeightsString(query)
 	if len(tokens) == 0 {
 		return nil, nil
 	}
@@ -1597,19 +1604,4 @@ func quoteFTS(query string) string {
 		tokens[i] = fmt.Sprintf(`"%s"*`, strings.ReplaceAll(token, `"`, ""))
 	}
 	return strings.Join(tokens, " ")
-}
-
-func tokenizeForSearch(text string) map[string]float64 {
-	text = strings.ToLower(text)
-	fields := strings.FieldsFunc(text, func(r rune) bool {
-		return !(r == '_' || r == '-' || r == '.' || r == '/' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
-	})
-	out := map[string]float64{}
-	for _, field := range fields {
-		if len(field) < 2 {
-			continue
-		}
-		out[field] += 1
-	}
-	return out
 }

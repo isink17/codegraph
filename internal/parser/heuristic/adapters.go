@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/texttoken"
 )
 
 type importPattern struct {
@@ -27,6 +28,8 @@ type Adapter struct {
 	imports     []importPattern
 	symbols     []symbolPattern
 	skipFuncSet map[string]struct{}
+	cStyle      bool
+	hashStyle   bool
 }
 
 func NewJava() *Adapter {
@@ -40,6 +43,7 @@ func NewJava() *Adapter {
 			{kind: "type", re: regexp.MustCompile(`\b(class|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
 			{kind: "function", re: regexp.MustCompile(`^\s*(?:public|protected|private|static|final|native|synchronized|abstract|\s)*[A-Za-z0-9_<>\[\], ?]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:\{|throws|$)`), nameGroup: 1},
 		},
+		cStyle: true,
 	}
 }
 
@@ -54,6 +58,7 @@ func NewKotlin() *Adapter {
 			{kind: "type", re: regexp.MustCompile(`\b(class|interface|object|enum\s+class)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
 			{kind: "function", re: regexp.MustCompile(`^\s*fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), nameGroup: 1},
 		},
+		cStyle: true,
 	}
 }
 
@@ -68,6 +73,7 @@ func NewCSharp() *Adapter {
 			{kind: "type", re: regexp.MustCompile(`\b(class|interface|struct|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
 			{kind: "function", re: regexp.MustCompile(`^\s*(?:public|private|protected|internal|static|virtual|override|async|sealed|new|partial|\s)+[A-Za-z0-9_<>\[\],?.]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), nameGroup: 1},
 		},
+		cStyle: true,
 	}
 }
 
@@ -85,6 +91,7 @@ func NewTypeScriptJavaScript() *Adapter {
 			{kind: "function", re: regexp.MustCompile(`\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), nameGroup: 1},
 			{kind: "function", re: regexp.MustCompile(`\b(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>`), nameGroup: 1},
 		},
+		cStyle: true,
 	}
 }
 
@@ -99,6 +106,7 @@ func NewRust() *Adapter {
 			{kind: "type", re: regexp.MustCompile(`\b(struct|enum|trait|impl)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
 			{kind: "function", re: regexp.MustCompile(`^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), nameGroup: 1},
 		},
+		cStyle: true,
 	}
 }
 
@@ -113,6 +121,7 @@ func NewRuby() *Adapter {
 			{kind: "type", re: regexp.MustCompile(`^\s*(?:class|module)\s+([A-Za-z_][A-Za-z0-9_:]*)`), nameGroup: 1},
 			{kind: "function", re: regexp.MustCompile(`^\s*def\s+([A-Za-z_][A-Za-z0-9_!?=]*)`), nameGroup: 1},
 		},
+		hashStyle: true,
 	}
 }
 
@@ -127,6 +136,7 @@ func NewSwift() *Adapter {
 			{kind: "type", re: regexp.MustCompile(`\b(class|struct|enum|protocol|actor)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
 			{kind: "function", re: regexp.MustCompile(`^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), nameGroup: 1},
 		},
+		cStyle: true,
 	}
 }
 
@@ -142,6 +152,8 @@ func NewPHP() *Adapter {
 			{kind: "type", re: regexp.MustCompile(`\b(class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
 			{kind: "function", re: regexp.MustCompile(`^\s*(?:public|private|protected|static|\s)*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), nameGroup: 1},
 		},
+		cStyle:    true,
+		hashStyle: true,
 	}
 }
 
@@ -159,6 +171,7 @@ func NewCAndCpp() *Adapter {
 		skipFuncSet: map[string]struct{}{
 			"if": {}, "for": {}, "while": {}, "switch": {}, "catch": {}, "sizeof": {}, "return": {},
 		},
+		cStyle: true,
 	}
 }
 
@@ -190,17 +203,20 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	lines := strings.Split(string(content), "\n")
 	pf := graph.ParsedFile{
 		Language:   a.language,
-		FileTokens: tokenWeights(content),
+		FileTokens: texttoken.Weights(content),
 	}
 
 	depth := 0
 	classScopes := []classScope{}
+	inBlockComment := false
 
 	for i, line := range lines {
 		lineNo := i + 1
-		trimmed := strings.TrimSpace(line)
+		normalized, blockState := stripForHeuristic(line, inBlockComment, a.cStyle, a.hashStyle)
+		inBlockComment = blockState
+		trimmed := strings.TrimSpace(normalized)
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#!") {
-			depth += braceDelta(line)
+			depth += braceDelta(normalized)
 			continue
 		}
 		for len(classScopes) > 0 && depth < classScopes[len(classScopes)-1].depth {
@@ -208,7 +224,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 
 		for _, imp := range a.imports {
-			if m := imp.re.FindStringSubmatch(line); len(m) > imp.nameGroup {
+			if m := imp.re.FindStringSubmatch(normalized); len(m) > imp.nameGroup {
 				val := strings.TrimSpace(m[imp.nameGroup])
 				if val != "" {
 					pf.Imports = append(pf.Imports, val)
@@ -217,7 +233,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 
 		for _, sym := range a.symbols {
-			m := sym.re.FindStringSubmatch(line)
+			m := sym.re.FindStringSubmatch(normalized)
 			if len(m) <= sym.nameGroup {
 				continue
 			}
@@ -269,7 +285,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			break
 		}
 
-		depth += braceDelta(line)
+		depth += braceDelta(normalized)
 		if depth < 0 {
 			depth = 0
 		}
@@ -310,17 +326,60 @@ func utf8FirstRune(s string) (rune, int) {
 	return rune(0), 0
 }
 
-func tokenWeights(content []byte) map[string]float64 {
-	text := strings.ToLower(string(content))
-	fields := strings.FieldsFunc(text, func(r rune) bool {
-		return !(r == '_' || r == '-' || r == '.' || r == '/' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
-	})
-	weights := map[string]float64{}
-	for _, field := range fields {
-		if len(field) < 2 {
+func stripForHeuristic(line string, inBlockComment, cStyle, hashStyle bool) (string, bool) {
+	if line == "" {
+		return "", inBlockComment
+	}
+	var b strings.Builder
+	b.Grow(len(line))
+	inString := false
+	stringQuote := byte(0)
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		next := byte(0)
+		if i+1 < len(line) {
+			next = line[i+1]
+		}
+		if inBlockComment {
+			if cStyle && ch == '*' && next == '/' {
+				inBlockComment = false
+				i++
+			}
 			continue
 		}
-		weights[field] += 1
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == stringQuote {
+				inString = false
+				stringQuote = 0
+			}
+			continue
+		}
+		if cStyle && ch == '/' && next == '*' {
+			inBlockComment = true
+			i++
+			continue
+		}
+		if cStyle && ch == '/' && next == '/' {
+			break
+		}
+		if hashStyle && ch == '#' {
+			break
+		}
+		if ch == '"' || ch == '\'' || ch == '`' {
+			inString = true
+			stringQuote = ch
+			continue
+		}
+		b.WriteByte(ch)
 	}
-	return weights
+	return b.String(), inBlockComment
 }

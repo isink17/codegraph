@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/texttoken"
 )
 
 var (
@@ -43,7 +44,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	lines := strings.Split(string(content), "\n")
 	pf := graph.ParsedFile{
 		Language:   "python",
-		FileTokens: tokenWeights(content),
+		FileTokens: texttoken.Weights(content),
 	}
 	funcByStable := map[string]graph.Symbol{}
 	var classStack []scope
@@ -211,19 +212,4 @@ func isPythonKeyword(name string) bool {
 	default:
 		return false
 	}
-}
-
-func tokenWeights(content []byte) map[string]float64 {
-	text := strings.ToLower(string(content))
-	fields := strings.FieldsFunc(text, func(r rune) bool {
-		return !(r == '_' || r == '-' || r == '.' || r == '/' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
-	})
-	weights := map[string]float64{}
-	for _, field := range fields {
-		if len(field) < 2 {
-			continue
-		}
-		weights[field] += 1
-	}
-	return weights
 }
