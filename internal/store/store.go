@@ -639,49 +639,177 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) error {
 		}
 		targets = append(targets, t)
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	qualifiedSet := map[string]struct{}{}
 	for _, t := range targets {
-		id, ok, err := s.resolveTargetSymbol(ctx, repoID, t.dstName)
-		if err != nil {
-			return err
+		if t.dstName != "" {
+			qualifiedSet[t.dstName] = struct{}{}
 		}
-		if !ok {
+	}
+	qualifiedNames := make([]string, 0, len(qualifiedSet))
+	for name := range qualifiedSet {
+		qualifiedNames = append(qualifiedNames, name)
+	}
+	byQualified, err := s.resolveSymbolsByQualifiedNames(ctx, repoID, qualifiedNames)
+	if err != nil {
+		return err
+	}
+
+	shortSet := map[string]struct{}{}
+	for _, t := range targets {
+		if _, ok := byQualified[t.dstName]; ok {
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, id, t.edgeID); err != nil {
+		parts := strings.Split(t.dstName, ".")
+		short := strings.TrimSpace(parts[len(parts)-1])
+		if short != "" {
+			shortSet[short] = struct{}{}
+		}
+	}
+	shortNames := make([]string, 0, len(shortSet))
+	for name := range shortSet {
+		shortNames = append(shortNames, name)
+	}
+	byShort, err := s.resolveUniqueSymbolsByNames(ctx, repoID, shortNames)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	updateStmt, err := tx.PrepareContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer updateStmt.Close()
+
+	for _, t := range targets {
+		dstID, ok := byQualified[t.dstName]
+		if !ok {
+			parts := strings.Split(t.dstName, ".")
+			short := strings.TrimSpace(parts[len(parts)-1])
+			dstID, ok = byShort[short]
+		}
+		if !ok || dstID == 0 {
+			continue
+		}
+		if _, err := updateStmt.ExecContext(ctx, dstID, t.edgeID); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (s *Store) resolveTargetSymbol(ctx context.Context, repoID int64, name string) (int64, bool, error) {
-	var id int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM symbols WHERE repo_id = ? AND qualified_name = ? LIMIT 1`, repoID, name).Scan(&id)
-	if err == nil {
-		return id, true, nil
+func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64, qualifiedNames []string) (map[string]int64, error) {
+	out := map[string]int64{}
+	if len(qualifiedNames) == 0 {
+		return out, nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, err
-	}
-	parts := strings.Split(name, ".")
-	short := parts[len(parts)-1]
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM symbols WHERE repo_id = ? AND name = ? LIMIT 2`, repoID, short)
-	if err != nil {
-		return 0, false, err
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var candidate int64
-		if err := rows.Scan(&candidate); err != nil {
-			return 0, false, err
+	const chunkSize = 400
+	for start := 0; start < len(qualifiedNames); start += chunkSize {
+		end := start + chunkSize
+		if end > len(qualifiedNames) {
+			end = len(qualifiedNames)
 		}
-		ids = append(ids, candidate)
+		chunk := qualifiedNames[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT qualified_name, id
+			FROM symbols
+			WHERE repo_id = ? AND qualified_name IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, name := range chunk {
+			args = append(args, name)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var qualified string
+			var id int64
+			if err := rows.Scan(&qualified, &id); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if _, exists := out[qualified]; !exists {
+				out[qualified] = id
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
-	if len(ids) == 1 {
-		return ids[0], true, nil
+	return out, nil
+}
+
+func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, names []string) (map[string]int64, error) {
+	out := map[string]int64{}
+	if len(names) == 0 {
+		return out, nil
 	}
-	return 0, false, nil
+	const chunkSize = 400
+	for start := 0; start < len(names); start += chunkSize {
+		end := start + chunkSize
+		if end > len(names) {
+			end = len(names)
+		}
+		chunk := names[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT name, id
+			FROM symbols
+			WHERE repo_id = ? AND name IN (` + placeholders + `)
+			ORDER BY id ASC
+		`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, name := range chunk {
+			args = append(args, name)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		seenCount := map[string]int{}
+		firstID := map[string]int64{}
+		for rows.Next() {
+			var name string
+			var id int64
+			if err := rows.Scan(&name, &id); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			seenCount[name]++
+			if seenCount[name] == 1 {
+				firstID[name] = id
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		for name, count := range seenCount {
+			if count == 1 {
+				out[name] = firstID[name]
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, stableKeys []string) (map[string]int64, error) {

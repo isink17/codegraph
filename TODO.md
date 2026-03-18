@@ -3,19 +3,6 @@
 ## Note on references
 - Context7 was used for Go/SQLite lookup, but documentation snippets could not be fetched in this session (`resolve` worked, `query` failed). The items below are based on direct code inspection and established Go/SQLite patterns.
 
-## High priority
-1. Add key indexes for `related_tests` and frequent lookups.
-- Why: `test_links` queries use `repo_id + target_symbol_id` and `repo_id + test_file_id` paths.
-- Where: `internal/store/schema/*.sql`, `internal/store/store.go` (`RelatedTests`).
-- Task: add migration for:
-  - `idx_test_links_repo_target(repo_id, target_symbol_id)`
-  - `idx_test_links_repo_test_file(repo_id, test_file_id)`
-
-2. Reduce `ResolveEdges` N+1 lookups with batched resolution.
-- Why: unresolved edges are fetched, then each edge does separate symbol lookup/update.
-- Where: `internal/store/store.go` (`ResolveEdges`, `resolveTargetSymbol`).
-- Task: build candidate mapping with batched `IN` queries and perform updates in one transaction.
-
 ## Medium priority
 1. Remove dead/expensive AST parent walk in Go adapter.
 - Why: `parents := map[...]` and `children()` traversal is computed but unused.
