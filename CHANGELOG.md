@@ -10,6 +10,7 @@ Initial public release of `codegraph`.
 - Added a SQLite-backed repository graph with explicit migrations and incremental file hashing.
 - Added a parser abstraction with a working Go parser adapter and a clean seam for future Tree-sitter adapters.
 - Added MCP stdio support with generic tools for indexing, symbol lookup, call graph navigation, impact analysis, related test discovery, semantic search, and graph stats.
+- Added release automation for macOS, Linux, and Windows GitHub release artifacts.
 - Added agent-oriented documentation for Codex-style clients, Gemini CLI, and Claude-compatible MCP configuration examples.
 - Added initial automated tests for install flow, platform paths, incremental indexing, and MCP `graph_stats`.
 

@@ -31,12 +31,22 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            archive_ext: tar.gz
           - goos: linux
             goarch: arm64
+            archive_ext: tar.gz
           - goos: darwin
             goarch: amd64
+            archive_ext: tar.gz
           - goos: darwin
             goarch: arm64
+            archive_ext: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive_ext: zip
+          - goos: windows
+            goarch: arm64
+            archive_ext: zip
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -53,13 +63,25 @@ jobs:
           version="${GITHUB_REF_NAME}"
           dist="dist"
           binary="codegraph"
+          binary_name="${binary}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            binary_name="${binary}.exe"
+          fi
           archive_base="${binary}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
           mkdir -p "${dist}/${archive_base}"
-          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=0 go build -o "${dist}/${archive_base}/${binary}" ./cmd/codegraph
+          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=0 go build -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
           cp README.md "${dist}/${archive_base}/README.md"
           cp LICENSE "${dist}/${archive_base}/LICENSE"
-          tar -C "${dist}" -czf "${dist}/${archive_base}.tar.gz" "${archive_base}"
-          sha256sum "${dist}/${archive_base}.tar.gz" > "${dist}/${archive_base}.tar.gz.sha256"
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            (
+              cd "${dist}/${archive_base}"
+              zip -q -r "../${archive_base}.zip" .
+            )
+            sha256sum "${dist}/${archive_base}.zip" > "${dist}/${archive_base}.zip.sha256"
+          else
+            tar -C "${dist}" -czf "${dist}/${archive_base}.tar.gz" "${archive_base}"
+            sha256sum "${dist}/${archive_base}.tar.gz" > "${dist}/${archive_base}.tar.gz.sha256"
+          fi
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
@@ -68,3 +90,5 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
