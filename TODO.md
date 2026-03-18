@@ -4,12 +4,7 @@
 - Context7 was used for Go/SQLite lookup, but documentation snippets could not be fetched in this session (`resolve` worked, `query` failed). The items below are based on direct code inspection and established Go/SQLite patterns.
 
 ## Medium priority
-1. Add cancellation-aware background flushing in watcher.
-- Why: flush can run long and block event handling; no backpressure stats.
-- Where: `internal/watcher/watcher.go` (`Run`).
-- Task: decouple queue drain from event loop via worker goroutine, expose dropped/coalesced metrics.
-
-2. Improve GitHub version check efficiency and resilience.
+1. Improve GitHub version check efficiency and resilience.
 - Why: always requests full latest release payload when interval triggers.
 - Where: `internal/versioncheck/versioncheck.go`.
 - Task: use conditional request headers (`If-None-Match`/`If-Modified-Since`) and persist ETag/Last-Modified.

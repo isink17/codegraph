@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -16,13 +17,42 @@ import (
 type Watcher struct {
 	store   *store.Store
 	indexer *indexer.Indexer
+
+	flushSignals     atomic.Int64
+	coalescedSignals atomic.Int64
+	flushRuns        atomic.Int64
+	flushErrors      atomic.Int64
+}
+
+type WatchStats struct {
+	FlushSignals     int64 `json:"flush_signals"`
+	CoalescedSignals int64 `json:"coalesced_signals"`
+	FlushRuns        int64 `json:"flush_runs"`
+	FlushErrors      int64 `json:"flush_errors"`
 }
 
 func New(s *store.Store, idx *indexer.Indexer) *Watcher {
 	return &Watcher{store: s, indexer: idx}
 }
 
+func (w *Watcher) Stats() WatchStats {
+	return WatchStats{
+		FlushSignals:     w.flushSignals.Load(),
+		CoalescedSignals: w.coalescedSignals.Load(),
+		FlushRuns:        w.flushRuns.Load(),
+		FlushErrors:      w.flushErrors.Load(),
+	}
+}
+
 func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, debounce time.Duration) error {
+	w.flushSignals.Store(0)
+	w.coalescedSignals.Store(0)
+	w.flushRuns.Store(0)
+	w.flushErrors.Store(0)
+	if debounce <= 0 {
+		debounce = 750 * time.Millisecond
+	}
+
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -55,10 +85,6 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		return err
 	}
 
-	timer := time.NewTimer(debounce)
-	if !timer.Stop() {
-		<-timer.C
-	}
 	flush := func() error {
 		paths, err := w.store.DrainDirtyFiles(ctx, repoID)
 		if err != nil {
@@ -75,10 +101,54 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		return err
 	}
 
+	flushSignalCh := make(chan struct{}, 1)
+	flushErrCh := make(chan error, 1)
+	go func() {
+		timer := time.NewTimer(debounce)
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		pending := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-flushSignalCh:
+				pending = true
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(debounce)
+			case <-timer.C:
+				if !pending {
+					continue
+				}
+				pending = false
+				w.flushRuns.Add(1)
+				if err := flush(); err != nil {
+					w.flushErrors.Add(1)
+					select {
+					case flushErrCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-flushErrCh:
+			return err
 		case event, ok := <-fsw.Events:
 			if !ok {
 				return nil
@@ -99,10 +169,11 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				}
 			}
 			_ = w.store.QueueDirtyFile(ctx, repoID, rel, event.Op.String())
-			timer.Reset(debounce)
-		case <-timer.C:
-			if err := flush(); err != nil {
-				return err
+			select {
+			case flushSignalCh <- struct{}{}:
+				w.flushSignals.Add(1)
+			default:
+				w.coalescedSignals.Add(1)
 			}
 		case err, ok := <-fsw.Errors:
 			if !ok {
