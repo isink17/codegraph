@@ -893,10 +893,7 @@ func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 	return stats, nil
 }
 
-func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, limit int) ([]graph.Symbol, error) {
-	if limit <= 0 {
-		limit = 20
-	}
+func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
@@ -905,7 +902,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND symbol_fts MATCH ?
 		LIMIT ?
-	`, repoID, quoteFTS(query), limit)
+		OFFSET ?
+	`, repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
@@ -914,7 +912,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
 			LIMIT ?
-		`, repoID, "%"+query+"%", "%"+query+"%", limit)
+			OFFSET ?
+		`, repoID, "%"+query+"%", "%"+query+"%", safeLimit(limit), safeOffset(offset))
 		if err != nil {
 			return nil, err
 		}
@@ -931,11 +930,11 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 	return out, rows.Err()
 }
 
-func (s *Store) FindSymbol(ctx context.Context, repoID int64, query string, limit int) ([]graph.Symbol, error) {
-	return s.SearchSymbols(ctx, repoID, query, limit)
+func (s *Store) FindSymbol(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
+	return s.SearchSymbols(ctx, repoID, query, limit, offset)
 }
 
-func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit int) ([]graph.Symbol, error) {
+func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	targetID, err := s.lookupSymbolID(ctx, repoID, symbol, symbolID)
 	if err != nil {
 		return nil, err
@@ -948,7 +947,8 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		JOIN files f ON f.id = s.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id = ?
 		LIMIT ?
-	`, repoID, targetID, safeLimit(limit))
+		OFFSET ?
+	`, repoID, targetID, safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
@@ -964,7 +964,7 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 	return out, rows.Err()
 }
 
-func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit int) ([]graph.Symbol, error) {
+func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	srcID, err := s.lookupSymbolID(ctx, repoID, symbol, symbolID)
 	if err != nil {
 		return nil, err
@@ -977,7 +977,8 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 		JOIN files f ON f.id = s.file_id
 		WHERE e.repo_id = ? AND e.src_symbol_id = ?
 		LIMIT ?
-	`, repoID, srcID, safeLimit(limit))
+		OFFSET ?
+	`, repoID, srcID, safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
@@ -1093,7 +1094,7 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 	}, nil
 }
 
-func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit int) ([]RelatedTest, error) {
+func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]RelatedTest, error) {
 	var rows *sql.Rows
 	var err error
 	if file != "" {
@@ -1106,7 +1107,8 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 				SELECT id FROM files WHERE repo_id = ? AND path LIKE '%_test.go'
 			)
 			LIMIT ?
-		`, repoID, repoID, safeLimit(limit))
+			OFFSET ?
+		`, repoID, repoID, safeLimit(limit), safeOffset(offset))
 	} else {
 		targetID, err := s.lookupSymbolID(ctx, repoID, symbol, 0)
 		if err != nil {
@@ -1119,7 +1121,8 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 			LEFT JOIN symbols s ON s.id = t.test_symbol_id
 			WHERE t.repo_id = ? AND t.target_symbol_id = ?
 			LIMIT ?
-		`, repoID, targetID, safeLimit(limit))
+			OFFSET ?
+		`, repoID, targetID, safeLimit(limit), safeOffset(offset))
 	}
 	if err != nil {
 		return nil, err
@@ -1136,7 +1139,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 	return out, rows.Err()
 }
 
-func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit int) ([]map[string]any, error) {
+func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
 	tokens := tokenizeForSearch(query)
 	if len(tokens) == 0 {
 		return nil, nil
@@ -1155,6 +1158,7 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		GROUP BY f.path, s.qualified_name
 		ORDER BY score DESC
 		LIMIT ?
+		OFFSET ?
 	`
 	args := make([]any, 0, len(tokenList)+2)
 	args = append(args, repoID)
@@ -1162,6 +1166,7 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		args = append(args, token)
 	}
 	args = append(args, safeLimit(limit))
+	args = append(args, safeOffset(offset))
 	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		return nil, err
@@ -1245,6 +1250,13 @@ func safeLimit(limit int) int {
 		return 20
 	}
 	return limit
+}
+
+func safeOffset(offset int) int {
+	if offset < 0 {
+		return 0
+	}
+	return offset
 }
 
 func quoteFTS(query string) string {

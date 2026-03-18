@@ -133,13 +133,14 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		return s.handleIndex(ctx, raw, true)
 	case "find_symbol":
 		var req struct {
-			Query string `json:"query"`
-			Limit int    `json:"limit"`
+			Query  string `json:"query"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
-		items, err := s.query.FindSymbol(ctx, s.repoID, req.Query, req.Limit)
+		items, err := s.query.FindSymbol(ctx, s.repoID, req.Query, req.Limit, req.Offset)
 		return wrapData("matches", items, err)
 	case "find_callers":
 		return s.handleCallGraph(ctx, raw, true)
@@ -164,31 +165,34 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			Symbol string `json:"symbol"`
 			File   string `json:"file"`
 			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
-		items, err := s.query.RelatedTests(ctx, s.repoID, req.Symbol, req.File, req.Limit)
+		items, err := s.query.RelatedTests(ctx, s.repoID, req.Symbol, req.File, req.Limit, req.Offset)
 		return wrapData("tests", items, err)
 	case "search_symbols":
 		var req struct {
-			Query string `json:"query"`
-			Limit int    `json:"limit"`
+			Query  string `json:"query"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
-		items, err := s.query.SearchSymbols(ctx, s.repoID, req.Query, req.Limit)
+		items, err := s.query.SearchSymbols(ctx, s.repoID, req.Query, req.Limit, req.Offset)
 		return wrapData("matches", items, err)
 	case "search_semantic":
 		var req struct {
-			Query string `json:"query"`
-			Limit int    `json:"limit"`
+			Query  string `json:"query"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
-		items, err := s.query.SemanticSearch(ctx, s.repoID, req.Query, req.Limit)
+		items, err := s.query.SemanticSearch(ctx, s.repoID, req.Query, req.Limit, req.Offset)
 		return wrapData("matches", items, err)
 	case "graph_stats":
 		stats, err := s.query.Stats(ctx, s.repoID)
@@ -238,6 +242,7 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 		Symbol   string `json:"symbol"`
 		SymbolID int64  `json:"symbol_id"`
 		Limit    int    `json:"limit"`
+		Offset   int    `json:"offset"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
@@ -249,9 +254,9 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 	)
 	if callers {
 		key = "callers"
-		items, err = s.query.FindCallers(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit)
+		items, err = s.query.FindCallers(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
 	} else {
-		items, err = s.query.FindCallees(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit)
+		items, err = s.query.FindCallees(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
 	}
 	return wrapData(key, items, err)
 }
@@ -311,13 +316,13 @@ func toolDefinitions() []map[string]any {
 	return []map[string]any{
 		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_path", "force", "paths"}),
 		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_path", "paths"}),
-		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit"}),
-		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit"}),
-		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit"}),
+		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset"}),
+		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}),
+		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}),
 		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth"}),
-		toolDef("find_related_tests", "Find likely related tests for a symbol or file", []string{"symbol", "file", "limit"}),
-		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit"}),
-		toolDef("search_semantic", "Run lightweight local semantic search", []string{"query", "limit"}),
+		toolDef("find_related_tests", "Find likely related tests for a symbol or file", []string{"symbol", "file", "limit", "offset"}),
+		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset"}),
+		toolDef("search_semantic", "Run lightweight local semantic search", []string{"query", "limit", "offset"}),
 		toolDef("graph_stats", "Return repository graph statistics", nil),
 	}
 }
@@ -326,7 +331,7 @@ func toolDef(name, description string, properties []string) map[string]any {
 	props := map[string]any{}
 	for _, prop := range properties {
 		props[prop] = map[string]any{"type": "string"}
-		if prop == "limit" || prop == "symbol_id" || prop == "depth" {
+		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" {
 			props[prop] = map[string]any{"type": "integer"}
 		}
 		if prop == "force" {
