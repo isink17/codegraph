@@ -4,27 +4,17 @@
 - Context7 was used for Go/SQLite lookup, but documentation snippets could not be fetched in this session (`resolve` worked, `query` failed). The items below are based on direct code inspection and established Go/SQLite patterns.
 
 ## Medium priority
-1. Remove dead/expensive AST parent walk in Go adapter.
-- Why: `parents := map[...]` and `children()` traversal is computed but unused.
-- Where: `internal/parser/golang/adapter.go` (`Parse`, `children`).
-- Task: delete unused parent graph construction and helper.
-
-2. Fix function-context tracking during AST traversal.
-- Why: `contextStack` only pushes on `FuncDecl`, never pops; can mis-attribute call edges.
-- Where: `internal/parser/golang/adapter.go` (`Parse`).
-- Task: switch to explicit recursive walk or enter/exit tracking with correct stack unwind.
-
-3. Add pagination/streaming for large query results.
+1. Add pagination/streaming for large query results.
 - Why: callers/callees/symbol search return only `limit`; no cursor/offset for large repos.
 - Where: `internal/store/store.go` query methods, `internal/mcp/server.go` tool args/schemas.
 - Task: support `offset`/`cursor` in store + MCP tools.
 
-4. Add cancellation-aware background flushing in watcher.
+2. Add cancellation-aware background flushing in watcher.
 - Why: flush can run long and block event handling; no backpressure stats.
 - Where: `internal/watcher/watcher.go` (`Run`).
 - Task: decouple queue drain from event loop via worker goroutine, expose dropped/coalesced metrics.
 
-5. Improve GitHub version check efficiency and resilience.
+3. Improve GitHub version check efficiency and resilience.
 - Why: always requests full latest release payload when interval triggers.
 - Where: `internal/versioncheck/versioncheck.go`.
 - Task: use conditional request headers (`If-None-Match`/`If-Modified-Since`) and persist ETag/Last-Modified.

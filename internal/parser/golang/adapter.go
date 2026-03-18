@@ -51,14 +51,6 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		importAliases[base] = importPath
 	}
 
-	parents := map[ast.Node]ast.Node{}
-	ast.Inspect(file, func(n ast.Node) bool {
-		for _, child := range children(n) {
-			parents[child] = n
-		}
-		return true
-	})
-
 	commentMap := map[ast.Node]string{}
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
@@ -72,6 +64,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 
 	contextStack := []*graph.Symbol{}
+	enterFuncStack := []bool{}
 	symbolByKey := map[string]*graph.Symbol{}
 
 	for _, decl := range file.Decls {
@@ -99,11 +92,27 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 
 	ast.Inspect(file, func(n ast.Node) bool {
+		if n == nil {
+			if len(enterFuncStack) == 0 {
+				return true
+			}
+			enteredFunc := enterFuncStack[len(enterFuncStack)-1]
+			enterFuncStack = enterFuncStack[:len(enterFuncStack)-1]
+			if enteredFunc && len(contextStack) > 0 {
+				contextStack = contextStack[:len(contextStack)-1]
+			}
+			return true
+		}
+		enteredFunc := false
+		defer func() {
+			enterFuncStack = append(enterFuncStack, enteredFunc)
+		}()
 		switch node := n.(type) {
 		case *ast.FuncDecl:
 			key := stableFuncKey(pkgName, node)
 			if sym := symbolByKey[key]; sym != nil {
 				contextStack = append(contextStack, sym)
+				enteredFunc = true
 			}
 			return true
 		case *ast.CallExpr:
@@ -136,20 +145,6 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 	linkTests(pkgName, &pf)
 	return pf, nil
-}
-
-func children(n ast.Node) []ast.Node {
-	if n == nil {
-		return nil
-	}
-	var out []ast.Node
-	ast.Inspect(n, func(child ast.Node) bool {
-		if child != nil && child != n {
-			out = append(out, child)
-		}
-		return false
-	})
-	return out
 }
 
 func buildFuncSymbol(fset *token.FileSet, pkg string, fn *ast.FuncDecl, doc string) graph.Symbol {
