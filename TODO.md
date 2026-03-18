@@ -39,7 +39,7 @@
 - [x] Expand `graph export` to include edges and symbol metadata in JSON and real edges in DOT output.
 - [x] Support `.gitignore` semantics (including `!` negation) in `.codegraphignore`.
 - [x] Add per-language indexing coverage stats (files parsed vs skipped vs parse_failed).
-- [ ] Add optional `--jsonl` streaming output for long-running operations (`index`, `update`, `watch`) for easier client integration.
+- [x] Add optional `--jsonl` streaming output for long-running operations (`index`, `update`, `watch`) for easier client integration.
 
 ## Nice to Haves
 - [ ] Add `codegraph config` command (`show`, `edit-path`, `validate`) for easier setup.

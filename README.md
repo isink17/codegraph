@@ -179,6 +179,7 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - `codegraph install`
 - `codegraph index <path>`
 - `codegraph update <path>`
+- `codegraph index <path> --jsonl` and `codegraph update <path> --jsonl` for line-delimited machine-readable output
 - `codegraph serve --repo-root <path>`
 - `codegraph stats <path>`
 - `codegraph find-symbol <path> <query>`
@@ -189,6 +190,7 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - `codegraph doctor`
 - `codegraph graph export <path> --format json|dot`
 - `codegraph watch <path>`
+- `codegraph watch <path> --jsonl` for line-delimited watch lifecycle events and final watch stats
 
 ## MCP Tools Exposed By `serve`
 

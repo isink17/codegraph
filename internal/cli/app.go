@@ -135,10 +135,14 @@ func runInstall(stdout io.Writer) error {
 
 func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, args []string, update bool) error {
 	repoRoot := "."
+	jsonl := false
 	for _, arg := range args {
+		if arg == "--jsonl" {
+			jsonl = true
+			continue
+		}
 		if !strings.HasPrefix(arg, "-") {
 			repoRoot = arg
-			break
 		}
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
@@ -163,10 +167,20 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if err != nil {
 		return err
 	}
-	return writeJSON(stdout, map[string]any{
-		"summary": summary,
-		"stats":   stats,
-	})
+	if jsonl {
+		if err := writeJSONL(stdout, map[string]any{
+			"type":    "scan_summary",
+			"command": map[bool]string{true: "update", false: "index"}[update],
+			"data":    summary,
+		}); err != nil {
+			return err
+		}
+		return writeJSONL(stdout, map[string]any{
+			"type": "scan_stats",
+			"data": stats,
+		})
+	}
+	return writeJSON(stdout, map[string]any{"summary": summary, "stats": stats})
 }
 
 func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
@@ -339,17 +353,45 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 
 func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
 	repoRoot := "."
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		repoRoot = args[0]
+	jsonl := false
+	for _, arg := range args {
+		if arg == "--jsonl" {
+			jsonl = true
+			continue
+		}
+		if !strings.HasPrefix(arg, "-") {
+			repoRoot = arg
+		}
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
 	defer app.Close()
-	fmt.Fprintf(stdout, "watching %s\n", repo.RootPath)
+	if jsonl {
+		if err := writeJSONL(stdout, map[string]any{
+			"type":      "watch_started",
+			"repo_root": repo.RootPath,
+			"repo_id":   repoID,
+		}); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(stdout, "watching %s\n", repo.RootPath)
+	}
 	w := watcher.New(app.Store, app.Indexer)
-	return w.Run(ctx, repo.RootPath, repoID, cfg.WatchDebounce)
+	err = w.Run(ctx, repo.RootPath, repoID, cfg.WatchDebounce)
+	if jsonl {
+		event := map[string]any{
+			"type":  "watch_stopped",
+			"stats": w.Stats(),
+		}
+		if err != nil {
+			event["error"] = err.Error()
+		}
+		_ = writeJSONL(stdout, event)
+	}
+	return err
 }
 
 func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
@@ -609,11 +651,17 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
+func writeJSONL(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	return enc.Encode(v)
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "codegraph commands:")
 	fmt.Fprintln(w, "  install")
 	fmt.Fprintln(w, "  index <repo-path>")
 	fmt.Fprintln(w, "  update <repo-path>")
+	fmt.Fprintln(w, "    add --jsonl for streaming line-delimited JSON events")
 	fmt.Fprintln(w, "  serve --repo-root <repo-path>")
 	fmt.Fprintln(w, "  stats <repo-path>")
 	fmt.Fprintln(w, "  find-symbol <repo-path> <query>")
@@ -624,5 +672,6 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  doctor")
 	fmt.Fprintln(w, "  graph export <repo-path> [--format json|dot]")
 	fmt.Fprintln(w, "  watch <repo-path>")
+	fmt.Fprintln(w, "    add --jsonl for streaming line-delimited JSON events")
 	fmt.Fprintln(w, "  clean [repo-path] [--vacuum]")
 }
