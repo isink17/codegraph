@@ -100,9 +100,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
-	summary := store.ScanSummary{RepoID: repo.ID, ScanID: scanID}
+	summary := store.ScanSummary{RepoID: repo.ID, ScanID: scanID, ParseSamples: make([]string, 0, 20)}
 	summary.LanguageCoverage = map[string]store.LanguageCounts{}
-	candidateSet := map[string]struct{}{}
+	candidateSet := make(map[string]struct{}, len(opts.Paths))
 	if len(opts.Paths) > 0 {
 		for _, path := range opts.Paths {
 			rel := path
@@ -226,7 +226,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	markSeenBatch := make([]string, 0, metadataBatchSize)
 	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
-	changedPathSet := map[string]struct{}{}
+	changedPathSet := make(map[string]struct{}, 64)
 
 	flushMarkSeen := func() error {
 		if len(markSeenBatch) == 0 {
@@ -486,7 +486,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 		return result
 	}
 
-	parsed := graph.ParsedFile{Language: task.language, FileTokens: map[string]float64{}}
+	parsed := graph.ParsedFile{Language: task.language}
 	if task.adapter != nil {
 		parsed, err = task.adapter.Parse(ctx, task.path, content)
 		if err != nil {

@@ -58,12 +58,8 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			continue
 		}
 
-		for len(classStack) > 0 && indent <= classStack[len(classStack)-1].indent {
-			classStack = classStack[:len(classStack)-1]
-		}
-		for len(funcStack) > 0 && indent <= funcStack[len(funcStack)-1].indent {
-			funcStack = funcStack[:len(funcStack)-1]
-		}
+		classStack = trimScopesAtIndent(classStack, indent)
+		funcStack = trimScopesAtIndent(funcStack, indent)
 
 		if m := classRE.FindStringSubmatch(line); len(m) == 2 {
 			name := m[1]
@@ -177,6 +173,13 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 
 	return pf, nil
+}
+
+func trimScopesAtIndent(stack []scope, indent int) []scope {
+	for len(stack) > 0 && indent <= stack[len(stack)-1].indent {
+		stack = stack[:len(stack)-1]
+	}
+	return stack
 }
 
 func lineIndent(line string) int {

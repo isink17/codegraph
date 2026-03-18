@@ -410,15 +410,12 @@ func runInstall(stdout io.Writer) error {
 	} else {
 		fmt.Fprintln(stdout, "default config: already present")
 	}
-	fmt.Fprintln(stdout)
-	fmt.Fprintln(stdout, "Codex MCP snippet:")
-	fmt.Fprintln(stdout, `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`)
-	fmt.Fprintln(stdout)
-	fmt.Fprintln(stdout, "Gemini CLI MCP snippet:")
-	fmt.Fprintln(stdout, `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`)
-	fmt.Fprintln(stdout)
-	fmt.Fprintln(stdout, "Claude/Desktop MCP snippet:")
-	fmt.Fprintln(stdout, `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`)
+	snippet := `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`
+	for _, label := range []string{"Codex", "Gemini CLI", "Claude/Desktop"} {
+		fmt.Fprintln(stdout)
+		fmt.Fprintf(stdout, "%s MCP snippet:\n", label)
+		fmt.Fprintln(stdout, snippet)
+	}
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "If `codegraph` is not found after `go install`, your Go bin directory is probably not on PATH.")
 	fmt.Fprintln(stdout, "Check expected Go bin locations:")
@@ -946,19 +943,7 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 	if err != nil {
 		return nil, graphRepo{}, 0, err
 	}
-	registry := parser.NewRegistry(
-		goparser.New(),
-		pyparser.New(),
-		heuristicparser.NewJava(),
-		heuristicparser.NewKotlin(),
-		heuristicparser.NewCSharp(),
-		heuristicparser.NewTypeScriptJavaScript(),
-		heuristicparser.NewRust(),
-		heuristicparser.NewRuby(),
-		heuristicparser.NewSwift(),
-		heuristicparser.NewPHP(),
-		heuristicparser.NewCAndCpp(),
-	)
+	registry := newDefaultRegistry()
 	idx := indexer.New(s, registry)
 	repo, err := s.UpsertRepo(ctx, canonical)
 	if err != nil {
@@ -971,6 +956,22 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 		Query:   query.New(s),
 	}
 	return app, graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
+}
+
+func newDefaultRegistry() *parser.Registry {
+	return parser.NewRegistry(
+		goparser.New(),
+		pyparser.New(),
+		heuristicparser.NewJava(),
+		heuristicparser.NewKotlin(),
+		heuristicparser.NewCSharp(),
+		heuristicparser.NewTypeScriptJavaScript(),
+		heuristicparser.NewRust(),
+		heuristicparser.NewRuby(),
+		heuristicparser.NewSwift(),
+		heuristicparser.NewPHP(),
+		heuristicparser.NewCAndCpp(),
+	)
 }
 
 type graphRepo struct {
@@ -990,25 +991,29 @@ func writeJSONL(w io.Writer, v any) error {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "codegraph commands:")
-	fmt.Fprintln(w, "  install")
-	fmt.Fprintln(w, "  index <repo-path>")
-	fmt.Fprintln(w, "  update <repo-path>")
-	fmt.Fprintln(w, "    add --jsonl for streaming line-delimited JSON events")
-	fmt.Fprintln(w, "  serve --repo-root <repo-path>")
-	fmt.Fprintln(w, "  stats <repo-path>")
-	fmt.Fprintln(w, "  find-symbol <repo-path> <query>")
-	fmt.Fprintln(w, "  search <repo-path> <query>")
-	fmt.Fprintln(w, "  callers <repo-path> --symbol <name>")
-	fmt.Fprintln(w, "  callees <repo-path> --symbol <name>")
-	fmt.Fprintln(w, "  impact <repo-path> [--symbol <name>] [--file <path>]")
-	fmt.Fprintln(w, "  doctor")
-	fmt.Fprintln(w, "    add --fix for non-destructive autofixes")
-	fmt.Fprintln(w, "  config <show|edit-path|validate|init>")
-	fmt.Fprintln(w, "    config init [--repo PATH] [--force]")
-	fmt.Fprintln(w, "  benchmark [--count N] [--benchtime DURATION] [--save-baseline]")
-	fmt.Fprintln(w, "  graph export <repo-path> [--format json|dot]")
-	fmt.Fprintln(w, "  watch <repo-path>")
-	fmt.Fprintln(w, "    add --jsonl for streaming line-delimited JSON events")
-	fmt.Fprintln(w, "  clean [repo-path] [--vacuum]")
+	for _, line := range []string{
+		"codegraph commands:",
+		"  install",
+		"  index <repo-path>",
+		"  update <repo-path>",
+		"    add --jsonl for streaming line-delimited JSON events",
+		"  serve --repo-root <repo-path>",
+		"  stats <repo-path>",
+		"  find-symbol <repo-path> <query>",
+		"  search <repo-path> <query>",
+		"  callers <repo-path> --symbol <name>",
+		"  callees <repo-path> --symbol <name>",
+		"  impact <repo-path> [--symbol <name>] [--file <path>]",
+		"  doctor",
+		"    add --fix for non-destructive autofixes",
+		"  config <show|edit-path|validate|init>",
+		"    config init [--repo PATH] [--force]",
+		"  benchmark [--count N] [--benchtime DURATION] [--save-baseline]",
+		"  graph export <repo-path> [--format json|dot]",
+		"  watch <repo-path>",
+		"    add --jsonl for streaming line-delimited JSON events",
+		"  clean [repo-path] [--vacuum]",
+	} {
+		fmt.Fprintln(w, line)
+	}
 }

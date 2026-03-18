@@ -55,6 +55,13 @@ type toolArgSpec struct {
 	required   []string
 }
 
+type pageRequest struct {
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+var staticToolDefinitions = buildToolDefinitions()
+
 var frameBufferPool = sync.Pool{
 	New: func() any {
 		return &bytes.Buffer{}
@@ -121,7 +128,7 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 	case "notifications/initialized":
 		return rpcResponse{JSONRPC: "2.0"}
 	case "tools/list":
-		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": toolDefinitions()}}
+		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": staticToolDefinitions}}
 	case "tools/call":
 		var params struct {
 			Name      string          `json:"name"`
@@ -235,31 +242,22 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			},
 		}, nil
 	case "list_repos":
-		var req struct {
-			Limit  int `json:"limit"`
-			Offset int `json:"offset"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
+		req, err := decodePageRequest(raw)
+		if err != nil {
 			return nil, err
 		}
 		items, err := s.store.ListRepos(ctx, req.Limit, req.Offset)
 		return wrapData("repos", items, err)
 	case "list_scans":
-		var req struct {
-			Limit  int `json:"limit"`
-			Offset int `json:"offset"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
+		req, err := decodePageRequest(raw)
+		if err != nil {
 			return nil, err
 		}
 		items, err := s.store.ListScans(ctx, s.repoID, req.Limit, req.Offset)
 		return wrapData("scans", items, err)
 	case "latest_scan_errors":
-		var req struct {
-			Limit  int `json:"limit"`
-			Offset int `json:"offset"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
+		req, err := decodePageRequest(raw)
+		if err != nil {
 			return nil, err
 		}
 		items, err := s.store.LatestScanErrors(ctx, s.repoID, req.Limit, req.Offset)
@@ -391,7 +389,7 @@ func writeResponse(w io.Writer, resp rpcResponse) error {
 	return err
 }
 
-func toolDefinitions() []map[string]any {
+func buildToolDefinitions() []map[string]any {
 	return []map[string]any{
 		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_path", "force", "paths"}, nil),
 		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_path", "force", "paths"}, nil),
@@ -439,6 +437,14 @@ func toolDef(name, description string, properties, required []string) map[string
 func escape(s string) string {
 	b, _ := json.Marshal(s)
 	return strings.Trim(string(b), `"`)
+}
+
+func decodePageRequest(raw json.RawMessage) (pageRequest, error) {
+	var req pageRequest
+	if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
+		return pageRequest{}, err
+	}
+	return req, nil
 }
 
 var toolArgumentSpecs = map[string]toolArgSpec{

@@ -124,7 +124,6 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			if len(contextStack) == 0 {
 				return true
 			}
-			src := contextStack[len(contextStack)-1]
 			name := callName(node.Fun, importAliases)
 			if name == "" {
 				return true
@@ -143,7 +142,6 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				QualifiedName: name,
 				Range:         toRange(fset, node.Pos(), node.End()),
 			})
-			_ = src
 		}
 		return true
 	})

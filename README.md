@@ -4,6 +4,8 @@
 
 It builds and maintains a persistent local graph of files, symbols, references, and call edges, then exposes high-signal tools for coding agents and local developer workflows.
 
+Latest release: `v1.0.3` (March 18, 2026).
+
 ## What You Get
 
 - Local persistent repository graph in SQLite
@@ -200,6 +202,7 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - add `--limit` and `--offset` for paged JSON export slices
 - `codegraph watch <path>`
 - `codegraph watch <path> --jsonl` for line-delimited watch lifecycle events and final watch stats
+- Ongoing internal simplification and optimization in store/indexer/MCP paths (v1.0.3)
 
 ## MCP Tools Exposed By `serve`
 

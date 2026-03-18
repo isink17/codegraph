@@ -34,3 +34,9 @@
 - Run `go build ./cmd/codegraph`
 - For indexing changes, verify `codegraph index`, `codegraph update`, and `codegraph stats`
 - For MCP changes, verify `codegraph serve` still answers `tools/list` and `tools/call`
+
+## Release Hygiene
+
+- Keep `README.md` and `CHANGELOG.md` aligned with shipped behavior for each tag.
+- Add a new changelog section for each release (for example `v1.0.2 -> v1.0.3`) before tagging.
+- Tag releases with semantic version tags (`vX.Y.Z`) after tests/build pass.

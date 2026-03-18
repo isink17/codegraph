@@ -319,7 +319,11 @@ func visibility(name string) string {
 	if name == "" {
 		return ""
 	}
-	r, _ := utf8FirstRune(name)
+	var r rune
+	for _, v := range name {
+		r = v
+		break
+	}
 	if unicode.IsUpper(r) {
 		return "public"
 	}
@@ -327,13 +331,6 @@ func visibility(name string) string {
 		return "private"
 	}
 	return "module"
-}
-
-func utf8FirstRune(s string) (rune, int) {
-	for _, r := range s {
-		return r, 1
-	}
-	return rune(0), 0
 }
 
 func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (string, stripState) {

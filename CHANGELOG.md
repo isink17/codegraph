@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.0.3 - 2026-03-18
+
+### Changed
+
+- Simplified core code paths in `internal/store`, `internal/mcp`, `internal/cli`, and parser adapters while preserving behavior.
+- Reduced duplicated row-scanning and pagination parsing logic to improve maintainability.
+- Cached MCP tool definition payload construction for lower repeated allocation overhead on `tools/list`.
+
+### Notes
+
+- This release is focused on code quality, readability, and safe internal optimization with no intended user-facing breaking changes.
+
+## v1.0.2 - 2026-03-18
+
+### Highlights
+
+- Added `watch --jsonl`, benchmark improvements, and `config init` workflow updates.
+- Added/expanded query, export, MCP, and parser capabilities (including Python and heuristic multi-language adapters).
+- Improved indexing and store performance with batching, scoped edge resolution, and scan/stat tuning.
+- Added cleaner local maintenance workflows (`clean`, doctor improvements, and setup/path guidance updates).
+
 ## v1.0.1 - 2026-03-18
 
 ### Fixes

@@ -365,7 +365,7 @@ func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]Fil
 }
 
 func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths []string) (map[string]FileRecord, error) {
-	out := map[string]FileRecord{}
+	out := make(map[string]FileRecord, len(paths))
 	if len(paths) == 0 {
 		return out, nil
 	}
@@ -445,7 +445,7 @@ func (s *Store) attachScanLanguageCoverage(ctx context.Context, scans []ScanReco
 		return nil
 	}
 	ids := make([]int64, 0, len(scans))
-	indexByID := map[int64]int{}
+	indexByID := make(map[int64]int, len(scans))
 	for i, scan := range scans {
 		ids = append(ids, scan.ID)
 		indexByID[scan.ID] = i
@@ -1326,16 +1326,7 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			return nil, err
 		}
 	}
-	defer rows.Close()
-	var out []graph.Symbol
-	for rows.Next() {
-		sym, err := scanSymbol(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, sym)
-	}
-	return out, rows.Err()
+	return scanSymbols(rows)
 }
 
 func (s *Store) FindSymbol(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
@@ -1360,16 +1351,7 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []graph.Symbol
-	for rows.Next() {
-		sym, err := scanSymbol(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, sym)
-	}
-	return out, rows.Err()
+	return scanSymbols(rows)
 }
 
 func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
@@ -1390,21 +1372,12 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []graph.Symbol
-	for rows.Next() {
-		sym, err := scanSymbol(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, sym)
-	}
-	return out, rows.Err()
+	return scanSymbols(rows)
 }
 
 func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth int) (map[string]any, error) {
-	affected := map[int64]graph.Symbol{}
-	queue := []int64{}
+	affected := make(map[int64]graph.Symbol, len(symbols))
+	queue := make([]int64, 0, len(symbols))
 	for _, name := range symbols {
 		id, err := s.lookupSymbolID(ctx, repoID, name, 0)
 		if err != nil {
@@ -1457,22 +1430,30 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 		for _, id := range current {
 			seen[id] = struct{}{}
 		}
-		for _, callers := range []bool{true, false} {
-			neighbors, err := s.impactNeighbors(ctx, repoID, current, callers)
-			if err != nil {
-				return nil, err
+		callers, err := s.impactNeighbors(ctx, repoID, current, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, sym := range callers {
+			affected[sym.ID] = sym
+			if _, ok := seen[sym.ID]; !ok {
+				queue = append(queue, sym.ID)
 			}
-			for _, sym := range neighbors {
-				affected[sym.ID] = sym
-				if _, ok := seen[sym.ID]; !ok {
-					queue = append(queue, sym.ID)
-				}
+		}
+		callees, err := s.impactNeighbors(ctx, repoID, current, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, sym := range callees {
+			affected[sym.ID] = sym
+			if _, ok := seen[sym.ID]; !ok {
+				queue = append(queue, sym.ID)
 			}
 		}
 	}
-	filesSet := map[string]struct{}{}
-	var fileList []string
-	var symbolList []graph.Symbol
+	filesSet := make(map[string]struct{}, len(affected))
+	fileList := make([]string, 0, len(affected))
+	symbolList := make([]graph.Symbol, 0, len(affected))
 	for _, sym := range affected {
 		symbolList = append(symbolList, sym)
 		if _, ok := filesSet[sym.FilePath]; !ok {
@@ -1530,17 +1511,11 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			sym, err := scanSymbol(rows)
-			if err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			out = append(out, sym)
-		}
-		if err := rows.Close(); err != nil {
+		items, err := scanSymbols(rows)
+		if err != nil {
 			return nil, err
 		}
+		out = append(out, items...)
 	}
 	return out, nil
 }
@@ -1595,6 +1570,8 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	if len(tokens) == 0 {
 		return nil, nil
 	}
+	limitVal := safeLimit(limit)
+	offsetVal := safeOffset(offset)
 	tokenList := make([]string, 0, len(tokens))
 	for token := range tokens {
 		tokenList = append(tokenList, token)
@@ -1616,8 +1593,8 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	for _, token := range tokenList {
 		args = append(args, token)
 	}
-	args = append(args, safeLimit(limit))
-	args = append(args, safeOffset(offset))
+	args = append(args, limitVal)
+	args = append(args, offsetVal)
 	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		return nil, err
@@ -1629,7 +1606,7 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		symbol string
 		score  float64
 	}
-	out := make([]map[string]any, 0, safeLimit(limit))
+	out := make([]map[string]any, 0, limitVal)
 	for rows.Next() {
 		var item candidate
 		if err := rows.Scan(&item.file, &item.symbol, &item.score); err != nil {
@@ -1696,16 +1673,7 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []graph.Symbol
-	for rows.Next() {
-		sym, err := scanSymbol(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, sym)
-	}
-	return out, rows.Err()
+	return scanSymbols(rows)
 }
 
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
@@ -1738,16 +1706,7 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
-		var out []graph.Symbol
-		for rows.Next() {
-			sym, err := scanSymbol(rows)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, sym)
-		}
-		return out, rows.Err()
+		return scanSymbols(rows)
 	}
 	out := make([]graph.Symbol, 0, len(symbolIDs))
 	for _, chunk := range chunkInt64s(symbolIDs, 250) {
@@ -1768,17 +1727,11 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			sym, err := scanSymbol(rows)
-			if err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			out = append(out, sym)
-		}
-		if err := rows.Close(); err != nil {
+		items, err := scanSymbols(rows)
+		if err != nil {
 			return nil, err
 		}
+		out = append(out, items...)
 	}
 	return out, nil
 }
@@ -1933,6 +1886,19 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 		return graph.Symbol{}, err
 	}
 	return sym, nil
+}
+
+func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
+	defer rows.Close()
+	var out []graph.Symbol
+	for rows.Next() {
+		sym, err := scanSymbol(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sym)
+	}
+	return out, rows.Err()
 }
 
 func safeLimit(limit int) int {
