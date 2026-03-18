@@ -1590,6 +1590,50 @@ func (s *Store) GraphSnapshot(ctx context.Context, repoID int64, focusSymbol str
 	return impactSymbols, edges, nil
 }
 
+func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offset int) ([]graph.Symbol, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ?
+		ORDER BY s.id ASC
+		LIMIT ?
+		OFFSET ?
+	`, repoID, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []graph.Symbol
+	for rows.Next() {
+		sym, err := scanSymbol(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sym)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line
+		FROM edges e
+		LEFT JOIN symbols src ON src.id = e.src_symbol_id
+		LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
+		LEFT JOIN files f ON f.id = e.file_id
+		WHERE e.repo_id = ?
+		ORDER BY e.id ASC
+		LIMIT ?
+		OFFSET ?
+	`, repoID, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	return scanExportEdges(rows)
+}
+
 func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]graph.Symbol, error) {
 	if len(symbolIDs) == 0 {
 		rows, err := s.db.QueryContext(ctx, `

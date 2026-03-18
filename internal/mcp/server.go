@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -55,6 +56,14 @@ var frameBufferPool = sync.Pool{
 	},
 }
 
+type frameProtocolError struct {
+	msg string
+}
+
+func (e frameProtocolError) Error() string {
+	return e.msg
+}
+
 func (s *Server) Serve(ctx context.Context, in io.Reader, out, errOut io.Writer) error {
 	reader := bufio.NewReader(in)
 	for {
@@ -62,6 +71,16 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out, errOut io.Writer)
 		if err != nil {
 			if err == io.EOF {
 				return nil
+			}
+			var protocolErr frameProtocolError
+			if errors.As(err, &protocolErr) {
+				if writeErr := writeResponse(out, rpcResponse{
+					JSONRPC: "2.0",
+					Error:   &rpcError{Code: -32700, Message: protocolErr.Error()},
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
 			}
 			return err
 		}
@@ -307,26 +326,41 @@ func wrapData(key string, value any, err error) (map[string]any, error) {
 
 func readFrame(r *bufio.Reader) ([]byte, error) {
 	contentLength := 0
+	sawHeader := false
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
+			if err == io.EOF && !sawHeader {
+				return nil, io.EOF
+			}
 			return nil, err
 		}
-		line = strings.TrimSpace(line)
-		if line == "" {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(line) == "" {
 			break
 		}
-		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
-			v := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
+		sawHeader = true
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "content-length:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) != 2 {
+				return nil, frameProtocolError{msg: "invalid Content-Length header"}
+			}
+			v := strings.TrimSpace(parts[1])
 			n, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, err
+				return nil, frameProtocolError{msg: "invalid Content-Length value"}
+			}
+			if n < 0 {
+				return nil, frameProtocolError{msg: "negative Content-Length"}
 			}
 			contentLength = n
 		}
 	}
+	if !sawHeader {
+		return nil, frameProtocolError{msg: "missing frame headers"}
+	}
 	if contentLength <= 0 {
-		return nil, io.EOF
+		return nil, frameProtocolError{msg: "missing Content-Length header"}
 	}
 	payload := make([]byte, contentLength)
 	if _, err := io.ReadFull(r, payload); err != nil {

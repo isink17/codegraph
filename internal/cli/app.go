@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -32,6 +33,26 @@ import (
 )
 
 var startupVersionCheck = versioncheck.NotifyIfOutdated
+
+func parseFlagSet(name string, args []string) (*flag.FlagSet, []string, error) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		return nil, nil, err
+	}
+	return fs, fs.Args(), nil
+}
+
+type stringListFlag []string
+
+func (s *stringListFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringListFlag) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	startupVersionCheck(ctx, stderr)
@@ -87,13 +108,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func runDoctor(stdout io.Writer, args []string) error {
-	fix := false
-	for _, arg := range args {
-		if arg == "--fix" {
-			fix = true
-		}
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fix := fs.Bool("fix", false, "apply non-destructive fixes")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	report, err := doctor.RunWithFix(fix)
+	report, err := doctor.RunWithFix(*fix)
 	if err != nil {
 		return err
 	}
@@ -138,23 +159,15 @@ func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 }
 
 func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
-	count := 1
-	benchtime := "100ms"
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--count":
-			if i+1 < len(args) {
-				if v, err := strconv.Atoi(args[i+1]); err == nil && v > 0 {
-					count = v
-				}
-				i++
-			}
-		case "--benchtime":
-			if i+1 < len(args) {
-				benchtime = args[i+1]
-				i++
-			}
-		}
+	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	count := fs.Int("count", 1, "number of benchmark runs")
+	benchtime := fs.String("benchtime", "100ms", "benchmark time per test")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *count <= 0 {
+		*count = 1
 	}
 	cmdArgs := []string{
 		"test",
@@ -164,16 +177,16 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		"-run", "^$",
 		"-bench", ".",
 		"-benchmem",
-		"-count", strconv.Itoa(count),
-		"-benchtime", benchtime,
+		"-count", strconv.Itoa(*count),
+		"-benchtime", *benchtime,
 	}
 	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
 	cmd.Env = append(os.Environ(), "GOCACHE="+filepath.Join(".", ".gocache"))
 	out, err := cmd.CombinedOutput()
 	result := map[string]any{
 		"command":   append([]string{"go"}, cmdArgs...),
-		"count":     count,
-		"benchtime": benchtime,
+		"count":     *count,
+		"benchtime": *benchtime,
 		"output":    string(out),
 	}
 	if err != nil {
@@ -254,16 +267,23 @@ func runInstall(stdout io.Writer) error {
 }
 
 func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, args []string, update bool) error {
-	repoRoot := "."
+	fs := flag.NewFlagSet("index", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	jsonl := false
+	filtered := make([]string, 0, len(args))
 	for _, arg := range args {
 		if arg == "--jsonl" {
 			jsonl = true
 			continue
 		}
-		if !strings.HasPrefix(arg, "-") {
-			repoRoot = arg
-		}
+		filtered = append(filtered, arg)
+	}
+	if err := fs.Parse(filtered); err != nil {
+		return err
+	}
+	repoRoot := "."
+	if fs.NArg() > 0 {
+		repoRoot = fs.Arg(0)
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -304,9 +324,17 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 }
 
 func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	repoRoot := "."
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		repoRoot = args[0]
+	if *repoRootFlag != "" {
+		repoRoot = *repoRootFlag
+	} else if fs.NArg() > 0 {
+		repoRoot = fs.Arg(0)
 	}
 	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -321,66 +349,34 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 }
 
 func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, command string, args []string) error {
-	repoRoot := "."
-	queryValue := ""
-	symbol := ""
-	var symbols []string
-	var files []string
-	depth := 2
-	limit := 20
-	offset := 0
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root")
+	queryFlag := fs.String("query", "", "query text")
+	depth := fs.Int("depth", 2, "impact depth")
+	limit := fs.Int("limit", 20, "result limit")
+	offset := fs.Int("offset", 0, "result offset")
+	var symbols stringListFlag
+	var files stringListFlag
+	fs.Var(&symbols, "symbol", "symbol name (repeatable)")
+	fs.Var(&files, "file", "file path (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "--repo-root":
-			if i+1 < len(args) {
-				repoRoot = args[i+1]
-				i++
-			}
-		case "--query":
-			if i+1 < len(args) {
-				queryValue = args[i+1]
-				i++
-			}
-		case "--symbol":
-			if i+1 < len(args) {
-				symbol = args[i+1]
-				symbols = append(symbols, args[i+1])
-				i++
-			}
-		case "--file":
-			if i+1 < len(args) {
-				files = append(files, args[i+1])
-				i++
-			}
-		case "--depth":
-			if i+1 < len(args) {
-				fmt.Sscanf(args[i+1], "%d", &depth)
-				i++
-			}
-		case "--limit":
-			if i+1 < len(args) {
-				fmt.Sscanf(args[i+1], "%d", &limit)
-				i++
-			}
-		case "--offset":
-			if i+1 < len(args) {
-				fmt.Sscanf(args[i+1], "%d", &offset)
-				i++
-			}
-		default:
-			if strings.HasPrefix(arg, "-") {
-				continue
-			}
-			if repoRoot == "." {
-				repoRoot = arg
-				continue
-			}
-			if queryValue == "" {
-				queryValue = arg
-			}
-		}
+	repoRoot := "."
+	if *repoRootFlag != "" {
+		repoRoot = *repoRootFlag
+	}
+	queryValue := *queryFlag
+	symbol := ""
+	rest := fs.Args()
+	if *repoRootFlag == "" && len(rest) > 0 {
+		repoRoot = rest[0]
+		rest = rest[1:]
+	}
+	if queryValue == "" && len(rest) > 0 {
+		queryValue = rest[0]
 	}
 	if symbol == "" && len(symbols) > 0 {
 		symbol = symbols[0]
@@ -400,7 +396,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		if queryValue == "" {
 			return errors.New("usage: codegraph find-symbol <repo-path> <query> [--limit N] [--offset N]")
 		}
-		items, err := app.Query.FindSymbol(ctx, repoID, queryValue, limit, offset)
+		items, err := app.Query.FindSymbol(ctx, repoID, queryValue, *limit, *offset)
 		if err != nil {
 			return err
 		}
@@ -409,7 +405,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		if queryValue == "" {
 			return errors.New("usage: codegraph search <repo-path> <query> [--limit N] [--offset N]")
 		}
-		items, err := app.Query.SearchSymbols(ctx, repoID, queryValue, limit, offset)
+		items, err := app.Query.SearchSymbols(ctx, repoID, queryValue, *limit, *offset)
 		if err != nil {
 			return err
 		}
@@ -418,7 +414,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		if symbol == "" {
 			return errors.New("usage: codegraph callers <repo-path> --symbol <name> [--limit N] [--offset N]")
 		}
-		items, err := app.Query.FindCallers(ctx, repoID, symbol, 0, limit, offset)
+		items, err := app.Query.FindCallers(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
 			return err
 		}
@@ -427,7 +423,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		if symbol == "" {
 			return errors.New("usage: codegraph callees <repo-path> --symbol <name> [--limit N] [--offset N]")
 		}
-		items, err := app.Query.FindCallees(ctx, repoID, symbol, 0, limit, offset)
+		items, err := app.Query.FindCallees(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
 			return err
 		}
@@ -440,7 +436,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 				return errors.New("usage: codegraph impact <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]")
 			}
 		}
-		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, depth)
+		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, *depth)
 		if err != nil {
 			return err
 		}
@@ -451,16 +447,17 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 }
 
 func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	repoRoot := "."
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--repo-root" && i+1 < len(args) {
-			repoRoot = args[i+1]
-			i++
-			continue
-		}
-		if !strings.HasPrefix(args[i], "-") {
-			repoRoot = args[i]
-		}
+	if *repoRootFlag != "" {
+		repoRoot = *repoRootFlag
+	} else if fs.NArg() > 0 {
+		repoRoot = fs.Arg(0)
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -472,23 +469,25 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 }
 
 func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonl := fs.Bool("jsonl", false, "output line-delimited JSON events")
+	repoRootFlag := fs.String("repo-root", "", "repository root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	repoRoot := "."
-	jsonl := false
-	for _, arg := range args {
-		if arg == "--jsonl" {
-			jsonl = true
-			continue
-		}
-		if !strings.HasPrefix(arg, "-") {
-			repoRoot = arg
-		}
+	if *repoRootFlag != "" {
+		repoRoot = *repoRootFlag
+	} else if fs.NArg() > 0 {
+		repoRoot = fs.Arg(0)
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
 	defer app.Close()
-	if jsonl {
+	if *jsonl {
 		if err := writeJSONL(stdout, map[string]any{
 			"type":      "watch_started",
 			"repo_root": repo.RootPath,
@@ -501,7 +500,7 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	}
 	w := watcher.New(app.Store, app.Indexer)
 	err = w.Run(ctx, repo.RootPath, repoID, cfg.WatchDebounce)
-	if jsonl {
+	if *jsonl {
 		event := map[string]any{
 			"type":  "watch_stopped",
 			"stats": w.Stats(),
@@ -515,29 +514,28 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 }
 
 func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
-	if len(args) == 0 || args[0] != "export" {
-		return errors.New("usage: codegraph graph export <repo-path> [--format json|dot] [--symbol name]")
+	if len(args) == 0 {
+		return errors.New("usage: codegraph graph export <repo-path> [--format json|dot] [--symbol name] [--limit N] [--offset N] [--jsonl]")
+	}
+	switch args[0] {
+	case "export":
+	default:
+		return errors.New("usage: codegraph graph export <repo-path> [--format json|dot] [--symbol name] [--limit N] [--offset N] [--jsonl]")
+	}
+	fs := flag.NewFlagSet("graph export", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	format := fs.String("format", "json", "output format (json|dot)")
+	symbol := fs.String("symbol", "", "focus symbol")
+	focusSymbol := fs.String("focus-symbol", "", "focus symbol")
+	limit := fs.Int("limit", 0, "page size for JSON export")
+	offset := fs.Int("offset", 0, "offset for JSON export")
+	jsonl := fs.Bool("jsonl", false, "stream graph as line-delimited JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
 	}
 	repoRoot := "."
-	format := "json"
-	symbol := ""
-	for i := 1; i < len(args); i++ {
-		switch args[i] {
-		case "--format":
-			if i+1 < len(args) {
-				format = args[i+1]
-				i++
-			}
-		case "--symbol", "--focus-symbol":
-			if i+1 < len(args) {
-				symbol = args[i+1]
-				i++
-			}
-		default:
-			if !strings.HasPrefix(args[i], "-") {
-				repoRoot = args[i]
-			}
-		}
+	if fs.NArg() > 0 {
+		repoRoot = fs.Arg(0)
 	}
 	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -545,15 +543,22 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	}
 	defer app.Close()
 	exp := export.New(app.Query)
-	if format == "dot" {
-		out, err := exp.DOT(ctx, repoID, symbol, 2)
+	selectedSymbol := strings.TrimSpace(*symbol)
+	if selectedSymbol == "" {
+		selectedSymbol = strings.TrimSpace(*focusSymbol)
+	}
+	if *jsonl {
+		return exp.StreamJSONL(ctx, stdout, repoID, *limit)
+	}
+	if *format == "dot" {
+		out, err := exp.DOT(ctx, repoID, selectedSymbol, 2)
 		if err != nil {
 			return err
 		}
 		_, err = stdout.Write(out)
 		return err
 	}
-	out, err := exp.JSON(ctx, repoID)
+	out, err := exp.JSONPaged(ctx, repoID, selectedSymbol, 2, *limit, *offset)
 	if err != nil {
 		return err
 	}
@@ -562,17 +567,16 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 }
 
 func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
-	repoRoot := ""
-	vacuum := false
-	for _, arg := range args {
-		switch arg {
-		case "--vacuum":
-			vacuum = true
-		default:
-			if !strings.HasPrefix(arg, "-") {
-				repoRoot = arg
-			}
-		}
+	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	vacuum := fs.Bool("vacuum", false, "run VACUUM on databases")
+	repoRootFlag := fs.String("repo-root", "", "repository root to clean")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	repoRoot := strings.TrimSpace(*repoRootFlag)
+	if repoRoot == "" && fs.NArg() > 0 {
+		repoRoot = fs.Arg(0)
 	}
 
 	type dbResult struct {
@@ -583,7 +587,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		Error          string `json:"error,omitempty"`
 	}
 	report := map[string]any{
-		"vacuum": vacuum,
+		"vacuum": *vacuum,
 		"dbs":    []dbResult{},
 	}
 	var results []dbResult
@@ -602,7 +606,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			return err
 		}
 		defer s.Close()
-		if vacuum {
+		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
 				return err
 			}
@@ -677,7 +681,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			results = append(results, res)
 			continue
 		}
-		if vacuum {
+		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
 				_ = s.Close()
 				res.Action = "skipped"

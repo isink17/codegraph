@@ -28,6 +28,7 @@ This milestone includes:
 - `codegraph impact <path> --symbol <name>`
 - `codegraph serve --repo-root <path>`
 - `codegraph graph export <path>`
+- `codegraph graph export <path> --format json|dot [--limit N] [--offset N] [--jsonl]`
 - `codegraph doctor`
 - `codegraph doctor --fix`
 - `codegraph config show|edit-path|validate`
@@ -195,6 +196,8 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - `codegraph config <show|edit-path|validate>`
 - `codegraph benchmark [--count N] [--benchtime DURATION]`
 - `codegraph graph export <path> --format json|dot`
+- add `--jsonl` to stream symbols/edges as line-delimited events
+- add `--limit` and `--offset` for paged JSON export slices
 - `codegraph watch <path>`
 - `codegraph watch <path> --jsonl` for line-delimited watch lifecycle events and final watch stats
 

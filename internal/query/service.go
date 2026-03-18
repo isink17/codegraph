@@ -50,3 +50,11 @@ func (s *Service) SemanticSearch(ctx context.Context, repoID int64, query string
 func (s *Service) GraphSnapshot(ctx context.Context, repoID int64, symbol string, depth int) ([]graph.Symbol, []store.ExportEdge, error) {
 	return s.store.GraphSnapshot(ctx, repoID, symbol, depth)
 }
+
+func (s *Service) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offset int) ([]graph.Symbol, error) {
+	return s.store.ExportSymbolsPage(ctx, repoID, limit, offset)
+}
+
+func (s *Service) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]store.ExportEdge, error) {
+	return s.store.ExportEdgesPage(ctx, repoID, limit, offset)
+}

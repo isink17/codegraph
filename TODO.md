@@ -45,3 +45,38 @@
 - [x] Add `codegraph config` command (`show`, `edit-path`, `validate`) for easier setup.
 - [x] Add `doctor --fix` mode for non-destructive autofixes (create dirs, suggest PATH export command).
 - [x] Add a tiny benchmark command that runs store/query/index micro-benchmarks and prints regression deltas.
+
+## Fresh Backlog (New)
+
+### P0
+- [x] Harden MCP frame parsing and protocol error handling.
+  - Problem: `readFrame` currently treats missing/invalid `Content-Length` as EOF-like flow, which can silently terminate sessions.
+  - Target: return structured protocol errors for malformed frames and keep server loop resilient where safe.
+- [x] Replace ad-hoc CLI argument parsing with consistent flag parsing per command.
+  - Problem: manual argument loops already caused regressions (`--jsonl` order handling) and are hard to maintain.
+  - Target: migrate command handlers to typed flag parsing with consistent defaults/validation/error messages.
+- [x] Add export pagination/streaming mode for large graphs.
+  - Problem: `GraphSnapshot`/export paths currently materialize full symbol+edge sets in memory.
+  - Target: support paginated or JSONL streaming export (`--limit/--offset` or chunked stream) for large repos.
+
+### P1
+- [ ] Persist per-scan language coverage into storage.
+  - Problem: `language_coverage` exists only in in-memory scan summary output.
+  - Target: add a scan-language stats table and query APIs so coverage is available historically (`list_scans` detail).
+- [ ] Improve heuristic parser preprocessor for multiline/comment edge cases.
+  - Problem: current stripping is line-oriented and can still mis-handle multiline strings/heredocs in some languages.
+  - Target: language-family-aware multiline state handling and targeted tests for JS template strings, Ruby heredocs, etc.
+- [ ] Strengthen MCP tool schemas and argument validation.
+  - Problem: schemas are loosely typed and mostly optional, with minimal required/default contracts.
+  - Target: add required fields/default docs and centralized validation before tool dispatch.
+
+### P2
+- [ ] Add periodic JSONL watch events (heartbeat + flush summaries).
+  - Problem: `watch --jsonl` currently emits only start/stop lifecycle events.
+  - Target: emit incremental watcher/index activity events so clients can show live progress.
+- [ ] Benchmark command: add baseline comparison and simple delta report.
+  - Problem: benchmark output is returned raw; no regression signal is computed yet.
+  - Target: persist a local baseline snapshot and print per-benchmark % deltas vs latest baseline.
+- [ ] Add `config init --repo` helper for `.codegraph/config.json` templates.
+  - Problem: repo-level config setup is still manual.
+  - Target: generate a starter repo config with comments/examples for parse policy, size limits, include/exclude.
