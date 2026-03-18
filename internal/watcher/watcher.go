@@ -32,6 +32,16 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		if err != nil {
 			return err
 		}
+		if path != repoRoot {
+			rel, relErr := filepath.Rel(repoRoot, path)
+			if relErr != nil {
+				return relErr
+			}
+			rel = filepath.Clean(rel)
+			if d.IsDir() && indexer.ShouldSkipDir(rel, nil) {
+				return filepath.SkipDir
+			}
+		}
 		if d.IsDir() {
 			return fsw.Add(path)
 		}
@@ -72,7 +82,11 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			if err != nil {
 				continue
 			}
-			_ = w.store.QueueDirtyFile(ctx, repoID, filepath.Clean(rel), event.Op.String())
+			rel = filepath.Clean(rel)
+			if shouldIgnorePath(rel) {
+				continue
+			}
+			_ = w.store.QueueDirtyFile(ctx, repoID, rel, event.Op.String())
 			timer.Reset(debounce)
 		case <-timer.C:
 			if err := flush(); err != nil {
@@ -85,4 +99,19 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			return err
 		}
 	}
+}
+
+func shouldIgnorePath(rel string) bool {
+	current := rel
+	for current != "." && current != "" {
+		if indexer.ShouldSkipDir(current, nil) {
+			return true
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			break
+		}
+		current = next
+	}
+	return false
 }

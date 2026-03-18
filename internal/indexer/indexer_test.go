@@ -104,6 +104,49 @@ func main() {
 	}
 }
 
+func TestIndexSkipsDotAndGeneratedDirectories(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, "main.go"), `package main
+
+func main() {}
+`)
+	writeFile(t, filepath.Join(repoRoot, ".hidden", "ignored.go"), `package hidden
+func Ignored() {}
+`)
+	writeFile(t, filepath.Join(repoRoot, "app", "build", "generated.go"), `package generated
+func Generated() {}
+`)
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	idx := New(s, parser.NewRegistry(goparser.New()))
+	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
+	if err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	if summary.FilesIndexed != 1 {
+		t.Fatalf("FilesIndexed = %d, want 1", summary.FilesIndexed)
+	}
+
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	stats, err := s.Stats(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if stats.Files != 1 {
+		t.Fatalf("stats.Files = %d, want 1", stats.Files)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

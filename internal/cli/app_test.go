@@ -30,6 +30,7 @@ func TestRunInstallCreatesConfigAndPrintsSnippets(t *testing.T) {
 		"Codex MCP snippet:",
 		"Gemini CLI MCP snippet:",
 		"Claude/Desktop MCP snippet:",
+		"If `codegraph` is not found after `go install`",
 	} {
 		if !strings.Contains(out, needle) {
 			t.Fatalf("install output missing %q\noutput:\n%s", needle, out)

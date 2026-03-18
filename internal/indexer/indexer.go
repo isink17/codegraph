@@ -185,13 +185,17 @@ func hashContent(content []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func ShouldSkipDir(rel string, excludes []string) bool {
+	return shouldSkipDir(rel, excludes)
+}
+
 func shouldSkipDir(rel string, excludes []string) bool {
 	base := filepath.Base(rel)
-	switch base {
-	case ".git", ".codegraph", ".gocache", ".gomodcache", ".tmp", "node_modules", "vendor", "dist", "build", ".idea":
+	if strings.HasPrefix(base, ".") {
 		return true
 	}
-	if strings.HasPrefix(base, ".codegraph-home") {
+	switch base {
+	case "node_modules", "vendor", "dist", "build", "target", "out", "bin":
 		return true
 	}
 	return matchesAny(rel, excludes)

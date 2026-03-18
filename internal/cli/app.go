@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/appname"
@@ -103,7 +105,62 @@ func runInstall(stdout io.Writer) error {
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Claude/Desktop MCP snippet:")
 	fmt.Fprintln(stdout, `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`)
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "If `codegraph` is not found after `go install`, your Go bin directory is probably not on PATH.")
+	fmt.Fprintln(stdout, "Check expected Go bin locations:")
+	for _, dir := range goBinPathHints() {
+		fmt.Fprintf(stdout, "  - %s\n", dir)
+	}
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(stdout, "Then reopen PowerShell and verify: where.exe codegraph")
+	} else {
+		fmt.Fprintln(stdout, "Then reopen your shell and verify: command -v codegraph")
+	}
 	return nil
+}
+
+func goBinPathHints() []string {
+	var hints []string
+	if gobin := strings.TrimSpace(goEnv("GOBIN")); gobin != "" {
+		hints = append(hints, gobin)
+	}
+	if gopath := strings.TrimSpace(goEnv("GOPATH")); gopath != "" {
+		hints = append(hints, filepath.Join(gopath, "bin"))
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		if runtime.GOOS == "windows" {
+			hints = append(hints, filepath.Join(home, "go", "bin"))
+		} else {
+			hints = append(hints, filepath.Join(home, "go", "bin"))
+		}
+	}
+	if runtime.GOOS == "windows" {
+		hints = append(hints, `C:\Program Files\Go\bin`)
+	} else {
+		hints = append(hints, "/usr/local/go/bin")
+	}
+	seen := map[string]struct{}{}
+	var uniq []string
+	for _, h := range hints {
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		uniq = append(uniq, h)
+	}
+	return uniq
+}
+
+func goEnv(name string) string {
+	out, err := exec.Command("go", "env", name).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, args []string, update bool) error {
