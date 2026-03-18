@@ -89,6 +89,18 @@ type RelatedTest struct {
 	Score  float64 `json:"score"`
 }
 
+type ExportEdge struct {
+	ID               int64  `json:"edge_id"`
+	SrcSymbolID      int64  `json:"src_symbol_id"`
+	SrcQualifiedName string `json:"src_qualified_name"`
+	DstSymbolID      *int64 `json:"dst_symbol_id,omitempty"`
+	DstQualifiedName string `json:"dst_qualified_name,omitempty"`
+	DstName          string `json:"dst_name,omitempty"`
+	Kind             string `json:"kind"`
+	FilePath         string `json:"file,omitempty"`
+	Line             int    `json:"line"`
+}
+
 func Open(path string) (*Store, error) {
 	return OpenWithOptions(path, OpenOptions{})
 }
@@ -1529,6 +1541,201 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 			"score":  item.score,
 			"why":    []string{"token_overlap"},
 		})
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GraphSnapshot(ctx context.Context, repoID int64, focusSymbol string, depth int) ([]graph.Symbol, []ExportEdge, error) {
+	if strings.TrimSpace(focusSymbol) == "" {
+		symbols, err := s.loadSymbolsForExport(ctx, repoID, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		edges, err := s.loadEdgesForExport(ctx, repoID, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return symbols, edges, nil
+	}
+
+	impact, err := s.ImpactRadius(ctx, repoID, []string{focusSymbol}, nil, depth)
+	if err != nil {
+		return nil, nil, err
+	}
+	impactSymbols, _ := impact["symbols"].([]graph.Symbol)
+	if len(impactSymbols) == 0 {
+		return nil, nil, nil
+	}
+	idSet := map[int64]struct{}{}
+	ids := make([]int64, 0, len(impactSymbols))
+	for _, sym := range impactSymbols {
+		if _, ok := idSet[sym.ID]; ok {
+			continue
+		}
+		idSet[sym.ID] = struct{}{}
+		ids = append(ids, sym.ID)
+	}
+	edges, err := s.loadEdgesForExport(ctx, repoID, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	return impactSymbols, edges, nil
+}
+
+func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]graph.Symbol, error) {
+	if len(symbolIDs) == 0 {
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+			FROM symbols s
+			JOIN files f ON f.id = s.file_id
+			WHERE s.repo_id = ?
+		`, repoID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []graph.Symbol
+		for rows.Next() {
+			sym, err := scanSymbol(rows)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, sym)
+		}
+		return out, rows.Err()
+	}
+	out := make([]graph.Symbol, 0, len(symbolIDs))
+	for _, chunk := range chunkInt64s(symbolIDs, 250) {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+			FROM symbols s
+			JOIN files f ON f.id = s.file_id
+			WHERE s.repo_id = ? AND s.id IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			sym, err := scanSymbol(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out = append(out, sym)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]ExportEdge, error) {
+	if len(symbolIDs) == 0 {
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line
+			FROM edges e
+			LEFT JOIN symbols src ON src.id = e.src_symbol_id
+			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
+			LEFT JOIN files f ON f.id = e.file_id
+			WHERE e.repo_id = ?
+		`, repoID)
+		if err != nil {
+			return nil, err
+		}
+		return scanExportEdges(rows)
+	}
+	var out []ExportEdge
+	for _, chunk := range chunkInt64s(symbolIDs, 250) {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line
+			FROM edges e
+			LEFT JOIN symbols src ON src.id = e.src_symbol_id
+			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
+			LEFT JOIN files f ON f.id = e.file_id
+			WHERE e.repo_id = ? AND (e.src_symbol_id IN (` + placeholders + `) OR e.dst_symbol_id IN (` + placeholders + `))
+		`
+		args := make([]any, 0, (len(chunk)*2)+1)
+		args = append(args, repoID)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		items, err := scanExportEdges(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
+	}
+	byID := map[int64]ExportEdge{}
+	for _, edge := range out {
+		if _, ok := byID[edge.ID]; ok {
+			continue
+		}
+		byID[edge.ID] = edge
+	}
+	unique := make([]ExportEdge, 0, len(byID))
+	for _, edge := range byID {
+		unique = append(unique, edge)
+	}
+	return unique, nil
+}
+
+func chunkInt64s(values []int64, chunkSize int) [][]int64 {
+	if len(values) == 0 || chunkSize <= 0 {
+		return nil
+	}
+	out := make([][]int64, 0, (len(values)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(values); start += chunkSize {
+		end := start + chunkSize
+		if end > len(values) {
+			end = len(values)
+		}
+		out = append(out, values[start:end])
+	}
+	return out
+}
+
+func scanExportEdges(rows *sql.Rows) ([]ExportEdge, error) {
+	defer rows.Close()
+	var out []ExportEdge
+	for rows.Next() {
+		var edge ExportEdge
+		var dstID sql.NullInt64
+		if err := rows.Scan(
+			&edge.ID,
+			&edge.SrcSymbolID,
+			&edge.SrcQualifiedName,
+			&dstID,
+			&edge.DstQualifiedName,
+			&edge.DstName,
+			&edge.Kind,
+			&edge.FilePath,
+			&edge.Line,
+		); err != nil {
+			return nil, err
+		}
+		if dstID.Valid {
+			value := dstID.Int64
+			edge.DstSymbolID = &value
+		}
+		out = append(out, edge)
 	}
 	return out, rows.Err()
 }

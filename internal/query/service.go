@@ -46,3 +46,7 @@ func (s *Service) RelatedTests(ctx context.Context, repoID int64, symbol, file s
 func (s *Service) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
 	return s.store.SemanticSearch(ctx, repoID, query, limit, offset)
 }
+
+func (s *Service) GraphSnapshot(ctx context.Context, repoID int64, symbol string, depth int) ([]graph.Symbol, []store.ExportEdge, error) {
+	return s.store.GraphSnapshot(ctx, repoID, symbol, depth)
+}
