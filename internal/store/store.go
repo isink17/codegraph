@@ -41,6 +41,14 @@ type FileRecord struct {
 	IsDeleted   bool
 }
 
+type FileMetadataUpdate struct {
+	Path        string
+	Language    string
+	SizeBytes   int64
+	MtimeUnixNS int64
+	ContentHash string
+}
+
 type ScanSummary struct {
 	RepoID       int64 `json:"repo_id"`
 	ScanID       int64 `json:"scan_id"`
@@ -412,7 +420,57 @@ func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSumm
 }
 
 func (s *Store) TouchFileMetadata(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string) error {
-	_, err := s.db.ExecContext(ctx, `
+	return s.TouchFilesMetadataBatch(ctx, repoID, scanID, []FileMetadataUpdate{
+		{
+			Path:        path,
+			Language:    language,
+			SizeBytes:   sizeBytes,
+			MtimeUnixNS: mtimeUnixNS,
+			ContentHash: contentHash,
+		},
+	})
+}
+
+func (s *Store) MarkFileSeen(ctx context.Context, repoID, scanID int64, path string) error {
+	return s.MarkFilesSeenBatch(ctx, repoID, scanID, []string{path})
+}
+
+func (s *Store) MarkFilesSeenBatch(ctx context.Context, repoID, scanID int64, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		UPDATE files
+		SET last_scan_id = ?, is_deleted = 0
+		WHERE repo_id = ? AND path = ?
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	for _, path := range paths {
+		if _, err := stmt.ExecContext(ctx, scanID, repoID, path); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) TouchFilesMetadataBatch(ctx context.Context, repoID, scanID int64, updates []FileMetadataUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted)
 		VALUES(?, ?, ?, ?, ?, ?, 'skipped', ?, ?, 0)
 		ON CONFLICT(repo_id, path)
@@ -425,17 +483,30 @@ func (s *Store) TouchFileMetadata(ctx context.Context, repoID, scanID int64, pat
 			last_scan_id = excluded.last_scan_id,
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0
-	`, repoID, path, language, sizeBytes, mtimeUnixNS, contentHash, scanID, time.Now().UTC().Format(time.RFC3339))
-	return err
-}
-
-func (s *Store) MarkFileSeen(ctx context.Context, repoID, scanID int64, path string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE files
-		SET last_scan_id = ?, is_deleted = 0
-		WHERE repo_id = ? AND path = ?
-	`, scanID, repoID, path)
-	return err
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	indexedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, update := range updates {
+		if _, err := stmt.ExecContext(
+			ctx,
+			repoID,
+			update.Path,
+			update.Language,
+			update.SizeBytes,
+			update.MtimeUnixNS,
+			update.ContentHash,
+			scanID,
+			indexedAt,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string, parsed graph.ParsedFile) error {
@@ -734,35 +805,91 @@ func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (i
 	return int(n), nil
 }
 
+type edgeTarget struct {
+	edgeID  int64
+	dstName string
+}
+
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL`, repoID)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	type target struct {
-		edgeID  int64
-		dstName string
-	}
-	var targets []target
-	for rows.Next() {
-		var t target
-		if err := rows.Scan(&t.edgeID, &t.dstName); err != nil {
-			return err
-		}
-		targets = append(targets, t)
-	}
-	if err := rows.Err(); err != nil {
+	targets, err := scanEdgeTargets(rows)
+	if err != nil {
 		return err
 	}
+	return s.resolveEdgeTargets(ctx, repoID, targets)
+}
+
+func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	const chunkSize = 300
+	targets := make([]edgeTarget, 0, len(paths))
+	seen := map[int64]struct{}{}
+	for start := 0; start < len(paths); start += chunkSize {
+		end := start + chunkSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		chunk := paths[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT e.id, e.dst_name
+			FROM edges e
+			JOIN files f ON f.id = e.file_id
+			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND f.path IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		chunkTargets, err := scanEdgeTargets(rows)
+		if err != nil {
+			return err
+		}
+		for _, target := range chunkTargets {
+			if _, ok := seen[target.edgeID]; ok {
+				continue
+			}
+			seen[target.edgeID] = struct{}{}
+			targets = append(targets, target)
+		}
+	}
+	return s.resolveEdgeTargets(ctx, repoID, targets)
+}
+
+func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
+	defer rows.Close()
+	var targets []edgeTarget
+	for rows.Next() {
+		var target edgeTarget
+		if err := rows.Scan(&target.edgeID, &target.dstName); err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return targets, nil
+}
+
+func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget) error {
 	if len(targets) == 0 {
 		return nil
 	}
-
 	qualifiedSet := map[string]struct{}{}
-	for _, t := range targets {
-		if t.dstName != "" {
-			qualifiedSet[t.dstName] = struct{}{}
+	for _, target := range targets {
+		if target.dstName != "" {
+			qualifiedSet[target.dstName] = struct{}{}
 		}
 	}
 	qualifiedNames := make([]string, 0, len(qualifiedSet))
@@ -775,11 +902,11 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) error {
 	}
 
 	shortSet := map[string]struct{}{}
-	for _, t := range targets {
-		if _, ok := byQualified[t.dstName]; ok {
+	for _, target := range targets {
+		if _, ok := byQualified[target.dstName]; ok {
 			continue
 		}
-		parts := strings.Split(t.dstName, ".")
+		parts := strings.Split(target.dstName, ".")
 		short := strings.TrimSpace(parts[len(parts)-1])
 		if short != "" {
 			shortSet[short] = struct{}{}
@@ -805,17 +932,17 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) error {
 	}
 	defer updateStmt.Close()
 
-	for _, t := range targets {
-		dstID, ok := byQualified[t.dstName]
+	for _, target := range targets {
+		dstID, ok := byQualified[target.dstName]
 		if !ok {
-			parts := strings.Split(t.dstName, ".")
+			parts := strings.Split(target.dstName, ".")
 			short := strings.TrimSpace(parts[len(parts)-1])
 			dstID, ok = byShort[short]
 		}
 		if !ok || dstID == 0 {
 			continue
 		}
-		if _, err := updateStmt.ExecContext(ctx, dstID, t.edgeID); err != nil {
+		if _, err := updateStmt.ExecContext(ctx, dstID, target.edgeID); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

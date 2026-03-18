@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ type Watcher struct {
 	coalescedSignals atomic.Int64
 	flushRuns        atomic.Int64
 	flushErrors      atomic.Int64
+	queueErrors      atomic.Int64
 }
 
 type WatchStats struct {
@@ -29,6 +31,7 @@ type WatchStats struct {
 	CoalescedSignals int64 `json:"coalesced_signals"`
 	FlushRuns        int64 `json:"flush_runs"`
 	FlushErrors      int64 `json:"flush_errors"`
+	QueueErrors      int64 `json:"queue_errors"`
 }
 
 func New(s *store.Store, idx *indexer.Indexer) *Watcher {
@@ -41,6 +44,7 @@ func (w *Watcher) Stats() WatchStats {
 		CoalescedSignals: w.coalescedSignals.Load(),
 		FlushRuns:        w.flushRuns.Load(),
 		FlushErrors:      w.flushErrors.Load(),
+		QueueErrors:      w.queueErrors.Load(),
 	}
 }
 
@@ -49,6 +53,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	w.coalescedSignals.Store(0)
 	w.flushRuns.Store(0)
 	w.flushErrors.Store(0)
+	w.queueErrors.Store(0)
 	if debounce <= 0 {
 		debounce = 750 * time.Millisecond
 	}
@@ -168,7 +173,10 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 					}
 				}
 			}
-			_ = w.store.QueueDirtyFile(ctx, repoID, rel, event.Op.String())
+			if err := w.queueDirtyWithRetry(ctx, repoID, rel, event.Op.String()); err != nil {
+				w.queueErrors.Add(1)
+				return err
+			}
 			select {
 			case flushSignalCh <- struct{}{}:
 				w.flushSignals.Add(1)
@@ -182,6 +190,25 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			return err
 		}
 	}
+}
+
+func (w *Watcher) queueDirtyWithRetry(ctx context.Context, repoID int64, path, reason string) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := w.store.QueueDirtyFile(ctx, repoID, path, reason); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		delay := time.Duration(attempt*50) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return fmt.Errorf("queue dirty file %s: %w", path, lastErr)
 }
 
 func shouldIgnorePath(rel string) bool {

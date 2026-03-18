@@ -213,6 +213,32 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		close(results)
 	}()
 
+	const metadataBatchSize = 300
+	markSeenBatch := make([]string, 0, metadataBatchSize)
+	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
+	changedPathSet := map[string]struct{}{}
+
+	flushMarkSeen := func() error {
+		if len(markSeenBatch) == 0 {
+			return nil
+		}
+		if err := i.store.MarkFilesSeenBatch(ctx, repo.ID, scanID, markSeenBatch); err != nil {
+			return err
+		}
+		markSeenBatch = markSeenBatch[:0]
+		return nil
+	}
+	flushTouch := func() error {
+		if len(touchBatch) == 0 {
+			return nil
+		}
+		if err := i.store.TouchFilesMetadataBatch(ctx, repo.ID, scanID, touchBatch); err != nil {
+			return err
+		}
+		touchBatch = touchBatch[:0]
+		return nil
+	}
+
 	var runErr error
 	for res := range results {
 		summary.FilesSeen++
@@ -230,13 +256,29 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		case "skip_only":
 			summary.FilesSkipped++
 		case "mark_seen":
-			if err := i.store.MarkFileSeen(ctx, repo.ID, scanID, res.task.rel); err != nil {
+			markSeenBatch = append(markSeenBatch, res.task.rel)
+			if len(markSeenBatch) < metadataBatchSize {
+				summary.FilesSkipped++
+				continue
+			}
+			if err := flushMarkSeen(); err != nil {
 				runErr = err
 				cancel()
 			}
 			summary.FilesSkipped++
 		case "touch":
-			if err := i.store.TouchFileMetadata(ctx, repo.ID, scanID, res.task.rel, res.task.language, res.task.info.Size(), res.task.info.ModTime().UnixNano(), res.hash); err != nil {
+			touchBatch = append(touchBatch, store.FileMetadataUpdate{
+				Path:        res.task.rel,
+				Language:    res.task.language,
+				SizeBytes:   res.task.info.Size(),
+				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
+				ContentHash: res.hash,
+			})
+			if len(touchBatch) < metadataBatchSize {
+				summary.FilesSkipped++
+				continue
+			}
+			if err := flushTouch(); err != nil {
 				runErr = err
 				cancel()
 			}
@@ -247,8 +289,22 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				cancel()
 				continue
 			}
+			changedPathSet[res.task.rel] = struct{}{}
 			summary.FilesChanged++
 			summary.FilesIndexed++
+		}
+	}
+
+	if runErr == nil {
+		if err := flushMarkSeen(); err != nil {
+			runErr = err
+			cancel()
+		}
+	}
+	if runErr == nil {
+		if err := flushTouch(); err != nil {
+			runErr = err
+			cancel()
 		}
 	}
 
@@ -267,9 +323,20 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, err
 	}
 	summary.FilesDeleted = deleted
-	if err := i.store.ResolveEdges(ctx, repo.ID); err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
+	if len(candidateSet) > 0 {
+		changedPaths := make([]string, 0, len(changedPathSet))
+		for path := range changedPathSet {
+			changedPaths = append(changedPaths, path)
+		}
+		if err := i.store.ResolveEdgesForPaths(ctx, repo.ID, changedPaths); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+	} else {
+		if err := i.store.ResolveEdges(ctx, repo.ID); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
 	}
 	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
 		return summary, err
