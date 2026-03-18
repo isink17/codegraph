@@ -32,7 +32,7 @@ This first substantial milestone includes:
 ## Install
 
 ```bash
-go install github.com/<owner>/<repo>/cmd/codegraph@latest
+go install github.com/isink17/codegraph/cmd/codegraph@latest
 codegraph install
 ```
 
