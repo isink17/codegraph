@@ -138,6 +138,26 @@ func TestRunConfigCommands(t *testing.T) {
 	if strings.TrimSpace(out.String()) == "" {
 		t.Fatalf("config edit-path output empty")
 	}
+
+	out.Reset()
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoRoot) error = %v", err)
+	}
+	if err := Run(context.Background(), []string{"config", "init", "--repo", repoRoot}, &out, &errOut); err != nil {
+		t.Fatalf("Run(config init) error = %v", err)
+	}
+	repoCfgPath := filepath.Join(repoRoot, ".codegraph", "config.json")
+	if _, err := os.Stat(repoCfgPath); err != nil {
+		t.Fatalf("expected repo config at %q: %v", repoCfgPath, err)
+	}
+	var cfgData map[string]any
+	if err := json.Unmarshal([]byte(out.String()), &cfgData); err != nil {
+		t.Fatalf("config init output json parse error = %v", err)
+	}
+	if cfgData["path"] == "" {
+		t.Fatalf("config init output missing path: %s", out.String())
+	}
 }
 
 func TestRunDoctorFix(t *testing.T) {
@@ -156,5 +176,43 @@ func TestRunDoctorFix(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"applied_fixes"`) {
 		t.Fatalf("doctor --fix output missing applied_fixes: %s", out.String())
+	}
+}
+
+func TestParseBenchmarkMetrics(t *testing.T) {
+	output := `
+goos: windows
+goarch: amd64
+BenchmarkStoreQuery-16           165           7201 ns/op            256 B/op          4 allocs/op
+BenchmarkIndexerUpdate-16         55          18123 ns/op            640 B/op         10 allocs/op
+PASS
+`
+	parsed := parseBenchmarkMetrics(output)
+	if len(parsed) != 2 {
+		t.Fatalf("parsed benchmark count = %d, want 2", len(parsed))
+	}
+	if parsed["BenchmarkStoreQuery-16"].NsPerOp != 7201 {
+		t.Fatalf("unexpected ns/op for BenchmarkStoreQuery-16: %#v", parsed["BenchmarkStoreQuery-16"])
+	}
+	if parsed["BenchmarkIndexerUpdate-16"].AllocsPerOp != 10 {
+		t.Fatalf("unexpected allocs/op for BenchmarkIndexerUpdate-16: %#v", parsed["BenchmarkIndexerUpdate-16"])
+	}
+}
+
+func TestComputeMetricDelta(t *testing.T) {
+	delta := computeMetricDelta(
+		benchmarkMetric{NsPerOp: 110, BytesPerOp: 55, AllocsPerOp: 11},
+		benchmarkMetric{NsPerOp: 100, BytesPerOp: 50, AllocsPerOp: 10},
+	)
+	nsRaw, ok := delta["ns_per_op"]
+	if !ok {
+		t.Fatalf("missing ns_per_op delta: %#v", delta)
+	}
+	ns, ok := nsRaw.(map[string]any)
+	if !ok {
+		t.Fatalf("ns_per_op delta has unexpected type: %T", nsRaw)
+	}
+	if ns["delta_pct"] != 10.0 {
+		t.Fatalf("ns_per_op delta_pct = %v, want 10", ns["delta_pct"])
 	}
 }

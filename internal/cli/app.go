@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/isink17/codegraph/internal/appname"
 	"github.com/isink17/codegraph/internal/config"
@@ -123,7 +125,7 @@ func runDoctor(stdout io.Writer, args []string) error {
 
 func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: codegraph config <show|edit-path|validate>")
+		return errors.New("usage: codegraph config <show|edit-path|validate|init>")
 	}
 	switch args[0] {
 	case "show":
@@ -153,9 +155,129 @@ func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 			"valid":  len(issues) == 0,
 			"issues": issues,
 		})
+	case "init":
+		fs := flag.NewFlagSet("config init", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		repoRootFlag := fs.String("repo", "", "repository root")
+		force := fs.Bool("force", false, "overwrite existing repo config")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		repoRoot := strings.TrimSpace(*repoRootFlag)
+		if repoRoot == "" && fs.NArg() > 0 {
+			repoRoot = strings.TrimSpace(fs.Arg(0))
+		}
+		if repoRoot == "" {
+			repoRoot = "."
+		}
+		absRepoRoot, err := filepath.Abs(repoRoot)
+		if err != nil {
+			return err
+		}
+		cfgPath := config.RepoConfigPath(absRepoRoot)
+		if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+			return err
+		}
+		if !*force {
+			if _, err := os.Stat(cfgPath); err == nil {
+				return fmt.Errorf("repo config already exists: %s (use --force to overwrite)", cfgPath)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		repoCfg := config.RepoConfig{
+			Include:          []string{"**/*"},
+			Exclude:          []string{".git/**", ".codegraph/**", "node_modules/**", "vendor/**", "dist/**", "build/**"},
+			Languages:        append([]string(nil), cfg.DefaultLanguages...),
+			WatchDebounce:    cfg.WatchDebounce,
+			SemanticMaxTerms: 8,
+			MaxFileSizeBytes: 8 * 1024 * 1024,
+			ParseErrorPolicy: "best_effort",
+		}
+		data, err := json.MarshalIndent(repoCfg, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(cfgPath, append(data, '\n'), 0o644); err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{
+			"path":      cfgPath,
+			"repo_root": absRepoRoot,
+			"created":   true,
+		})
 	default:
 		return fmt.Errorf("unknown config subcommand %q", args[0])
 	}
+}
+
+type benchmarkMetric struct {
+	NsPerOp     float64 `json:"ns_per_op,omitempty"`
+	BytesPerOp  float64 `json:"bytes_per_op,omitempty"`
+	AllocsPerOp float64 `json:"allocs_per_op,omitempty"`
+}
+
+type benchmarkBaseline struct {
+	CreatedAt  string                     `json:"created_at"`
+	Command    []string                   `json:"command"`
+	Count      int                        `json:"count"`
+	Benchtime  string                     `json:"benchtime"`
+	Benchmarks map[string]benchmarkMetric `json:"benchmarks"`
+}
+
+func parseBenchmarkMetrics(output string) map[string]benchmarkMetric {
+	metrics := make(map[string]benchmarkMetric)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Benchmark") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		name := fields[0]
+		var m benchmarkMetric
+		for i := 0; i+1 < len(fields); i++ {
+			value, err := strconv.ParseFloat(fields[i], 64)
+			if err != nil {
+				continue
+			}
+			switch fields[i+1] {
+			case "ns/op":
+				m.NsPerOp = value
+			case "B/op":
+				m.BytesPerOp = value
+			case "allocs/op":
+				m.AllocsPerOp = value
+			}
+		}
+		if m.NsPerOp != 0 || m.BytesPerOp != 0 || m.AllocsPerOp != 0 {
+			metrics[name] = m
+		}
+	}
+	return metrics
+}
+
+func computeMetricDelta(current, baseline benchmarkMetric) map[string]any {
+	out := map[string]any{}
+	add := func(name string, cur, base float64) {
+		if cur == 0 && base == 0 {
+			return
+		}
+		item := map[string]any{
+			"current":  cur,
+			"baseline": base,
+		}
+		if base != 0 {
+			item["delta_pct"] = ((cur - base) / base) * 100.0
+		}
+		out[name] = item
+	}
+	add("ns_per_op", current.NsPerOp, baseline.NsPerOp)
+	add("bytes_per_op", current.BytesPerOp, baseline.BytesPerOp)
+	add("allocs_per_op", current.AllocsPerOp, baseline.AllocsPerOp)
+	return out
 }
 
 func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
@@ -163,6 +285,7 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	fs.SetOutput(io.Discard)
 	count := fs.Int("count", 1, "number of benchmark runs")
 	benchtime := fs.String("benchtime", "100ms", "benchmark time per test")
+	saveBaseline := fs.Bool("save-baseline", true, "save current benchmark result as baseline")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -193,6 +316,46 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		result["ok"] = false
 		result["error"] = err.Error()
 		return writeJSON(stdout, result)
+	}
+	parsed := parseBenchmarkMetrics(string(out))
+	result["benchmarks"] = parsed
+	paths, pathErr := platform.DefaultPaths()
+	if pathErr == nil {
+		baselinePath := filepath.Join(paths.CacheDir, "bench_baseline.json")
+		result["baseline_path"] = baselinePath
+		var baseline benchmarkBaseline
+		if data, readErr := os.ReadFile(baselinePath); readErr == nil {
+			if unmarshalErr := json.Unmarshal(data, &baseline); unmarshalErr == nil && len(baseline.Benchmarks) > 0 {
+				deltas := map[string]any{}
+				for name, current := range parsed {
+					base, ok := baseline.Benchmarks[name]
+					if !ok {
+						continue
+					}
+					deltas[name] = computeMetricDelta(current, base)
+				}
+				if len(deltas) > 0 {
+					result["delta_vs_baseline"] = deltas
+				}
+				result["baseline_created_at"] = baseline.CreatedAt
+			}
+		}
+		if *saveBaseline {
+			if mkdirErr := os.MkdirAll(filepath.Dir(baselinePath), 0o755); mkdirErr == nil {
+				payload := benchmarkBaseline{
+					CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+					Command:    append([]string{"go"}, cmdArgs...),
+					Count:      *count,
+					Benchtime:  *benchtime,
+					Benchmarks: parsed,
+				}
+				if data, marshalErr := json.MarshalIndent(payload, "", "  "); marshalErr == nil {
+					if writeErr := os.WriteFile(baselinePath, append(data, '\n'), 0o644); writeErr == nil {
+						result["baseline_saved"] = true
+					}
+				}
+			}
+		}
 	}
 	result["ok"] = true
 	return writeJSON(stdout, result)
@@ -499,7 +662,53 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		fmt.Fprintf(stdout, "watching %s\n", repo.RootPath)
 	}
 	w := watcher.New(app.Store, app.Indexer)
+	var reporterDone sync.WaitGroup
+	reporterCtx, reporterCancel := context.WithCancel(ctx)
+	var writeMu sync.Mutex
+	writeEvent := func(event map[string]any) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		_ = writeJSONL(stdout, event)
+	}
+	if *jsonl {
+		reporterDone.Add(1)
+		go func() {
+			defer reporterDone.Done()
+			heartbeatEvery := 2 * time.Second
+			if cfg.WatchDebounce > 0 && cfg.WatchDebounce > heartbeatEvery {
+				heartbeatEvery = cfg.WatchDebounce
+			}
+			ticker := time.NewTicker(heartbeatEvery)
+			defer ticker.Stop()
+			var prev watcher.WatchStats
+			for {
+				select {
+				case <-reporterCtx.Done():
+					return
+				case <-ticker.C:
+					current := w.Stats()
+					writeEvent(map[string]any{
+						"type":  "watch_heartbeat",
+						"stats": current,
+					})
+					flushDelta := current.FlushRuns - prev.FlushRuns
+					if flushDelta > 0 || current.FlushErrors > prev.FlushErrors || current.QueueErrors > prev.QueueErrors {
+						writeEvent(map[string]any{
+							"type":               "watch_flush_summary",
+							"stats":              current,
+							"delta_flush_runs":   flushDelta,
+							"delta_flush_errors": current.FlushErrors - prev.FlushErrors,
+							"delta_queue_errors": current.QueueErrors - prev.QueueErrors,
+						})
+					}
+					prev = current
+				}
+			}
+		}()
+	}
 	err = w.Run(ctx, repo.RootPath, repoID, cfg.WatchDebounce)
+	reporterCancel()
+	reporterDone.Wait()
 	if *jsonl {
 		event := map[string]any{
 			"type":  "watch_stopped",
@@ -795,8 +1004,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  impact <repo-path> [--symbol <name>] [--file <path>]")
 	fmt.Fprintln(w, "  doctor")
 	fmt.Fprintln(w, "    add --fix for non-destructive autofixes")
-	fmt.Fprintln(w, "  config <show|edit-path|validate>")
-	fmt.Fprintln(w, "  benchmark [--count N] [--benchtime DURATION]")
+	fmt.Fprintln(w, "  config <show|edit-path|validate|init>")
+	fmt.Fprintln(w, "    config init [--repo PATH] [--force]")
+	fmt.Fprintln(w, "  benchmark [--count N] [--benchtime DURATION] [--save-baseline]")
 	fmt.Fprintln(w, "  graph export <repo-path> [--format json|dot]")
 	fmt.Fprintln(w, "  watch <repo-path>")
 	fmt.Fprintln(w, "    add --jsonl for streaming line-delimited JSON events")

@@ -71,12 +71,12 @@
   - Target: add required fields/default docs and centralized validation before tool dispatch.
 
 ### P2
-- [ ] Add periodic JSONL watch events (heartbeat + flush summaries).
+- [x] Add periodic JSONL watch events (heartbeat + flush summaries).
   - Problem: `watch --jsonl` currently emits only start/stop lifecycle events.
   - Target: emit incremental watcher/index activity events so clients can show live progress.
-- [ ] Benchmark command: add baseline comparison and simple delta report.
+- [x] Benchmark command: add baseline comparison and simple delta report.
   - Problem: benchmark output is returned raw; no regression signal is computed yet.
   - Target: persist a local baseline snapshot and print per-benchmark % deltas vs latest baseline.
-- [ ] Add `config init --repo` helper for `.codegraph/config.json` templates.
+- [x] Add `config init --repo` helper for `.codegraph/config.json` templates.
   - Problem: repo-level config setup is still manual.
   - Target: generate a starter repo config with comments/examples for parse policy, size limits, include/exclude.
