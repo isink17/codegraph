@@ -22,6 +22,8 @@ type symbolPattern struct {
 	nameGroup int
 }
 
+var heredocStartRE = regexp.MustCompile(`<<[-~]?['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+
 type Adapter struct {
 	language    string
 	exts        map[string]struct{}
@@ -198,6 +200,14 @@ type classScope struct {
 	depth int
 }
 
+type stripState struct {
+	inBlockComment bool
+	inString       bool
+	stringQuote    byte
+	escaped        bool
+	heredocTerm    string
+}
+
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	lines := strings.Split(string(content), "\n")
@@ -208,12 +218,12 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 	depth := 0
 	classScopes := []classScope{}
-	inBlockComment := false
+	state := stripState{}
 
 	for i, line := range lines {
 		lineNo := i + 1
-		normalized, blockState := stripForHeuristic(line, inBlockComment, a.cStyle, a.hashStyle)
-		inBlockComment = blockState
+		normalized, nextState := stripForHeuristic(line, state, a.cStyle, a.hashStyle)
+		state = nextState
 		trimmed := strings.TrimSpace(normalized)
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#!") {
 			depth += braceDelta(normalized)
@@ -326,45 +336,48 @@ func utf8FirstRune(s string) (rune, int) {
 	return rune(0), 0
 }
 
-func stripForHeuristic(line string, inBlockComment, cStyle, hashStyle bool) (string, bool) {
+func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (string, stripState) {
 	if line == "" {
-		return "", inBlockComment
+		return "", state
+	}
+	if state.heredocTerm != "" {
+		if strings.TrimSpace(line) == state.heredocTerm {
+			state.heredocTerm = ""
+		}
+		return "", state
 	}
 	var b strings.Builder
 	b.Grow(len(line))
-	inString := false
-	stringQuote := byte(0)
-	escaped := false
 	for i := 0; i < len(line); i++ {
 		ch := line[i]
 		next := byte(0)
 		if i+1 < len(line) {
 			next = line[i+1]
 		}
-		if inBlockComment {
+		if state.inBlockComment {
 			if cStyle && ch == '*' && next == '/' {
-				inBlockComment = false
+				state.inBlockComment = false
 				i++
 			}
 			continue
 		}
-		if inString {
-			if escaped {
-				escaped = false
+		if state.inString {
+			if state.escaped {
+				state.escaped = false
 				continue
 			}
 			if ch == '\\' {
-				escaped = true
+				state.escaped = true
 				continue
 			}
-			if ch == stringQuote {
-				inString = false
-				stringQuote = 0
+			if ch == state.stringQuote {
+				state.inString = false
+				state.stringQuote = 0
 			}
 			continue
 		}
 		if cStyle && ch == '/' && next == '*' {
-			inBlockComment = true
+			state.inBlockComment = true
 			i++
 			continue
 		}
@@ -375,11 +388,17 @@ func stripForHeuristic(line string, inBlockComment, cStyle, hashStyle bool) (str
 			break
 		}
 		if ch == '"' || ch == '\'' || ch == '`' {
-			inString = true
-			stringQuote = ch
+			state.inString = true
+			state.stringQuote = ch
 			continue
+		}
+		if hashStyle && ch == '<' && next == '<' {
+			if m := heredocStartRE.FindStringSubmatch(line[i:]); len(m) == 2 {
+				state.heredocTerm = m[1]
+				break
+			}
 		}
 		b.WriteByte(ch)
 	}
-	return b.String(), inBlockComment
+	return b.String(), state
 }

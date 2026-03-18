@@ -168,6 +168,42 @@ func TestServeMalformedFrameReturnsParseErrorAndContinues(t *testing.T) {
 	}
 }
 
+func TestToolValidationRejectsMissingQuery(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	s := openTestStore(t)
+	defer s.Close()
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s))
+
+	var input bytes.Buffer
+	writeFrameToBuffer(t, &input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "find_symbol",
+			"arguments": map[string]any{},
+		},
+	})
+	var output bytes.Buffer
+	if err := server.Serve(ctx, &input, &output, io.Discard); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	responses := readAllFrames(t, &output)
+	if len(responses) != 1 {
+		t.Fatalf("response count = %d, want 1", len(responses))
+	}
+	result := responses[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("expected tool error response, got %v", result)
+	}
+}
+
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))

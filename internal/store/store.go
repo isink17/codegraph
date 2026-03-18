@@ -78,16 +78,17 @@ type LanguageCounts struct {
 }
 
 type ScanRecord struct {
-	ID           int64  `json:"id"`
-	RepoID       int64  `json:"repo_id"`
-	ScanKind     string `json:"scan_kind"`
-	StartedAt    string `json:"started_at"`
-	FinishedAt   string `json:"finished_at,omitempty"`
-	Status       string `json:"status"`
-	FilesSeen    int64  `json:"files_seen"`
-	FilesChanged int64  `json:"files_changed"`
-	FilesDeleted int64  `json:"files_deleted"`
-	ErrorText    string `json:"error_text,omitempty"`
+	ID               int64                     `json:"id"`
+	RepoID           int64                     `json:"repo_id"`
+	ScanKind         string                    `json:"scan_kind"`
+	StartedAt        string                    `json:"started_at"`
+	FinishedAt       string                    `json:"finished_at,omitempty"`
+	Status           string                    `json:"status"`
+	FilesSeen        int64                     `json:"files_seen"`
+	FilesChanged     int64                     `json:"files_changed"`
+	FilesDeleted     int64                     `json:"files_deleted"`
+	ErrorText        string                    `json:"error_text,omitempty"`
+	LanguageCoverage map[string]LanguageCounts `json:"language_coverage,omitempty"`
 }
 
 type RelatedTest struct {
@@ -313,7 +314,14 @@ func (s *Store) ListScans(ctx context.Context, repoID int64, limit, offset int) 
 		return nil, err
 	}
 	defer rows.Close()
-	return scanScanRecords(rows)
+	out, err := scanScanRecords(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachScanLanguageCoverage(ctx, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Store) LatestScanErrors(ctx context.Context, repoID int64, limit, offset int) ([]ScanRecord, error) {
@@ -329,7 +337,14 @@ func (s *Store) LatestScanErrors(ctx context.Context, repoID int64, limit, offse
 		return nil, err
 	}
 	defer rows.Close()
-	return scanScanRecords(rows)
+	out, err := scanScanRecords(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachScanLanguageCoverage(ctx, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Store) Vacuum(ctx context.Context) error {
@@ -425,6 +440,55 @@ func scanScanRecords(rows *sql.Rows) ([]ScanRecord, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) attachScanLanguageCoverage(ctx context.Context, scans []ScanRecord) error {
+	if len(scans) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(scans))
+	indexByID := map[int64]int{}
+	for i, scan := range scans {
+		ids = append(ids, scan.ID)
+		indexByID[scan.ID] = i
+	}
+	for _, chunk := range chunkInt64s(ids, 250) {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT scan_id, language, seen, indexed, skipped, parse_failed
+			FROM scan_language_coverage
+			WHERE scan_id IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk))
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var scanID int64
+			var lang string
+			var cov LanguageCounts
+			if err := rows.Scan(&scanID, &lang, &cov.Seen, &cov.Indexed, &cov.Skipped, &cov.ParseFailed); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			idx, ok := indexByID[scanID]
+			if !ok {
+				continue
+			}
+			if scans[idx].LanguageCoverage == nil {
+				scans[idx].LanguageCoverage = map[string]LanguageCounts{}
+			}
+			scans[idx].LanguageCoverage[lang] = cov
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) BeginScan(ctx context.Context, repoID int64, kind string) (int64, time.Time, error) {
 	started := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
@@ -440,12 +504,40 @@ func (s *Store) BeginScan(ctx context.Context, repoID int64, kind string) (int64
 
 func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSummary, started time.Time, status string, errText string) error {
 	finished := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE scans
 		SET finished_at = ?, status = ?, files_seen = ?, files_changed = ?, files_deleted = ?, error_text = ?
 		WHERE id = ?
-	`, finished.Format(time.RFC3339), status, summary.FilesSeen, summary.FilesChanged, summary.FilesDeleted, errText, scanID)
-	return err
+	`, finished.Format(time.RFC3339), status, summary.FilesSeen, summary.FilesChanged, summary.FilesDeleted, errText, scanID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM scan_language_coverage WHERE scan_id = ?`, scanID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if len(summary.LanguageCoverage) > 0 {
+		stmt, err := tx.PrepareContext(ctx, `
+			INSERT INTO scan_language_coverage(scan_id, language, seen, indexed, skipped, parse_failed)
+			VALUES(?, ?, ?, ?, ?, ?)
+		`)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		defer stmt.Close()
+		for lang, cov := range summary.LanguageCoverage {
+			if _, err := stmt.ExecContext(ctx, scanID, lang, cov.Seen, cov.Indexed, cov.Skipped, cov.ParseFailed); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) TouchFileMetadata(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string) error {

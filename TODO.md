@@ -60,13 +60,13 @@
   - Target: support paginated or JSONL streaming export (`--limit/--offset` or chunked stream) for large repos.
 
 ### P1
-- [ ] Persist per-scan language coverage into storage.
+- [x] Persist per-scan language coverage into storage.
   - Problem: `language_coverage` exists only in in-memory scan summary output.
   - Target: add a scan-language stats table and query APIs so coverage is available historically (`list_scans` detail).
-- [ ] Improve heuristic parser preprocessor for multiline/comment edge cases.
+- [x] Improve heuristic parser preprocessor for multiline/comment edge cases.
   - Problem: current stripping is line-oriented and can still mis-handle multiline strings/heredocs in some languages.
   - Target: language-family-aware multiline state handling and targeted tests for JS template strings, Ruby heredocs, etc.
-- [ ] Strengthen MCP tool schemas and argument validation.
+- [x] Strengthen MCP tool schemas and argument validation.
   - Problem: schemas are loosely typed and mostly optional, with minimal required/default contracts.
   - Target: add required fields/default docs and centralized validation before tool dispatch.
 

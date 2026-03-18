@@ -50,6 +50,11 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+type toolArgSpec struct {
+	properties map[string]string
+	required   []string
+}
+
 var frameBufferPool = sync.Pool{
 	New: func() any {
 		return &bytes.Buffer{}
@@ -145,6 +150,9 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 }
 
 func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage) (map[string]any, error) {
+	if err := validateToolArguments(name, raw); err != nil {
+		return nil, err
+	}
 	switch name {
 	case "index_repo":
 		return s.handleIndex(ctx, raw, false)
@@ -385,24 +393,24 @@ func writeResponse(w io.Writer, resp rpcResponse) error {
 
 func toolDefinitions() []map[string]any {
 	return []map[string]any{
-		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_path", "force", "paths"}),
-		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_path", "paths"}),
-		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset"}),
-		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}),
-		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}),
-		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth"}),
-		toolDef("find_related_tests", "Find likely related tests for a symbol or file", []string{"symbol", "file", "limit", "offset"}),
-		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset"}),
-		toolDef("search_semantic", "Run lightweight local semantic search", []string{"query", "limit", "offset"}),
-		toolDef("graph_stats", "Return repository graph statistics", nil),
-		toolDef("supported_languages", "List supported languages and file extensions", nil),
-		toolDef("list_repos", "List repositories known to the local graph store", []string{"limit", "offset"}),
-		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}),
-		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}),
+		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_path", "force", "paths"}, nil),
+		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_path", "force", "paths"}, nil),
+		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset"}, []string{"query"}),
+		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
+		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
+		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth"}, nil),
+		toolDef("find_related_tests", "Find likely related tests for a symbol or file", []string{"symbol", "file", "limit", "offset"}, nil),
+		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset"}, []string{"query"}),
+		toolDef("search_semantic", "Run lightweight local semantic search", []string{"query", "limit", "offset"}, []string{"query"}),
+		toolDef("graph_stats", "Return repository graph statistics", nil, nil),
+		toolDef("supported_languages", "List supported languages and file extensions", nil, nil),
+		toolDef("list_repos", "List repositories known to the local graph store", []string{"limit", "offset"}, nil),
+		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}, nil),
+		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}, nil),
 	}
 }
 
-func toolDef(name, description string, properties []string) map[string]any {
+func toolDef(name, description string, properties, required []string) map[string]any {
 	props := map[string]any{}
 	for _, prop := range properties {
 		props[prop] = map[string]any{"type": "string"}
@@ -420,8 +428,10 @@ func toolDef(name, description string, properties []string) map[string]any {
 		"name":        name,
 		"description": description,
 		"inputSchema": map[string]any{
-			"type":       "object",
-			"properties": props,
+			"type":                 "object",
+			"properties":           props,
+			"required":             required,
+			"additionalProperties": false,
 		},
 	}
 }
@@ -429,4 +439,111 @@ func toolDef(name, description string, properties []string) map[string]any {
 func escape(s string) string {
 	b, _ := json.Marshal(s)
 	return strings.Trim(string(b), `"`)
+}
+
+var toolArgumentSpecs = map[string]toolArgSpec{
+	"index_repo":          {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
+	"update_graph":        {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
+	"find_symbol":         {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
+	"find_callers":        {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
+	"find_callees":        {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
+	"get_impact_radius":   {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer"}},
+	"find_related_tests":  {properties: map[string]string{"symbol": "string", "file": "string", "limit": "integer", "offset": "integer"}},
+	"search_symbols":      {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
+	"search_semantic":     {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
+	"graph_stats":         {properties: map[string]string{}},
+	"supported_languages": {properties: map[string]string{}},
+	"list_repos":          {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"list_scans":          {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"latest_scan_errors":  {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+}
+
+func validateToolArguments(name string, raw json.RawMessage) error {
+	spec, ok := toolArgumentSpecs[name]
+	if !ok {
+		return fmt.Errorf("unknown tool %q", name)
+	}
+	args := map[string]any{}
+	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return fmt.Errorf("invalid arguments payload: %w", err)
+		}
+	}
+	for key := range args {
+		expected, ok := spec.properties[key]
+		if !ok {
+			return fmt.Errorf("unknown argument %q for tool %q", key, name)
+		}
+		if err := validateArgType(key, args[key], expected); err != nil {
+			return err
+		}
+	}
+	for _, req := range spec.required {
+		val, ok := args[req]
+		if !ok {
+			return fmt.Errorf("missing required argument %q", req)
+		}
+		if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
+			return fmt.Errorf("required argument %q must not be empty", req)
+		}
+	}
+	switch name {
+	case "find_callers", "find_callees":
+		symbol, _ := args["symbol"].(string)
+		symbolID, _ := asInt64(args["symbol_id"])
+		if strings.TrimSpace(symbol) == "" && symbolID == 0 {
+			return fmt.Errorf("one of symbol or symbol_id is required")
+		}
+	case "find_related_tests":
+		symbol, _ := args["symbol"].(string)
+		file, _ := args["file"].(string)
+		if strings.TrimSpace(symbol) == "" && strings.TrimSpace(file) == "" {
+			return fmt.Errorf("one of symbol or file is required")
+		}
+	case "get_impact_radius":
+		symbols, _ := args["symbols"].([]any)
+		files, _ := args["files"].([]any)
+		if len(symbols) == 0 && len(files) == 0 {
+			return fmt.Errorf("one of symbols or files is required")
+		}
+	}
+	return nil
+}
+
+func validateArgType(name string, value any, expected string) error {
+	switch expected {
+	case "string":
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("argument %q must be a string", name)
+		}
+	case "boolean":
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("argument %q must be a boolean", name)
+		}
+	case "integer":
+		if _, ok := asInt64(value); !ok {
+			return fmt.Errorf("argument %q must be an integer", name)
+		}
+	case "array":
+		if _, ok := value.([]any); !ok {
+			return fmt.Errorf("argument %q must be an array", name)
+		}
+	}
+	return nil
+}
+
+func asInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case float64:
+		if float64(int64(v)) == v {
+			return int64(v), true
+		}
+		return 0, false
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	default:
+		return 0, false
+	}
 }
