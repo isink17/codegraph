@@ -2,3 +2,73 @@
 
 ## Note on references
 - Context7 was used for Go/SQLite lookup, but documentation snippets could not be fetched in this session (`resolve` worked, `query` failed). The items below are based on direct code inspection and established Go/SQLite patterns.
+
+## High priority
+1. Add key indexes for `related_tests` and frequent lookups.
+- Why: `test_links` queries use `repo_id + target_symbol_id` and `repo_id + test_file_id` paths.
+- Where: `internal/store/schema/*.sql`, `internal/store/store.go` (`RelatedTests`).
+- Task: add migration for:
+  - `idx_test_links_repo_target(repo_id, target_symbol_id)`
+  - `idx_test_links_repo_test_file(repo_id, test_file_id)`
+
+2. Reduce `ResolveEdges` N+1 lookups with batched resolution.
+- Why: unresolved edges are fetched, then each edge does separate symbol lookup/update.
+- Where: `internal/store/store.go` (`ResolveEdges`, `resolveTargetSymbol`).
+- Task: build candidate mapping with batched `IN` queries and perform updates in one transaction.
+
+## Medium priority
+1. Remove dead/expensive AST parent walk in Go adapter.
+- Why: `parents := map[...]` and `children()` traversal is computed but unused.
+- Where: `internal/parser/golang/adapter.go` (`Parse`, `children`).
+- Task: delete unused parent graph construction and helper.
+
+2. Fix function-context tracking during AST traversal.
+- Why: `contextStack` only pushes on `FuncDecl`, never pops; can mis-attribute call edges.
+- Where: `internal/parser/golang/adapter.go` (`Parse`).
+- Task: switch to explicit recursive walk or enter/exit tracking with correct stack unwind.
+
+3. Add pagination/streaming for large query results.
+- Why: callers/callees/symbol search return only `limit`; no cursor/offset for large repos.
+- Where: `internal/store/store.go` query methods, `internal/mcp/server.go` tool args/schemas.
+- Task: support `offset`/`cursor` in store + MCP tools.
+
+4. Add cancellation-aware background flushing in watcher.
+- Why: flush can run long and block event handling; no backpressure stats.
+- Where: `internal/watcher/watcher.go` (`Run`).
+- Task: decouple queue drain from event loop via worker goroutine, expose dropped/coalesced metrics.
+
+5. Improve GitHub version check efficiency and resilience.
+- Why: always requests full latest release payload when interval triggers.
+- Where: `internal/versioncheck/versioncheck.go`.
+- Task: use conditional request headers (`If-None-Match`/`If-Modified-Since`) and persist ETag/Last-Modified.
+
+## Feature opportunities
+1. Add `codegraph clean` command for stale DB files and cache maintenance.
+- Where: `internal/cli/app.go`, `internal/store`.
+- Scope: remove orphaned DB files, vacuum selected repos, print reclaimed size.
+
+2. Add repo-level ignore file support (`.codegraphignore`).
+- Why: easier local tuning than editing JSON config for quick excludes.
+- Where: `internal/config`, `internal/indexer`.
+- Task: merge ignore patterns from repo file + repo config excludes.
+
+3. Add MCP tool for repo/list + scan/history.
+- Why: clients cannot inspect known repos/scans without direct DB access.
+- Where: `internal/mcp/server.go`, `internal/store/store.go`.
+- Task: expose `list_repos`, `list_scans`, and latest scan errors.
+
+4. Add parser adapters beyond Go behind current abstraction.
+- Why: architecture already supports multi-language adapters.
+- Where: `internal/parser/*`.
+- Task: start with one high-value language adapter and shared tokenization/edge normalization rules.
+
+## Nice-to-have
+1. Consolidate duplicated PATH hint logic.
+- Why: same helper logic exists in CLI install and doctor.
+- Where: `internal/cli/app.go`, `internal/doctor/doctor.go`.
+- Task: move into shared package to keep output behavior consistent.
+
+2. Add structured benchmark targets for index/update/query.
+- Why: no performance baseline regression guard.
+- Where: `internal/indexer`, `internal/store`, `internal/mcp`.
+- Task: add `go test -bench` suites with representative fixture repos.

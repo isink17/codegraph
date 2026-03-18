@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/graph"
@@ -31,6 +34,22 @@ type Options struct {
 type Indexer struct {
 	store    *store.Store
 	registry *parser.Registry
+}
+
+type fileTask struct {
+	path     string
+	rel      string
+	info     fs.FileInfo
+	adapter  parser.Adapter
+	language string
+}
+
+type fileResult struct {
+	task   fileTask
+	action string
+	hash   string
+	parsed graph.ParsedFile
+	err    error
 }
 
 func New(s *store.Store, registry *parser.Registry) *Indexer {
@@ -75,11 +94,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return store.ScanSummary{}, err
 	}
 	summary := store.ScanSummary{RepoID: repo.ID, ScanID: scanID}
-	existing, err := i.store.ExistingFiles(ctx, repo.ID)
-	if err != nil {
-		return summary, err
-	}
-
 	candidateSet := map[string]struct{}{}
 	if len(opts.Paths) > 0 {
 		for _, path := range opts.Paths {
@@ -93,95 +107,160 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 	}
 
-	err = filepath.WalkDir(opts.RepoRoot, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	var existing map[string]store.FileRecord
+	if len(candidateSet) > 0 {
+		paths := make([]string, 0, len(candidateSet))
+		for rel := range candidateSet {
+			paths = append(paths, rel)
 		}
-		if path == opts.RepoRoot {
-			return nil
-		}
-		rel, err := filepath.Rel(opts.RepoRoot, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.Clean(rel)
-		if d.IsDir() && shouldSkipDir(rel, opts.Exclude) {
-			return filepath.SkipDir
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if len(candidateSet) > 0 {
-			if _, ok := candidateSet[rel]; !ok {
-				return nil
-			}
-		}
-		if shouldSkipFile(rel, opts.Include, opts.Exclude) {
-			return nil
-		}
-		summary.FilesSeen++
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		adapter := i.registry.AdapterFor(rel)
-		language := ""
-		if adapter != nil {
-			language = adapter.Language()
-		}
-		if len(opts.Languages) > 0 && language != "" && !slices.Contains(opts.Languages, language) {
-			return i.store.MarkFileSeen(ctx, repo.ID, scanID, rel)
-		}
-		prev, exists := existing[rel]
-		if exists && !opts.Force && prev.SizeBytes == info.Size() && prev.MtimeUnixNS == info.ModTime().UnixNano() {
-			summary.FilesSkipped++
-			return i.store.MarkFileSeen(ctx, repo.ID, scanID, rel)
-		}
-
-		if repoCfg.MaxFileSizeBytes > 0 && info.Size() > repoCfg.MaxFileSizeBytes {
-			summary.FilesSkipped++
-			return i.store.TouchFileMetadata(ctx, repo.ID, scanID, rel, language, info.Size(), info.ModTime().UnixNano(), "")
-		}
-
-		hash := ""
-		var content []byte
-		if adapter == nil {
-			hash, err = hashFile(path)
-			if err != nil {
-				return err
-			}
-		} else {
-			content, err = os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			hash = hashContent(content)
-		}
-		if exists && !opts.Force && prev.ContentHash == hash {
-			summary.FilesSkipped++
-			return i.store.TouchFileMetadata(ctx, repo.ID, scanID, rel, language, info.Size(), info.ModTime().UnixNano(), hash)
-		}
-		parsed := graph.ParsedFile{Language: language, FileTokens: map[string]float64{}}
-		if adapter != nil {
-			parsed, err = adapter.Parse(ctx, path, content)
-			if err != nil {
-				return err
-			}
-		}
-		if parsed.Language == "" {
-			parsed.Language = language
-		}
-		if err := i.store.ReplaceFileGraph(ctx, repo.ID, scanID, rel, parsed.Language, info.Size(), info.ModTime().UnixNano(), hash, parsed); err != nil {
-			return err
-		}
-		summary.FilesChanged++
-		summary.FilesIndexed++
-		return nil
-	})
+		existing, err = i.store.ExistingFilesForPaths(ctx, repo.ID, paths)
+	} else {
+		existing, err = i.store.ExistingFiles(ctx, repo.ID)
+	}
 	if err != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 		return summary, err
 	}
+
+	workerCount := runtime.NumCPU()
+	if workerCount < 2 {
+		workerCount = 2
+	}
+	if workerCount > 8 {
+		workerCount = 8
+	}
+
+	ctxRun, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	tasks := make(chan fileTask, workerCount*2)
+	results := make(chan fileResult, workerCount*2)
+	producerErr := make(chan error, 1)
+
+	go func() {
+		defer close(tasks)
+		producerErr <- filepath.WalkDir(opts.RepoRoot, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if path == opts.RepoRoot {
+				return nil
+			}
+			rel, err := filepath.Rel(opts.RepoRoot, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.Clean(rel)
+			if d.IsDir() && shouldSkipDir(rel, opts.Exclude) {
+				return filepath.SkipDir
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if len(candidateSet) > 0 {
+				if _, ok := candidateSet[rel]; !ok {
+					return nil
+				}
+			}
+			if shouldSkipFile(rel, opts.Include, opts.Exclude) {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			adapter := i.registry.AdapterFor(rel)
+			language := ""
+			if adapter != nil {
+				language = adapter.Language()
+			}
+			task := fileTask{
+				path:     path,
+				rel:      rel,
+				info:     info,
+				adapter:  adapter,
+				language: language,
+			}
+			select {
+			case tasks <- task:
+				return nil
+			case <-ctxRun.Done():
+				return ctxRun.Err()
+			}
+		})
+	}()
+
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				res := processFileTask(ctxRun, task, existing[task.rel], opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages)
+				select {
+				case results <- res:
+				case <-ctxRun.Done():
+					return
+				}
+				if res.err != nil {
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var runErr error
+	for res := range results {
+		summary.FilesSeen++
+		if res.err != nil {
+			if runErr == nil {
+				runErr = fmt.Errorf("%s: %w", res.task.rel, res.err)
+				cancel()
+			}
+			continue
+		}
+		if runErr != nil {
+			continue
+		}
+		switch res.action {
+		case "skip_only":
+			summary.FilesSkipped++
+		case "mark_seen":
+			if err := i.store.MarkFileSeen(ctx, repo.ID, scanID, res.task.rel); err != nil {
+				runErr = err
+				cancel()
+			}
+			summary.FilesSkipped++
+		case "touch":
+			if err := i.store.TouchFileMetadata(ctx, repo.ID, scanID, res.task.rel, res.task.language, res.task.info.Size(), res.task.info.ModTime().UnixNano(), res.hash); err != nil {
+				runErr = err
+				cancel()
+			}
+			summary.FilesSkipped++
+		case "replace":
+			if err := i.store.ReplaceFileGraph(ctx, repo.ID, scanID, res.task.rel, res.parsed.Language, res.task.info.Size(), res.task.info.ModTime().UnixNano(), res.hash, res.parsed); err != nil {
+				runErr = err
+				cancel()
+				continue
+			}
+			summary.FilesChanged++
+			summary.FilesIndexed++
+		}
+	}
+
+	walkErr := <-producerErr
+	if runErr == nil && walkErr != nil && walkErr != context.Canceled {
+		runErr = walkErr
+	}
+	if runErr != nil {
+		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", runErr.Error())
+		return summary, runErr
+	}
+
 	deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
 	if err != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
@@ -196,6 +275,66 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, err
 	}
 	return summary, nil
+}
+
+func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, force bool, maxFileSizeBytes int64, allowedLanguages []string) fileResult {
+	result := fileResult{task: task}
+	hasPrev := prev.Path != ""
+
+	if len(allowedLanguages) > 0 && task.language != "" && !slices.Contains(allowedLanguages, task.language) {
+		if hasPrev {
+			result.action = "mark_seen"
+		} else {
+			result.action = "skip_only"
+		}
+		return result
+	}
+	if hasPrev && !force && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano() {
+		result.action = "mark_seen"
+		return result
+	}
+	if maxFileSizeBytes > 0 && task.info.Size() > maxFileSizeBytes {
+		result.action = "touch"
+		return result
+	}
+
+	hash := ""
+	var content []byte
+	var err error
+	if task.adapter == nil {
+		hash, err = hashFile(task.path)
+		if err != nil {
+			result.err = err
+			return result
+		}
+	} else {
+		content, err = os.ReadFile(task.path)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		hash = hashContent(content)
+	}
+	result.hash = hash
+	if hasPrev && !force && prev.ContentHash == hash {
+		result.action = "touch"
+		return result
+	}
+
+	parsed := graph.ParsedFile{Language: task.language, FileTokens: map[string]float64{}}
+	if task.adapter != nil {
+		parsed, err = task.adapter.Parse(ctx, task.path, content)
+		if err != nil {
+			result.err = err
+			return result
+		}
+	}
+	if parsed.Language == "" {
+		parsed.Language = task.language
+	}
+	result.parsed = parsed
+	result.action = "replace"
+	return result
 }
 
 func hashContent(content []byte) string {

@@ -219,8 +219,49 @@ func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]Fil
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return scanExistingFiles(rows)
+}
 
+func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths []string) (map[string]FileRecord, error) {
+	out := map[string]FileRecord{}
+	if len(paths) == 0 {
+		return out, nil
+	}
+	const chunkSize = 400
+	for start := 0; start < len(paths); start += chunkSize {
+		end := start + chunkSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		chunk := paths[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT id, path, language, size_bytes, mtime_unix_ns, content_sha256, is_deleted
+			FROM files
+			WHERE repo_id = ? AND path IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		records, err := scanExistingFiles(rows)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range records {
+			out[k] = v
+		}
+	}
+	return out, nil
+}
+
+func scanExistingFiles(rows *sql.Rows) (map[string]FileRecord, error) {
+	defer rows.Close()
 	out := map[string]FileRecord{}
 	for rows.Next() {
 		var rec FileRecord
