@@ -20,6 +20,7 @@ import (
 	"github.com/isink17/codegraph/internal/mcp"
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
+	heuristicparser "github.com/isink17/codegraph/internal/parser/heuristic"
 	pyparser "github.com/isink17/codegraph/internal/parser/python"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/query"
@@ -430,7 +431,19 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 	if err != nil {
 		return nil, graphRepo{}, 0, err
 	}
-	registry := parser.NewRegistry(goparser.New(), pyparser.New())
+	registry := parser.NewRegistry(
+		goparser.New(),
+		pyparser.New(),
+		heuristicparser.NewJava(),
+		heuristicparser.NewKotlin(),
+		heuristicparser.NewCSharp(),
+		heuristicparser.NewTypeScriptJavaScript(),
+		heuristicparser.NewRust(),
+		heuristicparser.NewRuby(),
+		heuristicparser.NewSwift(),
+		heuristicparser.NewPHP(),
+		heuristicparser.NewCAndCpp(),
+	)
 	idx := indexer.New(s, registry)
 	repo, err := s.UpsertRepo(ctx, canonical)
 	if err != nil {
