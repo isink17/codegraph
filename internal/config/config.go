@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/example/localcodegraph/internal/platform"
+	"github.com/isink17/codegraph/internal/platform"
 )
 
 const fileName = "config.json"

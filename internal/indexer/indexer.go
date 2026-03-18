@@ -10,10 +10,10 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/example/localcodegraph/internal/config"
-	"github.com/example/localcodegraph/internal/graph"
-	"github.com/example/localcodegraph/internal/parser"
-	"github.com/example/localcodegraph/internal/store"
+	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 type Options struct {

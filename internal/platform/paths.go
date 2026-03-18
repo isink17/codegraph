@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/example/localcodegraph/internal/appname"
+	"github.com/isink17/codegraph/internal/appname"
 )
 
 type Paths struct {

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/example/localcodegraph/internal/query"
+	"github.com/isink17/codegraph/internal/query"
 )
 
 type Service struct {

@@ -8,8 +8,8 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"github.com/example/localcodegraph/internal/indexer"
-	"github.com/example/localcodegraph/internal/store"
+	"github.com/isink17/codegraph/internal/indexer"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 type Watcher struct {

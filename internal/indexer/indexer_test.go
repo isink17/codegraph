@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/localcodegraph/internal/parser"
-	goparser "github.com/example/localcodegraph/internal/parser/golang"
-	"github.com/example/localcodegraph/internal/store"
+	"github.com/isink17/codegraph/internal/parser"
+	goparser "github.com/isink17/codegraph/internal/parser/golang"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 func TestIndexAndIncrementalUpdate(t *testing.T) {
