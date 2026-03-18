@@ -174,6 +174,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, err
 	}
 	summary.FilesDeleted = deleted
+	if err := i.store.ResolveEdges(ctx, repo.ID); err != nil {
+		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+		return summary, err
+	}
 	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
 		return summary, err
 	}

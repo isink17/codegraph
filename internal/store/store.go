@@ -271,12 +271,81 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 		_ = tx.Rollback()
 		return err
 	}
+
+	insertSymbolStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertSymbolStmt.Close()
+
+	insertSymbolFTSStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO symbol_fts(repo_id, symbol_id, name, qualified_name, signature, doc_summary)
+		VALUES(?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertSymbolFTSStmt.Close()
+
+	insertSymbolTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO symbol_tokens(symbol_id, token, weight) VALUES(?, ?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertSymbolTokenStmt.Close()
+
+	insertReferenceStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO references_tbl(repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertReferenceStmt.Close()
+
+	insertEdgeStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertEdgeStmt.Close()
+
+	insertImportStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_imports(repo_id, file_id, import_path) VALUES(?, ?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertImportStmt.Close()
+
+	insertFileTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_tokens(file_id, token, weight) VALUES(?, ?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertFileTokenStmt.Close()
+
+	insertTestLinkStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score)
+		VALUES(?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer insertTestLinkStmt.Close()
+
 	stableToID := map[string]int64{}
 	for _, sym := range parsed.Symbols {
-		res, err := tx.ExecContext(ctx, `
-			INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
+		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
 		if err != nil {
 			_ = tx.Rollback()
 			return err
@@ -287,15 +356,12 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 			return err
 		}
 		stableToID[sym.StableKey] = symbolID
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO symbol_fts(repo_id, symbol_id, name, qualified_name, signature, doc_summary)
-			VALUES(?, ?, ?, ?, ?, ?)
-		`, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary); err != nil {
+		if _, err := insertSymbolFTSStmt.ExecContext(ctx, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 		for token, weight := range tokenizeForSearch(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO symbol_tokens(symbol_id, token, weight) VALUES(?, ?, ?)`, symbolID, token, weight); err != nil {
+			if _, err := insertSymbolTokenStmt.ExecContext(ctx, symbolID, token, weight); err != nil {
 				_ = tx.Rollback()
 				return err
 			}
@@ -311,10 +377,7 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 		if contextSymbolID != 0 {
 			contextID = contextSymbolID
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO references_tbl(repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, repoID, fileID, symbolID, ref.Kind, ref.Name, ref.QualifiedName, ref.Range.StartLine, ref.Range.StartCol, ref.Range.EndLine, ref.Range.EndCol, contextID); err != nil {
+		if _, err := insertReferenceStmt.ExecContext(ctx, repoID, fileID, symbolID, ref.Kind, ref.Name, ref.QualifiedName, ref.Range.StartLine, ref.Range.StartCol, ref.Range.EndLine, ref.Range.EndCol, contextID); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -324,22 +387,19 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 		if srcID == 0 {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-			VALUES(?, ?, ?, ?, ?, ?, ?)
-		`, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line); err != nil {
+		if _, err := insertEdgeStmt.ExecContext(ctx, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 	}
 	for _, imp := range parsed.Imports {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO file_imports(repo_id, file_id, import_path) VALUES(?, ?, ?)`, repoID, fileID, imp); err != nil {
+		if _, err := insertImportStmt.ExecContext(ctx, repoID, fileID, imp); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 	}
 	for token, weight := range parsed.FileTokens {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO file_tokens(file_id, token, weight) VALUES(?, ?, ?)`, fileID, token, weight); err != nil {
+		if _, err := insertFileTokenStmt.ExecContext(ctx, fileID, token, weight); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -353,10 +413,7 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 		if id, ok, err := s.resolveSymbolByStableKey(ctx, repoID, link.TargetStableKey); err == nil && ok {
 			targetSymbolID = id
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score)
-			VALUES(?, ?, ?, ?, ?, ?)
-		`, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score); err != nil {
+		if _, err := insertTestLinkStmt.ExecContext(ctx, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -364,7 +421,7 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.ResolveEdges(ctx, repoID)
+	return nil
 }
 
 func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
@@ -382,11 +439,24 @@ func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
 		symbolIDs = append(symbolIDs, id)
 	}
 	_ = rows.Close()
+
+	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_tokens WHERE symbol_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer deleteSymbolTokensStmt.Close()
+
+	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_fts WHERE symbol_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer deleteSymbolFTSStmt.Close()
+
 	for _, symbolID := range symbolIDs {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM symbol_tokens WHERE symbol_id = ?`, symbolID); err != nil {
+		if _, err := deleteSymbolTokensStmt.ExecContext(ctx, symbolID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM symbol_fts WHERE symbol_id = ?`, symbolID); err != nil {
+		if _, err := deleteSymbolFTSStmt.ExecContext(ctx, symbolID); err != nil {
 			return err
 		}
 	}
@@ -830,49 +900,44 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	if len(tokens) == 0 {
 		return nil, nil
 	}
+	tokenList := make([]string, 0, len(tokens))
+	for token := range tokens {
+		tokenList = append(tokenList, token)
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(tokenList)), ",")
+	sqlQuery := `
+		SELECT f.path, COALESCE(s.qualified_name, ''), SUM(st.weight) AS score
+		FROM symbol_tokens st
+		JOIN symbols s ON s.id = st.symbol_id
+		JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ? AND st.token IN (` + placeholders + `)
+		GROUP BY f.path, s.qualified_name
+		ORDER BY score DESC
+		LIMIT ?
+	`
+	args := make([]any, 0, len(tokenList)+2)
+	args = append(args, repoID)
+	for _, token := range tokenList {
+		args = append(args, token)
+	}
+	args = append(args, safeLimit(limit))
+	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
 	type candidate struct {
 		file   string
 		symbol string
 		score  float64
 	}
-	agg := map[string]candidate{}
-	for token := range tokens {
-		rows, err := s.db.QueryContext(ctx, `
-			SELECT f.path, COALESCE(s.qualified_name, ''), st.weight
-			FROM symbol_tokens st
-			JOIN symbols s ON s.id = st.symbol_id
-			JOIN files f ON f.id = s.file_id
-			WHERE s.repo_id = ? AND st.token = ?
-		`, repoID, token)
-		if err != nil {
+	out := make([]map[string]any, 0, safeLimit(limit))
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.file, &item.symbol, &item.score); err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var c candidate
-			var weight float64
-			if err := rows.Scan(&c.file, &c.symbol, &weight); err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			key := c.file + "|" + c.symbol
-			existing := agg[key]
-			existing.file = c.file
-			existing.symbol = c.symbol
-			existing.score += weight
-			agg[key] = existing
-		}
-		_ = rows.Close()
-	}
-	var items []candidate
-	for _, c := range agg {
-		items = append(items, c)
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].score > items[j].score })
-	if len(items) > safeLimit(limit) {
-		items = items[:safeLimit(limit)]
-	}
-	out := make([]map[string]any, 0, len(items))
-	for _, item := range items {
 		out = append(out, map[string]any{
 			"file":   item.file,
 			"symbol": item.symbol,
@@ -880,7 +945,7 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 			"why":    []string{"token_overlap"},
 		})
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason string) error {
