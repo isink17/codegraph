@@ -643,21 +643,6 @@ func (s *Store) resolveTargetSymbol(ctx context.Context, repoID int64, name stri
 	return 0, false, nil
 }
 
-func (s *Store) resolveSymbolByStableKey(ctx context.Context, repoID int64, stableKey string) (int64, bool, error) {
-	if stableKey == "" {
-		return 0, false, nil
-	}
-	var id int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM symbols WHERE repo_id = ? AND stable_key = ? LIMIT 1`, repoID, stableKey).Scan(&id)
-	if err == nil {
-		return id, true, nil
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
-	return 0, false, err
-}
-
 func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, stableKeys []string) (map[string]int64, error) {
 	out := map[string]int64{}
 	if len(stableKeys) == 0 {
@@ -693,25 +678,26 @@ func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, st
 func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 	var stats graph.Stats
 	stats.RepoID = repoID
-	if err := s.db.QueryRowContext(ctx, `SELECT root_path FROM repos WHERE id = ?`, repoID).Scan(&stats.RepoRoot); err != nil {
-		return graph.Stats{}, err
-	}
-	queries := []struct {
-		sql  string
-		dest *int64
-	}{
-		{`SELECT COUNT(1) FROM files WHERE repo_id = ? AND is_deleted = 0`, &stats.Files},
-		{`SELECT COUNT(1) FROM symbols WHERE repo_id = ?`, &stats.Symbols},
-		{`SELECT COUNT(1) FROM references_tbl WHERE repo_id = ?`, &stats.References},
-		{`SELECT COUNT(1) FROM edges WHERE repo_id = ?`, &stats.Edges},
-		{`SELECT COUNT(1) FROM dirty_files WHERE repo_id = ?`, &stats.DirtyFiles},
-	}
-	for _, q := range queries {
-		if err := s.db.QueryRowContext(ctx, q.sql, repoID).Scan(q.dest); err != nil {
-			return graph.Stats{}, err
-		}
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM scans WHERE repo_id = ?`, repoID).Scan(&stats.LastScanID); err != nil {
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT
+			r.root_path,
+			(SELECT COUNT(1) FROM files f WHERE f.repo_id = r.id AND f.is_deleted = 0) AS files_count,
+			(SELECT COUNT(1) FROM symbols s WHERE s.repo_id = r.id) AS symbols_count,
+			(SELECT COUNT(1) FROM references_tbl rt WHERE rt.repo_id = r.id) AS refs_count,
+			(SELECT COUNT(1) FROM edges e WHERE e.repo_id = r.id) AS edges_count,
+			(SELECT COUNT(1) FROM dirty_files d WHERE d.repo_id = r.id) AS dirty_count,
+			(SELECT COALESCE(MAX(sc.id), 0) FROM scans sc WHERE sc.repo_id = r.id) AS last_scan_id
+		FROM repos r
+		WHERE r.id = ?
+	`, repoID).Scan(
+		&stats.RepoRoot,
+		&stats.Files,
+		&stats.Symbols,
+		&stats.References,
+		&stats.Edges,
+		&stats.DirtyFiles,
+		&stats.LastScanID,
+	); err != nil {
 		return graph.Stats{}, err
 	}
 	var indexedAt sql.NullString

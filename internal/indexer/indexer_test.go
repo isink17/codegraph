@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,6 +145,35 @@ func Generated() {}
 	}
 	if stats.Files != 1 {
 		t.Fatalf("stats.Files = %d, want 1", stats.Files)
+	}
+}
+
+func TestIndexSkipsLargeFilesByRepoConfig(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, ".codegraph", "config.json"), `{"max_file_size_bytes":64}`)
+	writeFile(t, filepath.Join(repoRoot, "small.go"), `package main
+func small() {}
+`)
+	writeFile(t, filepath.Join(repoRoot, "large.go"), "package main\n"+strings.Repeat("var X = 1\n", 64))
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	idx := New(s, parser.NewRegistry(goparser.New()))
+	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
+	if err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	if summary.FilesSkipped == 0 {
+		t.Fatalf("FilesSkipped = %d, want at least 1", summary.FilesSkipped)
+	}
+	if summary.FilesIndexed != 1 {
+		t.Fatalf("FilesIndexed = %d, want 1", summary.FilesIndexed)
 	}
 }
 

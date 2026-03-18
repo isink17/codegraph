@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -136,11 +137,26 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.FilesSkipped++
 			return i.store.MarkFileSeen(ctx, repo.ID, scanID, rel)
 		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
+
+		if repoCfg.MaxFileSizeBytes > 0 && info.Size() > repoCfg.MaxFileSizeBytes {
+			summary.FilesSkipped++
+			return i.store.TouchFileMetadata(ctx, repo.ID, scanID, rel, language, info.Size(), info.ModTime().UnixNano(), "")
 		}
-		hash := hashContent(content)
+
+		hash := ""
+		var content []byte
+		if adapter == nil {
+			hash, err = hashFile(path)
+			if err != nil {
+				return err
+			}
+		} else {
+			content, err = os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			hash = hashContent(content)
+		}
 		if exists && !opts.Force && prev.ContentHash == hash {
 			summary.FilesSkipped++
 			return i.store.TouchFileMetadata(ctx, repo.ID, scanID, rel, language, info.Size(), info.ModTime().UnixNano(), hash)
@@ -151,9 +167,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			if err != nil {
 				return err
 			}
-			if parsed.Language == "" {
-				parsed.Language = language
-			}
+		}
+		if parsed.Language == "" {
+			parsed.Language = language
 		}
 		if err := i.store.ReplaceFileGraph(ctx, repo.ID, scanID, rel, parsed.Language, info.Size(), info.ModTime().UnixNano(), hash, parsed); err != nil {
 			return err
@@ -185,6 +201,19 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 func hashContent(content []byte) string {
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:])
+}
+
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func ShouldSkipDir(rel string, excludes []string) bool {

@@ -10,6 +10,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/query"
@@ -46,6 +47,12 @@ type rpcResponse struct {
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+var frameBufferPool = sync.Pool{
+	New: func() any {
+		return &bytes.Buffer{}
+	},
 }
 
 func (s *Server) Serve(ctx context.Context, in io.Reader, out, errOut io.Writer) error {
@@ -291,8 +298,10 @@ func writeResponse(w io.Writer, resp rpcResponse) error {
 	if err != nil {
 		return err
 	}
-	var frame bytes.Buffer
-	fmt.Fprintf(&frame, "Content-Length: %d\r\n\r\n", len(payload))
+	frame := frameBufferPool.Get().(*bytes.Buffer)
+	frame.Reset()
+	defer frameBufferPool.Put(frame)
+	fmt.Fprintf(frame, "Content-Length: %d\r\n\r\n", len(payload))
 	frame.Write(payload)
 	_, err = w.Write(frame.Bytes())
 	return err

@@ -28,6 +28,7 @@ type RepoConfig struct {
 	Languages        []string      `json:"languages"`
 	WatchDebounce    time.Duration `json:"watch_debounce"`
 	SemanticMaxTerms int           `json:"semantic_max_terms"`
+	MaxFileSizeBytes int64         `json:"max_file_size_bytes"`
 }
 
 func Default() (Config, error) {
@@ -124,7 +125,10 @@ func SaveIfMissing(cfg Config) (string, bool, error) {
 }
 
 func LoadRepo(repoRoot string) (RepoConfig, error) {
-	cfg := RepoConfig{SemanticMaxTerms: 8}
+	cfg := RepoConfig{
+		SemanticMaxTerms: 8,
+		MaxFileSizeBytes: 8 * 1024 * 1024,
+	}
 	path := RepoConfigPath(repoRoot)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -138,6 +142,9 @@ func LoadRepo(repoRoot string) (RepoConfig, error) {
 	}
 	if cfg.SemanticMaxTerms == 0 {
 		cfg.SemanticMaxTerms = 8
+	}
+	if cfg.MaxFileSizeBytes == 0 {
+		cfg.MaxFileSizeBytes = 8 * 1024 * 1024
 	}
 	return cfg, nil
 }
