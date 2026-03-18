@@ -18,7 +18,9 @@ func TestCheckerWritesCurrentVersion(t *testing.T) {
 		Current:       "v1.2.3",
 		CheckInterval: 24 * time.Hour,
 		Now:           func() time.Time { return time.Date(2026, 3, 18, 10, 0, 0, 0, time.UTC) },
-		FetchLatest:   func(context.Context) (string, error) { return "v1.2.3", nil },
+		FetchLatest: func(context.Context, state) (fetchResult, error) {
+			return fetchResult{LatestVersion: "v1.2.3"}, nil
+		},
 	}
 
 	if err := c.Run(context.Background(), &bytes.Buffer{}); err != nil {
@@ -38,7 +40,9 @@ func TestCheckerPrintsUpdateNoticeWhenLatestIsNewer(t *testing.T) {
 		Current:       "v1.2.3",
 		CheckInterval: 24 * time.Hour,
 		Now:           func() time.Time { return time.Date(2026, 3, 18, 10, 0, 0, 0, time.UTC) },
-		FetchLatest:   func(context.Context) (string, error) { return "v1.3.0", nil },
+		FetchLatest: func(context.Context, state) (fetchResult, error) {
+			return fetchResult{LatestVersion: "v1.3.0"}, nil
+		},
 	}
 
 	var errOut bytes.Buffer
@@ -66,9 +70,9 @@ func TestCheckerSkipsFetchWithinInterval(t *testing.T) {
 		Current:       "v1.2.3",
 		CheckInterval: 24 * time.Hour,
 		Now:           func() time.Time { return time.Date(2026, 3, 18, 12, 0, 0, 0, time.UTC) },
-		FetchLatest: func(context.Context) (string, error) {
+		FetchLatest: func(context.Context, state) (fetchResult, error) {
 			fetchCalls++
-			return "v9.9.9", nil
+			return fetchResult{LatestVersion: "v9.9.9"}, nil
 		},
 	}
 
@@ -81,6 +85,39 @@ func TestCheckerSkipsFetchWithinInterval(t *testing.T) {
 	st := readState(t, statePath)
 	if got, want := st.CurrentVersion, "v1.2.3"; got != want {
 		t.Fatalf("current_version = %q, want %q", got, want)
+	}
+}
+
+func TestCheckerHandlesNotModifiedAndPreservesLatest(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "version-state.json")
+	initial := state{
+		CurrentVersion: "v1.2.2",
+		LatestVersion:  "v1.2.9",
+		ETag:           `"abc123"`,
+		LastModified:   "Wed, 18 Mar 2026 09:00:00 GMT",
+		LastCheckedAt:  time.Date(2026, 3, 17, 8, 0, 0, 0, time.UTC).Format(time.RFC3339),
+	}
+	writeState(t, statePath, initial)
+
+	c := Checker{
+		StatePath:     statePath,
+		Current:       "v1.2.3",
+		CheckInterval: 24 * time.Hour,
+		Now:           func() time.Time { return time.Date(2026, 3, 18, 10, 0, 0, 0, time.UTC) },
+		FetchLatest: func(_ context.Context, st state) (fetchResult, error) {
+			if st.ETag != `"abc123"` {
+				t.Fatalf("expected etag to be forwarded, got %q", st.ETag)
+			}
+			return fetchResult{NotModified: true}, nil
+		},
+	}
+
+	if err := c.Run(context.Background(), &bytes.Buffer{}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	st := readState(t, statePath)
+	if got, want := st.LatestVersion, "v1.2.9"; got != want {
+		t.Fatalf("latest_version = %q, want %q", got, want)
 	}
 }
 

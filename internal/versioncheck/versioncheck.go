@@ -26,6 +26,15 @@ type state struct {
 	CurrentVersion string `json:"current_version"`
 	LatestVersion  string `json:"latest_version,omitempty"`
 	LastCheckedAt  string `json:"last_checked_at,omitempty"`
+	ETag           string `json:"etag,omitempty"`
+	LastModified   string `json:"last_modified,omitempty"`
+}
+
+type fetchResult struct {
+	LatestVersion string
+	ETag          string
+	LastModified  string
+	NotModified   bool
 }
 
 type Checker struct {
@@ -33,7 +42,7 @@ type Checker struct {
 	Current       string
 	CheckInterval time.Duration
 	Now           func() time.Time
-	FetchLatest   func(context.Context) (string, error)
+	FetchLatest   func(context.Context, state) (fetchResult, error)
 }
 
 func NotifyIfOutdated(ctx context.Context, stderr io.Writer) {
@@ -55,8 +64,8 @@ func DefaultChecker() (Checker, error) {
 		Current:       current,
 		CheckInterval: 24 * time.Hour,
 		Now:           time.Now,
-		FetchLatest: func(ctx context.Context) (string, error) {
-			return fetchLatestFromGitHub(ctx, current)
+		FetchLatest: func(ctx context.Context, st state) (fetchResult, error) {
+			return fetchLatestFromGitHub(ctx, current, st.ETag, st.LastModified)
 		},
 	}, nil
 }
@@ -69,7 +78,7 @@ func (c Checker) Run(ctx context.Context, stderr io.Writer) error {
 		c.Now = time.Now
 	}
 	if c.FetchLatest == nil {
-		c.FetchLatest = func(context.Context) (string, error) { return "", nil }
+		c.FetchLatest = func(context.Context, state) (fetchResult, error) { return fetchResult{}, nil }
 	}
 	if c.CheckInterval <= 0 {
 		c.CheckInterval = 24 * time.Hour
@@ -80,8 +89,16 @@ func (c Checker) Run(ctx context.Context, stderr io.Writer) error {
 
 	lastChecked, _ := time.Parse(time.RFC3339, st.LastCheckedAt)
 	if now.Sub(lastChecked) >= c.CheckInterval || st.LastCheckedAt == "" {
-		if latest, err := c.FetchLatest(ctx); err == nil && latest != "" {
-			st.LatestVersion = latest
+		if latest, err := c.FetchLatest(ctx, st); err == nil {
+			if latest.ETag != "" {
+				st.ETag = latest.ETag
+			}
+			if latest.LastModified != "" {
+				st.LastModified = latest.LastModified
+			}
+			if !latest.NotModified && latest.LatestVersion != "" {
+				st.LatestVersion = latest.LatestVersion
+			}
 		}
 		st.LastCheckedAt = now.Format(time.RFC3339)
 	}
@@ -132,33 +149,50 @@ func normalizedSemver(v string) (string, bool) {
 	return v, semver.IsValid(v)
 }
 
-func fetchLatestFromGitHub(ctx context.Context, current string) (string, error) {
+func fetchLatestFromGitHub(ctx context.Context, current, etag, lastModified string) (fetchResult, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, githubLatestRelease, nil)
 	if err != nil {
-		return "", err
+		return fetchResult{}, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "codegraph/"+sanitizeVersion(current))
+	if strings.TrimSpace(etag) != "" {
+		req.Header.Set("If-None-Match", strings.TrimSpace(etag))
+	}
+	if strings.TrimSpace(lastModified) != "" {
+		req.Header.Set("If-Modified-Since", strings.TrimSpace(lastModified))
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return fetchResult{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return fetchResult{
+			NotModified:  true,
+			ETag:         strings.TrimSpace(resp.Header.Get("ETag")),
+			LastModified: strings.TrimSpace(resp.Header.Get("Last-Modified")),
+		}, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github latest release request failed: %s", resp.Status)
+		return fetchResult{}, fmt.Errorf("github latest release request failed: %s", resp.Status)
 	}
 
 	var payload struct {
 		TagName string `json:"tag_name"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", err
+		return fetchResult{}, err
 	}
-	return strings.TrimSpace(payload.TagName), nil
+	return fetchResult{
+		LatestVersion: strings.TrimSpace(payload.TagName),
+		ETag:          strings.TrimSpace(resp.Header.Get("ETag")),
+		LastModified:  strings.TrimSpace(resp.Header.Get("Last-Modified")),
+	}, nil
 }
 
 func sanitizeVersion(v string) string {
