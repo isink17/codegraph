@@ -228,3 +228,11 @@ For MCP integration, confirm your client can call `tools/list` and `tools/call` 
 - Stronger semantic search ranking
 - Richer related-test heuristics
 - More export formats and visualization workflows
+
+
+## License
+
+This project is licensed under the Functional Source License, Version 1.1, MIT Future License (`FSL-1.1-MIT`).
+
+On the second anniversary of each version’s release, that version converts to the MIT License.
+See [`LICENSE`](./LICENSE) for details.
