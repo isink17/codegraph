@@ -200,6 +200,13 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			return nil, err
 		}
 		return map[string]any{"ok": true, "data": stats}, nil
+	case "supported_languages":
+		return map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"languages": s.indexer.SupportedLanguages(),
+			},
+		}, nil
 	case "list_repos":
 		var req struct {
 			Limit  int `json:"limit"`
@@ -354,6 +361,7 @@ func toolDefinitions() []map[string]any {
 		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset"}),
 		toolDef("search_semantic", "Run lightweight local semantic search", []string{"query", "limit", "offset"}),
 		toolDef("graph_stats", "Return repository graph statistics", nil),
+		toolDef("supported_languages", "List supported languages and file extensions", nil),
 		toolDef("list_repos", "List repositories known to the local graph store", []string{"limit", "offset"}),
 		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}),
 		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}),

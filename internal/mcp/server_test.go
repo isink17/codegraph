@@ -82,6 +82,49 @@ func main() {}
 	}
 }
 
+func TestSupportedLanguagesTool(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	s := openTestStore(t)
+	defer s.Close()
+
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s))
+
+	input := bytes.NewBuffer(nil)
+	writeFrameToBuffer(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "supported_languages",
+			"arguments": map[string]any{},
+		},
+	})
+	var output bytes.Buffer
+	if err := server.Serve(ctx, input, &output, io.Discard); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	responses := readAllFrames(t, &output)
+	if len(responses) != 1 {
+		t.Fatalf("response count = %d, want 1", len(responses))
+	}
+	result := responses[0]["result"].(map[string]any)
+	if got := result["isError"]; got != false {
+		t.Fatalf("isError = %v, want false", got)
+	}
+	content := result["structuredContent"].(map[string]any)
+	data := content["data"].(map[string]any)
+	languages := data["languages"].([]any)
+	if len(languages) == 0 {
+		t.Fatalf("languages = %v, want non-empty", languages)
+	}
+}
+
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))

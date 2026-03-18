@@ -59,6 +59,10 @@ func New(s *store.Store, registry *parser.Registry) *Indexer {
 	return &Indexer{store: s, registry: registry}
 }
 
+func (i *Indexer) SupportedLanguages() []parser.LanguageSupport {
+	return i.registry.SupportedLanguages()
+}
+
 func (i *Indexer) Index(ctx context.Context, opts Options) (store.ScanSummary, error) {
 	return i.run(ctx, opts)
 }

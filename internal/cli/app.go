@@ -55,6 +55,16 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runIndex(ctx, globalCfg, stdout, args[1:], true)
 	case "stats":
 		return runStats(ctx, globalCfg, stdout, args[1:])
+	case "find-symbol":
+		return runQueryCommand(ctx, globalCfg, stdout, "find-symbol", args[1:])
+	case "callers":
+		return runQueryCommand(ctx, globalCfg, stdout, "callers", args[1:])
+	case "callees":
+		return runQueryCommand(ctx, globalCfg, stdout, "callees", args[1:])
+	case "impact":
+		return runQueryCommand(ctx, globalCfg, stdout, "impact", args[1:])
+	case "search":
+		return runQueryCommand(ctx, globalCfg, stdout, "search", args[1:])
 	case "doctor":
 		report, err := doctor.Run()
 		if err != nil {
@@ -174,6 +184,136 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		return err
 	}
 	return writeJSON(stdout, stats)
+}
+
+func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, command string, args []string) error {
+	repoRoot := "."
+	queryValue := ""
+	symbol := ""
+	var symbols []string
+	var files []string
+	depth := 2
+	limit := 20
+	offset := 0
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--repo-root":
+			if i+1 < len(args) {
+				repoRoot = args[i+1]
+				i++
+			}
+		case "--query":
+			if i+1 < len(args) {
+				queryValue = args[i+1]
+				i++
+			}
+		case "--symbol":
+			if i+1 < len(args) {
+				symbol = args[i+1]
+				symbols = append(symbols, args[i+1])
+				i++
+			}
+		case "--file":
+			if i+1 < len(args) {
+				files = append(files, args[i+1])
+				i++
+			}
+		case "--depth":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &depth)
+				i++
+			}
+		case "--limit":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &limit)
+				i++
+			}
+		case "--offset":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &offset)
+				i++
+			}
+		default:
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			if repoRoot == "." {
+				repoRoot = arg
+				continue
+			}
+			if queryValue == "" {
+				queryValue = arg
+			}
+		}
+	}
+	if symbol == "" && len(symbols) > 0 {
+		symbol = symbols[0]
+	}
+	if queryValue == "" {
+		queryValue = symbol
+	}
+
+	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+	if err != nil {
+		return err
+	}
+	defer app.Close()
+
+	switch command {
+	case "find-symbol":
+		if queryValue == "" {
+			return errors.New("usage: codegraph find-symbol <repo-path> <query> [--limit N] [--offset N]")
+		}
+		items, err := app.Query.FindSymbol(ctx, repoID, queryValue, limit, offset)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{"matches": items})
+	case "search":
+		if queryValue == "" {
+			return errors.New("usage: codegraph search <repo-path> <query> [--limit N] [--offset N]")
+		}
+		items, err := app.Query.SearchSymbols(ctx, repoID, queryValue, limit, offset)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{"matches": items})
+	case "callers":
+		if symbol == "" {
+			return errors.New("usage: codegraph callers <repo-path> --symbol <name> [--limit N] [--offset N]")
+		}
+		items, err := app.Query.FindCallers(ctx, repoID, symbol, 0, limit, offset)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{"callers": items})
+	case "callees":
+		if symbol == "" {
+			return errors.New("usage: codegraph callees <repo-path> --symbol <name> [--limit N] [--offset N]")
+		}
+		items, err := app.Query.FindCallees(ctx, repoID, symbol, 0, limit, offset)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{"callees": items})
+	case "impact":
+		if len(symbols) == 0 && len(files) == 0 {
+			if symbol != "" {
+				symbols = append(symbols, symbol)
+			} else {
+				return errors.New("usage: codegraph impact <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]")
+			}
+		}
+		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, depth)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, data)
+	default:
+		return fmt.Errorf("unknown query command %q", command)
+	}
 }
 
 func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
@@ -476,6 +616,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  update <repo-path>")
 	fmt.Fprintln(w, "  serve --repo-root <repo-path>")
 	fmt.Fprintln(w, "  stats <repo-path>")
+	fmt.Fprintln(w, "  find-symbol <repo-path> <query>")
+	fmt.Fprintln(w, "  search <repo-path> <query>")
+	fmt.Fprintln(w, "  callers <repo-path> --symbol <name>")
+	fmt.Fprintln(w, "  callees <repo-path> --symbol <name>")
+	fmt.Fprintln(w, "  impact <repo-path> [--symbol <name>] [--file <path>]")
 	fmt.Fprintln(w, "  doctor")
 	fmt.Fprintln(w, "  graph export <repo-path> [--format json|dot]")
 	fmt.Fprintln(w, "  watch <repo-path>")

@@ -21,6 +21,11 @@ This milestone includes:
 - `codegraph index <path>`
 - `codegraph update <path>`
 - `codegraph stats <path>`
+- `codegraph find-symbol <path> <query>`
+- `codegraph search <path> <query>`
+- `codegraph callers <path> --symbol <name>`
+- `codegraph callees <path> --symbol <name>`
+- `codegraph impact <path> --symbol <name>`
 - `codegraph serve --repo-root <path>`
 - `codegraph graph export <path>`
 - `codegraph doctor`
@@ -176,6 +181,11 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - `codegraph update <path>`
 - `codegraph serve --repo-root <path>`
 - `codegraph stats <path>`
+- `codegraph find-symbol <path> <query>`
+- `codegraph search <path> <query>`
+- `codegraph callers <path> --symbol <name>`
+- `codegraph callees <path> --symbol <name>`
+- `codegraph impact <path> [--symbol <name>] [--file <path>]`
 - `codegraph doctor`
 - `codegraph graph export <path> --format json|dot`
 - `codegraph watch <path>`
@@ -192,6 +202,7 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - `search_symbols`
 - `search_semantic`
 - `graph_stats`
+- `supported_languages`
 
 ## Verification
 

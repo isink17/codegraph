@@ -43,3 +43,36 @@ func TestRunInstallCreatesConfigAndPrintsSnippets(t *testing.T) {
 		}
 	}
 }
+
+func TestRunFindSymbolQueryCommand(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoRoot) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(`package main
+func HelloWorld() {}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go) error = %v", err)
+	}
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"index", repoRoot}, &out, &errOut); err != nil {
+		t.Fatalf("Run(index) error = %v", err)
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"find-symbol", repoRoot, "HelloWorld"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(find-symbol) error = %v", err)
+	}
+	if !strings.Contains(out.String(), "HelloWorld") {
+		t.Fatalf("find-symbol output missing symbol, output:\n%s", out.String())
+	}
+}
