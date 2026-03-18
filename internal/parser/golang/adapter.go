@@ -27,6 +27,10 @@ func (a *Adapter) Supports(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".go")
 }
 
+func (a *Adapter) Extensions() []string {
+	return []string{".go"}
+}
+
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, content, parser.ParseComments)

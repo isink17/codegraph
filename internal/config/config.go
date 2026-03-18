@@ -32,6 +32,7 @@ type RepoConfig struct {
 	WatchDebounce    time.Duration `json:"watch_debounce"`
 	SemanticMaxTerms int           `json:"semantic_max_terms"`
 	MaxFileSizeBytes int64         `json:"max_file_size_bytes"`
+	ParseErrorPolicy string        `json:"parse_error_policy"`
 }
 
 func Default() (Config, error) {
@@ -131,6 +132,7 @@ func LoadRepo(repoRoot string) (RepoConfig, error) {
 	cfg := RepoConfig{
 		SemanticMaxTerms: 8,
 		MaxFileSizeBytes: 8 * 1024 * 1024,
+		ParseErrorPolicy: "fail_fast",
 	}
 	path := RepoConfigPath(repoRoot)
 	data, err := os.ReadFile(path)
@@ -147,6 +149,14 @@ func LoadRepo(repoRoot string) (RepoConfig, error) {
 	}
 	if cfg.MaxFileSizeBytes == 0 {
 		cfg.MaxFileSizeBytes = 8 * 1024 * 1024
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ParseErrorPolicy)) {
+	case "", "fail_fast":
+		cfg.ParseErrorPolicy = "fail_fast"
+	case "best_effort":
+		cfg.ParseErrorPolicy = "best_effort"
+	default:
+		cfg.ParseErrorPolicy = "fail_fast"
 	}
 	ignorePatterns, err := loadIgnorePatterns(repoRoot)
 	if err != nil {

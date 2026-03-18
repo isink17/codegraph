@@ -12,13 +12,13 @@
   - Target: resolve by affected files/symbols first, fall back to global pass only when needed.
 
 ## P1
-- [ ] Precompute extension-to-adapter lookup in parser registry.
+- [x] Precompute extension-to-adapter lookup in parser registry.
   - Problem: `Registry.AdapterFor` is linear over all adapters for each file.
   - Target: keep current interface but add fast-path map by extension to reduce per-file dispatch overhead.
-- [ ] Replace N+1 impact traversal queries with set-based traversal.
+- [x] Replace N+1 impact traversal queries with set-based traversal.
   - Problem: `ImpactRadius` issues repeated per-node queries per depth level.
   - Target: switch to batched edge expansion (`IN (...)`) or recursive CTE to reduce DB round trips.
-- [ ] Add configurable parser error policy.
+- [x] Add configurable parser error policy.
   - Problem: a single parse error currently fails scan/update.
   - Target: support `fail_fast` (current) and `best_effort` modes with per-file parse error reporting in scan summary.
 

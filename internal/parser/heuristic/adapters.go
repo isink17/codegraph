@@ -172,6 +172,14 @@ func (a *Adapter) Supports(path string) bool {
 	return ok
 }
 
+func (a *Adapter) Extensions() []string {
+	out := make([]string, 0, len(a.exts))
+	for ext := range a.exts {
+		out = append(out, ext)
+	}
+	return out
+}
+
 type classScope struct {
 	name  string
 	depth int

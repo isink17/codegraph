@@ -177,6 +177,40 @@ func small() {}
 	}
 }
 
+func TestIndexBestEffortParseErrors(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, ".codegraph", "config.json"), `{"parse_error_policy":"best_effort"}`)
+	writeFile(t, filepath.Join(repoRoot, "main.go"), `package main
+func ok() {}
+`)
+	writeFile(t, filepath.Join(repoRoot, "broken.go"), `package main
+func broken( {
+`)
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	idx := New(s, parser.NewRegistry(goparser.New()))
+	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
+	if err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	if summary.ParseErrors != 1 {
+		t.Fatalf("ParseErrors = %d, want 1", summary.ParseErrors)
+	}
+	if len(summary.ParseSamples) == 0 {
+		t.Fatalf("ParseSamples = %v, want at least one sample", summary.ParseSamples)
+	}
+	if summary.FilesIndexed != 1 {
+		t.Fatalf("FilesIndexed = %d, want 1", summary.FilesIndexed)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

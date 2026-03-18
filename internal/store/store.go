@@ -50,14 +50,16 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
-	RepoID       int64 `json:"repo_id"`
-	ScanID       int64 `json:"scan_id"`
-	FilesSeen    int   `json:"files_seen"`
-	FilesIndexed int   `json:"files_indexed"`
-	FilesSkipped int   `json:"files_skipped"`
-	FilesChanged int   `json:"files_changed"`
-	FilesDeleted int   `json:"files_deleted"`
-	DurationMS   int64 `json:"duration_ms"`
+	RepoID       int64    `json:"repo_id"`
+	ScanID       int64    `json:"scan_id"`
+	FilesSeen    int      `json:"files_seen"`
+	FilesIndexed int      `json:"files_indexed"`
+	FilesSkipped int      `json:"files_skipped"`
+	FilesChanged int      `json:"files_changed"`
+	FilesDeleted int      `json:"files_deleted"`
+	ParseErrors  int      `json:"parse_errors,omitempty"`
+	ParseSamples []string `json:"parse_samples,omitempty"`
+	DurationMS   int64    `json:"duration_ms"`
 }
 
 type ScanRecord struct {
@@ -480,6 +482,53 @@ func (s *Store) TouchFilesMetadataBatch(ctx context.Context, repoID, scanID int6
 			mtime_unix_ns = excluded.mtime_unix_ns,
 			content_sha256 = excluded.content_sha256,
 			parse_state = 'skipped',
+			last_scan_id = excluded.last_scan_id,
+			indexed_at = excluded.indexed_at,
+			is_deleted = 0
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	indexedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, update := range updates {
+		if _, err := stmt.ExecContext(
+			ctx,
+			repoID,
+			update.Path,
+			update.Language,
+			update.SizeBytes,
+			update.MtimeUnixNS,
+			update.ContentHash,
+			scanID,
+			indexedAt,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) MarkFilesParseFailedBatch(ctx context.Context, repoID, scanID int64, updates []FileMetadataUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted)
+		VALUES(?, ?, ?, ?, ?, ?, 'failed', ?, ?, 0)
+		ON CONFLICT(repo_id, path)
+		DO UPDATE SET
+			language = excluded.language,
+			size_bytes = excluded.size_bytes,
+			mtime_unix_ns = excluded.mtime_unix_ns,
+			content_sha256 = excluded.content_sha256,
+			parse_state = 'failed',
 			last_scan_id = excluded.last_scan_id,
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0
@@ -1270,47 +1319,35 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 	}
 	seen := map[int64]struct{}{}
 	for level := 0; level < depth && len(queue) > 0; level++ {
-		current := queue
-		queue = nil
-		for _, id := range current {
+		currentSet := map[int64]struct{}{}
+		current := make([]int64, 0, len(queue))
+		for _, id := range queue {
 			if _, ok := seen[id]; ok {
 				continue
 			}
+			if _, ok := currentSet[id]; ok {
+				continue
+			}
+			currentSet[id] = struct{}{}
+			current = append(current, id)
+		}
+		queue = nil
+		if len(current) == 0 {
+			continue
+		}
+		for _, id := range current {
 			seen[id] = struct{}{}
-			for _, direction := range []string{"caller", "callee"} {
-				query := `
-					SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-					       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-					FROM edges e
-					JOIN symbols s ON s.id = e.src_symbol_id
-					JOIN files f ON f.id = s.file_id
-					WHERE e.repo_id = ? AND e.dst_symbol_id = ?
-				`
-				arg := id
-				if direction == "callee" {
-					query = `
-						SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-						       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-						FROM edges e
-						JOIN symbols s ON s.id = e.dst_symbol_id
-						JOIN files f ON f.id = s.file_id
-						WHERE e.repo_id = ? AND e.src_symbol_id = ? AND e.dst_symbol_id IS NOT NULL
-					`
-				}
-				rows, err := s.db.QueryContext(ctx, query, repoID, arg)
-				if err != nil {
-					return nil, err
-				}
-				for rows.Next() {
-					sym, err := scanSymbol(rows)
-					if err != nil {
-						_ = rows.Close()
-						return nil, err
-					}
-					affected[sym.ID] = sym
+		}
+		for _, callers := range []bool{true, false} {
+			neighbors, err := s.impactNeighbors(ctx, repoID, current, callers)
+			if err != nil {
+				return nil, err
+			}
+			for _, sym := range neighbors {
+				affected[sym.ID] = sym
+				if _, ok := seen[sym.ID]; !ok {
 					queue = append(queue, sym.ID)
 				}
-				_ = rows.Close()
 			}
 		}
 	}
@@ -1332,6 +1369,61 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 			"affected_files":   len(fileList),
 		},
 	}, nil
+}
+
+func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []int64, callers bool) ([]graph.Symbol, error) {
+	if len(frontier) == 0 {
+		return nil, nil
+	}
+	const chunkSize = 250
+	var out []graph.Symbol
+	for start := 0; start < len(frontier); start += chunkSize {
+		end := start + chunkSize
+		if end > len(frontier) {
+			end = len(frontier)
+		}
+		chunk := frontier[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+			FROM edges e
+			JOIN symbols s ON s.id = e.src_symbol_id
+			JOIN files f ON f.id = s.file_id
+			WHERE e.repo_id = ? AND e.dst_symbol_id IN (` + placeholders + `)
+		`
+		if !callers {
+			query = `
+				SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+				       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+				FROM edges e
+				JOIN symbols s ON s.id = e.dst_symbol_id
+				JOIN files f ON f.id = s.file_id
+				WHERE e.repo_id = ? AND e.src_symbol_id IN (` + placeholders + `) AND e.dst_symbol_id IS NOT NULL
+			`
+		}
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			sym, err := scanSymbol(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out = append(out, sym)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]RelatedTest, error) {

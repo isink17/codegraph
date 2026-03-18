@@ -34,6 +34,10 @@ func (a *Adapter) Supports(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".py")
 }
 
+func (a *Adapter) Extensions() []string {
+	return []string{".py"}
+}
+
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	lines := strings.Split(string(content), "\n")

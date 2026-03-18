@@ -45,11 +45,12 @@ type fileTask struct {
 }
 
 type fileResult struct {
-	task   fileTask
-	action string
-	hash   string
-	parsed graph.ParsedFile
-	err    error
+	task     fileTask
+	action   string
+	hash     string
+	parsed   graph.ParsedFile
+	err      error
+	parseErr string
 }
 
 func New(s *store.Store, registry *parser.Registry) *Indexer {
@@ -196,7 +197,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		go func() {
 			defer wg.Done()
 			for task := range tasks {
-				res := processFileTask(ctxRun, task, existing[task.rel], opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages)
+				res := processFileTask(ctxRun, task, existing[task.rel], opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy)
 				select {
 				case results <- res:
 				case <-ctxRun.Done():
@@ -216,6 +217,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	const metadataBatchSize = 300
 	markSeenBatch := make([]string, 0, metadataBatchSize)
 	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
+	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	changedPathSet := map[string]struct{}{}
 
 	flushMarkSeen := func() error {
@@ -236,6 +238,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return err
 		}
 		touchBatch = touchBatch[:0]
+		return nil
+	}
+	flushParseFailed := func() error {
+		if len(parseFailedBatch) == 0 {
+			return nil
+		}
+		if err := i.store.MarkFilesParseFailedBatch(ctx, repo.ID, scanID, parseFailedBatch); err != nil {
+			return err
+		}
+		parseFailedBatch = parseFailedBatch[:0]
 		return nil
 	}
 
@@ -292,6 +304,25 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			changedPathSet[res.task.rel] = struct{}{}
 			summary.FilesChanged++
 			summary.FilesIndexed++
+		case "parse_failed":
+			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
+				Path:        res.task.rel,
+				Language:    res.task.language,
+				SizeBytes:   res.task.info.Size(),
+				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
+				ContentHash: res.hash,
+			})
+			summary.ParseErrors++
+			if len(summary.ParseSamples) < 20 {
+				summary.ParseSamples = append(summary.ParseSamples, fmt.Sprintf("%s: %s", res.task.rel, res.parseErr))
+			}
+			if len(parseFailedBatch) >= metadataBatchSize {
+				if err := flushParseFailed(); err != nil {
+					runErr = err
+					cancel()
+				}
+			}
+			summary.FilesSkipped++
 		}
 	}
 
@@ -303,6 +334,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	if runErr == nil {
 		if err := flushTouch(); err != nil {
+			runErr = err
+			cancel()
+		}
+	}
+	if runErr == nil {
+		if err := flushParseFailed(); err != nil {
 			runErr = err
 			cancel()
 		}
@@ -344,7 +381,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	return summary, nil
 }
 
-func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, force bool, maxFileSizeBytes int64, allowedLanguages []string) fileResult {
+func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string) fileResult {
 	result := fileResult{task: task}
 	hasPrev := prev.Path != ""
 
@@ -392,6 +429,11 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 	if task.adapter != nil {
 		parsed, err = task.adapter.Parse(ctx, task.path, content)
 		if err != nil {
+			if parseErrorPolicy == "best_effort" {
+				result.action = "parse_failed"
+				result.parseErr = err.Error()
+				return result
+			}
 			result.err = err
 			return result
 		}
