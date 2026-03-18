@@ -200,6 +200,36 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			return nil, err
 		}
 		return map[string]any{"ok": true, "data": stats}, nil
+	case "list_repos":
+		var req struct {
+			Limit  int `json:"limit"`
+			Offset int `json:"offset"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
+			return nil, err
+		}
+		items, err := s.store.ListRepos(ctx, req.Limit, req.Offset)
+		return wrapData("repos", items, err)
+	case "list_scans":
+		var req struct {
+			Limit  int `json:"limit"`
+			Offset int `json:"offset"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
+			return nil, err
+		}
+		items, err := s.store.ListScans(ctx, s.repoID, req.Limit, req.Offset)
+		return wrapData("scans", items, err)
+	case "latest_scan_errors":
+		var req struct {
+			Limit  int `json:"limit"`
+			Offset int `json:"offset"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
+			return nil, err
+		}
+		items, err := s.store.LatestScanErrors(ctx, s.repoID, req.Limit, req.Offset)
+		return wrapData("errors", items, err)
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
@@ -324,6 +354,9 @@ func toolDefinitions() []map[string]any {
 		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset"}),
 		toolDef("search_semantic", "Run lightweight local semantic search", []string{"query", "limit", "offset"}),
 		toolDef("graph_stats", "Return repository graph statistics", nil),
+		toolDef("list_repos", "List repositories known to the local graph store", []string{"limit", "offset"}),
+		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}),
+		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}),
 	}
 }
 

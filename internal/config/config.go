@@ -1,16 +1,19 @@
 package config
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/isink17/codegraph/internal/platform"
 )
 
 const fileName = "config.json"
+const ignoreFileName = ".codegraphignore"
 
 type Config struct {
 	DefaultLogLevel      string        `json:"default_log_level"`
@@ -131,14 +134,13 @@ func LoadRepo(repoRoot string) (RepoConfig, error) {
 	}
 	path := RepoConfigPath(repoRoot)
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return cfg, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return RepoConfig{}, err
 	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return RepoConfig{}, err
+	if err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return RepoConfig{}, err
+		}
 	}
 	if cfg.SemanticMaxTerms == 0 {
 		cfg.SemanticMaxTerms = 8
@@ -146,5 +148,38 @@ func LoadRepo(repoRoot string) (RepoConfig, error) {
 	if cfg.MaxFileSizeBytes == 0 {
 		cfg.MaxFileSizeBytes = 8 * 1024 * 1024
 	}
+	ignorePatterns, err := loadIgnorePatterns(repoRoot)
+	if err != nil {
+		return RepoConfig{}, err
+	}
+	if len(ignorePatterns) > 0 {
+		cfg.Exclude = append(cfg.Exclude, ignorePatterns...)
+	}
 	return cfg, nil
+}
+
+func loadIgnorePatterns(repoRoot string) ([]string, error) {
+	path := filepath.Join(repoRoot, ignoreFileName)
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var patterns []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return patterns, nil
 }

@@ -52,6 +52,19 @@ type ScanSummary struct {
 	DurationMS   int64 `json:"duration_ms"`
 }
 
+type ScanRecord struct {
+	ID           int64  `json:"id"`
+	RepoID       int64  `json:"repo_id"`
+	ScanKind     string `json:"scan_kind"`
+	StartedAt    string `json:"started_at"`
+	FinishedAt   string `json:"finished_at,omitempty"`
+	Status       string `json:"status"`
+	FilesSeen    int64  `json:"files_seen"`
+	FilesChanged int64  `json:"files_changed"`
+	FilesDeleted int64  `json:"files_deleted"`
+	ErrorText    string `json:"error_text,omitempty"`
+}
+
 type RelatedTest struct {
 	File   string  `json:"file"`
 	Symbol string  `json:"symbol"`
@@ -210,6 +223,83 @@ func (s *Store) UpsertRepo(ctx context.Context, rootPath string) (graph.Repo, er
 	return repo, nil
 }
 
+func (s *Store) PrimaryRepo(ctx context.Context) (graph.Repo, bool, error) {
+	var repo graph.Repo
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, root_path, canonical_path
+		FROM repos
+		ORDER BY id ASC
+		LIMIT 1
+	`).Scan(&repo.ID, &repo.RootPath, &repo.CanonicalPath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return graph.Repo{}, false, nil
+	}
+	if err != nil {
+		return graph.Repo{}, false, err
+	}
+	return repo, true, nil
+}
+
+func (s *Store) ListRepos(ctx context.Context, limit, offset int) ([]graph.Repo, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, root_path, canonical_path
+		FROM repos
+		ORDER BY id ASC
+		LIMIT ?
+		OFFSET ?
+	`, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var repos []graph.Repo
+	for rows.Next() {
+		var repo graph.Repo
+		if err := rows.Scan(&repo.ID, &repo.RootPath, &repo.CanonicalPath); err != nil {
+			return nil, err
+		}
+		repos = append(repos, repo)
+	}
+	return repos, rows.Err()
+}
+
+func (s *Store) ListScans(ctx context.Context, repoID int64, limit, offset int) ([]ScanRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, repo_id, scan_kind, started_at, COALESCE(finished_at, ''), status, files_seen, files_changed, files_deleted, error_text
+		FROM scans
+		WHERE repo_id = ?
+		ORDER BY id DESC
+		LIMIT ?
+		OFFSET ?
+	`, repoID, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanScanRecords(rows)
+}
+
+func (s *Store) LatestScanErrors(ctx context.Context, repoID int64, limit, offset int) ([]ScanRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, repo_id, scan_kind, started_at, COALESCE(finished_at, ''), status, files_seen, files_changed, files_deleted, error_text
+		FROM scans
+		WHERE repo_id = ? AND status = 'failed' AND error_text <> ''
+		ORDER BY id DESC
+		LIMIT ?
+		OFFSET ?
+	`, repoID, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanScanRecords(rows)
+}
+
+func (s *Store) Vacuum(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `VACUUM`)
+	return err
+}
+
 func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]FileRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, path, language, size_bytes, mtime_unix_ns, content_sha256, is_deleted
@@ -271,6 +361,29 @@ func scanExistingFiles(rows *sql.Rows) (map[string]FileRecord, error) {
 		}
 		rec.IsDeleted = isDeleted == 1
 		out[rec.Path] = rec
+	}
+	return out, rows.Err()
+}
+
+func scanScanRecords(rows *sql.Rows) ([]ScanRecord, error) {
+	var out []ScanRecord
+	for rows.Next() {
+		var rec ScanRecord
+		if err := rows.Scan(
+			&rec.ID,
+			&rec.RepoID,
+			&rec.ScanKind,
+			&rec.StartedAt,
+			&rec.FinishedAt,
+			&rec.Status,
+			&rec.FilesSeen,
+			&rec.FilesChanged,
+			&rec.FilesDeleted,
+			&rec.ErrorText,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
 	}
 	return out, rows.Err()
 }

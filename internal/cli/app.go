@@ -21,6 +21,7 @@ import (
 	"github.com/isink17/codegraph/internal/mcp"
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
+	pyparser "github.com/isink17/codegraph/internal/parser/python"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
@@ -66,6 +67,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runWatch(ctx, globalCfg, stdout, args[1:])
 	case "graph":
 		return runGraph(ctx, globalCfg, stdout, args[1:])
+	case "clean":
+		return runClean(ctx, globalCfg, stdout, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -304,6 +307,156 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	return err
 }
 
+func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	repoRoot := ""
+	vacuum := false
+	for _, arg := range args {
+		switch arg {
+		case "--vacuum":
+			vacuum = true
+		default:
+			if !strings.HasPrefix(arg, "-") {
+				repoRoot = arg
+			}
+		}
+	}
+
+	type dbResult struct {
+		Path           string `json:"path"`
+		Action         string `json:"action"`
+		ReclaimedBytes int64  `json:"reclaimed_bytes"`
+		CanonicalRepo  string `json:"canonical_repo,omitempty"`
+		Error          string `json:"error,omitempty"`
+	}
+	report := map[string]any{
+		"vacuum": vacuum,
+		"dbs":    []dbResult{},
+	}
+	var results []dbResult
+	var reclaimed int64
+
+	if repoRoot != "" {
+		canonical, err := store.CanonicalRepoPath(repoRoot)
+		if err != nil {
+			return err
+		}
+		dbPath := filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical))
+		res := dbResult{Path: dbPath, CanonicalRepo: canonical}
+		before := fileSize(dbPath)
+		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		if vacuum {
+			if err := s.Vacuum(ctx); err != nil {
+				return err
+			}
+			after := fileSize(dbPath)
+			if before > after {
+				res.ReclaimedBytes = before - after
+				reclaimed += res.ReclaimedBytes
+			}
+			res.Action = "vacuumed"
+		} else {
+			res.Action = "inspected"
+		}
+		results = append(results, res)
+		report["dbs"] = results
+		report["reclaimed_bytes"] = reclaimed
+		return writeJSON(stdout, report)
+	}
+
+	if err := os.MkdirAll(cfg.DBDir, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(cfg.DBDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".sqlite") {
+			continue
+		}
+		dbPath := filepath.Join(cfg.DBDir, entry.Name())
+		sizeBefore := fileSize(dbPath)
+		res := dbResult{Path: dbPath}
+		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+		if err != nil {
+			res.Action = "skipped"
+			res.Error = err.Error()
+			results = append(results, res)
+			continue
+		}
+		repo, ok, repoErr := s.PrimaryRepo(ctx)
+		if repoErr != nil {
+			_ = s.Close()
+			res.Action = "skipped"
+			res.Error = repoErr.Error()
+			results = append(results, res)
+			continue
+		}
+		if !ok {
+			_ = s.Close()
+			if err := os.Remove(dbPath); err == nil {
+				res.Action = "deleted_orphan"
+				res.ReclaimedBytes = sizeBefore
+				reclaimed += sizeBefore
+			} else {
+				res.Action = "skipped"
+				res.Error = err.Error()
+			}
+			results = append(results, res)
+			continue
+		}
+		res.CanonicalRepo = repo.CanonicalPath
+		if _, err := os.Stat(repo.CanonicalPath); err != nil {
+			_ = s.Close()
+			if err := os.Remove(dbPath); err == nil {
+				res.Action = "deleted_orphan"
+				res.ReclaimedBytes = sizeBefore
+				reclaimed += sizeBefore
+			} else {
+				res.Action = "skipped"
+				res.Error = err.Error()
+			}
+			results = append(results, res)
+			continue
+		}
+		if vacuum {
+			if err := s.Vacuum(ctx); err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			after := fileSize(dbPath)
+			if sizeBefore > after {
+				res.ReclaimedBytes = sizeBefore - after
+				reclaimed += res.ReclaimedBytes
+			}
+			res.Action = "vacuumed"
+		} else {
+			res.Action = "kept"
+		}
+		_ = s.Close()
+		results = append(results, res)
+	}
+
+	report["dbs"] = results
+	report["reclaimed_bytes"] = reclaimed
+	return writeJSON(stdout, report)
+}
+
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
 type App struct {
 	Store   *store.Store
 	Indexer *indexer.Indexer
@@ -326,7 +479,7 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 	if err != nil {
 		return nil, graphRepo{}, 0, err
 	}
-	registry := parser.NewRegistry(goparser.New())
+	registry := parser.NewRegistry(goparser.New(), pyparser.New())
 	idx := indexer.New(s, registry)
 	repo, err := s.UpsertRepo(ctx, canonical)
 	if err != nil {
@@ -362,4 +515,5 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  doctor")
 	fmt.Fprintln(w, "  graph export <repo-path> [--format json|dot]")
 	fmt.Fprintln(w, "  watch <repo-path>")
+	fmt.Fprintln(w, "  clean [repo-path] [--vacuum]")
 }
