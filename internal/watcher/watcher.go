@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -28,25 +29,29 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	}
 	defer fsw.Close()
 
-	if err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if path != repoRoot {
-			rel, relErr := filepath.Rel(repoRoot, path)
-			if relErr != nil {
-				return relErr
+	addWatchTree := func(root string) error {
+		return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
 			}
-			rel = filepath.Clean(rel)
-			if d.IsDir() && indexer.ShouldSkipDir(rel, nil) {
-				return filepath.SkipDir
+			if path != repoRoot {
+				rel, relErr := filepath.Rel(repoRoot, path)
+				if relErr != nil {
+					return relErr
+				}
+				rel = filepath.Clean(rel)
+				if d.IsDir() && indexer.ShouldSkipDir(rel, nil) {
+					return filepath.SkipDir
+				}
 			}
-		}
-		if d.IsDir() {
-			return fsw.Add(path)
-		}
-		return nil
-	}); err != nil {
+			if d.IsDir() {
+				return fsw.Add(path)
+			}
+			return nil
+		})
+	}
+
+	if err := addWatchTree(repoRoot); err != nil {
 		return err
 	}
 
@@ -85,6 +90,13 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			rel = filepath.Clean(rel)
 			if shouldIgnorePath(rel) {
 				continue
+			}
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				if info, statErr := os.Stat(event.Name); statErr == nil && info.IsDir() {
+					if err := addWatchTree(event.Name); err != nil {
+						return err
+					}
+				}
 			}
 			_ = w.store.QueueDirtyFile(ctx, repoID, rel, event.Op.String())
 			timer.Reset(debounce)

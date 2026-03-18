@@ -13,12 +13,13 @@ import (
 const fileName = "config.json"
 
 type Config struct {
-	DefaultLogLevel  string        `json:"default_log_level"`
-	DefaultExcludes  []string      `json:"default_excludes"`
-	DefaultLanguages []string      `json:"default_languages"`
-	WatchDebounce    time.Duration `json:"watch_debounce"`
-	DBDir            string        `json:"db_dir"`
-	CacheDir         string        `json:"cache_dir"`
+	DefaultLogLevel      string        `json:"default_log_level"`
+	DefaultExcludes      []string      `json:"default_excludes"`
+	DefaultLanguages     []string      `json:"default_languages"`
+	WatchDebounce        time.Duration `json:"watch_debounce"`
+	DBDir                string        `json:"db_dir"`
+	CacheDir             string        `json:"cache_dir"`
+	DBPerformanceProfile string        `json:"db_performance_profile"`
 }
 
 type RepoConfig struct {
@@ -35,12 +36,13 @@ func Default() (Config, error) {
 		return Config{}, err
 	}
 	return Config{
-		DefaultLogLevel:  "info",
-		DefaultExcludes:  []string{".git/**", ".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "node_modules/**", "vendor/**", "dist/**", "build/**"},
-		DefaultLanguages: []string{"go"},
-		WatchDebounce:    750 * time.Millisecond,
-		DBDir:            filepath.Join(paths.DataDir, "db"),
-		CacheDir:         paths.CacheDir,
+		DefaultLogLevel:      "info",
+		DefaultExcludes:      []string{".git/**", ".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "node_modules/**", "vendor/**", "dist/**", "build/**"},
+		DefaultLanguages:     []string{"go"},
+		WatchDebounce:        750 * time.Millisecond,
+		DBDir:                filepath.Join(paths.DataDir, "db"),
+		CacheDir:             paths.CacheDir,
+		DBPerformanceProfile: "balanced",
 	}, nil
 }
 
@@ -93,6 +95,9 @@ func Load() (Config, error) {
 	}
 	if cfg.WatchDebounce == 0 {
 		cfg.WatchDebounce = defaults.WatchDebounce
+	}
+	if cfg.DBPerformanceProfile == "" {
+		cfg.DBPerformanceProfile = defaults.DBPerformanceProfile
 	}
 	return cfg, nil
 }

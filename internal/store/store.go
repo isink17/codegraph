@@ -27,6 +27,10 @@ type Store struct {
 	db *sql.DB
 }
 
+type OpenOptions struct {
+	PerformanceProfile string
+}
+
 type FileRecord struct {
 	ID          int64
 	Path        string
@@ -56,6 +60,10 @@ type RelatedTest struct {
 }
 
 func Open(path string) (*Store, error) {
+	return OpenWithOptions(path, OpenOptions{})
+}
+
+func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -63,13 +71,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec(`PRAGMA foreign_keys = ON;`); err != nil {
+	if err := applyPragmas(db, opts.PerformanceProfile); err != nil {
 		return nil, err
 	}
 	s := &Store{db: db}
@@ -77,6 +79,40 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func applyPragmas(db *sql.DB, profile string) error {
+	base := []string{
+		`PRAGMA journal_mode = WAL;`,
+		`PRAGMA busy_timeout = 5000;`,
+		`PRAGMA foreign_keys = ON;`,
+	}
+	perf := strings.ToLower(strings.TrimSpace(profile))
+	switch perf {
+	case "", "balanced":
+		base = append(base,
+			`PRAGMA synchronous = NORMAL;`,
+			`PRAGMA temp_store = MEMORY;`,
+		)
+	case "durable":
+		base = append(base, `PRAGMA synchronous = FULL;`)
+	case "fast":
+		base = append(base,
+			`PRAGMA synchronous = OFF;`,
+			`PRAGMA temp_store = MEMORY;`,
+		)
+	default:
+		base = append(base,
+			`PRAGMA synchronous = NORMAL;`,
+			`PRAGMA temp_store = MEMORY;`,
+		)
+	}
+	for _, pragma := range base {
+		if _, err := db.Exec(pragma); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -236,6 +272,15 @@ func (s *Store) TouchFileMetadata(ctx context.Context, repoID, scanID int64, pat
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0
 	`, repoID, path, language, sizeBytes, mtimeUnixNS, contentHash, scanID, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *Store) MarkFileSeen(ctx context.Context, repoID, scanID int64, path string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE files
+		SET last_scan_id = ?, is_deleted = 0
+		WHERE repo_id = ? AND path = ?
+	`, scanID, repoID, path)
 	return err
 }
 
@@ -404,13 +449,30 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 			return err
 		}
 	}
+
+	targetKeySet := map[string]struct{}{}
+	for _, link := range parsed.TestLinks {
+		if link.TargetStableKey != "" {
+			targetKeySet[link.TargetStableKey] = struct{}{}
+		}
+	}
+	targetKeys := make([]string, 0, len(targetKeySet))
+	for key := range targetKeySet {
+		targetKeys = append(targetKeys, key)
+	}
+	targetStableToID, err := s.resolveSymbolsByStableKeys(ctx, repoID, targetKeys)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
 	for _, link := range parsed.TestLinks {
 		var testSymbolID any
 		var targetSymbolID any
 		if id := stableToID[link.TestSymbolKey]; id != 0 {
 			testSymbolID = id
 		}
-		if id, ok, err := s.resolveSymbolByStableKey(ctx, repoID, link.TargetStableKey); err == nil && ok {
+		if id, ok := targetStableToID[link.TargetStableKey]; ok {
 			targetSymbolID = id
 		}
 		if _, err := insertTestLinkStmt.ExecContext(ctx, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score); err != nil {
@@ -502,28 +564,20 @@ func chooseSrcSymbolID(stableToID map[string]int64, symbols []graph.Symbol, line
 	return firstFunctionID(stableToID, symbols)
 }
 
-func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64, seen map[string]struct{}) (int, error) {
-	records, err := s.ExistingFiles(ctx, repoID)
+func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE files
+		SET is_deleted = 1, parse_state = 'deleted', last_scan_id = ?
+		WHERE repo_id = ? AND is_deleted = 0 AND last_scan_id <> ?
+	`, scanID, repoID, scanID)
 	if err != nil {
 		return 0, err
 	}
-	count := 0
-	for path, rec := range records {
-		if _, ok := seen[path]; ok {
-			continue
-		}
-		if rec.IsDeleted {
-			continue
-		}
-		if _, err := s.db.ExecContext(ctx, `
-			UPDATE files SET is_deleted = 1, parse_state = 'deleted', last_scan_id = ?
-			WHERE id = ?
-		`, scanID, rec.ID); err != nil {
-			return count, err
-		}
-		count++
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
 	}
-	return count, nil
+	return int(n), nil
 }
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) error {
@@ -602,6 +656,38 @@ func (s *Store) resolveSymbolByStableKey(ctx context.Context, repoID int64, stab
 		return 0, false, nil
 	}
 	return 0, false, err
+}
+
+func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, stableKeys []string) (map[string]int64, error) {
+	out := map[string]int64{}
+	if len(stableKeys) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(stableKeys)), ",")
+	query := `
+		SELECT stable_key, id
+		FROM symbols
+		WHERE repo_id = ? AND stable_key IN (` + placeholders + `)
+	`
+	args := make([]any, 0, len(stableKeys)+1)
+	args = append(args, repoID)
+	for _, key := range stableKeys {
+		args = append(args, key)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var id int64
+		if err := rows.Scan(&key, &id); err != nil {
+			return nil, err
+		}
+		out[key] = id
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {

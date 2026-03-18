@@ -74,7 +74,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return store.ScanSummary{}, err
 	}
 	summary := store.ScanSummary{RepoID: repo.ID, ScanID: scanID}
-	seen := map[string]struct{}{}
 	existing, err := i.store.ExistingFiles(ctx, repo.ID)
 	if err != nil {
 		return summary, err
@@ -120,7 +119,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return nil
 		}
 		summary.FilesSeen++
-		seen[rel] = struct{}{}
 		info, err := d.Info()
 		if err != nil {
 			return err
@@ -131,12 +129,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			language = adapter.Language()
 		}
 		if len(opts.Languages) > 0 && language != "" && !slices.Contains(opts.Languages, language) {
-			return nil
+			return i.store.MarkFileSeen(ctx, repo.ID, scanID, rel)
 		}
 		prev, exists := existing[rel]
 		if exists && !opts.Force && prev.SizeBytes == info.Size() && prev.MtimeUnixNS == info.ModTime().UnixNano() {
 			summary.FilesSkipped++
-			return nil
+			return i.store.MarkFileSeen(ctx, repo.ID, scanID, rel)
 		}
 		content, err := os.ReadFile(path)
 		if err != nil {
@@ -168,7 +166,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 		return summary, err
 	}
-	deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID, seen)
+	deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
 	if err != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 		return summary, err

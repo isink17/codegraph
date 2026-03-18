@@ -320,7 +320,9 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 		return nil, graphRepo{}, 0, err
 	}
 	dbPath := filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical))
-	s, err := store.Open(dbPath)
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{
+		PerformanceProfile: cfg.DBPerformanceProfile,
+	})
 	if err != nil {
 		return nil, graphRepo{}, 0, err
 	}
