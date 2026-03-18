@@ -1,0 +1,14 @@
+.DS_Store
+.codegraph/
+.codegraph-home*/
+.gocache/
+.gomodcache/
+.gotelemetry/
+.tmp/
+bin/
+dist/
+coverage.out
+*.test
+*.tmp
+*.swp
+*.swo
