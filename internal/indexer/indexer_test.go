@@ -211,6 +211,53 @@ func broken( {
 	}
 }
 
+func TestCodegraphIgnoreNegationUnignoresInsideSkippedDir(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, ".codegraphignore"), "vendor/**\n!vendor/keep.go\n")
+	writeFile(t, filepath.Join(repoRoot, "vendor", "skip.go"), `package vendor
+func Skip() {}
+`)
+	writeFile(t, filepath.Join(repoRoot, "vendor", "keep.go"), `package vendor
+func Keep() {}
+`)
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	idx := New(s, parser.NewRegistry(goparser.New()))
+	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	existing, err := s.ExistingFiles(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("ExistingFiles() error = %v", err)
+	}
+	if _, ok := existing[filepath.Clean(filepath.Join("vendor", "keep.go"))]; !ok {
+		t.Fatalf("expected vendor/keep.go to be indexed, got keys: %v", mapKeys(existing))
+	}
+	if _, ok := existing[filepath.Clean(filepath.Join("vendor", "skip.go"))]; ok {
+		t.Fatalf("expected vendor/skip.go to be ignored")
+	}
+}
+
+func mapKeys(m map[string]store.FileRecord) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

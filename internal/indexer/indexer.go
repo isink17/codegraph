@@ -509,19 +509,23 @@ func ShouldSkipDir(rel string, excludes []string) bool {
 }
 
 func shouldSkipDir(rel string, excludes []string) bool {
+	rel = filepath.ToSlash(rel)
 	base := filepath.Base(rel)
 	if strings.HasPrefix(base, ".") {
-		return true
+		return !hasNegationWithin(rel, excludes)
 	}
 	switch base {
 	case "node_modules", "vendor", "dist", "build", "target", "out", "bin":
-		return true
+		return !hasNegationWithin(rel, excludes)
 	}
-	return matchesAny(rel, excludes)
+	if matchesIgnore(rel, excludes) {
+		return !hasNegationWithin(rel, excludes)
+	}
+	return false
 }
 
 func shouldSkipFile(rel string, includes, excludes []string) bool {
-	if matchesAny(rel, excludes) {
+	if matchesIgnore(rel, excludes) {
 		return true
 	}
 	if len(includes) == 0 {
@@ -533,19 +537,74 @@ func shouldSkipFile(rel string, includes, excludes []string) bool {
 func matchesAny(path string, globs []string) bool {
 	path = filepath.ToSlash(path)
 	for _, glob := range globs {
-		glob = filepath.ToSlash(glob)
-		if strings.HasSuffix(glob, "/**") {
-			prefix := strings.TrimSuffix(glob, "/**")
-			if strings.HasPrefix(path, prefix) {
-				return true
-			}
-		}
-		if ok, _ := filepath.Match(glob, path); ok {
+		if matchPattern(path, glob) {
 			return true
 		}
-		if ok, _ := filepath.Match(glob, filepath.Base(path)); ok {
+	}
+	return false
+}
+
+func matchesIgnore(path string, patterns []string) bool {
+	path = filepath.ToSlash(path)
+	ignored := false
+	for _, raw := range patterns {
+		pattern := strings.TrimSpace(filepath.ToSlash(raw))
+		if pattern == "" {
+			continue
+		}
+		negated := strings.HasPrefix(pattern, "!")
+		if negated {
+			pattern = strings.TrimPrefix(pattern, "!")
+		}
+		if !matchPattern(path, pattern) {
+			continue
+		}
+		if negated {
+			ignored = false
+		} else {
+			ignored = true
+		}
+	}
+	return ignored
+}
+
+func hasNegationWithin(dir string, patterns []string) bool {
+	dir = strings.Trim(filepath.ToSlash(dir), "/")
+	if dir == "" || dir == "." {
+		return false
+	}
+	prefix := dir + "/"
+	for _, raw := range patterns {
+		pattern := strings.TrimSpace(filepath.ToSlash(raw))
+		if !strings.HasPrefix(pattern, "!") {
+			continue
+		}
+		pattern = strings.TrimPrefix(pattern, "!")
+		pattern = strings.TrimPrefix(pattern, "/")
+		if pattern == dir || strings.HasPrefix(pattern, prefix) {
 			return true
 		}
+	}
+	return false
+}
+
+func matchPattern(path, pattern string) bool {
+	pattern = strings.TrimSpace(filepath.ToSlash(pattern))
+	if pattern == "" {
+		return false
+	}
+	pattern = strings.TrimPrefix(pattern, "/")
+	if strings.HasSuffix(pattern, "/**") {
+		prefix := strings.TrimSuffix(pattern, "/**")
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	if ok, _ := filepath.Match(pattern, path); ok {
+		return true
+	}
+	if ok, _ := filepath.Match(pattern, filepath.Base(path)); ok {
+		return true
 	}
 	return false
 }
