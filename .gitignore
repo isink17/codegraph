@@ -12,3 +12,5 @@ coverage.out
 *.tmp
 *.swp
 *.swo
+TODO.md
+codegraph.exe

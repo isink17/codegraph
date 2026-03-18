@@ -27,6 +27,7 @@
 - Use SQLite migrations for schema changes
 - Keep JSON responses concise and predictable
 - Avoid adding cloud services, heavy UI, or client-specific behavior in core packages
+- Use `codegraph` MCP for codebase exploration and context queries when available (`codegraph serve --repo-root <repo>`).
 
 ## Verification
 
@@ -34,6 +35,7 @@
 - Run `go build ./cmd/codegraph`
 - For indexing changes, verify `codegraph index`, `codegraph update`, and `codegraph stats`
 - For MCP changes, verify `codegraph serve` still answers `tools/list` and `tools/call`
+- Prefer MCP-backed checks (`tools/list`, `tools/call`) before adding ad-hoc local inspection scripts.
 
 ## Release Hygiene
 

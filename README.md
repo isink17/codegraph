@@ -218,6 +218,43 @@ All follow the same `codegraph serve --repo-root <repo>` command pattern.
 - `graph_stats`
 - `supported_languages`
 
+## Quick Graph Preview
+
+You can export the current repo graph and render it with Graphviz.
+
+Install Graphviz (one-time):
+
+```bash
+# macOS (Homebrew)
+brew install graphviz
+
+# Ubuntu/Debian
+sudo apt-get update && sudo apt-get install -y graphviz
+```
+
+```powershell
+# Windows (winget)
+winget install -e --id Graphviz.Graphviz
+```
+
+```bash
+codegraph graph export . --format dot > graph.dot
+dot -Tsvg graph.dot -o graph.svg
+```
+
+If you prefer PNG:
+
+```bash
+dot -Tpng graph.dot -o graph.png
+```
+
+Tip: for large repos, focus on one symbol first to keep the graph readable:
+
+```bash
+codegraph graph export . --format dot --symbol MyTypeOrFunction > graph.dot
+dot -Tsvg graph.dot -o graph.svg
+```
+
 ## Verification
 
 Use this checklist after setup:
