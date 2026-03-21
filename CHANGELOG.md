@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Switched the default database location to per-repository `codegraph.sqlite` and excluded `codegraph.sqlite*` from indexing so repo-local DB mode works on repeated `index` and `serve` runs.
+- Treated the previous global `db_dir` default as a legacy value so existing installs fall forward to repo-local DB behavior without manual config edits.
+- Updated Codex MCP setup guidance and examples to use `config.toml` with `startup_timeout_sec = 60`.
+
 ## v1.0.3 - 2026-03-18
 
 ### Changed

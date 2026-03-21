@@ -35,6 +35,7 @@ func TestRunInstallCreatesConfigAndPrintsSnippets(t *testing.T) {
 	for _, needle := range []string{
 		"codegraph install complete",
 		"Codex MCP snippet:",
+		"startup_timeout_sec = 60",
 		"Gemini CLI MCP snippet:",
 		"Claude/Desktop MCP snippet:",
 		"If `codegraph` is not found after `go install`",
@@ -111,6 +112,58 @@ func main() {}
 	}
 	if first["type"] != "scan_summary" {
 		t.Fatalf("first event type = %v, want scan_summary", first["type"])
+	}
+}
+
+func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(config) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "config", "config.json"), []byte("{\n  \"db_dir\": \"repo\"\n}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(config.json) error = %v", err)
+	}
+
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoRoot) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go) error = %v", err)
+	}
+
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"index", repoRoot}, &out, &errOut); err != nil {
+		t.Fatalf("first Run(index) error = %v", err)
+	}
+	out.Reset()
+	if err := Run(context.Background(), []string{"index", repoRoot}, &out, &errOut); err != nil {
+		t.Fatalf("second Run(index) error = %v", err)
+	}
+
+	dbPath := filepath.Join(repoRoot, "codegraph.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("expected repo database at %q: %v", dbPath, err)
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"stats", repoRoot}, &out, &errOut); err != nil {
+		t.Fatalf("Run(stats) error = %v", err)
+	}
+	var stats map[string]any
+	if err := json.Unmarshal(out.Bytes(), &stats); err != nil {
+		t.Fatalf("stats output json parse error = %v", err)
+	}
+	if got := int(stats["files"].(float64)); got != 1 {
+		t.Fatalf("stats files = %d, want 1; output=%s", got, out.String())
 	}
 }
 

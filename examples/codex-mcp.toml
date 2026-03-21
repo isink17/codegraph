@@ -1,0 +1,4 @@
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["serve", "--repo-root", "/absolute/path/to/repo"]
+startup_timeout_sec = 60

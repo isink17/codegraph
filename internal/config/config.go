@@ -14,6 +14,8 @@ import (
 
 const fileName = "config.json"
 const ignoreFileName = ".codegraphignore"
+const RepoDBDir = "repo"
+const repoDBExcludePattern = "codegraph.sqlite*"
 
 type Config struct {
 	DefaultLogLevel      string        `json:"default_log_level"`
@@ -42,10 +44,10 @@ func Default() (Config, error) {
 	}
 	return Config{
 		DefaultLogLevel:      "info",
-		DefaultExcludes:      []string{".git/**", ".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "node_modules/**", "vendor/**", "dist/**", "build/**"},
+		DefaultExcludes:      []string{".git/**", ".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "node_modules/**", "vendor/**", "dist/**", "build/**", repoDBExcludePattern},
 		DefaultLanguages:     []string{"go"},
 		WatchDebounce:        750 * time.Millisecond,
-		DBDir:                filepath.Join(paths.DataDir, "db"),
+		DBDir:                RepoDBDir,
 		CacheDir:             paths.CacheDir,
 		DBPerformanceProfile: "balanced",
 	}, nil
@@ -68,6 +70,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	paths, err := platform.DefaultPaths()
+	if err != nil {
+		return Config{}, err
+	}
 	path, err := ConfigPath()
 	if err != nil {
 		return Config{}, err
@@ -85,6 +91,9 @@ func Load() (Config, error) {
 	}
 	if cfg.DBDir == "" {
 		cfg.DBDir = defaults.DBDir
+	}
+	if isLegacyGlobalDBDir(cfg.DBDir, paths) {
+		cfg.DBDir = RepoDBDir
 	}
 	if cfg.CacheDir == "" {
 		cfg.CacheDir = defaults.CacheDir
@@ -105,6 +114,23 @@ func Load() (Config, error) {
 		cfg.DBPerformanceProfile = defaults.DBPerformanceProfile
 	}
 	return cfg, nil
+}
+
+func IsRepoDBDir(dbDir string) bool {
+	return strings.EqualFold(strings.TrimSpace(dbDir), RepoDBDir)
+}
+
+func RepoDBExcludePattern() string {
+	return repoDBExcludePattern
+}
+
+func isLegacyGlobalDBDir(dbDir string, paths platform.Paths) bool {
+	cleaned := strings.TrimSpace(dbDir)
+	if cleaned == "" {
+		return false
+	}
+	legacy := filepath.Join(paths.DataDir, "db")
+	return strings.EqualFold(filepath.Clean(cleaned), filepath.Clean(legacy))
 }
 
 func SaveIfMissing(cfg Config) (string, bool, error) {

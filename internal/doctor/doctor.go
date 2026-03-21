@@ -53,6 +53,9 @@ func RunWithFix(fix bool) (Report, error) {
 			return Report{}, err
 		}
 		for _, dir := range []string{paths.ConfigDir, paths.DataDir, paths.CacheDir, defaultCfg.DBDir} {
+			if config.IsRepoDBDir(dir) {
+				continue
+			}
 			if err := os.MkdirAll(dir, 0o755); err == nil {
 				appliedFixes = append(appliedFixes, "ensured directory: "+dir)
 			}

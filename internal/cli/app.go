@@ -187,7 +187,7 @@ func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 		}
 		repoCfg := config.RepoConfig{
 			Include:          []string{"**/*"},
-			Exclude:          []string{".git/**", ".codegraph/**", "node_modules/**", "vendor/**", "dist/**", "build/**"},
+			Exclude:          []string{".git/**", ".codegraph/**", "node_modules/**", "vendor/**", "dist/**", "build/**", config.RepoDBExcludePattern()},
 			Languages:        append([]string(nil), cfg.DefaultLanguages...),
 			WatchDebounce:    cfg.WatchDebounce,
 			SemanticMaxTerms: 8,
@@ -390,6 +390,9 @@ func runInstall(stdout io.Writer) error {
 		return err
 	}
 	for _, dir := range []string{paths.ConfigDir, paths.DataDir, cfg.DBDir, paths.CacheDir} {
+		if config.IsRepoDBDir(dir) {
+			continue
+		}
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -410,11 +413,15 @@ func runInstall(stdout io.Writer) error {
 	} else {
 		fmt.Fprintln(stdout, "default config: already present")
 	}
-	snippet := `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`
-	for _, label := range []string{"Codex", "Gemini CLI", "Claude/Desktop"} {
+	codexSnippet := "[mcp_servers.codegraph]\ncommand = \"codegraph\"\nargs = [\"serve\", \"--repo-root\", \"/absolute/path/to/repo\"]\nstartup_timeout_sec = 60"
+	clientSnippet := `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Codex MCP snippet:")
+	fmt.Fprintln(stdout, codexSnippet)
+	for _, label := range []string{"Gemini CLI", "Claude/Desktop"} {
 		fmt.Fprintln(stdout)
 		fmt.Fprintf(stdout, "%s MCP snippet:\n", label)
-		fmt.Fprintln(stdout, snippet)
+		fmt.Fprintln(stdout, clientSnippet)
 	}
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "If `codegraph` is not found after `go install`, your Go bin directory is probably not on PATH.")
@@ -784,6 +791,9 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if repoRoot == "" && fs.NArg() > 0 {
 		repoRoot = fs.Arg(0)
 	}
+	if repoRoot == "" && config.IsRepoDBDir(cfg.DBDir) {
+		repoRoot = "."
+	}
 
 	type dbResult struct {
 		Path           string `json:"path"`
@@ -804,7 +814,10 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		if err != nil {
 			return err
 		}
-		dbPath := filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical))
+		dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+		if err != nil {
+			return err
+		}
 		res := dbResult{Path: dbPath, CanonicalRepo: canonical}
 		before := fileSize(dbPath)
 		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
@@ -936,7 +949,10 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 	if err != nil {
 		return nil, graphRepo{}, 0, err
 	}
-	dbPath := filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical))
+	dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		return nil, graphRepo{}, 0, err
+	}
 	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{
 		PerformanceProfile: cfg.DBPerformanceProfile,
 	})
@@ -972,6 +988,19 @@ func newDefaultRegistry() *parser.Registry {
 		heuristicparser.NewPHP(),
 		heuristicparser.NewCAndCpp(),
 	)
+}
+
+const repoDBFileName = "codegraph.sqlite"
+
+func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error) {
+	if config.IsRepoDBDir(cfg.DBDir) {
+		absRoot, err := filepath.Abs(repoRoot)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(absRoot, repoDBFileName), nil
+	}
+	return filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical)), nil
 }
 
 type graphRepo struct {
