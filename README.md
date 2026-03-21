@@ -4,7 +4,7 @@
 
 It builds a persistent repository graph in SQLite, keeps it incrementally up to date, and exposes that graph through both a CLI and an MCP stdio server for tools like Codex, Gemini CLI, and Claude Desktop.
 
-Latest release: `v1.0.4` (March 21, 2026).
+Latest release: `v1.0.5` (March 21, 2026).
 
 ## What It Does
 
