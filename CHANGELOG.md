@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.0.6 - 2026-03-26
+
+### Fixed
+
+- Stopped sending JSON-RPC responses to MCP notifications (`notifications/initialized` and other `notifications/*` methods), which violated the protocol and caused strict clients to fail on connect.
+- Changed tool schema `"required": null` to omit the field when empty, fixing JSON Schema validation failures in strict MCP clients.
+- Removed non-standard `structuredContent` field from tool call responses to conform to the MCP spec.
+- Routed unhandled-method logging through the configured stderr writer instead of Go's default logger.
+
+### Changed
+
+- `NewServer` now accepts an `io.Writer` for error output, giving callers control over diagnostic logging.
+
+### Docs
+
+- Added Claude Code MCP setup section to README with `.mcp.json` examples.
+- Added missing `list_scans` and `latest_scan_errors` to the MCP tools list in README.
+- Added one-line descriptions to all 14 MCP tools in README.
+
 ## v1.0.5 - 2026-03-21
 
 ### Fixed
