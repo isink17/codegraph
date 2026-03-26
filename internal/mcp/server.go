@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,10 +24,11 @@ type Server struct {
 	store    *store.Store
 	indexer  *indexer.Indexer
 	query    *query.Service
+	errOut   io.Writer
 }
 
-func NewServer(repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service) *Server {
-	return &Server{repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q}
+func NewServer(repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
+	return &Server{repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q, errOut: errOut}
 }
 
 type rpcRequest struct {
@@ -101,14 +101,17 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out, errOut io.Writer)
 			writeResponse(out, rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: err.Error()}})
 			continue
 		}
-		resp := s.handle(ctx, req)
+		resp, shouldRespond := s.handle(ctx, req)
+		if !shouldRespond {
+			continue
+		}
 		if err := writeResponse(out, resp); err != nil {
 			return err
 		}
 	}
 }
 
-func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
+func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool) {
 	switch req.Method {
 	case "initialize":
 		return rpcResponse{
@@ -124,35 +127,37 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 					"tools": map[string]any{},
 				},
 			},
-		}
+		}, true
 	case "notifications/initialized":
-		return rpcResponse{JSONRPC: "2.0"}
+		return rpcResponse{}, false
 	case "tools/list":
-		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": staticToolDefinitions}}
+		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": staticToolDefinitions}}, true
 	case "tools/call":
 		var params struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: err.Error()}}
+			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: err.Error()}}, true
 		}
 		result, err := s.callTool(ctx, params.Name, params.Arguments)
 		if err != nil {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 				"content": []map[string]any{{"type": "text", "text": `{"ok":false,"error":"` + escape(err.Error()) + `"}`}},
 				"isError": true,
-			}}
+			}}, true
 		}
 		payload, _ := json.Marshal(result)
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"content":           []map[string]any{{"type": "text", "text": string(payload)}},
-			"structuredContent": result,
-			"isError":           false,
-		}}
+			"content": []map[string]any{{"type": "text", "text": string(payload)}},
+			"isError": false,
+		}}, true
 	default:
-		log.Printf("unhandled MCP method: %s", req.Method)
-		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found"}}
+		if strings.HasPrefix(req.Method, "notifications/") {
+			return rpcResponse{}, false
+		}
+		fmt.Fprintf(s.errOut, "codegraph: unhandled MCP method: %s\n", req.Method)
+		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found"}}, true
 	}
 }
 
@@ -422,15 +427,18 @@ func toolDef(name, description string, properties, required []string) map[string
 			props[prop] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
 		}
 	}
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           props,
+		"additionalProperties": false,
+	}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
 	return map[string]any{
 		"name":        name,
 		"description": description,
-		"inputSchema": map[string]any{
-			"type":                 "object",
-			"properties":           props,
-			"required":             required,
-			"additionalProperties": false,
-		},
+		"inputSchema": schema,
 	}
 }
 

@@ -631,7 +631,7 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 		return err
 	}
 	defer app.Close()
-	server := mcp.NewServer(repo.RootPath, repoID, app.Store, app.Indexer, app.Query)
+	server := mcp.NewServer(repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
 	return server.Serve(ctx, os.Stdin, stdout, stderr)
 }
 
