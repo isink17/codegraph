@@ -226,6 +226,34 @@ args = ["run", "./cmd/codegraph", "serve", "--repo-root", "/absolute/path/to/rep
 startup_timeout_sec = 60
 ```
 
+### Claude Code
+
+Add to your project's `.mcp.json` or global settings:
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--repo-root", "/absolute/path/to/repo"]
+    }
+  }
+}
+```
+
+If `codegraph` is not on `PATH`, use `go run` from the source checkout:
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "go",
+      "args": ["run", "./cmd/codegraph", "serve", "--repo-root", "/absolute/path/to/repo"]
+    }
+  }
+}
+```
+
 ### Gemini CLI and Claude Desktop
 
 Examples:
@@ -249,18 +277,20 @@ For Codex specifically, keep `startup_timeout_sec = 60` so the server has enough
 
 `codegraph serve` currently exposes these MCP tools:
 
-- `index_repo`
-- `update_graph`
-- `find_symbol`
-- `find_callers`
-- `find_callees`
-- `get_impact_radius`
-- `find_related_tests`
-- `search_symbols`
-- `search_semantic`
-- `graph_stats`
-- `supported_languages`
-- `list_repos`
+- `index_repo` — index a repository into the local code graph
+- `update_graph` — update only changed files in the graph
+- `find_symbol` — find symbols by exact or fuzzy query
+- `find_callers` — find callers of a symbol
+- `find_callees` — find callees of a symbol
+- `get_impact_radius` — estimate affected symbols and files around a change
+- `find_related_tests` — find likely related tests for a symbol or file
+- `search_symbols` — search symbol names, signatures, and docs
+- `search_semantic` — run lightweight local semantic search
+- `graph_stats` — return repository graph statistics
+- `supported_languages` — list supported languages and file extensions
+- `list_repos` — list repositories known to the local graph store
+- `list_scans` — list recent scans for the active repository
+- `latest_scan_errors` — list latest failed scans and error details
 
 ## Graphviz Preview
 

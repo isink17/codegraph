@@ -38,7 +38,7 @@ func main() {}
 		t.Fatalf("Index() error = %v", err)
 	}
 
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s))
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
 	input := bytes.NewBuffer(nil)
 	writeFrameToBuffer(t, input, map[string]any{
 		"jsonrpc": "2.0",
@@ -75,8 +75,16 @@ func main() {}
 	if got := toolResult["isError"]; got != false {
 		t.Fatalf("isError = %v, want false", got)
 	}
-	structured := toolResult["structuredContent"].(map[string]any)
-	data := structured["data"].(map[string]any)
+	contentArr := toolResult["content"].([]any)
+	if len(contentArr) == 0 {
+		t.Fatal("expected content array to be non-empty")
+	}
+	textEntry := contentArr[0].(map[string]any)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(textEntry["text"].(string)), &parsed); err != nil {
+		t.Fatalf("json.Unmarshal(content text) error = %v", err)
+	}
+	data := parsed["data"].(map[string]any)
 	if got := int(data["files"].(float64)); got != 1 {
 		t.Fatalf("files = %d, want 1", got)
 	}
@@ -93,7 +101,7 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s))
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
 
 	input := bytes.NewBuffer(nil)
 	writeFrameToBuffer(t, input, map[string]any{
@@ -117,9 +125,17 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	if got := result["isError"]; got != false {
 		t.Fatalf("isError = %v, want false", got)
 	}
-	content := result["structuredContent"].(map[string]any)
-	data := content["data"].(map[string]any)
-	languages := data["languages"].([]any)
+	contentArr := result["content"].([]any)
+	if len(contentArr) == 0 {
+		t.Fatal("expected content array to be non-empty")
+	}
+	textEntry := contentArr[0].(map[string]any)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(textEntry["text"].(string)), &parsed); err != nil {
+		t.Fatalf("json.Unmarshal(content text) error = %v", err)
+	}
+	langData := parsed["data"].(map[string]any)
+	languages := langData["languages"].([]any)
 	if len(languages) == 0 {
 		t.Fatalf("languages = %v, want non-empty", languages)
 	}
@@ -135,7 +151,7 @@ func TestServeMalformedFrameReturnsParseErrorAndContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s))
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
 
 	var input bytes.Buffer
 	input.WriteString("Content-Length: bad\r\n\r\n")
@@ -178,7 +194,7 @@ func TestToolValidationRejectsMissingQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s))
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
 
 	var input bytes.Buffer
 	writeFrameToBuffer(t, &input, map[string]any{
