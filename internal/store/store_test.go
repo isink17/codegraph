@@ -25,7 +25,7 @@ func TestListScansIncludesLanguageCoverage(t *testing.T) {
 	}
 	defer s.Close()
 
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}

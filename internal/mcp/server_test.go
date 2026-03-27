@@ -29,7 +29,7 @@ func main() {}
 	s := openTestStore(t)
 	defer s.Close()
 
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	repo, err := s.UpsertRepo(ctx, repoRoot)
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
@@ -38,7 +38,7 @@ func main() {}
 		t.Fatalf("Index() error = %v", err)
 	}
 
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 	input := bytes.NewBuffer(nil)
 	writeFrameToBuffer(t, input, map[string]any{
 		"jsonrpc": "2.0",
@@ -96,12 +96,12 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	s := openTestStore(t)
 	defer s.Close()
 
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	repo, err := s.UpsertRepo(ctx, repoRoot)
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	input := bytes.NewBuffer(nil)
 	writeFrameToBuffer(t, input, map[string]any{
@@ -146,12 +146,12 @@ func TestServeMalformedFrameReturnsParseErrorAndContinues(t *testing.T) {
 	repoRoot := t.TempDir()
 	s := openTestStore(t)
 	defer s.Close()
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	repo, err := s.UpsertRepo(ctx, repoRoot)
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	var input bytes.Buffer
 	input.WriteString("Content-Length: bad\r\n\r\n")
@@ -189,12 +189,12 @@ func TestToolValidationRejectsMissingQuery(t *testing.T) {
 	repoRoot := t.TempDir()
 	s := openTestStore(t)
 	defer s.Close()
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	repo, err := s.UpsertRepo(ctx, repoRoot)
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	var input bytes.Buffer
 	writeFrameToBuffer(t, &input, map[string]any{

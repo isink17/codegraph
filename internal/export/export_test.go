@@ -27,7 +27,7 @@ func main() { helper() }
 		t.Fatalf("store.Open() error = %v", err)
 	}
 	defer s.Close()
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	repo, err := s.UpsertRepo(ctx, repoRoot)
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
@@ -36,7 +36,7 @@ func main() { helper() }
 		t.Fatalf("Index() error = %v", err)
 	}
 
-	svc := New(query.New(s))
+	svc := New(query.New(s, nil))
 	jsonOut, err := svc.JSON(ctx, repo.ID)
 	if err != nil {
 		t.Fatalf("JSON() error = %v", err)

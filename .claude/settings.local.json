@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(./codegraph.exe --help)",
+      "Bash(./codegraph --help)",
+      "Bash(go run:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(./codegraph.exe install:*)",
+      "Bash(./codegraph.exe index:*)",
+      "Bash(git clone:*)",
+      "Bash(cygpath:*)",
+      "Bash(ls:*)",
+      "Bash(gcc --version)",
+      "Bash(go get:*)",
+      "Bash(go mod:*)",
+      "Bash(go version:*)",
+      "Bash(find . -name *schema* -o -name *migration*)",
+      "Bash(grep -v '//')",
+      "Bash(go list:*)",
+      "Bash(go fmt:*)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Bash(gofmt -l \"$f\")",
+      "Bash(done)",
+      "Bash(grep:*)"
+    ]
+  }
+}

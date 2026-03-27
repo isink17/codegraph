@@ -82,3 +82,25 @@ type Stats struct {
 	LastIndexedAt string         `json:"last_indexed_at,omitempty"`
 	Languages     map[string]int `json:"languages"`
 }
+
+type TaskContext struct {
+	Task      string            `json:"task"`
+	Files     []TaskContextFile `json:"files"`
+	TestFiles []TaskContextFile `json:"test_files,omitempty"`
+}
+
+type TaskContextFile struct {
+	Path           string              `json:"path"`
+	Language       string              `json:"language"`
+	RelevanceScore float64             `json:"relevance_score"`
+	Symbols        []TaskContextSymbol `json:"symbols"`
+}
+
+type TaskContextSymbol struct {
+	Name          string `json:"name"`
+	Kind          string `json:"kind"`
+	Signature     string `json:"signature,omitempty"`
+	DocSummary    string `json:"doc_summary,omitempty"`
+	Relevance     string `json:"relevance"` // "direct_match", "caller", "callee", "test"
+	QualifiedName string `json:"qualified_name"`
+}
