@@ -26,7 +26,7 @@ func BenchmarkIndexerIndex(b *testing.B) {
 		if err != nil {
 			b.Fatalf("store.Open() error = %v", err)
 		}
-		idx := New(s, parser.NewRegistry(goparser.New()))
+		idx := New(s, parser.NewRegistry(goparser.New()), nil)
 		if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
 			_ = s.Close()
 			b.Fatalf("Index() error = %v", err)
@@ -46,7 +46,7 @@ func BenchmarkIndexerUpdateOneFile(b *testing.B) {
 		b.Fatalf("store.Open() error = %v", err)
 	}
 	defer s.Close()
-	idx := New(s, parser.NewRegistry(goparser.New()))
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
 		b.Fatalf("Index() error = %v", err)
 	}

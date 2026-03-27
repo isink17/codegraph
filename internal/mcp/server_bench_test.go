@@ -61,7 +61,7 @@ func setupMCPBenchServer(b *testing.B, ctx context.Context) *Server {
 	}
 	b.Cleanup(func() { _ = s.Close() })
 
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	repo, err := s.UpsertRepo(ctx, repoRoot)
 	if err != nil {
 		b.Fatalf("UpsertRepo() error = %v", err)
@@ -69,5 +69,5 @@ func setupMCPBenchServer(b *testing.B, ctx context.Context) *Server {
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		b.Fatalf("Index() error = %v", err)
 	}
-	return NewServer(repoRoot, repo.ID, s, idx, query.New(s), io.Discard)
+	return NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 }

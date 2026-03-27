@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/isink17/codegraph/internal/agent"
+	"github.com/isink17/codegraph/internal/framework"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
@@ -25,10 +27,16 @@ type Server struct {
 	indexer  *indexer.Indexer
 	query    *query.Service
 	errOut   io.Writer
+	agentCfg agent.OllamaLLMConfig
 }
 
 func NewServer(repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
 	return &Server{repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q, errOut: errOut}
+}
+
+// SetAgentConfig configures the LLM backend for the agentic_query tool.
+func (s *Server) SetAgentConfig(baseURL, model string) {
+	s.agentCfg = agent.OllamaLLMConfig{BaseURL: baseURL, Model: model}
 }
 
 type rpcRequest struct {
@@ -201,13 +209,19 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		return map[string]any{"ok": true, "data": data}, nil
 	case "find_related_tests":
 		var req struct {
-			Symbol string `json:"symbol"`
-			File   string `json:"file"`
-			Limit  int    `json:"limit"`
-			Offset int    `json:"offset"`
+			Symbol string   `json:"symbol"`
+			File   string   `json:"file"`
+			Files  []string `json:"files"`
+			Limit  int      `json:"limit"`
+			Offset int      `json:"offset"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
+		}
+		// If multiple files provided, aggregate tests from all of them.
+		if len(req.Files) > 0 {
+			allTests, err := s.query.RelatedTestsForFiles(ctx, s.repoID, req.Files, req.Limit, req.Offset)
+			return wrapData("tests", allTests, err)
 		}
 		items, err := s.query.RelatedTests(ctx, s.repoID, req.Symbol, req.File, req.Limit, req.Offset)
 		return wrapData("tests", items, err)
@@ -267,6 +281,196 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		}
 		items, err := s.store.LatestScanErrors(ctx, s.repoID, req.Limit, req.Offset)
 		return wrapData("errors", items, err)
+	case "find_dead_code":
+		req, err := decodePageRequest(raw)
+		if err != nil {
+			return nil, err
+		}
+		items, err := s.query.FindDeadCode(ctx, s.repoID, req.Limit, req.Offset)
+		return wrapData("dead_code", items, err)
+	case "list_files":
+		var req struct {
+			PathFilter string `json:"path_filter"`
+			Limit      int    `json:"limit"`
+			Offset     int    `json:"offset"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		items, err := s.query.ListFiles(ctx, s.repoID, req.PathFilter, req.Limit, req.Offset)
+		return wrapData("files", items, err)
+	case "context_for_task":
+		var req struct {
+			Task           string `json:"task"`
+			MaxFiles       int    `json:"max_files"`
+			MaxSymbols     int    `json:"max_symbols"`
+			IncludeTests   *bool  `json:"include_tests"`
+			IncludeCallers *bool  `json:"include_callers"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		opts := query.ContextForTaskOptions{
+			MaxFiles:       req.MaxFiles,
+			MaxSymbols:     req.MaxSymbols,
+			IncludeTests:   true,
+			IncludeCallers: true,
+		}
+		if req.IncludeTests != nil {
+			opts.IncludeTests = *req.IncludeTests
+		}
+		if req.IncludeCallers != nil {
+			opts.IncludeCallers = *req.IncludeCallers
+		}
+		result, err := s.query.ContextForTask(ctx, s.repoID, req.Task, opts)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "data": result}, nil
+	case "architecture_overview":
+		data, err := s.query.ArchitectureOverview(ctx, s.repoID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "data": data}, nil
+	case "trace_dependencies":
+		var req struct {
+			Symbol    string `json:"symbol"`
+			Direction string `json:"direction"`
+			Depth     int    `json:"depth"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if req.Depth <= 0 {
+			req.Depth = 3
+		}
+		if req.Depth > 10 {
+			req.Depth = 10
+		}
+		items, err := s.query.TraceDependencies(ctx, s.repoID, req.Symbol, req.Direction, req.Depth)
+		return wrapData("dependencies", items, err)
+	case "detect_frameworks":
+		imports, err := s.query.AllImports(ctx, s.repoID)
+		if err != nil {
+			return nil, err
+		}
+		files, err := s.query.AllFilePaths(ctx, s.repoID)
+		if err != nil {
+			return nil, err
+		}
+		detections := framework.Detect(files, imports)
+		return map[string]any{"ok": true, "data": map[string]any{"frameworks": detections}}, nil
+	case "benchmark_tokens":
+		var req struct {
+			Task string `json:"task"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		data, err := s.query.BenchmarkTokens(ctx, s.repoID, req.Task)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "data": data}, nil
+	case "cross_language_links":
+		count, err := s.query.ResolveCrossLanguageLinks(ctx, s.repoID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "data": map[string]any{"links_created": count}}, nil
+	case "session_log":
+		var req struct {
+			EventType string `json:"event_type"`
+			Key       string `json:"key"`
+			Value     string `json:"value"`
+			Metadata  string `json:"metadata"`
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		err := s.store.SessionLogEvent(ctx, s.repoID, req.SessionID, req.EventType, req.Key, req.Value, req.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true}, nil
+	case "session_history":
+		var req struct {
+			SessionID string `json:"session_id"`
+			EventType string `json:"event_type"`
+			Limit     int    `json:"limit"`
+			Offset    int    `json:"offset"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		items, err := s.store.SessionGetHistory(ctx, s.repoID, req.SessionID, req.EventType, req.Limit, req.Offset)
+		return wrapData("events", items, err)
+	case "session_hot_files":
+		var req struct {
+			SessionID string `json:"session_id"`
+			Limit     int    `json:"limit"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		items, err := s.store.SessionGetHotFiles(ctx, s.repoID, req.SessionID, req.Limit)
+		return wrapData("hot_files", items, err)
+	case "session_context":
+		var req struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		data, err := s.store.SessionGetContext(ctx, s.repoID, req.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "data": data}, nil
+	case "graph_analytics":
+		var req struct {
+			Analysis string `json:"analysis"`
+			Limit    int    `json:"limit"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		if req.Limit <= 0 {
+			req.Limit = 20
+		}
+		switch req.Analysis {
+		case "pagerank":
+			items, err := s.query.PageRank(ctx, s.repoID, req.Limit)
+			return wrapData("pagerank", items, err)
+		case "coupling":
+			items, err := s.query.CouplingMetrics(ctx, s.repoID, req.Limit)
+			return wrapData("coupling", items, err)
+		case "cycles":
+			items, err := s.query.DetectCycles(ctx, s.repoID, req.Limit)
+			return wrapData("cycles", items, err)
+		default:
+			return nil, fmt.Errorf("unknown analysis type %q, expected: pagerank, coupling, cycles", req.Analysis)
+		}
+	case "agentic_query":
+		var req struct {
+			Query    string `json:"query"`
+			MaxSteps int    `json:"max_steps"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		llmFn := agent.NewOllamaLLM(s.agentCfg)
+		toolFn := func(ctx context.Context, name string, args json.RawMessage) (map[string]any, error) {
+			return s.callTool(ctx, name, args)
+		}
+		ag := agent.New(llmFn, toolFn, req.MaxSteps)
+		result, err := ag.Run(ctx, req.Query)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "data": result}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
@@ -402,14 +606,28 @@ func buildToolDefinitions() []map[string]any {
 		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
 		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
 		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth"}, nil),
-		toolDef("find_related_tests", "Find likely related tests for a symbol or file", []string{"symbol", "file", "limit", "offset"}, nil),
+		toolDef("find_related_tests", "Find likely related tests for a symbol, file, or set of changed files", []string{"symbol", "file", "files", "limit", "offset"}, nil),
 		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset"}, []string{"query"}),
-		toolDef("search_semantic", "Run lightweight local semantic search", []string{"query", "limit", "offset"}, []string{"query"}),
+		toolDef("search_semantic", "Hybrid semantic search (vector similarity + FTS when embeddings available, token-overlap fallback)", []string{"query", "limit", "offset"}, []string{"query"}),
 		toolDef("graph_stats", "Return repository graph statistics", nil, nil),
 		toolDef("supported_languages", "List supported languages and file extensions", nil, nil),
 		toolDef("list_repos", "List repositories known to the local graph store", []string{"limit", "offset"}, nil),
 		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}, nil),
 		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}, nil),
+		toolDef("context_for_task", "Return relevant files, symbols, and relationships for a natural-language task description", []string{"task", "max_files", "max_symbols", "include_tests", "include_callers"}, []string{"task"}),
+		toolDef("find_dead_code", "Find symbols with no callers or references (likely dead code)", []string{"limit", "offset"}, nil),
+		toolDef("list_files", "List indexed files in the repository, optionally filtered by path prefix", []string{"path_filter", "limit", "offset"}, nil),
+		toolDef("architecture_overview", "High-level repository architecture: languages, directories, key symbols, dependency patterns", nil, nil),
+		toolDef("trace_dependencies", "Trace transitive dependency chains from a symbol (upstream callers or downstream callees)", []string{"symbol", "direction", "depth"}, []string{"symbol"}),
+		toolDef("detect_frameworks", "Detect frameworks and libraries used in the repository", nil, nil),
+		toolDef("benchmark_tokens", "Estimate token savings from using codegraph vs reading raw files", []string{"task"}, nil),
+		toolDef("cross_language_links", "Find and create cross-language symbol references", nil, nil),
+		toolDef("session_log", "Log a session event (read, edit, decision, task, fact)", []string{"event_type", "key", "value", "metadata", "session_id"}, []string{"event_type"}),
+		toolDef("session_history", "Get session event history", []string{"session_id", "event_type", "limit", "offset"}, nil),
+		toolDef("session_hot_files", "Get most frequently accessed files in sessions", []string{"session_id", "limit"}, nil),
+		toolDef("session_context", "Get aggregated session context for pre-loading", []string{"session_id"}, nil),
+		toolDef("graph_analytics", "Run graph analytics: pagerank, coupling, or cycles", []string{"analysis", "limit"}, []string{"analysis"}),
+		toolDef("agentic_query", "Ask a question answered by an AI agent that reasons over the code graph (requires local Ollama)", []string{"query", "max_steps"}, []string{"query"}),
 	}
 }
 
@@ -417,10 +635,10 @@ func toolDef(name, description string, properties, required []string) map[string
 	props := map[string]any{}
 	for _, prop := range properties {
 		props[prop] = map[string]any{"type": "string"}
-		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" {
+		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" || prop == "max_files" || prop == "max_symbols" || prop == "max_steps" {
 			props[prop] = map[string]any{"type": "integer"}
 		}
-		if prop == "force" {
+		if prop == "force" || prop == "include_tests" || prop == "include_callers" {
 			props[prop] = map[string]any{"type": "boolean"}
 		}
 		if prop == "paths" || prop == "symbols" || prop == "files" {
@@ -456,20 +674,34 @@ func decodePageRequest(raw json.RawMessage) (pageRequest, error) {
 }
 
 var toolArgumentSpecs = map[string]toolArgSpec{
-	"index_repo":          {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
-	"update_graph":        {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
-	"find_symbol":         {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
-	"find_callers":        {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
-	"find_callees":        {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
-	"get_impact_radius":   {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer"}},
-	"find_related_tests":  {properties: map[string]string{"symbol": "string", "file": "string", "limit": "integer", "offset": "integer"}},
-	"search_symbols":      {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
-	"search_semantic":     {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
-	"graph_stats":         {properties: map[string]string{}},
-	"supported_languages": {properties: map[string]string{}},
-	"list_repos":          {properties: map[string]string{"limit": "integer", "offset": "integer"}},
-	"list_scans":          {properties: map[string]string{"limit": "integer", "offset": "integer"}},
-	"latest_scan_errors":  {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"index_repo":            {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
+	"update_graph":          {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
+	"find_symbol":           {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
+	"find_callers":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
+	"find_callees":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
+	"get_impact_radius":     {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer"}},
+	"find_related_tests":    {properties: map[string]string{"symbol": "string", "file": "string", "files": "array", "limit": "integer", "offset": "integer"}},
+	"search_symbols":        {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
+	"search_semantic":       {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
+	"graph_stats":           {properties: map[string]string{}},
+	"supported_languages":   {properties: map[string]string{}},
+	"list_repos":            {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"list_scans":            {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"latest_scan_errors":    {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"find_dead_code":        {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"context_for_task":      {properties: map[string]string{"task": "string", "max_files": "integer", "max_symbols": "integer", "include_tests": "boolean", "include_callers": "boolean"}, required: []string{"task"}},
+	"list_files":            {properties: map[string]string{"path_filter": "string", "limit": "integer", "offset": "integer"}},
+	"architecture_overview": {properties: map[string]string{}},
+	"trace_dependencies":    {properties: map[string]string{"symbol": "string", "direction": "string", "depth": "integer"}, required: []string{"symbol"}},
+	"detect_frameworks":     {properties: map[string]string{}},
+	"benchmark_tokens":      {properties: map[string]string{"task": "string"}},
+	"cross_language_links":  {properties: map[string]string{}},
+	"session_log":           {properties: map[string]string{"event_type": "string", "key": "string", "value": "string", "metadata": "string", "session_id": "string"}, required: []string{"event_type"}},
+	"session_history":       {properties: map[string]string{"session_id": "string", "event_type": "string", "limit": "integer", "offset": "integer"}},
+	"session_hot_files":     {properties: map[string]string{"session_id": "string", "limit": "integer"}},
+	"session_context":       {properties: map[string]string{"session_id": "string"}},
+	"graph_analytics":       {properties: map[string]string{"analysis": "string", "limit": "integer"}, required: []string{"analysis"}},
+	"agentic_query":         {properties: map[string]string{"query": "string", "max_steps": "integer"}, required: []string{"query"}},
 }
 
 func validateToolArguments(name string, raw json.RawMessage) error {
@@ -511,8 +743,9 @@ func validateToolArguments(name string, raw json.RawMessage) error {
 	case "find_related_tests":
 		symbol, _ := args["symbol"].(string)
 		file, _ := args["file"].(string)
-		if strings.TrimSpace(symbol) == "" && strings.TrimSpace(file) == "" {
-			return fmt.Errorf("one of symbol or file is required")
+		files, _ := args["files"].([]any)
+		if strings.TrimSpace(symbol) == "" && strings.TrimSpace(file) == "" && len(files) == 0 {
+			return fmt.Errorf("one of symbol, file, or files is required")
 		}
 	case "get_impact_radius":
 		symbols, _ := args["symbols"].([]any)
