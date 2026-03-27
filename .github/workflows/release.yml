@@ -27,6 +27,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -56,6 +57,15 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Show build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ref=${GITHUB_REF_NAME}"
+          echo "runner=$(uname -a)"
+          go version
+          go env GOOS GOARCH CGO_ENABLED GOPATH GOMODCACHE GOCACHE
+
       - name: Build archive
         shell: bash
         run: |
@@ -69,7 +79,7 @@ jobs:
           fi
           archive_base="${binary}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
           mkdir -p "${dist}/${archive_base}"
-          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=0 go build -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
+          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=0 go build -v -x -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
           cp README.md "${dist}/${archive_base}/README.md"
           cp LICENSE "${dist}/${archive_base}/LICENSE"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
