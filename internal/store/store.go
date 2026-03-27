@@ -2512,7 +2512,6 @@ func (s *Store) VectorSearch(ctx context.Context, repoID int64, queryVec []float
 	var embCount int64
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&embCount)
 	if embCount > maxVectorScanSymbols {
-		// For very large repos, limit the scan to the most recently updated embeddings.
 		rows, err := s.db.QueryContext(ctx, `
 			SELECT se.symbol_id, se.embedding, se.dimensions,
 				   s.qualified_name, s.kind, s.signature, s.doc_summary,
