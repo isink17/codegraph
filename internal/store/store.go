@@ -540,22 +540,6 @@ func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSumm
 	return tx.Commit()
 }
 
-func (s *Store) TouchFileMetadata(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string) error {
-	return s.TouchFilesMetadataBatch(ctx, repoID, scanID, []FileMetadataUpdate{
-		{
-			Path:        path,
-			Language:    language,
-			SizeBytes:   sizeBytes,
-			MtimeUnixNS: mtimeUnixNS,
-			ContentHash: contentHash,
-		},
-	})
-}
-
-func (s *Store) MarkFileSeen(ctx context.Context, repoID, scanID int64, path string) error {
-	return s.MarkFilesSeenBatch(ctx, repoID, scanID, []string{path})
-}
-
 func (s *Store) MarkFilesSeenBatch(ctx context.Context, repoID, scanID int64, paths []string) error {
 	if len(paths) == 0 {
 		return nil

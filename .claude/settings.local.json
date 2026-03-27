@@ -28,7 +28,9 @@
       "Bash(do echo:*)",
       "Bash(gofmt -l \"$f\")",
       "Bash(done)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(go install:*)",
+      "Bash(deadcode ./...)"
     ]
   }
 }

@@ -337,23 +337,6 @@ func (s *Service) AllFilePaths(ctx context.Context, repoID int64) ([]string, err
 	return s.store.AllFilePaths(ctx, repoID)
 }
 
-// --- Session Memory pass-throughs ---
-
-func (s *Service) SessionLogEvent(ctx context.Context, repoID int64, sessionID, eventType, key, value, metadata string) error {
-	return s.store.SessionLogEvent(ctx, repoID, sessionID, eventType, key, value, metadata)
-}
-
-func (s *Service) SessionGetHistory(ctx context.Context, repoID int64, sessionID string, eventType string, limit, offset int) ([]map[string]any, error) {
-	return s.store.SessionGetHistory(ctx, repoID, sessionID, eventType, limit, offset)
-}
-
-func (s *Service) SessionGetHotFiles(ctx context.Context, repoID int64, sessionID string, limit int) ([]map[string]any, error) {
-	return s.store.SessionGetHotFiles(ctx, repoID, sessionID, limit)
-}
-
-func (s *Service) SessionGetContext(ctx context.Context, repoID int64, sessionID string) (map[string]any, error) {
-	return s.store.SessionGetContext(ctx, repoID, sessionID)
-}
 
 // parseSeedSymbols extracts Symbol structs from semantic search result maps.
 func parseSeedSymbols(results []map[string]any) []graph.Symbol {
