@@ -1,4 +1,5 @@
 .DS_Store
+.claude/
 .codegraph/
 .codegraph-home*/
 .gocache/
@@ -13,5 +14,8 @@ coverage.out
 *.swp
 *.swo
 TODO.md
+codegraph
 codegraph.exe
 codegraph.sqlite
+codegraph.sqlite-shm
+codegraph.sqlite-wal

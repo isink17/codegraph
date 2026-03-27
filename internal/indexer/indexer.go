@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/embedding"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/store"
@@ -35,6 +36,7 @@ type Options struct {
 type Indexer struct {
 	store    *store.Store
 	registry *parser.Registry
+	embedder embedding.Embedder
 }
 
 type fileTask struct {
@@ -55,8 +57,11 @@ type fileResult struct {
 	processMS int64
 }
 
-func New(s *store.Store, registry *parser.Registry) *Indexer {
-	return &Indexer{store: s, registry: registry}
+func New(s *store.Store, registry *parser.Registry, embedder embedding.Embedder) *Indexer {
+	if embedder == nil {
+		embedder = embedding.NewNoop()
+	}
+	return &Indexer{store: s, registry: registry, embedder: embedder}
 }
 
 func (i *Indexer) SupportedLanguages() []parser.LanguageSupport {
@@ -332,6 +337,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				cancel()
 				continue
 			}
+			if !embedding.IsNoop(i.embedder) {
+				i.embedFileSymbols(ctx, repo.ID, res.task.rel, res.parsed)
+			}
 			writeMS += time.Since(writeStart).Milliseconds()
 			changedPathSet[res.task.rel] = struct{}{}
 			summary.FilesChanged++
@@ -421,9 +429,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, err
 		}
 	} else {
-		if err := i.store.ResolveEdges(ctx, repo.ID); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
+			return summary, resolveErr
 		}
 	}
 	summary.ResolveMS = time.Since(resolveStart).Milliseconds()
@@ -639,4 +647,38 @@ func matchPattern(path, pattern string) bool {
 		return true
 	}
 	return false
+}
+
+// embedFileSymbols computes and stores embeddings for all symbols in a parsed file.
+func (i *Indexer) embedFileSymbols(ctx context.Context, repoID int64, relPath string, parsed graph.ParsedFile) {
+	if len(parsed.Symbols) == 0 {
+		return
+	}
+
+	texts := make([]string, len(parsed.Symbols))
+	keys := make([]string, len(parsed.Symbols))
+	for j, sym := range parsed.Symbols {
+		texts[j] = embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary)
+		keys[j] = sym.StableKey
+	}
+
+	vectors, err := i.embedder.EmbedBatch(ctx, texts)
+	if err != nil {
+		return // best-effort: don't fail indexing on embedding errors
+	}
+
+	fileID, err := i.store.FileIDByPath(ctx, repoID, relPath)
+	if err != nil || fileID == 0 {
+		return
+	}
+
+	symbolMap := make(map[string][]float32, len(keys))
+	for j, key := range keys {
+		if vectors[j] != nil {
+			symbolMap[key] = vectors[j]
+		}
+	}
+	if len(symbolMap) > 0 {
+		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
+	}
 }

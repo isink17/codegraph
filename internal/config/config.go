@@ -27,14 +27,30 @@ type Config struct {
 	DBPerformanceProfile string        `json:"db_performance_profile"`
 }
 
+type EmbeddingConfig struct {
+	Enabled    bool   `json:"enabled"`
+	Provider   string `json:"provider"`   // "ollama" (default when enabled)
+	Model      string `json:"model"`      // default: nomic-embed-text
+	BaseURL    string `json:"base_url"`   // default: http://localhost:11434
+	Dimensions int    `json:"dimensions"` // default: 768
+}
+
+type AgentConfig struct {
+	Enabled bool   `json:"enabled"`
+	Model   string `json:"model"`    // default: llama3.2
+	BaseURL string `json:"base_url"` // default: http://localhost:11434
+}
+
 type RepoConfig struct {
-	Include          []string      `json:"include"`
-	Exclude          []string      `json:"exclude"`
-	Languages        []string      `json:"languages"`
-	WatchDebounce    time.Duration `json:"watch_debounce"`
-	SemanticMaxTerms int           `json:"semantic_max_terms"`
-	MaxFileSizeBytes int64         `json:"max_file_size_bytes"`
-	ParseErrorPolicy string        `json:"parse_error_policy"`
+	Include          []string        `json:"include"`
+	Exclude          []string        `json:"exclude"`
+	Languages        []string        `json:"languages"`
+	WatchDebounce    time.Duration   `json:"watch_debounce"`
+	SemanticMaxTerms int             `json:"semantic_max_terms"`
+	MaxFileSizeBytes int64           `json:"max_file_size_bytes"`
+	ParseErrorPolicy string          `json:"parse_error_policy"`
+	Embedding        EmbeddingConfig `json:"embedding"`
+	Agent            AgentConfig     `json:"agent"`
 }
 
 func Default() (Config, error) {
