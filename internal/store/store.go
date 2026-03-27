@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
+	"slices"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -371,10 +374,7 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 	}
 	const chunkSize = 400
 	for start := 0; start < len(paths); start += chunkSize {
-		end := start + chunkSize
-		if end > len(paths) {
-			end = len(paths)
-		}
+		end := min(start+chunkSize, len(paths))
 		chunk := paths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
@@ -538,22 +538,6 @@ func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSumm
 		}
 	}
 	return tx.Commit()
-}
-
-func (s *Store) TouchFileMetadata(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string) error {
-	return s.TouchFilesMetadataBatch(ctx, repoID, scanID, []FileMetadataUpdate{
-		{
-			Path:        path,
-			Language:    language,
-			SizeBytes:   sizeBytes,
-			MtimeUnixNS: mtimeUnixNS,
-			ContentHash: contentHash,
-		},
-	})
-}
-
-func (s *Store) MarkFileSeen(ctx context.Context, repoID, scanID int64, path string) error {
-	return s.MarkFilesSeenBatch(ctx, repoID, scanID, []string{path})
 }
 
 func (s *Store) MarkFilesSeenBatch(ctx context.Context, repoID, scanID int64, paths []string) error {
@@ -930,6 +914,9 @@ func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM test_links WHERE test_file_id = ?`, fileID); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM symbol_embeddings WHERE file_id = ?`, fileID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE file_id = ?`, fileID); err != nil {
 		return err
 	}
@@ -978,16 +965,88 @@ type edgeTarget struct {
 	dstName string
 }
 
-func (s *Store) ResolveEdges(ctx context.Context, repoID int64) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL`, repoID)
+func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
+	totalResolved := 0
+
+	// Strategy 1: Exact qualified name match
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE edges SET dst_symbol_id = (
+			SELECT s.id FROM symbols s
+			WHERE s.repo_id = ? AND s.qualified_name = edges.dst_name
+			LIMIT 1
+		)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.qualified_name = edges.dst_name)
+	`, repoID, repoID, repoID)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	targets, err := scanEdgeTargets(rows)
+	if n, _ := res.RowsAffected(); n > 0 {
+		totalResolved += int(n)
+	}
+
+	// Strategy 2: Name match (unqualified)
+	res, err = s.db.ExecContext(ctx, `
+		UPDATE edges SET dst_symbol_id = (
+			SELECT s.id FROM symbols s
+			WHERE s.repo_id = ? AND s.name = edges.dst_name
+			AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+			LIMIT 1
+		)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.name = edges.dst_name AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface'))
+	`, repoID, repoID, repoID)
 	if err != nil {
-		return err
+		return totalResolved, err
 	}
-	return s.resolveEdgeTargets(ctx, repoID, targets)
+	if n, _ := res.RowsAffected(); n > 0 {
+		totalResolved += int(n)
+	}
+
+	// Strategy 3: Suffix match (e.g., pkg.Func matches github.com/org/repo/pkg.Func)
+	res, err = s.db.ExecContext(ctx, `
+		UPDATE edges SET dst_symbol_id = (
+			SELECT s.id FROM symbols s
+			WHERE s.repo_id = ?
+			AND (s.qualified_name LIKE '%.' || edges.dst_name OR s.qualified_name LIKE '%/' || edges.dst_name)
+			LIMIT 1
+		)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND EXISTS (
+			SELECT 1 FROM symbols s WHERE s.repo_id = ?
+			AND (s.qualified_name LIKE '%.' || edges.dst_name OR s.qualified_name LIKE '%/' || edges.dst_name)
+		)
+	`, repoID, repoID, repoID)
+	if err != nil {
+		return totalResolved, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		totalResolved += int(n)
+	}
+
+	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething)
+	res, err = s.db.ExecContext(ctx, `
+		UPDATE edges SET dst_symbol_id = (
+			SELECT s.id FROM symbols s
+			WHERE s.repo_id = ?
+			AND s.name = edges.dst_name
+			AND s.container_name != ''
+			LIMIT 1
+		)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND EXISTS (
+			SELECT 1 FROM symbols s WHERE s.repo_id = ?
+			AND s.name = edges.dst_name AND s.container_name != ''
+		)
+	`, repoID, repoID, repoID)
+	if err != nil {
+		return totalResolved, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		totalResolved += int(n)
+	}
+
+	return totalResolved, nil
 }
 
 func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []string) error {
@@ -998,10 +1057,7 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	targets := make([]edgeTarget, 0, len(paths))
 	seen := map[int64]struct{}{}
 	for start := 0; start < len(paths); start += chunkSize {
-		end := start + chunkSize
-		if end > len(paths) {
-			end = len(paths)
-		}
+		end := min(start+chunkSize, len(paths))
 		chunk := paths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
@@ -1128,10 +1184,7 @@ func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64
 	}
 	const chunkSize = 400
 	for start := 0; start < len(qualifiedNames); start += chunkSize {
-		end := start + chunkSize
-		if end > len(qualifiedNames) {
-			end = len(qualifiedNames)
-		}
+		end := min(start+chunkSize, len(qualifiedNames))
 		chunk := qualifiedNames[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
@@ -1173,10 +1226,7 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 	}
 	const chunkSize = 400
 	for start := 0; start < len(names); start += chunkSize {
-		end := start + chunkSize
-		if end > len(names) {
-			end = len(names)
-		}
+		end := min(start+chunkSize, len(names))
 		chunk := names[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
@@ -1478,10 +1528,7 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 	const chunkSize = 250
 	var out []graph.Symbol
 	for start := 0; start < len(frontier); start += chunkSize {
-		end := start + chunkSize
-		if end > len(frontier) {
-			end = len(frontier)
-		}
+		end := min(start+chunkSize, len(frontier))
 		chunk := frontier[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
@@ -1800,10 +1847,7 @@ func chunkInt64s(values []int64, chunkSize int) [][]int64 {
 	}
 	out := make([][]int64, 0, (len(values)+chunkSize-1)/chunkSize)
 	for start := 0; start < len(values); start += chunkSize {
-		end := start + chunkSize
-		if end > len(values) {
-			end = len(values)
-		}
+		end := min(start+chunkSize, len(values))
 		out = append(out, values[start:end])
 	}
 	return out
@@ -1888,6 +1932,158 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 	return sym, nil
 }
 
+// TraceDependencies performs a BFS traversal of the dependency graph starting
+// from the given symbol, returning the full chain up to maxDepth levels.
+func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth int) ([]map[string]any, error) {
+	if maxDepth <= 0 {
+		maxDepth = 3
+	}
+	maxDepth = min(maxDepth, 10)
+	if direction == "" {
+		direction = "downstream"
+	}
+
+	// Find starting symbols by name match.
+	pattern := "%" + symbol + "%"
+	seedRows, err := s.db.QueryContext(ctx,
+		`SELECT id, qualified_name, kind, name FROM symbols WHERE repo_id = ? AND (qualified_name LIKE ? OR name = ?)`,
+		repoID, pattern, symbol)
+	if err != nil {
+		return nil, fmt.Errorf("trace_dependencies seed query: %w", err)
+	}
+	type symInfo struct {
+		id            int64
+		qualifiedName string
+		kind          string
+		name          string
+	}
+	var seeds []symInfo
+	for seedRows.Next() {
+		var si symInfo
+		if err := seedRows.Scan(&si.id, &si.qualifiedName, &si.kind, &si.name); err != nil {
+			seedRows.Close()
+			return nil, err
+		}
+		seeds = append(seeds, si)
+	}
+	seedRows.Close()
+	if err := seedRows.Err(); err != nil {
+		return nil, err
+	}
+
+	type bfsEntry struct {
+		id            int64
+		qualifiedName string
+		kind          string
+		name          string
+		file          string
+		depth         int
+		dir           string
+	}
+
+	visited := map[int64]bool{}
+	var results []bfsEntry
+
+	bfs := func(startSeeds []symInfo, dir string) error {
+		queue := make([]bfsEntry, 0, len(startSeeds))
+		for _, seed := range startSeeds {
+			if visited[seed.id] {
+				continue
+			}
+			visited[seed.id] = true
+			queue = append(queue, bfsEntry{
+				id: seed.id, qualifiedName: seed.qualifiedName,
+				kind: seed.kind, name: seed.name, depth: 0, dir: dir,
+			})
+			results = append(results, bfsEntry{
+				id: seed.id, qualifiedName: seed.qualifiedName,
+				kind: seed.kind, name: seed.name, depth: 0, dir: dir,
+			})
+		}
+
+		var query string
+		if dir == "downstream" {
+			query = `SELECT DISTINCT s.id, s.qualified_name, s.kind, s.name, f.path
+				FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id JOIN files f ON f.id = s.file_id
+				WHERE e.src_symbol_id = ? AND e.dst_symbol_id IS NOT NULL`
+		} else {
+			query = `SELECT DISTINCT s.id, s.qualified_name, s.kind, s.name, f.path
+				FROM edges e JOIN symbols s ON s.id = e.src_symbol_id JOIN files f ON f.id = s.file_id
+				WHERE e.dst_symbol_id = ?`
+		}
+
+		for i := 0; i < len(queue); i++ {
+			entry := queue[i]
+			if entry.depth >= maxDepth {
+				continue
+			}
+			rows, err := s.db.QueryContext(ctx, query, entry.id)
+			if err != nil {
+				return fmt.Errorf("trace_dependencies bfs query: %w", err)
+			}
+			for rows.Next() {
+				var si bfsEntry
+				if err := rows.Scan(&si.id, &si.qualifiedName, &si.kind, &si.name, &si.file); err != nil {
+					rows.Close()
+					return err
+				}
+				if visited[si.id] {
+					continue
+				}
+				visited[si.id] = true
+				si.depth = entry.depth + 1
+				si.dir = dir
+				queue = append(queue, si)
+				results = append(results, si)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if direction == "downstream" || direction == "both" {
+		if err := bfs(seeds, "downstream"); err != nil {
+			return nil, err
+		}
+	}
+	if direction == "upstream" || direction == "both" {
+		// Reset visited for upstream pass when doing both, but keep seed visited
+		if direction == "both" {
+			visited = map[int64]bool{}
+			for _, s := range seeds {
+				visited[s.id] = true
+			}
+		}
+		if err := bfs(seeds, "upstream"); err != nil {
+			return nil, err
+		}
+	}
+
+	// Sort by depth ascending, then by symbol name.
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].depth != results[j].depth {
+			return results[i].depth < results[j].depth
+		}
+		return results[i].qualifiedName < results[j].qualifiedName
+	})
+
+	out := make([]map[string]any, len(results))
+	for i, r := range results {
+		out[i] = map[string]any{
+			"symbol":    r.qualifiedName,
+			"kind":      r.kind,
+			"name":      r.name,
+			"file":      r.file,
+			"depth":     r.depth,
+			"direction": r.dir,
+		}
+	}
+	return out, nil
+}
+
 func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
 	defer rows.Close()
 	var out []graph.Symbol
@@ -1901,6 +2097,253 @@ func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
 	return out, rows.Err()
 }
 
+// PageRank computes a simplified PageRank over the symbol dependency graph and
+// returns the top-N symbols sorted by rank descending.
+func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	limit = safeLimit(limit)
+
+	// Step 1: load all resolved edges.
+	rows2, err := s.db.QueryContext(ctx,
+		`SELECT src_symbol_id, dst_symbol_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NOT NULL`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows2.Close()
+
+	outLinks := map[int64][]int64{} // src -> list of dst
+	allNodes := map[int64]struct{}{}
+	for rows2.Next() {
+		var src, dst int64
+		if err := rows2.Scan(&src, &dst); err != nil {
+			return nil, err
+		}
+		outLinks[src] = append(outLinks[src], dst)
+		allNodes[src] = struct{}{}
+		allNodes[dst] = struct{}{}
+	}
+	if err := rows2.Err(); err != nil {
+		return nil, err
+	}
+
+	n := len(allNodes)
+	if n == 0 {
+		return []map[string]any{}, nil
+	}
+
+	// Assign indices.
+	nodeIndex := make(map[int64]int, n)
+	indexNode := make([]int64, 0, n)
+	for id := range allNodes {
+		nodeIndex[id] = len(indexNode)
+		indexNode = append(indexNode, id)
+	}
+
+	// Step 2: run PageRank.
+	const damping = 0.85
+	const iterations = 20
+	rank := make([]float64, n)
+	newRank := make([]float64, n)
+	initial := 1.0 / float64(n)
+	for i := range rank {
+		rank[i] = initial
+	}
+
+	for range iterations {
+		base := (1.0 - damping) / float64(n)
+		for i := range newRank {
+			newRank[i] = base
+		}
+		for src, dsts := range outLinks {
+			si := nodeIndex[src]
+			share := damping * rank[si] / float64(len(dsts))
+			for _, dst := range dsts {
+				newRank[nodeIndex[dst]] += share
+			}
+		}
+		rank, newRank = newRank, rank
+	}
+
+	// Step 3: sort by rank descending and pick top N.
+	type ranked struct {
+		id    int64
+		score float64
+	}
+	results := make([]ranked, n)
+	for i, id := range indexNode {
+		results[i] = ranked{id: id, score: rank[i]}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+	results = results[:min(len(results), limit)]
+
+	// Step 4: load symbol info.
+	prOut := make([]map[string]any, 0, len(results))
+	for _, r := range results {
+		var name, kind, path string
+		err := s.db.QueryRowContext(ctx,
+			`SELECT s.qualified_name, s.kind, COALESCE(f.path, '') FROM symbols s LEFT JOIN files f ON f.id = s.file_id WHERE s.id = ?`, r.id).
+			Scan(&name, &kind, &path)
+		if err != nil {
+			continue
+		}
+		prOut = append(prOut, map[string]any{
+			"symbol": name,
+			"kind":   kind,
+			"file":   path,
+			"rank":   math.Round(r.score*1e6) / 1e6,
+		})
+	}
+	return prOut, nil
+}
+
+// CouplingMetrics computes file-level coupling based on cross-file edge counts.
+func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	limit = safeLimit(limit)
+
+	cRows, err := s.db.QueryContext(ctx, `
+		SELECT f1.path as file_a, f2.path as file_b, COUNT(*) as edge_count
+		FROM edges e
+		JOIN symbols s1 ON s1.id = e.src_symbol_id
+		JOIN symbols s2 ON s2.id = e.dst_symbol_id
+		JOIN files f1 ON f1.id = s1.file_id
+		JOIN files f2 ON f2.id = s2.file_id
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f1.id != f2.id
+		GROUP BY f1.path, f2.path
+		ORDER BY edge_count DESC
+		LIMIT ?`, repoID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer cRows.Close()
+
+	cOut := make([]map[string]any, 0)
+	for cRows.Next() {
+		var fileA, fileB string
+		var edgeCount int
+		if err := cRows.Scan(&fileA, &fileB, &edgeCount); err != nil {
+			return nil, err
+		}
+		coupling := "low"
+		if edgeCount >= 10 {
+			coupling = "high"
+		} else if edgeCount >= 5 {
+			coupling = "medium"
+		}
+		cOut = append(cOut, map[string]any{
+			"file_a":     fileA,
+			"file_b":     fileB,
+			"edge_count": edgeCount,
+			"coupling":   coupling,
+		})
+	}
+	return cOut, cRows.Err()
+}
+
+// DetectCycles finds circular dependencies at the file level using DFS with
+// white/gray/black coloring.
+func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	limit = safeLimit(limit)
+
+	// Build file-level dependency graph.
+	dRows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT f1.path, f2.path
+		FROM edges e
+		JOIN symbols s1 ON s1.id = e.src_symbol_id
+		JOIN symbols s2 ON s2.id = e.dst_symbol_id
+		JOIN files f1 ON f1.id = s1.file_id
+		JOIN files f2 ON f2.id = s2.file_id
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f1.id != f2.id`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer dRows.Close()
+
+	fileGraph := map[string][]string{}
+	allFiles := map[string]struct{}{}
+	for dRows.Next() {
+		var src, dst string
+		if err := dRows.Scan(&src, &dst); err != nil {
+			return nil, err
+		}
+		fileGraph[src] = append(fileGraph[src], dst)
+		allFiles[src] = struct{}{}
+		allFiles[dst] = struct{}{}
+	}
+	if err := dRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// DFS cycle detection with coloring.
+	const (
+		white = 0
+		gray  = 1
+		black = 2
+	)
+	color := map[string]int{}
+	for f := range allFiles {
+		color[f] = white
+	}
+
+	var cycles [][]string
+	parent := map[string]string{}
+
+	var dfs func(node string)
+	dfs = func(node string) {
+		if len(cycles) >= limit {
+			return
+		}
+		color[node] = gray
+		for _, next := range fileGraph[node] {
+			if len(cycles) >= limit {
+				return
+			}
+			switch color[next] {
+			case gray:
+				// Back edge found — extract cycle.
+				cycle := []string{next}
+				cur := node
+				for cur != next {
+					cycle = append(cycle, cur)
+					cur = parent[cur]
+				}
+				// Reverse to get correct order.
+				for i, j := 0, len(cycle)-1; i < j; i, j = i+1, j-1 {
+					cycle[i], cycle[j] = cycle[j], cycle[i]
+				}
+				cycle = append(cycle, next) // close the cycle
+				cycles = append(cycles, cycle)
+			case white:
+				parent[next] = node
+				dfs(next)
+			}
+		}
+		color[node] = black
+	}
+
+	// Sort files for deterministic output.
+	sortedFiles := make([]string, 0, len(allFiles))
+	for f := range allFiles {
+		sortedFiles = append(sortedFiles, f)
+	}
+	sort.Strings(sortedFiles)
+
+	for _, f := range sortedFiles {
+		if color[f] == white && len(cycles) < limit {
+			dfs(f)
+		}
+	}
+
+	dOut := make([]map[string]any, 0, len(cycles))
+	for _, c := range cycles {
+		dOut = append(dOut, map[string]any{
+			"cycle":  c,
+			"length": len(c) - 1, // subtract the closing node
+		})
+	}
+	return dOut, nil
+}
+
 func safeLimit(limit int) int {
 	if limit <= 0 {
 		return 20
@@ -1909,10 +2352,7 @@ func safeLimit(limit int) int {
 }
 
 func safeOffset(offset int) int {
-	if offset < 0 {
-		return 0
-	}
-	return offset
+	return max(offset, 0)
 }
 
 func quoteFTS(query string) string {
@@ -1921,4 +2361,979 @@ func quoteFTS(query string) string {
 		tokens[i] = fmt.Sprintf(`"%s"*`, strings.ReplaceAll(token, `"`, ""))
 	}
 	return strings.Join(tokens, " ")
+}
+
+// FileIDByPath returns the file ID for a given repo and relative path.
+func (s *Store) FileIDByPath(ctx context.Context, repoID int64, path string) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repoID, path).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
+}
+
+// ListFiles returns indexed files for a repository, optionally filtered by path prefix.
+func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, limit, offset int) ([]map[string]any, error) {
+	query := `SELECT path, language, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`
+	args := []any{repoID}
+	if pathFilter != "" {
+		query += ` AND path LIKE ?`
+		args = append(args, pathFilter+"%")
+	}
+	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
+	args = append(args, safeLimit(limit), safeOffset(offset))
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []map[string]any
+	for rows.Next() {
+		var path, language string
+		var sizeBytes int64
+		if err := rows.Scan(&path, &language, &sizeBytes); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"path":       path,
+			"language":   language,
+			"size_bytes": sizeBytes,
+		})
+	}
+	return out, rows.Err()
+}
+
+// FindDeadCode returns symbols with no incoming edges and no references — likely dead code.
+func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT s.id, s.qualified_name, s.kind, s.name, f.path, f.language,
+		       s.start_line, s.end_line
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ?
+		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
+		  AND s.id NOT IN (
+		      SELECT DISTINCT dst_symbol_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+		  )
+		  AND s.id NOT IN (
+		      SELECT DISTINCT symbol_id FROM references_tbl WHERE repo_id = ? AND symbol_id IS NOT NULL
+		  )
+		  AND s.name NOT IN ('main', 'init', 'Main', 'Init')
+		  AND s.name NOT LIKE 'Test%'
+		  AND s.name NOT LIKE 'Benchmark%'
+		  AND s.name NOT LIKE 'Example%'
+		ORDER BY f.path, s.start_line
+		LIMIT ? OFFSET ?
+	`, repoID, repoID, repoID, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []map[string]any
+	for rows.Next() {
+		var id int64
+		var qualifiedName, kind, name, path, language string
+		var startLine, endLine int
+		if err := rows.Scan(&id, &qualifiedName, &kind, &name, &path, &language, &startLine, &endLine); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"symbol":     qualifiedName,
+			"kind":       kind,
+			"name":       name,
+			"file":       path,
+			"language":   language,
+			"start_line": startLine,
+			"end_line":   endLine,
+		})
+	}
+	return out, rows.Err()
+}
+
+// --- Embedding methods ---
+
+// UpsertSymbolEmbeddings stores vector embeddings for symbols in a file.
+// symbolMap maps stable_key -> embedding vector.
+func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID, fileID int64, modelName string, symbolMap map[string][]float32) error {
+	if len(symbolMap) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at)
+		SELECT s.id, ?, ?, ?, ?, ?, ?
+		FROM symbols s
+		WHERE s.file_id = ? AND s.stable_key = ?
+		ON CONFLICT(symbol_id) DO UPDATE SET
+			embedding = excluded.embedding,
+			dimensions = excluded.dimensions,
+			model_name = excluded.model_name,
+			updated_at = excluded.updated_at
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+
+	for stableKey, vec := range symbolMap {
+		blob := float32ToBytes(vec)
+		if _, err := stmt.ExecContext(ctx, fileID, repoID, blob, len(vec), modelName, now, fileID, stableKey); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// VectorSearch performs cosine similarity search over symbol embeddings.
+// For repos with fewer than maxVectorScanSymbols embeddings, it uses a
+// brute-force scan. For larger repos it pre-filters via FTS to keep memory
+// bounded. Consider replacing with an HNSW index (e.g. sqlite-vss) for
+// very large codebases.
+const maxVectorScanSymbols = 50_000
+
+func (s *Store) VectorSearch(ctx context.Context, repoID int64, queryVec []float32, limit, offset int) ([]map[string]any, error) {
+	limitVal := safeLimit(limit)
+	offsetVal := safeOffset(offset)
+
+	// Guard against loading too many embeddings into memory.
+	var embCount int64
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&embCount)
+	if embCount > maxVectorScanSymbols {
+		// For very large repos, limit the scan to the most recently updated embeddings.
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT se.symbol_id, se.embedding, se.dimensions,
+				   s.qualified_name, s.kind, s.signature, s.doc_summary,
+				   f.path
+			FROM symbol_embeddings se
+			JOIN symbols s ON s.id = se.symbol_id
+			JOIN files f ON f.id = s.file_id
+			WHERE se.repo_id = ?
+			ORDER BY se.updated_at DESC
+			LIMIT ?
+		`, repoID, maxVectorScanSymbols)
+		if err != nil {
+			return nil, err
+		}
+		return s.scanAndRankVectors(rows, queryVec, limitVal, offsetVal)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT se.symbol_id, se.embedding, se.dimensions,
+			   s.qualified_name, s.kind, s.signature, s.doc_summary,
+			   f.path
+		FROM symbol_embeddings se
+		JOIN symbols s ON s.id = se.symbol_id
+		JOIN files f ON f.id = s.file_id
+		WHERE se.repo_id = ?
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanAndRankVectors(rows, queryVec, limitVal, offsetVal)
+}
+
+func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, offset int) ([]map[string]any, error) {
+	defer rows.Close()
+
+	type scored struct {
+		file   string
+		symbol string
+		kind   string
+		score  float64
+	}
+
+	var candidates []scored
+	for rows.Next() {
+		var symbolID int64
+		var blob []byte
+		var dims int
+		var qualName, kind, sig, doc, filePath string
+		if err := rows.Scan(&symbolID, &blob, &dims, &qualName, &kind, &sig, &doc, &filePath); err != nil {
+			return nil, err
+		}
+		vec := bytesToFloat32(blob)
+		sim := cosineSimilarity(queryVec, vec)
+		if sim > 0 {
+			candidates = append(candidates, scored{file: filePath, symbol: qualName, kind: kind, score: sim})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	end := min(offset+limit, len(candidates))
+	if offset >= len(candidates) {
+		return nil, nil
+	}
+	candidates = candidates[offset:end]
+
+	out := make([]map[string]any, 0, len(candidates))
+	for _, c := range candidates {
+		out = append(out, map[string]any{
+			"file":   c.file,
+			"symbol": c.symbol,
+			"kind":   c.kind,
+			"score":  c.score,
+			"why":    []string{"vector_similarity"},
+		})
+	}
+	return out, nil
+}
+
+// HybridSearch combines FTS5 and vector search using Reciprocal Rank Fusion.
+func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, queryVec []float32, limit, offset int) ([]map[string]any, error) {
+	// Run both searches with a larger window for fusion.
+	fusionK := 60
+	fetchLimit := max(safeLimit(limit)*3, 50)
+
+	ftsResults, err := s.SearchSymbols(ctx, repoID, query, fetchLimit, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	vecResults, err := s.VectorSearch(ctx, repoID, queryVec, fetchLimit, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build RRF scores keyed by "file::symbol"
+	type entry struct {
+		file   string
+		symbol string
+		kind   string
+		score  float64
+		why    []string
+	}
+	merged := map[string]*entry{}
+
+	for rank, sym := range ftsResults {
+		key := sym.FilePath + "::" + sym.QualifiedName
+		e, ok := merged[key]
+		if !ok {
+			e = &entry{file: sym.FilePath, symbol: sym.QualifiedName, kind: sym.Kind}
+			merged[key] = e
+		}
+		e.score += 1.0 / float64(fusionK+rank+1)
+		e.why = appendUnique(e.why, "fts")
+	}
+
+	for rank, vm := range vecResults {
+		key := vm["file"].(string) + "::" + vm["symbol"].(string)
+		e, ok := merged[key]
+		if !ok {
+			e = &entry{
+				file:   vm["file"].(string),
+				symbol: vm["symbol"].(string),
+				kind:   vm["kind"].(string),
+			}
+			merged[key] = e
+		}
+		e.score += 1.0 / float64(fusionK+rank+1)
+		e.why = appendUnique(e.why, "vector_similarity")
+	}
+
+	sorted := make([]*entry, 0, len(merged))
+	for _, e := range merged {
+		sorted = append(sorted, e)
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].score > sorted[j].score
+	})
+
+	limitVal := safeLimit(limit)
+	offsetVal := safeOffset(offset)
+	end := min(offsetVal+limitVal, len(sorted))
+	if offsetVal >= len(sorted) {
+		return nil, nil
+	}
+	sorted = sorted[offsetVal:end]
+
+	out := make([]map[string]any, 0, len(sorted))
+	for _, e := range sorted {
+		out = append(out, map[string]any{
+			"file":   e.file,
+			"symbol": e.symbol,
+			"kind":   e.kind,
+			"score":  e.score,
+			"why":    e.why,
+		})
+	}
+	return out, nil
+}
+
+// HasEmbeddings checks whether the repo has any stored embeddings.
+func (s *Store) HasEmbeddings(ctx context.Context, repoID int64) (bool, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&count)
+	if err != nil {
+		// Table may not exist yet in older databases.
+		return false, nil
+	}
+	return count > 0, nil
+}
+
+// --- Embedding helpers ---
+
+func float32ToBytes(vec []float32) []byte {
+	buf := make([]byte, len(vec)*4)
+	for i, v := range vec {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
+	}
+	return buf
+}
+
+func bytesToFloat32(buf []byte) []float32 {
+	vec := make([]float32, len(buf)/4)
+	for i := range vec {
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[i*4:]))
+	}
+	return vec
+}
+
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot, normA, normB float64
+	for i := range a {
+		ai, bi := float64(a[i]), float64(b[i])
+		dot += ai * bi
+		normA += ai * ai
+		normB += bi * bi
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
+func appendUnique(slice []string, val string) []string {
+	if slices.Contains(slice, val) {
+		return slice
+	}
+	return append(slice, val)
+}
+
+// ArchitectureOverview returns a high-level overview of the repository
+// including language breakdown, top-level directories, symbol/edge kind
+// breakdowns, key entry points, and hub symbols.
+func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[string]any, error) {
+	stats, err := s.Stats(ctx, repoID)
+	if err != nil {
+		return nil, fmt.Errorf("architecture overview: stats: %w", err)
+	}
+
+	// Language breakdown
+	languages := []map[string]any{}
+	{
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT language, COUNT(*) as file_count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY language ORDER BY file_count DESC`,
+			repoID)
+		if err != nil {
+			return nil, fmt.Errorf("architecture overview: languages: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var lang string
+			var count int
+			if err := rows.Scan(&lang, &count); err != nil {
+				return nil, err
+			}
+			languages = append(languages, map[string]any{"language": lang, "file_count": count})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Top-level directories
+	topDirs := []map[string]any{}
+	{
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT SUBSTR(path, 1, INSTR(path||'/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC LIMIT 20`,
+			repoID)
+		if err != nil {
+			return nil, fmt.Errorf("architecture overview: directories: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var dir string
+			var count int
+			if err := rows.Scan(&dir, &count); err != nil {
+				return nil, err
+			}
+			topDirs = append(topDirs, map[string]any{"directory": dir, "file_count": count})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Symbol kind breakdown
+	symbolKinds := []map[string]any{}
+	{
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT kind, COUNT(*) as count FROM symbols WHERE repo_id = ? GROUP BY kind ORDER BY count DESC`,
+			repoID)
+		if err != nil {
+			return nil, fmt.Errorf("architecture overview: symbol kinds: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var kind string
+			var count int
+			if err := rows.Scan(&kind, &count); err != nil {
+				return nil, err
+			}
+			symbolKinds = append(symbolKinds, map[string]any{"kind": kind, "count": count})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Edge kind breakdown
+	edgeKinds := []map[string]any{}
+	{
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT edge_kind, COUNT(*) as count FROM edges WHERE repo_id = ? GROUP BY edge_kind ORDER BY count DESC`,
+			repoID)
+		if err != nil {
+			return nil, fmt.Errorf("architecture overview: edge kinds: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var kind string
+			var count int
+			if err := rows.Scan(&kind, &count); err != nil {
+				return nil, err
+			}
+			edgeKinds = append(edgeKinds, map[string]any{"kind": kind, "count": count})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Key entry points (most incoming edges)
+	entryPoints := []map[string]any{}
+	{
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT s.qualified_name, s.kind, f.path, COUNT(e.id) as caller_count FROM symbols s JOIN files f ON f.id = s.file_id LEFT JOIN edges e ON e.dst_symbol_id = s.id WHERE s.repo_id = ? GROUP BY s.id ORDER BY caller_count DESC LIMIT 15`,
+			repoID)
+		if err != nil {
+			return nil, fmt.Errorf("architecture overview: entry points: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var qname, kind, path string
+			var count int
+			if err := rows.Scan(&qname, &kind, &path, &count); err != nil {
+				return nil, err
+			}
+			entryPoints = append(entryPoints, map[string]any{
+				"qualified_name": qname, "kind": kind, "file": path, "caller_count": count,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Hub symbols (most outgoing edges)
+	hubSymbols := []map[string]any{}
+	{
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT s.qualified_name, s.kind, f.path, COUNT(e.id) as callee_count FROM symbols s JOIN files f ON f.id = s.file_id LEFT JOIN edges e ON e.src_symbol_id = s.id WHERE s.repo_id = ? GROUP BY s.id ORDER BY callee_count DESC LIMIT 15`,
+			repoID)
+		if err != nil {
+			return nil, fmt.Errorf("architecture overview: hub symbols: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var qname, kind, path string
+			var count int
+			if err := rows.Scan(&qname, &kind, &path, &count); err != nil {
+				return nil, err
+			}
+			hubSymbols = append(hubSymbols, map[string]any{
+				"qualified_name": qname, "kind": kind, "file": path, "callee_count": count,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	return map[string]any{
+		"languages":       languages,
+		"top_directories": topDirs,
+		"symbol_kinds":    symbolKinds,
+		"edge_kinds":      edgeKinds,
+		"entry_points":    entryPoints,
+		"hub_symbols":     hubSymbols,
+		"totals": map[string]any{
+			"files":      stats.Files,
+			"symbols":    stats.Symbols,
+			"edges":      stats.Edges,
+			"references": stats.References,
+		},
+	}, nil
+}
+
+// AllImports returns a map of file path to list of import paths for the given repo.
+func (s *Store) AllImports(ctx context.Context, repoID int64) (map[string][]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT f.path, fi.import_path
+		FROM file_imports fi
+		JOIN files f ON f.id = fi.file_id
+		WHERE f.repo_id = ? AND f.is_deleted = 0
+		ORDER BY f.path`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string][]string)
+	for rows.Next() {
+		var path, importPath string
+		if err := rows.Scan(&path, &importPath); err != nil {
+			return nil, err
+		}
+		result[path] = append(result[path], importPath)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// AllFilePaths returns all non-deleted file paths for the given repo.
+func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT path FROM files
+		WHERE repo_id = ? AND is_deleted = 0
+		ORDER BY path`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
+// BenchmarkTokens estimates the token savings from using codegraph context
+// vs reading all raw files in the repository.
+func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) (map[string]any, error) {
+	// Step 1: total repo file stats.
+	var fileCount int64
+	var totalBytes int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) AS file_count, COALESCE(SUM(size_bytes),0) AS total_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`,
+		repoID,
+	).Scan(&fileCount, &totalBytes)
+	if err != nil {
+		return nil, fmt.Errorf("benchmark repo totals: %w", err)
+	}
+
+	// Step 2: estimate context cost.
+	var contextFileCount int64
+	var contextBytes int64
+
+	if task != "" {
+		// Run a semantic search to find relevant files, similar to context_for_task.
+		results, err := s.SemanticSearch(ctx, repoID, task, 30, 0)
+		if err != nil {
+			return nil, fmt.Errorf("benchmark semantic search: %w", err)
+		}
+		// Collect unique file paths from results.
+		filePaths := map[string]bool{}
+		for _, r := range results {
+			if p, ok := r["file"].(string); ok && p != "" {
+				filePaths[p] = true
+			}
+		}
+		// Cap at 10 files to mirror context_for_task defaults.
+		paths := make([]string, 0, len(filePaths))
+		for p := range filePaths {
+			if len(paths) >= 10 {
+				break
+			}
+			paths = append(paths, p)
+		}
+		if len(paths) > 0 {
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(paths)), ",")
+			args := make([]any, 0, len(paths)+1)
+			args = append(args, repoID)
+			for _, p := range paths {
+				args = append(args, p)
+			}
+			err = s.db.QueryRowContext(ctx,
+				`SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM files WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+placeholders+`)`,
+				args...,
+			).Scan(&contextFileCount, &contextBytes)
+			if err != nil {
+				return nil, fmt.Errorf("benchmark context bytes: %w", err)
+			}
+		}
+	} else {
+		// No task provided: estimate based on average file size * 10 files.
+		var avgSize float64
+		err := s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(AVG(size_bytes),0) FROM files WHERE repo_id = ? AND is_deleted = 0`,
+			repoID,
+		).Scan(&avgSize)
+		if err != nil {
+			return nil, fmt.Errorf("benchmark avg size: %w", err)
+		}
+		contextFileCount = min(10, fileCount)
+		contextBytes = int64(avgSize) * contextFileCount
+	}
+
+	// Step 3: build comparison result.
+	totalTokens := totalBytes / 4
+	contextTokens := contextBytes / 4
+	var savingsPct float64
+	if totalTokens > 0 {
+		savingsPct = float64(totalTokens-contextTokens) / float64(totalTokens) * 100.0
+	}
+
+	return map[string]any{
+		"repo_total_files":  fileCount,
+		"repo_total_bytes":  totalBytes,
+		"repo_total_tokens": totalTokens,
+		"context_files":     contextFileCount,
+		"context_bytes":     contextBytes,
+		"context_tokens":    contextTokens,
+		"token_savings_pct": savingsPct,
+		"estimated_cost_without": map[string]any{
+			"claude_sonnet_input": float64(totalTokens) * 3.0 / 1_000_000,
+		},
+		"estimated_cost_with": map[string]any{
+			"claude_sonnet_input": float64(contextTokens) * 3.0 / 1_000_000,
+		},
+	}, nil
+}
+
+// ResolveCrossLanguageLinks creates edges between symbols in different languages
+// that reference each other. It returns the total number of new edges created.
+func (s *Store) ResolveCrossLanguageLinks(ctx context.Context, repoID int64) (int, error) {
+	totalCreated := 0
+
+	// Strategy 1: Shared name matching across languages.
+	// Find symbols with identical names in different languages and create
+	// cross_language_ref edges, filtering out short/common names.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT s1.id, s2.id, s1.name, s1.language, s2.language, s1.file_id, s2.file_id
+		FROM symbols s1
+		JOIN symbols s2 ON s1.name = s2.name AND s1.language != s2.language AND s1.repo_id = s2.repo_id
+		WHERE s1.repo_id = ?
+		AND s1.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+		AND s2.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+		AND length(s1.name) > 3
+		AND s1.name NOT IN ('main', 'init', 'new', 'get', 'set', 'run', 'start', 'stop', 'open', 'close', 'read', 'write', 'delete', 'update', 'create', 'test', 'setup', 'handle', 'process')
+		AND s1.id < s2.id
+	`, repoID)
+	if err != nil {
+		return 0, fmt.Errorf("cross-language shared name query: %w", err)
+	}
+	defer rows.Close()
+
+	type crossLink struct {
+		srcID   int64
+		dstID   int64
+		name    string
+		srcLang string
+		dstLang string
+		srcFile int64
+		dstFile int64
+	}
+	var links []crossLink
+	for rows.Next() {
+		var l crossLink
+		if err := rows.Scan(&l.srcID, &l.dstID, &l.name, &l.srcLang, &l.dstLang, &l.srcFile, &l.dstFile); err != nil {
+			return 0, fmt.Errorf("cross-language scan: %w", err)
+		}
+		links = append(links, l)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("cross-language rows: %w", err)
+	}
+
+	for _, l := range links {
+		evidence := "shared_name:" + l.srcLang + "→" + l.dstLang
+		// Check if this edge already exists to avoid duplicates.
+		var exists int
+		err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM edges
+			WHERE repo_id = ? AND src_symbol_id = ? AND dst_symbol_id = ? AND edge_kind = 'cross_language_ref'
+		`, repoID, l.srcID, l.dstID).Scan(&exists)
+		if err != nil {
+			return totalCreated, fmt.Errorf("cross-language check existing: %w", err)
+		}
+		if exists > 0 {
+			continue
+		}
+		_, err = s.db.ExecContext(ctx, `
+			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
+			VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0)
+		`, repoID, l.srcID, l.dstID, l.name, evidence, l.srcFile)
+		if err != nil {
+			return totalCreated, fmt.Errorf("cross-language insert: %w", err)
+		}
+		totalCreated++
+	}
+
+	// Strategy 2: Import-path based linking.
+	// Find file_imports that reference paths matching files in other languages,
+	// then link exported symbols between those files.
+	importRows, err := s.db.QueryContext(ctx, `
+		SELECT fi.file_id, fi.import_path, f.language
+		FROM file_imports fi
+		JOIN files f ON f.id = fi.file_id
+		WHERE f.repo_id = ? AND f.is_deleted = 0
+	`, repoID)
+	if err != nil {
+		return totalCreated, fmt.Errorf("cross-language imports query: %w", err)
+	}
+	defer importRows.Close()
+
+	type importInfo struct {
+		fileID     int64
+		importPath string
+		language   string
+	}
+	var imports []importInfo
+	for importRows.Next() {
+		var info importInfo
+		if err := importRows.Scan(&info.fileID, &info.importPath, &info.language); err != nil {
+			return totalCreated, fmt.Errorf("cross-language import scan: %w", err)
+		}
+		imports = append(imports, info)
+	}
+	if err := importRows.Err(); err != nil {
+		return totalCreated, fmt.Errorf("cross-language import rows: %w", err)
+	}
+
+	// Build a map of file paths (without extension) to file IDs and languages.
+	fileRows, err := s.db.QueryContext(ctx, `
+		SELECT id, path, language FROM files WHERE repo_id = ? AND is_deleted = 0
+	`, repoID)
+	if err != nil {
+		return totalCreated, fmt.Errorf("cross-language files query: %w", err)
+	}
+	defer fileRows.Close()
+
+	type fileInfo struct {
+		id       int64
+		language string
+	}
+	filesByBase := map[string][]fileInfo{}
+	for fileRows.Next() {
+		var id int64
+		var path, lang string
+		if err := fileRows.Scan(&id, &path, &lang); err != nil {
+			return totalCreated, fmt.Errorf("cross-language file scan: %w", err)
+		}
+		// Strip extension to get the base path for matching.
+		base := strings.TrimSuffix(path, filepath.Ext(path))
+		filesByBase[base] = append(filesByBase[base], fileInfo{id: id, language: lang})
+	}
+	if err := fileRows.Err(); err != nil {
+		return totalCreated, fmt.Errorf("cross-language file rows: %w", err)
+	}
+
+	for _, imp := range imports {
+		// Normalize import path: strip leading ./ or ../ prefixes and extensions.
+		normalized := imp.importPath
+		normalized = strings.TrimPrefix(normalized, "./")
+		normalized = strings.TrimPrefix(normalized, "../")
+		normalized = strings.TrimSuffix(normalized, filepath.Ext(normalized))
+
+		matches, ok := filesByBase[normalized]
+		if !ok {
+			continue
+		}
+		for _, match := range matches {
+			if match.language == imp.language {
+				continue // only cross-language links
+			}
+			// Link exported symbols from the importing file to the target file's symbols.
+			linkRows, err := s.db.QueryContext(ctx, `
+				SELECT src.id, dst.id, dst.name, src.file_id
+				FROM symbols src
+				JOIN symbols dst ON dst.file_id = ? AND src.repo_id = dst.repo_id
+				WHERE src.file_id = ? AND src.repo_id = ?
+				AND src.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+				AND dst.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+				AND NOT EXISTS (
+					SELECT 1 FROM edges
+					WHERE repo_id = ? AND src_symbol_id = src.id AND dst_symbol_id = dst.id AND edge_kind = 'cross_language_ref'
+				)
+				LIMIT 50
+			`, match.id, imp.fileID, repoID, repoID)
+			if err != nil {
+				continue
+			}
+			for linkRows.Next() {
+				var srcID, dstID, srcFileID int64
+				var dstName string
+				if err := linkRows.Scan(&srcID, &dstID, &dstName, &srcFileID); err != nil {
+					continue
+				}
+				evidence := "import_path:" + imp.language + "→" + match.language
+				_, err = s.db.ExecContext(ctx, `
+					INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
+					VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0)
+				`, repoID, srcID, dstID, dstName, evidence, srcFileID)
+				if err == nil {
+					totalCreated++
+				}
+			}
+			linkRows.Close()
+		}
+	}
+
+	return totalCreated, nil
+}
+
+// --- Session Memory ---
+
+func (s *Store) SessionLogEvent(ctx context.Context, repoID int64, sessionID, eventType, key, value, metadata string) error {
+	if metadata == "" {
+		metadata = "{}"
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO session_events (repo_id, session_id, event_type, key, value, metadata, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, sessionID, eventType, key, value, metadata, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *Store) SessionGetHistory(ctx context.Context, repoID int64, sessionID string, eventType string, limit, offset int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `SELECT id, session_id, event_type, key, value, metadata, created_at FROM session_events WHERE repo_id = ?`
+	args := []any{repoID}
+	if sessionID != "" {
+		query += ` AND session_id = ?`
+		args = append(args, sessionID)
+	}
+	if eventType != "" {
+		query += ` AND event_type = ?`
+		args = append(args, eventType)
+	}
+	query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []map[string]any
+	for rows.Next() {
+		var id int64
+		var sid, etype, k, v, meta, createdAt string
+		if err := rows.Scan(&id, &sid, &etype, &k, &v, &meta, &createdAt); err != nil {
+			return nil, err
+		}
+		results = append(results, map[string]any{
+			"id":         id,
+			"session_id": sid,
+			"event_type": etype,
+			"key":        k,
+			"value":      v,
+			"metadata":   meta,
+			"created_at": createdAt,
+		})
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) SessionGetHotFiles(ctx context.Context, repoID int64, sessionID string, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT key AS file, COUNT(*) AS access_count, MAX(created_at) AS last_accessed
+		FROM session_events
+		WHERE repo_id = ? AND event_type IN ('read', 'edit')
+		AND (? = '' OR session_id = ?)
+		GROUP BY key
+		ORDER BY access_count DESC
+		LIMIT ?
+	`, repoID, sessionID, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []map[string]any
+	for rows.Next() {
+		var file, lastAccessed string
+		var count int64
+		if err := rows.Scan(&file, &count, &lastAccessed); err != nil {
+			return nil, err
+		}
+		results = append(results, map[string]any{
+			"file":          file,
+			"access_count":  count,
+			"last_accessed": lastAccessed,
+		})
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) SessionGetContext(ctx context.Context, repoID int64, sessionID string) (map[string]any, error) {
+	decisions, err := s.SessionGetHistory(ctx, repoID, sessionID, "decision", 10, 0)
+	if err != nil {
+		return nil, err
+	}
+	facts, err := s.SessionGetHistory(ctx, repoID, sessionID, "fact", 10, 0)
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := s.SessionGetHistory(ctx, repoID, sessionID, "task", 10, 0)
+	if err != nil {
+		return nil, err
+	}
+	hotFiles, err := s.SessionGetHotFiles(ctx, repoID, sessionID, 10)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"decisions": decisions,
+		"facts":     facts,
+		"tasks":     tasks,
+		"hot_files": hotFiles,
+	}, nil
 }

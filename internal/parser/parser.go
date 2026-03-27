@@ -76,14 +76,6 @@ func (r *Registry) AdapterFor(path string) Adapter {
 	return nil
 }
 
-func (r *Registry) Languages() []string {
-	out := make([]string, 0, len(r.adapters))
-	for _, adapter := range r.adapters {
-		out = append(out, adapter.Language())
-	}
-	return out
-}
-
 func (r *Registry) SupportedLanguages() []LanguageSupport {
 	out := make([]LanguageSupport, 0, len(r.adapters))
 	for _, adapter := range r.adapters {

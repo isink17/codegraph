@@ -32,7 +32,7 @@ func main() {
 	}
 	defer s.Close()
 
-	idx := New(s, parser.NewRegistry(goparser.New()))
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 
 	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
 	if err != nil {
@@ -126,7 +126,7 @@ func Generated() {}
 	}
 	defer s.Close()
 
-	idx := New(s, parser.NewRegistry(goparser.New()))
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
 	if err != nil {
 		t.Fatalf("Index() error = %v", err)
@@ -164,7 +164,7 @@ func small() {}
 	}
 	defer s.Close()
 
-	idx := New(s, parser.NewRegistry(goparser.New()))
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
 	if err != nil {
 		t.Fatalf("Index() error = %v", err)
@@ -195,7 +195,7 @@ func broken( {
 	}
 	defer s.Close()
 
-	idx := New(s, parser.NewRegistry(goparser.New()))
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
 	if err != nil {
 		t.Fatalf("Index() error = %v", err)
@@ -233,7 +233,7 @@ func Keep() {}
 	}
 	defer s.Close()
 
-	idx := New(s, parser.NewRegistry(goparser.New()))
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
@@ -271,7 +271,7 @@ func main() {}
 	}
 	defer s.Close()
 
-	idx := New(s, parser.NewRegistry(goparser.New()))
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
 	if err != nil {
 		t.Fatalf("Index() error = %v", err)

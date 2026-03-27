@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,32 +20,23 @@ import (
 	"github.com/isink17/codegraph/internal/appname"
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/doctor"
+	"github.com/isink17/codegraph/internal/embedding"
 	"github.com/isink17/codegraph/internal/export"
 	"github.com/isink17/codegraph/internal/gotool"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/logging"
 	"github.com/isink17/codegraph/internal/mcp"
 	"github.com/isink17/codegraph/internal/parser"
-	goparser "github.com/isink17/codegraph/internal/parser/golang"
-	heuristicparser "github.com/isink17/codegraph/internal/parser/heuristic"
-	pyparser "github.com/isink17/codegraph/internal/parser/python"
+	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
 	"github.com/isink17/codegraph/internal/versioncheck"
+	"github.com/isink17/codegraph/internal/viz"
 	"github.com/isink17/codegraph/internal/watcher"
 )
 
 var startupVersionCheck = versioncheck.NotifyIfOutdated
-
-func parseFlagSet(name string, args []string) (*flag.FlagSet, []string, error) {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	if err := fs.Parse(args); err != nil {
-		return nil, nil, err
-	}
-	return fs, fs.Args(), nil
-}
 
 type stringListFlag []string
 
@@ -104,6 +97,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runGraph(ctx, globalCfg, stdout, args[1:])
 	case "clean":
 		return runClean(ctx, globalCfg, stdout, args[1:])
+	case "affected-tests":
+		return runAffectedTests(ctx, globalCfg, stdout, args[1:])
+	case "visualize":
+		return runVisualize(ctx, globalCfg, stdout, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -227,7 +224,7 @@ type benchmarkBaseline struct {
 
 func parseBenchmarkMetrics(output string) map[string]benchmarkMetric {
 	metrics := make(map[string]benchmarkMetric)
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "Benchmark") {
 			continue
@@ -413,12 +410,35 @@ func runInstall(stdout io.Writer) error {
 	} else {
 		fmt.Fprintln(stdout, "default config: already present")
 	}
+
+	// Auto-configure MCP for detected AI tools.
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Auto-configuring MCP for detected AI tools:")
+	configured := autoConfigureMCP(stdout)
+	if configured > 0 {
+		fmt.Fprintf(stdout, "\n%d tool(s) auto-configured.\n", configured)
+	}
+
+	// Print Claude Code permissions snippet.
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Claude Code permissions snippet (add to .claude/settings.json):")
+	fmt.Fprintln(stdout, `{
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__*"
+    ]
+  }
+}`)
+
+	// Always print manual snippets as a fallback / reference.
 	codexSnippet := "[mcp_servers.codegraph]\ncommand = \"codegraph\"\nargs = [\"serve\", \"--repo-root\", \"/absolute/path/to/repo\"]\nstartup_timeout_sec = 60"
 	clientSnippet := `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`
 	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Manual MCP snippets (if auto-configure did not apply):")
+	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Codex MCP snippet:")
 	fmt.Fprintln(stdout, codexSnippet)
-	for _, label := range []string{"Gemini CLI", "Claude/Desktop"} {
+	for _, label := range []string{"Gemini CLI", "Claude/Desktop", "Cursor", "Windsurf"} {
 		fmt.Fprintln(stdout)
 		fmt.Fprintf(stdout, "%s MCP snippet:\n", label)
 		fmt.Fprintln(stdout, clientSnippet)
@@ -632,6 +652,11 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 	}
 	defer app.Close()
 	server := mcp.NewServer(repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
+	if repoCfg, err := config.LoadRepo(repo.RootPath); err == nil {
+		if repoCfg.Agent.Enabled || repoCfg.Agent.BaseURL != "" || repoCfg.Agent.Model != "" {
+			server.SetAgentConfig(repoCfg.Agent.BaseURL, repoCfg.Agent.Model)
+		}
+	}
 	return server.Serve(ctx, os.Stdin, stdout, stderr)
 }
 
@@ -675,9 +700,7 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		_ = writeJSONL(stdout, event)
 	}
 	if *jsonl {
-		reporterDone.Add(1)
-		go func() {
-			defer reporterDone.Done()
+		reporterDone.Go(func() {
 			heartbeatEvery := 2 * time.Second
 			if cfg.WatchDebounce > 0 && cfg.WatchDebounce > heartbeatEvery {
 				heartbeatEvery = cfg.WatchDebounce
@@ -708,7 +731,7 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 					prev = current
 				}
 			}
-		}()
+		})
 	}
 	err = w.Run(ctx, repo.RootPath, repoID, cfg.WatchDebounce)
 	reporterCancel()
@@ -777,6 +800,72 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	}
 	_, err = stdout.Write(out)
 	return err
+}
+
+func runVisualize(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("visualize", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRoot := fs.String("repo-root", ".", "repository root")
+	symbol := fs.String("symbol", "", "focus on a specific symbol")
+	output := fs.String("output", "", "write HTML to this file instead of opening a browser")
+	depth := fs.Int("depth", 2, "traversal depth from focus symbol")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 && *repoRoot == "." {
+		*repoRoot = fs.Arg(0)
+	}
+
+	app, _, repoID, err := openApp(ctx, cfg, *repoRoot)
+	if err != nil {
+		return err
+	}
+	defer app.Close()
+
+	symbols, edges, err := app.Query.GraphSnapshot(ctx, repoID, strings.TrimSpace(*symbol), *depth)
+	if err != nil {
+		return err
+	}
+
+	if *output != "" {
+		f, err := os.Create(*output)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if err := viz.GenerateHTML(f, symbols, edges); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "wrote %s\n", *output)
+		return nil
+	}
+
+	tmp, err := os.CreateTemp("", "codegraph-viz-*.html")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if err := viz.GenerateHTML(tmp, symbols, edges); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	fmt.Fprintf(stdout, "opening %s\n", tmpPath)
+	return openBrowser(tmpPath)
+}
+
+func openBrowser(url string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", url).Start()
+	case "linux":
+		return exec.Command("xdg-open", url).Start()
+	case "windows":
+		return exec.Command("cmd", "/c", "start", url).Start()
+	default:
+		return fmt.Errorf("unsupported platform %s; open %s manually", runtime.GOOS, url)
+	}
 }
 
 func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
@@ -960,7 +1049,9 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 		return nil, graphRepo{}, 0, err
 	}
 	registry := newDefaultRegistry()
-	idx := indexer.New(s, registry)
+	repoCfg, _ := config.LoadRepo(canonical)
+	embedder := newEmbedder(repoCfg.Embedding)
+	idx := indexer.New(s, registry, embedder)
 	repo, err := s.UpsertRepo(ctx, canonical)
 	if err != nil {
 		_ = s.Close()
@@ -969,25 +1060,36 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 	app := &App{
 		Store:   s,
 		Indexer: idx,
-		Query:   query.New(s),
+		Query:   query.New(s, embedder),
 	}
 	return app, graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
 }
 
 func newDefaultRegistry() *parser.Registry {
 	return parser.NewRegistry(
-		goparser.New(),
-		pyparser.New(),
-		heuristicparser.NewJava(),
-		heuristicparser.NewKotlin(),
-		heuristicparser.NewCSharp(),
-		heuristicparser.NewTypeScriptJavaScript(),
-		heuristicparser.NewRust(),
-		heuristicparser.NewRuby(),
-		heuristicparser.NewSwift(),
-		heuristicparser.NewPHP(),
-		heuristicparser.NewCAndCpp(),
+		tsparser.NewGo(),
+		tsparser.NewPython(),
+		tsparser.NewJava(),
+		tsparser.NewKotlin(),
+		tsparser.NewCSharp(),
+		tsparser.NewTypeScript(),
+		tsparser.NewRust(),
+		tsparser.NewRuby(),
+		tsparser.NewSwift(),
+		tsparser.NewPHP(),
+		tsparser.NewCpp(),
 	)
+}
+
+func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
+	if !cfg.Enabled {
+		return nil
+	}
+	return embedding.NewOllama(embedding.OllamaConfig{
+		BaseURL:    cfg.BaseURL,
+		Model:      cfg.Model,
+		Dimensions: cfg.Dimensions,
+	})
 }
 
 const repoDBFileName = "codegraph.sqlite"
@@ -1019,6 +1121,69 @@ func writeJSONL(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
+func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("affected-tests", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root")
+	stdinFlag := fs.Bool("stdin", false, "read file paths from stdin (one per line)")
+	jsonFlag := fs.Bool("json", false, "output as JSON")
+	limit := fs.Int("limit", 50, "maximum number of test results")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	repoRoot := "."
+	if *repoRootFlag != "" {
+		repoRoot = *repoRootFlag
+	}
+
+	var files []string
+	if *stdinFlag {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" {
+				files = append(files, line)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+	}
+	files = append(files, fs.Args()...)
+
+	if len(files) == 0 {
+		return errors.New("usage: codegraph affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...")
+	}
+
+	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+	if err != nil {
+		return err
+	}
+	defer app.Close()
+
+	tests, err := app.Query.RelatedTestsForFiles(ctx, repoID, files, *limit, 0)
+	if err != nil {
+		return err
+	}
+
+	if *jsonFlag {
+		return writeJSON(stdout, map[string]any{
+			"affected_tests": tests,
+			"total":          len(tests),
+		})
+	}
+
+	seen := map[string]bool{}
+	for _, t := range tests {
+		if !seen[t.File] {
+			seen[t.File] = true
+			fmt.Fprintln(stdout, t.File)
+		}
+	}
+	return nil
+}
+
 func printUsage(w io.Writer) {
 	for _, line := range []string{
 		"codegraph commands:",
@@ -1041,6 +1206,10 @@ func printUsage(w io.Writer) {
 		"  graph export <repo-path> [--format json|dot]",
 		"  watch <repo-path>",
 		"    add --jsonl for streaming line-delimited JSON events",
+		"  affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...",
+		"    find tests affected by changed files; pipe from git diff --name-only",
+		"  visualize [--repo-root PATH] [--symbol NAME] [--depth N] [--output FILE]",
+		"    interactive D3.js graph visualization; opens browser or writes HTML file",
 		"  clean [repo-path] [--vacuum]",
 	} {
 		fmt.Fprintln(w, line)

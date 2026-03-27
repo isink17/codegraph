@@ -64,7 +64,7 @@ func setupStoreBenchData(b *testing.B, ctx context.Context) (*store.Store, int64
 	}
 	b.Cleanup(func() { _ = s.Close() })
 
-	idx := indexer.New(s, parser.NewRegistry(goparser.New()))
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		b.Fatalf("Index() error = %v", err)
 	}
