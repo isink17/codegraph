@@ -26,8 +26,6 @@ import (
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/logging"
 	"github.com/isink17/codegraph/internal/mcp"
-	"github.com/isink17/codegraph/internal/parser"
-	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
@@ -1063,22 +1061,6 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 		Query:   query.New(s, embedder),
 	}
 	return app, graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
-}
-
-func newDefaultRegistry() *parser.Registry {
-	return parser.NewRegistry(
-		tsparser.NewGo(),
-		tsparser.NewPython(),
-		tsparser.NewJava(),
-		tsparser.NewKotlin(),
-		tsparser.NewCSharp(),
-		tsparser.NewTypeScript(),
-		tsparser.NewRust(),
-		tsparser.NewRuby(),
-		tsparser.NewSwift(),
-		tsparser.NewPHP(),
-		tsparser.NewCpp(),
-	)
 }
 
 func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
