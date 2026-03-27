@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.7 - 2026-03-27
+
+### Fixed
+
+- Restored release cross-compilation by splitting tree-sitter adapters behind `//go:build cgo` and using heuristic parsers in `CGO_ENABLED=0` builds.
+
 ## v1.0.6 - 2026-03-26
 
 ### Fixed
