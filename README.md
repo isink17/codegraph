@@ -1,5 +1,7 @@
 # codegraph
 
+[![gitcgr](https://gitcgr.com/badge/isink17/codegraph.svg)](https://gitcgr.com/isink17/codegraph)
+
 **Your codebase, understood. Locally.**
 
 `codegraph` is a local-first code context engine and MCP server that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — without sending a single byte to the cloud.
