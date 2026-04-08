@@ -87,6 +87,7 @@ All languages use tree-sitter for AST parsing:
 | Swift | `.swift` |
 | PHP | `.php` |
 | C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc` |
+*does not completely support node yet.
 
 ---
 
