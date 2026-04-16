@@ -131,8 +131,8 @@ func Generated() {}
 	if err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-	if summary.FilesIndexed != 1 {
-		t.Fatalf("FilesIndexed = %d, want 1", summary.FilesIndexed)
+	if summary.FilesIndexed != 2 {
+		t.Fatalf("FilesIndexed = %d, want 2", summary.FilesIndexed)
 	}
 
 	repo, err := s.UpsertRepo(ctx, repoRoot)
@@ -143,8 +143,8 @@ func Generated() {}
 	if err != nil {
 		t.Fatalf("Stats() error = %v", err)
 	}
-	if stats.Files != 1 {
-		t.Fatalf("stats.Files = %d, want 1", stats.Files)
+	if stats.Files != 2 {
+		t.Fatalf("stats.Files = %d, want 2", stats.Files)
 	}
 }
 

@@ -60,7 +60,7 @@ func Default() (Config, error) {
 	}
 	return Config{
 		DefaultLogLevel:      "info",
-		DefaultExcludes:      []string{".git/**", ".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "node_modules/**", "vendor/**", "dist/**", "build/**", repoDBExcludePattern},
+		DefaultExcludes:      []string{".git/**", ".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "node_modules/**", "vendor/**", "dist/**", "build/**", ".next/**", ".nuxt/**", ".svelte-kit/**", ".turbo/**", ".cache/**", "coverage/**", "out/**", ".yarn/**", ".pnpm-store/**", ".parcel-cache/**", repoDBExcludePattern},
 		DefaultLanguages:     []string{"go"},
 		WatchDebounce:        750 * time.Millisecond,
 		DBDir:                RepoDBDir,
