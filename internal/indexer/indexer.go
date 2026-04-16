@@ -537,19 +537,23 @@ func ShouldSkipDir(rel string, excludes []string) bool {
 	return shouldSkipDir(rel, excludes)
 }
 
-// shouldSkipDir checks if a directory should be skipped during indexing.
-// Hardcoded skips (e.g., node_modules, .next) are applied by default but can be overridden
-// by providing a negation pattern (e.g., !node_modules) in .codegraphignore.
 func shouldSkipDir(rel string, excludes []string) bool {
 	rel = filepath.ToSlash(rel)
 	base := filepath.Base(rel)
+
+	// Always skip hardcoded directories - not overridable.
+	for _, skip := range config.HardcodedSkips {
+		if base == skip {
+			return true
+		}
+	}
+
+	// Generic hidden directories can be overridden.
 	if strings.HasPrefix(base, ".") {
 		return !hasNegationWithin(rel, excludes)
 	}
-	switch base {
-	case ".git", "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pnpm-store", ".yarn", ".parcel-cache":
-		return !hasNegationWithin(rel, excludes)
-	}
+
+	// Configurable ignores.
 	if matchesIgnore(rel, excludes) {
 		return !hasNegationWithin(rel, excludes)
 	}
