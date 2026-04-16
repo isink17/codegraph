@@ -1,12 +1,27 @@
 # Changelog
 
-## v1.0.7 - 2026-03-27
+# Release v1.0.9 - 16-04-2026
+
+Improved Node.js repo indexing stability by hard-skipping common generated/tooling directories (for example node_modules and .next), refining default excludes, and clarifying ignore override behavior.
+
+## Changes
+
+### Fixes
+- **Indexer:** Established a strict skip policy for common Node.js generated directories (e.g., `node_modules`, `.next`, `.nuxt`). These are now hardcoded and enforced early during filesystem traversal.
+- **Indexer:** Clarified ignore override behavior; hardcoded skips are now non-overridable via negation patterns in `.codegraphignore` to ensure predictable indexer performance.
+- **Config:** Centralized default exclude patterns to maintain consistency across the CLI and indexer.
+- **SQL Hardening:** Added explicit bounds and safety checks for all path-filtering SQL queries.
+
+## Upgrade Notes
+- No required migrations or configuration changes.
+
+## v1.0.7 - 27-03-2026
 
 ### Fixed
 
 - Restored release cross-compilation by splitting tree-sitter adapters behind `//go:build cgo` and using heuristic parsers in `CGO_ENABLED=0` builds.
 
-## v1.0.6 - 2026-03-26
+## v1.0.6 - 26-03-2026
 
 ### Fixed
 
@@ -25,7 +40,7 @@
 - Added missing `list_scans` and `latest_scan_errors` to the MCP tools list in README.
 - Added one-line descriptions to all 14 MCP tools in README.
 
-## v1.0.5 - 2026-03-21
+## v1.0.5 - 21-03-2026
 
 ### Fixed
 
@@ -33,7 +48,7 @@
 - Treated the previous global `db_dir` default as a legacy value so existing installs fall forward to repo-local DB behavior without manual config edits.
 - Updated Codex MCP setup guidance and examples to use `config.toml` with `startup_timeout_sec = 60`.
 
-## v1.0.3 - 2026-03-18
+## v1.0.3 - 18-03-2026
 
 ### Changed
 
@@ -54,7 +69,7 @@
 - Improved indexing and store performance with batching, scoped edge resolution, and scan/stat tuning.
 - Added cleaner local maintenance workflows (`clean`, doctor improvements, and setup/path guidance updates).
 
-## v1.0.1 - 2026-03-18
+## v1.0.1 - 18-03-2026
 
 ### Fixes
 
@@ -62,7 +77,7 @@
 - Updated internal imports to match the published module path.
 - Updated install docs with actual module path and Go install/PATH troubleshooting guidance.
 
-## v1.0.0 - 2026-03-18
+## v1.0.0 - 18-03-2026
 
 Initial public release of `codegraph`.
 
