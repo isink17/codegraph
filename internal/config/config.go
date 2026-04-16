@@ -17,6 +17,10 @@ const ignoreFileName = ".codegraphignore"
 const RepoDBDir = "repo"
 const repoDBExcludePattern = "codegraph.sqlite*"
 
+var HardcodedSkips = []string{".git", "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pnpm-store", ".yarn", ".parcel-cache"}
+var DefaultExcludes = []string{".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "vendor/**", "dist/**", "build/**", "coverage/**", "out/**", ".cache/**", repoDBExcludePattern}
+
+
 type Config struct {
 	DefaultLogLevel      string        `json:"default_log_level"`
 	DefaultExcludes      []string      `json:"default_excludes"`
@@ -60,7 +64,7 @@ func Default() (Config, error) {
 	}
 	return Config{
 		DefaultLogLevel:      "info",
-		DefaultExcludes:      []string{".git/**", ".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "node_modules/**", "vendor/**", "dist/**", "build/**", repoDBExcludePattern},
+		DefaultExcludes:      DefaultExcludes,
 		DefaultLanguages:     []string{"go"},
 		WatchDebounce:        750 * time.Millisecond,
 		DBDir:                RepoDBDir,

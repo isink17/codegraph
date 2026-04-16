@@ -540,13 +540,20 @@ func ShouldSkipDir(rel string, excludes []string) bool {
 func shouldSkipDir(rel string, excludes []string) bool {
 	rel = filepath.ToSlash(rel)
 	base := filepath.Base(rel)
+
+	// Always skip hardcoded directories - not overridable.
+	for _, skip := range config.HardcodedSkips {
+		if base == skip {
+			return true
+		}
+	}
+
+	// Generic hidden directories can be overridden.
 	if strings.HasPrefix(base, ".") {
 		return !hasNegationWithin(rel, excludes)
 	}
-	switch base {
-	case "node_modules", "vendor", "dist", "build", "target", "out", "bin":
-		return !hasNegationWithin(rel, excludes)
-	}
+
+	// Configurable ignores.
 	if matchesIgnore(rel, excludes) {
 		return !hasNegationWithin(rel, excludes)
 	}

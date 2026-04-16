@@ -182,7 +182,7 @@ func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 		}
 		repoCfg := config.RepoConfig{
 			Include:          []string{"**/*"},
-			Exclude:          []string{".git/**", ".codegraph/**", "node_modules/**", "vendor/**", "dist/**", "build/**", config.RepoDBExcludePattern()},
+			Exclude:          append(config.DefaultExcludes, config.HardcodedSkips...),
 			Languages:        append([]string(nil), cfg.DefaultLanguages...),
 			WatchDebounce:    cfg.WatchDebounce,
 			SemanticMaxTerms: 8,
