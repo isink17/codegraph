@@ -62,46 +62,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	logger := logging.New(globalCfg.DefaultLogLevel, stderr)
 	_ = logger
 
-	switch args[0] {
-	case "install":
-		return runInstall(stdout)
-	case "index":
-		return runIndex(ctx, globalCfg, stdout, args[1:], false)
-	case "update":
-		return runIndex(ctx, globalCfg, stdout, args[1:], true)
-	case "stats":
-		return runStats(ctx, globalCfg, stdout, args[1:])
-	case "find-symbol":
-		return runQueryCommand(ctx, globalCfg, stdout, "find-symbol", args[1:])
-	case "callers":
-		return runQueryCommand(ctx, globalCfg, stdout, "callers", args[1:])
-	case "callees":
-		return runQueryCommand(ctx, globalCfg, stdout, "callees", args[1:])
-	case "impact":
-		return runQueryCommand(ctx, globalCfg, stdout, "impact", args[1:])
-	case "search":
-		return runQueryCommand(ctx, globalCfg, stdout, "search", args[1:])
-	case "doctor":
-		return runDoctor(stdout, args[1:])
-	case "config":
-		return runConfig(globalCfg, stdout, args[1:])
-	case "benchmark":
-		return runBenchmark(ctx, stdout, args[1:])
-	case "serve":
-		return runServe(ctx, globalCfg, stdout, stderr, args[1:])
-	case "watch":
-		return runWatch(ctx, globalCfg, stdout, args[1:])
-	case "graph":
-		return runGraph(ctx, globalCfg, stdout, args[1:])
-	case "clean":
-		return runClean(ctx, globalCfg, stdout, args[1:])
-	case "affected-tests":
-		return runAffectedTests(ctx, globalCfg, stdout, args[1:])
-	case "visualize":
-		return runVisualize(ctx, globalCfg, stdout, args[1:])
-	default:
+	cmd, ok := lookupCommand(args[0])
+	if !ok {
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+
+	return cmd.run(ctx, globalCfg, stdout, stderr, args[1:])
 }
 
 func runDoctor(stdout io.Writer, args []string) error {
@@ -1167,33 +1133,18 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 }
 
 func printUsage(w io.Writer) {
-	for _, line := range []string{
-		"codegraph commands:",
-		"  install",
-		"  index <repo-path>",
-		"  update <repo-path>",
-		"    add --jsonl for streaming line-delimited JSON events",
-		"  serve --repo-root <repo-path>",
-		"  stats <repo-path>",
-		"  find-symbol <repo-path> <query>",
-		"  search <repo-path> <query>",
-		"  callers <repo-path> --symbol <name>",
-		"  callees <repo-path> --symbol <name>",
-		"  impact <repo-path> [--symbol <name>] [--file <path>]",
-		"  doctor",
-		"    add --fix for non-destructive autofixes",
-		"  config <show|edit-path|validate|init>",
-		"    config init [--repo PATH] [--force]",
-		"  benchmark [--count N] [--benchtime DURATION] [--save-baseline]",
-		"  graph export <repo-path> [--format json|dot]",
-		"  watch <repo-path>",
-		"    add --jsonl for streaming line-delimited JSON events",
-		"  affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...",
-		"    find tests affected by changed files; pipe from git diff --name-only",
-		"  visualize [--repo-root PATH] [--symbol NAME] [--depth N] [--output FILE]",
-		"    interactive D3.js graph visualization; opens browser or writes HTML file",
-		"  clean [repo-path] [--vacuum]",
-	} {
-		fmt.Fprintln(w, line)
+	fmt.Fprintln(w, "codegraph commands:")
+	for _, cmd := range commandList {
+		lines := cmd.usageLines
+		if len(lines) == 0 {
+			lines = []string{"  " + cmd.name}
+		}
+		for i, line := range lines {
+			if i == 0 && cmd.description != "" {
+				fmt.Fprintf(w, "%s  - %s\n", line, cmd.description)
+				continue
+			}
+			fmt.Fprintln(w, line)
+		}
 	}
 }

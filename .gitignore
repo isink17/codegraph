@@ -15,6 +15,7 @@ coverage.out
 *.swo
 TODO.md
 GEMINI.md
+ANALYSIS.md
 codegraph
 codegraph.exe
 codegraph.sqlite
