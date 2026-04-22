@@ -1133,33 +1133,18 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 }
 
 func printUsage(w io.Writer) {
-	for _, line := range []string{
-		"codegraph commands:",
-		"  install",
-		"  index <repo-path>",
-		"  update <repo-path>",
-		"    add --jsonl for streaming line-delimited JSON events",
-		"  serve --repo-root <repo-path>",
-		"  stats <repo-path>",
-		"  find-symbol <repo-path> <query>",
-		"  search <repo-path> <query>",
-		"  callers <repo-path> --symbol <name>",
-		"  callees <repo-path> --symbol <name>",
-		"  impact <repo-path> [--symbol <name>] [--file <path>]",
-		"  doctor",
-		"    add --fix for non-destructive autofixes",
-		"  config <show|edit-path|validate|init>",
-		"    config init [--repo PATH] [--force]",
-		"  benchmark [--count N] [--benchtime DURATION] [--save-baseline]",
-		"  graph export <repo-path> [--format json|dot]",
-		"  watch <repo-path>",
-		"    add --jsonl for streaming line-delimited JSON events",
-		"  affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...",
-		"    find tests affected by changed files; pipe from git diff --name-only",
-		"  visualize [--repo-root PATH] [--symbol NAME] [--depth N] [--output FILE]",
-		"    interactive D3.js graph visualization; opens browser or writes HTML file",
-		"  clean [repo-path] [--vacuum]",
-	} {
-		fmt.Fprintln(w, line)
+	fmt.Fprintln(w, "codegraph commands:")
+	for _, cmd := range commandList {
+		lines := cmd.usageLines
+		if len(lines) == 0 {
+			lines = []string{"  " + cmd.name}
+		}
+		for i, line := range lines {
+			if i == 0 && cmd.description != "" {
+				fmt.Fprintf(w, "%s  - %s\n", line, cmd.description)
+				continue
+			}
+			fmt.Fprintln(w, line)
+		}
 	}
 }
