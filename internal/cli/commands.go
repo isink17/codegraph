@@ -119,6 +119,7 @@ func newCommandList() []*command {
 			description: "index a repository",
 			usageLines:  []string{"  index <repo-path>"},
 			flags: []commandFlag{
+				{name: "--force", description: "re-index files even if unchanged"},
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
 			},
 			examples: []string{
@@ -135,6 +136,7 @@ func newCommandList() []*command {
 			description: "update only changed files",
 			usageLines:  []string{"  update_graph <repo-path>"},
 			flags: []commandFlag{
+				{name: "--force", description: "re-index files even if unchanged"},
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
 			},
 			examples: []string{

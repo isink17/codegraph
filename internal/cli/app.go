@@ -456,6 +456,7 @@ func runInstall(stdout io.Writer) error {
 func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string, update bool) error {
 	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	force := fs.Bool("force", false, "re-index files even if unchanged")
 	jsonl := false
 	filtered := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -478,7 +479,7 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	}
 	defer app.Close()
 	_ = repo
-	opts := indexer.Options{RepoRoot: repo.RootPath}
+	opts := indexer.Options{RepoRoot: repo.RootPath, Force: *force}
 	var summary store.ScanSummary
 	if update {
 		opts.ScanKind = "update"
@@ -502,6 +503,21 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 		}); err != nil {
 			return err
 		}
+		_ = writeJSONL(stdout, map[string]any{
+			"type": "scan_phases",
+			"data": map[string]any{
+				"existing_load_ms":  summary.ExistingLoadMS,
+				"walk_ms":           summary.WalkMS,
+				"process_wall_ms":   summary.ProcessWallMS,
+				"write_ms":          summary.WriteMS,
+				"write_metadata_ms": summary.WriteMetadataMS,
+				"write_replace_ms":  summary.WriteReplaceMS,
+				"embed_ms":          summary.EmbedMS,
+				"mark_missing_ms":   summary.MarkMissingMS,
+				"resolve_ms":        summary.ResolveMS,
+				"duration_ms":       summary.DurationMS,
+			},
+		})
 		return writeJSONL(stdout, map[string]any{
 			"type": "scan_stats",
 			"data": stats,
