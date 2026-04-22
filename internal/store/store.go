@@ -1246,7 +1246,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, repoID int64) (in
 		if slash < 0 || slash+1 >= len(qname) {
 			continue
 		}
-		suffix := qname[slash+1:]
+		suffix := strings.Clone(qname[slash+1:])
 		if suffix == "" {
 			continue
 		}
