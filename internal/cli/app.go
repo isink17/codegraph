@@ -530,8 +530,8 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	return writeJSON(stdout, stats)
 }
 
-func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, command string, args []string) error {
-	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, queryKind, cmdName string, args []string) error {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoRootFlag := fs.String("repo-root", "", "repository root")
 	queryFlag := fs.String("query", "", "query text")
@@ -573,10 +573,10 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 	}
 	defer app.Close()
 
-	switch command {
+	switch queryKind {
 	case "find-symbol":
 		if queryValue == "" {
-			return errors.New("usage: codegraph find-symbol <repo-path> <query> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindSymbol(ctx, repoID, queryValue, *limit, *offset)
 		if err != nil {
@@ -585,7 +585,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		return writeJSON(stdout, map[string]any{"matches": items})
 	case "search":
 		if queryValue == "" {
-			return errors.New("usage: codegraph search <repo-path> <query> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.SearchSymbols(ctx, repoID, queryValue, *limit, *offset)
 		if err != nil {
@@ -594,7 +594,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		return writeJSON(stdout, map[string]any{"matches": items})
 	case "callers":
 		if symbol == "" {
-			return errors.New("usage: codegraph callers <repo-path> --symbol <name> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> --symbol <name> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindCallers(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
@@ -603,7 +603,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		return writeJSON(stdout, map[string]any{"callers": items})
 	case "callees":
 		if symbol == "" {
-			return errors.New("usage: codegraph callees <repo-path> --symbol <name> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> --symbol <name> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindCallees(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
@@ -615,7 +615,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 			if symbol != "" {
 				symbols = append(symbols, symbol)
 			} else {
-				return errors.New("usage: codegraph impact <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]")
+				return fmt.Errorf("usage: %s %s <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]", appname.BinaryName, cmdName)
 			}
 		}
 		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, *depth)
@@ -624,7 +624,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		}
 		return writeJSON(stdout, data)
 	default:
-		return fmt.Errorf("unknown query command %q", command)
+		return fmt.Errorf("unknown query command %q", queryKind)
 	}
 }
 

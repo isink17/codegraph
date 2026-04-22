@@ -162,7 +162,7 @@ func newCommandList() []*command {
 				"codegraph find_symbol . HelloWorld",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "find-symbol", args)
+				return runQueryCommand(ctx, cfg, stdout, "find-symbol", "find_symbol", args)
 			},
 		},
 		{
@@ -179,7 +179,7 @@ func newCommandList() []*command {
 				"codegraph find_callers . --symbol HelloWorld",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "callers", args)
+				return runQueryCommand(ctx, cfg, stdout, "callers", "find_callers", args)
 			},
 		},
 		{
@@ -196,7 +196,7 @@ func newCommandList() []*command {
 				"codegraph find_callees . --symbol HelloWorld",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "callees", args)
+				return runQueryCommand(ctx, cfg, stdout, "callees", "find_callees", args)
 			},
 		},
 		{
@@ -214,7 +214,7 @@ func newCommandList() []*command {
 				"codegraph get_impact_radius . --file main.go",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "impact", args)
+				return runQueryCommand(ctx, cfg, stdout, "impact", "get_impact_radius", args)
 			},
 		},
 		{
@@ -222,7 +222,7 @@ func newCommandList() []*command {
 			description: "search",
 			usageLines:  []string{"  search <repo-path> <query>"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "search", args)
+				return runQueryCommand(ctx, cfg, stdout, "search", "search", args)
 			},
 		},
 		{
