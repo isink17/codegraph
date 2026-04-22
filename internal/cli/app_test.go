@@ -267,11 +267,11 @@ func TestRunHelpCommandWithSubcommand(t *testing.T) {
 
 	var out bytes.Buffer
 	var errOut bytes.Buffer
-	if err := Run(context.Background(), []string{"help", "index"}, &out, &errOut); err != nil {
-		t.Fatalf("Run(help index) error = %v", err)
+	if err := Run(context.Background(), []string{"help", "find_symbol"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(help find_symbol) error = %v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "index <repo-path>") {
-		t.Fatalf("help index output unexpected, output:\n%s", got)
+	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "find_symbol <repo-path> <query>") {
+		t.Fatalf("help find_symbol output unexpected, output:\n%s", got)
 	}
 }
 
@@ -284,11 +284,11 @@ func TestRunCommandHelpFlag(t *testing.T) {
 
 	var out bytes.Buffer
 	var errOut bytes.Buffer
-	if err := Run(context.Background(), []string{"find-symbol", ".", "--help"}, &out, &errOut); err != nil {
-		t.Fatalf("Run(find-symbol --help) error = %v", err)
+	if err := Run(context.Background(), []string{"find_symbol", ".", "--help"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(find_symbol --help) error = %v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "find-symbol <repo-path> <query>") {
-		t.Fatalf("find-symbol --help output unexpected, output:\n%s", got)
+	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "find_symbol <repo-path> <query>") {
+		t.Fatalf("find_symbol --help output unexpected, output:\n%s", got)
 	}
 }
 

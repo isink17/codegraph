@@ -150,50 +150,71 @@ func newCommandList() []*command {
 			},
 		},
 		{
-			name:        "find-symbol",
+			name:        "find_symbol",
+			aliases:     []string{"find-symbol"},
 			description: "find symbols by name",
-			usageLines:  []string{"  find-symbol <repo-path> <query>"},
+			usageLines:  []string{"  find_symbol <repo-path> <query>"},
 			flags: []commandFlag{
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
 			},
 			examples: []string{
-				"codegraph find-symbol . HelloWorld",
+				"codegraph find_symbol . HelloWorld",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "find-symbol", args)
+				return runQueryCommand(ctx, cfg, stdout, "find-symbol", "find_symbol", args)
 			},
 		},
 		{
-			name:        "callers",
+			name:        "find_callers",
+			aliases:     []string{"callers"},
 			description: "find callers of a symbol",
-			usageLines:  []string{"  callers <repo-path> --symbol <name>"},
+			usageLines:  []string{"  find_callers <repo-path> --symbol <name>"},
 			flags: []commandFlag{
 				{name: "--symbol", description: "symbol name to query (required)"},
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
 			},
 			examples: []string{
-				"codegraph callers . --symbol HelloWorld",
+				"codegraph find_callers . --symbol HelloWorld",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "callers", args)
+				return runQueryCommand(ctx, cfg, stdout, "callers", "find_callers", args)
 			},
 		},
 		{
-			name:        "callees",
+			name:        "find_callees",
+			aliases:     []string{"callees"},
 			description: "find callees of a symbol",
-			usageLines:  []string{"  callees <repo-path> --symbol <name>"},
+			usageLines:  []string{"  find_callees <repo-path> --symbol <name>"},
+			flags: []commandFlag{
+				{name: "--symbol", description: "symbol name to query (required)"},
+				{name: "--limit", description: "limit results"},
+				{name: "--offset", description: "offset into result set"},
+			},
+			examples: []string{
+				"codegraph find_callees . --symbol HelloWorld",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "callees", args)
+				return runQueryCommand(ctx, cfg, stdout, "callees", "find_callees", args)
 			},
 		},
 		{
-			name:        "impact",
+			name:        "get_impact_radius",
+			aliases:     []string{"impact"},
 			description: "compute impact radius",
-			usageLines:  []string{"  impact <repo-path> [--symbol <name>] [--file <path>]"},
+			usageLines:  []string{"  get_impact_radius <repo-path> [--symbol <name>] [--file <path>]"},
+			flags: []commandFlag{
+				{name: "--symbol", description: "symbol name to query"},
+				{name: "--file", description: "file path to query"},
+				{name: "--depth", description: "limit traversal depth"},
+			},
+			examples: []string{
+				"codegraph get_impact_radius . --symbol HelloWorld",
+				"codegraph get_impact_radius . --file main.go",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "impact", args)
+				return runQueryCommand(ctx, cfg, stdout, "impact", "get_impact_radius", args)
 			},
 		},
 		{
@@ -201,7 +222,7 @@ func newCommandList() []*command {
 			description: "search",
 			usageLines:  []string{"  search <repo-path> <query>"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "search", args)
+				return runQueryCommand(ctx, cfg, stdout, "search", "search", args)
 			},
 		},
 		{
