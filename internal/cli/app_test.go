@@ -232,6 +232,66 @@ func TestRunDoctorFix(t *testing.T) {
 	}
 }
 
+func TestRunRootHelp(t *testing.T) {
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	for _, args := range [][]string{
+		{},
+		{"--help"},
+		{"-h"},
+		{"help"},
+	} {
+		t.Run(strings.Join(append([]string{"root"}, args...), "_"), func(t *testing.T) {
+			var out bytes.Buffer
+			var errOut bytes.Buffer
+			if err := Run(context.Background(), args, &out, &errOut); err != nil {
+				t.Fatalf("Run(%v) error = %v", args, err)
+			}
+			if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "Commands:") {
+				t.Fatalf("help output missing sections, output:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestRunHelpCommandWithSubcommand(t *testing.T) {
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"help", "index"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(help index) error = %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "index <repo-path>") {
+		t.Fatalf("help index output unexpected, output:\n%s", got)
+	}
+}
+
+func TestRunCommandHelpFlag(t *testing.T) {
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"find-symbol", ".", "--help"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(find-symbol --help) error = %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "find-symbol <repo-path> <query>") {
+		t.Fatalf("find-symbol --help output unexpected, output:\n%s", got)
+	}
+}
+
 func TestParseBenchmarkMetrics(t *testing.T) {
 	output := `
 goos: windows

@@ -50,8 +50,8 @@ func (s *stringListFlag) Set(value string) error {
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	startupVersionCheck(ctx, stderr)
 
-	if len(args) == 0 {
-		printUsage(stdout)
+	if len(args) == 0 || isRootHelpFlag(args[0]) {
+		printRootHelp(stdout)
 		return nil
 	}
 
@@ -67,7 +67,38 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 
-	return cmd.run(ctx, globalCfg, stdout, stderr, args[1:])
+	// Per-command help: `codegraph <command> --help|-h`.
+	if hasHelpFlag(args[1:]) {
+		printCommandHelp(stdout, cmd)
+		return nil
+	}
+
+	if err := cmd.run(ctx, globalCfg, stdout, stderr, args[1:]); err != nil {
+		// Treat user-invoked flag help as success (handlers may return flag.ErrHelp).
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func isRootHelpFlag(arg string) bool {
+	switch arg {
+	case "-h", "--help":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, a := range args {
+		if isRootHelpFlag(a) {
+			return true
+		}
+	}
+	return false
 }
 
 func runDoctor(stdout io.Writer, args []string) error {
@@ -1133,18 +1164,66 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "codegraph commands:")
-	for _, cmd := range commandList {
-		lines := cmd.usageLines
-		if len(lines) == 0 {
-			lines = []string{"  " + cmd.name}
+	printRootHelp(w)
+}
+
+func printRootHelp(w io.Writer) {
+	fmt.Fprintf(w, "%s - local-first code context engine and MCP server\n\n", appname.BinaryName)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintf(w, "  %s <command> [args]\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s --help\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s help\n\n", appname.BinaryName)
+
+	fmt.Fprintln(w, "Commands:")
+	for _, cmd := range commands() {
+		synopsis := cmd.name
+		if len(cmd.usageLines) > 0 {
+			synopsis = strings.TrimSpace(cmd.usageLines[0])
 		}
-		for i, line := range lines {
-			if i == 0 && cmd.description != "" {
-				fmt.Fprintf(w, "%s  - %s\n", line, cmd.description)
-				continue
-			}
+		if cmd.description != "" {
+			fmt.Fprintf(w, "  %s  - %s\n", synopsis, cmd.description)
+		} else {
+			fmt.Fprintf(w, "  %s\n", synopsis)
+		}
+	}
+
+	fmt.Fprintln(w, "\nExamples:")
+	fmt.Fprintf(w, "  %s help index\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s index .\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s stats .\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s serve --repo-root .\n", appname.BinaryName)
+}
+
+func printCommandHelp(w io.Writer, cmd *command) {
+	fmt.Fprintf(w, "%s %s\n", appname.BinaryName, cmd.name)
+	if cmd.description != "" {
+		fmt.Fprintf(w, "%s\n", cmd.description)
+	}
+
+	fmt.Fprintln(w, "\nUsage:")
+	if len(cmd.usageLines) > 0 {
+		for _, line := range cmd.usageLines {
 			fmt.Fprintln(w, line)
+		}
+	} else {
+		fmt.Fprintf(w, "  %s %s\n", appname.BinaryName, cmd.name)
+	}
+
+	if len(cmd.flags) > 0 {
+		fmt.Fprintln(w, "\nFlags:")
+		for _, f := range cmd.flags {
+			if f.description != "" {
+				fmt.Fprintf(w, "  %s  - %s\n", f.name, f.description)
+			} else {
+				fmt.Fprintf(w, "  %s\n", f.name)
+			}
+		}
+	}
+
+	if len(cmd.examples) > 0 {
+		fmt.Fprintln(w, "\nExamples:")
+		for _, ex := range cmd.examples {
+			fmt.Fprintf(w, "  %s\n", ex)
 		}
 	}
 }
