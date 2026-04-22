@@ -671,7 +671,7 @@ func (s *Store) MarkFilesParseFailedBatch(ctx context.Context, repoID, scanID in
 }
 
 func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string, parsed graph.ParsedFile) error {
-	return s.ReplaceFileGraphsBatch(ctx, repoID, scanID, []ReplaceFileGraphInput{{
+	_, err := s.ReplaceFileGraphsBatch(ctx, repoID, scanID, []ReplaceFileGraphInput{{
 		Path:        path,
 		Language:    language,
 		SizeBytes:   sizeBytes,
@@ -679,15 +679,16 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 		ContentHash: contentHash,
 		Parsed:      parsed,
 	}})
+	return err
 }
 
-func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput) error {
+func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput) ([]int64, error) {
 	if len(inputs) == 0 {
-		return nil
+		return nil, nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	upsertFileStmt, err := tx.PrepareContext(ctx, `
@@ -706,28 +707,34 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer upsertFileStmt.Close()
 
 	selectFileIDStmt, err := tx.PrepareContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer selectFileIDStmt.Close()
 
-	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_tokens WHERE symbol_id = ?`)
+	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `
+		DELETE FROM symbol_tokens
+		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
+	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer deleteSymbolTokensStmt.Close()
 
-	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_fts WHERE symbol_id = ?`)
+	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `
+		DELETE FROM symbol_fts
+		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
+	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer deleteSymbolFTSStmt.Close()
 
@@ -737,7 +744,7 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertSymbolStmt.Close()
 
@@ -747,14 +754,14 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertSymbolFTSStmt.Close()
 
 	insertSymbolTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO symbol_tokens(symbol_id, token, weight) VALUES(?, ?, ?)`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertSymbolTokenStmt.Close()
 
@@ -764,7 +771,7 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertReferenceStmt.Close()
 
@@ -774,21 +781,21 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertEdgeStmt.Close()
 
 	insertImportStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_imports(repo_id, file_id, import_path) VALUES(?, ?, ?)`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertImportStmt.Close()
 
 	insertFileTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_tokens(file_id, token, weight) VALUES(?, ?, ?)`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertFileTokenStmt.Close()
 
@@ -798,25 +805,27 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 	defer insertTestLinkStmt.Close()
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	fileIDs := make([]int64, 0, len(inputs))
 	for _, input := range inputs {
 		if _, err := upsertFileStmt.ExecContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now); err != nil {
 			_ = tx.Rollback()
-			return err
+			return nil, err
 		}
 		var fileID int64
 		if err := selectFileIDStmt.QueryRowContext(ctx, repoID, input.Path).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
-			return err
+			return nil, err
 		}
 		if err := deleteFileGraphWithStmts(ctx, tx, fileID, deleteSymbolTokensStmt, deleteSymbolFTSStmt); err != nil {
 			_ = tx.Rollback()
-			return err
+			return nil, err
 		}
+		fileIDs = append(fileIDs, fileID)
 		if err := insertParsedFileGraph(
 			ctx,
 			tx,
@@ -833,39 +842,30 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 			insertTestLinkStmt,
 		); err != nil {
 			_ = tx.Rollback()
-			return err
+			return nil, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return fileIDs, nil
 }
 
 func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM symbols WHERE file_id = ?`, fileID)
-	if err != nil {
-		return err
-	}
-	var symbolIDs []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		symbolIDs = append(symbolIDs, id)
-	}
-	_ = rows.Close()
-
-	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_tokens WHERE symbol_id = ?`)
+	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `
+		DELETE FROM symbol_tokens
+		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
+	`)
 	if err != nil {
 		return err
 	}
 	defer deleteSymbolTokensStmt.Close()
 
-	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_fts WHERE symbol_id = ?`)
+	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `
+		DELETE FROM symbol_fts
+		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
+	`)
 	if err != nil {
 		return err
 	}
@@ -875,28 +875,11 @@ func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
 }
 
 func deleteFileGraphWithStmts(ctx context.Context, tx *sql.Tx, fileID int64, deleteSymbolTokensStmt, deleteSymbolFTSStmt *sql.Stmt) error {
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM symbols WHERE file_id = ?`, fileID)
-	if err != nil {
+	if _, err := deleteSymbolTokensStmt.ExecContext(ctx, fileID); err != nil {
 		return err
 	}
-	var symbolIDs []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		symbolIDs = append(symbolIDs, id)
-	}
-	_ = rows.Close()
-
-	for _, symbolID := range symbolIDs {
-		if _, err := deleteSymbolTokensStmt.ExecContext(ctx, symbolID); err != nil {
-			return err
-		}
-		if _, err := deleteSymbolFTSStmt.ExecContext(ctx, symbolID); err != nil {
-			return err
-		}
+	if _, err := deleteSymbolFTSStmt.ExecContext(ctx, fileID); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE file_id = ?`, fileID); err != nil {
 		return err

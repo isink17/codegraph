@@ -269,12 +269,17 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if len(replaceBatch) == 0 {
 			return nil
 		}
-		if err := i.store.ReplaceFileGraphsBatch(ctx, repo.ID, scanID, replaceBatch); err != nil {
+		fileIDs, err := i.store.ReplaceFileGraphsBatch(ctx, repo.ID, scanID, replaceBatch)
+		if err != nil {
 			return err
 		}
 		if !embedding.IsNoop(i.embedder) {
-			for _, input := range replaceBatch {
-				i.embedFileSymbols(ctx, repo.ID, input.Path, input.Parsed)
+			for idx, input := range replaceBatch {
+				fileID := int64(0)
+				if idx < len(fileIDs) {
+					fileID = fileIDs[idx]
+				}
+				i.embedFileSymbolsWithFileID(ctx, repo.ID, fileID, input.Parsed)
 			}
 		}
 		replaceBatch = replaceBatch[:0]
@@ -708,6 +713,34 @@ func (i *Indexer) embedFileSymbols(ctx context.Context, repoID int64, relPath st
 	fileID, err := i.store.FileIDByPath(ctx, repoID, relPath)
 	if err != nil || fileID == 0 {
 		return
+	}
+
+	symbolMap := make(map[string][]float32, len(keys))
+	for j, key := range keys {
+		if vectors[j] != nil {
+			symbolMap[key] = vectors[j]
+		}
+	}
+	if len(symbolMap) > 0 {
+		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
+	}
+}
+
+func (i *Indexer) embedFileSymbolsWithFileID(ctx context.Context, repoID int64, fileID int64, parsed graph.ParsedFile) {
+	if len(parsed.Symbols) == 0 || fileID == 0 {
+		return
+	}
+
+	texts := make([]string, len(parsed.Symbols))
+	keys := make([]string, len(parsed.Symbols))
+	for j, sym := range parsed.Symbols {
+		texts[j] = embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary)
+		keys[j] = sym.StableKey
+	}
+
+	vectors, err := i.embedder.EmbedBatch(ctx, texts)
+	if err != nil {
+		return // best-effort: don't fail indexing on embedding errors
 	}
 
 	symbolMap := make(map[string][]float32, len(keys))
