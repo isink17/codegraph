@@ -152,14 +152,16 @@ func newCommandList() []*command {
 		{
 			name:        "find_symbol",
 			aliases:     []string{"find-symbol"},
-			description: "find symbols by name",
+			description: "find symbols by name (substring match by default)",
 			usageLines:  []string{"  find_symbol <repo-path> <query>"},
 			flags: []commandFlag{
+				{name: "--exact", description: "match symbol name exactly"},
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
 			},
 			examples: []string{
 				"codegraph find_symbol . HelloWorld",
+				"codegraph find_symbol . HelloWorld --exact",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runQueryCommand(ctx, cfg, stdout, "find-symbol", "find_symbol", args)
