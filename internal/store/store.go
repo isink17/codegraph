@@ -166,10 +166,13 @@ func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA busy_timeout = 5000;`,
 		`PRAGMA foreign_keys = ON;`,
-		`PRAGMA auto_vacuum = INCREMENTAL;`,
 		`PRAGMA cache_size = -65536;`,
 	}
 	if isNewDB {
+		// auto_vacuum is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, switching auto_vacuum requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `PRAGMA auto_vacuum = INCREMENTAL;`)
+
 		// page_size is only reliably applied for a brand-new DB before any tables are created.
 		// For existing DBs, changing page_size requires VACUUM; we avoid doing that implicitly.
 		base = append(base, `PRAGMA page_size = 8192;`)
@@ -1187,7 +1190,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.name = edges.dst_name AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface'))
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		totalResolved += int(n)
@@ -1197,7 +1200,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	// Avoid per-edge LIKE scans by precomputing (tail -> symbol_id) once, then doing an indexed equality update.
 	n, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	totalResolved += n
 
@@ -1218,7 +1221,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		)
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		totalResolved += int(n)
@@ -1240,7 +1243,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		)
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		totalResolved += int(n)
