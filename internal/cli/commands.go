@@ -171,13 +171,14 @@ func newCommandList() []*command {
 			name:        "find_callers",
 			aliases:     []string{"callers"},
 			description: "find callers of a symbol",
-			usageLines:  []string{"  find_callers <repo-path> --symbol <name>"},
+			usageLines:  []string{"  find_callers <repo-path> <symbol>"},
 			flags: []commandFlag{
-				{name: "--symbol", description: "symbol name to query (required)"},
+				{name: "--symbol", description: "symbol name to query (repeatable; first wins)"},
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
 			},
 			examples: []string{
+				"codegraph find_callers . HelloWorld",
 				"codegraph find_callers . --symbol HelloWorld",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
@@ -188,13 +189,14 @@ func newCommandList() []*command {
 			name:        "find_callees",
 			aliases:     []string{"callees"},
 			description: "find callees of a symbol",
-			usageLines:  []string{"  find_callees <repo-path> --symbol <name>"},
+			usageLines:  []string{"  find_callees <repo-path> <symbol>"},
 			flags: []commandFlag{
-				{name: "--symbol", description: "symbol name to query (required)"},
+				{name: "--symbol", description: "symbol name to query (repeatable; first wins)"},
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
 			},
 			examples: []string{
+				"codegraph find_callees . HelloWorld",
 				"codegraph find_callees . --symbol HelloWorld",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
