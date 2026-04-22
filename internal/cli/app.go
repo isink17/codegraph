@@ -67,7 +67,20 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 
-	return cmd.run(ctx, globalCfg, stdout, stderr, args[1:])
+	// Per-command help: `codegraph <command> --help|-h`.
+	if hasHelpFlag(args[1:]) {
+		printCommandHelp(stdout, cmd)
+		return nil
+	}
+
+	if err := cmd.run(ctx, globalCfg, stdout, stderr, args[1:]); err != nil {
+		// Treat user-invoked flag help as success (handlers may return flag.ErrHelp).
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func isRootHelpFlag(arg string) bool {
@@ -77,6 +90,15 @@ func isRootHelpFlag(arg string) bool {
 	default:
 		return false
 	}
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, a := range args {
+		if isRootHelpFlag(a) {
+			return true
+		}
+	}
+	return false
 }
 
 func runDoctor(stdout io.Writer, args []string) error {
@@ -508,8 +530,8 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	return writeJSON(stdout, stats)
 }
 
-func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, command string, args []string) error {
-	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, queryKind, cmdName string, args []string) error {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoRootFlag := fs.String("repo-root", "", "repository root")
 	queryFlag := fs.String("query", "", "query text")
@@ -551,10 +573,10 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 	}
 	defer app.Close()
 
-	switch command {
+	switch queryKind {
 	case "find-symbol":
 		if queryValue == "" {
-			return errors.New("usage: codegraph find-symbol <repo-path> <query> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindSymbol(ctx, repoID, queryValue, *limit, *offset)
 		if err != nil {
@@ -563,7 +585,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		return writeJSON(stdout, map[string]any{"matches": items})
 	case "search":
 		if queryValue == "" {
-			return errors.New("usage: codegraph search <repo-path> <query> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.SearchSymbols(ctx, repoID, queryValue, *limit, *offset)
 		if err != nil {
@@ -572,7 +594,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		return writeJSON(stdout, map[string]any{"matches": items})
 	case "callers":
 		if symbol == "" {
-			return errors.New("usage: codegraph callers <repo-path> --symbol <name> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> --symbol <name> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindCallers(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
@@ -581,7 +603,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		return writeJSON(stdout, map[string]any{"callers": items})
 	case "callees":
 		if symbol == "" {
-			return errors.New("usage: codegraph callees <repo-path> --symbol <name> [--limit N] [--offset N]")
+			return fmt.Errorf("usage: %s %s <repo-path> --symbol <name> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindCallees(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
@@ -593,7 +615,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 			if symbol != "" {
 				symbols = append(symbols, symbol)
 			} else {
-				return errors.New("usage: codegraph impact <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]")
+				return fmt.Errorf("usage: %s %s <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]", appname.BinaryName, cmdName)
 			}
 		}
 		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, *depth)
@@ -602,7 +624,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, c
 		}
 		return writeJSON(stdout, data)
 	default:
-		return fmt.Errorf("unknown query command %q", command)
+		return fmt.Errorf("unknown query command %q", queryKind)
 	}
 }
 
@@ -1166,9 +1188,43 @@ func printRootHelp(w io.Writer) {
 	}
 
 	fmt.Fprintln(w, "\nExamples:")
-	fmt.Fprintf(w, "  %s install\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s help index\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s index .\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s stats .\n", appname.BinaryName)
-	fmt.Fprintf(w, "  %s find-symbol . MySymbol\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s find_symbol . MySymbol\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s serve --repo-root .\n", appname.BinaryName)
+}
+
+func printCommandHelp(w io.Writer, cmd *command) {
+	fmt.Fprintf(w, "%s %s\n", appname.BinaryName, cmd.name)
+	if cmd.description != "" {
+		fmt.Fprintf(w, "%s\n", cmd.description)
+	}
+
+	fmt.Fprintln(w, "\nUsage:")
+	if len(cmd.usageLines) > 0 {
+		for _, line := range cmd.usageLines {
+			fmt.Fprintln(w, line)
+		}
+	} else {
+		fmt.Fprintf(w, "  %s %s\n", appname.BinaryName, cmd.name)
+	}
+
+	if len(cmd.flags) > 0 {
+		fmt.Fprintln(w, "\nFlags:")
+		for _, f := range cmd.flags {
+			if f.description != "" {
+				fmt.Fprintf(w, "  %s  - %s\n", f.name, f.description)
+			} else {
+				fmt.Fprintf(w, "  %s\n", f.name)
+			}
+		}
+	}
+
+	if len(cmd.examples) > 0 {
+		fmt.Fprintln(w, "\nExamples:")
+		for _, ex := range cmd.examples {
+			fmt.Fprintf(w, "  %s\n", ex)
+		}
+	}
 }

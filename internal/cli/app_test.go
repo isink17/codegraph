@@ -232,7 +232,7 @@ func TestRunDoctorFix(t *testing.T) {
 	}
 }
 
-func TestRunRootHelpFlagsAndCommand(t *testing.T) {
+func TestRunRootHelp(t *testing.T) {
 	prev := startupVersionCheck
 	startupVersionCheck = func(context.Context, io.Writer) {}
 	t.Cleanup(func() {
@@ -257,7 +257,7 @@ func TestRunRootHelpFlagsAndCommand(t *testing.T) {
 	}
 }
 
-func TestRunHelpCommand(t *testing.T) {
+func TestRunHelpCommandWithSubcommand(t *testing.T) {
 	prev := startupVersionCheck
 	startupVersionCheck = func(context.Context, io.Writer) {}
 	t.Cleanup(func() {
@@ -266,11 +266,28 @@ func TestRunHelpCommand(t *testing.T) {
 
 	var out bytes.Buffer
 	var errOut bytes.Buffer
-	if err := Run(context.Background(), []string{"help"}, &out, &errOut); err != nil {
-		t.Fatalf("Run(help) error = %v", err)
+	if err := Run(context.Background(), []string{"help", "find_symbol"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(help find_symbol) error = %v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "Commands:") {
-		t.Fatalf("help output missing sections, output:\n%s", got)
+	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "find_symbol <repo-path> <query>") {
+		t.Fatalf("help find_symbol output unexpected, output:\n%s", got)
+	}
+}
+
+func TestRunCommandHelpFlag(t *testing.T) {
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"find_symbol", ".", "--help"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(find_symbol --help) error = %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "find_symbol <repo-path> <query>") {
+		t.Fatalf("find_symbol --help output unexpected, output:\n%s", got)
 	}
 }
 
