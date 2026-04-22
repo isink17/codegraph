@@ -786,7 +786,8 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 
 func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
 	usage := func() error {
-		return fmt.Errorf("usage: %s graph export <repo-path> [--format json|dot] [--symbol name] [--limit N] [--offset N] [--jsonl]", appname.BinaryName)
+		// `flag` stops parsing at the first non-flag arg, so flags must come before <repo-path>.
+		return fmt.Errorf("usage: %s graph export [--format json|dot] [--symbol name] [--focus-symbol name] [--limit N] [--offset N] [--jsonl] <repo-path>", appname.BinaryName)
 	}
 	if len(args) == 0 {
 		return usage()
