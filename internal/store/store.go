@@ -53,6 +53,9 @@ const (
 	// sqliteImportValuesBatchRows controls multi-row inserts into file_imports where each row uses 3 parameters.
 	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteImportValuesBatchRows = 300
+	// sqliteTestLinkValuesBatchRows controls multi-row inserts into test_links where each row uses 6 parameters.
+	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteTestLinkValuesBatchRows = 150
 )
 
 type Store struct {
@@ -793,16 +796,6 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	}
 	defer insertSymbolFTSStmt.Close()
 
-	insertTestLinkStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score)
-		VALUES(?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertTestLinkStmt.Close()
-
 	now := time.Now().UTC().Format(time.RFC3339)
 	fileIDs := make([]int64, 0, len(inputs))
 	for _, input := range inputs {
@@ -829,7 +822,6 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 			input.Parsed,
 			insertSymbolStmt,
 			insertSymbolFTSStmt,
-			insertTestLinkStmt,
 		); err != nil {
 			_ = tx.Rollback()
 			return nil, err
@@ -967,7 +959,6 @@ func insertParsedFileGraph(
 	parsed graph.ParsedFile,
 	insertSymbolStmt *sql.Stmt,
 	insertSymbolFTSStmt *sql.Stmt,
-	insertTestLinkStmt *sql.Stmt,
 ) error {
 	stableToID := map[string]int64{}
 	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
@@ -1110,17 +1101,29 @@ func insertParsedFileGraph(
 	if err != nil {
 		return err
 	}
-	for _, link := range parsed.TestLinks {
-		var testSymbolID any
-		var targetSymbolID any
-		if id := stableToID[link.TestSymbolKey]; id != 0 {
-			testSymbolID = id
+	if len(parsed.TestLinks) > 0 {
+		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*6)
+		for _, link := range parsed.TestLinks {
+			var testSymbolID any
+			var targetSymbolID any
+			if id := stableToID[link.TestSymbolKey]; id != 0 {
+				testSymbolID = id
+			}
+			if id, ok := targetStableToID[link.TargetStableKey]; ok {
+				targetSymbolID = id
+			}
+			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score)
+			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*6 {
+				if err := execTestLinksInsert(ctx, tx, testLinkArgs); err != nil {
+					return err
+				}
+				testLinkArgs = testLinkArgs[:0]
+			}
 		}
-		if id, ok := targetStableToID[link.TargetStableKey]; ok {
-			targetSymbolID = id
-		}
-		if _, err := insertTestLinkStmt.ExecContext(ctx, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score); err != nil {
-			return err
+		if len(testLinkArgs) > 0 {
+			if err := execTestLinksInsert(ctx, tx, testLinkArgs); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1180,6 +1183,10 @@ func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
 
 func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
 	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args)
+}
+
+func execTestLinksInsert(ctx context.Context, tx *sql.Tx, args []any) error {
+	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score", 6, args)
 }
 
 func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any) error {
