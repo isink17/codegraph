@@ -449,8 +449,8 @@ func runInstall(stdout io.Writer) error {
 	return nil
 }
 
-func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, args []string, update bool) error {
-	fs := flag.NewFlagSet("index", flag.ContinueOnError)
+func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string, update bool) error {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	jsonl := false
 	filtered := make([]string, 0, len(args))
@@ -610,7 +610,13 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		return writeJSON(stdout, map[string]any{"matches": items})
+		if items == nil {
+			items = []graph.Symbol{}
+		}
+		return writeJSON(stdout, map[string]any{
+			"matches": items,
+			"count":   len(items),
+		})
 	case "callers":
 		if symbol == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
@@ -1178,9 +1184,12 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 	}
 
 	if *jsonFlag {
+		if tests == nil {
+			tests = []store.RelatedTest{}
+		}
 		return writeJSON(stdout, map[string]any{
 			"affected_tests": tests,
-			"total":          len(tests),
+			"count":          len(tests),
 		})
 	}
 
