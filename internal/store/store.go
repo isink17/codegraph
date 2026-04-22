@@ -1147,67 +1147,43 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 	return err
 }
 
-func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
+func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, rowsPerBatch int, args []any) error {
 	if len(args) == 0 {
 		return nil
 	}
-	// Each row uses 11 params; batch sizes are controlled by sqliteReferenceValuesBatchRows to stay under sqliteDefaultMaxVariables.
-	if len(args)%11 != 0 {
-		return fmt.Errorf("invalid references insert args len=%d", len(args))
+	if len(args)%rowsPerBatch != 0 {
+		return fmt.Errorf("invalid %s insert args len=%d (expected multiple of %d)", table, len(args), rowsPerBatch)
 	}
-	rows := len(args) / 11
+	rowCount := len(args) / rowsPerBatch
 	var b strings.Builder
-	b.WriteString("INSERT INTO references_tbl(repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id) VALUES ")
-	for i := 0; i < rows; i++ {
+	fmt.Fprintf(&b, "INSERT INTO %s(%s) VALUES ", table, columns)
+	for i := 0; i < rowCount; i++ {
 		if i > 0 {
 			b.WriteString(",")
 		}
-		b.WriteString("(?,?,?,?,?,?,?,?,?,?,?)")
+		b.WriteString("(")
+		for j := 0; j < rowsPerBatch; j++ {
+			if j > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("?")
+		}
+		b.WriteString(")")
 	}
 	_, err := tx.ExecContext(ctx, b.String(), args...)
 	return err
+}
+
+func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
+	return execBatchInsert(ctx, tx, "references_tbl", "repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id", 11, args)
 }
 
 func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
-	if len(args) == 0 {
-		return nil
-	}
-	// Each row uses 7 params; batch sizes are controlled by sqliteEdgeValuesBatchRows to stay under sqliteDefaultMaxVariables.
-	if len(args)%7 != 0 {
-		return fmt.Errorf("invalid edges insert args len=%d", len(args))
-	}
-	rows := len(args) / 7
-	var b strings.Builder
-	b.WriteString("INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line) VALUES ")
-	for i := 0; i < rows; i++ {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("(?,?,?,?,?,?,?)")
-	}
-	_, err := tx.ExecContext(ctx, b.String(), args...)
-	return err
+	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args)
 }
 
 func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any) error {
-	if len(args) == 0 {
-		return nil
-	}
-	// Each row uses 3 params; batch sizes are controlled by sqliteImportValuesBatchRows to stay under sqliteDefaultMaxVariables.
-	if len(args)%3 != 0 {
-		return fmt.Errorf("invalid file_imports insert args len=%d", len(args))
-	}
-	rows := len(args) / 3
-	var b strings.Builder
-	b.WriteString("INSERT INTO file_imports(repo_id, file_id, import_path) VALUES ")
-	for i := 0; i < rows; i++ {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("(?,?,?)")
-	}
-	_, err := tx.ExecContext(ctx, b.String(), args...)
-	return err
+	return execBatchInsert(ctx, tx, "file_imports", "repo_id, file_id, import_path", 3, args)
 }
 
 func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 {
