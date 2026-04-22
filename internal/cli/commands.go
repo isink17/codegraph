@@ -127,7 +127,7 @@ func newCommandList() []*command {
 				"codegraph index . --jsonl",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runIndex(ctx, cfg, stdout, args, false)
+				return runIndex(ctx, cfg, stdout, "index", args, false)
 			},
 		},
 		{
@@ -143,7 +143,7 @@ func newCommandList() []*command {
 				"codegraph update_graph . --jsonl",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runIndex(ctx, cfg, stdout, args, true)
+				return runIndex(ctx, cfg, stdout, "update_graph", args, true)
 			},
 		},
 		{
