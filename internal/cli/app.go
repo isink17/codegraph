@@ -1262,8 +1262,9 @@ func formatCommandUsageLine(line, canonicalName, displayName string) string {
 		return line
 	}
 	// Only rewrite the top-level command token to match the invoked name.
-	if strings.HasPrefix(line, "  "+canonicalName) {
-		return "  " + displayName + line[len("  "+canonicalName):]
+	prefix := "  " + canonicalName
+	if line == prefix || strings.HasPrefix(line, prefix+" ") {
+		return "  " + displayName + line[len(prefix):]
 	}
 	return line
 }
