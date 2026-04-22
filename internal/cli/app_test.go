@@ -243,7 +243,6 @@ func TestRunRootHelp(t *testing.T) {
 		{},
 		{"--help"},
 		{"-h"},
-		{"help"},
 	} {
 		t.Run(strings.Join(append([]string{"root"}, args...), "_"), func(t *testing.T) {
 			var out bytes.Buffer

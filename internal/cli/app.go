@@ -1163,9 +1163,7 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 	return nil
 }
 
-func printUsage(w io.Writer) {
-	printRootHelp(w)
-}
+func printUsage(w io.Writer) { printRootHelp(w) }
 
 func printRootHelp(w io.Writer) {
 	fmt.Fprintf(w, "%s - local-first code context engine and MCP server\n\n", appname.BinaryName)
@@ -1176,6 +1174,8 @@ func printRootHelp(w io.Writer) {
 
 	fmt.Fprintln(w, "Commands:")
 	for _, cmd := range commands() {
+		// Use the first usage line as the synopsis so help stays stable even if
+		// additional notes exist below it (jsonl hints, etc.).
 		synopsis := cmd.name
 		if len(cmd.usageLines) > 0 {
 			synopsis = strings.TrimSpace(cmd.usageLines[0])
