@@ -50,8 +50,8 @@ func (s *stringListFlag) Set(value string) error {
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	startupVersionCheck(ctx, stderr)
 
-	if len(args) == 0 {
-		printUsage(stdout)
+	if len(args) == 0 || isRootHelpFlag(args[0]) {
+		printRootHelp(stdout)
 		return nil
 	}
 
@@ -68,6 +68,15 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	return cmd.run(ctx, globalCfg, stdout, stderr, args[1:])
+}
+
+func isRootHelpFlag(arg string) bool {
+	switch arg {
+	case "-h", "--help":
+		return true
+	default:
+		return false
+	}
 }
 
 func runDoctor(stdout io.Writer, args []string) error {
@@ -1132,19 +1141,34 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 	return nil
 }
 
-func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "codegraph commands:")
+func printUsage(w io.Writer) { printRootHelp(w) }
+
+func printRootHelp(w io.Writer) {
+	fmt.Fprintf(w, "%s - local-first code context engine and MCP server\n\n", appname.BinaryName)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintf(w, "  %s <command> [args]\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s --help\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s help\n\n", appname.BinaryName)
+
+	fmt.Fprintln(w, "Commands:")
 	for _, cmd := range commandList {
-		lines := cmd.usageLines
-		if len(lines) == 0 {
-			lines = []string{"  " + cmd.name}
+		// Use the first usage line as the synopsis so help stays stable even if
+		// additional notes exist below it (jsonl hints, etc.).
+		synopsis := cmd.name
+		if len(cmd.usageLines) > 0 {
+			synopsis = strings.TrimSpace(cmd.usageLines[0])
 		}
-		for i, line := range lines {
-			if i == 0 && cmd.description != "" {
-				fmt.Fprintf(w, "%s  - %s\n", line, cmd.description)
-				continue
-			}
-			fmt.Fprintln(w, line)
+		if cmd.description != "" {
+			fmt.Fprintf(w, "  %s  - %s\n", synopsis, cmd.description)
+		} else {
+			fmt.Fprintf(w, "  %s\n", synopsis)
 		}
 	}
+
+	fmt.Fprintln(w, "\nExamples:")
+	fmt.Fprintf(w, "  %s install\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s index .\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s stats .\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s find-symbol . MySymbol\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s serve --repo-root .\n", appname.BinaryName)
 }

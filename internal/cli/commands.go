@@ -62,6 +62,17 @@ func registerCommand(reg map[string]*command, c *command) {
 func newCommandList() []*command {
 	return []*command{
 		{
+			name:        "help",
+			description: "show help",
+			usageLines:  []string{"  help"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+				// Keep this minimal for now. Per-command help can be added later without
+				// changing the dispatch surface.
+				printRootHelp(stdout)
+				return nil
+			},
+		},
+		{
 			name:        "install",
 			description: "install codegraph",
 			usageLines:  []string{"  install"},

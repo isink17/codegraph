@@ -232,6 +232,48 @@ func TestRunDoctorFix(t *testing.T) {
 	}
 }
 
+func TestRunRootHelpFlagsAndCommand(t *testing.T) {
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	for _, args := range [][]string{
+		{},
+		{"--help"},
+		{"-h"},
+	} {
+		t.Run(strings.Join(append([]string{"root"}, args...), "_"), func(t *testing.T) {
+			var out bytes.Buffer
+			var errOut bytes.Buffer
+			if err := Run(context.Background(), args, &out, &errOut); err != nil {
+				t.Fatalf("Run(%v) error = %v", args, err)
+			}
+			if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "Commands:") {
+				t.Fatalf("help output missing sections, output:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestRunHelpCommand(t *testing.T) {
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"help"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(help) error = %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "Commands:") {
+		t.Fatalf("help output missing sections, output:\n%s", got)
+	}
+}
+
 func TestParseBenchmarkMetrics(t *testing.T) {
 	output := `
 goos: windows
