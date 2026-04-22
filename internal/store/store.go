@@ -3000,7 +3000,11 @@ func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, m
 		return nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+tx, err := s.db.BeginTx(ctx, nil)
+if err != nil {
+	return err
+}
+defer tx.Rollback()
 	if err != nil {
 		return err
 	}
