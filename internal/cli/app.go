@@ -118,7 +118,7 @@ func runDoctor(stdout io.Writer, args []string) error {
 
 func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: codegraph config <show|edit-path|validate|init>")
+		return fmt.Errorf("usage: %s config <show|edit-path|validate|init>", appname.BinaryName)
 	}
 	switch args[0] {
 	case "show":
@@ -139,6 +139,9 @@ func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 		return err
 	case "validate":
 		issues := validateConfig(cfg)
+		if issues == nil {
+			issues = []string{}
+		}
 		path, err := config.ConfigPath()
 		if err != nil {
 			return err
@@ -427,8 +430,8 @@ func runInstall(stdout io.Writer) error {
 }`)
 
 	// Always print manual snippets as a fallback / reference.
-	codexSnippet := "[mcp_servers.codegraph]\ncommand = \"codegraph\"\nargs = [\"serve\", \"--repo-root\", \"/absolute/path/to/repo\"]\nstartup_timeout_sec = 60"
-	clientSnippet := `{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--repo-root","/absolute/path/to/repo"]}}}`
+	codexSnippet := fmt.Sprintf("[mcp_servers.codegraph]\ncommand = %q\nargs = [\"serve\", \"--repo-root\", \"/absolute/path/to/repo\"]\nstartup_timeout_sec = 60", appname.BinaryName)
+	clientSnippet := fmt.Sprintf(`{"mcpServers":{"codegraph":{"command":%q,"args":["serve","--repo-root","/absolute/path/to/repo"]}}}`, appname.BinaryName)
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Manual MCP snippets (if auto-configure did not apply):")
 	fmt.Fprintln(stdout)
@@ -782,13 +785,16 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 }
 
 func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	usage := func() error {
+		return fmt.Errorf("usage: %s graph export <repo-path> [--format json|dot] [--symbol name] [--limit N] [--offset N] [--jsonl]", appname.BinaryName)
+	}
 	if len(args) == 0 {
-		return errors.New("usage: codegraph graph export <repo-path> [--format json|dot] [--symbol name] [--limit N] [--offset N] [--jsonl]")
+		return usage()
 	}
 	switch args[0] {
 	case "export":
 	default:
-		return errors.New("usage: codegraph graph export <repo-path> [--format json|dot] [--symbol name] [--limit N] [--offset N] [--jsonl]")
+		return usage()
 	}
 	fs := flag.NewFlagSet("graph export", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
