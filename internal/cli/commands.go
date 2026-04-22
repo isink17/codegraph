@@ -16,7 +16,8 @@ type command struct {
 	usageLines  []string
 	flags       []commandFlag
 	examples    []string
-	run         func(context.Context, config.Config, io.Writer, io.Writer, []string) error
+	// invokedName is the actual token the user typed (could be an alias).
+	run func(context.Context, config.Config, io.Writer, io.Writer, string, []string) error
 }
 
 type commandFlag struct {
@@ -50,11 +51,9 @@ func ensureCommandsInit() {
 
 func newCommandRegistry(cmds []*command) map[string]*command {
 	reg := map[string]*command{}
-
 	for _, c := range cmds {
 		registerCommand(reg, c)
 	}
-
 	return reg
 }
 
@@ -91,7 +90,7 @@ func newCommandList() []*command {
 				"codegraph help",
 				"codegraph help index",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				if len(args) == 0 {
 					printRootHelp(stdout)
 					return nil
@@ -100,7 +99,7 @@ func newCommandList() []*command {
 				if !ok {
 					return fmt.Errorf("unknown command %q", args[0])
 				}
-				printCommandHelp(stdout, cmd)
+				printCommandHelp(stdout, cmd, args[0])
 				return nil
 			},
 		},
@@ -111,7 +110,7 @@ func newCommandList() []*command {
 			examples: []string{
 				"codegraph install",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runInstall(stdout)
 			},
 		},
@@ -126,8 +125,8 @@ func newCommandList() []*command {
 				"codegraph index .",
 				"codegraph index . --jsonl",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runIndex(ctx, cfg, stdout, "index", args, false)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runIndex(ctx, cfg, stdout, invokedName, args, false)
 			},
 		},
 		{
@@ -142,15 +141,18 @@ func newCommandList() []*command {
 				"codegraph update_graph .",
 				"codegraph update_graph . --jsonl",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runIndex(ctx, cfg, stdout, "update_graph", args, true)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runIndex(ctx, cfg, stdout, invokedName, args, true)
 			},
 		},
 		{
 			name:        "stats",
 			description: "show index stats",
 			usageLines:  []string{"  stats <repo-path>"},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			examples: []string{
+				"codegraph stats .",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runStats(ctx, cfg, stdout, args)
 			},
 		},
@@ -168,8 +170,8 @@ func newCommandList() []*command {
 				"codegraph find_symbol . HelloWorld",
 				"codegraph find_symbol . HelloWorld --exact",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "find-symbol", "find_symbol", args)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runQueryCommand(ctx, cfg, stdout, "find-symbol", invokedName, args)
 			},
 		},
 		{
@@ -186,8 +188,8 @@ func newCommandList() []*command {
 				"codegraph find_callers . HelloWorld",
 				"codegraph find_callers . --symbol HelloWorld",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "callers", "find_callers", args)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runQueryCommand(ctx, cfg, stdout, "callers", invokedName, args)
 			},
 		},
 		{
@@ -204,8 +206,8 @@ func newCommandList() []*command {
 				"codegraph find_callees . HelloWorld",
 				"codegraph find_callees . --symbol HelloWorld",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "callees", "find_callees", args)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runQueryCommand(ctx, cfg, stdout, "callees", invokedName, args)
 			},
 		},
 		{
@@ -224,12 +226,10 @@ func newCommandList() []*command {
 			examples: []string{
 				"codegraph get_impact_radius . HelloWorld",
 				"codegraph get_impact_radius . --symbol HelloWorld",
-				"codegraph get_impact_radius . --symbol HelloWorld --symbol OtherFunc",
-				"codegraph get_impact_radius . --file main.go",
 				"codegraph get_impact_radius . --file main.go --depth 3",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "impact", "get_impact_radius", args)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runQueryCommand(ctx, cfg, stdout, "impact", invokedName, args)
 			},
 		},
 		{
@@ -245,8 +245,8 @@ func newCommandList() []*command {
 				"codegraph search_symbols . HelloWorld",
 				"codegraph search_symbols . \"http handler\"",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "search", "search_symbols", args)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runQueryCommand(ctx, cfg, stdout, "search", invokedName, args)
 			},
 		},
 		{
@@ -256,7 +256,7 @@ func newCommandList() []*command {
 				"  doctor",
 				"    add --fix for non-destructive autofixes",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runDoctor(stdout, args)
 			},
 		},
@@ -267,7 +267,7 @@ func newCommandList() []*command {
 				"  config <show|edit-path|validate|init>",
 				"    config init [--repo PATH] [--force]",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runConfig(cfg, stdout, args)
 			},
 		},
@@ -275,7 +275,7 @@ func newCommandList() []*command {
 			name:        "benchmark",
 			description: "benchmarks",
 			usageLines:  []string{"  benchmark [--count N] [--benchtime DURATION] [--save-baseline]"},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runBenchmark(ctx, stdout, args)
 			},
 		},
@@ -283,7 +283,7 @@ func newCommandList() []*command {
 			name:        "serve",
 			description: "start MCP server",
 			usageLines:  []string{"  serve --repo-root <repo-path>"},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runServe(ctx, cfg, stdout, stderr, args)
 			},
 		},
@@ -294,7 +294,7 @@ func newCommandList() []*command {
 				"  watch <repo-path>",
 				"    add --jsonl for streaming line-delimited JSON events",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runWatch(ctx, cfg, stdout, args)
 			},
 		},
@@ -315,7 +315,7 @@ func newCommandList() []*command {
 				"codegraph graph export --format dot .",
 				"codegraph graph export --symbol HelloWorld --limit 100 .",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runGraph(ctx, cfg, stdout, args)
 			},
 		},
@@ -330,7 +330,7 @@ func newCommandList() []*command {
 				"codegraph clean .",
 				"codegraph clean . --vacuum",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runClean(ctx, cfg, stdout, args)
 			},
 		},
@@ -345,8 +345,8 @@ func newCommandList() []*command {
 				"codegraph find_related_tests --repo-root . main.go",
 				"git diff --name-only | codegraph find_related_tests --stdin --repo-root .",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runAffectedTests(ctx, cfg, stdout, "find_related_tests", args)
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runAffectedTests(ctx, cfg, stdout, invokedName, args)
 			},
 		},
 		{
@@ -356,7 +356,7 @@ func newCommandList() []*command {
 				"  visualize [--repo-root PATH] [--symbol NAME] [--depth N] [--output FILE]",
 				"    interactive D3.js graph visualization; opens browser or writes HTML file",
 			},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runVisualize(ctx, cfg, stdout, args)
 			},
 		},
