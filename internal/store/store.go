@@ -1184,19 +1184,26 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if len(paths) == 0 {
 		return nil
 	}
-	const chunkSize = 300
-	targets := make([]edgeTarget, 0, len(paths))
-	seen := map[int64]struct{}{}
-	for start := 0; start < len(paths); start += chunkSize {
-		end := min(start+chunkSize, len(paths))
-		chunk := paths[start:end]
+	uniquePaths := make([]string, 0, len(paths))
+	seenPaths := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, ok := seenPaths[path]; ok {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		uniquePaths = append(uniquePaths, path)
+	}
+
+	const chunkSize = 400
+	fileIDs := make([]int64, 0, len(uniquePaths))
+	for start := 0; start < len(uniquePaths); start += chunkSize {
+		end := min(start+chunkSize, len(uniquePaths))
+		chunk := uniquePaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `
-			SELECT e.id, e.dst_name
-			FROM edges e
-			JOIN files f ON f.id = e.file_id
-			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND f.path IN (` + placeholders + `)
-		`
+		query := `SELECT id FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, path := range chunk {
@@ -1206,17 +1213,39 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		if err != nil {
 			return err
 		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			fileIDs = append(fileIDs, id)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+
+	targets := make([]edgeTarget, 0, len(fileIDs))
+	for start := 0; start < len(fileIDs); start += chunkSize {
+		end := min(start+chunkSize, len(fileIDs))
+		chunk := fileIDs[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
 		chunkTargets, err := scanEdgeTargets(rows)
 		if err != nil {
 			return err
 		}
-		for _, target := range chunkTargets {
-			if _, ok := seen[target.edgeID]; ok {
-				continue
-			}
-			seen[target.edgeID] = struct{}{}
-			targets = append(targets, target)
-		}
+		targets = append(targets, chunkTargets...)
 	}
 	return s.resolveEdgeTargets(ctx, repoID, targets)
 }
@@ -1276,17 +1305,15 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return err
 	}
 
+	type edgeResolution struct {
+		edgeID int64
+		dstID  int64
+	}
+	resolutions := make([]edgeResolution, 0, len(targets))
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	updateStmt, err := tx.PrepareContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer updateStmt.Close()
-
 	for _, target := range targets {
 		dstID, ok := byQualified[target.dstName]
 		if !ok {
@@ -1297,10 +1324,55 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if !ok || dstID == 0 {
 			continue
 		}
-		if _, err := updateStmt.ExecContext(ctx, dstID, target.edgeID); err != nil {
+		resolutions = append(resolutions, edgeResolution{edgeID: target.edgeID, dstID: dstID})
+	}
+
+	if len(resolutions) == 0 {
+		_ = tx.Rollback()
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_resolution(edge_id INTEGER PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_edge_resolution`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	// Keep well under SQLite's default variable limit (999).
+	const maxPairsPerInsert = 400
+	for start := 0; start < len(resolutions); start += maxPairsPerInsert {
+		end := min(start+maxPairsPerInsert, len(resolutions))
+		chunk := resolutions[start:end]
+		var b strings.Builder
+		b.WriteString(`INSERT INTO tmp_edge_resolution(edge_id, dst_symbol_id) VALUES `)
+		args := make([]any, 0, len(chunk)*2)
+		for i, r := range chunk {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?,?)")
+			args = append(args, r.edgeID, r.dstID)
+		}
+		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_edge_resolution t WHERE t.edge_id = edges.id)
+		WHERE edges.id IN (SELECT edge_id FROM tmp_edge_resolution)
+	`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_edge_resolution`); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
