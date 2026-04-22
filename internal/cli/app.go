@@ -642,12 +642,12 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 			"count":   len(items),
 		})
 	case "impact":
+		// Allow a positional symbol alongside --file, but do not override explicit --symbol flags.
+		if symbol != "" && len(symbols) == 0 {
+			symbols = append(symbols, symbol)
+		}
 		if len(symbols) == 0 && len(files) == 0 {
-			if symbol != "" {
-				symbols = append(symbols, symbol)
-			} else {
-				return fmt.Errorf("usage: %s %s <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]", appname.BinaryName, cmdName)
-			}
+			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--file <path>]... [--depth N]", appname.BinaryName, cmdName)
 		}
 		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, *depth)
 		if err != nil {
@@ -1131,8 +1131,8 @@ func writeJSONL(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
-	fs := flag.NewFlagSet("affected-tests", flag.ContinueOnError)
+func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string) error {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoRootFlag := fs.String("repo-root", "", "repository root")
 	stdinFlag := fs.Bool("stdin", false, "read file paths from stdin (one per line)")
@@ -1163,7 +1163,7 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 	files = append(files, fs.Args()...)
 
 	if len(files) == 0 {
-		return errors.New("usage: codegraph affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...")
+		return fmt.Errorf("usage: %s %s [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...", appname.BinaryName, cmdName)
 	}
 
 	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
