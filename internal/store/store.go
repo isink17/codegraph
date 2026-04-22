@@ -1221,6 +1221,10 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 			}
 			fileIDs = append(fileIDs, id)
 		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
 		if err := rows.Close(); err != nil {
 			return err
 		}
