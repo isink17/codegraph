@@ -284,11 +284,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	var writeMetadataMS int64
 	var writeReplaceMS int64
 	var embedMS int64
+	var batchFlushes int64
+	var totalReplacedFiles int64
 
 	flushMarkSeen := func() error {
 		if len(markSeenBatch) == 0 {
 			return nil
 		}
+		batchFlushes++
 		started := time.Now()
 		if err := i.store.MarkFilesSeenBatch(ctx, repo.ID, scanID, markSeenBatch); err != nil {
 			return err
@@ -301,6 +304,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if len(touchBatch) == 0 {
 			return nil
 		}
+		batchFlushes++
 		started := time.Now()
 		if err := i.store.TouchFilesMetadataBatch(ctx, repo.ID, scanID, touchBatch); err != nil {
 			return err
@@ -313,6 +317,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if len(parseFailedBatch) == 0 {
 			return nil
 		}
+		batchFlushes++
 		started := time.Now()
 		if err := i.store.MarkFilesParseFailedBatch(ctx, repo.ID, scanID, parseFailedBatch); err != nil {
 			return err
@@ -325,6 +330,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if len(replaceBatch) == 0 {
 			return nil
 		}
+		batchFlushes++
+		totalReplacedFiles += int64(len(replaceBatch))
 		started := time.Now()
 		fileIDs, err := i.store.ReplaceFileGraphsBatch(ctx, repo.ID, scanID, replaceBatch)
 		if err != nil {
