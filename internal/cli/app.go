@@ -1191,6 +1191,7 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintf(w, "  %s help index\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s index .\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s stats .\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s find_symbol . MySymbol\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s serve --repo-root .\n", appname.BinaryName)
 }
 
