@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/isink17/codegraph/internal/config"
 )
@@ -13,17 +14,38 @@ type command struct {
 	aliases     []string
 	description string
 	usageLines  []string
+	flags       []commandFlag
+	examples    []string
 	run         func(context.Context, config.Config, io.Writer, io.Writer, []string) error
 }
 
+type commandFlag struct {
+	name        string
+	description string
+}
+
 var (
-	commandList   = newCommandList()
-	commandByName = newCommandRegistry(commandList)
+	commandInitOnce sync.Once
+	commandList     []*command
+	commandByName   map[string]*command
 )
 
 func lookupCommand(name string) (*command, bool) {
+	ensureCommandsInit()
 	c, ok := commandByName[name]
 	return c, ok
+}
+
+func commands() []*command {
+	ensureCommandsInit()
+	return commandList
+}
+
+func ensureCommandsInit() {
+	commandInitOnce.Do(func() {
+		commandList = newCommandList()
+		commandByName = newCommandRegistry(commandList)
+	})
 }
 
 func newCommandRegistry(cmds []*command) map[string]*command {
@@ -62,9 +84,33 @@ func registerCommand(reg map[string]*command, c *command) {
 func newCommandList() []*command {
 	return []*command{
 		{
+			name:        "help",
+			description: "show help",
+			usageLines:  []string{"  help [command]"},
+			examples: []string{
+				"codegraph help",
+				"codegraph help index",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+				if len(args) == 0 {
+					printRootHelp(stdout)
+					return nil
+				}
+				cmd, ok := lookupCommand(args[0])
+				if !ok {
+					return fmt.Errorf("unknown command %q", args[0])
+				}
+				printCommandHelp(stdout, cmd)
+				return nil
+			},
+		},
+		{
 			name:        "install",
 			description: "install codegraph",
 			usageLines:  []string{"  install"},
+			examples: []string{
+				"codegraph install",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runInstall(stdout)
 			},
@@ -73,6 +119,13 @@ func newCommandList() []*command {
 			name:        "index",
 			description: "index a repository",
 			usageLines:  []string{"  index <repo-path>"},
+			flags: []commandFlag{
+				{name: "--jsonl", description: "stream line-delimited JSON events"},
+			},
+			examples: []string{
+				"codegraph index .",
+				"codegraph index . --jsonl",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runIndex(ctx, cfg, stdout, args, false)
 			},
@@ -100,6 +153,13 @@ func newCommandList() []*command {
 			name:        "find-symbol",
 			description: "find symbols by name",
 			usageLines:  []string{"  find-symbol <repo-path> <query>"},
+			flags: []commandFlag{
+				{name: "--limit", description: "limit results"},
+				{name: "--offset", description: "offset into result set"},
+			},
+			examples: []string{
+				"codegraph find-symbol . HelloWorld",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runQueryCommand(ctx, cfg, stdout, "find-symbol", args)
 			},
@@ -108,6 +168,14 @@ func newCommandList() []*command {
 			name:        "callers",
 			description: "find callers of a symbol",
 			usageLines:  []string{"  callers <repo-path> --symbol <name>"},
+			flags: []commandFlag{
+				{name: "--symbol", description: "symbol name to query (required)"},
+				{name: "--limit", description: "limit results"},
+				{name: "--offset", description: "offset into result set"},
+			},
+			examples: []string{
+				"codegraph callers . --symbol HelloWorld",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runQueryCommand(ctx, cfg, stdout, "callers", args)
 			},
@@ -197,6 +265,13 @@ func newCommandList() []*command {
 			name:        "clean",
 			description: "clean index data",
 			usageLines:  []string{"  clean [repo-path] [--vacuum]"},
+			flags: []commandFlag{
+				{name: "--vacuum", description: "VACUUM the database after cleanup"},
+			},
+			examples: []string{
+				"codegraph clean .",
+				"codegraph clean . --vacuum",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runClean(ctx, cfg, stdout, args)
 			},
