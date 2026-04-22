@@ -568,6 +568,9 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 	if queryValue == "" {
 		queryValue = symbol
 	}
+	if symbol == "" && queryValue != "" {
+		symbol = queryValue
+	}
 
 	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -610,22 +613,34 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		return writeJSON(stdout, map[string]any{"matches": items})
 	case "callers":
 		if symbol == "" {
-			return fmt.Errorf("usage: %s %s <repo-path> --symbol <name> [--limit N] [--offset N]", appname.BinaryName, cmdName)
+			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindCallers(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
 			return err
 		}
-		return writeJSON(stdout, map[string]any{"callers": items})
+		if items == nil {
+			items = []graph.Symbol{}
+		}
+		return writeJSON(stdout, map[string]any{
+			"callers": items,
+			"count":   len(items),
+		})
 	case "callees":
 		if symbol == "" {
-			return fmt.Errorf("usage: %s %s <repo-path> --symbol <name> [--limit N] [--offset N]", appname.BinaryName, cmdName)
+			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
 		items, err := app.Query.FindCallees(ctx, repoID, symbol, 0, *limit, *offset)
 		if err != nil {
 			return err
 		}
-		return writeJSON(stdout, map[string]any{"callees": items})
+		if items == nil {
+			items = []graph.Symbol{}
+		}
+		return writeJSON(stdout, map[string]any{
+			"callees": items,
+			"count":   len(items),
+		})
 	case "impact":
 		if len(symbols) == 0 && len(files) == 0 {
 			if symbol != "" {
