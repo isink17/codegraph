@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
@@ -53,6 +55,37 @@ func BenchmarkStoreSemanticSearch(b *testing.B) {
 	}
 }
 
+func BenchmarkStoreReplaceFileGraphWriteHeavy(b *testing.B) {
+	ctx := context.Background()
+	profile := sqliteBenchProfile()
+	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
+	b.Logf("sqlite_profile=%s", profile)
+
+	dbPath := filepath.Join(b.TempDir(), "store-write-heavy.sqlite")
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: profile})
+	if err != nil {
+		b.Fatalf("store.OpenWithOptions() error = %v", err)
+	}
+	b.Cleanup(func() { _ = s.Close() })
+
+	repoRoot := b.TempDir()
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		b.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	parsed := heavyParsedFile(80, 3, 2)
+	path := "bench/heavy.go"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.ReplaceFileGraph(ctx, repo.ID, 1, path, "go", 1024, int64(i), strconv.Itoa(i), parsed); err != nil {
+			b.Fatalf("ReplaceFileGraph() error = %v", err)
+		}
+	}
+}
+
 func setupStoreBenchData(b *testing.B, ctx context.Context) (*store.Store, int64) {
 	b.Helper()
 	repoRoot := b.TempDir()
@@ -81,4 +114,60 @@ func setupStoreBenchData(b *testing.B, ctx context.Context) (*store.Store, int64
 		b.Fatalf("UpsertRepo() error = %v", err)
 	}
 	return s, repo.ID
+}
+
+func sqliteBenchProfile() string {
+	// Keep benchmarks repeatable without requiring CLI wiring; override with CODEGRAPH_BENCH_SQLITE_PROFILE.
+	if v := os.Getenv("CODEGRAPH_BENCH_SQLITE_PROFILE"); v != "" {
+		return v
+	}
+	return "balanced"
+}
+
+func heavyParsedFile(symbols, refsPerSymbol, edgesPerSymbol int) graph.ParsedFile {
+	out := graph.ParsedFile{
+		Language: "go",
+	}
+	out.Symbols = make([]graph.Symbol, 0, symbols)
+	out.References = make([]graph.Reference, 0, symbols*refsPerSymbol)
+	out.Edges = make([]graph.Edge, 0, symbols*edgesPerSymbol)
+
+	for i := 0; i < symbols; i++ {
+		name := fmt.Sprintf("BenchHeavyFn%d", i)
+		qname := fmt.Sprintf("bench.%s", name)
+		stable := fmt.Sprintf("go:%s:%d", qname, i)
+		out.Symbols = append(out.Symbols, graph.Symbol{
+			Language:      "go",
+			Kind:          "function",
+			Name:          name,
+			QualifiedName: qname,
+			Range:         graph.Position{StartLine: i + 1, StartCol: 1, EndLine: i + 1, EndCol: 10},
+			StableKey:     stable,
+		})
+
+		for r := 0; r < refsPerSymbol; r++ {
+			out.References = append(out.References, graph.Reference{
+				Kind: "call",
+				Name: name,
+				Range: graph.Position{
+					StartLine: i + 1,
+					StartCol:  1 + r,
+					EndLine:   i + 1,
+					EndCol:    2 + r,
+				},
+			})
+		}
+
+		for e := 0; e < edgesPerSymbol; e++ {
+			dst := fmt.Sprintf("bench.BenchHeavyFn%d", (i+e+1)%symbols)
+			out.Edges = append(out.Edges, graph.Edge{
+				DstName:  dst,
+				Kind:     "calls",
+				Evidence: "bench",
+				Line:     i + 1,
+			})
+		}
+	}
+
+	return out
 }

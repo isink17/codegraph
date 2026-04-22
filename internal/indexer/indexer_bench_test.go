@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/parser"
@@ -15,9 +16,16 @@ import (
 func BenchmarkIndexerIndex(b *testing.B) {
 	ctx := context.Background()
 	repoRoot := b.TempDir()
-	createGoFixtureRepo(b, repoRoot, 80)
+	files := 80
+	if v := os.Getenv("CODEGRAPH_BENCH_FILES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			files = n
+		}
+	}
+	createGoFixtureRepo(b, repoRoot, files)
 	dbDir := b.TempDir()
 	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
+	b.Logf("fixture_files=%d", files)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -39,9 +47,16 @@ func BenchmarkIndexerIndex(b *testing.B) {
 func BenchmarkIndexerUpdateOneFile(b *testing.B) {
 	ctx := context.Background()
 	repoRoot := b.TempDir()
-	createGoFixtureRepo(b, repoRoot, 80)
+	files := 80
+	if v := os.Getenv("CODEGRAPH_BENCH_FILES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			files = n
+		}
+	}
+	createGoFixtureRepo(b, repoRoot, files)
 	dbPath := filepath.Join(b.TempDir(), "bench-update.sqlite")
 	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
+	b.Logf("fixture_files=%d", files)
 
 	s, err := store.Open(dbPath)
 	if err != nil {

@@ -763,13 +763,6 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	}
 	defer insertSymbolFTSStmt.Close()
 
-	insertSymbolTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO symbol_tokens(symbol_id, token, weight) VALUES(?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertSymbolTokenStmt.Close()
-
 	insertReferenceStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO references_tbl(repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -796,13 +789,6 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 		return nil, err
 	}
 	defer insertImportStmt.Close()
-
-	insertFileTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_tokens(file_id, token, weight) VALUES(?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertFileTokenStmt.Close()
 
 	insertTestLinkStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score)
@@ -840,11 +826,9 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 			input.Parsed,
 			insertSymbolStmt,
 			insertSymbolFTSStmt,
-			insertSymbolTokenStmt,
 			insertReferenceStmt,
 			insertEdgeStmt,
 			insertImportStmt,
-			insertFileTokenStmt,
 			insertTestLinkStmt,
 		); err != nil {
 			_ = tx.Rollback()
@@ -985,14 +969,13 @@ func insertParsedFileGraph(
 	parsed graph.ParsedFile,
 	insertSymbolStmt *sql.Stmt,
 	insertSymbolFTSStmt *sql.Stmt,
-	insertSymbolTokenStmt *sql.Stmt,
 	insertReferenceStmt *sql.Stmt,
 	insertEdgeStmt *sql.Stmt,
 	insertImportStmt *sql.Stmt,
-	insertFileTokenStmt *sql.Stmt,
 	insertTestLinkStmt *sql.Stmt,
 ) error {
 	stableToID := map[string]int64{}
+	symbolTokenArgs := make([]any, 0, 300*3)
 	for _, sym := range parsed.Symbols {
 		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
 		if err != nil {
@@ -1007,9 +990,18 @@ func insertParsedFileGraph(
 			return err
 		}
 		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
-			if _, err := insertSymbolTokenStmt.ExecContext(ctx, symbolID, token, weight); err != nil {
-				return err
+			symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
+			if len(symbolTokenArgs) >= 300*3 {
+				if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs); err != nil {
+					return err
+				}
+				symbolTokenArgs = symbolTokenArgs[:0]
 			}
+		}
+	}
+	if len(symbolTokenArgs) > 0 {
+		if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs); err != nil {
+			return err
 		}
 	}
 	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
@@ -1040,9 +1032,21 @@ func insertParsedFileGraph(
 			return err
 		}
 	}
-	for token, weight := range parsed.FileTokens {
-		if _, err := insertFileTokenStmt.ExecContext(ctx, fileID, token, weight); err != nil {
-			return err
+	if len(parsed.FileTokens) > 0 {
+		fileTokenArgs := make([]any, 0, min(len(parsed.FileTokens), 300)*3)
+		for token, weight := range parsed.FileTokens {
+			fileTokenArgs = append(fileTokenArgs, fileID, token, weight)
+			if len(fileTokenArgs) >= 300*3 {
+				if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs); err != nil {
+					return err
+				}
+				fileTokenArgs = fileTokenArgs[:0]
+			}
+		}
+		if len(fileTokenArgs) > 0 {
+			if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1074,6 +1078,27 @@ func insertParsedFileGraph(
 		}
 	}
 	return nil
+}
+
+func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn string, args []any) error {
+	if len(args) == 0 {
+		return nil
+	}
+	// SQLite's default parameter limit is commonly 999. Each row uses 3 params.
+	if len(args)%3 != 0 {
+		return fmt.Errorf("invalid token insert args len=%d", len(args))
+	}
+	rows := len(args) / 3
+	var b strings.Builder
+	fmt.Fprintf(&b, "INSERT INTO %s(%s, token, weight) VALUES ", table, idColumn)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(?,?,?)")
+	}
+	_, err := tx.ExecContext(ctx, b.String(), args...)
+	return err
 }
 
 func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 {
@@ -2868,32 +2893,238 @@ func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID, fileID int64
 		return err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at)
-		SELECT s.id, ?, ?, ?, ?, ?, ?
-		FROM symbols s
-		WHERE s.file_id = ? AND s.stable_key = ?
-		ON CONFLICT(symbol_id) DO UPDATE SET
-			embedding = excluded.embedding,
-			dimensions = excluded.dimensions,
-			model_name = excluded.model_name,
-			updated_at = excluded.updated_at
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
+	stableKeys := make([]string, 0, len(symbolMap))
+	for k := range symbolMap {
+		stableKeys = append(stableKeys, k)
 	}
-	defer stmt.Close()
 
-	for stableKey, vec := range symbolMap {
-		blob := float32ToBytes(vec)
-		if _, err := stmt.ExecContext(ctx, fileID, repoID, blob, len(vec), modelName, now, fileID, stableKey); err != nil {
+	// Resolve symbol ids in chunks to avoid per-row subqueries during embedding writes.
+	// Keep under SQLite's default variable limit (999).
+	const keyChunkSize = 900
+	stableToID := make(map[string]int64, len(stableKeys))
+	for start := 0; start < len(stableKeys); start += keyChunkSize {
+		end := min(start+keyChunkSize, len(stableKeys))
+		chunk := stableKeys[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, fileID)
+		for _, k := range chunk {
+			args = append(args, k)
+		}
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		for rows.Next() {
+			var stableKey string
+			var id int64
+			if err := rows.Scan(&stableKey, &id); err != nil {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return err
+			}
+			stableToID[stableKey] = id
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			_ = tx.Rollback()
+			return err
+		}
+		if err := rows.Close(); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 	}
 
+	const embedCols = 7
+	const maxRowsPerInsert = 100 // 100*7=700 vars, stays under 999.
+	embedArgs := make([]any, 0, maxRowsPerInsert*embedCols)
+	flush := func() error {
+		if len(embedArgs) == 0 {
+			return nil
+		}
+		rows := len(embedArgs) / embedCols
+		var b strings.Builder
+		b.WriteString(`INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at) VALUES `)
+		for i := 0; i < rows; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?,?,?,?,?,?,?)")
+		}
+		b.WriteString(`
+			ON CONFLICT(symbol_id) DO UPDATE SET
+				embedding = excluded.embedding,
+				dimensions = excluded.dimensions,
+				model_name = excluded.model_name,
+				updated_at = excluded.updated_at
+		`)
+		if _, err := tx.ExecContext(ctx, b.String(), embedArgs...); err != nil {
+			return err
+		}
+		embedArgs = embedArgs[:0]
+		return nil
+	}
+
+	for stableKey, vec := range symbolMap {
+		symbolID := stableToID[stableKey]
+		if symbolID == 0 {
+			continue
+		}
+		blob := float32ToBytes(vec)
+		embedArgs = append(embedArgs, symbolID, fileID, repoID, blob, len(vec), modelName, now)
+		if len(embedArgs) >= maxRowsPerInsert*embedCols {
+			if err := flush(); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+type SymbolEmbeddingUpsert struct {
+	FileID    int64
+	StableKey string
+	Vector    []float32
+}
+
+func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, modelName string, items []SymbolEmbeddingUpsert) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	type vecRef struct {
+		stableKey string
+		vector    []float32
+	}
+	byFile := map[int64][]vecRef{}
+	for _, item := range items {
+		if item.FileID == 0 || item.StableKey == "" || len(item.Vector) == 0 {
+			continue
+		}
+		byFile[item.FileID] = append(byFile[item.FileID], vecRef{stableKey: item.StableKey, vector: item.Vector})
+	}
+	if len(byFile) == 0 {
+		_ = tx.Rollback()
+		return nil
+	}
+
+	const embedCols = 7
+	const maxRowsPerInsert = 100 // 100*7=700 vars, stays under 999.
+	embedArgs := make([]any, 0, maxRowsPerInsert*embedCols)
+	flush := func() error {
+		if len(embedArgs) == 0 {
+			return nil
+		}
+		rows := len(embedArgs) / embedCols
+		var b strings.Builder
+		b.WriteString(`INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at) VALUES `)
+		for i := 0; i < rows; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?,?,?,?,?,?,?)")
+		}
+		b.WriteString(`
+			ON CONFLICT(symbol_id) DO UPDATE SET
+				embedding = excluded.embedding,
+				dimensions = excluded.dimensions,
+				model_name = excluded.model_name,
+				updated_at = excluded.updated_at
+		`)
+		if _, err := tx.ExecContext(ctx, b.String(), embedArgs...); err != nil {
+			return err
+		}
+		embedArgs = embedArgs[:0]
+		return nil
+	}
+
+	// Resolve symbol ids per file in chunks, then multi-row upsert embeddings.
+	// Keep well under SQLite's default variable limit (999).
+	const keyChunkSize = 900
+	for fileID, vecs := range byFile {
+		if len(vecs) == 0 {
+			continue
+		}
+		stableToVec := make(map[string][]float32, len(vecs))
+		stableKeys := make([]string, 0, len(vecs))
+		for _, v := range vecs {
+			if v.stableKey == "" || len(v.vector) == 0 {
+				continue
+			}
+			// If the same stable key appears multiple times, the last one wins; vectors should be identical anyway.
+			if _, ok := stableToVec[v.stableKey]; !ok {
+				stableKeys = append(stableKeys, v.stableKey)
+			}
+			stableToVec[v.stableKey] = v.vector
+		}
+		for start := 0; start < len(stableKeys); start += keyChunkSize {
+			end := min(start+keyChunkSize, len(stableKeys))
+			chunk := stableKeys[start:end]
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+			query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, fileID)
+			for _, k := range chunk {
+				args = append(args, k)
+			}
+			rows, err := tx.QueryContext(ctx, query, args...)
+			if err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			for rows.Next() {
+				var stableKey string
+				var symbolID int64
+				if err := rows.Scan(&stableKey, &symbolID); err != nil {
+					_ = rows.Close()
+					_ = tx.Rollback()
+					return err
+				}
+				vec := stableToVec[stableKey]
+				if symbolID == 0 || len(vec) == 0 {
+					continue
+				}
+				embedArgs = append(embedArgs, symbolID, fileID, repoID, float32ToBytes(vec), len(vec), modelName, now)
+				if len(embedArgs) >= maxRowsPerInsert*embedCols {
+					if err := rows.Close(); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+					if err := flush(); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+					continue
+				}
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return err
+			}
+			if err := rows.Close(); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	return tx.Commit()
 }
 

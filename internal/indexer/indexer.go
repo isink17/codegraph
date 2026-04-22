@@ -333,13 +333,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		writeReplaceMS += time.Since(started).Milliseconds()
 		if !embedding.IsNoop(i.embedder) {
 			embedStarted := time.Now()
-			for idx, input := range replaceBatch {
-				fileID := int64(0)
-				if idx < len(fileIDs) {
-					fileID = fileIDs[idx]
-				}
-				i.embedFileSymbolsWithFileID(ctx, repo.ID, fileID, input.Parsed)
-			}
+			i.embedReplaceBatch(ctx, repo.ID, fileIDs, replaceBatch)
 			embedMS += time.Since(embedStarted).Milliseconds()
 		}
 		replaceBatch = replaceBatch[:0]
@@ -866,4 +860,70 @@ func (i *Indexer) embedFileSymbolsWithFileID(ctx context.Context, repoID int64, 
 	if len(symbolMap) > 0 {
 		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
 	}
+}
+
+func (i *Indexer) embedReplaceBatch(ctx context.Context, repoID int64, fileIDs []int64, inputs []store.ReplaceFileGraphInput) {
+	type keyRef struct {
+		fileID    int64
+		stableKey string
+	}
+
+	totalSyms := 0
+	for idx := range inputs {
+		if idx >= len(fileIDs) {
+			break
+		}
+		totalSyms += len(inputs[idx].Parsed.Symbols)
+	}
+	if totalSyms == 0 {
+		return
+	}
+
+	texts := make([]string, 0, totalSyms)
+	keys := make([]keyRef, 0, totalSyms)
+	for idx, input := range inputs {
+		if idx >= len(fileIDs) {
+			break
+		}
+		fileID := fileIDs[idx]
+		if fileID == 0 || len(input.Parsed.Symbols) == 0 {
+			continue
+		}
+		for _, sym := range input.Parsed.Symbols {
+			texts = append(texts, embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary))
+			keys = append(keys, keyRef{fileID: fileID, stableKey: sym.StableKey})
+		}
+	}
+	if len(texts) == 0 {
+		return
+	}
+
+	const embedChunkSize = 128
+	upserts := make([]store.SymbolEmbeddingUpsert, 0, len(texts))
+	for start := 0; start < len(texts); start += embedChunkSize {
+		end := min(start+embedChunkSize, len(texts))
+		vectors, err := i.embedder.EmbedBatch(ctx, texts[start:end])
+		if err != nil {
+			return // best-effort: don't fail indexing on embedding errors
+		}
+		for j := range vectors {
+			vec := vectors[j]
+			if vec == nil {
+				continue
+			}
+			ref := keys[start+j]
+			if ref.fileID == 0 || ref.stableKey == "" {
+				continue
+			}
+			upserts = append(upserts, store.SymbolEmbeddingUpsert{
+				FileID:    ref.fileID,
+				StableKey: ref.stableKey,
+				Vector:    vec,
+			})
+		}
+	}
+	if len(upserts) == 0 {
+		return
+	}
+	_ = i.store.UpsertSymbolEmbeddingsBatch(ctx, repoID, "", upserts)
 }
