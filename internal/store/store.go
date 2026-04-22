@@ -1090,7 +1090,7 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 	}
 	rows := len(args) / 3
 	var b strings.Builder
-	fmt.Fprintf(&b, "INSERT INTO %s(%s, token, weight) VALUES ", table, idColumn)
+fmt.Fprintf(&b, "INSERT INTO %q(%q, token, weight) VALUES ", table, idColumn)
 	for i := 0; i < rows; i++ {
 		if i > 0 {
 			b.WriteString(",")
