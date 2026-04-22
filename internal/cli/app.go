@@ -1151,7 +1151,7 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintf(w, "  %s help\n\n", appname.BinaryName)
 
 	fmt.Fprintln(w, "Commands:")
-	for _, cmd := range commandList {
+	for _, cmd := range commands() {
 		// Use the first usage line as the synopsis so help stays stable even if
 		// additional notes exist below it (jsonl hints, etc.).
 		synopsis := cmd.name

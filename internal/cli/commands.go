@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/isink17/codegraph/internal/config"
 )
@@ -17,13 +18,27 @@ type command struct {
 }
 
 var (
-	commandList   = newCommandList()
-	commandByName = newCommandRegistry(commandList)
+	commandInitOnce sync.Once
+	commandList     []*command
+	commandByName   map[string]*command
 )
 
 func lookupCommand(name string) (*command, bool) {
+	ensureCommandsInit()
 	c, ok := commandByName[name]
 	return c, ok
+}
+
+func commands() []*command {
+	ensureCommandsInit()
+	return commandList
+}
+
+func ensureCommandsInit() {
+	commandInitOnce.Do(func() {
+		commandList = newCommandList()
+		commandByName = newCommandRegistry(commandList)
+	})
 }
 
 func newCommandRegistry(cmds []*command) map[string]*command {
