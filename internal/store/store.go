@@ -18,8 +18,6 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
@@ -139,7 +137,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open(sqliteDriverName, path)
 	if err != nil {
 		return nil, err
 	}
@@ -1091,6 +1089,39 @@ func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (i
 	return int(n), nil
 }
 
+func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64, paths []string) (int, error) {
+	if len(paths) == 0 {
+		return 0, nil
+	}
+	const chunkSize = 400
+	total := int64(0)
+	for start := 0; start < len(paths); start += chunkSize {
+		end := min(start+chunkSize, len(paths))
+		chunk := paths[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			UPDATE files
+			SET is_deleted = 1, parse_state = 'deleted', last_scan_id = ?
+			WHERE repo_id = ? AND is_deleted = 0 AND path IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, scanID, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		res, err := s.db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return int(total), err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return int(total), err
+		}
+		total += affected
+	}
+	return int(total), nil
+}
+
 type edgeTarget struct {
 	edgeID  int64
 	dstName string
@@ -1134,18 +1165,28 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		totalResolved += int(n)
 	}
 
-	// Strategy 3: Suffix match (e.g., pkg.Func matches github.com/org/repo/pkg.Func)
+	// Strategy 3a: Suffix match for slash-qualified symbols (e.g., pkg.Func matches github.com/org/repo/pkg.Func).
+	// Avoid per-edge LIKE scans by precomputing (tail -> symbol_id) once, then doing an indexed equality update.
+	n, err := s.resolveEdgesBySlashSuffix(ctx, repoID)
+	if err != nil {
+		return totalResolved, err
+	}
+	totalResolved += n
+
+	// Strategy 3b: Dot-suffix fallback (for qualified names without a slash separator).
+	// Kept as a narrower fallback to preserve existing semantics across languages that don't use '/' in qualified names.
 	res, err = s.db.ExecContext(ctx, `
 		UPDATE edges SET dst_symbol_id = (
 			SELECT s.id FROM symbols s
 			WHERE s.repo_id = ?
-			AND (s.qualified_name LIKE '%.' || edges.dst_name OR s.qualified_name LIKE '%/' || edges.dst_name)
+			AND s.qualified_name LIKE '%.' || edges.dst_name
 			LIMIT 1
 		)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
 		AND EXISTS (
 			SELECT 1 FROM symbols s WHERE s.repo_id = ?
-			AND (s.qualified_name LIKE '%.' || edges.dst_name OR s.qualified_name LIKE '%/' || edges.dst_name)
+			AND s.qualified_name LIKE '%.' || edges.dst_name
 		)
 	`, repoID, repoID, repoID)
 	if err != nil {
@@ -1178,6 +1219,113 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	}
 
 	return totalResolved, nil
+}
+
+func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, repoID int64) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	type resolvedSuffix struct {
+		dstName string
+		dstID   int64
+	}
+	// Map: suffix (after last '/') -> minimum symbol id. Using MIN keeps behavior stable when multiple symbols share the same suffix.
+	minBySuffix := map[string]int64{}
+	for rows.Next() {
+		var id int64
+		var qname string
+		if err := rows.Scan(&id, &qname); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if qname == "" {
+			continue
+		}
+		slash := strings.LastIndexByte(qname, '/')
+		if slash < 0 || slash+1 >= len(qname) {
+			continue
+		}
+		suffix := qname[slash+1:]
+		if suffix == "" {
+			continue
+		}
+		if cur, ok := minBySuffix[suffix]; !ok || id < cur {
+			minBySuffix[suffix] = id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(minBySuffix) == 0 {
+		return 0, nil
+	}
+
+	resolved := make([]resolvedSuffix, 0, len(minBySuffix))
+	for dstName, dstID := range minBySuffix {
+		resolved = append(resolved, resolvedSuffix{dstName: dstName, dstID: dstID})
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+
+	// Keep well under SQLite's default variable limit (999).
+	const maxPairsPerInsert = 400
+	for start := 0; start < len(resolved); start += maxPairsPerInsert {
+		end := min(start+maxPairsPerInsert, len(resolved))
+		chunk := resolved[start:end]
+		var b strings.Builder
+		b.WriteString(`INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_symbol_id) VALUES `)
+		args := make([]any, 0, len(chunk)*2)
+		for i, r := range chunk {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?,?)")
+			args = append(args, r.dstName, r.dstID)
+		}
+		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+	}
+
+	updateRes, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_slash_suffix t WHERE t.dst_name = edges.dst_name)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
+	`, repoID)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	n, err := updateRes.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
 }
 
 func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []string) error {

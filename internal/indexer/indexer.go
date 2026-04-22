@@ -122,15 +122,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			candidateSet[filepath.Clean(rel)] = struct{}{}
 		}
 	}
+	candidatePaths := make([]string, 0, len(candidateSet))
+	for rel := range candidateSet {
+		candidatePaths = append(candidatePaths, rel)
+	}
 
 	var existing map[string]store.FileRecord
 	existingLoadStarted := time.Now()
 	if len(candidateSet) > 0 {
-		paths := make([]string, 0, len(candidateSet))
-		for rel := range candidateSet {
-			paths = append(paths, rel)
-		}
-		existing, err = i.store.ExistingFilesForPaths(ctx, repo.ID, paths)
+		existing, err = i.store.ExistingFilesForPaths(ctx, repo.ID, candidatePaths)
 	} else {
 		existing, err = i.store.ExistingFiles(ctx, repo.ID)
 	}
@@ -155,9 +155,55 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	results := make(chan fileResult, workerCount*2)
 	producerErr := make(chan error, 1)
 	walkStart := time.Now()
+	missingCandidatePaths := make([]string, 0, 16)
 
 	go func() {
 		defer close(tasks)
+		if len(candidateSet) > 0 {
+			for _, rel := range candidatePaths {
+				rel = filepath.Clean(rel)
+				if shouldIgnorePath(rel, opts.Exclude) {
+					continue
+				}
+				if shouldSkipFile(rel, opts.Include, opts.Exclude) {
+					continue
+				}
+				abs := filepath.Join(opts.RepoRoot, rel)
+				info, err := os.Stat(abs)
+				if err != nil {
+					if os.IsNotExist(err) {
+						missingCandidatePaths = append(missingCandidatePaths, rel)
+						continue
+					}
+					producerErr <- err
+					return
+				}
+				if info.IsDir() {
+					continue
+				}
+				adapter := i.registry.AdapterFor(rel)
+				language := ""
+				if adapter != nil {
+					language = adapter.Language()
+				}
+				task := fileTask{
+					path:     abs,
+					rel:      rel,
+					info:     info,
+					adapter:  adapter,
+					language: language,
+				}
+				select {
+				case tasks <- task:
+				case <-ctxRun.Done():
+					producerErr <- ctxRun.Err()
+					return
+				}
+			}
+			producerErr <- nil
+			return
+		}
+
 		producerErr <- filepath.WalkDir(opts.RepoRoot, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -175,11 +221,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			if d.IsDir() {
 				return nil
-			}
-			if len(candidateSet) > 0 {
-				if _, ok := candidateSet[rel]; !ok {
-					return nil
-				}
 			}
 			if shouldSkipFile(rel, opts.Include, opts.Exclude) {
 				return nil
@@ -481,16 +522,29 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, runErr
 	}
 
-	missingStarted := time.Now()
-	deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
-	if err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
+	if len(candidateSet) == 0 {
+		missingStarted := time.Now()
+		deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		summary.MarkMissingMS = time.Since(missingStarted).Milliseconds()
+		summary.FilesDeleted = deleted
 	}
-	summary.MarkMissingMS = time.Since(missingStarted).Milliseconds()
-	summary.FilesDeleted = deleted
 	resolveStart := time.Now()
-	if len(candidateSet) > 0 {
+	if len(missingCandidatePaths) > 0 {
+		deleted, err := i.store.MarkFilesDeletedBatch(ctx, repo.ID, scanID, missingCandidatePaths)
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		summary.FilesDeleted += deleted
+	}
+
+	if len(changedPathSet) == 0 {
+		summary.ResolveMS = 0
+	} else if len(candidateSet) > 0 {
 		changedPaths := make([]string, 0, len(changedPathSet))
 		for path := range changedPathSet {
 			changedPaths = append(changedPaths, path)
@@ -505,7 +559,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, resolveErr
 		}
 	}
-	summary.ResolveMS = time.Since(resolveStart).Milliseconds()
+	if len(changedPathSet) > 0 {
+		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
+	}
 	summary.DurationMS = time.Since(started).Milliseconds()
 	summary.FilesTotal = summary.FilesSeen + summary.FilesDeleted
 	if summary.FilesTotal > 0 {
@@ -650,6 +706,21 @@ func shouldSkipFile(rel string, includes, excludes []string) bool {
 		return false
 	}
 	return !matchesAny(rel, includes)
+}
+
+func shouldIgnorePath(rel string, excludes []string) bool {
+	current := filepath.Clean(rel)
+	for current != "." && current != "" {
+		if shouldSkipDir(current, excludes) {
+			return true
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			break
+		}
+		current = next
+	}
+	return false
 }
 
 func matchesAny(path string, globs []string) bool {
