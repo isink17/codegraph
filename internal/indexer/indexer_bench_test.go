@@ -17,6 +17,7 @@ func BenchmarkIndexerIndex(b *testing.B) {
 	repoRoot := b.TempDir()
 	createGoFixtureRepo(b, repoRoot, 80)
 	dbDir := b.TempDir()
+	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -40,6 +41,7 @@ func BenchmarkIndexerUpdateOneFile(b *testing.B) {
 	repoRoot := b.TempDir()
 	createGoFixtureRepo(b, repoRoot, 80)
 	dbPath := filepath.Join(b.TempDir(), "bench-update.sqlite")
+	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
 
 	s, err := store.Open(dbPath)
 	if err != nil {
