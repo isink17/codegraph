@@ -228,9 +228,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}()
 
 	const metadataBatchSize = 300
+	const replaceBatchSize = 20
 	markSeenBatch := make([]string, 0, metadataBatchSize)
 	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
+	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
 
 	flushMarkSeen := func() error {
@@ -261,6 +263,26 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return err
 		}
 		parseFailedBatch = parseFailedBatch[:0]
+		return nil
+	}
+	flushReplace := func() error {
+		if len(replaceBatch) == 0 {
+			return nil
+		}
+		fileIDs, err := i.store.ReplaceFileGraphsBatch(ctx, repo.ID, scanID, replaceBatch)
+		if err != nil {
+			return err
+		}
+		if !embedding.IsNoop(i.embedder) {
+			for idx, input := range replaceBatch {
+				fileID := int64(0)
+				if idx < len(fileIDs) {
+					fileID = fileIDs[idx]
+				}
+				i.embedFileSymbolsWithFileID(ctx, repo.ID, fileID, input.Parsed)
+			}
+		}
+		replaceBatch = replaceBatch[:0]
 		return nil
 	}
 
@@ -332,21 +354,27 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.FilesSkipped++
 		case "replace":
 			writeStart := time.Now()
-			if err := i.store.ReplaceFileGraph(ctx, repo.ID, scanID, res.task.rel, res.parsed.Language, res.task.info.Size(), res.task.info.ModTime().UnixNano(), res.hash, res.parsed); err != nil {
-				runErr = err
-				cancel()
-				continue
-			}
-			if !embedding.IsNoop(i.embedder) {
-				i.embedFileSymbols(ctx, repo.ID, res.task.rel, res.parsed)
-			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			replaceBatch = append(replaceBatch, store.ReplaceFileGraphInput{
+				Path:        res.task.rel,
+				Language:    res.parsed.Language,
+				SizeBytes:   res.task.info.Size(),
+				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
+				ContentHash: res.hash,
+				Parsed:      res.parsed,
+			})
 			changedPathSet[res.task.rel] = struct{}{}
 			summary.FilesChanged++
 			summary.FilesIndexed++
 			coverage := summary.LanguageCoverage[coverageLanguage]
 			coverage.Indexed++
 			summary.LanguageCoverage[coverageLanguage] = coverage
+			if len(replaceBatch) >= replaceBatchSize {
+				if err := flushReplace(); err != nil {
+					runErr = err
+					cancel()
+				}
+			}
+			writeMS += time.Since(writeStart).Milliseconds()
 		case "parse_failed":
 			writeStart := time.Now()
 			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
@@ -378,6 +406,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if runErr == nil {
 		writeStart := time.Now()
 		if err := flushMarkSeen(); err != nil {
+			runErr = err
+			cancel()
+		}
+		writeMS += time.Since(writeStart).Milliseconds()
+	}
+	if runErr == nil {
+		writeStart := time.Now()
+		if err := flushReplace(); err != nil {
 			runErr = err
 			cancel()
 		}
@@ -677,6 +713,34 @@ func (i *Indexer) embedFileSymbols(ctx context.Context, repoID int64, relPath st
 	fileID, err := i.store.FileIDByPath(ctx, repoID, relPath)
 	if err != nil || fileID == 0 {
 		return
+	}
+
+	symbolMap := make(map[string][]float32, len(keys))
+	for j, key := range keys {
+		if vectors[j] != nil {
+			symbolMap[key] = vectors[j]
+		}
+	}
+	if len(symbolMap) > 0 {
+		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
+	}
+}
+
+func (i *Indexer) embedFileSymbolsWithFileID(ctx context.Context, repoID int64, fileID int64, parsed graph.ParsedFile) {
+	if len(parsed.Symbols) == 0 || fileID == 0 {
+		return
+	}
+
+	texts := make([]string, len(parsed.Symbols))
+	keys := make([]string, len(parsed.Symbols))
+	for j, sym := range parsed.Symbols {
+		texts[j] = embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary)
+		keys[j] = sym.StableKey
+	}
+
+	vectors, err := i.embedder.EmbedBatch(ctx, texts)
+	if err != nil {
+		return // best-effort: don't fail indexing on embedding errors
 	}
 
 	symbolMap := make(map[string][]float32, len(keys))
