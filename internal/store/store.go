@@ -113,6 +113,15 @@ type ExportEdge struct {
 	Line             int    `json:"line"`
 }
 
+type ReplaceFileGraphInput struct {
+	Path        string
+	Language    string
+	SizeBytes   int64
+	MtimeUnixNS int64
+	ContentHash string
+	Parsed      graph.ParsedFile
+}
+
 func Open(path string) (*Store, error) {
 	return OpenWithOptions(path, OpenOptions{})
 }
@@ -662,12 +671,26 @@ func (s *Store) MarkFilesParseFailedBatch(ctx context.Context, repoID, scanID in
 }
 
 func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string, parsed graph.ParsedFile) error {
+	return s.ReplaceFileGraphsBatch(ctx, repoID, scanID, []ReplaceFileGraphInput{{
+		Path:        path,
+		Language:    language,
+		SizeBytes:   sizeBytes,
+		MtimeUnixNS: mtimeUnixNS,
+		ContentHash: contentHash,
+		Parsed:      parsed,
+	}})
+}
+
+func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput) error {
+	if len(inputs) == 0 {
+		return nil
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := tx.ExecContext(ctx, `
+
+	upsertFileStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted)
 		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0)
 		ON CONFLICT(repo_id, path)
@@ -680,19 +703,33 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 			last_scan_id = excluded.last_scan_id,
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0
-	`, repoID, path, language, sizeBytes, mtimeUnixNS, contentHash, scanID, now); err != nil {
+	`)
+	if err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	var fileID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repoID, path).Scan(&fileID); err != nil {
+	defer upsertFileStmt.Close()
+
+	selectFileIDStmt, err := tx.PrepareContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`)
+	if err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	if err := deleteFileGraph(ctx, tx, fileID); err != nil {
+	defer selectFileIDStmt.Close()
+
+	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_tokens WHERE symbol_id = ?`)
+	if err != nil {
 		_ = tx.Rollback()
 		return err
 	}
+	defer deleteSymbolTokensStmt.Close()
+
+	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_fts WHERE symbol_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer deleteSymbolFTSStmt.Close()
 
 	insertSymbolStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key)
@@ -765,98 +802,41 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 	}
 	defer insertTestLinkStmt.Close()
 
-	stableToID := map[string]int64{}
-	for _, sym := range parsed.Symbols {
-		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
-		if err != nil {
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, input := range inputs {
+		if _, err := upsertFileStmt.ExecContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
-		symbolID, err := res.LastInsertId()
-		if err != nil {
+		var fileID int64
+		if err := selectFileIDStmt.QueryRowContext(ctx, repoID, input.Path).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
-		stableToID[sym.StableKey] = symbolID
-		if _, err := insertSymbolFTSStmt.ExecContext(ctx, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary); err != nil {
+		if err := deleteFileGraphWithStmts(ctx, tx, fileID, deleteSymbolTokensStmt, deleteSymbolFTSStmt); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
-		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
-			if _, err := insertSymbolTokenStmt.ExecContext(ctx, symbolID, token, weight); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-		}
-	}
-	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
-	for _, ref := range parsed.References {
-		var symbolID any
-		if ref.SymbolID != nil {
-			symbolID = *ref.SymbolID
-		}
-		var contextID any
-		if contextSymbolID != 0 {
-			contextID = contextSymbolID
-		}
-		if _, err := insertReferenceStmt.ExecContext(ctx, repoID, fileID, symbolID, ref.Kind, ref.Name, ref.QualifiedName, ref.Range.StartLine, ref.Range.StartCol, ref.Range.EndLine, ref.Range.EndCol, contextID); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	for _, edge := range parsed.Edges {
-		srcID := chooseSrcSymbolID(stableToID, parsed.Symbols, edge.Line)
-		if srcID == 0 {
-			continue
-		}
-		if _, err := insertEdgeStmt.ExecContext(ctx, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	for _, imp := range parsed.Imports {
-		if _, err := insertImportStmt.ExecContext(ctx, repoID, fileID, imp); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	for token, weight := range parsed.FileTokens {
-		if _, err := insertFileTokenStmt.ExecContext(ctx, fileID, token, weight); err != nil {
+		if err := insertParsedFileGraph(
+			ctx,
+			tx,
+			repoID,
+			fileID,
+			input.Parsed,
+			insertSymbolStmt,
+			insertSymbolFTSStmt,
+			insertSymbolTokenStmt,
+			insertReferenceStmt,
+			insertEdgeStmt,
+			insertImportStmt,
+			insertFileTokenStmt,
+			insertTestLinkStmt,
+		); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 	}
 
-	targetKeySet := map[string]struct{}{}
-	for _, link := range parsed.TestLinks {
-		if link.TargetStableKey != "" {
-			targetKeySet[link.TargetStableKey] = struct{}{}
-		}
-	}
-	targetKeys := make([]string, 0, len(targetKeySet))
-	for key := range targetKeySet {
-		targetKeys = append(targetKeys, key)
-	}
-	targetStableToID, err := s.resolveSymbolsByStableKeys(ctx, repoID, targetKeys)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-
-	for _, link := range parsed.TestLinks {
-		var testSymbolID any
-		var targetSymbolID any
-		if id := stableToID[link.TestSymbolKey]; id != 0 {
-			testSymbolID = id
-		}
-		if id, ok := targetStableToID[link.TargetStableKey]; ok {
-			targetSymbolID = id
-		}
-		if _, err := insertTestLinkStmt.ExecContext(ctx, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -891,6 +871,25 @@ func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
 	}
 	defer deleteSymbolFTSStmt.Close()
 
+	return deleteFileGraphWithStmts(ctx, tx, fileID, deleteSymbolTokensStmt, deleteSymbolFTSStmt)
+}
+
+func deleteFileGraphWithStmts(ctx context.Context, tx *sql.Tx, fileID int64, deleteSymbolTokensStmt, deleteSymbolFTSStmt *sql.Stmt) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM symbols WHERE file_id = ?`, fileID)
+	if err != nil {
+		return err
+	}
+	var symbolIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		symbolIDs = append(symbolIDs, id)
+	}
+	_ = rows.Close()
+
 	for _, symbolID := range symbolIDs {
 		if _, err := deleteSymbolTokensStmt.ExecContext(ctx, symbolID); err != nil {
 			return err
@@ -919,6 +918,105 @@ func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE file_id = ?`, fileID); err != nil {
 		return err
+	}
+	return nil
+}
+
+func insertParsedFileGraph(
+	ctx context.Context,
+	tx *sql.Tx,
+	repoID int64,
+	fileID int64,
+	parsed graph.ParsedFile,
+	insertSymbolStmt *sql.Stmt,
+	insertSymbolFTSStmt *sql.Stmt,
+	insertSymbolTokenStmt *sql.Stmt,
+	insertReferenceStmt *sql.Stmt,
+	insertEdgeStmt *sql.Stmt,
+	insertImportStmt *sql.Stmt,
+	insertFileTokenStmt *sql.Stmt,
+	insertTestLinkStmt *sql.Stmt,
+) error {
+	stableToID := map[string]int64{}
+	for _, sym := range parsed.Symbols {
+		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
+		if err != nil {
+			return err
+		}
+		symbolID, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		stableToID[sym.StableKey] = symbolID
+		if _, err := insertSymbolFTSStmt.ExecContext(ctx, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary); err != nil {
+			return err
+		}
+		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
+			if _, err := insertSymbolTokenStmt.ExecContext(ctx, symbolID, token, weight); err != nil {
+				return err
+			}
+		}
+	}
+	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
+	for _, ref := range parsed.References {
+		var symbolID any
+		if ref.SymbolID != nil {
+			symbolID = *ref.SymbolID
+		}
+		var contextID any
+		if contextSymbolID != 0 {
+			contextID = contextSymbolID
+		}
+		if _, err := insertReferenceStmt.ExecContext(ctx, repoID, fileID, symbolID, ref.Kind, ref.Name, ref.QualifiedName, ref.Range.StartLine, ref.Range.StartCol, ref.Range.EndLine, ref.Range.EndCol, contextID); err != nil {
+			return err
+		}
+	}
+	for _, edge := range parsed.Edges {
+		srcID := chooseSrcSymbolID(stableToID, parsed.Symbols, edge.Line)
+		if srcID == 0 {
+			continue
+		}
+		if _, err := insertEdgeStmt.ExecContext(ctx, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line); err != nil {
+			return err
+		}
+	}
+	for _, imp := range parsed.Imports {
+		if _, err := insertImportStmt.ExecContext(ctx, repoID, fileID, imp); err != nil {
+			return err
+		}
+	}
+	for token, weight := range parsed.FileTokens {
+		if _, err := insertFileTokenStmt.ExecContext(ctx, fileID, token, weight); err != nil {
+			return err
+		}
+	}
+
+	targetKeySet := map[string]struct{}{}
+	for _, link := range parsed.TestLinks {
+		if link.TargetStableKey != "" {
+			targetKeySet[link.TargetStableKey] = struct{}{}
+		}
+	}
+	targetKeys := make([]string, 0, len(targetKeySet))
+	for key := range targetKeySet {
+		targetKeys = append(targetKeys, key)
+	}
+	targetStableToID, err := resolveSymbolsByStableKeysQuery(ctx, tx, repoID, targetKeys)
+	if err != nil {
+		return err
+	}
+	for _, link := range parsed.TestLinks {
+		var testSymbolID any
+		var targetSymbolID any
+		if id := stableToID[link.TestSymbolKey]; id != 0 {
+			testSymbolID = id
+		}
+		if id, ok := targetStableToID[link.TargetStableKey]; ok {
+			targetSymbolID = id
+		}
+		if _, err := insertTestLinkStmt.ExecContext(ctx, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1271,6 +1369,14 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 }
 
 func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, stableKeys []string) (map[string]int64, error) {
+	return resolveSymbolsByStableKeysQuery(ctx, s.db, repoID, stableKeys)
+}
+
+type queryContexter interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func resolveSymbolsByStableKeysQuery(ctx context.Context, q queryContexter, repoID int64, stableKeys []string) (map[string]int64, error) {
 	out := map[string]int64{}
 	if len(stableKeys) == 0 {
 		return out, nil
@@ -1286,7 +1392,7 @@ func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, st
 	for _, key := range stableKeys {
 		args = append(args, key)
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

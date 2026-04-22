@@ -228,9 +228,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}()
 
 	const metadataBatchSize = 300
+	const replaceBatchSize = 20
 	markSeenBatch := make([]string, 0, metadataBatchSize)
 	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
+	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
 
 	flushMarkSeen := func() error {
@@ -261,6 +263,21 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return err
 		}
 		parseFailedBatch = parseFailedBatch[:0]
+		return nil
+	}
+	flushReplace := func() error {
+		if len(replaceBatch) == 0 {
+			return nil
+		}
+		if err := i.store.ReplaceFileGraphsBatch(ctx, repo.ID, scanID, replaceBatch); err != nil {
+			return err
+		}
+		if !embedding.IsNoop(i.embedder) {
+			for _, input := range replaceBatch {
+				i.embedFileSymbols(ctx, repo.ID, input.Path, input.Parsed)
+			}
+		}
+		replaceBatch = replaceBatch[:0]
 		return nil
 	}
 
@@ -332,21 +349,27 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.FilesSkipped++
 		case "replace":
 			writeStart := time.Now()
-			if err := i.store.ReplaceFileGraph(ctx, repo.ID, scanID, res.task.rel, res.parsed.Language, res.task.info.Size(), res.task.info.ModTime().UnixNano(), res.hash, res.parsed); err != nil {
-				runErr = err
-				cancel()
-				continue
-			}
-			if !embedding.IsNoop(i.embedder) {
-				i.embedFileSymbols(ctx, repo.ID, res.task.rel, res.parsed)
-			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			replaceBatch = append(replaceBatch, store.ReplaceFileGraphInput{
+				Path:        res.task.rel,
+				Language:    res.parsed.Language,
+				SizeBytes:   res.task.info.Size(),
+				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
+				ContentHash: res.hash,
+				Parsed:      res.parsed,
+			})
 			changedPathSet[res.task.rel] = struct{}{}
 			summary.FilesChanged++
 			summary.FilesIndexed++
 			coverage := summary.LanguageCoverage[coverageLanguage]
 			coverage.Indexed++
 			summary.LanguageCoverage[coverageLanguage] = coverage
+			if len(replaceBatch) >= replaceBatchSize {
+				if err := flushReplace(); err != nil {
+					runErr = err
+					cancel()
+				}
+			}
+			writeMS += time.Since(writeStart).Milliseconds()
 		case "parse_failed":
 			writeStart := time.Now()
 			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
@@ -378,6 +401,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if runErr == nil {
 		writeStart := time.Now()
 		if err := flushMarkSeen(); err != nil {
+			runErr = err
+			cancel()
+		}
+		writeMS += time.Since(writeStart).Milliseconds()
+	}
+	if runErr == nil {
+		writeStart := time.Now()
+		if err := flushReplace(); err != nil {
 			runErr = err
 			cancel()
 		}
