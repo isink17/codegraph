@@ -1278,17 +1278,17 @@ func printCommandHelp(w io.Writer, cmd *command, invokedName string) {
 	if cmd.description != "" {
 		fmt.Fprintf(w, "%s\n", cmd.description)
 	}
-	if len(cmd.aliases) > 0 {
-		aliases := make([]string, 0, len(cmd.aliases))
-		for _, a := range cmd.aliases {
-			if a == "" || a == displayName {
-				continue
-			}
+	aliases := make([]string, 0, len(cmd.aliases)+1)
+	if cmd.name != displayName {
+		aliases = append(aliases, cmd.name)
+	}
+	for _, a := range cmd.aliases {
+		if a != "" && a != displayName {
 			aliases = append(aliases, a)
 		}
-		if len(aliases) > 0 {
-			fmt.Fprintf(w, "Aliases: %s\n", strings.Join(aliases, ", "))
-		}
+	}
+	if len(aliases) > 0 {
+		fmt.Fprintf(w, "Aliases: %s\n", strings.Join(aliases, ", "))
 	}
 
 	fmt.Fprintln(w, "\nUsage:")
