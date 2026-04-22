@@ -41,6 +41,18 @@ const (
 	// sqliteEmbeddingValuesBatchRows controls multi-row upserts into symbol_embeddings where each row uses 7 parameters.
 	// 100*7=700 variables, staying under sqliteDefaultMaxVariables.
 	sqliteEmbeddingValuesBatchRows = 100
+
+	// sqliteReferenceValuesBatchRows controls multi-row inserts into references_tbl where each row uses 11 parameters.
+	// 90*11=990 variables, staying under sqliteDefaultMaxVariables.
+	sqliteReferenceValuesBatchRows = 90
+
+	// sqliteEdgeValuesBatchRows controls multi-row inserts into edges where each row uses 7 parameters.
+	// 140*7=980 variables, staying under sqliteDefaultMaxVariables.
+	sqliteEdgeValuesBatchRows = 140
+
+	// sqliteImportValuesBatchRows controls multi-row inserts into file_imports where each row uses 3 parameters.
+	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteImportValuesBatchRows = 300
 )
 
 type Store struct {
@@ -781,33 +793,6 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	}
 	defer insertSymbolFTSStmt.Close()
 
-	insertReferenceStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO references_tbl(repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertReferenceStmt.Close()
-
-	insertEdgeStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertEdgeStmt.Close()
-
-	insertImportStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_imports(repo_id, file_id, import_path) VALUES(?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertImportStmt.Close()
-
 	insertTestLinkStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score)
 		VALUES(?, ?, ?, ?, ?, ?)
@@ -844,9 +829,6 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 			input.Parsed,
 			insertSymbolStmt,
 			insertSymbolFTSStmt,
-			insertReferenceStmt,
-			insertEdgeStmt,
-			insertImportStmt,
 			insertTestLinkStmt,
 		); err != nil {
 			_ = tx.Rollback()
@@ -985,9 +967,6 @@ func insertParsedFileGraph(
 	parsed graph.ParsedFile,
 	insertSymbolStmt *sql.Stmt,
 	insertSymbolFTSStmt *sql.Stmt,
-	insertReferenceStmt *sql.Stmt,
-	insertEdgeStmt *sql.Stmt,
-	insertImportStmt *sql.Stmt,
 	insertTestLinkStmt *sql.Stmt,
 ) error {
 	stableToID := map[string]int64{}
@@ -1021,31 +1000,82 @@ func insertParsedFileGraph(
 		}
 	}
 	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
-	for _, ref := range parsed.References {
-		var symbolID any
-		if ref.SymbolID != nil {
-			symbolID = *ref.SymbolID
+	if len(parsed.References) > 0 {
+		referenceArgs := make([]any, 0, min(len(parsed.References), sqliteReferenceValuesBatchRows)*11)
+		for _, ref := range parsed.References {
+			var symbolID any
+			if ref.SymbolID != nil {
+				symbolID = *ref.SymbolID
+			}
+			var contextID any
+			if contextSymbolID != 0 {
+				contextID = contextSymbolID
+			}
+			referenceArgs = append(
+				referenceArgs,
+				repoID,
+				fileID,
+				symbolID,
+				ref.Kind,
+				ref.Name,
+				ref.QualifiedName,
+				ref.Range.StartLine,
+				ref.Range.StartCol,
+				ref.Range.EndLine,
+				ref.Range.EndCol,
+				contextID,
+			)
+			if len(referenceArgs) >= sqliteReferenceValuesBatchRows*11 {
+				if err := execReferencesInsert(ctx, tx, referenceArgs); err != nil {
+					return err
+				}
+				referenceArgs = referenceArgs[:0]
+			}
 		}
-		var contextID any
-		if contextSymbolID != 0 {
-			contextID = contextSymbolID
-		}
-		if _, err := insertReferenceStmt.ExecContext(ctx, repoID, fileID, symbolID, ref.Kind, ref.Name, ref.QualifiedName, ref.Range.StartLine, ref.Range.StartCol, ref.Range.EndLine, ref.Range.EndCol, contextID); err != nil {
-			return err
+		if len(referenceArgs) > 0 {
+			if err := execReferencesInsert(ctx, tx, referenceArgs); err != nil {
+				return err
+			}
 		}
 	}
-	for _, edge := range parsed.Edges {
-		srcID := chooseSrcSymbolID(stableToID, parsed.Symbols, edge.Line)
-		if srcID == 0 {
-			continue
+
+	if len(parsed.Edges) > 0 {
+		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*7)
+		for _, edge := range parsed.Edges {
+			srcID := chooseSrcSymbolID(stableToID, parsed.Symbols, edge.Line)
+			if srcID == 0 {
+				continue
+			}
+			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line)
+			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*7 {
+				if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs); err != nil {
+					return err
+				}
+				edgeArgs = edgeArgs[:0]
+			}
 		}
-		if _, err := insertEdgeStmt.ExecContext(ctx, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line); err != nil {
-			return err
+		if len(edgeArgs) > 0 {
+			if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs); err != nil {
+				return err
+			}
 		}
 	}
-	for _, imp := range parsed.Imports {
-		if _, err := insertImportStmt.ExecContext(ctx, repoID, fileID, imp); err != nil {
-			return err
+
+	if len(parsed.Imports) > 0 {
+		importArgs := make([]any, 0, min(len(parsed.Imports), sqliteImportValuesBatchRows)*3)
+		for _, imp := range parsed.Imports {
+			importArgs = append(importArgs, repoID, fileID, imp)
+			if len(importArgs) >= sqliteImportValuesBatchRows*3 {
+				if err := execImportsInsert(ctx, tx, importArgs); err != nil {
+					return err
+				}
+				importArgs = importArgs[:0]
+			}
+		}
+		if len(importArgs) > 0 {
+			if err := execImportsInsert(ctx, tx, importArgs); err != nil {
+				return err
+			}
 		}
 	}
 	if len(parsed.FileTokens) > 0 {
@@ -1115,6 +1145,45 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 	}
 	_, err := tx.ExecContext(ctx, b.String(), args...)
 	return err
+}
+
+func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, rowsPerBatch int, args []any) error {
+	if len(args) == 0 {
+		return nil
+	}
+	if len(args)%rowsPerBatch != 0 {
+		return fmt.Errorf("invalid %s insert args len=%d (expected multiple of %d)", table, len(args), rowsPerBatch)
+	}
+	rowCount := len(args) / rowsPerBatch
+	var b strings.Builder
+	fmt.Fprintf(&b, "INSERT INTO %s(%s) VALUES ", table, columns)
+	for i := 0; i < rowCount; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(")
+		for j := 0; j < rowsPerBatch; j++ {
+			if j > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("?")
+		}
+		b.WriteString(")")
+	}
+	_, err := tx.ExecContext(ctx, b.String(), args...)
+	return err
+}
+
+func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
+	return execBatchInsert(ctx, tx, "references_tbl", "repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id", 11, args)
+}
+
+func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
+	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args)
+}
+
+func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any) error {
+	return execBatchInsert(ctx, tx, "file_imports", "repo_id, file_id, import_path", 3, args)
 }
 
 func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 {
