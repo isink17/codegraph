@@ -62,7 +62,7 @@ These issues matter more on large repositories because users end up iterating on
   - Several usage strings hardcode `codegraph` rather than using `internal/appname.BinaryName`, making renames harder and risking drift.
 - **Command naming is inconsistent with desired canonical naming:**
   - Query-related commands are currently a mix of hyphenated and short nouns (`find-symbol`, `callers`, `callees`, `impact`).
-  - Desired canonical names are action-oriented and explicit.
+  - Desired canonical names are action-oriented and explicit, and use `snake_case` to match the MCP/tooling surface.
 - **Dispatch architecture is monolithic:**
   - Root `switch args[0]` centralizes all commands in one function; adding commands expands the switch and the hand-maintained usage list.
   - Command-specific parsing/usage logic is scattered across the file with no single source of truth for command metadata.
@@ -73,12 +73,25 @@ These issues matter more on large repositories because users end up iterating on
 
 ## Recommended Canonical Command Naming
 
-Define canonical, stable names for query-like commands. These become the names shown in `codegraph help` and documentation.
+Define canonical, stable names for the CLI surface. These become the names shown in `codegraph help` and documentation.
 
+### Source of Truth
+
+The repo should have a single, vendor-neutral source of truth for tool/assistant-facing naming and usage. See `docs/ai-assistant-guidance.md` and the root `README.md` (MCP tools and setup) for the intended naming style and surface area.
+
+### Canonical Names (Documented In Repo Docs)
+
+These names are grounded in existing repo docs, and represent the intended "clean" surface to converge on:
+
+- `graph_stats`
+- `update_graph`
 - `find_symbol`
 - `find_callers`
 - `find_callees`
 - `get_impact_radius`
+- `find_related_tests`
+- `search_symbols`
+- `search_semantic`
 
 ### Backward-Compatible Aliases To Keep
 
@@ -88,6 +101,11 @@ Preserve the existing command surface as aliases (at least through one major rel
 - `callers` -> `find_callers`
 - `callees` -> `find_callees`
 - `impact` -> `get_impact_radius`
+- `stats` -> `graph_stats`
+- `index` -> `update_graph`
+- `update` -> `update_graph`
+- `affected-tests` -> `find_related_tests`
+- `search` -> `search_symbols`
 
 Implementation note: the alias should be implemented at the dispatch layer (mapping old name to canonical handler), not by duplicating parsing/logic in two places.
 
@@ -109,9 +127,9 @@ This order keeps diffs small and aims for immediate UX improvements without rewr
 3. **Normalize how `FlagSet` help is rendered**
    - Stop discarding `FlagSet` output.
    - Provide a consistent `Usage` function per command that prints synopsis + flags.
-   - Ensure `flag.ErrHelp` returns nil (or prints help and returns nil) to match user expectation.
+   - Treat `flag.ErrHelp` as a successful, user-help result (exit code 0) rather than an error.
 4. **Introduce canonical query command names + alias mapping**
-   - Add the four canonical names above, keep the existing aliases.
+   - Add the canonical names above (from repo docs), keep the existing aliases.
    - Keep JSON output, flags, and behavior identical (only names/help changes).
 5. **Tighten naming consistency in output strings**
    - Replace hard-coded `codegraph` in usage strings with `appname.BinaryName` where practical.
@@ -133,3 +151,12 @@ The goal is to improve help and command discovery first, without re-architecting
    - Treat `flag.ErrHelp` as a non-error result (exit code 0).
 4. Keep `printUsage` as a compatibility fallback initially, then migrate it to render from the command table.
 
+### Help-System Expectations
+
+- Every command has a consistent "help path":
+  - `codegraph help`
+  - `codegraph help <command>`
+  - `codegraph <command> --help` (and `-h`)
+- Help is not an error:
+  - If a `FlagSet` returns `flag.ErrHelp`, render help/usage and return success (exit code 0).
+  - Usage errors (missing required args, unknown subcommand) should return an error and include a short usage line (and optionally a hint to run `codegraph help <command>`).

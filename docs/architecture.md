@@ -12,7 +12,7 @@ Core engine:
 Client-specific integration:
 
 - `AGENTS.md`
-- `GEMINI.md`
+- `docs/ai-assistant-guidance.md`
 - `examples/*.json`
 
 See the root README for the current milestone scope.
