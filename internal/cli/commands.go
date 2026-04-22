@@ -134,10 +134,7 @@ func newCommandList() []*command {
 			name:        "update_graph",
 			aliases:     []string{"update"},
 			description: "update only changed files",
-			usageLines: []string{
-				"  update_graph <repo-path>",
-				"    add --jsonl for streaming line-delimited JSON events",
-			},
+			usageLines:  []string{"  update_graph <repo-path>"},
 			flags: []commandFlag{
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
 			},
@@ -239,7 +236,7 @@ func newCommandList() []*command {
 			name:        "search_symbols",
 			aliases:     []string{"search"},
 			description: "search symbols by name/signature/docs (FTS)",
-			usageLines:  []string{"  search_symbols <repo-path> <query>"},
+			usageLines:  []string{"  search_symbols <repo-path> <query> [--limit N] [--offset N]"},
 			flags: []commandFlag{
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
@@ -330,14 +327,13 @@ func newCommandList() []*command {
 			description: "find tests related to changed files",
 			usageLines: []string{
 				"  find_related_tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...",
-				"    find tests affected by changed files; pipe from git diff --name-only",
 			},
 			examples: []string{
 				"codegraph find_related_tests --repo-root . main.go",
 				"git diff --name-only | codegraph find_related_tests --stdin --repo-root .",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runAffectedTests(ctx, cfg, stdout, args)
+				return runAffectedTests(ctx, cfg, stdout, "find_related_tests", args)
 			},
 		},
 		{
