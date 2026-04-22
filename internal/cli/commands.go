@@ -301,7 +301,20 @@ func newCommandList() []*command {
 		{
 			name:        "graph",
 			description: "graph commands",
-			usageLines:  []string{"  graph export <repo-path> [--format json|dot]"},
+			usageLines:  []string{"  graph export [--format json|dot] [--symbol name] [--focus-symbol name] [--limit N] [--offset N] [--jsonl] <repo-path>"},
+			flags: []commandFlag{
+				{name: "--format", description: "output format (json|dot)"},
+				{name: "--symbol", description: "focus symbol"},
+				{name: "--focus-symbol", description: "focus symbol (alias of --symbol)"},
+				{name: "--limit", description: "page size for JSON export"},
+				{name: "--offset", description: "offset for JSON export"},
+				{name: "--jsonl", description: "stream graph as line-delimited JSON"},
+			},
+			examples: []string{
+				"codegraph graph export .",
+				"codegraph graph export --format dot .",
+				"codegraph graph export --symbol HelloWorld --limit 100 .",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runGraph(ctx, cfg, stdout, args)
 			},
