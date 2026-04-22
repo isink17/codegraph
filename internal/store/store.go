@@ -137,11 +137,21 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
+	isNewDB := false
+	if st, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			isNewDB = true
+		} else {
+			return nil, err
+		}
+	} else if st.Size() == 0 {
+		isNewDB = true
+	}
 	db, err := sql.Open(sqliteDriverName, path)
 	if err != nil {
 		return nil, err
 	}
-	if err := applyPragmas(db, opts.PerformanceProfile); err != nil {
+	if err := applyPragmas(db, isNewDB, opts.PerformanceProfile); err != nil {
 		return nil, err
 	}
 	s := &Store{db: db}
@@ -151,11 +161,21 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	return s, nil
 }
 
-func applyPragmas(db *sql.DB, profile string) error {
+func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
 	base := []string{
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA busy_timeout = 5000;`,
 		`PRAGMA foreign_keys = ON;`,
+		`PRAGMA cache_size = -65536;`,
+	}
+	if isNewDB {
+		// auto_vacuum is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, switching auto_vacuum requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `PRAGMA auto_vacuum = INCREMENTAL;`)
+
+		// page_size is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, changing page_size requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `PRAGMA page_size = 8192;`)
 	}
 	perf := strings.ToLower(strings.TrimSpace(profile))
 	switch perf {
@@ -560,22 +580,26 @@ func (s *Store) MarkFilesSeenBatch(ctx context.Context, repoID, scanID int64, pa
 	if len(paths) == 0 {
 		return nil
 	}
+	const chunkSize = 400
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.PrepareContext(ctx, `
-		UPDATE files
-		SET last_scan_id = ?, is_deleted = 0
-		WHERE repo_id = ? AND path = ?
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer stmt.Close()
-	for _, path := range paths {
-		if _, err := stmt.ExecContext(ctx, scanID, repoID, path); err != nil {
+	for start := 0; start < len(paths); start += chunkSize {
+		end := min(start+chunkSize, len(paths))
+		chunk := paths[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			UPDATE files
+			SET last_scan_id = ?, is_deleted = 0
+			WHERE repo_id = ? AND path IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, scanID, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -1129,9 +1153,16 @@ type edgeTarget struct {
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	totalResolved := 0
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
 
 	// Strategy 1: Exact qualified name match
-	res, err := s.db.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE edges SET dst_symbol_id = (
 			SELECT s.id FROM symbols s
 			WHERE s.repo_id = ? AND s.qualified_name = edges.dst_name
@@ -1148,7 +1179,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	}
 
 	// Strategy 2: Name match (unqualified)
-	res, err = s.db.ExecContext(ctx, `
+	res, err = tx.ExecContext(ctx, `
 		UPDATE edges SET dst_symbol_id = (
 			SELECT s.id FROM symbols s
 			WHERE s.repo_id = ? AND s.name = edges.dst_name
@@ -1159,7 +1190,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.name = edges.dst_name AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface'))
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		totalResolved += int(n)
@@ -1167,15 +1198,15 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 
 	// Strategy 3a: Suffix match for slash-qualified symbols (e.g., pkg.Func matches github.com/org/repo/pkg.Func).
 	// Avoid per-edge LIKE scans by precomputing (tail -> symbol_id) once, then doing an indexed equality update.
-	n, err := s.resolveEdgesBySlashSuffix(ctx, repoID)
+	n, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	totalResolved += n
 
 	// Strategy 3b: Dot-suffix fallback (for qualified names without a slash separator).
 	// Kept as a narrower fallback to preserve existing semantics across languages that don't use '/' in qualified names.
-	res, err = s.db.ExecContext(ctx, `
+	res, err = tx.ExecContext(ctx, `
 		UPDATE edges SET dst_symbol_id = (
 			SELECT s.id FROM symbols s
 			WHERE s.repo_id = ?
@@ -1190,14 +1221,14 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		)
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		totalResolved += int(n)
 	}
 
 	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething)
-	res, err = s.db.ExecContext(ctx, `
+	res, err = tx.ExecContext(ctx, `
 		UPDATE edges SET dst_symbol_id = (
 			SELECT s.id FROM symbols s
 			WHERE s.repo_id = ?
@@ -1212,17 +1243,20 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		)
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		totalResolved += int(n)
 	}
 
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	return totalResolved, nil
 }
 
-func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, repoID int64) (int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`, repoID)
+func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`, repoID)
 	if err != nil {
 		return 0, err
 	}
@@ -1269,17 +1303,10 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, repoID int64) (in
 	for dstName, dstID := range minBySuffix {
 		resolved = append(resolved, resolvedSuffix{dstName: dstName, dstID: dstID})
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
-		_ = tx.Rollback()
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
-		_ = tx.Rollback()
 		return 0, err
 	}
 
@@ -1299,7 +1326,6 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, repoID int64) (in
 			args = append(args, r.dstName, r.dstID)
 		}
 		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
-			_ = tx.Rollback()
 			return 0, err
 		}
 	}
@@ -1311,14 +1337,9 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, repoID int64) (in
 		AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
 	`, repoID)
 	if err != nil {
-		_ = tx.Rollback()
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
-		_ = tx.Rollback()
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	n, err := updateRes.RowsAffected()
