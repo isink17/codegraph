@@ -23,6 +23,7 @@ import (
 	"github.com/isink17/codegraph/internal/embedding"
 	"github.com/isink17/codegraph/internal/export"
 	"github.com/isink17/codegraph/internal/gotool"
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/logging"
 	"github.com/isink17/codegraph/internal/mcp"
@@ -535,6 +536,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 	fs.SetOutput(io.Discard)
 	repoRootFlag := fs.String("repo-root", "", "repository root")
 	queryFlag := fs.String("query", "", "query text")
+	exact := fs.Bool("exact", false, "match symbol name exactly (find_symbol)")
 	depth := fs.Int("depth", 2, "impact depth")
 	limit := fs.Int("limit", 20, "result limit")
 	offset := fs.Int("offset", 0, "result offset")
@@ -582,7 +584,22 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		return writeJSON(stdout, map[string]any{"matches": items})
+		if *exact {
+			filtered := items[:0]
+			for _, sym := range items {
+				if sym.Name == queryValue || sym.QualifiedName == queryValue {
+					filtered = append(filtered, sym)
+				}
+			}
+			items = filtered
+		}
+		if items == nil {
+			items = []graph.Symbol{}
+		}
+		return writeJSON(stdout, map[string]any{
+			"matches": items,
+			"total":   len(items),
+		})
 	case "search":
 		if queryValue == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
