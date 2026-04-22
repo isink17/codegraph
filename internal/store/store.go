@@ -12,8 +12,8 @@ import (
 	"io/fs"
 	"math"
 	"os"
-	"slices"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1381,6 +1381,22 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 
 func (s *Store) FindSymbol(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
 	return s.SearchSymbols(ctx, repoID, query, limit, offset)
+}
+
+func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ? AND (s.name = ? OR s.qualified_name = ?)
+		LIMIT ?
+		OFFSET ?
+	`, repoID, query, query, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
 }
 
 func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {

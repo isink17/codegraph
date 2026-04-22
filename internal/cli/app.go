@@ -580,25 +580,24 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if queryValue == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
-		items, err := app.Query.FindSymbol(ctx, repoID, queryValue, *limit, *offset)
+		var (
+			items []graph.Symbol
+			err   error
+		)
+		if *exact {
+			items, err = app.Query.FindSymbolExact(ctx, repoID, queryValue, *limit, *offset)
+		} else {
+			items, err = app.Query.FindSymbol(ctx, repoID, queryValue, *limit, *offset)
+		}
 		if err != nil {
 			return err
-		}
-		if *exact {
-			filtered := items[:0]
-			for _, sym := range items {
-				if sym.Name == queryValue || sym.QualifiedName == queryValue {
-					filtered = append(filtered, sym)
-				}
-			}
-			items = filtered
 		}
 		if items == nil {
 			items = []graph.Symbol{}
 		}
 		return writeJSON(stdout, map[string]any{
 			"matches": items,
-			"total":   len(items),
+			"count":   len(items),
 		})
 	case "search":
 		if queryValue == "" {

@@ -34,6 +34,10 @@ func (s *Service) FindSymbol(ctx context.Context, repoID int64, query string, li
 	return s.store.FindSymbol(ctx, repoID, query, limit, offset)
 }
 
+func (s *Service) FindSymbolExact(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
+	return s.store.FindSymbolExact(ctx, repoID, query, limit, offset)
+}
+
 func (s *Service) SearchSymbols(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
 	return s.store.SearchSymbols(ctx, repoID, query, limit, offset)
 }
@@ -336,7 +340,6 @@ func (s *Service) AllImports(ctx context.Context, repoID int64) (map[string][]st
 func (s *Service) AllFilePaths(ctx context.Context, repoID int64) ([]string, error) {
 	return s.store.AllFilePaths(ctx, repoID)
 }
-
 
 // parseSeedSymbols extracts Symbol structs from semantic search result maps.
 func parseSeedSymbols(results []map[string]any) []graph.Symbol {
