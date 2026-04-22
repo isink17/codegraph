@@ -66,9 +66,18 @@ type ScanSummary struct {
 	ParseErrors      int                       `json:"parse_errors,omitempty"`
 	ParseSamples     []string                  `json:"parse_samples,omitempty"`
 	LanguageCoverage map[string]LanguageCounts `json:"language_coverage,omitempty"`
+	ExistingLoadMS   int64                     `json:"existing_load_ms,omitempty"`
 	WalkMS           int64                     `json:"walk_ms,omitempty"`
+	ProcessWallMS    int64                     `json:"process_wall_ms,omitempty"`
 	ParseMS          int64                     `json:"parse_ms,omitempty"`
+	ReadMS           int64                     `json:"read_ms,omitempty"`
+	HashMS           int64                     `json:"hash_ms,omitempty"`
+	AdapterParseMS   int64                     `json:"adapter_parse_ms,omitempty"`
 	WriteMS          int64                     `json:"write_ms,omitempty"`
+	WriteMetadataMS  int64                     `json:"write_metadata_ms,omitempty"`
+	WriteReplaceMS   int64                     `json:"write_replace_ms,omitempty"`
+	EmbedMS          int64                     `json:"embed_ms,omitempty"`
+	MarkMissingMS    int64                     `json:"mark_missing_ms,omitempty"`
 	ResolveMS        int64                     `json:"resolve_ms,omitempty"`
 	DurationMS       int64                     `json:"duration_ms"`
 }
@@ -704,19 +713,13 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 			last_scan_id = excluded.last_scan_id,
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0
+		RETURNING id
 	`)
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, err
 	}
 	defer upsertFileStmt.Close()
-
-	selectFileIDStmt, err := tx.PrepareContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer selectFileIDStmt.Close()
 
 	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `
 		DELETE FROM symbol_tokens
@@ -737,6 +740,55 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 		return nil, err
 	}
 	defer deleteSymbolFTSStmt.Close()
+
+	deleteEdgesStmt, err := tx.PrepareContext(ctx, `DELETE FROM edges WHERE file_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	defer deleteEdgesStmt.Close()
+
+	deleteReferencesStmt, err := tx.PrepareContext(ctx, `DELETE FROM references_tbl WHERE file_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	defer deleteReferencesStmt.Close()
+
+	deleteImportsStmt, err := tx.PrepareContext(ctx, `DELETE FROM file_imports WHERE file_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	defer deleteImportsStmt.Close()
+
+	deleteFileTokensStmt, err := tx.PrepareContext(ctx, `DELETE FROM file_tokens WHERE file_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	defer deleteFileTokensStmt.Close()
+
+	deleteTestLinksStmt, err := tx.PrepareContext(ctx, `DELETE FROM test_links WHERE test_file_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	defer deleteTestLinksStmt.Close()
+
+	deleteEmbeddingsStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_embeddings WHERE file_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	defer deleteEmbeddingsStmt.Close()
+
+	deleteSymbolsStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbols WHERE file_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	defer deleteSymbolsStmt.Close()
 
 	insertSymbolStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key)
@@ -812,16 +864,24 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	now := time.Now().UTC().Format(time.RFC3339)
 	fileIDs := make([]int64, 0, len(inputs))
 	for _, input := range inputs {
-		if _, err := upsertFileStmt.ExecContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now); err != nil {
-			_ = tx.Rollback()
-			return nil, err
-		}
 		var fileID int64
-		if err := selectFileIDStmt.QueryRowContext(ctx, repoID, input.Path).Scan(&fileID); err != nil {
+		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
 			return nil, err
 		}
-		if err := deleteFileGraphWithStmts(ctx, tx, fileID, deleteSymbolTokensStmt, deleteSymbolFTSStmt); err != nil {
+		if err := deleteFileGraphWithStmtsPrepared(
+			ctx,
+			fileID,
+			deleteSymbolTokensStmt,
+			deleteSymbolFTSStmt,
+			deleteEdgesStmt,
+			deleteReferencesStmt,
+			deleteImportsStmt,
+			deleteFileTokensStmt,
+			deleteTestLinksStmt,
+			deleteEmbeddingsStmt,
+			deleteSymbolsStmt,
+		); err != nil {
 			_ = tx.Rollback()
 			return nil, err
 		}
@@ -900,6 +960,49 @@ func deleteFileGraphWithStmts(ctx context.Context, tx *sql.Tx, fileID int64, del
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE file_id = ?`, fileID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteFileGraphWithStmtsPrepared(
+	ctx context.Context,
+	fileID int64,
+	deleteSymbolTokensStmt *sql.Stmt,
+	deleteSymbolFTSStmt *sql.Stmt,
+	deleteEdgesStmt *sql.Stmt,
+	deleteReferencesStmt *sql.Stmt,
+	deleteImportsStmt *sql.Stmt,
+	deleteFileTokensStmt *sql.Stmt,
+	deleteTestLinksStmt *sql.Stmt,
+	deleteEmbeddingsStmt *sql.Stmt,
+	deleteSymbolsStmt *sql.Stmt,
+) error {
+	if _, err := deleteSymbolTokensStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteSymbolFTSStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteEdgesStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteReferencesStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteImportsStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteFileTokensStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteTestLinksStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteEmbeddingsStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteSymbolsStmt.ExecContext(ctx, fileID); err != nil {
 		return err
 	}
 	return nil
