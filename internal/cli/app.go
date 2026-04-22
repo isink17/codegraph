@@ -63,18 +63,19 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	logger := logging.New(globalCfg.DefaultLogLevel, stderr)
 	_ = logger
 
-	cmd, ok := lookupCommand(args[0])
+	invokedName := args[0]
+	cmd, ok := lookupCommand(invokedName)
 	if !ok {
-		return fmt.Errorf("unknown command %q", args[0])
+		return fmt.Errorf("unknown command %q", invokedName)
 	}
 
-	// Per-command help: `codegraph <command> --help|-h`.
+	// Per-command help: `<binary> <command> --help|-h`.
 	if hasHelpFlag(args[1:]) {
-		printCommandHelp(stdout, cmd)
+		printCommandHelp(stdout, cmd, invokedName)
 		return nil
 	}
 
-	if err := cmd.run(ctx, globalCfg, stdout, stderr, args[1:]); err != nil {
+	if err := cmd.run(ctx, globalCfg, stdout, stderr, invokedName, args[1:]); err != nil {
 		// Treat user-invoked flag help as success (handlers may return flag.ErrHelp).
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -443,7 +444,7 @@ func runInstall(stdout io.Writer) error {
 		fmt.Fprintln(stdout, clientSnippet)
 	}
 	fmt.Fprintln(stdout)
-	fmt.Fprintln(stdout, "If `codegraph` is not found after `go install`, your Go bin directory is probably not on PATH.")
+	fmt.Fprintf(stdout, "If `%s` is not found after `go install`, your Go bin directory is probably not on PATH.\n", appname.BinaryName)
 	fmt.Fprintln(stdout, "Check expected Go bin locations:")
 	for _, dir := range gotool.BinPathHints() {
 		fmt.Fprintf(stdout, "  - %s\n", dir)
@@ -879,7 +880,7 @@ func runVisualize(ctx context.Context, cfg config.Config, stdout io.Writer, args
 		return nil
 	}
 
-	tmp, err := os.CreateTemp("", "codegraph-viz-*.html")
+	tmp, err := os.CreateTemp("", appname.BinaryName+"-viz-*.html")
 	if err != nil {
 		return err
 	}
@@ -934,7 +935,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		"vacuum": *vacuum,
 		"dbs":    []dbResult{},
 	}
-	var results []dbResult
+	results := make([]dbResult, 0)
 	var reclaimed int64
 
 	if repoRoot != "" {
@@ -1227,6 +1228,9 @@ func printRootHelp(w io.Writer) {
 		if len(cmd.usageLines) > 0 {
 			synopsis = strings.TrimSpace(cmd.usageLines[0])
 		}
+		if len(cmd.aliases) > 0 {
+			synopsis = fmt.Sprintf("%s (aliases: %s)", synopsis, strings.Join(cmd.aliases, ", "))
+		}
 		if cmd.description != "" {
 			fmt.Fprintf(w, "  %s  - %s\n", synopsis, cmd.description)
 		} else {
@@ -1242,19 +1246,57 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintf(w, "  %s serve --repo-root .\n", appname.BinaryName)
 }
 
-func printCommandHelp(w io.Writer, cmd *command) {
-	fmt.Fprintf(w, "%s %s\n", appname.BinaryName, cmd.name)
+func formatCommandExample(ex string) string {
+	// Keep examples stable in source while still respecting renames of the binary.
+	if ex == "codegraph" {
+		return appname.BinaryName
+	}
+	if strings.HasPrefix(ex, "codegraph ") {
+		return appname.BinaryName + ex[len("codegraph"):]
+	}
+	return ex
+}
+
+func formatCommandUsageLine(line, canonicalName, displayName string) string {
+	if canonicalName == "" || displayName == "" || canonicalName == displayName {
+		return line
+	}
+	// Only rewrite the top-level command token to match the invoked name.
+	if strings.HasPrefix(line, "  "+canonicalName) {
+		return "  " + displayName + line[len("  "+canonicalName):]
+	}
+	return line
+}
+
+func printCommandHelp(w io.Writer, cmd *command, invokedName string) {
+	displayName := strings.TrimSpace(invokedName)
+	if displayName == "" {
+		displayName = cmd.name
+	}
+	fmt.Fprintf(w, "%s %s\n", appname.BinaryName, displayName)
 	if cmd.description != "" {
 		fmt.Fprintf(w, "%s\n", cmd.description)
+	}
+	if len(cmd.aliases) > 0 {
+		aliases := make([]string, 0, len(cmd.aliases))
+		for _, a := range cmd.aliases {
+			if a == "" || a == displayName {
+				continue
+			}
+			aliases = append(aliases, a)
+		}
+		if len(aliases) > 0 {
+			fmt.Fprintf(w, "Aliases: %s\n", strings.Join(aliases, ", "))
+		}
 	}
 
 	fmt.Fprintln(w, "\nUsage:")
 	if len(cmd.usageLines) > 0 {
 		for _, line := range cmd.usageLines {
-			fmt.Fprintln(w, line)
+			fmt.Fprintln(w, formatCommandUsageLine(line, cmd.name, displayName))
 		}
 	} else {
-		fmt.Fprintf(w, "  %s %s\n", appname.BinaryName, cmd.name)
+		fmt.Fprintf(w, "  %s %s\n", appname.BinaryName, displayName)
 	}
 
 	if len(cmd.flags) > 0 {
@@ -1271,7 +1313,7 @@ func printCommandHelp(w io.Writer, cmd *command) {
 	if len(cmd.examples) > 0 {
 		fmt.Fprintln(w, "\nExamples:")
 		for _, ex := range cmd.examples {
-			fmt.Fprintf(w, "  %s\n", ex)
+			fmt.Fprintf(w, "  %s\n", formatCommandExample(ex))
 		}
 	}
 }
