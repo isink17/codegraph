@@ -25,6 +25,24 @@ import (
 //go:embed schema/*.sql
 var migrationFS embed.FS
 
+const (
+	// sqliteDefaultMaxVariables is SQLite's commonly configured parameter limit (often 999).
+	// Keep batch sizes below this to avoid "too many SQL variables" errors.
+	sqliteDefaultMaxVariables = 999
+
+	// sqliteInClauseBatchSize is a conservative IN-clause chunk size used for set-based deletes/updates.
+	// It stays under sqliteDefaultMaxVariables with room for any additional parameters.
+	sqliteInClauseBatchSize = 900
+
+	// sqliteTokenValuesBatchRows controls multi-row inserts into token tables where each row uses 3 parameters.
+	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteTokenValuesBatchRows = 300
+
+	// sqliteEmbeddingValuesBatchRows controls multi-row upserts into symbol_embeddings where each row uses 7 parameters.
+	// 100*7=700 variables, staying under sqliteDefaultMaxVariables.
+	sqliteEmbeddingValuesBatchRows = 100
+)
+
 type Store struct {
 	db *sql.DB
 }
@@ -847,11 +865,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64) err
 		return nil
 	}
 
-	const maxVars = 900
-
 	execInChunks := func(sqlPrefix, sqlSuffix string, ids []int64) error {
-		for start := 0; start < len(ids); start += maxVars {
-			end := start + maxVars
+		for start := 0; start < len(ids); start += sqliteInClauseBatchSize {
+			end := start + sqliteInClauseBatchSize
 			if end > len(ids) {
 				end = len(ids)
 			}
@@ -975,7 +991,7 @@ func insertParsedFileGraph(
 	insertTestLinkStmt *sql.Stmt,
 ) error {
 	stableToID := map[string]int64{}
-	symbolTokenArgs := make([]any, 0, 300*3)
+	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
 	for _, sym := range parsed.Symbols {
 		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
 		if err != nil {
@@ -991,7 +1007,7 @@ func insertParsedFileGraph(
 		}
 		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
 			symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
-			if len(symbolTokenArgs) >= 300*3 {
+			if len(symbolTokenArgs) >= sqliteTokenValuesBatchRows*3 {
 				if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs); err != nil {
 					return err
 				}
@@ -1033,10 +1049,10 @@ func insertParsedFileGraph(
 		}
 	}
 	if len(parsed.FileTokens) > 0 {
-		fileTokenArgs := make([]any, 0, min(len(parsed.FileTokens), 300)*3)
+		fileTokenArgs := make([]any, 0, min(len(parsed.FileTokens), sqliteTokenValuesBatchRows)*3)
 		for token, weight := range parsed.FileTokens {
 			fileTokenArgs = append(fileTokenArgs, fileID, token, weight)
-			if len(fileTokenArgs) >= 300*3 {
+			if len(fileTokenArgs) >= sqliteTokenValuesBatchRows*3 {
 				if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs); err != nil {
 					return err
 				}
@@ -1084,13 +1100,13 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 	if len(args) == 0 {
 		return nil
 	}
-	// SQLite's default parameter limit is commonly 999. Each row uses 3 params.
+	// Each row uses 3 params; batch sizes are controlled by sqliteTokenValuesBatchRows to stay under sqliteDefaultMaxVariables.
 	if len(args)%3 != 0 {
 		return fmt.Errorf("invalid token insert args len=%d", len(args))
 	}
 	rows := len(args) / 3
 	var b strings.Builder
-fmt.Fprintf(&b, "INSERT INTO %q(%q, token, weight) VALUES ", table, idColumn)
+	fmt.Fprintf(&b, "INSERT INTO %s(%s, token, weight) VALUES ", table, idColumn)
 	for i := 0; i < rows; i++ {
 		if i > 0 {
 			b.WriteString(",")
@@ -2899,11 +2915,10 @@ func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID, fileID int64
 	}
 
 	// Resolve symbol ids in chunks to avoid per-row subqueries during embedding writes.
-	// Keep under SQLite's default variable limit (999).
-	const keyChunkSize = 900
+	// Keep under sqliteDefaultMaxVariables.
 	stableToID := make(map[string]int64, len(stableKeys))
-	for start := 0; start < len(stableKeys); start += keyChunkSize {
-		end := min(start+keyChunkSize, len(stableKeys))
+	for start := 0; start < len(stableKeys); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(stableKeys))
 		chunk := stableKeys[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
@@ -2939,8 +2954,7 @@ func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID, fileID int64
 	}
 
 	const embedCols = 7
-	const maxRowsPerInsert = 100 // 100*7=700 vars, stays under 999.
-	embedArgs := make([]any, 0, maxRowsPerInsert*embedCols)
+	embedArgs := make([]any, 0, sqliteEmbeddingValuesBatchRows*embedCols)
 	flush := func() error {
 		if len(embedArgs) == 0 {
 			return nil
@@ -2975,7 +2989,7 @@ func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID, fileID int64
 		}
 		blob := float32ToBytes(vec)
 		embedArgs = append(embedArgs, symbolID, fileID, repoID, blob, len(vec), modelName, now)
-		if len(embedArgs) >= maxRowsPerInsert*embedCols {
+		if len(embedArgs) >= sqliteEmbeddingValuesBatchRows*embedCols {
 			if err := flush(); err != nil {
 				_ = tx.Rollback()
 				return err
@@ -3000,11 +3014,11 @@ func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, m
 		return nil
 	}
 
-tx, err := s.db.BeginTx(ctx, nil)
-if err != nil {
-	return err
-}
-defer tx.Rollback()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	if err != nil {
 		return err
 	}
@@ -3026,8 +3040,7 @@ defer tx.Rollback()
 	}
 
 	const embedCols = 7
-	const maxRowsPerInsert = 100 // 100*7=700 vars, stays under 999.
-	embedArgs := make([]any, 0, maxRowsPerInsert*embedCols)
+	embedArgs := make([]any, 0, sqliteEmbeddingValuesBatchRows*embedCols)
 	flush := func() error {
 		if len(embedArgs) == 0 {
 			return nil
@@ -3056,8 +3069,7 @@ defer tx.Rollback()
 	}
 
 	// Resolve symbol ids per file in chunks, then multi-row upsert embeddings.
-	// Keep well under SQLite's default variable limit (999).
-	const keyChunkSize = 900
+	// Keep well under sqliteDefaultMaxVariables.
 	for fileID, vecs := range byFile {
 		if len(vecs) == 0 {
 			continue
@@ -3074,8 +3086,8 @@ defer tx.Rollback()
 			}
 			stableToVec[v.stableKey] = v.vector
 		}
-		for start := 0; start < len(stableKeys); start += keyChunkSize {
-			end := min(start+keyChunkSize, len(stableKeys))
+		for start := 0; start < len(stableKeys); start += sqliteInClauseBatchSize {
+			end := min(start+sqliteInClauseBatchSize, len(stableKeys))
 			chunk := stableKeys[start:end]
 			placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 			query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
@@ -3102,7 +3114,7 @@ defer tx.Rollback()
 					continue
 				}
 				embedArgs = append(embedArgs, symbolID, fileID, repoID, float32ToBytes(vec), len(vec), modelName, now)
-				if len(embedArgs) >= maxRowsPerInsert*embedCols {
+				if len(embedArgs) >= sqliteEmbeddingValuesBatchRows*embedCols {
 					if err := rows.Close(); err != nil {
 						_ = tx.Rollback()
 						return err
