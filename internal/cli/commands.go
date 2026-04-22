@@ -131,11 +131,19 @@ func newCommandList() []*command {
 			},
 		},
 		{
-			name:        "update",
-			description: "incrementally update an index",
+			name:        "update_graph",
+			aliases:     []string{"update"},
+			description: "update only changed files",
 			usageLines: []string{
-				"  update <repo-path>",
+				"  update_graph <repo-path>",
 				"    add --jsonl for streaming line-delimited JSON events",
+			},
+			flags: []commandFlag{
+				{name: "--jsonl", description: "stream line-delimited JSON events"},
+			},
+			examples: []string{
+				"codegraph update_graph .",
+				"codegraph update_graph . --jsonl",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runIndex(ctx, cfg, stdout, args, true)
@@ -207,26 +215,41 @@ func newCommandList() []*command {
 			name:        "get_impact_radius",
 			aliases:     []string{"impact"},
 			description: "compute impact radius",
-			usageLines:  []string{"  get_impact_radius <repo-path> [--symbol <name>] [--file <path>]"},
+			usageLines: []string{
+				"  get_impact_radius <repo-path> <symbol>",
+				"  get_impact_radius <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]",
+			},
 			flags: []commandFlag{
-				{name: "--symbol", description: "symbol name to query"},
-				{name: "--file", description: "file path to query"},
+				{name: "--symbol", description: "symbol name to query (repeatable)"},
+				{name: "--file", description: "file path to query (repeatable)"},
 				{name: "--depth", description: "limit traversal depth"},
 			},
 			examples: []string{
+				"codegraph get_impact_radius . HelloWorld",
 				"codegraph get_impact_radius . --symbol HelloWorld",
+				"codegraph get_impact_radius . --symbol HelloWorld --symbol OtherFunc",
 				"codegraph get_impact_radius . --file main.go",
+				"codegraph get_impact_radius . --file main.go --depth 3",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runQueryCommand(ctx, cfg, stdout, "impact", "get_impact_radius", args)
 			},
 		},
 		{
-			name:        "search",
-			description: "search",
-			usageLines:  []string{"  search <repo-path> <query>"},
+			name:        "search_symbols",
+			aliases:     []string{"search"},
+			description: "search symbols by name/signature/docs (FTS)",
+			usageLines:  []string{"  search_symbols <repo-path> <query>"},
+			flags: []commandFlag{
+				{name: "--limit", description: "limit results"},
+				{name: "--offset", description: "offset into result set"},
+			},
+			examples: []string{
+				"codegraph search_symbols . HelloWorld",
+				"codegraph search_symbols . \"http handler\"",
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
-				return runQueryCommand(ctx, cfg, stdout, "search", "search", args)
+				return runQueryCommand(ctx, cfg, stdout, "search", "search_symbols", args)
 			},
 		},
 		{
@@ -302,11 +325,16 @@ func newCommandList() []*command {
 			},
 		},
 		{
-			name:        "affected-tests",
-			description: "find affected tests",
+			name:        "find_related_tests",
+			aliases:     []string{"affected-tests"},
+			description: "find tests related to changed files",
 			usageLines: []string{
-				"  affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...",
+				"  find_related_tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...",
 				"    find tests affected by changed files; pipe from git diff --name-only",
+			},
+			examples: []string{
+				"codegraph find_related_tests --repo-root . main.go",
+				"git diff --name-only | codegraph find_related_tests --stdin --repo-root .",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
 				return runAffectedTests(ctx, cfg, stdout, args)
