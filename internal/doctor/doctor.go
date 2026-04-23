@@ -19,17 +19,18 @@ import (
 )
 
 type Report struct {
-	GOOS            string   `json:"goos"`
-	ConfigPath      string   `json:"config_path"`
-	ConfigExists    bool     `json:"config_exists"`
-	DataDir         string   `json:"data_dir"`
-	CacheDir        string   `json:"cache_dir"`
-	CodegraphOnPath bool     `json:"codegraph_on_path"`
-	CodegraphPath   string   `json:"codegraph_path,omitempty"`
-	SQLiteDriver    string   `json:"sqlite_driver"`
-	DB              *DBInfo  `json:"db,omitempty"`
-	AppliedFixes    []string `json:"applied_fixes,omitempty"`
-	Recommendations []string `json:"recommendations,omitempty"`
+	GOOS            string    `json:"goos"`
+	ConfigPath      string    `json:"config_path"`
+	ConfigExists    bool      `json:"config_exists"`
+	DataDir         string    `json:"data_dir"`
+	CacheDir        string    `json:"cache_dir"`
+	CodegraphOnPath bool      `json:"codegraph_on_path"`
+	CodegraphPath   string    `json:"codegraph_path,omitempty"`
+	SQLiteDriver    string    `json:"sqlite_driver"`
+	DB              *DBInfo   `json:"db,omitempty"`
+	Deep            *DeepInfo `json:"deep,omitempty"`
+	AppliedFixes    []string  `json:"applied_fixes,omitempty"`
+	Recommendations []string  `json:"recommendations,omitempty"`
 }
 
 type DBInfo struct {
@@ -38,11 +39,32 @@ type DBInfo struct {
 	Pragmas   store.DBPragmas `json:"pragmas"`
 }
 
+type DeepInfo struct {
+	DB *DBDeepInfo `json:"db,omitempty"`
+}
+
+type DBDeepInfo struct {
+	IntegrityOK        bool     `json:"integrity_ok"`
+	IntegrityMessages  []string `json:"integrity_messages,omitempty"`
+	IntegrityTruncated bool     `json:"integrity_truncated,omitempty"`
+	ForeignKeyIssues   int64    `json:"foreign_key_issues,omitempty"`
+}
+
 func Run() (Report, error) {
 	return RunWithFix(false, "")
 }
 
 func RunWithFix(fix bool, dbPath string) (Report, error) {
+	return RunWithOptions(Options{Fix: fix, DBPath: dbPath})
+}
+
+type Options struct {
+	Fix    bool
+	DBPath string
+	Deep   bool
+}
+
+func RunWithOptions(opts Options) (Report, error) {
 	paths, err := platform.DefaultPaths()
 	if err != nil {
 		return Report{}, err
@@ -61,7 +83,7 @@ func RunWithFix(fix bool, dbPath string) (Report, error) {
 		binaryPath = ""
 	}
 	appliedFixes := []string{}
-	if fix {
+	if opts.Fix {
 		defaultCfg, err := config.Default()
 		if err != nil {
 			return Report{}, err
@@ -96,12 +118,21 @@ func RunWithFix(fix bool, dbPath string) (Report, error) {
 	}
 
 	var dbInfo *DBInfo
-	if strings.TrimSpace(dbPath) != "" {
-		info, err := inspectDB(context.Background(), dbPath)
+	var deepInfo *DeepInfo
+	if strings.TrimSpace(opts.DBPath) != "" {
+		info, err := inspectDB(context.Background(), opts.DBPath)
 		if err != nil {
 			recommendations = append(recommendations, "repo DB inspect failed: "+err.Error())
 		} else {
 			dbInfo = info
+		}
+		if opts.Deep {
+			di, err := inspectDeepDB(context.Background(), opts.DBPath)
+			if err != nil {
+				recommendations = append(recommendations, "repo DB deep inspect failed: "+err.Error())
+			} else {
+				deepInfo = &DeepInfo{DB: di}
+			}
 		}
 	}
 
@@ -115,6 +146,7 @@ func RunWithFix(fix bool, dbPath string) (Report, error) {
 		CodegraphPath:   binaryPath,
 		SQLiteDriver:    store.SQLiteDriverName(),
 		DB:              dbInfo,
+		Deep:            deepInfo,
 		AppliedFixes:    appliedFixes,
 		Recommendations: recommendations,
 	}, nil
@@ -147,5 +179,66 @@ func inspectDB(ctx context.Context, dbPath string) (*DBInfo, error) {
 		Path:      filepath.Clean(dbPath),
 		SizeBytes: st.Size(),
 		Pragmas:   pragmas,
+	}, nil
+}
+
+func inspectDeepDB(ctx context.Context, dbPath string) (*DBDeepInfo, error) {
+	db, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	// integrity_check can return many rows; keep this bounded and human-usable.
+	const maxIntegrityMessages = 20
+	integrityMessages := make([]string, 0)
+	truncated := false
+	rows, err := db.QueryContext(ctx, `PRAGMA integrity_check`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var msg string
+		if err := rows.Scan(&msg); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if len(integrityMessages) < maxIntegrityMessages {
+			integrityMessages = append(integrityMessages, msg)
+		} else {
+			truncated = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	integrityOK := len(integrityMessages) == 1 && integrityMessages[0] == "ok"
+	if integrityOK {
+		integrityMessages = nil
+		truncated = false
+	}
+
+	var foreignKeyIssues int64
+	fkRows, err := db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return nil, err
+	}
+	for fkRows.Next() {
+		foreignKeyIssues++
+	}
+	if err := fkRows.Err(); err != nil {
+		fkRows.Close()
+		return nil, err
+	}
+	fkRows.Close()
+
+	return &DBDeepInfo{
+		IntegrityOK:        integrityOK,
+		IntegrityMessages:  integrityMessages,
+		IntegrityTruncated: truncated,
+		ForeignKeyIssues:   foreignKeyIssues,
 	}, nil
 }
