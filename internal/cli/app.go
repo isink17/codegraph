@@ -629,6 +629,9 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 		scanKind := map[bool]string{true: "update", false: "index"}[update]
 		if err := writeJSONL(stdout, map[string]any{
 			"type":      "scan_summary",
+			"repo_root": repo.RootPath,
+			"repo_id":   summary.RepoID,
+			"scan_id":   summary.ScanID,
 			"command":   scanKind,
 			"scan_kind": scanKind,
 			"data":      summary,
@@ -636,7 +639,10 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 			return err
 		}
 		_ = writeJSONL(stdout, map[string]any{
-			"type": "scan_phases",
+			"type":      "scan_phases",
+			"repo_root": repo.RootPath,
+			"repo_id":   summary.RepoID,
+			"scan_id":   summary.ScanID,
 			"data": map[string]any{
 				"existing_load_ms":  summary.ExistingLoadMS,
 				"walk_ms":           summary.WalkMS,
@@ -656,8 +662,11 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 			},
 		})
 		return writeJSONL(stdout, map[string]any{
-			"type": "scan_stats",
-			"data": stats,
+			"type":      "scan_stats",
+			"repo_root": repo.RootPath,
+			"repo_id":   summary.RepoID,
+			"scan_id":   summary.ScanID,
+			"data":      stats,
 		})
 	}
 	return writeJSON(stdout, map[string]any{"summary": summary, "stats": stats})
