@@ -1851,43 +1851,95 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 		return 0, nil
 	}
 
-	// Query shape: do a single unresolved-edge scan, then filter in Go.
-	// This avoids repeated SQL queries with many OR/L LIKE clauses (which are
-	// difficult for SQLite to optimize with indexes).
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, dst_name
-		FROM edges
-		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-	`, repoID)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-
 	nameSet := make(map[string]struct{}, len(unique))
 	for _, name := range unique {
 		nameSet[name] = struct{}{}
 	}
 
-	targets := make([]edgeTarget, 0, 64)
+	// Candidate selection:
+	//
+	// 1) Use indexed exact matches for dst_name = <name> (covers the common case
+	//    where unresolved edges reference the simple symbol name directly).
+	// 2) Only if needed, scan unresolved edges that contain a '.' and filter in Go
+	//    for suffix matches (dst_name ends with ".<name>").
+	//
+	// This avoids scanning the full unresolved-edge set on large repos where many
+	// unresolved edges have simple (non-qualified) dst_name values.
+	targetByID := make(map[int64]edgeTarget, 64)
+
+	// Keep under sqliteDefaultMaxVariables (repoID + N names).
+	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(unique))
+		chunk := unique[start:end]
+
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name IN (` + placeholders + `)`
+		args := make([]any, 1+len(chunk))
+		args[0] = repoID
+		for i, name := range chunk {
+			args[i+1] = name
+		}
+
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return 0, err
+		}
+		for rows.Next() {
+			var id int64
+			var dstName string
+			if err := rows.Scan(&id, &dstName); err != nil {
+				_ = rows.Close()
+				return 0, err
+			}
+			targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if err := rows.Close(); err != nil {
+			return 0, err
+		}
+	}
+
+	// Suffix matching requires looking at qualified dst_name values. Keep this
+	// as a single pass over the qualified unresolved set (no repeated LIKE
+	// queries), but avoid scanning simple dst_name values entirely.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != '' AND instr(dst_name, '.') > 0
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
 	for rows.Next() {
 		var id int64
 		var dstName string
 		if err := rows.Scan(&id, &dstName); err != nil {
+			_ = rows.Close()
 			return 0, err
 		}
-		if _, ok := nameSet[dstName]; ok {
-			targets = append(targets, edgeTarget{edgeID: id, dstName: dstName})
+		if _, ok := targetByID[id]; ok {
 			continue
 		}
 		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
 			if _, ok := nameSet[dstName[dot+1:]]; ok {
-				targets = append(targets, edgeTarget{edgeID: id, dstName: dstName})
+				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	targets := make([]edgeTarget, 0, len(targetByID))
+	for _, target := range targetByID {
+		targets = append(targets, target)
 	}
 	if err := s.resolveEdgeTargets(ctx, repoID, targets); err != nil {
 		return 0, err
