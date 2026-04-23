@@ -44,12 +44,7 @@ func WeightsBytesInto(dst map[string]float64, content []byte) {
 			if b >= 'A' && b <= 'Z' {
 				b = b + ('a' - 'A')
 			}
-			if len(token) < cap(token) {
-				token = append(token, b)
-			} else {
-				// Rare slow path for very long tokens.
-				token = append(token, b)
-			}
+			token = append(token, b)
 			continue
 		}
 		if len(token) > 0 {
