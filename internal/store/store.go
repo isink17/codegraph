@@ -118,6 +118,7 @@ type ScanSummary struct {
 	WriteMetadataMS         int64                     `json:"write_metadata_ms,omitempty"`
 	WriteReplaceMS          int64                     `json:"write_replace_ms,omitempty"`
 	WriteMarkSeenFlushes    int                       `json:"write_mark_seen_flushes,omitempty"`
+	WriteMarkSeenSkipped    int                       `json:"write_mark_seen_skipped,omitempty"`
 	WriteTouchFlushes       int                       `json:"write_touch_flushes,omitempty"`
 	WriteParseFailedFlushes int                       `json:"write_parse_failed_flushes,omitempty"`
 	WriteReplaceFlushes     int                       `json:"write_replace_flushes,omitempty"`

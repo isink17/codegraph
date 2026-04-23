@@ -126,6 +126,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	for rel := range candidateSet {
 		candidatePaths = append(candidatePaths, rel)
 	}
+	pathScoped := len(candidateSet) > 0
 
 	var existing map[string]store.FileRecord
 	existingLoadStarted := time.Now()
@@ -290,6 +291,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if len(markSeenBatch) == 0 {
 			return nil
 		}
+		if pathScoped {
+			summary.WriteMarkSeenSkipped += len(markSeenBatch)
+			markSeenBatch = markSeenBatch[:0]
+			return nil
+		}
 		started := time.Now()
 		if err := i.store.MarkFilesSeenBatch(ctx, repo.ID, scanID, markSeenBatch); err != nil {
 			return err
@@ -390,6 +396,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			coverage.Skipped++
 			summary.LanguageCoverage[coverageLanguage] = coverage
 			if len(markSeenBatch) < metadataBatchSize {
+				if pathScoped {
+					summary.WriteMarkSeenSkipped++
+					markSeenBatch = markSeenBatch[:0]
+				}
 				writeDur += time.Since(writeStart)
 				summary.FilesSkipped++
 				continue
@@ -614,7 +624,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 		}
 		return result
 	}
-	if hasPrev && !force && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano() {
+	if hasPrev && !prev.IsDeleted && !force && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano() {
 		result.action = "mark_seen"
 		return result
 	}
