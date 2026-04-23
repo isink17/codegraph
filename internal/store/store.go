@@ -92,44 +92,58 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
-	RepoID                  int64                     `json:"repo_id"`
-	ScanID                  int64                     `json:"scan_id"`
-	FilesSeen               int                       `json:"files_seen"`
-	FilesIndexed            int                       `json:"files_indexed"`
-	FilesSkipped            int                       `json:"files_skipped"`
-	FilesChanged            int                       `json:"files_changed"`
-	FilesDeleted            int                       `json:"files_deleted"`
-	FilesTotal              int                       `json:"files_total,omitempty"`
-	FilesDeletedPct         float64                   `json:"files_deleted_pct,omitempty"`
-	ParseErrors             int                       `json:"parse_errors,omitempty"`
-	ParseSamples            []string                  `json:"parse_samples,omitempty"`
-	LanguageCoverage        map[string]LanguageCounts `json:"language_coverage,omitempty"`
-	PhaseTimings            []ScanPhaseTiming         `json:"phase_timings,omitempty"`
-	ExistingLoadMS          int64                     `json:"existing_load_ms,omitempty"`
-	WalkMS                  int64                     `json:"walk_ms,omitempty"`
-	ProcessWallMS           int64                     `json:"process_wall_ms,omitempty"`
-	TaskMS                  int64                     `json:"task_ms,omitempty"`
-	TaskOtherMS             int64                     `json:"task_other_ms,omitempty"`
-	ParseMS                 int64                     `json:"parse_ms,omitempty"`
-	ReadMS                  int64                     `json:"read_ms,omitempty"`
-	HashMS                  int64                     `json:"hash_ms,omitempty"`
-	AdapterParseMS          int64                     `json:"adapter_parse_ms,omitempty"`
-	WriteMS                 int64                     `json:"write_ms,omitempty"`
-	WriteMetadataMS         int64                     `json:"write_metadata_ms,omitempty"`
-	WriteReplaceMS          int64                     `json:"write_replace_ms,omitempty"`
-	WriteMarkSeenFlushes    int                       `json:"write_mark_seen_flushes,omitempty"`
-	WriteMarkSeenSkipped    int                       `json:"write_mark_seen_skipped,omitempty"`
-	WriteTouchFlushes       int                       `json:"write_touch_flushes,omitempty"`
-	WriteParseFailedFlushes int                       `json:"write_parse_failed_flushes,omitempty"`
-	WriteReplaceFlushes     int                       `json:"write_replace_flushes,omitempty"`
-	WriteStats              *WriteStats               `json:"write_stats,omitempty"`
-	EmbedMS                 int64                     `json:"embed_ms,omitempty"`
-	MarkMissingMS           int64                     `json:"mark_missing_ms,omitempty"`
-	ResolveMS               int64                     `json:"resolve_ms,omitempty"`
-	ResolveMode             string                    `json:"resolve_mode,omitempty"`
-	ResolveCrossFileMS      int64                     `json:"resolve_cross_file_ms,omitempty"`
-	ResolveCrossFileTargets int                       `json:"resolve_cross_file_targets,omitempty"`
-	DurationMS              int64                     `json:"duration_ms"`
+	RepoID                  int64                      `json:"repo_id"`
+	ScanID                  int64                      `json:"scan_id"`
+	FilesSeen               int                        `json:"files_seen"`
+	FilesIndexed            int                        `json:"files_indexed"`
+	FilesSkipped            int                        `json:"files_skipped"`
+	FilesChanged            int                        `json:"files_changed"`
+	FilesDeleted            int                        `json:"files_deleted"`
+	FilesTotal              int                        `json:"files_total,omitempty"`
+	FilesDeletedPct         float64                    `json:"files_deleted_pct,omitempty"`
+	ParseErrors             int                        `json:"parse_errors,omitempty"`
+	ParseSamples            []string                   `json:"parse_samples,omitempty"`
+	LanguageCoverage        map[string]LanguageCounts  `json:"language_coverage,omitempty"`
+	PhaseTimings            []ScanPhaseTiming          `json:"phase_timings,omitempty"`
+	ExistingLoadMS          int64                      `json:"existing_load_ms,omitempty"`
+	WalkMS                  int64                      `json:"walk_ms,omitempty"`
+	ProcessWallMS           int64                      `json:"process_wall_ms,omitempty"`
+	TaskMS                  int64                      `json:"task_ms,omitempty"`
+	TaskOtherMS             int64                      `json:"task_other_ms,omitempty"`
+	ParseMS                 int64                      `json:"parse_ms,omitempty"`
+	ReadMS                  int64                      `json:"read_ms,omitempty"`
+	HashMS                  int64                      `json:"hash_ms,omitempty"`
+	AdapterParseMS          int64                      `json:"adapter_parse_ms,omitempty"`
+	WriteMS                 int64                      `json:"write_ms,omitempty"`
+	WriteMetadataMS         int64                      `json:"write_metadata_ms,omitempty"`
+	WriteReplaceMS          int64                      `json:"write_replace_ms,omitempty"`
+	WriteMarkSeenFlushes    int                        `json:"write_mark_seen_flushes,omitempty"`
+	WriteMarkSeenSkipped    int                        `json:"write_mark_seen_skipped,omitempty"`
+	WriteTouchFlushes       int                        `json:"write_touch_flushes,omitempty"`
+	WriteParseFailedFlushes int                        `json:"write_parse_failed_flushes,omitempty"`
+	WriteReplaceFlushes     int                        `json:"write_replace_flushes,omitempty"`
+	WriteStats              *WriteStats                `json:"write_stats,omitempty"`
+	EmbedMS                 int64                      `json:"embed_ms,omitempty"`
+	MarkMissingMS           int64                      `json:"mark_missing_ms,omitempty"`
+	ResolveMS               int64                      `json:"resolve_ms,omitempty"`
+	ResolveMode             string                     `json:"resolve_mode,omitempty"`
+	ResolveCrossFileMS      int64                      `json:"resolve_cross_file_ms,omitempty"`
+	ResolveCrossFileTargets int                        `json:"resolve_cross_file_targets,omitempty"`
+	ResolveCrossFile        *ResolveEdgesForNamesStats `json:"resolve_cross_file,omitempty"`
+	DurationMS              int64                      `json:"duration_ms"`
+}
+
+type ResolveEdgesForNamesStats struct {
+	NamesInput        int   `json:"names_input,omitempty"`
+	NamesUnique       int   `json:"names_unique,omitempty"`
+	ExactQueryBatches int   `json:"exact_query_batches,omitempty"`
+	ExactHits         int   `json:"exact_hits,omitempty"`
+	QualifiedScanned  int   `json:"qualified_scanned,omitempty"`
+	SuffixHits        int   `json:"suffix_hits,omitempty"`
+	TargetsSelected   int   `json:"targets_selected,omitempty"`
+	ExactSelectMS     int64 `json:"exact_select_ms,omitempty"`
+	SuffixSelectMS    int64 `json:"suffix_select_ms,omitempty"`
+	ResolveTargetsMS  int64 `json:"resolve_targets_ms,omitempty"`
 }
 
 type ScanPhaseTiming struct {
@@ -1831,9 +1845,19 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 //
 // It returns the number of candidate edges selected for resolution.
 func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []string) (int, error) {
-	if len(names) == 0 {
-		return 0, nil
+	stats, err := s.ResolveEdgesForNamesWithStats(ctx, repoID, names)
+	if err != nil {
+		return 0, err
 	}
+	return stats.TargetsSelected, nil
+}
+
+func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string) (ResolveEdgesForNamesStats, error) {
+	var stats ResolveEdgesForNamesStats
+	if len(names) == 0 {
+		return stats, nil
+	}
+	stats.NamesInput = len(names)
 	seen := make(map[string]struct{}, len(names))
 	unique := make([]string, 0, len(names))
 	for _, name := range names {
@@ -1848,8 +1872,9 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 		unique = append(unique, name)
 	}
 	if len(unique) == 0 {
-		return 0, nil
+		return stats, nil
 	}
+	stats.NamesUnique = len(unique)
 
 	nameSet := make(map[string]struct{}, len(unique))
 	for _, name := range unique {
@@ -1867,6 +1892,7 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 	// unresolved edges have simple (non-qualified) dst_name values.
 	targetByID := make(map[int64]edgeTarget, 64)
 
+	exactStarted := time.Now()
 	// Keep under sqliteDefaultMaxVariables (repoID + N names).
 	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
 		end := min(start+sqliteInClauseBatchSize, len(unique))
@@ -1882,69 +1908,79 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
-			return 0, err
+			return stats, err
 		}
 		for rows.Next() {
 			var id int64
 			var dstName string
 			if err := rows.Scan(&id, &dstName); err != nil {
 				_ = rows.Close()
-				return 0, err
+				return stats, err
 			}
 			targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+			stats.ExactHits++
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
-			return 0, err
+			return stats, err
 		}
 		if err := rows.Close(); err != nil {
-			return 0, err
+			return stats, err
 		}
+		stats.ExactQueryBatches++
 	}
+	stats.ExactSelectMS = time.Since(exactStarted).Milliseconds()
 
 	// Suffix matching requires looking at qualified dst_name values. Keep this
 	// as a single pass over the qualified unresolved set (no repeated LIKE
 	// queries), but avoid scanning simple dst_name values entirely.
+	suffixStarted := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, dst_name
 		FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != '' AND instr(dst_name, '.') > 0
 	`, repoID)
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
 	for rows.Next() {
 		var id int64
 		var dstName string
 		if err := rows.Scan(&id, &dstName); err != nil {
 			_ = rows.Close()
-			return 0, err
+			return stats, err
 		}
+		stats.QualifiedScanned++
 		if _, ok := targetByID[id]; ok {
 			continue
 		}
 		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
 			if _, ok := nameSet[dstName[dot+1:]]; ok {
 				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+				stats.SuffixHits++
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return 0, err
+		return stats, err
 	}
 	if err := rows.Close(); err != nil {
-		return 0, err
+		return stats, err
 	}
+	stats.SuffixSelectMS = time.Since(suffixStarted).Milliseconds()
 
 	targets := make([]edgeTarget, 0, len(targetByID))
 	for _, target := range targetByID {
 		targets = append(targets, target)
 	}
+	stats.TargetsSelected = len(targets)
+	resolveStarted := time.Now()
 	if err := s.resolveEdgeTargets(ctx, repoID, targets); err != nil {
-		return 0, err
+		return stats, err
 	}
-	return len(targets), nil
+	stats.ResolveTargetsMS = time.Since(resolveStarted).Milliseconds()
+	return stats, nil
 }
 
 func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
@@ -1961,6 +1997,16 @@ func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
 		return nil, err
 	}
 	return targets, nil
+}
+
+func (s *Store) CountUnresolvedEdgesByDstName(ctx context.Context, repoID int64, dstName string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name = ?
+	`, repoID, dstName).Scan(&n)
+	return n, err
 }
 
 func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget) error {
