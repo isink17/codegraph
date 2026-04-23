@@ -1323,12 +1323,14 @@ type graphRepo struct {
 
 func writeJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }
 
 func writeJSONL(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	return enc.Encode(v)
 }
 
