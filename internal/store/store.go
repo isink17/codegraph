@@ -2688,22 +2688,75 @@ func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason s
 }
 
 func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
-	if err != nil {
+	// Prefer an atomic drain. `DELETE ... RETURNING` guarantees we only remove rows
+	// that are returned to the caller (no SELECT+DELETE race).
+	rows, err := s.db.QueryContext(ctx, `
+		WITH deleted AS (
+			DELETE FROM dirty_files
+			WHERE repo_id = ?
+			RETURNING path, queued_at
+		)
+		SELECT path
+		FROM deleted
+		ORDER BY queued_at
+	`, repoID)
+	if err == nil {
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				return nil, err
+			}
+			out = append(out, path)
+		}
+		return out, rows.Err()
+	}
+
+	// Fallback for older SQLite builds/drivers without `RETURNING`.
+	// We take a write lock up-front so that events queued concurrently cannot be
+	// inserted until after we delete the drained rows.
+	conn, connErr := s.db.Conn(ctx)
+	if connErr != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer conn.Close()
+
+	if _, lockErr := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); lockErr != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+	}()
+
+	selRows, selErr := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
+	if selErr != nil {
+		return nil, selErr
+	}
+	defer selRows.Close()
+
 	var out []string
-	for rows.Next() {
+	for selRows.Next() {
 		var path string
-		if err := rows.Scan(&path); err != nil {
-			return nil, err
+		if scanErr := selRows.Scan(&path); scanErr != nil {
+			return nil, scanErr
 		}
 		out = append(out, path)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); err != nil {
-		return nil, err
+	if rowsErr := selRows.Err(); rowsErr != nil {
+		return nil, rowsErr
 	}
+	if _, delErr := conn.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); delErr != nil {
+		return nil, delErr
+	}
+	if _, commitErr := conn.ExecContext(ctx, `COMMIT`); commitErr != nil {
+		return nil, commitErr
+	}
+	committed = true
 	return out, nil
 }
 
