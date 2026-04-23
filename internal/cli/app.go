@@ -933,13 +933,17 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 				case <-ticker.C:
 					current := w.Stats()
 					writeEvent(map[string]any{
-						"type":  "watch_heartbeat",
-						"stats": current,
+						"type":      "watch_heartbeat",
+						"repo_root": repo.RootPath,
+						"repo_id":   repoID,
+						"stats":     current,
 					})
 					flushDelta := current.FlushRuns - prev.FlushRuns
 					if flushDelta > 0 || current.FlushErrors > prev.FlushErrors || current.QueueErrors > prev.QueueErrors {
 						writeEvent(map[string]any{
 							"type":               "watch_flush_summary",
+							"repo_root":          repo.RootPath,
+							"repo_id":            repoID,
 							"stats":              current,
 							"delta_flush_runs":   flushDelta,
 							"delta_flush_errors": current.FlushErrors - prev.FlushErrors,
@@ -956,8 +960,10 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	reporterDone.Wait()
 	if *jsonl {
 		event := map[string]any{
-			"type":  "watch_stopped",
-			"stats": w.Stats(),
+			"type":      "watch_stopped",
+			"repo_root": repo.RootPath,
+			"repo_id":   repoID,
+			"stats":     w.Stats(),
 		}
 		if err != nil {
 			event["error"] = err.Error()
