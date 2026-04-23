@@ -1867,17 +1867,10 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 	// unresolved edges have simple (non-qualified) dst_name values.
 	targetByID := make(map[int64]edgeTarget, 64)
 
-	const maxVars = 999 // SQLite default
-	const chunkSize = 900
-	for start := 0; start < len(unique); start += chunkSize {
-		end := min(start+chunkSize, len(unique))
+	// Keep under sqliteDefaultMaxVariables (repoID + N names).
+	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(unique))
 		chunk := unique[start:end]
-
-		// args: repoID + N names
-		if len(chunk)+1 > maxVars {
-			// Defensive: chunkSize should keep us under maxVars.
-			chunk = chunk[:maxVars-1]
-		}
 
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name IN (` + placeholders + `)`
