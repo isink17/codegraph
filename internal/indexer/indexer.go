@@ -284,6 +284,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	var writeMetadataMS int64
 	var writeReplaceMS int64
 	var embedMS int64
+	var writeStats store.WriteStats
 
 	flushMarkSeen := func() error {
 		if len(markSeenBatch) == 0 {
@@ -293,6 +294,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if err := i.store.MarkFilesSeenBatch(ctx, repo.ID, scanID, markSeenBatch); err != nil {
 			return err
 		}
+		summary.WriteMarkSeenFlushes++
 		writeMetadataMS += time.Since(started).Milliseconds()
 		markSeenBatch = markSeenBatch[:0]
 		return nil
@@ -305,6 +307,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if err := i.store.TouchFilesMetadataBatch(ctx, repo.ID, scanID, touchBatch); err != nil {
 			return err
 		}
+		summary.WriteTouchFlushes++
 		writeMetadataMS += time.Since(started).Milliseconds()
 		touchBatch = touchBatch[:0]
 		return nil
@@ -317,6 +320,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if err := i.store.MarkFilesParseFailedBatch(ctx, repo.ID, scanID, parseFailedBatch); err != nil {
 			return err
 		}
+		summary.WriteParseFailedFlushes++
 		writeMetadataMS += time.Since(started).Milliseconds()
 		parseFailedBatch = parseFailedBatch[:0]
 		return nil
@@ -326,10 +330,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return nil
 		}
 		started := time.Now()
-		fileIDs, err := i.store.ReplaceFileGraphsBatch(ctx, repo.ID, scanID, replaceBatch)
+		fileIDs, err := i.store.ReplaceFileGraphsBatchWithStats(ctx, repo.ID, scanID, replaceBatch, &writeStats)
 		if err != nil {
 			return err
 		}
+		summary.WriteReplaceFlushes++
 		writeReplaceMS += time.Since(started).Milliseconds()
 		if !embedding.IsNoop(i.embedder) {
 			embedStarted := time.Now()
@@ -341,17 +346,22 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 
 	var runErr error
-	var parseMS int64
+	var taskMS int64
+	var taskOtherMS int64
 	var readMS int64
 	var hashMS int64
 	var adapterParseMS int64
 	var writeMS int64
 	processWallStart := time.Now()
 	for res := range results {
-		parseMS += res.processMS
+		taskMS += res.processMS
 		readMS += res.readMS
 		hashMS += res.hashMS
 		adapterParseMS += res.parseMS
+		other := res.processMS - res.readMS - res.hashMS - res.parseMS
+		if other > 0 {
+			taskOtherMS += other
+		}
 		summary.FilesSeen++
 		coverageLanguage := coverageKey(res.task.language)
 		coverage := summary.LanguageCoverage[coverageLanguage]
@@ -500,7 +510,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	walkErr := <-producerErr
 	summary.WalkMS = time.Since(walkStart).Milliseconds()
 	summary.ProcessWallMS = time.Since(processWallStart).Milliseconds()
-	summary.ParseMS = parseMS
+	summary.TaskMS = taskMS
+	summary.TaskOtherMS = taskOtherMS
+	summary.ParseMS = taskMS
 	summary.ReadMS = readMS
 	summary.HashMS = hashMS
 	summary.AdapterParseMS = adapterParseMS
@@ -508,6 +520,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	summary.WriteMetadataMS = writeMetadataMS
 	summary.WriteReplaceMS = writeReplaceMS
 	summary.EmbedMS = embedMS
+	if writeStats != (store.WriteStats{}) {
+		summary.WriteStats = &writeStats
+	}
 	if runErr == nil && walkErr != nil && walkErr != context.Canceled {
 		runErr = walkErr
 	}
@@ -557,6 +572,22 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
 	}
 	summary.DurationMS = time.Since(started).Milliseconds()
+	summary.PhaseTimings = []store.ScanPhaseTiming{
+		{Phase: "existing_load", MS: summary.ExistingLoadMS},
+		{Phase: "walk", MS: summary.WalkMS},
+		{Phase: "task", MS: summary.TaskMS},
+		{Phase: "task_other", MS: summary.TaskOtherMS},
+		{Phase: "read", MS: summary.ReadMS},
+		{Phase: "hash", MS: summary.HashMS},
+		{Phase: "adapter_parse", MS: summary.AdapterParseMS},
+		{Phase: "write", MS: summary.WriteMS},
+		{Phase: "write_metadata", MS: summary.WriteMetadataMS},
+		{Phase: "write_replace", MS: summary.WriteReplaceMS},
+		{Phase: "embed", MS: summary.EmbedMS},
+		{Phase: "mark_missing", MS: summary.MarkMissingMS},
+		{Phase: "resolve_edges", MS: summary.ResolveMS},
+		{Phase: "total", MS: summary.DurationMS},
+	}
 	summary.FilesTotal = summary.FilesSeen + summary.FilesDeleted
 	if summary.FilesTotal > 0 {
 		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100

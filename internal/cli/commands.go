@@ -276,7 +276,7 @@ func newCommandList() []*command {
 		{
 			name:        "benchmark",
 			description: "benchmarks",
-			usageLines:  []string{"  benchmark [--count N] [--benchtime DURATION] [--save-baseline]"},
+			usageLines:  []string{"  benchmark [--count N] [--benchtime DURATION] [--save-baseline] [--files N] [--gomaxprocs N]"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runBenchmark(ctx, stdout, args)
 			},

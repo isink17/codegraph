@@ -25,13 +25,14 @@ func BenchmarkIndexerIndex(b *testing.B) {
 	createGoFixtureRepo(b, repoRoot, files)
 	dbDir := b.TempDir()
 	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
+	b.Logf("sqlite_profile=%s", sqliteBenchProfile())
 	b.Logf("fixture_files=%d", files)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		dbPath := filepath.Join(dbDir, "bench-index.sqlite")
 		_ = os.Remove(dbPath)
-		s, err := store.Open(dbPath)
+		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: sqliteBenchProfile()})
 		if err != nil {
 			b.Fatalf("store.Open() error = %v", err)
 		}
@@ -56,9 +57,10 @@ func BenchmarkIndexerUpdateOneFile(b *testing.B) {
 	createGoFixtureRepo(b, repoRoot, files)
 	dbPath := filepath.Join(b.TempDir(), "bench-update.sqlite")
 	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
+	b.Logf("sqlite_profile=%s", sqliteBenchProfile())
 	b.Logf("fixture_files=%d", files)
 
-	s, err := store.Open(dbPath)
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: sqliteBenchProfile()})
 	if err != nil {
 		b.Fatalf("store.Open() error = %v", err)
 	}
@@ -91,4 +93,11 @@ func createGoFixtureRepo(b *testing.B, repoRoot string, files int) {
 			b.Fatalf("WriteFile(%q) error = %v", path, err)
 		}
 	}
+}
+
+func sqliteBenchProfile() string {
+	if v := os.Getenv("CODEGRAPH_BENCH_SQLITE_PROFILE"); v != "" {
+		return v
+	}
+	return "balanced"
 }

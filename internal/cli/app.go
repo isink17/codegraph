@@ -219,6 +219,13 @@ type benchmarkBaseline struct {
 	Command    []string                   `json:"command"`
 	Count      int                        `json:"count"`
 	Benchtime  string                     `json:"benchtime"`
+	GoVersion  string                     `json:"go_version,omitempty"`
+	GOOS       string                     `json:"goos,omitempty"`
+	GOARCH     string                     `json:"goarch,omitempty"`
+	GOMAXPROCS string                     `json:"gomaxprocs,omitempty"`
+	SQLite     string                     `json:"sqlite_driver,omitempty"`
+	BenchCtx   map[string]any             `json:"bench_ctx,omitempty"`
+	Env        map[string]string          `json:"env,omitempty"`
 	Benchmarks map[string]benchmarkMetric `json:"benchmarks"`
 }
 
@@ -277,12 +284,50 @@ func computeMetricDelta(current, baseline benchmarkMetric) map[string]any {
 	return out
 }
 
+func extractBenchmarkContext(output string) map[string]any {
+	// Keep this intentionally narrow: only pull a few high-signal markers that help
+	// interpret perf comparisons (fixture sizing, driver selection, etc.).
+	keys := []string{
+		"fixture_files",
+		"sqlite_driver",
+	}
+	out := map[string]any{}
+	for line := range strings.SplitSeq(output, "\n") {
+		line = strings.TrimSpace(line)
+		for _, k := range keys {
+			needle := k + "="
+			idx := strings.Index(line, needle)
+			if idx == -1 {
+				continue
+			}
+			raw := strings.TrimSpace(line[idx+len(needle):])
+			if raw == "" {
+				continue
+			}
+			switch k {
+			case "fixture_files":
+				if n, err := strconv.Atoi(raw); err == nil {
+					out[k] = n
+				}
+			default:
+				out[k] = raw
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	count := fs.Int("count", 1, "number of benchmark runs")
 	benchtime := fs.String("benchtime", "100ms", "benchmark time per test")
 	saveBaseline := fs.Bool("save-baseline", true, "save current benchmark result as baseline")
+	files := fs.Int("files", 0, "fixture file count (sets CODEGRAPH_BENCH_FILES)")
+	gomaxprocs := fs.Int("gomaxprocs", 0, "GOMAXPROCS for benchmark subprocess (0 = default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -294,6 +339,7 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		"./internal/indexer",
 		"./internal/store",
 		"./internal/mcp",
+		"-v",
 		"-run", "^$",
 		"-bench", ".",
 		"-benchmem",
@@ -301,13 +347,44 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		"-benchtime", *benchtime,
 	}
 	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
-	cmd.Env = append(os.Environ(), "GOCACHE="+filepath.Join(".", ".gocache"))
+	env := append([]string(nil), os.Environ()...)
+	gocachePath, err := filepath.Abs(filepath.Join(".", ".gocache"))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(gocachePath, 0o755); err != nil {
+		return err
+	}
+	env = append(env, "GOCACHE="+gocachePath)
+	benchEnv := map[string]string{}
+	if *files > 0 {
+		v := strconv.Itoa(*files)
+		env = append(env, "CODEGRAPH_BENCH_FILES="+v)
+		benchEnv["CODEGRAPH_BENCH_FILES"] = v
+	} else if v := strings.TrimSpace(os.Getenv("CODEGRAPH_BENCH_FILES")); v != "" {
+		benchEnv["CODEGRAPH_BENCH_FILES"] = v
+	}
+	if *gomaxprocs > 0 {
+		v := strconv.Itoa(*gomaxprocs)
+		env = append(env, "GOMAXPROCS="+v)
+		benchEnv["GOMAXPROCS"] = v
+	} else if v := strings.TrimSpace(os.Getenv("GOMAXPROCS")); v != "" {
+		benchEnv["GOMAXPROCS"] = v
+	}
+	cmd.Env = env
 	out, err := cmd.CombinedOutput()
+	benchCtx := extractBenchmarkContext(string(out))
 	result := map[string]any{
-		"command":   append([]string{"go"}, cmdArgs...),
-		"count":     *count,
-		"benchtime": *benchtime,
-		"output":    string(out),
+		"command":       append([]string{"go"}, cmdArgs...),
+		"count":         *count,
+		"benchtime":     *benchtime,
+		"go_version":    runtime.Version(),
+		"goos":          runtime.GOOS,
+		"goarch":        runtime.GOARCH,
+		"sqlite_driver": store.SQLiteDriverName(),
+		"env":           benchEnv,
+		"bench_ctx":     benchCtx,
+		"output":        string(out),
 	}
 	if err != nil {
 		result["ok"] = false
@@ -339,11 +416,22 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		}
 		if *saveBaseline {
 			if mkdirErr := os.MkdirAll(filepath.Dir(baselinePath), 0o755); mkdirErr == nil {
+				gomaxLabel := benchEnv["GOMAXPROCS"]
+				if gomaxLabel == "" {
+					gomaxLabel = "default"
+				}
 				payload := benchmarkBaseline{
 					CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 					Command:    append([]string{"go"}, cmdArgs...),
 					Count:      *count,
 					Benchtime:  *benchtime,
+					GoVersion:  runtime.Version(),
+					GOOS:       runtime.GOOS,
+					GOARCH:     runtime.GOARCH,
+					GOMAXPROCS: gomaxLabel,
+					SQLite:     store.SQLiteDriverName(),
+					BenchCtx:   benchCtx,
+					Env:        benchEnv,
 					Benchmarks: parsed,
 				}
 				if data, marshalErr := json.MarshalIndent(payload, "", "  "); marshalErr == nil {
@@ -509,6 +597,11 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 				"existing_load_ms":  summary.ExistingLoadMS,
 				"walk_ms":           summary.WalkMS,
 				"process_wall_ms":   summary.ProcessWallMS,
+				"task_ms":           summary.TaskMS,
+				"task_other_ms":     summary.TaskOtherMS,
+				"read_ms":           summary.ReadMS,
+				"hash_ms":           summary.HashMS,
+				"adapter_parse_ms":  summary.AdapterParseMS,
 				"write_ms":          summary.WriteMS,
 				"write_metadata_ms": summary.WriteMetadataMS,
 				"write_replace_ms":  summary.WriteReplaceMS,
