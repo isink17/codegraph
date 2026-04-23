@@ -265,6 +265,8 @@ type benchmarkBaseline struct {
 	GOOS       string                     `json:"goos,omitempty"`
 	GOARCH     string                     `json:"goarch,omitempty"`
 	GOMAXPROCS string                     `json:"gomaxprocs,omitempty"`
+	NumCPU     int                        `json:"num_cpu"`
+	CWD        string                     `json:"cwd"`
 	SQLite     string                     `json:"sqlite_driver,omitempty"`
 	BenchCtx   map[string]any             `json:"bench_ctx,omitempty"`
 	Env        map[string]string          `json:"env,omitempty"`
@@ -482,6 +484,8 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 					GOOS:       runtime.GOOS,
 					GOARCH:     runtime.GOARCH,
 					GOMAXPROCS: gomaxLabel,
+					NumCPU:     runtime.NumCPU(),
+					CWD:        cwd,
 					SQLite:     store.SQLiteDriverName(),
 					BenchCtx:   benchCtx,
 					Env:        benchEnv,
