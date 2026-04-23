@@ -20,23 +20,47 @@ type Watcher struct {
 	store   *store.Store
 	indexer *indexer.Indexer
 
+	eventsSeen         atomic.Int64
+	eventsIgnored      atomic.Int64
+	eventsIgnoredDir   atomic.Int64
+	eventsIgnoredChmod atomic.Int64
+
 	flushSignals     atomic.Int64
 	coalescedSignals atomic.Int64
 	flushRuns        atomic.Int64
 	flushErrors      atomic.Int64
-	queueExecs       atomic.Int64
-	queueSkipped     atomic.Int64
-	queueErrors      atomic.Int64
+	flushNoop        atomic.Int64
+
+	queueExecs   atomic.Int64
+	queueSkipped atomic.Int64
+	queueErrors  atomic.Int64
+
+	drainRuns   atomic.Int64
+	drainPaths  atomic.Int64
+	updateRuns  atomic.Int64
+	updatePaths atomic.Int64
 }
 
 type WatchStats struct {
+	EventsSeen         int64 `json:"events_seen"`
+	EventsIgnored      int64 `json:"events_ignored"`
+	EventsIgnoredDir   int64 `json:"events_ignored_dir"`
+	EventsIgnoredChmod int64 `json:"events_ignored_chmod"`
+
 	FlushSignals     int64 `json:"flush_signals"`
 	CoalescedSignals int64 `json:"coalesced_signals"`
 	FlushRuns        int64 `json:"flush_runs"`
 	FlushErrors      int64 `json:"flush_errors"`
-	QueueExecs       int64 `json:"queue_execs"`
-	QueueSkipped     int64 `json:"queue_skipped"`
-	QueueErrors      int64 `json:"queue_errors"`
+	FlushNoop        int64 `json:"flush_noop"`
+
+	DrainRuns   int64 `json:"drain_runs"`
+	DrainPaths  int64 `json:"drain_paths"`
+	UpdateRuns  int64 `json:"update_runs"`
+	UpdatePaths int64 `json:"update_paths"`
+
+	QueueExecs   int64 `json:"queue_execs"`
+	QueueSkipped int64 `json:"queue_skipped"`
+	QueueErrors  int64 `json:"queue_errors"`
 }
 
 func New(s *store.Store, idx *indexer.Indexer) *Watcher {
@@ -45,24 +69,45 @@ func New(s *store.Store, idx *indexer.Indexer) *Watcher {
 
 func (w *Watcher) Stats() WatchStats {
 	return WatchStats{
+		EventsSeen:         w.eventsSeen.Load(),
+		EventsIgnored:      w.eventsIgnored.Load(),
+		EventsIgnoredDir:   w.eventsIgnoredDir.Load(),
+		EventsIgnoredChmod: w.eventsIgnoredChmod.Load(),
+
 		FlushSignals:     w.flushSignals.Load(),
 		CoalescedSignals: w.coalescedSignals.Load(),
 		FlushRuns:        w.flushRuns.Load(),
 		FlushErrors:      w.flushErrors.Load(),
-		QueueExecs:       w.queueExecs.Load(),
-		QueueSkipped:     w.queueSkipped.Load(),
-		QueueErrors:      w.queueErrors.Load(),
+		FlushNoop:        w.flushNoop.Load(),
+
+		DrainRuns:   w.drainRuns.Load(),
+		DrainPaths:  w.drainPaths.Load(),
+		UpdateRuns:  w.updateRuns.Load(),
+		UpdatePaths: w.updatePaths.Load(),
+
+		QueueExecs:   w.queueExecs.Load(),
+		QueueSkipped: w.queueSkipped.Load(),
+		QueueErrors:  w.queueErrors.Load(),
 	}
 }
 
 func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, debounce time.Duration) error {
+	w.eventsSeen.Store(0)
+	w.eventsIgnored.Store(0)
+	w.eventsIgnoredDir.Store(0)
+	w.eventsIgnoredChmod.Store(0)
 	w.flushSignals.Store(0)
 	w.coalescedSignals.Store(0)
 	w.flushRuns.Store(0)
 	w.flushErrors.Store(0)
+	w.flushNoop.Store(0)
 	w.queueExecs.Store(0)
 	w.queueSkipped.Store(0)
 	w.queueErrors.Store(0)
+	w.drainRuns.Store(0)
+	w.drainPaths.Store(0)
+	w.updateRuns.Store(0)
+	w.updatePaths.Store(0)
 	if debounce <= 0 {
 		debounce = 750 * time.Millisecond
 	}
@@ -100,18 +145,25 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	}
 
 	flush := func() error {
+		w.drainRuns.Add(1)
 		paths, err := w.store.DrainDirtyFiles(ctx, repoID)
 		if err != nil {
 			return err
 		}
 		if len(paths) == 0 {
+			w.flushNoop.Add(1)
 			return nil
 		}
+		w.drainPaths.Add(int64(len(paths)))
 		_, err = w.indexer.Update(ctx, indexer.Options{
 			RepoRoot: repoRoot,
 			Paths:    paths,
 			ScanKind: "watch",
 		})
+		if err == nil {
+			w.updateRuns.Add(1)
+			w.updatePaths.Add(int64(len(paths)))
+		}
 		return err
 	}
 
@@ -176,12 +228,22 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			if !ok {
 				return nil
 			}
+			w.eventsSeen.Add(1)
+
+			// Avoid churn from chmod-only events (common on some editors).
+			if event.Op == fsnotify.Chmod {
+				w.eventsIgnored.Add(1)
+				w.eventsIgnoredChmod.Add(1)
+				continue
+			}
 			rel, err := filepath.Rel(repoRoot, event.Name)
 			if err != nil {
+				w.eventsIgnored.Add(1)
 				continue
 			}
 			rel = filepath.Clean(rel)
 			if shouldIgnorePath(rel) {
+				w.eventsIgnored.Add(1)
 				continue
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
@@ -189,6 +251,10 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 					if err := addWatchTree(event.Name); err != nil {
 						return err
 					}
+					// Directory creates are not indexable file updates.
+					w.eventsIgnored.Add(1)
+					w.eventsIgnoredDir.Add(1)
+					continue
 				}
 			}
 
