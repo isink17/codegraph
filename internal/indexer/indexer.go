@@ -564,21 +564,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if len(changedPathSet) == 0 {
 		summary.ResolveMS = 0
 		summary.ResolveMode = "none"
-	} else if len(candidateSet) > 0 {
-		changedPaths := make([]string, 0, len(changedPathSet))
-		for path := range changedPathSet {
-			changedPaths = append(changedPaths, path)
-		}
-		if err := i.store.ResolveEdgesForPaths(ctx, repo.ID, changedPaths); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
-		}
-		summary.ResolveMode = "paths"
-	} else if scanKind == "update" {
-		// For incremental updates, limit edge resolution to the changed files.
-		// This keeps watch/update runs fast; full index runs will still do repo-wide
-		// resolution which can also resolve edges in other files against newly
-		// introduced symbols.
+	} else if len(candidateSet) > 0 || scanKind == "update" {
+		// For path-scoped updates (Options.Paths) and incremental update runs, limit edge
+		// resolution to the changed files. Full index runs still do repo-wide resolution.
 		changedPaths := make([]string, 0, len(changedPathSet))
 		for path := range changedPathSet {
 			changedPaths = append(changedPaths, path)
