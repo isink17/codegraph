@@ -256,10 +256,11 @@ func newCommandList() []*command {
 			description: "run diagnostics",
 			usageLines: []string{
 				"  doctor",
+				"    add --repo-root PATH to inspect a repo DB",
 				"    add --fix for non-destructive autofixes",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
-				return runDoctor(stdout, args)
+				return runDoctor(ctx, cfg, stdout, args)
 			},
 		},
 		{
@@ -324,13 +325,15 @@ func newCommandList() []*command {
 		{
 			name:        "clean",
 			description: "clean index data",
-			usageLines:  []string{"  clean [repo-path] [--vacuum]"},
+			usageLines:  []string{"  clean [repo-path] [--vacuum] [--fts-optimize]"},
 			flags: []commandFlag{
 				{name: "--vacuum", description: "VACUUM the database after cleanup"},
+				{name: "--fts-optimize", description: "run FTS optimize (symbol_fts)"},
 			},
 			examples: []string{
 				"codegraph clean .",
 				"codegraph clean . --vacuum",
+				"codegraph clean . --fts-optimize",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runClean(ctx, cfg, stdout, args)

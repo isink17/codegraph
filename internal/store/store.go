@@ -503,6 +503,74 @@ func (s *Store) Vacuum(ctx context.Context) error {
 	return err
 }
 
+func (s *Store) OptimizeFTS(ctx context.Context) (time.Duration, error) {
+	start := time.Now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO symbol_fts(symbol_fts) VALUES('optimize')`)
+	return time.Since(start), err
+}
+
+type DBPragmas struct {
+	SQLiteVersion     string `json:"sqlite_version"`
+	JournalMode       string `json:"journal_mode"`
+	Synchronous       string `json:"synchronous"`
+	TempStore         string `json:"temp_store"`
+	AutoVacuum        int64  `json:"auto_vacuum"`
+	PageSize          int64  `json:"page_size"`
+	BusyTimeoutMS     int64  `json:"busy_timeout_ms"`
+	ForeignKeys       bool   `json:"foreign_keys"`
+	WalAutocheckpoint int64  `json:"wal_autocheckpoint"`
+	UserVersion       int64  `json:"user_version"`
+	SymbolFTSPresent  bool   `json:"symbol_fts_present"`
+}
+
+func (s *Store) DBPragmas(ctx context.Context) (DBPragmas, error) {
+	var out DBPragmas
+
+	if err := s.db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&out.SQLiteVersion); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&out.JournalMode); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&out.Synchronous); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA temp_store`).Scan(&out.TempStore); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&out.AutoVacuum); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&out.PageSize); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&out.BusyTimeoutMS); err != nil {
+		return DBPragmas{}, err
+	}
+	var foreignKeys int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return DBPragmas{}, err
+	}
+	out.ForeignKeys = foreignKeys != 0
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_autocheckpoint`).Scan(&out.WalAutocheckpoint); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&out.UserVersion); err != nil {
+		return DBPragmas{}, err
+	}
+
+	var symbolFTSName string
+	err := s.db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='symbol_fts'`).Scan(&symbolFTSName)
+	if err == nil && symbolFTSName == "symbol_fts" {
+		out.SymbolFTSPresent = true
+	} else if errors.Is(err, sql.ErrNoRows) {
+		out.SymbolFTSPresent = false
+	} else if err != nil {
+		return DBPragmas{}, err
+	}
+	return out, nil
+}
+
 func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]FileRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, path, language, size_bytes, mtime_unix_ns, content_sha256, is_deleted

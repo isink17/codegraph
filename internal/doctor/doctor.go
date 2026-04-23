@@ -1,17 +1,21 @@
 package doctor
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/isink17/codegraph/internal/appname"
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/gotool"
 	"github.com/isink17/codegraph/internal/platform"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 type Report struct {
@@ -22,15 +26,23 @@ type Report struct {
 	CacheDir        string   `json:"cache_dir"`
 	CodegraphOnPath bool     `json:"codegraph_on_path"`
 	CodegraphPath   string   `json:"codegraph_path,omitempty"`
+	SQLiteDriver    string   `json:"sqlite_driver"`
+	DB              *DBInfo  `json:"db,omitempty"`
 	AppliedFixes    []string `json:"applied_fixes,omitempty"`
 	Recommendations []string `json:"recommendations,omitempty"`
 }
 
-func Run() (Report, error) {
-	return RunWithFix(false)
+type DBInfo struct {
+	Path      string          `json:"path"`
+	SizeBytes int64           `json:"size_bytes"`
+	Pragmas   store.DBPragmas `json:"pragmas"`
 }
 
-func RunWithFix(fix bool) (Report, error) {
+func Run() (Report, error) {
+	return RunWithFix(false, "")
+}
+
+func RunWithFix(fix bool, dbPath string) (Report, error) {
 	paths, err := platform.DefaultPaths()
 	if err != nil {
 		return Report{}, err
@@ -44,7 +56,9 @@ func RunWithFix(fix bool) (Report, error) {
 	binaryPath, lookErr := exec.LookPath("codegraph")
 	onPath := lookErr == nil
 	if lookErr != nil && !errors.Is(lookErr, exec.ErrNotFound) {
-		return Report{}, lookErr
+		// Be conservative: doctor should still run even if the PATH lookup found something unusable.
+		onPath = false
+		binaryPath = ""
 	}
 	appliedFixes := []string{}
 	if fix {
@@ -81,6 +95,16 @@ func RunWithFix(fix bool) (Report, error) {
 		recommendations = append(recommendations, "verify after reopening shell: "+gotool.VerifyCommandHint(appname.BinaryName))
 	}
 
+	var dbInfo *DBInfo
+	if strings.TrimSpace(dbPath) != "" {
+		info, err := inspectDB(context.Background(), dbPath)
+		if err != nil {
+			recommendations = append(recommendations, "repo DB inspect failed: "+err.Error())
+		} else {
+			dbInfo = info
+		}
+	}
+
 	return Report{
 		GOOS:            runtime.GOOS,
 		ConfigPath:      filepath.Clean(configPath),
@@ -89,6 +113,8 @@ func RunWithFix(fix bool) (Report, error) {
 		CacheDir:        paths.CacheDir,
 		CodegraphOnPath: onPath,
 		CodegraphPath:   binaryPath,
+		SQLiteDriver:    store.SQLiteDriverName(),
+		DB:              dbInfo,
 		AppliedFixes:    appliedFixes,
 		Recommendations: recommendations,
 	}, nil
@@ -100,4 +126,64 @@ func firstPathHint() string {
 		return ""
 	}
 	return hints[0]
+}
+
+func inspectDB(ctx context.Context, dbPath string) (*DBInfo, error) {
+	st, err := os.Stat(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	var pragmas store.DBPragmas
+	if err := db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&pragmas.SQLiteVersion); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&pragmas.JournalMode); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&pragmas.Synchronous); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA temp_store`).Scan(&pragmas.TempStore); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&pragmas.AutoVacuum); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pragmas.PageSize); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&pragmas.BusyTimeoutMS); err != nil {
+		return nil, err
+	}
+	var foreignKeys int64
+	if err := db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return nil, err
+	}
+	pragmas.ForeignKeys = foreignKeys != 0
+	if err := db.QueryRowContext(ctx, `PRAGMA wal_autocheckpoint`).Scan(&pragmas.WalAutocheckpoint); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&pragmas.UserVersion); err != nil {
+		return nil, err
+	}
+	var symbolFTSName string
+	err = db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='symbol_fts'`).Scan(&symbolFTSName)
+	if err == nil && symbolFTSName == "symbol_fts" {
+		pragmas.SymbolFTSPresent = true
+	} else if errors.Is(err, sql.ErrNoRows) {
+		pragmas.SymbolFTSPresent = false
+	} else if err != nil {
+		return nil, err
+	}
+
+	return &DBInfo{
+		Path:      filepath.Clean(dbPath),
+		SizeBytes: st.Size(),
+		Pragmas:   pragmas,
+	}, nil
 }

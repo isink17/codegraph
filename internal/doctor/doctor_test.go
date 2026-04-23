@@ -58,7 +58,7 @@ func TestRunReportsCodegraphMissingFromPath(t *testing.T) {
 func TestRunWithFixCreatesConfig(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
 	t.Setenv("CODEGRAPH_HOME", home)
-	report, err := RunWithFix(true)
+	report, err := RunWithFix(true, "")
 	if err != nil {
 		t.Fatalf("RunWithFix(true) error = %v", err)
 	}
