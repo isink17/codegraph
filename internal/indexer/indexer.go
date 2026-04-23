@@ -593,12 +593,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				names = append(names, name)
 			}
 			crossStart := time.Now()
-			n, err := i.store.ResolveEdgesForNames(ctx, repo.ID, names)
+			stats, err := i.store.ResolveEdgesForNamesWithStats(ctx, repo.ID, names)
 			if err != nil {
 				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 				return summary, err
 			}
-			summary.ResolveCrossFileTargets = n
+			if stats != (store.ResolveEdgesForNamesStats{}) {
+				summary.ResolveCrossFile = &stats
+			}
+			summary.ResolveCrossFileTargets = stats.TargetsSelected
 			summary.ResolveCrossFileMS = time.Since(crossStart).Milliseconds()
 			summary.ResolveMode = "paths+names"
 		}
