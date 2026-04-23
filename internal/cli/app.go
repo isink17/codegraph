@@ -103,14 +103,55 @@ func hasHelpFlag(args []string) bool {
 	return false
 }
 
-func runDoctor(stdout io.Writer, args []string) error {
+func parseOptionalRepoRootArg(fs *flag.FlagSet, args []string, repoRootFlag *string, defaultRepoRoot string) (string, error) {
+	repoRootArg := ""
+	parseArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		repoRootArg = args[0]
+		parseArgs = args[1:]
+	}
+	if err := fs.Parse(parseArgs); err != nil {
+		return "", err
+	}
+	repoRoot := strings.TrimSpace(*repoRootFlag)
+	if repoRoot == "" {
+		repoRoot = strings.TrimSpace(repoRootArg)
+	}
+	if repoRoot == "" {
+		repoRoot = defaultRepoRoot
+	}
+	return repoRoot, nil
+}
+
+func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fix := fs.Bool("fix", false, "apply non-destructive fixes")
-	if err := fs.Parse(args); err != nil {
+	repoRootFlag := fs.String("repo-root", "", "repository root to inspect (optional)")
+
+	defaultRepoRoot := ""
+	if config.IsRepoDBDir(cfg.DBDir) {
+		defaultRepoRoot = "."
+	}
+	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	if err != nil {
 		return err
 	}
-	report, err := doctor.RunWithFix(*fix)
+
+	dbPath := ""
+	if repoRoot != "" {
+		canonical, err := store.CanonicalRepoPath(repoRoot)
+		if err != nil {
+			return err
+		}
+		p, err := dbPathForRepo(cfg, repoRoot, canonical)
+		if err != nil {
+			return err
+		}
+		dbPath = p
+	}
+
+	report, err := doctor.RunWithFix(*fix, dbPath)
 	if err != nil {
 		return err
 	}
@@ -1021,28 +1062,34 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	vacuum := fs.Bool("vacuum", false, "run VACUUM on databases")
+	ftsOptimize := fs.Bool("fts-optimize", false, "run FTS optimize on databases (symbol_fts)")
 	repoRootFlag := fs.String("repo-root", "", "repository root to clean")
-	if err := fs.Parse(args); err != nil {
+
+	defaultRepoRoot := ""
+	if config.IsRepoDBDir(cfg.DBDir) {
+		defaultRepoRoot = "."
+	}
+	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	if err != nil {
 		return err
-	}
-	repoRoot := strings.TrimSpace(*repoRootFlag)
-	if repoRoot == "" && fs.NArg() > 0 {
-		repoRoot = fs.Arg(0)
-	}
-	if repoRoot == "" && config.IsRepoDBDir(cfg.DBDir) {
-		repoRoot = "."
 	}
 
 	type dbResult struct {
 		Path           string `json:"path"`
 		Action         string `json:"action"`
+		SizeBefore     int64  `json:"size_before_bytes"`
+		SizeAfter      int64  `json:"size_after_bytes"`
 		ReclaimedBytes int64  `json:"reclaimed_bytes"`
+		Vacuumed       bool   `json:"vacuumed,omitempty"`
+		FTSOptimized   bool   `json:"fts_optimized,omitempty"`
+		FTSOptimizeMS  int64  `json:"fts_optimize_ms,omitempty"`
 		CanonicalRepo  string `json:"canonical_repo,omitempty"`
 		Error          string `json:"error,omitempty"`
 	}
 	report := map[string]any{
-		"vacuum": *vacuum,
-		"dbs":    []dbResult{},
+		"vacuum":       *vacuum,
+		"fts_optimize": *ftsOptimize,
+		"dbs":          []dbResult{},
 	}
 	results := make([]dbResult, 0)
 	var reclaimed int64
@@ -1058,23 +1105,36 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		}
 		res := dbResult{Path: dbPath, CanonicalRepo: canonical}
 		before := fileSize(dbPath)
+		res.SizeBefore = before
 		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
 		if err != nil {
 			return err
 		}
 		defer s.Close()
+		if *ftsOptimize {
+			dur, err := s.OptimizeFTS(ctx)
+			if err != nil {
+				return err
+			}
+			res.FTSOptimized = true
+			res.FTSOptimizeMS = dur.Milliseconds()
+		}
 		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
 				return err
 			}
-			after := fileSize(dbPath)
-			if before > after {
-				res.ReclaimedBytes = before - after
-				reclaimed += res.ReclaimedBytes
-			}
+			res.Vacuumed = true
 			res.Action = "vacuumed"
+		} else if *ftsOptimize {
+			res.Action = "fts_optimized"
 		} else {
 			res.Action = "inspected"
+		}
+		after := fileSize(dbPath)
+		res.SizeAfter = after
+		if before > after {
+			res.ReclaimedBytes = before - after
+			reclaimed += res.ReclaimedBytes
 		}
 		results = append(results, res)
 		report["dbs"] = results
@@ -1095,7 +1155,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		}
 		dbPath := filepath.Join(cfg.DBDir, entry.Name())
 		sizeBefore := fileSize(dbPath)
-		res := dbResult{Path: dbPath}
+		res := dbResult{Path: dbPath, SizeBefore: sizeBefore}
 		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
 		if err != nil {
 			res.Action = "skipped"
@@ -1138,6 +1198,24 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			results = append(results, res)
 			continue
 		}
+		if !*vacuum {
+			res.Action = "kept"
+		}
+		if *ftsOptimize {
+			dur, err := s.OptimizeFTS(ctx)
+			if err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			res.FTSOptimized = true
+			res.FTSOptimizeMS = dur.Milliseconds()
+			if !*vacuum && res.Action == "kept" {
+				res.Action = "fts_optimized"
+			}
+		}
 		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
 				_ = s.Close()
@@ -1146,16 +1224,16 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 				results = append(results, res)
 				continue
 			}
-			after := fileSize(dbPath)
-			if sizeBefore > after {
-				res.ReclaimedBytes = sizeBefore - after
-				reclaimed += res.ReclaimedBytes
-			}
+			res.Vacuumed = true
 			res.Action = "vacuumed"
-		} else {
-			res.Action = "kept"
 		}
 		_ = s.Close()
+		sizeAfter := fileSize(dbPath)
+		res.SizeAfter = sizeAfter
+		if sizeBefore > sizeAfter {
+			res.ReclaimedBytes = sizeBefore - sizeAfter
+			reclaimed += res.ReclaimedBytes
+		}
 		results = append(results, res)
 	}
 
