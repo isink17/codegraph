@@ -627,38 +627,45 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	}
 	if jsonl {
 		scanKind := map[bool]string{true: "update", false: "index"}[update]
-		if err := writeJSONL(stdout, map[string]any{
-			"type":      "scan_summary",
-			"command":   scanKind,
-			"scan_kind": scanKind,
-			"data":      summary,
-		}); err != nil {
+		envelope := func(eventType string) map[string]any {
+			return map[string]any{
+				"type":      eventType,
+				"repo_root": repo.RootPath,
+				"repo_id":   summary.RepoID,
+				"scan_id":   summary.ScanID,
+			}
+		}
+		ev := envelope("scan_summary")
+		ev["command"] = scanKind
+		ev["scan_kind"] = scanKind
+		ev["data"] = summary
+		if err := writeJSONL(stdout, ev); err != nil {
 			return err
 		}
-		_ = writeJSONL(stdout, map[string]any{
-			"type": "scan_phases",
-			"data": map[string]any{
-				"existing_load_ms":  summary.ExistingLoadMS,
-				"walk_ms":           summary.WalkMS,
-				"process_wall_ms":   summary.ProcessWallMS,
-				"task_ms":           summary.TaskMS,
-				"task_other_ms":     summary.TaskOtherMS,
-				"parse_ms":          summary.ParseMS,
-				"read_ms":           summary.ReadMS,
-				"hash_ms":           summary.HashMS,
-				"write_ms":          summary.WriteMS,
-				"write_metadata_ms": summary.WriteMetadataMS,
-				"write_replace_ms":  summary.WriteReplaceMS,
-				"embed_ms":          summary.EmbedMS,
-				"mark_missing_ms":   summary.MarkMissingMS,
-				"resolve_ms":        summary.ResolveMS,
-				"duration_ms":       summary.DurationMS,
-			},
-		})
-		return writeJSONL(stdout, map[string]any{
-			"type": "scan_stats",
-			"data": stats,
-		})
+		ev = envelope("scan_phases")
+		ev["data"] = map[string]any{
+			"existing_load_ms":  summary.ExistingLoadMS,
+			"walk_ms":           summary.WalkMS,
+			"process_wall_ms":   summary.ProcessWallMS,
+			"task_ms":           summary.TaskMS,
+			"task_other_ms":     summary.TaskOtherMS,
+			"parse_ms":          summary.ParseMS,
+			"read_ms":           summary.ReadMS,
+			"hash_ms":           summary.HashMS,
+			"write_ms":          summary.WriteMS,
+			"write_metadata_ms": summary.WriteMetadataMS,
+			"write_replace_ms":  summary.WriteReplaceMS,
+			"embed_ms":          summary.EmbedMS,
+			"mark_missing_ms":   summary.MarkMissingMS,
+			"resolve_ms":        summary.ResolveMS,
+			"duration_ms":       summary.DurationMS,
+		}
+		if err := writeJSONL(stdout, ev); err != nil {
+			return err
+		}
+		ev = envelope("scan_stats")
+		ev["data"] = stats
+		return writeJSONL(stdout, ev)
 	}
 	return writeJSON(stdout, map[string]any{"summary": summary, "stats": stats})
 }
