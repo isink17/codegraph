@@ -127,6 +127,8 @@ type ScanSummary struct {
 	MarkMissingMS           int64                     `json:"mark_missing_ms,omitempty"`
 	ResolveMS               int64                     `json:"resolve_ms,omitempty"`
 	ResolveMode             string                    `json:"resolve_mode,omitempty"`
+	ResolveCrossFileMS      int64                     `json:"resolve_cross_file_ms,omitempty"`
+	ResolveCrossFileTargets int                       `json:"resolve_cross_file_targets,omitempty"`
 	DurationMS              int64                     `json:"duration_ms"`
 }
 
@@ -1820,6 +1822,83 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		targets = append(targets, chunkTargets...)
 	}
 	return s.resolveEdgeTargets(ctx, repoID, targets)
+}
+
+// ResolveEdgesForNames attempts to resolve currently-unresolved edges across the
+// repo whose dst_name matches (or ends with ".<name>") any of the provided
+// names. This is used to keep incremental update runs correct when newly
+// introduced symbols should resolve previously-unresolved edges in other files.
+//
+// It returns the number of candidate edges selected for resolution.
+func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []string) (int, error) {
+	if len(names) == 0 {
+		return 0, nil
+	}
+	seen := make(map[string]struct{}, len(names))
+	unique := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		unique = append(unique, name)
+	}
+	if len(unique) == 0 {
+		return 0, nil
+	}
+
+	const chunkSize = 200
+	targets := make([]edgeTarget, 0, 64)
+	for start := 0; start < len(unique); start += chunkSize {
+		end := min(start+chunkSize, len(unique))
+		chunk := unique[start:end]
+
+		var b strings.Builder
+		b.WriteString(`SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND (`)
+
+		// Exact matches.
+		b.WriteString(`dst_name IN (`)
+		for i := range chunk {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("?")
+		}
+		b.WriteString(`)`)
+
+		// Suffix matches for qualified-like names (e.g. "pkg.Foo", "import/path.Foo").
+		for range chunk {
+			b.WriteString(` OR dst_name LIKE ?`)
+		}
+		b.WriteString(`)`)
+
+		args := make([]any, 0, 1+(len(chunk)*2))
+		args = append(args, repoID)
+		for _, name := range chunk {
+			args = append(args, name)
+		}
+		for _, name := range chunk {
+			args = append(args, "%."+name)
+		}
+
+		rows, err := s.db.QueryContext(ctx, b.String(), args...)
+		if err != nil {
+			return 0, err
+		}
+		chunkTargets, err := scanEdgeTargets(rows)
+		if err != nil {
+			return 0, err
+		}
+		targets = append(targets, chunkTargets...)
+	}
+	if err := s.resolveEdgeTargets(ctx, repoID, targets); err != nil {
+		return 0, err
+	}
+	return len(targets), nil
 }
 
 func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
