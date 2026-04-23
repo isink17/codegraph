@@ -151,8 +151,10 @@ type WriteStats struct {
 	SymbolFTSInsertBatches int `json:"symbol_fts_insert_batches,omitempty"`
 	SymbolFTSInsertRows    int `json:"symbol_fts_insert_rows,omitempty"`
 
-	SymbolTokenInsertBatches int `json:"symbol_token_insert_batches,omitempty"`
-	SymbolTokenInsertRows    int `json:"symbol_token_insert_rows,omitempty"`
+	SymbolTokenInsertBatches int   `json:"symbol_token_insert_batches,omitempty"`
+	SymbolTokenInsertRows    int   `json:"symbol_token_insert_rows,omitempty"`
+	SymbolTokenizeNS         int64 `json:"symbol_tokenize_ns,omitempty"`
+	SymbolTokenizeCalls      int   `json:"symbol_tokenize_calls,omitempty"`
 
 	FileTokenInsertBatches int `json:"file_token_insert_batches,omitempty"`
 	FileTokenInsertRows    int `json:"file_token_insert_rows,omitempty"`
@@ -1094,6 +1096,7 @@ func insertParsedFileGraph(
 ) error {
 	stableToID := map[string]int64{}
 	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
+	symbolTokenWeights := make(map[string]float64, 64)
 	symbolFTSArgs := make([]any, 0, min(len(parsed.Symbols), sqliteSymbolFTSValuesBatchRows)*6)
 	for start := 0; start < len(parsed.Symbols); start += sqliteSymbolValuesBatchRows {
 		end := start + sqliteSymbolValuesBatchRows
@@ -1118,7 +1121,17 @@ func insertParsedFileGraph(
 				}
 				symbolFTSArgs = symbolFTSArgs[:0]
 			}
-			for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
+			clear(symbolTokenWeights)
+			var tokenStart time.Time
+			if stats != nil {
+				tokenStart = time.Now()
+				stats.SymbolTokenizeCalls++
+			}
+			texttoken.WeightsStringsInto(symbolTokenWeights, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
+			if stats != nil {
+				stats.SymbolTokenizeNS += time.Since(tokenStart).Nanoseconds()
+			}
+			for token, weight := range symbolTokenWeights {
 				symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
 				if len(symbolTokenArgs) >= sqliteTokenValuesBatchRows*3 {
 					if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
