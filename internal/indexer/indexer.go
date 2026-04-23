@@ -281,6 +281,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
+	changedSymbolNameSet := make(map[string]struct{}, 256)
 
 	var writeMetadataDur time.Duration
 	var writeReplaceDur time.Duration
@@ -444,6 +445,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				Parsed:      res.parsed,
 			})
 			changedPathSet[res.task.rel] = struct{}{}
+			for _, sym := range res.parsed.Symbols {
+				if sym.Name == "" {
+					continue
+				}
+				changedSymbolNameSet[sym.Name] = struct{}{}
+			}
 			summary.FilesChanged++
 			summary.FilesIndexed++
 			coverage := summary.LanguageCoverage[coverageLanguage]
@@ -576,6 +583,25 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, err
 		}
 		summary.ResolveMode = "paths"
+
+		// Correctness: partial runs can introduce symbols that should resolve previously-unresolved
+		// edges in other files. Do a narrow cross-file pass keyed by the introduced symbol names,
+		// without falling back to repo-wide resolution.
+		if len(changedSymbolNameSet) > 0 {
+			names := make([]string, 0, len(changedSymbolNameSet))
+			for name := range changedSymbolNameSet {
+				names = append(names, name)
+			}
+			crossStart := time.Now()
+			n, err := i.store.ResolveEdgesForNames(ctx, repo.ID, names)
+			if err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			summary.ResolveCrossFileTargets = n
+			summary.ResolveCrossFileMS = time.Since(crossStart).Milliseconds()
+			summary.ResolveMode = "paths+names"
+		}
 	} else {
 		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())

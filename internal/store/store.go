@@ -127,6 +127,8 @@ type ScanSummary struct {
 	MarkMissingMS           int64                     `json:"mark_missing_ms,omitempty"`
 	ResolveMS               int64                     `json:"resolve_ms,omitempty"`
 	ResolveMode             string                    `json:"resolve_mode,omitempty"`
+	ResolveCrossFileMS      int64                     `json:"resolve_cross_file_ms,omitempty"`
+	ResolveCrossFileTargets int                       `json:"resolve_cross_file_targets,omitempty"`
 	DurationMS              int64                     `json:"duration_ms"`
 }
 
@@ -1820,6 +1822,77 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		targets = append(targets, chunkTargets...)
 	}
 	return s.resolveEdgeTargets(ctx, repoID, targets)
+}
+
+// ResolveEdgesForNames attempts to resolve currently-unresolved edges across the
+// repo whose dst_name matches (or ends with ".<name>") any of the provided
+// names. This is used to keep incremental update runs correct when newly
+// introduced symbols should resolve previously-unresolved edges in other files.
+//
+// It returns the number of candidate edges selected for resolution.
+func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []string) (int, error) {
+	if len(names) == 0 {
+		return 0, nil
+	}
+	seen := make(map[string]struct{}, len(names))
+	unique := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		unique = append(unique, name)
+	}
+	if len(unique) == 0 {
+		return 0, nil
+	}
+
+	// Query shape: do a single unresolved-edge scan, then filter in Go.
+	// This avoids repeated SQL queries with many OR/L LIKE clauses (which are
+	// difficult for SQLite to optimize with indexes).
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	nameSet := make(map[string]struct{}, len(unique))
+	for _, name := range unique {
+		nameSet[name] = struct{}{}
+	}
+
+	targets := make([]edgeTarget, 0, 64)
+	for rows.Next() {
+		var id int64
+		var dstName string
+		if err := rows.Scan(&id, &dstName); err != nil {
+			return 0, err
+		}
+		if _, ok := nameSet[dstName]; ok {
+			targets = append(targets, edgeTarget{edgeID: id, dstName: dstName})
+			continue
+		}
+		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
+			if _, ok := nameSet[dstName[dot+1:]]; ok {
+				targets = append(targets, edgeTarget{edgeID: id, dstName: dstName})
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := s.resolveEdgeTargets(ctx, repoID, targets); err != nil {
+		return 0, err
+	}
+	return len(targets), nil
 }
 
 func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
