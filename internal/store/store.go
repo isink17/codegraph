@@ -126,6 +126,7 @@ type ScanSummary struct {
 	EmbedMS                 int64                     `json:"embed_ms,omitempty"`
 	MarkMissingMS           int64                     `json:"mark_missing_ms,omitempty"`
 	ResolveMS               int64                     `json:"resolve_ms,omitempty"`
+	ResolveMode             string                    `json:"resolve_mode,omitempty"`
 	DurationMS              int64                     `json:"duration_ms"`
 }
 
