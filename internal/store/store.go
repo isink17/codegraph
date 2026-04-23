@@ -910,9 +910,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 			placeholders := strings.Repeat("(?),", len(chunk))
 			placeholders = strings.TrimSuffix(placeholders, ",")
 			query := `INSERT INTO tmp_delete_file_ids(id) VALUES ` + placeholders
-			args := make([]any, 0, len(chunk))
-			for _, id := range chunk {
-				args = append(args, id)
+			args := make([]any, len(chunk))
+			for i, id := range chunk {
+				args[i] = id
 			}
 			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 				return err
@@ -977,9 +977,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 			placeholders := strings.Repeat("?,", len(chunk))
 			placeholders = strings.TrimSuffix(placeholders, ",")
 			query := sqlPrefix + placeholders + sqlSuffix
-			args := make([]any, 0, len(chunk))
-			for _, id := range chunk {
-				args = append(args, id)
+			args := make([]any, len(chunk))
+			for i, id := range chunk {
+				args[i] = id
 			}
 			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 				return err
@@ -1283,32 +1283,31 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		return map[string]int64{}, nil
 	}
 
-	args := make([]any, 0, len(symbols)*15)
+	args := make([]any, len(symbols)*15)
 	var b strings.Builder
 	b.WriteString("INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key) VALUES ")
+	argIdx := 0
 	for i, sym := range symbols {
 		if i > 0 {
 			b.WriteString(",")
 		}
 		b.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-		args = append(
-			args,
-			repoID,
-			fileID,
-			sym.Language,
-			sym.Kind,
-			sym.Name,
-			sym.QualifiedName,
-			sym.ContainerName,
-			sym.Signature,
-			sym.Visibility,
-			sym.Range.StartLine,
-			sym.Range.StartCol,
-			sym.Range.EndLine,
-			sym.Range.EndCol,
-			sym.DocSummary,
-			sym.StableKey,
-		)
+		args[argIdx+0] = repoID
+		args[argIdx+1] = fileID
+		args[argIdx+2] = sym.Language
+		args[argIdx+3] = sym.Kind
+		args[argIdx+4] = sym.Name
+		args[argIdx+5] = sym.QualifiedName
+		args[argIdx+6] = sym.ContainerName
+		args[argIdx+7] = sym.Signature
+		args[argIdx+8] = sym.Visibility
+		args[argIdx+9] = sym.Range.StartLine
+		args[argIdx+10] = sym.Range.StartCol
+		args[argIdx+11] = sym.Range.EndLine
+		args[argIdx+12] = sym.Range.EndCol
+		args[argIdx+13] = sym.DocSummary
+		args[argIdx+14] = sym.StableKey
+		argIdx += 15
 	}
 	b.WriteString(" RETURNING id, stable_key")
 
