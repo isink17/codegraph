@@ -56,6 +56,13 @@ const (
 	// sqliteTestLinkValuesBatchRows controls multi-row inserts into test_links where each row uses 6 parameters.
 	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteTestLinkValuesBatchRows = 150
+
+	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 15 parameters.
+	// 60*15=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteSymbolValuesBatchRows = 60
+	// sqliteSymbolFTSValuesBatchRows controls multi-row inserts into symbol_fts where each row uses 6 parameters.
+	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteSymbolFTSValuesBatchRows = 150
 )
 
 type Store struct {
@@ -131,11 +138,18 @@ type WriteStats struct {
 
 	FileUpsertStatements int `json:"file_upsert_statements,omitempty"`
 
-	FileGraphDeleteChunks     int `json:"file_graph_delete_chunks,omitempty"`
-	FileGraphDeleteStatements int `json:"file_graph_delete_statements,omitempty"`
+	FileGraphDeleteChunks              int `json:"file_graph_delete_chunks,omitempty"`
+	FileGraphDeleteStatements          int `json:"file_graph_delete_statements,omitempty"`
+	FileGraphDeleteTempIDInsertBatches int `json:"file_graph_delete_temp_id_insert_batches,omitempty"`
+	FileGraphDeleteTempIDInsertRows    int `json:"file_graph_delete_temp_id_insert_rows,omitempty"`
 
 	SymbolInserts    int `json:"symbol_inserts,omitempty"`
 	SymbolFTSInserts int `json:"symbol_fts_inserts,omitempty"`
+
+	SymbolInsertBatches    int `json:"symbol_insert_batches,omitempty"`
+	SymbolInsertRows       int `json:"symbol_insert_rows,omitempty"`
+	SymbolFTSInsertBatches int `json:"symbol_fts_insert_batches,omitempty"`
+	SymbolFTSInsertRows    int `json:"symbol_fts_insert_rows,omitempty"`
 
 	SymbolTokenInsertBatches int `json:"symbol_token_insert_batches,omitempty"`
 	SymbolTokenInsertRows    int `json:"symbol_token_insert_rows,omitempty"`
@@ -829,26 +843,6 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	}
 	defer upsertFileStmt.Close()
 
-	insertSymbolStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertSymbolStmt.Close()
-
-	insertSymbolFTSStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO symbol_fts(repo_id, symbol_id, name, qualified_name, signature, doc_summary)
-		VALUES(?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	defer insertSymbolFTSStmt.Close()
-
 	now := time.Now().UTC().Format(time.RFC3339)
 	fileIDs := make([]int64, 0, len(inputs))
 	for _, input := range inputs {
@@ -873,8 +867,6 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			repoID,
 			fileID,
 			input.Parsed,
-			insertSymbolStmt,
-			insertSymbolFTSStmt,
 			stats,
 		); err != nil {
 			_ = tx.Rollback()
@@ -890,6 +882,88 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 
 func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, stats *WriteStats) error {
 	if len(fileIDs) == 0 {
+		return nil
+	}
+
+	// For large batches, use a temp table to avoid repeating large IN clauses across each dependent-table delete.
+	// This reduces statement pressure from ~O(numTables * chunks) down to O(chunks + numTables).
+	if len(fileIDs) > sqliteInClauseBatchSize {
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_delete_file_ids(id INTEGER PRIMARY KEY)`); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.TotalExecStatements++
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_delete_file_ids`); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.TotalExecStatements++
+		}
+
+		for start := 0; start < len(fileIDs); start += sqliteInClauseBatchSize {
+			end := start + sqliteInClauseBatchSize
+			if end > len(fileIDs) {
+				end = len(fileIDs)
+			}
+			chunk := fileIDs[start:end]
+			placeholders := strings.Repeat("(?),", len(chunk))
+			placeholders = strings.TrimSuffix(placeholders, ",")
+			query := `INSERT INTO tmp_delete_file_ids(id) VALUES ` + placeholders
+			args := make([]any, 0, len(chunk))
+			for _, id := range chunk {
+				args = append(args, id)
+			}
+			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+				return err
+			}
+			if stats != nil {
+				stats.FileGraphDeleteTempIDInsertBatches++
+				stats.FileGraphDeleteTempIDInsertRows += len(chunk)
+				stats.TotalExecStatements++
+			}
+		}
+
+		exec := func(query string) error {
+			if _, err := tx.ExecContext(ctx, query); err != nil {
+				return err
+			}
+			if stats != nil {
+				stats.FileGraphDeleteStatements++
+				stats.TotalExecStatements++
+			}
+			return nil
+		}
+
+		// Dependent tables that reference symbols must be deleted before deleting symbols.
+		if err := exec(`DELETE FROM symbol_tokens WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
+			return err
+		}
+		if err := exec(`DELETE FROM symbol_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
+			return err
+		}
+
+		if err := exec(`DELETE FROM edges WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+			return err
+		}
+		if err := exec(`DELETE FROM references_tbl WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+			return err
+		}
+		if err := exec(`DELETE FROM file_imports WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+			return err
+		}
+		if err := exec(`DELETE FROM file_tokens WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+			return err
+		}
+		if err := exec(`DELETE FROM test_links WHERE test_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+			return err
+		}
+		if err := exec(`DELETE FROM symbol_embeddings WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+			return err
+		}
+		if err := exec(`DELETE FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -1016,41 +1090,48 @@ func insertParsedFileGraph(
 	repoID int64,
 	fileID int64,
 	parsed graph.ParsedFile,
-	insertSymbolStmt *sql.Stmt,
-	insertSymbolFTSStmt *sql.Stmt,
 	stats *WriteStats,
 ) error {
 	stableToID := map[string]int64{}
 	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
-	for _, sym := range parsed.Symbols {
-		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
+	symbolFTSArgs := make([]any, 0, min(len(parsed.Symbols), sqliteSymbolFTSValuesBatchRows)*6)
+	for start := 0; start < len(parsed.Symbols); start += sqliteSymbolValuesBatchRows {
+		end := start + sqliteSymbolValuesBatchRows
+		if end > len(parsed.Symbols) {
+			end = len(parsed.Symbols)
+		}
+		batch := parsed.Symbols[start:end]
+		batchStableToID, err := insertSymbolsBatchReturning(ctx, tx, repoID, fileID, batch, stats)
 		if err != nil {
 			return err
 		}
-		if stats != nil {
-			stats.SymbolInserts++
-			stats.TotalExecStatements++
-		}
-		symbolID, err := res.LastInsertId()
-		if err != nil {
-			return err
-		}
-		stableToID[sym.StableKey] = symbolID
-		if _, err := insertSymbolFTSStmt.ExecContext(ctx, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary); err != nil {
-			return err
-		}
-		if stats != nil {
-			stats.SymbolFTSInserts++
-			stats.TotalExecStatements++
-		}
-		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
-			symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
-			if len(symbolTokenArgs) >= sqliteTokenValuesBatchRows*3 {
-				if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
+		for _, sym := range batch {
+			symbolID, ok := batchStableToID[sym.StableKey]
+			if !ok || symbolID == 0 {
+				return fmt.Errorf("missing inserted id for stable_key=%q", sym.StableKey)
+			}
+			stableToID[sym.StableKey] = symbolID
+			symbolFTSArgs = append(symbolFTSArgs, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
+			if len(symbolFTSArgs) >= sqliteSymbolFTSValuesBatchRows*6 {
+				if err := execSymbolFTSInsert(ctx, tx, symbolFTSArgs, stats); err != nil {
 					return err
 				}
-				symbolTokenArgs = symbolTokenArgs[:0]
+				symbolFTSArgs = symbolFTSArgs[:0]
 			}
+			for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
+				symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
+				if len(symbolTokenArgs) >= sqliteTokenValuesBatchRows*3 {
+					if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
+						return err
+					}
+					symbolTokenArgs = symbolTokenArgs[:0]
+				}
+			}
+		}
+	}
+	if len(symbolFTSArgs) > 0 {
+		if err := execSymbolFTSInsert(ctx, tx, symbolFTSArgs, stats); err != nil {
+			return err
 		}
 	}
 	if len(symbolTokenArgs) > 0 {
@@ -1193,6 +1274,91 @@ func insertParsedFileGraph(
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID int64, symbols []graph.Symbol, stats *WriteStats) (map[string]int64, error) {
+	if len(symbols) == 0 {
+		return map[string]int64{}, nil
+	}
+
+	args := make([]any, 0, len(symbols)*15)
+	var b strings.Builder
+	b.WriteString("INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key) VALUES ")
+	for i, sym := range symbols {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		args = append(
+			args,
+			repoID,
+			fileID,
+			sym.Language,
+			sym.Kind,
+			sym.Name,
+			sym.QualifiedName,
+			sym.ContainerName,
+			sym.Signature,
+			sym.Visibility,
+			sym.Range.StartLine,
+			sym.Range.StartCol,
+			sym.Range.EndLine,
+			sym.Range.EndCol,
+			sym.DocSummary,
+			sym.StableKey,
+		)
+	}
+	b.WriteString(" RETURNING id, stable_key")
+
+	rows, err := tx.QueryContext(ctx, b.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]int64, len(symbols))
+	rowCount := 0
+	for rows.Next() {
+		var id int64
+		var stableKey string
+		if err := rows.Scan(&id, &stableKey); err != nil {
+			return nil, err
+		}
+		out[stableKey] = id
+		rowCount++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if rowCount != len(symbols) {
+		return nil, fmt.Errorf("symbol insert returned %d rows (expected %d)", rowCount, len(symbols))
+	}
+	if stats != nil {
+		stats.SymbolInsertBatches++
+		stats.SymbolInsertRows += rowCount
+		stats.SymbolInserts += rowCount
+		stats.TotalExecStatements++
+	}
+	return out, nil
+}
+
+func execSymbolFTSInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	if len(args) == 0 {
+		return nil
+	}
+	if len(args)%6 != 0 {
+		return fmt.Errorf("invalid symbol_fts insert args len=%d", len(args))
+	}
+	rows := len(args) / 6
+	if err := execBatchInsert(ctx, tx, "symbol_fts", "repo_id, symbol_id, name, qualified_name, signature, doc_summary", 6, args, stats); err != nil {
+		return err
+	}
+	if stats != nil {
+		stats.SymbolFTSInsertBatches++
+		stats.SymbolFTSInsertRows += rows
+		stats.SymbolFTSInserts += rows
 	}
 	return nil
 }
