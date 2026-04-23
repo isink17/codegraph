@@ -646,7 +646,6 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 				"parse_ms":          summary.ParseMS,
 				"read_ms":           summary.ReadMS,
 				"hash_ms":           summary.HashMS,
-				"adapter_parse_ms":  summary.AdapterParseMS,
 				"write_ms":          summary.WriteMS,
 				"write_metadata_ms": summary.WriteMetadataMS,
 				"write_replace_ms":  summary.WriteReplaceMS,
