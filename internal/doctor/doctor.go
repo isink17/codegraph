@@ -138,46 +138,8 @@ func inspectDB(ctx context.Context, dbPath string) (*DBInfo, error) {
 		return nil, err
 	}
 	defer db.Close()
-	var pragmas store.DBPragmas
-	if err := db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&pragmas.SQLiteVersion); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&pragmas.JournalMode); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&pragmas.Synchronous); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRowContext(ctx, `PRAGMA temp_store`).Scan(&pragmas.TempStore); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&pragmas.AutoVacuum); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pragmas.PageSize); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&pragmas.BusyTimeoutMS); err != nil {
-		return nil, err
-	}
-	var foreignKeys int64
-	if err := db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
-		return nil, err
-	}
-	pragmas.ForeignKeys = foreignKeys != 0
-	if err := db.QueryRowContext(ctx, `PRAGMA wal_autocheckpoint`).Scan(&pragmas.WalAutocheckpoint); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&pragmas.UserVersion); err != nil {
-		return nil, err
-	}
-	var symbolFTSName string
-	err = db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='symbol_fts'`).Scan(&symbolFTSName)
-	if err == nil && symbolFTSName == "symbol_fts" {
-		pragmas.SymbolFTSPresent = true
-	} else if errors.Is(err, sql.ErrNoRows) {
-		pragmas.SymbolFTSPresent = false
-	} else if err != nil {
+	pragmas, err := store.QueryDBPragmas(ctx, db)
+	if err != nil {
 		return nil, err
 	}
 

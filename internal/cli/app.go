@@ -103,11 +103,7 @@ func hasHelpFlag(args []string) bool {
 	return false
 }
 
-func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
-	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fix := fs.Bool("fix", false, "apply non-destructive fixes")
-	repoRootFlag := fs.String("repo-root", "", "repository root to inspect (optional)")
+func parseOptionalRepoRootArg(fs *flag.FlagSet, args []string, repoRootFlag *string, defaultRepoRoot string) (string, error) {
 	repoRootArg := ""
 	parseArgs := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -115,14 +111,31 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 		parseArgs = args[1:]
 	}
 	if err := fs.Parse(parseArgs); err != nil {
-		return err
+		return "", err
 	}
 	repoRoot := strings.TrimSpace(*repoRootFlag)
 	if repoRoot == "" {
 		repoRoot = strings.TrimSpace(repoRootArg)
 	}
-	if repoRoot == "" && config.IsRepoDBDir(cfg.DBDir) {
-		repoRoot = "."
+	if repoRoot == "" {
+		repoRoot = defaultRepoRoot
+	}
+	return repoRoot, nil
+}
+
+func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fix := fs.Bool("fix", false, "apply non-destructive fixes")
+	repoRootFlag := fs.String("repo-root", "", "repository root to inspect (optional)")
+
+	defaultRepoRoot := ""
+	if config.IsRepoDBDir(cfg.DBDir) {
+		defaultRepoRoot = "."
+	}
+	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	if err != nil {
+		return err
 	}
 
 	dbPath := ""
@@ -1051,21 +1064,14 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	vacuum := fs.Bool("vacuum", false, "run VACUUM on databases")
 	ftsOptimize := fs.Bool("fts-optimize", false, "run FTS optimize on databases (symbol_fts)")
 	repoRootFlag := fs.String("repo-root", "", "repository root to clean")
-	repoRootArg := ""
-	parseArgs := args
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		repoRootArg = args[0]
-		parseArgs = args[1:]
+
+	defaultRepoRoot := ""
+	if config.IsRepoDBDir(cfg.DBDir) {
+		defaultRepoRoot = "."
 	}
-	if err := fs.Parse(parseArgs); err != nil {
+	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	if err != nil {
 		return err
-	}
-	repoRoot := strings.TrimSpace(*repoRootFlag)
-	if repoRoot == "" {
-		repoRoot = strings.TrimSpace(repoRootArg)
-	}
-	if repoRoot == "" && config.IsRepoDBDir(cfg.DBDir) {
-		repoRoot = "."
 	}
 
 	type dbResult struct {
