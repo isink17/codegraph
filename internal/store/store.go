@@ -1851,49 +1851,43 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 		return 0, nil
 	}
 
-	const chunkSize = 200
+	// Query shape: do a single unresolved-edge scan, then filter in Go.
+	// This avoids repeated SQL queries with many OR/L LIKE clauses (which are
+	// difficult for SQLite to optimize with indexes).
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	nameSet := make(map[string]struct{}, len(unique))
+	for _, name := range unique {
+		nameSet[name] = struct{}{}
+	}
+
 	targets := make([]edgeTarget, 0, 64)
-	for start := 0; start < len(unique); start += chunkSize {
-		end := min(start+chunkSize, len(unique))
-		chunk := unique[start:end]
-
-		var b strings.Builder
-		b.WriteString(`SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND (`)
-
-		// Exact matches.
-		b.WriteString(`dst_name IN (`)
-		for i := range chunk {
-			if i > 0 {
-				b.WriteString(",")
+	for rows.Next() {
+		var id int64
+		var dstName string
+		if err := rows.Scan(&id, &dstName); err != nil {
+			return 0, err
+		}
+		if _, ok := nameSet[dstName]; ok {
+			targets = append(targets, edgeTarget{edgeID: id, dstName: dstName})
+			continue
+		}
+		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
+			if _, ok := nameSet[dstName[dot+1:]]; ok {
+				targets = append(targets, edgeTarget{edgeID: id, dstName: dstName})
 			}
-			b.WriteString("?")
 		}
-		b.WriteString(`)`)
-
-		// Suffix matches for qualified-like names (e.g. "pkg.Foo", "import/path.Foo").
-		for range chunk {
-			b.WriteString(` OR dst_name LIKE ?`)
-		}
-		b.WriteString(`)`)
-
-		args := make([]any, 0, 1+(len(chunk)*2))
-		args = append(args, repoID)
-		for _, name := range chunk {
-			args = append(args, name)
-		}
-		for _, name := range chunk {
-			args = append(args, "%."+name)
-		}
-
-		rows, err := s.db.QueryContext(ctx, b.String(), args...)
-		if err != nil {
-			return 0, err
-		}
-		chunkTargets, err := scanEdgeTargets(rows)
-		if err != nil {
-			return 0, err
-		}
-		targets = append(targets, chunkTargets...)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
 	}
 	if err := s.resolveEdgeTargets(ctx, repoID, targets); err != nil {
 		return 0, err

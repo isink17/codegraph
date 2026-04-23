@@ -584,9 +584,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 		summary.ResolveMode = "paths"
 
-		// Correctness: if this update introduced symbols, try to resolve previously-unresolved
-		// edges in other files that reference those names without falling back to repo-wide resolve.
-		if scanKind == "update" && len(changedSymbolNameSet) > 0 {
+		// Correctness: partial runs can introduce symbols that should resolve previously-unresolved
+		// edges in other files. Do a narrow cross-file pass keyed by the introduced symbol names,
+		// without falling back to repo-wide resolution.
+		if len(changedSymbolNameSet) > 0 {
 			names := make([]string, 0, len(changedSymbolNameSet))
 			for name := range changedSymbolNameSet {
 				names = append(names, name)
