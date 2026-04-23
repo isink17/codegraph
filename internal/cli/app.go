@@ -265,6 +265,8 @@ type benchmarkBaseline struct {
 	GOOS       string                     `json:"goos,omitempty"`
 	GOARCH     string                     `json:"goarch,omitempty"`
 	GOMAXPROCS string                     `json:"gomaxprocs,omitempty"`
+	NumCPU     int                        `json:"num_cpu"`
+	CWD        string                     `json:"cwd"`
 	SQLite     string                     `json:"sqlite_driver,omitempty"`
 	BenchCtx   map[string]any             `json:"bench_ctx,omitempty"`
 	Env        map[string]string          `json:"env,omitempty"`
@@ -332,6 +334,7 @@ func extractBenchmarkContext(output string) map[string]any {
 	keys := []string{
 		"fixture_files",
 		"sqlite_driver",
+		"sqlite_profile",
 	}
 	out := map[string]any{}
 	for line := range strings.SplitSeq(output, "\n") {
@@ -369,6 +372,7 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	benchtime := fs.String("benchtime", "100ms", "benchmark time per test")
 	saveBaseline := fs.Bool("save-baseline", true, "save current benchmark result as baseline")
 	files := fs.Int("files", 0, "fixture file count (sets CODEGRAPH_BENCH_FILES)")
+	sqliteProfile := fs.String("sqlite-profile", "", "SQLite performance profile for benchmarks (sets CODEGRAPH_BENCH_SQLITE_PROFILE)")
 	gomaxprocs := fs.Int("gomaxprocs", 0, "GOMAXPROCS for benchmark subprocess (0 = default)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -406,6 +410,12 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	} else if v := strings.TrimSpace(os.Getenv("CODEGRAPH_BENCH_FILES")); v != "" {
 		benchEnv["CODEGRAPH_BENCH_FILES"] = v
 	}
+	if v := strings.TrimSpace(*sqliteProfile); v != "" {
+		env = append(env, "CODEGRAPH_BENCH_SQLITE_PROFILE="+v)
+		benchEnv["CODEGRAPH_BENCH_SQLITE_PROFILE"] = v
+	} else if v := strings.TrimSpace(os.Getenv("CODEGRAPH_BENCH_SQLITE_PROFILE")); v != "" {
+		benchEnv["CODEGRAPH_BENCH_SQLITE_PROFILE"] = v
+	}
 	if *gomaxprocs > 0 {
 		v := strconv.Itoa(*gomaxprocs)
 		env = append(env, "GOMAXPROCS="+v)
@@ -416,6 +426,7 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	benchCtx := extractBenchmarkContext(string(out))
+	cwd, _ := os.Getwd()
 	result := map[string]any{
 		"command":       append([]string{"go"}, cmdArgs...),
 		"count":         *count,
@@ -423,6 +434,8 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		"go_version":    runtime.Version(),
 		"goos":          runtime.GOOS,
 		"goarch":        runtime.GOARCH,
+		"num_cpu":       runtime.NumCPU(),
+		"cwd":           cwd,
 		"sqlite_driver": store.SQLiteDriverName(),
 		"env":           benchEnv,
 		"bench_ctx":     benchCtx,
@@ -471,6 +484,8 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 					GOOS:       runtime.GOOS,
 					GOARCH:     runtime.GOARCH,
 					GOMAXPROCS: gomaxLabel,
+					NumCPU:     runtime.NumCPU(),
+					CWD:        cwd,
 					SQLite:     store.SQLiteDriverName(),
 					BenchCtx:   benchCtx,
 					Env:        benchEnv,

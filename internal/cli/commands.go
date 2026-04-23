@@ -278,7 +278,15 @@ func newCommandList() []*command {
 		{
 			name:        "benchmark",
 			description: "benchmarks",
-			usageLines:  []string{"  benchmark [--count N] [--benchtime DURATION] [--save-baseline] [--files N] [--gomaxprocs N]"},
+			usageLines:  []string{"  benchmark [--count N] [--benchtime DURATION] [--save-baseline] [--files N] [--sqlite-profile NAME] [--gomaxprocs N]"},
+			flags: []commandFlag{
+				{name: "--count", description: "number of benchmark runs"},
+				{name: "--benchtime", description: "benchmark time per test"},
+				{name: "--save-baseline", description: "save current benchmark result as baseline"},
+				{name: "--files", description: "fixture file count (sets CODEGRAPH_BENCH_FILES)"},
+				{name: "--sqlite-profile", description: "SQLite performance profile (sets CODEGRAPH_BENCH_SQLITE_PROFILE)"},
+				{name: "--gomaxprocs", description: "GOMAXPROCS for benchmark subprocess (0 = default)"},
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runBenchmark(ctx, stdout, args)
 			},

@@ -115,6 +115,37 @@ func main() {}
 	}
 }
 
+func TestBenchmarkBaselineIncludesContextFields(t *testing.T) {
+	payload := benchmarkBaseline{
+		CreatedAt:  "2026-01-02T03:04:05Z",
+		Command:    []string{"go", "test"},
+		Count:      1,
+		Benchtime:  "10ms",
+		GoVersion:  "go1.x",
+		GOOS:       "windows",
+		GOARCH:     "amd64",
+		GOMAXPROCS: "default",
+		NumCPU:     12,
+		CWD:        "C:\\repo",
+		SQLite:     "sqlite",
+		Benchmarks: map[string]benchmarkMetric{"BenchmarkX": {NsPerOp: 1}},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(payload) error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal(payload) error = %v", err)
+	}
+	if _, ok := decoded["num_cpu"]; !ok {
+		t.Fatalf("payload missing num_cpu: %s", string(data))
+	}
+	if _, ok := decoded["cwd"]; !ok {
+		t.Fatalf("payload missing cwd: %s", string(data))
+	}
+}
+
 func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
 	t.Setenv("CODEGRAPH_HOME", home)
