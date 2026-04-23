@@ -29,8 +29,8 @@ type Report struct {
 	SQLiteDriver    string    `json:"sqlite_driver"`
 	DB              *DBInfo   `json:"db,omitempty"`
 	Deep            *DeepInfo `json:"deep,omitempty"`
-	AppliedFixes    []string  `json:"applied_fixes,omitempty"`
-	Recommendations []string  `json:"recommendations,omitempty"`
+	AppliedFixes    []string  `json:"applied_fixes"`
+	Recommendations []string  `json:"recommendations"`
 }
 
 type DBInfo struct {
