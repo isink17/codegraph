@@ -85,32 +85,77 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
-	RepoID           int64                     `json:"repo_id"`
-	ScanID           int64                     `json:"scan_id"`
-	FilesSeen        int                       `json:"files_seen"`
-	FilesIndexed     int                       `json:"files_indexed"`
-	FilesSkipped     int                       `json:"files_skipped"`
-	FilesChanged     int                       `json:"files_changed"`
-	FilesDeleted     int                       `json:"files_deleted"`
-	FilesTotal       int                       `json:"files_total,omitempty"`
-	FilesDeletedPct  float64                   `json:"files_deleted_pct,omitempty"`
-	ParseErrors      int                       `json:"parse_errors,omitempty"`
-	ParseSamples     []string                  `json:"parse_samples,omitempty"`
-	LanguageCoverage map[string]LanguageCounts `json:"language_coverage,omitempty"`
-	ExistingLoadMS   int64                     `json:"existing_load_ms,omitempty"`
-	WalkMS           int64                     `json:"walk_ms,omitempty"`
-	ProcessWallMS    int64                     `json:"process_wall_ms,omitempty"`
-	ParseMS          int64                     `json:"parse_ms,omitempty"`
-	ReadMS           int64                     `json:"read_ms,omitempty"`
-	HashMS           int64                     `json:"hash_ms,omitempty"`
-	AdapterParseMS   int64                     `json:"adapter_parse_ms,omitempty"`
-	WriteMS          int64                     `json:"write_ms,omitempty"`
-	WriteMetadataMS  int64                     `json:"write_metadata_ms,omitempty"`
-	WriteReplaceMS   int64                     `json:"write_replace_ms,omitempty"`
-	EmbedMS          int64                     `json:"embed_ms,omitempty"`
-	MarkMissingMS    int64                     `json:"mark_missing_ms,omitempty"`
-	ResolveMS        int64                     `json:"resolve_ms,omitempty"`
-	DurationMS       int64                     `json:"duration_ms"`
+	RepoID                  int64                     `json:"repo_id"`
+	ScanID                  int64                     `json:"scan_id"`
+	FilesSeen               int                       `json:"files_seen"`
+	FilesIndexed            int                       `json:"files_indexed"`
+	FilesSkipped            int                       `json:"files_skipped"`
+	FilesChanged            int                       `json:"files_changed"`
+	FilesDeleted            int                       `json:"files_deleted"`
+	FilesTotal              int                       `json:"files_total,omitempty"`
+	FilesDeletedPct         float64                   `json:"files_deleted_pct,omitempty"`
+	ParseErrors             int                       `json:"parse_errors,omitempty"`
+	ParseSamples            []string                  `json:"parse_samples,omitempty"`
+	LanguageCoverage        map[string]LanguageCounts `json:"language_coverage,omitempty"`
+	PhaseTimings            []ScanPhaseTiming         `json:"phase_timings,omitempty"`
+	ExistingLoadMS          int64                     `json:"existing_load_ms,omitempty"`
+	WalkMS                  int64                     `json:"walk_ms,omitempty"`
+	ProcessWallMS           int64                     `json:"process_wall_ms,omitempty"`
+	TaskMS                  int64                     `json:"task_ms,omitempty"`
+	TaskOtherMS             int64                     `json:"task_other_ms,omitempty"`
+	ParseMS                 int64                     `json:"parse_ms,omitempty"`
+	ReadMS                  int64                     `json:"read_ms,omitempty"`
+	HashMS                  int64                     `json:"hash_ms,omitempty"`
+	AdapterParseMS          int64                     `json:"adapter_parse_ms,omitempty"`
+	WriteMS                 int64                     `json:"write_ms,omitempty"`
+	WriteMetadataMS         int64                     `json:"write_metadata_ms,omitempty"`
+	WriteReplaceMS          int64                     `json:"write_replace_ms,omitempty"`
+	WriteMarkSeenFlushes    int                       `json:"write_mark_seen_flushes,omitempty"`
+	WriteTouchFlushes       int                       `json:"write_touch_flushes,omitempty"`
+	WriteParseFailedFlushes int                       `json:"write_parse_failed_flushes,omitempty"`
+	WriteReplaceFlushes     int                       `json:"write_replace_flushes,omitempty"`
+	WriteStats              *WriteStats               `json:"write_stats,omitempty"`
+	EmbedMS                 int64                     `json:"embed_ms,omitempty"`
+	MarkMissingMS           int64                     `json:"mark_missing_ms,omitempty"`
+	ResolveMS               int64                     `json:"resolve_ms,omitempty"`
+	DurationMS              int64                     `json:"duration_ms"`
+}
+
+type ScanPhaseTiming struct {
+	Phase string `json:"phase"`
+	MS    int64  `json:"ms"`
+}
+
+type WriteStats struct {
+	TxCount int `json:"tx_count,omitempty"`
+
+	FileUpsertStatements int `json:"file_upsert_statements,omitempty"`
+
+	FileGraphDeleteChunks     int `json:"file_graph_delete_chunks,omitempty"`
+	FileGraphDeleteStatements int `json:"file_graph_delete_statements,omitempty"`
+
+	SymbolInserts    int `json:"symbol_inserts,omitempty"`
+	SymbolFTSInserts int `json:"symbol_fts_inserts,omitempty"`
+
+	SymbolTokenInsertBatches int `json:"symbol_token_insert_batches,omitempty"`
+	SymbolTokenInsertRows    int `json:"symbol_token_insert_rows,omitempty"`
+
+	FileTokenInsertBatches int `json:"file_token_insert_batches,omitempty"`
+	FileTokenInsertRows    int `json:"file_token_insert_rows,omitempty"`
+
+	ReferenceInsertBatches int `json:"reference_insert_batches,omitempty"`
+	ReferenceInsertRows    int `json:"reference_insert_rows,omitempty"`
+
+	EdgeInsertBatches int `json:"edge_insert_batches,omitempty"`
+	EdgeInsertRows    int `json:"edge_insert_rows,omitempty"`
+
+	ImportInsertBatches int `json:"import_insert_batches,omitempty"`
+	ImportInsertRows    int `json:"import_insert_rows,omitempty"`
+
+	TestLinkInsertBatches int `json:"test_link_insert_batches,omitempty"`
+	TestLinkInsertRows    int `json:"test_link_insert_rows,omitempty"`
+
+	TotalExecStatements int `json:"total_exec_statements,omitempty"`
 }
 
 type LanguageCounts struct {
@@ -747,8 +792,16 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 }
 
 func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput) ([]int64, error) {
+	return s.ReplaceFileGraphsBatchWithStats(ctx, repoID, scanID, inputs, nil)
+}
+
+func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput, stats *WriteStats) ([]int64, error) {
 	if len(inputs) == 0 {
 		return nil, nil
+	}
+	if stats != nil {
+		stats.TxCount++
+		stats.FileUpsertStatements += len(inputs)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -807,7 +860,7 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 		fileIDs = append(fileIDs, fileID)
 	}
 
-	if err := deleteFileGraphsBatch(ctx, tx, fileIDs); err != nil {
+	if err := deleteFileGraphsBatch(ctx, tx, fileIDs, stats); err != nil {
 		_ = tx.Rollback()
 		return nil, err
 	}
@@ -822,6 +875,7 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 			input.Parsed,
 			insertSymbolStmt,
 			insertSymbolFTSStmt,
+			stats,
 		); err != nil {
 			_ = tx.Rollback()
 			return nil, err
@@ -834,7 +888,7 @@ func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64
 	return fileIDs, nil
 }
 
-func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64) error {
+func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, stats *WriteStats) error {
 	if len(fileIDs) == 0 {
 		return nil
 	}
@@ -855,6 +909,11 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64) err
 			}
 			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 				return err
+			}
+			if stats != nil {
+				stats.FileGraphDeleteChunks++
+				stats.FileGraphDeleteStatements++
+				stats.TotalExecStatements++
 			}
 		}
 		return nil
@@ -959,6 +1018,7 @@ func insertParsedFileGraph(
 	parsed graph.ParsedFile,
 	insertSymbolStmt *sql.Stmt,
 	insertSymbolFTSStmt *sql.Stmt,
+	stats *WriteStats,
 ) error {
 	stableToID := map[string]int64{}
 	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
@@ -966,6 +1026,10 @@ func insertParsedFileGraph(
 		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
 		if err != nil {
 			return err
+		}
+		if stats != nil {
+			stats.SymbolInserts++
+			stats.TotalExecStatements++
 		}
 		symbolID, err := res.LastInsertId()
 		if err != nil {
@@ -975,10 +1039,14 @@ func insertParsedFileGraph(
 		if _, err := insertSymbolFTSStmt.ExecContext(ctx, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary); err != nil {
 			return err
 		}
+		if stats != nil {
+			stats.SymbolFTSInserts++
+			stats.TotalExecStatements++
+		}
 		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
 			symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
 			if len(symbolTokenArgs) >= sqliteTokenValuesBatchRows*3 {
-				if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs); err != nil {
+				if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
 					return err
 				}
 				symbolTokenArgs = symbolTokenArgs[:0]
@@ -986,7 +1054,7 @@ func insertParsedFileGraph(
 		}
 	}
 	if len(symbolTokenArgs) > 0 {
-		if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs); err != nil {
+		if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
 			return err
 		}
 	}
@@ -1017,14 +1085,14 @@ func insertParsedFileGraph(
 				contextID,
 			)
 			if len(referenceArgs) >= sqliteReferenceValuesBatchRows*11 {
-				if err := execReferencesInsert(ctx, tx, referenceArgs); err != nil {
+				if err := execReferencesInsert(ctx, tx, referenceArgs, stats); err != nil {
 					return err
 				}
 				referenceArgs = referenceArgs[:0]
 			}
 		}
 		if len(referenceArgs) > 0 {
-			if err := execReferencesInsert(ctx, tx, referenceArgs); err != nil {
+			if err := execReferencesInsert(ctx, tx, referenceArgs, stats); err != nil {
 				return err
 			}
 		}
@@ -1039,14 +1107,14 @@ func insertParsedFileGraph(
 			}
 			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line)
 			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*7 {
-				if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs); err != nil {
+				if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
 					return err
 				}
 				edgeArgs = edgeArgs[:0]
 			}
 		}
 		if len(edgeArgs) > 0 {
-			if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs); err != nil {
+			if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
 				return err
 			}
 		}
@@ -1057,14 +1125,14 @@ func insertParsedFileGraph(
 		for _, imp := range parsed.Imports {
 			importArgs = append(importArgs, repoID, fileID, imp)
 			if len(importArgs) >= sqliteImportValuesBatchRows*3 {
-				if err := execImportsInsert(ctx, tx, importArgs); err != nil {
+				if err := execImportsInsert(ctx, tx, importArgs, stats); err != nil {
 					return err
 				}
 				importArgs = importArgs[:0]
 			}
 		}
 		if len(importArgs) > 0 {
-			if err := execImportsInsert(ctx, tx, importArgs); err != nil {
+			if err := execImportsInsert(ctx, tx, importArgs, stats); err != nil {
 				return err
 			}
 		}
@@ -1074,14 +1142,14 @@ func insertParsedFileGraph(
 		for token, weight := range parsed.FileTokens {
 			fileTokenArgs = append(fileTokenArgs, fileID, token, weight)
 			if len(fileTokenArgs) >= sqliteTokenValuesBatchRows*3 {
-				if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs); err != nil {
+				if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs, stats); err != nil {
 					return err
 				}
 				fileTokenArgs = fileTokenArgs[:0]
 			}
 		}
 		if len(fileTokenArgs) > 0 {
-			if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs); err != nil {
+			if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs, stats); err != nil {
 				return err
 			}
 		}
@@ -1114,14 +1182,14 @@ func insertParsedFileGraph(
 			}
 			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score)
 			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*6 {
-				if err := execTestLinksInsert(ctx, tx, testLinkArgs); err != nil {
+				if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
 					return err
 				}
 				testLinkArgs = testLinkArgs[:0]
 			}
 		}
 		if len(testLinkArgs) > 0 {
-			if err := execTestLinksInsert(ctx, tx, testLinkArgs); err != nil {
+			if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
 				return err
 			}
 		}
@@ -1129,7 +1197,7 @@ func insertParsedFileGraph(
 	return nil
 }
 
-func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn string, args []any) error {
+func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn string, args []any, stats *WriteStats) error {
 	if len(args) == 0 {
 		return nil
 	}
@@ -1147,10 +1215,24 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 		b.WriteString("(?,?,?)")
 	}
 	_, err := tx.ExecContext(ctx, b.String(), args...)
-	return err
+	if err != nil {
+		return err
+	}
+	if stats != nil {
+		switch table {
+		case "symbol_tokens":
+			stats.SymbolTokenInsertBatches++
+			stats.SymbolTokenInsertRows += rows
+		case "file_tokens":
+			stats.FileTokenInsertBatches++
+			stats.FileTokenInsertRows += rows
+		}
+		stats.TotalExecStatements++
+	}
+	return nil
 }
 
-func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, rowsPerBatch int, args []any) error {
+func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, rowsPerBatch int, args []any, stats *WriteStats) error {
 	if len(args) == 0 {
 		return nil
 	}
@@ -1174,23 +1256,43 @@ func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, row
 		b.WriteString(")")
 	}
 	_, err := tx.ExecContext(ctx, b.String(), args...)
-	return err
+	if err != nil {
+		return err
+	}
+	if stats != nil {
+		switch table {
+		case "references_tbl":
+			stats.ReferenceInsertBatches++
+			stats.ReferenceInsertRows += rowCount
+		case "edges":
+			stats.EdgeInsertBatches++
+			stats.EdgeInsertRows += rowCount
+		case "test_links":
+			stats.TestLinkInsertBatches++
+			stats.TestLinkInsertRows += rowCount
+		case "file_imports":
+			stats.ImportInsertBatches++
+			stats.ImportInsertRows += rowCount
+		}
+		stats.TotalExecStatements++
+	}
+	return nil
 }
 
-func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
-	return execBatchInsert(ctx, tx, "references_tbl", "repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id", 11, args)
+func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "references_tbl", "repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id", 11, args, stats)
 }
 
-func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any) error {
-	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args)
+func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args, stats)
 }
 
-func execTestLinksInsert(ctx context.Context, tx *sql.Tx, args []any) error {
-	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score", 6, args)
+func execTestLinksInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score", 6, args, stats)
 }
 
-func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any) error {
-	return execBatchInsert(ctx, tx, "file_imports", "repo_id, file_id, import_path", 3, args)
+func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "file_imports", "repo_id, file_id, import_path", 3, args, stats)
 }
 
 func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 {

@@ -48,16 +48,16 @@ type fileTask struct {
 }
 
 type fileResult struct {
-	task      fileTask
-	action    string
-	hash      string
-	parsed    graph.ParsedFile
-	err       error
-	parseErr  string
-	processMS int64
-	readMS    int64
-	hashMS    int64
-	parseMS   int64
+	task       fileTask
+	action     string
+	hash       string
+	parsed     graph.ParsedFile
+	err        error
+	parseErr   string
+	processDur time.Duration
+	readDur    time.Duration
+	hashDur    time.Duration
+	parseDur   time.Duration
 }
 
 func New(s *store.Store, registry *parser.Registry, embedder embedding.Embedder) *Indexer {
@@ -281,9 +281,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
 
-	var writeMetadataMS int64
-	var writeReplaceMS int64
-	var embedMS int64
+	var writeMetadataDur time.Duration
+	var writeReplaceDur time.Duration
+	var embedDur time.Duration
+	var writeStats store.WriteStats
 
 	flushMarkSeen := func() error {
 		if len(markSeenBatch) == 0 {
@@ -293,7 +294,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if err := i.store.MarkFilesSeenBatch(ctx, repo.ID, scanID, markSeenBatch); err != nil {
 			return err
 		}
-		writeMetadataMS += time.Since(started).Milliseconds()
+		summary.WriteMarkSeenFlushes++
+		writeMetadataDur += time.Since(started)
 		markSeenBatch = markSeenBatch[:0]
 		return nil
 	}
@@ -305,7 +307,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if err := i.store.TouchFilesMetadataBatch(ctx, repo.ID, scanID, touchBatch); err != nil {
 			return err
 		}
-		writeMetadataMS += time.Since(started).Milliseconds()
+		summary.WriteTouchFlushes++
+		writeMetadataDur += time.Since(started)
 		touchBatch = touchBatch[:0]
 		return nil
 	}
@@ -317,7 +320,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if err := i.store.MarkFilesParseFailedBatch(ctx, repo.ID, scanID, parseFailedBatch); err != nil {
 			return err
 		}
-		writeMetadataMS += time.Since(started).Milliseconds()
+		summary.WriteParseFailedFlushes++
+		writeMetadataDur += time.Since(started)
 		parseFailedBatch = parseFailedBatch[:0]
 		return nil
 	}
@@ -326,32 +330,38 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return nil
 		}
 		started := time.Now()
-		fileIDs, err := i.store.ReplaceFileGraphsBatch(ctx, repo.ID, scanID, replaceBatch)
+		fileIDs, err := i.store.ReplaceFileGraphsBatchWithStats(ctx, repo.ID, scanID, replaceBatch, &writeStats)
 		if err != nil {
 			return err
 		}
-		writeReplaceMS += time.Since(started).Milliseconds()
+		summary.WriteReplaceFlushes++
+		writeReplaceDur += time.Since(started)
 		if !embedding.IsNoop(i.embedder) {
 			embedStarted := time.Now()
 			i.embedReplaceBatch(ctx, repo.ID, fileIDs, replaceBatch)
-			embedMS += time.Since(embedStarted).Milliseconds()
+			embedDur += time.Since(embedStarted)
 		}
 		replaceBatch = replaceBatch[:0]
 		return nil
 	}
 
 	var runErr error
-	var parseMS int64
-	var readMS int64
-	var hashMS int64
-	var adapterParseMS int64
-	var writeMS int64
+	var taskDur time.Duration
+	var taskOtherDur time.Duration
+	var readDur time.Duration
+	var hashDur time.Duration
+	var adapterParseDur time.Duration
+	var writeDur time.Duration
 	processWallStart := time.Now()
 	for res := range results {
-		parseMS += res.processMS
-		readMS += res.readMS
-		hashMS += res.hashMS
-		adapterParseMS += res.parseMS
+		taskDur += res.processDur
+		readDur += res.readDur
+		hashDur += res.hashDur
+		adapterParseDur += res.parseDur
+		other := res.processDur - res.readDur - res.hashDur - res.parseDur
+		if other > 0 {
+			taskOtherDur += other
+		}
 		summary.FilesSeen++
 		coverageLanguage := coverageKey(res.task.language)
 		coverage := summary.LanguageCoverage[coverageLanguage]
@@ -380,7 +390,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			coverage.Skipped++
 			summary.LanguageCoverage[coverageLanguage] = coverage
 			if len(markSeenBatch) < metadataBatchSize {
-				writeMS += time.Since(writeStart).Milliseconds()
+				writeDur += time.Since(writeStart)
 				summary.FilesSkipped++
 				continue
 			}
@@ -388,7 +398,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				runErr = err
 				cancel()
 			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
 		case "touch":
 			writeStart := time.Now()
@@ -403,7 +413,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			coverage.Skipped++
 			summary.LanguageCoverage[coverageLanguage] = coverage
 			if len(touchBatch) < metadataBatchSize {
-				writeMS += time.Since(writeStart).Milliseconds()
+				writeDur += time.Since(writeStart)
 				summary.FilesSkipped++
 				continue
 			}
@@ -411,7 +421,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				runErr = err
 				cancel()
 			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
 		case "replace":
 			writeStart := time.Now()
@@ -435,7 +445,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					cancel()
 				}
 			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			writeDur += time.Since(writeStart)
 		case "parse_failed":
 			writeStart := time.Now()
 			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
@@ -455,7 +465,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					cancel()
 				}
 			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
 			coverage := summary.LanguageCoverage[coverageLanguage]
 			coverage.Skipped++
@@ -470,7 +480,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			runErr = err
 			cancel()
 		}
-		writeMS += time.Since(writeStart).Milliseconds()
+		writeDur += time.Since(writeStart)
 	}
 	if runErr == nil {
 		writeStart := time.Now()
@@ -478,7 +488,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			runErr = err
 			cancel()
 		}
-		writeMS += time.Since(writeStart).Milliseconds()
+		writeDur += time.Since(writeStart)
 	}
 	if runErr == nil {
 		writeStart := time.Now()
@@ -486,7 +496,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			runErr = err
 			cancel()
 		}
-		writeMS += time.Since(writeStart).Milliseconds()
+		writeDur += time.Since(writeStart)
 	}
 	if runErr == nil {
 		writeStart := time.Now()
@@ -494,20 +504,25 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			runErr = err
 			cancel()
 		}
-		writeMS += time.Since(writeStart).Milliseconds()
+		writeDur += time.Since(writeStart)
 	}
 
 	walkErr := <-producerErr
 	summary.WalkMS = time.Since(walkStart).Milliseconds()
 	summary.ProcessWallMS = time.Since(processWallStart).Milliseconds()
-	summary.ParseMS = parseMS
-	summary.ReadMS = readMS
-	summary.HashMS = hashMS
-	summary.AdapterParseMS = adapterParseMS
-	summary.WriteMS = writeMS
-	summary.WriteMetadataMS = writeMetadataMS
-	summary.WriteReplaceMS = writeReplaceMS
-	summary.EmbedMS = embedMS
+	summary.TaskMS = taskDur.Milliseconds()
+	summary.TaskOtherMS = taskOtherDur.Milliseconds()
+	summary.ParseMS = taskDur.Milliseconds()
+	summary.ReadMS = readDur.Milliseconds()
+	summary.HashMS = hashDur.Milliseconds()
+	summary.AdapterParseMS = adapterParseDur.Milliseconds()
+	summary.WriteMS = writeDur.Milliseconds()
+	summary.WriteMetadataMS = writeMetadataDur.Milliseconds()
+	summary.WriteReplaceMS = writeReplaceDur.Milliseconds()
+	summary.EmbedMS = embedDur.Milliseconds()
+	if writeStats != (store.WriteStats{}) {
+		summary.WriteStats = &writeStats
+	}
 	if runErr == nil && walkErr != nil && walkErr != context.Canceled {
 		runErr = walkErr
 	}
@@ -557,6 +572,22 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
 	}
 	summary.DurationMS = time.Since(started).Milliseconds()
+	summary.PhaseTimings = []store.ScanPhaseTiming{
+		{Phase: "existing_load", MS: summary.ExistingLoadMS},
+		{Phase: "walk", MS: summary.WalkMS},
+		{Phase: "task", MS: summary.TaskMS},
+		{Phase: "task_other", MS: summary.TaskOtherMS},
+		{Phase: "read", MS: summary.ReadMS},
+		{Phase: "hash", MS: summary.HashMS},
+		{Phase: "adapter_parse", MS: summary.AdapterParseMS},
+		{Phase: "write", MS: summary.WriteMS},
+		{Phase: "write_metadata", MS: summary.WriteMetadataMS},
+		{Phase: "write_replace", MS: summary.WriteReplaceMS},
+		{Phase: "embed", MS: summary.EmbedMS},
+		{Phase: "mark_missing", MS: summary.MarkMissingMS},
+		{Phase: "resolve_edges", MS: summary.ResolveMS},
+		{Phase: "total", MS: summary.DurationMS},
+	}
 	summary.FilesTotal = summary.FilesSeen + summary.FilesDeleted
 	if summary.FilesTotal > 0 {
 		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100
@@ -571,7 +602,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 	result := fileResult{task: task}
 	started := time.Now()
 	defer func() {
-		result.processMS = time.Since(started).Milliseconds()
+		result.processDur = time.Since(started)
 	}()
 	hasPrev := prev.Path != ""
 
@@ -602,7 +633,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 			result.err = err
 			return result
 		}
-		result.hashMS = time.Since(hashStarted).Milliseconds()
+		result.hashDur = time.Since(hashStarted)
 	} else {
 		readStarted := time.Now()
 		content, err = os.ReadFile(task.path)
@@ -610,10 +641,10 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 			result.err = err
 			return result
 		}
-		result.readMS = time.Since(readStarted).Milliseconds()
+		result.readDur = time.Since(readStarted)
 		hashStarted := time.Now()
 		hash = hashContent(content)
-		result.hashMS = time.Since(hashStarted).Milliseconds()
+		result.hashDur = time.Since(hashStarted)
 	}
 	result.hash = hash
 	if hasPrev && !force && prev.ContentHash == hash {
@@ -625,7 +656,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 	if task.adapter != nil {
 		parseStarted := time.Now()
 		parsed, err = task.adapter.Parse(ctx, task.path, content)
-		result.parseMS = time.Since(parseStarted).Milliseconds()
+		result.parseDur = time.Since(parseStarted)
 		if err != nil {
 			if parseErrorPolicy == "best_effort" {
 				result.action = "parse_failed"
