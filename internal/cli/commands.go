@@ -258,6 +258,7 @@ func newCommandList() []*command {
 				"  doctor",
 				"    add --repo-root PATH to inspect a repo DB",
 				"    add --fix for non-destructive autofixes",
+				"    add --deep for slower DB checks (integrity_check)",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runDoctor(ctx, cfg, stdout, args)
@@ -325,15 +326,20 @@ func newCommandList() []*command {
 		{
 			name:        "clean",
 			description: "clean index data",
-			usageLines:  []string{"  clean [repo-path] [--vacuum] [--fts-optimize]"},
+			usageLines:  []string{"  clean [repo-path] [--vacuum] [--fts-optimize] [--analyze] [--wal-checkpoint-truncate] [--incremental-vacuum]"},
 			flags: []commandFlag{
 				{name: "--vacuum", description: "VACUUM the database after cleanup"},
 				{name: "--fts-optimize", description: "run FTS optimize (symbol_fts)"},
+				{name: "--analyze", description: "run ANALYZE"},
+				{name: "--wal-checkpoint-truncate", description: "run PRAGMA wal_checkpoint(TRUNCATE)"},
+				{name: "--incremental-vacuum", description: "run PRAGMA incremental_vacuum (requires auto_vacuum=INCREMENTAL)"},
 			},
 			examples: []string{
 				"codegraph clean .",
 				"codegraph clean . --vacuum",
 				"codegraph clean . --fts-optimize",
+				"codegraph clean . --analyze",
+				"codegraph clean . --wal-checkpoint-truncate",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runClean(ctx, cfg, stdout, args)

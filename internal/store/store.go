@@ -509,6 +509,67 @@ func (s *Store) OptimizeFTS(ctx context.Context) (time.Duration, error) {
 	return time.Since(start), err
 }
 
+type WalCheckpointResult struct {
+	Busy       int64  `json:"busy"`
+	LogFrames  int64  `json:"log_frames"`
+	CkptFrames int64  `json:"checkpointed_frames"`
+	Mode       string `json:"mode"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+func (s *Store) Analyze(ctx context.Context) (time.Duration, error) {
+	start := time.Now()
+	_, err := s.db.ExecContext(ctx, `ANALYZE`)
+	return time.Since(start), err
+}
+
+func (s *Store) WalCheckpointTruncate(ctx context.Context) (WalCheckpointResult, error) {
+	start := time.Now()
+	var busy, logFrames, ckptFrames int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &ckptFrames); err != nil {
+		return WalCheckpointResult{}, err
+	}
+	return WalCheckpointResult{
+		Busy:       busy,
+		LogFrames:  logFrames,
+		CkptFrames: ckptFrames,
+		Mode:       "TRUNCATE",
+		DurationMS: time.Since(start).Milliseconds(),
+	}, nil
+}
+
+func (s *Store) IncrementalVacuumAll(ctx context.Context) (beforeFreelist, afterFreelist int64, dur time.Duration, err error) {
+	before, err := s.DBPragmas(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	// SQLite auto_vacuum modes:
+	//   0 = NONE
+	//   1 = FULL
+	//   2 = INCREMENTAL (required for PRAGMA incremental_vacuum to reclaim pages)
+	switch before.AutoVacuum {
+	case 2:
+		// ok
+	case 0:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); database is auto_vacuum=NONE (0)")
+	case 1:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); database is auto_vacuum=FULL (1)")
+	default:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); got auto_vacuum=%d", before.AutoVacuum)
+	}
+
+	start := time.Now()
+	// PRAGMA incremental_vacuum without an argument attempts to remove all pages from the freelist.
+	if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+		return 0, 0, 0, err
+	}
+	after, err := s.DBPragmas(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return before.FreelistCount, after.FreelistCount, time.Since(start), nil
+}
+
 type DBPragmas struct {
 	SQLiteVersion     string `json:"sqlite_version"`
 	JournalMode       string `json:"journal_mode"`
@@ -516,6 +577,8 @@ type DBPragmas struct {
 	TempStore         string `json:"temp_store"`
 	AutoVacuum        int64  `json:"auto_vacuum"`
 	PageSize          int64  `json:"page_size"`
+	PageCount         int64  `json:"page_count"`
+	FreelistCount     int64  `json:"freelist_count"`
 	BusyTimeoutMS     int64  `json:"busy_timeout_ms"`
 	ForeignKeys       bool   `json:"foreign_keys"`
 	WalAutocheckpoint int64  `json:"wal_autocheckpoint"`
@@ -546,6 +609,12 @@ func QueryDBPragmas(ctx context.Context, db *sql.DB) (DBPragmas, error) {
 		return DBPragmas{}, err
 	}
 	if err := db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&out.PageSize); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&out.PageCount); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&out.FreelistCount); err != nil {
 		return DBPragmas{}, err
 	}
 	if err := db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&out.BusyTimeoutMS); err != nil {

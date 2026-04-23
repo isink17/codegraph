@@ -127,6 +127,7 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fix := fs.Bool("fix", false, "apply non-destructive fixes")
+	deep := fs.Bool("deep", false, "run deeper (potentially slow) diagnostics, including integrity_check")
 	repoRootFlag := fs.String("repo-root", "", "repository root to inspect (optional)")
 
 	defaultRepoRoot := ""
@@ -151,7 +152,7 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 		dbPath = p
 	}
 
-	report, err := doctor.RunWithFix(*fix, dbPath)
+	report, err := doctor.RunWithOptions(doctor.Options{Fix: *fix, DBPath: dbPath, Deep: *deep})
 	if err != nil {
 		return err
 	}
@@ -1063,6 +1064,9 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	fs.SetOutput(io.Discard)
 	vacuum := fs.Bool("vacuum", false, "run VACUUM on databases")
 	ftsOptimize := fs.Bool("fts-optimize", false, "run FTS optimize on databases (symbol_fts)")
+	analyze := fs.Bool("analyze", false, "run ANALYZE on databases")
+	walCheckpointTruncate := fs.Bool("wal-checkpoint-truncate", false, "run PRAGMA wal_checkpoint(TRUNCATE) on databases")
+	incrementalVacuum := fs.Bool("incremental-vacuum", false, "run PRAGMA incremental_vacuum (requires auto_vacuum=INCREMENTAL)")
 	repoRootFlag := fs.String("repo-root", "", "repository root to clean")
 
 	defaultRepoRoot := ""
@@ -1075,24 +1079,63 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	}
 
 	type dbResult struct {
-		Path           string `json:"path"`
-		Action         string `json:"action"`
-		SizeBefore     int64  `json:"size_before_bytes"`
-		SizeAfter      int64  `json:"size_after_bytes"`
-		ReclaimedBytes int64  `json:"reclaimed_bytes"`
-		Vacuumed       bool   `json:"vacuumed,omitempty"`
-		FTSOptimized   bool   `json:"fts_optimized,omitempty"`
-		FTSOptimizeMS  int64  `json:"fts_optimize_ms,omitempty"`
-		CanonicalRepo  string `json:"canonical_repo,omitempty"`
-		Error          string `json:"error,omitempty"`
+		Path                    string                     `json:"path"`
+		Action                  string                     `json:"action"`
+		SizeBefore              int64                      `json:"size_before_bytes"`
+		SizeAfter               int64                      `json:"size_after_bytes"`
+		ReclaimedBytes          int64                      `json:"reclaimed_bytes"`
+		Vacuumed                bool                       `json:"vacuumed,omitempty"`
+		FTSOptimized            bool                       `json:"fts_optimized,omitempty"`
+		FTSOptimizeMS           int64                      `json:"fts_optimize_ms,omitempty"`
+		Analyzed                bool                       `json:"analyzed,omitempty"`
+		AnalyzeMS               int64                      `json:"analyze_ms,omitempty"`
+		WALCheckpoint           *store.WalCheckpointResult `json:"wal_checkpoint,omitempty"`
+		IncVacuumed             bool                       `json:"incremental_vacuumed,omitempty"`
+		IncVacuumMS             int64                      `json:"incremental_vacuum_ms,omitempty"`
+		IncVacuumBeforeFreelist int64                      `json:"incremental_vacuum_before_freelist_pages,omitempty"`
+		IncVacuumAfterFreelist  int64                      `json:"incremental_vacuum_after_freelist_pages,omitempty"`
+		CanonicalRepo           string                     `json:"canonical_repo,omitempty"`
+		Error                   string                     `json:"error,omitempty"`
 	}
 	report := map[string]any{
-		"vacuum":       *vacuum,
-		"fts_optimize": *ftsOptimize,
-		"dbs":          []dbResult{},
+		"vacuum":                  *vacuum,
+		"fts_optimize":            *ftsOptimize,
+		"analyze":                 *analyze,
+		"wal_checkpoint_truncate": *walCheckpointTruncate,
+		"incremental_vacuum":      *incrementalVacuum,
+		"dbs":                     []dbResult{},
 	}
 	results := make([]dbResult, 0)
 	var reclaimed int64
+
+	runAnalyze := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		dur, err := s.Analyze(ctx)
+		if err != nil {
+			return err
+		}
+		res.Analyzed = true
+		res.AnalyzeMS = dur.Milliseconds()
+		return nil
+	}
+	runWalCheckpointTruncate := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		walRes, err := s.WalCheckpointTruncate(ctx)
+		if err != nil {
+			return err
+		}
+		res.WALCheckpoint = &walRes
+		return nil
+	}
+	runIncrementalVacuumAll := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		beforePages, afterPages, dur, err := s.IncrementalVacuumAll(ctx)
+		if err != nil {
+			return err
+		}
+		res.IncVacuumed = true
+		res.IncVacuumMS = dur.Milliseconds()
+		res.IncVacuumBeforeFreelist = beforePages
+		res.IncVacuumAfterFreelist = afterPages
+		return nil
+	}
 
 	if repoRoot != "" {
 		canonical, err := store.CanonicalRepoPath(repoRoot)
@@ -1111,6 +1154,11 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			return err
 		}
 		defer s.Close()
+		if *analyze {
+			if err := runAnalyze(ctx, s, &res); err != nil {
+				return err
+			}
+		}
 		if *ftsOptimize {
 			dur, err := s.OptimizeFTS(ctx)
 			if err != nil {
@@ -1119,12 +1167,28 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			res.FTSOptimized = true
 			res.FTSOptimizeMS = dur.Milliseconds()
 		}
+		if *walCheckpointTruncate {
+			if err := runWalCheckpointTruncate(ctx, s, &res); err != nil {
+				return err
+			}
+		}
+		if *incrementalVacuum {
+			if err := runIncrementalVacuumAll(ctx, s, &res); err != nil {
+				return err
+			}
+		}
 		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
 				return err
 			}
 			res.Vacuumed = true
 			res.Action = "vacuumed"
+		} else if *incrementalVacuum {
+			res.Action = "incremental_vacuumed"
+		} else if *walCheckpointTruncate {
+			res.Action = "wal_checkpointed"
+		} else if *analyze {
+			res.Action = "analyzed"
 		} else if *ftsOptimize {
 			res.Action = "fts_optimized"
 		} else {
@@ -1201,6 +1265,18 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		if !*vacuum {
 			res.Action = "kept"
 		}
+		if *analyze {
+			if err := runAnalyze(ctx, s, &res); err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			if !*vacuum && !*ftsOptimize && res.Action == "kept" {
+				res.Action = "analyzed"
+			}
+		}
 		if *ftsOptimize {
 			dur, err := s.OptimizeFTS(ctx)
 			if err != nil {
@@ -1214,6 +1290,30 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			res.FTSOptimizeMS = dur.Milliseconds()
 			if !*vacuum && res.Action == "kept" {
 				res.Action = "fts_optimized"
+			}
+		}
+		if *walCheckpointTruncate {
+			if err := runWalCheckpointTruncate(ctx, s, &res); err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			if !*vacuum && !*ftsOptimize && !*analyze && res.Action == "kept" {
+				res.Action = "wal_checkpointed"
+			}
+		}
+		if *incrementalVacuum {
+			if err := runIncrementalVacuumAll(ctx, s, &res); err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			if !*vacuum && !*ftsOptimize && !*analyze && !*walCheckpointTruncate && res.Action == "kept" {
+				res.Action = "incremental_vacuumed"
 			}
 		}
 		if *vacuum {
