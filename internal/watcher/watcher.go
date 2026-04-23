@@ -155,13 +155,15 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			return nil
 		}
 		w.drainPaths.Add(int64(len(paths)))
-		w.updateRuns.Add(1)
-		w.updatePaths.Add(int64(len(paths)))
 		_, err = w.indexer.Update(ctx, indexer.Options{
 			RepoRoot: repoRoot,
 			Paths:    paths,
 			ScanKind: "watch",
 		})
+		if err == nil {
+			w.updateRuns.Add(1)
+			w.updatePaths.Add(int64(len(paths)))
+		}
 		return err
 	}
 
