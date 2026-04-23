@@ -626,10 +626,12 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 		return err
 	}
 	if jsonl {
+		scanKind := map[bool]string{true: "update", false: "index"}[update]
 		if err := writeJSONL(stdout, map[string]any{
-			"type":    "scan_summary",
-			"command": map[bool]string{true: "update", false: "index"}[update],
-			"data":    summary,
+			"type":      "scan_summary",
+			"command":   scanKind,
+			"scan_kind": scanKind,
+			"data":      summary,
 		}); err != nil {
 			return err
 		}
@@ -641,9 +643,9 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 				"process_wall_ms":   summary.ProcessWallMS,
 				"task_ms":           summary.TaskMS,
 				"task_other_ms":     summary.TaskOtherMS,
+				"parse_ms":          summary.ParseMS,
 				"read_ms":           summary.ReadMS,
 				"hash_ms":           summary.HashMS,
-				"adapter_parse_ms":  summary.AdapterParseMS,
 				"write_ms":          summary.WriteMS,
 				"write_metadata_ms": summary.WriteMetadataMS,
 				"write_replace_ms":  summary.WriteReplaceMS,

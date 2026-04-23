@@ -113,7 +113,6 @@ type ScanSummary struct {
 	ParseMS                 int64                      `json:"parse_ms,omitempty"`
 	ReadMS                  int64                      `json:"read_ms,omitempty"`
 	HashMS                  int64                      `json:"hash_ms,omitempty"`
-	AdapterParseMS          int64                      `json:"adapter_parse_ms,omitempty"`
 	WriteMS                 int64                      `json:"write_ms,omitempty"`
 	WriteMetadataMS         int64                      `json:"write_metadata_ms,omitempty"`
 	WriteReplaceMS          int64                      `json:"write_replace_ms,omitempty"`

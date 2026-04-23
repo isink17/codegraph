@@ -529,10 +529,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	summary.ProcessWallMS = time.Since(processWallStart).Milliseconds()
 	summary.TaskMS = taskDur.Milliseconds()
 	summary.TaskOtherMS = taskOtherDur.Milliseconds()
-	summary.ParseMS = taskDur.Milliseconds()
+	// ParseMS is the time spent parsing file content (adapter parse), excluding read/hash/DB writes.
+	summary.ParseMS = adapterParseDur.Milliseconds()
 	summary.ReadMS = readDur.Milliseconds()
 	summary.HashMS = hashDur.Milliseconds()
-	summary.AdapterParseMS = adapterParseDur.Milliseconds()
 	summary.WriteMS = writeDur.Milliseconds()
 	summary.WriteMetadataMS = writeMetadataDur.Milliseconds()
 	summary.WriteReplaceMS = writeReplaceDur.Milliseconds()
@@ -623,7 +623,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		{Phase: "task_other", MS: summary.TaskOtherMS},
 		{Phase: "read", MS: summary.ReadMS},
 		{Phase: "hash", MS: summary.HashMS},
-		{Phase: "adapter_parse", MS: summary.AdapterParseMS},
+		{Phase: "parse", MS: summary.ParseMS},
 		{Phase: "write", MS: summary.WriteMS},
 		{Phase: "write_metadata", MS: summary.WriteMetadataMS},
 		{Phase: "write_replace", MS: summary.WriteReplaceMS},
