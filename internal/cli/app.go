@@ -1108,6 +1108,35 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	results := make([]dbResult, 0)
 	var reclaimed int64
 
+	runAnalyze := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		dur, err := s.Analyze(ctx)
+		if err != nil {
+			return err
+		}
+		res.Analyzed = true
+		res.AnalyzeMS = dur.Milliseconds()
+		return nil
+	}
+	runWalCheckpointTruncate := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		walRes, err := s.WalCheckpointTruncate(ctx)
+		if err != nil {
+			return err
+		}
+		res.WALCheckpoint = &walRes
+		return nil
+	}
+	runIncrementalVacuumAll := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		beforePages, afterPages, dur, err := s.IncrementalVacuumAll(ctx)
+		if err != nil {
+			return err
+		}
+		res.IncVacuumed = true
+		res.IncVacuumMS = dur.Milliseconds()
+		res.IncVacuumBeforeFreelist = beforePages
+		res.IncVacuumAfterFreelist = afterPages
+		return nil
+	}
+
 	if repoRoot != "" {
 		canonical, err := store.CanonicalRepoPath(repoRoot)
 		if err != nil {
@@ -1126,12 +1155,9 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		}
 		defer s.Close()
 		if *analyze {
-			dur, err := s.Analyze(ctx)
-			if err != nil {
+			if err := runAnalyze(ctx, s, &res); err != nil {
 				return err
 			}
-			res.Analyzed = true
-			res.AnalyzeMS = dur.Milliseconds()
 		}
 		if *ftsOptimize {
 			dur, err := s.OptimizeFTS(ctx)
@@ -1142,21 +1168,14 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			res.FTSOptimizeMS = dur.Milliseconds()
 		}
 		if *walCheckpointTruncate {
-			walRes, err := s.WalCheckpointTruncate(ctx)
-			if err != nil {
+			if err := runWalCheckpointTruncate(ctx, s, &res); err != nil {
 				return err
 			}
-			res.WALCheckpoint = &walRes
 		}
 		if *incrementalVacuum {
-			beforePages, afterPages, dur, err := s.IncrementalVacuumAll(ctx)
-			if err != nil {
+			if err := runIncrementalVacuumAll(ctx, s, &res); err != nil {
 				return err
 			}
-			res.IncVacuumed = true
-			res.IncVacuumMS = dur.Milliseconds()
-			res.IncVacuumBeforeFreelist = beforePages
-			res.IncVacuumAfterFreelist = afterPages
 		}
 		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
@@ -1247,16 +1266,13 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			res.Action = "kept"
 		}
 		if *analyze {
-			dur, err := s.Analyze(ctx)
-			if err != nil {
+			if err := runAnalyze(ctx, s, &res); err != nil {
 				_ = s.Close()
 				res.Action = "skipped"
 				res.Error = err.Error()
 				results = append(results, res)
 				continue
 			}
-			res.Analyzed = true
-			res.AnalyzeMS = dur.Milliseconds()
 			if !*vacuum && !*ftsOptimize && res.Action == "kept" {
 				res.Action = "analyzed"
 			}
@@ -1277,32 +1293,25 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			}
 		}
 		if *walCheckpointTruncate {
-			walRes, err := s.WalCheckpointTruncate(ctx)
-			if err != nil {
+			if err := runWalCheckpointTruncate(ctx, s, &res); err != nil {
 				_ = s.Close()
 				res.Action = "skipped"
 				res.Error = err.Error()
 				results = append(results, res)
 				continue
 			}
-			res.WALCheckpoint = &walRes
 			if !*vacuum && !*ftsOptimize && !*analyze && res.Action == "kept" {
 				res.Action = "wal_checkpointed"
 			}
 		}
 		if *incrementalVacuum {
-			beforePages, afterPages, dur, err := s.IncrementalVacuumAll(ctx)
-			if err != nil {
+			if err := runIncrementalVacuumAll(ctx, s, &res); err != nil {
 				_ = s.Close()
 				res.Action = "skipped"
 				res.Error = err.Error()
 				results = append(results, res)
 				continue
 			}
-			res.IncVacuumed = true
-			res.IncVacuumMS = dur.Milliseconds()
-			res.IncVacuumBeforeFreelist = beforePages
-			res.IncVacuumAfterFreelist = afterPages
 			if !*vacuum && !*ftsOptimize && !*analyze && !*walCheckpointTruncate && res.Action == "kept" {
 				res.Action = "incremental_vacuumed"
 			}

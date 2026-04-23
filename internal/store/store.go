@@ -543,8 +543,19 @@ func (s *Store) IncrementalVacuumAll(ctx context.Context) (beforeFreelist, after
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	if before.AutoVacuum != 2 {
-		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=2 (INCREMENTAL), got %d", before.AutoVacuum)
+	// SQLite auto_vacuum modes:
+	//   0 = NONE
+	//   1 = FULL
+	//   2 = INCREMENTAL (required for PRAGMA incremental_vacuum to reclaim pages)
+	switch before.AutoVacuum {
+	case 2:
+		// ok
+	case 0:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); database is auto_vacuum=NONE (0)")
+	case 1:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); database is auto_vacuum=FULL (1)")
+	default:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); got auto_vacuum=%d", before.AutoVacuum)
 	}
 
 	start := time.Now()
