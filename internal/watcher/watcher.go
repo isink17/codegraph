@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +24,8 @@ type Watcher struct {
 	coalescedSignals atomic.Int64
 	flushRuns        atomic.Int64
 	flushErrors      atomic.Int64
+	queueExecs       atomic.Int64
+	queueSkipped     atomic.Int64
 	queueErrors      atomic.Int64
 }
 
@@ -31,6 +34,8 @@ type WatchStats struct {
 	CoalescedSignals int64 `json:"coalesced_signals"`
 	FlushRuns        int64 `json:"flush_runs"`
 	FlushErrors      int64 `json:"flush_errors"`
+	QueueExecs       int64 `json:"queue_execs"`
+	QueueSkipped     int64 `json:"queue_skipped"`
 	QueueErrors      int64 `json:"queue_errors"`
 }
 
@@ -44,6 +49,8 @@ func (w *Watcher) Stats() WatchStats {
 		CoalescedSignals: w.coalescedSignals.Load(),
 		FlushRuns:        w.flushRuns.Load(),
 		FlushErrors:      w.flushErrors.Load(),
+		QueueExecs:       w.queueExecs.Load(),
+		QueueSkipped:     w.queueSkipped.Load(),
 		QueueErrors:      w.queueErrors.Load(),
 	}
 }
@@ -53,6 +60,8 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	w.coalescedSignals.Store(0)
 	w.flushRuns.Store(0)
 	w.flushErrors.Store(0)
+	w.queueExecs.Store(0)
+	w.queueSkipped.Store(0)
 	w.queueErrors.Store(0)
 	if debounce <= 0 {
 		debounce = 750 * time.Millisecond
@@ -108,6 +117,12 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 
 	flushSignalCh := make(chan struct{}, 1)
 	flushErrCh := make(chan error, 1)
+
+	// Coalesce repeated fsnotify events for the same file between flushes to avoid
+	// redundant SQLite upserts under bursty save patterns.
+	var seenMu sync.Mutex
+	seenSinceFlush := make(map[string]struct{})
+
 	go func() {
 		timer := time.NewTimer(debounce)
 		if !timer.Stop() {
@@ -135,6 +150,9 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 					continue
 				}
 				pending = false
+				seenMu.Lock()
+				clear(seenSinceFlush)
+				seenMu.Unlock()
 				w.flushRuns.Add(1)
 				if err := flush(); err != nil {
 					w.flushErrors.Add(1)
@@ -173,9 +191,22 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 					}
 				}
 			}
-			if err := w.queueDirtyWithRetry(ctx, repoID, rel, event.Op.String()); err != nil {
-				w.queueErrors.Add(1)
-				return err
+
+			seenMu.Lock()
+			_, alreadyQueued := seenSinceFlush[rel]
+			if !alreadyQueued {
+				seenSinceFlush[rel] = struct{}{}
+			}
+			seenMu.Unlock()
+
+			if !alreadyQueued {
+				w.queueExecs.Add(1)
+				if err := w.queueDirtyWithRetry(ctx, repoID, rel, event.Op.String()); err != nil {
+					w.queueErrors.Add(1)
+					return err
+				}
+			} else {
+				w.queueSkipped.Add(1)
 			}
 			select {
 			case flushSignalCh <- struct{}{}:

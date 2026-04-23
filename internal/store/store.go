@@ -2688,20 +2688,44 @@ func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason s
 }
 
 func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `SELECT path, queued_at FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+
 	var out []string
+	var maxQueuedAt string
 	for rows.Next() {
 		var path string
-		if err := rows.Scan(&path); err != nil {
+		var queuedAt string
+		if err := rows.Scan(&path, &queuedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, path)
+		if queuedAt > maxQueuedAt {
+			maxQueuedAt = queuedAt
+		}
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); err != nil {
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Delete only the rows we observed. This avoids dropping events that arrive
+	// concurrently while we're draining.
+	if maxQueuedAt != "" {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ? AND queued_at <= ?`, repoID, maxQueuedAt); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return out, nil
