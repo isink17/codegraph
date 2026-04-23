@@ -635,10 +635,28 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 				"scan_id":   summary.ScanID,
 			}
 		}
+		stripEnvelopeKeys := func(v any, keys ...string) (map[string]any, error) {
+			b, err := json.Marshal(v)
+			if err != nil {
+				return nil, err
+			}
+			var out map[string]any
+			if err := json.Unmarshal(b, &out); err != nil {
+				return nil, err
+			}
+			for _, k := range keys {
+				delete(out, k)
+			}
+			return out, nil
+		}
 		ev := envelope("scan_summary")
 		ev["command"] = scanKind
 		ev["scan_kind"] = scanKind
-		ev["data"] = summary
+		summaryData, err := stripEnvelopeKeys(summary, "repo_id", "scan_id")
+		if err != nil {
+			return err
+		}
+		ev["data"] = summaryData
 		if err := writeJSONL(stdout, ev); err != nil {
 			return err
 		}
@@ -664,7 +682,11 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 			return err
 		}
 		ev = envelope("scan_stats")
-		ev["data"] = stats
+		statsData, err := stripEnvelopeKeys(stats, "repo_root", "repo_id")
+		if err != nil {
+			return err
+		}
+		ev["data"] = statsData
 		return writeJSONL(stdout, ev)
 	}
 	return writeJSON(stdout, map[string]any{"summary": summary, "stats": stats})
