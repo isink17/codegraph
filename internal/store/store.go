@@ -1936,15 +1936,16 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	}
 
 	// Strategy 3a: Suffix match for slash-qualified symbols (e.g., pkg.Func matches github.com/org/repo/pkg.Func).
-	// Avoid per-edge LIKE scans by precomputing (tail -> symbol_id) once, then doing an indexed equality update.
+	// Strategy 3b: Two-segment dot-tail match (e.g., pkg.Func matches x.y.pkg.Func and also x.pkg.Func matches x.y.x.pkg.Func).
+	// Avoid per-edge LIKE scans by precomputing suffix maps once, then doing indexed equality updates.
 	n, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID)
 	if err != nil {
 		return 0, err
 	}
 	totalResolved += n
 
-	// Strategy 3b: Dot-suffix fallback (for qualified names without a slash separator).
-	// Kept as a narrower fallback to preserve existing semantics across languages that don't use '/' in qualified names.
+	// Strategy 3c: Dot-suffix fallback (for qualified names without a slash separator).
+	// Keep as a narrower fallback (multi-dot dst_name only) to preserve existing semantics without paying LIKE cost on common pkg.Func cases.
 	res, err = tx.ExecContext(ctx, `
 		UPDATE edges SET dst_symbol_id = (
 			SELECT s.id FROM symbols s
@@ -1954,6 +1955,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 		AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
+		AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') > 0
 		AND EXISTS (
 			SELECT 1 FROM symbols s WHERE s.repo_id = ?
 			AND s.qualified_name LIKE '%.' || edges.dst_name
@@ -2005,6 +2007,8 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 	}
 	// Map: suffix (after last '/') -> minimum symbol id. Using MIN keeps behavior stable when multiple symbols share the same suffix.
 	minBySuffix := map[string]int64{}
+	// Map: dot tail (last 2 segments after last '/') -> minimum symbol id.
+	minByDotTail2 := map[string]int64{}
 	for rows.Next() {
 		var id int64
 		var qname string
@@ -2015,16 +2019,30 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if qname == "" {
 			continue
 		}
-		slash := strings.LastIndexByte(qname, '/')
-		if slash < 0 || slash+1 >= len(qname) {
-			continue
+
+		afterSlash := qname
+		if slash := strings.LastIndexByte(qname, '/'); slash >= 0 && slash+1 < len(qname) {
+			afterSlash = qname[slash+1:]
+			suffix := strings.Clone(afterSlash)
+			if suffix != "" {
+				if cur, ok := minBySuffix[suffix]; !ok || id < cur {
+					minBySuffix[suffix] = id
+				}
+			}
 		}
-		suffix := strings.Clone(qname[slash+1:])
-		if suffix == "" {
-			continue
-		}
-		if cur, ok := minBySuffix[suffix]; !ok || id < cur {
-			minBySuffix[suffix] = id
+
+		lastDot := strings.LastIndexByte(afterSlash, '.')
+		if lastDot >= 0 && lastDot+1 < len(afterSlash) {
+			start := 0
+			if prevDot := strings.LastIndexByte(afterSlash[:lastDot], '.'); prevDot >= 0 {
+				start = prevDot + 1
+			}
+			tail2 := strings.Clone(afterSlash[start:])
+			if tail2 != "" {
+				if cur, ok := minByDotTail2[tail2]; !ok || id < cur {
+					minByDotTail2[tail2] = id
+				}
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -2034,58 +2052,113 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 	if err := rows.Close(); err != nil {
 		return 0, err
 	}
-	if len(minBySuffix) == 0 {
-		return 0, nil
-	}
+	totalResolved := 0
 
-	resolved := make([]resolvedSuffix, 0, len(minBySuffix))
-	for dstName, dstID := range minBySuffix {
-		resolved = append(resolved, resolvedSuffix{dstName: dstName, dstID: dstID})
-	}
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
-		return 0, err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
-		return 0, err
-	}
-
-	// Keep well under SQLite's default variable limit (999).
-	const maxPairsPerInsert = 400
-	for start := 0; start < len(resolved); start += maxPairsPerInsert {
-		end := min(start+maxPairsPerInsert, len(resolved))
-		chunk := resolved[start:end]
-		var b strings.Builder
-		b.WriteString(`INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_symbol_id) VALUES `)
-		args := make([]any, 0, len(chunk)*2)
-		for i, r := range chunk {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString("(?,?)")
-			args = append(args, r.dstName, r.dstID)
+	if len(minBySuffix) > 0 {
+		resolved := make([]resolvedSuffix, 0, len(minBySuffix))
+		for dstName, dstID := range minBySuffix {
+			resolved = append(resolved, resolvedSuffix{dstName: dstName, dstID: dstID})
 		}
-		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
 			return 0, err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
+			return 0, err
+		}
+
+		// Keep well under SQLite's default variable limit (999).
+		const maxPairsPerInsert = 400
+		for start := 0; start < len(resolved); start += maxPairsPerInsert {
+			end := min(start+maxPairsPerInsert, len(resolved))
+			chunk := resolved[start:end]
+			var b strings.Builder
+			b.WriteString(`INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_symbol_id) VALUES `)
+			args := make([]any, 0, len(chunk)*2)
+			for i, r := range chunk {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("(?,?)")
+				args = append(args, r.dstName, r.dstID)
+			}
+			if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+				return 0, err
+			}
+		}
+
+		updateRes, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_slash_suffix t WHERE t.dst_name = edges.dst_name)
+			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
+		`, repoID)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
+			return 0, err
+		}
+		n, err := updateRes.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		totalResolved += int(n)
 	}
 
-	updateRes, err := tx.ExecContext(ctx, `
-		UPDATE edges
-		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_slash_suffix t WHERE t.dst_name = edges.dst_name)
-		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
-	`, repoID)
-	if err != nil {
-		return 0, err
+	if len(minByDotTail2) > 0 {
+		resolved := make([]resolvedSuffix, 0, len(minByDotTail2))
+		for dstName, dstID := range minByDotTail2 {
+			resolved = append(resolved, resolvedSuffix{dstName: dstName, dstID: dstID})
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_dot_tail2(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_dot_tail2`); err != nil {
+			return 0, err
+		}
+
+		// Keep well under SQLite's default variable limit (999).
+		const maxPairsPerInsert = 400
+		for start := 0; start < len(resolved); start += maxPairsPerInsert {
+			end := min(start+maxPairsPerInsert, len(resolved))
+			chunk := resolved[start:end]
+			var b strings.Builder
+			b.WriteString(`INSERT INTO tmp_symbol_dot_tail2(dst_name, dst_symbol_id) VALUES `)
+			args := make([]any, 0, len(chunk)*2)
+			for i, r := range chunk {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("(?,?)")
+				args = append(args, r.dstName, r.dstID)
+			}
+			if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+				return 0, err
+			}
+		}
+
+		updateRes, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_dot_tail2 t WHERE t.dst_name = edges.dst_name)
+			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+			AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
+			AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') = 0
+			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_dot_tail2)
+		`, repoID)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_dot_tail2`); err != nil {
+			return 0, err
+		}
+		n, err := updateRes.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		totalResolved += int(n)
 	}
-	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
-		return 0, err
-	}
-	n, err := updateRes.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
+
+	return totalResolved, nil
 }
 
 func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []string) error {
@@ -2352,13 +2425,23 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return err
 	}
 
+	dotTail := func(name string) string {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return ""
+		}
+		if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
+			return strings.TrimSpace(name[dot+1:])
+		}
+		return name
+	}
+
 	shortSet := map[string]struct{}{}
 	for _, target := range targets {
 		if _, ok := byQualified[target.dstName]; ok {
 			continue
 		}
-		parts := strings.Split(target.dstName, ".")
-		short := strings.TrimSpace(parts[len(parts)-1])
+		short := dotTail(target.dstName)
 		if short != "" {
 			shortSet[short] = struct{}{}
 		}
@@ -2384,8 +2467,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	for _, target := range targets {
 		dstID, ok := byQualified[target.dstName]
 		if !ok {
-			parts := strings.Split(target.dstName, ".")
-			short := strings.TrimSpace(parts[len(parts)-1])
+			short := dotTail(target.dstName)
 			dstID, ok = byShort[short]
 		}
 		if !ok || dstID == 0 {
@@ -2500,10 +2582,11 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 		chunk := names[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT name, id
+			SELECT name, MIN(id)
 			FROM symbols
 			WHERE repo_id = ? AND name IN (` + placeholders + `)
-			ORDER BY id ASC
+			GROUP BY name
+			HAVING COUNT(1) = 1
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -2514,8 +2597,6 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 		if err != nil {
 			return nil, err
 		}
-		seenCount := map[string]int{}
-		firstID := map[string]int64{}
 		for rows.Next() {
 			var name string
 			var id int64
@@ -2523,18 +2604,10 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 				_ = rows.Close()
 				return nil, err
 			}
-			seenCount[name]++
-			if seenCount[name] == 1 {
-				firstID[name] = id
-			}
+			out[name] = id
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err
-		}
-		for name, count := range seenCount {
-			if count == 1 {
-				out[name] = firstID[name]
-			}
 		}
 	}
 	return out, nil
