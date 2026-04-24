@@ -558,7 +558,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		summary.MarkMissingMS = time.Since(missingStarted).Milliseconds()
 		summary.FilesDeleted = deleted
 	}
-	resolveStart := time.Now()
 	if len(missingCandidatePaths) > 0 {
 		deleted, err := i.store.MarkFilesDeletedBatch(ctx, repo.ID, scanID, missingCandidatePaths)
 		if err != nil {
@@ -567,6 +566,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 		summary.FilesDeleted += deleted
 	}
+
+	if summary.FilesDeleted > 0 {
+		if _, err := i.store.PurgeDeletedFileGraphsForScan(ctx, repo.ID, scanID); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+	}
+
+	resolveStart := time.Now()
 
 	if len(changedPathSet) == 0 {
 		summary.ResolveMS = 0

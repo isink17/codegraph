@@ -1701,6 +1701,170 @@ func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64,
 	return int(total), nil
 }
 
+// PurgeDeletedFileGraphsForScan removes dependent graph rows for files that were
+// marked deleted during the given scan. This keeps stats/search/export from
+// surfacing stale symbols/edges/references after file deletions while allowing
+// future restores to re-index cleanly.
+//
+// Note: this also nulls out cross-file references to symbols defined in deleted
+// files (for example edges.dst_symbol_id), so that future resolve passes can
+// re-resolve them if the file returns.
+func (s *Store) PurgeDeletedFileGraphsForScan(ctx context.Context, repoID, scanID int64) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id
+		FROM files
+		WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
+	`, repoID, scanID)
+	if err != nil {
+		return 0, err
+	}
+	var fileIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		fileIDs = append(fileIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(fileIDs) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	if err := nullifyDeletedSymbolReferences(ctx, tx, repoID, fileIDs); err != nil {
+		return 0, err
+	}
+	if err := deleteFileGraphsBatch(ctx, tx, fileIDs, nil); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+	return len(fileIDs), nil
+}
+
+func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int64, fileIDs []int64) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+
+	if len(fileIDs) > sqliteInClauseBatchSize {
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_delete_file_ids(id INTEGER PRIMARY KEY)`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_delete_file_ids`); err != nil {
+			return err
+		}
+		for start := 0; start < len(fileIDs); start += sqliteInClauseBatchSize {
+			end := start + sqliteInClauseBatchSize
+			if end > len(fileIDs) {
+				end = len(fileIDs)
+			}
+			chunk := fileIDs[start:end]
+			placeholders := strings.Repeat("(?),", len(chunk))
+			placeholders = strings.TrimSuffix(placeholders, ",")
+			query := `INSERT INTO tmp_delete_file_ids(id) VALUES ` + placeholders
+			args := make([]any, len(chunk))
+			for i, id := range chunk {
+				args[i] = id
+			}
+			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+				return err
+			}
+		}
+
+		symbolIDs := `SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET dst_symbol_id = NULL
+			WHERE repo_id = ? AND dst_symbol_id IN (`+symbolIDs+`)
+		`, repoID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE test_links
+			SET target_symbol_id = NULL
+			WHERE repo_id = ? AND target_symbol_id IN (`+symbolIDs+`)
+		`, repoID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE references_tbl
+			SET symbol_id = NULL
+			WHERE repo_id = ? AND symbol_id IN (`+symbolIDs+`)
+		`, repoID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE references_tbl
+			SET context_symbol_id = NULL
+			WHERE repo_id = ? AND context_symbol_id IN (`+symbolIDs+`)
+		`, repoID); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	placeholders := strings.Repeat("?,", len(fileIDs))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]any, 0, len(fileIDs)+1)
+	args = append(args, repoID)
+	for _, id := range fileIDs {
+		args = append(args, id)
+	}
+	symbolIDs := `SELECT id FROM symbols WHERE file_id IN (` + placeholders + `)`
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = NULL
+		WHERE repo_id = ? AND dst_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE test_links
+		SET target_symbol_id = NULL
+		WHERE repo_id = ? AND target_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET symbol_id = NULL
+		WHERE repo_id = ? AND symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET context_symbol_id = NULL
+		WHERE repo_id = ? AND context_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
 type edgeTarget struct {
 	edgeID  int64
 	dstName string
