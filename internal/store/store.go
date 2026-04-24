@@ -3184,6 +3184,18 @@ func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason s
 	return err
 }
 
+func (s *Store) HasDirtyFiles(ctx context.Context, repoID int64) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM dirty_files WHERE repo_id = ? LIMIT 1`, repoID).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
 	// Prefer an atomic drain. `DELETE ... RETURNING` guarantees we only remove rows
 	// that are returned to the caller (no SELECT+DELETE race).
