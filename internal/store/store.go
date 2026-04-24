@@ -3406,7 +3406,19 @@ func (s *Store) DeleteClaimedDirtyFiles(ctx context.Context, repoID int64, paths
 	if claimedAt == "" {
 		return fmt.Errorf("claimedAt must be non-empty")
 	}
-	for _, chunk := range chunkStrings(paths, 900) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	for _, chunk := range chunkStrings(paths, sqliteInClauseBatchSize) {
 		qMarks := strings.Repeat("?,", len(chunk))
 		qMarks = qMarks[:len(qMarks)-1]
 		args := make([]any, 0, 3+len(chunk))
@@ -3414,13 +3426,18 @@ func (s *Store) DeleteClaimedDirtyFiles(ctx context.Context, repoID int64, paths
 		for _, p := range chunk {
 			args = append(args, p)
 		}
-		if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			DELETE FROM dirty_files
 			WHERE repo_id = ? AND queued_at = ? AND path IN (%s)
 		`, qMarks), args...); err != nil {
 			return err
 		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
