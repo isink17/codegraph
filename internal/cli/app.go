@@ -784,11 +784,17 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 
 	var base *indexSmokeBaseline
 	if p := strings.TrimSpace(*baselinePath); p != "" {
-		if data, err := os.ReadFile(p); err == nil {
+		data, err := os.ReadFile(p)
+		if errors.Is(err, os.ErrNotExist) {
+			// Baseline is optional.
+		} else if err != nil {
+			return fmt.Errorf("read baseline %s: %w", p, err)
+		} else {
 			var decoded indexSmokeBaseline
-			if err := json.Unmarshal(data, &decoded); err == nil {
-				base = &decoded
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				return fmt.Errorf("decode baseline %s: %w", p, err)
 			}
+			base = &decoded
 		}
 	}
 
@@ -844,7 +850,11 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 			return nil, graphRepo{}, 0, err
 		}
 		registry := newDefaultRegistry()
-		repoCfg, _ := config.LoadRepo(repoCanonical)
+		repoCfg, err := config.LoadRepo(repoCanonical)
+		if err != nil {
+			_ = s.Close()
+			return nil, graphRepo{}, 0, fmt.Errorf("load repo config %s: %w", config.RepoConfigPath(repoCanonical), err)
+		}
 		embedder := newEmbedder(repoCfg.Embedding)
 		idx := indexer.New(s, registry, embedder)
 		repo, err := s.UpsertRepo(ctx, repoCanonical)
@@ -861,6 +871,12 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 	}
 	defer os.RemoveAll(tmpDir)
 	dbPath := filepath.Join(tmpDir, "smoke.sqlite")
+	resetSmokeDB := func() error {
+		if err := os.RemoveAll(dbPath); err != nil {
+			return fmt.Errorf("remove smoke db %s: %w", dbPath, err)
+		}
+		return nil
+	}
 
 	median := func(vals []int64) int64 {
 		if len(vals) == 0 {
@@ -946,14 +962,18 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 
 	// Ensure update-mode timings are "update" (db already exists).
 	if scanKind == "update" {
-		_ = os.RemoveAll(dbPath)
+		if err := resetSmokeDB(); err != nil {
+			return err
+		}
 		if _, _, err := runOne(false); err != nil {
 			return err
 		}
 	}
 	for i := 0; i < *warmup; i++ {
 		if scanKind == "index" {
-			_ = os.RemoveAll(dbPath)
+			if err := resetSmokeDB(); err != nil {
+				return err
+			}
 		}
 		if _, _, err := runOne(scanKind == "update"); err != nil {
 			return err
@@ -961,7 +981,9 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 	}
 	for i := 0; i < *runs; i++ {
 		if scanKind == "index" {
-			_ = os.RemoveAll(dbPath)
+			if err := resetSmokeDB(); err != nil {
+				return err
+			}
 		}
 		summary, statsData, err := runOne(scanKind == "update")
 		if err != nil {
@@ -1047,10 +1069,16 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 			Context:   ctxFields,
 			Median:    medianFields,
 		}
-		if data, err := json.MarshalIndent(payload, "", "  "); err == nil {
-			if err := os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
-				_ = os.WriteFile(p, append(data, '\n'), 0o644)
-			}
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode baseline %s: %w", p, err)
+		}
+		dir := filepath.Dir(p)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir baseline dir %s: %w", dir, err)
+		}
+		if err := os.WriteFile(p, append(data, '\n'), 0o644); err != nil {
+			return fmt.Errorf("write baseline %s: %w", p, err)
 		}
 	}
 	return writeJSONLEvent("index_smoke_summary", final)
