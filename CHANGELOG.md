@@ -44,7 +44,7 @@ Improved Node.js repo indexing stability by hard-skipping common generated/tooli
 
 ### Fixed
 
-- Switched the default database location to per-repository `codegraph.sqlite` and excluded `codegraph.sqlite*` from indexing so repo-local DB mode works on repeated `index` and `serve` runs.
+- Switched the default repo-local database location to `.codegraph/codegraph.sqlite` (while continuing to recognize legacy `codegraph.sqlite` at the repo root) and excluded both from indexing so repeated `index`/`serve` runs stay repo-local without accidental self-indexing.
 - Treated the previous global `db_dir` default as a legacy value so existing installs fall forward to repo-local DB behavior without manual config edits.
 - Updated Codex MCP setup guidance and examples to use `config.toml` with `startup_timeout_sec = 60`.
 

@@ -42,13 +42,14 @@ If `codegraph` is not on `PATH`, replace `command` and `args` with a form that l
 By default, `codegraph` stores its database in the served repository as:
 
 ```text
-codegraph.sqlite
+.codegraph/codegraph.sqlite
 ```
 
 If you do not want to commit the local database, ignore:
 
 ```text
-codegraph.sqlite
-codegraph.sqlite-shm
-codegraph.sqlite-wal
+.codegraph/
+
+# Legacy location (still recognized if present):
+codegraph.sqlite*
 ```

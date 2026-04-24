@@ -395,7 +395,7 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	}
 	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
 	env := append([]string(nil), os.Environ()...)
-	gocachePath, err := filepath.Abs(filepath.Join(".", ".gocache"))
+	gocachePath, err := filepath.Abs(filepath.Join(config.RepoArtifactsDir, "gocache"))
 	if err != nil {
 		return err
 	}
@@ -1840,7 +1840,22 @@ func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error
 		if err != nil {
 			return "", err
 		}
-		return filepath.Join(absRoot, repoDBFileName), nil
+		newPath := filepath.Join(absRoot, config.RepoArtifactsDir, repoDBFileName)
+		legacyPath := filepath.Join(absRoot, repoDBFileName)
+		if _, err := os.Stat(newPath); err == nil {
+			return newPath, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("stat %s: %w", newPath, err)
+		}
+		if _, err := os.Stat(legacyPath); err == nil {
+			return legacyPath, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("stat %s: %w", legacyPath, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+			return "", err
+		}
+		return newPath, nil
 	}
 	return filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical)), nil
 }
