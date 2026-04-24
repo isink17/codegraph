@@ -17,7 +17,7 @@ const ignoreFileName = ".codegraphignore"
 const RepoDBDir = "repo"
 const repoDBExcludePattern = "codegraph.sqlite*"
 
-var HardcodedSkips = []string{".git", "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pnpm-store", ".yarn", ".parcel-cache"}
+var HardcodedSkips = []string{".git", ".codegraph", "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pnpm-store", ".yarn", ".parcel-cache"}
 var DefaultExcludes = []string{".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "vendor/**", "dist/**", "build/**", "coverage/**", "out/**", ".cache/**", repoDBExcludePattern}
 
 type Config struct {

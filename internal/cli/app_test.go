@@ -223,7 +223,7 @@ func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
 		t.Fatalf("second Run(index) error = %v", err)
 	}
 
-	dbPath := filepath.Join(repoRoot, "codegraph.sqlite")
+	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("expected repo database at %q: %v", dbPath, err)
 	}

@@ -395,7 +395,7 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	}
 	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
 	env := append([]string(nil), os.Environ()...)
-	gocachePath, err := filepath.Abs(filepath.Join(".", ".gocache"))
+	gocachePath, err := filepath.Abs(filepath.Join(".", repoArtifactsDirName, "gocache"))
 	if err != nil {
 		return err
 	}
@@ -1833,6 +1833,7 @@ func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
 }
 
 const repoDBFileName = "codegraph.sqlite"
+const repoArtifactsDirName = ".codegraph"
 
 func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error) {
 	if config.IsRepoDBDir(cfg.DBDir) {
@@ -1840,7 +1841,15 @@ func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error
 		if err != nil {
 			return "", err
 		}
-		return filepath.Join(absRoot, repoDBFileName), nil
+		newPath := filepath.Join(absRoot, repoArtifactsDirName, repoDBFileName)
+		legacyPath := filepath.Join(absRoot, repoDBFileName)
+		if _, err := os.Stat(newPath); err == nil {
+			return newPath, nil
+		}
+		if _, err := os.Stat(legacyPath); err == nil {
+			return legacyPath, nil
+		}
+		return newPath, nil
 	}
 	return filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical)), nil
 }

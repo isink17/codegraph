@@ -359,6 +359,8 @@ dist/
 *.generated.go
 ```
 
+Note: `.codegraph/` is always skipped by the indexer (repo-local config/artifacts).
+
 ---
 
 ## Architecture
