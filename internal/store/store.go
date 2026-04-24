@@ -2023,10 +2023,12 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		afterSlash := qname
 		if slash := strings.LastIndexByte(qname, '/'); slash >= 0 && slash+1 < len(qname) {
 			afterSlash = qname[slash+1:]
-			suffix := strings.Clone(afterSlash)
-			if suffix != "" {
-				if cur, ok := minBySuffix[suffix]; !ok || id < cur {
-					minBySuffix[suffix] = id
+			if afterSlash != "" {
+				if cur, ok := minBySuffix[afterSlash]; !ok {
+					minBySuffix[strings.Clone(afterSlash)] = id
+				} else if id < cur {
+					// Update value only; existing map key remains the cloned string.
+					minBySuffix[afterSlash] = id
 				}
 			}
 		}
@@ -2037,9 +2039,12 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			if prevDot := strings.LastIndexByte(afterSlash[:lastDot], '.'); prevDot >= 0 {
 				start = prevDot + 1
 			}
-			tail2 := strings.Clone(afterSlash[start:])
+			tail2 := afterSlash[start:]
 			if tail2 != "" {
-				if cur, ok := minByDotTail2[tail2]; !ok || id < cur {
+				if cur, ok := minByDotTail2[tail2]; !ok {
+					minByDotTail2[strings.Clone(tail2)] = id
+				} else if id < cur {
+					// Update value only; existing map key remains the cloned string.
 					minByDotTail2[tail2] = id
 				}
 			}
@@ -2062,6 +2067,13 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
 			return 0, err
 		}
+		droppedSlashSuffix := false
+		defer func() {
+			if droppedSlashSuffix {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_slash_suffix`)
+		}()
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
 			return 0, err
 		}
@@ -2098,6 +2110,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
 			return 0, err
 		}
+		droppedSlashSuffix = true
 		n, err := updateRes.RowsAffected()
 		if err != nil {
 			return 0, err
@@ -2113,6 +2126,13 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_dot_tail2(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
 			return 0, err
 		}
+		droppedDotTail2 := false
+		defer func() {
+			if droppedDotTail2 {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_dot_tail2`)
+		}()
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_dot_tail2`); err != nil {
 			return 0, err
 		}
@@ -2151,6 +2171,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_dot_tail2`); err != nil {
 			return 0, err
 		}
+		droppedDotTail2 = true
 		n, err := updateRes.RowsAffected()
 		if err != nil {
 			return 0, err
