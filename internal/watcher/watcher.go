@@ -12,6 +12,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/store"
 )
@@ -112,6 +113,13 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		debounce = 750 * time.Millisecond
 	}
 
+	repoCfg, err := config.LoadRepo(repoRoot)
+	if err != nil {
+		return err
+	}
+	includes := repoCfg.Include
+	excludes := repoCfg.Exclude
+
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -129,7 +137,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 					return relErr
 				}
 				rel = filepath.Clean(rel)
-				if d.IsDir() && indexer.ShouldSkipDir(rel, nil) {
+				if d.IsDir() && indexer.ShouldSkipDir(rel, excludes) {
 					return filepath.SkipDir
 				}
 			}
@@ -160,11 +168,29 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			Paths:    paths,
 			ScanKind: "watch",
 		})
-		if err == nil {
-			w.updateRuns.Add(1)
-			w.updatePaths.Add(int64(len(paths)))
+		if err != nil {
+			// `DrainDirtyFiles` is destructive; re-queue the drained paths on failure so
+			// work isn't silently dropped.
+			if requeueErr := w.store.QueueDirtyFiles(ctx, repoID, paths, "watch_retry"); requeueErr != nil {
+				return fmt.Errorf("update failed: %w (retry re-queue failed: %v)", err, requeueErr)
+			}
+			return err
 		}
+		w.updateRuns.Add(1)
+		w.updatePaths.Add(int64(len(paths)))
 		return err
+	}
+
+	if hasDirty, err := w.store.HasDirtyFiles(ctx, repoID); err != nil {
+		return err
+	} else if hasDirty {
+		// Ensure any queued work from previous runs is processed even if no new
+		// fsnotify events occur.
+		w.flushRuns.Add(1)
+		if err := flush(); err != nil {
+			w.flushErrors.Add(1)
+			return err
+		}
 	}
 
 	flushSignalCh := make(chan struct{}, 1)
@@ -242,7 +268,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				continue
 			}
 			rel = filepath.Clean(rel)
-			if shouldIgnorePath(rel) {
+			if indexer.ShouldIgnorePath(rel, excludes) {
 				w.eventsIgnored.Add(1)
 				continue
 			}
@@ -256,6 +282,10 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 					w.eventsIgnoredDir.Add(1)
 					continue
 				}
+			}
+			if indexer.ShouldSkipFile(rel, includes, excludes) {
+				w.eventsIgnored.Add(1)
+				continue
 			}
 
 			seenMu.Lock()
@@ -306,19 +336,4 @@ func (w *Watcher) queueDirtyWithRetry(ctx context.Context, repoID int64, path, r
 		}
 	}
 	return fmt.Errorf("queue dirty file %s: %w", path, lastErr)
-}
-
-func shouldIgnorePath(rel string) bool {
-	current := rel
-	for current != "." && current != "" {
-		if indexer.ShouldSkipDir(current, nil) {
-			return true
-		}
-		next := filepath.Dir(current)
-		if next == current {
-			break
-		}
-		current = next
-	}
-	return false
 }

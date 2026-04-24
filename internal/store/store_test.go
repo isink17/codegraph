@@ -12,6 +12,69 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
+func TestDirtyFilesQueueAndDrain(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	if ok, err := s.HasDirtyFiles(ctx, repo.ID); err != nil {
+		t.Fatalf("HasDirtyFiles() error = %v", err)
+	} else if ok {
+		t.Fatalf("expected no dirty files at start")
+	}
+
+	if err := s.QueueDirtyFile(ctx, repo.ID, "a.go", "test"); err != nil {
+		t.Fatalf("QueueDirtyFile(a.go) error = %v", err)
+	}
+	if err := s.QueueDirtyFile(ctx, repo.ID, "b.go", "test"); err != nil {
+		t.Fatalf("QueueDirtyFile(b.go) error = %v", err)
+	}
+	if err := s.QueueDirtyFile(ctx, repo.ID, "a.go", "test2"); err != nil {
+		t.Fatalf("QueueDirtyFile(a.go update) error = %v", err)
+	}
+
+	if ok, err := s.HasDirtyFiles(ctx, repo.ID); err != nil {
+		t.Fatalf("HasDirtyFiles() error = %v", err)
+	} else if !ok {
+		t.Fatalf("expected dirty files after queueing")
+	}
+
+	paths, err := s.DrainDirtyFiles(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("DrainDirtyFiles() error = %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 paths, got %d (%v)", len(paths), paths)
+	}
+
+	if ok, err := s.HasDirtyFiles(ctx, repo.ID); err != nil {
+		t.Fatalf("HasDirtyFiles() error = %v", err)
+	} else if ok {
+		t.Fatalf("expected no dirty files after drain")
+	}
+
+	if err := s.QueueDirtyFiles(ctx, repo.ID, []string{"c.go", "d.go"}, "batch"); err != nil {
+		t.Fatalf("QueueDirtyFiles() error = %v", err)
+	}
+
+	paths, err = s.DrainDirtyFiles(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("DrainDirtyFiles() (2) error = %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 paths from batch, got %d (%v)", len(paths), paths)
+	}
+}
+
 func TestListScansIncludesLanguageCoverage(t *testing.T) {
 	ctx := context.Background()
 	repoRoot := t.TempDir()

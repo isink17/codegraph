@@ -749,6 +749,14 @@ func ShouldSkipDir(rel string, excludes []string) bool {
 	return shouldSkipDir(rel, excludes)
 }
 
+func ShouldSkipFile(rel string, includes, excludes []string) bool {
+	return shouldSkipFile(rel, includes, excludes)
+}
+
+func ShouldIgnorePath(rel string, excludes []string) bool {
+	return shouldIgnorePath(rel, excludes)
+}
+
 func shouldSkipDir(rel string, excludes []string) bool {
 	rel = filepath.ToSlash(rel)
 	base := filepath.Base(rel)

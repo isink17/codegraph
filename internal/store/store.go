@@ -3184,6 +3184,56 @@ func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason s
 	return err
 }
 
+func (s *Store) QueueDirtyFiles(ctx context.Context, repoID int64, paths []string, reason string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO dirty_files(repo_id, path, reason, queued_at)
+		VALUES(?, ?, ?, ?)
+		ON CONFLICT(repo_id, path) DO UPDATE SET reason=excluded.reason, queued_at=excluded.queued_at
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, path := range paths {
+		if _, err := stmt.ExecContext(ctx, repoID, path, reason, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) HasDirtyFiles(ctx context.Context, repoID int64) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM dirty_files WHERE repo_id = ? LIMIT 1`, repoID).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
 	// Prefer an atomic drain. `DELETE ... RETURNING` guarantees we only remove rows
 	// that are returned to the caller (no SELECT+DELETE race).
