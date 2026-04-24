@@ -3274,7 +3274,7 @@ func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason s
 		INSERT INTO dirty_files(repo_id, path, reason, queued_at)
 		VALUES(?, ?, ?, ?)
 		ON CONFLICT(repo_id, path) DO UPDATE SET reason=excluded.reason, queued_at=excluded.queued_at
-	`, repoID, path, reason, time.Now().UTC().Format(time.RFC3339))
+	`, repoID, path, reason, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
@@ -3305,7 +3305,7 @@ func (s *Store) QueueDirtyFiles(ctx context.Context, repoID int64, paths []strin
 	defer stmt.Close()
 
 	for _, path := range paths {
-		if _, err := stmt.ExecContext(ctx, repoID, path, reason, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		if _, err := stmt.ExecContext(ctx, repoID, path, reason, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 	}
@@ -3328,42 +3328,22 @@ func (s *Store) HasDirtyFiles(ctx context.Context, repoID int64) (bool, error) {
 	return true, nil
 }
 
-func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
-	// Prefer an atomic drain. `DELETE ... RETURNING` guarantees we only remove rows
-	// that are returned to the caller (no SELECT+DELETE race).
-	rows, err := s.db.QueryContext(ctx, `
-		WITH deleted AS (
-			DELETE FROM dirty_files
-			WHERE repo_id = ?
-			RETURNING path, queued_at
-		)
-		SELECT path
-		FROM deleted
-		ORDER BY queued_at
-	`, repoID)
-	if err == nil {
-		defer rows.Close()
-		var out []string
-		for rows.Next() {
-			var path string
-			if err := rows.Scan(&path); err != nil {
-				return nil, err
-			}
-			out = append(out, path)
-		}
-		return out, rows.Err()
+// ClaimDirtyFiles snapshots all currently queued dirty paths for a repo and
+// marks them as "inflight" by rewriting queued_at/reason in a single write
+// transaction. This avoids the crash window inherent in destructive draining
+// (delete-then-process) while still allowing successful callers to delete only
+// the rows they claimed.
+func (s *Store) ClaimDirtyFiles(ctx context.Context, repoID int64, claimAt, claimReason string) ([]string, error) {
+	if claimAt == "" {
+		return nil, fmt.Errorf("claimAt must be non-empty")
 	}
-
-	// Fallback for older SQLite builds/drivers without `RETURNING`.
-	// We take a write lock up-front so that events queued concurrently cannot be
-	// inserted until after we delete the drained rows.
-	conn, connErr := s.db.Conn(ctx)
-	if connErr != nil {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
-	if _, lockErr := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); lockErr != nil {
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return nil, err
 	}
 	committed := false
@@ -3374,31 +3354,194 @@ func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, er
 		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 	}()
 
-	selRows, selErr := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
-	if selErr != nil {
-		return nil, selErr
+	rows, err := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	for _, chunk := range chunkStrings(paths, 900) {
+		qMarks := strings.Repeat("?,", len(chunk))
+		qMarks = qMarks[:len(qMarks)-1]
+		args := make([]any, 0, 3+len(chunk))
+		args = append(args, claimAt, claimReason, repoID)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE dirty_files
+			SET queued_at = ?, reason = ?
+			WHERE repo_id = ? AND path IN (%s)
+		`, qMarks), args...); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, err
+	}
+	committed = true
+	return paths, nil
+}
+
+// DeleteClaimedDirtyFiles removes previously-claimed rows, but only if their
+// queued_at still matches the claim timestamp. If a path was re-queued after
+// claim (queued_at changed), it is retained for the next flush.
+func (s *Store) DeleteClaimedDirtyFiles(ctx context.Context, repoID int64, paths []string, claimedAt string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	if claimedAt == "" {
+		return fmt.Errorf("claimedAt must be non-empty")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	for _, chunk := range chunkStrings(paths, sqliteInClauseBatchSize) {
+		qMarks := strings.Repeat("?,", len(chunk))
+		qMarks = qMarks[:len(qMarks)-1]
+		args := make([]any, 0, 3+len(chunk))
+		args = append(args, repoID, claimedAt)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			DELETE FROM dirty_files
+			WHERE repo_id = ? AND queued_at = ? AND path IN (%s)
+		`, qMarks), args...); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
+	// Take a write lock up-front so that events queued concurrently cannot be
+	// inserted until after we delete the drained rows. Also ensures we can safely
+	// rollback if scanning fails/cancels (avoids losing work on partial reads).
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+	}()
+
+	rows, err := conn.QueryContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ? RETURNING path, queued_at`, repoID)
+	if err == nil {
+		defer rows.Close()
+		type drained struct {
+			path     string
+			queuedAt string
+		}
+		var drainedRows []drained
+		for rows.Next() {
+			var d drained
+			if err := rows.Scan(&d.path, &d.queuedAt); err != nil {
+				return nil, err
+			}
+			drainedRows = append(drainedRows, d)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		sort.Slice(drainedRows, func(i, j int) bool { return drainedRows[i].queuedAt < drainedRows[j].queuedAt })
+		out := make([]string, len(drainedRows))
+		for i := range drainedRows {
+			out[i] = drainedRows[i].path
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return nil, err
+		}
+		committed = true
+		return out, nil
+	}
+
+	// Fallback for older SQLite builds/drivers without `RETURNING`.
+	if !isSQLiteReturningUnsupported(err) {
+		return nil, err
+	}
+
+	selRows, err := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
+	if err != nil {
+		return nil, err
 	}
 	defer selRows.Close()
 
 	var out []string
 	for selRows.Next() {
 		var path string
-		if scanErr := selRows.Scan(&path); scanErr != nil {
-			return nil, scanErr
+		if err := selRows.Scan(&path); err != nil {
+			return nil, err
 		}
 		out = append(out, path)
 	}
-	if rowsErr := selRows.Err(); rowsErr != nil {
-		return nil, rowsErr
+	if err := selRows.Err(); err != nil {
+		return nil, err
 	}
-	if _, delErr := conn.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); delErr != nil {
-		return nil, delErr
+	if _, err := conn.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); err != nil {
+		return nil, err
 	}
-	if _, commitErr := conn.ExecContext(ctx, `COMMIT`); commitErr != nil {
-		return nil, commitErr
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, err
 	}
 	committed = true
 	return out, nil
+}
+
+func isSQLiteReturningUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "returning") && strings.Contains(msg, "syntax")
+}
+
+func chunkStrings(values []string, chunkSize int) [][]string {
+	if len(values) == 0 || chunkSize <= 0 {
+		return nil
+	}
+	out := make([][]string, 0, (len(values)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(values); start += chunkSize {
+		end := min(start+chunkSize, len(values))
+		out = append(out, values[start:end])
+	}
+	return out
 }
 
 func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string, symbolID int64) (int64, error) {

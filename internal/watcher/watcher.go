@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,6 +93,23 @@ func (w *Watcher) Stats() WatchStats {
 	}
 }
 
+func isRelPathWithinRepo(rel string) bool {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	return rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+func isWatcherConfigPath(rel string) bool {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	rel = strings.TrimPrefix(rel, "./")
+	if strings.EqualFold(rel, ".codegraphignore") {
+		return true
+	}
+	if strings.EqualFold(rel, filepath.ToSlash(filepath.Join(config.RepoArtifactsDir, "config.json"))) {
+		return true
+	}
+	return false
+}
+
 func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, debounce time.Duration) error {
 	w.eventsSeen.Store(0)
 	w.eventsIgnored.Store(0)
@@ -120,11 +138,15 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	includes := repoCfg.Include
 	excludes := repoCfg.Exclude
 
+	var forceFullScan atomic.Bool
+
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
-	defer fsw.Close()
+	defer func() { _ = fsw.Close() }()
+	eventsCh := fsw.Events
+	errorsCh := fsw.Errors
 
 	addWatchTree := func(root string) error {
 		return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -138,6 +160,13 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				}
 				rel = filepath.Clean(rel)
 				if d.IsDir() && indexer.ShouldSkipDir(rel, excludes) {
+					if filepath.Base(rel) == config.RepoArtifactsDir {
+						// Keep watching repo-local config updates even though artifacts are
+						// never indexable.
+						if addErr := fsw.Add(path); addErr != nil {
+							return addErr
+						}
+					}
 					return filepath.SkipDir
 				}
 			}
@@ -148,36 +177,60 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		})
 	}
 
+	resetWatcher := func() error {
+		// Rebuild the watcher so include/exclude changes take effect (especially
+		// for directories that were previously skipped and not watched).
+		_ = fsw.Close()
+		next, err := fsnotify.NewWatcher()
+		if err != nil {
+			return err
+		}
+		fsw = next
+		eventsCh = fsw.Events
+		errorsCh = fsw.Errors
+		return addWatchTree(repoRoot)
+	}
+
 	if err := addWatchTree(repoRoot); err != nil {
 		return err
 	}
 
 	flush := func() error {
 		w.drainRuns.Add(1)
-		paths, err := w.store.DrainDirtyFiles(ctx, repoID)
+		force := forceFullScan.Swap(false)
+		claimedAt := time.Now().UTC().Format(time.RFC3339Nano)
+		paths, err := w.store.ClaimDirtyFiles(ctx, repoID, claimedAt, "watch_inflight")
 		if err != nil {
 			return err
 		}
-		if len(paths) == 0 {
+		if len(paths) == 0 && !force {
 			w.flushNoop.Add(1)
 			return nil
 		}
 		w.drainPaths.Add(int64(len(paths)))
-		_, err = w.indexer.Update(ctx, indexer.Options{
+		opts := indexer.Options{
 			RepoRoot: repoRoot,
-			Paths:    paths,
 			ScanKind: "watch",
-		})
+		}
+		if force {
+			opts.ScanKind = "watch_config"
+		} else {
+			opts.Paths = paths
+		}
+		_, err = w.indexer.Update(ctx, opts)
 		if err != nil {
-			// `DrainDirtyFiles` is destructive; re-queue the drained paths on failure so
-			// work isn't silently dropped.
-			if requeueErr := w.store.QueueDirtyFiles(ctx, repoID, paths, "watch_retry"); requeueErr != nil {
-				return fmt.Errorf("update failed: %w (retry re-queue failed: %v)", err, requeueErr)
-			}
 			return err
 		}
+		if len(paths) > 0 {
+			deleteCtx := context.WithoutCancel(ctx)
+			if err := w.store.DeleteClaimedDirtyFiles(deleteCtx, repoID, paths, claimedAt); err != nil {
+				return err
+			}
+		}
 		w.updateRuns.Add(1)
-		w.updatePaths.Add(int64(len(paths)))
+		if !force {
+			w.updatePaths.Add(int64(len(paths)))
+		}
 		return err
 	}
 
@@ -250,7 +303,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			return ctx.Err()
 		case err := <-flushErrCh:
 			return err
-		case event, ok := <-fsw.Events:
+		case event, ok := <-eventsCh:
 			if !ok {
 				return nil
 			}
@@ -268,6 +321,32 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				continue
 			}
 			rel = filepath.Clean(rel)
+			if !isRelPathWithinRepo(rel) {
+				w.eventsIgnored.Add(1)
+				continue
+			}
+
+			// Config changes must be handled before ignore filtering since repo-local
+			// config lives under ignored paths (e.g. `.codegraph/**`).
+			if isWatcherConfigPath(rel) {
+				nextCfg, loadErr := config.LoadRepo(repoRoot)
+				if loadErr == nil {
+					includes = nextCfg.Include
+					excludes = nextCfg.Exclude
+					forceFullScan.Store(true)
+					if err := resetWatcher(); err != nil {
+						return err
+					}
+					select {
+					case flushSignalCh <- struct{}{}:
+						w.flushSignals.Add(1)
+					default:
+						w.coalescedSignals.Add(1)
+					}
+				}
+				w.eventsIgnored.Add(1)
+				continue
+			}
 			if indexer.ShouldIgnorePath(rel, excludes) {
 				w.eventsIgnored.Add(1)
 				continue
@@ -310,7 +389,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			default:
 				w.coalescedSignals.Add(1)
 			}
-		case err, ok := <-fsw.Errors:
+		case err, ok := <-errorsCh:
 			if !ok {
 				return nil
 			}
