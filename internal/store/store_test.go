@@ -48,9 +48,10 @@ func TestDirtyFilesQueueAndDrain(t *testing.T) {
 		t.Fatalf("expected dirty files after queueing")
 	}
 
-	paths, err := s.DrainDirtyFiles(ctx, repo.ID)
+	claimedAt := "2026-01-01T00:00:00Z"
+	paths, err := s.ClaimDirtyFiles(ctx, repo.ID, claimedAt, "test_inflight")
 	if err != nil {
-		t.Fatalf("DrainDirtyFiles() error = %v", err)
+		t.Fatalf("ClaimDirtyFiles() error = %v", err)
 	}
 	if len(paths) != 2 {
 		t.Fatalf("expected 2 paths, got %d (%v)", len(paths), paths)
@@ -58,20 +59,32 @@ func TestDirtyFilesQueueAndDrain(t *testing.T) {
 
 	if ok, err := s.HasDirtyFiles(ctx, repo.ID); err != nil {
 		t.Fatalf("HasDirtyFiles() error = %v", err)
+	} else if !ok {
+		t.Fatalf("expected dirty files after claim")
+	}
+	if err := s.DeleteClaimedDirtyFiles(ctx, repo.ID, paths, claimedAt); err != nil {
+		t.Fatalf("DeleteClaimedDirtyFiles() error = %v", err)
+	}
+	if ok, err := s.HasDirtyFiles(ctx, repo.ID); err != nil {
+		t.Fatalf("HasDirtyFiles() error = %v", err)
 	} else if ok {
-		t.Fatalf("expected no dirty files after drain")
+		t.Fatalf("expected no dirty files after delete")
 	}
 
 	if err := s.QueueDirtyFiles(ctx, repo.ID, []string{"c.go", "d.go"}, "batch"); err != nil {
 		t.Fatalf("QueueDirtyFiles() error = %v", err)
 	}
 
-	paths, err = s.DrainDirtyFiles(ctx, repo.ID)
+	claimedAt = "2026-01-01T00:00:01Z"
+	paths, err = s.ClaimDirtyFiles(ctx, repo.ID, claimedAt, "batch_inflight")
 	if err != nil {
-		t.Fatalf("DrainDirtyFiles() (2) error = %v", err)
+		t.Fatalf("ClaimDirtyFiles() (2) error = %v", err)
 	}
 	if len(paths) != 2 {
 		t.Fatalf("expected 2 paths from batch, got %d (%v)", len(paths), paths)
+	}
+	if err := s.DeleteClaimedDirtyFiles(ctx, repo.ID, paths, claimedAt); err != nil {
+		t.Fatalf("DeleteClaimedDirtyFiles() (2) error = %v", err)
 	}
 }
 
