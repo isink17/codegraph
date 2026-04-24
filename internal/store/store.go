@@ -1048,83 +1048,10 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 	// For large batches, use a temp table to avoid repeating large IN clauses across each dependent-table delete.
 	// This reduces statement pressure from ~O(numTables * chunks) down to O(chunks + numTables).
 	if len(fileIDs) > sqliteInClauseBatchSize {
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_delete_file_ids(id INTEGER PRIMARY KEY)`); err != nil {
+		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, stats); err != nil {
 			return err
 		}
-		if stats != nil {
-			stats.TotalExecStatements++
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_delete_file_ids`); err != nil {
-			return err
-		}
-		if stats != nil {
-			stats.TotalExecStatements++
-		}
-
-		for start := 0; start < len(fileIDs); start += sqliteInClauseBatchSize {
-			end := start + sqliteInClauseBatchSize
-			if end > len(fileIDs) {
-				end = len(fileIDs)
-			}
-			chunk := fileIDs[start:end]
-			placeholders := strings.Repeat("(?),", len(chunk))
-			placeholders = strings.TrimSuffix(placeholders, ",")
-			query := `INSERT INTO tmp_delete_file_ids(id) VALUES ` + placeholders
-			args := make([]any, len(chunk))
-			for i, id := range chunk {
-				args[i] = id
-			}
-			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-				return err
-			}
-			if stats != nil {
-				stats.FileGraphDeleteTempIDInsertBatches++
-				stats.FileGraphDeleteTempIDInsertRows += len(chunk)
-				stats.TotalExecStatements++
-			}
-		}
-
-		exec := func(query string) error {
-			if _, err := tx.ExecContext(ctx, query); err != nil {
-				return err
-			}
-			if stats != nil {
-				stats.FileGraphDeleteStatements++
-				stats.TotalExecStatements++
-			}
-			return nil
-		}
-
-		// Dependent tables that reference symbols must be deleted before deleting symbols.
-		if err := exec(`DELETE FROM symbol_tokens WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
-			return err
-		}
-		if err := exec(`DELETE FROM symbol_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
-			return err
-		}
-
-		if err := exec(`DELETE FROM edges WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-			return err
-		}
-		if err := exec(`DELETE FROM references_tbl WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-			return err
-		}
-		if err := exec(`DELETE FROM file_imports WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-			return err
-		}
-		if err := exec(`DELETE FROM file_tokens WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-			return err
-		}
-		if err := exec(`DELETE FROM test_links WHERE test_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-			return err
-		}
-		if err := exec(`DELETE FROM symbol_embeddings WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-			return err
-		}
-		if err := exec(`DELETE FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-			return err
-		}
-		return nil
+		return deleteFileGraphsBatchFromTemp(ctx, tx, stats)
 	}
 
 	execInChunks := func(sqlPrefix, sqlSuffix string, ids []int64) error {
@@ -1189,6 +1116,90 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 	}
 
 	return execInChunks(`DELETE FROM symbols WHERE file_id IN (`, `)`, fileIDs)
+}
+
+func prepareTmpDeleteFileIDs(ctx context.Context, tx *sql.Tx, fileIDs []int64, stats *WriteStats) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_delete_file_ids(id INTEGER PRIMARY KEY)`); err != nil {
+		return err
+	}
+	if stats != nil {
+		stats.TotalExecStatements++
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_delete_file_ids`); err != nil {
+		return err
+	}
+	if stats != nil {
+		stats.TotalExecStatements++
+	}
+
+	for start := 0; start < len(fileIDs); start += sqliteInClauseBatchSize {
+		end := start + sqliteInClauseBatchSize
+		if end > len(fileIDs) {
+			end = len(fileIDs)
+		}
+		chunk := fileIDs[start:end]
+		placeholders := strings.Repeat("(?),", len(chunk))
+		placeholders = strings.TrimSuffix(placeholders, ",")
+		query := `INSERT INTO tmp_delete_file_ids(id) VALUES ` + placeholders
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.FileGraphDeleteTempIDInsertBatches++
+			stats.FileGraphDeleteTempIDInsertRows += len(chunk)
+			stats.TotalExecStatements++
+		}
+	}
+
+	return nil
+}
+
+func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, stats *WriteStats) error {
+	exec := func(query string) error {
+		if _, err := tx.ExecContext(ctx, query); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.FileGraphDeleteStatements++
+			stats.TotalExecStatements++
+		}
+		return nil
+	}
+
+	// Dependent tables that reference symbols must be deleted before deleting symbols.
+	if err := exec(`DELETE FROM symbol_tokens WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM symbol_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
+		return err
+	}
+
+	if err := exec(`DELETE FROM edges WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM references_tbl WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM file_imports WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM file_tokens WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM test_links WHERE test_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM symbol_embeddings WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	return nil
 }
 
 func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
@@ -1699,6 +1710,179 @@ func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64,
 		total += affected
 	}
 	return int(total), nil
+}
+
+// PurgeDeletedFileGraphsForScan removes dependent graph rows for files that were
+// marked deleted during the given scan. This keeps stats/search/export from
+// surfacing stale symbols/edges/references after file deletions while allowing
+// future restores to re-index cleanly.
+//
+// Note: this also nulls out cross-file references to symbols defined in deleted
+// files (for example edges.dst_symbol_id), so that future resolve passes can
+// re-resolve them if the file returns.
+func (s *Store) PurgeDeletedFileGraphsForScan(ctx context.Context, repoID, scanID int64) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id
+		FROM files
+		WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
+	`, repoID, scanID)
+	if err != nil {
+		return 0, err
+	}
+	var fileIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		fileIDs = append(fileIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(fileIDs) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	if len(fileIDs) > sqliteInClauseBatchSize {
+		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, nil); err != nil {
+			return 0, err
+		}
+		if err := nullifyDeletedSymbolReferencesFromTemp(ctx, tx, repoID); err != nil {
+			return 0, err
+		}
+		if err := deleteFileGraphsBatchFromTemp(ctx, tx, nil); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := nullifyDeletedSymbolReferences(ctx, tx, repoID, fileIDs); err != nil {
+			return 0, err
+		}
+		if err := deleteFileGraphsBatch(ctx, tx, fileIDs, nil); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+	return len(fileIDs), nil
+}
+
+func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int64, fileIDs []int64) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+
+	if len(fileIDs) > sqliteInClauseBatchSize {
+		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, nil); err != nil {
+			return err
+		}
+		return nullifyDeletedSymbolReferencesFromTemp(ctx, tx, repoID)
+	}
+
+	placeholders := strings.Repeat("?,", len(fileIDs))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]any, 0, len(fileIDs)+1)
+	args = append(args, repoID)
+	for _, id := range fileIDs {
+		args = append(args, id)
+	}
+	symbolIDs := `SELECT id FROM symbols WHERE file_id IN (` + placeholders + `)`
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = NULL
+		WHERE repo_id = ? AND dst_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE test_links
+		SET target_symbol_id = NULL
+		WHERE repo_id = ? AND target_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET symbol_id = NULL
+		WHERE repo_id = ? AND symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET context_symbol_id = NULL
+		WHERE repo_id = ? AND context_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, repoID int64) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_delete_symbol_ids(id INTEGER PRIMARY KEY)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_delete_symbol_ids`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tmp_delete_symbol_ids(id)
+		SELECT id
+		FROM symbols
+		WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)
+	`); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = NULL
+		WHERE repo_id = ? AND dst_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE test_links
+		SET target_symbol_id = NULL
+		WHERE repo_id = ? AND target_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET symbol_id = NULL
+		WHERE repo_id = ? AND symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET context_symbol_id = NULL
+		WHERE repo_id = ? AND context_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	return nil
 }
 
 type edgeTarget struct {
