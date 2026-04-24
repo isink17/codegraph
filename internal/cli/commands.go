@@ -148,6 +148,31 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			name:        "index_smoke",
+			aliases:     []string{"smoke_index", "smoke-index"},
+			description: "run repeatable index/update smoke timing",
+			usageLines:  []string{"  index_smoke <repo-path>"},
+			flags: []commandFlag{
+				{name: "--mode", description: "scan mode: index|update (default index)"},
+				{name: "--runs", description: "number of measured runs"},
+				{name: "--warmup", description: "number of warmup runs (not reported)"},
+				{name: "--force", description: "re-index files even if unchanged"},
+				{name: "--profile", description: "SQLite performance profile: balanced|durable|fast (default from config)"},
+				{name: "--gomaxprocs", description: "set GOMAXPROCS for this process (0 = leave unchanged)"},
+				{name: "--baseline", description: "read baseline JSON (optional)"},
+				{name: "--save-baseline", description: "write baseline JSON (default true when --baseline is set)"},
+				{name: "--json", description: "pretty JSON output instead of jsonl"},
+			},
+			examples: []string{
+				"codegraph index_smoke .",
+				"codegraph index_smoke . --mode update --force",
+				"codegraph index_smoke . --runs 5 --baseline .codegraph/smoke-baseline.json",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runIndexSmoke(ctx, cfg, stdout, invokedName, args)
+			},
+		},
+		{
 			name:        "stats",
 			description: "show index stats",
 			usageLines:  []string{"  stats <repo-path>"},

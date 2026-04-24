@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -705,6 +706,382 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 		return writeJSONL(stdout, ev)
 	}
 	return writeJSON(stdout, map[string]any{"summary": summary, "stats": stats})
+}
+
+type indexSmokeRun struct {
+	Run      int            `json:"run"`
+	ScanKind string         `json:"scan_kind"`
+	Force    bool           `json:"force"`
+	Summary  map[string]any `json:"summary"`
+	Stats    map[string]any `json:"stats,omitempty"`
+	RepoRoot string         `json:"repo_root"`
+	Context  map[string]any `json:"context"`
+}
+
+type indexSmokeBaseline struct {
+	CreatedAt string         `json:"created_at"`
+	Command   []string       `json:"command"`
+	Context   map[string]any `json:"context"`
+	Median    map[string]any `json:"median"`
+}
+
+func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string) error {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	mode := fs.String("mode", "index", "scan mode: index|update")
+	runs := fs.Int("runs", 3, "number of measured runs")
+	warmup := fs.Int("warmup", 0, "number of warmup runs (not reported)")
+	force := fs.Bool("force", false, "re-index files even if unchanged")
+	profile := fs.String("profile", "", "SQLite performance profile: balanced|durable|fast (default from config)")
+	gomaxprocs := fs.Int("gomaxprocs", 0, "set GOMAXPROCS for this process (0 = leave unchanged)")
+	baselinePath := fs.String("baseline", "", "read/write baseline JSON (optional)")
+	saveBaseline := fs.Bool("save-baseline", true, "write baseline JSON")
+	prettyJSON := fs.Bool("json", false, "pretty JSON output instead of jsonl")
+	repoRootArg := ""
+	parseArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		repoRootArg = args[0]
+		parseArgs = args[1:]
+	}
+	if err := fs.Parse(parseArgs); err != nil {
+		return err
+	}
+	repoRoot := strings.TrimSpace(repoRootArg)
+	if repoRoot == "" && fs.NArg() > 0 {
+		repoRoot = strings.TrimSpace(fs.Arg(0))
+	}
+	if repoRoot == "" {
+		return fmt.Errorf("usage: %s %s <repo-path>", appname.BinaryName, cmdName)
+	}
+	if *runs < 1 {
+		return fmt.Errorf("--runs must be >= 1")
+	}
+	if *warmup < 0 {
+		return fmt.Errorf("--warmup must be >= 0")
+	}
+	if *gomaxprocs > 0 {
+		runtime.GOMAXPROCS(*gomaxprocs)
+	}
+	scanKind := strings.ToLower(strings.TrimSpace(*mode))
+	if scanKind == "" {
+		scanKind = "index"
+	}
+	switch scanKind {
+	case "index", "update":
+	default:
+		return fmt.Errorf("--mode must be one of: index, update")
+	}
+	effectiveProfile := strings.TrimSpace(*profile)
+	if effectiveProfile == "" {
+		effectiveProfile = cfg.DBPerformanceProfile
+	}
+
+	repoCanonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		return err
+	}
+	repoAbs := repoCanonical
+
+	var base *indexSmokeBaseline
+	if p := strings.TrimSpace(*baselinePath); p != "" {
+		data, err := os.ReadFile(p)
+		if errors.Is(err, os.ErrNotExist) {
+			// Baseline is optional.
+		} else if err != nil {
+			return fmt.Errorf("read baseline %s: %w", p, err)
+		} else {
+			var decoded indexSmokeBaseline
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				return fmt.Errorf("decode baseline %s: %w", p, err)
+			}
+			base = &decoded
+		}
+	}
+
+	ctxFields := map[string]any{
+		"go_version": runtime.Version(),
+		"goos":       runtime.GOOS,
+		"goarch":     runtime.GOARCH,
+		"gomaxprocs": runtime.GOMAXPROCS(0),
+		"num_cpu":    runtime.NumCPU(),
+		"sqlite":     store.SQLiteDriverName(),
+		"db_profile": effectiveProfile,
+	}
+
+	compactSummary := func(summary store.ScanSummary) map[string]any {
+		out := map[string]any{
+			"files_seen":      summary.FilesSeen,
+			"files_indexed":   summary.FilesIndexed,
+			"files_changed":   summary.FilesChanged,
+			"files_deleted":   summary.FilesDeleted,
+			"process_wall_ms": summary.ProcessWallMS,
+			"task_ms":         summary.TaskMS,
+			"task_other_ms":   summary.TaskOtherMS,
+			"write_ms":        summary.WriteMS,
+			"resolve_ms":      summary.ResolveMS,
+			"duration_ms":     summary.DurationMS,
+			"resolve_mode":    summary.ResolveMode,
+			"write_flush_total": summary.WriteMarkSeenFlushes +
+				summary.WriteTouchFlushes +
+				summary.WriteParseFailedFlushes +
+				summary.WriteReplaceFlushes,
+		}
+		if summary.WriteStats != nil {
+			out["write_tx_count"] = summary.WriteStats.TxCount
+			out["total_exec_statements"] = summary.WriteStats.TotalExecStatements
+		}
+		return out
+	}
+
+	writeJSONLEvent := func(eventType string, data any) error {
+		if *prettyJSON {
+			return writeJSON(stdout, data)
+		}
+		return writeJSONL(stdout, map[string]any{
+			"type":      eventType,
+			"repo_root": repoAbs,
+			"data":      data,
+		})
+	}
+
+	makeApp := func(dbPath string) (*App, graphRepo, int64, error) {
+		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: effectiveProfile})
+		if err != nil {
+			return nil, graphRepo{}, 0, err
+		}
+		registry := newDefaultRegistry()
+		repoCfg, err := config.LoadRepo(repoCanonical)
+		if err != nil {
+			_ = s.Close()
+			return nil, graphRepo{}, 0, fmt.Errorf("load repo config %s: %w", config.RepoConfigPath(repoCanonical), err)
+		}
+		embedder := newEmbedder(repoCfg.Embedding)
+		idx := indexer.New(s, registry, embedder)
+		repo, err := s.UpsertRepo(ctx, repoCanonical)
+		if err != nil {
+			_ = s.Close()
+			return nil, graphRepo{}, 0, err
+		}
+		return &App{Store: s, Indexer: idx, Query: query.New(s, embedder)}, graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
+	}
+
+	tmpDir, err := os.MkdirTemp("", "codegraph-index-smoke-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	dbPath := filepath.Join(tmpDir, "smoke.sqlite")
+	resetSmokeDB := func() error {
+		if err := os.RemoveAll(dbPath); err != nil {
+			return fmt.Errorf("remove smoke db %s: %w", dbPath, err)
+		}
+		return nil
+	}
+
+	median := func(vals []int64) int64 {
+		if len(vals) == 0 {
+			return 0
+		}
+		cp := append([]int64(nil), vals...)
+		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+		mid := len(cp) / 2
+		if len(cp)%2 == 1 {
+			return cp[mid]
+		}
+		return (cp[mid-1] + cp[mid]) / 2
+	}
+	medianInt := func(vals []int) int {
+		if len(vals) == 0 {
+			return 0
+		}
+		cp := append([]int(nil), vals...)
+		sort.Ints(cp)
+		mid := len(cp) / 2
+		if len(cp)%2 == 1 {
+			return cp[mid]
+		}
+		return (cp[mid-1] + cp[mid]) / 2
+	}
+
+	type sample struct {
+		wallMS  int64
+		taskMS  int64
+		otherMS int64
+		writeMS int64
+		resMS   int64
+		exec    int
+		tx      int
+		flush   int
+	}
+	var samples []sample
+
+	stripStats := func(v any) (map[string]any, error) {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		var out map[string]any
+		if err := json.Unmarshal(b, &out); err != nil {
+			return nil, err
+		}
+		delete(out, "repo_root")
+		delete(out, "repo_id")
+		return out, nil
+	}
+
+	runOne := func(update bool) (store.ScanSummary, map[string]any, error) {
+		app, repo, repoID, err := makeApp(dbPath)
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		defer app.Close()
+		opts := indexer.Options{
+			RepoRoot: repo.RootPath,
+			Force:    *force,
+			ScanKind: map[bool]string{true: "update", false: "index"}[update],
+		}
+		var summary store.ScanSummary
+		if update {
+			summary, err = app.Indexer.Update(ctx, opts)
+		} else {
+			summary, err = app.Indexer.Index(ctx, opts)
+		}
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		stats, err := app.Query.Stats(ctx, repoID)
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		statsData, err := stripStats(stats)
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		return summary, statsData, nil
+	}
+
+	// Ensure update-mode timings are "update" (db already exists).
+	if scanKind == "update" {
+		if err := resetSmokeDB(); err != nil {
+			return err
+		}
+		if _, _, err := runOne(false); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < *warmup; i++ {
+		if scanKind == "index" {
+			if err := resetSmokeDB(); err != nil {
+				return err
+			}
+		}
+		if _, _, err := runOne(scanKind == "update"); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < *runs; i++ {
+		if scanKind == "index" {
+			if err := resetSmokeDB(); err != nil {
+				return err
+			}
+		}
+		summary, statsData, err := runOne(scanKind == "update")
+		if err != nil {
+			return err
+		}
+		ev := indexSmokeRun{
+			Run:      i + 1,
+			ScanKind: scanKind,
+			Force:    *force,
+			Summary:  compactSummary(summary),
+			Stats:    statsData,
+			RepoRoot: repoAbs,
+			Context:  ctxFields,
+		}
+		if err := writeJSONLEvent("index_smoke_run", ev); err != nil {
+			return err
+		}
+		var exec, tx int
+		if summary.WriteStats != nil {
+			exec = summary.WriteStats.TotalExecStatements
+			tx = summary.WriteStats.TxCount
+		}
+		samples = append(samples, sample{
+			wallMS:  summary.ProcessWallMS,
+			taskMS:  summary.TaskMS,
+			otherMS: summary.TaskOtherMS,
+			writeMS: summary.WriteMS,
+			resMS:   summary.ResolveMS,
+			exec:    exec,
+			tx:      tx,
+			flush: summary.WriteMarkSeenFlushes +
+				summary.WriteTouchFlushes +
+				summary.WriteParseFailedFlushes +
+				summary.WriteReplaceFlushes,
+		})
+	}
+
+	var walls, tasks, others, writes, resolves []int64
+	var execs, txs, flushes []int
+	for _, s := range samples {
+		walls = append(walls, s.wallMS)
+		tasks = append(tasks, s.taskMS)
+		others = append(others, s.otherMS)
+		writes = append(writes, s.writeMS)
+		resolves = append(resolves, s.resMS)
+		execs = append(execs, s.exec)
+		txs = append(txs, s.tx)
+		flushes = append(flushes, s.flush)
+	}
+	medianFields := map[string]any{
+		"process_wall_ms":       median(walls),
+		"task_ms":               median(tasks),
+		"task_other_ms":         median(others),
+		"write_ms":              median(writes),
+		"resolve_ms":            median(resolves),
+		"total_exec_statements": medianInt(execs),
+		"write_tx_count":        medianInt(txs),
+		"write_flush_total":     medianInt(flushes),
+	}
+	final := map[string]any{
+		"ok":      true,
+		"context": ctxFields,
+		"median":  medianFields,
+	}
+	if base != nil && base.Median != nil {
+		delta := map[string]any{}
+		for _, k := range []string{"process_wall_ms", "task_ms", "task_other_ms", "write_ms", "resolve_ms", "total_exec_statements"} {
+			cur, ok1 := medianFields[k]
+			baseV, ok2 := base.Median[k]
+			if ok1 && ok2 {
+				delta[k] = map[string]any{"current": cur, "baseline": baseV}
+			}
+		}
+		if len(delta) > 0 {
+			final["delta_vs_baseline"] = delta
+			final["baseline_created_at"] = base.CreatedAt
+		}
+	}
+	if p := strings.TrimSpace(*baselinePath); p != "" && *saveBaseline {
+		payload := indexSmokeBaseline{
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			Command:   append([]string{appname.BinaryName, cmdName}, args...),
+			Context:   ctxFields,
+			Median:    medianFields,
+		}
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode baseline %s: %w", p, err)
+		}
+		dir := filepath.Dir(p)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir baseline dir %s: %w", dir, err)
+		}
+		if err := os.WriteFile(p, append(data, '\n'), 0o644); err != nil {
+			return fmt.Errorf("write baseline %s: %w", p, err)
+		}
+	}
+	return writeJSONLEvent("index_smoke_summary", final)
 }
 
 func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
