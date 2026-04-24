@@ -61,6 +61,18 @@ func TestDirtyFilesQueueAndDrain(t *testing.T) {
 	} else if ok {
 		t.Fatalf("expected no dirty files after drain")
 	}
+
+	if err := s.QueueDirtyFiles(ctx, repo.ID, []string{"c.go", "d.go"}, "batch"); err != nil {
+		t.Fatalf("QueueDirtyFiles() error = %v", err)
+	}
+
+	paths, err = s.DrainDirtyFiles(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("DrainDirtyFiles() (2) error = %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 paths from batch, got %d (%v)", len(paths), paths)
+	}
 }
 
 func TestListScansIncludesLanguageCoverage(t *testing.T) {

@@ -171,8 +171,8 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		if err != nil {
 			// `DrainDirtyFiles` is destructive; re-queue the drained paths on failure so
 			// work isn't silently dropped.
-			for _, path := range paths {
-				_ = w.store.QueueDirtyFile(ctx, repoID, path, "watch_retry")
+			if requeueErr := w.store.QueueDirtyFiles(ctx, repoID, paths, "watch_retry"); requeueErr != nil {
+				return fmt.Errorf("update failed: %w (retry re-queue failed: %v)", err, requeueErr)
 			}
 			return err
 		}
