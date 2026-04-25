@@ -65,7 +65,7 @@ func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files 
 	if limit <= 0 {
 		limit = 20
 	}
-	perFileLimit := max(50, limit+offset)
+perFileLimit := min(max(50, limit+offset), 1000)
 
 	seen := map[string]bool{}
 	var all []store.RelatedTest
