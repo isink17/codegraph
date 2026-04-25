@@ -1946,27 +1946,11 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 
 	// Strategy 3c: Dot-suffix fallback (for qualified names without a slash separator).
 	// Keep as a narrower fallback (multi-dot dst_name only) to preserve existing semantics without paying LIKE cost on common pkg.Func cases.
-	res, err = tx.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ?
-			AND s.qualified_name LIKE '%.' || edges.dst_name
-			LIMIT 1
-		)
-		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
-		AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') > 0
-		AND EXISTS (
-			SELECT 1 FROM symbols s WHERE s.repo_id = ?
-			AND s.qualified_name LIKE '%.' || edges.dst_name
-		)
-	`, repoID, repoID, repoID)
+	n, err = s.resolveEdgesByDotSuffix(ctx, tx, repoID)
 	if err != nil {
 		return 0, err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		totalResolved += int(n)
-	}
+	totalResolved += n
 
 	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething)
 	res, err = tx.ExecContext(ctx, `
@@ -1996,7 +1980,102 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	return totalResolved, nil
 }
 
+func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_dot_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		return 0, err
+	}
+	dropped := false
+	defer func() {
+		if dropped {
+			return
+		}
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_edge_dot_suffix`)
+	}()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_edge_dot_suffix`); err != nil {
+		return 0, err
+	}
+
+	// De-correlate the expensive LIKE suffix match: do the work once per distinct dst_name,
+	// then apply the result via a fast equality update on edges.dst_name.
+	//
+	// This preserves the prior semantics (pick a single match via MIN(id)) while scaling
+	// with the number of unique names rather than total unresolved edges.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tmp_edge_dot_suffix(dst_name, dst_symbol_id)
+		SELECT e.dst_name,
+			(SELECT MIN(s.id) FROM symbols s WHERE s.repo_id = ? AND s.qualified_name LIKE '%.' || e.dst_name)
+		FROM (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL
+			AND instr(dst_name, '.') > 0 AND instr(dst_name, '/') = 0
+			AND instr(substr(dst_name, instr(dst_name, '.') + 1), '.') > 0
+		) e
+		WHERE EXISTS (
+			SELECT 1 FROM symbols s
+			WHERE s.repo_id = ? AND s.qualified_name LIKE '%.' || e.dst_name
+		)
+	`, repoID, repoID, repoID); err != nil {
+		return 0, err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_edge_dot_suffix t WHERE t.dst_name = edges.dst_name)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND edges.dst_name IN (SELECT dst_name FROM tmp_edge_dot_suffix)
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_edge_dot_suffix`); err != nil {
+		return 0, err
+	}
+	dropped = true
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
 func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	// Restrict suffix maps to names that can actually be consumed by the unresolved edge set.
+	// This avoids building large Go maps for symbols that can't match any current unresolved edges.
+	neededSuffix := map[string]struct{}{}
+	neededTail2 := map[string]struct{}{}
+	needRows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != '' AND instr(dst_name, '/') = 0
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	for needRows.Next() {
+		var dstName string
+		if err := needRows.Scan(&dstName); err != nil {
+			_ = needRows.Close()
+			return 0, err
+		}
+		if dstName == "" {
+			continue
+		}
+		neededSuffix[dstName] = struct{}{}
+		firstDot := strings.IndexByte(dstName, '.')
+		if firstDot >= 0 && firstDot == strings.LastIndexByte(dstName, '.') {
+			// Dot-tail2 optimization only applies to dst_name values with exactly one dot.
+			neededTail2[dstName] = struct{}{}
+		}
+	}
+	if err := needRows.Err(); err != nil {
+		_ = needRows.Close()
+		return 0, err
+	}
+	if err := needRows.Close(); err != nil {
+		return 0, err
+	}
+
 	rows, err := tx.QueryContext(ctx, `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`, repoID)
 	if err != nil {
 		return 0, err
@@ -2024,6 +2103,9 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if slash := strings.LastIndexByte(qname, '/'); slash >= 0 && slash+1 < len(qname) {
 			afterSlash = qname[slash+1:]
 			if afterSlash != "" {
+				if _, ok := neededSuffix[afterSlash]; !ok {
+					continue
+				}
 				if cur, ok := minBySuffix[afterSlash]; !ok {
 					minBySuffix[strings.Clone(afterSlash)] = id
 				} else if id < cur {
@@ -2041,6 +2123,9 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			}
 			tail2 := afterSlash[start:]
 			if tail2 != "" {
+				if _, ok := neededTail2[tail2]; !ok {
+					continue
+				}
 				if cur, ok := minByDotTail2[tail2]; !ok {
 					minByDotTail2[strings.Clone(tail2)] = id
 				} else if id < cur {

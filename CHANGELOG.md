@@ -1,5 +1,37 @@
 # Changelog
 
+# Release v1.0.10 - TBD
+
+## Changes
+
+### Watch / Incremental Indexing
+- **watch:** Apply repo include/exclude consistently; harden dirty-file draining. (#47)
+- **watch:** Make dirty queue crash-safe via claim/delete; align watch config behavior. (#50)
+- **watch:** Ignore chmod-only + directory-create events; add repeated-work stats. (#36)
+- **indexer:** Target cross-file edge resolution on update runs (preserve path-scoped behavior; avoid repo-wide resolve). (#32, #33)
+
+### Correctness / Data Hygiene
+- **store/indexer:** Purge deleted-file graph rows and nullify cross-file symbol references. (#46)
+
+### Performance (Store / Indexing)
+- **store:** Speed up edge resolver (dotted-edge indexes, dot-tail2 strategy, resolver symbol indexes). (#48)
+- **store:** Reduce repo-wide resolver cost (de-correlate dot-suffix fallback; shrink slash-suffix symbol maps to unresolved-name set). (unreleased)
+- **indexing/store:** Broad batching + reduced statement pressure across symbols/FTS/inserts; add/extend phase timings + write_stats counters. (#20, #21, #22, #24, #25, #26, #28, #29)
+- **indexing:** Reduce tokenization allocations; add tokenize timing stats. (#30)
+
+### CLI / Output Stability
+- **json/jsonl:** Stabilize `watch` and `doctor` machine-readable output (event envelopes; arrays always present; disable HTML escaping). (#38, #43)
+- **cli/index:** Stabilize `--jsonl` scan payloads/envelopes (scan_kind, parse_ms, correlation fields; dedupe envelopes; handle phase write errors). (#40, #41, #42)
+
+### Maintenance / Benchmarking
+- **clean/doctor:** Add ANALYZE, WAL checkpoint, incremental vacuum; add `doctor --deep` integrity checks; expand DB diagnostics + FTS optimize. (#37, #39)
+- **benchmark:** Add `--sqlite-profile` and capture sqlite_profile/host context. (#44)
+- **cli:** Add `index_smoke` runner with compact jsonl + median baseline for perf diffs. (#45)
+
+### Config / UX
+- **cli/config:** Default repo artifacts under `.codegraph/` (DB + bench gocache) with legacy DB fallback; harden repo DB path handling. (#49)
+- **cli/help/commands:** Command registry + per-command help; canonical query command names with backward-compatible aliases; help/usage normalization. (#10, #12, #13, #14, #15, #16, #17, #18, #19)
+
 # Release v1.0.9 - 16-04-2026
 
 Improved Node.js repo indexing stability by hard-skipping common generated/tooling directories (for example node_modules and .next), refining default excludes, and clarifying ignore override behavior.
