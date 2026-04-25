@@ -2485,16 +2485,16 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			return stats, err
 		}
 		stats.QualifiedScanned++
-			if _, ok := targetByID[id]; ok {
-				continue
-			}
-			if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
-				if _, ok := seen[dstName[dot+1:]]; ok {
-					targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
-					stats.SuffixHits++
-				}
+		if _, ok := targetByID[id]; ok {
+			continue
+		}
+		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
+			if _, ok := seen[dstName[dot+1:]]; ok {
+				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+				stats.SuffixHits++
 			}
 		}
+	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
 		return stats, err
@@ -2899,6 +2899,7 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		JOIN symbols s ON s.id = e.src_symbol_id
 		JOIN files f ON f.id = s.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id = ?
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, targetID, safeLimit(limit), safeOffset(offset))
@@ -2920,6 +2921,7 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 		JOIN symbols s ON s.id = e.dst_symbol_id
 		JOIN files f ON f.id = s.file_id
 		WHERE e.repo_id = ? AND e.src_symbol_id = ?
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, srcID, safeLimit(limit), safeOffset(offset))
@@ -2940,6 +2942,10 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 		queue = append(queue, id)
 	}
 	for _, file := range files {
+		file = normalizeRepoRelPath(file)
+		if file == "" {
+			continue
+		}
 		rows, err := s.db.QueryContext(ctx, `
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
@@ -2959,6 +2965,9 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 			queue = append(queue, sym.ID)
 		}
 		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 	}
 	if depth <= 0 {
 		depth = 2
@@ -3015,6 +3024,22 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 			fileList = append(fileList, sym.FilePath)
 		}
 	}
+	sort.Slice(symbolList, func(i, j int) bool {
+		if symbolList[i].FilePath != symbolList[j].FilePath {
+			return symbolList[i].FilePath < symbolList[j].FilePath
+		}
+		if symbolList[i].QualifiedName != symbolList[j].QualifiedName {
+			return symbolList[i].QualifiedName < symbolList[j].QualifiedName
+		}
+		if symbolList[i].Range.StartLine != symbolList[j].Range.StartLine {
+			return symbolList[i].Range.StartLine < symbolList[j].Range.StartLine
+		}
+		if symbolList[i].Range.StartCol != symbolList[j].Range.StartCol {
+			return symbolList[i].Range.StartCol < symbolList[j].Range.StartCol
+		}
+		return symbolList[i].ID < symbolList[j].ID
+	})
+	sort.Strings(fileList)
 	return map[string]any{
 		"symbols": symbolList,
 		"files":   fileList,
@@ -3042,6 +3067,7 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 			JOIN symbols s ON s.id = e.src_symbol_id
 			JOIN files f ON f.id = s.file_id
 			WHERE e.repo_id = ? AND e.dst_symbol_id IN (` + placeholders + `)
+			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		`
 		if !callers {
 			query = `
@@ -3051,6 +3077,7 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 				JOIN symbols s ON s.id = e.dst_symbol_id
 				JOIN files f ON f.id = s.file_id
 				WHERE e.repo_id = ? AND e.src_symbol_id IN (` + placeholders + `) AND e.dst_symbol_id IS NOT NULL
+				ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			`
 		}
 		args := make([]any, 0, len(chunk)+1)
@@ -3075,17 +3102,28 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 	var rows *sql.Rows
 	var err error
 	if file != "" {
+		file = normalizeRepoRelPath(file)
+		if file == "" {
+			return []RelatedTest{}, nil
+		}
+		var targetFileID int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? LIMIT 1`, repoID, file).Scan(&targetFileID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return []RelatedTest{}, nil
+			}
+			return nil, err
+		}
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT f.path, COALESCE(s.qualified_name, ''), t.reason, t.score
 			FROM test_links t
 			JOIN files f ON f.id = t.test_file_id
 			LEFT JOIN symbols s ON s.id = t.test_symbol_id
-			WHERE t.repo_id = ? AND t.test_file_id IN (
-				SELECT id FROM files WHERE repo_id = ? AND path LIKE '%_test.go'
-			)
+			WHERE t.repo_id = ? AND t.target_file_id = ?
+			AND f.path LIKE '%_test.go'
+			ORDER BY t.score DESC, f.path, COALESCE(s.qualified_name, '')
 			LIMIT ?
 			OFFSET ?
-		`, repoID, repoID, safeLimit(limit), safeOffset(offset))
+		`, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
 	} else {
 		targetID, err := s.lookupSymbolID(ctx, repoID, symbol, 0)
 		if err != nil {
@@ -3097,6 +3135,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 			JOIN files f ON f.id = t.test_file_id
 			LEFT JOIN symbols s ON s.id = t.test_symbol_id
 			WHERE t.repo_id = ? AND t.target_symbol_id = ?
+			ORDER BY t.score DESC, f.path, COALESCE(s.qualified_name, '')
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetID, safeLimit(limit), safeOffset(offset))
@@ -3111,6 +3150,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 		if err := rows.Scan(&item.File, &item.Symbol, &item.Reason, &item.Score); err != nil {
 			return nil, err
 		}
+		item.File = filepath.ToSlash(item.File)
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -3666,8 +3706,18 @@ func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string,
 	}
 	var id int64
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id FROM symbols WHERE repo_id = ? AND (qualified_name = ? OR name = ?) LIMIT 1
-	`, repoID, symbol, symbol).Scan(&id)
+		SELECT s.id
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ? AND (s.qualified_name = ? OR s.name = ?)
+		ORDER BY
+			CASE WHEN s.qualified_name = ? THEN 0 ELSE 1 END,
+			f.path ASC,
+			s.start_line ASC,
+			s.start_col ASC,
+			s.id ASC
+		LIMIT 1
+	`, repoID, symbol, symbol, symbol).Scan(&id)
 	return id, err
 }
 
@@ -3679,6 +3729,8 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 	); err != nil {
 		return graph.Symbol{}, err
 	}
+	// Normalize paths in outputs to be deterministic across platforms and call sites.
+	sym.FilePath = filepath.ToSlash(sym.FilePath)
 	return sym, nil
 }
 
@@ -4105,6 +4157,20 @@ func safeOffset(offset int) int {
 	return max(offset, 0)
 }
 
+func normalizeRepoRelPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	// Normalize common caller variations: forward slashes, leading ./, etc.
+	path = filepath.FromSlash(path)
+	path = filepath.Clean(path)
+	if path == "." {
+		return ""
+	}
+	return path
+}
+
 func quoteFTS(query string) string {
 	tokens := strings.Fields(query)
 	for i, token := range tokens {
@@ -4165,11 +4231,13 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ?
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
-		  AND s.id NOT IN (
-		      SELECT DISTINCT dst_symbol_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM edges e
+		      WHERE e.repo_id = s.repo_id AND e.dst_symbol_id = s.id
 		  )
-		  AND s.id NOT IN (
-		      SELECT DISTINCT symbol_id FROM references_tbl WHERE repo_id = ? AND symbol_id IS NOT NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM references_tbl r
+		      WHERE r.repo_id = s.repo_id AND r.symbol_id = s.id
 		  )
 		  AND s.name NOT IN ('main', 'init', 'Main', 'Init')
 		  AND s.name NOT LIKE 'Test%'
@@ -4177,7 +4245,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Example%'
 		ORDER BY f.path, s.start_line
 		LIMIT ? OFFSET ?
-	`, repoID, repoID, repoID, safeLimit(limit), safeOffset(offset))
+	`, repoID, safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
