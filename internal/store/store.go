@@ -2062,10 +2062,10 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			continue
 		}
 		neededSuffix[dstName] = struct{}{}
-		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
-			if strings.IndexByte(dstName[dot+1:], '.') < 0 {
-				neededTail2[dstName] = struct{}{}
-			}
+		firstDot := strings.IndexByte(dstName, '.')
+		if firstDot >= 0 && firstDot == strings.LastIndexByte(dstName, '.') {
+			// Dot-tail2 optimization only applies to dst_name values with exactly one dot.
+			neededTail2[dstName] = struct{}{}
 		}
 	}
 	if err := needRows.Err(); err != nil {
