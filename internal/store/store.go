@@ -1902,13 +1902,26 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 
 	// Strategy 1: Exact qualified name match
 	res, err := tx.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ? AND s.qualified_name = edges.dst_name
-			LIMIT 1
+		WITH distinct_names AS (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+		),
+		resolutions AS (
+			SELECT
+				n.dst_name,
+				(
+					SELECT s.id
+					FROM symbols s
+					WHERE s.repo_id = ? AND s.qualified_name = n.dst_name
+					LIMIT 1
+				) AS dst_symbol_id
+			FROM distinct_names n
 		)
+		UPDATE edges
+		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.qualified_name = edges.dst_name)
+		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -1919,14 +1932,27 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 
 	// Strategy 2: Name match (unqualified)
 	res, err = tx.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ? AND s.name = edges.dst_name
-			AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
-			LIMIT 1
+		WITH distinct_names AS (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+		),
+		resolutions AS (
+			SELECT
+				n.dst_name,
+				(
+					SELECT s.id
+					FROM symbols s
+					WHERE s.repo_id = ? AND s.name = n.dst_name
+					AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+					LIMIT 1
+				) AS dst_symbol_id
+			FROM distinct_names n
 		)
+		UPDATE edges
+		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.name = edges.dst_name AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface'))
+		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -1954,18 +1980,28 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 
 	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething)
 	res, err = tx.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ?
-			AND s.name = edges.dst_name
-			AND s.container_name != ''
-			LIMIT 1
+		WITH distinct_names AS (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+		),
+		resolutions AS (
+			SELECT
+				n.dst_name,
+				(
+					SELECT s.id
+					FROM symbols s
+					WHERE s.repo_id = ?
+					AND s.name = n.dst_name
+					AND s.container_name != ''
+					LIMIT 1
+				) AS dst_symbol_id
+			FROM distinct_names n
 		)
+		UPDATE edges
+		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND EXISTS (
-			SELECT 1 FROM symbols s WHERE s.repo_id = ?
-			AND s.name = edges.dst_name AND s.container_name != ''
-		)
+		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -2379,11 +2415,6 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	}
 	stats.NamesUnique = len(unique)
 
-	nameSet := make(map[string]struct{}, len(unique))
-	for _, name := range unique {
-		nameSet[name] = struct{}{}
-	}
-
 	// Candidate selection:
 	//
 	// 1) Use indexed exact matches for dst_name = <name> (covers the common case
@@ -2454,16 +2485,16 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			return stats, err
 		}
 		stats.QualifiedScanned++
-		if _, ok := targetByID[id]; ok {
-			continue
-		}
-		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
-			if _, ok := nameSet[dstName[dot+1:]]; ok {
-				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
-				stats.SuffixHits++
+			if _, ok := targetByID[id]; ok {
+				continue
+			}
+			if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
+				if _, ok := seen[dstName[dot+1:]]; ok {
+					targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+					stats.SuffixHits++
+				}
 			}
 		}
-	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
 		return stats, err
@@ -2516,7 +2547,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if len(targets) == 0 {
 		return nil
 	}
-	qualifiedSet := map[string]struct{}{}
+	qualifiedSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		if target.dstName != "" {
 			qualifiedSet[target.dstName] = struct{}{}
@@ -2542,7 +2573,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return name
 	}
 
-	shortSet := map[string]struct{}{}
+	shortSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		if _, ok := byQualified[target.dstName]; ok {
 			continue
