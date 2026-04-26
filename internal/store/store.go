@@ -268,16 +268,10 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(6 * time.Second)
-	for {
-		if err := applyPragmas(db, isNewDB, opts.PerformanceProfile); err != nil {
-			if isSQLiteBusy(err) && time.Now().Before(deadline) {
-				time.Sleep(50 * time.Millisecond)
-				continue
-			}
-			return nil, err
-		}
-		break
+	if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
+		return applyPragmas(db, isNewDB, opts.PerformanceProfile)
+	}); err != nil {
+		return nil, err
 	}
 	s := &Store{db: db}
 	if err := s.Migrate(); err != nil {
@@ -312,12 +306,18 @@ func BuildSQLiteDSN(path string, opts OpenOptions, isNewDB bool, readOnly bool) 
 	return u.String(), nil
 }
 
-func isSQLiteBusy(err error) bool {
-	if err == nil {
-		return false
+func withSQLiteBusyRetry(timeout, interval time.Duration, fn func() error) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := fn(); err != nil {
+			if isSQLiteBusy(err) && time.Now().Before(deadline) {
+				time.Sleep(interval)
+				continue
+			}
+			return err
+		}
+		return nil
 	}
-	s := err.Error()
-	return strings.Contains(s, "database is locked") || strings.Contains(s, "SQLITE_BUSY")
 }
 
 func buildPragmas(isNewDB bool, profile string) []string {
@@ -416,19 +416,11 @@ func (s *Store) Migrate() error {
 		if _, err := fmt.Sscanf(name, "%d_", &version); err != nil {
 			continue
 		}
-		deadline := time.Now().Add(6 * time.Second)
-		for {
-			if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-				if isSQLiteBusy(err) {
-					if time.Now().After(deadline) {
-						return err
-					}
-					time.Sleep(50 * time.Millisecond)
-					continue
-				}
-				return err
-			}
-			break
+		if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
+			_, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`)
+			return err
+		}); err != nil {
+			return err
 		}
 
 		exists, err := hasMigrationConn(ctx, conn, version)
