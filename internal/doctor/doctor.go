@@ -165,7 +165,11 @@ func inspectDB(ctx context.Context, dbPath string) (*DBInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, true)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +187,11 @@ func inspectDB(ctx context.Context, dbPath string) (*DBInfo, error) {
 }
 
 func inspectDeepDB(ctx context.Context, dbPath string) (*DBDeepInfo, error) {
-	db, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, true)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), dsn)
 	if err != nil {
 		return nil, err
 	}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -259,7 +260,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	} else if st.Size() == 0 {
 		isNewDB = true
 	}
-	db, err := sql.Open(sqliteDriverName, path)
+	dsn, err := BuildSQLiteDSN(path, opts, isNewDB, false)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(sqliteDriverName, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -271,6 +276,62 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func BuildSQLiteDSN(path string, opts OpenOptions, isNewDB bool, readOnly bool) (string, error) {
+	pragmas := buildPragmas(isNewDB, opts.PerformanceProfile)
+	values := url.Values{}
+	if readOnly {
+		values.Set("mode", "ro")
+	}
+	for _, pragma := range pragmas {
+		values.Add("_pragma", pragma)
+	}
+	p := filepath.ToSlash(path)
+	u := url.URL{Scheme: "file"}
+	if strings.HasPrefix(p, "//") {
+		rest := strings.TrimPrefix(p, "//")
+		host, tail, _ := strings.Cut(rest, "/")
+		u.Host = host
+		u.Path = "/" + tail
+	} else {
+		if len(p) >= 2 && p[1] == ':' {
+			p = "/" + p
+		}
+		u.Path = p
+	}
+	u.RawQuery = values.Encode()
+	return u.String(), nil
+}
+
+func buildPragmas(isNewDB bool, profile string) []string {
+	base := []string{
+		`journal_mode(WAL)`,
+		`busy_timeout(5000)`,
+		`foreign_keys(ON)`,
+		`cache_size(-65536)`,
+	}
+	if isNewDB {
+		// auto_vacuum is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, switching auto_vacuum requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `auto_vacuum(INCREMENTAL)`)
+
+		// page_size is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, changing page_size requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `page_size(8192)`)
+	}
+	perf := strings.ToLower(strings.TrimSpace(profile))
+	switch perf {
+	case "", "balanced":
+		base = append(base, `synchronous(NORMAL)`, `temp_store(MEMORY)`)
+	case "durable":
+		base = append(base, `synchronous(FULL)`)
+	case "fast":
+		base = append(base, `synchronous(OFF)`, `temp_store(MEMORY)`)
+	default:
+		base = append(base, `synchronous(NORMAL)`, `temp_store(MEMORY)`)
+	}
+	return base
 }
 
 func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
@@ -322,41 +383,64 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate() error {
+	ctx := context.Background()
 	entries, err := fs.ReadDir(migrationFS, "schema")
 	if err != nil {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	for _, entry := range entries {
 		name := entry.Name()
 		var version int
 		if _, err := fmt.Sscanf(name, "%d_", &version); err != nil {
 			continue
 		}
-		exists, err := hasMigration(s.db, version)
+		deadline := time.Now().Add(6 * time.Second)
+		for {
+			if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+				if strings.Contains(err.Error(), "database is locked") || strings.Contains(err.Error(), "SQLITE_BUSY") {
+					if time.Now().After(deadline) {
+						return err
+					}
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				return err
+			}
+			break
+		}
+
+		exists, err := hasMigrationConn(ctx, conn, version)
 		if err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
 		if exists {
+			if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+				return err
+			}
 			continue
 		}
 		sqlBytes, err := migrationFS.ReadFile(filepath.ToSlash(filepath.Join("schema", name)))
 		if err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
-		tx, err := s.db.Begin()
-		if err != nil {
+		if _, err := conn.ExecContext(ctx, string(sqlBytes)); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
-		if _, err := tx.Exec(string(sqlBytes)); err != nil {
-			_ = tx.Rollback()
+		if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, version, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, version, time.Now().UTC().Format(time.RFC3339)); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
 	}
@@ -366,6 +450,18 @@ func (s *Store) Migrate() error {
 func hasMigration(db *sql.DB, version int) (bool, error) {
 	var exists int
 	err := db.QueryRow(`SELECT COUNT(1) FROM schema_migrations WHERE version = ?`, version).Scan(&exists)
+	if err == nil {
+		return exists > 0, nil
+	}
+	if strings.Contains(err.Error(), "no such table") {
+		return false, nil
+	}
+	return false, err
+}
+
+func hasMigrationConn(ctx context.Context, conn *sql.Conn, version int) (bool, error) {
+	var exists int
+	err := conn.QueryRowContext(ctx, `SELECT COUNT(1) FROM schema_migrations WHERE version = ?`, version).Scan(&exists)
 	if err == nil {
 		return exists > 0, nil
 	}
