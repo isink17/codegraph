@@ -1719,19 +1719,13 @@ func (c srcSymbolChooser) Choose(line int) int64 {
 	if i < 0 {
 		return c.fallback
 	}
-	var match int64
+	// Spans are monotonic by start line, but can be nested/overlapping.
+	// Scan backward from the last start<=line and return the most-specific match.
 	for j := i; j >= 0; j-- {
 		span := c.spans[j]
-		if line < span.start {
-			continue
+		if line >= span.start && line <= span.end {
+			return span.id
 		}
-		if line > span.end {
-			break
-		}
-		match = span.id
-	}
-	if match != 0 {
-		return match
 	}
 	return c.fallback
 }
