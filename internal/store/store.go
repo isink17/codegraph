@@ -1166,9 +1166,7 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 				end = len(ids)
 			}
 			chunk := ids[start:end]
-			placeholders := strings.Repeat("?,", len(chunk))
-			placeholders = strings.TrimSuffix(placeholders, ",")
-			query := sqlPrefix + placeholders + sqlSuffix
+			query := sqlPrefix + sqlitePlaceholders(len(chunk)) + sqlSuffix
 			args := make([]any, len(chunk))
 			for i, id := range chunk {
 				args[i] = id
@@ -1572,14 +1570,8 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 	}
 
 	args := make([]any, len(symbols)*15)
-	var b strings.Builder
-	b.WriteString("INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key) VALUES ")
 	argIdx := 0
-	for i, sym := range symbols {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+	for _, sym := range symbols {
 		args[argIdx+0] = repoID
 		args[argIdx+1] = fileID
 		args[argIdx+2] = sym.Language
@@ -1597,9 +1589,8 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		args[argIdx+14] = sym.StableKey
 		argIdx += 15
 	}
-	b.WriteString(" RETURNING id, stable_key")
 
-	rows, err := tx.QueryContext(ctx, b.String(), args...)
+	rows, err := tx.QueryContext(ctx, symbolInsertSQL(len(symbols)), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1629,6 +1620,34 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		stats.TotalExecStatements++
 	}
 	return out, nil
+}
+
+var symbolInsertSQLCache sync.Map // map[int]string
+
+func symbolInsertSQL(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if v, ok := symbolInsertSQLCache.Load(n); ok {
+		return v.(string)
+	}
+	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key) VALUES "
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const suffix = " RETURNING id, stable_key"
+
+	var b strings.Builder
+	b.Grow(len(prefix) + n*(len(row)+1) + len(suffix))
+	b.WriteString(prefix)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(row)
+	}
+	b.WriteString(suffix)
+	s := b.String()
+	actual, _ := symbolInsertSQLCache.LoadOrStore(n, s)
+	return actual.(string)
 }
 
 func execSymbolFTSInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
@@ -1684,6 +1703,28 @@ type insertSQLKey struct {
 }
 
 var insertSQLCache sync.Map // map[insertSQLKey]string
+
+var sqlitePlaceholdersCache sync.Map // map[int]string
+
+func sqlitePlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if v, ok := sqlitePlaceholdersCache.Load(n); ok {
+		return v.(string)
+	}
+	var b strings.Builder
+	b.Grow(n*2 - 1)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('?')
+	}
+	s := b.String()
+	actual, _ := sqlitePlaceholdersCache.LoadOrStore(n, s)
+	return actual.(string)
+}
 
 func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, rowsPerBatch int, args []any, stats *WriteStats) error {
 	if len(args) == 0 {
