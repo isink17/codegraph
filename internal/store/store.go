@@ -288,15 +288,20 @@ func BuildSQLiteDSN(path string, opts OpenOptions, isNewDB bool, readOnly bool) 
 		values.Add("_pragma", pragma)
 	}
 	p := filepath.ToSlash(path)
-	if len(p) >= 2 && p[1] == ':' {
-		p = "/" + p
+	u := url.URL{Scheme: "file"}
+	if strings.HasPrefix(p, "//") {
+		rest := strings.TrimPrefix(p, "//")
+		host, tail, _ := strings.Cut(rest, "/")
+		u.Host = host
+		u.Path = "/" + tail
+	} else {
+		if len(p) >= 2 && p[1] == ':' {
+			p = "/" + p
+		}
+		u.Path = p
 	}
-	p = strings.ReplaceAll(p, " ", "%20")
-	dsn := "file:" + p
-	if q := values.Encode(); q != "" {
-		dsn += "?" + q
-	}
-	return dsn, nil
+	u.RawQuery = values.Encode()
+	return u.String(), nil
 }
 
 func buildPragmas(isNewDB bool, profile string) []string {
@@ -384,57 +389,60 @@ func (s *Store) Migrate() error {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	for _, entry := range entries {
 		name := entry.Name()
 		var version int
 		if _, err := fmt.Sscanf(name, "%d_", &version); err != nil {
 			continue
 		}
-		conn, err := s.db.Conn(ctx)
-		if err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-			conn.Close()
-			return err
+		deadline := time.Now().Add(6 * time.Second)
+		for {
+			if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+				if strings.Contains(err.Error(), "database is locked") || strings.Contains(err.Error(), "SQLITE_BUSY") {
+					if time.Now().After(deadline) {
+						return err
+					}
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				return err
+			}
+			break
 		}
 
 		exists, err := hasMigrationConn(ctx, conn, version)
 		if err != nil {
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
-			conn.Close()
 			return err
 		}
 		if exists {
 			if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
-				conn.Close()
 				return err
 			}
-			conn.Close()
 			continue
 		}
 		sqlBytes, err := migrationFS.ReadFile(filepath.ToSlash(filepath.Join("schema", name)))
 		if err != nil {
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
-			conn.Close()
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, string(sqlBytes)); err != nil {
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
-			conn.Close()
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, version, time.Now().UTC().Format(time.RFC3339)); err != nil {
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
-			conn.Close()
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
-			conn.Close()
 			return err
 		}
-		conn.Close()
 	}
 	return nil
 }
