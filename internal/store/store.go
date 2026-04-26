@@ -16,6 +16,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -1263,7 +1264,7 @@ func insertParsedFileGraph(
 	parsed graph.ParsedFile,
 	stats *WriteStats,
 ) error {
-	stableToID := map[string]int64{}
+	stableToID := make(map[string]int64, len(parsed.Symbols))
 	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
 	symbolTokenWeights := make(map[string]float64, 64)
 	symbolFTSArgs := make([]any, 0, min(len(parsed.Symbols), sqliteSymbolFTSValuesBatchRows)*6)
@@ -1362,9 +1363,10 @@ func insertParsedFileGraph(
 	}
 
 	if len(parsed.Edges) > 0 {
+		srcChooser := newSrcSymbolChooser(stableToID, parsed.Symbols)
 		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*7)
 		for _, edge := range parsed.Edges {
-			srcID := chooseSrcSymbolID(stableToID, parsed.Symbols, edge.Line)
+			srcID := srcChooser.Choose(edge.Line)
 			if srcID == 0 {
 				continue
 			}
@@ -1418,7 +1420,7 @@ func insertParsedFileGraph(
 		}
 	}
 
-	targetKeySet := map[string]struct{}{}
+	targetKeySet := make(map[string]struct{}, len(parsed.TestLinks))
 	for _, link := range parsed.TestLinks {
 		if link.TargetStableKey != "" {
 			targetKeySet[link.TargetStableKey] = struct{}{}
@@ -1548,21 +1550,12 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 	if len(args) == 0 {
 		return nil
 	}
-	// Each row uses 3 params; batch sizes are controlled by sqliteTokenValuesBatchRows to stay under sqliteDefaultMaxVariables.
 	if len(args)%3 != 0 {
 		return fmt.Errorf("invalid token insert args len=%d", len(args))
 	}
 	rows := len(args) / 3
-	var b strings.Builder
-	fmt.Fprintf(&b, "INSERT INTO %s(%s, token, weight) VALUES ", table, idColumn)
-	for i := 0; i < rows; i++ {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("(?,?,?)")
-	}
-	_, err := tx.ExecContext(ctx, b.String(), args...)
-	if err != nil {
+	// Each row uses 3 params; batch sizes are controlled by sqliteTokenValuesBatchRows to stay under sqliteDefaultMaxVariables.
+	if err := execBatchInsert(ctx, tx, table, idColumn+", token, weight", 3, args, stats); err != nil {
 		return err
 	}
 	if stats != nil {
@@ -1579,6 +1572,15 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 	return nil
 }
 
+type insertSQLKey struct {
+	table   string
+	columns string
+	width   int
+	rows    int
+}
+
+var insertSQLCache sync.Map // map[insertSQLKey]string
+
 func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, rowsPerBatch int, args []any, stats *WriteStats) error {
 	if len(args) == 0 {
 		return nil
@@ -1587,22 +1589,27 @@ func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, row
 		return fmt.Errorf("invalid %s insert args len=%d (expected multiple of %d)", table, len(args), rowsPerBatch)
 	}
 	rowCount := len(args) / rowsPerBatch
-	var b strings.Builder
-	fmt.Fprintf(&b, "INSERT INTO %s(%s) VALUES ", table, columns)
-	for i := 0; i < rowCount; i++ {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("(")
-		for j := 0; j < rowsPerBatch; j++ {
-			if j > 0 {
+	key := insertSQLKey{table: table, columns: columns, width: rowsPerBatch, rows: rowCount}
+	queryAny, ok := insertSQLCache.Load(key)
+	if !ok {
+		var b strings.Builder
+		fmt.Fprintf(&b, "INSERT INTO %s(%s) VALUES ", table, columns)
+		for i := 0; i < rowCount; i++ {
+			if i > 0 {
 				b.WriteString(",")
 			}
-			b.WriteString("?")
+			b.WriteString("(")
+			for j := 0; j < rowsPerBatch; j++ {
+				if j > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("?")
+			}
+			b.WriteString(")")
 		}
-		b.WriteString(")")
+		queryAny, _ = insertSQLCache.LoadOrStore(key, b.String())
 	}
-	_, err := tx.ExecContext(ctx, b.String(), args...)
+	_, err := tx.ExecContext(ctx, queryAny.(string), args...)
 	if err != nil {
 		return err
 	}
@@ -1620,6 +1627,12 @@ func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, row
 		case "file_imports":
 			stats.ImportInsertBatches++
 			stats.ImportInsertRows += rowCount
+		case "symbol_tokens":
+			stats.SymbolTokenInsertBatches++
+			stats.SymbolTokenInsertRows += rowCount
+		case "file_tokens":
+			stats.FileTokenInsertBatches++
+			stats.FileTokenInsertRows += rowCount
 		}
 		stats.TotalExecStatements++
 	}
@@ -1651,16 +1664,70 @@ func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 
 	return 0
 }
 
-func chooseSrcSymbolID(stableToID map[string]int64, symbols []graph.Symbol, line int) int64 {
+type funcSpan struct {
+	start int
+	end   int
+	id    int64
+}
+
+type srcSymbolChooser struct {
+	spans     []funcSpan
+	fallback  int64
+	monotonic bool
+}
+
+func newSrcSymbolChooser(stableToID map[string]int64, symbols []graph.Symbol) srcSymbolChooser {
+	out := srcSymbolChooser{
+		spans:     make([]funcSpan, 0, 16),
+		monotonic: true,
+	}
+	lastStart := -1
 	for _, sym := range symbols {
 		if sym.Kind != "function" {
 			continue
 		}
-		if line >= sym.Range.StartLine && line <= sym.Range.EndLine {
-			return stableToID[sym.StableKey]
+		id := stableToID[sym.StableKey]
+		if id == 0 {
+			continue
+		}
+		if out.fallback == 0 {
+			out.fallback = id
+		}
+		start := sym.Range.StartLine
+		if start < lastStart {
+			out.monotonic = false
+		}
+		lastStart = start
+		out.spans = append(out.spans, funcSpan{start: start, end: sym.Range.EndLine, id: id})
+	}
+	return out
+}
+
+func (c srcSymbolChooser) Choose(line int) int64 {
+	if len(c.spans) == 0 {
+		return 0
+	}
+	if !c.monotonic {
+		for _, span := range c.spans {
+			if line >= span.start && line <= span.end {
+				return span.id
+			}
+		}
+		return c.fallback
+	}
+	i := sort.Search(len(c.spans), func(i int) bool { return c.spans[i].start > line }) - 1
+	if i < 0 {
+		return c.fallback
+	}
+	// Spans are monotonic by start line, but can be nested/overlapping.
+	// Scan backward from the last start<=line and return the most-specific match.
+	for j := i; j >= 0; j-- {
+		span := c.spans[j]
+		if line >= span.start && line <= span.end {
+			return span.id
 		}
 	}
-	return firstFunctionID(stableToID, symbols)
+	return c.fallback
 }
 
 func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (int, error) {
