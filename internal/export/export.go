@@ -341,21 +341,11 @@ func (s *Service) DOTStream(ctx context.Context, w io.Writer, repoID int64, page
 			break
 		}
 		for _, edge := range edges {
-			src := edge.SrcQualifiedName
-			if src == "" {
-				src = fmt.Sprintf("symbol#%d", edge.SrcSymbolID)
+			line := dotEdgeLine(edge)
+			if line == "" {
+				continue
 			}
-			dst := edge.DstQualifiedName
-			attrs := []string{}
-			if dst == "" {
-				dst = edge.DstName
-				if dst == "" {
-					continue
-				}
-				attrs = append(attrs, `style="dashed"`)
-			}
-			attrs = append(attrs, fmt.Sprintf(`label=%q`, edge.Kind))
-			if _, err = fmt.Fprintf(bw, "  %q -> %q [%s];\n", src, dst, strings.Join(attrs, ",")); err != nil {
+			if _, err = bw.WriteString(line); err != nil {
 				return err
 			}
 		}
@@ -390,24 +380,36 @@ func (s *Service) DOT(ctx context.Context, repoID int64, symbol string, depth in
 		b.WriteString(fmt.Sprintf("  %q;\n", n))
 	}
 	for _, edge := range edges {
-		src := edge.SrcQualifiedName
-		if src == "" {
-			src = fmt.Sprintf("symbol#%d", edge.SrcSymbolID)
+		line := dotEdgeLine(edge)
+		if line == "" {
+			continue
 		}
-		dst := edge.DstQualifiedName
-		attrs := []string{}
-		if dst == "" {
-			dst = edge.DstName
-			if dst == "" {
-				continue
-			}
-			attrs = append(attrs, `style="dashed"`)
-		}
-		attrs = append(attrs, fmt.Sprintf(`label=%q`, edge.Kind))
-		b.WriteString(fmt.Sprintf("  %q -> %q [%s];\n", src, dst, strings.Join(attrs, ",")))
+		b.WriteString(line)
 	}
 	b.WriteString("}\n")
 	return []byte(b.String()), nil
+}
+
+// dotEdgeLine renders a single DOT edge line (with trailing newline) or ""
+// when the edge has neither a resolved nor a fallback dst name. Shared by
+// DOT() and DOTStream so the resolved-vs-dashed-vs-skipped attribute logic
+// lives in exactly one place.
+func dotEdgeLine(edge store.ExportEdge) string {
+	src := edge.SrcQualifiedName
+	if src == "" {
+		src = fmt.Sprintf("symbol#%d", edge.SrcSymbolID)
+	}
+	dst := edge.DstQualifiedName
+	attrs := []string{}
+	if dst == "" {
+		dst = edge.DstName
+		if dst == "" {
+			return ""
+		}
+		attrs = append(attrs, `style="dashed"`)
+	}
+	attrs = append(attrs, fmt.Sprintf(`label=%q`, edge.Kind))
+	return fmt.Sprintf("  %q -> %q [%s];\n", src, dst, strings.Join(attrs, ","))
 }
 
 func pageSlice[T any](items []T, limit, offset int) []T {
