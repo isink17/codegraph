@@ -281,6 +281,81 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnlyLargeScale(b *testing.B) {
 	}
 }
 
+// BenchmarkResolveEdgesBySlashSuffix_DotTail2LargeScale stresses the
+// dot-tail2 sub-branch at the same scale as `_SlashOnlyLargeScale` (40k
+// total symbols). With the pre-016 / pre-dot_tail2 design the dot-tail2
+// branch always materialised the full repo symbols table in Go and
+// derived `tail2` per row — that grows ~O(symbols). The migration-017
+// schema-backed path turns the same matching into an indexed JOIN against
+// `symbols.dot_tail2`, which grows ~O(unique_needed_names) instead.
+func BenchmarkResolveEdgesBySlashSuffix_DotTail2LargeScale(b *testing.B) {
+	ctx := context.Background()
+	s := openBenchStore(b)
+	defer s.Close()
+
+	repoID := upsertBenchRepo(ctx, b, s)
+
+	const (
+		numFiles     = 200
+		numNames     = 20000
+		numNoiseSyms = 20000
+		numEdges     = 5000
+	)
+
+	fileIDs := makeBenchFiles(ctx, b, s, repoID, numFiles)
+	srcIDs := makeBenchSrcSymbols(ctx, b, s, repoID, fileIDs)
+
+	// Dot-tail2 targets: no slash, qualified_name has a leading segment
+	// before the matched 2-segment tail (e.g. "io.pkg_3.Func_42"). Mirrors
+	// `_DotTail2`'s qualified-name shape, scaled up to 20k.
+	for i := 0; i < numNames; i++ {
+		name := fmt.Sprintf("Func_%d", i)
+		qualified := fmt.Sprintf("io.pkg_%d.%s", i%50, name)
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
+			b.Fatalf("insertTestSymbol(dot-tail2 dst) error = %v", err)
+		}
+	}
+	// Slash-bearing noise symbols. Their `afterSlash` won't be in
+	// `neededSuffix` so they don't feed the slash branch, and once
+	// `dot_tail2` is in the schema they're indexed-out by the partial-index
+	// `WHERE dot_tail2 != ''` filter (slash-bearing names with no dot in
+	// `afterSlash` get an empty `dot_tail2`).
+	for i := 0; i < numNoiseSyms; i++ {
+		name := fmt.Sprintf("Noise_%d", i)
+		qualified := fmt.Sprintf("github.com/org/repo/noise/%s", name)
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
+			b.Fatalf("insertTestSymbol(noise) error = %v", err)
+		}
+	}
+
+	for i := 0; i < numEdges; i++ {
+		dstName := fmt.Sprintf("pkg_%d.Func_%d", i%50, i%numNames)
+		fileID := fileIDs[i%len(fileIDs)]
+		srcID := srcIDs[i%len(srcIDs)]
+		if _, err := insertTestEdge(ctx, s, repoID, fileID, srcID, dstName); err != nil {
+			b.Fatalf("insertTestEdge() error = %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			b.Fatalf("BeginTx() error = %v", err)
+		}
+		b.StartTimer()
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
+		}
+		b.StopTimer()
+		_ = tx.Rollback()
+	}
+}
+
 // BenchmarkResolveEdgesBySlashSuffix_NoUnresolved measures the steady-state
 // floor cost when every edge is already resolved (no candidate dst_names for
 // either suffix strategy). Captures the win from skipping the full symbols

@@ -130,10 +130,10 @@ func insertTestSymbol(ctx context.Context, s *Store, repoID, fileID int64, name,
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO symbols(
 			repo_id, file_id, language, kind, name, qualified_name,
-			start_line, start_col, end_line, end_col, stable_key, qualified_suffix
+			start_line, start_col, end_line, end_col, stable_key, qualified_suffix, dot_tail2
 		)
-		VALUES(?, ?, ?, ?, ?, ?, 1, 1, 1, 1, ?, ?)
-	`, repoID, fileID, "go", "function", name, qualified, qualified, qualifiedSuffix(qualified))
+		VALUES(?, ?, ?, ?, ?, ?, 1, 1, 1, 1, ?, ?, ?)
+	`, repoID, fileID, "go", "function", name, qualified, qualified, qualifiedSuffix(qualified), dotTail2(qualified))
 	if err != nil {
 		return 0, err
 	}
