@@ -1,8 +1,18 @@
-# codegraph
+<p align="center">
+  <img src="docs/banner.svg" alt="codegraph" width="100%"/>
+</p>
 
-**Your codebase, understood. Locally.**
+<p align="center">
+  <a href="https://github.com/isink17/codegraph/releases/latest"><img src="https://img.shields.io/github/v/release/isink17/codegraph?color=00ff88&style=flat-square&label=release" alt="Latest Release"/></a>
+  <a href="https://pkg.go.dev/github.com/isink17/codegraph"><img src="https://img.shields.io/badge/go-1.23+-00d4ff?style=flat-square&logo=go&logoColor=white" alt="Go version"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--MIT-ffaa44?style=flat-square" alt="License"/></a>
+  <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-8899aa?style=flat-square" alt="Platforms"/>
+  <img src="https://img.shields.io/badge/MCP%20tools-29-00ff88?style=flat-square" alt="MCP Tools"/>
+</p>
 
-`codegraph` is a local-first code context engine and MCP server that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — without sending a single byte to the cloud.
+<br/>
+
+`codegraph` is a **local-first code context engine and MCP server** that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — without sending a single byte to the cloud.
 
 **Single binary. Zero config. No external databases. No API keys.**
 
@@ -12,58 +22,72 @@
 
 AI coding assistants are powerful, but they spend most of their token budget *discovering* what to change — grepping files, reading code, reconstructing call graphs from partial evidence.
 
-**codegraph shifts that cost.** One tool call to `context_for_task` returns the exact files, symbols, and relationships an agent needs. One call to `agentic_query` gets a synthesized answer backed by graph traversal and semantic search.
-
-### How It Works
+**codegraph shifts that cost.** One call to `context_for_task` returns the exact files, symbols, and relationships an agent needs. One call to `agentic_query` gets a synthesized answer backed by graph traversal and semantic search.
 
 ```
-Your Code ──> tree-sitter AST ──> SQLite Graph ──> MCP Tools ──> AI Assistant
-                 │                    │                │
-            12 languages        symbols, edges     29 tools
-            framework detect    embeddings         agentic reasoning
-            import resolution   session memory     hybrid search
+❌ Without codegraph
+   AI reads files one by one → greps for patterns → burns tokens on context-gathering
+
+✅ With codegraph
+   AI calls context_for_task("add retry logic to HTTP client")
+   → instantly gets relevant files, functions, callers, callees, and tests
 ```
 
-**Without codegraph:** AI reads files one by one, grep for patterns, burns tokens on context-gathering.
+---
 
-**With codegraph:** AI calls `context_for_task("add retry logic to HTTP client")` and instantly gets the relevant files, functions, callers, callees, and tests.
+## How It Works
+
+```
+Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools ──▶ AI Assistant
+                    │                   │                │
+               12 languages       symbols, edges      29 tools
+               framework detect   embeddings          agentic reasoning
+               import resolution  session memory      hybrid search
+```
+
+`codegraph index .` walks your repo, parses every file with tree-sitter, resolves imports using four strategies (exact, name, suffix, method-receiver), and writes a fully-linked symbol graph into a local `codegraph.sqlite`. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no cloud, no Docker, no API keys.
 
 ---
 
 ## Features
 
-### Parsing & Indexing
-- **Tree-sitter parsing** for all 12 languages — robust AST extraction, not regex
-- **4-strategy import resolution** — exact, name, suffix, and method receiver matching
-- **Cross-language linking** — connects symbols across language boundaries
-- **Incremental updates** — only re-indexes changed files
-- **Framework detection** — recognizes 20+ frameworks (Express, Django, gin, React, Spring, Laravel, etc.)
+### 🔍 Parsing & Indexing
 
-### Search & Query
-- **Hybrid search** — vector similarity (via Ollama embeddings) + FTS5, fused with Reciprocal Rank Fusion
+- **Tree-sitter parsing** for all 12 supported languages — robust AST extraction, not regex
+- **4-strategy import resolution** — exact, name, suffix, and method-receiver matching
+- **Cross-language linking** — connects symbols across language boundaries
+- **Incremental updates** — only re-indexes changed files; fast on large repos
+- **Framework detection** — recognizes 20+ frameworks (Express, Django, gin, React, Spring, Laravel, …)
+
+### 🔎 Search & Query
+
+- **Hybrid search** — vector similarity (Ollama embeddings) + FTS5, fused with Reciprocal Rank Fusion
 - **Semantic search** — find code by meaning, not just text
 - **Call graph traversal** — callers, callees, transitive dependency chains
 - **Impact analysis** — know what breaks before you change it
 - **Dead code detection** — find symbols with zero references
 - **Architecture overview** — language breakdown, entry points, hub symbols, coupling metrics
 
-### AI Integration
-- **29 MCP tools** — comprehensive API for AI assistants
-- **Agentic reasoning** — ReAct loop over local Ollama LLM chains tools and synthesizes answers
+### 🤖 AI Integration
+
+- **29 MCP tools** — comprehensive API for AI coding assistants
+- **Agentic reasoning** — ReAct loop over a local Ollama LLM that chains tools and synthesizes answers
 - **Context building** — one tool call returns everything an agent needs for a task
 - **Session memory** — persist reads, edits, decisions, and facts across sessions
 - **Token benchmarking** — measure savings vs. naive file reading
 
-### Graph Analytics
+### 📊 Graph Analytics
+
 - **PageRank** — find the most important symbols in your codebase
 - **Coupling metrics** — identify tightly coupled file pairs
 - **Cycle detection** — find circular dependencies at the file level
 - **Interactive visualization** — D3.js force-directed graph with search and zoom
 
-### Developer Experience
+### 🛠 Developer Experience
+
 - **Single Go binary** — no runtime dependencies, cross-platform
 - **Zero-config SQLite** — no Docker, no external databases
-- **Auto-configure** — `codegraph install` detects and configures Claude Code, Cursor, Windsurf, Gemini CLI
+- **`codegraph install`** — auto-detects and configures Claude Code, Cursor, Windsurf, Gemini CLI
 - **File watching** — automatic re-indexing on changes
 - **100% local** — no data leaves your machine
 
@@ -74,7 +98,7 @@ Your Code ──> tree-sitter AST ──> SQLite Graph ──> MCP Tools ──>
 All languages use tree-sitter for AST parsing:
 
 | Language | Extensions |
-|----------|-----------|
+|---|---|
 | Go | `.go` |
 | Python | `.py` |
 | TypeScript | `.ts`, `.tsx` |
@@ -87,7 +111,8 @@ All languages use tree-sitter for AST parsing:
 | Swift | `.swift` |
 | PHP | `.php` |
 | C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc` |
-*does not completely support node yet.
+
+> Node.js repos are supported; full tree-sitter node support is still in progress.
 
 ---
 
@@ -99,13 +124,15 @@ All languages use tree-sitter for AST parsing:
 go install github.com/isink17/codegraph/cmd/codegraph@latest
 ```
 
+Requires Go 1.23+ and a C compiler (for tree-sitter CGo bindings).
+
 ### 2. Auto-configure your AI tool
 
 ```bash
 codegraph install
 ```
 
-This detects Claude Code, Cursor, Windsurf, and Gemini CLI and writes the MCP config automatically.
+Detects Claude Code, Cursor, Windsurf, and Gemini CLI and writes the MCP config automatically.
 
 ### 3. Index your project
 
@@ -120,7 +147,62 @@ codegraph index .
 codegraph serve --repo-root .
 ```
 
-That's it. Your AI assistant now has deep code understanding.
+That's it. Your AI assistant now has deep structural code understanding.
+
+---
+
+## MCP Setup
+
+### Auto-configure (recommended)
+
+```bash
+codegraph install
+```
+
+### Manual Setup
+
+<details>
+<summary><strong>Claude Code</strong> — add to <code>.mcp.json</code></summary>
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--repo-root", "."]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>Cursor / Windsurf</strong> — add to <code>mcp.json</code></summary>
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--repo-root", "."]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>Codex</strong> — add to <code>config.toml</code></summary>
+
+```toml
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["serve", "--repo-root", "/path/to/repo"]
+startup_timeout_sec = 60
+```
+</details>
+
+See the [`examples/`](examples/) directory for more configuration samples.
 
 ---
 
@@ -129,22 +211,22 @@ That's it. Your AI assistant now has deep code understanding.
 ### Code Intelligence
 
 | Tool | Description |
-|------|-------------|
+|---|---|
 | `find_symbol` | Find symbols by exact or fuzzy query |
 | `search_symbols` | Search symbol names, signatures, and docs (FTS5) |
-| `search_semantic` | Hybrid semantic search (vector + FTS when embeddings available) |
-| `find_callers` | Find what calls a function |
-| `find_callees` | Find what a function calls |
+| `search_semantic` | Hybrid semantic search (vector + FTS when embeddings enabled) |
+| `find_callers` | Find what calls a given function |
+| `find_callees` | Find what a given function calls |
 | `get_impact_radius` | Estimate affected symbols and files around a change |
 | `trace_dependencies` | Trace transitive dependency chains (upstream/downstream) |
 | `find_related_tests` | Find tests for a symbol, file, or set of changed files |
 | `find_dead_code` | Find symbols with no callers or references |
-| `context_for_task` | Build focused context bundle for a natural-language task |
+| `context_for_task` | Build a focused context bundle for a natural-language task |
 
 ### Architecture & Analysis
 
 | Tool | Description |
-|------|-------------|
+|---|---|
 | `architecture_overview` | Language breakdown, directories, entry points, hub symbols |
 | `graph_analytics` | PageRank, coupling metrics, or cycle detection |
 | `detect_frameworks` | Detect frameworks and libraries used in the repo |
@@ -154,7 +236,7 @@ That's it. Your AI assistant now has deep code understanding.
 ### Repository Management
 
 | Tool | Description |
-|------|-------------|
+|---|---|
 | `index_repo` | Index a repository into the local code graph |
 | `update_graph` | Update only changed files |
 | `list_files` | List indexed files with optional path filter |
@@ -162,12 +244,12 @@ That's it. Your AI assistant now has deep code understanding.
 | `supported_languages` | List supported languages and extensions |
 | `list_repos` | List known repositories |
 | `list_scans` | List recent scans |
-| `latest_scan_errors` | List scan errors |
+| `latest_scan_errors` | List indexer errors from the last scan |
 
 ### Session Memory
 
 | Tool | Description |
-|------|-------------|
+|---|---|
 | `session_log` | Log a session event (read, edit, decision, task, fact) |
 | `session_history` | Get session event history |
 | `session_hot_files` | Get most frequently accessed files |
@@ -176,37 +258,46 @@ That's it. Your AI assistant now has deep code understanding.
 ### Agentic
 
 | Tool | Description |
-|------|-------------|
-| `agentic_query` | Ask a question answered by an AI agent that reasons over the code graph (requires local Ollama) |
+|---|---|
+| `agentic_query` | Ask a question answered by a local AI agent that reasons over the code graph (requires Ollama) |
 
 ---
 
-## CLI Commands
+## CLI Reference
 
 ```bash
-codegraph install                  # Auto-configure AI tools
-codegraph index <path>             # Full index
-codegraph update <path>            # Incremental update
-codegraph stats <path>             # Graph statistics
-codegraph serve --repo-root <path> # Start MCP server
-codegraph watch <path>             # Watch and auto-reindex
+# Setup
+codegraph install                         # Auto-configure AI tools
+codegraph doctor                          # Check installation health
+codegraph config show                     # Show current config
 
-codegraph find-symbol <path> <query>        # Find symbols
-codegraph search <path> <query>             # Search symbols
-codegraph callers <path> --symbol <name>    # Find callers
-codegraph callees <path> --symbol <name>    # Find callees
-codegraph impact <path> --symbol <name>     # Impact analysis
+# Indexing
+codegraph index <path>                    # Full index
+codegraph update <path>                   # Incremental update
+codegraph watch <path>                    # Watch and auto-reindex
+codegraph clean <path>                    # Clean database
 
-codegraph affected-tests [--stdin] <files>  # Find tests affected by changes
-codegraph visualize --repo-root <path>      # Interactive graph visualization
+# MCP Server
+codegraph serve --repo-root <path>        # Start MCP server
 
+# Query
+codegraph stats <path>                    # Graph statistics
+codegraph find-symbol <path> <query>      # Find symbols
+codegraph search <path> <query>           # Full-text symbol search
+codegraph callers <path> --symbol <name>  # Find callers
+codegraph callees <path> --symbol <name>  # Find callees
+codegraph impact <path> --symbol <name>   # Impact analysis
+
+# Testing
+codegraph affected-tests [--stdin] <files>  # Tests affected by changed files
+
+# Visualization & Export
+codegraph visualize --repo-root <path>      # Interactive D3.js graph
 codegraph graph export <path> --format dot  # Export as Graphviz DOT
 codegraph graph export <path> --format json # Export as JSON
 
-codegraph doctor                   # Check installation
-codegraph config show              # Show config
-codegraph clean <path>             # Clean database
-codegraph benchmark                # Run benchmark
+# Benchmarking
+codegraph benchmark                         # Token savings benchmark
 ```
 
 ### Affected Tests with Git
@@ -222,71 +313,24 @@ go test $TESTS
 
 ---
 
-## MCP Setup
-
-### Auto-configure (recommended)
-
-```bash
-codegraph install
-```
-
-Automatically detects and configures Claude Code, Cursor, Windsurf, and Gemini CLI.
-
-### Manual Setup
-
-**Claude Code** — add to `.mcp.json`:
-```json
-{
-  "mcpServers": {
-    "codegraph": {
-      "command": "codegraph",
-      "args": ["serve", "--repo-root", "."]
-    }
-  }
-}
-```
-
-**Codex** — add to `config.toml`:
-```toml
-[mcp_servers.codegraph]
-command = "codegraph"
-args = ["serve", "--repo-root", "/path/to/repo"]
-startup_timeout_sec = 60
-```
-
-**Cursor / Windsurf** — add to `mcp.json`:
-```json
-{
-  "mcpServers": {
-    "codegraph": {
-      "command": "codegraph",
-      "args": ["serve", "--repo-root", "."]
-    }
-  }
-}
-```
-
-See `examples/` for more configuration samples.
-
----
-
 ## Optional: Embeddings & Agentic Mode
 
-codegraph works fully without any external services. For enhanced capabilities, you can optionally enable:
+codegraph works fully without any external services. Enable these for enhanced capabilities:
 
 ### Vector Embeddings (via Ollama)
 
 Enables hybrid semantic search (vector + FTS):
 
 ```bash
-# Install and start Ollama
+# Install and pull embedding model
 ollama pull nomic-embed-text
 
-# Enable in repo config
+# Initialize repo config
 codegraph config init --repo .
 ```
 
 Edit `.codegraph/config.json`:
+
 ```json
 {
   "embedding": {
@@ -296,20 +340,22 @@ Edit `.codegraph/config.json`:
 }
 ```
 
-Re-index to generate embeddings:
+Then re-index to generate embeddings:
+
 ```bash
 codegraph index . --force
 ```
 
 ### Agentic Reasoning (via Ollama)
 
-The `agentic_query` tool uses a local LLM to reason over the graph:
+The `agentic_query` tool uses a local LLM to reason over the graph with a ReAct loop:
 
 ```bash
 ollama pull llama3.2
 ```
 
 Edit `.codegraph/config.json`:
+
 ```json
 {
   "agent": {
@@ -325,10 +371,11 @@ Edit `.codegraph/config.json`:
 
 ### Global config
 
-Located at the standard OS config directory:
-- **Windows:** `%AppData%\codegraph\config.json`
-- **macOS:** `~/Library/Application Support/codegraph/config.json`
-- **Linux:** `${XDG_CONFIG_HOME:-~/.config}/codegraph/config.json`
+| Platform | Path |
+|---|---|
+| macOS | `~/Library/Application Support/codegraph/config.json` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/codegraph/config.json` |
+| Windows | `%AppData%\codegraph\config.json` |
 
 ### Repo config
 
@@ -353,13 +400,14 @@ Created with `codegraph config init --repo .` at `.codegraph/config.json`:
 ### Ignore file
 
 Create `.codegraphignore` in the repo root (same syntax as `.gitignore`):
+
 ```
 build/
 dist/
 *.generated.go
 ```
 
-Note: `.codegraph/` is always skipped by the indexer (repo-local config/artifacts).
+> **Note:** Common generated directories (`node_modules`, `.next`, `.nuxt`, etc.) are always skipped and cannot be un-ignored.
 
 ---
 
@@ -374,7 +422,7 @@ internal/
   embedding/            Vector embedding (Ollama HTTP client)
   export/               JSON and DOT graph export
   framework/            Framework detection (20+ frameworks)
-  graph/                Core types (Symbol, Edge, Reference, etc.)
+  graph/                Core types (Symbol, Edge, Reference, …)
   indexer/              Repository scan, incremental updates, embedding
   mcp/                  MCP stdio server (29 tools)
   parser/               Parser interface and adapters
@@ -390,19 +438,21 @@ internal/
 
 ---
 
-## Build
+## Building from Source
 
 ```bash
+git clone https://github.com/isink17/codegraph
+cd codegraph
 go build ./cmd/codegraph
 go test ./...
 ```
 
-Requires Go 1.26+ and a C compiler (for tree-sitter CGo bindings).
+Requires Go 1.23+ and a C compiler for the tree-sitter CGo bindings.
 
 ---
 
 ## License
 
-This project is licensed under the Functional Source License, Version 1.1, MIT Future License (`FSL-1.1-MIT`).
+This project is licensed under the **Functional Source License, Version 1.1, MIT Future License** (`FSL-1.1-MIT`).
 
-On the second anniversary of each version's release, that version converts to the MIT License. See `LICENSE` for details.
+On the second anniversary of each version's release, that version converts to the MIT License. See [`LICENSE`](LICENSE) for full terms.
