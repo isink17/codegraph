@@ -16,7 +16,7 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnly(b *testing.B) {
 	s := openBenchStore(b)
 	defer s.Close()
 
-	repo := upsertBenchRepo(ctx, b, s)
+	repoID := upsertBenchRepo(ctx, b, s)
 
 	const (
 		numFiles       = 100
@@ -26,15 +26,15 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnly(b *testing.B) {
 		dstQNamePrefix = "github.com/org/repo/pkg/"
 	)
 
-	fileIDs := makeBenchFiles(ctx, b, s, repo.ID, numFiles)
-	srcIDs := makeBenchSrcSymbols(ctx, b, s, repo.ID, fileIDs)
+	fileIDs := makeBenchFiles(ctx, b, s, repoID, numFiles)
+	srcIDs := makeBenchSrcSymbols(ctx, b, s, repoID, fileIDs)
 
 	// Slash-qualified target symbols: qualified_name has a '/', name part has no dot.
 	for i := 0; i < numNames; i++ {
 		name := fmt.Sprintf("Func_%d", i)
 		qualified := fmt.Sprintf("%spkg_%d/%s", dstQNamePrefix, i%50, name)
 		fileID := fileIDs[i%len(fileIDs)]
-		if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, name, qualified); err != nil {
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
 			b.Fatalf("insertTestSymbol(slash dst) error = %v", err)
 		}
 	}
@@ -43,7 +43,7 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnly(b *testing.B) {
 		name := fmt.Sprintf("Noise_%d", i)
 		qualified := fmt.Sprintf("noise.%s", name)
 		fileID := fileIDs[i%len(fileIDs)]
-		if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, name, qualified); err != nil {
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
 			b.Fatalf("insertTestSymbol(noise) error = %v", err)
 		}
 	}
@@ -53,7 +53,7 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnly(b *testing.B) {
 		dstName := fmt.Sprintf("Func_%d", i%numNames)
 		fileID := fileIDs[i%len(fileIDs)]
 		srcID := srcIDs[i%len(srcIDs)]
-		if _, err := insertTestEdge(ctx, s, repo.ID, fileID, srcID, dstName); err != nil {
+		if _, err := insertTestEdge(ctx, s, repoID, fileID, srcID, dstName); err != nil {
 			b.Fatalf("insertTestEdge() error = %v", err)
 		}
 	}
@@ -67,7 +67,7 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnly(b *testing.B) {
 			b.Fatalf("BeginTx() error = %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repo.ID); err != nil {
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -84,7 +84,7 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 	s := openBenchStore(b)
 	defer s.Close()
 
-	repo := upsertBenchRepo(ctx, b, s)
+	repoID := upsertBenchRepo(ctx, b, s)
 
 	const (
 		numFiles     = 100
@@ -93,8 +93,8 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 		numEdges     = 5000
 	)
 
-	fileIDs := makeBenchFiles(ctx, b, s, repo.ID, numFiles)
-	srcIDs := makeBenchSrcSymbols(ctx, b, s, repo.ID, fileIDs)
+	fileIDs := makeBenchFiles(ctx, b, s, repoID, numFiles)
+	srcIDs := makeBenchSrcSymbols(ctx, b, s, repoID, fileIDs)
 
 	// Dot-tail2 target symbols: no slash, qualified_name has a leading segment
 	// before the matched 2-segment tail (e.g., "io.pkg_3.Func_42").
@@ -102,7 +102,7 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 		name := fmt.Sprintf("Func_%d", i)
 		qualified := fmt.Sprintf("io.pkg_%d.%s", i%50, name)
 		fileID := fileIDs[i%len(fileIDs)]
-		if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, name, qualified); err != nil {
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
 			b.Fatalf("insertTestSymbol(dot-tail2 dst) error = %v", err)
 		}
 	}
@@ -112,7 +112,7 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 		name := fmt.Sprintf("Noise_%d", i)
 		qualified := fmt.Sprintf("github.com/org/repo/noise/%s", name)
 		fileID := fileIDs[i%len(fileIDs)]
-		if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, name, qualified); err != nil {
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
 			b.Fatalf("insertTestSymbol(noise) error = %v", err)
 		}
 	}
@@ -122,7 +122,7 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 		dstName := fmt.Sprintf("pkg_%d.Func_%d", i%50, i%numNames)
 		fileID := fileIDs[i%len(fileIDs)]
 		srcID := srcIDs[i%len(srcIDs)]
-		if _, err := insertTestEdge(ctx, s, repo.ID, fileID, srcID, dstName); err != nil {
+		if _, err := insertTestEdge(ctx, s, repoID, fileID, srcID, dstName); err != nil {
 			b.Fatalf("insertTestEdge() error = %v", err)
 		}
 	}
@@ -136,7 +136,7 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 			b.Fatalf("BeginTx() error = %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repo.ID); err != nil {
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -152,7 +152,7 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 	s := openBenchStore(b)
 	defer s.Close()
 
-	repo := upsertBenchRepo(ctx, b, s)
+	repoID := upsertBenchRepo(ctx, b, s)
 
 	const (
 		numFiles     = 100
@@ -161,8 +161,8 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 		numEdges     = 5000
 	)
 
-	fileIDs := makeBenchFiles(ctx, b, s, repo.ID, numFiles)
-	srcIDs := makeBenchSrcSymbols(ctx, b, s, repo.ID, fileIDs)
+	fileIDs := makeBenchFiles(ctx, b, s, repoID, numFiles)
+	srcIDs := makeBenchSrcSymbols(ctx, b, s, repoID, fileIDs)
 
 	// Multi-dot target symbols: qualified_name = "x.<dst_name>" so the LIKE
 	// '%.<dst_name>' suffix match resolves them.
@@ -170,7 +170,7 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 		dstSuffix := fmt.Sprintf("a_%d.b_%d.c_%d", i%50, i%25, i)
 		qualified := "x." + dstSuffix
 		fileID := fileIDs[i%len(fileIDs)]
-		if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, fmt.Sprintf("c_%d", i), qualified); err != nil {
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, fmt.Sprintf("c_%d", i), qualified); err != nil {
 			b.Fatalf("insertTestSymbol(dot-suffix dst) error = %v", err)
 		}
 	}
@@ -179,7 +179,7 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 		name := fmt.Sprintf("Noise_%d", i)
 		qualified := fmt.Sprintf("noise.%s", name)
 		fileID := fileIDs[i%len(fileIDs)]
-		if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, name, qualified); err != nil {
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
 			b.Fatalf("insertTestSymbol(noise) error = %v", err)
 		}
 	}
@@ -191,7 +191,7 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 		dstName := fmt.Sprintf("a_%d.b_%d.c_%d", nameIdx%50, nameIdx%25, nameIdx)
 		fileID := fileIDs[i%len(fileIDs)]
 		srcID := srcIDs[i%len(srcIDs)]
-		if _, err := insertTestEdge(ctx, s, repo.ID, fileID, srcID, dstName); err != nil {
+		if _, err := insertTestEdge(ctx, s, repoID, fileID, srcID, dstName); err != nil {
 			b.Fatalf("insertTestEdge() error = %v", err)
 		}
 	}
@@ -205,7 +205,7 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 			b.Fatalf("BeginTx() error = %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repo.ID); err != nil {
+		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
 			b.Fatalf("resolveEdgesByDotSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -224,15 +224,13 @@ func openBenchStore(b *testing.B) *Store {
 	return s
 }
 
-func upsertBenchRepo(ctx context.Context, b *testing.B, s *Store) struct {
-	ID int64
-} {
+func upsertBenchRepo(ctx context.Context, b *testing.B, s *Store) int64 {
 	b.Helper()
 	repo, err := s.UpsertRepo(ctx, b.TempDir())
 	if err != nil {
 		b.Fatalf("UpsertRepo() error = %v", err)
 	}
-	return struct{ ID int64 }{ID: repo.ID}
+	return repo.ID
 }
 
 func makeBenchFiles(ctx context.Context, b *testing.B, s *Store, repoID int64, n int) []int64 {
