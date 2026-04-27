@@ -59,9 +59,9 @@ const (
 	// 128*7=896 variables, staying under sqliteDefaultMaxVariables.
 	sqliteTestLinkValuesBatchRows = 128
 
-	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 17 parameters.
-	// 58*17=986 variables, staying under sqliteDefaultMaxVariables.
-	sqliteSymbolValuesBatchRows = 58
+	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 18 parameters.
+	// 55*18=990 variables, staying under sqliteDefaultMaxVariables.
+	sqliteSymbolValuesBatchRows = 55
 	// sqliteSymbolFTSValuesBatchRows controls multi-row inserts into symbol_fts where each row uses 6 parameters.
 	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteSymbolFTSValuesBatchRows = 150
@@ -1591,7 +1591,7 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		return map[string]int64{}, nil
 	}
 
-	args := make([]any, len(symbols)*17)
+	args := make([]any, len(symbols)*18)
 	argIdx := 0
 	for _, sym := range symbols {
 		args[argIdx+0] = repoID
@@ -1611,7 +1611,8 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		args[argIdx+14] = sym.StableKey
 		args[argIdx+15] = qualifiedSuffix(sym.QualifiedName)
 		args[argIdx+16] = dotTail2(sym.QualifiedName)
-		argIdx += 17
+		args[argIdx+17] = dotTail3(sym.QualifiedName)
+		argIdx += 18
 	}
 
 	rows, err := tx.QueryContext(ctx, symbolInsertSQL(len(symbols)), args...)
@@ -1655,8 +1656,8 @@ func symbolInsertSQL(n int) string {
 	if v, ok := symbolInsertSQLCache.Load(n); ok {
 		return v.(string)
 	}
-	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2) VALUES "
-	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2, dot_tail3) VALUES "
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 	const suffix = " RETURNING id, stable_key"
 
 	var b strings.Builder
@@ -2307,6 +2308,37 @@ func qualifiedSuffix(qname string) string {
 	return ""
 }
 
+// dotTail3 returns the last three dot-separated segments of `qname`'s
+// after-slash portion when that portion has at least three dots
+// (i.e., at least four segments). Empty otherwise — including the case
+// where `afterSlash` has exactly three segments, because such a qname
+// can never match a `LIKE '%.' || dst_name` pattern (no preceding `.`
+// before the leading segment). Persisted in `symbols.dot_tail3` so
+// `resolveEdgesByDotSuffix`'s 2-dot dst_name path can do an indexed
+// equality JOIN against `idx_symbols_repo_dot_tail3` instead of a
+// repo-wide LIKE scan.
+func dotTail3(qname string) string {
+	afterSlash := qualifiedSuffix(qname)
+	if afterSlash == "" {
+		afterSlash = qname
+	}
+	dots := strings.Count(afterSlash, ".")
+	if dots < 3 {
+		return ""
+	}
+	rest := afterSlash
+	// Strip leading "<segment>." (dots-2) times so `rest` becomes the last
+	// three segments. e.g. "a.b.c.d.e" with dots=4 strips twice → "c.d.e".
+	for i := 0; i < dots-2; i++ {
+		idx := strings.IndexByte(rest, '.')
+		if idx < 0 {
+			return ""
+		}
+		rest = rest[idx+1:]
+	}
+	return rest
+}
+
 // dotTail2 returns the last two dot-separated segments of `qname`'s
 // after-slash portion (matching the SQL CASE in migration 017's backfill).
 // Empty when there's no dot in afterSlash. Persisted in
@@ -2330,6 +2362,22 @@ func dotTail2(qname string) string {
 }
 
 func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	totalResolved := 0
+
+	// Schema-backed prelude: 2-dot, no-slash dst_names match exactly the
+	// last three segments of `afterSlash`, which is persisted in
+	// `symbols.dot_tail3` (migration 018) + indexed by
+	// `idx_symbols_repo_dot_tail3`. An indexed equality JOIN replaces the
+	// per-distinct-dst-name LIKE scan for this dominant multi-dot case.
+	// dst_names with ≥3 dots fall through to the LIKE fallback below.
+	{
+		n, err := s.resolveEdgesByDotTail3(ctx, tx, repoID)
+		if err != nil {
+			return totalResolved, err
+		}
+		totalResolved += n
+	}
+
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_dot_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
 		return 0, err
 	}
@@ -2382,6 +2430,92 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 	}
 	dropped = true
 	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	totalResolved += int(n)
+	return totalResolved, nil
+}
+
+// resolveEdgesByDotTail3 handles the 2-dot, no-slash dst_name case via the
+// schema-backed `symbols.dot_tail3` partial index (migration 018). The
+// matching predicate is the same as the LIKE pattern
+// `qualified_name LIKE '%.' || dst_name` for 2-dot dst_names, but bound
+// to an equality JOIN that scales with the unique-needed-name count
+// instead of total symbols.
+func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_needed_tail3(dst_name TEXT PRIMARY KEY)`); err != nil {
+		return 0, err
+	}
+	droppedNeeded := false
+	defer func() {
+		if droppedNeeded {
+			return
+		}
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_resolver_needed_tail3`)
+	}()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_needed_tail3`); err != nil {
+		return 0, err
+	}
+
+	// Seed with distinct unresolved dst_names that have exactly 2 dots and
+	// no slash. (Length-of-string minus length-of-dotless-string == 2 dots.)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO tmp_resolver_needed_tail3(dst_name)
+		SELECT DISTINCT dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL
+		AND instr(dst_name, '/') = 0
+		AND length(dst_name) - length(replace(dst_name, '.', '')) = 2
+	`, repoID); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_dot_tail3(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		return 0, err
+	}
+	droppedDotTail3 := false
+	defer func() {
+		if droppedDotTail3 {
+			return
+		}
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_dot_tail3`)
+	}()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_dot_tail3`); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tmp_symbol_dot_tail3(dst_name, dst_symbol_id)
+		SELECT n.dst_name, MIN(s.id)
+		FROM tmp_resolver_needed_tail3 n
+		JOIN symbols s
+		  ON s.repo_id = ?
+		 AND s.dot_tail3 = n.dst_name
+		WHERE s.dot_tail3 != ''
+		GROUP BY n.dst_name
+	`, repoID); err != nil {
+		return 0, err
+	}
+
+	updateRes, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_dot_tail3 t WHERE t.dst_name = edges.dst_name)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_dot_tail3)
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_dot_tail3`); err != nil {
+		return 0, err
+	}
+	droppedDotTail3 = true
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_tail3`); err != nil {
+		return 0, err
+	}
+	droppedNeeded = true
+	n, err := updateRes.RowsAffected()
 	if err != nil {
 		return 0, err
 	}

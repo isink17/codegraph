@@ -213,6 +213,78 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 	}
 }
 
+// BenchmarkResolveEdgesByDotSuffixLargeScale stresses
+// resolveEdgesByDotSuffix at the same scale as `_SlashOnlyLargeScale` /
+// `_DotTail2LargeScale` (40k total symbols, of which 20k carry a multi-dot
+// `qualified_name` shape that the LIKE-suffix subquery must scan against).
+// dst_names match the strategy's multi-dot, no-slash pre-filter, and the
+// per-row correlated subquery `s.qualified_name LIKE '%.' || e.dst_name`
+// is unindexable — this fixture is the natural stress for whether the
+// remaining LIKE path warrants a schema-backed equality JOIN.
+func BenchmarkResolveEdgesByDotSuffixLargeScale(b *testing.B) {
+	ctx := context.Background()
+	s := openBenchStore(b)
+	defer s.Close()
+
+	repoID := upsertBenchRepo(ctx, b, s)
+
+	const (
+		numFiles     = 200
+		numNames     = 20000
+		numNoiseSyms = 20000
+		numEdges     = 5000
+	)
+
+	fileIDs := makeBenchFiles(ctx, b, s, repoID, numFiles)
+	srcIDs := makeBenchSrcSymbols(ctx, b, s, repoID, fileIDs)
+
+	// Multi-dot target symbols: qualified_name has a leading segment before
+	// the matched 3-segment tail, so `LIKE '%.' || dst_name` matches the
+	// last three segments. Mirrors the small-scale `_DotSuffix` shape.
+	for i := 0; i < numNames; i++ {
+		dstSuffix := fmt.Sprintf("a_%d.b_%d.c_%d", i%50, i%25, i)
+		qualified := "x." + dstSuffix
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, fmt.Sprintf("c_%d", i), qualified); err != nil {
+			b.Fatalf("insertTestSymbol(dot-suffix dst) error = %v", err)
+		}
+	}
+	for i := 0; i < numNoiseSyms; i++ {
+		name := fmt.Sprintf("Noise_%d", i)
+		qualified := fmt.Sprintf("noise.%s", name)
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
+			b.Fatalf("insertTestSymbol(noise) error = %v", err)
+		}
+	}
+
+	for i := 0; i < numEdges; i++ {
+		nameIdx := i % numNames
+		dstName := fmt.Sprintf("a_%d.b_%d.c_%d", nameIdx%50, nameIdx%25, nameIdx)
+		fileID := fileIDs[i%len(fileIDs)]
+		srcID := srcIDs[i%len(srcIDs)]
+		if _, err := insertTestEdge(ctx, s, repoID, fileID, srcID, dstName); err != nil {
+			b.Fatalf("insertTestEdge() error = %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			b.Fatalf("BeginTx() error = %v", err)
+		}
+		b.StartTimer()
+		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
+			b.Fatalf("resolveEdgesByDotSuffix() error = %v", err)
+		}
+		b.StopTimer()
+		_ = tx.Rollback()
+	}
+}
+
 // BenchmarkResolveEdgesBySlashSuffix_SlashOnlyLargeScale stresses the slash
 // branch with 20k slash-qualified targets + 20k noise symbols. The Go-scan +
 // hash-filter path is O(symbols), so it grows ~linearly with this fixture
