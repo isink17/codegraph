@@ -3626,6 +3626,36 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 	return scanSymbols(rows)
 }
 
+// ExportDOTNodeNamesPage yields the unique, non-empty qualified_name values
+// for the repo in stable alphabetical order, paged. It exists so DOTStream
+// can emit deduped + sorted DOT node lines without materialising the full
+// `[]graph.Symbol` slice (peak memory on the no-focus DOT path was
+// previously O(repo) in `Symbol`-sized rows; this trims it to O(pageSize)
+// in plain strings).
+func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT qualified_name
+		FROM symbols
+		WHERE repo_id = ? AND qualified_name <> ''
+		ORDER BY qualified_name ASC
+		LIMIT ?
+		OFFSET ?
+	`, repoID, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, limit)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line

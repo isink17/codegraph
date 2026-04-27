@@ -291,6 +291,73 @@ func (s *Service) StreamJSONL(ctx context.Context, w io.Writer, repoID int64, pa
 	return enc.Encode(map[string]any{"type": "graph_done"})
 }
 
+// DOTStream emits the same `digraph codegraph { ... }` shape as `DOT()`
+// (no-focus only) but pages nodes via `ExportDOTNodeNamesPage` (server-side
+// `SELECT DISTINCT qualified_name ... ORDER BY qualified_name`) and edges
+// via `ExportEdgesPage`, writing incrementally to `w`. Peak memory drops
+// from O(repo) (full `[]graph.Symbol` + `[]ExportEdge` slices plus the
+// strings.Builder buffer) to O(pageSize). Edge ordering follows
+// `ExportEdgesPage` (ID ASC) instead of `loadEdgesForExport`'s insertion
+// order; both are unspecified by `DOT()`'s contract.
+func (s *Service) DOTStream(ctx context.Context, w io.Writer, repoID int64, pageSize int) (err error) {
+	if pageSize <= 0 {
+		pageSize = 500
+	}
+	bw := bufio.NewWriterSize(w, 64*1024)
+	defer func() {
+		if flushErr := bw.Flush(); flushErr != nil && err == nil {
+			err = flushErr
+		}
+	}()
+
+	if _, err = bw.WriteString("digraph codegraph {\n"); err != nil {
+		return err
+	}
+
+	offset := 0
+	for {
+		names, e := s.query.ExportDOTNodeNamesPage(ctx, repoID, pageSize, offset)
+		if e != nil {
+			return e
+		}
+		if len(names) == 0 {
+			break
+		}
+		for _, n := range names {
+			if _, err = fmt.Fprintf(bw, "  %q;\n", n); err != nil {
+				return err
+			}
+		}
+		offset += len(names)
+	}
+
+	offset = 0
+	for {
+		edges, e := s.query.ExportEdgesPage(ctx, repoID, pageSize, offset)
+		if e != nil {
+			return e
+		}
+		if len(edges) == 0 {
+			break
+		}
+		for _, edge := range edges {
+			line := dotEdgeLine(edge)
+			if line == "" {
+				continue
+			}
+			if _, err = bw.WriteString(line); err != nil {
+				return err
+			}
+		}
+		offset += len(edges)
+	}
+
+	if _, err = bw.WriteString("}\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Service) DOT(ctx context.Context, repoID int64, symbol string, depth int) ([]byte, error) {
 	symbols, edges, err := s.query.GraphSnapshot(ctx, repoID, symbol, depth)
 	if err != nil {
@@ -313,24 +380,36 @@ func (s *Service) DOT(ctx context.Context, repoID int64, symbol string, depth in
 		b.WriteString(fmt.Sprintf("  %q;\n", n))
 	}
 	for _, edge := range edges {
-		src := edge.SrcQualifiedName
-		if src == "" {
-			src = fmt.Sprintf("symbol#%d", edge.SrcSymbolID)
+		line := dotEdgeLine(edge)
+		if line == "" {
+			continue
 		}
-		dst := edge.DstQualifiedName
-		attrs := []string{}
-		if dst == "" {
-			dst = edge.DstName
-			if dst == "" {
-				continue
-			}
-			attrs = append(attrs, `style="dashed"`)
-		}
-		attrs = append(attrs, fmt.Sprintf(`label=%q`, edge.Kind))
-		b.WriteString(fmt.Sprintf("  %q -> %q [%s];\n", src, dst, strings.Join(attrs, ",")))
+		b.WriteString(line)
 	}
 	b.WriteString("}\n")
 	return []byte(b.String()), nil
+}
+
+// dotEdgeLine renders a single DOT edge line (with trailing newline) or ""
+// when the edge has neither a resolved nor a fallback dst name. Shared by
+// DOT() and DOTStream so the resolved-vs-dashed-vs-skipped attribute logic
+// lives in exactly one place.
+func dotEdgeLine(edge store.ExportEdge) string {
+	src := edge.SrcQualifiedName
+	if src == "" {
+		src = fmt.Sprintf("symbol#%d", edge.SrcSymbolID)
+	}
+	dst := edge.DstQualifiedName
+	attrs := []string{}
+	if dst == "" {
+		dst = edge.DstName
+		if dst == "" {
+			return ""
+		}
+		attrs = append(attrs, `style="dashed"`)
+	}
+	attrs = append(attrs, fmt.Sprintf(`label=%q`, edge.Kind))
+	return fmt.Sprintf("  %q -> %q [%s];\n", src, dst, strings.Join(attrs, ","))
 }
 
 func pageSlice[T any](items []T, limit, offset int) []T {

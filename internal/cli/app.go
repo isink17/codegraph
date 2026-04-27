@@ -1407,6 +1407,14 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		return exp.StreamJSONL(ctx, stdout, repoID, *limit)
 	}
 	if *format == "dot" {
+		// Unbounded no-focus DOT: stream nodes via paged DISTINCT
+		// qualified_name and edges via ExportEdgesPage so peak memory is
+		// O(pageSize) instead of O(repo). Focused DOT (--symbol) keeps the
+		// byte-slice GraphSnapshot path because the bounded subgraph is
+		// already O(subgraph) and matches the focused-edge dedup shape.
+		if selectedSymbol == "" {
+			return exp.DOTStream(ctx, stdout, repoID, 0)
+		}
 		out, err := exp.DOT(ctx, repoID, selectedSymbol, 2)
 		if err != nil {
 			return err

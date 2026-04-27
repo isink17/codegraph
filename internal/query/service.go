@@ -65,7 +65,7 @@ func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files 
 	if limit <= 0 {
 		limit = 20
 	}
-perFileLimit := min(max(50, limit+offset), 1000)
+	perFileLimit := min(max(50, limit+offset), 1000)
 
 	seen := map[string]bool{}
 	var all []store.RelatedTest
@@ -137,6 +137,10 @@ func (s *Service) ExportSymbolsPage(ctx context.Context, repoID int64, limit, of
 
 func (s *Service) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]store.ExportEdge, error) {
 	return s.store.ExportEdgesPage(ctx, repoID, limit, offset)
+}
+
+func (s *Service) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
+	return s.store.ExportDOTNodeNamesPage(ctx, repoID, limit, offset)
 }
 
 func (s *Service) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth int) ([]map[string]any, error) {
