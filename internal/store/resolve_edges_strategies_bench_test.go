@@ -213,6 +213,74 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 	}
 }
 
+// BenchmarkResolveEdgesBySlashSuffix_SlashOnlyLargeScale stresses the slash
+// branch with 20k slash-qualified targets + 20k noise symbols. The Go-scan +
+// hash-filter path is O(symbols), so it grows ~linearly with this fixture
+// size; the schema-backed indexed JOIN against `qualified_suffix`
+// (migration 016) grows ~O(unique_needed_names) and should pull ahead at
+// scale. Companion bench to `_SlashOnly` (2k symbols), which is too small for
+// the scan cost to dominate.
+func BenchmarkResolveEdgesBySlashSuffix_SlashOnlyLargeScale(b *testing.B) {
+	ctx := context.Background()
+	s := openBenchStore(b)
+	defer s.Close()
+
+	repoID := upsertBenchRepo(ctx, b, s)
+
+	const (
+		numFiles       = 200
+		numNames       = 20000
+		numNoiseSyms   = 20000
+		numEdges       = 5000
+		dstQNamePrefix = "github.com/org/repo/pkg/"
+	)
+
+	fileIDs := makeBenchFiles(ctx, b, s, repoID, numFiles)
+	srcIDs := makeBenchSrcSymbols(ctx, b, s, repoID, fileIDs)
+
+	for i := 0; i < numNames; i++ {
+		name := fmt.Sprintf("Func_%d", i)
+		qualified := fmt.Sprintf("%spkg_%d/%s", dstQNamePrefix, i%50, name)
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
+			b.Fatalf("insertTestSymbol(slash dst) error = %v", err)
+		}
+	}
+	for i := 0; i < numNoiseSyms; i++ {
+		name := fmt.Sprintf("Noise_%d", i)
+		qualified := fmt.Sprintf("noise.%s", name)
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
+			b.Fatalf("insertTestSymbol(noise) error = %v", err)
+		}
+	}
+
+	for i := 0; i < numEdges; i++ {
+		dstName := fmt.Sprintf("Func_%d", i%numNames)
+		fileID := fileIDs[i%len(fileIDs)]
+		srcID := srcIDs[i%len(srcIDs)]
+		if _, err := insertTestEdge(ctx, s, repoID, fileID, srcID, dstName); err != nil {
+			b.Fatalf("insertTestEdge() error = %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			b.Fatalf("BeginTx() error = %v", err)
+		}
+		b.StartTimer()
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
+		}
+		b.StopTimer()
+		_ = tx.Rollback()
+	}
+}
+
 // BenchmarkResolveEdgesBySlashSuffix_NoUnresolved measures the steady-state
 // floor cost when every edge is already resolved (no candidate dst_names for
 // either suffix strategy). Captures the win from skipping the full symbols

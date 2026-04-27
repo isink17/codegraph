@@ -1578,7 +1578,7 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		return map[string]int64{}, nil
 	}
 
-	args := make([]any, len(symbols)*15)
+	args := make([]any, len(symbols)*16)
 	argIdx := 0
 	for _, sym := range symbols {
 		args[argIdx+0] = repoID
@@ -1596,7 +1596,8 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		args[argIdx+12] = sym.Range.EndCol
 		args[argIdx+13] = sym.DocSummary
 		args[argIdx+14] = sym.StableKey
-		argIdx += 15
+		args[argIdx+15] = qualifiedSuffix(sym.QualifiedName)
+		argIdx += 16
 	}
 
 	rows, err := tx.QueryContext(ctx, symbolInsertSQL(len(symbols)), args...)
@@ -1640,8 +1641,8 @@ func symbolInsertSQL(n int) string {
 	if v, ok := symbolInsertSQLCache.Load(n); ok {
 		return v.(string)
 	}
-	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key) VALUES "
-	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix) VALUES "
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 	const suffix = " RETURNING id, stable_key"
 
 	var b strings.Builder
@@ -2257,6 +2258,19 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	return totalResolved, nil
 }
 
+// qualifiedSuffix returns the substring of qname after the last '/' for
+// slash-containing names, '' otherwise. It mirrors the resolver's `afterSlash`
+// logic and is the value persisted in `symbols.qualified_suffix` (migration
+// 016) so `resolveEdgesBySlashSuffix` can do an indexed equality JOIN against
+// `idx_symbols_repo_qsuffix` instead of a repo-wide symbols scan + Go-side
+// hash filter.
+func qualifiedSuffix(qname string) string {
+	if i := strings.LastIndexByte(qname, '/'); i >= 0 && i+1 < len(qname) {
+		return qname[i+1:]
+	}
+	return ""
+}
+
 func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_dot_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
 		return 0, err
@@ -2355,20 +2369,124 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 	// Skip the full symbols scan entirely when no current unresolved edge can
 	// be satisfied by either suffix strategy. This is the common case after
 	// upstream strategies have already absorbed the resolvable edges.
-if len(neededSuffix) == 0 {
+	if len(neededSuffix) == 0 {
 		return 0, nil
+	}
+	totalResolved := 0
+
+	// Slash-suffix path: indexed equality JOIN against the persisted
+	// `qualified_suffix` column (`idx_symbols_repo_qsuffix`, migration 016)
+	// instead of a `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`
+	// scan + Go-side neededSuffix hash filter. The MIN(s.id) preserves the
+	// stable-tie-breaker behaviour of the prior `minBySuffix` map.
+	{
+		needNames := make([]string, 0, len(neededSuffix))
+		for name := range neededSuffix {
+			needNames = append(needNames, name)
+		}
+
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_needed_suffix(dst_name TEXT PRIMARY KEY)`); err != nil {
+			return 0, err
+		}
+		droppedNeeded := false
+		defer func() {
+			if droppedNeeded {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_resolver_needed_suffix`)
+		}()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_needed_suffix`); err != nil {
+			return 0, err
+		}
+
+		// Keep well under SQLite's default variable limit (999).
+		const maxPerInsert = 400
+		for start := 0; start < len(needNames); start += maxPerInsert {
+			end := min(start+maxPerInsert, len(needNames))
+			chunk := needNames[start:end]
+			var b strings.Builder
+			b.WriteString(`INSERT OR IGNORE INTO tmp_resolver_needed_suffix(dst_name) VALUES `)
+			args := make([]any, 0, len(chunk))
+			for i, name := range chunk {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("(?)")
+				args = append(args, name)
+			}
+			if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+				return 0, err
+			}
+		}
+
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+			return 0, err
+		}
+		droppedSlashSuffix := false
+		defer func() {
+			if droppedSlashSuffix {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_slash_suffix`)
+		}()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
+			return 0, err
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_symbol_id)
+			SELECT n.dst_name, MIN(s.id)
+			FROM tmp_resolver_needed_suffix n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.qualified_suffix = n.dst_name
+			WHERE s.qualified_suffix != ''
+			GROUP BY n.dst_name
+		`, repoID); err != nil {
+			return 0, err
+		}
+
+		updateRes, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_slash_suffix t WHERE t.dst_name = edges.dst_name)
+			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
+		`, repoID)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
+			return 0, err
+		}
+		droppedSlashSuffix = true
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_suffix`); err != nil {
+			return 0, err
+		}
+		droppedNeeded = true
+		n, err := updateRes.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		totalResolved += int(n)
+	}
+
+	// Dot-tail2 path: this branch matches `last-2-dot-segments(afterSlash)`
+	// rather than `afterSlash` itself, so a single `qualified_suffix` column
+	// can't serve it without schema sprawl (see OPTIMIZATIONS.md Batch 3).
+	// Keep the Go-side scan but only run it when a current unresolved edge
+	// could actually consume tail2 candidates.
+	if len(neededTail2) == 0 {
+		return totalResolved, nil
 	}
 
 	rows, err := tx.QueryContext(ctx, `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`, repoID)
 	if err != nil {
-		return 0, err
+		return totalResolved, err
 	}
 	type resolvedSuffix struct {
 		dstName string
 		dstID   int64
 	}
-	// Map: suffix (after last '/') -> minimum symbol id. Using MIN keeps behavior stable when multiple symbols share the same suffix.
-	minBySuffix := map[string]int64{}
 	// Map: dot tail (last 2 segments after last '/') -> minimum symbol id.
 	minByDotTail2 := map[string]int64{}
 	for rows.Next() {
@@ -2376,7 +2494,7 @@ if len(neededSuffix) == 0 {
 		var qname string
 		if err := rows.Scan(&id, &qname); err != nil {
 			_ = rows.Close()
-			return 0, err
+			return totalResolved, err
 		}
 		if qname == "" {
 			continue
@@ -2385,17 +2503,6 @@ if len(neededSuffix) == 0 {
 		afterSlash := qname
 		if slash := strings.LastIndexByte(qname, '/'); slash >= 0 && slash+1 < len(qname) {
 			afterSlash = qname[slash+1:]
-			if afterSlash != "" {
-				if _, ok := neededSuffix[afterSlash]; !ok {
-					continue
-				}
-				if cur, ok := minBySuffix[afterSlash]; !ok {
-					minBySuffix[strings.Clone(afterSlash)] = id
-				} else if id < cur {
-					// Update value only; existing map key remains the cloned string.
-					minBySuffix[afterSlash] = id
-				}
-			}
 		}
 
 		lastDot := strings.LastIndexByte(afterSlash, '.')
@@ -2420,70 +2527,10 @@ if len(neededSuffix) == 0 {
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return 0, err
+		return totalResolved, err
 	}
 	if err := rows.Close(); err != nil {
-		return 0, err
-	}
-	totalResolved := 0
-
-	if len(minBySuffix) > 0 {
-		resolved := make([]resolvedSuffix, 0, len(minBySuffix))
-		for dstName, dstID := range minBySuffix {
-			resolved = append(resolved, resolvedSuffix{dstName: dstName, dstID: dstID})
-		}
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
-			return 0, err
-		}
-		droppedSlashSuffix := false
-		defer func() {
-			if droppedSlashSuffix {
-				return
-			}
-			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_slash_suffix`)
-		}()
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
-			return 0, err
-		}
-
-		// Keep well under SQLite's default variable limit (999).
-		const maxPairsPerInsert = 400
-		for start := 0; start < len(resolved); start += maxPairsPerInsert {
-			end := min(start+maxPairsPerInsert, len(resolved))
-			chunk := resolved[start:end]
-			var b strings.Builder
-			b.WriteString(`INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_symbol_id) VALUES `)
-			args := make([]any, 0, len(chunk)*2)
-			for i, r := range chunk {
-				if i > 0 {
-					b.WriteString(",")
-				}
-				b.WriteString("(?,?)")
-				args = append(args, r.dstName, r.dstID)
-			}
-			if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
-				return 0, err
-			}
-		}
-
-		updateRes, err := tx.ExecContext(ctx, `
-			UPDATE edges
-			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_slash_suffix t WHERE t.dst_name = edges.dst_name)
-			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
-		`, repoID)
-		if err != nil {
-			return 0, err
-		}
-		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
-			return 0, err
-		}
-		droppedSlashSuffix = true
-		n, err := updateRes.RowsAffected()
-		if err != nil {
-			return 0, err
-		}
-		totalResolved += int(n)
+		return totalResolved, err
 	}
 
 	if len(minByDotTail2) > 0 {
