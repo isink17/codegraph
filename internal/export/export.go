@@ -65,6 +65,12 @@ func (s *Service) JSONPaged(ctx context.Context, repoID int64, symbol string, de
 		if err != nil {
 			return nil, err
 		}
+		// GraphSnapshot returns slices in unspecified order (the no-focus
+		// loaders have no ORDER BY, and loadEdgesForExport's dedup map
+		// further randomises focused-edge order). Sort by ID ASC to match
+		// the optimized paging branch and make pageSlice deterministic.
+		sort.Slice(symbols, func(i, j int) bool { return symbols[i].ID < symbols[j].ID })
+		sort.Slice(edges, func(i, j int) bool { return edges[i].ID < edges[j].ID })
 		symbols = pageSlice(symbols, limit, offset)
 		edges = pageSlice(edges, limit, offset)
 	}
