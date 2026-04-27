@@ -16,6 +16,9 @@ Changes since `v1.0.9` (based on `git log v1.0.9..HEAD`).
 - **store:** Cache symbol insert SQL + IN-placeholder strings to reduce write-path allocations. (#58)
 - **store:** Steady-state guard skips the full symbols scan in `resolveEdgesBySlashSuffix` when no unresolved non-slash edge remains; ~31× faster / ~1200× fewer allocs on the new no-unresolved bench. (#64)
 - **store/indexer:** Trim repo-wide change-detection floor cost by narrowing `ExistingFiles` / `ExistingFilesForPaths` projection and filtering tombstones server-side; add `BenchmarkIndexerNoOpUpdateRepoWide`. (#61)
+- **indexer:** Overlap `ExistingFiles` load with the FS walk on repo-wide scans (workers gate on `existingReady`; tasks chan buffer bumped to `workerCount*64`). 2k-file fixture ~17% faster, 5k-file ~13%. (#65)
+- **store/resolver:** Schema-backed slash-suffix path via persisted `symbols.qualified_suffix` (migration 016) + partial index `idx_symbols_repo_qsuffix`; `resolveEdgesBySlashSuffix` now does an indexed equality JOIN instead of a Go-side hash filter over a full symbols scan. Large-scale (40k symbols) ~10% faster, ~11.3× fewer allocs. (#66)
+- **export:** Add writer-based `JSONStream` for the unbounded JSON export path; CLI `graph export --format json` (no `--limit`, no focus) now streams via `ExportSymbolsPage` / `ExportEdgesPage` to stdout, dropping peak memory from ~3× O(repo) (full symbol + edge slices plus marshalled bytes) to O(pageSize). DOT path still buffered.
 - **store:** Trim residual write-path allocations in `ReplaceFileGraphsBatch`; add multi-file batch bench. (#60)
 - **export:** Page no-focus `JSONPaged` directly via `ExportSymbolsPage` / `ExportEdgesPage` so peak memory is O(page) instead of O(repo) on the bounded-page CLI path. (#62)
 - **indexing/store:** Broad batching + reduced statement pressure across symbols/FTS/inserts; add/extend phase timings + write_stats counters. (#20, #21, #22, #24, #25, #26, #28, #29)

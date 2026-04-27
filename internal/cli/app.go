@@ -1414,6 +1414,12 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		_, err = stdout.Write(out)
 		return err
 	}
+	// Unbounded no-focus JSON: stream straight to stdout via paged loaders so
+	// peak memory is O(pageSize) instead of O(repo). Bounded/focused paths
+	// keep the byte-slice JSONPaged shape (single MarshalIndent call).
+	if selectedSymbol == "" && *limit <= 0 {
+		return exp.JSONStream(ctx, stdout, repoID, 0)
+	}
 	out, err := exp.JSONPaged(ctx, repoID, selectedSymbol, 2, *limit, *offset)
 	if err != nil {
 		return err
