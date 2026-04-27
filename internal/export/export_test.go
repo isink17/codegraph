@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -202,6 +203,90 @@ func TestJSONStreamMatchesJSONShape(t *testing.T) {
 		if !refKeys[k] {
 			t.Fatalf("stream symbol stable_key %q not in JSON() output", k)
 		}
+	}
+}
+
+// TestDOTStreamMatchesDOTShape pins down that the writer-based no-focus
+// DOT path emits the same node set and the same digraph framing as the
+// byte-slice DOT() path. Edge ordering differs (DOTStream pages via
+// ExportEdgesPage's ORDER BY id; DOT() iterates GraphSnapshot's
+// loadEdgesForExport result), so this test asserts node parity and
+// edge-line set parity rather than byte equality.
+func TestDOTStreamMatchesDOTShape(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	for i := 0; i < 6; i++ {
+		writeFile(t, filepath.Join(repoRoot, fmt.Sprintf("file_%d.go", i)),
+			fmt.Sprintf("package main\nfunc helper%d() {}\nfunc main%d() { helper%d() }\n", i, i, i))
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	svc := New(query.New(s, nil))
+
+	refOut, err := svc.DOT(ctx, repo.ID, "", 0)
+	if err != nil {
+		t.Fatalf("DOT() error = %v", err)
+	}
+	var buf bytes.Buffer
+	// Force a tiny page size so the stitching path runs.
+	if err := svc.DOTStream(ctx, &buf, repo.ID, 2); err != nil {
+		t.Fatalf("DOTStream() error = %v", err)
+	}
+
+	splitDOT := func(b []byte) (header string, nodes, edges []string, footer string) {
+		lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+		if len(lines) < 2 {
+			t.Fatalf("DOT output too short:\n%s", b)
+		}
+		header = lines[0]
+		footer = lines[len(lines)-1]
+		for _, ln := range lines[1 : len(lines)-1] {
+			trim := strings.TrimSpace(ln)
+			switch {
+			case strings.Contains(trim, "->"):
+				edges = append(edges, trim)
+			case strings.HasSuffix(trim, ";"):
+				nodes = append(nodes, trim)
+			}
+		}
+		return
+	}
+	refHdr, refNodes, refEdges, refFtr := splitDOT(refOut)
+	strHdr, strNodes, strEdges, strFtr := splitDOT(buf.Bytes())
+
+	if refHdr != strHdr || refHdr != "digraph codegraph {" {
+		t.Fatalf("header mismatch: ref=%q stream=%q", refHdr, strHdr)
+	}
+	if refFtr != strFtr || refFtr != "}" {
+		t.Fatalf("footer mismatch: ref=%q stream=%q", refFtr, strFtr)
+	}
+	if len(refNodes) == 0 || len(refEdges) == 0 {
+		t.Fatalf("ref produced no nodes/edges; nodes=%d edges=%d", len(refNodes), len(refEdges))
+	}
+	if !reflect.DeepEqual(refNodes, strNodes) {
+		t.Fatalf("node lines mismatch:\nref=%v\nstream=%v", refNodes, strNodes)
+	}
+	refEdgeSet := map[string]int{}
+	for _, e := range refEdges {
+		refEdgeSet[e]++
+	}
+	strEdgeSet := map[string]int{}
+	for _, e := range strEdges {
+		strEdgeSet[e]++
+	}
+	if !reflect.DeepEqual(refEdgeSet, strEdgeSet) {
+		t.Fatalf("edge multiset mismatch:\nref=%v\nstream=%v", refEdgeSet, strEdgeSet)
 	}
 }
 
