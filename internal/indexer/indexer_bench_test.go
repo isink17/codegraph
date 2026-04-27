@@ -87,6 +87,45 @@ func BenchmarkIndexerNoOpUpdateRepoWide(b *testing.B) {
 	}
 }
 
+// BenchmarkIndexerNoOpUpdateRepoWide_FileScaling exposes the per-row cost of
+// the existing-files map by sweeping fixture sizes. Surfaces wins or
+// regressions in the change-detection floor as file count grows; the slim
+// `ExistingFileMeta` (no `ContentHash`) keeps per-row alloc bounded so the
+// curve stays roughly linear in N rather than amplified by per-file string
+// allocs.
+func BenchmarkIndexerNoOpUpdateRepoWide_FileScaling(b *testing.B) {
+	ctx := context.Background()
+	cases := []int{500, 2000, 5000}
+	for _, files := range cases {
+		b.Run(fmt.Sprintf("files=%d", files), func(b *testing.B) {
+			repoRoot := b.TempDir()
+			createGoFixtureRepo(b, repoRoot, files)
+			dbPath := filepath.Join(b.TempDir(), "bench-noop-update-scaling.sqlite")
+			s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: sqliteBenchProfile()})
+			if err != nil {
+				b.Fatalf("store.Open() error = %v", err)
+			}
+			defer s.Close()
+			idx := New(s, parser.NewRegistry(goparser.New()), nil)
+			if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
+				b.Fatalf("Index() error = %v", err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				summary, err := idx.Update(ctx, Options{RepoRoot: repoRoot})
+				if err != nil {
+					b.Fatalf("Update() error = %v", err)
+				}
+				if summary.FilesChanged != 0 {
+					b.Fatalf("expected 0 files changed on no-op update, got %d", summary.FilesChanged)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkIndexerUpdateOneFile(b *testing.B) {
 	ctx := context.Background()
 	repoRoot := b.TempDir()

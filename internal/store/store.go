@@ -749,25 +749,26 @@ func QueryDBPragmas(ctx context.Context, db *sql.DB) (DBPragmas, error) {
 }
 
 // ExistingFileMeta is the slim per-row value the change-detection path
-// actually consumes. It intentionally omits the `Path` (held by the map
-// key), `ID`, `Language`, and `IsDeleted` fields — none are read by the
-// indexer worker, and dropping them shrinks the per-entry footprint of the
-// repo-wide existing-files map. On a 2k/5k-file no-op the trim is the
-// dominant remaining alloc on this path.
+// actually consumes upfront. It carries only the (size, mtime) pair —
+// the fields the indexer's fast path checks first. `content_sha256` is
+// deliberately NOT in this struct: it's only consulted in the slow
+// branch (size/mtime mismatch) and is fetched lazily via
+// `LookupFileContentHash` so a repo-wide no-op load doesn't allocate
+// one hex string per file.
 type ExistingFileMeta struct {
 	SizeBytes   int64
 	MtimeUnixNS int64
-	ContentHash string
 }
 
 // ExistingFiles returns active (non-deleted) file records for the repo,
 // keyed by path with a slim `ExistingFileMeta` value. The projection is
-// the change-detection minimum (`size_bytes`, `mtime_unix_ns`,
-// `content_sha256`); `is_deleted = 0` is applied server-side so tombstone
-// rows never reach the Go map.
+// the fast-path minimum (`size_bytes`, `mtime_unix_ns`); `is_deleted = 0`
+// is applied server-side so tombstone rows never reach the Go map. The
+// content hash is fetched on demand via `LookupFileContentHash` only
+// when (size, mtime) differs from disk.
 func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]ExistingFileMeta, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT path, size_bytes, mtime_unix_ns, content_sha256
+		SELECT path, size_bytes, mtime_unix_ns
 		FROM files
 		WHERE repo_id = ? AND is_deleted = 0
 	`, repoID)
@@ -794,7 +795,7 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		chunk := paths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT path, size_bytes, mtime_unix_ns, content_sha256
+			SELECT path, size_bytes, mtime_unix_ns
 			FROM files
 			WHERE repo_id = ? AND is_deleted = 0 AND path IN (` + placeholders + `)
 		`
@@ -814,6 +815,27 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 	return out, nil
 }
 
+// LookupFileContentHash returns the stored `content_sha256` for the given
+// active file path, or ("", false, nil) if no live row exists. Used by the
+// indexer's slow-path "touch vs. replace" decision after a (size, mtime)
+// mismatch — folding this into a per-file query keeps the upfront
+// `ExistingFiles` map free of per-row hex strings.
+func (s *Store) LookupFileContentHash(ctx context.Context, repoID int64, path string) (string, bool, error) {
+	var hash string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT content_sha256
+		FROM files
+		WHERE repo_id = ? AND is_deleted = 0 AND path = ?
+	`, repoID, path).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return hash, true, nil
+}
+
 // scanExistingFileMetasInto scans rows directly into `dst` so callers can
 // reuse a pre-allocated destination map across chunked queries instead of
 // paying for a per-chunk map alloc + merge-loop.
@@ -822,7 +844,7 @@ func scanExistingFileMetasInto(rows *sql.Rows, dst map[string]ExistingFileMeta) 
 	for rows.Next() {
 		var path string
 		var meta ExistingFileMeta
-		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS, &meta.ContentHash); err != nil {
+		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS); err != nil {
 			return err
 		}
 		dst[path] = meta
