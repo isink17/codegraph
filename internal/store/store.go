@@ -748,16 +748,24 @@ func QueryDBPragmas(ctx context.Context, db *sql.DB) (DBPragmas, error) {
 	return out, nil
 }
 
+// ExistingFileMeta is the slim per-row value the change-detection path
+// actually consumes. It intentionally omits the `Path` (held by the map
+// key), `ID`, `Language`, and `IsDeleted` fields — none are read by the
+// indexer worker, and dropping them shrinks the per-entry footprint of the
+// repo-wide existing-files map. On a 2k/5k-file no-op the trim is the
+// dominant remaining alloc on this path.
+type ExistingFileMeta struct {
+	SizeBytes   int64
+	MtimeUnixNS int64
+	ContentHash string
+}
+
 // ExistingFiles returns active (non-deleted) file records for the repo,
-// projecting only the columns the change-detection path actually consumes
-// (`path`, `size_bytes`, `mtime_unix_ns`, `content_sha256`). `ID` and
-// `Language` on the returned `FileRecord` are intentionally left zero.
-//
-// Filtering `is_deleted = 0` server-side avoids materializing tombstone rows
-// that can never match a walked path, shrinking both the query result set
-// and the resulting Go map. `IsDeleted` is therefore always false on returned
-// records.
-func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]FileRecord, error) {
+// keyed by path with a slim `ExistingFileMeta` value. The projection is
+// the change-detection minimum (`size_bytes`, `mtime_unix_ns`,
+// `content_sha256`); `is_deleted = 0` is applied server-side so tombstone
+// rows never reach the Go map.
+func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]ExistingFileMeta, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT path, size_bytes, mtime_unix_ns, content_sha256
 		FROM files
@@ -766,13 +774,13 @@ func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]Fil
 	if err != nil {
 		return nil, err
 	}
-	return scanExistingFiles(rows)
+	return scanExistingFileMetas(rows, 0)
 }
 
 // ExistingFilesForPaths is the path-scoped sibling of ExistingFiles; same
 // projection and same `is_deleted = 0` filter apply.
-func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths []string) (map[string]FileRecord, error) {
-	out := make(map[string]FileRecord, len(paths))
+func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths []string) (map[string]ExistingFileMeta, error) {
+	out := make(map[string]ExistingFileMeta, len(paths))
 	if len(paths) == 0 {
 		return out, nil
 	}
@@ -795,7 +803,7 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		if err != nil {
 			return nil, err
 		}
-		records, err := scanExistingFiles(rows)
+		records, err := scanExistingFileMetas(rows, len(chunk))
 		if err != nil {
 			return nil, err
 		}
@@ -806,15 +814,16 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 	return out, nil
 }
 
-func scanExistingFiles(rows *sql.Rows) (map[string]FileRecord, error) {
+func scanExistingFileMetas(rows *sql.Rows, sizeHint int) (map[string]ExistingFileMeta, error) {
 	defer rows.Close()
-	out := map[string]FileRecord{}
+	out := make(map[string]ExistingFileMeta, sizeHint)
 	for rows.Next() {
-		var rec FileRecord
-		if err := rows.Scan(&rec.Path, &rec.SizeBytes, &rec.MtimeUnixNS, &rec.ContentHash); err != nil {
+		var path string
+		var meta ExistingFileMeta
+		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS, &meta.ContentHash); err != nil {
 			return nil, err
 		}
-		out[rec.Path] = rec
+		out[path] = meta
 	}
 	return out, rows.Err()
 }

@@ -303,7 +303,7 @@ func main() {}
 	}
 }
 
-func mapKeys(m map[string]store.FileRecord) []string {
+func mapKeys(m map[string]store.ExistingFileMeta) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)

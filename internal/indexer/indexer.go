@@ -136,7 +136,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// larger) `tasks` buffer in parallel. On load failure a monitor goroutine
 	// cancels `ctxRun` so the producer/workers drain cleanly.
 	var (
-		existing       map[string]store.FileRecord
+		existing       map[string]store.ExistingFileMeta
 		loadErr        error
 		existingLoadMS int64
 	)
@@ -145,7 +145,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	go func() {
 		defer close(existingReady)
 		var (
-			m   map[string]store.FileRecord
+			m   map[string]store.ExistingFileMeta
 			err error
 		)
 		if pathScoped {
@@ -293,7 +293,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				return
 			}
 			for task := range tasks {
-				res := processFileTask(ctxRun, task, existing[task.rel], opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy)
+				prev, hasPrev := existing[task.rel]
+				res := processFileTask(ctxRun, task, prev, hasPrev, opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy)
 				select {
 				case results <- res:
 				case <-ctxRun.Done():
@@ -693,13 +694,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	return summary, nil
 }
 
-func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string) fileResult {
+func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFileMeta, hasPrev bool, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string) fileResult {
 	result := fileResult{task: task}
 	started := time.Now()
 	defer func() {
 		result.processDur = time.Since(started)
 	}()
-	hasPrev := prev.Path != ""
 
 	if len(allowedLanguages) > 0 && task.language != "" && !slices.Contains(allowedLanguages, task.language) {
 		if hasPrev {
@@ -709,7 +709,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 		}
 		return result
 	}
-	if hasPrev && !prev.IsDeleted && !force && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano() {
+	if hasPrev && !force && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano() {
 		result.action = "mark_seen"
 		return result
 	}
