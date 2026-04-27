@@ -55,9 +55,9 @@ const (
 	// sqliteImportValuesBatchRows controls multi-row inserts into file_imports where each row uses 3 parameters.
 	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteImportValuesBatchRows = 300
-	// sqliteTestLinkValuesBatchRows controls multi-row inserts into test_links where each row uses 6 parameters.
-	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
-	sqliteTestLinkValuesBatchRows = 150
+	// sqliteTestLinkValuesBatchRows controls multi-row inserts into test_links where each row uses 7 parameters.
+	// 128*7=896 variables, staying under sqliteDefaultMaxVariables.
+	sqliteTestLinkValuesBatchRows = 128
 
 	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 15 parameters.
 	// 60*15=900 variables, staying under sqliteDefaultMaxVariables.
@@ -1541,23 +1541,25 @@ func insertParsedFileGraph(
 	for key := range targetKeySet {
 		targetKeys = append(targetKeys, key)
 	}
-	targetStableToID, err := resolveSymbolsByStableKeysQuery(ctx, tx, repoID, targetKeys)
+	targetStableToRef, err := resolveSymbolFilesByStableKeysQuery(ctx, tx, repoID, targetKeys)
 	if err != nil {
 		return err
 	}
 	if len(parsed.TestLinks) > 0 {
-		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*6)
+		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*7)
 		for _, link := range parsed.TestLinks {
 			var testSymbolID any
 			var targetSymbolID any
+			var targetFileID any
 			if id := stableToID[link.TestSymbolKey]; id != 0 {
 				testSymbolID = id
 			}
-			if id, ok := targetStableToID[link.TargetStableKey]; ok {
-				targetSymbolID = id
+			if ref, ok := targetStableToRef[link.TargetStableKey]; ok {
+				targetSymbolID = ref.id
+				targetFileID = ref.fileID
 			}
-			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score)
-			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*6 {
+			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, targetFileID, targetSymbolID, link.Reason, link.Score)
+			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*7 {
 				if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
 					return err
 				}
@@ -1813,7 +1815,7 @@ func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any, stat
 }
 
 func execTestLinksInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
-	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score", 6, args, stats)
+	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score", 7, args, stats)
 }
 
 func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
@@ -2281,7 +2283,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 }
 
 // qualifiedSuffix returns the substring of qname after the last '/' for
-// slash-containing names, '' otherwise. It mirrors the resolver's `afterSlash`
+// slash-containing names, ” otherwise. It mirrors the resolver's `afterSlash`
 // logic and is the value persisted in `symbols.qualified_suffix` (migration
 // 016) so `resolveEdgesBySlashSuffix` can do an indexed equality JOIN against
 // `idx_symbols_repo_qsuffix` instead of a repo-wide symbols scan + Go-side
@@ -3072,6 +3074,47 @@ func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, st
 
 type queryContexter interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// symbolFileRef pairs a resolved symbol id with the file_id that hosts it.
+// Used by the test_links insert path to populate target_file_id alongside
+// target_symbol_id so PurgeDeletedFileGraphsForScan can match rows whose
+// target file was deleted.
+type symbolFileRef struct {
+	id     int64
+	fileID int64
+}
+
+func resolveSymbolFilesByStableKeysQuery(ctx context.Context, q queryContexter, repoID int64, stableKeys []string) (map[string]symbolFileRef, error) {
+	out := map[string]symbolFileRef{}
+	if len(stableKeys) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(stableKeys)), ",")
+	query := `
+		SELECT stable_key, id, file_id
+		FROM symbols
+		WHERE repo_id = ? AND stable_key IN (` + placeholders + `)
+	`
+	args := make([]any, 0, len(stableKeys)+1)
+	args = append(args, repoID)
+	for _, key := range stableKeys {
+		args = append(args, key)
+	}
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var ref symbolFileRef
+		if err := rows.Scan(&key, &ref.id, &ref.fileID); err != nil {
+			return nil, err
+		}
+		out[key] = ref
+	}
+	return out, rows.Err()
 }
 
 func resolveSymbolsByStableKeysQuery(ctx context.Context, q queryContexter, repoID int64, stableKeys []string) (map[string]int64, error) {
