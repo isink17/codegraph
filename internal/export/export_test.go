@@ -1,6 +1,7 @@
 package export
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -125,6 +126,81 @@ func TestJSONPagedNoFocusUsesPagingHelpers(t *testing.T) {
 	for _, sym := range parsed1.Symbols {
 		if k, ok := sym["stable_key"].(string); ok && k != "" && keys[k] {
 			t.Fatalf("page1 overlaps page0 on stable_key %q", k)
+		}
+	}
+}
+
+// TestJSONStreamMatchesJSONShape validates that the writer-based unbounded
+// path emits the same top-level shape as the byte-slice JSON() path
+// (`repo`, `stats`, `symbols`, `edges`) and the same row identities. Peak
+// memory drops from O(repo) to O(pageSize) is structural — not measured
+// here, just the output equivalence is asserted.
+func TestJSONStreamMatchesJSONShape(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	for i := 0; i < 6; i++ {
+		writeFile(t, filepath.Join(repoRoot, fmt.Sprintf("file_%d.go", i)),
+			fmt.Sprintf("package main\nfunc helper%d() {}\nfunc main%d() { helper%d() }\n", i, i, i))
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+	idx := indexer.New(s, parser.NewRegistry(goparser.New()), nil)
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	svc := New(query.New(s, nil))
+
+	jsonOut, err := svc.JSON(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("JSON() error = %v", err)
+	}
+	var buf bytes.Buffer
+	// Force a tiny page size to exercise the page-boundary stitching path.
+	if err := svc.JSONStream(ctx, &buf, repo.ID, 2); err != nil {
+		t.Fatalf("JSONStream() error = %v", err)
+	}
+
+	type doc struct {
+		Repo    string           `json:"repo"`
+		Stats   map[string]any   `json:"stats"`
+		Symbols []map[string]any `json:"symbols"`
+		Edges   []map[string]any `json:"edges"`
+	}
+	var refDoc, streamDoc doc
+	if err := json.Unmarshal(jsonOut, &refDoc); err != nil {
+		t.Fatalf("Unmarshal(JSON output): %v", err)
+	}
+	if err := json.Unmarshal(buf.Bytes(), &streamDoc); err != nil {
+		t.Fatalf("Unmarshal(JSONStream output): %v\n%s", err, buf.String())
+	}
+	if refDoc.Repo != streamDoc.Repo || refDoc.Repo == "" {
+		t.Fatalf("repo mismatch: ref=%q stream=%q", refDoc.Repo, streamDoc.Repo)
+	}
+	if len(refDoc.Symbols) == 0 || len(streamDoc.Symbols) != len(refDoc.Symbols) {
+		t.Fatalf("symbols count mismatch: ref=%d stream=%d", len(refDoc.Symbols), len(streamDoc.Symbols))
+	}
+	if len(refDoc.Edges) == 0 || len(streamDoc.Edges) != len(refDoc.Edges) {
+		t.Fatalf("edges count mismatch: ref=%d stream=%d", len(refDoc.Edges), len(streamDoc.Edges))
+	}
+	// Stable_key sets must match exactly (paged loader is ORDER BY id, JSON
+	// path goes through GraphSnapshot — both end up covering all symbols).
+	refKeys := map[string]bool{}
+	for _, sym := range refDoc.Symbols {
+		if k, ok := sym["stable_key"].(string); ok {
+			refKeys[k] = true
+		}
+	}
+	for _, sym := range streamDoc.Symbols {
+		k, _ := sym["stable_key"].(string)
+		if !refKeys[k] {
+			t.Fatalf("stream symbol stable_key %q not in JSON() output", k)
 		}
 	}
 }
