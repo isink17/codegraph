@@ -10,18 +10,32 @@ Changes since `v1.0.9` (based on `git log v1.0.9..HEAD`).
 - **watch:** Ignore chmod-only + directory-create events; add repeated-work stats. (#36)
 - **indexer:** Target cross-file edge resolution on update runs (preserve path-scoped behavior; avoid repo-wide resolve). (#32, #33)
 - **store:** Speed up edge resolver (dotted-edge indexes, dot-tail2 strategy, resolver symbol indexes). (#48)
+- **store:** Scale `ResolveEdges` dot-suffix path and cap slash-suffix map growth; restrict dot-tail2 candidate set to single-dot `dst_name`. (#52)
+- **store:** De-correlate `ResolveEdges` strategies 1/2/4 by distinct `dst_name`; add `BenchmarkResolveEdgesForNames_CrossFileScale`. (#53)
+- **store:** Cache batch-insert SQL and speed up edge-source selection in the write path via `srcSymbolChooser` span/binary-search. (#55)
+- **store:** Cache symbol insert SQL + IN-placeholder strings to reduce write-path allocations. (#58)
+- **store:** Steady-state guard skips the full symbols scan in `resolveEdgesBySlashSuffix` when no unresolved non-slash edge remains; ~31× faster / ~1200× fewer allocs on the new no-unresolved bench. (#64)
+- **store/indexer:** Trim repo-wide change-detection floor cost by narrowing `ExistingFiles` / `ExistingFilesForPaths` projection and filtering tombstones server-side; add `BenchmarkIndexerNoOpUpdateRepoWide`. (#61)
+- **store:** Trim residual write-path allocations in `ReplaceFileGraphsBatch`; add multi-file batch bench. (#60)
+- **export:** Page no-focus `JSONPaged` directly via `ExportSymbolsPage` / `ExportEdgesPage` so peak memory is O(page) instead of O(repo) on the bounded-page CLI path. (#62)
 - **indexing/store:** Broad batching + reduced statement pressure across symbols/FTS/inserts; add/extend phase timings + write_stats counters. (#20, #21, #22, #24, #25, #26, #28, #29)
 - **indexing:** Reduce tokenization allocations; add tokenize timing stats. (#30)
 - **json/jsonl:** Stabilize `watch` and `doctor` machine-readable output (event envelopes; arrays always present; disable HTML escaping). (#38, #43)
 - **cli/index:** Stabilize `--jsonl` scan payloads/envelopes (scan_kind, parse_ms, correlation fields; dedupe envelopes; handle phase write errors). (#40, #41, #42)
 - **clean/doctor:** Add ANALYZE, WAL checkpoint, incremental vacuum; add `doctor --deep` integrity checks; expand DB diagnostics + FTS optimize. (#37, #39)
 - **benchmark:** Add `--sqlite-profile` and capture sqlite_profile/host context. (#44)
+- **store/bench:** Add chooser + callers/callees benchmarks; retry `applyPragmas` on `SQLITE_BUSY`. (#57)
+- **store/bench:** Add per-strategy resolver microbenchmarks (slash-suffix, dot-tail2, dot-suffix). (#59)
+- **store:** Speed up `FindDeadCode` with new `idx_refs_repo_symbol_id` / `idx_refs_repo_context_symbol_id` indexes. (#54)
 - **cli:** Add `index_smoke` runner with compact jsonl + median baseline for perf diffs. (#45)
 - **cli/config:** Default repo artifacts under `.codegraph/` (DB + bench gocache) with legacy DB fallback; harden repo DB path handling. (#49)
 - **cli/help/commands:** Command registry + per-command help; canonical query command names with backward-compatible aliases; help/usage normalization. (#10, #12, #13, #14, #15, #16, #17, #18, #19)
 
 ### Fixed
 - **store/indexer:** Purge deleted-file graph rows and nullify cross-file symbol references. (#46)
+- **store:** Scope `RelatedTests(file)` correctly via `target_file_id`; make symbol lookup deterministic. (#54)
+- **store/doctor:** Harden DB pragmas and migration lifecycle correctness; concurrent-open coverage via `TestOpen_ConcurrentMigrateIsSafe`. (#56)
+- **store:** Fix duplicate token-stat counting in batched writes. (#60)
 
 ## v1.0.9 - 2026-04-16
 
