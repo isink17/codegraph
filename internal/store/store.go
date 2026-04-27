@@ -2049,6 +2049,18 @@ func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int6
 	}
 	symbolIDs := `SELECT id FROM symbols WHERE file_id IN (` + placeholders + `)`
 
+	// test_links pointing AT one of the deleted target files become meaningless
+	// once the target file is gone (target_symbol_id will be nulled out below
+	// alongside the other symbol-level fan-out, but target_file_id has no
+	// nullification path of its own — without this delete the row would survive
+	// with a stale target_file_id and surface in RelatedTests(file=...).
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM test_links
+		WHERE repo_id = ? AND target_file_id IN (`+placeholders+`)
+	`, args...); err != nil {
+		return err
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE edges
 		SET dst_symbol_id = NULL
@@ -2093,6 +2105,16 @@ func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, rep
 		FROM symbols
 		WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)
 	`); err != nil {
+		return err
+	}
+
+	// See nullifyDeletedSymbolReferences: rows with target_file_id pointing at
+	// any deleted file become orphans even after target_symbol_id is nulled,
+	// which would surface in RelatedTests(file=...). Delete them up front.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM test_links
+		WHERE repo_id = ? AND target_file_id IN (SELECT id FROM tmp_delete_file_ids)
+	`, repoID); err != nil {
 		return err
 	}
 
