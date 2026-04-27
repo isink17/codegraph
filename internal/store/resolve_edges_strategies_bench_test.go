@@ -213,6 +213,62 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 	}
 }
 
+// BenchmarkResolveEdgesBySlashSuffix_NoUnresolved measures the steady-state
+// floor cost when every edge is already resolved (no candidate dst_names for
+// either suffix strategy). Captures the win from skipping the full symbols
+// scan when the needed-set is empty.
+func BenchmarkResolveEdgesBySlashSuffix_NoUnresolved(b *testing.B) {
+	ctx := context.Background()
+	s := openBenchStore(b)
+	defer s.Close()
+
+	repoID := upsertBenchRepo(ctx, b, s)
+
+	const (
+		numFiles     = 100
+		numSyms      = 2000
+		numNoiseSyms = 1000
+	)
+
+	fileIDs := makeBenchFiles(ctx, b, s, repoID, numFiles)
+	_ = makeBenchSrcSymbols(ctx, b, s, repoID, fileIDs)
+	for i := 0; i < numSyms; i++ {
+		name := fmt.Sprintf("Func_%d", i)
+		qualified := fmt.Sprintf("github.com/org/repo/pkg_%d/%s", i%50, name)
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
+			b.Fatalf("insertTestSymbol() error = %v", err)
+		}
+	}
+	for i := 0; i < numNoiseSyms; i++ {
+		name := fmt.Sprintf("Noise_%d", i)
+		qualified := fmt.Sprintf("noise.%s", name)
+		fileID := fileIDs[i%len(fileIDs)]
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, qualified); err != nil {
+			b.Fatalf("insertTestSymbol(noise) error = %v", err)
+		}
+	}
+
+	// Intentionally insert no unresolved edges: the SELECT DISTINCT dst_name
+	// query returns zero rows, so neededSuffix and neededTail2 stay empty.
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			b.Fatalf("BeginTx() error = %v", err)
+		}
+		b.StartTimer()
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
+		}
+		b.StopTimer()
+		_ = tx.Rollback()
+	}
+}
+
 // openBenchStore opens a fresh sqlite store under b.TempDir().
 func openBenchStore(b *testing.B) *Store {
 	b.Helper()

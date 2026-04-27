@@ -2352,6 +2352,12 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 	if err := needRows.Close(); err != nil {
 		return 0, err
 	}
+	// Skip the full symbols scan entirely when no current unresolved edge can
+	// be satisfied by either suffix strategy. This is the common case after
+	// upstream strategies have already absorbed the resolvable edges.
+	if len(neededSuffix) == 0 && len(neededTail2) == 0 {
+		return 0, nil
+	}
 
 	rows, err := tx.QueryContext(ctx, `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`, repoID)
 	if err != nil {
