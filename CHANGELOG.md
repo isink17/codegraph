@@ -35,6 +35,7 @@ Changes since `v1.0.9` (based on `git log v1.0.9..HEAD`).
 - **cli/help/commands:** Command registry + per-command help; canonical query command names with backward-compatible aliases; help/usage normalization. (#10, #12, #13, #14, #15, #16, #17, #18, #19)
 
 ### Fixed
+- **store:** Purge-time delete of `test_links` whose `target_file_id` points at a deleted file. Previously the symbol-side companion (`target_symbol_id`) was nulled but the row survived with a stale `target_file_id`, surfacing as a ghost association in `RelatedTests(file=path)` because the path→id lookup does not filter `is_deleted`. Covered by new `TestPurgeDeletes_TestLinksTargetingDeletedFile` and `TestPurgeNullifiesEdgeAndRefSymbolReferences`.
 - **store/indexer:** Purge deleted-file graph rows and nullify cross-file symbol references. (#46)
 - **store:** Scope `RelatedTests(file)` correctly via `target_file_id`; make symbol lookup deterministic. (#54)
 - **store/doctor:** Harden DB pragmas and migration lifecycle correctness; concurrent-open coverage via `TestOpen_ConcurrentMigrateIsSafe`. (#56)
