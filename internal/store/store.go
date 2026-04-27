@@ -774,7 +774,11 @@ func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]Exi
 	if err != nil {
 		return nil, err
 	}
-	return scanExistingFileMetas(rows, 0)
+	out := map[string]ExistingFileMeta{}
+	if err := scanExistingFileMetasInto(rows, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ExistingFilesForPaths is the path-scoped sibling of ExistingFiles; same
@@ -803,29 +807,27 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		if err != nil {
 			return nil, err
 		}
-		records, err := scanExistingFileMetas(rows, len(chunk))
-		if err != nil {
+		if err := scanExistingFileMetasInto(rows, out); err != nil {
 			return nil, err
-		}
-		for k, v := range records {
-			out[k] = v
 		}
 	}
 	return out, nil
 }
 
-func scanExistingFileMetas(rows *sql.Rows, sizeHint int) (map[string]ExistingFileMeta, error) {
+// scanExistingFileMetasInto scans rows directly into `dst` so callers can
+// reuse a pre-allocated destination map across chunked queries instead of
+// paying for a per-chunk map alloc + merge-loop.
+func scanExistingFileMetasInto(rows *sql.Rows, dst map[string]ExistingFileMeta) error {
 	defer rows.Close()
-	out := make(map[string]ExistingFileMeta, sizeHint)
 	for rows.Next() {
 		var path string
 		var meta ExistingFileMeta
 		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS, &meta.ContentHash); err != nil {
-			return nil, err
+			return err
 		}
-		out[path] = meta
+		dst[path] = meta
 	}
-	return out, rows.Err()
+	return rows.Err()
 }
 
 func scanScanRecords(rows *sql.Rows) ([]ScanRecord, error) {
