@@ -8,7 +8,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/query"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 type Service struct {
@@ -36,17 +38,36 @@ func (s *Service) JSON(ctx context.Context, repoID int64) ([]byte, error) {
 	}, "", "  ")
 }
 
+// JSONPaged returns a JSON-encoded subset of the graph. When the caller
+// requests a bounded page over the whole repo (symbol == "" && limit > 0)
+// rows are streamed straight from the paging helpers so peak memory is
+// O(page), not O(repo). The unbounded (limit <= 0) and focused (symbol != "")
+// paths still go through GraphSnapshot since they intentionally want the full
+// snapshot or a bounded impact subgraph respectively.
 func (s *Service) JSONPaged(ctx context.Context, repoID int64, symbol string, depth, limit, offset int) ([]byte, error) {
 	stats, err := s.query.Stats(ctx, repoID)
 	if err != nil {
 		return nil, err
 	}
-	symbols, edges, err := s.query.GraphSnapshot(ctx, repoID, symbol, depth)
-	if err != nil {
-		return nil, err
+	var symbols []graph.Symbol
+	var edges []store.ExportEdge
+	if symbol == "" && limit > 0 {
+		symbols, err = s.query.ExportSymbolsPage(ctx, repoID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		edges, err = s.query.ExportEdgesPage(ctx, repoID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		symbols, edges, err = s.query.GraphSnapshot(ctx, repoID, symbol, depth)
+		if err != nil {
+			return nil, err
+		}
+		symbols = pageSlice(symbols, limit, offset)
+		edges = pageSlice(edges, limit, offset)
 	}
-	symbols = pageSlice(symbols, limit, offset)
-	edges = pageSlice(edges, limit, offset)
 	return json.MarshalIndent(map[string]any{
 		"repo":    stats.RepoRoot,
 		"stats":   stats,
