@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -579,12 +580,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if writeStats != (store.WriteStats{}) {
 		summary.WriteStats = &writeStats
 	}
-if (runErr == nil || errors.Is(runErr, context.Canceled)) && walkErr != nil && !errors.Is(walkErr, context.Canceled) {
-	runErr = walkErr
-}
-if (runErr == nil || errors.Is(runErr, context.Canceled)) && loadErr != nil {
-	runErr = loadErr
-}
+	if (runErr == nil || errors.Is(runErr, context.Canceled)) && walkErr != nil && !errors.Is(walkErr, context.Canceled) {
+		runErr = walkErr
+	}
+	if (runErr == nil || errors.Is(runErr, context.Canceled)) && loadErr != nil {
+		runErr = loadErr
+	}
 	if runErr != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", runErr.Error())
 		return summary, runErr
