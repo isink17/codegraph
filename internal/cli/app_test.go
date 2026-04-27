@@ -115,6 +115,80 @@ func main() {}
 	}
 }
 
+func TestRunIndexSmokeJSONL(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoRoot) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(`package main
+func main() {}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go) error = %v", err)
+	}
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"index_smoke", repoRoot, "--runs", "1"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(index_smoke) error = %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected at least 2 jsonl lines, got %d: %q", len(lines), out.String())
+	}
+	var first map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first line unmarshal error = %v", err)
+	}
+	if first["type"] != "index_smoke_run" {
+		t.Fatalf("first event type = %v, want index_smoke_run", first["type"])
+	}
+	var last map[string]any
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+		t.Fatalf("last line unmarshal error = %v", err)
+	}
+	if last["type"] != "index_smoke_summary" {
+		t.Fatalf("last event type = %v, want index_smoke_summary", last["type"])
+	}
+}
+
+func TestBenchmarkBaselineIncludesContextFields(t *testing.T) {
+	payload := benchmarkBaseline{
+		CreatedAt:  "2026-01-02T03:04:05Z",
+		Command:    []string{"go", "test"},
+		Count:      1,
+		Benchtime:  "10ms",
+		GoVersion:  "go1.x",
+		GOOS:       "windows",
+		GOARCH:     "amd64",
+		GOMAXPROCS: "default",
+		NumCPU:     12,
+		CWD:        "C:\\repo",
+		SQLite:     "sqlite",
+		Benchmarks: map[string]benchmarkMetric{"BenchmarkX": {NsPerOp: 1}},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(payload) error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal(payload) error = %v", err)
+	}
+	if _, ok := decoded["num_cpu"]; !ok {
+		t.Fatalf("payload missing num_cpu: %s", string(data))
+	}
+	if _, ok := decoded["cwd"]; !ok {
+		t.Fatalf("payload missing cwd: %s", string(data))
+	}
+}
+
 func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
 	t.Setenv("CODEGRAPH_HOME", home)
@@ -149,7 +223,7 @@ func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
 		t.Fatalf("second Run(index) error = %v", err)
 	}
 
-	dbPath := filepath.Join(repoRoot, "codegraph.sqlite")
+	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("expected repo database at %q: %v", dbPath, err)
 	}

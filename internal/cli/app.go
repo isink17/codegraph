@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,14 +105,79 @@ func hasHelpFlag(args []string) bool {
 	return false
 }
 
-func runDoctor(stdout io.Writer, args []string) error {
+// isJSONEmpty mirrors `encoding/json`'s `omitempty` rules so reflection-based
+// envelope builders produce the same output shape as a `json.Marshal` round-trip.
+func isJSONEmpty(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Pointer:
+		return v.IsNil()
+	}
+	return false
+}
+
+func parseOptionalRepoRootArg(fs *flag.FlagSet, args []string, repoRootFlag *string, defaultRepoRoot string) (string, error) {
+	repoRootArg := ""
+	parseArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		repoRootArg = args[0]
+		parseArgs = args[1:]
+	}
+	if err := fs.Parse(parseArgs); err != nil {
+		return "", err
+	}
+	if repoRootArg == "" && fs.NArg() > 0 {
+		repoRootArg = fs.Arg(0)
+	}
+	repoRoot := strings.TrimSpace(*repoRootFlag)
+	if repoRoot == "" {
+		repoRoot = strings.TrimSpace(repoRootArg)
+	}
+	if repoRoot == "" {
+		repoRoot = defaultRepoRoot
+	}
+	return repoRoot, nil
+}
+
+func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fix := fs.Bool("fix", false, "apply non-destructive fixes")
-	if err := fs.Parse(args); err != nil {
+	deep := fs.Bool("deep", false, "run deeper (potentially slow) diagnostics, including integrity_check")
+	repoRootFlag := fs.String("repo-root", "", "repository root to inspect (optional)")
+
+	defaultRepoRoot := ""
+	if config.IsRepoDBDir(cfg.DBDir) {
+		defaultRepoRoot = "."
+	}
+	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	if err != nil {
 		return err
 	}
-	report, err := doctor.RunWithFix(*fix)
+
+	dbPath := ""
+	if repoRoot != "" {
+		canonical, err := store.CanonicalRepoPath(repoRoot)
+		if err != nil {
+			return err
+		}
+		p, err := dbPathForRepo(cfg, repoRoot, canonical)
+		if err != nil {
+			return err
+		}
+		dbPath = p
+	}
+
+	report, err := doctor.RunWithOptions(doctor.Options{Fix: *fix, DBPath: dbPath, Deep: *deep})
 	if err != nil {
 		return err
 	}
@@ -219,6 +286,15 @@ type benchmarkBaseline struct {
 	Command    []string                   `json:"command"`
 	Count      int                        `json:"count"`
 	Benchtime  string                     `json:"benchtime"`
+	GoVersion  string                     `json:"go_version,omitempty"`
+	GOOS       string                     `json:"goos,omitempty"`
+	GOARCH     string                     `json:"goarch,omitempty"`
+	GOMAXPROCS string                     `json:"gomaxprocs,omitempty"`
+	NumCPU     int                        `json:"num_cpu"`
+	CWD        string                     `json:"cwd"`
+	SQLite     string                     `json:"sqlite_driver,omitempty"`
+	BenchCtx   map[string]any             `json:"bench_ctx,omitempty"`
+	Env        map[string]string          `json:"env,omitempty"`
 	Benchmarks map[string]benchmarkMetric `json:"benchmarks"`
 }
 
@@ -277,12 +353,52 @@ func computeMetricDelta(current, baseline benchmarkMetric) map[string]any {
 	return out
 }
 
+func extractBenchmarkContext(output string) map[string]any {
+	// Keep this intentionally narrow: only pull a few high-signal markers that help
+	// interpret perf comparisons (fixture sizing, driver selection, etc.).
+	keys := []string{
+		"fixture_files",
+		"sqlite_driver",
+		"sqlite_profile",
+	}
+	out := map[string]any{}
+	for line := range strings.SplitSeq(output, "\n") {
+		line = strings.TrimSpace(line)
+		for _, k := range keys {
+			needle := k + "="
+			idx := strings.Index(line, needle)
+			if idx == -1 {
+				continue
+			}
+			raw := strings.TrimSpace(line[idx+len(needle):])
+			if raw == "" {
+				continue
+			}
+			switch k {
+			case "fixture_files":
+				if n, err := strconv.Atoi(raw); err == nil {
+					out[k] = n
+				}
+			default:
+				out[k] = raw
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	count := fs.Int("count", 1, "number of benchmark runs")
 	benchtime := fs.String("benchtime", "100ms", "benchmark time per test")
 	saveBaseline := fs.Bool("save-baseline", true, "save current benchmark result as baseline")
+	files := fs.Int("files", 0, "fixture file count (sets CODEGRAPH_BENCH_FILES)")
+	sqliteProfile := fs.String("sqlite-profile", "", "SQLite performance profile for benchmarks (sets CODEGRAPH_BENCH_SQLITE_PROFILE)")
+	gomaxprocs := fs.Int("gomaxprocs", 0, "GOMAXPROCS for benchmark subprocess (0 = default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -294,6 +410,7 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		"./internal/indexer",
 		"./internal/store",
 		"./internal/mcp",
+		"-v",
 		"-run", "^$",
 		"-bench", ".",
 		"-benchmem",
@@ -301,13 +418,53 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		"-benchtime", *benchtime,
 	}
 	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
-	cmd.Env = append(os.Environ(), "GOCACHE="+filepath.Join(".", ".gocache"))
+	env := append([]string(nil), os.Environ()...)
+	gocachePath, err := filepath.Abs(filepath.Join(config.RepoArtifactsDir, "gocache"))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(gocachePath, 0o755); err != nil {
+		return err
+	}
+	env = append(env, "GOCACHE="+gocachePath)
+	benchEnv := map[string]string{}
+	if *files > 0 {
+		v := strconv.Itoa(*files)
+		env = append(env, "CODEGRAPH_BENCH_FILES="+v)
+		benchEnv["CODEGRAPH_BENCH_FILES"] = v
+	} else if v := strings.TrimSpace(os.Getenv("CODEGRAPH_BENCH_FILES")); v != "" {
+		benchEnv["CODEGRAPH_BENCH_FILES"] = v
+	}
+	if v := strings.TrimSpace(*sqliteProfile); v != "" {
+		env = append(env, "CODEGRAPH_BENCH_SQLITE_PROFILE="+v)
+		benchEnv["CODEGRAPH_BENCH_SQLITE_PROFILE"] = v
+	} else if v := strings.TrimSpace(os.Getenv("CODEGRAPH_BENCH_SQLITE_PROFILE")); v != "" {
+		benchEnv["CODEGRAPH_BENCH_SQLITE_PROFILE"] = v
+	}
+	if *gomaxprocs > 0 {
+		v := strconv.Itoa(*gomaxprocs)
+		env = append(env, "GOMAXPROCS="+v)
+		benchEnv["GOMAXPROCS"] = v
+	} else if v := strings.TrimSpace(os.Getenv("GOMAXPROCS")); v != "" {
+		benchEnv["GOMAXPROCS"] = v
+	}
+	cmd.Env = env
 	out, err := cmd.CombinedOutput()
+	benchCtx := extractBenchmarkContext(string(out))
+	cwd, _ := os.Getwd()
 	result := map[string]any{
-		"command":   append([]string{"go"}, cmdArgs...),
-		"count":     *count,
-		"benchtime": *benchtime,
-		"output":    string(out),
+		"command":       append([]string{"go"}, cmdArgs...),
+		"count":         *count,
+		"benchtime":     *benchtime,
+		"go_version":    runtime.Version(),
+		"goos":          runtime.GOOS,
+		"goarch":        runtime.GOARCH,
+		"num_cpu":       runtime.NumCPU(),
+		"cwd":           cwd,
+		"sqlite_driver": store.SQLiteDriverName(),
+		"env":           benchEnv,
+		"bench_ctx":     benchCtx,
+		"output":        string(out),
 	}
 	if err != nil {
 		result["ok"] = false
@@ -339,11 +496,24 @@ func runBenchmark(ctx context.Context, stdout io.Writer, args []string) error {
 		}
 		if *saveBaseline {
 			if mkdirErr := os.MkdirAll(filepath.Dir(baselinePath), 0o755); mkdirErr == nil {
+				gomaxLabel := benchEnv["GOMAXPROCS"]
+				if gomaxLabel == "" {
+					gomaxLabel = "default"
+				}
 				payload := benchmarkBaseline{
 					CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 					Command:    append([]string{"go"}, cmdArgs...),
 					Count:      *count,
 					Benchtime:  *benchtime,
+					GoVersion:  runtime.Version(),
+					GOOS:       runtime.GOOS,
+					GOARCH:     runtime.GOARCH,
+					GOMAXPROCS: gomaxLabel,
+					NumCPU:     runtime.NumCPU(),
+					CWD:        cwd,
+					SQLite:     store.SQLiteDriverName(),
+					BenchCtx:   benchCtx,
+					Env:        benchEnv,
 					Benchmarks: parsed,
 				}
 				if data, marshalErr := json.MarshalIndent(payload, "", "  "); marshalErr == nil {
@@ -456,6 +626,7 @@ func runInstall(stdout io.Writer) error {
 func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string, update bool) error {
 	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	force := fs.Bool("force", false, "re-index files even if unchanged")
 	jsonl := false
 	filtered := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -478,7 +649,7 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	}
 	defer app.Close()
 	_ = repo
-	opts := indexer.Options{RepoRoot: repo.RootPath}
+	opts := indexer.Options{RepoRoot: repo.RootPath, Force: *force}
 	var summary store.ScanSummary
 	if update {
 		opts.ScanKind = "update"
@@ -495,19 +666,481 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 		return err
 	}
 	if jsonl {
-		if err := writeJSONL(stdout, map[string]any{
-			"type":    "scan_summary",
-			"command": map[bool]string{true: "update", false: "index"}[update],
-			"data":    summary,
-		}); err != nil {
+		scanKind := map[bool]string{true: "update", false: "index"}[update]
+		envelope := func(eventType string) map[string]any {
+			return map[string]any{
+				"type":      eventType,
+				"repo_root": repo.RootPath,
+				"repo_id":   summary.RepoID,
+				"scan_id":   summary.ScanID,
+			}
+		}
+		stripEnvelopeKeys := func(v any, keys ...string) (map[string]any, error) {
+			skip := make(map[string]struct{}, len(keys))
+			for _, k := range keys {
+				skip[k] = struct{}{}
+			}
+			rv := reflect.ValueOf(v)
+			for rv.Kind() == reflect.Pointer {
+				if rv.IsNil() {
+					return map[string]any{}, nil
+				}
+				rv = rv.Elem()
+			}
+			if rv.Kind() != reflect.Struct {
+				return nil, fmt.Errorf("stripEnvelopeKeys: expected struct, got %s", rv.Kind())
+			}
+			rt := rv.Type()
+			out := make(map[string]any, rt.NumField())
+			for i := 0; i < rt.NumField(); i++ {
+				sf := rt.Field(i)
+				if !sf.IsExported() {
+					continue
+				}
+				name := sf.Name
+				omitempty := false
+				if tag := sf.Tag.Get("json"); tag != "" {
+					parts := strings.Split(tag, ",")
+					if parts[0] == "-" {
+						continue
+					}
+					if parts[0] != "" {
+						name = parts[0]
+					}
+					for _, opt := range parts[1:] {
+						if opt == "omitempty" {
+							omitempty = true
+						}
+					}
+				}
+				if _, drop := skip[name]; drop {
+					continue
+				}
+				fv := rv.Field(i)
+				if omitempty && isJSONEmpty(fv) {
+					continue
+				}
+				out[name] = fv.Interface()
+			}
+			return out, nil
+		}
+		ev := envelope("scan_summary")
+		ev["command"] = scanKind
+		ev["scan_kind"] = scanKind
+		summaryData, err := stripEnvelopeKeys(summary, "repo_id", "scan_id")
+		if err != nil {
 			return err
 		}
-		return writeJSONL(stdout, map[string]any{
-			"type": "scan_stats",
-			"data": stats,
-		})
+		ev["data"] = summaryData
+		if err := writeJSONL(stdout, ev); err != nil {
+			return err
+		}
+		ev = envelope("scan_phases")
+		ev["data"] = map[string]any{
+			"existing_load_ms":  summary.ExistingLoadMS,
+			"walk_ms":           summary.WalkMS,
+			"process_wall_ms":   summary.ProcessWallMS,
+			"task_ms":           summary.TaskMS,
+			"task_other_ms":     summary.TaskOtherMS,
+			"parse_ms":          summary.ParseMS,
+			"read_ms":           summary.ReadMS,
+			"hash_ms":           summary.HashMS,
+			"write_ms":          summary.WriteMS,
+			"write_metadata_ms": summary.WriteMetadataMS,
+			"write_replace_ms":  summary.WriteReplaceMS,
+			"embed_ms":          summary.EmbedMS,
+			"mark_missing_ms":   summary.MarkMissingMS,
+			"resolve_ms":        summary.ResolveMS,
+			"duration_ms":       summary.DurationMS,
+		}
+		if err := writeJSONL(stdout, ev); err != nil {
+			return err
+		}
+		ev = envelope("scan_stats")
+		statsData, err := stripEnvelopeKeys(stats, "repo_root", "repo_id")
+		if err != nil {
+			return err
+		}
+		ev["data"] = statsData
+		return writeJSONL(stdout, ev)
 	}
 	return writeJSON(stdout, map[string]any{"summary": summary, "stats": stats})
+}
+
+type indexSmokeRun struct {
+	Run      int            `json:"run"`
+	ScanKind string         `json:"scan_kind"`
+	Force    bool           `json:"force"`
+	Summary  map[string]any `json:"summary"`
+	Stats    map[string]any `json:"stats,omitempty"`
+	RepoRoot string         `json:"repo_root"`
+	Context  map[string]any `json:"context"`
+}
+
+type indexSmokeBaseline struct {
+	CreatedAt string         `json:"created_at"`
+	Command   []string       `json:"command"`
+	Context   map[string]any `json:"context"`
+	Median    map[string]any `json:"median"`
+}
+
+func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string) error {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	mode := fs.String("mode", "index", "scan mode: index|update")
+	runs := fs.Int("runs", 3, "number of measured runs")
+	warmup := fs.Int("warmup", 0, "number of warmup runs (not reported)")
+	force := fs.Bool("force", false, "re-index files even if unchanged")
+	profile := fs.String("profile", "", "SQLite performance profile: balanced|durable|fast (default from config)")
+	gomaxprocs := fs.Int("gomaxprocs", 0, "set GOMAXPROCS for this process (0 = leave unchanged)")
+	baselinePath := fs.String("baseline", "", "read/write baseline JSON (optional)")
+	saveBaseline := fs.Bool("save-baseline", true, "write baseline JSON")
+	prettyJSON := fs.Bool("json", false, "pretty JSON output instead of jsonl")
+	repoRootArg := ""
+	parseArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		repoRootArg = args[0]
+		parseArgs = args[1:]
+	}
+	if err := fs.Parse(parseArgs); err != nil {
+		return err
+	}
+	repoRoot := strings.TrimSpace(repoRootArg)
+	if repoRoot == "" && fs.NArg() > 0 {
+		repoRoot = strings.TrimSpace(fs.Arg(0))
+	}
+	if repoRoot == "" {
+		return fmt.Errorf("usage: %s %s <repo-path>", appname.BinaryName, cmdName)
+	}
+	if *runs < 1 {
+		return fmt.Errorf("--runs must be >= 1")
+	}
+	if *warmup < 0 {
+		return fmt.Errorf("--warmup must be >= 0")
+	}
+	if *gomaxprocs > 0 {
+		runtime.GOMAXPROCS(*gomaxprocs)
+	}
+	scanKind := strings.ToLower(strings.TrimSpace(*mode))
+	if scanKind == "" {
+		scanKind = "index"
+	}
+	switch scanKind {
+	case "index", "update":
+	default:
+		return fmt.Errorf("--mode must be one of: index, update")
+	}
+	effectiveProfile := strings.TrimSpace(*profile)
+	if effectiveProfile == "" {
+		effectiveProfile = cfg.DBPerformanceProfile
+	}
+
+	repoCanonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		return err
+	}
+	repoAbs := repoCanonical
+
+	var base *indexSmokeBaseline
+	if p := strings.TrimSpace(*baselinePath); p != "" {
+		data, err := os.ReadFile(p)
+		if errors.Is(err, os.ErrNotExist) {
+			// Baseline is optional.
+		} else if err != nil {
+			return fmt.Errorf("read baseline %s: %w", p, err)
+		} else {
+			var decoded indexSmokeBaseline
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				return fmt.Errorf("decode baseline %s: %w", p, err)
+			}
+			base = &decoded
+		}
+	}
+
+	ctxFields := map[string]any{
+		"go_version": runtime.Version(),
+		"goos":       runtime.GOOS,
+		"goarch":     runtime.GOARCH,
+		"gomaxprocs": runtime.GOMAXPROCS(0),
+		"num_cpu":    runtime.NumCPU(),
+		"sqlite":     store.SQLiteDriverName(),
+		"db_profile": effectiveProfile,
+	}
+
+	compactSummary := func(summary store.ScanSummary) map[string]any {
+		out := map[string]any{
+			"files_seen":      summary.FilesSeen,
+			"files_indexed":   summary.FilesIndexed,
+			"files_changed":   summary.FilesChanged,
+			"files_deleted":   summary.FilesDeleted,
+			"process_wall_ms": summary.ProcessWallMS,
+			"task_ms":         summary.TaskMS,
+			"task_other_ms":   summary.TaskOtherMS,
+			"write_ms":        summary.WriteMS,
+			"resolve_ms":      summary.ResolveMS,
+			"duration_ms":     summary.DurationMS,
+			"resolve_mode":    summary.ResolveMode,
+			"write_flush_total": summary.WriteMarkSeenFlushes +
+				summary.WriteTouchFlushes +
+				summary.WriteParseFailedFlushes +
+				summary.WriteReplaceFlushes,
+		}
+		if summary.WriteStats != nil {
+			out["write_tx_count"] = summary.WriteStats.TxCount
+			out["total_exec_statements"] = summary.WriteStats.TotalExecStatements
+		}
+		return out
+	}
+
+	writeJSONLEvent := func(eventType string, data any) error {
+		if *prettyJSON {
+			return writeJSON(stdout, data)
+		}
+		return writeJSONL(stdout, map[string]any{
+			"type":      eventType,
+			"repo_root": repoAbs,
+			"data":      data,
+		})
+	}
+
+	makeApp := func(dbPath string) (*App, graphRepo, int64, error) {
+		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: effectiveProfile})
+		if err != nil {
+			return nil, graphRepo{}, 0, err
+		}
+		registry := newDefaultRegistry()
+		repoCfg, err := config.LoadRepo(repoCanonical)
+		if err != nil {
+			_ = s.Close()
+			return nil, graphRepo{}, 0, fmt.Errorf("load repo config %s: %w", config.RepoConfigPath(repoCanonical), err)
+		}
+		embedder := newEmbedder(repoCfg.Embedding)
+		idx := indexer.New(s, registry, embedder)
+		repo, err := s.UpsertRepo(ctx, repoCanonical)
+		if err != nil {
+			_ = s.Close()
+			return nil, graphRepo{}, 0, err
+		}
+		return &App{Store: s, Indexer: idx, Query: query.New(s, embedder)}, graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
+	}
+
+	tmpDir, err := os.MkdirTemp("", "codegraph-index-smoke-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	dbPath := filepath.Join(tmpDir, "smoke.sqlite")
+	resetSmokeDB := func() error {
+		if err := os.RemoveAll(dbPath); err != nil {
+			return fmt.Errorf("remove smoke db %s: %w", dbPath, err)
+		}
+		return nil
+	}
+
+	median := func(vals []int64) int64 {
+		if len(vals) == 0 {
+			return 0
+		}
+		cp := append([]int64(nil), vals...)
+		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+		mid := len(cp) / 2
+		if len(cp)%2 == 1 {
+			return cp[mid]
+		}
+		return (cp[mid-1] + cp[mid]) / 2
+	}
+	medianInt := func(vals []int) int {
+		if len(vals) == 0 {
+			return 0
+		}
+		cp := append([]int(nil), vals...)
+		sort.Ints(cp)
+		mid := len(cp) / 2
+		if len(cp)%2 == 1 {
+			return cp[mid]
+		}
+		return (cp[mid-1] + cp[mid]) / 2
+	}
+
+	type sample struct {
+		wallMS  int64
+		taskMS  int64
+		otherMS int64
+		writeMS int64
+		resMS   int64
+		exec    int
+		tx      int
+		flush   int
+	}
+	var samples []sample
+
+	stripStats := func(v any) (map[string]any, error) {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		var out map[string]any
+		if err := json.Unmarshal(b, &out); err != nil {
+			return nil, err
+		}
+		delete(out, "repo_root")
+		delete(out, "repo_id")
+		return out, nil
+	}
+
+	runOne := func(update bool) (store.ScanSummary, map[string]any, error) {
+		app, repo, repoID, err := makeApp(dbPath)
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		defer app.Close()
+		opts := indexer.Options{
+			RepoRoot: repo.RootPath,
+			Force:    *force,
+			ScanKind: map[bool]string{true: "update", false: "index"}[update],
+		}
+		var summary store.ScanSummary
+		if update {
+			summary, err = app.Indexer.Update(ctx, opts)
+		} else {
+			summary, err = app.Indexer.Index(ctx, opts)
+		}
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		stats, err := app.Query.Stats(ctx, repoID)
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		statsData, err := stripStats(stats)
+		if err != nil {
+			return store.ScanSummary{}, nil, err
+		}
+		return summary, statsData, nil
+	}
+
+	// Ensure update-mode timings are "update" (db already exists).
+	if scanKind == "update" {
+		if err := resetSmokeDB(); err != nil {
+			return err
+		}
+		if _, _, err := runOne(false); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < *warmup; i++ {
+		if scanKind == "index" {
+			if err := resetSmokeDB(); err != nil {
+				return err
+			}
+		}
+		if _, _, err := runOne(scanKind == "update"); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < *runs; i++ {
+		if scanKind == "index" {
+			if err := resetSmokeDB(); err != nil {
+				return err
+			}
+		}
+		summary, statsData, err := runOne(scanKind == "update")
+		if err != nil {
+			return err
+		}
+		ev := indexSmokeRun{
+			Run:      i + 1,
+			ScanKind: scanKind,
+			Force:    *force,
+			Summary:  compactSummary(summary),
+			Stats:    statsData,
+			RepoRoot: repoAbs,
+			Context:  ctxFields,
+		}
+		if err := writeJSONLEvent("index_smoke_run", ev); err != nil {
+			return err
+		}
+		var exec, tx int
+		if summary.WriteStats != nil {
+			exec = summary.WriteStats.TotalExecStatements
+			tx = summary.WriteStats.TxCount
+		}
+		samples = append(samples, sample{
+			wallMS:  summary.ProcessWallMS,
+			taskMS:  summary.TaskMS,
+			otherMS: summary.TaskOtherMS,
+			writeMS: summary.WriteMS,
+			resMS:   summary.ResolveMS,
+			exec:    exec,
+			tx:      tx,
+			flush: summary.WriteMarkSeenFlushes +
+				summary.WriteTouchFlushes +
+				summary.WriteParseFailedFlushes +
+				summary.WriteReplaceFlushes,
+		})
+	}
+
+	var walls, tasks, others, writes, resolves []int64
+	var execs, txs, flushes []int
+	for _, s := range samples {
+		walls = append(walls, s.wallMS)
+		tasks = append(tasks, s.taskMS)
+		others = append(others, s.otherMS)
+		writes = append(writes, s.writeMS)
+		resolves = append(resolves, s.resMS)
+		execs = append(execs, s.exec)
+		txs = append(txs, s.tx)
+		flushes = append(flushes, s.flush)
+	}
+	medianFields := map[string]any{
+		"process_wall_ms":       median(walls),
+		"task_ms":               median(tasks),
+		"task_other_ms":         median(others),
+		"write_ms":              median(writes),
+		"resolve_ms":            median(resolves),
+		"total_exec_statements": medianInt(execs),
+		"write_tx_count":        medianInt(txs),
+		"write_flush_total":     medianInt(flushes),
+	}
+	final := map[string]any{
+		"ok":      true,
+		"context": ctxFields,
+		"median":  medianFields,
+	}
+	if base != nil && base.Median != nil {
+		delta := map[string]any{}
+		for _, k := range []string{"process_wall_ms", "task_ms", "task_other_ms", "write_ms", "resolve_ms", "total_exec_statements"} {
+			cur, ok1 := medianFields[k]
+			baseV, ok2 := base.Median[k]
+			if ok1 && ok2 {
+				delta[k] = map[string]any{"current": cur, "baseline": baseV}
+			}
+		}
+		if len(delta) > 0 {
+			final["delta_vs_baseline"] = delta
+			final["baseline_created_at"] = base.CreatedAt
+		}
+	}
+	if p := strings.TrimSpace(*baselinePath); p != "" && *saveBaseline {
+		payload := indexSmokeBaseline{
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			Command:   append([]string{appname.BinaryName, cmdName}, args...),
+			Context:   ctxFields,
+			Median:    medianFields,
+		}
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode baseline %s: %w", p, err)
+		}
+		dir := filepath.Dir(p)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir baseline dir %s: %w", dir, err)
+		}
+		if err := os.WriteFile(p, append(data, '\n'), 0o644); err != nil {
+			return fmt.Errorf("write baseline %s: %w", p, err)
+		}
+	}
+	return writeJSONLEvent("index_smoke_summary", final)
 }
 
 func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
@@ -751,13 +1384,17 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 				case <-ticker.C:
 					current := w.Stats()
 					writeEvent(map[string]any{
-						"type":  "watch_heartbeat",
-						"stats": current,
+						"type":      "watch_heartbeat",
+						"repo_root": repo.RootPath,
+						"repo_id":   repoID,
+						"stats":     current,
 					})
 					flushDelta := current.FlushRuns - prev.FlushRuns
 					if flushDelta > 0 || current.FlushErrors > prev.FlushErrors || current.QueueErrors > prev.QueueErrors {
 						writeEvent(map[string]any{
 							"type":               "watch_flush_summary",
+							"repo_root":          repo.RootPath,
+							"repo_id":            repoID,
 							"stats":              current,
 							"delta_flush_runs":   flushDelta,
 							"delta_flush_errors": current.FlushErrors - prev.FlushErrors,
@@ -774,8 +1411,10 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	reporterDone.Wait()
 	if *jsonl {
 		event := map[string]any{
-			"type":  "watch_stopped",
-			"stats": w.Stats(),
+			"type":      "watch_stopped",
+			"repo_root": repo.RootPath,
+			"repo_id":   repoID,
+			"stats":     w.Stats(),
 		}
 		if err != nil {
 			event["error"] = err.Error()
@@ -827,12 +1466,26 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		return exp.StreamJSONL(ctx, stdout, repoID, *limit)
 	}
 	if *format == "dot" {
+		// Unbounded no-focus DOT: stream nodes via paged DISTINCT
+		// qualified_name and edges via ExportEdgesPage so peak memory is
+		// O(pageSize) instead of O(repo). Focused DOT (--symbol) keeps the
+		// byte-slice GraphSnapshot path because the bounded subgraph is
+		// already O(subgraph) and matches the focused-edge dedup shape.
+		if selectedSymbol == "" {
+			return exp.DOTStream(ctx, stdout, repoID, 0)
+		}
 		out, err := exp.DOT(ctx, repoID, selectedSymbol, 2)
 		if err != nil {
 			return err
 		}
 		_, err = stdout.Write(out)
 		return err
+	}
+	// Unbounded no-focus JSON: stream straight to stdout via paged loaders so
+	// peak memory is O(pageSize) instead of O(repo). Bounded/focused paths
+	// keep the byte-slice JSONPaged shape (single MarshalIndent call).
+	if selectedSymbol == "" && *limit <= 0 {
+		return exp.JSONStream(ctx, stdout, repoID, 0)
 	}
 	out, err := exp.JSONPaged(ctx, repoID, selectedSymbol, 2, *limit, *offset)
 	if err != nil {
@@ -912,31 +1565,79 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	vacuum := fs.Bool("vacuum", false, "run VACUUM on databases")
+	ftsOptimize := fs.Bool("fts-optimize", false, "run FTS optimize on databases (symbol_fts)")
+	analyze := fs.Bool("analyze", false, "run ANALYZE on databases")
+	walCheckpointTruncate := fs.Bool("wal-checkpoint-truncate", false, "run PRAGMA wal_checkpoint(TRUNCATE) on databases")
+	incrementalVacuum := fs.Bool("incremental-vacuum", false, "run PRAGMA incremental_vacuum (requires auto_vacuum=INCREMENTAL)")
 	repoRootFlag := fs.String("repo-root", "", "repository root to clean")
-	if err := fs.Parse(args); err != nil {
+
+	defaultRepoRoot := ""
+	if config.IsRepoDBDir(cfg.DBDir) {
+		defaultRepoRoot = "."
+	}
+	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	if err != nil {
 		return err
-	}
-	repoRoot := strings.TrimSpace(*repoRootFlag)
-	if repoRoot == "" && fs.NArg() > 0 {
-		repoRoot = fs.Arg(0)
-	}
-	if repoRoot == "" && config.IsRepoDBDir(cfg.DBDir) {
-		repoRoot = "."
 	}
 
 	type dbResult struct {
-		Path           string `json:"path"`
-		Action         string `json:"action"`
-		ReclaimedBytes int64  `json:"reclaimed_bytes"`
-		CanonicalRepo  string `json:"canonical_repo,omitempty"`
-		Error          string `json:"error,omitempty"`
+		Path                    string                     `json:"path"`
+		Action                  string                     `json:"action"`
+		SizeBefore              int64                      `json:"size_before_bytes"`
+		SizeAfter               int64                      `json:"size_after_bytes"`
+		ReclaimedBytes          int64                      `json:"reclaimed_bytes"`
+		Vacuumed                bool                       `json:"vacuumed,omitempty"`
+		FTSOptimized            bool                       `json:"fts_optimized,omitempty"`
+		FTSOptimizeMS           int64                      `json:"fts_optimize_ms,omitempty"`
+		Analyzed                bool                       `json:"analyzed,omitempty"`
+		AnalyzeMS               int64                      `json:"analyze_ms,omitempty"`
+		WALCheckpoint           *store.WalCheckpointResult `json:"wal_checkpoint,omitempty"`
+		IncVacuumed             bool                       `json:"incremental_vacuumed,omitempty"`
+		IncVacuumMS             int64                      `json:"incremental_vacuum_ms,omitempty"`
+		IncVacuumBeforeFreelist int64                      `json:"incremental_vacuum_before_freelist_pages,omitempty"`
+		IncVacuumAfterFreelist  int64                      `json:"incremental_vacuum_after_freelist_pages,omitempty"`
+		CanonicalRepo           string                     `json:"canonical_repo,omitempty"`
+		Error                   string                     `json:"error,omitempty"`
 	}
 	report := map[string]any{
-		"vacuum": *vacuum,
-		"dbs":    []dbResult{},
+		"vacuum":                  *vacuum,
+		"fts_optimize":            *ftsOptimize,
+		"analyze":                 *analyze,
+		"wal_checkpoint_truncate": *walCheckpointTruncate,
+		"incremental_vacuum":      *incrementalVacuum,
+		"dbs":                     []dbResult{},
 	}
 	results := make([]dbResult, 0)
 	var reclaimed int64
+
+	runAnalyze := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		dur, err := s.Analyze(ctx)
+		if err != nil {
+			return err
+		}
+		res.Analyzed = true
+		res.AnalyzeMS = dur.Milliseconds()
+		return nil
+	}
+	runWalCheckpointTruncate := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		walRes, err := s.WalCheckpointTruncate(ctx)
+		if err != nil {
+			return err
+		}
+		res.WALCheckpoint = &walRes
+		return nil
+	}
+	runIncrementalVacuumAll := func(ctx context.Context, s *store.Store, res *dbResult) error {
+		beforePages, afterPages, dur, err := s.IncrementalVacuumAll(ctx)
+		if err != nil {
+			return err
+		}
+		res.IncVacuumed = true
+		res.IncVacuumMS = dur.Milliseconds()
+		res.IncVacuumBeforeFreelist = beforePages
+		res.IncVacuumAfterFreelist = afterPages
+		return nil
+	}
 
 	if repoRoot != "" {
 		canonical, err := store.CanonicalRepoPath(repoRoot)
@@ -949,23 +1650,57 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		}
 		res := dbResult{Path: dbPath, CanonicalRepo: canonical}
 		before := fileSize(dbPath)
+		res.SizeBefore = before
 		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
 		if err != nil {
 			return err
 		}
 		defer s.Close()
+		if *analyze {
+			if err := runAnalyze(ctx, s, &res); err != nil {
+				return err
+			}
+		}
+		if *ftsOptimize {
+			dur, err := s.OptimizeFTS(ctx)
+			if err != nil {
+				return err
+			}
+			res.FTSOptimized = true
+			res.FTSOptimizeMS = dur.Milliseconds()
+		}
+		if *walCheckpointTruncate {
+			if err := runWalCheckpointTruncate(ctx, s, &res); err != nil {
+				return err
+			}
+		}
+		if *incrementalVacuum {
+			if err := runIncrementalVacuumAll(ctx, s, &res); err != nil {
+				return err
+			}
+		}
 		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
 				return err
 			}
-			after := fileSize(dbPath)
-			if before > after {
-				res.ReclaimedBytes = before - after
-				reclaimed += res.ReclaimedBytes
-			}
+			res.Vacuumed = true
 			res.Action = "vacuumed"
+		} else if *incrementalVacuum {
+			res.Action = "incremental_vacuumed"
+		} else if *walCheckpointTruncate {
+			res.Action = "wal_checkpointed"
+		} else if *analyze {
+			res.Action = "analyzed"
+		} else if *ftsOptimize {
+			res.Action = "fts_optimized"
 		} else {
 			res.Action = "inspected"
+		}
+		after := fileSize(dbPath)
+		res.SizeAfter = after
+		if before > after {
+			res.ReclaimedBytes = before - after
+			reclaimed += res.ReclaimedBytes
 		}
 		results = append(results, res)
 		report["dbs"] = results
@@ -986,7 +1721,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		}
 		dbPath := filepath.Join(cfg.DBDir, entry.Name())
 		sizeBefore := fileSize(dbPath)
-		res := dbResult{Path: dbPath}
+		res := dbResult{Path: dbPath, SizeBefore: sizeBefore}
 		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
 		if err != nil {
 			res.Action = "skipped"
@@ -1029,6 +1764,60 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			results = append(results, res)
 			continue
 		}
+		if !*vacuum {
+			res.Action = "kept"
+		}
+		if *analyze {
+			if err := runAnalyze(ctx, s, &res); err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			if !*vacuum && !*ftsOptimize && res.Action == "kept" {
+				res.Action = "analyzed"
+			}
+		}
+		if *ftsOptimize {
+			dur, err := s.OptimizeFTS(ctx)
+			if err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			res.FTSOptimized = true
+			res.FTSOptimizeMS = dur.Milliseconds()
+			if !*vacuum && res.Action == "kept" {
+				res.Action = "fts_optimized"
+			}
+		}
+		if *walCheckpointTruncate {
+			if err := runWalCheckpointTruncate(ctx, s, &res); err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			if !*vacuum && !*ftsOptimize && !*analyze && res.Action == "kept" {
+				res.Action = "wal_checkpointed"
+			}
+		}
+		if *incrementalVacuum {
+			if err := runIncrementalVacuumAll(ctx, s, &res); err != nil {
+				_ = s.Close()
+				res.Action = "skipped"
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			if !*vacuum && !*ftsOptimize && !*analyze && !*walCheckpointTruncate && res.Action == "kept" {
+				res.Action = "incremental_vacuumed"
+			}
+		}
 		if *vacuum {
 			if err := s.Vacuum(ctx); err != nil {
 				_ = s.Close()
@@ -1037,16 +1826,16 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 				results = append(results, res)
 				continue
 			}
-			after := fileSize(dbPath)
-			if sizeBefore > after {
-				res.ReclaimedBytes = sizeBefore - after
-				reclaimed += res.ReclaimedBytes
-			}
+			res.Vacuumed = true
 			res.Action = "vacuumed"
-		} else {
-			res.Action = "kept"
 		}
 		_ = s.Close()
+		sizeAfter := fileSize(dbPath)
+		res.SizeAfter = sizeAfter
+		if sizeBefore > sizeAfter {
+			res.ReclaimedBytes = sizeBefore - sizeAfter
+			reclaimed += res.ReclaimedBytes
+		}
 		results = append(results, res)
 	}
 
@@ -1124,7 +1913,22 @@ func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error
 		if err != nil {
 			return "", err
 		}
-		return filepath.Join(absRoot, repoDBFileName), nil
+		newPath := filepath.Join(absRoot, config.RepoArtifactsDir, repoDBFileName)
+		legacyPath := filepath.Join(absRoot, repoDBFileName)
+		if _, err := os.Stat(newPath); err == nil {
+			return newPath, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("stat %s: %w", newPath, err)
+		}
+		if _, err := os.Stat(legacyPath); err == nil {
+			return legacyPath, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("stat %s: %w", legacyPath, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+			return "", err
+		}
+		return newPath, nil
 	}
 	return filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical)), nil
 }
@@ -1136,12 +1940,14 @@ type graphRepo struct {
 
 func writeJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }
 
 func writeJSONL(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	return enc.Encode(v)
 }
 

@@ -103,6 +103,23 @@ func main() {
 	if deletedSummary.FilesDeleted != 1 {
 		t.Fatalf("FilesDeleted = %d, want 1", deletedSummary.FilesDeleted)
 	}
+
+	stats, err = s.Stats(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("Stats(after delete) error = %v", err)
+	}
+	if stats.Files != 0 {
+		t.Fatalf("stats.Files after delete = %d, want 0", stats.Files)
+	}
+	if stats.Symbols != 0 {
+		t.Fatalf("stats.Symbols after delete = %d, want 0", stats.Symbols)
+	}
+	if stats.References != 0 {
+		t.Fatalf("stats.References after delete = %d, want 0", stats.References)
+	}
+	if stats.Edges != 0 {
+		t.Fatalf("stats.Edges after delete = %d, want 0", stats.Edges)
+	}
 }
 
 func TestIndexSkipsDotAndGeneratedDirectories(t *testing.T) {
@@ -286,7 +303,7 @@ func main() {}
 	}
 }
 
-func mapKeys(m map[string]store.FileRecord) []string {
+func mapKeys(m map[string]store.ExistingFileMeta) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
