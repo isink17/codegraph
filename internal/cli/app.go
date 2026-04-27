@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -104,6 +105,26 @@ func hasHelpFlag(args []string) bool {
 	return false
 }
 
+// isJSONEmpty mirrors `encoding/json`'s `omitempty` rules so reflection-based
+// envelope builders produce the same output shape as a `json.Marshal` round-trip.
+func isJSONEmpty(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Pointer:
+		return v.IsNil()
+	}
+	return false
+}
+
 func parseOptionalRepoRootArg(fs *flag.FlagSet, args []string, repoRootFlag *string, defaultRepoRoot string) (string, error) {
 	repoRootArg := ""
 	parseArgs := args
@@ -113,6 +134,9 @@ func parseOptionalRepoRootArg(fs *flag.FlagSet, args []string, repoRootFlag *str
 	}
 	if err := fs.Parse(parseArgs); err != nil {
 		return "", err
+	}
+	if repoRootArg == "" && fs.NArg() > 0 {
+		repoRootArg = fs.Arg(0)
 	}
 	repoRoot := strings.TrimSpace(*repoRootFlag)
 	if repoRoot == "" {
@@ -652,16 +676,51 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 			}
 		}
 		stripEnvelopeKeys := func(v any, keys ...string) (map[string]any, error) {
-			b, err := json.Marshal(v)
-			if err != nil {
-				return nil, err
-			}
-			var out map[string]any
-			if err := json.Unmarshal(b, &out); err != nil {
-				return nil, err
-			}
+			skip := make(map[string]struct{}, len(keys))
 			for _, k := range keys {
-				delete(out, k)
+				skip[k] = struct{}{}
+			}
+			rv := reflect.ValueOf(v)
+			for rv.Kind() == reflect.Pointer {
+				if rv.IsNil() {
+					return map[string]any{}, nil
+				}
+				rv = rv.Elem()
+			}
+			if rv.Kind() != reflect.Struct {
+				return nil, fmt.Errorf("stripEnvelopeKeys: expected struct, got %s", rv.Kind())
+			}
+			rt := rv.Type()
+			out := make(map[string]any, rt.NumField())
+			for i := 0; i < rt.NumField(); i++ {
+				sf := rt.Field(i)
+				if !sf.IsExported() {
+					continue
+				}
+				name := sf.Name
+				omitempty := false
+				if tag := sf.Tag.Get("json"); tag != "" {
+					parts := strings.Split(tag, ",")
+					if parts[0] == "-" {
+						continue
+					}
+					if parts[0] != "" {
+						name = parts[0]
+					}
+					for _, opt := range parts[1:] {
+						if opt == "omitempty" {
+							omitempty = true
+						}
+					}
+				}
+				if _, drop := skip[name]; drop {
+					continue
+				}
+				fv := rv.Field(i)
+				if omitempty && isJSONEmpty(fv) {
+					continue
+				}
+				out[name] = fv.Interface()
 			}
 			return out, nil
 		}

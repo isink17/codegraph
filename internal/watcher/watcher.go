@@ -148,7 +148,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	eventsCh := fsw.Events
 	errorsCh := fsw.Errors
 
-	addWatchTree := func(root string) error {
+	addWatchTreeTo := func(target *fsnotify.Watcher, root string) error {
 		return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -163,7 +163,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 					if filepath.Base(rel) == config.RepoArtifactsDir {
 						// Keep watching repo-local config updates even though artifacts are
 						// never indexable.
-						if addErr := fsw.Add(path); addErr != nil {
+						if addErr := target.Add(path); addErr != nil {
 							return addErr
 						}
 					}
@@ -171,24 +171,34 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				}
 			}
 			if d.IsDir() {
-				return fsw.Add(path)
+				return target.Add(path)
 			}
 			return nil
 		})
 	}
+	addWatchTree := func(root string) error { return addWatchTreeTo(fsw, root) }
 
 	resetWatcher := func() error {
 		// Rebuild the watcher so include/exclude changes take effect (especially
-		// for directories that were previously skipped and not watched).
-		_ = fsw.Close()
+		// for directories that were previously skipped and not watched). Build
+		// and fully populate the new watcher before swapping it in and closing
+		// the old one, so events on already-watched paths keep flowing through
+		// the old watcher during the rebuild instead of falling into a window
+		// where neither watcher is active.
 		next, err := fsnotify.NewWatcher()
 		if err != nil {
 			return err
 		}
+		if err := addWatchTreeTo(next, repoRoot); err != nil {
+			_ = next.Close()
+			return err
+		}
+		old := fsw
 		fsw = next
-		eventsCh = fsw.Events
-		errorsCh = fsw.Errors
-		return addWatchTree(repoRoot)
+		eventsCh = next.Events
+		errorsCh = next.Errors
+		_ = old.Close()
+		return nil
 	}
 
 	if err := addWatchTree(repoRoot); err != nil {

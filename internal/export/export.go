@@ -2,7 +2,6 @@ package export
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -117,14 +116,9 @@ func (s *Service) JSONStream(ctx context.Context, w io.Writer, repoID int64, pag
 		if e != nil {
 			return e
 		}
-		// JSONStream writes the first-line indentation context manually
-		// before each call. Strip a leading prefix from MarshalIndent's
-		// output so the first line is never double-indented — defensive
-		// against the encoder's contract changing or a future swap to one
-		// that does prefix the first line.
-		if len(prefix) > 0 && bytes.HasPrefix(b, []byte(prefix)) {
-			b = b[len(prefix):]
-		}
+		// `encoding/json.MarshalIndent` does not emit `prefix` before the
+		// first line; JSONStream writes the call-site indentation manually
+		// before each call, so we can write the bytes through unchanged.
 		_, e = bw.Write(b)
 		return e
 	}

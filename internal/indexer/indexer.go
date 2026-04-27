@@ -184,7 +184,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	results := make(chan fileResult, workerCount*2)
 	producerErr := make(chan error, 1)
 	walkStart := time.Now()
-	missingCandidatePaths := make([]string, 0, 16)
+	missingCap := len(candidatePaths)
+	if missingCap > 128 {
+		missingCap = 128
+	}
+	missingCandidatePaths := make([]string, 0, missingCap)
 
 	go func() {
 		defer close(tasks)
