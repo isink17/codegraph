@@ -23,7 +23,7 @@ jobs:
       - name: Run tests
         run: go test ./...
 
-  build-and-release:
+  build:
     needs: test
     runs-on: ubuntu-latest
     strategy:
@@ -48,6 +48,7 @@ jobs:
           - goos: windows
             goarch: arm64
             archive_ext: zip
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -93,12 +94,80 @@ jobs:
             sha256sum "${dist}/${archive_base}.tar.gz" > "${dist}/${archive_base}.tar.gz.sha256"
           fi
 
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          generate_release_notes: true
-          files: |
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/*.zip
             dist/*.zip.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten downloaded artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-dist
+          find dist -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" -o -name "*.zip" -o -name "*.zip.sha256" \) -exec cp {} release-dist/ \;
+
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          section_header="## ${version} -"
+
+          awk -v header="$section_header" '
+            BEGIN { found=0 }
+            $0 ~ /^## / && found { exit }
+            index($0, header) == 1 { found=1 }
+            found { print }
+          ' CHANGELOG.md > release-notes-full.md
+
+          if ! grep -q "^## ${version} -" release-notes-full.md; then
+            echo "Could not find release notes section for tag ${version} in CHANGELOG.md"
+            exit 1
+          fi
+
+          tail -n +2 release-notes-full.md > release-notes.md
+
+      - name: Create or update GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md
+          fi
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" release-dist/* --clobber
