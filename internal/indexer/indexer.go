@@ -292,9 +292,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				}
 				return
 			}
+			hashLookup := func(rel string) (string, bool) {
+				h, ok, err := i.store.LookupFileContentHash(ctxRun, repo.ID, rel)
+				if err != nil {
+					return "", false
+				}
+				return h, ok
+			}
 			for task := range tasks {
 				prev, hasPrev := existing[task.rel]
-				res := processFileTask(ctxRun, task, prev, hasPrev, opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy)
+				res := processFileTask(ctxRun, task, prev, hasPrev, opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy, hashLookup)
 				select {
 				case results <- res:
 				case <-ctxRun.Done():
@@ -694,7 +701,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	return summary, nil
 }
 
-func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFileMeta, hasPrev bool, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string) fileResult {
+func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFileMeta, hasPrev bool, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string, hashLookup func(rel string) (string, bool)) fileResult {
 	result := fileResult{task: task}
 	started := time.Now()
 	defer func() {
@@ -742,9 +749,11 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 		result.hashDur = time.Since(hashStarted)
 	}
 	result.hash = hash
-	if hasPrev && !force && prev.ContentHash == hash {
-		result.action = "touch"
-		return result
+	if hasPrev && !force && hashLookup != nil {
+		if prevHash, ok := hashLookup(task.rel); ok && prevHash == hash {
+			result.action = "touch"
+			return result
+		}
 	}
 
 	parsed := graph.ParsedFile{Language: task.language}
