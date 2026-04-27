@@ -1669,6 +1669,14 @@ func execSymbolFTSInsert(ctx context.Context, tx *sql.Tx, args []any, stats *Wri
 	return nil
 }
 
+// Pre-baked column lists for the only two (table, idColumn) call sites
+// (`symbol_tokens`/`symbol_id` and `file_tokens`/`file_id`). Avoids
+// reallocating the column-list string per token-insert call.
+const (
+	symbolTokensInsertColumns = "symbol_id, token, weight"
+	fileTokensInsertColumns   = "file_id, token, weight"
+)
+
 func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn string, args []any, stats *WriteStats) error {
 	if len(args) == 0 {
 		return nil
@@ -1676,23 +1684,20 @@ func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn str
 	if len(args)%3 != 0 {
 		return fmt.Errorf("invalid token insert args len=%d", len(args))
 	}
-	rows := len(args) / 3
-	// Each row uses 3 params; batch sizes are controlled by sqliteTokenValuesBatchRows to stay under sqliteDefaultMaxVariables.
-	if err := execBatchInsert(ctx, tx, table, idColumn+", token, weight", 3, args, stats); err != nil {
-		return err
+	var columns string
+	switch idColumn {
+	case "symbol_id":
+		columns = symbolTokensInsertColumns
+	case "file_id":
+		columns = fileTokensInsertColumns
+	default:
+		columns = idColumn + ", token, weight"
 	}
-	if stats != nil {
-		switch table {
-		case "symbol_tokens":
-			stats.SymbolTokenInsertBatches++
-			stats.SymbolTokenInsertRows += rows
-		case "file_tokens":
-			stats.FileTokenInsertBatches++
-			stats.FileTokenInsertRows += rows
-		}
-		stats.TotalExecStatements++
-	}
-	return nil
+	// Each row uses 3 params; batch sizes are controlled by sqliteTokenValuesBatchRows
+	// to stay under sqliteDefaultMaxVariables. Stats counters (Symbol/FileToken*,
+	// TotalExecStatements) are bumped exclusively in execBatchInsert to avoid
+	// double-counting from this wrapper.
+	return execBatchInsert(ctx, tx, table, columns, 3, args, stats)
 }
 
 type insertSQLKey struct {
@@ -1737,20 +1742,25 @@ func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, row
 	key := insertSQLKey{table: table, columns: columns, width: rowsPerBatch, rows: rowCount}
 	queryAny, ok := insertSQLCache.Load(key)
 	if !ok {
+		// Build the row tuple once via the cached placeholder string, then
+		// concatenate it rowCount times. Avoids the inner per-row loops and
+		// the fmt.Fprintf allocation in the previous implementation.
+		tuple := "(" + sqlitePlaceholders(rowsPerBatch) + ")"
+		const prefix = "INSERT INTO "
+		const sep = "("
+		const valuesKw = ") VALUES "
 		var b strings.Builder
-		fmt.Fprintf(&b, "INSERT INTO %s(%s) VALUES ", table, columns)
+		b.Grow(len(prefix) + len(table) + len(sep) + len(columns) + len(valuesKw) + rowCount*(len(tuple)+1))
+		b.WriteString(prefix)
+		b.WriteString(table)
+		b.WriteString(sep)
+		b.WriteString(columns)
+		b.WriteString(valuesKw)
 		for i := 0; i < rowCount; i++ {
 			if i > 0 {
-				b.WriteString(",")
+				b.WriteByte(',')
 			}
-			b.WriteString("(")
-			for j := 0; j < rowsPerBatch; j++ {
-				if j > 0 {
-					b.WriteString(",")
-				}
-				b.WriteString("?")
-			}
-			b.WriteString(")")
+			b.WriteString(tuple)
 		}
 		queryAny, _ = insertSQLCache.LoadOrStore(key, b.String())
 	}
@@ -1822,8 +1832,18 @@ type srcSymbolChooser struct {
 }
 
 func newSrcSymbolChooser(stableToID map[string]int64, symbols []graph.Symbol) srcSymbolChooser {
+	// Pre-size to the upper bound of function symbols (capped to keep the
+	// allocation small for files with many non-function symbols). Avoids
+	// the 16->32->64 doubling sequence for files with >16 functions.
+	capHint := len(symbols)
+	if capHint > 64 {
+		capHint = 64
+	}
+	if capHint < 8 {
+		capHint = 8
+	}
 	out := srcSymbolChooser{
-		spans:     make([]funcSpan, 0, 16),
+		spans:     make([]funcSpan, 0, capHint),
 		monotonic: true,
 	}
 	lastStart := -1

@@ -86,6 +86,64 @@ func BenchmarkStoreReplaceFileGraphWriteHeavy(b *testing.B) {
 	}
 }
 
+// BenchmarkStoreReplaceFileGraphsBatchWriteHeavy stresses the multi-file batch
+// path (`ReplaceFileGraphsBatchWithStats`) so per-batch hot-loop allocations
+// are visible in isolation from single-file overhead.
+func BenchmarkStoreReplaceFileGraphsBatchWriteHeavy(b *testing.B) {
+	ctx := context.Background()
+	profile := sqliteBenchProfile()
+	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
+	b.Logf("sqlite_profile=%s", profile)
+
+	dbPath := filepath.Join(b.TempDir(), "store-batch-write-heavy.sqlite")
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: profile})
+	if err != nil {
+		b.Fatalf("store.OpenWithOptions() error = %v", err)
+	}
+	b.Cleanup(func() { _ = s.Close() })
+
+	repoRoot := b.TempDir()
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		b.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	const (
+		filesPerBatch  = 16
+		symbolsPerFile = 40
+		refsPerSymbol  = 2
+		edgesPerSymbol = 2
+	)
+
+	parsed := heavyParsedFile(symbolsPerFile, refsPerSymbol, edgesPerSymbol)
+	inputs := make([]store.ReplaceFileGraphInput, 0, filesPerBatch)
+	for j := 0; j < filesPerBatch; j++ {
+		inputs = append(inputs, store.ReplaceFileGraphInput{
+			Path:        fmt.Sprintf("bench/batch_%d.go", j),
+			Language:    "go",
+			SizeBytes:   1024,
+			MtimeUnixNS: 0,
+			ContentHash: "",
+			Parsed:      parsed,
+		})
+	}
+
+	stats := &store.WriteStats{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Vary mtime/hash per iteration so the upsert always writes.
+		hash := strconv.Itoa(i)
+		for j := range inputs {
+			inputs[j].MtimeUnixNS = int64(i)
+			inputs[j].ContentHash = hash
+		}
+		if _, err := s.ReplaceFileGraphsBatchWithStats(ctx, repo.ID, 1, inputs, stats); err != nil {
+			b.Fatalf("ReplaceFileGraphsBatchWithStats() error = %v", err)
+		}
+	}
+}
+
 func setupStoreBenchData(b *testing.B, ctx context.Context) (*store.Store, int64) {
 	b.Helper()
 	repoRoot := b.TempDir()
