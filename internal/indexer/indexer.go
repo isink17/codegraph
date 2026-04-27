@@ -128,18 +128,33 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	pathScoped := len(candidateSet) > 0
 
-	var existing map[string]store.FileRecord
+	// Run the existing-files load concurrently with the filesystem walk so
+	// the floor cost of a no-op repo-wide update is roughly max(loadMS, walkMS)
+	// instead of loadMS+walkMS. Workers block on `existingReady` before
+	// reading the resulting map; the FS-walk producer fills the (now
+	// larger) `tasks` buffer in parallel. On load failure a monitor goroutine
+	// cancels `ctxRun` so the producer/workers drain cleanly.
+	var (
+		existing       map[string]store.FileRecord
+		loadErr        error
+		existingLoadMS int64
+	)
 	existingLoadStarted := time.Now()
-	if len(candidateSet) > 0 {
-		existing, err = i.store.ExistingFilesForPaths(ctx, repo.ID, candidatePaths)
-	} else {
-		existing, err = i.store.ExistingFiles(ctx, repo.ID)
-	}
-	summary.ExistingLoadMS = time.Since(existingLoadStarted).Milliseconds()
-	if err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
-	}
+	existingReady := make(chan struct{})
+	go func() {
+		defer close(existingReady)
+		var (
+			m   map[string]store.FileRecord
+			err error
+		)
+		if pathScoped {
+			m, err = i.store.ExistingFilesForPaths(ctx, repo.ID, candidatePaths)
+		} else {
+			m, err = i.store.ExistingFiles(ctx, repo.ID)
+		}
+		existingLoadMS = time.Since(existingLoadStarted).Milliseconds()
+		existing, loadErr = m, err
+	}()
 
 	workerCount := runtime.NumCPU()
 	if workerCount < 2 {
@@ -152,7 +167,19 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	ctxRun, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	tasks := make(chan fileTask, workerCount*2)
+	go func() {
+		<-existingReady
+		if loadErr != nil {
+			cancel()
+		}
+	}()
+
+	// `tasks` is sized so the FS-walk producer can keep filling while the
+	// existing-files load is still in flight. With cap=workerCount*2 the
+	// producer would stall on a full channel after ~16 dirents, defeating
+	// the overlap on large repos. workerCount*64 (≤512 entries × ~200B
+	// per fileTask ≈ ~100KB) keeps peak buffer trivial.
+	tasks := make(chan fileTask, workerCount*64)
 	results := make(chan fileResult, workerCount*2)
 	producerErr := make(chan error, 1)
 	walkStart := time.Now()
@@ -256,6 +283,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-existingReady
+			if loadErr != nil {
+				// Drain producer-buffered tasks so the producer's
+				// send-side select can observe ctxRun cancellation and exit.
+				for range tasks {
+				}
+				return
+			}
 			for task := range tasks {
 				res := processFileTask(ctxRun, task, existing[task.rel], opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy)
 				select {
@@ -525,6 +560,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 
 	walkErr := <-producerErr
+	// Safe to read existingLoadMS here: the workers' `<-existingReady` happens-
+	// before any workers exit, and wg.Wait() (closing `results`) joined them
+	// before this consumer-loop returned.
+	summary.ExistingLoadMS = existingLoadMS
 	summary.WalkMS = time.Since(walkStart).Milliseconds()
 	summary.ProcessWallMS = time.Since(processWallStart).Milliseconds()
 	summary.TaskMS = taskDur.Milliseconds()
@@ -540,9 +579,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if writeStats != (store.WriteStats{}) {
 		summary.WriteStats = &writeStats
 	}
-	if runErr == nil && walkErr != nil && walkErr != context.Canceled {
-		runErr = walkErr
-	}
+if (runErr == nil || errors.Is(runErr, context.Canceled)) && walkErr != nil && !errors.Is(walkErr, context.Canceled) {
+	runErr = walkErr
+}
+if (runErr == nil || errors.Is(runErr, context.Canceled)) && loadErr != nil {
+	runErr = loadErr
+}
 	if runErr != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", runErr.Error())
 		return summary, runErr
