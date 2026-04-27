@@ -748,11 +748,20 @@ func QueryDBPragmas(ctx context.Context, db *sql.DB) (DBPragmas, error) {
 	return out, nil
 }
 
+// ExistingFiles returns active (non-deleted) file records for the repo,
+// projecting only the columns the change-detection path actually consumes
+// (`path`, `size_bytes`, `mtime_unix_ns`, `content_sha256`). `ID` and
+// `Language` on the returned `FileRecord` are intentionally left zero.
+//
+// Filtering `is_deleted = 0` server-side avoids materializing tombstone rows
+// that can never match a walked path, shrinking both the query result set
+// and the resulting Go map. `IsDeleted` is therefore always false on returned
+// records.
 func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]FileRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, path, language, size_bytes, mtime_unix_ns, content_sha256, is_deleted
+		SELECT path, size_bytes, mtime_unix_ns, content_sha256
 		FROM files
-		WHERE repo_id = ?
+		WHERE repo_id = ? AND is_deleted = 0
 	`, repoID)
 	if err != nil {
 		return nil, err
@@ -760,6 +769,8 @@ func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]Fil
 	return scanExistingFiles(rows)
 }
 
+// ExistingFilesForPaths is the path-scoped sibling of ExistingFiles; same
+// projection and same `is_deleted = 0` filter apply.
 func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths []string) (map[string]FileRecord, error) {
 	out := make(map[string]FileRecord, len(paths))
 	if len(paths) == 0 {
@@ -771,9 +782,9 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		chunk := paths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT id, path, language, size_bytes, mtime_unix_ns, content_sha256, is_deleted
+			SELECT path, size_bytes, mtime_unix_ns, content_sha256
 			FROM files
-			WHERE repo_id = ? AND path IN (` + placeholders + `)
+			WHERE repo_id = ? AND is_deleted = 0 AND path IN (` + placeholders + `)
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -800,11 +811,9 @@ func scanExistingFiles(rows *sql.Rows) (map[string]FileRecord, error) {
 	out := map[string]FileRecord{}
 	for rows.Next() {
 		var rec FileRecord
-		var isDeleted int
-		if err := rows.Scan(&rec.ID, &rec.Path, &rec.Language, &rec.SizeBytes, &rec.MtimeUnixNS, &rec.ContentHash, &isDeleted); err != nil {
+		if err := rows.Scan(&rec.Path, &rec.SizeBytes, &rec.MtimeUnixNS, &rec.ContentHash); err != nil {
 			return nil, err
 		}
-		rec.IsDeleted = isDeleted == 1
 		out[rec.Path] = rec
 	}
 	return out, rows.Err()
