@@ -11,14 +11,14 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/texttoken"
@@ -26,6 +26,46 @@ import (
 
 //go:embed schema/*.sql
 var migrationFS embed.FS
+
+const (
+	// sqliteDefaultMaxVariables is SQLite's commonly configured parameter limit (often 999).
+	// Keep batch sizes below this to avoid "too many SQL variables" errors.
+	sqliteDefaultMaxVariables = 999
+
+	// sqliteInClauseBatchSize is a conservative IN-clause chunk size used for set-based deletes/updates.
+	// It stays under sqliteDefaultMaxVariables with room for any additional parameters.
+	sqliteInClauseBatchSize = 900
+
+	// sqliteTokenValuesBatchRows controls multi-row inserts into token tables where each row uses 3 parameters.
+	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteTokenValuesBatchRows = 300
+
+	// sqliteEmbeddingValuesBatchRows controls multi-row upserts into symbol_embeddings where each row uses 7 parameters.
+	// 100*7=700 variables, staying under sqliteDefaultMaxVariables.
+	sqliteEmbeddingValuesBatchRows = 100
+
+	// sqliteReferenceValuesBatchRows controls multi-row inserts into references_tbl where each row uses 11 parameters.
+	// 90*11=990 variables, staying under sqliteDefaultMaxVariables.
+	sqliteReferenceValuesBatchRows = 90
+
+	// sqliteEdgeValuesBatchRows controls multi-row inserts into edges where each row uses 7 parameters.
+	// 140*7=980 variables, staying under sqliteDefaultMaxVariables.
+	sqliteEdgeValuesBatchRows = 140
+
+	// sqliteImportValuesBatchRows controls multi-row inserts into file_imports where each row uses 3 parameters.
+	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteImportValuesBatchRows = 300
+	// sqliteTestLinkValuesBatchRows controls multi-row inserts into test_links where each row uses 7 parameters.
+	// 128*7=896 variables, staying under sqliteDefaultMaxVariables.
+	sqliteTestLinkValuesBatchRows = 128
+
+	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 18 parameters.
+	// 55*18=990 variables, staying under sqliteDefaultMaxVariables.
+	sqliteSymbolValuesBatchRows = 55
+	// sqliteSymbolFTSValuesBatchRows controls multi-row inserts into symbol_fts where each row uses 6 parameters.
+	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
+	sqliteSymbolFTSValuesBatchRows = 150
+)
 
 type Store struct {
 	db *sql.DB
@@ -54,23 +94,103 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
-	RepoID           int64                     `json:"repo_id"`
-	ScanID           int64                     `json:"scan_id"`
-	FilesSeen        int                       `json:"files_seen"`
-	FilesIndexed     int                       `json:"files_indexed"`
-	FilesSkipped     int                       `json:"files_skipped"`
-	FilesChanged     int                       `json:"files_changed"`
-	FilesDeleted     int                       `json:"files_deleted"`
-	FilesTotal       int                       `json:"files_total,omitempty"`
-	FilesDeletedPct  float64                   `json:"files_deleted_pct,omitempty"`
-	ParseErrors      int                       `json:"parse_errors,omitempty"`
-	ParseSamples     []string                  `json:"parse_samples,omitempty"`
-	LanguageCoverage map[string]LanguageCounts `json:"language_coverage,omitempty"`
-	WalkMS           int64                     `json:"walk_ms,omitempty"`
-	ParseMS          int64                     `json:"parse_ms,omitempty"`
-	WriteMS          int64                     `json:"write_ms,omitempty"`
-	ResolveMS        int64                     `json:"resolve_ms,omitempty"`
-	DurationMS       int64                     `json:"duration_ms"`
+	RepoID                  int64                      `json:"repo_id"`
+	ScanID                  int64                      `json:"scan_id"`
+	FilesSeen               int                        `json:"files_seen"`
+	FilesIndexed            int                        `json:"files_indexed"`
+	FilesSkipped            int                        `json:"files_skipped"`
+	FilesChanged            int                        `json:"files_changed"`
+	FilesDeleted            int                        `json:"files_deleted"`
+	FilesTotal              int                        `json:"files_total,omitempty"`
+	FilesDeletedPct         float64                    `json:"files_deleted_pct,omitempty"`
+	ParseErrors             int                        `json:"parse_errors,omitempty"`
+	ParseSamples            []string                   `json:"parse_samples,omitempty"`
+	LanguageCoverage        map[string]LanguageCounts  `json:"language_coverage,omitempty"`
+	PhaseTimings            []ScanPhaseTiming          `json:"phase_timings,omitempty"`
+	ExistingLoadMS          int64                      `json:"existing_load_ms,omitempty"`
+	WalkMS                  int64                      `json:"walk_ms,omitempty"`
+	ProcessWallMS           int64                      `json:"process_wall_ms,omitempty"`
+	TaskMS                  int64                      `json:"task_ms,omitempty"`
+	TaskOtherMS             int64                      `json:"task_other_ms,omitempty"`
+	ParseMS                 int64                      `json:"parse_ms,omitempty"`
+	ReadMS                  int64                      `json:"read_ms,omitempty"`
+	HashMS                  int64                      `json:"hash_ms,omitempty"`
+	WriteMS                 int64                      `json:"write_ms,omitempty"`
+	WriteMetadataMS         int64                      `json:"write_metadata_ms,omitempty"`
+	WriteReplaceMS          int64                      `json:"write_replace_ms,omitempty"`
+	WriteMarkSeenFlushes    int                        `json:"write_mark_seen_flushes,omitempty"`
+	WriteMarkSeenSkipped    int                        `json:"write_mark_seen_skipped,omitempty"`
+	WriteTouchFlushes       int                        `json:"write_touch_flushes,omitempty"`
+	WriteParseFailedFlushes int                        `json:"write_parse_failed_flushes,omitempty"`
+	WriteReplaceFlushes     int                        `json:"write_replace_flushes,omitempty"`
+	WriteStats              *WriteStats                `json:"write_stats,omitempty"`
+	EmbedMS                 int64                      `json:"embed_ms,omitempty"`
+	MarkMissingMS           int64                      `json:"mark_missing_ms,omitempty"`
+	ResolveMS               int64                      `json:"resolve_ms,omitempty"`
+	ResolveMode             string                     `json:"resolve_mode,omitempty"`
+	ResolveCrossFileMS      int64                      `json:"resolve_cross_file_ms,omitempty"`
+	ResolveCrossFileTargets int                        `json:"resolve_cross_file_targets,omitempty"`
+	ResolveCrossFile        *ResolveEdgesForNamesStats `json:"resolve_cross_file,omitempty"`
+	DurationMS              int64                      `json:"duration_ms"`
+}
+
+type ResolveEdgesForNamesStats struct {
+	NamesInput        int   `json:"names_input,omitempty"`
+	NamesUnique       int   `json:"names_unique,omitempty"`
+	ExactQueryBatches int   `json:"exact_query_batches,omitempty"`
+	ExactHits         int   `json:"exact_hits,omitempty"`
+	QualifiedScanned  int   `json:"qualified_scanned,omitempty"`
+	SuffixHits        int   `json:"suffix_hits,omitempty"`
+	TargetsSelected   int   `json:"targets_selected,omitempty"`
+	ExactSelectMS     int64 `json:"exact_select_ms,omitempty"`
+	SuffixSelectMS    int64 `json:"suffix_select_ms,omitempty"`
+	ResolveTargetsMS  int64 `json:"resolve_targets_ms,omitempty"`
+}
+
+type ScanPhaseTiming struct {
+	Phase string `json:"phase"`
+	MS    int64  `json:"ms"`
+}
+
+type WriteStats struct {
+	TxCount int `json:"tx_count,omitempty"`
+
+	FileUpsertStatements int `json:"file_upsert_statements,omitempty"`
+
+	FileGraphDeleteChunks              int `json:"file_graph_delete_chunks,omitempty"`
+	FileGraphDeleteStatements          int `json:"file_graph_delete_statements,omitempty"`
+	FileGraphDeleteTempIDInsertBatches int `json:"file_graph_delete_temp_id_insert_batches,omitempty"`
+	FileGraphDeleteTempIDInsertRows    int `json:"file_graph_delete_temp_id_insert_rows,omitempty"`
+
+	SymbolInserts    int `json:"symbol_inserts,omitempty"`
+	SymbolFTSInserts int `json:"symbol_fts_inserts,omitempty"`
+
+	SymbolInsertBatches    int `json:"symbol_insert_batches,omitempty"`
+	SymbolInsertRows       int `json:"symbol_insert_rows,omitempty"`
+	SymbolFTSInsertBatches int `json:"symbol_fts_insert_batches,omitempty"`
+	SymbolFTSInsertRows    int `json:"symbol_fts_insert_rows,omitempty"`
+
+	SymbolTokenInsertBatches int   `json:"symbol_token_insert_batches,omitempty"`
+	SymbolTokenInsertRows    int   `json:"symbol_token_insert_rows,omitempty"`
+	SymbolTokenizeNS         int64 `json:"symbol_tokenize_ns,omitempty"`
+	SymbolTokenizeCalls      int   `json:"symbol_tokenize_calls,omitempty"`
+
+	FileTokenInsertBatches int `json:"file_token_insert_batches,omitempty"`
+	FileTokenInsertRows    int `json:"file_token_insert_rows,omitempty"`
+
+	ReferenceInsertBatches int `json:"reference_insert_batches,omitempty"`
+	ReferenceInsertRows    int `json:"reference_insert_rows,omitempty"`
+
+	EdgeInsertBatches int `json:"edge_insert_batches,omitempty"`
+	EdgeInsertRows    int `json:"edge_insert_rows,omitempty"`
+
+	ImportInsertBatches int `json:"import_insert_batches,omitempty"`
+	ImportInsertRows    int `json:"import_insert_rows,omitempty"`
+
+	TestLinkInsertBatches int `json:"test_link_insert_batches,omitempty"`
+	TestLinkInsertRows    int `json:"test_link_insert_rows,omitempty"`
+
+	TotalExecStatements int `json:"total_exec_statements,omitempty"`
 }
 
 type LanguageCounts struct {
@@ -113,6 +233,15 @@ type ExportEdge struct {
 	Line             int    `json:"line"`
 }
 
+type ReplaceFileGraphInput struct {
+	Path        string
+	Language    string
+	SizeBytes   int64
+	MtimeUnixNS int64
+	ContentHash string
+	Parsed      graph.ParsedFile
+}
+
 func Open(path string) (*Store, error) {
 	return OpenWithOptions(path, OpenOptions{})
 }
@@ -121,11 +250,27 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	isNewDB := false
+	if st, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			isNewDB = true
+		} else {
+			return nil, err
+		}
+	} else if st.Size() == 0 {
+		isNewDB = true
+	}
+	dsn, err := BuildSQLiteDSN(path, opts, isNewDB, false)
 	if err != nil {
 		return nil, err
 	}
-	if err := applyPragmas(db, opts.PerformanceProfile); err != nil {
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
+		return applyPragmas(db, isNewDB, opts.PerformanceProfile)
+	}); err != nil {
 		return nil, err
 	}
 	s := &Store{db: db}
@@ -135,11 +280,91 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	return s, nil
 }
 
-func applyPragmas(db *sql.DB, profile string) error {
+func BuildSQLiteDSN(path string, opts OpenOptions, isNewDB bool, readOnly bool) (string, error) {
+	pragmas := buildPragmas(isNewDB, opts.PerformanceProfile)
+	values := url.Values{}
+	if readOnly {
+		values.Set("mode", "ro")
+	}
+	for _, pragma := range pragmas {
+		values.Add("_pragma", pragma)
+	}
+	p := filepath.ToSlash(path)
+	u := url.URL{Scheme: "file"}
+	if strings.HasPrefix(p, "//") {
+		rest := strings.TrimPrefix(p, "//")
+		host, tail, _ := strings.Cut(rest, "/")
+		u.Host = host
+		u.Path = "/" + tail
+	} else {
+		if len(p) >= 2 && p[1] == ':' {
+			p = "/" + p
+		}
+		u.Path = p
+	}
+	u.RawQuery = values.Encode()
+	return u.String(), nil
+}
+
+func withSQLiteBusyRetry(timeout, interval time.Duration, fn func() error) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := fn(); err != nil {
+			if isSQLiteBusy(err) && time.Now().Before(deadline) {
+				time.Sleep(interval)
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+}
+
+func buildPragmas(isNewDB bool, profile string) []string {
+	base := []string{
+		`journal_mode(WAL)`,
+		`busy_timeout(5000)`,
+		`foreign_keys(ON)`,
+		`cache_size(-65536)`,
+	}
+	if isNewDB {
+		// auto_vacuum is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, switching auto_vacuum requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `auto_vacuum(INCREMENTAL)`)
+
+		// page_size is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, changing page_size requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `page_size(8192)`)
+	}
+	perf := strings.ToLower(strings.TrimSpace(profile))
+	switch perf {
+	case "", "balanced":
+		base = append(base, `synchronous(NORMAL)`, `temp_store(MEMORY)`)
+	case "durable":
+		base = append(base, `synchronous(FULL)`)
+	case "fast":
+		base = append(base, `synchronous(OFF)`, `temp_store(MEMORY)`)
+	default:
+		base = append(base, `synchronous(NORMAL)`, `temp_store(MEMORY)`)
+	}
+	return base
+}
+
+func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
 	base := []string{
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA busy_timeout = 5000;`,
 		`PRAGMA foreign_keys = ON;`,
+		`PRAGMA cache_size = -65536;`,
+	}
+	if isNewDB {
+		// auto_vacuum is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, switching auto_vacuum requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `PRAGMA auto_vacuum = INCREMENTAL;`)
+
+		// page_size is only reliably applied for a brand-new DB before any tables are created.
+		// For existing DBs, changing page_size requires VACUUM; we avoid doing that implicitly.
+		base = append(base, `PRAGMA page_size = 8192;`)
 	}
 	perf := strings.ToLower(strings.TrimSpace(profile))
 	switch perf {
@@ -174,41 +399,56 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate() error {
+	ctx := context.Background()
 	entries, err := fs.ReadDir(migrationFS, "schema")
 	if err != nil {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	for _, entry := range entries {
 		name := entry.Name()
 		var version int
 		if _, err := fmt.Sscanf(name, "%d_", &version); err != nil {
 			continue
 		}
-		exists, err := hasMigration(s.db, version)
+		if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
+			_, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`)
+			return err
+		}); err != nil {
+			return err
+		}
+
+		exists, err := hasMigrationConn(ctx, conn, version)
 		if err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
 		if exists {
+			if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+				return err
+			}
 			continue
 		}
 		sqlBytes, err := migrationFS.ReadFile(filepath.ToSlash(filepath.Join("schema", name)))
 		if err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
-		tx, err := s.db.Begin()
-		if err != nil {
+		if _, err := conn.ExecContext(ctx, string(sqlBytes)); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
-		if _, err := tx.Exec(string(sqlBytes)); err != nil {
-			_ = tx.Rollback()
+		if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, version, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, version, time.Now().UTC().Format(time.RFC3339)); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
 	}
@@ -218,6 +458,18 @@ func (s *Store) Migrate() error {
 func hasMigration(db *sql.DB, version int) (bool, error) {
 	var exists int
 	err := db.QueryRow(`SELECT COUNT(1) FROM schema_migrations WHERE version = ?`, version).Scan(&exists)
+	if err == nil {
+		return exists > 0, nil
+	}
+	if strings.Contains(err.Error(), "no such table") {
+		return false, nil
+	}
+	return false, err
+}
+
+func hasMigrationConn(ctx context.Context, conn *sql.Conn, version int) (bool, error) {
+	var exists int
+	err := conn.QueryRowContext(ctx, `SELECT COUNT(1) FROM schema_migrations WHERE version = ?`, version).Scan(&exists)
 	if err == nil {
 		return exists > 0, nil
 	}
@@ -355,20 +607,185 @@ func (s *Store) Vacuum(ctx context.Context) error {
 	return err
 }
 
-func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]FileRecord, error) {
+func (s *Store) OptimizeFTS(ctx context.Context) (time.Duration, error) {
+	start := time.Now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO symbol_fts(symbol_fts) VALUES('optimize')`)
+	return time.Since(start), err
+}
+
+type WalCheckpointResult struct {
+	Busy       int64  `json:"busy"`
+	LogFrames  int64  `json:"log_frames"`
+	CkptFrames int64  `json:"checkpointed_frames"`
+	Mode       string `json:"mode"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+func (s *Store) Analyze(ctx context.Context) (time.Duration, error) {
+	start := time.Now()
+	_, err := s.db.ExecContext(ctx, `ANALYZE`)
+	return time.Since(start), err
+}
+
+func (s *Store) WalCheckpointTruncate(ctx context.Context) (WalCheckpointResult, error) {
+	start := time.Now()
+	var busy, logFrames, ckptFrames int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &ckptFrames); err != nil {
+		return WalCheckpointResult{}, err
+	}
+	return WalCheckpointResult{
+		Busy:       busy,
+		LogFrames:  logFrames,
+		CkptFrames: ckptFrames,
+		Mode:       "TRUNCATE",
+		DurationMS: time.Since(start).Milliseconds(),
+	}, nil
+}
+
+func (s *Store) IncrementalVacuumAll(ctx context.Context) (beforeFreelist, afterFreelist int64, dur time.Duration, err error) {
+	before, err := s.DBPragmas(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	// SQLite auto_vacuum modes:
+	//   0 = NONE
+	//   1 = FULL
+	//   2 = INCREMENTAL (required for PRAGMA incremental_vacuum to reclaim pages)
+	switch before.AutoVacuum {
+	case 2:
+		// ok
+	case 0:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); database is auto_vacuum=NONE (0)")
+	case 1:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); database is auto_vacuum=FULL (1)")
+	default:
+		return 0, 0, 0, fmt.Errorf("incremental vacuum requires PRAGMA auto_vacuum=INCREMENTAL (2); got auto_vacuum=%d", before.AutoVacuum)
+	}
+
+	start := time.Now()
+	// PRAGMA incremental_vacuum without an argument attempts to remove all pages from the freelist.
+	if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+		return 0, 0, 0, err
+	}
+	after, err := s.DBPragmas(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return before.FreelistCount, after.FreelistCount, time.Since(start), nil
+}
+
+type DBPragmas struct {
+	SQLiteVersion     string `json:"sqlite_version"`
+	JournalMode       string `json:"journal_mode"`
+	Synchronous       string `json:"synchronous"`
+	TempStore         string `json:"temp_store"`
+	AutoVacuum        int64  `json:"auto_vacuum"`
+	PageSize          int64  `json:"page_size"`
+	PageCount         int64  `json:"page_count"`
+	FreelistCount     int64  `json:"freelist_count"`
+	BusyTimeoutMS     int64  `json:"busy_timeout_ms"`
+	ForeignKeys       bool   `json:"foreign_keys"`
+	WalAutocheckpoint int64  `json:"wal_autocheckpoint"`
+	UserVersion       int64  `json:"user_version"`
+	SymbolFTSPresent  bool   `json:"symbol_fts_present"`
+}
+
+func (s *Store) DBPragmas(ctx context.Context) (DBPragmas, error) {
+	return QueryDBPragmas(ctx, s.db)
+}
+
+func QueryDBPragmas(ctx context.Context, db *sql.DB) (DBPragmas, error) {
+	var out DBPragmas
+
+	if err := db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&out.SQLiteVersion); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&out.JournalMode); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&out.Synchronous); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA temp_store`).Scan(&out.TempStore); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&out.AutoVacuum); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&out.PageSize); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&out.PageCount); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&out.FreelistCount); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&out.BusyTimeoutMS); err != nil {
+		return DBPragmas{}, err
+	}
+	var foreignKeys int64
+	if err := db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return DBPragmas{}, err
+	}
+	out.ForeignKeys = foreignKeys != 0
+	if err := db.QueryRowContext(ctx, `PRAGMA wal_autocheckpoint`).Scan(&out.WalAutocheckpoint); err != nil {
+		return DBPragmas{}, err
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&out.UserVersion); err != nil {
+		return DBPragmas{}, err
+	}
+
+	var symbolFTSName string
+	err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='symbol_fts'`).Scan(&symbolFTSName)
+	if err == nil && symbolFTSName == "symbol_fts" {
+		out.SymbolFTSPresent = true
+	} else if errors.Is(err, sql.ErrNoRows) {
+		out.SymbolFTSPresent = false
+	} else if err != nil {
+		return DBPragmas{}, err
+	}
+	return out, nil
+}
+
+// ExistingFileMeta is the slim per-row value the change-detection path
+// actually consumes upfront. It carries only the (size, mtime) pair —
+// the fields the indexer's fast path checks first. `content_sha256` is
+// deliberately NOT in this struct: it's only consulted in the slow
+// branch (size/mtime mismatch) and is fetched lazily via
+// `LookupFileContentHash` so a repo-wide no-op load doesn't allocate
+// one hex string per file.
+type ExistingFileMeta struct {
+	SizeBytes   int64
+	MtimeUnixNS int64
+}
+
+// ExistingFiles returns active (non-deleted) file records for the repo,
+// keyed by path with a slim `ExistingFileMeta` value. The projection is
+// the fast-path minimum (`size_bytes`, `mtime_unix_ns`); `is_deleted = 0`
+// is applied server-side so tombstone rows never reach the Go map. The
+// content hash is fetched on demand via `LookupFileContentHash` only
+// when (size, mtime) differs from disk.
+func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]ExistingFileMeta, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, path, language, size_bytes, mtime_unix_ns, content_sha256, is_deleted
+		SELECT path, size_bytes, mtime_unix_ns
 		FROM files
-		WHERE repo_id = ?
+		WHERE repo_id = ? AND is_deleted = 0
 	`, repoID)
 	if err != nil {
 		return nil, err
 	}
-	return scanExistingFiles(rows)
+	out := map[string]ExistingFileMeta{}
+	if err := scanExistingFileMetasInto(rows, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths []string) (map[string]FileRecord, error) {
-	out := make(map[string]FileRecord, len(paths))
+// ExistingFilesForPaths is the path-scoped sibling of ExistingFiles; same
+// projection and same `is_deleted = 0` filter apply.
+func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths []string) (map[string]ExistingFileMeta, error) {
+	out := make(map[string]ExistingFileMeta, len(paths))
 	if len(paths) == 0 {
 		return out, nil
 	}
@@ -378,9 +795,9 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		chunk := paths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT id, path, language, size_bytes, mtime_unix_ns, content_sha256, is_deleted
+			SELECT path, size_bytes, mtime_unix_ns
 			FROM files
-			WHERE repo_id = ? AND path IN (` + placeholders + `)
+			WHERE repo_id = ? AND is_deleted = 0 AND path IN (` + placeholders + `)
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -391,30 +808,48 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		if err != nil {
 			return nil, err
 		}
-		records, err := scanExistingFiles(rows)
-		if err != nil {
+		if err := scanExistingFileMetasInto(rows, out); err != nil {
 			return nil, err
-		}
-		for k, v := range records {
-			out[k] = v
 		}
 	}
 	return out, nil
 }
 
-func scanExistingFiles(rows *sql.Rows) (map[string]FileRecord, error) {
-	defer rows.Close()
-	out := map[string]FileRecord{}
-	for rows.Next() {
-		var rec FileRecord
-		var isDeleted int
-		if err := rows.Scan(&rec.ID, &rec.Path, &rec.Language, &rec.SizeBytes, &rec.MtimeUnixNS, &rec.ContentHash, &isDeleted); err != nil {
-			return nil, err
-		}
-		rec.IsDeleted = isDeleted == 1
-		out[rec.Path] = rec
+// LookupFileContentHash returns the stored `content_sha256` for the given
+// active file path, or ("", false, nil) if no live row exists. Used by the
+// indexer's slow-path "touch vs. replace" decision after a (size, mtime)
+// mismatch — folding this into a per-file query keeps the upfront
+// `ExistingFiles` map free of per-row hex strings.
+func (s *Store) LookupFileContentHash(ctx context.Context, repoID int64, path string) (string, bool, error) {
+	var hash string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT content_sha256
+		FROM files
+		WHERE repo_id = ? AND is_deleted = 0 AND path = ?
+	`, repoID, path).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
 	}
-	return out, rows.Err()
+	if err != nil {
+		return "", false, err
+	}
+	return hash, true, nil
+}
+
+// scanExistingFileMetasInto scans rows directly into `dst` so callers can
+// reuse a pre-allocated destination map across chunked queries instead of
+// paying for a per-chunk map alloc + merge-loop.
+func scanExistingFileMetasInto(rows *sql.Rows, dst map[string]ExistingFileMeta) error {
+	defer rows.Close()
+	for rows.Next() {
+		var path string
+		var meta ExistingFileMeta
+		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS); err != nil {
+			return err
+		}
+		dst[path] = meta
+	}
+	return rows.Err()
 }
 
 func scanScanRecords(rows *sql.Rows) ([]ScanRecord, error) {
@@ -544,22 +979,26 @@ func (s *Store) MarkFilesSeenBatch(ctx context.Context, repoID, scanID int64, pa
 	if len(paths) == 0 {
 		return nil
 	}
+	const chunkSize = 400
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.PrepareContext(ctx, `
-		UPDATE files
-		SET last_scan_id = ?, is_deleted = 0
-		WHERE repo_id = ? AND path = ?
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer stmt.Close()
-	for _, path := range paths {
-		if _, err := stmt.ExecContext(ctx, scanID, repoID, path); err != nil {
+	for start := 0; start < len(paths); start += chunkSize {
+		end := min(start+chunkSize, len(paths))
+		chunk := paths[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			UPDATE files
+			SET last_scan_id = ?, is_deleted = 0
+			WHERE repo_id = ? AND path IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, scanID, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -662,12 +1101,35 @@ func (s *Store) MarkFilesParseFailedBatch(ctx context.Context, repoID, scanID in
 }
 
 func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string, parsed graph.ParsedFile) error {
+	_, err := s.ReplaceFileGraphsBatch(ctx, repoID, scanID, []ReplaceFileGraphInput{{
+		Path:        path,
+		Language:    language,
+		SizeBytes:   sizeBytes,
+		MtimeUnixNS: mtimeUnixNS,
+		ContentHash: contentHash,
+		Parsed:      parsed,
+	}})
+	return err
+}
+
+func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput) ([]int64, error) {
+	return s.ReplaceFileGraphsBatchWithStats(ctx, repoID, scanID, inputs, nil)
+}
+
+func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput, stats *WriteStats) ([]int64, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	if stats != nil {
+		stats.TxCount++
+		stats.FileUpsertStatements += len(inputs)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := tx.ExecContext(ctx, `
+
+	upsertFileStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted)
 		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0)
 		ON CONFLICT(repo_id, path)
@@ -680,224 +1142,239 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 			last_scan_id = excluded.last_scan_id,
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0
-	`, repoID, path, language, sizeBytes, mtimeUnixNS, contentHash, scanID, now); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	var fileID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repoID, path).Scan(&fileID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := deleteFileGraph(ctx, tx, fileID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-
-	insertSymbolStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING id
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
-	defer insertSymbolStmt.Close()
+	defer upsertFileStmt.Close()
 
-	insertSymbolFTSStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO symbol_fts(repo_id, symbol_id, name, qualified_name, signature, doc_summary)
-		VALUES(?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer insertSymbolFTSStmt.Close()
-
-	insertSymbolTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO symbol_tokens(symbol_id, token, weight) VALUES(?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer insertSymbolTokenStmt.Close()
-
-	insertReferenceStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO references_tbl(repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer insertReferenceStmt.Close()
-
-	insertEdgeStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer insertEdgeStmt.Close()
-
-	insertImportStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_imports(repo_id, file_id, import_path) VALUES(?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer insertImportStmt.Close()
-
-	insertFileTokenStmt, err := tx.PrepareContext(ctx, `INSERT INTO file_tokens(file_id, token, weight) VALUES(?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer insertFileTokenStmt.Close()
-
-	insertTestLinkStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_symbol_id, reason, score)
-		VALUES(?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer insertTestLinkStmt.Close()
-
-	stableToID := map[string]int64{}
-	for _, sym := range parsed.Symbols {
-		res, err := insertSymbolStmt.ExecContext(ctx, repoID, fileID, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.ContainerName, sym.Signature, sym.Visibility, sym.Range.StartLine, sym.Range.StartCol, sym.Range.EndLine, sym.Range.EndCol, sym.DocSummary, sym.StableKey)
-		if err != nil {
+	now := time.Now().UTC().Format(time.RFC3339)
+	fileIDs := make([]int64, 0, len(inputs))
+	for _, input := range inputs {
+		var fileID int64
+		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
+			return nil, err
+		}
+		fileIDs = append(fileIDs, fileID)
+	}
+
+	if err := deleteFileGraphsBatch(ctx, tx, fileIDs, stats); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+
+	for idx, input := range inputs {
+		fileID := fileIDs[idx]
+		if err := insertParsedFileGraph(
+			ctx,
+			tx,
+			repoID,
+			fileID,
+			input.Parsed,
+			stats,
+		); err != nil {
+			_ = tx.Rollback()
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return fileIDs, nil
+}
+
+func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, stats *WriteStats) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+
+	// For large batches, use a temp table to avoid repeating large IN clauses across each dependent-table delete.
+	// This reduces statement pressure from ~O(numTables * chunks) down to O(chunks + numTables).
+	if len(fileIDs) > sqliteInClauseBatchSize {
+		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, stats); err != nil {
 			return err
 		}
-		symbolID, err := res.LastInsertId()
-		if err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		stableToID[sym.StableKey] = symbolID
-		if _, err := insertSymbolFTSStmt.ExecContext(ctx, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		for token, weight := range texttoken.WeightsString(sym.Name + " " + sym.QualifiedName + " " + sym.Signature + " " + sym.DocSummary) {
-			if _, err := insertSymbolTokenStmt.ExecContext(ctx, symbolID, token, weight); err != nil {
-				_ = tx.Rollback()
+		return deleteFileGraphsBatchFromTemp(ctx, tx, stats)
+	}
+
+	execInChunks := func(sqlPrefix, sqlSuffix string, ids []int64) error {
+		for start := 0; start < len(ids); start += sqliteInClauseBatchSize {
+			end := start + sqliteInClauseBatchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			chunk := ids[start:end]
+			query := sqlPrefix + sqlitePlaceholders(len(chunk)) + sqlSuffix
+			args := make([]any, len(chunk))
+			for i, id := range chunk {
+				args[i] = id
+			}
+			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 				return err
 			}
+			if stats != nil {
+				stats.FileGraphDeleteChunks++
+				stats.FileGraphDeleteStatements++
+				stats.TotalExecStatements++
+			}
 		}
-	}
-	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
-	for _, ref := range parsed.References {
-		var symbolID any
-		if ref.SymbolID != nil {
-			symbolID = *ref.SymbolID
-		}
-		var contextID any
-		if contextSymbolID != 0 {
-			contextID = contextSymbolID
-		}
-		if _, err := insertReferenceStmt.ExecContext(ctx, repoID, fileID, symbolID, ref.Kind, ref.Name, ref.QualifiedName, ref.Range.StartLine, ref.Range.StartCol, ref.Range.EndLine, ref.Range.EndCol, contextID); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	for _, edge := range parsed.Edges {
-		srcID := chooseSrcSymbolID(stableToID, parsed.Symbols, edge.Line)
-		if srcID == 0 {
-			continue
-		}
-		if _, err := insertEdgeStmt.ExecContext(ctx, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	for _, imp := range parsed.Imports {
-		if _, err := insertImportStmt.ExecContext(ctx, repoID, fileID, imp); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	for token, weight := range parsed.FileTokens {
-		if _, err := insertFileTokenStmt.ExecContext(ctx, fileID, token, weight); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
+		return nil
 	}
 
-	targetKeySet := map[string]struct{}{}
-	for _, link := range parsed.TestLinks {
-		if link.TargetStableKey != "" {
-			targetKeySet[link.TargetStableKey] = struct{}{}
-		}
+	// Dependent tables that reference symbols must be deleted before deleting symbols.
+	if err := execInChunks(
+		`DELETE FROM symbol_tokens WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (`,
+		`))`,
+		fileIDs,
+	); err != nil {
+		return err
 	}
-	targetKeys := make([]string, 0, len(targetKeySet))
-	for key := range targetKeySet {
-		targetKeys = append(targetKeys, key)
-	}
-	targetStableToID, err := s.resolveSymbolsByStableKeys(ctx, repoID, targetKeys)
-	if err != nil {
-		_ = tx.Rollback()
+	if err := execInChunks(
+		`DELETE FROM symbol_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (`,
+		`))`,
+		fileIDs,
+	); err != nil {
 		return err
 	}
 
-	for _, link := range parsed.TestLinks {
-		var testSymbolID any
-		var targetSymbolID any
-		if id := stableToID[link.TestSymbolKey]; id != 0 {
-			testSymbolID = id
+	if err := execInChunks(`DELETE FROM edges WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+	if err := execInChunks(`DELETE FROM references_tbl WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+	if err := execInChunks(`DELETE FROM file_imports WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+	if err := execInChunks(`DELETE FROM file_tokens WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+	if err := execInChunks(`DELETE FROM test_links WHERE test_file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+	if err := execInChunks(`DELETE FROM symbol_embeddings WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+
+	return execInChunks(`DELETE FROM symbols WHERE file_id IN (`, `)`, fileIDs)
+}
+
+func prepareTmpDeleteFileIDs(ctx context.Context, tx *sql.Tx, fileIDs []int64, stats *WriteStats) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_delete_file_ids(id INTEGER PRIMARY KEY)`); err != nil {
+		return err
+	}
+	if stats != nil {
+		stats.TotalExecStatements++
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_delete_file_ids`); err != nil {
+		return err
+	}
+	if stats != nil {
+		stats.TotalExecStatements++
+	}
+
+	for start := 0; start < len(fileIDs); start += sqliteInClauseBatchSize {
+		end := start + sqliteInClauseBatchSize
+		if end > len(fileIDs) {
+			end = len(fileIDs)
 		}
-		if id, ok := targetStableToID[link.TargetStableKey]; ok {
-			targetSymbolID = id
+		chunk := fileIDs[start:end]
+		placeholders := strings.Repeat("(?),", len(chunk))
+		placeholders = strings.TrimSuffix(placeholders, ",")
+		query := `INSERT INTO tmp_delete_file_ids(id) VALUES ` + placeholders
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
 		}
-		if _, err := insertTestLinkStmt.ExecContext(ctx, repoID, fileID, testSymbolID, targetSymbolID, link.Reason, link.Score); err != nil {
-			_ = tx.Rollback()
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return err
 		}
+		if stats != nil {
+			stats.FileGraphDeleteTempIDInsertBatches++
+			stats.FileGraphDeleteTempIDInsertRows += len(chunk)
+			stats.TotalExecStatements++
+		}
 	}
-	if err := tx.Commit(); err != nil {
+
+	return nil
+}
+
+func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, stats *WriteStats) error {
+	exec := func(query string) error {
+		if _, err := tx.ExecContext(ctx, query); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.FileGraphDeleteStatements++
+			stats.TotalExecStatements++
+		}
+		return nil
+	}
+
+	// Dependent tables that reference symbols must be deleted before deleting symbols.
+	if err := exec(`DELETE FROM symbol_tokens WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM symbol_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids))`); err != nil {
+		return err
+	}
+
+	if err := exec(`DELETE FROM edges WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM references_tbl WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM file_imports WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM file_tokens WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM test_links WHERE test_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM symbol_embeddings WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	return nil
 }
 
 func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM symbols WHERE file_id = ?`, fileID)
-	if err != nil {
-		return err
-	}
-	var symbolIDs []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		symbolIDs = append(symbolIDs, id)
-	}
-	_ = rows.Close()
-
-	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_tokens WHERE symbol_id = ?`)
+	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `
+		DELETE FROM symbol_tokens
+		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
+	`)
 	if err != nil {
 		return err
 	}
 	defer deleteSymbolTokensStmt.Close()
 
-	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM symbol_fts WHERE symbol_id = ?`)
+	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `
+		DELETE FROM symbol_fts
+		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
+	`)
 	if err != nil {
 		return err
 	}
 	defer deleteSymbolFTSStmt.Close()
 
-	for _, symbolID := range symbolIDs {
-		if _, err := deleteSymbolTokensStmt.ExecContext(ctx, symbolID); err != nil {
-			return err
-		}
-		if _, err := deleteSymbolFTSStmt.ExecContext(ctx, symbolID); err != nil {
-			return err
-		}
+	return deleteFileGraphWithStmts(ctx, tx, fileID, deleteSymbolTokensStmt, deleteSymbolFTSStmt)
+}
+
+func deleteFileGraphWithStmts(ctx context.Context, tx *sql.Tx, fileID int64, deleteSymbolTokensStmt, deleteSymbolFTSStmt *sql.Stmt) error {
+	if _, err := deleteSymbolTokensStmt.ExecContext(ctx, fileID); err != nil {
+		return err
+	}
+	if _, err := deleteSymbolFTSStmt.ExecContext(ctx, fileID); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE file_id = ?`, fileID); err != nil {
 		return err
@@ -923,6 +1400,463 @@ func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
 	return nil
 }
 
+func insertParsedFileGraph(
+	ctx context.Context,
+	tx *sql.Tx,
+	repoID int64,
+	fileID int64,
+	parsed graph.ParsedFile,
+	stats *WriteStats,
+) error {
+	stableToID := make(map[string]int64, len(parsed.Symbols))
+	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
+	symbolTokenWeights := make(map[string]float64, 64)
+	symbolFTSArgs := make([]any, 0, min(len(parsed.Symbols), sqliteSymbolFTSValuesBatchRows)*6)
+	for start := 0; start < len(parsed.Symbols); start += sqliteSymbolValuesBatchRows {
+		end := start + sqliteSymbolValuesBatchRows
+		if end > len(parsed.Symbols) {
+			end = len(parsed.Symbols)
+		}
+		batch := parsed.Symbols[start:end]
+		batchStableToID, err := insertSymbolsBatchReturning(ctx, tx, repoID, fileID, batch, stats)
+		if err != nil {
+			return err
+		}
+		for _, sym := range batch {
+			symbolID, ok := batchStableToID[sym.StableKey]
+			if !ok || symbolID == 0 {
+				return fmt.Errorf("missing inserted id for stable_key=%q", sym.StableKey)
+			}
+			stableToID[sym.StableKey] = symbolID
+			symbolFTSArgs = append(symbolFTSArgs, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
+			if len(symbolFTSArgs) >= sqliteSymbolFTSValuesBatchRows*6 {
+				if err := execSymbolFTSInsert(ctx, tx, symbolFTSArgs, stats); err != nil {
+					return err
+				}
+				symbolFTSArgs = symbolFTSArgs[:0]
+			}
+			clear(symbolTokenWeights)
+			var tokenStart time.Time
+			if stats != nil {
+				tokenStart = time.Now()
+				stats.SymbolTokenizeCalls++
+			}
+			texttoken.WeightsStringsInto(symbolTokenWeights, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
+			if stats != nil {
+				stats.SymbolTokenizeNS += time.Since(tokenStart).Nanoseconds()
+			}
+			for token, weight := range symbolTokenWeights {
+				symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
+				if len(symbolTokenArgs) >= sqliteTokenValuesBatchRows*3 {
+					if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
+						return err
+					}
+					symbolTokenArgs = symbolTokenArgs[:0]
+				}
+			}
+		}
+	}
+	if len(symbolFTSArgs) > 0 {
+		if err := execSymbolFTSInsert(ctx, tx, symbolFTSArgs, stats); err != nil {
+			return err
+		}
+	}
+	if len(symbolTokenArgs) > 0 {
+		if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
+			return err
+		}
+	}
+	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
+	if len(parsed.References) > 0 {
+		referenceArgs := make([]any, 0, min(len(parsed.References), sqliteReferenceValuesBatchRows)*11)
+		for _, ref := range parsed.References {
+			var symbolID any
+			if ref.SymbolID != nil {
+				symbolID = *ref.SymbolID
+			}
+			var contextID any
+			if contextSymbolID != 0 {
+				contextID = contextSymbolID
+			}
+			referenceArgs = append(
+				referenceArgs,
+				repoID,
+				fileID,
+				symbolID,
+				ref.Kind,
+				ref.Name,
+				ref.QualifiedName,
+				ref.Range.StartLine,
+				ref.Range.StartCol,
+				ref.Range.EndLine,
+				ref.Range.EndCol,
+				contextID,
+			)
+			if len(referenceArgs) >= sqliteReferenceValuesBatchRows*11 {
+				if err := execReferencesInsert(ctx, tx, referenceArgs, stats); err != nil {
+					return err
+				}
+				referenceArgs = referenceArgs[:0]
+			}
+		}
+		if len(referenceArgs) > 0 {
+			if err := execReferencesInsert(ctx, tx, referenceArgs, stats); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(parsed.Edges) > 0 {
+		srcChooser := newSrcSymbolChooser(stableToID, parsed.Symbols)
+		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*7)
+		for _, edge := range parsed.Edges {
+			srcID := srcChooser.Choose(edge.Line)
+			if srcID == 0 {
+				continue
+			}
+			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line)
+			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*7 {
+				if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
+					return err
+				}
+				edgeArgs = edgeArgs[:0]
+			}
+		}
+		if len(edgeArgs) > 0 {
+			if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(parsed.Imports) > 0 {
+		importArgs := make([]any, 0, min(len(parsed.Imports), sqliteImportValuesBatchRows)*3)
+		for _, imp := range parsed.Imports {
+			importArgs = append(importArgs, repoID, fileID, imp)
+			if len(importArgs) >= sqliteImportValuesBatchRows*3 {
+				if err := execImportsInsert(ctx, tx, importArgs, stats); err != nil {
+					return err
+				}
+				importArgs = importArgs[:0]
+			}
+		}
+		if len(importArgs) > 0 {
+			if err := execImportsInsert(ctx, tx, importArgs, stats); err != nil {
+				return err
+			}
+		}
+	}
+	if len(parsed.FileTokens) > 0 {
+		fileTokenArgs := make([]any, 0, min(len(parsed.FileTokens), sqliteTokenValuesBatchRows)*3)
+		for token, weight := range parsed.FileTokens {
+			fileTokenArgs = append(fileTokenArgs, fileID, token, weight)
+			if len(fileTokenArgs) >= sqliteTokenValuesBatchRows*3 {
+				if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs, stats); err != nil {
+					return err
+				}
+				fileTokenArgs = fileTokenArgs[:0]
+			}
+		}
+		if len(fileTokenArgs) > 0 {
+			if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs, stats); err != nil {
+				return err
+			}
+		}
+	}
+
+	targetKeySet := make(map[string]struct{}, len(parsed.TestLinks))
+	for _, link := range parsed.TestLinks {
+		if link.TargetStableKey != "" {
+			targetKeySet[link.TargetStableKey] = struct{}{}
+		}
+	}
+	targetKeys := make([]string, 0, len(targetKeySet))
+	for key := range targetKeySet {
+		targetKeys = append(targetKeys, key)
+	}
+	targetStableToRef, err := resolveSymbolFilesByStableKeysQuery(ctx, tx, repoID, targetKeys)
+	if err != nil {
+		return err
+	}
+	if len(parsed.TestLinks) > 0 {
+		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*7)
+		for _, link := range parsed.TestLinks {
+			var testSymbolID any
+			var targetSymbolID any
+			var targetFileID any
+			if id := stableToID[link.TestSymbolKey]; id != 0 {
+				testSymbolID = id
+			}
+			if ref, ok := targetStableToRef[link.TargetStableKey]; ok {
+				targetSymbolID = ref.id
+				targetFileID = ref.fileID
+			}
+			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, targetFileID, targetSymbolID, link.Reason, link.Score)
+			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*7 {
+				if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
+					return err
+				}
+				testLinkArgs = testLinkArgs[:0]
+			}
+		}
+		if len(testLinkArgs) > 0 {
+			if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID int64, symbols []graph.Symbol, stats *WriteStats) (map[string]int64, error) {
+	if len(symbols) == 0 {
+		return map[string]int64{}, nil
+	}
+
+	args := make([]any, len(symbols)*18)
+	argIdx := 0
+	for _, sym := range symbols {
+		args[argIdx+0] = repoID
+		args[argIdx+1] = fileID
+		args[argIdx+2] = sym.Language
+		args[argIdx+3] = sym.Kind
+		args[argIdx+4] = sym.Name
+		args[argIdx+5] = sym.QualifiedName
+		args[argIdx+6] = sym.ContainerName
+		args[argIdx+7] = sym.Signature
+		args[argIdx+8] = sym.Visibility
+		args[argIdx+9] = sym.Range.StartLine
+		args[argIdx+10] = sym.Range.StartCol
+		args[argIdx+11] = sym.Range.EndLine
+		args[argIdx+12] = sym.Range.EndCol
+		args[argIdx+13] = sym.DocSummary
+		args[argIdx+14] = sym.StableKey
+		args[argIdx+15] = qualifiedSuffix(sym.QualifiedName)
+		args[argIdx+16] = dotTail2(sym.QualifiedName)
+		args[argIdx+17] = dotTail3(sym.QualifiedName)
+		argIdx += 18
+	}
+
+	rows, err := tx.QueryContext(ctx, symbolInsertSQL(len(symbols)), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]int64, len(symbols))
+	rowCount := 0
+	for rows.Next() {
+		var id int64
+		var stableKey string
+		if err := rows.Scan(&id, &stableKey); err != nil {
+			return nil, err
+		}
+		out[stableKey] = id
+		rowCount++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if rowCount != len(symbols) {
+		return nil, fmt.Errorf("symbol insert returned %d rows (expected %d)", rowCount, len(symbols))
+	}
+	if stats != nil {
+		stats.SymbolInsertBatches++
+		stats.SymbolInsertRows += rowCount
+		stats.SymbolInserts += rowCount
+		stats.TotalExecStatements++
+	}
+	return out, nil
+}
+
+var symbolInsertSQLCache sync.Map // map[int]string
+
+func symbolInsertSQL(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if v, ok := symbolInsertSQLCache.Load(n); ok {
+		return v.(string)
+	}
+	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2, dot_tail3) VALUES "
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const suffix = " RETURNING id, stable_key"
+
+	var b strings.Builder
+	b.Grow(len(prefix) + n*(len(row)+1) + len(suffix))
+	b.WriteString(prefix)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(row)
+	}
+	b.WriteString(suffix)
+	s := b.String()
+	actual, _ := symbolInsertSQLCache.LoadOrStore(n, s)
+	return actual.(string)
+}
+
+func execSymbolFTSInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	if len(args) == 0 {
+		return nil
+	}
+	if len(args)%6 != 0 {
+		return fmt.Errorf("invalid symbol_fts insert args len=%d", len(args))
+	}
+	rows := len(args) / 6
+	if err := execBatchInsert(ctx, tx, "symbol_fts", "repo_id, symbol_id, name, qualified_name, signature, doc_summary", 6, args, stats); err != nil {
+		return err
+	}
+	if stats != nil {
+		stats.SymbolFTSInsertBatches++
+		stats.SymbolFTSInsertRows += rows
+		stats.SymbolFTSInserts += rows
+	}
+	return nil
+}
+
+// Pre-baked column lists for the only two (table, idColumn) call sites
+// (`symbol_tokens`/`symbol_id` and `file_tokens`/`file_id`). Avoids
+// reallocating the column-list string per token-insert call.
+const (
+	symbolTokensInsertColumns = "symbol_id, token, weight"
+	fileTokensInsertColumns   = "file_id, token, weight"
+)
+
+func execTokenTriplesInsert(ctx context.Context, tx *sql.Tx, table, idColumn string, args []any, stats *WriteStats) error {
+	if len(args) == 0 {
+		return nil
+	}
+	if len(args)%3 != 0 {
+		return fmt.Errorf("invalid token insert args len=%d", len(args))
+	}
+	var columns string
+	switch idColumn {
+	case "symbol_id":
+		columns = symbolTokensInsertColumns
+	case "file_id":
+		columns = fileTokensInsertColumns
+	default:
+		columns = idColumn + ", token, weight"
+	}
+	// Each row uses 3 params; batch sizes are controlled by sqliteTokenValuesBatchRows
+	// to stay under sqliteDefaultMaxVariables. Stats counters (Symbol/FileToken*,
+	// TotalExecStatements) are bumped exclusively in execBatchInsert to avoid
+	// double-counting from this wrapper.
+	return execBatchInsert(ctx, tx, table, columns, 3, args, stats)
+}
+
+type insertSQLKey struct {
+	table   string
+	columns string
+	width   int
+	rows    int
+}
+
+var insertSQLCache sync.Map // map[insertSQLKey]string
+
+var sqlitePlaceholdersCache sync.Map // map[int]string
+
+func sqlitePlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if v, ok := sqlitePlaceholdersCache.Load(n); ok {
+		return v.(string)
+	}
+	var b strings.Builder
+	b.Grow(n*2 - 1)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('?')
+	}
+	s := b.String()
+	actual, _ := sqlitePlaceholdersCache.LoadOrStore(n, s)
+	return actual.(string)
+}
+
+func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, rowsPerBatch int, args []any, stats *WriteStats) error {
+	if len(args) == 0 {
+		return nil
+	}
+	if len(args)%rowsPerBatch != 0 {
+		return fmt.Errorf("invalid %s insert args len=%d (expected multiple of %d)", table, len(args), rowsPerBatch)
+	}
+	rowCount := len(args) / rowsPerBatch
+	key := insertSQLKey{table: table, columns: columns, width: rowsPerBatch, rows: rowCount}
+	queryAny, ok := insertSQLCache.Load(key)
+	if !ok {
+		// Build the row tuple once via the cached placeholder string, then
+		// concatenate it rowCount times. Avoids the inner per-row loops and
+		// the fmt.Fprintf allocation in the previous implementation.
+		tuple := "(" + sqlitePlaceholders(rowsPerBatch) + ")"
+		const prefix = "INSERT INTO "
+		const sep = "("
+		const valuesKw = ") VALUES "
+		var b strings.Builder
+		b.Grow(len(prefix) + len(table) + len(sep) + len(columns) + len(valuesKw) + rowCount*(len(tuple)+1))
+		b.WriteString(prefix)
+		b.WriteString(table)
+		b.WriteString(sep)
+		b.WriteString(columns)
+		b.WriteString(valuesKw)
+		for i := 0; i < rowCount; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(tuple)
+		}
+		queryAny, _ = insertSQLCache.LoadOrStore(key, b.String())
+	}
+	_, err := tx.ExecContext(ctx, queryAny.(string), args...)
+	if err != nil {
+		return err
+	}
+	if stats != nil {
+		switch table {
+		case "references_tbl":
+			stats.ReferenceInsertBatches++
+			stats.ReferenceInsertRows += rowCount
+		case "edges":
+			stats.EdgeInsertBatches++
+			stats.EdgeInsertRows += rowCount
+		case "test_links":
+			stats.TestLinkInsertBatches++
+			stats.TestLinkInsertRows += rowCount
+		case "file_imports":
+			stats.ImportInsertBatches++
+			stats.ImportInsertRows += rowCount
+		case "symbol_tokens":
+			stats.SymbolTokenInsertBatches++
+			stats.SymbolTokenInsertRows += rowCount
+		case "file_tokens":
+			stats.FileTokenInsertBatches++
+			stats.FileTokenInsertRows += rowCount
+		}
+		stats.TotalExecStatements++
+	}
+	return nil
+}
+
+func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "references_tbl", "repo_id, file_id, symbol_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col, context_symbol_id", 11, args, stats)
+}
+
+func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args, stats)
+}
+
+func execTestLinksInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score", 7, args, stats)
+}
+
+func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
+	return execBatchInsert(ctx, tx, "file_imports", "repo_id, file_id, import_path", 3, args, stats)
+}
+
 func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 {
 	for _, sym := range symbols {
 		if sym.Kind == "function" {
@@ -932,16 +1866,80 @@ func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 
 	return 0
 }
 
-func chooseSrcSymbolID(stableToID map[string]int64, symbols []graph.Symbol, line int) int64 {
+type funcSpan struct {
+	start int
+	end   int
+	id    int64
+}
+
+type srcSymbolChooser struct {
+	spans     []funcSpan
+	fallback  int64
+	monotonic bool
+}
+
+func newSrcSymbolChooser(stableToID map[string]int64, symbols []graph.Symbol) srcSymbolChooser {
+	// Pre-size to the upper bound of function symbols (capped to keep the
+	// allocation small for files with many non-function symbols). Avoids
+	// the 16->32->64 doubling sequence for files with >16 functions.
+	capHint := len(symbols)
+	if capHint > 64 {
+		capHint = 64
+	}
+	if capHint < 8 {
+		capHint = 8
+	}
+	out := srcSymbolChooser{
+		spans:     make([]funcSpan, 0, capHint),
+		monotonic: true,
+	}
+	lastStart := -1
 	for _, sym := range symbols {
 		if sym.Kind != "function" {
 			continue
 		}
-		if line >= sym.Range.StartLine && line <= sym.Range.EndLine {
-			return stableToID[sym.StableKey]
+		id := stableToID[sym.StableKey]
+		if id == 0 {
+			continue
+		}
+		if out.fallback == 0 {
+			out.fallback = id
+		}
+		start := sym.Range.StartLine
+		if start < lastStart {
+			out.monotonic = false
+		}
+		lastStart = start
+		out.spans = append(out.spans, funcSpan{start: start, end: sym.Range.EndLine, id: id})
+	}
+	return out
+}
+
+func (c srcSymbolChooser) Choose(line int) int64 {
+	if len(c.spans) == 0 {
+		return 0
+	}
+	if !c.monotonic {
+		for _, span := range c.spans {
+			if line >= span.start && line <= span.end {
+				return span.id
+			}
+		}
+		return c.fallback
+	}
+	i := sort.Search(len(c.spans), func(i int) bool { return c.spans[i].start > line }) - 1
+	if i < 0 {
+		return c.fallback
+	}
+	// Spans are monotonic by start line, but can be nested/overlapping.
+	// Scan backward from the last start<=line and return the most-specific match.
+	for j := i; j >= 0; j-- {
+		span := c.spans[j]
+		if line >= span.start && line <= span.end {
+			return span.id
 		}
 	}
-	return firstFunctionID(stableToID, symbols)
+	return c.fallback
 }
 
 func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (int, error) {
@@ -960,6 +1958,234 @@ func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (i
 	return int(n), nil
 }
 
+func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64, paths []string) (int, error) {
+	if len(paths) == 0 {
+		return 0, nil
+	}
+	const chunkSize = 400
+	total := int64(0)
+	for start := 0; start < len(paths); start += chunkSize {
+		end := min(start+chunkSize, len(paths))
+		chunk := paths[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `
+			UPDATE files
+			SET is_deleted = 1, parse_state = 'deleted', last_scan_id = ?
+			WHERE repo_id = ? AND is_deleted = 0 AND path IN (` + placeholders + `)
+		`
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, scanID, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		res, err := s.db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return int(total), err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return int(total), err
+		}
+		total += affected
+	}
+	return int(total), nil
+}
+
+// PurgeDeletedFileGraphsForScan removes dependent graph rows for files that were
+// marked deleted during the given scan. This keeps stats/search/export from
+// surfacing stale symbols/edges/references after file deletions while allowing
+// future restores to re-index cleanly.
+//
+// Note: this also nulls out cross-file references to symbols defined in deleted
+// files (for example edges.dst_symbol_id), so that future resolve passes can
+// re-resolve them if the file returns.
+func (s *Store) PurgeDeletedFileGraphsForScan(ctx context.Context, repoID, scanID int64) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id
+		FROM files
+		WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
+	`, repoID, scanID)
+	if err != nil {
+		return 0, err
+	}
+	var fileIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		fileIDs = append(fileIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(fileIDs) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	if len(fileIDs) > sqliteInClauseBatchSize {
+		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, nil); err != nil {
+			return 0, err
+		}
+		if err := nullifyDeletedSymbolReferencesFromTemp(ctx, tx, repoID); err != nil {
+			return 0, err
+		}
+		if err := deleteFileGraphsBatchFromTemp(ctx, tx, nil); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := nullifyDeletedSymbolReferences(ctx, tx, repoID, fileIDs); err != nil {
+			return 0, err
+		}
+		if err := deleteFileGraphsBatch(ctx, tx, fileIDs, nil); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+	return len(fileIDs), nil
+}
+
+func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int64, fileIDs []int64) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+
+	if len(fileIDs) > sqliteInClauseBatchSize {
+		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, nil); err != nil {
+			return err
+		}
+		return nullifyDeletedSymbolReferencesFromTemp(ctx, tx, repoID)
+	}
+
+	placeholders := strings.Repeat("?,", len(fileIDs))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]any, 0, len(fileIDs)+1)
+	args = append(args, repoID)
+	for _, id := range fileIDs {
+		args = append(args, id)
+	}
+	symbolIDs := `SELECT id FROM symbols WHERE file_id IN (` + placeholders + `)`
+
+	// test_links pointing AT one of the deleted target files become meaningless
+	// once the target file is gone (target_symbol_id will be nulled out below
+	// alongside the other symbol-level fan-out, but target_file_id has no
+	// nullification path of its own — without this delete the row would survive
+	// with a stale target_file_id and surface in RelatedTests(file=...).
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM test_links
+		WHERE repo_id = ? AND target_file_id IN (`+placeholders+`)
+	`, args...); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = NULL
+		WHERE repo_id = ? AND dst_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE test_links
+		SET target_symbol_id = NULL
+		WHERE repo_id = ? AND target_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET symbol_id = NULL
+		WHERE repo_id = ? AND symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET context_symbol_id = NULL
+		WHERE repo_id = ? AND context_symbol_id IN (`+symbolIDs+`)
+	`, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, repoID int64) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_delete_symbol_ids(id INTEGER PRIMARY KEY)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_delete_symbol_ids`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tmp_delete_symbol_ids(id)
+		SELECT id
+		FROM symbols
+		WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)
+	`); err != nil {
+		return err
+	}
+
+	// See nullifyDeletedSymbolReferences: rows with target_file_id pointing at
+	// any deleted file become orphans even after target_symbol_id is nulled,
+	// which would surface in RelatedTests(file=...). Delete them up front.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM test_links
+		WHERE repo_id = ? AND target_file_id IN (SELECT id FROM tmp_delete_file_ids)
+	`, repoID); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = NULL
+		WHERE repo_id = ? AND dst_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE test_links
+		SET target_symbol_id = NULL
+		WHERE repo_id = ? AND target_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET symbol_id = NULL
+		WHERE repo_id = ? AND symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE references_tbl
+		SET context_symbol_id = NULL
+		WHERE repo_id = ? AND context_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
+	`, repoID); err != nil {
+		return err
+	}
+	return nil
+}
+
 type edgeTarget struct {
 	edgeID  int64
 	dstName string
@@ -967,16 +2193,36 @@ type edgeTarget struct {
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	totalResolved := 0
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
 
 	// Strategy 1: Exact qualified name match
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ? AND s.qualified_name = edges.dst_name
-			LIMIT 1
+	res, err := tx.ExecContext(ctx, `
+		WITH distinct_names AS (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+		),
+		resolutions AS (
+			SELECT
+				n.dst_name,
+				(
+					SELECT s.id
+					FROM symbols s
+					WHERE s.repo_id = ? AND s.qualified_name = n.dst_name
+					LIMIT 1
+				) AS dst_symbol_id
+			FROM distinct_names n
 		)
+		UPDATE edges
+		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.qualified_name = edges.dst_name)
+		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -986,63 +2232,555 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	}
 
 	// Strategy 2: Name match (unqualified)
-	res, err = s.db.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ? AND s.name = edges.dst_name
-			AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
-			LIMIT 1
+	res, err = tx.ExecContext(ctx, `
+		WITH distinct_names AS (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+		),
+		resolutions AS (
+			SELECT
+				n.dst_name,
+				(
+					SELECT s.id
+					FROM symbols s
+					WHERE s.repo_id = ? AND s.name = n.dst_name
+					AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+					LIMIT 1
+				) AS dst_symbol_id
+			FROM distinct_names n
 		)
+		UPDATE edges
+		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND EXISTS (SELECT 1 FROM symbols s WHERE s.repo_id = ? AND s.name = edges.dst_name AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface'))
+		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		totalResolved += int(n)
 	}
 
-	// Strategy 3: Suffix match (e.g., pkg.Func matches github.com/org/repo/pkg.Func)
-	res, err = s.db.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ?
-			AND (s.qualified_name LIKE '%.' || edges.dst_name OR s.qualified_name LIKE '%/' || edges.dst_name)
-			LIMIT 1
-		)
-		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND EXISTS (
-			SELECT 1 FROM symbols s WHERE s.repo_id = ?
-			AND (s.qualified_name LIKE '%.' || edges.dst_name OR s.qualified_name LIKE '%/' || edges.dst_name)
-		)
-	`, repoID, repoID, repoID)
+	// Strategy 3a: Suffix match for slash-qualified symbols (e.g., pkg.Func matches github.com/org/repo/pkg.Func).
+	// Strategy 3b: Two-segment dot-tail match (e.g., pkg.Func matches x.y.pkg.Func and also x.pkg.Func matches x.y.x.pkg.Func).
+	// Avoid per-edge LIKE scans by precomputing suffix maps once, then doing indexed equality updates.
+	n, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		totalResolved += int(n)
+	totalResolved += n
+
+	// Strategy 3c: Dot-suffix fallback (for qualified names without a slash separator).
+	// Keep as a narrower fallback (multi-dot dst_name only) to preserve existing semantics without paying LIKE cost on common pkg.Func cases.
+	n, err = s.resolveEdgesByDotSuffix(ctx, tx, repoID)
+	if err != nil {
+		return 0, err
 	}
+	totalResolved += n
 
 	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething)
-	res, err = s.db.ExecContext(ctx, `
-		UPDATE edges SET dst_symbol_id = (
-			SELECT s.id FROM symbols s
-			WHERE s.repo_id = ?
-			AND s.name = edges.dst_name
-			AND s.container_name != ''
-			LIMIT 1
+	res, err = tx.ExecContext(ctx, `
+		WITH distinct_names AS (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+		),
+		resolutions AS (
+			SELECT
+				n.dst_name,
+				(
+					SELECT s.id
+					FROM symbols s
+					WHERE s.repo_id = ?
+					AND s.name = n.dst_name
+					AND s.container_name != ''
+					LIMIT 1
+				) AS dst_symbol_id
+			FROM distinct_names n
 		)
+		UPDATE edges
+		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND EXISTS (
-			SELECT 1 FROM symbols s WHERE s.repo_id = ?
-			AND s.name = edges.dst_name AND s.container_name != ''
-		)
+		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
 	`, repoID, repoID, repoID)
 	if err != nil {
-		return totalResolved, err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
+		totalResolved += int(n)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return totalResolved, nil
+}
+
+// qualifiedSuffix returns the substring of qname after the last '/' for
+// slash-containing names, ” otherwise. It mirrors the resolver's `afterSlash`
+// logic and is the value persisted in `symbols.qualified_suffix` (migration
+// 016) so `resolveEdgesBySlashSuffix` can do an indexed equality JOIN against
+// `idx_symbols_repo_qsuffix` instead of a repo-wide symbols scan + Go-side
+// hash filter.
+func qualifiedSuffix(qname string) string {
+	if i := strings.LastIndexByte(qname, '/'); i >= 0 && i+1 < len(qname) {
+		return qname[i+1:]
+	}
+	return ""
+}
+
+// dotTail3 returns the last three dot-separated segments of `qname`'s
+// after-slash portion when that portion has at least three dots
+// (i.e., at least four segments). Empty otherwise — including the case
+// where `afterSlash` has exactly three segments, because such a qname
+// can never match a `LIKE '%.' || dst_name` pattern (no preceding `.`
+// before the leading segment). Persisted in `symbols.dot_tail3` so
+// `resolveEdgesByDotSuffix`'s 2-dot dst_name path can do an indexed
+// equality JOIN against `idx_symbols_repo_dot_tail3` instead of a
+// repo-wide LIKE scan.
+func dotTail3(qname string) string {
+	afterSlash := qualifiedSuffix(qname)
+	if afterSlash == "" {
+		afterSlash = qname
+	}
+	dots := strings.Count(afterSlash, ".")
+	if dots < 3 {
+		return ""
+	}
+	rest := afterSlash
+	// Strip leading "<segment>." (dots-2) times so `rest` becomes the last
+	// three segments. e.g. "a.b.c.d.e" with dots=4 strips twice → "c.d.e".
+	for i := 0; i < dots-2; i++ {
+		idx := strings.IndexByte(rest, '.')
+		if idx < 0 {
+			return ""
+		}
+		rest = rest[idx+1:]
+	}
+	return rest
+}
+
+// dotTail2 returns the last two dot-separated segments of `qname`'s
+// after-slash portion (matching the SQL CASE in migration 017's backfill).
+// Empty when there's no dot in afterSlash. Persisted in
+// `symbols.dot_tail2` so `resolveEdgesBySlashSuffix`'s dot-tail2 sub-branch
+// can do an indexed equality JOIN against `idx_symbols_repo_dot_tail2`
+// instead of a repo-wide symbols scan + Go-side string slicing.
+func dotTail2(qname string) string {
+	afterSlash := qualifiedSuffix(qname)
+	if afterSlash == "" {
+		afterSlash = qname
+	}
+	lastDot := strings.LastIndexByte(afterSlash, '.')
+	if lastDot < 0 || lastDot+1 >= len(afterSlash) {
+		return ""
+	}
+	start := 0
+	if prevDot := strings.LastIndexByte(afterSlash[:lastDot], '.'); prevDot >= 0 {
+		start = prevDot + 1
+	}
+	return afterSlash[start:]
+}
+
+func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	totalResolved := 0
+
+	// Schema-backed prelude: 2-dot, no-slash dst_names match exactly the
+	// last three segments of `afterSlash`, which is persisted in
+	// `symbols.dot_tail3` (migration 018) + indexed by
+	// `idx_symbols_repo_dot_tail3`. An indexed equality JOIN replaces the
+	// per-distinct-dst-name LIKE scan for this dominant multi-dot case.
+	// dst_names with ≥3 dots fall through to the LIKE fallback below.
+	{
+		n, err := s.resolveEdgesByDotTail3(ctx, tx, repoID)
+		if err != nil {
+			return totalResolved, err
+		}
+		totalResolved += n
+	}
+
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_dot_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		return 0, err
+	}
+	dropped := false
+	defer func() {
+		if dropped {
+			return
+		}
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_edge_dot_suffix`)
+	}()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_edge_dot_suffix`); err != nil {
+		return 0, err
+	}
+
+	// De-correlate the expensive LIKE suffix match: do the work once per distinct dst_name,
+	// then apply the result via a fast equality update on edges.dst_name.
+	//
+	// This preserves the prior semantics (pick a single match via MIN(id)) while scaling
+	// with the number of unique names rather than total unresolved edges.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tmp_edge_dot_suffix(dst_name, dst_symbol_id)
+		SELECT e.dst_name,
+			(SELECT MIN(s.id) FROM symbols s WHERE s.repo_id = ? AND s.qualified_name LIKE '%.' || e.dst_name)
+		FROM (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL
+			AND instr(dst_name, '.') > 0 AND instr(dst_name, '/') = 0
+			AND instr(substr(dst_name, instr(dst_name, '.') + 1), '.') > 0
+		) e
+		WHERE EXISTS (
+			SELECT 1 FROM symbols s
+			WHERE s.repo_id = ? AND s.qualified_name LIKE '%.' || e.dst_name
+		)
+	`, repoID, repoID, repoID); err != nil {
+		return 0, err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_edge_dot_suffix t WHERE t.dst_name = edges.dst_name)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND edges.dst_name IN (SELECT dst_name FROM tmp_edge_dot_suffix)
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_edge_dot_suffix`); err != nil {
+		return 0, err
+	}
+	dropped = true
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	totalResolved += int(n)
+	return totalResolved, nil
+}
+
+// resolveEdgesByDotTail3 handles the 2-dot, no-slash dst_name case via the
+// schema-backed `symbols.dot_tail3` partial index (migration 018). The
+// matching predicate is the same as the LIKE pattern
+// `qualified_name LIKE '%.' || dst_name` for 2-dot dst_names, but bound
+// to an equality JOIN that scales with the unique-needed-name count
+// instead of total symbols.
+func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_needed_tail3(dst_name TEXT PRIMARY KEY)`); err != nil {
+		return 0, err
+	}
+	droppedNeeded := false
+	defer func() {
+		if droppedNeeded {
+			return
+		}
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_resolver_needed_tail3`)
+	}()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_needed_tail3`); err != nil {
+		return 0, err
+	}
+
+	// Seed with distinct unresolved dst_names that have exactly 2 dots and
+	// no slash. (Length-of-string minus length-of-dotless-string == 2 dots.)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO tmp_resolver_needed_tail3(dst_name)
+		SELECT DISTINCT dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL
+		AND instr(dst_name, '/') = 0
+		AND length(dst_name) - length(replace(dst_name, '.', '')) = 2
+	`, repoID); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_dot_tail3(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		return 0, err
+	}
+	droppedDotTail3 := false
+	defer func() {
+		if droppedDotTail3 {
+			return
+		}
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_dot_tail3`)
+	}()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_dot_tail3`); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tmp_symbol_dot_tail3(dst_name, dst_symbol_id)
+		SELECT n.dst_name, MIN(s.id)
+		FROM tmp_resolver_needed_tail3 n
+		JOIN symbols s
+		  ON s.repo_id = ?
+		 AND s.dot_tail3 = n.dst_name
+		WHERE s.dot_tail3 != ''
+		GROUP BY n.dst_name
+	`, repoID); err != nil {
+		return 0, err
+	}
+
+	updateRes, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_dot_tail3 t WHERE t.dst_name = edges.dst_name)
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_dot_tail3)
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_dot_tail3`); err != nil {
+		return 0, err
+	}
+	droppedDotTail3 = true
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_tail3`); err != nil {
+		return 0, err
+	}
+	droppedNeeded = true
+	n, err := updateRes.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+	// Restrict suffix maps to names that can actually be consumed by the unresolved edge set.
+	// This avoids building large Go maps for symbols that can't match any current unresolved edges.
+	neededSuffix := map[string]struct{}{}
+	neededTail2 := map[string]struct{}{}
+	needRows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != '' AND instr(dst_name, '/') = 0
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	for needRows.Next() {
+		var dstName string
+		if err := needRows.Scan(&dstName); err != nil {
+			_ = needRows.Close()
+			return 0, err
+		}
+		if dstName == "" {
+			continue
+		}
+		neededSuffix[dstName] = struct{}{}
+		firstDot := strings.IndexByte(dstName, '.')
+		if firstDot >= 0 && firstDot == strings.LastIndexByte(dstName, '.') {
+			// Dot-tail2 optimization only applies to dst_name values with exactly one dot.
+			neededTail2[dstName] = struct{}{}
+		}
+	}
+	if err := needRows.Err(); err != nil {
+		_ = needRows.Close()
+		return 0, err
+	}
+	if err := needRows.Close(); err != nil {
+		return 0, err
+	}
+	// Skip the full symbols scan entirely when no current unresolved edge can
+	// be satisfied by either suffix strategy. This is the common case after
+	// upstream strategies have already absorbed the resolvable edges.
+	if len(neededSuffix) == 0 {
+		return 0, nil
+	}
+	totalResolved := 0
+
+	// Slash-suffix path: indexed equality JOIN against the persisted
+	// `qualified_suffix` column (`idx_symbols_repo_qsuffix`, migration 016)
+	// instead of a `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`
+	// scan + Go-side neededSuffix hash filter. The MIN(s.id) preserves the
+	// stable-tie-breaker behaviour of the prior `minBySuffix` map.
+	{
+		needNames := make([]string, 0, len(neededSuffix))
+		for name := range neededSuffix {
+			needNames = append(needNames, name)
+		}
+
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_needed_suffix(dst_name TEXT PRIMARY KEY)`); err != nil {
+			return 0, err
+		}
+		droppedNeeded := false
+		defer func() {
+			if droppedNeeded {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_resolver_needed_suffix`)
+		}()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_needed_suffix`); err != nil {
+			return 0, err
+		}
+
+		// Keep well under SQLite's default variable limit (999).
+		const maxPerInsert = 400
+		for start := 0; start < len(needNames); start += maxPerInsert {
+			end := min(start+maxPerInsert, len(needNames))
+			chunk := needNames[start:end]
+			var b strings.Builder
+			b.WriteString(`INSERT OR IGNORE INTO tmp_resolver_needed_suffix(dst_name) VALUES `)
+			args := make([]any, 0, len(chunk))
+			for i, name := range chunk {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("(?)")
+				args = append(args, name)
+			}
+			if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+				return 0, err
+			}
+		}
+
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+			return 0, err
+		}
+		droppedSlashSuffix := false
+		defer func() {
+			if droppedSlashSuffix {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_slash_suffix`)
+		}()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
+			return 0, err
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_symbol_id)
+			SELECT n.dst_name, MIN(s.id)
+			FROM tmp_resolver_needed_suffix n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.qualified_suffix = n.dst_name
+			WHERE s.qualified_suffix != ''
+			GROUP BY n.dst_name
+		`, repoID); err != nil {
+			return 0, err
+		}
+
+		updateRes, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_slash_suffix t WHERE t.dst_name = edges.dst_name)
+			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
+		`, repoID)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
+			return 0, err
+		}
+		droppedSlashSuffix = true
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_suffix`); err != nil {
+			return 0, err
+		}
+		droppedNeeded = true
+		n, err := updateRes.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		totalResolved += int(n)
+	}
+
+	// Dot-tail2 path: this branch matches `last-2-dot-segments(afterSlash)`.
+	// Schema-backed by `symbols.dot_tail2` (migration 017) + partial index
+	// `idx_symbols_repo_dot_tail2`, so the same matching is now an indexed
+	// equality JOIN instead of a Go-side full repo symbols scan + per-row
+	// string slicing.
+	if len(neededTail2) == 0 {
+		return totalResolved, nil
+	}
+	{
+		needNames := make([]string, 0, len(neededTail2))
+		for name := range neededTail2 {
+			needNames = append(needNames, name)
+		}
+
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_needed_tail2(dst_name TEXT PRIMARY KEY)`); err != nil {
+			return 0, err
+		}
+		droppedNeededTail2 := false
+		defer func() {
+			if droppedNeededTail2 {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_resolver_needed_tail2`)
+		}()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_needed_tail2`); err != nil {
+			return 0, err
+		}
+
+		const maxPerInsert = 400
+		for start := 0; start < len(needNames); start += maxPerInsert {
+			end := min(start+maxPerInsert, len(needNames))
+			chunk := needNames[start:end]
+			var b strings.Builder
+			b.WriteString(`INSERT OR IGNORE INTO tmp_resolver_needed_tail2(dst_name) VALUES `)
+			args := make([]any, 0, len(chunk))
+			for i, name := range chunk {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("(?)")
+				args = append(args, name)
+			}
+			if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+				return 0, err
+			}
+		}
+
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_dot_tail2(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+			return 0, err
+		}
+		droppedDotTail2 := false
+		defer func() {
+			if droppedDotTail2 {
+				return
+			}
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_dot_tail2`)
+		}()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_dot_tail2`); err != nil {
+			return 0, err
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO tmp_symbol_dot_tail2(dst_name, dst_symbol_id)
+			SELECT n.dst_name, MIN(s.id)
+			FROM tmp_resolver_needed_tail2 n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.dot_tail2 = n.dst_name
+			WHERE s.dot_tail2 != ''
+			GROUP BY n.dst_name
+		`, repoID); err != nil {
+			return 0, err
+		}
+
+		updateRes, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_dot_tail2 t WHERE t.dst_name = edges.dst_name)
+			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+			AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
+			AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') = 0
+			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_dot_tail2)
+		`, repoID)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_dot_tail2`); err != nil {
+			return 0, err
+		}
+		droppedDotTail2 = true
+		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_tail2`); err != nil {
+			return 0, err
+		}
+		droppedNeededTail2 = true
+		n, err := updateRes.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
 		totalResolved += int(n)
 	}
 
@@ -1053,19 +2791,26 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if len(paths) == 0 {
 		return nil
 	}
-	const chunkSize = 300
-	targets := make([]edgeTarget, 0, len(paths))
-	seen := map[int64]struct{}{}
-	for start := 0; start < len(paths); start += chunkSize {
-		end := min(start+chunkSize, len(paths))
-		chunk := paths[start:end]
+	uniquePaths := make([]string, 0, len(paths))
+	seenPaths := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, ok := seenPaths[path]; ok {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		uniquePaths = append(uniquePaths, path)
+	}
+
+	const chunkSize = 400
+	fileIDs := make([]int64, 0, len(uniquePaths))
+	for start := 0; start < len(uniquePaths); start += chunkSize {
+		end := min(start+chunkSize, len(uniquePaths))
+		chunk := uniquePaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `
-			SELECT e.id, e.dst_name
-			FROM edges e
-			JOIN files f ON f.id = e.file_id
-			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND f.path IN (` + placeholders + `)
-		`
+		query := `SELECT id FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, path := range chunk {
@@ -1075,19 +2820,185 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		if err != nil {
 			return err
 		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			fileIDs = append(fileIDs, id)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+
+	targets := make([]edgeTarget, 0, len(fileIDs))
+	for start := 0; start < len(fileIDs); start += chunkSize {
+		end := min(start+chunkSize, len(fileIDs))
+		chunk := fileIDs[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
 		chunkTargets, err := scanEdgeTargets(rows)
 		if err != nil {
 			return err
 		}
-		for _, target := range chunkTargets {
-			if _, ok := seen[target.edgeID]; ok {
-				continue
-			}
-			seen[target.edgeID] = struct{}{}
-			targets = append(targets, target)
-		}
+		targets = append(targets, chunkTargets...)
 	}
 	return s.resolveEdgeTargets(ctx, repoID, targets)
+}
+
+// ResolveEdgesForNames attempts to resolve currently-unresolved edges across the
+// repo whose dst_name matches (or ends with ".<name>") any of the provided
+// names. This is used to keep incremental update runs correct when newly
+// introduced symbols should resolve previously-unresolved edges in other files.
+//
+// It returns the number of candidate edges selected for resolution.
+func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []string) (int, error) {
+	stats, err := s.ResolveEdgesForNamesWithStats(ctx, repoID, names)
+	if err != nil {
+		return 0, err
+	}
+	return stats.TargetsSelected, nil
+}
+
+func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string) (ResolveEdgesForNamesStats, error) {
+	var stats ResolveEdgesForNamesStats
+	if len(names) == 0 {
+		return stats, nil
+	}
+	stats.NamesInput = len(names)
+	seen := make(map[string]struct{}, len(names))
+	unique := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		unique = append(unique, name)
+	}
+	if len(unique) == 0 {
+		return stats, nil
+	}
+	stats.NamesUnique = len(unique)
+
+	// Candidate selection:
+	//
+	// 1) Use indexed exact matches for dst_name = <name> (covers the common case
+	//    where unresolved edges reference the simple symbol name directly).
+	// 2) Only if needed, scan unresolved edges that contain a '.' and filter in Go
+	//    for suffix matches (dst_name ends with ".<name>").
+	//
+	// This avoids scanning the full unresolved-edge set on large repos where many
+	// unresolved edges have simple (non-qualified) dst_name values.
+	targetByID := make(map[int64]edgeTarget, 64)
+
+	exactStarted := time.Now()
+	// Keep under sqliteDefaultMaxVariables (repoID + N names).
+	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(unique))
+		chunk := unique[start:end]
+
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name IN (` + placeholders + `)`
+		args := make([]any, 1+len(chunk))
+		args[0] = repoID
+		for i, name := range chunk {
+			args[i+1] = name
+		}
+
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return stats, err
+		}
+		for rows.Next() {
+			var id int64
+			var dstName string
+			if err := rows.Scan(&id, &dstName); err != nil {
+				_ = rows.Close()
+				return stats, err
+			}
+			targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+			stats.ExactHits++
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return stats, err
+		}
+		if err := rows.Close(); err != nil {
+			return stats, err
+		}
+		stats.ExactQueryBatches++
+	}
+	stats.ExactSelectMS = time.Since(exactStarted).Milliseconds()
+
+	// Suffix matching requires looking at qualified dst_name values. Keep this
+	// as a single pass over the qualified unresolved set (no repeated LIKE
+	// queries), but avoid scanning simple dst_name values entirely.
+	suffixStarted := time.Now()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, dst_name
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != '' AND instr(dst_name, '.') > 0
+	`, repoID)
+	if err != nil {
+		return stats, err
+	}
+	for rows.Next() {
+		var id int64
+		var dstName string
+		if err := rows.Scan(&id, &dstName); err != nil {
+			_ = rows.Close()
+			return stats, err
+		}
+		stats.QualifiedScanned++
+		if _, ok := targetByID[id]; ok {
+			continue
+		}
+		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
+			if _, ok := seen[dstName[dot+1:]]; ok {
+				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+				stats.SuffixHits++
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return stats, err
+	}
+	if err := rows.Close(); err != nil {
+		return stats, err
+	}
+	stats.SuffixSelectMS = time.Since(suffixStarted).Milliseconds()
+
+	targets := make([]edgeTarget, 0, len(targetByID))
+	for _, target := range targetByID {
+		targets = append(targets, target)
+	}
+	stats.TargetsSelected = len(targets)
+	resolveStarted := time.Now()
+	if err := s.resolveEdgeTargets(ctx, repoID, targets); err != nil {
+		return stats, err
+	}
+	stats.ResolveTargetsMS = time.Since(resolveStarted).Milliseconds()
+	return stats, nil
 }
 
 func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
@@ -1106,11 +3017,21 @@ func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
 	return targets, nil
 }
 
+func (s *Store) CountUnresolvedEdgesByDstName(ctx context.Context, repoID int64, dstName string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name = ?
+	`, repoID, dstName).Scan(&n)
+	return n, err
+}
+
 func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget) error {
 	if len(targets) == 0 {
 		return nil
 	}
-	qualifiedSet := map[string]struct{}{}
+	qualifiedSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		if target.dstName != "" {
 			qualifiedSet[target.dstName] = struct{}{}
@@ -1125,13 +3046,23 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return err
 	}
 
-	shortSet := map[string]struct{}{}
+	dotTail := func(name string) string {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return ""
+		}
+		if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
+			return strings.TrimSpace(name[dot+1:])
+		}
+		return name
+	}
+
+	shortSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		if _, ok := byQualified[target.dstName]; ok {
 			continue
 		}
-		parts := strings.Split(target.dstName, ".")
-		short := strings.TrimSpace(parts[len(parts)-1])
+		short := dotTail(target.dstName)
 		if short != "" {
 			shortSet[short] = struct{}{}
 		}
@@ -1145,31 +3076,73 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return err
 	}
 
+	type edgeResolution struct {
+		edgeID int64
+		dstID  int64
+	}
+	resolutions := make([]edgeResolution, 0, len(targets))
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	updateStmt, err := tx.PrepareContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer updateStmt.Close()
-
 	for _, target := range targets {
 		dstID, ok := byQualified[target.dstName]
 		if !ok {
-			parts := strings.Split(target.dstName, ".")
-			short := strings.TrimSpace(parts[len(parts)-1])
+			short := dotTail(target.dstName)
 			dstID, ok = byShort[short]
 		}
 		if !ok || dstID == 0 {
 			continue
 		}
-		if _, err := updateStmt.ExecContext(ctx, dstID, target.edgeID); err != nil {
+		resolutions = append(resolutions, edgeResolution{edgeID: target.edgeID, dstID: dstID})
+	}
+
+	if len(resolutions) == 0 {
+		_ = tx.Rollback()
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_resolution(edge_id INTEGER PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_edge_resolution`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	// Keep well under SQLite's default variable limit (999).
+	const maxPairsPerInsert = 400
+	for start := 0; start < len(resolutions); start += maxPairsPerInsert {
+		end := min(start+maxPairsPerInsert, len(resolutions))
+		chunk := resolutions[start:end]
+		var b strings.Builder
+		b.WriteString(`INSERT INTO tmp_edge_resolution(edge_id, dst_symbol_id) VALUES `)
+		args := make([]any, 0, len(chunk)*2)
+		for i, r := range chunk {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?,?)")
+			args = append(args, r.edgeID, r.dstID)
+		}
+		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE edges
+		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_edge_resolution t WHERE t.edge_id = edges.id)
+		WHERE edges.id IN (SELECT edge_id FROM tmp_edge_resolution)
+	`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_edge_resolution`); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -1230,10 +3203,11 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 		chunk := names[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT name, id
+			SELECT name, MIN(id)
 			FROM symbols
 			WHERE repo_id = ? AND name IN (` + placeholders + `)
-			ORDER BY id ASC
+			GROUP BY name
+			HAVING COUNT(1) = 1
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -1244,8 +3218,6 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 		if err != nil {
 			return nil, err
 		}
-		seenCount := map[string]int{}
-		firstID := map[string]int64{}
 		for rows.Next() {
 			var name string
 			var id int64
@@ -1253,24 +3225,65 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 				_ = rows.Close()
 				return nil, err
 			}
-			seenCount[name]++
-			if seenCount[name] == 1 {
-				firstID[name] = id
-			}
+			out[name] = id
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err
-		}
-		for name, count := range seenCount {
-			if count == 1 {
-				out[name] = firstID[name]
-			}
 		}
 	}
 	return out, nil
 }
 
 func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, stableKeys []string) (map[string]int64, error) {
+	return resolveSymbolsByStableKeysQuery(ctx, s.db, repoID, stableKeys)
+}
+
+type queryContexter interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// symbolFileRef pairs a resolved symbol id with the file_id that hosts it.
+// Used by the test_links insert path to populate target_file_id alongside
+// target_symbol_id so PurgeDeletedFileGraphsForScan can match rows whose
+// target file was deleted.
+type symbolFileRef struct {
+	id     int64
+	fileID int64
+}
+
+func resolveSymbolFilesByStableKeysQuery(ctx context.Context, q queryContexter, repoID int64, stableKeys []string) (map[string]symbolFileRef, error) {
+	out := map[string]symbolFileRef{}
+	if len(stableKeys) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(stableKeys)), ",")
+	query := `
+		SELECT stable_key, id, file_id
+		FROM symbols
+		WHERE repo_id = ? AND stable_key IN (` + placeholders + `)
+	`
+	args := make([]any, 0, len(stableKeys)+1)
+	args = append(args, repoID)
+	for _, key := range stableKeys {
+		args = append(args, key)
+	}
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var ref symbolFileRef
+		if err := rows.Scan(&key, &ref.id, &ref.fileID); err != nil {
+			return nil, err
+		}
+		out[key] = ref
+	}
+	return out, rows.Err()
+}
+
+func resolveSymbolsByStableKeysQuery(ctx context.Context, q queryContexter, repoID int64, stableKeys []string) (map[string]int64, error) {
 	out := map[string]int64{}
 	if len(stableKeys) == 0 {
 		return out, nil
@@ -1286,7 +3299,7 @@ func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, st
 	for _, key := range stableKeys {
 		args = append(args, key)
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1411,6 +3424,7 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		JOIN symbols s ON s.id = e.src_symbol_id
 		JOIN files f ON f.id = s.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id = ?
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, targetID, safeLimit(limit), safeOffset(offset))
@@ -1432,6 +3446,7 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 		JOIN symbols s ON s.id = e.dst_symbol_id
 		JOIN files f ON f.id = s.file_id
 		WHERE e.repo_id = ? AND e.src_symbol_id = ?
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, srcID, safeLimit(limit), safeOffset(offset))
@@ -1452,6 +3467,10 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 		queue = append(queue, id)
 	}
 	for _, file := range files {
+		file = normalizeRepoRelPath(file)
+		if file == "" {
+			continue
+		}
 		rows, err := s.db.QueryContext(ctx, `
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
@@ -1471,6 +3490,9 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 			queue = append(queue, sym.ID)
 		}
 		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 	}
 	if depth <= 0 {
 		depth = 2
@@ -1527,6 +3549,22 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 			fileList = append(fileList, sym.FilePath)
 		}
 	}
+	sort.Slice(symbolList, func(i, j int) bool {
+		if symbolList[i].FilePath != symbolList[j].FilePath {
+			return symbolList[i].FilePath < symbolList[j].FilePath
+		}
+		if symbolList[i].QualifiedName != symbolList[j].QualifiedName {
+			return symbolList[i].QualifiedName < symbolList[j].QualifiedName
+		}
+		if symbolList[i].Range.StartLine != symbolList[j].Range.StartLine {
+			return symbolList[i].Range.StartLine < symbolList[j].Range.StartLine
+		}
+		if symbolList[i].Range.StartCol != symbolList[j].Range.StartCol {
+			return symbolList[i].Range.StartCol < symbolList[j].Range.StartCol
+		}
+		return symbolList[i].ID < symbolList[j].ID
+	})
+	sort.Strings(fileList)
 	return map[string]any{
 		"symbols": symbolList,
 		"files":   fileList,
@@ -1554,6 +3592,7 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 			JOIN symbols s ON s.id = e.src_symbol_id
 			JOIN files f ON f.id = s.file_id
 			WHERE e.repo_id = ? AND e.dst_symbol_id IN (` + placeholders + `)
+			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		`
 		if !callers {
 			query = `
@@ -1563,6 +3602,7 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 				JOIN symbols s ON s.id = e.dst_symbol_id
 				JOIN files f ON f.id = s.file_id
 				WHERE e.repo_id = ? AND e.src_symbol_id IN (` + placeholders + `) AND e.dst_symbol_id IS NOT NULL
+				ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			`
 		}
 		args := make([]any, 0, len(chunk)+1)
@@ -1587,17 +3627,28 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 	var rows *sql.Rows
 	var err error
 	if file != "" {
+		file = normalizeRepoRelPath(file)
+		if file == "" {
+			return []RelatedTest{}, nil
+		}
+		var targetFileID int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? LIMIT 1`, repoID, file).Scan(&targetFileID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return []RelatedTest{}, nil
+			}
+			return nil, err
+		}
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT f.path, COALESCE(s.qualified_name, ''), t.reason, t.score
 			FROM test_links t
 			JOIN files f ON f.id = t.test_file_id
 			LEFT JOIN symbols s ON s.id = t.test_symbol_id
-			WHERE t.repo_id = ? AND t.test_file_id IN (
-				SELECT id FROM files WHERE repo_id = ? AND path LIKE '%_test.go'
-			)
+			WHERE t.repo_id = ? AND t.target_file_id = ?
+			AND f.path LIKE '%_test.go'
+			ORDER BY t.score DESC, f.path, COALESCE(s.qualified_name, '')
 			LIMIT ?
 			OFFSET ?
-		`, repoID, repoID, safeLimit(limit), safeOffset(offset))
+		`, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
 	} else {
 		targetID, err := s.lookupSymbolID(ctx, repoID, symbol, 0)
 		if err != nil {
@@ -1609,6 +3660,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 			JOIN files f ON f.id = t.test_file_id
 			LEFT JOIN symbols s ON s.id = t.test_symbol_id
 			WHERE t.repo_id = ? AND t.target_symbol_id = ?
+			ORDER BY t.score DESC, f.path, COALESCE(s.qualified_name, '')
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetID, safeLimit(limit), safeOffset(offset))
@@ -1623,6 +3675,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 		if err := rows.Scan(&item.File, &item.Symbol, &item.Reason, &item.Score); err != nil {
 			return nil, err
 		}
+		item.File = filepath.ToSlash(item.File)
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -1737,6 +3790,36 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 		return nil, err
 	}
 	return scanSymbols(rows)
+}
+
+// ExportDOTNodeNamesPage yields the unique, non-empty qualified_name values
+// for the repo in stable alphabetical order, paged. It exists so DOTStream
+// can emit deduped + sorted DOT node lines without materialising the full
+// `[]graph.Symbol` slice (peak memory on the no-focus DOT path was
+// previously O(repo) in `Symbol`-sized rows; this trims it to O(pageSize)
+// in plain strings).
+func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT qualified_name
+		FROM symbols
+		WHERE repo_id = ? AND qualified_name <> ''
+		ORDER BY qualified_name ASC
+		LIMIT ?
+		OFFSET ?
+	`, repoID, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, limit)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
@@ -1902,28 +3985,274 @@ func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason s
 		INSERT INTO dirty_files(repo_id, path, reason, queued_at)
 		VALUES(?, ?, ?, ?)
 		ON CONFLICT(repo_id, path) DO UPDATE SET reason=excluded.reason, queued_at=excluded.queued_at
-	`, repoID, path, reason, time.Now().UTC().Format(time.RFC3339))
+	`, repoID, path, reason, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
-func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
+func (s *Store) QueueDirtyFiles(ctx context.Context, repoID int64, paths []string, reason string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO dirty_files(repo_id, path, reason, queued_at)
+		VALUES(?, ?, ?, ?)
+		ON CONFLICT(repo_id, path) DO UPDATE SET reason=excluded.reason, queued_at=excluded.queued_at
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, path := range paths {
+		if _, err := stmt.ExecContext(ctx, repoID, path, reason, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) HasDirtyFiles(ctx context.Context, repoID int64) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM dirty_files WHERE repo_id = ? LIMIT 1`, repoID).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ClaimDirtyFiles snapshots all currently queued dirty paths for a repo and
+// marks them as "inflight" by rewriting queued_at/reason in a single write
+// transaction. This avoids the crash window inherent in destructive draining
+// (delete-then-process) while still allowing successful callers to delete only
+// the rows they claimed.
+func (s *Store) ClaimDirtyFiles(ctx context.Context, repoID int64, claimAt, claimReason string) ([]string, error) {
+	if claimAt == "" {
+		return nil, fmt.Errorf("claimAt must be non-empty")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+	}()
+
+	rows, err := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+
+	var paths []string
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
 			return nil, err
 		}
-		out = append(out, path)
+		paths = append(paths, path)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+
+	for _, chunk := range chunkStrings(paths, 900) {
+		qMarks := strings.Repeat("?,", len(chunk))
+		qMarks = qMarks[:len(qMarks)-1]
+		args := make([]any, 0, 3+len(chunk))
+		args = append(args, claimAt, claimReason, repoID)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE dirty_files
+			SET queued_at = ?, reason = ?
+			WHERE repo_id = ? AND path IN (%s)
+		`, qMarks), args...); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, err
+	}
+	committed = true
+	return paths, nil
+}
+
+// DeleteClaimedDirtyFiles removes previously-claimed rows, but only if their
+// queued_at still matches the claim timestamp. If a path was re-queued after
+// claim (queued_at changed), it is retained for the next flush.
+func (s *Store) DeleteClaimedDirtyFiles(ctx context.Context, repoID int64, paths []string, claimedAt string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	if claimedAt == "" {
+		return fmt.Errorf("claimedAt must be non-empty")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = tx.Rollback()
+	}()
+
+	for _, chunk := range chunkStrings(paths, sqliteInClauseBatchSize) {
+		qMarks := strings.Repeat("?,", len(chunk))
+		qMarks = qMarks[:len(qMarks)-1]
+		args := make([]any, 0, 3+len(chunk))
+		args = append(args, repoID, claimedAt)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			DELETE FROM dirty_files
+			WHERE repo_id = ? AND queued_at = ? AND path IN (%s)
+		`, qMarks), args...); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
+	// Take a write lock up-front so that events queued concurrently cannot be
+	// inserted until after we delete the drained rows. Also ensures we can safely
+	// rollback if scanning fails/cancels (avoids losing work on partial reads).
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+	}()
+
+	rows, err := conn.QueryContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ? RETURNING path, queued_at`, repoID)
+	if err == nil {
+		defer rows.Close()
+		type drained struct {
+			path     string
+			queuedAt string
+		}
+		var drainedRows []drained
+		for rows.Next() {
+			var d drained
+			if err := rows.Scan(&d.path, &d.queuedAt); err != nil {
+				return nil, err
+			}
+			drainedRows = append(drainedRows, d)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		sort.Slice(drainedRows, func(i, j int) bool { return drainedRows[i].queuedAt < drainedRows[j].queuedAt })
+		out := make([]string, len(drainedRows))
+		for i := range drainedRows {
+			out[i] = drainedRows[i].path
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return nil, err
+		}
+		committed = true
+		return out, nil
+	}
+
+	// Fallback for older SQLite builds/drivers without `RETURNING`.
+	if !isSQLiteReturningUnsupported(err) {
+		return nil, err
+	}
+
+	selRows, err := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer selRows.Close()
+
+	var out []string
+	for selRows.Next() {
+		var path string
+		if err := selRows.Scan(&path); err != nil {
+			return nil, err
+		}
+		out = append(out, path)
+	}
+	if err := selRows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, err
+	}
+	committed = true
 	return out, nil
+}
+
+func isSQLiteReturningUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "returning") && strings.Contains(msg, "syntax")
+}
+
+func chunkStrings(values []string, chunkSize int) [][]string {
+	if len(values) == 0 || chunkSize <= 0 {
+		return nil
+	}
+	out := make([][]string, 0, (len(values)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(values); start += chunkSize {
+		end := min(start+chunkSize, len(values))
+		out = append(out, values[start:end])
+	}
+	return out
 }
 
 func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string, symbolID int64) (int64, error) {
@@ -1932,8 +4261,18 @@ func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string,
 	}
 	var id int64
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id FROM symbols WHERE repo_id = ? AND (qualified_name = ? OR name = ?) LIMIT 1
-	`, repoID, symbol, symbol).Scan(&id)
+		SELECT s.id
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ? AND (s.qualified_name = ? OR s.name = ?)
+		ORDER BY
+			CASE WHEN s.qualified_name = ? THEN 0 ELSE 1 END,
+			f.path ASC,
+			s.start_line ASC,
+			s.start_col ASC,
+			s.id ASC
+		LIMIT 1
+	`, repoID, symbol, symbol, symbol).Scan(&id)
 	return id, err
 }
 
@@ -1945,6 +4284,8 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 	); err != nil {
 		return graph.Symbol{}, err
 	}
+	// Normalize paths in outputs to be deterministic across platforms and call sites.
+	sym.FilePath = filepath.ToSlash(sym.FilePath)
 	return sym, nil
 }
 
@@ -2371,6 +4712,20 @@ func safeOffset(offset int) int {
 	return max(offset, 0)
 }
 
+func normalizeRepoRelPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	// Normalize common caller variations: forward slashes, leading ./, etc.
+	path = filepath.FromSlash(path)
+	path = filepath.Clean(path)
+	if path == "." {
+		return ""
+	}
+	return path
+}
+
 func quoteFTS(query string) string {
 	tokens := strings.Fields(query)
 	for i, token := range tokens {
@@ -2431,11 +4786,13 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ?
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
-		  AND s.id NOT IN (
-		      SELECT DISTINCT dst_symbol_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM edges e
+		      WHERE e.repo_id = s.repo_id AND e.dst_symbol_id = s.id
 		  )
-		  AND s.id NOT IN (
-		      SELECT DISTINCT symbol_id FROM references_tbl WHERE repo_id = ? AND symbol_id IS NOT NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM references_tbl r
+		      WHERE r.repo_id = s.repo_id AND r.symbol_id = s.id
 		  )
 		  AND s.name NOT IN ('main', 'init', 'Main', 'Init')
 		  AND s.name NOT LIKE 'Test%'
@@ -2443,7 +4800,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Example%'
 		ORDER BY f.path, s.start_line
 		LIMIT ? OFFSET ?
-	`, repoID, repoID, repoID, safeLimit(limit), safeOffset(offset))
+	`, repoID, safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
@@ -2484,32 +4841,238 @@ func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID, fileID int64
 		return err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at)
-		SELECT s.id, ?, ?, ?, ?, ?, ?
-		FROM symbols s
-		WHERE s.file_id = ? AND s.stable_key = ?
-		ON CONFLICT(symbol_id) DO UPDATE SET
-			embedding = excluded.embedding,
-			dimensions = excluded.dimensions,
-			model_name = excluded.model_name,
-			updated_at = excluded.updated_at
-	`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
+	stableKeys := make([]string, 0, len(symbolMap))
+	for k := range symbolMap {
+		stableKeys = append(stableKeys, k)
 	}
-	defer stmt.Close()
 
-	for stableKey, vec := range symbolMap {
-		blob := float32ToBytes(vec)
-		if _, err := stmt.ExecContext(ctx, fileID, repoID, blob, len(vec), modelName, now, fileID, stableKey); err != nil {
+	// Resolve symbol ids in chunks to avoid per-row subqueries during embedding writes.
+	// Keep under sqliteDefaultMaxVariables.
+	stableToID := make(map[string]int64, len(stableKeys))
+	for start := 0; start < len(stableKeys); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(stableKeys))
+		chunk := stableKeys[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, fileID)
+		for _, k := range chunk {
+			args = append(args, k)
+		}
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		for rows.Next() {
+			var stableKey string
+			var id int64
+			if err := rows.Scan(&stableKey, &id); err != nil {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return err
+			}
+			stableToID[stableKey] = id
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			_ = tx.Rollback()
+			return err
+		}
+		if err := rows.Close(); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 	}
 
+	const embedCols = 7
+	embedArgs := make([]any, 0, sqliteEmbeddingValuesBatchRows*embedCols)
+	flush := func() error {
+		if len(embedArgs) == 0 {
+			return nil
+		}
+		rows := len(embedArgs) / embedCols
+		var b strings.Builder
+		b.WriteString(`INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at) VALUES `)
+		for i := 0; i < rows; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?,?,?,?,?,?,?)")
+		}
+		b.WriteString(`
+			ON CONFLICT(symbol_id) DO UPDATE SET
+				embedding = excluded.embedding,
+				dimensions = excluded.dimensions,
+				model_name = excluded.model_name,
+				updated_at = excluded.updated_at
+		`)
+		if _, err := tx.ExecContext(ctx, b.String(), embedArgs...); err != nil {
+			return err
+		}
+		embedArgs = embedArgs[:0]
+		return nil
+	}
+
+	for stableKey, vec := range symbolMap {
+		symbolID := stableToID[stableKey]
+		if symbolID == 0 {
+			continue
+		}
+		blob := float32ToBytes(vec)
+		embedArgs = append(embedArgs, symbolID, fileID, repoID, blob, len(vec), modelName, now)
+		if len(embedArgs) >= sqliteEmbeddingValuesBatchRows*embedCols {
+			if err := flush(); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+type SymbolEmbeddingUpsert struct {
+	FileID    int64
+	StableKey string
+	Vector    []float32
+}
+
+func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, modelName string, items []SymbolEmbeddingUpsert) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	type vecRef struct {
+		stableKey string
+		vector    []float32
+	}
+	byFile := map[int64][]vecRef{}
+	for _, item := range items {
+		if item.FileID == 0 || item.StableKey == "" || len(item.Vector) == 0 {
+			continue
+		}
+		byFile[item.FileID] = append(byFile[item.FileID], vecRef{stableKey: item.StableKey, vector: item.Vector})
+	}
+	if len(byFile) == 0 {
+		_ = tx.Rollback()
+		return nil
+	}
+
+	const embedCols = 7
+	embedArgs := make([]any, 0, sqliteEmbeddingValuesBatchRows*embedCols)
+	flush := func() error {
+		if len(embedArgs) == 0 {
+			return nil
+		}
+		rows := len(embedArgs) / embedCols
+		var b strings.Builder
+		b.WriteString(`INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at) VALUES `)
+		for i := 0; i < rows; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?,?,?,?,?,?,?)")
+		}
+		b.WriteString(`
+			ON CONFLICT(symbol_id) DO UPDATE SET
+				embedding = excluded.embedding,
+				dimensions = excluded.dimensions,
+				model_name = excluded.model_name,
+				updated_at = excluded.updated_at
+		`)
+		if _, err := tx.ExecContext(ctx, b.String(), embedArgs...); err != nil {
+			return err
+		}
+		embedArgs = embedArgs[:0]
+		return nil
+	}
+
+	// Resolve symbol ids per file in chunks, then multi-row upsert embeddings.
+	// Keep well under sqliteDefaultMaxVariables.
+	for fileID, vecs := range byFile {
+		if len(vecs) == 0 {
+			continue
+		}
+		stableToVec := make(map[string][]float32, len(vecs))
+		stableKeys := make([]string, 0, len(vecs))
+		for _, v := range vecs {
+			if v.stableKey == "" || len(v.vector) == 0 {
+				continue
+			}
+			// If the same stable key appears multiple times, the last one wins; vectors should be identical anyway.
+			if _, ok := stableToVec[v.stableKey]; !ok {
+				stableKeys = append(stableKeys, v.stableKey)
+			}
+			stableToVec[v.stableKey] = v.vector
+		}
+		for start := 0; start < len(stableKeys); start += sqliteInClauseBatchSize {
+			end := min(start+sqliteInClauseBatchSize, len(stableKeys))
+			chunk := stableKeys[start:end]
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+			query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, fileID)
+			for _, k := range chunk {
+				args = append(args, k)
+			}
+			rows, err := tx.QueryContext(ctx, query, args...)
+			if err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			for rows.Next() {
+				var stableKey string
+				var symbolID int64
+				if err := rows.Scan(&stableKey, &symbolID); err != nil {
+					_ = rows.Close()
+					_ = tx.Rollback()
+					return err
+				}
+				vec := stableToVec[stableKey]
+				if symbolID == 0 || len(vec) == 0 {
+					continue
+				}
+				embedArgs = append(embedArgs, symbolID, fileID, repoID, float32ToBytes(vec), len(vec), modelName, now)
+				if len(embedArgs) >= sqliteEmbeddingValuesBatchRows*embedCols {
+					if err := rows.Close(); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+					if err := flush(); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+					continue
+				}
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return err
+			}
+			if err := rows.Close(); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	return tx.Commit()
 }
 

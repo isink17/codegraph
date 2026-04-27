@@ -1,0 +1,11 @@
+# Repo-local ignores for codegraph indexing.
+# This file uses .gitignore-like patterns and is loaded by codegraph in addition
+# to config defaults.
+
+.codegraph/**
+
+codegraph
+codegraph.exe
+codegraph.sqlite*
+.gotelemetry/**
+.claude/**

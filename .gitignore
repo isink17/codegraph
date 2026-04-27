@@ -21,3 +21,4 @@ codegraph.exe
 codegraph.sqlite
 codegraph.sqlite-shm
 codegraph.sqlite-wal
+OPTIMIZATIONS.md

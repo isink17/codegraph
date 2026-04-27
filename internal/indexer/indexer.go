@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -48,13 +49,16 @@ type fileTask struct {
 }
 
 type fileResult struct {
-	task      fileTask
-	action    string
-	hash      string
-	parsed    graph.ParsedFile
-	err       error
-	parseErr  string
-	processMS int64
+	task       fileTask
+	action     string
+	hash       string
+	parsed     graph.ParsedFile
+	err        error
+	parseErr   string
+	processDur time.Duration
+	readDur    time.Duration
+	hashDur    time.Duration
+	parseDur   time.Duration
 }
 
 func New(s *store.Store, registry *parser.Registry, embedder embedding.Embedder) *Indexer {
@@ -119,21 +123,39 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			candidateSet[filepath.Clean(rel)] = struct{}{}
 		}
 	}
+	candidatePaths := make([]string, 0, len(candidateSet))
+	for rel := range candidateSet {
+		candidatePaths = append(candidatePaths, rel)
+	}
+	pathScoped := len(candidateSet) > 0
 
-	var existing map[string]store.FileRecord
-	if len(candidateSet) > 0 {
-		paths := make([]string, 0, len(candidateSet))
-		for rel := range candidateSet {
-			paths = append(paths, rel)
+	// Run the existing-files load concurrently with the filesystem walk so
+	// the floor cost of a no-op repo-wide update is roughly max(loadMS, walkMS)
+	// instead of loadMS+walkMS. Workers block on `existingReady` before
+	// reading the resulting map; the FS-walk producer fills the (now
+	// larger) `tasks` buffer in parallel. On load failure a monitor goroutine
+	// cancels `ctxRun` so the producer/workers drain cleanly.
+	var (
+		existing       map[string]store.ExistingFileMeta
+		loadErr        error
+		existingLoadMS int64
+	)
+	existingLoadStarted := time.Now()
+	existingReady := make(chan struct{})
+	go func() {
+		defer close(existingReady)
+		var (
+			m   map[string]store.ExistingFileMeta
+			err error
+		)
+		if pathScoped {
+			m, err = i.store.ExistingFilesForPaths(ctx, repo.ID, candidatePaths)
+		} else {
+			m, err = i.store.ExistingFiles(ctx, repo.ID)
 		}
-		existing, err = i.store.ExistingFilesForPaths(ctx, repo.ID, paths)
-	} else {
-		existing, err = i.store.ExistingFiles(ctx, repo.ID)
-	}
-	if err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
-	}
+		existingLoadMS = time.Since(existingLoadStarted).Milliseconds()
+		existing, loadErr = m, err
+	}()
 
 	workerCount := runtime.NumCPU()
 	if workerCount < 2 {
@@ -146,13 +168,75 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	ctxRun, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	tasks := make(chan fileTask, workerCount*2)
+	go func() {
+		<-existingReady
+		if loadErr != nil {
+			cancel()
+		}
+	}()
+
+	// `tasks` is sized so the FS-walk producer can keep filling while the
+	// existing-files load is still in flight. With cap=workerCount*2 the
+	// producer would stall on a full channel after ~16 dirents, defeating
+	// the overlap on large repos. workerCount*64 (≤512 entries × ~200B
+	// per fileTask ≈ ~100KB) keeps peak buffer trivial.
+	tasks := make(chan fileTask, workerCount*64)
 	results := make(chan fileResult, workerCount*2)
 	producerErr := make(chan error, 1)
 	walkStart := time.Now()
+	missingCap := len(candidatePaths)
+	if missingCap > 128 {
+		missingCap = 128
+	}
+	missingCandidatePaths := make([]string, 0, missingCap)
 
 	go func() {
 		defer close(tasks)
+		if len(candidateSet) > 0 {
+			for _, rel := range candidatePaths {
+				rel = filepath.Clean(rel)
+				if shouldIgnorePath(rel, opts.Exclude) {
+					continue
+				}
+				if shouldSkipFile(rel, opts.Include, opts.Exclude) {
+					continue
+				}
+				abs := filepath.Join(opts.RepoRoot, rel)
+				info, err := os.Stat(abs)
+				if err != nil {
+					if os.IsNotExist(err) {
+						missingCandidatePaths = append(missingCandidatePaths, rel)
+						continue
+					}
+					producerErr <- err
+					return
+				}
+				if info.IsDir() {
+					continue
+				}
+				adapter := i.registry.AdapterFor(rel)
+				language := ""
+				if adapter != nil {
+					language = adapter.Language()
+				}
+				task := fileTask{
+					path:     abs,
+					rel:      rel,
+					info:     info,
+					adapter:  adapter,
+					language: language,
+				}
+				select {
+				case tasks <- task:
+				case <-ctxRun.Done():
+					producerErr <- ctxRun.Err()
+					return
+				}
+			}
+			producerErr <- nil
+			return
+		}
+
 		producerErr <- filepath.WalkDir(opts.RepoRoot, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -170,11 +254,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			if d.IsDir() {
 				return nil
-			}
-			if len(candidateSet) > 0 {
-				if _, ok := candidateSet[rel]; !ok {
-					return nil
-				}
 			}
 			if shouldSkipFile(rel, opts.Include, opts.Exclude) {
 				return nil
@@ -209,8 +288,20 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-existingReady
+			if loadErr != nil {
+				// Drain producer-buffered tasks so the producer's
+				// send-side select can observe ctxRun cancellation and exit.
+				for range tasks {
+				}
+				return
+			}
+			hashLookup := func(rel string) (string, bool, error) {
+				return i.store.LookupFileContentHash(ctxRun, repo.ID, rel)
+			}
 			for task := range tasks {
-				res := processFileTask(ctxRun, task, existing[task.rel], opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy)
+				prev, hasPrev := existing[task.rel]
+				res := processFileTask(ctxRun, task, prev, hasPrev, opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy, hashLookup)
 				select {
 				case results <- res:
 				case <-ctxRun.Done():
@@ -228,18 +319,34 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}()
 
 	const metadataBatchSize = 300
+	const replaceBatchSize = 20
 	markSeenBatch := make([]string, 0, metadataBatchSize)
 	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
+	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
+	changedSymbolNameSet := make(map[string]struct{}, 256)
+
+	var writeMetadataDur time.Duration
+	var writeReplaceDur time.Duration
+	var embedDur time.Duration
+	var writeStats store.WriteStats
 
 	flushMarkSeen := func() error {
 		if len(markSeenBatch) == 0 {
 			return nil
 		}
+		if pathScoped {
+			summary.WriteMarkSeenSkipped += len(markSeenBatch)
+			markSeenBatch = markSeenBatch[:0]
+			return nil
+		}
+		started := time.Now()
 		if err := i.store.MarkFilesSeenBatch(ctx, repo.ID, scanID, markSeenBatch); err != nil {
 			return err
 		}
+		summary.WriteMarkSeenFlushes++
+		writeMetadataDur += time.Since(started)
 		markSeenBatch = markSeenBatch[:0]
 		return nil
 	}
@@ -247,9 +354,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if len(touchBatch) == 0 {
 			return nil
 		}
+		started := time.Now()
 		if err := i.store.TouchFilesMetadataBatch(ctx, repo.ID, scanID, touchBatch); err != nil {
 			return err
 		}
+		summary.WriteTouchFlushes++
+		writeMetadataDur += time.Since(started)
 		touchBatch = touchBatch[:0]
 		return nil
 	}
@@ -257,18 +367,52 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if len(parseFailedBatch) == 0 {
 			return nil
 		}
+		started := time.Now()
 		if err := i.store.MarkFilesParseFailedBatch(ctx, repo.ID, scanID, parseFailedBatch); err != nil {
 			return err
 		}
+		summary.WriteParseFailedFlushes++
+		writeMetadataDur += time.Since(started)
 		parseFailedBatch = parseFailedBatch[:0]
+		return nil
+	}
+	flushReplace := func() error {
+		if len(replaceBatch) == 0 {
+			return nil
+		}
+		started := time.Now()
+		fileIDs, err := i.store.ReplaceFileGraphsBatchWithStats(ctx, repo.ID, scanID, replaceBatch, &writeStats)
+		if err != nil {
+			return err
+		}
+		summary.WriteReplaceFlushes++
+		writeReplaceDur += time.Since(started)
+		if !embedding.IsNoop(i.embedder) {
+			embedStarted := time.Now()
+			i.embedReplaceBatch(ctx, repo.ID, fileIDs, replaceBatch)
+			embedDur += time.Since(embedStarted)
+		}
+		replaceBatch = replaceBatch[:0]
 		return nil
 	}
 
 	var runErr error
-	var parseMS int64
-	var writeMS int64
+	var taskDur time.Duration
+	var taskOtherDur time.Duration
+	var readDur time.Duration
+	var hashDur time.Duration
+	var adapterParseDur time.Duration
+	var writeDur time.Duration
+	processWallStart := time.Now()
 	for res := range results {
-		parseMS += res.processMS
+		taskDur += res.processDur
+		readDur += res.readDur
+		hashDur += res.hashDur
+		adapterParseDur += res.parseDur
+		other := res.processDur - res.readDur - res.hashDur - res.parseDur
+		if other > 0 {
+			taskOtherDur += other
+		}
 		summary.FilesSeen++
 		coverageLanguage := coverageKey(res.task.language)
 		coverage := summary.LanguageCoverage[coverageLanguage]
@@ -297,7 +441,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			coverage.Skipped++
 			summary.LanguageCoverage[coverageLanguage] = coverage
 			if len(markSeenBatch) < metadataBatchSize {
-				writeMS += time.Since(writeStart).Milliseconds()
+				if pathScoped {
+					summary.WriteMarkSeenSkipped++
+					markSeenBatch = markSeenBatch[:0]
+				}
+				writeDur += time.Since(writeStart)
 				summary.FilesSkipped++
 				continue
 			}
@@ -305,7 +453,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				runErr = err
 				cancel()
 			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
 		case "touch":
 			writeStart := time.Now()
@@ -320,7 +468,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			coverage.Skipped++
 			summary.LanguageCoverage[coverageLanguage] = coverage
 			if len(touchBatch) < metadataBatchSize {
-				writeMS += time.Since(writeStart).Milliseconds()
+				writeDur += time.Since(writeStart)
 				summary.FilesSkipped++
 				continue
 			}
@@ -328,25 +476,37 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				runErr = err
 				cancel()
 			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
 		case "replace":
 			writeStart := time.Now()
-			if err := i.store.ReplaceFileGraph(ctx, repo.ID, scanID, res.task.rel, res.parsed.Language, res.task.info.Size(), res.task.info.ModTime().UnixNano(), res.hash, res.parsed); err != nil {
-				runErr = err
-				cancel()
-				continue
-			}
-			if !embedding.IsNoop(i.embedder) {
-				i.embedFileSymbols(ctx, repo.ID, res.task.rel, res.parsed)
-			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			replaceBatch = append(replaceBatch, store.ReplaceFileGraphInput{
+				Path:        res.task.rel,
+				Language:    res.parsed.Language,
+				SizeBytes:   res.task.info.Size(),
+				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
+				ContentHash: res.hash,
+				Parsed:      res.parsed,
+			})
 			changedPathSet[res.task.rel] = struct{}{}
+			for _, sym := range res.parsed.Symbols {
+				if sym.Name == "" {
+					continue
+				}
+				changedSymbolNameSet[sym.Name] = struct{}{}
+			}
 			summary.FilesChanged++
 			summary.FilesIndexed++
 			coverage := summary.LanguageCoverage[coverageLanguage]
 			coverage.Indexed++
 			summary.LanguageCoverage[coverageLanguage] = coverage
+			if len(replaceBatch) >= replaceBatchSize {
+				if err := flushReplace(); err != nil {
+					runErr = err
+					cancel()
+				}
+			}
+			writeDur += time.Since(writeStart)
 		case "parse_failed":
 			writeStart := time.Now()
 			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
@@ -366,7 +526,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					cancel()
 				}
 			}
-			writeMS += time.Since(writeStart).Milliseconds()
+			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
 			coverage := summary.LanguageCoverage[coverageLanguage]
 			coverage.Skipped++
@@ -381,7 +541,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			runErr = err
 			cancel()
 		}
-		writeMS += time.Since(writeStart).Milliseconds()
+		writeDur += time.Since(writeStart)
+	}
+	if runErr == nil {
+		writeStart := time.Now()
+		if err := flushReplace(); err != nil {
+			runErr = err
+			cancel()
+		}
+		writeDur += time.Since(writeStart)
 	}
 	if runErr == nil {
 		writeStart := time.Now()
@@ -389,7 +557,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			runErr = err
 			cancel()
 		}
-		writeMS += time.Since(writeStart).Milliseconds()
+		writeDur += time.Since(writeStart)
 	}
 	if runErr == nil {
 		writeStart := time.Now()
@@ -397,29 +565,74 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			runErr = err
 			cancel()
 		}
-		writeMS += time.Since(writeStart).Milliseconds()
+		writeDur += time.Since(writeStart)
 	}
 
 	walkErr := <-producerErr
+	// Safe to read existingLoadMS here: the workers' `<-existingReady` happens-
+	// before any workers exit, and wg.Wait() (closing `results`) joined them
+	// before this consumer-loop returned.
+	summary.ExistingLoadMS = existingLoadMS
 	summary.WalkMS = time.Since(walkStart).Milliseconds()
-	summary.ParseMS = parseMS
-	summary.WriteMS = writeMS
-	if runErr == nil && walkErr != nil && walkErr != context.Canceled {
+	summary.ProcessWallMS = time.Since(processWallStart).Milliseconds()
+	summary.TaskMS = taskDur.Milliseconds()
+	summary.TaskOtherMS = taskOtherDur.Milliseconds()
+	// ParseMS is the time spent parsing file content (adapter parse), excluding read/hash/DB writes.
+	summary.ParseMS = adapterParseDur.Milliseconds()
+	summary.ReadMS = readDur.Milliseconds()
+	summary.HashMS = hashDur.Milliseconds()
+	summary.WriteMS = writeDur.Milliseconds()
+	summary.WriteMetadataMS = writeMetadataDur.Milliseconds()
+	summary.WriteReplaceMS = writeReplaceDur.Milliseconds()
+	summary.EmbedMS = embedDur.Milliseconds()
+	if writeStats != (store.WriteStats{}) {
+		summary.WriteStats = &writeStats
+	}
+	if (runErr == nil || errors.Is(runErr, context.Canceled)) && walkErr != nil && !errors.Is(walkErr, context.Canceled) {
 		runErr = walkErr
+	}
+	if (runErr == nil || errors.Is(runErr, context.Canceled)) && loadErr != nil {
+		runErr = loadErr
 	}
 	if runErr != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", runErr.Error())
 		return summary, runErr
 	}
 
-	deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
-	if err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
+	if len(candidateSet) == 0 {
+		missingStarted := time.Now()
+		deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		summary.MarkMissingMS = time.Since(missingStarted).Milliseconds()
+		summary.FilesDeleted = deleted
 	}
-	summary.FilesDeleted = deleted
+	if len(missingCandidatePaths) > 0 {
+		deleted, err := i.store.MarkFilesDeletedBatch(ctx, repo.ID, scanID, missingCandidatePaths)
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		summary.FilesDeleted += deleted
+	}
+
+	if summary.FilesDeleted > 0 {
+		if _, err := i.store.PurgeDeletedFileGraphsForScan(ctx, repo.ID, scanID); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+	}
+
 	resolveStart := time.Now()
-	if len(candidateSet) > 0 {
+
+	if len(changedPathSet) == 0 {
+		summary.ResolveMS = 0
+		summary.ResolveMode = "none"
+	} else if len(candidateSet) > 0 || scanKind == "update" {
+		// For path-scoped updates (Options.Paths) and incremental update runs, limit edge
+		// resolution to the changed files. Full index runs still do repo-wide resolution.
 		changedPaths := make([]string, 0, len(changedPathSet))
 		for path := range changedPathSet {
 			changedPaths = append(changedPaths, path)
@@ -428,14 +641,56 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
+		summary.ResolveMode = "paths"
+
+		// Correctness: partial runs can introduce symbols that should resolve previously-unresolved
+		// edges in other files. Do a narrow cross-file pass keyed by the introduced symbol names,
+		// without falling back to repo-wide resolution.
+		if len(changedSymbolNameSet) > 0 {
+			names := make([]string, 0, len(changedSymbolNameSet))
+			for name := range changedSymbolNameSet {
+				names = append(names, name)
+			}
+			crossStart := time.Now()
+			stats, err := i.store.ResolveEdgesForNamesWithStats(ctx, repo.ID, names)
+			if err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			if stats != (store.ResolveEdgesForNamesStats{}) {
+				summary.ResolveCrossFile = &stats
+			}
+			summary.ResolveCrossFileTargets = stats.TargetsSelected
+			summary.ResolveCrossFileMS = time.Since(crossStart).Milliseconds()
+			summary.ResolveMode = "paths+names"
+		}
 	} else {
 		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
 			return summary, resolveErr
 		}
+		summary.ResolveMode = "repo"
 	}
-	summary.ResolveMS = time.Since(resolveStart).Milliseconds()
+	if len(changedPathSet) > 0 {
+		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
+	}
 	summary.DurationMS = time.Since(started).Milliseconds()
+	summary.PhaseTimings = []store.ScanPhaseTiming{
+		{Phase: "existing_load", MS: summary.ExistingLoadMS},
+		{Phase: "walk", MS: summary.WalkMS},
+		{Phase: "task", MS: summary.TaskMS},
+		{Phase: "task_other", MS: summary.TaskOtherMS},
+		{Phase: "read", MS: summary.ReadMS},
+		{Phase: "hash", MS: summary.HashMS},
+		{Phase: "parse", MS: summary.ParseMS},
+		{Phase: "write", MS: summary.WriteMS},
+		{Phase: "write_metadata", MS: summary.WriteMetadataMS},
+		{Phase: "write_replace", MS: summary.WriteReplaceMS},
+		{Phase: "embed", MS: summary.EmbedMS},
+		{Phase: "mark_missing", MS: summary.MarkMissingMS},
+		{Phase: "resolve_edges", MS: summary.ResolveMS},
+		{Phase: "total", MS: summary.DurationMS},
+	}
 	summary.FilesTotal = summary.FilesSeen + summary.FilesDeleted
 	if summary.FilesTotal > 0 {
 		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100
@@ -446,13 +701,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	return summary, nil
 }
 
-func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string) fileResult {
+func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFileMeta, hasPrev bool, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string, hashLookup func(rel string) (string, bool, error)) fileResult {
 	result := fileResult{task: task}
 	started := time.Now()
 	defer func() {
-		result.processMS = time.Since(started).Milliseconds()
+		result.processDur = time.Since(started)
 	}()
-	hasPrev := prev.Path != ""
 
 	if len(allowedLanguages) > 0 && task.language != "" && !slices.Contains(allowedLanguages, task.language) {
 		if hasPrev {
@@ -475,28 +729,43 @@ func processFileTask(ctx context.Context, task fileTask, prev store.FileRecord, 
 	var content []byte
 	var err error
 	if task.adapter == nil {
+		hashStarted := time.Now()
 		hash, err = hashFile(task.path)
 		if err != nil {
 			result.err = err
 			return result
 		}
+		result.hashDur = time.Since(hashStarted)
 	} else {
+		readStarted := time.Now()
 		content, err = os.ReadFile(task.path)
 		if err != nil {
 			result.err = err
 			return result
 		}
+		result.readDur = time.Since(readStarted)
+		hashStarted := time.Now()
 		hash = hashContent(content)
+		result.hashDur = time.Since(hashStarted)
 	}
 	result.hash = hash
-	if hasPrev && !force && prev.ContentHash == hash {
-		result.action = "touch"
-		return result
+	if hasPrev && !force && hashLookup != nil {
+		prevHash, ok, err := hashLookup(task.rel)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		if ok && prevHash == hash {
+			result.action = "touch"
+			return result
+		}
 	}
 
 	parsed := graph.ParsedFile{Language: task.language}
 	if task.adapter != nil {
+		parseStarted := time.Now()
 		parsed, err = task.adapter.Parse(ctx, task.path, content)
+		result.parseDur = time.Since(parseStarted)
 		if err != nil {
 			if parseErrorPolicy == "best_effort" {
 				result.action = "parse_failed"
@@ -537,6 +806,14 @@ func ShouldSkipDir(rel string, excludes []string) bool {
 	return shouldSkipDir(rel, excludes)
 }
 
+func ShouldSkipFile(rel string, includes, excludes []string) bool {
+	return shouldSkipFile(rel, includes, excludes)
+}
+
+func ShouldIgnorePath(rel string, excludes []string) bool {
+	return shouldIgnorePath(rel, excludes)
+}
+
 func shouldSkipDir(rel string, excludes []string) bool {
 	rel = filepath.ToSlash(rel)
 	base := filepath.Base(rel)
@@ -571,6 +848,21 @@ func shouldSkipFile(rel string, includes, excludes []string) bool {
 		return false
 	}
 	return !matchesAny(rel, includes)
+}
+
+func shouldIgnorePath(rel string, excludes []string) bool {
+	current := filepath.Clean(rel)
+	for current != "." && current != "" {
+		if shouldSkipDir(current, excludes) {
+			return true
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			break
+		}
+		current = next
+	}
+	return false
 }
 
 func matchesAny(path string, globs []string) bool {
@@ -688,4 +980,98 @@ func (i *Indexer) embedFileSymbols(ctx context.Context, repoID int64, relPath st
 	if len(symbolMap) > 0 {
 		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
 	}
+}
+
+func (i *Indexer) embedFileSymbolsWithFileID(ctx context.Context, repoID int64, fileID int64, parsed graph.ParsedFile) {
+	if len(parsed.Symbols) == 0 || fileID == 0 {
+		return
+	}
+
+	texts := make([]string, len(parsed.Symbols))
+	keys := make([]string, len(parsed.Symbols))
+	for j, sym := range parsed.Symbols {
+		texts[j] = embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary)
+		keys[j] = sym.StableKey
+	}
+
+	vectors, err := i.embedder.EmbedBatch(ctx, texts)
+	if err != nil {
+		return // best-effort: don't fail indexing on embedding errors
+	}
+
+	symbolMap := make(map[string][]float32, len(keys))
+	for j, key := range keys {
+		if vectors[j] != nil {
+			symbolMap[key] = vectors[j]
+		}
+	}
+	if len(symbolMap) > 0 {
+		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
+	}
+}
+
+func (i *Indexer) embedReplaceBatch(ctx context.Context, repoID int64, fileIDs []int64, inputs []store.ReplaceFileGraphInput) {
+	type keyRef struct {
+		fileID    int64
+		stableKey string
+	}
+
+	totalSyms := 0
+	for idx := range inputs {
+		if idx >= len(fileIDs) {
+			break
+		}
+		totalSyms += len(inputs[idx].Parsed.Symbols)
+	}
+	if totalSyms == 0 {
+		return
+	}
+
+	texts := make([]string, 0, totalSyms)
+	keys := make([]keyRef, 0, totalSyms)
+	for idx, input := range inputs {
+		if idx >= len(fileIDs) {
+			break
+		}
+		fileID := fileIDs[idx]
+		if fileID == 0 || len(input.Parsed.Symbols) == 0 {
+			continue
+		}
+		for _, sym := range input.Parsed.Symbols {
+			texts = append(texts, embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary))
+			keys = append(keys, keyRef{fileID: fileID, stableKey: sym.StableKey})
+		}
+	}
+	if len(texts) == 0 {
+		return
+	}
+
+	const embedChunkSize = 128
+	upserts := make([]store.SymbolEmbeddingUpsert, 0, len(texts))
+	for start := 0; start < len(texts); start += embedChunkSize {
+		end := min(start+embedChunkSize, len(texts))
+		vectors, err := i.embedder.EmbedBatch(ctx, texts[start:end])
+		if err != nil {
+			return // best-effort: don't fail indexing on embedding errors
+		}
+		for j := range vectors {
+			vec := vectors[j]
+			if vec == nil {
+				continue
+			}
+			ref := keys[start+j]
+			if ref.fileID == 0 || ref.stableKey == "" {
+				continue
+			}
+			upserts = append(upserts, store.SymbolEmbeddingUpsert{
+				FileID:    ref.fileID,
+				StableKey: ref.stableKey,
+				Vector:    vec,
+			})
+		}
+	}
+	if len(upserts) == 0 {
+		return
+	}
+	_ = i.store.UpsertSymbolEmbeddingsBatch(ctx, repoID, "", upserts)
 }

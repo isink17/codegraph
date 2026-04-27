@@ -1,6 +1,7 @@
 package export
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/query"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 type Service struct {
@@ -36,23 +39,200 @@ func (s *Service) JSON(ctx context.Context, repoID int64) ([]byte, error) {
 	}, "", "  ")
 }
 
+// JSONPaged returns a JSON-encoded subset of the graph. When the caller
+// requests a bounded page over the whole repo (symbol == "" && limit > 0)
+// rows are streamed straight from the paging helpers so peak memory is
+// O(page), not O(repo). The unbounded (limit <= 0) and focused (symbol != "")
+// paths still go through GraphSnapshot since they intentionally want the full
+// snapshot or a bounded impact subgraph respectively.
 func (s *Service) JSONPaged(ctx context.Context, repoID int64, symbol string, depth, limit, offset int) ([]byte, error) {
 	stats, err := s.query.Stats(ctx, repoID)
 	if err != nil {
 		return nil, err
 	}
-	symbols, edges, err := s.query.GraphSnapshot(ctx, repoID, symbol, depth)
-	if err != nil {
-		return nil, err
+	var symbols []graph.Symbol
+	var edges []store.ExportEdge
+	if symbol == "" && limit > 0 {
+		symbols, err = s.query.ExportSymbolsPage(ctx, repoID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		edges, err = s.query.ExportEdgesPage(ctx, repoID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		symbols, edges, err = s.query.GraphSnapshot(ctx, repoID, symbol, depth)
+		if err != nil {
+			return nil, err
+		}
+		// GraphSnapshot returns slices in unspecified order (the no-focus
+		// loaders have no ORDER BY, and loadEdgesForExport's dedup map
+		// further randomises focused-edge order). Sort by ID ASC to match
+		// the optimized paging branch and make pageSlice deterministic.
+		sort.Slice(symbols, func(i, j int) bool { return symbols[i].ID < symbols[j].ID })
+		sort.Slice(edges, func(i, j int) bool { return edges[i].ID < edges[j].ID })
+		symbols = pageSlice(symbols, limit, offset)
+		edges = pageSlice(edges, limit, offset)
 	}
-	symbols = pageSlice(symbols, limit, offset)
-	edges = pageSlice(edges, limit, offset)
 	return json.MarshalIndent(map[string]any{
 		"repo":    stats.RepoRoot,
 		"stats":   stats,
 		"symbols": symbols,
 		"edges":   edges,
 	}, "", "  ")
+}
+
+// JSONStream emits the same single-object shape as `JSON()` (keys: edges,
+// repo, stats, symbols — alphabetical to match `MarshalIndent` over a
+// `map[string]any`) but pages symbols/edges via `ExportSymbolsPage` /
+// `ExportEdgesPage` and writes incrementally to `w`. Peak memory is
+// O(pageSize) instead of O(repo): the prior `JSON()` path materialised the
+// full symbol + edge slices via `GraphSnapshot("")` and then allocated the
+// JSON byte slice, holding ~3× repo-scale memory. The CLI default JSON
+// export (`graph export` without `--limit`) routes through this for stdout.
+func (s *Service) JSONStream(ctx context.Context, w io.Writer, repoID int64, pageSize int) (err error) {
+	if pageSize <= 0 {
+		pageSize = 500
+	}
+	stats, err := s.query.Stats(ctx, repoID)
+	if err != nil {
+		return err
+	}
+
+	bw := bufio.NewWriterSize(w, 64*1024)
+	defer func() {
+		if flushErr := bw.Flush(); flushErr != nil && err == nil {
+			err = flushErr
+		}
+	}()
+
+	write := func(s string) error {
+		_, e := bw.WriteString(s)
+		return e
+	}
+	encodeIndented := func(v any, prefix, indent string) error {
+		b, e := json.MarshalIndent(v, prefix, indent)
+		if e != nil {
+			return e
+		}
+		// `encoding/json.MarshalIndent` does not emit `prefix` before the
+		// first line; JSONStream writes the call-site indentation manually
+		// before each call, so we can write the bytes through unchanged.
+		_, e = bw.Write(b)
+		return e
+	}
+
+	if err = write("{\n"); err != nil {
+		return err
+	}
+
+	// "edges": [ <paged> ]
+	if err = write(`  "edges": [`); err != nil {
+		return err
+	}
+	first := true
+	offset := 0
+	for {
+		edges, e := s.query.ExportEdgesPage(ctx, repoID, pageSize, offset)
+		if e != nil {
+			return e
+		}
+		if len(edges) == 0 {
+			break
+		}
+		for _, edge := range edges {
+			if first {
+				if err = write("\n    "); err != nil {
+					return err
+				}
+				first = false
+			} else {
+				if err = write(",\n    "); err != nil {
+					return err
+				}
+			}
+			if err = encodeIndented(edge, "    ", "  "); err != nil {
+				return err
+			}
+		}
+		offset += len(edges)
+	}
+	if !first {
+		if err = write("\n  "); err != nil {
+			return err
+		}
+	}
+	if err = write("],\n"); err != nil {
+		return err
+	}
+
+	// "repo": "..."
+	repoBytes, err := json.Marshal(stats.RepoRoot)
+	if err != nil {
+		return err
+	}
+	if err = write(`  "repo": `); err != nil {
+		return err
+	}
+	if _, err = bw.Write(repoBytes); err != nil {
+		return err
+	}
+	if err = write(",\n"); err != nil {
+		return err
+	}
+
+	// "stats": { ... }
+	if err = write(`  "stats": `); err != nil {
+		return err
+	}
+	if err = encodeIndented(stats, "  ", "  "); err != nil {
+		return err
+	}
+	if err = write(",\n"); err != nil {
+		return err
+	}
+
+	// "symbols": [ <paged> ]
+	if err = write(`  "symbols": [`); err != nil {
+		return err
+	}
+	first = true
+	offset = 0
+	for {
+		symbols, e := s.query.ExportSymbolsPage(ctx, repoID, pageSize, offset)
+		if e != nil {
+			return e
+		}
+		if len(symbols) == 0 {
+			break
+		}
+		for _, sym := range symbols {
+			if first {
+				if err = write("\n    "); err != nil {
+					return err
+				}
+				first = false
+			} else {
+				if err = write(",\n    "); err != nil {
+					return err
+				}
+			}
+			if err = encodeIndented(sym, "    ", "  "); err != nil {
+				return err
+			}
+		}
+		offset += len(symbols)
+	}
+	if !first {
+		if err = write("\n  "); err != nil {
+			return err
+		}
+	}
+	if err = write("]\n}\n"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Service) StreamJSONL(ctx context.Context, w io.Writer, repoID int64, pageSize int) error {
@@ -105,6 +285,73 @@ func (s *Service) StreamJSONL(ctx context.Context, w io.Writer, repoID int64, pa
 	return enc.Encode(map[string]any{"type": "graph_done"})
 }
 
+// DOTStream emits the same `digraph codegraph { ... }` shape as `DOT()`
+// (no-focus only) but pages nodes via `ExportDOTNodeNamesPage` (server-side
+// `SELECT DISTINCT qualified_name ... ORDER BY qualified_name`) and edges
+// via `ExportEdgesPage`, writing incrementally to `w`. Peak memory drops
+// from O(repo) (full `[]graph.Symbol` + `[]ExportEdge` slices plus the
+// strings.Builder buffer) to O(pageSize). Edge ordering follows
+// `ExportEdgesPage` (ID ASC) instead of `loadEdgesForExport`'s insertion
+// order; both are unspecified by `DOT()`'s contract.
+func (s *Service) DOTStream(ctx context.Context, w io.Writer, repoID int64, pageSize int) (err error) {
+	if pageSize <= 0 {
+		pageSize = 500
+	}
+	bw := bufio.NewWriterSize(w, 64*1024)
+	defer func() {
+		if flushErr := bw.Flush(); flushErr != nil && err == nil {
+			err = flushErr
+		}
+	}()
+
+	if _, err = bw.WriteString("digraph codegraph {\n"); err != nil {
+		return err
+	}
+
+	offset := 0
+	for {
+		names, e := s.query.ExportDOTNodeNamesPage(ctx, repoID, pageSize, offset)
+		if e != nil {
+			return e
+		}
+		if len(names) == 0 {
+			break
+		}
+		for _, n := range names {
+			if _, err = fmt.Fprintf(bw, "  %q;\n", n); err != nil {
+				return err
+			}
+		}
+		offset += len(names)
+	}
+
+	offset = 0
+	for {
+		edges, e := s.query.ExportEdgesPage(ctx, repoID, pageSize, offset)
+		if e != nil {
+			return e
+		}
+		if len(edges) == 0 {
+			break
+		}
+		for _, edge := range edges {
+			line := dotEdgeLine(edge)
+			if line == "" {
+				continue
+			}
+			if _, err = bw.WriteString(line); err != nil {
+				return err
+			}
+		}
+		offset += len(edges)
+	}
+
+	if _, err = bw.WriteString("}\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Service) DOT(ctx context.Context, repoID int64, symbol string, depth int) ([]byte, error) {
 	symbols, edges, err := s.query.GraphSnapshot(ctx, repoID, symbol, depth)
 	if err != nil {
@@ -127,24 +374,36 @@ func (s *Service) DOT(ctx context.Context, repoID int64, symbol string, depth in
 		b.WriteString(fmt.Sprintf("  %q;\n", n))
 	}
 	for _, edge := range edges {
-		src := edge.SrcQualifiedName
-		if src == "" {
-			src = fmt.Sprintf("symbol#%d", edge.SrcSymbolID)
+		line := dotEdgeLine(edge)
+		if line == "" {
+			continue
 		}
-		dst := edge.DstQualifiedName
-		attrs := []string{}
-		if dst == "" {
-			dst = edge.DstName
-			if dst == "" {
-				continue
-			}
-			attrs = append(attrs, `style="dashed"`)
-		}
-		attrs = append(attrs, fmt.Sprintf(`label=%q`, edge.Kind))
-		b.WriteString(fmt.Sprintf("  %q -> %q [%s];\n", src, dst, strings.Join(attrs, ",")))
+		b.WriteString(line)
 	}
 	b.WriteString("}\n")
 	return []byte(b.String()), nil
+}
+
+// dotEdgeLine renders a single DOT edge line (with trailing newline) or ""
+// when the edge has neither a resolved nor a fallback dst name. Shared by
+// DOT() and DOTStream so the resolved-vs-dashed-vs-skipped attribute logic
+// lives in exactly one place.
+func dotEdgeLine(edge store.ExportEdge) string {
+	src := edge.SrcQualifiedName
+	if src == "" {
+		src = fmt.Sprintf("symbol#%d", edge.SrcSymbolID)
+	}
+	dst := edge.DstQualifiedName
+	attrs := []string{}
+	if dst == "" {
+		dst = edge.DstName
+		if dst == "" {
+			return ""
+		}
+		attrs = append(attrs, `style="dashed"`)
+	}
+	attrs = append(attrs, fmt.Sprintf(`label=%q`, edge.Kind))
+	return fmt.Sprintf("  %q -> %q [%s];\n", src, dst, strings.Join(attrs, ","))
 }
 
 func pageSlice[T any](items []T, limit, offset int) []T {

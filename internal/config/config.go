@@ -14,12 +14,14 @@ import (
 
 const fileName = "config.json"
 const ignoreFileName = ".codegraphignore"
+const RepoArtifactsDir = ".codegraph"
 const RepoDBDir = "repo"
 const repoDBExcludePattern = "codegraph.sqlite*"
 
-var HardcodedSkips = []string{".git", "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pnpm-store", ".yarn", ".parcel-cache"}
-var DefaultExcludes = []string{".codegraph/**", ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "vendor/**", "dist/**", "build/**", "coverage/**", "out/**", ".cache/**", repoDBExcludePattern}
+const repoArtifactsExcludePattern = RepoArtifactsDir + "/**"
 
+var HardcodedSkips = []string{".git", RepoArtifactsDir, "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pnpm-store", ".yarn", ".parcel-cache"}
+var DefaultExcludes = []string{repoArtifactsExcludePattern, ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "vendor/**", "dist/**", "build/**", "coverage/**", "out/**", ".cache/**", repoDBExcludePattern}
 
 type Config struct {
 	DefaultLogLevel      string        `json:"default_log_level"`
@@ -82,7 +84,7 @@ func ConfigPath() (string, error) {
 }
 
 func RepoConfigPath(repoRoot string) string {
-	return filepath.Join(repoRoot, ".codegraph", "config.json")
+	return filepath.Join(repoRoot, RepoArtifactsDir, "config.json")
 }
 
 func Load() (Config, error) {

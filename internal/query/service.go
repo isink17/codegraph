@@ -59,12 +59,20 @@ func (s *Service) RelatedTests(ctx context.Context, repoID int64, symbol, file s
 }
 
 func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files []string, limit, offset int) ([]store.RelatedTest, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	perFileLimit := min(max(50, limit+offset), 1000)
+
 	seen := map[string]bool{}
 	var all []store.RelatedTest
 	for _, f := range files {
-		tests, err := s.store.RelatedTests(ctx, repoID, "", f, 50, 0)
+		tests, err := s.store.RelatedTests(ctx, repoID, "", f, perFileLimit, 0)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		for _, t := range tests {
 			key := t.File + "::" + t.Symbol
@@ -74,19 +82,19 @@ func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files 
 			}
 		}
 	}
-	// Sort by score descending.
+	// Sort deterministically: score desc, then file, then symbol.
 	sort.Slice(all, func(i, j int) bool {
-		return all[i].Score > all[j].Score
+		if all[i].Score != all[j].Score {
+			return all[i].Score > all[j].Score
+		}
+		if all[i].File != all[j].File {
+			return all[i].File < all[j].File
+		}
+		return all[i].Symbol < all[j].Symbol
 	})
 	// Apply limit/offset.
-	if offset < 0 {
-		offset = 0
-	}
-	if limit <= 0 {
-		limit = 20
-	}
 	if offset >= len(all) {
-		return nil, nil
+		return []store.RelatedTest{}, nil
 	}
 	end := offset + limit
 	if end > len(all) {
@@ -129,6 +137,10 @@ func (s *Service) ExportSymbolsPage(ctx context.Context, repoID int64, limit, of
 
 func (s *Service) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]store.ExportEdge, error) {
 	return s.store.ExportEdgesPage(ctx, repoID, limit, offset)
+}
+
+func (s *Service) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
+	return s.store.ExportDOTNodeNamesPage(ctx, repoID, limit, offset)
 }
 
 func (s *Service) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth int) ([]map[string]any, error) {

@@ -119,6 +119,7 @@ func newCommandList() []*command {
 			description: "index a repository",
 			usageLines:  []string{"  index <repo-path>"},
 			flags: []commandFlag{
+				{name: "--force", description: "re-index files even if unchanged"},
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
 			},
 			examples: []string{
@@ -135,6 +136,7 @@ func newCommandList() []*command {
 			description: "update only changed files",
 			usageLines:  []string{"  update_graph <repo-path>"},
 			flags: []commandFlag{
+				{name: "--force", description: "re-index files even if unchanged"},
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
 			},
 			examples: []string{
@@ -143,6 +145,31 @@ func newCommandList() []*command {
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runIndex(ctx, cfg, stdout, invokedName, args, true)
+			},
+		},
+		{
+			name:        "index_smoke",
+			aliases:     []string{"smoke_index", "smoke-index"},
+			description: "run repeatable index/update smoke timing",
+			usageLines:  []string{"  index_smoke <repo-path>"},
+			flags: []commandFlag{
+				{name: "--mode", description: "scan mode: index|update (default index)"},
+				{name: "--runs", description: "number of measured runs"},
+				{name: "--warmup", description: "number of warmup runs (not reported)"},
+				{name: "--force", description: "re-index files even if unchanged"},
+				{name: "--profile", description: "SQLite performance profile: balanced|durable|fast (default from config)"},
+				{name: "--gomaxprocs", description: "set GOMAXPROCS for this process (0 = leave unchanged)"},
+				{name: "--baseline", description: "read baseline JSON (optional)"},
+				{name: "--save-baseline", description: "write baseline JSON (default true when --baseline is set)"},
+				{name: "--json", description: "pretty JSON output instead of jsonl"},
+			},
+			examples: []string{
+				"codegraph index_smoke .",
+				"codegraph index_smoke . --mode update --force",
+				"codegraph index_smoke . --runs 5 --baseline .codegraph/smoke-baseline.json",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runIndexSmoke(ctx, cfg, stdout, invokedName, args)
 			},
 		},
 		{
@@ -254,10 +281,12 @@ func newCommandList() []*command {
 			description: "run diagnostics",
 			usageLines: []string{
 				"  doctor",
+				"    add --repo-root PATH to inspect a repo DB",
 				"    add --fix for non-destructive autofixes",
+				"    add --deep for slower DB checks (integrity_check)",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
-				return runDoctor(stdout, args)
+				return runDoctor(ctx, cfg, stdout, args)
 			},
 		},
 		{
@@ -274,7 +303,15 @@ func newCommandList() []*command {
 		{
 			name:        "benchmark",
 			description: "benchmarks",
-			usageLines:  []string{"  benchmark [--count N] [--benchtime DURATION] [--save-baseline]"},
+			usageLines:  []string{"  benchmark [--count N] [--benchtime DURATION] [--save-baseline] [--files N] [--sqlite-profile NAME] [--gomaxprocs N]"},
+			flags: []commandFlag{
+				{name: "--count", description: "number of benchmark runs"},
+				{name: "--benchtime", description: "benchmark time per test"},
+				{name: "--save-baseline", description: "save current benchmark result as baseline"},
+				{name: "--files", description: "fixture file count (sets CODEGRAPH_BENCH_FILES)"},
+				{name: "--sqlite-profile", description: "SQLite performance profile (sets CODEGRAPH_BENCH_SQLITE_PROFILE)"},
+				{name: "--gomaxprocs", description: "GOMAXPROCS for benchmark subprocess (0 = default)"},
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runBenchmark(ctx, stdout, args)
 			},
@@ -322,13 +359,20 @@ func newCommandList() []*command {
 		{
 			name:        "clean",
 			description: "clean index data",
-			usageLines:  []string{"  clean [repo-path] [--vacuum]"},
+			usageLines:  []string{"  clean [repo-path] [--vacuum] [--fts-optimize] [--analyze] [--wal-checkpoint-truncate] [--incremental-vacuum]"},
 			flags: []commandFlag{
 				{name: "--vacuum", description: "VACUUM the database after cleanup"},
+				{name: "--fts-optimize", description: "run FTS optimize (symbol_fts)"},
+				{name: "--analyze", description: "run ANALYZE"},
+				{name: "--wal-checkpoint-truncate", description: "run PRAGMA wal_checkpoint(TRUNCATE)"},
+				{name: "--incremental-vacuum", description: "run PRAGMA incremental_vacuum (requires auto_vacuum=INCREMENTAL)"},
 			},
 			examples: []string{
 				"codegraph clean .",
 				"codegraph clean . --vacuum",
+				"codegraph clean . --fts-optimize",
+				"codegraph clean . --analyze",
+				"codegraph clean . --wal-checkpoint-truncate",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runClean(ctx, cfg, stdout, args)
