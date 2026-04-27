@@ -45,6 +45,48 @@ func BenchmarkIndexerIndex(b *testing.B) {
 	}
 }
 
+// BenchmarkIndexerNoOpUpdateRepoWide measures the floor cost of a repo-wide
+// update where 0 files have changed: existing-files load + filesystem walk +
+// per-file (mtime,size) compare + mark-seen flushes, with no parses or graph
+// rewrites. Surfaces ExistingLoadMS / WalkMS regressions on large repos.
+func BenchmarkIndexerNoOpUpdateRepoWide(b *testing.B) {
+	ctx := context.Background()
+	repoRoot := b.TempDir()
+	files := 200
+	if v := os.Getenv("CODEGRAPH_BENCH_FILES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			files = n
+		}
+	}
+	createGoFixtureRepo(b, repoRoot, files)
+	dbPath := filepath.Join(b.TempDir(), "bench-noop-update.sqlite")
+	b.Logf("sqlite_driver=%s", store.SQLiteDriverName())
+	b.Logf("sqlite_profile=%s", sqliteBenchProfile())
+	b.Logf("fixture_files=%d", files)
+
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: sqliteBenchProfile()})
+	if err != nil {
+		b.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
+		b.Fatalf("Index() error = %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		summary, err := idx.Update(ctx, Options{RepoRoot: repoRoot})
+		if err != nil {
+			b.Fatalf("Update() error = %v", err)
+		}
+		if summary.FilesChanged != 0 {
+			b.Fatalf("expected 0 files changed on no-op update, got %d", summary.FilesChanged)
+		}
+	}
+}
+
 func BenchmarkIndexerUpdateOneFile(b *testing.B) {
 	ctx := context.Background()
 	repoRoot := b.TempDir()
