@@ -144,8 +144,10 @@ codegraph index .
 ### 4. Start the MCP server
 
 ```bash
-codegraph serve --repo-root .
+codegraph serve
 ```
+
+Repo root is auto-detected from git (or falls back to your current working directory).
 
 That's it. Your AI assistant now has deep structural code understanding.
 
@@ -169,7 +171,7 @@ codegraph install
   "mcpServers": {
     "codegraph": {
       "command": "codegraph",
-      "args": ["serve", "--repo-root", "."]
+      "args": ["serve"]
     }
   }
 }
@@ -184,7 +186,7 @@ codegraph install
   "mcpServers": {
     "codegraph": {
       "command": "codegraph",
-      "args": ["serve", "--repo-root", "."]
+      "args": ["serve"]
     }
   }
 }
@@ -197,7 +199,7 @@ codegraph install
 ```toml
 [mcp_servers.codegraph]
 command = "codegraph"
-args = ["serve", "--repo-root", "/path/to/repo"]
+args = ["serve"]
 startup_timeout_sec = 60
 ```
 </details>
@@ -278,7 +280,7 @@ codegraph watch <path>                    # Watch and auto-reindex
 codegraph clean <path>                    # Clean database
 
 # MCP Server
-codegraph serve --repo-root <path>        # Start MCP server
+codegraph serve [--repo-root <path>]      # Start MCP server (auto-detects repo root)
 
 # Query
 codegraph stats <path>                    # Graph statistics
@@ -292,7 +294,7 @@ codegraph impact <path> --symbol <name>   # Impact analysis
 codegraph affected-tests [--stdin] <files>  # Tests affected by changed files
 
 # Visualization & Export
-codegraph visualize --repo-root <path>      # Interactive D3.js graph
+codegraph visualize [--repo-root <path>]    # Interactive D3.js graph (auto-detects repo root)
 codegraph graph export <path> --format dot  # Export as Graphviz DOT
 codegraph graph export <path> --format json # Export as JSON
 
@@ -307,9 +309,11 @@ codegraph benchmark                         # Token savings benchmark
 git diff --name-only | codegraph affected-tests --stdin
 
 # CI integration
-TESTS=$(git diff --name-only HEAD~1 | codegraph affected-tests --stdin --repo-root .)
+TESTS=$(git diff --name-only HEAD~1 | codegraph affected-tests --stdin)
 go test $TESTS
 ```
+
+Replace `--repo-root .` with nothing if you are already in the repo you want to inspect.
 
 ---
 
@@ -396,6 +400,16 @@ Created with `codegraph config init --repo .` at `.codegraph/config.json`:
   }
 }
 ```
+
+### Repo Root Resolution
+
+When `--repo-root` (CLI) or `repo_root` (MCP tool parameter) is omitted, codegraph resolves the repo root using:
+
+1. Per-call `repo_root` MCP tool parameter
+2. `--repo-root` CLI flag (process-level default)
+3. `git rev-parse --show-toplevel` from the current working directory
+4. `os.Getwd()` (current working directory)
+5. Return error
 
 ### Ignore file
 

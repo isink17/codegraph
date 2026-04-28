@@ -155,11 +155,11 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 	deep := fs.Bool("deep", false, "run deeper (potentially slow) diagnostics, including integrity_check")
 	repoRootFlag := fs.String("repo-root", "", "repository root to inspect (optional)")
 
-	defaultRepoRoot := ""
-	if config.IsRepoDBDir(cfg.DBDir) {
-		defaultRepoRoot = "."
+	repoRootCandidate, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, "")
+	if err != nil {
+		return err
 	}
-	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
 	if err != nil {
 		return err
 	}
@@ -601,8 +601,8 @@ func runInstall(stdout io.Writer) error {
 }`)
 
 	// Always print manual snippets as a fallback / reference.
-	codexSnippet := fmt.Sprintf("[mcp_servers.codegraph]\ncommand = %q\nargs = [\"serve\", \"--repo-root\", \"/absolute/path/to/repo\"]\nstartup_timeout_sec = 60", appname.BinaryName)
-	clientSnippet := fmt.Sprintf(`{"mcpServers":{"codegraph":{"command":%q,"args":["serve","--repo-root","/absolute/path/to/repo"]}}}`, appname.BinaryName)
+	codexSnippet := fmt.Sprintf("[mcp_servers.codegraph]\ncommand = %q\nargs = [\"serve\"]\nstartup_timeout_sec = 60", appname.BinaryName)
+	clientSnippet := fmt.Sprintf(`{"mcpServers":{"codegraph":{"command":%q,"args":["serve"]}}}`, appname.BinaryName)
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Manual MCP snippets (if auto-configure did not apply):")
 	fmt.Fprintln(stdout)
@@ -639,9 +639,13 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	if err := fs.Parse(filtered); err != nil {
 		return err
 	}
-	repoRoot := "."
+	repoRootCandidate := ""
 	if fs.NArg() > 0 {
-		repoRoot = fs.Arg(0)
+		repoRootCandidate = fs.Arg(0)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -1150,11 +1154,13 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	repoRoot := "."
-	if *repoRootFlag != "" {
-		repoRoot = *repoRootFlag
-	} else if fs.NArg() > 0 {
-		repoRoot = fs.Arg(0)
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	if repoRootCandidate == "" && fs.NArg() > 0 {
+		repoRootCandidate = fs.Arg(0)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
 	}
 	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -1185,15 +1191,12 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		return err
 	}
 
-	repoRoot := "."
-	if *repoRootFlag != "" {
-		repoRoot = *repoRootFlag
-	}
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
 	queryValue := *queryFlag
 	symbol := ""
 	rest := fs.Args()
-	if *repoRootFlag == "" && len(rest) > 0 {
-		repoRoot = rest[0]
+	if repoRootCandidate == "" && len(rest) > 0 {
+		repoRootCandidate = rest[0]
 		rest = rest[1:]
 	}
 	if queryValue == "" && len(rest) > 0 {
@@ -1209,6 +1212,10 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		symbol = queryValue
 	}
 
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
+	}
 	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
@@ -1309,18 +1316,20 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	repoRoot := "."
-	if *repoRootFlag != "" {
-		repoRoot = *repoRootFlag
-	} else if fs.NArg() > 0 {
-		repoRoot = fs.Arg(0)
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	if repoRootCandidate == "" && fs.NArg() > 0 {
+		repoRootCandidate = fs.Arg(0)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
 	defer app.Close()
-	server := mcp.NewServer(repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
+	server := mcp.NewServer(repoRootCandidate, repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
 	if repoCfg, err := config.LoadRepo(repo.RootPath); err == nil {
 		if repoCfg.Agent.Enabled || repoCfg.Agent.BaseURL != "" || repoCfg.Agent.Model != "" {
 			server.SetAgentConfig(repoCfg.Agent.BaseURL, repoCfg.Agent.Model)
@@ -1337,11 +1346,13 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	repoRoot := "."
-	if *repoRootFlag != "" {
-		repoRoot = *repoRootFlag
-	} else if fs.NArg() > 0 {
-		repoRoot = fs.Arg(0)
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	if repoRootCandidate == "" && fs.NArg() > 0 {
+		repoRootCandidate = fs.Arg(0)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -1498,18 +1509,24 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 func runVisualize(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
 	fs := flag.NewFlagSet("visualize", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	repoRoot := fs.String("repo-root", ".", "repository root")
+	repoRootFlag := fs.String("repo-root", "", "repository root")
 	symbol := fs.String("symbol", "", "focus on a specific symbol")
 	output := fs.String("output", "", "write HTML to this file instead of opening a browser")
 	depth := fs.Int("depth", 2, "traversal depth from focus symbol")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() > 0 && *repoRoot == "." {
-		*repoRoot = fs.Arg(0)
+
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	if repoRootCandidate == "" && fs.NArg() > 0 {
+		repoRootCandidate = fs.Arg(0)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
 	}
 
-	app, _, repoID, err := openApp(ctx, cfg, *repoRoot)
+	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -1571,11 +1588,11 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	incrementalVacuum := fs.Bool("incremental-vacuum", false, "run PRAGMA incremental_vacuum (requires auto_vacuum=INCREMENTAL)")
 	repoRootFlag := fs.String("repo-root", "", "repository root to clean")
 
-	defaultRepoRoot := ""
-	if config.IsRepoDBDir(cfg.DBDir) {
-		defaultRepoRoot = "."
+	repoRootCandidate, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, "")
+	if err != nil {
+		return err
 	}
-	repoRoot, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, defaultRepoRoot)
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
 	if err != nil {
 		return err
 	}
@@ -1962,9 +1979,10 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 		return err
 	}
 
-	repoRoot := "."
-	if *repoRootFlag != "" {
-		repoRoot = *repoRootFlag
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
 	}
 
 	var files []string
@@ -2049,7 +2067,7 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintf(w, "  %s index .\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s stats .\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s find_symbol . MySymbol\n", appname.BinaryName)
-	fmt.Fprintf(w, "  %s serve --repo-root .\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s serve\n", appname.BinaryName)
 }
 
 func formatCommandExample(ex string) string {

@@ -45,7 +45,7 @@ func discoverTools(home string) []mcpTool {
 func mcpServerEntry(binaryPath string) map[string]any {
 	return map[string]any{
 		"command": binaryPath,
-		"args":    []string{"serve", "--repo-root", "."},
+		"args":    []string{"serve"},
 	}
 }
 
