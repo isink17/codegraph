@@ -1,6 +1,6 @@
 # Changelog
 
-# v1.1.1 - 28-04-2026
+## v1.1.1 - 28-04-2026
 
 Made `--repo-root` optional across all CLI commands and MCP tools. The server
 now auto-detects the repository root so editor configs no longer require
