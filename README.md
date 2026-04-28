@@ -405,8 +405,8 @@ Created with `codegraph config init --repo .` at `.codegraph/config.json`:
 
 When `--repo-root` (CLI) or `repo_root` (MCP tool parameter) is omitted, codegraph resolves the repo root using:
 
-1. `--repo-root` CLI flag (explicit)
-2. Per-call `repo_root` MCP tool parameter
+1. Per-call `repo_root` MCP tool parameter
+2. `--repo-root` CLI flag (process-level default)
 3. `git rev-parse --show-toplevel` from the current working directory
 4. `os.Getwd()` (current working directory)
 5. Return error

@@ -14,18 +14,18 @@ var (
 )
 
 // ResolveRepoRoot resolves the repository root directory using a stable fallback chain:
-//  1. Explicit CLI flag value (flagValue)
-//  2. Per-call MCP tool parameter (toolParam)
+//  1. Per-call MCP tool parameter (toolParam) (most specific override)
+//  2. Explicit CLI flag value (flagValue) (process-level default)
 //  3. `git rev-parse --show-toplevel` from the current working directory
 //  4. os.Getwd()
 //  5. Return error
 //
 // Empty inputs are treated as "not provided".
 func ResolveRepoRoot(flagValue, toolParam string) (string, error) {
-	if v := strings.TrimSpace(flagValue); v != "" {
+	if v := strings.TrimSpace(toolParam); v != "" {
 		return v, nil
 	}
-	if v := strings.TrimSpace(toolParam); v != "" {
+	if v := strings.TrimSpace(flagValue); v != "" {
 		return v, nil
 	}
 

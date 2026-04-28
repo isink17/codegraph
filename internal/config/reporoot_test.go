@@ -7,24 +7,24 @@ import (
 	"testing"
 )
 
-func TestResolveRepoRoot_ExplicitFlagWins(t *testing.T) {
+func TestResolveRepoRoot_ToolParamWinsOverFlag(t *testing.T) {
 	t.Cleanup(resetRepoRootTestHooks(t))
 
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		t.Fatalf("execCommand should not be called when flag is set")
+		t.Fatalf("execCommand should not be called when toolParam is set")
 		return nil
 	}
 	getwd = func() (string, error) {
-		t.Fatalf("getwd should not be called when flag is set")
+		t.Fatalf("getwd should not be called when toolParam is set")
 		return "", nil
 	}
 
-	got, err := ResolveRepoRoot("  /explicit  ", "/tool")
+	got, err := ResolveRepoRoot("  /explicit  ", "  /tool  ")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "/explicit" {
-		t.Fatalf("got %q, want %q", got, "/explicit")
+	if got != "/tool" {
+		t.Fatalf("got %q, want %q", got, "/tool")
 	}
 }
 
@@ -57,8 +57,16 @@ func TestResolveRepoRoot_GitRootDetected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if filepath.Clean(got) != filepath.Clean(gitRoot) {
-		t.Fatalf("got %q, want %q", got, gitRoot)
+	gotEval, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		t.Fatalf("evalsymlinks(got): %v", err)
+	}
+	wantEval, err := filepath.EvalSymlinks(gitRoot)
+	if err != nil {
+		t.Fatalf("evalsymlinks(want): %v", err)
+	}
+	if filepath.Clean(gotEval) != filepath.Clean(wantEval) {
+		t.Fatalf("got %q, want %q", gotEval, wantEval)
 	}
 }
 
@@ -80,8 +88,16 @@ func TestResolveRepoRoot_CwdFallbackWhenNotGitRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if filepath.Clean(got) != filepath.Clean(dir) {
-		t.Fatalf("got %q, want %q", got, dir)
+	gotEval, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		t.Fatalf("evalsymlinks(got): %v", err)
+	}
+	wantEval, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("evalsymlinks(want): %v", err)
+	}
+	if filepath.Clean(gotEval) != filepath.Clean(wantEval) {
+		t.Fatalf("got %q, want %q", gotEval, wantEval)
 	}
 }
 
