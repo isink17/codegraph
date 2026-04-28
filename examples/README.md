@@ -13,7 +13,7 @@ This directory contains minimal `codegraph` MCP server configuration examples fo
 All examples start the same server command:
 
 ```text
-codegraph serve --repo-root /absolute/path/to/repo
+codegraph serve
 ```
 
 Replace `/absolute/path/to/repo` with the repository you want `codegraph` to serve.
@@ -23,7 +23,7 @@ Replace `/absolute/path/to/repo` with the repository you want `codegraph` to ser
 `codex-mcp.toml` includes:
 
 - `command = "codegraph"`
-- `args = ["serve", "--repo-root", "..."]`
+- `args = ["serve"]`
 - `startup_timeout_sec = 60`
 
 Keep `startup_timeout_sec = 60` so Codex allows enough time for the server to open or migrate the local SQLite database on startup.
@@ -33,7 +33,7 @@ Keep `startup_timeout_sec = 60` so Codex allows enough time for the server to op
 The JSON examples are intentionally minimal:
 
 - `command`: `codegraph`
-- `args`: `["serve", "--repo-root", "/absolute/path/to/repo"]`
+- `args`: `["serve"]`
 
 If `codegraph` is not on `PATH`, replace `command` and `args` with a form that launches it through `go run` from the repository checkout.
 

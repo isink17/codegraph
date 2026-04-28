@@ -37,11 +37,11 @@ Observed in `internal/cli/app.go:Run` dispatch and `printUsage`:
 - `doctor`
 - `config <show|edit-path|validate|init>`
 - `benchmark`
-- `serve --repo-root <repo-path>`
+- `serve [--repo-root <repo-path>]`
 - `watch <repo-path>`
 - `graph export <repo-path> [--format json|dot] ...`
-- `affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...`
-- `visualize [--repo-root PATH] ...`
+- `affected-tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...` (repo root auto-detects when omitted)
+- `visualize [--repo-root PATH] ...` (repo root auto-detects when omitted)
 - `clean [repo-path] [--vacuum]`
 
 Notes:

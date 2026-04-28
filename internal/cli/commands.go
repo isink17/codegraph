@@ -319,7 +319,7 @@ func newCommandList() []*command {
 		{
 			name:        "serve",
 			description: "start MCP server",
-			usageLines:  []string{"  serve --repo-root <repo-path>"},
+			usageLines:  []string{"  serve [--repo-root <repo-path>]"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runServe(ctx, cfg, stdout, stderr, args)
 			},
@@ -386,8 +386,8 @@ func newCommandList() []*command {
 				"  find_related_tests [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...",
 			},
 			examples: []string{
-				"codegraph find_related_tests --repo-root . main.go",
-				"git diff --name-only | codegraph find_related_tests --stdin --repo-root .",
+				"codegraph find_related_tests main.go",
+				"git diff --name-only | codegraph find_related_tests --stdin",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runAffectedTests(ctx, cfg, stdout, invokedName, args)

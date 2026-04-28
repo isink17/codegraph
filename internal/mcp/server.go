@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/isink17/codegraph/internal/agent"
+	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/framework"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/query"
@@ -21,17 +22,21 @@ import (
 )
 
 type Server struct {
-	repoRoot string
-	repoID   int64
-	store    *store.Store
-	indexer  *indexer.Indexer
-	query    *query.Service
-	errOut   io.Writer
-	agentCfg agent.OllamaLLMConfig
+	cliRepoRoot string
+	repoRoot    string
+	repoID      int64
+	store       *store.Store
+	indexer     *indexer.Indexer
+	query       *query.Service
+	errOut      io.Writer
+	agentCfg    agent.OllamaLLMConfig
 }
 
-func NewServer(repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
-	return &Server{repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q, errOut: errOut}
+// NewServer builds an MCP server. cliRepoRoot is the raw `--repo-root` flag value
+// provided to `codegraph serve` (empty when omitted). repoRoot is the resolved
+// active repository root for tools that operate on the initially opened repo.
+func NewServer(cliRepoRoot, repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
+	return &Server{cliRepoRoot: cliRepoRoot, repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q, errOut: errOut}
 }
 
 // SetAgentConfig configures the LLM backend for the agentic_query tool.
@@ -478,6 +483,7 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 
 func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bool) (map[string]any, error) {
 	var req struct {
+		RepoRoot string   `json:"repo_root"`
 		RepoPath string   `json:"repo_path"`
 		Force    bool     `json:"force"`
 		Paths    []string `json:"paths"`
@@ -485,16 +491,20 @@ func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bo
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	toolParam := strings.TrimSpace(req.RepoRoot)
+	if toolParam == "" {
+		toolParam = strings.TrimSpace(req.RepoPath)
+	}
+	resolved, err := config.ResolveRepoRoot(s.cliRepoRoot, toolParam)
+	if err != nil {
+		return nil, err
+	}
 	opts := indexer.Options{
-		RepoRoot: s.repoRoot,
+		RepoRoot: resolved,
 		Force:    req.Force,
 		Paths:    req.Paths,
 	}
-	if req.RepoPath != "" {
-		opts.RepoRoot = req.RepoPath
-	}
 	var summary store.ScanSummary
-	var err error
 	if update {
 		opts.ScanKind = "update"
 		summary, err = s.indexer.Update(ctx, opts)
@@ -600,8 +610,8 @@ func writeResponse(w io.Writer, resp rpcResponse) error {
 
 func buildToolDefinitions() []map[string]any {
 	return []map[string]any{
-		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_path", "force", "paths"}, nil),
-		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_path", "force", "paths"}, nil),
+		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
+		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
 		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset"}, []string{"query"}),
 		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
 		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
@@ -674,8 +684,8 @@ func decodePageRequest(raw json.RawMessage) (pageRequest, error) {
 }
 
 var toolArgumentSpecs = map[string]toolArgSpec{
-	"index_repo":            {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
-	"update_graph":          {properties: map[string]string{"repo_path": "string", "force": "boolean", "paths": "array"}},
+	"index_repo":            {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
+	"update_graph":          {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
 	"find_symbol":           {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
 	"find_callers":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
 	"find_callees":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
