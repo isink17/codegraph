@@ -1,5 +1,50 @@
 # Changelog
 
+# v1.1.1 - 28-04-2026
+
+Made `--repo-root` optional across all CLI commands and MCP tools. The server
+now auto-detects the repository root so editor configs no longer require
+hardcoded paths.
+
+## Changes
+
+### Features
+
+* **Config:** Added `ResolveRepoRoot(flagValue, toolParam string)` in
+  `internal/config/reporoot.go` with a 5-step fallback chain: per-call MCP
+  tool parameter → CLI flag → `git rev-parse --show-toplevel` → `os.Getwd()`
+  → error. Per-call tool parameter takes priority over the process-level flag.
+* **CLI:** All commands that previously required `--repo-root` (`serve`,
+  `watch`, `visualize`, `index`, `stats`, `query`, `doctor`, `clean`,
+  `affected-tests`) now resolve the repo root through the shared helper,
+  making the flag optional everywhere.
+* **MCP:** `index_repo` and `update_graph` tools accept an optional `repo_root`
+  parameter; when omitted, the shared resolver is used.
+* **Install:** `codegraph install` no longer writes `--repo-root` into
+  generated MCP config snippets for any editor (Claude Code, Cursor, Windsurf,
+  Gemini CLI, Codex).
+
+### Fixes
+
+* Fixed macOS symlink path mismatch in `TestResolveRepoRoot_GitRootDetected`
+  by normalizing paths with `filepath.EvalSymlinks` before comparison.
+* Fixed incorrect resolution priority: per-call `toolParam` now correctly
+  takes precedence over process-level `flagValue`.
+
+### Docs
+
+* Added "Repo Root Resolution" section to README.md documenting the fallback
+  chain with correct priority order.
+* Updated all MCP config snippets in README.md and examples/ to omit
+  `--repo-root`.
+* Updated `docs/ai-assistant-guidance.md`, `docs/codegraph-roadmap.md`, and
+  `examples/README.md` to reflect optional `--repo-root`.
+
+## Upgrade Notes
+
+* No breaking changes. Existing configs with explicit `--repo-root` continue
+  to work unchanged.
+
 ## v1.1.0 - 27-04-2026
 
 A performance, correctness, and operability release focused on faster indexing, schema-backed edge resolution, streaming exports, and tighter DB lifecycle handling.
