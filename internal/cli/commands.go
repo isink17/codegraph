@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/versioncheck"
 )
 
 type command struct {
@@ -391,6 +392,16 @@ func newCommandList() []*command {
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runAffectedTests(ctx, cfg, stdout, invokedName, args)
+			},
+		},
+		{
+			name:        "version-check",
+			aliases:     []string{"version_check"},
+			description: "check if a newer release is available",
+			usageLines:  []string{"  version-check"},
+			examples:    []string{"codegraph version-check"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return versioncheck.RunCheck(ctx, stdout)
 			},
 		},
 		{
