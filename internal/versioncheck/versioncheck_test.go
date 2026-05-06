@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,6 +119,107 @@ func TestCheckerHandlesNotModifiedAndPreservesLatest(t *testing.T) {
 	st := readState(t, statePath)
 	if got, want := st.LatestVersion, "v1.2.9"; got != want {
 		t.Fatalf("latest_version = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizedSemver(t *testing.T) {
+	cases := []struct {
+		input  string
+		want   string
+		wantOK bool
+	}{
+		{"v1.2.3", "v1.2.3", true},
+		{"1.2.3", "v1.2.3", true},
+		{"  v1.2.3  ", "v1.2.3", true},
+		{"1.2.3-rc.1", "v1.2.3-rc.1", true},
+		{"", "", false},
+		{"dev", "vdev", false},
+		{"(devel)", "v(devel)", false},
+	}
+	for _, tc := range cases {
+		got, ok := normalizedSemver(tc.input)
+		if ok != tc.wantOK || got != tc.want {
+			t.Errorf("normalizedSemver(%q) = (%q, %v), want (%q, %v)", tc.input, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+func TestRunCheckUpToDate(t *testing.T) {
+	var out bytes.Buffer
+	err := runCheck(context.Background(), "v1.2.3", func(_ context.Context, _ string) (string, error) {
+		return "v1.2.3", nil
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), "up to date") {
+		t.Fatalf("expected up to date message, got: %q", out.String())
+	}
+}
+
+func TestRunCheckOutdated(t *testing.T) {
+	var out bytes.Buffer
+	err := runCheck(context.Background(), "v1.2.3", func(_ context.Context, _ string) (string, error) {
+		return "v1.3.0", nil
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "not on the latest version") {
+		t.Fatalf("expected outdated message, got: %q", s)
+	}
+	if !strings.Contains(s, installCmd) {
+		t.Fatalf("expected install command, got: %q", s)
+	}
+	if !strings.Contains(s, releasesPage) {
+		t.Fatalf("expected releases page, got: %q", s)
+	}
+}
+
+func TestRunCheckCurrentAheadOfLatest(t *testing.T) {
+	var out bytes.Buffer
+	err := runCheck(context.Background(), "v2.0.0", func(_ context.Context, _ string) (string, error) {
+		return "v1.9.9", nil
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), "up to date") {
+		t.Fatalf("expected up to date message, got: %q", out.String())
+	}
+}
+
+func TestRunCheckUnknownVersion(t *testing.T) {
+	var out bytes.Buffer
+	err := runCheck(context.Background(), "dev", func(_ context.Context, _ string) (string, error) {
+		return "v1.3.0", nil
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "unknown") {
+		t.Fatalf("expected unknown version message, got: %q", s)
+	}
+	if !strings.Contains(s, "v1.3.0") {
+		t.Fatalf("expected latest version in output, got: %q", s)
+	}
+	if !strings.Contains(s, installCmd) {
+		t.Fatalf("expected install command, got: %q", s)
+	}
+}
+
+func TestRunCheckNetworkFailure(t *testing.T) {
+	var out bytes.Buffer
+	err := runCheck(context.Background(), "v1.2.3", func(_ context.Context, _ string) (string, error) {
+		return "", fmt.Errorf("connection refused")
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error on network failure")
+	}
+	if !strings.Contains(out.String(), releasesPage) {
+		t.Fatalf("expected releases page in output, got: %q", out.String())
 	}
 }
 

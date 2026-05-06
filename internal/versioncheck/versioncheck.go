@@ -20,6 +20,8 @@ import (
 const (
 	stateFileName       = "version-state.json"
 	githubLatestRelease = "https://api.github.com/repos/isink17/codegraph/releases/latest"
+	releasesPage        = "https://github.com/isink17/codegraph/releases"
+	installCmd          = "go install github.com/isink17/codegraph/cmd/codegraph@latest"
 )
 
 type state struct {
@@ -193,6 +195,74 @@ func fetchLatestFromGitHub(ctx context.Context, current, etag, lastModified stri
 		ETag:          strings.TrimSpace(resp.Header.Get("ETag")),
 		LastModified:  strings.TrimSpace(resp.Header.Get("Last-Modified")),
 	}, nil
+}
+
+// RunCheck performs an explicit, non-cached version check and writes results to w.
+// Returns a non-nil error (non-zero exit code) if GitHub could not be reached.
+func RunCheck(ctx context.Context, w io.Writer) error {
+	current := version.Current()
+	return runCheck(ctx, current, fetchTagNow, w)
+}
+
+func runCheck(ctx context.Context, current string, fetchFn func(context.Context, string) (string, error), w io.Writer) error {
+	latest, err := fetchFn(ctx, current)
+	if err != nil {
+		fmt.Fprintf(w, "version check failed: %s\n\nSee releases at:\n  %s\n", err, releasesPage)
+		return fmt.Errorf("version check: %w", err)
+	}
+
+	currentNorm, currentOK := normalizedSemver(current)
+	latestNorm, latestOK := normalizedSemver(latest)
+	unknownCurrent := !currentOK || strings.TrimSpace(current) == "dev"
+
+	if unknownCurrent {
+		fmt.Fprintf(w, "Current version: unknown (installed as %q)\n", current)
+	} else {
+		fmt.Fprintf(w, "Current version: %s\n", current)
+	}
+	fmt.Fprintf(w, "Latest version:  %s\n", latest)
+
+	if !unknownCurrent && latestOK {
+		if semver.Compare(currentNorm, latestNorm) >= 0 {
+			fmt.Fprintln(w, "\ncodegraph is up to date.")
+		} else {
+			fmt.Fprintln(w, "\ncodegraph is not on the latest version.")
+			fmt.Fprintf(w, "\nUpdate with:\n  %s\n\nReleases:\n  %s\n", installCmd, releasesPage)
+		}
+		return nil
+	}
+
+	if unknownCurrent {
+		fmt.Fprintln(w, "\nLocal version could not be reliably determined.")
+	}
+	fmt.Fprintf(w, "\nUpdate with:\n  %s\n\nReleases:\n  %s\n", installCmd, releasesPage)
+	return nil
+}
+
+func fetchTagNow(ctx context.Context, current string) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, githubLatestRelease, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "codegraph-version-check/"+sanitizeVersion(current))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("github API returned %s", resp.Status)
+	}
+	var payload struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(payload.TagName), nil
 }
 
 func sanitizeVersion(v string) string {
