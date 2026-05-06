@@ -213,7 +213,7 @@ func runCheck(ctx context.Context, current string, fetchFn func(context.Context,
 
 	currentNorm, currentOK := normalizedSemver(current)
 	latestNorm, latestOK := normalizedSemver(latest)
-	unknownCurrent := !currentOK || strings.TrimSpace(current) == "dev"
+	unknownCurrent := !currentOK
 
 	if unknownCurrent {
 		fmt.Fprintf(w, "Current version: unknown (installed as %q)\n", current)
