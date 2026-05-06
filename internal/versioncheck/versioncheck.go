@@ -24,6 +24,13 @@ const (
 	installCmd          = "go install github.com/isink17/codegraph/cmd/codegraph@latest"
 )
 
+const versionCheckTimeout = 5 * time.Second
+
+var (
+	githubLatestReleaseURL = githubLatestRelease
+	versionHTTPClient      = &http.Client{Timeout: versionCheckTimeout}
+)
+
 type state struct {
 	CurrentVersion string `json:"current_version"`
 	LatestVersion  string `json:"latest_version,omitempty"`
@@ -151,13 +158,20 @@ func normalizedSemver(v string) (string, bool) {
 	return v, semver.IsValid(v)
 }
 
-func fetchLatestFromGitHub(ctx context.Context, current, etag, lastModified string) (fetchResult, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+type latestReleaseResult struct {
+	TagName      string
+	ETag         string
+	LastModified string
+	NotModified  bool
+}
+
+func fetchLatestReleaseFromGitHub(ctx context.Context, current, etag, lastModified string) (latestReleaseResult, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, versionCheckTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, githubLatestRelease, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, githubLatestReleaseURL, nil)
 	if err != nil {
-		return fetchResult{}, err
+		return latestReleaseResult{}, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "codegraph/"+sanitizeVersion(current))
@@ -168,33 +182,49 @@ func fetchLatestFromGitHub(ctx context.Context, current, etag, lastModified stri
 		req.Header.Set("If-Modified-Since", strings.TrimSpace(lastModified))
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := versionHTTPClient.Do(req)
 	if err != nil {
-		return fetchResult{}, err
+		return latestReleaseResult{}, err
 	}
 	defer resp.Body.Close()
+
+	trimmedETag := strings.TrimSpace(resp.Header.Get("ETag"))
+	trimmedLastModified := strings.TrimSpace(resp.Header.Get("Last-Modified"))
+
 	if resp.StatusCode == http.StatusNotModified {
-		return fetchResult{
+		return latestReleaseResult{
 			NotModified:  true,
-			ETag:         strings.TrimSpace(resp.Header.Get("ETag")),
-			LastModified: strings.TrimSpace(resp.Header.Get("Last-Modified")),
+			ETag:         trimmedETag,
+			LastModified: trimmedLastModified,
 		}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fetchResult{}, fmt.Errorf("github latest release request failed: %s", resp.Status)
+		return latestReleaseResult{}, fmt.Errorf("github latest release request failed: %s", resp.Status)
 	}
 
 	var payload struct {
 		TagName string `json:"tag_name"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return latestReleaseResult{}, err
+	}
+
+	return latestReleaseResult{
+		TagName:      strings.TrimSpace(payload.TagName),
+		ETag:         trimmedETag,
+		LastModified: trimmedLastModified,
+	}, nil
+}
+
+func fetchLatestFromGitHub(ctx context.Context, current, etag, lastModified string) (fetchResult, error) {
+	res, err := fetchLatestReleaseFromGitHub(ctx, current, etag, lastModified)
+	if err != nil {
 		return fetchResult{}, err
 	}
-	return fetchResult{
-		LatestVersion: strings.TrimSpace(payload.TagName),
-		ETag:          strings.TrimSpace(resp.Header.Get("ETag")),
-		LastModified:  strings.TrimSpace(resp.Header.Get("Last-Modified")),
-	}, nil
+	if res.NotModified {
+		return fetchResult{NotModified: true, ETag: res.ETag, LastModified: res.LastModified}, nil
+	}
+	return fetchResult{LatestVersion: res.TagName, ETag: res.ETag, LastModified: res.LastModified}, nil
 }
 
 // RunCheck performs an explicit, non-cached version check and writes results to w.
@@ -208,7 +238,8 @@ func runCheck(ctx context.Context, current string, fetchFn func(context.Context,
 	latest, err := fetchFn(ctx, current)
 	if err != nil {
 		fmt.Fprintf(w, "version check failed: %s\n\nSee releases at:\n  %s\n", err, releasesPage)
-		return fmt.Errorf("version check: %w", err)
+		// Avoid double-reporting: callers already print returned errors.
+		return nil
 	}
 
 	currentNorm, currentOK := normalizedSemver(current)
@@ -240,29 +271,15 @@ func runCheck(ctx context.Context, current string, fetchFn func(context.Context,
 }
 
 func fetchTagNow(ctx context.Context, current string) (string, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, githubLatestRelease, nil)
+	res, err := fetchLatestReleaseFromGitHub(ctx, current, "", "")
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "codegraph-version-check/"+sanitizeVersion(current))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
+	if res.NotModified {
+		// Should not happen without cache headers, but treat as empty/no-op.
+		return "", nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github API returned %s", resp.Status)
-	}
-	var payload struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(payload.TagName), nil
+	return res.TagName, nil
 }
 
 func sanitizeVersion(v string) string {

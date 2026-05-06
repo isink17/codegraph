@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -215,11 +217,93 @@ func TestRunCheckNetworkFailure(t *testing.T) {
 	err := runCheck(context.Background(), "v1.2.3", func(_ context.Context, _ string) (string, error) {
 		return "", fmt.Errorf("connection refused")
 	}, &out)
-	if err == nil {
-		t.Fatal("expected error on network failure")
+	if err != nil {
+		t.Fatalf("expected nil error (printed message already), got: %v", err)
 	}
 	if !strings.Contains(out.String(), releasesPage) {
 		t.Fatalf("expected releases page in output, got: %q", out.String())
+	}
+}
+
+func TestFetchLatestFromGitHub200(t *testing.T) {
+	restoreURL, restoreClient := githubLatestReleaseURL, versionHTTPClient
+	t.Cleanup(func() {
+		githubLatestReleaseURL = restoreURL
+		versionHTTPClient = restoreClient
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "application/vnd.github+json" {
+			t.Fatalf("Accept = %q, want application/vnd.github+json", got)
+		}
+		if got := r.Header.Get("User-Agent"); got == "" {
+			t.Fatalf("expected User-Agent to be set")
+		}
+		w.Header().Set("ETag", `"etag123"`)
+		w.Header().Set("Last-Modified", "Wed, 18 Mar 2026 09:00:00 GMT")
+		_, _ = w.Write([]byte(`{"tag_name":"v1.2.3"}`))
+	}))
+	defer srv.Close()
+
+	githubLatestReleaseURL = srv.URL
+	versionHTTPClient = srv.Client()
+
+	got, err := fetchLatestFromGitHub(context.Background(), "v1.0.0", "", "")
+	if err != nil {
+		t.Fatalf("fetchLatestFromGitHub() error = %v", err)
+	}
+	if got.NotModified {
+		t.Fatalf("NotModified = true, want false")
+	}
+	if got.LatestVersion != "v1.2.3" {
+		t.Fatalf("LatestVersion = %q, want v1.2.3", got.LatestVersion)
+	}
+	if got.ETag != `"etag123"` {
+		t.Fatalf("ETag = %q, want %q", got.ETag, `"etag123"`)
+	}
+	if got.LastModified == "" {
+		t.Fatalf("LastModified = empty, want non-empty")
+	}
+}
+
+func TestFetchLatestFromGitHub304(t *testing.T) {
+	restoreURL, restoreClient := githubLatestReleaseURL, versionHTTPClient
+	t.Cleanup(func() {
+		githubLatestReleaseURL = restoreURL
+		versionHTTPClient = restoreClient
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("If-None-Match"); got != `"abc123"` {
+			t.Fatalf("If-None-Match = %q, want %q", got, `"abc123"`)
+		}
+		if got := r.Header.Get("If-Modified-Since"); got != "Wed, 18 Mar 2026 09:00:00 GMT" {
+			t.Fatalf("If-Modified-Since = %q, want %q", got, "Wed, 18 Mar 2026 09:00:00 GMT")
+		}
+		w.Header().Set("ETag", `"etag-new"`)
+		w.Header().Set("Last-Modified", "Thu, 19 Mar 2026 09:00:00 GMT")
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	githubLatestReleaseURL = srv.URL
+	versionHTTPClient = srv.Client()
+
+	got, err := fetchLatestFromGitHub(context.Background(), "v1.0.0", `"abc123"`, "Wed, 18 Mar 2026 09:00:00 GMT")
+	if err != nil {
+		t.Fatalf("fetchLatestFromGitHub() error = %v", err)
+	}
+	if !got.NotModified {
+		t.Fatalf("NotModified = false, want true")
+	}
+	if got.LatestVersion != "" {
+		t.Fatalf("LatestVersion = %q, want empty", got.LatestVersion)
+	}
+	if got.ETag != `"etag-new"` {
+		t.Fatalf("ETag = %q, want %q", got.ETag, `"etag-new"`)
+	}
+	if got.LastModified != "Thu, 19 Mar 2026 09:00:00 GMT" {
+		t.Fatalf("LastModified = %q, want %q", got.LastModified, "Thu, 19 Mar 2026 09:00:00 GMT")
 	}
 }
 
