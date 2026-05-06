@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -141,7 +140,7 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	}
 }
 
-func TestServeMalformedFrameReturnsParseErrorAndContinues(t *testing.T) {
+func TestServeMalformedJSONReturnsParseErrorAndContinues(t *testing.T) {
 	ctx := context.Background()
 	repoRoot := t.TempDir()
 	s := openTestStore(t)
@@ -154,7 +153,8 @@ func TestServeMalformedFrameReturnsParseErrorAndContinues(t *testing.T) {
 	server := NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	var input bytes.Buffer
-	input.WriteString("Content-Length: bad\r\n\r\n")
+	input.WriteString("not-json\n")
+	input.WriteString("\n")
 	writeFrameToBuffer(t, &input, map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -166,21 +166,14 @@ func TestServeMalformedFrameReturnsParseErrorAndContinues(t *testing.T) {
 		t.Fatalf("Serve() error = %v", err)
 	}
 	responses := readAllFrames(t, &output)
-	if len(responses) < 2 {
-		t.Fatalf("response count = %d, want at least 2", len(responses))
+	if len(responses) != 2 {
+		t.Fatalf("response count = %d, want 2", len(responses))
 	}
-	seenError := false
-	seenResult := false
-	for _, resp := range responses {
-		if _, ok := resp["error"]; ok {
-			seenError = true
-		}
-		if _, ok := resp["result"]; ok {
-			seenResult = true
-		}
+	if _, ok := responses[0]["error"]; !ok {
+		t.Fatalf("first response should be parse error, got: %v", responses[0])
 	}
-	if !seenError || !seenResult {
-		t.Fatalf("expected both error and result responses, got: %v", responses)
+	if _, ok := responses[1]["result"]; !ok {
+		t.Fatalf("second response should be initialize result, got: %v", responses[1])
 	}
 }
 
@@ -246,8 +239,8 @@ func writeFrameToBuffer(t *testing.T, buf *bytes.Buffer, payload any) {
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
-	fmt.Fprintf(buf, "Content-Length: %d\r\n\r\n", len(body))
 	buf.Write(body)
+	buf.WriteByte('\n')
 }
 
 func readAllFrames(t *testing.T, buf *bytes.Buffer) []map[string]any {
@@ -261,6 +254,9 @@ func readAllFrames(t *testing.T, buf *bytes.Buffer) []map[string]any {
 		}
 		if err != nil {
 			t.Fatalf("readFrame() error = %v", err)
+		}
+		if len(body) == 0 {
+			continue
 		}
 		var decoded map[string]any
 		if err := json.Unmarshal(body, &decoded); err != nil {

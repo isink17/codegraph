@@ -2,15 +2,11 @@ package mcp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/isink17/codegraph/internal/agent"
 	"github.com/isink17/codegraph/internal/config"
@@ -75,20 +71,9 @@ type pageRequest struct {
 
 var staticToolDefinitions = buildToolDefinitions()
 
-var frameBufferPool = sync.Pool{
-	New: func() any {
-		return &bytes.Buffer{}
-	},
-}
-
-type frameProtocolError struct {
-	msg string
-}
-
-func (e frameProtocolError) Error() string {
-	return e.msg
-}
-
+// Serve reads JSON-RPC requests from `in` and writes responses to `out`,
+// framed per the MCP stdio transport: one JSON object per line, terminated
+// by '\n', with no embedded newlines in the JSON itself.
 func (s *Server) Serve(ctx context.Context, in io.Reader, out, errOut io.Writer) error {
 	reader := bufio.NewReader(in)
 	for {
@@ -97,17 +82,10 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out, errOut io.Writer)
 			if err == io.EOF {
 				return nil
 			}
-			var protocolErr frameProtocolError
-			if errors.As(err, &protocolErr) {
-				if writeErr := writeResponse(out, rpcResponse{
-					JSONRPC: "2.0",
-					Error:   &rpcError{Code: -32700, Message: protocolErr.Error()},
-				}); writeErr != nil {
-					return writeErr
-				}
-				continue
-			}
 			return err
+		}
+		if len(msg) == 0 {
+			continue
 		}
 		var req rpcRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
@@ -549,62 +527,35 @@ func wrapData(key string, value any, err error) (map[string]any, error) {
 	return map[string]any{"ok": true, "data": map[string]any{key: value}}, nil
 }
 
+// readFrame reads a single MCP stdio message: one line of JSON terminated
+// by '\n' (CRLF tolerated). Empty lines yield an empty payload, which the
+// caller skips. EOF is returned when the input is fully consumed.
 func readFrame(r *bufio.Reader) ([]byte, error) {
-	contentLength := 0
-	sawHeader := false
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			if err == io.EOF && !sawHeader {
-				return nil, io.EOF
-			}
+	line, err := r.ReadBytes('\n')
+	if err != nil {
+		if err == io.EOF && len(line) == 0 {
+			return nil, io.EOF
+		}
+		if err != io.EOF {
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if strings.TrimSpace(line) == "" {
-			break
-		}
-		sawHeader = true
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "content-length:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) != 2 {
-				return nil, frameProtocolError{msg: "invalid Content-Length header"}
-			}
-			v := strings.TrimSpace(parts[1])
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, frameProtocolError{msg: "invalid Content-Length value"}
-			}
-			if n < 0 {
-				return nil, frameProtocolError{msg: "negative Content-Length"}
-			}
-			contentLength = n
-		}
 	}
-	if !sawHeader {
-		return nil, frameProtocolError{msg: "missing frame headers"}
+	trimmed := strings.TrimRight(string(line), "\r\n")
+	if strings.TrimSpace(trimmed) == "" {
+		return nil, nil
 	}
-	if contentLength <= 0 {
-		return nil, frameProtocolError{msg: "missing Content-Length header"}
-	}
-	payload := make([]byte, contentLength)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
+	return []byte(trimmed), nil
 }
 
+// writeResponse marshals resp as compact JSON and writes it followed by a
+// single '\n', per MCP stdio framing.
 func writeResponse(w io.Writer, resp rpcResponse) error {
 	payload, err := json.Marshal(resp)
 	if err != nil {
 		return err
 	}
-	frame := frameBufferPool.Get().(*bytes.Buffer)
-	frame.Reset()
-	defer frameBufferPool.Put(frame)
-	fmt.Fprintf(frame, "Content-Length: %d\r\n\r\n", len(payload))
-	frame.Write(payload)
-	_, err = w.Write(frame.Bytes())
+	payload = append(payload, '\n')
+	_, err = w.Write(payload)
 	return err
 }
 

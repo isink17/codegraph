@@ -126,6 +126,26 @@ go install github.com/isink17/codegraph/cmd/codegraph@latest
 
 Requires Go 1.23+ and a C compiler (for tree-sitter CGo bindings).
 
+### Check for updates
+
+```bash
+codegraph version-check
+```
+
+Compares your installed version against the latest GitHub release. If outdated:
+
+```
+codegraph is not on the latest version.
+Current version: v1.0.0
+Latest version:  v1.1.0
+
+Update with:
+  go install github.com/isink17/codegraph/cmd/codegraph@latest
+
+Releases:
+  https://github.com/isink17/codegraph/releases
+```
+
 ### 2. Auto-configure your AI tool
 
 ```bash
@@ -272,6 +292,7 @@ See the [`examples/`](examples/) directory for more configuration samples.
 codegraph install                         # Auto-configure AI tools
 codegraph doctor                          # Check installation health
 codegraph config show                     # Show current config
+codegraph version-check                   # Check if a newer release is available
 
 # Indexing
 codegraph index <path>                    # Full index
