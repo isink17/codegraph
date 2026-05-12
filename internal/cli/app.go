@@ -2001,11 +2001,6 @@ func removeRepoDBFiles(cfg config.Config, repoRoot, canonical string) ([]string,
 				continue
 			}
 			seen[candidate] = struct{}{}
-			if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
-				continue
-			} else if err != nil {
-				return nil, err
-			}
 			if err := repoDBRemove(candidate); err != nil {
 				if errors.Is(err, os.ErrNotExist) {
 					continue
