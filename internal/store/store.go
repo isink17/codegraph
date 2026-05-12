@@ -198,6 +198,9 @@ type LanguageCounts struct {
 	Indexed     int `json:"indexed"`
 	Skipped     int `json:"skipped"`
 	ParseFailed int `json:"parse_failed"`
+	// Extensions is only populated for "unknown" language coverage to make the
+	// output actionable without changing existing JSON fields.
+	Extensions map[string]LanguageCounts `json:"extensions,omitempty"`
 }
 
 type ScanRecord struct {

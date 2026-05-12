@@ -194,6 +194,71 @@ func small() {}
 	}
 }
 
+func TestIndex_DeniedExtensionsAreSeenButNeverIndexed(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+
+	writeFile(t, filepath.Join(repoRoot, "build.vcxproj"), `<Project></Project>`)
+	writeFile(t, filepath.Join(repoRoot, "rules.props"), `<Project></Project>`)
+	writeFile(t, filepath.Join(repoRoot, "resource.rc"), `#define IDD_ABOUTBOX 100`)
+	writeFile(t, filepath.Join(repoRoot, "exports.def"), `LIBRARY Foo`)
+	writeFile(t, filepath.Join(repoRoot, "inline.inl"), `inline int x() { return 1; }`)
+
+	// Denied extensions: the content doesn't matter; they must never be indexed.
+	writeFile(t, filepath.Join(repoRoot, "logo.png"), "not really a png")
+	writeFile(t, filepath.Join(repoRoot, "image.tif"), "not really a tif")
+	writeFile(t, filepath.Join(repoRoot, "engine.lib"), "not really a lib")
+	writeFile(t, filepath.Join(repoRoot, "runtime.dll"), "not really a dll")
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	summary, err := idx.Index(ctx, Options{RepoRoot: repoRoot})
+	if err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	if summary.FilesSeen != 9 {
+		t.Fatalf("FilesSeen = %d, want 9", summary.FilesSeen)
+	}
+	if summary.FilesIndexed != 5 {
+		t.Fatalf("FilesIndexed = %d, want 5", summary.FilesIndexed)
+	}
+	if summary.FilesSkipped != 4 {
+		t.Fatalf("FilesSkipped = %d, want 4", summary.FilesSkipped)
+	}
+
+	unknown, ok := summary.LanguageCoverage["unknown"]
+	if !ok {
+		t.Fatalf("LanguageCoverage[unknown] missing")
+	}
+	if unknown.Extensions == nil {
+		t.Fatalf("unknown.Extensions is nil")
+	}
+	for _, ext := range []string{".png", ".tif", ".lib", ".dll"} {
+		c := unknown.Extensions[ext]
+		if c.Seen != 1 || c.Skipped != 1 || c.Indexed != 0 {
+			t.Fatalf("unknown.Extensions[%s]=%+v, want seen=1 skipped=1 indexed=0", ext, c)
+		}
+	}
+
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	stats, err := s.Stats(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if stats.Files != 5 {
+		t.Fatalf("stats.Files = %d, want 5", stats.Files)
+	}
+}
+
 func TestIndexBestEffortParseErrors(t *testing.T) {
 	ctx := context.Background()
 	repoRoot := t.TempDir()

@@ -415,9 +415,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 		summary.FilesSeen++
 		coverageLanguage := coverageKey(res.task.language)
-		coverage := summary.LanguageCoverage[coverageLanguage]
-		coverage.Seen++
-		summary.LanguageCoverage[coverageLanguage] = coverage
+		updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Seen: 1})
 		if res.err != nil {
 			if runErr == nil {
 				runErr = fmt.Errorf("%s: %w", res.task.rel, res.err)
@@ -431,15 +429,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		switch res.action {
 		case "skip_only":
 			summary.FilesSkipped++
-			coverage := summary.LanguageCoverage[coverageLanguage]
-			coverage.Skipped++
-			summary.LanguageCoverage[coverageLanguage] = coverage
+			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
 		case "mark_seen":
 			writeStart := time.Now()
 			markSeenBatch = append(markSeenBatch, res.task.rel)
-			coverage := summary.LanguageCoverage[coverageLanguage]
-			coverage.Skipped++
-			summary.LanguageCoverage[coverageLanguage] = coverage
+			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
 			if len(markSeenBatch) < metadataBatchSize {
 				if pathScoped {
 					summary.WriteMarkSeenSkipped++
@@ -464,9 +458,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
 				ContentHash: res.hash,
 			})
-			coverage := summary.LanguageCoverage[coverageLanguage]
-			coverage.Skipped++
-			summary.LanguageCoverage[coverageLanguage] = coverage
+			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
 			if len(touchBatch) < metadataBatchSize {
 				writeDur += time.Since(writeStart)
 				summary.FilesSkipped++
@@ -497,9 +489,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			summary.FilesChanged++
 			summary.FilesIndexed++
-			coverage := summary.LanguageCoverage[coverageLanguage]
-			coverage.Indexed++
-			summary.LanguageCoverage[coverageLanguage] = coverage
+			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Indexed: 1})
 			if len(replaceBatch) >= replaceBatchSize {
 				if err := flushReplace(); err != nil {
 					runErr = err
@@ -528,10 +518,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
-			coverage := summary.LanguageCoverage[coverageLanguage]
-			coverage.Skipped++
-			coverage.ParseFailed++
-			summary.LanguageCoverage[coverageLanguage] = coverage
+			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1, ParseFailed: 1})
 		}
 	}
 
@@ -708,6 +695,11 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 		result.processDur = time.Since(started)
 	}()
 
+	if shouldSkipIndexByExtension(task.rel) {
+		result.action = "skip_only"
+		return result
+	}
+
 	if len(allowedLanguages) > 0 && task.language != "" && !slices.Contains(allowedLanguages, task.language) {
 		if hasPrev {
 			result.action = "mark_seen"
@@ -782,6 +774,35 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	result.parsed = parsed
 	result.action = "replace"
 	return result
+}
+
+func shouldSkipIndexByExtension(relPath string) bool {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if ext == "" {
+		return false
+	}
+	_, denied := deniedIndexExtensions[ext]
+	return denied
+}
+
+var deniedIndexExtensions = map[string]struct{}{
+	// Windows build artifacts and debug symbols.
+	".exe": {}, ".dll": {}, ".lib": {}, ".exp": {}, ".pdb": {}, ".ilk": {}, ".obj": {}, ".sbr": {}, ".bsc": {}, ".tlb": {}, ".map": {}, ".dmp": {},
+
+	// Archives.
+	".7z": {}, ".zip": {}, ".rar": {},
+
+	// Images and binary assets.
+	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".bmp": {}, ".tif": {}, ".tiff": {}, ".dds": {}, ".ico": {}, ".cur": {}, ".psd": {}, ".raw": {},
+
+	// Audio.
+	".mp3": {}, ".wav": {},
+
+	// Game/engine and other binary formats seen in legacy repos.
+	".anm": {}, ".dff": {}, ".rpe": {}, ".eff": {}, ".pk": {}, ".dat": {}, ".bin": {}, ".arc": {}, ".bsp": {}, ".bm1": {}, ".pix": {}, ".grp": {},
+
+	// Documents/help.
+	".pdf": {}, ".doc": {}, ".pptx": {}, ".chm": {},
 }
 
 func hashContent(content []byte) string {
@@ -881,6 +902,37 @@ func coverageKey(language string) string {
 		return "unknown"
 	}
 	return normalized
+}
+
+func updateLanguageCoverage(coverage map[string]store.LanguageCounts, language string, relPath string, delta store.LanguageCounts) {
+	current := coverage[language]
+	current.Seen += delta.Seen
+	current.Indexed += delta.Indexed
+	current.Skipped += delta.Skipped
+	current.ParseFailed += delta.ParseFailed
+
+	if language == "unknown" {
+		extKey := coverageExtensionKey(relPath)
+		if current.Extensions == nil {
+			current.Extensions = map[string]store.LanguageCounts{}
+		}
+		extCounts := current.Extensions[extKey]
+		extCounts.Seen += delta.Seen
+		extCounts.Indexed += delta.Indexed
+		extCounts.Skipped += delta.Skipped
+		extCounts.ParseFailed += delta.ParseFailed
+		current.Extensions[extKey] = extCounts
+	}
+
+	coverage[language] = current
+}
+
+func coverageExtensionKey(relPath string) string {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if ext == "" {
+		return "[no extension]"
+	}
+	return ext
 }
 
 func matchesIgnore(path string, patterns []string) bool {
