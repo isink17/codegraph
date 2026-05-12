@@ -295,17 +295,9 @@ func cppCallTarget(fnNode *sitter.Node, content []byte) (name, kind, receiver st
 }
 
 func splitCallTarget(text, sep string) (string, string) {
-	left, right, found := strings.Cut(text, sep)
-	if !found {
+	idx := strings.LastIndex(text, sep)
+	if idx < 0 {
 		return "", text
 	}
-	for {
-		nextLeft, nextRight, nextFound := strings.Cut(right, sep)
-		if !nextFound {
-			break
-		}
-		left += sep + nextLeft
-		right = nextRight
-	}
-	return left, right
+	return text[:idx], text[idx+len(sep):]
 }

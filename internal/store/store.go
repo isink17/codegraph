@@ -3423,84 +3423,47 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 	if err != nil {
 		return nil, err
 	}
-	if len(targetIDs) == 0 {
-		return []graph.Symbol{}, nil
-	}
-	resolvedRows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-		FROM edges e
-		JOIN symbols s ON s.id = e.src_symbol_id
-		JOIN files f ON f.id = s.file_id
-		WHERE e.repo_id = ? AND e.dst_symbol_id IN (`+strings.TrimRight(strings.Repeat("?,", len(targetIDs)), ",")+`)
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
-		LIMIT ?
-		OFFSET ?
-	`, append(append([]any{repoID}, int64SliceToAny(targetIDs)...), safeLimit(limit), safeOffset(offset))...)
-	if err != nil {
-		return nil, err
-	}
-	resolvedCallers, err := scanSymbols(resolvedRows)
-	if err != nil {
-		return nil, err
+
+	seen := map[int64]struct{}{}
+	var callerIDs []int64
+
+	if len(targetIDs) > 0 {
+		ids, err := s.queryEdgeSrcIDsByDstIDs(ctx, repoID, targetIDs)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				callerIDs = append(callerIDs, id)
+			}
+		}
 	}
 
 	short := lookupSymbolShortName(strings.TrimSpace(strings.TrimPrefix(symbol, "::")))
-	if short == "" {
-		return resolvedCallers, nil
+	if short != "" {
+		ids, err := s.queryEdgeSrcIDsByDstName(ctx, repoID, symbol, short)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				callerIDs = append(callerIDs, id)
+			}
+		}
 	}
 
-	fallbackRows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-		FROM edges e
-		JOIN symbols s ON s.id = e.src_symbol_id
-		JOIN files f ON f.id = s.file_id
-		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND (
-			e.dst_name = ? OR e.dst_name = ? OR e.dst_name LIKE ? OR e.dst_name LIKE ?
-		)
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
-		LIMIT ?
-		OFFSET ?
-	`, repoID, symbol, short, "%::"+short, "%."+short, safeLimit(limit), safeOffset(offset))
+	if len(callerIDs) == 0 {
+		return []graph.Symbol{}, nil
+	}
+
+	syms, err := s.loadSymbolsByIDs(ctx, repoID, callerIDs)
 	if err != nil {
 		return nil, err
 	}
-	fallbackCallers, err := scanSymbols(fallbackRows)
-	if err != nil {
-		return nil, err
-	}
-	if len(fallbackCallers) == 0 {
-		return resolvedCallers, nil
-	}
-	// Pagination here stays symbol-level; unresolved-member fallback is best-effort
-	// and only adds name-based matches when exact symbol edges are missing.
-	merged := make(map[int64]graph.Symbol, len(resolvedCallers)+len(fallbackCallers))
-	for _, sym := range resolvedCallers {
-		merged[sym.ID] = sym
-	}
-	for _, sym := range fallbackCallers {
-		if _, exists := merged[sym.ID]; !exists {
-			merged[sym.ID] = sym
-		}
-	}
-	out := make([]graph.Symbol, 0, len(merged))
-	for _, sym := range merged {
-		out = append(out, sym)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].QualifiedName != out[j].QualifiedName {
-			return out[i].QualifiedName < out[j].QualifiedName
-		}
-		if out[i].Range.StartLine != out[j].Range.StartLine {
-			return out[i].Range.StartLine < out[j].Range.StartLine
-		}
-		if out[i].Range.StartCol != out[j].Range.StartCol {
-			return out[i].Range.StartCol < out[j].Range.StartCol
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out, nil
+	sortSymbols(syms)
+	return paginateSymbols(syms, offset, limit), nil
 }
 
 func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
@@ -3511,97 +3474,48 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 	if len(srcIDs) == 0 {
 		return []graph.Symbol{}, nil
 	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(srcIDs)), ",")
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-		FROM edges e
-		JOIN symbols s ON s.id = e.dst_symbol_id
-		JOIN files f ON f.id = s.file_id
-		WHERE e.repo_id = ? AND e.src_symbol_id IN (`+placeholders+`)
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
-		LIMIT ?
-		OFFSET ?
-	`, append(append([]any{repoID}, int64SliceToAny(srcIDs)...), safeLimit(limit), safeOffset(offset))...)
-	if err != nil {
-		return nil, err
-	}
-	resolvedCallees, err := scanSymbols(rows)
-	if err != nil {
-		return nil, err
-	}
 
-	unresolvedRows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT e.dst_name
-		FROM edges e
-		WHERE e.repo_id = ? AND e.src_symbol_id IN (`+placeholders+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''
-	`, append([]any{repoID}, int64SliceToAny(srcIDs)...)...)
+	seen := map[int64]struct{}{}
+	var calleeIDs []int64
+
+	resolved, err := s.queryEdgeDstIDsBySrcIDs(ctx, repoID, srcIDs)
 	if err != nil {
 		return nil, err
 	}
-	defer unresolvedRows.Close()
-
-	seenIDs := map[int64]struct{}{}
-	fallbackIDs := make([]int64, 0, 8)
-	for unresolvedRows.Next() {
-		var dstName string
-		if err := unresolvedRows.Scan(&dstName); err != nil {
-			return nil, err
+	for _, id := range resolved {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			calleeIDs = append(calleeIDs, id)
 		}
-		ids, err := s.lookupSymbolIDs(ctx, repoID, dstName, 0)
+	}
+
+	dstNames, err := s.queryUnresolvedDstNamesBySrcIDs(ctx, repoID, srcIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(dstNames) > 0 {
+		fallbackIDs, err := s.lookupSymbolIDsForNames(ctx, repoID, dstNames)
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range ids {
-			if id == 0 {
-				continue
+		for _, id := range fallbackIDs {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				calleeIDs = append(calleeIDs, id)
 			}
-			if _, exists := seenIDs[id]; exists {
-				continue
-			}
-			seenIDs[id] = struct{}{}
-			fallbackIDs = append(fallbackIDs, id)
 		}
 	}
-	if err := unresolvedRows.Err(); err != nil {
-		return nil, err
+
+	if len(calleeIDs) == 0 {
+		return []graph.Symbol{}, nil
 	}
-	if len(fallbackIDs) == 0 {
-		return resolvedCallees, nil
-	}
-	fallbackCallees, err := s.symbolsByIDs(ctx, repoID, fallbackIDs, limit, offset)
+
+	syms, err := s.loadSymbolsByIDs(ctx, repoID, calleeIDs)
 	if err != nil {
 		return nil, err
 	}
-	if len(fallbackCallees) == 0 {
-		return resolvedCallees, nil
-	}
-	merged := make(map[int64]graph.Symbol, len(resolvedCallees)+len(fallbackCallees))
-	for _, sym := range resolvedCallees {
-		merged[sym.ID] = sym
-	}
-	for _, sym := range fallbackCallees {
-		if _, exists := merged[sym.ID]; !exists {
-			merged[sym.ID] = sym
-		}
-	}
-	out := make([]graph.Symbol, 0, len(merged))
-	for _, sym := range merged {
-		out = append(out, sym)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].QualifiedName != out[j].QualifiedName {
-			return out[i].QualifiedName < out[j].QualifiedName
-		}
-		if out[i].Range.StartLine != out[j].Range.StartLine {
-			return out[i].Range.StartLine < out[j].Range.StartLine
-		}
-		if out[i].Range.StartCol != out[j].Range.StartCol {
-			return out[i].Range.StartCol < out[j].Range.StartCol
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out, nil
+	sortSymbols(syms)
+	return paginateSymbols(syms, offset, limit), nil
 }
 
 func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth int) (map[string]any, error) {
@@ -4551,6 +4465,129 @@ func (s *Store) symbolsByIDs(ctx context.Context, repoID int64, ids []int64, lim
 		return nil, err
 	}
 	return scanSymbols(rows)
+}
+
+func (s *Store) queryEdgeSrcIDsByDstIDs(ctx context.Context, repoID int64, dstIDs []int64) ([]int64, error) {
+	if len(dstIDs) == 0 {
+		return nil, nil
+	}
+	ph := strings.TrimRight(strings.Repeat("?,", len(dstIDs)), ",")
+	return s.lookupSymbolIDsByQuery(ctx,
+		`SELECT DISTINCT e.src_symbol_id FROM edges e WHERE e.repo_id = ? AND e.dst_symbol_id IN (`+ph+`)`,
+		append([]any{repoID}, int64SliceToAny(dstIDs)...)...)
+}
+
+func (s *Store) queryEdgeSrcIDsByDstName(ctx context.Context, repoID int64, symbol, short string) ([]int64, error) {
+	return s.lookupSymbolIDsByQuery(ctx,
+		`SELECT DISTINCT e.src_symbol_id FROM edges e
+		 WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND (
+		     e.dst_name = ? OR e.dst_name = ? OR e.dst_name LIKE ? OR e.dst_name LIKE ?
+		 )`,
+		repoID, symbol, short, "%::"+short, "%."+short)
+}
+
+func (s *Store) queryEdgeDstIDsBySrcIDs(ctx context.Context, repoID int64, srcIDs []int64) ([]int64, error) {
+	if len(srcIDs) == 0 {
+		return nil, nil
+	}
+	ph := strings.TrimRight(strings.Repeat("?,", len(srcIDs)), ",")
+	return s.lookupSymbolIDsByQuery(ctx,
+		`SELECT DISTINCT e.dst_symbol_id FROM edges e WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NOT NULL`,
+		append([]any{repoID}, int64SliceToAny(srcIDs)...)...)
+}
+
+func (s *Store) queryUnresolvedDstNamesBySrcIDs(ctx context.Context, repoID int64, srcIDs []int64) ([]string, error) {
+	if len(srcIDs) == 0 {
+		return nil, nil
+	}
+	ph := strings.TrimRight(strings.Repeat("?,", len(srcIDs)), ",")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT e.dst_name FROM edges e
+		 WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''`,
+		append([]any{repoID}, int64SliceToAny(srcIDs)...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+func (s *Store) lookupSymbolIDsForNames(ctx context.Context, repoID int64, names []string) ([]int64, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	seen := map[int64]struct{}{}
+	var out []int64
+	for _, name := range names {
+		ids, err := s.lookupSymbolIDs(ctx, repoID, name, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			if id == 0 {
+				continue
+			}
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) loadSymbolsByIDs(ctx context.Context, repoID int64, ids []int64) ([]graph.Symbol, error) {
+	if len(ids) == 0 {
+		return []graph.Symbol{}, nil
+	}
+	ph := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ? AND s.id IN (`+ph+`)
+	`, append([]any{repoID}, int64SliceToAny(ids)...)...)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
+}
+
+func sortSymbols(syms []graph.Symbol) {
+	sort.Slice(syms, func(i, j int) bool {
+		if syms[i].QualifiedName != syms[j].QualifiedName {
+			return syms[i].QualifiedName < syms[j].QualifiedName
+		}
+		if syms[i].Range.StartLine != syms[j].Range.StartLine {
+			return syms[i].Range.StartLine < syms[j].Range.StartLine
+		}
+		if syms[i].Range.StartCol != syms[j].Range.StartCol {
+			return syms[i].Range.StartCol < syms[j].Range.StartCol
+		}
+		return syms[i].ID < syms[j].ID
+	})
+}
+
+func paginateSymbols(syms []graph.Symbol, offset, limit int) []graph.Symbol {
+	off := safeOffset(offset)
+	if off >= len(syms) {
+		return []graph.Symbol{}
+	}
+	syms = syms[off:]
+	lim := safeLimit(limit)
+	if lim < len(syms) {
+		syms = syms[:lim]
+	}
+	return syms
 }
 
 func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, error) {
