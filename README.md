@@ -126,25 +126,37 @@ go install github.com/isink17/codegraph/cmd/codegraph@latest
 
 Requires Go 1.23+ and a C compiler (for tree-sitter CGo bindings).
 
-### Check for updates
+### Build from source
 
 ```bash
-codegraph version-check
+git clone https://github.com/isink17/codegraph
+cd codegraph
+go build ./cmd/codegraph
+go test ./...
 ```
 
-Compares your installed version against the latest GitHub release. If outdated:
+Requires Go 1.23+ and a C compiler (for tree-sitter CGo bindings).
 
+#### Clean rebuild
+
+```bash
+cd your-project
+codegraph index . --rebuild
 ```
-codegraph is not on the latest version.
-Current version: v1.0.0
-Latest version:  v1.1.0
 
-Update with:
-  go install github.com/isink17/codegraph/cmd/codegraph@latest
+Use this after parser or indexer changes when you need a true full reindex from scratch.
+`codegraph index . --rebuild` needs exclusive access to the repo database.
+If rebuild fails because the DB is in use, stop `codegraph serve` or other `codegraph` processes and retry.
+Use `codegraph clean .` for database maintenance tasks like WAL checkpointing, VACUUM, FTS optimize, ANALYZE, and incremental vacuum.
 
-Releases:
-  https://github.com/isink17/codegraph/releases
+### Version
+
+```bash
+codegraph --version
+codegraph version
 ```
+
+Prints the installed local version only. It does not contact GitHub.
 
 ### 2. Auto-configure your AI tool
 
@@ -292,7 +304,8 @@ See the [`examples/`](examples/) directory for more configuration samples.
 codegraph install                         # Auto-configure AI tools
 codegraph doctor                          # Check installation health
 codegraph config show                     # Show current config
-codegraph version-check                   # Check if a newer release is available
+codegraph --version                       # Print current version
+codegraph version                          # Print current version
 
 # Indexing
 codegraph index <path>                    # Full index
@@ -483,6 +496,14 @@ go test ./...
 ```
 
 Requires Go 1.23+ and a C compiler for the tree-sitter CGo bindings.
+
+For a clean rebuild after parser/indexer changes:
+
+```bash
+codegraph index . --rebuild
+```
+
+This rebuild path needs exclusive access to the repo database. If it fails because another `codegraph` process is holding the DB, stop that process and retry.
 
 ---
 

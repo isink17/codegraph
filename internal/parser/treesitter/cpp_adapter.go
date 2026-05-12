@@ -133,10 +133,7 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 	if container != "" && container != module {
 		effectiveContainer = container
 	}
-	qualified := module + "." + name
-	if container != "" && container != module {
-		qualified = module + "." + container + "." + name
-	}
+	qualified := cppQualifiedName(effectiveContainer, name)
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "cpp",
@@ -147,7 +144,7 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
-		StableKey:     "func:cpp:" + module + ":" + name,
+		StableKey:     cppStableKey("func", module, effectiveContainer, name),
 	})
 }
 
@@ -165,10 +162,7 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 	if container != "" && container != module {
 		effectiveContainer = container
 	}
-	qualified := module + "." + name
-	if container != "" && container != module {
-		qualified = module + "." + container + "." + name
-	}
+	qualified := cppQualifiedName(effectiveContainer, name)
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "cpp",
@@ -179,7 +173,7 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(decl),
 		DocSummary:    prevCommentText(decl, content),
-		StableKey:     "func:cpp:" + module + ":" + name,
+		StableKey:     cppStableKey("func", module, effectiveContainer, name),
 	})
 }
 
@@ -197,12 +191,12 @@ func cppAddType(node *sitter.Node, module, kind string, content []byte, pf *grap
 		Language:      "cpp",
 		Kind:          kind,
 		Name:          name,
-		QualifiedName: module + "." + name,
+		QualifiedName: cppQualifiedName(module, name),
 		ContainerName: module,
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
-		StableKey:     "type:cpp:" + module + ":" + name,
+		StableKey:     cppStableKey("type", module, module, name),
 	})
 
 	body := childByFieldName(node, "body")
@@ -217,23 +211,93 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if fnNode == nil {
 			continue
 		}
-		name := nodeText(fnNode, content)
-		if name == "" || cppSkipFuncs[name] {
+		callName, callKind, receiver := cppCallTarget(fnNode, content)
+		if callName == "" || cppSkipFuncs[callName] {
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		evidence := callKind + ":" + nodeText(fnNode, content)
+		if receiver != "" {
+			evidence = callKind + ":" + receiver + ":" + nodeText(fnNode, content)
+		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
-			DstName:     name,
+			DstName:     callName,
 			Kind:        "calls",
-			Evidence:    name,
+			Evidence:    evidence,
 			Line:        line,
 		})
 		pf.References = append(pf.References, graph.Reference{
 			Kind:          "call",
-			Name:          name,
-			QualifiedName: name,
+			Name:          callName,
+			QualifiedName: callName,
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+func cppQualifiedName(container, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if strings.Contains(name, "::") {
+		return name
+	}
+	container = strings.TrimSpace(container)
+	if container == "" {
+		return name
+	}
+	return container + "::" + name
+}
+
+func cppStableKey(prefix, module, container, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	key := name
+	if !strings.Contains(name, "::") {
+		container = strings.TrimSpace(container)
+		if container != "" {
+			key = container + "::" + name
+		}
+	}
+	module = strings.TrimSpace(module)
+	if module == "" {
+		return prefix + ":cpp:" + key
+	}
+	if strings.HasPrefix(key, module+"::") {
+		key = strings.TrimPrefix(key, module+"::")
+	}
+	return prefix + ":cpp:" + module + ":" + key
+}
+
+func cppCallTarget(fnNode *sitter.Node, content []byte) (name, kind, receiver string) {
+	raw := strings.TrimSpace(nodeText(fnNode, content))
+	if raw == "" {
+		return "", "", ""
+	}
+	switch {
+	case strings.HasPrefix(raw, "::"):
+		return strings.TrimPrefix(raw, "::"), "static_qualified", ""
+	case strings.Contains(raw, "::"):
+		return raw, "static_qualified", ""
+	case strings.Contains(raw, "->"):
+		receiver, name = splitCallTarget(raw, "->")
+		return strings.TrimSpace(name), "member_pointer", strings.TrimSpace(receiver)
+	case strings.Contains(raw, "."):
+		receiver, name = splitCallTarget(raw, ".")
+		return strings.TrimSpace(name), "member_value", strings.TrimSpace(receiver)
+	default:
+		return raw, "direct", ""
+	}
+}
+
+func splitCallTarget(text, sep string) (string, string) {
+	idx := strings.LastIndex(text, sep)
+	if idx < 0 {
+		return "", text
+	}
+	return text[:idx], text[idx+len(sep):]
 }

@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/isink17/codegraph/internal/config"
-	"github.com/isink17/codegraph/internal/versioncheck"
 )
 
 type command struct {
@@ -116,15 +115,26 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			name:        "version",
+			description: "print current version",
+			usageLines:  []string{"  version"},
+			examples:    []string{"codegraph version"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runVersion(stdout)
+			},
+		},
+		{
 			name:        "index",
 			description: "index a repository",
 			usageLines:  []string{"  index <repo-path>"},
 			flags: []commandFlag{
 				{name: "--force", description: "re-index files even if unchanged"},
+				{name: "--rebuild", description: "remove the existing repo database before indexing (implies --force)"},
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
 			},
 			examples: []string{
 				"codegraph index .",
+				"codegraph index . --rebuild",
 				"codegraph index . --jsonl",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
@@ -359,7 +369,7 @@ func newCommandList() []*command {
 		},
 		{
 			name:        "clean",
-			description: "clean index data",
+			description: "database maintenance",
 			usageLines:  []string{"  clean [repo-path] [--vacuum] [--fts-optimize] [--analyze] [--wal-checkpoint-truncate] [--incremental-vacuum]"},
 			flags: []commandFlag{
 				{name: "--vacuum", description: "VACUUM the database after cleanup"},
@@ -392,16 +402,6 @@ func newCommandList() []*command {
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runAffectedTests(ctx, cfg, stdout, invokedName, args)
-			},
-		},
-		{
-			name:        "version-check",
-			aliases:     []string{"version_check"},
-			description: "check if a newer release is available",
-			usageLines:  []string{"  version-check"},
-			examples:    []string{"codegraph version-check"},
-			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
-				return versioncheck.RunCheck(ctx, stdout)
 			},
 		},
 		{

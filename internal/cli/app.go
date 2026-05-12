@@ -32,6 +32,7 @@ import (
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
+	"github.com/isink17/codegraph/internal/version"
 	"github.com/isink17/codegraph/internal/versioncheck"
 	"github.com/isink17/codegraph/internal/viz"
 	"github.com/isink17/codegraph/internal/watcher"
@@ -51,12 +52,26 @@ func (s *stringListFlag) Set(value string) error {
 }
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	startupVersionCheck(ctx, stderr)
-
 	if len(args) == 0 || isRootHelpFlag(args[0]) {
 		printRootHelp(stdout)
 		return nil
 	}
+	if isRootVersionFlag(args[0]) {
+		return runVersion(stdout)
+	}
+	if args[0] == "version" {
+		if hasHelpFlag(args[1:]) {
+			cmd, ok := lookupCommand("version")
+			if !ok {
+				return fmt.Errorf("unknown command %q", args[0])
+			}
+			printCommandHelp(stdout, cmd, args[0])
+			return nil
+		}
+		return runVersion(stdout)
+	}
+
+	startupVersionCheck(ctx, stderr)
 
 	globalCfg, err := config.Load()
 	if err != nil {
@@ -96,6 +111,15 @@ func isRootHelpFlag(arg string) bool {
 	}
 }
 
+func isRootVersionFlag(arg string) bool {
+	switch arg {
+	case "-v", "--version":
+		return true
+	default:
+		return false
+	}
+}
+
 func hasHelpFlag(args []string) bool {
 	for _, a := range args {
 		if isRootHelpFlag(a) {
@@ -103,6 +127,11 @@ func hasHelpFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+func runVersion(stdout io.Writer) error {
+	_, err := fmt.Fprintf(stdout, "%s %s\n", appname.BinaryName, version.Current())
+	return err
 }
 
 // isJSONEmpty mirrors `encoding/json`'s `omitempty` rules so reflection-based
@@ -624,28 +653,24 @@ func runInstall(stdout io.Writer) error {
 }
 
 func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string, update bool) error {
-	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	force := fs.Bool("force", false, "re-index files even if unchanged")
-	jsonl := false
-	filtered := make([]string, 0, len(args))
-	for _, arg := range args {
-		if arg == "--jsonl" {
-			jsonl = true
-			continue
-		}
-		filtered = append(filtered, arg)
-	}
-	if err := fs.Parse(filtered); err != nil {
+	repoRootCandidate, jsonl, force, rebuild, err := parseIndexArgs(args)
+	if err != nil {
 		return err
-	}
-	repoRootCandidate := ""
-	if fs.NArg() > 0 {
-		repoRootCandidate = fs.Arg(0)
 	}
 	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
 	if err != nil {
 		return err
+	}
+	canonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		return err
+	}
+	removedDBFiles := []string{}
+	if rebuild {
+		removedDBFiles, err = removeRepoDBFiles(cfg, repoRoot, canonical)
+		if err != nil {
+			return err
+		}
 	}
 	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
@@ -653,7 +678,7 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	}
 	defer app.Close()
 	_ = repo
-	opts := indexer.Options{RepoRoot: repo.RootPath, Force: *force}
+	opts := indexer.Options{RepoRoot: repo.RootPath, Force: force || rebuild}
 	var summary store.ScanSummary
 	if update {
 		opts.ScanKind = "update"
@@ -665,6 +690,8 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	if err != nil {
 		return err
 	}
+	summary.Rebuild = rebuild
+	summary.RemovedDBFiles = removedDBFiles
 	stats, err := app.Query.Stats(ctx, repoID)
 	if err != nil {
 		return err
@@ -1924,30 +1951,66 @@ func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
 
 const repoDBFileName = "codegraph.sqlite"
 
+var repoDBRemove = os.Remove
+
 func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error) {
+	paths, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		return "", err
+	}
+	if config.IsRepoDBDir(cfg.DBDir) {
+		for _, path := range paths {
+			if _, err := os.Stat(path); err == nil {
+				return path, nil
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return "", fmt.Errorf("stat %s: %w", path, err)
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(paths[0]), 0o755); err != nil {
+			return "", err
+		}
+		return paths[0], nil
+	}
+	return paths[0], nil
+}
+
+func repoDBPathsForRepo(cfg config.Config, repoRoot, canonical string) ([]string, error) {
 	if config.IsRepoDBDir(cfg.DBDir) {
 		absRoot, err := filepath.Abs(repoRoot)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		newPath := filepath.Join(absRoot, config.RepoArtifactsDir, repoDBFileName)
-		legacyPath := filepath.Join(absRoot, repoDBFileName)
-		if _, err := os.Stat(newPath); err == nil {
-			return newPath, nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("stat %s: %w", newPath, err)
-		}
-		if _, err := os.Stat(legacyPath); err == nil {
-			return legacyPath, nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("stat %s: %w", legacyPath, err)
-		}
-		if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
-			return "", err
-		}
-		return newPath, nil
+		return []string{
+			filepath.Join(absRoot, config.RepoArtifactsDir, repoDBFileName),
+			filepath.Join(absRoot, repoDBFileName),
+		}, nil
 	}
-	return filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical)), nil
+	return []string{filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical))}, nil
+}
+
+func removeRepoDBFiles(cfg config.Config, repoRoot, canonical string) ([]string, error) {
+	paths, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		return nil, err
+	}
+	removed := make([]string, 0, len(paths)*3)
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			if err := repoDBRemove(candidate); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return nil, fmt.Errorf("rebuild cannot remove repo database file %q; it may be in use by codegraph serve or another codegraph process. Stop those processes and retry: %w", candidate, err)
+			}
+			removed = append(removed, candidate)
+		}
+	}
+	return removed, nil
 }
 
 type graphRepo struct {
@@ -2035,12 +2098,37 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 	return nil
 }
 
+func parseIndexArgs(args []string) (repoRoot string, jsonl bool, force bool, rebuild bool, err error) {
+	for _, arg := range args {
+		switch arg {
+		case "--jsonl":
+			jsonl = true
+		case "--force":
+			force = true
+		case "--rebuild":
+			rebuild = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", false, false, false, fmt.Errorf("flag provided but not defined: %s", arg)
+			}
+			if repoRoot == "" {
+				repoRoot = arg
+				continue
+			}
+			return "", false, false, false, fmt.Errorf("index accepts at most one repo path")
+		}
+	}
+	return repoRoot, jsonl, force, rebuild, nil
+}
+
 func printUsage(w io.Writer) { printRootHelp(w) }
 
 func printRootHelp(w io.Writer) {
 	fmt.Fprintf(w, "%s - local-first code context engine and MCP server\n\n", appname.BinaryName)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintf(w, "  %s <command> [args]\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s --version\n", appname.BinaryName)
+	fmt.Fprintf(w, "  %s -v\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s --help\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s help\n\n", appname.BinaryName)
 
@@ -2063,6 +2151,7 @@ func printRootHelp(w io.Writer) {
 	}
 
 	fmt.Fprintln(w, "\nExamples:")
+	fmt.Fprintf(w, "  %s --version\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s help index\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s index .\n", appname.BinaryName)
 	fmt.Fprintf(w, "  %s stats .\n", appname.BinaryName)
