@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.2.0 - 12-05-2026
+
+C++ call graph support, DB rebuild, asset filtering, pagination correctness, and version UX improvements.
+
+### Added
+
+- **`codegraph index . --rebuild`** — drops the repo database before indexing; implies `--force`. Use after parser or indexer changes when stale rows must be cleared. Requires exclusive DB access (stop `codegraph serve` first if locked).
+- **`codegraph version`** command and **`codegraph --version`** / **`codegraph -v`** flags — print installed version without any network calls.
+- **C++ call graph:** member-pointer (`->`), member-value (`.`), static-qualified (`::`), and direct calls are now extracted as edges with structured evidence, enabling `find_callers` and `find_callees` across legacy C++ codebases.
+- **Binary/asset deny-list:** the indexer now hard-skips files by extension before hashing or parsing. Skipped categories: Windows build artifacts (`.exe`, `.dll`, `.lib`, `.pdb`, `.obj`, …), archives (`.7z`, `.zip`, `.rar`), images, fonts, audio, video, game/engine formats (`.anm`, `.dff`, `.bsp`, `.dat`, `.bin`, …), and documents (`.pdf`, `.doc`, `.chm`).
+- **Per-extension unknown coverage:** files landing in the `unknown` language bucket now accumulate per-extension sub-counts in `language_coverage.unknown.extensions`.
+- **Versioncheck improvements:** overridable HTTP client and URL for testability, raised check timeout from 2 s to 5 s, structured `latestReleaseResult` type, comprehensive test suite.
+
+### Changed
+
+- **C++ qualified names** now use `Container::Name` (double-colon) instead of `Module.Container.Name` (dot). Fixes duplicated container names like `ApmMap.ApmMap::LoadWorldMap`.
+- **`find_callers` / `find_callees` pagination** overhauled: all candidate IDs are collected (resolved edges + unresolved `dst_name` fallback), deduplicated, sorted once by `qualified_name / start_line / start_col / id`, then a single `offset + limit` slice is returned. Previously each path was paginated independently, producing incorrect or truncated pages when both paths had results.
+- **`FindCallees` fallback lookup** is no longer N+1: distinct `dst_name` values are fetched in one query; symbol resolution is batched across all names rather than calling `lookupSymbolIDs` once per cursor row.
+- **`startupVersionCheck`** is now deferred past the version flag / `version` command check, so `codegraph --version` and `codegraph version` never trigger a network round-trip.
+- **`clean` command** description changed from "clean index data" to "database maintenance" to reflect its actual scope (VACUUM, FTS optimize, ANALYZE, WAL checkpoint, incremental vacuum).
+- **Language coverage update** refactored into `updateLanguageCoverage` helper; unknown files now report per-extension sub-counts.
+- **MCP stdio transport** simplified to newline-framed JSON (one JSON object per `\n`). Previous Content-Length header framing removed.
+- README updated: build-from-source instructions, `--rebuild` usage, and `version` command documented. `version-check` references removed.
+
+### Fixed
+
+- Fixed `find_callers` returning empty results for valid C++ member-call references (e.g. `AgcmMinimap::F` → `pcsApmMap->LoadWorldMap` → `ApmMap::LoadWorldMap`).
+- Fixed `find_callers` and `find_callees` returning wrong or duplicate results across pages when resolved and fallback result sets were independently limited and merged.
+- Fixed `splitCallTarget` using a manual `strings.Cut` loop; replaced with `strings.LastIndex` for correctness on paths with multiple separators.
+- Fixed C++ stable keys and qualified names including redundant container prefixes.
+
+### Removed
+
+- **`codegraph version-check`** command removed. Use `codegraph --version`, `codegraph -v`, or `codegraph version` for local version output. The background startup version check still runs automatically on normal commands.
+
+### Upgrade Notes
+
+- `--rebuild` replaces any manual "delete the DB and re-index" workflow. It is safe to run at any time on a clean working directory.
+- MCP stdio protocol change (newline-framed vs Content-Length) may affect custom MCP client integrations that relied on the old framing.
+- C++ unresolved-member fallback is name-based; results are included only when receiver type cannot be resolved to a symbol ID. This is best-effort for legacy codebases without full type resolution.
+
 ## v1.1.1 - 28-04-2026
 
 Made `--repo-root` optional across all CLI commands and MCP tools. The server
