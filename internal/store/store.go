@@ -96,6 +96,8 @@ type FileMetadataUpdate struct {
 type ScanSummary struct {
 	RepoID                  int64                      `json:"repo_id"`
 	ScanID                  int64                      `json:"scan_id"`
+	Rebuild                 bool                       `json:"rebuild,omitempty"`
+	RemovedDBFiles          []string                   `json:"removed_db_files,omitempty"`
 	FilesSeen               int                        `json:"files_seen"`
 	FilesIndexed            int                        `json:"files_indexed"`
 	FilesSkipped            int                        `json:"files_skipped"`
@@ -198,8 +200,9 @@ type LanguageCounts struct {
 	Indexed     int `json:"indexed"`
 	Skipped     int `json:"skipped"`
 	ParseFailed int `json:"parse_failed"`
-	// Extensions is only populated for "unknown" language coverage to make the
-	// output actionable without changing existing JSON fields.
+	// Extensions is populated for live scan/index summaries only.
+	// It is not persisted in scan_language_coverage.
+	// Historical scan summaries keep aggregate unknown counts only.
 	Extensions map[string]LanguageCounts `json:"extensions,omitempty"`
 }
 
@@ -3416,47 +3419,189 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 }
 
 func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	targetID, err := s.lookupSymbolID(ctx, repoID, symbol, symbolID)
+	targetIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+	if len(targetIDs) == 0 {
+		return []graph.Symbol{}, nil
+	}
+	resolvedRows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM edges e
 		JOIN symbols s ON s.id = e.src_symbol_id
 		JOIN files f ON f.id = s.file_id
-		WHERE e.repo_id = ? AND e.dst_symbol_id = ?
+		WHERE e.repo_id = ? AND e.dst_symbol_id IN (`+strings.TrimRight(strings.Repeat("?,", len(targetIDs)), ",")+`)
 		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
-	`, repoID, targetID, safeLimit(limit), safeOffset(offset))
+	`, append(append([]any{repoID}, int64SliceToAny(targetIDs)...), safeLimit(limit), safeOffset(offset))...)
 	if err != nil {
 		return nil, err
 	}
-	return scanSymbols(rows)
+	resolvedCallers, err := scanSymbols(resolvedRows)
+	if err != nil {
+		return nil, err
+	}
+
+	short := lookupSymbolShortName(strings.TrimSpace(strings.TrimPrefix(symbol, "::")))
+	if short == "" {
+		return resolvedCallers, nil
+	}
+
+	fallbackRows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+		FROM edges e
+		JOIN symbols s ON s.id = e.src_symbol_id
+		JOIN files f ON f.id = s.file_id
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND (
+			e.dst_name = ? OR e.dst_name = ? OR e.dst_name LIKE ? OR e.dst_name LIKE ?
+		)
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		LIMIT ?
+		OFFSET ?
+	`, repoID, symbol, short, "%::"+short, "%."+short, safeLimit(limit), safeOffset(offset))
+	if err != nil {
+		return nil, err
+	}
+	fallbackCallers, err := scanSymbols(fallbackRows)
+	if err != nil {
+		return nil, err
+	}
+	if len(fallbackCallers) == 0 {
+		return resolvedCallers, nil
+	}
+	// Pagination here stays symbol-level; unresolved-member fallback is best-effort
+	// and only adds name-based matches when exact symbol edges are missing.
+	merged := make(map[int64]graph.Symbol, len(resolvedCallers)+len(fallbackCallers))
+	for _, sym := range resolvedCallers {
+		merged[sym.ID] = sym
+	}
+	for _, sym := range fallbackCallers {
+		if _, exists := merged[sym.ID]; !exists {
+			merged[sym.ID] = sym
+		}
+	}
+	out := make([]graph.Symbol, 0, len(merged))
+	for _, sym := range merged {
+		out = append(out, sym)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].QualifiedName != out[j].QualifiedName {
+			return out[i].QualifiedName < out[j].QualifiedName
+		}
+		if out[i].Range.StartLine != out[j].Range.StartLine {
+			return out[i].Range.StartLine < out[j].Range.StartLine
+		}
+		if out[i].Range.StartCol != out[j].Range.StartCol {
+			return out[i].Range.StartCol < out[j].Range.StartCol
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
 }
 
 func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	srcID, err := s.lookupSymbolID(ctx, repoID, symbol, symbolID)
+	srcIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
 		return nil, err
 	}
+	if len(srcIDs) == 0 {
+		return []graph.Symbol{}, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(srcIDs)), ",")
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM edges e
 		JOIN symbols s ON s.id = e.dst_symbol_id
 		JOIN files f ON f.id = s.file_id
-		WHERE e.repo_id = ? AND e.src_symbol_id = ?
+		WHERE e.repo_id = ? AND e.src_symbol_id IN (`+placeholders+`)
 		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
-	`, repoID, srcID, safeLimit(limit), safeOffset(offset))
+	`, append(append([]any{repoID}, int64SliceToAny(srcIDs)...), safeLimit(limit), safeOffset(offset))...)
 	if err != nil {
 		return nil, err
 	}
-	return scanSymbols(rows)
+	resolvedCallees, err := scanSymbols(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	unresolvedRows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT e.dst_name
+		FROM edges e
+		WHERE e.repo_id = ? AND e.src_symbol_id IN (`+placeholders+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''
+	`, append([]any{repoID}, int64SliceToAny(srcIDs)...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer unresolvedRows.Close()
+
+	seenIDs := map[int64]struct{}{}
+	fallbackIDs := make([]int64, 0, 8)
+	for unresolvedRows.Next() {
+		var dstName string
+		if err := unresolvedRows.Scan(&dstName); err != nil {
+			return nil, err
+		}
+		ids, err := s.lookupSymbolIDs(ctx, repoID, dstName, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			if id == 0 {
+				continue
+			}
+			if _, exists := seenIDs[id]; exists {
+				continue
+			}
+			seenIDs[id] = struct{}{}
+			fallbackIDs = append(fallbackIDs, id)
+		}
+	}
+	if err := unresolvedRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(fallbackIDs) == 0 {
+		return resolvedCallees, nil
+	}
+	fallbackCallees, err := s.symbolsByIDs(ctx, repoID, fallbackIDs, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if len(fallbackCallees) == 0 {
+		return resolvedCallees, nil
+	}
+	merged := make(map[int64]graph.Symbol, len(resolvedCallees)+len(fallbackCallees))
+	for _, sym := range resolvedCallees {
+		merged[sym.ID] = sym
+	}
+	for _, sym := range fallbackCallees {
+		if _, exists := merged[sym.ID]; !exists {
+			merged[sym.ID] = sym
+		}
+	}
+	out := make([]graph.Symbol, 0, len(merged))
+	for _, sym := range merged {
+		out = append(out, sym)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].QualifiedName != out[j].QualifiedName {
+			return out[i].QualifiedName < out[j].QualifiedName
+		}
+		if out[i].Range.StartLine != out[j].Range.StartLine {
+			return out[i].Range.StartLine < out[j].Range.StartLine
+		}
+		if out[i].Range.StartCol != out[j].Range.StartCol {
+			return out[i].Range.StartCol < out[j].Range.StartCol
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
 }
 
 func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth int) (map[string]any, error) {
@@ -4259,24 +4404,153 @@ func chunkStrings(values []string, chunkSize int) [][]string {
 }
 
 func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string, symbolID int64) (int64, error) {
-	if symbolID != 0 {
-		return symbolID, nil
+	ids, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
+	if err != nil {
+		return 0, err
 	}
-	var id int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT s.id
+	if len(ids) == 0 {
+		return 0, sql.ErrNoRows
+	}
+	return ids[0], nil
+}
+
+func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string, symbolID int64) ([]int64, error) {
+	if symbolID != 0 {
+		return []int64{symbolID}, nil
+	}
+	symbol = strings.TrimSpace(strings.TrimPrefix(symbol, "::"))
+	if symbol == "" {
+		return nil, nil
+	}
+	short := lookupSymbolShortName(symbol)
+	queries := []struct {
+		sql  string
+		args []any
+	}{
+		{
+			sql: `
+				SELECT DISTINCT s.id
+				FROM symbols s
+				JOIN files f ON f.id = s.file_id
+				WHERE s.repo_id = ? AND s.qualified_name = ?
+				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			`,
+			args: []any{repoID, symbol},
+		},
+		{
+			sql: `
+				SELECT DISTINCT s.id
+				FROM symbols s
+				JOIN files f ON f.id = s.file_id
+				WHERE s.repo_id = ? AND s.name = ?
+				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			`,
+			args: []any{repoID, symbol},
+		},
+	}
+	if short != "" {
+		queries = append(queries, struct {
+			sql  string
+			args []any
+		}{
+			sql: `
+				SELECT DISTINCT s.id
+				FROM symbols s
+				JOIN files f ON f.id = s.file_id
+				WHERE s.repo_id = ? AND (s.qualified_name LIKE ? OR s.qualified_name LIKE ?)
+				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			`,
+			args: []any{repoID, "%::" + short, "%." + short},
+		})
+	}
+	if short != "" && short != symbol {
+		queries = append(queries, struct {
+			sql  string
+			args []any
+		}{
+			sql: `
+				SELECT DISTINCT s.id
+				FROM symbols s
+				JOIN files f ON f.id = s.file_id
+				WHERE s.repo_id = ? AND s.name = ?
+				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			`,
+			args: []any{repoID, short},
+		})
+	}
+	for _, query := range queries {
+		ids, err := s.lookupSymbolIDsByQuery(ctx, query.sql, query.args...)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) > 0 {
+			return ids, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *Store) lookupSymbolIDsByQuery(ctx context.Context, query string, args ...any) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, 4)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func lookupSymbolShortName(symbol string) string {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(symbol, "::"); idx >= 0 && idx+2 < len(symbol) {
+		return strings.TrimSpace(symbol[idx+2:])
+	}
+	if idx := strings.LastIndexByte(symbol, '.'); idx >= 0 && idx+1 < len(symbol) {
+		return strings.TrimSpace(symbol[idx+1:])
+	}
+	return symbol
+}
+
+func int64SliceToAny(values []int64) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		out = append(out, value)
+	}
+	return out
+}
+
+func (s *Store) symbolsByIDs(ctx context.Context, repoID int64, ids []int64, limit, offset int) ([]graph.Symbol, error) {
+	if len(ids) == 0 {
+		return []graph.Symbol{}, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id
-		WHERE s.repo_id = ? AND (s.qualified_name = ? OR s.name = ?)
-		ORDER BY
-			CASE WHEN s.qualified_name = ? THEN 0 ELSE 1 END,
-			f.path ASC,
-			s.start_line ASC,
-			s.start_col ASC,
-			s.id ASC
-		LIMIT 1
-	`, repoID, symbol, symbol, symbol).Scan(&id)
-	return id, err
+		WHERE s.repo_id = ? AND s.id IN (`+placeholders+`)
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		LIMIT ?
+		OFFSET ?
+	`, append(append([]any{repoID}, int64SliceToAny(ids)...), safeLimit(limit), safeOffset(offset))...)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
 }
 
 func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, error) {

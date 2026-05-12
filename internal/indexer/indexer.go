@@ -795,8 +795,14 @@ var deniedIndexExtensions = map[string]struct{}{
 	// Images and binary assets.
 	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".bmp": {}, ".tif": {}, ".tiff": {}, ".dds": {}, ".ico": {}, ".cur": {}, ".psd": {}, ".raw": {},
 
+	// Fonts.
+	".ttf": {}, ".otf": {}, ".woff": {}, ".woff2": {}, ".eot": {},
+
 	// Audio.
 	".mp3": {}, ".wav": {},
+
+	// Video.
+	".mp4": {}, ".mkv": {}, ".avi": {}, ".mov": {}, ".wmv": {}, ".webm": {}, ".mpg": {}, ".mpeg": {}, ".m4v": {}, ".flv": {},
 
 	// Game/engine and other binary formats seen in legacy repos.
 	".anm": {}, ".dff": {}, ".rpe": {}, ".eff": {}, ".pk": {}, ".dat": {}, ".bin": {}, ".arc": {}, ".bsp": {}, ".bm1": {}, ".pix": {}, ".grp": {},
@@ -905,6 +911,7 @@ func coverageKey(language string) string {
 }
 
 func updateLanguageCoverage(coverage map[string]store.LanguageCounts, language string, relPath string, delta store.LanguageCounts) {
+	// TODO: per-file callers can precompute extension deltas in a later optimization pass.
 	current := coverage[language]
 	current.Seen += delta.Seen
 	current.Indexed += delta.Indexed

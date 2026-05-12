@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/version"
 )
 
 func TestRunInstallCreatesConfigAndPrintsSnippets(t *testing.T) {
@@ -112,6 +115,35 @@ func main() {}
 	}
 	if first["type"] != "scan_summary" {
 		t.Fatalf("first event type = %v, want scan_summary", first["type"])
+	}
+}
+
+func TestRunIndexRejectsUnknownFlag(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoRoot) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(`package main
+func main() {}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go) error = %v", err)
+	}
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	err := Run(context.Background(), []string{"index", repoRoot, "--does-not-exist"}, &out, &errOut)
+	if err == nil {
+		t.Fatalf("Run(index --does-not-exist) error = nil")
+	}
+	if !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("unexpected error for unknown flag: %v", err)
 	}
 }
 
@@ -241,6 +273,113 @@ func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
 	}
 }
 
+func TestRunIndexRebuildDropsStaleRows(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoRoot) error = %v", err)
+	}
+	firstFile := []byte(`package main
+
+func OldThing() {}
+`)
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), firstFile, 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go) error = %v", err)
+	}
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"index", repoRoot}, &out, &errOut); err != nil {
+		t.Fatalf("Run(index) error = %v", err)
+	}
+	if count := queryCount(t, repoRoot, "OldThing"); count == 0 {
+		t.Fatalf("expected OldThing before rebuild")
+	}
+
+	secondFile := []byte(`package main
+
+func NewThing() {}
+`)
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), secondFile, 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go) rewrite error = %v", err)
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"index", repoRoot, "--rebuild"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(index --rebuild) error = %v", err)
+	}
+	var rebuilt map[string]any
+	if err := json.Unmarshal(out.Bytes(), &rebuilt); err != nil {
+		t.Fatalf("rebuild output json parse error = %v", err)
+	}
+	summary, ok := rebuilt["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("rebuild output missing summary: %s", out.String())
+	}
+	if got, ok := summary["rebuild"].(bool); !ok || !got {
+		t.Fatalf("rebuild output missing rebuild=true: %s", out.String())
+	}
+	removed, ok := summary["removed_db_files"].([]any)
+	if !ok || len(removed) == 0 {
+		t.Fatalf("rebuild output missing removed_db_files: %s", out.String())
+	}
+	if count := queryCount(t, repoRoot, "OldThing"); count != 0 {
+		t.Fatalf("OldThing still indexed after rebuild: count=%d", count)
+	}
+	if count := queryCount(t, repoRoot, "NewThing"); count == 0 {
+		t.Fatalf("NewThing missing after rebuild")
+	}
+}
+
+func TestRemoveRepoDBFilesWrapsInUseError(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".codegraph"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.codegraph) error = %v", err)
+	}
+	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
+	if err := os.WriteFile(dbPath, []byte("db"), 0o644); err != nil {
+		t.Fatalf("WriteFile(db) error = %v", err)
+	}
+	prevRemove := repoDBRemove
+	repoDBRemove = func(string) error { return os.ErrPermission }
+	t.Cleanup(func() {
+		repoDBRemove = prevRemove
+	})
+
+	_, err := removeRepoDBFiles(config.Config{DBDir: config.RepoDBDir}, repoRoot, repoRoot)
+	if err == nil {
+		t.Fatalf("removeRepoDBFiles error = nil")
+	}
+	if !strings.Contains(err.Error(), "rebuild cannot remove repo database file") {
+		t.Fatalf("error missing actionable rebuild text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "codegraph serve") {
+		t.Fatalf("error missing process hint: %v", err)
+	}
+}
+
+func queryCount(t *testing.T, repoRoot, symbol string) int {
+	t.Helper()
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"find-symbol", repoRoot, symbol, "--exact"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(find-symbol %q) error = %v", symbol, err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("find-symbol %q output json parse error = %v", symbol, err)
+	}
+	return int(decoded["count"].(float64))
+}
+
 func TestRunConfigCommands(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
 	t.Setenv("CODEGRAPH_HOME", home)
@@ -327,6 +466,9 @@ func TestRunRootHelp(t *testing.T) {
 			if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "Commands:") {
 				t.Fatalf("help output missing sections, output:\n%s", got)
 			}
+			if !strings.Contains(out.String(), "--version") || !strings.Contains(out.String(), "-v") {
+				t.Fatalf("root help missing version flags, output:\n%s", out.String())
+			}
 		})
 	}
 }
@@ -362,6 +504,58 @@ func TestRunCommandHelpFlag(t *testing.T) {
 	}
 	if got := out.String(); !strings.Contains(got, "Usage:") || !strings.Contains(got, "find_symbol <repo-path> <query>") {
 		t.Fatalf("find_symbol --help output unexpected, output:\n%s", got)
+	}
+}
+
+func TestRunVersionFlagsAndCommand(t *testing.T) {
+	want := "codegraph " + version.Current()
+	for _, args := range [][]string{
+		{"--version"},
+		{"-v"},
+		{"version"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			called := false
+			prev := startupVersionCheck
+			startupVersionCheck = func(context.Context, io.Writer) { called = true }
+			t.Cleanup(func() {
+				startupVersionCheck = prev
+			})
+
+			var out bytes.Buffer
+			var errOut bytes.Buffer
+			if err := Run(context.Background(), args, &out, &errOut); err != nil {
+				t.Fatalf("Run(%v) error = %v", args, err)
+			}
+			if called {
+				t.Fatalf("startupVersionCheck called for %v", args)
+			}
+			got := out.String()
+			if !strings.Contains(got, want) {
+				t.Fatalf("version output missing %q, output:\n%s", want, got)
+			}
+			if strings.Contains(got, "Latest version") {
+				t.Fatalf("version output leaked latest-version text, output:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestRunRemovedVersionCheckCommand(t *testing.T) {
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() {
+		startupVersionCheck = prev
+	})
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	err := Run(context.Background(), []string{"version-check"}, &out, &errOut)
+	if err == nil {
+		t.Fatalf("Run(version-check) error = nil")
+	}
+	if !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("Run(version-check) error = %v", err)
 	}
 }
 

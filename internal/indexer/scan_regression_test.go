@@ -9,7 +9,7 @@ func TestShouldSkipDirRegression(t *testing.T) {
 	// These directories are skipped by filepath.WalkDir early and cannot be bypassed
 	// by adding !pattern to .codegraphignore.
 	excludes := []string{"node_modules/**", "dist/**", ".next/**", "build/**"}
-	
+
 	tests := []struct {
 		rel  string
 		skip bool

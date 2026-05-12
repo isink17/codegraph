@@ -6,7 +6,7 @@ import (
 
 func TestShouldSkipDir(t *testing.T) {
 	excludes := []string{"node_modules/**", "dist/**", ".next/**"}
-	
+
 	tests := []struct {
 		rel  string
 		skip bool
