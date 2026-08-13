@@ -86,7 +86,10 @@ func BenchmarkResolveEdgesForNames_CrossFileScale(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = NULL WHERE repo_id = ?`, repo.ID); err != nil {
+		// Reset to the exact state production leaves an unbound edge in --
+		// destination and provenance cleared together -- so the second and later
+		// iterations measure the same row shape as the first.
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+` WHERE repo_id = ?`, repo.ID); err != nil {
 			b.Fatalf("reset edges error = %v", err)
 		}
 		b.StartTimer()
