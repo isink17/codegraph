@@ -126,6 +126,15 @@ type EdgeObservation struct {
 	DstFile          string `json:"dst_file,omitempty"`
 	DstLanguage      string `json:"dst_language,omitempty"`
 	DstKind          string `json:"dst_kind,omitempty"`
+	// TargetClassification is the P8 answer to "what is this destination":
+	// `project` for a bound edge, otherwise `builtin`, `stdlib`, `external`, or
+	// `unknown`. Read from the export record, not recomputed here -- the audit
+	// measures the production classifier rather than a copy of its rules.
+	//
+	// It is reported, never asserted on. An unresolved edge that classifies as
+	// `builtin` is still an unresolved edge, so the outcome vocabulary
+	// (correctly_unresolved, miswired, ...) is unchanged by this field.
+	TargetClassification string `json:"target_classification,omitempty"`
 }
 
 func (e EdgeObservation) key() string {
@@ -174,6 +183,16 @@ type CaseResult struct {
 	TestShadowBinding bool   `json:"test_shadow_binding"`
 	MiswiredAnyRun    bool   `json:"miswired_any_run"`
 	Note              string `json:"note,omitempty"`
+
+	// TargetClassification is the P8 classification every repeat agreed on;
+	// TargetClassificationVariants holds the sorted set instead when they did
+	// not. Classification is a pure function of persisted evidence, so variance
+	// here means the underlying graph varied, and it is reported as a divergence
+	// rather than folded away.
+	//
+	// Reported, not asserted: this field never participates in Outcome.
+	TargetClassification         string   `json:"target_classification,omitempty"`
+	TargetClassificationVariants []string `json:"target_classification_variants,omitempty"`
 }
 
 // Determinism reports whether repeated measurement agreed.
@@ -504,10 +523,11 @@ func loadCallEdges(ctx context.Context, st *store.Store, repoID int64, symbols m
 				continue
 			}
 			obs := EdgeObservation{
-				SrcQualifiedName: edge.SrcQualifiedName,
-				SrcFile:          filepath.ToSlash(edge.FilePath),
-				Line:             edge.Line,
-				DstName:          edge.DstName,
+				SrcQualifiedName:     edge.SrcQualifiedName,
+				SrcFile:              filepath.ToSlash(edge.FilePath),
+				Line:                 edge.Line,
+				DstName:              edge.DstName,
+				TargetClassification: edge.TargetClassification,
 			}
 			if src, ok := symbols[edge.SrcSymbolID]; ok {
 				obs.SrcLanguage = src.Language
@@ -696,6 +716,7 @@ func classify(runs []runObservation) ([]CaseResult, Determinism) {
 
 		targets := map[string]struct{}{}
 		outcomes := map[Outcome]struct{}{}
+		classifications := map[string]struct{}{}
 		var sample *EdgeObservation
 		shadow := false
 
@@ -711,6 +732,7 @@ func classify(runs []runObservation) ([]CaseResult, Determinism) {
 				continue
 			}
 			targets[edge.target()] = struct{}{}
+			classifications[edge.TargetClassification] = struct{}{}
 			// Prefer run 0 so the reported destination and the candidate set
 			// below describe the same measurement pass.
 			if sample == nil {
@@ -744,6 +766,23 @@ func classify(runs []runObservation) ([]CaseResult, Determinism) {
 				det.Divergences = append(det.Divergences, fmt.Sprintf(
 					"case %s selected %s, which the harness candidate model does not cover; ambiguity counts understate reality", c.ID, target))
 			}
+		}
+
+		switch len(classifications) {
+		case 0:
+			// No call edge in any run; nothing to classify.
+		case 1:
+			for value := range classifications {
+				res.TargetClassification = value
+			}
+		default:
+			// Recorded on the case, deliberately NOT appended to
+			// det.Divergences. The determinism block is about resolver
+			// stability, and its flags gate the "no divergences while stable"
+			// invariant; a classification-only variance would fail that
+			// invariant under an unrelated message. Reported, never asserted --
+			// render.go surfaces the variant set.
+			res.TargetClassificationVariants = sortedKeys(classifications)
 		}
 
 		res.TestShadowBinding = shadow

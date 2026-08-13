@@ -16,6 +16,21 @@ func (r *Report) WriteJSON(w io.Writer) error {
 	return enc.Encode(r)
 }
 
+// caseTargetClassification renders the P8 classification for one case: the
+// agreed value, the variant set when the repeats disagreed, or "-" when the case
+// produced no call edge to classify. One short enum per case -- the audit
+// reports the classification, it does not explain it per edge.
+func caseTargetClassification(c CaseResult) string {
+	switch {
+	case c.TargetClassification != "":
+		return c.TargetClassification
+	case len(c.TargetClassificationVariants) > 0:
+		return strings.Join(c.TargetClassificationVariants, "|")
+	default:
+		return "-"
+	}
+}
+
 // WriteText emits a concise human-readable summary suitable for CI logs.
 func (r *Report) WriteText(w io.Writer) error {
 	var b strings.Builder
@@ -40,8 +55,9 @@ func (r *Report) WriteText(w io.Writer) error {
 
 	b.WriteString("\ncase outcomes:\n")
 	for _, c := range r.Cases {
-		fmt.Fprintf(&b, "  %-2s %-22s %-10s src=%s(%s) dst_name=%s candidates=%d\n",
-			c.ID, c.Outcome, c.Expectation, c.SrcFile, c.SrcLanguage, c.DstName, c.CandidateCount)
+		fmt.Fprintf(&b, "  %-2s %-22s %-10s src=%s(%s) dst_name=%s candidates=%d target=%s\n",
+			c.ID, c.Outcome, c.Expectation, c.SrcFile, c.SrcLanguage, c.DstName,
+			c.CandidateCount, caseTargetClassification(c))
 		switch {
 		case c.Selected != nil && c.Selected.Resolved:
 			fmt.Fprintf(&b, "       -> selected %s (%s) in %s [kind=%s]\n",
