@@ -1,5 +1,94 @@
 # Changelog
 
+## Unreleased
+
+Query latency budget: local graph queries are measured against a deterministic ~100k-symbol
+fixture, the measured bottlenecks are fixed, and the measurement is reproducible from the CLI.
+
+### Added
+
+- **`codegraph bench-queries [PATH]`** (alias of `bench_queries`) — benchmarks the local graph
+  queries against an already-indexed repository and prints a `codegraph.query_bench/v1` JSON
+  report with p50/p95/max per scenario. Read-only: it opens the existing database with
+  `OpenReadOnly`, never indexes, never migrates, and never writes synthetic rows. Scenario
+  arguments are selected deterministically from the repository's own graph (most-called symbol,
+  highest fan-out symbol, most-linked test file); a scenario the graph cannot supply a target for
+  is reported as `skipped` with a reason rather than replaced by an invented query. Flags:
+  `--repo-root`, `--runs`, `--warmup`, `--budget-ms`, `--fail-over-budget` (which changes the exit
+  status only, after the report has been written).
+- Deterministic ~100k-symbol query-latency fixture and benchmark suite in `internal/store`, plus a
+  three-layer MCP benchmark (store / dispatch / dispatch+encode) in `internal/mcp`.
+
+### Changed
+
+- **`find_callers` / `find_callees`** now dedupe, order and page inside SQLite instead of
+  materialising the whole neighbourhood in Go. The result set and its ordering are unchanged.
+  This also removes the `IN (?, ?, …)` list that grew with fan-in: the whole caller/callee set
+  used to be read into Go and bound back into a second statement, which on a hub meant tens of
+  thousands of bound variables — over `SQLITE_MAX_VARIABLE_NUMBER` on drivers still using the
+  historical 999-variable limit. The neighbour set now never leaves SQLite.
+- **Multi-name symbol lookup** (`FindCallees`' unresolved-destination fallback) resolves its
+  four-stage cascade for all names at once. The per-name stage that needs a leading-wildcard
+  `LIKE` now costs one scan per call instead of one per name.
+- **`architecture_overview`** computes its entry-point and hub-symbol lists by aggregating on the
+  edge side rather than grouping every symbol in the repository, and derives its file/symbol/edge
+  totals from the breakdowns it already computes instead of a second full count.
+- **`find_dead_code`** constrains the file join to the repository, which both restores repo
+  isolation on that join and lets the ordering come from indexes.
+- **`architecture_overview`'s `caller_count`/`callee_count`** are now scoped to the repository
+  being described. The previous `LEFT JOIN edges` had no `repo_id` predicate, so in a database
+  holding several repositories the reported degrees summed across all of them.
+
+### Fixed
+
+- **Unstable pagination in symbol search.** `search_symbols`, `find_symbol` and
+  `find_symbol --exact` applied `LIMIT`/`OFFSET` with no `ORDER BY`, so which rows a page returned
+  depended on storage order and consecutive pages could overlap or skip. They now use the same
+  total order the rest of the symbol surface uses (`qualified_name`, `start_line`, `start_col`,
+  `id`). This changes which rows a broad query returns, because previously that was arbitrary.
+- **Unstable pagination in `search_semantic`.** Token-overlap search ordered by score alone, and
+  weights come from a small fixed set, so ties were the rule and page boundaries fell arbitrarily.
+  It now breaks ties by file path and qualified name.
+- **`find_callees` variable-count limit.** The query that collects a symbol's unresolved
+  destination names spliced every source symbol id into one `IN (?, ?, …)` list, which could
+  exceed `SQLITE_MAX_VARIABLE_NUMBER` for an ambiguous name in a large repository. It is chunked.
+
+### Performance
+
+Measured on a deterministic 100k-symbol / 212k-edge fixture, p95 of 30 warm runs, same fixture
+before and after:
+
+| Query | Before | After |
+|---|---|---|
+| `find_callees` (300 unresolved destinations) | 8581 ms | 39.1 ms |
+| `find_dead_code` (first page) | 128 ms | 0.57 ms |
+| `find_callers` (hub, 18,432 distinct callers) | 236 ms | 38.2 ms |
+| `architecture_overview` | 406 ms | 132 ms |
+| `find_callers` (medium degree) | 42.9 ms | 14.4 ms |
+| `find_callers` (low degree) | 38.2 ms | 13.4 ms |
+| `search_semantic` | 35.0 ms | 24.4 ms |
+| `find_callees` (hub, 4000 destinations) | 21.8 ms | 8.5 ms |
+
+The deterministic-ordering fix costs latency where it buys correctness: `search_symbols` on a term
+matching ~9% of a 100k-symbol graph went from 0.6 ms to 14.3 ms, because a page can no longer be
+whatever SQLite reached first. It stays inside the 50 ms budget.
+
+Two whole-graph operations remain over budget and are reported that way rather than narrowed:
+`architecture_overview` (132 ms) aggregates every symbol and edge by definition, and
+`get_impact_radius` at its default depth of 2 around a hot hub (476 ms) returns 34,564 affected
+symbols — its cost tracks the size of the answer, and it has no result limit in its public
+contract. Bounding either would be an API change, not an optimisation.
+
+The `find_dead_code` figure is for the first page: the index change removes the sort, which is
+what lets `LIMIT` stop the scan early, so the win depends on dead symbols appearing early in path
+order. A repository whose alphabetically-first files are entirely live still scans further.
+
+Three indexes were replaced by wider ones with the same leading columns and partiality
+(migration 022), so the index count — and therefore the per-row write cost — is unchanged:
+`idx_edges_repo_unresolved_name` → `idx_edges_repo_unresolved_name_src`, `idx_symbols_file_id` →
+`idx_symbols_file_start`, `idx_symbol_tokens_token` → `idx_symbol_tokens_token_symbol`. Full and
+incremental indexing are unchanged within noise; the database grows about 1.7%.
+
 ## v1.2.0 - 12-05-2026
 
 C++ call graph support, DB rebuild, asset filtering, pagination correctness, and version UX improvements.

@@ -327,6 +327,37 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			// bench_queries measures; audit judges. Keeping them separate keeps
+			// the audit report free of timing noise and this report free of
+			// correctness findings.
+			name:        "bench_queries",
+			aliases:     []string{"bench-queries"},
+			description: "benchmark local graph query latency on an indexed repository",
+			usageLines: []string{
+				"  bench_queries [PATH]",
+				"    add --repo-root PATH instead of the positional argument",
+				"    add --runs N to change the measured calls per scenario",
+				"    add --warmup N to change the unmeasured warmup calls",
+				"    add --budget-ms MS to change the reported p95 budget",
+				"    add --fail-over-budget to exit non-zero when a scenario misses it",
+			},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root to benchmark (defaults to the git repo root)"},
+				{name: "--runs N", description: "measured calls per scenario (default 20)"},
+				{name: "--warmup N", description: "unmeasured warmup calls per scenario (default 3)"},
+				{name: "--budget-ms MS", description: "p95 budget per scenario in milliseconds (default 50; 0 uses the default)"},
+				{name: "--fail-over-budget", description: "exit non-zero after printing the report if any scenario is over budget"},
+			},
+			examples: []string{
+				"codegraph bench-queries .",
+				"codegraph bench-queries . --runs 50",
+				"codegraph bench-queries . --fail-over-budget",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runBenchQueries(ctx, cfg, stdout, args)
+			},
+		},
+		{
 			name:        "config",
 			description: "config commands",
 			usageLines: []string{

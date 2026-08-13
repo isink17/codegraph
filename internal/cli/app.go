@@ -247,57 +247,12 @@ func runAudit(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if *examples < 0 {
 		return fmt.Errorf("invalid --examples %d: want 0 or more", *examples)
 	}
-	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	opened, err := openIndexedRepoReadOnly(ctx, cfg, repoRootCandidate)
 	if err != nil {
 		return err
 	}
-
-	canonical, err := store.CanonicalRepoPath(repoRoot)
-	if err != nil {
-		return err
-	}
-	candidates, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
-	if err != nil {
-		return err
-	}
-	dbPath := ""
-	for _, path := range candidates {
-		st, statErr := os.Stat(path)
-		if statErr != nil {
-			if errors.Is(statErr, os.ErrNotExist) {
-				continue
-			}
-			// A database we cannot stat is not an unindexed repository. Telling
-			// the user to re-index a permission-denied or I/O-failing database
-			// would be wrong advice, and following it would rewrite a database
-			// that may have been fine -- so surface the real error, the way
-			// dbPathForRepo already does.
-			return fmt.Errorf("stat %s: %w", path, statErr)
-		}
-		if st.Size() > 0 {
-			dbPath = path
-			break
-		}
-	}
-	if dbPath == "" {
-		return fmt.Errorf("%s is not indexed: no graph database found (run %s index %s)",
-			repoRoot, appname.BinaryName, repoRoot)
-	}
-
-	s, err := store.OpenReadOnly(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-
-	repo, found, err := s.FindRepo(ctx, repoRoot)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return fmt.Errorf("%s is not indexed: %s holds no graph for it (run %s index %s)",
-			repoRoot, dbPath, appname.BinaryName, repoRoot)
-	}
+	defer opened.Close()
+	s, repo, repoRoot, dbPath := opened.Store, opened.Repo, opened.Root, opened.DBPath
 
 	// A negative ExampleLimit means "counts only" to graphaudit, while 0 means
 	// "use the default". The CLI spells counts-only as --examples 0, so the
