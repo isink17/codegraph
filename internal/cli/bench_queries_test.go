@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -244,49 +246,124 @@ func TestBenchQueriesDoesNotWriteToTheDatabase(t *testing.T) {
 	}
 }
 
-// TestBenchQueriesFailPolicyChangesOnlyTheExitStatus pins the CI contract: the
-// report is emitted first, and it is byte-identical with and without the
-// policy.
-func TestBenchQueriesFailPolicyChangesOnlyTheExitStatus(t *testing.T) {
+// benchReport builds a report with a known budget outcome. Constructed rather
+// than measured: the contract under test is "what the policy does with a given
+// report", and feeding it real timings would make the assertion depend on the
+// host's clock resolution.
+func benchReport(overBudget int) querybench.Report {
+	r := querybench.Report{
+		Schema:   querybench.Schema,
+		Runs:     2,
+		Warmup:   0,
+		BudgetMS: querybench.DefaultBudgetMS,
+		Results: []querybench.Result{
+			{Name: "graph_stats", Status: querybench.StatusMeasured, Samples: 2, P50MS: 1, P95MS: 1, MaxMS: 1, BudgetMet: true},
+			{Name: "related_tests", Status: querybench.StatusSkipped, SkipReason: "no test links"},
+		},
+	}
+	r.Summary = querybench.Summary{Measured: 1, Skipped: 1, WithinBudget: 1}
+	for i := 0; i < overBudget; i++ {
+		r.Results = append(r.Results, querybench.Result{
+			Name: fmt.Sprintf("slow_%d", i), Status: querybench.StatusMeasured,
+			Samples: 2, P50MS: 900, P95MS: 999, MaxMS: 1000, BudgetMet: false,
+		})
+		r.Summary.Measured++
+		r.Summary.OverBudget++
+		r.Summary.Slowest = "slow_0"
+		r.Summary.SlowestP95MS = 999
+	}
+	return r
+}
+
+// TestBenchQueryFailPolicyError pins the exit-status policy itself: for a given
+// report, the flag is the only thing that decides whether there is an error.
+func TestBenchQueryFailPolicyError(t *testing.T) {
+	cases := []struct {
+		name           string
+		overBudget     int
+		failOverBudget bool
+		wantErr        bool
+	}{
+		{"over budget, policy off", 2, false, false},
+		{"over budget, policy on", 2, true, true},
+		{"within budget, policy off", 0, false, false},
+		{"within budget, policy on", 0, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			report := benchReport(tc.overBudget)
+			err := benchQueryFailPolicyError(report, tc.failOverBudget)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("benchQueryFailPolicyError(overBudget=%d, policy=%v) = %v, wantErr=%v",
+					tc.overBudget, tc.failOverBudget, err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "slow_0") {
+				t.Errorf("error does not name the slowest scenario: %v", err)
+			}
+		})
+	}
+}
+
+// TestEmitBenchQueryReportWritesBeforeFailing pins the ordering and the
+// byte-identity: the same report produces the same stdout under either policy,
+// and the failing case still emits it in full before returning the error.
+func TestEmitBenchQueryReportWritesBeforeFailing(t *testing.T) {
+	report := benchReport(3)
+
+	var withoutPolicy bytes.Buffer
+	if err := emitBenchQueryReport(&withoutPolicy, report, false); err != nil {
+		t.Fatalf("policy off: unexpected error %v", err)
+	}
+	var withPolicy bytes.Buffer
+	err := emitBenchQueryReport(&withPolicy, report, true)
+	if err == nil {
+		t.Fatal("policy on: over-budget report returned no error")
+	}
+
+	if withPolicy.String() != withoutPolicy.String() {
+		t.Fatalf("the policy changed the emitted bytes:\n--- off ---\n%s\n--- on ---\n%s",
+			withoutPolicy.String(), withPolicy.String())
+	}
+	// The bytes must be a complete, parseable report, not a truncated prefix
+	// written before the error path bailed out.
+	var parsed querybench.Report
+	if jsonErr := json.Unmarshal(withPolicy.Bytes(), &parsed); jsonErr != nil {
+		t.Fatalf("emitted output is not a valid report: %v\n%s", jsonErr, withPolicy.String())
+	}
+	if parsed.Summary.OverBudget != report.Summary.OverBudget || len(parsed.Results) != len(report.Results) {
+		t.Fatalf("emitted report does not match the input: %+v", parsed.Summary)
+	}
+}
+
+// TestBenchQueriesEmitsAReportWhicheverWayThePolicyGoes is the integration-level
+// half of the same contract.
+//
+// It deliberately does not assert *whether* a one-microsecond budget is missed:
+// that depends on the host clock's resolution, and on Windows a sub-millisecond
+// query can measure as 0.000ms and meet the budget. Comparing two live
+// benchmark runs' budget outcomes -- which an earlier version of this test did
+// -- is comparing two different wall-clock measurements and is nondeterministic
+// by construction. What is invariant, and is asserted, is that the command
+// emits a complete report that agrees with its own exit status either way.
+func TestBenchQueriesEmitsAReportWhicheverWayThePolicyGoes(t *testing.T) {
 	quietStartup(t)
 	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "home"))
 	repoRoot := benchRepo(t)
 
-	// A budget of one microsecond puts every measured scenario over budget: the
-	// fastest query on this graph is tens of microseconds.
-	base := []string{"bench-queries", repoRoot, "--runs", "2", "--warmup", "0", "--budget-ms", "0.001"}
+	args := []string{"bench-queries", repoRoot, "--runs", "2", "--warmup", "0",
+		"--budget-ms", "0.001", "--fail-over-budget"}
+	out, _, err := runCLI(t, args...)
 
-	plain, _, plainErr := runCLI(t, base...)
-	if plainErr != nil {
-		t.Fatalf("without --fail-over-budget: %v", plainErr)
+	report := mustReport(t, out)
+	if report.Schema != querybench.Schema {
+		t.Fatalf("schema = %q, want %q", report.Schema, querybench.Schema)
 	}
-	failing, _, failErr := runCLI(t, append(append([]string{}, base...), "--fail-over-budget")...)
-	if failErr == nil {
-		t.Fatal("--fail-over-budget did not fail on an over-budget report")
+	if report.Summary.Measured == 0 {
+		t.Fatal("no scenario was measured")
 	}
-	if failing == "" {
-		t.Fatal("--fail-over-budget suppressed the report")
-	}
-
-	// Timings differ run to run, so compare the structure rather than the bytes.
-	normalize := func(s string) string {
-		var r querybench.Report
-		if err := json.Unmarshal([]byte(s), &r); err != nil {
-			t.Fatalf("unmarshal: %v", err)
-		}
-		var b strings.Builder
-		b.WriteString(r.Schema)
-		for _, res := range r.Results {
-			b.WriteString("|" + res.Name + ":" + res.Status + ":" + res.Target + ":" + strconv.FormatBool(res.BudgetMet))
-		}
-		b.WriteString("|over=" + strconv.Itoa(r.Summary.OverBudget))
-		return b.String()
-	}
-	if normalize(plain) != normalize(failing) {
-		t.Fatalf("report differs with the failure policy:\n%s\n%s", normalize(plain), normalize(failing))
-	}
-	if r := mustReport(t, failing); r.Summary.OverBudget == 0 {
-		t.Fatalf("a one-microsecond budget produced no over-budget scenario: %+v", r.Summary)
+	if (err != nil) != (report.Summary.OverBudget > 0) {
+		t.Fatalf("exit status and report disagree: err=%v, over_budget=%d",
+			err, report.Summary.OverBudget)
 	}
 }
 

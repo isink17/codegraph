@@ -63,13 +63,31 @@ func runBenchQueries(ctx context.Context, cfg config.Config, stdout io.Writer, a
 	if err != nil {
 		return err
 	}
-	if err := writeJSON(stdout, report); err != nil {
+	return emitBenchQueryReport(stdout, report, *failOverBudget)
+}
+
+// emitBenchQueryReport writes the report, then applies the failure policy.
+//
+// The order is the contract: --fail-over-budget is an exit-status policy, not a
+// filter, so a CI job that fails still gets the numbers that made it fail. Both
+// halves live here rather than inline in runBenchQueries so the contract can be
+// tested against a constructed report instead of against two live benchmark
+// runs, whose timings differ by definition.
+func emitBenchQueryReport(w io.Writer, report querybench.Report, failOverBudget bool) error {
+	if err := writeJSON(w, report); err != nil {
 		return err
 	}
-	if *failOverBudget && report.OverBudget() {
-		return fmt.Errorf("%d of %d measured scenarios exceeded the %.0fms budget (slowest: %s at %.3fms)",
-			report.Summary.OverBudget, report.Summary.Measured, report.BudgetMS,
-			report.Summary.Slowest, report.Summary.SlowestP95MS)
+	return benchQueryFailPolicyError(report, failOverBudget)
+}
+
+// benchQueryFailPolicyError returns the policy violation for an already-produced
+// report, or nil. It reads nothing but the report, so the policy is a pure
+// function of the bytes the command already printed.
+func benchQueryFailPolicyError(report querybench.Report, failOverBudget bool) error {
+	if !failOverBudget || !report.OverBudget() {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%d of %d measured scenarios exceeded the %.0fms budget (slowest: %s at %.3fms)",
+		report.Summary.OverBudget, report.Summary.Measured, report.BudgetMS,
+		report.Summary.Slowest, report.Summary.SlowestP95MS)
 }
