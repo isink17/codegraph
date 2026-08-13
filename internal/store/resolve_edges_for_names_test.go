@@ -118,22 +118,37 @@ func TestResolveEdgesForNames_QualifiedSuffix(t *testing.T) {
 	}
 }
 
+// insertTestFile inserts a Go file. Use insertTestFileLang for other languages.
 func insertTestFile(ctx context.Context, s *Store, repoID int64, path string) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `INSERT INTO files(repo_id, path, language, indexed_at) VALUES(?, ?, ?, '')`, repoID, path, "go")
+	return insertTestFileLang(ctx, s, repoID, path, "go")
+}
+
+// insertTestFileLang inserts a file with an explicit persisted language. An
+// empty language models a file the registry could not classify.
+func insertTestFileLang(ctx context.Context, s *Store, repoID int64, path, language string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `INSERT INTO files(repo_id, path, language, indexed_at) VALUES(?, ?, ?, '')`, repoID, path, language)
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
 }
 
+// insertTestSymbol inserts a Go function symbol. Use insertTestSymbolLang for
+// other languages.
 func insertTestSymbol(ctx context.Context, s *Store, repoID, fileID int64, name, qualified string) (int64, error) {
+	return insertTestSymbolLang(ctx, s, repoID, fileID, name, qualified, "go")
+}
+
+// insertTestSymbolLang inserts a function symbol with an explicit persisted
+// language, so resolver language gating can be exercised directly.
+func insertTestSymbolLang(ctx context.Context, s *Store, repoID, fileID int64, name, qualified, language string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO symbols(
 			repo_id, file_id, language, kind, name, qualified_name,
 			start_line, start_col, end_line, end_col, stable_key, qualified_suffix, dot_tail2, dot_tail3
 		)
 		VALUES(?, ?, ?, ?, ?, ?, 1, 1, 1, 1, ?, ?, ?, ?)
-	`, repoID, fileID, "go", "function", name, qualified, qualified, qualifiedSuffix(qualified), dotTail2(qualified), dotTail3(qualified))
+	`, repoID, fileID, language, "function", name, qualified, qualified+"|"+language, qualifiedSuffix(qualified), dotTail2(qualified), dotTail3(qualified))
 	if err != nil {
 		return 0, err
 	}

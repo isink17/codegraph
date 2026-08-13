@@ -144,7 +144,23 @@ type ResolveEdgesForNamesStats struct {
 	QualifiedScanned  int   `json:"qualified_scanned,omitempty"`
 	SuffixHits        int   `json:"suffix_hits,omitempty"`
 	TargetsSelected   int   `json:"targets_selected,omitempty"`
-	ExactSelectMS     int64 `json:"exact_select_ms,omitempty"`
+	// TargetsResolved counts edges actually bound to a destination symbol,
+	// not merely selected as candidates.
+	TargetsResolved int `json:"targets_resolved,omitempty"`
+	// TargetsUnresolved counts selected edges with a known source language that
+	// found no compatible destination. TargetsResolved + TargetsUnresolved +
+	// UnknownSrcLanguage always equals TargetsSelected.
+	TargetsUnresolved int `json:"targets_unresolved,omitempty"`
+	// LanguageBlocked is the subset of TargetsUnresolved whose name was seen
+	// under a different language. It is a lower bound, not an exact count: a
+	// foreign definition that is itself ambiguous within its own language is
+	// never a candidate and so is not observed here.
+	LanguageBlocked int `json:"language_blocked,omitempty"`
+	// UnknownSrcLanguage counts selected edges whose source file has no
+	// persisted language. Implicit resolution fails closed for them regardless
+	// of whether a destination existed.
+	UnknownSrcLanguage int   `json:"unknown_src_language,omitempty"`
+	ExactSelectMS      int64 `json:"exact_select_ms,omitempty"`
 	SuffixSelectMS    int64 `json:"suffix_select_ms,omitempty"`
 	ResolveTargetsMS  int64 `json:"resolve_targets_ms,omitempty"`
 }
@@ -2193,8 +2209,11 @@ func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, rep
 }
 
 type edgeTarget struct {
-	edgeID  int64
-	dstName string
+	edgeID int64
+	// srcLanguage is the persisted language of the edge's own source file. It
+	// gates which candidate symbols may bind; an empty value fails closed.
+	srcLanguage string
+	dstName     string
 }
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
@@ -2207,7 +2226,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		_ = tx.Rollback()
 	}()
 
-	// Strategy 1: Exact qualified name match
+	// Strategy 1: Exact qualified name match.
+	// Candidates are grouped per (dst_name, language) and applied only to edges
+	// whose own source file language matches -- see resolver_language.go.
 	res, err := tx.ExecContext(ctx, `
 		WITH distinct_names AS (
 			SELECT DISTINCT dst_name
@@ -2215,20 +2236,20 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
 		),
 		resolutions AS (
-			SELECT
-				n.dst_name,
-				(
-					SELECT s.id
-					FROM symbols s
-					WHERE s.repo_id = ? AND s.qualified_name = n.dst_name
-					LIMIT 1
-				) AS dst_symbol_id
+			SELECT n.dst_name AS dst_name, s.language AS dst_language, MIN(s.id) AS dst_symbol_id
 			FROM distinct_names n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.qualified_name = n.dst_name
+			WHERE s.language != ''
+			GROUP BY n.dst_name, s.language
 		)
 		UPDATE edges
-		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
-		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
+		SET dst_symbol_id = r.dst_symbol_id
+		FROM resolutions r, files f
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
+		AND r.dst_name = edges.dst_name
+		AND ` + resolverLanguageGateSQL + `
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -2237,7 +2258,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		totalResolved += int(n)
 	}
 
-	// Strategy 2: Name match (unqualified)
+	// Strategy 2: Name match (unqualified), language-gated.
 	res, err = tx.ExecContext(ctx, `
 		WITH distinct_names AS (
 			SELECT DISTINCT dst_name
@@ -2245,21 +2266,21 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
 		),
 		resolutions AS (
-			SELECT
-				n.dst_name,
-				(
-					SELECT s.id
-					FROM symbols s
-					WHERE s.repo_id = ? AND s.name = n.dst_name
-					AND s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
-					LIMIT 1
-				) AS dst_symbol_id
+			SELECT n.dst_name AS dst_name, s.language AS dst_language, MIN(s.id) AS dst_symbol_id
 			FROM distinct_names n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.name = n.dst_name
+			WHERE s.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
+			AND s.language != ''
+			GROUP BY n.dst_name, s.language
 		)
 		UPDATE edges
-		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
-		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
+		SET dst_symbol_id = r.dst_symbol_id
+		FROM resolutions r, files f
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
+		AND r.dst_name = edges.dst_name
+		AND ` + resolverLanguageGateSQL + `
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -2285,7 +2306,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	}
 	totalResolved += n
 
-	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething)
+	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething), language-gated.
 	res, err = tx.ExecContext(ctx, `
 		WITH distinct_names AS (
 			SELECT DISTINCT dst_name
@@ -2293,22 +2314,21 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
 		),
 		resolutions AS (
-			SELECT
-				n.dst_name,
-				(
-					SELECT s.id
-					FROM symbols s
-					WHERE s.repo_id = ?
-					AND s.name = n.dst_name
-					AND s.container_name != ''
-					LIMIT 1
-				) AS dst_symbol_id
+			SELECT n.dst_name AS dst_name, s.language AS dst_language, MIN(s.id) AS dst_symbol_id
 			FROM distinct_names n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.name = n.dst_name
+			WHERE s.container_name != ''
+			AND s.language != ''
+			GROUP BY n.dst_name, s.language
 		)
 		UPDATE edges
-		SET dst_symbol_id = (SELECT r.dst_symbol_id FROM resolutions r WHERE r.dst_name = edges.dst_name)
-		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND edges.dst_name IN (SELECT dst_name FROM resolutions WHERE dst_symbol_id IS NOT NULL)
+		SET dst_symbol_id = r.dst_symbol_id
+		FROM resolutions r, files f
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
+		AND r.dst_name = edges.dst_name
+		AND ` + resolverLanguageGateSQL + `
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -2406,7 +2426,10 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 		totalResolved += n
 	}
 
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_dot_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_edge_dot_suffix`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_edge_dot_suffix(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
 		return 0, err
 	}
 	dropped := false
@@ -2414,21 +2437,18 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 		if dropped {
 			return
 		}
-		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_edge_dot_suffix`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_edge_dot_suffix`)
 	}()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_edge_dot_suffix`); err != nil {
-		return 0, err
-	}
 
-	// De-correlate the expensive LIKE suffix match: do the work once per distinct dst_name,
-	// then apply the result via a fast equality update on edges.dst_name.
+	// De-correlate the expensive LIKE suffix match: do the work once per distinct
+	// (dst_name, candidate language), then apply the result via an equality update
+	// on edges.dst_name restricted to the edge's own source language.
 	//
-	// This preserves the prior semantics (pick a single match via MIN(id)) while scaling
-	// with the number of unique names rather than total unresolved edges.
+	// This preserves the prior tie-break semantics (MIN(id)) while scaling with the
+	// number of unique names rather than total unresolved edges.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tmp_edge_dot_suffix(dst_name, dst_symbol_id)
-		SELECT e.dst_name,
-			(SELECT MIN(s.id) FROM symbols s WHERE s.repo_id = ? AND s.qualified_name LIKE '%.' || e.dst_name)
+		INSERT INTO tmp_edge_dot_suffix(dst_name, dst_language, dst_symbol_id)
+		SELECT e.dst_name, s.language, MIN(s.id)
 		FROM (
 			SELECT DISTINCT dst_name
 			FROM edges
@@ -2436,24 +2456,27 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 			AND instr(dst_name, '.') > 0 AND instr(dst_name, '/') = 0
 			AND instr(substr(dst_name, instr(dst_name, '.') + 1), '.') > 0
 		) e
-		WHERE EXISTS (
-			SELECT 1 FROM symbols s
-			WHERE s.repo_id = ? AND s.qualified_name LIKE '%.' || e.dst_name
-		)
-	`, repoID, repoID, repoID); err != nil {
+		JOIN symbols s
+		  ON s.repo_id = ?
+		 AND s.qualified_name LIKE '%.' || e.dst_name
+		WHERE s.language != ''
+		GROUP BY e.dst_name, s.language
+	`, repoID, repoID); err != nil {
 		return 0, err
 	}
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE edges
-		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_edge_dot_suffix t WHERE t.dst_name = edges.dst_name)
+		SET dst_symbol_id = r.dst_symbol_id
+		FROM tmp_edge_dot_suffix r, files f
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND edges.dst_name IN (SELECT dst_name FROM tmp_edge_dot_suffix)
+		AND r.dst_name = edges.dst_name
+		AND ` + resolverLanguageGateSQL + `
 	`, repoID)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_edge_dot_suffix`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE temp.tmp_edge_dot_suffix`); err != nil {
 		return 0, err
 	}
 	dropped = true
@@ -2499,7 +2522,10 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 		return 0, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_dot_tail3(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_dot_tail3`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_dot_tail3(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
 		return 0, err
 	}
 	droppedDotTail3 := false
@@ -2507,35 +2533,34 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 		if droppedDotTail3 {
 			return
 		}
-		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_dot_tail3`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_dot_tail3`)
 	}()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_dot_tail3`); err != nil {
-		return 0, err
-	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tmp_symbol_dot_tail3(dst_name, dst_symbol_id)
-		SELECT n.dst_name, MIN(s.id)
+		INSERT INTO tmp_symbol_dot_tail3(dst_name, dst_language, dst_symbol_id)
+		SELECT n.dst_name, s.language, MIN(s.id)
 		FROM tmp_resolver_needed_tail3 n
 		JOIN symbols s
 		  ON s.repo_id = ?
 		 AND s.dot_tail3 = n.dst_name
-		WHERE s.dot_tail3 != ''
-		GROUP BY n.dst_name
+		WHERE s.dot_tail3 != '' AND s.language != ''
+		GROUP BY n.dst_name, s.language
 	`, repoID); err != nil {
 		return 0, err
 	}
 
 	updateRes, err := tx.ExecContext(ctx, `
 		UPDATE edges
-		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_dot_tail3 t WHERE t.dst_name = edges.dst_name)
+		SET dst_symbol_id = r.dst_symbol_id
+		FROM tmp_symbol_dot_tail3 r, files f
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-		AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_dot_tail3)
+		AND r.dst_name = edges.dst_name
+		AND ` + resolverLanguageGateSQL + `
 	`, repoID)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_dot_tail3`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE temp.tmp_symbol_dot_tail3`); err != nil {
 		return 0, err
 	}
 	droppedDotTail3 = true
@@ -2639,7 +2664,10 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			}
 		}
 
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_slash_suffix(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_slash_suffix`); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_slash_suffix(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
 			return 0, err
 		}
 		droppedSlashSuffix := false
@@ -2647,35 +2675,34 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			if droppedSlashSuffix {
 				return
 			}
-			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_slash_suffix`)
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_slash_suffix`)
 		}()
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_slash_suffix`); err != nil {
-			return 0, err
-		}
 
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_symbol_id)
-			SELECT n.dst_name, MIN(s.id)
+			INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_language, dst_symbol_id)
+			SELECT n.dst_name, s.language, MIN(s.id)
 			FROM tmp_resolver_needed_suffix n
 			JOIN symbols s
 			  ON s.repo_id = ?
 			 AND s.qualified_suffix = n.dst_name
-			WHERE s.qualified_suffix != ''
-			GROUP BY n.dst_name
+			WHERE s.qualified_suffix != '' AND s.language != ''
+			GROUP BY n.dst_name, s.language
 		`, repoID); err != nil {
 			return 0, err
 		}
 
 		updateRes, err := tx.ExecContext(ctx, `
 			UPDATE edges
-			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_slash_suffix t WHERE t.dst_name = edges.dst_name)
+			SET dst_symbol_id = r.dst_symbol_id
+			FROM tmp_symbol_slash_suffix r, files f
 			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_slash_suffix)
+			AND r.dst_name = edges.dst_name
+			AND ` + resolverLanguageGateSQL + `
 		`, repoID)
 		if err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_slash_suffix`); err != nil {
+		if _, err := tx.ExecContext(ctx, `DROP TABLE temp.tmp_symbol_slash_suffix`); err != nil {
 			return 0, err
 		}
 		droppedSlashSuffix = true
@@ -2737,7 +2764,10 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			}
 		}
 
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_symbol_dot_tail2(dst_name TEXT PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_dot_tail2`); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_dot_tail2(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
 			return 0, err
 		}
 		droppedDotTail2 := false
@@ -2745,37 +2775,36 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			if droppedDotTail2 {
 				return
 			}
-			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_symbol_dot_tail2`)
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_dot_tail2`)
 		}()
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_symbol_dot_tail2`); err != nil {
-			return 0, err
-		}
 
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tmp_symbol_dot_tail2(dst_name, dst_symbol_id)
-			SELECT n.dst_name, MIN(s.id)
+			INSERT INTO tmp_symbol_dot_tail2(dst_name, dst_language, dst_symbol_id)
+			SELECT n.dst_name, s.language, MIN(s.id)
 			FROM tmp_resolver_needed_tail2 n
 			JOIN symbols s
 			  ON s.repo_id = ?
 			 AND s.dot_tail2 = n.dst_name
-			WHERE s.dot_tail2 != ''
-			GROUP BY n.dst_name
+			WHERE s.dot_tail2 != '' AND s.language != ''
+			GROUP BY n.dst_name, s.language
 		`, repoID); err != nil {
 			return 0, err
 		}
 
 		updateRes, err := tx.ExecContext(ctx, `
 			UPDATE edges
-			SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_symbol_dot_tail2 t WHERE t.dst_name = edges.dst_name)
+			SET dst_symbol_id = r.dst_symbol_id
+			FROM tmp_symbol_dot_tail2 r, files f
 			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 			AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
 			AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') = 0
-			AND edges.dst_name IN (SELECT dst_name FROM tmp_symbol_dot_tail2)
+			AND r.dst_name = edges.dst_name
+			AND ` + resolverLanguageGateSQL + `
 		`, repoID)
 		if err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_symbol_dot_tail2`); err != nil {
+		if _, err := tx.ExecContext(ctx, `DROP TABLE temp.tmp_symbol_dot_tail2`); err != nil {
 			return 0, err
 		}
 		droppedDotTail2 = true
@@ -2812,11 +2841,14 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 
 	const chunkSize = 400
 	fileIDs := make([]int64, 0, len(uniquePaths))
+	// Source language per file is read once here (no per-edge lookup) and carried
+	// into resolveEdgeTargets, which applies the shared language gate.
+	languageByFileID := make(map[int64]string, len(uniquePaths))
 	for start := 0; start < len(uniquePaths); start += chunkSize {
 		end := min(start+chunkSize, len(uniquePaths))
 		chunk := uniquePaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
+		query := `SELECT id, language FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, path := range chunk {
@@ -2828,11 +2860,13 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		}
 		for rows.Next() {
 			var id int64
-			if err := rows.Scan(&id); err != nil {
+			var language string
+			if err := rows.Scan(&id, &language); err != nil {
 				_ = rows.Close()
 				return err
 			}
 			fileIDs = append(fileIDs, id)
+			languageByFileID[id] = language
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -2848,7 +2882,7 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		end := min(start+chunkSize, len(fileIDs))
 		chunk := fileIDs[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
+		query := `SELECT id, dst_name, file_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, id := range chunk {
@@ -2858,13 +2892,14 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		if err != nil {
 			return err
 		}
-		chunkTargets, err := scanEdgeTargets(rows)
+		chunkTargets, err := scanEdgeTargets(rows, languageByFileID)
 		if err != nil {
 			return err
 		}
 		targets = append(targets, chunkTargets...)
 	}
-	return s.resolveEdgeTargets(ctx, repoID, targets)
+	_, err := s.resolveEdgeTargets(ctx, repoID, targets)
+	return err
 }
 
 // ResolveEdgesForNames attempts to resolve currently-unresolved edges across the
@@ -2923,7 +2958,13 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		chunk := unique[start:end]
 
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id, dst_name FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name IN (` + placeholders + `)`
+		// The files join is one primary-key join per batch (not per edge) and
+		// supplies the source language required by the shared resolver gate.
+		query := `
+			SELECT e.id, e.dst_name, f.language
+			FROM edges e
+			JOIN files f ON f.id = e.file_id
+			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)`
 		args := make([]any, 1+len(chunk))
 		args[0] = repoID
 		for i, name := range chunk {
@@ -2937,11 +2978,12 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		for rows.Next() {
 			var id int64
 			var dstName string
-			if err := rows.Scan(&id, &dstName); err != nil {
+			var srcLanguage string
+			if err := rows.Scan(&id, &dstName, &srcLanguage); err != nil {
 				_ = rows.Close()
 				return stats, err
 			}
-			targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+			targetByID[id] = edgeTarget{edgeID: id, dstName: dstName, srcLanguage: srcLanguage}
 			stats.ExactHits++
 		}
 		if err := rows.Err(); err != nil {
@@ -2960,9 +3002,10 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	// queries), but avoid scanning simple dst_name values entirely.
 	suffixStarted := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, dst_name
-		FROM edges
-		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != '' AND instr(dst_name, '.') > 0
+		SELECT e.id, e.dst_name, f.language
+		FROM edges e
+		JOIN files f ON f.id = e.file_id
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND instr(e.dst_name, '.') > 0
 	`, repoID)
 	if err != nil {
 		return stats, err
@@ -2970,7 +3013,8 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	for rows.Next() {
 		var id int64
 		var dstName string
-		if err := rows.Scan(&id, &dstName); err != nil {
+		var srcLanguage string
+		if err := rows.Scan(&id, &dstName, &srcLanguage); err != nil {
 			_ = rows.Close()
 			return stats, err
 		}
@@ -2980,7 +3024,7 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		}
 		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
 			if _, ok := seen[dstName[dot+1:]]; ok {
-				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName}
+				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName, srcLanguage: srcLanguage}
 				stats.SuffixHits++
 			}
 		}
@@ -3000,21 +3044,28 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	}
 	stats.TargetsSelected = len(targets)
 	resolveStarted := time.Now()
-	if err := s.resolveEdgeTargets(ctx, repoID, targets); err != nil {
+	outcome, err := s.resolveEdgeTargets(ctx, repoID, targets)
+	if err != nil {
 		return stats, err
 	}
+	stats.TargetsResolved = outcome.resolved
+	stats.TargetsUnresolved = outcome.unresolved
+	stats.LanguageBlocked = outcome.languageBlocked
+	stats.UnknownSrcLanguage = outcome.unknownSrcLanguage
 	stats.ResolveTargetsMS = time.Since(resolveStarted).Milliseconds()
 	return stats, nil
 }
 
-func scanEdgeTargets(rows *sql.Rows) ([]edgeTarget, error) {
+func scanEdgeTargets(rows *sql.Rows, languageByFileID map[int64]string) ([]edgeTarget, error) {
 	defer rows.Close()
 	var targets []edgeTarget
 	for rows.Next() {
 		var target edgeTarget
-		if err := rows.Scan(&target.edgeID, &target.dstName); err != nil {
+		var fileID int64
+		if err := rows.Scan(&target.edgeID, &target.dstName, &fileID); err != nil {
 			return nil, err
 		}
+		target.srcLanguage = languageByFileID[fileID]
 		targets = append(targets, target)
 	}
 	if err := rows.Err(); err != nil {
@@ -3033,9 +3084,29 @@ func (s *Store) CountUnresolvedEdgesByDstName(ctx context.Context, repoID int64,
 	return n, err
 }
 
-func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget) error {
+// resolveEdgeTargetsOutcome reports what the shared Go-side resolver actually
+// did, so callers can distinguish real resolutions from candidates that were
+// selected but rejected by the language gate.
+type resolveEdgeTargetsOutcome struct {
+	resolved int
+	// unresolved counts targets with a known source language that found no
+	// compatible candidate, for any reason.
+	unresolved int
+	// languageBlocked is the subset of unresolved whose name was seen under a
+	// different language. It is a lower bound: a foreign candidate that is
+	// itself ambiguous within its own language never enters the candidate maps.
+	languageBlocked    int
+	unknownSrcLanguage int
+}
+
+// resolveEdgeTargets is the single Go-side binder shared by the path-scoped and
+// name-targeted resolvers. Candidate lookups are keyed by (name, language) and
+// a target only binds when resolverLanguageCompatible allows it, which is the
+// same rule the repo-wide SQL strategies apply.
+func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget) (resolveEdgeTargetsOutcome, error) {
+	var outcome resolveEdgeTargetsOutcome
 	if len(targets) == 0 {
-		return nil
+		return outcome, nil
 	}
 	qualifiedSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
@@ -3049,7 +3120,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	}
 	byQualified, err := s.resolveSymbolsByQualifiedNames(ctx, repoID, qualifiedNames)
 	if err != nil {
-		return err
+		return outcome, err
 	}
 
 	dotTail := func(name string) string {
@@ -3065,7 +3136,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 
 	shortSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
-		if _, ok := byQualified[target.dstName]; ok {
+		if _, ok := byQualified[symbolLangKey{name: target.dstName, language: target.srcLanguage}]; ok {
 			continue
 		}
 		short := dotTail(target.dstName)
@@ -3079,7 +3150,17 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	}
 	byShort, err := s.resolveUniqueSymbolsByNames(ctx, repoID, shortNames)
 	if err != nil {
-		return err
+		return outcome, err
+	}
+	// Names that exist somewhere in the repo but not in a compatible language.
+	// Used only to report honestly why a candidate stayed unresolved.
+	qualifiedNamesAnyLanguage := make(map[string]struct{}, len(byQualified))
+	for key := range byQualified {
+		qualifiedNamesAnyLanguage[key.name] = struct{}{}
+	}
+	shortNamesAnyLanguage := make(map[string]struct{}, len(byShort))
+	for key := range byShort {
+		shortNamesAnyLanguage[key.name] = struct{}{}
 	}
 
 	type edgeResolution struct {
@@ -3089,15 +3170,28 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	resolutions := make([]edgeResolution, 0, len(targets))
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return outcome, err
 	}
 	for _, target := range targets {
-		dstID, ok := byQualified[target.dstName]
+		short := dotTail(target.dstName)
+		if target.srcLanguage == "" {
+			// Unknown source language: never guess a destination language.
+			// Candidate maps only contain non-empty languages, so this is also
+			// what resolverLanguageCompatible would decide.
+			outcome.unknownSrcLanguage++
+			continue
+		}
+		dstID, ok := byQualified[symbolLangKey{name: target.dstName, language: target.srcLanguage}]
 		if !ok {
-			short := dotTail(target.dstName)
-			dstID, ok = byShort[short]
+			dstID, ok = byShort[symbolLangKey{name: short, language: target.srcLanguage}]
 		}
 		if !ok || dstID == 0 {
+			outcome.unresolved++
+			_, qualifiedElsewhere := qualifiedNamesAnyLanguage[target.dstName]
+			_, shortElsewhere := shortNamesAnyLanguage[short]
+			if qualifiedElsewhere || shortElsewhere {
+				outcome.languageBlocked++
+			}
 			continue
 		}
 		resolutions = append(resolutions, edgeResolution{edgeID: target.edgeID, dstID: dstID})
@@ -3105,16 +3199,16 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 
 	if len(resolutions) == 0 {
 		_ = tx.Rollback()
-		return nil
+		return outcome, nil
 	}
 
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_resolution(edge_id INTEGER PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
 		_ = tx.Rollback()
-		return err
+		return outcome, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_edge_resolution`); err != nil {
 		_ = tx.Rollback()
-		return err
+		return outcome, err
 	}
 
 	// Keep well under SQLite's default variable limit (999).
@@ -3134,30 +3228,42 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
 			_ = tx.Rollback()
-			return err
+			return outcome, err
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `
+	updateRes, err := tx.ExecContext(ctx, `
 		UPDATE edges
 		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_edge_resolution t WHERE t.edge_id = edges.id)
 		WHERE edges.id IN (SELECT edge_id FROM tmp_edge_resolution)
-	`); err != nil {
+	`)
+	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return outcome, err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_edge_resolution`); err != nil {
 		_ = tx.Rollback()
-		return err
+		return outcome, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return outcome, err
 	}
-	return nil
+	if n, err := updateRes.RowsAffected(); err != nil {
+		// Every resolution targets a distinct, still-unresolved edge id, so the
+		// count is known exactly even when the driver cannot report it.
+		outcome.resolved = len(resolutions)
+	} else {
+		outcome.resolved = int(n)
+	}
+	return outcome, nil
 }
 
-func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64, qualifiedNames []string) (map[string]int64, error) {
-	out := map[string]int64{}
+// resolveSymbolsByQualifiedNames returns one candidate per
+// (qualified_name, language) so a caller can only ever select a destination in
+// its own language. Symbols with no persisted language are excluded (fail
+// closed). MIN(id) keeps the pick deterministic within a language.
+func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64, qualifiedNames []string) (map[symbolLangKey]int64, error) {
+	out := map[symbolLangKey]int64{}
 	if len(qualifiedNames) == 0 {
 		return out, nil
 	}
@@ -3167,9 +3273,10 @@ func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64
 		chunk := qualifiedNames[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT qualified_name, id
+			SELECT qualified_name, language, MIN(id)
 			FROM symbols
-			WHERE repo_id = ? AND qualified_name IN (` + placeholders + `)
+			WHERE repo_id = ? AND language != '' AND qualified_name IN (` + placeholders + `)
+			GROUP BY qualified_name, language
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -3182,13 +3289,15 @@ func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64
 		}
 		for rows.Next() {
 			var qualified string
+			var language string
 			var id int64
-			if err := rows.Scan(&qualified, &id); err != nil {
+			if err := rows.Scan(&qualified, &language, &id); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			if _, exists := out[qualified]; !exists {
-				out[qualified] = id
+			key := symbolLangKey{name: qualified, language: language}
+			if _, exists := out[key]; !exists {
+				out[key] = id
 			}
 		}
 		if err := rows.Close(); err != nil {
@@ -3198,8 +3307,16 @@ func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64
 	return out, nil
 }
 
-func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, names []string) (map[string]int64, error) {
-	out := map[string]int64{}
+// resolveUniqueSymbolsByNames returns short-name candidates that are unique
+// *within a language*, keyed by (name, language).
+//
+// Uniqueness is evaluated per language rather than repo-wide because the
+// language gate must not let an unrelated foreign-language definition of the
+// same name discard an otherwise valid same-language target. Ambiguity between
+// several same-language definitions still yields no candidate, exactly as
+// before. Symbols with no persisted language are excluded (fail closed).
+func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, names []string) (map[symbolLangKey]int64, error) {
+	out := map[symbolLangKey]int64{}
 	if len(names) == 0 {
 		return out, nil
 	}
@@ -3209,10 +3326,10 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 		chunk := names[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT name, MIN(id)
+			SELECT name, language, MIN(id)
 			FROM symbols
-			WHERE repo_id = ? AND name IN (` + placeholders + `)
-			GROUP BY name
+			WHERE repo_id = ? AND language != '' AND name IN (` + placeholders + `)
+			GROUP BY name, language
 			HAVING COUNT(1) = 1
 		`
 		args := make([]any, 0, len(chunk)+1)
@@ -3226,12 +3343,13 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 		}
 		for rows.Next() {
 			var name string
+			var language string
 			var id int64
-			if err := rows.Scan(&name, &id); err != nil {
+			if err := rows.Scan(&name, &language, &id); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			out[name] = id
+			out[symbolLangKey{name: name, language: language}] = id
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err
