@@ -40,6 +40,13 @@ const (
 	// coincidence with no call relationship, so any resolution is a false edge.
 	// The fixture contains no FFI or binding declarations of any kind.
 	ExpectInvalid Expectation = "expected_invalid"
+	// ExpectAmbiguous means several same-language definitions compete and the
+	// resolver holds no evidence that distinguishes them. One of them may well
+	// be what the call meant, but nothing in the graph says which, so binding
+	// any of them is an arbitrary choice and staying unresolved is the only
+	// reproducible outcome. Selecting the "reasonable" one is not credited: a
+	// ranking rule that earns that credit does not exist yet.
+	ExpectAmbiguous Expectation = "expected_ambiguous"
 )
 
 // Outcome is the harness verdict for a case after observing the real resolver.
@@ -79,6 +86,10 @@ type Case struct {
 	// ValidTargets lists qualified names that a correct resolver may select.
 	// Only meaningful for ExpectValid.
 	ValidTargets []string
+	// CompetingTargets lists the qualified names that make an ExpectAmbiguous
+	// case ambiguous. It documents what the resolver had to choose between; it
+	// is never a permission to select one of them.
+	CompetingTargets []string
 	// ShadowTargets lists qualified names that are test/mock/fixture
 	// definitions competing with ValidTargets. Selecting one is a miswire and
 	// is additionally counted as a test-shadow binding.
@@ -134,14 +145,17 @@ func Cases() []Case {
 			Note:    "Go emits dst_name Sorter.parse_d; the only dot_tail2 match is a Java method in ShapesD.java. Exercises the suffix strategies rather than exact-name matching.",
 		},
 		{
-			ID:            "E",
-			Title:         "test-shadow candidate competing with the production definition",
-			Expect:        ExpectValid,
-			SrcFile:       "src/py/caller_e.py",
-			DstName:       "load_config_e",
-			ValidTargets:  []string{"config_e.load_config_e"},
+			ID:      "E",
+			Title:   "test-shadow candidate competing with the production definition",
+			Expect:  ExpectAmbiguous,
+			SrcFile: "src/py/caller_e.py",
+			DstName: "load_config_e",
+			CompetingTargets: []string{
+				"config_e.load_config_e",
+				"test_config_e.load_config_e",
+			},
 			ShadowTargets: []string{"test_config_e.load_config_e"},
-			Note:          "Production code calls load_config_e; both a production and a test definition exist. Measures which one current resolution binds.",
+			Note:          "Production code calls load_config_e; a production and a test definition compete, both python, both plain functions. Until a test-shadow ranking rule exists the resolver has nothing that separates them, so P3 requires a stable unresolved result: binding the production definition would be the right answer reached by an arbitrary route (symbol insertion order), and binding the test definition would be a false edge.",
 		},
 		{
 			ID:      "F",
