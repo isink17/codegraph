@@ -2663,25 +2663,7 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 	// This scales with the number of unique names rather than total unresolved
 	// edges. A dst_name whose LIKE pattern matches several same-language symbols
 	// is ambiguous at suffix evidence level and is dropped, not tie-broken.
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tmp_edge_dot_suffix(dst_name, dst_language, any_symbol_id, production_symbol_id)
-		SELECT e.dst_name, s.language,
-			`+resolverCandidateAggregatesSQL+`
-		FROM (
-			SELECT DISTINCT dst_name
-			FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL
-			AND instr(dst_name, '.') > 0 AND instr(dst_name, '/') = 0
-			AND instr(substr(dst_name, instr(dst_name, '.') + 1), '.') > 0
-		) e
-		JOIN symbols s
-		  ON s.repo_id = ?
-		 AND s.qualified_name LIKE '%.' || e.dst_name
-		`+resolverCandidateJoinSQL+`
-		WHERE s.language != ''
-		GROUP BY e.dst_name, s.language
-		`+resolverCandidateHavingSQL+`
-	`, repoID, repoID); err != nil {
+	if err := s.populateDotSuffixCandidates(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
 
