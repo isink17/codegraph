@@ -15,7 +15,10 @@
 - `internal/parser`: parser interfaces and language adapters
 - `internal/classify`: evidence-based classification of unresolved edge targets
   (builtin/stdlib/external/unknown); owns all per-language rules
-- `internal/audit`: developer resolver-correctness audit and its fixture
+- `internal/audit`: developer-only resolver-correctness harness and its synthetic
+  fixture (`go run ./internal/audit/cmd/resolveraudit`); not a CLI or MCP command
+- `internal/graphaudit`: production audit of a user's already-indexed graph
+  (`codegraph audit`, MCP `audit`); read-only, observational, never re-resolves
 - `internal/query`: symbol, caller, callee, impact, and stats queries
 - `internal/search`: lightweight local semantic ranking
 - `internal/mcp`: stdio MCP server and tool routing

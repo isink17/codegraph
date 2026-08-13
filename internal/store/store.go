@@ -336,6 +336,15 @@ func BuildSQLiteDSN(path string, opts OpenOptions, isNewDB bool, readOnly bool) 
 		values.Set("mode", "ro")
 	}
 	for _, pragma := range pragmas {
+		// journal_mode is a persistent, written setting, so applying it over a
+		// mode=ro handle fails -- and it fails on the first statement rather
+		// than at open, surfacing as an unattributable "attempt to write a
+		// readonly database". A reader has no business changing the journal
+		// mode anyway: it must read the database in whatever mode it already
+		// uses, which is exactly what omitting the pragma does.
+		if readOnly && strings.HasPrefix(pragma, "journal_mode(") {
+			continue
+		}
 		values.Add("_pragma", pragma)
 	}
 	p := filepath.ToSlash(path)

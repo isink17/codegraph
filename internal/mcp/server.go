@@ -11,6 +11,7 @@ import (
 	"github.com/isink17/codegraph/internal/agent"
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/framework"
+	"github.com/isink17/codegraph/internal/graphaudit"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
@@ -157,6 +158,8 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		return nil, err
 	}
 	switch name {
+	case "audit":
+		return s.handleAudit(ctx, raw)
 	case "index_repo":
 		return s.handleIndex(ctx, raw, false)
 	case "update_graph":
@@ -520,6 +523,73 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 	return wrapData(key, items, err)
 }
 
+// handleAudit runs the production graph audit against the server's active
+// repository and returns the same graphaudit.Report the CLI prints. There is
+// one audit implementation; this is a second caller of it, not a second copy.
+//
+// Two differences from the CLI are deliberate:
+//
+//   - There is no --fail-on equivalent. Exit-code policy is a property of a
+//     process, and an MCP tool call has no exit code; a client that wants to
+//     gate on severity reads report.status, which is the same value --fail-on
+//     consults.
+//   - There is no repo argument. Every tool on this server operates on the
+//     repository it was started for, and audit follows that convention rather
+//     than introducing a way to reach outside it.
+//
+// The handle is the server's ordinary read-write store, so the driver-level
+// guarantee store.OpenReadOnly gives the CLI does not apply here. graphaudit
+// issues only SELECT either way -- see its package comment.
+func (s *Server) handleAudit(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		// Pointer so an omitted `examples` (use the default) is distinguishable
+		// from an explicit 0 (counts only).
+		Examples *int `json:"examples"`
+	}
+	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	exampleLimit := graphaudit.DefaultExampleLimit
+	if req.Examples != nil {
+		if *req.Examples < 0 {
+			return nil, fmt.Errorf("invalid examples %d: want 0 or more", *req.Examples)
+		}
+		// graphaudit spells counts-only as a negative limit and treats 0 as
+		// "use the default"; the wire spells counts-only as 0.
+		if exampleLimit = *req.Examples; exampleLimit == 0 {
+			exampleLimit = -1
+		}
+	}
+
+	// A lookup failure here means the database itself is unreadable, which the
+	// audit below would hit anyway with a less informative message. Surface it
+	// rather than reporting an empty canonical path as if the repository simply
+	// were not registered.
+	repo, found, err := s.store.FindRepo(ctx, s.repoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("look up repository %s: %w", s.repoRoot, err)
+	}
+	canonical := ""
+	if found {
+		canonical = repo.CanonicalPath
+	}
+
+	report, err := graphaudit.Run(ctx, s.store, graphaudit.Options{
+		RepoID:       s.repoID,
+		ExampleLimit: exampleLimit,
+		Repository: graphaudit.Repository{
+			Root:          s.repoRoot,
+			CanonicalPath: canonical,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": report}, nil
+}
+
 func wrapData(key string, value any, err error) (map[string]any, error) {
 	if err != nil {
 		return nil, err
@@ -589,6 +659,7 @@ func buildToolDefinitions() []map[string]any {
 		toolDef("session_context", "Get aggregated session context for pre-loading", []string{"session_id"}, nil),
 		toolDef("graph_analytics", "Run graph analytics: pagerank, coupling, or cycles", []string{"analysis", "limit"}, []string{"analysis"}),
 		toolDef("agentic_query", "Ask a question answered by an AI agent that reasons over the code graph (requires local Ollama)", []string{"query", "max_steps"}, []string{"query"}),
+		toolDef("audit", "Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only)", []string{"examples"}, nil),
 	}
 }
 
@@ -596,7 +667,7 @@ func toolDef(name, description string, properties, required []string) map[string
 	props := map[string]any{}
 	for _, prop := range properties {
 		props[prop] = map[string]any{"type": "string"}
-		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" || prop == "max_files" || prop == "max_symbols" || prop == "max_steps" {
+		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" || prop == "max_files" || prop == "max_symbols" || prop == "max_steps" || prop == "examples" {
 			props[prop] = map[string]any{"type": "integer"}
 		}
 		if prop == "force" || prop == "include_tests" || prop == "include_callers" {
@@ -663,6 +734,7 @@ var toolArgumentSpecs = map[string]toolArgSpec{
 	"session_context":       {properties: map[string]string{"session_id": "string"}},
 	"graph_analytics":       {properties: map[string]string{"analysis": "string", "limit": "integer"}, required: []string{"analysis"}},
 	"agentic_query":         {properties: map[string]string{"query": "string", "max_steps": "integer"}, required: []string{"query"}},
+	"audit":                 {properties: map[string]string{"examples": "integer"}},
 }
 
 func validateToolArguments(name string, raw json.RawMessage) error {

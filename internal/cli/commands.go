@@ -301,6 +301,32 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			// audit is deliberately separate from doctor: doctor reports on the
+			// installation and the database file, audit reports on the graph
+			// inside it. Neither reads what the other reads.
+			name:        "audit",
+			description: "audit the indexed graph for integrity and trust issues",
+			usageLines: []string{
+				"  audit [PATH]",
+				"    add --repo-root PATH instead of the positional argument",
+				"    add --examples N to cap examples per finding (0 for counts only)",
+				"    add --fail-on error|warning to exit non-zero on findings",
+			},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root to audit (defaults to the git repo root)"},
+				{name: "--examples N", description: "maximum examples per finding (default 5, 0 for counts only)"},
+				{name: "--fail-on VALUE", description: "none (default), error, or warning; affects the exit code only"},
+			},
+			examples: []string{
+				"codegraph audit .",
+				"codegraph audit . --examples 0",
+				"codegraph audit . --fail-on error",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runAudit(ctx, cfg, stdout, args)
+			},
+		},
+		{
 			name:        "config",
 			description: "config commands",
 			usageLines: []string{
