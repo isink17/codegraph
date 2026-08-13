@@ -239,13 +239,16 @@ func binderSetResolvedSQL() string {
 // cannot disagree about the confidence attached to the same evidence level.
 //
 // It assumes the surroundings every repo-wide strategy already has: the update
-// target is `edges` and the candidate relation is joined in as `r` with a
-// `dst_symbol_id` column.
+// target is `edges` and the candidate relation is joined in as `r` exposing the
+// two nullable candidate ids resolverCandidateAggregatesSQL computes. Which of
+// them is written is decided in exactly one place --
+// resolverChosenCandidateSQL -- so no strategy can apply the P7 caller-kind rule
+// differently from the rest.
 //
 // The interpolated values are compile-time constants from this file, never
 // caller input.
 func resolverSetResolvedSQL(strategy string) string {
-	return `SET dst_symbol_id = r.dst_symbol_id,
+	return `SET dst_symbol_id = ` + resolverChosenCandidateSQL + `,
 			resolution_strategy = '` + strategy + `',
 			resolution_confidence = '` + resolutionConfidenceFor(strategy) + `'`
 }

@@ -28,6 +28,15 @@ func TestFixtureIntegrity(t *testing.T) {
 		}
 		seenName[c.DstName] = c.ID
 
+		// A shadow target is by definition never a selectable one. Without this,
+		// a case could declare the same qualified name as both and pass whatever
+		// the resolver did.
+		for _, shadow := range c.ShadowTargets {
+			if containsString(c.ValidTargets, shadow) {
+				t.Errorf("case %s declares %q as both a valid and a shadow target", c.ID, shadow)
+			}
+		}
+
 		switch c.Expect {
 		case ExpectValid:
 			if len(c.ValidTargets) == 0 {
@@ -278,32 +287,42 @@ func TestAmbiguityIsMeasured(t *testing.T) {
 	}
 }
 
-// TestAmbiguousCaseStaysUnresolvedDeterministically pins the P3 contract for
-// case E: two same-language definitions compete, nothing distinguishes them, so
-// every repeat must leave the edge unresolved. A run that binds either one --
-// even the production definition -- is an arbitrary selection and fails here.
-func TestAmbiguousCaseStaysUnresolvedDeterministically(t *testing.T) {
+// TestTestShadowCaseResolvesToProductionDeterministically pins the P7 contract
+// for case E: a production caller faces one production and one test definition
+// of the same name, and every repeat must select the production one. Binding the
+// test definition, or leaving the edge unresolved, both fail here -- and so does
+// selecting a different destination on different runs, which is what would
+// happen if the answer came from insertion order rather than from the rule.
+func TestTestShadowCaseResolvesToProductionDeterministically(t *testing.T) {
 	report := runAudit(t, Options{Repeats: 5})
 
 	caseE := findCase(t, report, "E")
-	if caseE.Expectation != ExpectAmbiguous {
-		t.Fatalf("case E expectation = %q, want %q", caseE.Expectation, ExpectAmbiguous)
+	if caseE.Expectation != ExpectValid {
+		t.Fatalf("case E expectation = %q, want %q", caseE.Expectation, ExpectValid)
 	}
+	// The case is only meaningful while the shadow definition is still in the
+	// graph and still competing: without it, this measures nothing.
 	if caseE.CandidateCount < 2 {
 		t.Fatalf("case E should present competing candidates, got %d: %v", caseE.CandidateCount, caseE.CandidateTargets)
 	}
-	if caseE.Outcome != OutcomeExpectedUnresolved {
-		t.Errorf("case E outcome = %q (variants %v), want %q; ambiguous candidates must not be tie-broken",
-			caseE.Outcome, caseE.OutcomeVariants, OutcomeExpectedUnresolved)
+	if len(caseE.ShadowCandidates) == 0 {
+		t.Fatal("case E no longer has a competing test definition; the fixture stopped exercising test shadowing")
+	}
+	if caseE.Outcome != OutcomeExpectedValid {
+		t.Errorf("case E outcome = %q (variants %v), want %q; the production definition is the uniquely valid target",
+			caseE.Outcome, caseE.OutcomeVariants, OutcomeExpectedValid)
 	}
 	if caseE.MiswiredAnyRun {
-		t.Error("case E bound a destination in at least one run; ambiguity must not be resolved by insertion order")
+		t.Error("case E bound a destination the fixture declares invalid in at least one run")
 	}
 	if caseE.TestShadowBinding {
-		t.Error("case E bound a test definition; no test-shadow ranking rule exists")
+		t.Error("case E bound a test definition; production code must never be wired into a test")
 	}
 	if !caseE.SelectedStable {
 		t.Errorf("case E selected different destinations across runs: %v", caseE.SelectedVariants)
+	}
+	if caseE.Selected == nil || caseE.Selected.DstQualifiedName != "config_e.load_config_e" {
+		t.Errorf("case E selected %v, want config_e.load_config_e", caseE.Selected)
 	}
 }
 

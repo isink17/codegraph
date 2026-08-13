@@ -160,6 +160,12 @@ type ResolveEdgesForNamesStats struct {
 	// disjoint from LanguageBlocked: an edge is reported as blocked by the
 	// ambiguity it actually hit, never as both.
 	AmbiguityBlocked int `json:"ambiguity_blocked,omitempty"`
+	// TestShadowBlocked is the subset of TargetsUnresolved whose calling file is
+	// production code while every same-language candidate was declared in a test
+	// file. Disjoint from both counters above: the name matched, in the right
+	// language, unambiguously -- and production code is still not wired into a
+	// test definition. See resolver_testfile.go.
+	TestShadowBlocked int `json:"test_shadow_blocked,omitempty"`
 	// UnknownSrcLanguage counts selected edges whose source file has no
 	// persisted language. Implicit resolution fails closed for them regardless
 	// of whether a destination existed.
@@ -2203,7 +2209,13 @@ type edgeTarget struct {
 	// srcLanguage is the persisted language of the edge's own source file. It
 	// gates which candidate symbols may bind; an empty value fails closed.
 	srcLanguage string
-	dstName     string
+	// srcFileID identifies the edge's own source file. resolveEdgeTargets looks
+	// it up in the repo's test-file set to decide whether this call site may bind
+	// test definitions at all -- see resolver_testfile.go. Carrying the id rather
+	// than a classified bool keeps IsTestFilePath called once per file per
+	// resolve instead of once per edge.
+	srcFileID int64
+	dstName   string
 }
 
 // ensureResolverAmbiguousNamesTable makes the veto table exist for the current
@@ -2212,29 +2224,38 @@ type edgeTarget struct {
 // ensures it rather than assuming ResolveEdges ran first. An empty table vetoes
 // nothing, which is the correct reading for a strategy invoked in isolation.
 func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
-	_, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+resolverAmbiguousNamesTable+
-		`(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`)
-	return err
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+resolverAmbiguousNamesTable+
+		`(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, caller_is_test INTEGER NOT NULL,
+			PRIMARY KEY(dst_name, dst_language, caller_is_test)) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	// The veto predicate reads the test-file set to decide which caller kind a
+	// row applies to, so a strategy that ensures one table needs the other too.
+	return ensureResolverTestFilesTable(ctx, tx)
 }
 
-// recordAmbiguousResolverNames fills the cross-strategy ambiguity veto table
-// with the (dst_name, language) pairs that several same-language symbols claim,
-// evaluated over the currently unresolved edge names at the two broadest
-// evidence levels: exact qualified name and bare name.
+// prepareResolverTables builds the two per-resolve temp relations every
+// repo-wide strategy reads: the test-file set (P7) and the cross-strategy
+// ambiguity veto (P3). The veto aggregates classify candidates as production or
+// test, so the order matters -- the test-file set is populated first.
 //
-// Two set-based aggregates over the same indexed columns the strategies
-// themselves join on; no per-edge or per-name query.
-func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, repoID int64) error {
+// Re-indexing an already-resolved repository leaves nothing to decide, so a
+// single EXISTS check skips both populations rather than scanning for candidates
+// no edge is waiting on. The tables still exist (empty), which every strategy
+// reads as "no test files, no vetoed names".
+func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID int64) error {
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable); err != nil {
+		return err
+	}
+	// Both tables exist even on the early return below, so a strategy that runs
+	// anyway reads them as "no test files, no vetoed names" rather than failing.
 	if err := ensureResolverAmbiguousNamesTable(ctx, tx); err != nil {
 		return err
 	}
 
-	// Re-indexing an already-resolved repository leaves nothing to decide, so
-	// skip the aggregates entirely rather than scanning for candidates no edge
-	// is waiting on.
 	var hasUnresolved int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT EXISTS(
@@ -2247,39 +2268,72 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 	if hasUnresolved == 0 {
 		return nil
 	}
+	if err := s.recordResolverTestFiles(ctx, tx, repoID); err != nil {
+		return err
+	}
+	return s.recordAmbiguousResolverNames(ctx, tx, repoID)
+}
 
+// recordAmbiguousResolverNames fills the cross-strategy ambiguity veto table
+// with the (dst_name, language, caller kind) triples that no single candidate
+// serves, evaluated over the currently unresolved edge names at the two broadest
+// evidence levels: exact qualified name and bare name.
+//
+// One row per caller kind that the level failed to decide for: a test caller is
+// undecided when the group does not hold exactly one candidate, a production
+// caller when it does not hold exactly one production candidate. The cross join
+// against the two literal kinds keeps this at one aggregate per evidence level --
+// the same two set-based scans over the same indexed columns the strategies
+// themselves join on, with no per-edge or per-name query.
+func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, repoID int64) error {
+	// Both levels emit veto rows from the same shape: group candidate symbols by
+	// (dst_name, language), count them and count the production ones, then emit
+	// the caller kinds that count leaves undecided.
+	vetoScopes := `
+		JOIN (SELECT 0 AS caller_is_test UNION ALL SELECT 1) k
+		WHERE (k.caller_is_test = 1 AND g.candidates != 1)
+		   OR (k.caller_is_test = 0 AND g.production_candidates != 1)
+	`
+	candidateCounts := `COUNT(*) AS candidates,
+			SUM(CASE WHEN tf.file_id IS NULL THEN 1 ELSE 0 END) AS production_candidates`
 	ambiguityQueries := []string{
 		`
-		INSERT OR IGNORE INTO ` + resolverAmbiguousNamesTable + `(dst_name, dst_language)
-		SELECT n.dst_name, s.language
+		INSERT OR IGNORE INTO ` + resolverAmbiguousNamesTable + `(dst_name, dst_language, caller_is_test)
+		SELECT g.dst_name, g.dst_language, k.caller_is_test
 		FROM (
-			SELECT DISTINCT dst_name
-			FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-		) n
-		JOIN symbols s
-		  ON s.repo_id = ?
-		 AND s.qualified_name = n.dst_name
-		WHERE s.language != ''
-		GROUP BY n.dst_name, s.language
-		HAVING COUNT(*) > 1
-		`,
+			SELECT n.dst_name AS dst_name, s.language AS dst_language, ` + candidateCounts + `
+			FROM (
+				SELECT DISTINCT dst_name
+				FROM edges
+				WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+			) n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.qualified_name = n.dst_name
+			` + resolverCandidateJoinSQL + `
+			WHERE s.language != ''
+			GROUP BY n.dst_name, s.language
+		) g
+		` + vetoScopes,
 		`
-		INSERT OR IGNORE INTO ` + resolverAmbiguousNamesTable + `(dst_name, dst_language)
-		SELECT n.dst_name, s.language
+		INSERT OR IGNORE INTO ` + resolverAmbiguousNamesTable + `(dst_name, dst_language, caller_is_test)
+		SELECT g.dst_name, g.dst_language, k.caller_is_test
 		FROM (
-			SELECT DISTINCT dst_name
-			FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-		) n
-		JOIN symbols s
-		  ON s.repo_id = ?
-		 AND s.name = n.dst_name
-		WHERE (s.kind IN ` + resolverBareNameKindsSQL + ` OR s.container_name != '')
-		AND s.language != ''
-		GROUP BY n.dst_name, s.language
-		HAVING COUNT(*) > 1
-		`,
+			SELECT n.dst_name AS dst_name, s.language AS dst_language, ` + candidateCounts + `
+			FROM (
+				SELECT DISTINCT dst_name
+				FROM edges
+				WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+			) n
+			JOIN symbols s
+			  ON s.repo_id = ?
+			 AND s.name = n.dst_name
+			` + resolverCandidateJoinSQL + `
+			WHERE (s.kind IN ` + resolverBareNameKindsSQL + ` OR s.container_name != '')
+			AND s.language != ''
+			GROUP BY n.dst_name, s.language
+		) g
+		` + vetoScopes,
 	}
 	for _, query := range ambiguityQueries {
 		if _, err := tx.ExecContext(ctx, query, repoID, repoID); err != nil {
@@ -2299,22 +2353,24 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		_ = tx.Rollback()
 	}()
 
-	// Record, once, the names that are already undecidable at the broadest
-	// evidence levels, so no later strategy can bind one of them by matching a
-	// narrower slice of the same candidates. See resolver_ambiguity.go.
-	if err := s.recordAmbiguousResolverNames(ctx, tx, repoID); err != nil {
+	// Record, once, which files are test files (P7) and which names are already
+	// undecidable at the broadest evidence levels, so no later strategy can bind
+	// one of them by matching a narrower slice of the same candidates. See
+	// resolver_testfile.go and resolver_ambiguity.go.
+	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
-	// Temp DDL is transactional in SQLite, so a rollback already discards the
-	// veto table. The explicit drop before the commit below is what keeps a
-	// populated table off the pooled connection on the success path; this defer
-	// only covers returns that never reach it.
+	// Temp DDL is transactional in SQLite, so a rollback already discards these
+	// tables. The explicit drop before the commit below is what keeps populated
+	// tables off the pooled connection on the success path; this defer only
+	// covers returns that never reach it.
 	vetoDropped := false
 	defer func() {
 		if vetoDropped {
 			return
 		}
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable)
 	}()
 
 	// Strategy 1: Exact qualified name match.
@@ -2337,21 +2393,24 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
 		),
 		resolutions AS (
-			SELECT n.dst_name AS dst_name, s.language AS dst_language, MIN(s.id) AS dst_symbol_id
+			SELECT n.dst_name AS dst_name, s.language AS dst_language,
+				`+resolverCandidateAggregatesSQL+`
 			FROM distinct_names n
 			JOIN symbols s
 			  ON s.repo_id = ?
 			 AND s.qualified_name = n.dst_name
+			`+resolverCandidateJoinSQL+`
 			WHERE s.language != ''
 			GROUP BY n.dst_name, s.language
-			`+resolverUniqueCandidateSQL+`
+			`+resolverCandidateHavingSQL+`
 		)
 		UPDATE edges
 		`+resolverSetResolvedSQL(ResolutionStrategyExactQualified)+`
 		FROM resolutions r, files f
+			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
-		AND `+resolverLanguageGateSQL+`
+		AND `+resolverBindableCandidateSQL+`
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -2370,19 +2429,22 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
 		),
 		resolutions AS (
-			SELECT n.dst_name AS dst_name, s.language AS dst_language, MIN(s.id) AS dst_symbol_id
+			SELECT n.dst_name AS dst_name, s.language AS dst_language,
+				`+resolverCandidateAggregatesSQL+`
 			FROM distinct_names n
 			JOIN symbols s
 			  ON s.repo_id = ?
 			 AND s.name = n.dst_name
+			`+resolverCandidateJoinSQL+`
 			WHERE s.kind IN `+resolverBareNameKindsSQL+`
 			AND s.language != ''
 			GROUP BY n.dst_name, s.language
-			`+resolverUniqueCandidateSQL+`
+			`+resolverCandidateHavingSQL+`
 		)
 		UPDATE edges
 		`+resolverSetResolvedSQL(ResolutionStrategyExactName)+`
 		FROM resolutions r, files f
+			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
 		AND `+resolverBindGateSQL+`
@@ -2421,19 +2483,22 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
 		),
 		resolutions AS (
-			SELECT n.dst_name AS dst_name, s.language AS dst_language, MIN(s.id) AS dst_symbol_id
+			SELECT n.dst_name AS dst_name, s.language AS dst_language,
+				`+resolverCandidateAggregatesSQL+`
 			FROM distinct_names n
 			JOIN symbols s
 			  ON s.repo_id = ?
 			 AND s.name = n.dst_name
+			`+resolverCandidateJoinSQL+`
 			WHERE s.container_name != ''
 			AND s.language != ''
 			GROUP BY n.dst_name, s.language
-			`+resolverUniqueCandidateSQL+`
+			`+resolverCandidateHavingSQL+`
 		)
 		UPDATE edges
 		`+resolverSetResolvedSQL(ResolutionStrategyReceiverMethod)+`
 		FROM resolutions r, files f
+			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
 		AND `+resolverBindGateSQL+`
@@ -2446,6 +2511,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	}
 
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable); err != nil {
 		return 0, err
 	}
 	vetoDropped = true
@@ -2547,7 +2615,7 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_edge_dot_suffix`); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_edge_dot_suffix(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_edge_dot_suffix(`+resolverCandidateColumnsDDL+`) WITHOUT ROWID`); err != nil {
 		return 0, err
 	}
 	dropped := false
@@ -2566,8 +2634,9 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 	// edges. A dst_name whose LIKE pattern matches several same-language symbols
 	// is ambiguous at suffix evidence level and is dropped, not tie-broken.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tmp_edge_dot_suffix(dst_name, dst_language, dst_symbol_id)
-		SELECT e.dst_name, s.language, MIN(s.id)
+		INSERT INTO tmp_edge_dot_suffix(dst_name, dst_language, any_symbol_id, production_symbol_id)
+		SELECT e.dst_name, s.language,
+			`+resolverCandidateAggregatesSQL+`
 		FROM (
 			SELECT DISTINCT dst_name
 			FROM edges
@@ -2578,9 +2647,10 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 		JOIN symbols s
 		  ON s.repo_id = ?
 		 AND s.qualified_name LIKE '%.' || e.dst_name
+		`+resolverCandidateJoinSQL+`
 		WHERE s.language != ''
 		GROUP BY e.dst_name, s.language
-		`+resolverUniqueCandidateSQL+`
+		`+resolverCandidateHavingSQL+`
 	`, repoID, repoID); err != nil {
 		return 0, err
 	}
@@ -2589,6 +2659,7 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 		UPDATE edges
 		`+resolverSetResolvedSQL(ResolutionStrategyDotSuffix)+`
 		FROM tmp_edge_dot_suffix r, files f
+			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 		AND r.dst_name = edges.dst_name
 		AND `+resolverBindGateSQL+`
@@ -2651,7 +2722,7 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_dot_tail3`); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_dot_tail3(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_dot_tail3(`+resolverCandidateColumnsDDL+`) WITHOUT ROWID`); err != nil {
 		return 0, err
 	}
 	droppedDotTail3 := false
@@ -2663,15 +2734,17 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 	}()
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tmp_symbol_dot_tail3(dst_name, dst_language, dst_symbol_id)
-		SELECT n.dst_name, s.language, MIN(s.id)
+		INSERT INTO tmp_symbol_dot_tail3(dst_name, dst_language, any_symbol_id, production_symbol_id)
+		SELECT n.dst_name, s.language,
+			`+resolverCandidateAggregatesSQL+`
 		FROM tmp_resolver_needed_tail3 n
 		JOIN symbols s
 		  ON s.repo_id = ?
 		 AND s.dot_tail3 = n.dst_name
+		`+resolverCandidateJoinSQL+`
 		WHERE s.dot_tail3 != '' AND s.language != ''
 		GROUP BY n.dst_name, s.language
-		`+resolverUniqueCandidateSQL+`
+		`+resolverCandidateHavingSQL+`
 	`, repoID); err != nil {
 		return 0, err
 	}
@@ -2680,6 +2753,7 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 		UPDATE edges
 		`+resolverSetResolvedSQL(ResolutionStrategyDotTail3)+`
 		FROM tmp_symbol_dot_tail3 r, files f
+			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 		AND r.dst_name = edges.dst_name
 		AND `+resolverBindGateSQL+`
@@ -2800,7 +2874,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_slash_suffix`); err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_slash_suffix(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_slash_suffix(`+resolverCandidateColumnsDDL+`) WITHOUT ROWID`); err != nil {
 			return 0, err
 		}
 		droppedSlashSuffix := false
@@ -2812,15 +2886,17 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		}()
 
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_language, dst_symbol_id)
-			SELECT n.dst_name, s.language, MIN(s.id)
+			INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_language, any_symbol_id, production_symbol_id)
+			SELECT n.dst_name, s.language,
+				`+resolverCandidateAggregatesSQL+`
 			FROM tmp_resolver_needed_suffix n
 			JOIN symbols s
 			  ON s.repo_id = ?
 			 AND s.qualified_suffix = n.dst_name
+			`+resolverCandidateJoinSQL+`
 			WHERE s.qualified_suffix != '' AND s.language != ''
 			GROUP BY n.dst_name, s.language
-			`+resolverUniqueCandidateSQL+`
+			`+resolverCandidateHavingSQL+`
 		`, repoID); err != nil {
 			return 0, err
 		}
@@ -2829,6 +2905,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			UPDATE edges
 			`+resolverSetResolvedSQL(ResolutionStrategySlashSuffix)+`
 			FROM tmp_symbol_slash_suffix r, files f
+			`+resolverCallerTestJoinSQL+`
 			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 			AND r.dst_name = edges.dst_name
 			AND `+resolverBindGateSQL+`
@@ -2901,7 +2978,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_dot_tail2`); err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_dot_tail2(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, dst_symbol_id INTEGER NOT NULL, PRIMARY KEY(dst_name, dst_language)) WITHOUT ROWID`); err != nil {
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_dot_tail2(`+resolverCandidateColumnsDDL+`) WITHOUT ROWID`); err != nil {
 			return 0, err
 		}
 		droppedDotTail2 := false
@@ -2913,15 +2990,17 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 		}()
 
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tmp_symbol_dot_tail2(dst_name, dst_language, dst_symbol_id)
-			SELECT n.dst_name, s.language, MIN(s.id)
+			INSERT INTO tmp_symbol_dot_tail2(dst_name, dst_language, any_symbol_id, production_symbol_id)
+			SELECT n.dst_name, s.language,
+				`+resolverCandidateAggregatesSQL+`
 			FROM tmp_resolver_needed_tail2 n
 			JOIN symbols s
 			  ON s.repo_id = ?
 			 AND s.dot_tail2 = n.dst_name
+			`+resolverCandidateJoinSQL+`
 			WHERE s.dot_tail2 != '' AND s.language != ''
 			GROUP BY n.dst_name, s.language
-			`+resolverUniqueCandidateSQL+`
+			`+resolverCandidateHavingSQL+`
 		`, repoID); err != nil {
 			return 0, err
 		}
@@ -2930,6 +3009,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			UPDATE edges
 			`+resolverSetResolvedSQL(ResolutionStrategyDotTail2)+`
 			FROM tmp_symbol_dot_tail2 r, files f
+			`+resolverCallerTestJoinSQL+`
 			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 			AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
 			AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') = 0
@@ -3094,9 +3174,11 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		// The files join is one primary-key join per batch (not per edge) and
-		// supplies the source language required by the shared resolver gate.
+		// supplies the source language required by the shared resolver gate. The
+		// caller's own file id travels with it so resolveEdgeTargets can classify
+		// it against the repo's test-file set.
 		query := `
-			SELECT e.id, e.dst_name, f.language
+			SELECT e.id, e.dst_name, f.language, e.file_id
 			FROM edges e
 			JOIN files f ON f.id = e.file_id
 			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)`
@@ -3114,11 +3196,17 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			var id int64
 			var dstName string
 			var srcLanguage string
-			if err := rows.Scan(&id, &dstName, &srcLanguage); err != nil {
+			var srcFileID int64
+			if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID); err != nil {
 				_ = rows.Close()
 				return stats, err
 			}
-			targetByID[id] = edgeTarget{edgeID: id, dstName: dstName, srcLanguage: srcLanguage}
+			targetByID[id] = edgeTarget{
+				edgeID:      id,
+				dstName:     dstName,
+				srcLanguage: srcLanguage,
+				srcFileID:   srcFileID,
+			}
 			stats.ExactHits++
 		}
 		if err := rows.Err(); err != nil {
@@ -3137,7 +3225,7 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	// queries), but avoid scanning simple dst_name values entirely.
 	suffixStarted := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT e.id, e.dst_name, f.language
+		SELECT e.id, e.dst_name, f.language, e.file_id
 		FROM edges e
 		JOIN files f ON f.id = e.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND instr(e.dst_name, '.') > 0
@@ -3149,7 +3237,8 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		var id int64
 		var dstName string
 		var srcLanguage string
-		if err := rows.Scan(&id, &dstName, &srcLanguage); err != nil {
+		var srcFileID int64
+		if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID); err != nil {
 			_ = rows.Close()
 			return stats, err
 		}
@@ -3159,7 +3248,12 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		}
 		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
 			if _, ok := seen[dstName[dot+1:]]; ok {
-				targetByID[id] = edgeTarget{edgeID: id, dstName: dstName, srcLanguage: srcLanguage}
+				targetByID[id] = edgeTarget{
+					edgeID:      id,
+					dstName:     dstName,
+					srcLanguage: srcLanguage,
+					srcFileID:   srcFileID,
+				}
 				stats.SuffixHits++
 			}
 		}
@@ -3187,6 +3281,7 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	stats.TargetsUnresolved = outcome.unresolved
 	stats.LanguageBlocked = outcome.languageBlocked
 	stats.AmbiguityBlocked = outcome.ambiguityBlocked
+	stats.TestShadowBlocked = outcome.testShadowBlocked
 	stats.UnknownSrcLanguage = outcome.unknownSrcLanguage
 	stats.ResolveTargetsMS = time.Since(resolveStarted).Milliseconds()
 	return stats, nil
@@ -3197,11 +3292,10 @@ func scanEdgeTargets(rows *sql.Rows, languageByFileID map[int64]string) ([]edgeT
 	var targets []edgeTarget
 	for rows.Next() {
 		var target edgeTarget
-		var fileID int64
-		if err := rows.Scan(&target.edgeID, &target.dstName, &fileID); err != nil {
+		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID); err != nil {
 			return nil, err
 		}
-		target.srcLanguage = languageByFileID[fileID]
+		target.srcLanguage = languageByFileID[target.srcFileID]
 		targets = append(targets, target)
 	}
 	if err := rows.Err(); err != nil {
@@ -3252,7 +3346,13 @@ type resolveEdgeTargetsOutcome struct {
 	// same-language candidates and no evidence separating them. These two
 	// counters are disjoint: a target blocked by ambiguity in its own language
 	// is not reported as language-blocked.
-	ambiguityBlocked   int
+	ambiguityBlocked int
+	// testShadowBlocked is the subset of unresolved where the calling file is
+	// production code and every same-language candidate was declared in a test
+	// file. Disjoint from the two counters above: the name was found, in the
+	// right language, and was not ambiguous -- it was simply not something
+	// production code may be wired into.
+	testShadowBlocked  int
 	unknownSrcLanguage int
 }
 
@@ -3275,7 +3375,13 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	for name := range qualifiedSet {
 		qualifiedNames = append(qualifiedNames, name)
 	}
-	byQualified, err := s.resolveSymbolsByQualifiedNames(ctx, repoID, qualifiedNames)
+	// The repo's test-file set is read once per resolve and shared by both
+	// candidate lookups, so no candidate needs its own path or classification.
+	testFileIDs, err := testFileIDsForRepo(ctx, s.db, repoID)
+	if err != nil {
+		return outcome, err
+	}
+	byQualified, err := s.resolveSymbolsByQualifiedNames(ctx, repoID, qualifiedNames, testFileIDs)
 	if err != nil {
 		return outcome, err
 	}
@@ -3294,14 +3400,15 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	shortSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		key := symbolLangKey{name: target.dstName, language: target.srcLanguage}
-		if _, ok := byQualified.unique[key]; ok {
-			continue
-		}
-		if _, ambiguous := byQualified.ambiguous[key]; ambiguous {
-			// The qualified name already failed to identify one definition.
-			// Falling back to the bare tail of the same name is strictly weaker
-			// evidence, so it could only pick one of the same candidates
-			// arbitrarily.
+		if _, ok := byQualified.groups[key]; ok {
+			// The qualified name matched something in the caller's language, so
+			// the bare tail of the same name is never consulted: either the
+			// qualified evidence identifies one definition this caller may bind,
+			// or it identified candidates it may not, and falling back to
+			// strictly weaker evidence could only pick among the same set
+			// arbitrarily -- or, worse, retarget an explicit reference at an
+			// unrelated symbol. Mirrors the qualified-level veto rows in
+			// recordAmbiguousResolverNames.
 			continue
 		}
 		short := dotTail(target.dstName)
@@ -3313,7 +3420,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	for name := range shortSet {
 		shortNames = append(shortNames, name)
 	}
-	byShort, err := s.resolveUniqueSymbolsByNames(ctx, repoID, shortNames)
+	byShort, err := s.resolveUniqueSymbolsByNames(ctx, repoID, shortNames, testFileIDs)
 	if err != nil {
 		return outcome, err
 	}
@@ -3349,21 +3456,35 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 		qualifiedKey := symbolLangKey{name: target.dstName, language: target.srcLanguage}
 		shortKey := symbolLangKey{name: short, language: target.srcLanguage}
-		_, qualifiedAmbiguous := byQualified.ambiguous[qualifiedKey]
+		// Which candidates this edge may bind depends on whether the *calling*
+		// file is a test file, exactly as resolverChosenCandidateSQL decides it
+		// for the repo-wide strategies. See resolver_testfile.go.
+		_, callerIsTest := testFileIDs[target.srcFileID]
 		strategy := ResolutionStrategyExactQualified
-		dstID, ok := byQualified.unique[qualifiedKey]
-		if !ok && !qualifiedAmbiguous {
-			dstID, ok = byShort.unique[shortKey]
+		matchedGroup, matched := byQualified.groups[qualifiedKey]
+		if !matched {
+			// Only when the qualified name matched nothing in this language may
+			// the weaker bare-tail evidence be consulted.
+			matchedGroup, matched = byShort.groups[shortKey]
 			strategy = ResolutionStrategyBareTail
+		}
+		dstID, ok := int64(0), false
+		if matched {
+			dstID, ok = matchedGroup.chosen(callerIsTest)
 		}
 		if !ok || dstID == 0 {
 			outcome.unresolved++
-			_, shortAmbiguous := byShort.ambiguous[shortKey]
 			switch {
-			case qualifiedAmbiguous || shortAmbiguous:
-				// Several same-language definitions claimed this name. Report it
-				// as ambiguity rather than as a language block, which it is not.
+			case matched && matchedGroup.ambiguousFor(callerIsTest):
+				// Several definitions this caller may bind claimed this name.
+				// Report it as ambiguity rather than as a language block, which
+				// it is not.
 				outcome.ambiguityBlocked++
+			case matched:
+				// The name matched, and every match was a test definition this
+				// production caller may not bind. Not ambiguity and not a
+				// language block: a production call is never wired into a test.
+				outcome.testShadowBlocked++
 			default:
 				_, qualifiedElsewhere := qualifiedNamesAnyLanguage[target.dstName]
 				_, shortElsewhere := shortNamesAnyLanguage[short]
@@ -3459,63 +3580,131 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	return outcome, nil
 }
 
-// resolveSymbolsByQualifiedNames returns qualified-name candidates that are
-// unique *within a language*, keyed by (qualified_name, language), so a caller
-// can only ever select a destination in its own language and never picks
-// between several same-language definitions of the same qualified name.
-// Symbols with no persisted language are excluded (fail closed).
+// resolveSymbolsByQualifiedNames returns qualified-name candidate groups keyed
+// by (qualified_name, language), so a caller can only ever select a destination
+// in its own language and never picks between several same-language definitions
+// of the same qualified name. Symbols with no persisted language are excluded
+// (fail closed).
 //
-// A group with several same-language definitions is reported as ambiguous
-// instead of being collapsed with a tie-break, which is the same decision the
-// repo-wide exact-qualified strategy makes (resolver_ambiguity.go).
-func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64, qualifiedNames []string) (symbolCandidates, error) {
-	return s.resolveSymbolCandidates(ctx, repoID, "qualified_name", qualifiedNames)
+// A group with several definitions the caller may bind stays undecided instead
+// of being collapsed with a tie-break, which is the same decision the repo-wide
+// exact-qualified strategy makes (resolver_ambiguity.go).
+func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64, qualifiedNames []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
+	return s.resolveSymbolCandidates(ctx, repoID, "qualified_name", qualifiedNames, testFileIDs)
 }
 
-// resolveUniqueSymbolsByNames returns short-name candidates that are unique
-// *within a language*, keyed by (name, language), plus the (name, language)
-// pairs that several same-language definitions claim.
+// resolveUniqueSymbolsByNames returns short-name candidate groups keyed by
+// (name, language), including the groups several same-language definitions
+// claim.
 //
 // Uniqueness is evaluated per language rather than repo-wide because the
 // language gate must not let an unrelated foreign-language definition of the
 // same name discard an otherwise valid same-language target. Symbols with no
 // persisted language are excluded (fail closed).
-func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, names []string) (symbolCandidates, error) {
-	return s.resolveSymbolCandidates(ctx, repoID, "name", names)
+func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, names []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
+	return s.resolveSymbolCandidates(ctx, repoID, "name", names, testFileIDs)
 }
 
-// symbolCandidates is the outcome of one candidate lookup: the destinations
-// that a single same-language symbol claims, and the keys that several claim.
-// Keeping ambiguity explicit is what lets the binder refuse instead of falling
-// through to a weaker strategy that would pick arbitrarily.
+// candidateGroup is one (matched name, language) group of destination
+// candidates, summarised the same way resolverCandidateAggregatesSQL summarises
+// it for the repo-wide strategies.
+//
+// Each id is non-zero only while its count is exactly one: `add` clears it again
+// the moment a second candidate of that kind arrives. That is deliberate --
+// keeping the first-seen id past that point would store a value derived from SQL
+// row order, which is precisely the tie-break P3 removed, one careless read away
+// from returning.
+type candidateGroup struct {
+	candidates           int
+	productionCandidates int
+	anySymbolID          int64
+	productionSymbolID   int64
+}
+
+// add folds one candidate into the group. Order of calls does not affect the
+// result: the counts are order-free, and an id survives only in the case where
+// there is exactly one row it could have come from.
+func (g candidateGroup) add(symbolID int64, isTest bool) candidateGroup {
+	g.candidates++
+	switch g.candidates {
+	case 1:
+		g.anySymbolID = symbolID
+	case 2:
+		g.anySymbolID = 0
+	}
+	if isTest {
+		return g
+	}
+	g.productionCandidates++
+	switch g.productionCandidates {
+	case 1:
+		g.productionSymbolID = symbolID
+	case 2:
+		g.productionSymbolID = 0
+	}
+	return g
+}
+
+// chosen returns the destination a caller of the given kind may bind, mirroring
+// resolverChosenCandidateSQL exactly: a test caller binds the sole candidate, a
+// production caller binds the sole *production* candidate.
+func (g candidateGroup) chosen(callerIsTest bool) (int64, bool) {
+	if callerIsTest {
+		return g.anySymbolID, g.anySymbolID != 0
+	}
+	return g.productionSymbolID, g.productionSymbolID != 0
+}
+
+// ambiguousFor reports whether this group holds several candidates of the kind
+// the caller may bind. It is the Go-side twin of the veto rows
+// recordAmbiguousResolverNames writes for that caller kind.
+func (g candidateGroup) ambiguousFor(callerIsTest bool) bool {
+	if callerIsTest {
+		return g.candidates > 1
+	}
+	return g.productionCandidates > 1
+}
+
+// symbolCandidates is the outcome of one candidate lookup: every
+// (name, language) group that matched, with enough detail for the binder to
+// apply the same caller-kind rule the SQL strategies apply. Keeping the groups
+// explicit rather than pre-collapsing them to "unique or not" is what lets the
+// binder refuse instead of falling through to a weaker strategy that would pick
+// arbitrarily.
 type symbolCandidates struct {
-	unique    map[symbolLangKey]int64
-	ambiguous map[symbolLangKey]struct{}
+	groups map[symbolLangKey]candidateGroup
 }
 
 // names reports every name that matched a symbol in any language, ambiguous or
 // not. It backs the honest "why did this stay unresolved" counters.
 func (c symbolCandidates) names() map[string]struct{} {
-	out := make(map[string]struct{}, len(c.unique)+len(c.ambiguous))
-	for key := range c.unique {
-		out[key.name] = struct{}{}
-	}
-	for key := range c.ambiguous {
+	out := make(map[string]struct{}, len(c.groups))
+	for key := range c.groups {
 		out[key.name] = struct{}{}
 	}
 	return out
 }
 
-// resolveSymbolCandidates groups symbols by (column, language) and splits the
-// groups into unique candidates and ambiguous keys. COUNT(*) does the same
-// counting the repo-wide strategies do, so the two entrypoints agree on which
-// names are ambiguous; MIN(id) only ever names the sole member of a group of
-// one. `column` is a package-internal literal, never caller input.
-func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, column string, names []string) (symbolCandidates, error) {
-	out := symbolCandidates{
-		unique:    map[symbolLangKey]int64{},
-		ambiguous: map[symbolLangKey]struct{}{},
-	}
+// resolveSymbolCandidates loads the symbols matching `names` on `column` and
+// groups them in Go by (matched name, language), recording how many there are
+// and how many are declared outside a test file.
+//
+// The grouping is done here rather than in SQL because IsTestFilePath is the
+// single definition of "test file" (resolver_testfile.go) and restating it as a
+// SQL predicate is exactly the drift this phase forbids. `testFileIDs` is the
+// repo's test-file set, built once per resolve by the caller, so a candidate's
+// kind costs a map lookup on its `file_id` -- no join, no path string per
+// candidate, and no per-candidate query.
+//
+// A symbol whose file id is absent from the set counts as production, so a ghost
+// row still blocks rather than silently promoting another candidate.
+//
+// The Go-side counting matches the repo-wide COUNT(*)/SUM(...) exactly, so the
+// two entrypoints agree on which names are undecidable; the recorded ids only
+// ever name the sole member of a group of one. `column` is a package-internal
+// literal, never caller input.
+func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, column string, names []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
+	out := symbolCandidates{groups: map[symbolLangKey]candidateGroup{}}
 	if len(names) == 0 {
 		return out, nil
 	}
@@ -3525,10 +3714,9 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 		chunk := names[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT ` + column + `, language, MIN(id), COUNT(*)
+			SELECT ` + column + `, language, id, file_id
 			FROM symbols
 			WHERE repo_id = ? AND language != '' AND ` + column + ` IN (` + placeholders + `)
-			GROUP BY ` + column + `, language
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -3543,17 +3731,18 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 			var name string
 			var language string
 			var id int64
-			var candidates int64
-			if err := rows.Scan(&name, &language, &id, &candidates); err != nil {
+			var fileID int64
+			if err := rows.Scan(&name, &language, &id, &fileID); err != nil {
 				_ = rows.Close()
 				return symbolCandidates{}, err
 			}
 			key := symbolLangKey{name: name, language: language}
-			if candidates > 1 {
-				out.ambiguous[key] = struct{}{}
-				continue
-			}
-			out.unique[key] = id
+			_, isTest := testFileIDs[fileID]
+			out.groups[key] = out.groups[key].add(id, isTest)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return symbolCandidates{}, err
 		}
 		if err := rows.Close(); err != nil {
 			return symbolCandidates{}, err

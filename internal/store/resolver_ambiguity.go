@@ -46,9 +46,13 @@ package store
 //     697 by removing the ones the repo-wide resolver had been binding
 //     arbitrarily; closing the rest means giving one path the other's
 //     strategies, which is a resolver redesign, not an ambiguity rule.
-//   - Ranking evidence that would break a tie on purpose (test-shadow
-//     demotion, builtin/stdlib classification, edge confidence) is out of scope
-//     here. Until such a rule exists, no tie is broken at all.
+//   - Ranking evidence that would break a tie on purpose is out of scope here,
+//     with one exception added in P7: a production caller facing one production
+//     candidate and any number of test-only candidates binds the production one
+//     (resolver_testfile.go). That is not a tie-break -- the candidates are not
+//     tied, because which file declares a definition is real, reproducible
+//     evidence that separates them. Builtin/stdlib/external classification and
+//     edge-confidence ranking remain out of scope, and no other tie is broken.
 //
 // Nothing about the *candidate* definition changed in P3: strategies match the
 // same columns with the same predicates as before, so this is a refusal to
@@ -62,16 +66,12 @@ package store
 // definition chosen by insertion order. Read a drop in the resolved-edge count
 // after this change as removed guesses, not as lost capability.
 
-// resolverUniqueCandidateSQL is the one SQL predicate that enforces the rule
-// above. It is appended to the GROUP BY of every candidate relation and
-// requires only that the surrounding statement groups candidate symbols by
-// (matched name, language).
-//
-// With this clause a group reaching the caller always has exactly one member,
-// which is why the accompanying MIN(id) aggregates are identity rather than a
-// tie-break: they select the sole candidate's id, and there is no second row
-// they could ever prefer it over.
-const resolverUniqueCandidateSQL = `HAVING COUNT(*) = 1`
+// The SQL predicate that enforces the rule above lives in resolver_testfile.go
+// as resolverCandidateHavingSQL, because from P7 on "usable candidate group" has
+// two readings -- one per caller kind -- and both are computed by the same
+// aggregate. It is still the case that a group reaching a caller has exactly one
+// member *of the kind that caller may bind*, which is why the MIN(id) aggregates
+// there are identity rather than a tie-break: each minimises over a single row.
 
 // resolverBareNameKindsSQL restricts bare-name candidates to symbol kinds a
 // call edge can denote. It is the candidate set the repo-wide bare-name
@@ -103,9 +103,38 @@ const resolverBareNameKindsSQL = `('function', 'method', 'class', 'type', 'struc
 // definition. Suffix evidence comes from the destination's shape, not from the
 // call site, so it does not tell those definitions apart on the caller's
 // behalf. A missing edge is recoverable; a confidently wrong one is not.
+//
+// P7 makes the veto per caller kind rather than global, because "undecidable at
+// this evidence level" now has two readings (resolver_testfile.go):
+//
+//	a test caller is vetoed when the level had candidates but not exactly one
+//	a production caller is vetoed when the level had candidates but not exactly
+//	one *production* candidate
+//
+// Both readings are the same sentence -- "this level had matches yet none this
+// caller may bind" -- so neither weakens the other. Concretely: production A +
+// test B no longer vetoes a production caller (production A is uniquely usable,
+// so the broad level decided it) while it still vetoes a test caller (which has
+// two equally valid candidates and nothing to separate them). And a level whose
+// only match is a test definition now *starts* vetoing production callers, which
+// is what stops a narrower strategy from quietly retargeting an explicit
+// reference to a test symbol at some unrelated production symbol.
+//
+// One narrow gap comes with that relaxation, inherited from a kind-set mismatch
+// that predates P7: the bare-name veto counts symbols whose kind is callable
+// *or* which merely have a container, while the bare-name strategy binds only
+// the callable kinds. So a level holding one production candidate of a
+// non-callable, contained kind plus a test candidate now writes no production
+// veto row, and a suffix strategy (which runs before the receiver strategy) may
+// bind a *different* production symbol that the pre-P7 veto would have blocked.
+// Reaching it needs a dotted `symbols.name`, so it is not observed on this
+// repository; closing it means either giving the veto a second, suffix-only
+// scope or reordering the strategies, both of which are resolver changes rather
+// than ambiguity rules.
 const (
-	// resolverAmbiguousNamesTable holds (dst_name, dst_language) pairs that more
-	// than one same-language symbol claims.
+	// resolverAmbiguousNamesTable holds (dst_name, dst_language, caller_is_test)
+	// triples: the name was matched at a broad evidence level, and a caller of
+	// that kind had no single candidate it was allowed to bind.
 	resolverAmbiguousNamesTable = `tmp_resolver_ambiguous_names`
 
 	// resolverAmbiguousNamesSQL excludes vetoed names from a resolver UPDATE. It
@@ -114,12 +143,21 @@ const (
 	resolverAmbiguousNamesSQL = `NOT EXISTS (
 		SELECT 1 FROM ` + resolverAmbiguousNamesTable + ` a
 		WHERE a.dst_name = edges.dst_name AND a.dst_language = f.language
+		AND a.caller_is_test = CASE WHEN ` + resolverCallerIsTestSQL + ` THEN 1 ELSE 0 END
 	)`
 
+	// resolverBindableCandidateSQL is what a repo-wide strategy must satisfy to
+	// write a destination at all: the P2 language gate, plus the requirement
+	// that the candidate group actually holds an id this caller kind may bind
+	// (P7). The exact-qualified strategy carries this without the veto below.
+	resolverBindableCandidateSQL = resolverLanguageGateSQL + `
+		AND (` + resolverChosenCandidateSQL + `) IS NOT NULL`
+
 	// resolverBindGateSQL is what every repo-wide strategy's UPDATE must
-	// satisfy before it may write a destination: the P2 language gate and the
-	// P3 ambiguity veto. It is one constant so a strategy cannot be added that
-	// applies one rule and forgets the other.
-	resolverBindGateSQL = resolverLanguageGateSQL + `
+	// satisfy before it may write a destination: the P2 language gate, the P7
+	// caller-kind candidate choice, and the P3 ambiguity veto. It is one
+	// constant so a strategy cannot be added that applies one rule and forgets
+	// the other.
+	resolverBindGateSQL = resolverBindableCandidateSQL + `
 		AND ` + resolverAmbiguousNamesSQL
 )

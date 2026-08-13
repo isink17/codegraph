@@ -44,8 +44,11 @@ const (
 	// resolver holds no evidence that distinguishes them. One of them may well
 	// be what the call meant, but nothing in the graph says which, so binding
 	// any of them is an arbitrary choice and staying unresolved is the only
-	// reproducible outcome. Selecting the "reasonable" one is not credited: a
-	// ranking rule that earns that credit does not exist yet.
+	// reproducible outcome. Selecting the "reasonable" one is not credited
+	// unless a rule earns the credit: a production/test collision is no longer
+	// ambiguous, because P7 gives production callers real evidence that test
+	// definitions are not their candidates (store/resolver_testfile.go). A
+	// collision between two definitions of the same kind still is.
 	ExpectAmbiguous Expectation = "expected_ambiguous"
 )
 
@@ -145,17 +148,14 @@ func Cases() []Case {
 			Note:    "Go emits dst_name Sorter.parse_d; the only dot_tail2 match is a Java method in ShapesD.java. Exercises the suffix strategies rather than exact-name matching.",
 		},
 		{
-			ID:      "E",
-			Title:   "test-shadow candidate competing with the production definition",
-			Expect:  ExpectAmbiguous,
-			SrcFile: "src/py/caller_e.py",
-			DstName: "load_config_e",
-			CompetingTargets: []string{
-				"config_e.load_config_e",
-				"test_config_e.load_config_e",
-			},
+			ID:            "E",
+			Title:         "test-shadow candidate competing with the production definition",
+			Expect:        ExpectValid,
+			SrcFile:       "src/py/caller_e.py",
+			DstName:       "load_config_e",
+			ValidTargets:  []string{"config_e.load_config_e"},
 			ShadowTargets: []string{"test_config_e.load_config_e"},
-			Note:          "Production code calls load_config_e; a production and a test definition compete, both python, both plain functions. Until a test-shadow ranking rule exists the resolver has nothing that separates them, so P3 requires a stable unresolved result: binding the production definition would be the right answer reached by an arbitrary route (symbol insertion order), and binding the test definition would be a false edge.",
+			Note:          "Production code calls load_config_e; a production definition (src/py/config_e.py) and a test definition (tests/py/test_config_e.py) share the name, both python, both plain functions. P7 gives the resolver evidence that separates them -- the call site is production code, so the test definition is not a candidate for it at all -- which makes the production definition the uniquely valid target. Binding the test definition is still a false edge, and the expectation moved from expected_ambiguous only because the rule exists, not because the report stopped counting shadow candidates.",
 		},
 		{
 			ID:      "F",
