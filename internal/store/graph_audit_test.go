@@ -910,9 +910,15 @@ func TestOpenReadOnlyRefusesUnindexedRepo(t *testing.T) {
 	if _, err := OpenReadOnly(dbPath, OpenOptions{}); !errors.Is(err, ErrRepoNotIndexed) {
 		t.Fatalf("OpenReadOnly(missing) err = %v, want ErrRepoNotIndexed", err)
 	}
-	if _, err := Open(dbPath); err != nil {
-		// Open is expected to create it; this only proves the path was free.
+	// Open is expected to create it; this only proves the path was free. The
+	// handle must be closed before t.TempDir cleanup, or Windows refuses to
+	// remove the still-open database file.
+	s, err := Open(dbPath)
+	if err != nil {
 		t.Fatalf("Open() after OpenReadOnly error = %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 
