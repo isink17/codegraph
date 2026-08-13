@@ -326,6 +326,18 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
 	changedSymbolNameSet := make(map[string]struct{}, 256)
+	// Stable keys of every symbol the changed batch (re)defines. Pass 2 uses them
+	// to rebind test links in *unchanged* files whose target this batch supplied,
+	// the test-link analogue of changedSymbolNameSet for edges.
+	//
+	// Only the incremental branch of Pass 2 reads this, and stable keys are
+	// near-unique by construction, so populating it on a full index would retain
+	// one string per symbol in the repo for nothing. Both conditions the consumer
+	// tests are already known here.
+	collectResolveScope := pathScoped || scanKind == "update"
+	// Deliberately unsized: a no-op update changes nothing and would otherwise
+	// pay for a preallocated bucket array it never fills.
+	changedSymbolKeySet := make(map[string]struct{})
 
 	var writeMetadataDur time.Duration
 	var writeReplaceDur time.Duration
@@ -482,6 +494,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			})
 			changedPathSet[res.task.rel] = struct{}{}
 			for _, sym := range res.parsed.Symbols {
+				if collectResolveScope && sym.StableKey != "" {
+					changedSymbolKeySet[sym.StableKey] = struct{}{}
+				}
 				if sym.Name == "" {
 					continue
 				}
@@ -612,6 +627,21 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 	}
 
+	// ---------------------------------------------------------------------
+	// PASS 2 -- relationship resolution.
+	//
+	// Everything above this line is Pass 1: discover, parse, extract, and
+	// persist repository facts (files, symbols, references, imports, unresolved
+	// edges, unbound test links), plus deletion/purge of files that went away.
+	// Nothing above binds a relationship to a target in another file.
+	//
+	// Pass 2 therefore runs against a symbol/file table that already contains
+	// every file participating in this scan, which is what makes the resulting
+	// graph independent of filesystem traversal order, worker completion order,
+	// and intra-batch write order. Both relationship kinds are resolved here and
+	// scoped identically: repo-wide for a full index, changed-paths plus the
+	// changed batch's introduced symbols for an incremental run.
+	// ---------------------------------------------------------------------
 	resolveStart := time.Now()
 
 	if len(changedPathSet) == 0 {
@@ -628,6 +658,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
+		// Test links declared by the changed files: inserted unbound by Pass 1,
+		// bound here against the completed batch plus the existing repository.
+		testLinkStart := time.Now()
+		bound, err := i.store.ResolveTestLinksForPaths(ctx, repo.ID, changedPaths)
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		summary.ResolveTestLinksBound += bound
+		summary.ResolveTestLinksMS += time.Since(testLinkStart).Milliseconds()
 		summary.ResolveMode = "paths"
 
 		// Correctness: partial runs can introduce symbols that should resolve previously-unresolved
@@ -651,11 +691,35 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.ResolveCrossFileMS = time.Since(crossStart).Milliseconds()
 			summary.ResolveMode = "paths+names"
 		}
+		// Same cross-file correctness for test links: a target this batch
+		// introduced must bind links declared by files the batch did not touch.
+		if len(changedSymbolKeySet) > 0 {
+			keys := make([]string, 0, len(changedSymbolKeySet))
+			for key := range changedSymbolKeySet {
+				keys = append(keys, key)
+			}
+			testLinkCrossStart := time.Now()
+			bound, err := i.store.ResolveTestLinksForStableKeys(ctx, repo.ID, keys)
+			if err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			summary.ResolveTestLinksBound += bound
+			summary.ResolveTestLinksMS += time.Since(testLinkCrossStart).Milliseconds()
+		}
 	} else {
 		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
 			return summary, resolveErr
 		}
+		testLinkStart := time.Now()
+		bound, resolveErr := i.store.ResolveTestLinks(ctx, repo.ID)
+		if resolveErr != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
+			return summary, resolveErr
+		}
+		summary.ResolveTestLinksBound = bound
+		summary.ResolveTestLinksMS = time.Since(testLinkStart).Milliseconds()
 		summary.ResolveMode = "repo"
 	}
 	if len(changedPathSet) > 0 {
@@ -675,7 +739,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		{Phase: "write_replace", MS: summary.WriteReplaceMS},
 		{Phase: "embed", MS: summary.EmbedMS},
 		{Phase: "mark_missing", MS: summary.MarkMissingMS},
-		{Phase: "resolve_edges", MS: summary.ResolveMS},
+		{Phase: "resolve_edges", MS: summary.ResolveMS - summary.ResolveTestLinksMS},
+		{Phase: "resolve_test_links", MS: summary.ResolveTestLinksMS},
 		{Phase: "total", MS: summary.DurationMS},
 	}
 	summary.FilesTotal = summary.FilesSeen + summary.FilesDeleted
