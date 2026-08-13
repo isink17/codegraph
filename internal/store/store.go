@@ -257,6 +257,13 @@ type ExportEdge struct {
 	Kind             string `json:"kind"`
 	FilePath         string `json:"file,omitempty"`
 	Line             int    `json:"line"`
+	// ResolutionStrategy and ResolutionConfidence explain a bound destination:
+	// which resolver strategy selected it and how strong that evidence was.
+	// Both are empty -- and so omitted -- for unresolved edges and for edges
+	// bound before migration 019, which carry no recoverable provenance.
+	// See edge_resolution.go for the value sets and the confidence mapping.
+	ResolutionStrategy   string `json:"resolution_strategy,omitempty"`
+	ResolutionConfidence string `json:"resolution_confidence,omitempty"`
 }
 
 type ReplaceFileGraphInput struct {
@@ -2126,7 +2133,7 @@ func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int6
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE edges
-		SET dst_symbol_id = NULL
+		SET `+resolverClearResolutionSQL+`
 		WHERE repo_id = ? AND dst_symbol_id IN (`+symbolIDs+`)
 	`, args...); err != nil {
 		return err
@@ -2183,7 +2190,7 @@ func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, rep
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE edges
-		SET dst_symbol_id = NULL
+		SET `+resolverClearResolutionSQL+`
 		WHERE repo_id = ? AND dst_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
 	`, repoID); err != nil {
 		return err
@@ -2361,7 +2368,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			`+resolverUniqueCandidateSQL+`
 		)
 		UPDATE edges
-		SET dst_symbol_id = r.dst_symbol_id
+		`+resolverSetResolvedSQL(ResolutionStrategyExactQualified)+`
 		FROM resolutions r, files f
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
@@ -2395,7 +2402,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			`+resolverUniqueCandidateSQL+`
 		)
 		UPDATE edges
-		SET dst_symbol_id = r.dst_symbol_id
+		`+resolverSetResolvedSQL(ResolutionStrategyExactName)+`
 		FROM resolutions r, files f
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
@@ -2446,7 +2453,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 			`+resolverUniqueCandidateSQL+`
 		)
 		UPDATE edges
-		SET dst_symbol_id = r.dst_symbol_id
+		`+resolverSetResolvedSQL(ResolutionStrategyReceiverMethod)+`
 		FROM resolutions r, files f
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
@@ -2601,7 +2608,7 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE edges
-		SET dst_symbol_id = r.dst_symbol_id
+		`+resolverSetResolvedSQL(ResolutionStrategyDotSuffix)+`
 		FROM tmp_edge_dot_suffix r, files f
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 		AND r.dst_name = edges.dst_name
@@ -2692,7 +2699,7 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 
 	updateRes, err := tx.ExecContext(ctx, `
 		UPDATE edges
-		SET dst_symbol_id = r.dst_symbol_id
+		`+resolverSetResolvedSQL(ResolutionStrategyDotTail3)+`
 		FROM tmp_symbol_dot_tail3 r, files f
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 		AND r.dst_name = edges.dst_name
@@ -2841,7 +2848,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 
 		updateRes, err := tx.ExecContext(ctx, `
 			UPDATE edges
-			SET dst_symbol_id = r.dst_symbol_id
+			`+resolverSetResolvedSQL(ResolutionStrategySlashSuffix)+`
 			FROM tmp_symbol_slash_suffix r, files f
 			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 			AND r.dst_name = edges.dst_name
@@ -2942,7 +2949,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 
 		updateRes, err := tx.ExecContext(ctx, `
 			UPDATE edges
-			SET dst_symbol_id = r.dst_symbol_id
+			`+resolverSetResolvedSQL(ResolutionStrategyDotTail2)+`
 			FROM tmp_symbol_dot_tail2 r, files f
 			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 			AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
@@ -3324,6 +3331,12 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	type edgeResolution struct {
 		edgeID int64
 		dstID  int64
+		// strategy names the evidence level that actually bound this edge, so
+		// the UPDATE below can persist it alongside dst_symbol_id. The binder
+		// has exactly two: the qualified-name lookup and the bare-tail
+		// fallback. See edge_resolution.go for why the fallback is not reported
+		// as exact_name even when dst_name has no dot.
+		strategy string
 	}
 	resolutions := make([]edgeResolution, 0, len(targets))
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -3342,9 +3355,11 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		qualifiedKey := symbolLangKey{name: target.dstName, language: target.srcLanguage}
 		shortKey := symbolLangKey{name: short, language: target.srcLanguage}
 		_, qualifiedAmbiguous := byQualified.ambiguous[qualifiedKey]
+		strategy := ResolutionStrategyExactQualified
 		dstID, ok := byQualified.unique[qualifiedKey]
 		if !ok && !qualifiedAmbiguous {
 			dstID, ok = byShort.unique[shortKey]
+			strategy = ResolutionStrategyBareTail
 		}
 		if !ok || dstID == 0 {
 			outcome.unresolved++
@@ -3363,7 +3378,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			}
 			continue
 		}
-		resolutions = append(resolutions, edgeResolution{edgeID: target.edgeID, dstID: dstID})
+		resolutions = append(resolutions, edgeResolution{edgeID: target.edgeID, dstID: dstID, strategy: strategy})
 	}
 
 	if len(resolutions) == 0 {
@@ -3371,28 +3386,46 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, nil
 	}
 
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_edge_resolution(edge_id INTEGER PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
+	// `strategy_rank` is the row's index into binderStrategies. The strategy and
+	// confidence strings stay out of the temp table entirely; the single UPDATE
+	// below decodes the rank back into them with a CASE. That keeps the per-row
+	// payload at the two bound ids it was before provenance existed, plus one
+	// small integer written as statement text.
+	//
+	// Recreated rather than reused: the shape of this table changed once
+	// already, and a survivor from an older definition would fail the INSERT on
+	// a column count instead of being repaired. Matches how every other resolver
+	// temp table in this file is set up.
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_edge_resolution`); err != nil {
 		_ = tx.Rollback()
 		return outcome, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_edge_resolution`); err != nil {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_edge_resolution(edge_id INTEGER PRIMARY KEY, dst_symbol_id INTEGER NOT NULL, strategy_rank INTEGER NOT NULL)`); err != nil {
 		_ = tx.Rollback()
 		return outcome, err
 	}
 
-	// Keep well under SQLite's default variable limit (999).
+	// One pass over `resolutions`, chunked to stay under SQLite's default
+	// variable limit (999). Each row still binds exactly two values -- its rank
+	// is interpolated into the VALUES list rather than bound -- so the chunk
+	// size is unchanged from before provenance existed.
 	const maxPairsPerInsert = 400
 	for start := 0; start < len(resolutions); start += maxPairsPerInsert {
 		end := min(start+maxPairsPerInsert, len(resolutions))
 		chunk := resolutions[start:end]
 		var b strings.Builder
-		b.WriteString(`INSERT INTO tmp_edge_resolution(edge_id, dst_symbol_id) VALUES `)
+		b.WriteString(`INSERT INTO tmp_edge_resolution(edge_id, dst_symbol_id, strategy_rank) VALUES `)
 		args := make([]any, 0, len(chunk)*2)
 		for i, r := range chunk {
 			if i > 0 {
 				b.WriteString(",")
 			}
-			b.WriteString("(?,?)")
+			// The rank goes into the statement text, not the bound values: it is
+			// a small compile-time-derived integer, and binding it would widen
+			// every row's argument payload for no gain.
+			b.WriteString("(?,?,")
+			b.WriteString(binderStrategyRankLiteral(r.strategy))
+			b.WriteString(")")
 			args = append(args, r.edgeID, r.dstID)
 		}
 		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
@@ -3401,10 +3434,14 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 	}
 
+	// One statement writes the destination and the explanation together, so a
+	// bound edge can never be left unexplained -- the strategy_rank is decoded
+	// back into its strings by binderSetResolvedSQL.
 	updateRes, err := tx.ExecContext(ctx, `
 		UPDATE edges
-		SET dst_symbol_id = (SELECT t.dst_symbol_id FROM tmp_edge_resolution t WHERE t.edge_id = edges.id)
-		WHERE edges.id IN (SELECT edge_id FROM tmp_edge_resolution)
+		`+binderSetResolvedSQL()+`
+		FROM tmp_edge_resolution t
+		WHERE t.edge_id = edges.id
 	`)
 	if err != nil {
 		_ = tx.Rollback()
@@ -4176,7 +4213,7 @@ func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit,
 
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line
+		SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, e.resolution_strategy, e.resolution_confidence
 		FROM edges e
 		LEFT JOIN symbols src ON src.id = e.src_symbol_id
 		LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
@@ -4237,7 +4274,7 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]ExportEdge, error) {
 	if len(symbolIDs) == 0 {
 		rows, err := s.db.QueryContext(ctx, `
-			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line
+			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, e.resolution_strategy, e.resolution_confidence
 			FROM edges e
 			LEFT JOIN symbols src ON src.id = e.src_symbol_id
 			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
@@ -4253,7 +4290,7 @@ func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs 
 	for _, chunk := range chunkInt64s(symbolIDs, 250) {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line
+			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, e.resolution_strategy, e.resolution_confidence
 			FROM edges e
 			LEFT JOIN symbols src ON src.id = e.src_symbol_id
 			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
@@ -4320,6 +4357,8 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, error) {
 			&edge.Kind,
 			&edge.FilePath,
 			&edge.Line,
+			&edge.ResolutionStrategy,
+			&edge.ResolutionConfidence,
 		); err != nil {
 			return nil, err
 		}
@@ -6285,9 +6324,12 @@ func (s *Store) ResolveCrossLanguageLinks(ctx context.Context, repoID int64) (in
 			continue
 		}
 		_, err = s.db.ExecContext(ctx, `
-			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-			VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0)
-		`, repoID, l.srcID, l.dstID, l.name, evidence, l.srcFile)
+			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line,
+			                  resolution_strategy, resolution_confidence)
+			VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0, ?, ?)
+		`, repoID, l.srcID, l.dstID, l.name, evidence, l.srcFile,
+			ResolutionStrategyCrossLanguageSharedName,
+			resolutionConfidenceFor(ResolutionStrategyCrossLanguageSharedName))
 		if err != nil {
 			return totalCreated, fmt.Errorf("cross-language insert: %w", err)
 		}
@@ -6393,9 +6435,12 @@ func (s *Store) ResolveCrossLanguageLinks(ctx context.Context, repoID int64) (in
 				}
 				evidence := "import_path:" + imp.language + "→" + match.language
 				_, err = s.db.ExecContext(ctx, `
-					INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-					VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0)
-				`, repoID, srcID, dstID, dstName, evidence, srcFileID)
+					INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line,
+					                  resolution_strategy, resolution_confidence)
+					VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0, ?, ?)
+				`, repoID, srcID, dstID, dstName, evidence, srcFileID,
+					ResolutionStrategyCrossLanguageImportPath,
+					resolutionConfidenceFor(ResolutionStrategyCrossLanguageImportPath))
 				if err == nil {
 					totalCreated++
 				}
