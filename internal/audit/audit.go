@@ -177,10 +177,12 @@ type CaseResult struct {
 // Determinism reports whether repeated measurement agreed.
 //
 // This is a sampled property, not a proof. Indexing runs on a worker pool and
-// symbol row ids follow worker completion order, while the resolver breaks
-// same-name ties with MIN(id) or an unordered LIMIT 1. A case can therefore
-// look stable across N repeats and still select a different destination on the
-// next run. Stable == true means "no variance observed in this sample".
+// symbol row ids follow worker completion order, so any resolver path that
+// still selects by row order can vary between identical runs. Implicit
+// resolution no longer breaks ties between equally valid same-language
+// candidates, which removes the known source of that variance -- but a case can
+// still look stable across N repeats and differ on the next one. Stable == true
+// means "no variance observed in this sample".
 type Determinism struct {
 	Repeats               int      `json:"repeats"`
 	Sampled               bool     `json:"sampled"`
@@ -657,7 +659,7 @@ func classify(runs []runObservation) ([]CaseResult, Determinism) {
 		MetricsStable:         true,
 		CaseOutcomesStable:    true,
 		SelectedTargetsStable: true,
-		Note:                  "sampled over the repeats below; stability here is an observation, not a guarantee, because same-name ties are broken by MIN(id)/LIMIT 1 over concurrently inserted symbol rows",
+		Note:                  "sampled over the repeats below; stability here is an observation, not a proof. Implicit strategies no longer tie-break between equally valid same-language candidates, so a destination that varies across identical runs points at a resolver path that still selects by row or insertion order",
 	}
 	if !det.Sampled {
 		det.Note = "single run: variance was not sampled, so the stability flags below mean nothing was compared"
@@ -806,6 +808,15 @@ func caseOutcome(c Case, edge *EdgeObservation) Outcome {
 			return OutcomeMiswired
 		}
 		return OutcomeExpectedUnresolved
+	case ExpectAmbiguous:
+		// Any binding is a miswire here, including one that happens to land on
+		// the production definition: the fixture declares that no evidence
+		// distinguishes the candidates, so a selection can only have come from
+		// insertion order or another non-semantic tie-break.
+		if edge.Resolved {
+			return OutcomeMiswired
+		}
+		return OutcomeExpectedUnresolved
 	case ExpectValid:
 		if !edge.Resolved {
 			return OutcomeMissingEdge
@@ -950,7 +961,12 @@ func findings(r *Report) []string {
 		out = append(out, "measured with a single run: nondeterminism was not sampled, so the stability flags are not evidence")
 	}
 	for _, c := range r.Cases {
-		if len(c.ShadowCandidates) > 0 && !c.TestShadowBinding {
+		// A resolved destination while test/mock definitions of the same name
+		// competed is worth reporting even when the selected target is the
+		// production one: with no test-shadow rule, that outcome rests on
+		// symbol insertion order rather than on evidence.
+		resolvedSomewhere := (c.Selected != nil && c.Selected.Resolved) || !c.SelectedStable
+		if len(c.ShadowCandidates) > 0 && !c.TestShadowBinding && resolvedSomewhere {
 			out = append(out, fmt.Sprintf(
 				"case %s selected the production definition while %d competing test definition(s) existed; resolution has no test-shadow rule, so this outcome rests on symbol insertion order",
 				c.ID, len(c.ShadowCandidates)))
@@ -964,7 +980,7 @@ func findings(r *Report) []string {
 	}
 	if r.Metrics.AmbiguousCases > 0 {
 		out = append(out, fmt.Sprintf(
-			"%d cases had more than one candidate definition; resolution picks one with no ambiguity check, so the selected destination follows symbol insertion order",
+			"%d cases had more than one candidate definition; each such case must either resolve on evidence that singles one out or stay unresolved, never pick by insertion order",
 			r.Metrics.AmbiguousCases))
 	}
 	if !r.Determinism.SelectedTargetsStable {

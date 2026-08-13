@@ -142,13 +142,20 @@ func insertTestSymbol(ctx context.Context, s *Store, repoID, fileID int64, name,
 // insertTestSymbolLang inserts a function symbol with an explicit persisted
 // language, so resolver language gating can be exercised directly.
 func insertTestSymbolLang(ctx context.Context, s *Store, repoID, fileID int64, name, qualified, language string) (int64, error) {
+	return insertTestSymbolKind(ctx, s, repoID, fileID, name, qualified, "function", "", language)
+}
+
+// insertTestSymbolKind inserts a symbol with an explicit kind and container
+// name, so strategies that filter on kind or on the presence of a receiver can
+// be exercised directly.
+func insertTestSymbolKind(ctx context.Context, s *Store, repoID, fileID int64, name, qualified, kind, container, language string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO symbols(
-			repo_id, file_id, language, kind, name, qualified_name,
+			repo_id, file_id, language, kind, name, qualified_name, container_name,
 			start_line, start_col, end_line, end_col, stable_key, qualified_suffix, dot_tail2, dot_tail3
 		)
-		VALUES(?, ?, ?, ?, ?, ?, 1, 1, 1, 1, ?, ?, ?, ?)
-	`, repoID, fileID, language, "function", name, qualified, qualified+"|"+language, qualifiedSuffix(qualified), dotTail2(qualified), dotTail3(qualified))
+		VALUES(?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 1, ?, ?, ?, ?)
+	`, repoID, fileID, language, kind, name, qualified, container, qualified+"|"+language, qualifiedSuffix(qualified), dotTail2(qualified), dotTail3(qualified))
 	if err != nil {
 		return 0, err
 	}

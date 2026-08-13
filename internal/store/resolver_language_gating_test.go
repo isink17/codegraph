@@ -73,6 +73,39 @@ func (f *gateFixture) dstSymbolID(t *testing.T, edgeID int64) (int64, bool) {
 	return dst.Int64, dst.Valid
 }
 
+// symbolKind inserts a definition with an explicit kind, so strategies that
+// filter on kind can be exercised.
+func (f *gateFixture) symbolKind(t *testing.T, fileID int64, name, qualified, kind, language string) int64 {
+	t.Helper()
+	id, err := insertTestSymbolKind(f.ctx, f.store, f.repoID, fileID, name, qualified, kind, "", language)
+	if err != nil {
+		t.Fatalf("insertTestSymbolKind(%s, %q, %q) error = %v", qualified, kind, language, err)
+	}
+	return id
+}
+
+// method inserts a definition that declares a receiver, which is what the
+// repo-wide receiver strategy matches on.
+func (f *gateFixture) method(t *testing.T, fileID int64, name, qualified, container, language string) int64 {
+	t.Helper()
+	id, err := insertTestSymbolKind(f.ctx, f.store, f.repoID, fileID, name, qualified, "method", container, language)
+	if err != nil {
+		t.Fatalf("insertTestSymbolKind(%s, method, %q) error = %v", qualified, language, err)
+	}
+	return id
+}
+
+// qualifiedNameOf renders a resolved destination so a diverging selection is
+// reported by name rather than by an opaque symbol id.
+func (f *gateFixture) qualifiedNameOf(t *testing.T, symbolID int64) string {
+	t.Helper()
+	var qualified string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT qualified_name FROM symbols WHERE id = ?`, symbolID).Scan(&qualified); err != nil {
+		t.Fatalf("QueryRow(qualified_name) error = %v", err)
+	}
+	return qualified
+}
+
 // gateScenario builds a graph and states what the resolver is expected to do.
 type gateScenario struct {
 	name string

@@ -37,6 +37,29 @@ func TestFixtureIntegrity(t *testing.T) {
 			if len(c.ValidTargets) != 0 {
 				t.Errorf("case %s declares valid targets but is %s", c.ID, c.Expect)
 			}
+		case ExpectAmbiguous:
+			if len(c.ValidTargets) != 0 {
+				t.Errorf("case %s declares valid targets but is %s; an ambiguous case has no selectable target", c.ID, c.Expect)
+			}
+			if len(c.CompetingTargets) < 2 {
+				t.Errorf("case %s is expected_ambiguous but declares %d competing target(s); ambiguity needs at least 2",
+					c.ID, len(c.CompetingTargets))
+			}
+			// Without this, dropping one definition from the fixture would
+			// leave the case passing as "expected unresolved" while no longer
+			// being ambiguous, i.e. while no longer probing anything.
+			for _, shadow := range c.ShadowTargets {
+				if !containsString(c.CompetingTargets, shadow) {
+					t.Errorf("case %s declares shadow target %q that is not among its competing targets %v",
+						c.ID, shadow, c.CompetingTargets)
+				}
+			}
+			for _, competing := range c.CompetingTargets {
+				if !strings.HasSuffix(competing, "."+c.DstName) && competing != c.DstName {
+					t.Errorf("case %s competing target %q does not define the called name %q",
+						c.ID, competing, c.DstName)
+				}
+			}
 		default:
 			t.Errorf("case %s has unknown expectation %q", c.ID, c.Expect)
 		}
@@ -103,6 +126,7 @@ func TestClassificationRules(t *testing.T) {
 	invalid := Case{ID: "x", Expect: ExpectInvalid}
 	valid := Case{ID: "y", Expect: ExpectValid, ValidTargets: []string{"pkg.good"}}
 	honest := Case{ID: "z", Expect: ExpectUnresolved}
+	ambiguous := Case{ID: "w", Expect: ExpectAmbiguous, CompetingTargets: []string{"pkg.one", "tests.one"}}
 
 	tests := []struct {
 		name string
@@ -117,6 +141,9 @@ func TestClassificationRules(t *testing.T) {
 		{"valid case unresolved is a missing edge", valid, unresolved, OutcomeMissingEdge},
 		{"honest negative unresolved is expected", honest, unresolved, OutcomeExpectedUnresolved},
 		{"honest negative resolved is miswired", honest, resolved("anything"), OutcomeMiswired},
+		{"ambiguous case unresolved is expected", ambiguous, unresolved, OutcomeExpectedUnresolved},
+		{"ambiguous case resolved to a competing target is miswired", ambiguous, resolved("pkg.one"), OutcomeMiswired},
+		{"ambiguous case resolved to the test definition is miswired", ambiguous, resolved("tests.one"), OutcomeMiswired},
 		{"absent edge is reported", valid, nil, OutcomeNoEdge},
 	}
 	for _, tc := range tests {
@@ -248,6 +275,35 @@ func TestAmbiguityIsMeasured(t *testing.T) {
 	if caseC.CandidateCount < 3 {
 		t.Errorf("case C should present at least 3 candidate definitions, got %d: %v",
 			caseC.CandidateCount, caseC.CandidateTargets)
+	}
+}
+
+// TestAmbiguousCaseStaysUnresolvedDeterministically pins the P3 contract for
+// case E: two same-language definitions compete, nothing distinguishes them, so
+// every repeat must leave the edge unresolved. A run that binds either one --
+// even the production definition -- is an arbitrary selection and fails here.
+func TestAmbiguousCaseStaysUnresolvedDeterministically(t *testing.T) {
+	report := runAudit(t, Options{Repeats: 5})
+
+	caseE := findCase(t, report, "E")
+	if caseE.Expectation != ExpectAmbiguous {
+		t.Fatalf("case E expectation = %q, want %q", caseE.Expectation, ExpectAmbiguous)
+	}
+	if caseE.CandidateCount < 2 {
+		t.Fatalf("case E should present competing candidates, got %d: %v", caseE.CandidateCount, caseE.CandidateTargets)
+	}
+	if caseE.Outcome != OutcomeExpectedUnresolved {
+		t.Errorf("case E outcome = %q (variants %v), want %q; ambiguous candidates must not be tie-broken",
+			caseE.Outcome, caseE.OutcomeVariants, OutcomeExpectedUnresolved)
+	}
+	if caseE.MiswiredAnyRun {
+		t.Error("case E bound a destination in at least one run; ambiguity must not be resolved by insertion order")
+	}
+	if caseE.TestShadowBinding {
+		t.Error("case E bound a test definition; no test-shadow ranking rule exists")
+	}
+	if !caseE.SelectedStable {
+		t.Errorf("case E selected different destinations across runs: %v", caseE.SelectedVariants)
 	}
 }
 
