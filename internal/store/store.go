@@ -1194,7 +1194,7 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 		fileIDs = append(fileIDs, fileID)
 	}
 
-	if err := deleteFileGraphsBatch(ctx, tx, fileIDs, stats); err != nil {
+	if err := deleteFileGraphsBatch(ctx, tx, repoID, fileIDs, stats); err != nil {
 		_ = tx.Rollback()
 		return nil, err
 	}
@@ -1220,7 +1220,12 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	return fileIDs, nil
 }
 
-func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, stats *WriteStats) error {
+// deleteFileGraphsBatch drops every row owned by the given files, including the
+// symbols they define. Symbol ids are never reused (AUTOINCREMENT), so any edge
+// in another file still bound to one of those symbols would become a dangling
+// reference; the unbind step below clears those inbound bindings (and their P4
+// resolution metadata) inside the same transaction, before the symbols go away.
+func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileIDs []int64, stats *WriteStats) error {
 	if len(fileIDs) == 0 {
 		return nil
 	}
@@ -1231,10 +1236,10 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, stats); err != nil {
 			return err
 		}
-		return deleteFileGraphsBatchFromTemp(ctx, tx, stats)
+		return deleteFileGraphsBatchFromTemp(ctx, tx, repoID, stats)
 	}
 
-	execInChunks := func(sqlPrefix, sqlSuffix string, ids []int64) error {
+	execInChunks := func(sqlPrefix, sqlSuffix string, ids []int64, leadingArgs ...any) error {
 		for start := 0; start < len(ids); start += sqliteInClauseBatchSize {
 			end := start + sqliteInClauseBatchSize
 			if end > len(ids) {
@@ -1242,9 +1247,10 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 			}
 			chunk := ids[start:end]
 			query := sqlPrefix + sqlitePlaceholders(len(chunk)) + sqlSuffix
-			args := make([]any, len(chunk))
-			for i, id := range chunk {
-				args[i] = id
+			args := make([]any, 0, len(chunk)+len(leadingArgs))
+			args = append(args, leadingArgs...)
+			for _, id := range chunk {
+				args = append(args, id)
 			}
 			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 				return err
@@ -1293,6 +1299,20 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, fileIDs []int64, sta
 		return err
 	}
 
+	// Unbind inbound edges from other files before their destination symbols
+	// disappear, clearing the P4 provenance/confidence that described the now
+	// dead binding. The edge row itself (dst_name, kind, evidence) survives so a
+	// later resolve pass can re-bind it if a replacement symbol shows up.
+	if err := execInChunks(
+		`UPDATE edges SET `+resolverClearResolutionSQL+`
+		WHERE repo_id = ? AND dst_symbol_id IN (SELECT id FROM symbols WHERE file_id IN (`,
+		`))`,
+		fileIDs,
+		repoID,
+	); err != nil {
+		return err
+	}
+
 	return execInChunks(`DELETE FROM symbols WHERE file_id IN (`, `)`, fileIDs)
 }
 
@@ -1336,9 +1356,9 @@ func prepareTmpDeleteFileIDs(ctx context.Context, tx *sql.Tx, fileIDs []int64, s
 	return nil
 }
 
-func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, stats *WriteStats) error {
-	exec := func(query string) error {
-		if _, err := tx.ExecContext(ctx, query); err != nil {
+func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64, stats *WriteStats) error {
+	exec := func(query string, args ...any) error {
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return err
 		}
 		if stats != nil {
@@ -1374,60 +1394,15 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, stats *Write
 	if err := exec(`DELETE FROM symbol_embeddings WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
+	// See deleteFileGraphsBatch: unbind inbound edges (and clear their stale
+	// resolution metadata) while the destination symbols still exist.
+	if err := exec(`UPDATE edges SET `+resolverClearResolutionSQL+`
+		WHERE repo_id = ? AND dst_symbol_id IN (
+			SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)
+		)`, repoID); err != nil {
+		return err
+	}
 	if err := exec(`DELETE FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
-		return err
-	}
-	return nil
-}
-
-func deleteFileGraph(ctx context.Context, tx *sql.Tx, fileID int64) error {
-	deleteSymbolTokensStmt, err := tx.PrepareContext(ctx, `
-		DELETE FROM symbol_tokens
-		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
-	`)
-	if err != nil {
-		return err
-	}
-	defer deleteSymbolTokensStmt.Close()
-
-	deleteSymbolFTSStmt, err := tx.PrepareContext(ctx, `
-		DELETE FROM symbol_fts
-		WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)
-	`)
-	if err != nil {
-		return err
-	}
-	defer deleteSymbolFTSStmt.Close()
-
-	return deleteFileGraphWithStmts(ctx, tx, fileID, deleteSymbolTokensStmt, deleteSymbolFTSStmt)
-}
-
-func deleteFileGraphWithStmts(ctx context.Context, tx *sql.Tx, fileID int64, deleteSymbolTokensStmt, deleteSymbolFTSStmt *sql.Stmt) error {
-	if _, err := deleteSymbolTokensStmt.ExecContext(ctx, fileID); err != nil {
-		return err
-	}
-	if _, err := deleteSymbolFTSStmt.ExecContext(ctx, fileID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE file_id = ?`, fileID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM references_tbl WHERE file_id = ?`, fileID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM file_imports WHERE file_id = ?`, fileID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM file_tokens WHERE file_id = ?`, fileID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM test_links WHERE test_file_id = ?`, fileID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM symbol_embeddings WHERE file_id = ?`, fileID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE file_id = ?`, fileID); err != nil {
 		return err
 	}
 	return nil
@@ -2080,14 +2055,14 @@ func (s *Store) PurgeDeletedFileGraphsForScan(ctx context.Context, repoID, scanI
 		if err := nullifyDeletedSymbolReferencesFromTemp(ctx, tx, repoID); err != nil {
 			return 0, err
 		}
-		if err := deleteFileGraphsBatchFromTemp(ctx, tx, nil); err != nil {
+		if err := deleteFileGraphsBatchFromTemp(ctx, tx, repoID, nil); err != nil {
 			return 0, err
 		}
 	} else {
 		if err := nullifyDeletedSymbolReferences(ctx, tx, repoID, fileIDs); err != nil {
 			return 0, err
 		}
-		if err := deleteFileGraphsBatch(ctx, tx, fileIDs, nil); err != nil {
+		if err := deleteFileGraphsBatch(ctx, tx, repoID, fileIDs, nil); err != nil {
 			return 0, err
 		}
 	}
@@ -2131,13 +2106,9 @@ func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int6
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE edges
-		SET `+resolverClearResolutionSQL+`
-		WHERE repo_id = ? AND dst_symbol_id IN (`+symbolIDs+`)
-	`, args...); err != nil {
-		return err
-	}
+	// edges.dst_symbol_id is unbound by deleteFileGraphsBatch itself (every
+	// symbol-removal path needs that, not just this one), so it is not repeated
+	// here.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE test_links
 		SET target_symbol_id = NULL
@@ -2188,13 +2159,8 @@ func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, rep
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE edges
-		SET `+resolverClearResolutionSQL+`
-		WHERE repo_id = ? AND dst_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
-	`, repoID); err != nil {
-		return err
-	}
+	// See nullifyDeletedSymbolReferences: edges.dst_symbol_id is unbound by
+	// deleteFileGraphsBatchFromTemp, not here.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE test_links
 		SET target_symbol_id = NULL
@@ -3238,6 +3204,22 @@ func (s *Store) CountUnresolvedEdgesByDstName(ctx context.Context, repoID int64,
 		FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name = ?
 	`, repoID, dstName).Scan(&n)
+	return n, err
+}
+
+// CountDanglingEdgeTargets reports how many edges in the repo still carry a
+// dst_symbol_id whose symbol row no longer exists. The referential invariant is
+// that dst_symbol_id either points at a live symbol or is NULL, so this must be
+// zero after any indexing, re-indexing, or purge run.
+func (s *Store) CountDanglingEdgeTargets(ctx context.Context, repoID int64) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM edges e
+		WHERE e.repo_id = ?
+		  AND e.dst_symbol_id IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = e.dst_symbol_id)
+	`, repoID).Scan(&n)
 	return n, err
 }
 
