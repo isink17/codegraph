@@ -3853,15 +3853,29 @@ func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 }
 
 func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
+	// The page is selected in a subquery that carries only the ordering keys.
+	// A broad term can match tens of thousands of symbols, and sorting rows
+	// that drag doc_summary and signature through the sorter costs far more
+	// than sorting (qualified_name, id) pairs and then fetching twenty rows.
 	rows, err := s.db.QueryContext(ctx, `
+		WITH page AS (
+			SELECT s.id AS id
+			FROM symbol_fts fts
+			JOIN symbols s ON s.id = fts.symbol_id
+			WHERE s.repo_id = ? AND symbol_fts MATCH ?
+			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			LIMIT ?
+			OFFSET ?
+		)
 		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-		FROM symbol_fts fts
-		JOIN symbols s ON s.id = fts.symbol_id
+		-- CROSS JOIN for the same reason the caller/callee page query uses one:
+		-- the page is a twenty-row subset, and it must drive the join rather
+		-- than be probed once per symbol in the repository.
+		FROM page p
+		CROSS JOIN symbols s ON s.id = p.id
 		JOIN files f ON f.id = s.file_id
-		WHERE s.repo_id = ? AND symbol_fts MATCH ?
-		LIMIT ?
-		OFFSET ?
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 	`, repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		rows, err = s.db.QueryContext(ctx, `
@@ -3870,6 +3884,7 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
+			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			LIMIT ?
 			OFFSET ?
 		`, repoID, "%"+query+"%", "%"+query+"%", safeLimit(limit), safeOffset(offset))
@@ -3891,6 +3906,7 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND (s.name = ? OR s.qualified_name = ?)
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, query, query, safeLimit(limit), safeOffset(offset))
@@ -3898,106 +3914,6 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 		return nil, err
 	}
 	return scanSymbols(rows)
-}
-
-func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	targetIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
-	if err != nil {
-		return nil, err
-	}
-
-	seen := map[int64]struct{}{}
-	var callerIDs []int64
-
-	if len(targetIDs) > 0 {
-		ids, err := s.queryEdgeSrcIDsByDstIDs(ctx, repoID, targetIDs)
-		if err != nil {
-			return nil, err
-		}
-		for _, id := range ids {
-			if _, ok := seen[id]; !ok {
-				seen[id] = struct{}{}
-				callerIDs = append(callerIDs, id)
-			}
-		}
-	}
-
-	short := lookupSymbolShortName(strings.TrimSpace(strings.TrimPrefix(symbol, "::")))
-	if short != "" {
-		ids, err := s.queryEdgeSrcIDsByDstName(ctx, repoID, symbol, short)
-		if err != nil {
-			return nil, err
-		}
-		for _, id := range ids {
-			if _, ok := seen[id]; !ok {
-				seen[id] = struct{}{}
-				callerIDs = append(callerIDs, id)
-			}
-		}
-	}
-
-	if len(callerIDs) == 0 {
-		return []graph.Symbol{}, nil
-	}
-
-	syms, err := s.loadSymbolsByIDs(ctx, repoID, callerIDs)
-	if err != nil {
-		return nil, err
-	}
-	sortSymbols(syms)
-	return paginateSymbols(syms, offset, limit), nil
-}
-
-func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	srcIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
-	if err != nil {
-		return nil, err
-	}
-	if len(srcIDs) == 0 {
-		return []graph.Symbol{}, nil
-	}
-
-	seen := map[int64]struct{}{}
-	var calleeIDs []int64
-
-	resolved, err := s.queryEdgeDstIDsBySrcIDs(ctx, repoID, srcIDs)
-	if err != nil {
-		return nil, err
-	}
-	for _, id := range resolved {
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			calleeIDs = append(calleeIDs, id)
-		}
-	}
-
-	dstNames, err := s.queryUnresolvedDstNamesBySrcIDs(ctx, repoID, srcIDs)
-	if err != nil {
-		return nil, err
-	}
-	if len(dstNames) > 0 {
-		fallbackIDs, err := s.lookupSymbolIDsForNames(ctx, repoID, dstNames)
-		if err != nil {
-			return nil, err
-		}
-		for _, id := range fallbackIDs {
-			if _, ok := seen[id]; !ok {
-				seen[id] = struct{}{}
-				calleeIDs = append(calleeIDs, id)
-			}
-		}
-	}
-
-	if len(calleeIDs) == 0 {
-		return []graph.Symbol{}, nil
-	}
-
-	syms, err := s.loadSymbolsByIDs(ctx, repoID, calleeIDs)
-	if err != nil {
-		return nil, err
-	}
-	sortSymbols(syms)
-	return paginateSymbols(syms, offset, limit), nil
 }
 
 func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth int) (map[string]any, error) {
@@ -4119,6 +4035,13 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 	}, nil
 }
 
+// impactNeighbors returns the neighbours of a frontier chunk, one row per edge.
+//
+// Deduplicating in SQL was tried and reverted: adding DISTINCT cut allocations
+// by roughly a quarter on a hot hub but made the query 8-24% slower, because
+// SQLite has to dedupe sixteen wide columns while the caller is already folding
+// the rows into a map keyed by symbol id. The duplicate rows are cheaper than
+// the dedup.
 func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []int64, callers bool) ([]graph.Symbol, error) {
 	if len(frontier) == 0 {
 		return nil, nil
@@ -4244,7 +4167,11 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND st.token IN (` + placeholders + `)
 		GROUP BY f.path, s.qualified_name
-		ORDER BY score DESC
+		-- Score alone is not a total order: weights come from a small fixed set,
+		-- so ties are the rule rather than the exception and a LIMIT/OFFSET page
+		-- boundary would fall in an arbitrary place. The grouping keys are
+		-- already computed, so using them as the tie-break is free.
+		ORDER BY score DESC, f.path ASC, s.qualified_name ASC
 		LIMIT ?
 		OFFSET ?
 	`
@@ -4981,127 +4908,46 @@ func (s *Store) symbolsByIDs(ctx context.Context, repoID int64, ids []int64, lim
 	return scanSymbols(rows)
 }
 
-func (s *Store) queryEdgeSrcIDsByDstIDs(ctx context.Context, repoID int64, dstIDs []int64) ([]int64, error) {
-	if len(dstIDs) == 0 {
-		return nil, nil
-	}
-	ph := strings.TrimRight(strings.Repeat("?,", len(dstIDs)), ",")
-	return s.lookupSymbolIDsByQuery(ctx,
-		`SELECT DISTINCT e.src_symbol_id FROM edges e WHERE e.repo_id = ? AND e.dst_symbol_id IN (`+ph+`)`,
-		append([]any{repoID}, int64SliceToAny(dstIDs)...)...)
-}
-
-func (s *Store) queryEdgeSrcIDsByDstName(ctx context.Context, repoID int64, symbol, short string) ([]int64, error) {
-	return s.lookupSymbolIDsByQuery(ctx,
-		`SELECT DISTINCT e.src_symbol_id FROM edges e
-		 WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND (
-		     e.dst_name = ? OR e.dst_name = ? OR e.dst_name LIKE ? OR e.dst_name LIKE ?
-		 )`,
-		repoID, symbol, short, "%::"+short, "%."+short)
-}
-
-func (s *Store) queryEdgeDstIDsBySrcIDs(ctx context.Context, repoID int64, srcIDs []int64) ([]int64, error) {
-	if len(srcIDs) == 0 {
-		return nil, nil
-	}
-	ph := strings.TrimRight(strings.Repeat("?,", len(srcIDs)), ",")
-	return s.lookupSymbolIDsByQuery(ctx,
-		`SELECT DISTINCT e.dst_symbol_id FROM edges e WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NOT NULL`,
-		append([]any{repoID}, int64SliceToAny(srcIDs)...)...)
-}
-
+// queryUnresolvedDstNamesBySrcIDs returns the distinct unresolved destination
+// names of a set of source symbols.
+//
+// The id list is chunked: an ambiguous short name in a large repository can
+// resolve to thousands of source symbols, and splicing all of them into one
+// `IN (?, ?, ...)` would exceed SQLITE_MAX_VARIABLE_NUMBER on drivers still
+// built with the historical 999-variable limit.
 func (s *Store) queryUnresolvedDstNamesBySrcIDs(ctx context.Context, repoID int64, srcIDs []int64) ([]string, error) {
 	if len(srcIDs) == 0 {
 		return nil, nil
 	}
-	ph := strings.TrimRight(strings.Repeat("?,", len(srcIDs)), ",")
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT DISTINCT e.dst_name FROM edges e
-		 WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''`,
-		append([]any{repoID}, int64SliceToAny(srcIDs)...)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	seen := map[string]struct{}{}
 	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
-}
-
-func (s *Store) lookupSymbolIDsForNames(ctx context.Context, repoID int64, names []string) ([]int64, error) {
-	if len(names) == 0 {
-		return nil, nil
-	}
-	seen := map[int64]struct{}{}
-	var out []int64
-	for _, name := range names {
-		ids, err := s.lookupSymbolIDs(ctx, repoID, name, 0)
+	for _, chunk := range chunkInt64s(srcIDs, sqliteInClauseBatchSize) {
+		ph := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT DISTINCT e.dst_name FROM edges e
+			 WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''`,
+			append([]any{repoID}, int64SliceToAny(chunk)...)...)
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range ids {
-			if id == 0 {
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if _, ok := seen[name]; ok {
 				continue
 			}
-			if _, ok := seen[id]; !ok {
-				seen[id] = struct{}{}
-				out = append(out, id)
-			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
 		}
 	}
-	return out, nil
-}
-
-func (s *Store) loadSymbolsByIDs(ctx context.Context, repoID int64, ids []int64) ([]graph.Symbol, error) {
-	if len(ids) == 0 {
-		return []graph.Symbol{}, nil
-	}
-	ph := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-		FROM symbols s
-		JOIN files f ON f.id = s.file_id
-		WHERE s.repo_id = ? AND s.id IN (`+ph+`)
-	`, append([]any{repoID}, int64SliceToAny(ids)...)...)
-	if err != nil {
-		return nil, err
-	}
-	return scanSymbols(rows)
-}
-
-func sortSymbols(syms []graph.Symbol) {
-	sort.Slice(syms, func(i, j int) bool {
-		if syms[i].QualifiedName != syms[j].QualifiedName {
-			return syms[i].QualifiedName < syms[j].QualifiedName
-		}
-		if syms[i].Range.StartLine != syms[j].Range.StartLine {
-			return syms[i].Range.StartLine < syms[j].Range.StartLine
-		}
-		if syms[i].Range.StartCol != syms[j].Range.StartCol {
-			return syms[i].Range.StartCol < syms[j].Range.StartCol
-		}
-		return syms[i].ID < syms[j].ID
-	})
-}
-
-func paginateSymbols(syms []graph.Symbol, offset, limit int) []graph.Symbol {
-	off := safeOffset(offset)
-	if off >= len(syms) {
-		return []graph.Symbol{}
-	}
-	syms = syms[off:]
-	lim := safeLimit(limit)
-	if lim < len(syms) {
-		syms = syms[:lim]
-	}
-	return syms
+	return names, nil
 }
 
 func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, error) {
@@ -5612,7 +5458,11 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		       s.start_line, s.end_line
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id
-		WHERE s.repo_id = ?
+		-- f.repo_id is implied by the join (a symbol's file is in the symbol's
+		-- repo), but stating it lets SQLite seek idx_files_repo_path instead of
+		-- scanning every repo's files, which is also what makes the (f.path,
+		-- s.start_line) ordering come out of the indexes rather than a sort.
+		WHERE s.repo_id = ? AND f.repo_id = ?
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
 		  AND NOT EXISTS (
 		      SELECT 1 FROM edges e
@@ -5628,7 +5478,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Example%'
 		ORDER BY f.path, s.start_line
 		LIMIT ? OFFSET ?
-	`, repoID, safeLimit(limit), safeOffset(offset))
+	`, repoID, repoID, safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
@@ -6141,9 +5991,16 @@ func appendUnique(slice []string, val string) []string {
 // including language breakdown, top-level directories, symbol/edge kind
 // breakdowns, key entry points, and hub symbols.
 func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[string]any, error) {
-	stats, err := s.Stats(ctx, repoID)
-	if err != nil {
-		return nil, fmt.Errorf("architecture overview: stats: %w", err)
+	// Deriving the totals from the breakdowns (below) removed the Stats call
+	// that used to front this function, and with it the only thing that failed
+	// for a repository id that does not exist. Without this probe an unknown id
+	// would return a well-formed document full of zeroes instead of an error.
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM repos WHERE id = ?`, repoID).Scan(&exists); err != nil {
+		// Keep the context the removed Stats call used to supply: this error is
+		// returned straight to an MCP client, and a bare "sql: no rows in result
+		// set" says nothing about which call failed. errors.Is still matches.
+		return nil, fmt.Errorf("architecture overview: repo %d: %w", repoID, err)
 	}
 
 	// Language breakdown
@@ -6239,53 +6096,26 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	}
 
 	// Key entry points (most incoming edges)
-	entryPoints := []map[string]any{}
-	{
-		rows, err := s.db.QueryContext(ctx,
-			`SELECT s.qualified_name, s.kind, f.path, COUNT(e.id) as caller_count FROM symbols s JOIN files f ON f.id = s.file_id LEFT JOIN edges e ON e.dst_symbol_id = s.id WHERE s.repo_id = ? GROUP BY s.id ORDER BY caller_count DESC LIMIT 15`,
-			repoID)
-		if err != nil {
-			return nil, fmt.Errorf("architecture overview: entry points: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var qname, kind, path string
-			var count int
-			if err := rows.Scan(&qname, &kind, &path, &count); err != nil {
-				return nil, err
-			}
-			entryPoints = append(entryPoints, map[string]any{
-				"qualified_name": qname, "kind": kind, "file": path, "caller_count": count,
-			})
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
+	entryPoints, err := s.topDegreeSymbols(ctx, repoID, "dst_symbol_id", "caller_count", architectureTopN)
+	if err != nil {
+		return nil, fmt.Errorf("architecture overview: entry points: %w", err)
 	}
 
 	// Hub symbols (most outgoing edges)
-	hubSymbols := []map[string]any{}
-	{
-		rows, err := s.db.QueryContext(ctx,
-			`SELECT s.qualified_name, s.kind, f.path, COUNT(e.id) as callee_count FROM symbols s JOIN files f ON f.id = s.file_id LEFT JOIN edges e ON e.src_symbol_id = s.id WHERE s.repo_id = ? GROUP BY s.id ORDER BY callee_count DESC LIMIT 15`,
-			repoID)
-		if err != nil {
-			return nil, fmt.Errorf("architecture overview: hub symbols: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var qname, kind, path string
-			var count int
-			if err := rows.Scan(&qname, &kind, &path, &count); err != nil {
-				return nil, err
-			}
-			hubSymbols = append(hubSymbols, map[string]any{
-				"qualified_name": qname, "kind": kind, "file": path, "callee_count": count,
-			})
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
+	hubSymbols, err := s.topDegreeSymbols(ctx, repoID, "src_symbol_id", "callee_count", architectureTopN)
+	if err != nil {
+		return nil, fmt.Errorf("architecture overview: hub symbols: %w", err)
+	}
+
+	// Totals. Three of the four are exactly the sums of breakdowns this
+	// function has already computed, so re-deriving them costs nothing;
+	// asking Stats for them meant a second full count of files, symbols and
+	// edges (plus a repeated language GROUP BY) for numbers already in hand.
+	// Only the reference count has no breakdown to sum.
+	var references int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM references_tbl WHERE repo_id = ?`, repoID).Scan(&references); err != nil {
+		return nil, fmt.Errorf("architecture overview: references: %w", err)
 	}
 
 	return map[string]any{
@@ -6296,12 +6126,23 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 		"entry_points":    entryPoints,
 		"hub_symbols":     hubSymbols,
 		"totals": map[string]any{
-			"files":      stats.Files,
-			"symbols":    stats.Symbols,
-			"edges":      stats.Edges,
-			"references": stats.References,
+			"files":      sumCountField(languages, "file_count"),
+			"symbols":    sumCountField(symbolKinds, "count"),
+			"edges":      sumCountField(edgeKinds, "count"),
+			"references": references,
 		},
 	}, nil
+}
+
+// sumCountField totals an integer field across a breakdown list.
+func sumCountField(rows []map[string]any, field string) int64 {
+	var total int64
+	for _, row := range rows {
+		if v, ok := row[field].(int); ok {
+			total += int64(v)
+		}
+	}
+	return total
 }
 
 // AllImports returns a map of file path to list of import paths for the given repo.

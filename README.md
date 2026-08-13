@@ -322,6 +322,12 @@ codegraph audit <path>                    # Audit the indexed graph for integrit
 codegraph audit <path> --examples 0       # Counts only, no examples
 codegraph audit <path> --fail-on error    # Exit non-zero when the graph has error findings
 
+# Query latency benchmark (read-only; never indexes or migrates)
+codegraph bench-queries <path>                    # Benchmark local graph queries on an indexed repo
+codegraph bench-queries <path> --runs 50          # More samples for a tighter p95
+codegraph bench-queries <path> --budget-ms 25     # Report against a stricter budget
+codegraph bench-queries <path> --fail-over-budget # Exit non-zero after printing the report
+
 # Query
 codegraph stats <path>                    # Graph statistics
 codegraph find-symbol <path> <query>      # Find symbols
