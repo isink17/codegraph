@@ -55,9 +55,10 @@ const (
 	// sqliteImportValuesBatchRows controls multi-row inserts into file_imports where each row uses 3 parameters.
 	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteImportValuesBatchRows = 300
-	// sqliteTestLinkValuesBatchRows controls multi-row inserts into test_links where each row uses 7 parameters.
-	// 128*7=896 variables, staying under sqliteDefaultMaxVariables.
-	sqliteTestLinkValuesBatchRows = 128
+	// sqliteTestLinkValuesBatchRows controls multi-row inserts into test_links where each row uses 8 parameters
+	// (target_stable_key was added by migration 020).
+	// 124*8=992 variables, staying under sqliteDefaultMaxVariables.
+	sqliteTestLinkValuesBatchRows = 124
 
 	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 18 parameters.
 	// 55*18=990 variables, staying under sqliteDefaultMaxVariables.
@@ -133,7 +134,14 @@ type ScanSummary struct {
 	ResolveCrossFileMS      int64                      `json:"resolve_cross_file_ms,omitempty"`
 	ResolveCrossFileTargets int                        `json:"resolve_cross_file_targets,omitempty"`
 	ResolveCrossFile        *ResolveEdgesForNamesStats `json:"resolve_cross_file,omitempty"`
-	DurationMS              int64                      `json:"duration_ms"`
+	// ResolveTestLinksMS and ResolveTestLinksBound report the Pass-2 test-link
+	// resolution separately from edge resolution, so a drop in binding rate is
+	// visible in `codegraph index --json` instead of hiding inside ResolveMS.
+	// ResolveTestLinksMS is also counted in ResolveMS, which remains the total
+	// for the whole resolution pass.
+	ResolveTestLinksMS    int64 `json:"resolve_test_links_ms,omitempty"`
+	ResolveTestLinksBound int   `json:"resolve_test_links_bound,omitempty"`
+	DurationMS            int64 `json:"duration_ms"`
 }
 
 type ResolveEdgesForNamesStats struct {
@@ -1623,35 +1631,24 @@ func insertParsedFileGraph(
 		}
 	}
 
-	targetKeySet := make(map[string]struct{}, len(parsed.TestLinks))
-	for _, link := range parsed.TestLinks {
-		if link.TargetStableKey != "" {
-			targetKeySet[link.TargetStableKey] = struct{}{}
-		}
-	}
-	targetKeys := make([]string, 0, len(targetKeySet))
-	for key := range targetKeySet {
-		targetKeys = append(targetKeys, key)
-	}
-	targetStableToRef, err := resolveSymbolFilesByStableKeysQuery(ctx, tx, repoID, targetKeys)
-	if err != nil {
-		return err
-	}
+	// P10 Pass 1: persist the test-link *fact* only. The target is recorded as
+	// the parser's stable key and left unbound; binding it against the symbol
+	// table is a Pass-2 operation (ResolveTestLinks*, resolve_test_links.go).
+	//
+	// Before P10 this loop looked each key up in `symbols` inside the write
+	// transaction, which made the result depend on whether the target file
+	// happened to be persisted earlier in the same indexing batch. `test_symbol_id`
+	// stays here because it names a symbol of *this* file, inserted a few lines
+	// above: it is intra-file and cannot be affected by batch order.
 	if len(parsed.TestLinks) > 0 {
-		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*7)
+		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*testLinkInsertCols)
 		for _, link := range parsed.TestLinks {
 			var testSymbolID any
-			var targetSymbolID any
-			var targetFileID any
 			if id := stableToID[link.TestSymbolKey]; id != 0 {
 				testSymbolID = id
 			}
-			if ref, ok := targetStableToRef[link.TargetStableKey]; ok {
-				targetSymbolID = ref.id
-				targetFileID = ref.fileID
-			}
-			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, targetFileID, targetSymbolID, link.Reason, link.Score)
-			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*7 {
+			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, nil, nil, link.Reason, link.Score, link.TargetStableKey)
+			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*testLinkInsertCols {
 				if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
 					return err
 				}
@@ -1908,8 +1905,12 @@ func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any, stat
 	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args, stats)
 }
 
+// testLinkInsertCols is the arity of the test_links insert tuple. It includes
+// target_stable_key (migration 020), which Pass 2 resolves against.
+const testLinkInsertCols = 8
+
 func execTestLinksInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
-	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score", 7, args, stats)
+	return execBatchInsert(ctx, tx, "test_links", "repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score, target_stable_key", testLinkInsertCols, args, stats)
 }
 
 func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
@@ -2145,13 +2146,21 @@ func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int6
 	}
 	symbolIDs := `SELECT id FROM symbols WHERE file_id IN (` + placeholders + `)`
 
-	// test_links pointing AT one of the deleted target files become meaningless
-	// once the target file is gone (target_symbol_id will be nulled out below
-	// alongside the other symbol-level fan-out, but target_file_id has no
-	// nullification path of its own — without this delete the row would survive
-	// with a stale target_file_id and surface in RelatedTests(file=...).
+	// test_links pointing AT one of the deleted target files must lose that
+	// target: target_file_id has no nullification path of its own, so without
+	// this the row would survive pointing at a purged file and surface in
+	// RelatedTests(file=...).
+	//
+	// P10 unbinds rather than deleting. The row is a fact *declared by the test
+	// file*, which still exists and still declares it; only the target went
+	// away. Deleting it destroyed target_stable_key too, so a target that merely
+	// moved to another file could never rebind -- exactly the "permanently miss a
+	// valid target" failure P10 exists to remove. Unbinding leaves the same
+	// observable state for RelatedTests (no target file, no target symbol) while
+	// letting Pass 2 rebind if the definition reappears anywhere.
 	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM test_links
+		UPDATE test_links
+		SET target_file_id = NULL, target_symbol_id = NULL
 		WHERE repo_id = ? AND target_file_id IN (`+placeholders+`)
 	`, args...); err != nil {
 		return err
@@ -2195,9 +2204,11 @@ func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, rep
 
 	// See nullifyDeletedSymbolReferences: rows with target_file_id pointing at
 	// any deleted file become orphans even after target_symbol_id is nulled,
-	// which would surface in RelatedTests(file=...). Delete them up front.
+	// which would surface in RelatedTests(file=...). Unbind them up front,
+	// keeping the row (and its target_stable_key) rebindable by Pass 2.
 	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM test_links
+		UPDATE test_links
+		SET target_file_id = NULL, target_symbol_id = NULL
 		WHERE repo_id = ? AND target_file_id IN (SELECT id FROM tmp_delete_file_ids)
 	`, repoID); err != nil {
 		return err
@@ -3776,47 +3787,6 @@ func (s *Store) resolveSymbolsByStableKeys(ctx context.Context, repoID int64, st
 
 type queryContexter interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
-// symbolFileRef pairs a resolved symbol id with the file_id that hosts it.
-// Used by the test_links insert path to populate target_file_id alongside
-// target_symbol_id so PurgeDeletedFileGraphsForScan can match rows whose
-// target file was deleted.
-type symbolFileRef struct {
-	id     int64
-	fileID int64
-}
-
-func resolveSymbolFilesByStableKeysQuery(ctx context.Context, q queryContexter, repoID int64, stableKeys []string) (map[string]symbolFileRef, error) {
-	out := map[string]symbolFileRef{}
-	if len(stableKeys) == 0 {
-		return out, nil
-	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(stableKeys)), ",")
-	query := `
-		SELECT stable_key, id, file_id
-		FROM symbols
-		WHERE repo_id = ? AND stable_key IN (` + placeholders + `)
-	`
-	args := make([]any, 0, len(stableKeys)+1)
-	args = append(args, repoID)
-	for _, key := range stableKeys {
-		args = append(args, key)
-	}
-	rows, err := q.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var key string
-		var ref symbolFileRef
-		if err := rows.Scan(&key, &ref.id, &ref.fileID); err != nil {
-			return nil, err
-		}
-		out[key] = ref
-	}
-	return out, rows.Err()
 }
 
 func resolveSymbolsByStableKeysQuery(ctx context.Context, q queryContexter, repoID int64, stableKeys []string) (map[string]int64, error) {

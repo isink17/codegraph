@@ -78,11 +78,15 @@ import "testing"
 func TestHelper(t *testing.T) { Helper() }
 `
 
-// Test links are resolved against symbols already present in the database, so
-// a test file indexed in the same batch as its target may or may not bind
-// depending on intra-batch file order. Indexing targets first and test files
-// second keeps these regressions deterministic; intra-batch ordering is a
-// separate pre-existing property and not what P6 changes.
+// indexTargetsThenTests indexes the target files first and the test files in a
+// second run.
+//
+// This used to be load-bearing: before P10, test links were bound during the
+// write pass, so a test file indexed in the same batch as its target bound only
+// if the target happened to be persisted first. Two-pass resolution removed that
+// dependency (see two_pass_order_test.go), and the split is kept here only
+// because these P6 regressions are about what happens on a *later* re-index, so
+// they need the two runs to be distinct events.
 func (f *reindexFixture) indexTargetsThenTests(targets, tests map[string]string) {
 	f.t.Helper()
 	for rel, src := range targets {
@@ -164,6 +168,15 @@ func TestReindexUnbindsTestLinkWhenTargetSymbolDisappears(t *testing.T) {
 // TestReindexRecreatedTargetHasNoStaleTestLinkID covers the replacement case:
 // helper.go is re-indexed and still defines Helper, so its symbol row gets a
 // new id. The test_links row must never keep the old id.
+//
+// P10 update: this test previously asserted the P6 limitation that the link
+// stayed unbound until the *test* file was re-indexed, because the only code
+// that could bind a target ran inside the test file's own insert. Pass 2 binds
+// test links from the persisted `target_stable_key` after the batch completes,
+// so re-indexing the target alone now rebinds the link to the new symbol row.
+// The stale-id invariant the test was written for is unchanged and still
+// asserted below; only the "stays NULL" clause was a statement about the old
+// architecture.
 func TestReindexRecreatedTargetHasNoStaleTestLinkID(t *testing.T) {
 	f := newReindexFixture(t)
 	f.indexTargetsThenTests(
@@ -186,21 +199,24 @@ func TestReindexRecreatedTargetHasNoStaleTestLinkID(t *testing.T) {
 	if after.TargetFile != "helper.go" {
 		t.Fatalf("target_file_id lost: target file = %q, want helper.go", after.TargetFile)
 	}
-	// Documented P6 limitation: test_links rows are only rebuilt when the test
-	// file itself is re-indexed, so the symbol-level target stays NULL until
-	// then. P6 deliberately does not add a test-link rebinding pass.
-	if after.TargetSymbolID != nil {
-		t.Fatalf("target_symbol_id = %d; P6 expects NULL until the test file is re-indexed",
-			*after.TargetSymbolID)
+	// P10: Pass 2 rebinds from the persisted target_stable_key, so re-indexing
+	// only the target file is enough.
+	rebound := assertTargetBound(t, after)
+	if rebound == oldID {
+		t.Fatalf("rebound target_symbol_id = %d, want a new symbol row", rebound)
 	}
 
-	// Re-indexing the test file re-resolves the link against the new symbol row.
+	// Re-indexing the test file keeps it bound to the same (current) symbol row.
 	f.write("helper_test.go", helperTestSrc+"\n// touch\n")
 	f.update()
 	f.assertNoDanglingTestLinks()
-	rebound := assertTargetBound(t, f.testLink("helper_test.go", "helper.go"))
-	if rebound == oldID {
-		t.Fatalf("rebound target_symbol_id = %d, want a new symbol row", rebound)
+	afterTestReindex := assertTargetBound(t, f.testLink("helper_test.go", "helper.go"))
+	if afterTestReindex == oldID {
+		t.Fatalf("target_symbol_id = %d, want a new symbol row", afterTestReindex)
+	}
+	if afterTestReindex != rebound {
+		t.Fatalf("target_symbol_id = %d after test-file re-index, want %d (unchanged target row)",
+			afterTestReindex, rebound)
 	}
 }
 
