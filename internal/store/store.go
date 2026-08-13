@@ -1223,8 +1223,9 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 // deleteFileGraphsBatch drops every row owned by the given files, including the
 // symbols they define. Symbol ids are never reused (AUTOINCREMENT), so any edge
 // in another file still bound to one of those symbols would become a dangling
-// reference; the unbind step below clears those inbound bindings (and their P4
-// resolution metadata) inside the same transaction, before the symbols go away.
+// reference; the unbind steps below clear those inbound bindings (edges, with
+// their P4 resolution metadata, and test_links.target_symbol_id) inside the
+// same transaction, before the symbols go away.
 func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileIDs []int64, stats *WriteStats) error {
 	if len(fileIDs) == 0 {
 		return nil
@@ -1306,6 +1307,22 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(
 		`UPDATE edges SET `+resolverClearResolutionSQL+`
 		WHERE repo_id = ? AND dst_symbol_id IN (SELECT id FROM symbols WHERE file_id IN (`,
+		`))`,
+		fileIDs,
+		repoID,
+	); err != nil {
+		return err
+	}
+
+	// Same problem for test_links owned by other (test) files: their
+	// target_symbol_id points at a symbol that is about to disappear. Unbind the
+	// symbol-level target only — the row, its reason/score, and its
+	// target_file_id survive so file-level RelatedTests keeps working while the
+	// target file itself is still indexed. Rows whose target *file* is being
+	// deleted are handled by the purge path (nullifyDeletedSymbolReferences).
+	if err := execInChunks(
+		`UPDATE test_links SET target_symbol_id = NULL
+		WHERE repo_id = ? AND target_symbol_id IN (SELECT id FROM symbols WHERE file_id IN (`,
 		`))`,
 		fileIDs,
 		repoID,
@@ -1398,6 +1415,15 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 	// resolution metadata) while the destination symbols still exist.
 	if err := exec(`UPDATE edges SET `+resolverClearResolutionSQL+`
 		WHERE repo_id = ? AND dst_symbol_id IN (
+			SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)
+		)`, repoID); err != nil {
+		return err
+	}
+	// See deleteFileGraphsBatch: unbind test_links.target_symbol_id for links
+	// owned by other files, keeping the row, its target_file_id and its
+	// reason/score.
+	if err := exec(`UPDATE test_links SET target_symbol_id = NULL
+		WHERE repo_id = ? AND target_symbol_id IN (
 			SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)
 		)`, repoID); err != nil {
 		return err
@@ -2106,16 +2132,9 @@ func nullifyDeletedSymbolReferences(ctx context.Context, tx *sql.Tx, repoID int6
 		return err
 	}
 
-	// edges.dst_symbol_id is unbound by deleteFileGraphsBatch itself (every
-	// symbol-removal path needs that, not just this one), so it is not repeated
-	// here.
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE test_links
-		SET target_symbol_id = NULL
-		WHERE repo_id = ? AND target_symbol_id IN (`+symbolIDs+`)
-	`, args...); err != nil {
-		return err
-	}
+	// edges.dst_symbol_id and test_links.target_symbol_id are unbound by
+	// deleteFileGraphsBatch itself (every symbol-removal path needs that, not
+	// just this one), so they are not repeated here.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE references_tbl
 		SET symbol_id = NULL
@@ -2159,15 +2178,9 @@ func nullifyDeletedSymbolReferencesFromTemp(ctx context.Context, tx *sql.Tx, rep
 		return err
 	}
 
-	// See nullifyDeletedSymbolReferences: edges.dst_symbol_id is unbound by
-	// deleteFileGraphsBatchFromTemp, not here.
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE test_links
-		SET target_symbol_id = NULL
-		WHERE repo_id = ? AND target_symbol_id IN (SELECT id FROM tmp_delete_symbol_ids)
-	`, repoID); err != nil {
-		return err
-	}
+	// See nullifyDeletedSymbolReferences: edges.dst_symbol_id and
+	// test_links.target_symbol_id are unbound by deleteFileGraphsBatchFromTemp,
+	// not here.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE references_tbl
 		SET symbol_id = NULL
