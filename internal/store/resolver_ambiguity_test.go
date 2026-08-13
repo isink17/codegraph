@@ -34,8 +34,8 @@ func ambiguityScenarios() []ambiguityScenario {
 			build: func(t *testing.T, f *gateFixture) (int64, int64, string, string) {
 				first := f.file(t, "src/py/config.py", "python")
 				f.symbol(t, first, "load_config", "config.load_config", "python")
-				second := f.file(t, "tests/py/test_config.py", "python")
-				f.symbol(t, second, "load_config", "test_config.load_config", "python")
+				second := f.file(t, "src/py/config_alt.py", "python")
+				f.symbol(t, second, "load_config", "config_alt.load_config", "python")
 
 				caller := f.file(t, "src/py/caller.py", "python")
 				src := f.symbol(t, caller, "caller", "caller", "python")
@@ -48,8 +48,8 @@ func ambiguityScenarios() []ambiguityScenario {
 			// would flip its answer here; refusing to choose cannot.
 			name: "bare_name_ambiguity_unresolved_reversed_insertion_order",
 			build: func(t *testing.T, f *gateFixture) (int64, int64, string, string) {
-				second := f.file(t, "tests/py/test_config.py", "python")
-				f.symbol(t, second, "load_config", "test_config.load_config", "python")
+				second := f.file(t, "src/py/config_alt.py", "python")
+				f.symbol(t, second, "load_config", "config_alt.load_config", "python")
 				first := f.file(t, "src/py/config.py", "python")
 				f.symbol(t, first, "load_config", "config.load_config", "python")
 
@@ -70,8 +70,8 @@ func ambiguityScenarios() []ambiguityScenario {
 				}
 				first := f.file(t, "src/py/config.py", "python")
 				f.symbol(t, first, "load_config", "config.load_config", "python")
-				second := f.file(t, "tests/py/test_config.py", "python")
-				f.symbol(t, second, "load_config", "test_config.load_config", "python")
+				second := f.file(t, "src/py/config_alt.py", "python")
+				f.symbol(t, second, "load_config", "config_alt.load_config", "python")
 
 				caller := f.file(t, "src/py/caller.py", "python")
 				src := f.symbol(t, caller, "caller", "caller", "python")
@@ -464,10 +464,12 @@ func TestResolverAmbiguity_RepeatedRunsAgree(t *testing.T) {
 func TestResolverAmbiguity_FullAndNameTargetedAgreeOnAmbiguousGraph(t *testing.T) {
 	build := func(t *testing.T, f *gateFixture) int64 {
 		t.Helper()
-		production := f.file(t, "src/py/config_e.py", "python")
-		f.symbol(t, production, "load_config_e", "config_e.load_config_e", "python")
-		shadow := f.file(t, "tests/py/test_config_e.py", "python")
-		f.symbol(t, shadow, "load_config_e", "test_config_e.load_config_e", "python")
+		// Both definitions are production code: P7's test-shadow rule must not
+		// be able to decide this one, so it stays a pure P3 ambiguity.
+		first := f.file(t, "src/py/config_e.py", "python")
+		f.symbol(t, first, "load_config_e", "config_e.load_config_e", "python")
+		second := f.file(t, "src/py/config_e_alt.py", "python")
+		f.symbol(t, second, "load_config_e", "config_e_alt.load_config_e", "python")
 		caller := f.file(t, "src/py/caller_e.py", "python")
 		src := f.symbol(t, caller, "caller_e", "caller_e", "python")
 		return f.edge(t, caller, src, "load_config_e")
@@ -564,8 +566,8 @@ func TestResolverAmbiguity_StatsAccountForMixedBatch(t *testing.T) {
 	wantDst := f.symbol(t, uniqueDef, "normalize", "helpers.normalize", "python")
 	firstAmbiguous := f.file(t, "src/py/config.py", "python")
 	f.symbol(t, firstAmbiguous, "load_config", "config.load_config", "python")
-	secondAmbiguous := f.file(t, "tests/py/test_config.py", "python")
-	f.symbol(t, secondAmbiguous, "load_config", "test_config.load_config", "python")
+	secondAmbiguous := f.file(t, "src/py/config_alt.py", "python")
+	f.symbol(t, secondAmbiguous, "load_config", "config_alt.load_config", "python")
 
 	caller := f.file(t, "src/py/caller.py", "python")
 	src := f.symbol(t, caller, "caller", "caller", "python")

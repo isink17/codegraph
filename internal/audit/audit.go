@@ -163,9 +163,11 @@ type CaseResult struct {
 	OutcomeVariants  []string         `json:"outcome_variants,omitempty"`
 
 	// ShadowCandidates lists competing test/mock definitions that were present
-	// in the graph for this case, whether or not one was selected. A case that
-	// resolves correctly while shadow candidates exist is correct only by
-	// insertion order, because resolution has no test-shadow rule.
+	// in the graph for this case, whether or not one was selected. Since P7 a
+	// production caller resolving to the production definition while shadow
+	// candidates existed is the rule working, not luck; the list stays in the
+	// report so the shadowing is still visible and TestShadowBinding below still
+	// says whether one of them was bound.
 	ShadowCandidates []string `json:"shadow_candidates,omitempty"`
 	// TestShadowBinding and MiswiredAnyRun are true when the condition was seen
 	// in at least one repeat, so an intermittent defect is never rounded away.
@@ -961,14 +963,19 @@ func findings(r *Report) []string {
 		out = append(out, "measured with a single run: nondeterminism was not sampled, so the stability flags are not evidence")
 	}
 	for _, c := range r.Cases {
-		// A resolved destination while test/mock definitions of the same name
-		// competed is worth reporting even when the selected target is the
-		// production one: with no test-shadow rule, that outcome rests on
-		// symbol insertion order rather than on evidence.
+		// P7 gives *production* callers evidence that separates a production
+		// definition from a test one, so a production case resolving while shadow
+		// candidates existed is the rule working and is not reported. A call from
+		// a test file gets no such preference, so a test caller that resolved
+		// while several test/mock definitions competed still rests on something
+		// other than evidence and is still worth saying out loud.
+		if !store.IsTestFilePath(c.SrcFile) {
+			continue
+		}
 		resolvedSomewhere := (c.Selected != nil && c.Selected.Resolved) || !c.SelectedStable
 		if len(c.ShadowCandidates) > 0 && !c.TestShadowBinding && resolvedSomewhere {
 			out = append(out, fmt.Sprintf(
-				"case %s selected the production definition while %d competing test definition(s) existed; resolution has no test-shadow rule, so this outcome rests on symbol insertion order",
+				"case %s is called from a test file and resolved while %d competing test definition(s) existed; test callers get no production preference, so this outcome does not rest on the test-shadow rule",
 				c.ID, len(c.ShadowCandidates)))
 		}
 	}

@@ -301,8 +301,8 @@ func TestResolveEdgesLeavesUnresolvedEdgesWithoutMetadata(t *testing.T) {
 			build: func(t *testing.T, f *gateFixture) int64 {
 				first := f.file(t, "src/py/config.py", "python")
 				f.symbol(t, first, "load_config", "config.load_config", "python")
-				second := f.file(t, "tests/py/test_config.py", "python")
-				f.symbol(t, second, "load_config", "test_config.load_config", "python")
+				second := f.file(t, "src/py/config_alt.py", "python")
+				f.symbol(t, second, "load_config", "config_alt.load_config", "python")
 
 				caller := f.file(t, "src/py/caller.py", "python")
 				src := f.symbol(t, caller, "caller", "caller", "python")
@@ -414,8 +414,8 @@ func TestScopedResolversLeaveRefusedEdgesUnexplained(t *testing.T) {
 	f := newGateFixture(t)
 	first := f.file(t, "src/py/config.py", "python")
 	f.symbol(t, first, "load_config", "config.load_config", "python")
-	second := f.file(t, "tests/py/test_config.py", "python")
-	f.symbol(t, second, "load_config", "test_config.load_config", "python")
+	second := f.file(t, "src/py/config_alt.py", "python")
+	f.symbol(t, second, "load_config", "config_alt.load_config", "python")
 
 	caller := f.file(t, "src/py/caller.py", "python")
 	src := f.symbol(t, caller, "caller", "caller", "python")
