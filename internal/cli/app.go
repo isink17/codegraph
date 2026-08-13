@@ -26,6 +26,7 @@ import (
 	"github.com/isink17/codegraph/internal/export"
 	"github.com/isink17/codegraph/internal/gotool"
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/graphaudit"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/logging"
 	"github.com/isink17/codegraph/internal/mcp"
@@ -211,6 +212,120 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 		return err
 	}
 	return writeJSON(stdout, report)
+}
+
+// runAudit audits an already-indexed repository graph.
+//
+// Three properties of this handler are contractual, not incidental:
+//
+//   - It never indexes and never writes. It resolves the database path with
+//     repoDBPathsForRepo rather than dbPathForRepo, because the latter creates
+//     the artifacts directory when no database is found, and it opens with
+//     store.OpenReadOnly, which refuses a missing file instead of creating one
+//     and never migrates. A repository that was never indexed produces an
+//     actionable error, not an empty report about a database this command just
+//     brought into existence.
+//   - The report is written to stdout before any --fail-on policy is applied,
+//     so the JSON is byte-identical under every policy and only the exit code
+//     differs.
+//   - Findings are not command failures by default. See graphaudit.FailOnNone.
+func runAudit(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root to audit (optional)")
+	examples := fs.Int("examples", graphaudit.DefaultExampleLimit, "maximum examples per finding (0 for counts only)")
+	failOnFlag := fs.String("fail-on", string(graphaudit.FailOnNone), "exit non-zero on findings: none, error, or warning")
+
+	repoRootCandidate, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, "")
+	if err != nil {
+		return err
+	}
+	failOn, err := graphaudit.ParseFailOn(*failOnFlag)
+	if err != nil {
+		return err
+	}
+	if *examples < 0 {
+		return fmt.Errorf("invalid --examples %d: want 0 or more", *examples)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
+	}
+
+	canonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		return err
+	}
+	candidates, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		return err
+	}
+	dbPath := ""
+	for _, path := range candidates {
+		st, statErr := os.Stat(path)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			// A database we cannot stat is not an unindexed repository. Telling
+			// the user to re-index a permission-denied or I/O-failing database
+			// would be wrong advice, and following it would rewrite a database
+			// that may have been fine -- so surface the real error, the way
+			// dbPathForRepo already does.
+			return fmt.Errorf("stat %s: %w", path, statErr)
+		}
+		if st.Size() > 0 {
+			dbPath = path
+			break
+		}
+	}
+	if dbPath == "" {
+		return fmt.Errorf("%s is not indexed: no graph database found (run %s index %s)",
+			repoRoot, appname.BinaryName, repoRoot)
+	}
+
+	s, err := store.OpenReadOnly(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	repo, found, err := s.FindRepo(ctx, repoRoot)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("%s is not indexed: %s holds no graph for it (run %s index %s)",
+			repoRoot, dbPath, appname.BinaryName, repoRoot)
+	}
+
+	// A negative ExampleLimit means "counts only" to graphaudit, while 0 means
+	// "use the default". The CLI spells counts-only as --examples 0, so the
+	// zero case is translated rather than passed through.
+	exampleLimit := *examples
+	if exampleLimit == 0 {
+		exampleLimit = -1
+	}
+
+	report, err := graphaudit.Run(ctx, s, graphaudit.Options{
+		RepoID:       repo.ID,
+		ExampleLimit: exampleLimit,
+		Repository: graphaudit.Repository{
+			Root:          repoRoot,
+			CanonicalPath: repo.CanonicalPath,
+			DBPath:        dbPath,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := writeJSON(stdout, report); err != nil {
+		return err
+	}
+	if failOn.ShouldFail(report.Status) {
+		return fmt.Errorf("audit status %s violates --fail-on %s", report.Status, failOn)
+	}
+	return nil
 }
 
 func runConfig(cfg config.Config, stdout io.Writer, args []string) error {

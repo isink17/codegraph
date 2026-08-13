@@ -279,6 +279,7 @@ See the [`examples/`](examples/) directory for more configuration samples.
 | `list_repos` | List known repositories |
 | `list_scans` | List recent scans |
 | `latest_scan_errors` | List indexer errors from the last scan |
+| `audit` | Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only). Optional `examples` integer caps examples per finding; `0` means counts only |
 
 ### Session Memory
 
@@ -315,6 +316,11 @@ codegraph clean <path>                    # Clean database
 
 # MCP Server
 codegraph serve [--repo-root <path>]      # Start MCP server (auto-detects repo root)
+
+# Graph audit
+codegraph audit <path>                    # Audit the indexed graph for integrity/trust issues
+codegraph audit <path> --examples 0       # Counts only, no examples
+codegraph audit <path> --fail-on error    # Exit non-zero when the graph has error findings
 
 # Query
 codegraph stats <path>                    # Graph statistics
