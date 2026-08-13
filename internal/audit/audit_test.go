@@ -326,6 +326,55 @@ func TestTestShadowCaseResolvesToProductionDeterministically(t *testing.T) {
 	}
 }
 
+// TestTargetClassificationPerCase pins the P8 reading of the adversarial
+// fixture, and pins it to the resolver outcome rather than to the name alone.
+//
+// Case A is the one this exists for: a Python call to the builtin `sorted` whose
+// only project definition is an unrelated Swift function. It must stay
+// unresolved, must never become a Swift project edge, and must still be
+// explained as `builtin`. The fixture defines no imports at all, so every other
+// unresolved case is `unknown` -- which is the honest answer, not a shortfall.
+//
+// Classification never feeds an outcome, so this asserts the two independently
+// and requires them to agree: `project` if and only if a destination was bound.
+func TestTargetClassificationPerCase(t *testing.T) {
+	report := runAudit(t, Options{Repeats: 2})
+
+	want := map[string]struct {
+		classification string
+		resolved       bool
+	}{
+		"A": {"builtin", false},
+		"B": {"project", true},
+		"C": {"unknown", false},
+		"D": {"unknown", false},
+		"E": {"project", true},
+		"F": {"unknown", false},
+	}
+	for id, expect := range want {
+		c := findCase(t, report, id)
+		if len(c.TargetClassificationVariants) > 0 {
+			t.Errorf("case %s classified inconsistently across runs: %v", id, c.TargetClassificationVariants)
+			continue
+		}
+		if c.TargetClassification != expect.classification {
+			t.Errorf("case %s target_classification = %q, want %q (outcome %q, selected %v)",
+				id, c.TargetClassification, expect.classification, c.Outcome, c.Selected)
+		}
+		resolved := c.Selected != nil && c.Selected.Resolved
+		if resolved != expect.resolved {
+			t.Errorf("case %s resolved = %t, want %t; resolver outcomes must not shift with P8",
+				id, resolved, expect.resolved)
+		}
+		// The invariant that makes the field trustworthy: `project` means bound,
+		// and nothing else does.
+		if (c.TargetClassification == "project") != resolved {
+			t.Errorf("case %s: classification %q disagrees with resolved=%t",
+				id, c.TargetClassification, resolved)
+		}
+	}
+}
+
 // TestMetricsAreSelfConsistent checks the counters add up, so a baseline cannot
 // record an arithmetically impossible measurement.
 func TestMetricsAreSelfConsistent(t *testing.T) {

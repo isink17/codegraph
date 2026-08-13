@@ -13,6 +13,9 @@
 - `internal/store`: SQLite connection, migrations, persistence
 - `internal/indexer`: repository scan, hashing, incremental updates
 - `internal/parser`: parser interfaces and language adapters
+- `internal/classify`: evidence-based classification of unresolved edge targets
+  (builtin/stdlib/external/unknown); owns all per-language rules
+- `internal/audit`: developer resolver-correctness audit and its fixture
 - `internal/query`: symbol, caller, callee, impact, and stats queries
 - `internal/search`: lightweight local semantic ranking
 - `internal/mcp`: stdio MCP server and tool routing

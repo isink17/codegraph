@@ -270,6 +270,16 @@ type ExportEdge struct {
 	// See edge_resolution.go for the value sets and the confidence mapping.
 	ResolutionStrategy   string `json:"resolution_strategy,omitempty"`
 	ResolutionConfidence string `json:"resolution_confidence,omitempty"`
+	// TargetClassification says what this edge points at: `project` when a
+	// destination is bound, and otherwise what the unresolved `dst_name` can be
+	// proven to be -- `builtin`, `stdlib`, `external`, or `unknown`. It is
+	// derived on read from language, imports, and name evidence, never stored,
+	// so it cannot go stale against the binding in the same row. One short enum,
+	// no per-edge explanation blob.
+	//
+	// See internal/store/target_classification.go for the evidence loader and
+	// internal/classify for the rules and the deliberate per-language gaps.
+	TargetClassification string `json:"target_classification,omitempty"`
 }
 
 type ReplaceFileGraphInput struct {
@@ -4397,7 +4407,7 @@ func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit,
 
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, e.resolution_strategy, e.resolution_confidence
+		SELECT `+exportEdgeColumnsSQL+`
 		FROM edges e
 		LEFT JOIN symbols src ON src.id = e.src_symbol_id
 		LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
@@ -4410,7 +4420,14 @@ func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset
 	if err != nil {
 		return nil, err
 	}
-	return scanExportEdges(rows)
+	edges, evidence, err := scanExportEdges(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.classifyExportEdges(ctx, repoID, edges, evidence); err != nil {
+		return nil, err
+	}
+	return edges, nil
 }
 
 func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]graph.Symbol, error) {
@@ -4458,7 +4475,7 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]ExportEdge, error) {
 	if len(symbolIDs) == 0 {
 		rows, err := s.db.QueryContext(ctx, `
-			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, e.resolution_strategy, e.resolution_confidence
+			SELECT `+exportEdgeColumnsSQL+`
 			FROM edges e
 			LEFT JOIN symbols src ON src.id = e.src_symbol_id
 			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
@@ -4468,13 +4485,20 @@ func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs 
 		if err != nil {
 			return nil, err
 		}
-		return scanExportEdges(rows)
+		edges, evidence, err := scanExportEdges(rows)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.classifyExportEdges(ctx, repoID, edges, evidence); err != nil {
+			return nil, err
+		}
+		return edges, nil
 	}
 	var out []ExportEdge
 	for _, chunk := range chunkInt64s(symbolIDs, 250) {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, e.resolution_strategy, e.resolution_confidence
+			SELECT ` + exportEdgeColumnsSQL + `
 			FROM edges e
 			LEFT JOIN symbols src ON src.id = e.src_symbol_id
 			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
@@ -4493,8 +4517,11 @@ func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs 
 		if err != nil {
 			return nil, err
 		}
-		items, err := scanExportEdges(rows)
+		items, evidence, err := scanExportEdges(rows)
 		if err != nil {
+			return nil, err
+		}
+		if err := s.classifyExportEdges(ctx, repoID, items, evidence); err != nil {
 			return nil, err
 		}
 		out = append(out, items...)
@@ -4525,12 +4552,18 @@ func chunkInt64s(values []int64, chunkSize int) [][]int64 {
 	return out
 }
 
-func scanExportEdges(rows *sql.Rows) ([]ExportEdge, error) {
+// scanExportEdges reads exportEdgeColumnsSQL. It returns the wire records and,
+// positionally aligned with them, the classification evidence carried by the two
+// trailing columns. TargetClassification is left empty here: it is filled by
+// classifyExportEdges, which is the only place that decides it.
+func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error) {
 	defer rows.Close()
 	var out []ExportEdge
+	var evidence []exportEdgeEvidence
 	for rows.Next() {
 		var edge ExportEdge
 		var dstID sql.NullInt64
+		var item exportEdgeEvidence
 		if err := rows.Scan(
 			&edge.ID,
 			&edge.SrcSymbolID,
@@ -4543,16 +4576,23 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, error) {
 			&edge.Line,
 			&edge.ResolutionStrategy,
 			&edge.ResolutionConfidence,
+			&item.fileID,
+			&item.srcLanguage,
+			&item.callSite,
 		); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if dstID.Valid {
 			value := dstID.Int64
 			edge.DstSymbolID = &value
 		}
 		out = append(out, edge)
+		evidence = append(evidence, item)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return out, evidence, nil
 }
 
 func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason string) error {
