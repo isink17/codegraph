@@ -517,6 +517,73 @@ change it. Restart with the other mode to switch.
 
 ---
 
+## Result Limits
+
+Every public query returns a bounded page. The bounds exist so that one
+mistyped argument cannot spend a model's entire context, or make SQLite sort a
+repository into memory.
+
+| Argument | Default | Maximum | Applies to |
+| --- | --- | --- | --- |
+| `limit` | 20 | **500** | every paged query at `detail=card` |
+| `limit` | 20 | **200** | `detail=skeleton` |
+| `limit` | 20 | **50** | `detail=excerpt` and `detail=full` |
+| `offset` | 0 | uncapped | every paged query |
+| `depth` | 2 (impact), 3 (trace) | **10** | `get_impact_radius`, `trace_dependencies` |
+| `symbols`, `files` | — | **500 items** | batch arguments that cost one lookup each |
+| `max_steps` | agent default | **20** | `agentic_query` |
+| `examples` | 5 | **100** | `audit` |
+
+Rules worth knowing:
+
+- **Above the maximum is an error, not a trim.** A request for 100000000 rows
+  is refused with a message naming the bound. Silently returning 500 would tell
+  the caller something false about its own request.
+- **`limit=0` still means "use the default".** That convention is unchanged.
+  A negative `limit` or `offset` is an error; it never had a meaning.
+- **Pagination is untouched.** The maximum bounds one page, not the result set,
+  so `limit=100&offset=100000` is an ordinary request. Walking pages returns
+  every row exactly once, in stable order.
+- **`format` and `detail` cannot raise a bound.** `format` chooses how rows are
+  written, never how many exist, so `format=compact` obeys the same ceiling as
+  JSON. `detail` *lowers* it, because a record carrying source text costs
+  several times what a card costs.
+- **Traversals say when a page is partial.** `get_impact_radius` and
+  `trace_dependencies` report the full traversal size alongside the page and set
+  `truncated`, so a bounded answer never reads as a complete one.
+- **Rejection happens before the query runs**, so an oversized request costs a
+  comparison rather than a scan.
+- **Two tools keep their own policy**, because both were already bounded and
+  both clamp rather than reject: `tool_search` (max 20) and the hidden
+  `usage_stats` (max 200). `context_for_task` keeps its own `max_tokens` budget
+  and cursor.
+- **`graph export` is not a query page.** It streams, and `--limit 0` still
+  means "the whole repository". Only the non-streaming paged form is bounded, at
+  100000, and the error points back at `--limit 0`.
+
+The MCP schema is the machine-readable source: every bounded argument publishes
+its `minimum` and `maximum`, so a client can read the limit instead of
+discovering it by being refused. The CLI enforces the same numbers.
+
+### Missing things are CodeGraph errors
+
+Asking about something that is not in the index produces CodeGraph's own error,
+never the database driver's:
+
+```
+symbol not found: "ParseConfig"
+```
+
+An empty result and a missing entity are different answers and stay different:
+
+- a search with no matches is a valid empty result, not an error;
+- an indexed symbol that genuinely has no related tests returns an empty list;
+- a name that several definitions share is still resolved, not reported missing;
+- a real database failure stays a database error and is never relabelled
+  "not found".
+
+---
+
 ## Usage / Token Meter
 
 CodeGraph meters its own context cost so the savings above are observable rather

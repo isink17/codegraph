@@ -55,8 +55,8 @@ func (s *Service) FindCallees(ctx context.Context, repoID int64, symbol string, 
 	return s.store.FindCallees(ctx, repoID, symbol, symbolID, limit, offset)
 }
 
-func (s *Service) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth int) (map[string]any, error) {
-	return s.store.ImpactRadius(ctx, repoID, symbols, files, depth)
+func (s *Service) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth, limit, offset int) (map[string]any, error) {
+	return s.store.ImpactRadius(ctx, repoID, symbols, files, depth, limit, offset)
 }
 
 func (s *Service) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]store.RelatedTest, error) {
@@ -148,8 +148,8 @@ func (s *Service) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limi
 	return s.store.ExportDOTNodeNamesPage(ctx, repoID, limit, offset)
 }
 
-func (s *Service) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth int) ([]map[string]any, error) {
-	return s.store.TraceDependencies(ctx, repoID, symbol, direction, maxDepth)
+func (s *Service) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
+	return s.store.TraceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 }
 
 func (s *Service) BenchmarkTokens(ctx context.Context, repoID int64, task string) (map[string]any, error) {

@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/limits"
 )
 
 // TestBigGraphFixtureShape pins the properties the P12 latency numbers depend
@@ -119,7 +121,7 @@ func TestBigGraphFixtureShape(t *testing.T) {
 	}
 
 	// The chain must be deep and bound end to end.
-	chain, err := f.store.TraceDependencies(ctx, f.repoID, f.ChainHead, "downstream", 10)
+	chain, _, err := f.store.TraceDependencies(ctx, f.repoID, f.ChainHead, "downstream", 10, limits.MaxPage, 0)
 	if err != nil {
 		t.Fatalf("TraceDependencies: %v", err)
 	}

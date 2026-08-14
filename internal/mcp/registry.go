@@ -135,7 +135,7 @@ var toolRegistry = []toolDescriptor{
 	},
 	{
 		name: "get_impact_radius", description: "Estimate affected symbols and files around a change",
-		properties: []string{"symbols", "files", "depth", "detail", "format"},
+		properties: []string{"symbols", "files", "depth", "limit", "offset", "detail", "format"},
 		category:   "graph",
 		handler:    (*Server).handleImpactRadius,
 	},
@@ -213,7 +213,7 @@ var toolRegistry = []toolDescriptor{
 	},
 	{
 		name: "trace_dependencies", description: "Trace transitive dependency chains from a symbol (upstream callers or downstream callees)",
-		properties: []string{"symbol", "direction", "depth", "format"},
+		properties: []string{"symbol", "direction", "depth", "limit", "offset", "format"},
 		required:   []string{"symbol"},
 		category:   "graph",
 		handler:    (*Server).handleTraceDependencies,

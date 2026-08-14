@@ -289,15 +289,30 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // change to it is a change to every user's context cost. The constant is not a
 // style rule: if a deliberate edit moves it, update it here and say so in the
 // commit, which is exactly the review the number deserves.
+//
+// P18 moved these deliberately. The public size policy is now machine-readable:
+// every advertised `limit`, `offset`, and `depth` carries the minimum and
+// maximum the validator actually enforces, and get_impact_radius and
+// trace_dependencies gained the limit/offset pair that bounds their traversal.
+// Full grew 10703 -> 11870 bytes (+1167, +292 estimated tokens) and gateway
+// 3585 -> 3968 (+383, +95). The growth is four things: 182 bytes of new
+// limit/offset arguments on the two traversal tools, 562 bytes of
+// minimum/maximum on arguments that already existed, 103 bytes of maximum on
+// max_files, max_symbols, examples, and max_steps, and 320 bytes of prose on
+// the five tools whose `limit` ceiling depends on `detail`. That last part is
+// prose only because JSON Schema cannot express a bound conditioned on another
+// property, and a bare maximum of 500 would be wrong at detail=full, where 50
+// applies. A client that can read a bound does not have to discover it by
+// being rejected.
 const (
-	fullToolsListBytes  = 10703
-	fullToolsListTokens = 2676
+	fullToolsListBytes  = 11870
+	fullToolsListTokens = 2968
 	// The gateway payload is pinned for the same reason, and became load-bearing
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name
 	// nobody happened to assert on.
-	gatewayToolsListBytes  = 3585
-	gatewayToolsListTokens = 897
+	gatewayToolsListBytes  = 3968
+	gatewayToolsListTokens = 992
 )
 
 // TestGatewayToolsListIsByteIdentical pins the reduced surface's exact size.
