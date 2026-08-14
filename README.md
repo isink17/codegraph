@@ -464,6 +464,57 @@ says so in `skeleton_note` instead of listing members, and `full` returns a
 bounded window around the declaration with a `source_note` explaining why. Go
 built with either registry is unaffected.
 
+### Gateway MCP mode (`--tool-mode`)
+
+Describing 29 tools costs a session about 2,700 estimated tokens before it asks a
+single question. Gateway mode is an opt-in surface that charges a fraction of that
+without removing anything:
+
+```bash
+codegraph serve --tool-mode gateway
+codegraph install --tool-mode gateway   # write it into the client config
+```
+
+`install` never overwrites a `codegraph` entry a client config already has. If you
+are already configured, it prints the `args` to change (`["serve", "--tool-mode",
+"gateway"]`) rather than replacing your entry.
+
+| Mode | `tools/list` | Estimated tokens |
+|---|---|---|
+| `full` (default) | all 29 tools | ~2,676 |
+| `gateway` | 4 core tools + `tool_search` + `tool_call` | ~897 (**-66%**) |
+
+`full` remains the default, and it is unchanged: `codegraph serve` advertises the
+same tools with the same names, descriptions, and schemas it always has. The two
+gateway tools do not appear there.
+
+In gateway mode the tools an ordinary navigation session uses on nearly every task
+stay direct — `context_for_task`, `find_symbol`, `find_callers`, `find_callees` —
+so the common workflow needs no lookup at all. Everything else is found and called
+on demand:
+
+```
+tool_search(query="dependency trace")            # -> trace_dependencies
+tool_call(name="trace_dependencies",
+          arguments={"symbol": "Resolve", "depth": 3})
+```
+
+`tool_search` returns card-sized metadata: name, one-line description, category,
+whether the tool is already direct, and whether it writes. Results are bounded (5
+by default, 20 at most) and deterministic — it is a local name-and-description
+search, with no index, embeddings, or network. Add `include_schema` with an exact
+tool name to get that tool's argument schema, which is the same schema `tools/list`
+advertises in full mode.
+
+`tool_call` invokes the canonical tool: the same argument validation, the same
+handler, and the same result. `detail`, `format=compact`, `max_tokens`, and
+`cursor` all behave exactly as they do on a direct call, and errors arrive as the
+target tool's own error. The tool tables above stay the reference for what each
+tool does and what it accepts.
+
+The mode is chosen at startup and fixed for the life of the server; no tool can
+change it. Restart with the other mode to switch.
+
 ---
 
 ## CLI Reference
@@ -471,6 +522,7 @@ built with either registry is unaffected.
 ```bash
 # Setup
 codegraph install                         # Auto-configure AI tools
+codegraph install --tool-mode gateway     # Auto-configure with the reduced tool surface
 codegraph doctor                          # Check installation health
 codegraph config show                     # Show current config
 codegraph --version                       # Print current version
@@ -484,6 +536,7 @@ codegraph clean <path>                    # Clean database
 
 # MCP Server
 codegraph serve [--repo-root <path>]      # Start MCP server (auto-detects repo root)
+codegraph serve --tool-mode gateway       # Start with the reduced tool surface
 
 # Graph audit
 codegraph audit <path>                    # Audit the indexed graph for integrity/trust issues

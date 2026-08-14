@@ -106,12 +106,16 @@ func newCommandList() []*command {
 		{
 			name:        "install",
 			description: "install codegraph",
-			usageLines:  []string{"  install"},
+			usageLines:  []string{"  install [--tool-mode full|gateway]"},
+			flags: []commandFlag{
+				{name: "--tool-mode MODE", description: "MCP tool surface to configure: full (default) or gateway"},
+			},
 			examples: []string{
 				"codegraph install",
+				"codegraph install --tool-mode gateway",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
-				return runInstall(stdout)
+				return runInstall(stdout, args)
 			},
 		},
 		{
@@ -392,7 +396,11 @@ func newCommandList() []*command {
 		{
 			name:        "serve",
 			description: "start MCP server",
-			usageLines:  []string{"  serve [--repo-root <repo-path>]"},
+			usageLines:  []string{"  serve [--repo-root <repo-path>] [--tool-mode full|gateway]"},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root to serve (defaults to the git repo root)"},
+				{name: "--tool-mode MODE", description: "MCP tool surface: full (default, every tool) or gateway (small core plus tool_search/tool_call)"},
+			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runServe(ctx, cfg, stdout, stderr, args)
 			},

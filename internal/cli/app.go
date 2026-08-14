@@ -647,7 +647,19 @@ func validateConfig(cfg config.Config) []string {
 	return issues
 }
 
-func runInstall(stdout io.Writer) error {
+func runInstall(stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	toolModeFlag := fs.String("tool-mode", "", "MCP tool surface to configure: full (default) or gateway")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	// Same contract as serve: an unknown mode stops the install rather than
+	// writing a client config that means something the user did not ask for.
+	toolMode, err := mcp.ParseToolMode(*toolModeFlag)
+	if err != nil {
+		return err
+	}
 	cfg, err := config.Default()
 	if err != nil {
 		return err
@@ -684,7 +696,10 @@ func runInstall(stdout io.Writer) error {
 	// Auto-configure MCP for detected AI tools.
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Auto-configuring MCP for detected AI tools:")
-	configured := autoConfigureMCP(stdout)
+	if toolMode == mcp.ToolModeGateway {
+		fmt.Fprintf(stdout, "  tool surface: %s\n", mcp.ToolModeGateway)
+	}
+	configured := autoConfigureMCP(stdout, toolMode)
 	if configured > 0 {
 		fmt.Fprintf(stdout, "\n%d tool(s) auto-configured.\n", configured)
 	}
@@ -701,8 +716,16 @@ func runInstall(stdout io.Writer) error {
 }`)
 
 	// Always print manual snippets as a fallback / reference.
-	codexSnippet := fmt.Sprintf("[mcp_servers.codegraph]\ncommand = %q\nargs = [\"serve\"]\nstartup_timeout_sec = 60", appname.BinaryName)
-	clientSnippet := fmt.Sprintf(`{"mcpServers":{"codegraph":{"command":%q,"args":["serve"]}}}`, appname.BinaryName)
+	// The snippets quote the same argv autoConfigureMCP wrote, so a user who pastes
+	// one by hand gets the mode they asked to install.
+	launchArgs := serveArgs(toolMode)
+	quotedArgs := make([]string, 0, len(launchArgs))
+	for _, arg := range launchArgs {
+		quotedArgs = append(quotedArgs, fmt.Sprintf("%q", arg))
+	}
+	argList := strings.Join(quotedArgs, ", ")
+	codexSnippet := fmt.Sprintf("[mcp_servers.codegraph]\ncommand = %q\nargs = [%s]\nstartup_timeout_sec = 60", appname.BinaryName, argList)
+	clientSnippet := fmt.Sprintf(`{"mcpServers":{"codegraph":{"command":%q,"args":[%s]}}}`, appname.BinaryName, strings.Join(quotedArgs, ","))
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Manual MCP snippets (if auto-configure did not apply):")
 	fmt.Fprintln(stdout)
@@ -1526,7 +1549,14 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoRootFlag := fs.String("repo-root", "", "repository root")
+	toolModeFlag := fs.String("tool-mode", "", "MCP tool surface: full (default) or gateway")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	// Resolve the mode before opening the database: an invalid mode is a startup
+	// error, never a silent fallback to the default surface.
+	toolMode, err := mcp.ParseToolMode(*toolModeFlag)
+	if err != nil {
 		return err
 	}
 	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
@@ -1543,6 +1573,9 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 	}
 	defer app.Close()
 	server := mcp.NewServer(repoRootCandidate, repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
+	if err := server.SetToolMode(toolMode); err != nil {
+		return err
+	}
 	if repoCfg, err := config.LoadRepo(repo.RootPath); err == nil {
 		if repoCfg.Agent.Enabled || repoCfg.Agent.BaseURL != "" || repoCfg.Agent.Model != "" {
 			server.SetAgentConfig(repoCfg.Agent.BaseURL, repoCfg.Agent.Model)
