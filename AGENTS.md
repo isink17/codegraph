@@ -22,6 +22,8 @@
 - `internal/query`: symbol, caller, callee, impact, and stats queries
 - `internal/search`: lightweight local semantic ranking
 - `internal/mcp`: stdio MCP server and tool routing
+- `internal/compactfmt`: `codegraph.compact/v1` tabular encoding for bulk MCP
+  results (opt-in `format=compact`; JSON stays the default)
 - `internal/export`: JSON and DOT export
 - `internal/watcher`: file watch and debounced updates
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/isink17/codegraph/internal/agent"
+	"github.com/isink17/codegraph/internal/compactfmt"
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/detail"
 	"github.com/isink17/codegraph/internal/framework"
@@ -135,7 +136,7 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: err.Error()}}, true
 		}
-		result, err := s.callTool(ctx, params.Name, params.Arguments)
+		text, err := s.callToolContent(ctx, params.Name, params.Arguments)
 		if err != nil {
 			// Marshal the error document rather than splicing the message into a
 			// JSON literal: a message containing a quote (an argument name, a
@@ -150,9 +151,8 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 				"isError": true,
 			}}, true
 		}
-		payload, _ := json.Marshal(result)
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"content": []map[string]any{{"type": "text", "text": string(payload)}},
+			"content": []map[string]any{{"type": "text", "text": text}},
 			"isError": false,
 		}}, true
 	default:
@@ -164,10 +164,34 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 	}
 }
 
+// callTool validates one tool call and answers it as the JSON success envelope.
+//
+// It is the in-process entry point for agentic_query's tool loop, which consumes
+// the envelope as a map, so this path returns JSON and only JSON. Requesting
+// compact here is refused rather than ignored: a caller that asked for an
+// encoding and silently received another has no way to tell.
+//
+// The MCP surface goes through callToolContent instead, which validates once and
+// then calls dispatchTool directly, so a tool call is never validated twice.
 func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage) (map[string]any, error) {
 	if err := validateToolArguments(name, raw); err != nil {
 		return nil, err
 	}
+	format, err := formatArgument(raw)
+	if err != nil {
+		return nil, err
+	}
+	if format != compactfmt.FormatJSON {
+		return nil, fmt.Errorf("format %q is available to MCP clients only; this call path returns %q",
+			format, compactfmt.FormatJSON)
+	}
+	return s.dispatchTool(ctx, name, raw)
+}
+
+// dispatchTool routes a tool call to its handler and returns the JSON envelope.
+// Arguments must already be validated: every caller validates first, so doing it
+// here as well would parse the same payload twice on the hot path.
+func (s *Server) dispatchTool(ctx context.Context, name string, raw json.RawMessage) (map[string]any, error) {
 	switch name {
 	case "audit":
 		return s.handleAudit(ctx, raw)
@@ -176,84 +200,24 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 	case "update_graph":
 		return s.handleIndex(ctx, raw, true)
 	case "find_symbol":
-		var req struct {
-			Query  string `json:"query"`
-			Limit  int    `json:"limit"`
-			Offset int    `json:"offset"`
-			Detail string `json:"detail"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		level, err := detail.Parse(req.Detail, defaultToolDetail)
-		if err != nil {
-			return nil, err
-		}
-		items, err := s.query.FindSymbol(ctx, s.repoID, req.Query, req.Limit, req.Offset)
-		if err != nil {
-			return nil, err
-		}
-		return wrapData("matches", s.projector(level).Symbols(ctx, items), nil)
+		cards, err := s.symbolMatches(ctx, raw, false)
+		return wrapData("matches", cards, err)
 	case "find_callers":
 		return s.handleCallGraph(ctx, raw, true)
 	case "find_callees":
 		return s.handleCallGraph(ctx, raw, false)
 	case "get_impact_radius":
-		var req struct {
-			Symbols []string `json:"symbols"`
-			Files   []string `json:"files"`
-			Depth   int      `json:"depth"`
-			Detail  string   `json:"detail"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		level, err := detail.Parse(req.Detail, defaultToolDetail)
+		data, err := s.impactRadiusData(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
-		data, err := s.query.ImpactRadius(ctx, s.repoID, req.Symbols, req.Files, req.Depth)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": s.projectImpact(ctx, level, data)}, nil
+		return map[string]any{"ok": true, "data": data}, nil
 	case "find_related_tests":
-		var req struct {
-			Symbol string   `json:"symbol"`
-			File   string   `json:"file"`
-			Files  []string `json:"files"`
-			Limit  int      `json:"limit"`
-			Offset int      `json:"offset"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		// If multiple files provided, aggregate tests from all of them.
-		if len(req.Files) > 0 {
-			allTests, err := s.query.RelatedTestsForFiles(ctx, s.repoID, req.Files, req.Limit, req.Offset)
-			return wrapData("tests", allTests, err)
-		}
-		items, err := s.query.RelatedTests(ctx, s.repoID, req.Symbol, req.File, req.Limit, req.Offset)
+		items, err := s.relatedTests(ctx, raw)
 		return wrapData("tests", items, err)
 	case "search_symbols":
-		var req struct {
-			Query  string `json:"query"`
-			Limit  int    `json:"limit"`
-			Offset int    `json:"offset"`
-			Detail string `json:"detail"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		level, err := detail.Parse(req.Detail, defaultToolDetail)
-		if err != nil {
-			return nil, err
-		}
-		items, err := s.query.SearchSymbols(ctx, s.repoID, req.Query, req.Limit, req.Offset)
-		if err != nil {
-			return nil, err
-		}
-		return wrapData("matches", s.projector(level).Symbols(ctx, items), nil)
+		cards, err := s.symbolMatches(ctx, raw, true)
+		return wrapData("matches", cards, err)
 	case "search_semantic":
 		var req struct {
 			Query  string `json:"query"`
@@ -300,22 +264,10 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		items, err := s.store.LatestScanErrors(ctx, s.repoID, req.Limit, req.Offset)
 		return wrapData("errors", items, err)
 	case "find_dead_code":
-		req, err := decodePageRequest(raw)
-		if err != nil {
-			return nil, err
-		}
-		items, err := s.query.FindDeadCode(ctx, s.repoID, req.Limit, req.Offset)
+		items, err := s.deadCode(ctx, raw)
 		return wrapData("dead_code", items, err)
 	case "list_files":
-		var req struct {
-			PathFilter string `json:"path_filter"`
-			Limit      int    `json:"limit"`
-			Offset     int    `json:"offset"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		items, err := s.query.ListFiles(ctx, s.repoID, req.PathFilter, req.Limit, req.Offset)
+		items, err := s.listFiles(ctx, raw)
 		return wrapData("files", items, err)
 	case "context_for_task":
 		var req struct {
@@ -356,21 +308,7 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		}
 		return map[string]any{"ok": true, "data": data}, nil
 	case "trace_dependencies":
-		var req struct {
-			Symbol    string `json:"symbol"`
-			Direction string `json:"direction"`
-			Depth     int    `json:"depth"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		if req.Depth <= 0 {
-			req.Depth = 3
-		}
-		if req.Depth > 10 {
-			req.Depth = 10
-		}
-		items, err := s.query.TraceDependencies(ctx, s.repoID, req.Symbol, req.Direction, req.Depth)
+		items, err := s.traceDependencies(ctx, raw)
 		return wrapData("dependencies", items, err)
 	case "detect_frameworks":
 		imports, err := s.query.AllImports(ctx, s.repoID)
@@ -536,6 +474,47 @@ func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bo
 }
 
 func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, callers bool) (map[string]any, error) {
+	key, cards, err := s.callGraphCards(ctx, raw, callers)
+	return wrapData(key, cards, err)
+}
+
+// The helpers below answer one tool each and return the tool's typed result.
+// They exist so that the JSON envelope above and the compact encoder in
+// compact.go are two serializers of one query and one projection: neither
+// encoding can drift into a different result set, a different detail level, or a
+// different order than the other.
+
+// symbolMatches answers find_symbol (search=false) and search_symbols
+// (search=true).
+func (s *Server) symbolMatches(ctx context.Context, raw json.RawMessage, search bool) ([]detail.Symbol, error) {
+	var req struct {
+		Query  string `json:"query"`
+		Limit  int    `json:"limit"`
+		Offset int    `json:"offset"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	level, err := detail.Parse(req.Detail, defaultToolDetail)
+	if err != nil {
+		return nil, err
+	}
+	var items []graph.Symbol
+	if search {
+		items, err = s.query.SearchSymbols(ctx, s.repoID, req.Query, req.Limit, req.Offset)
+	} else {
+		items, err = s.query.FindSymbol(ctx, s.repoID, req.Query, req.Limit, req.Offset)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.projector(level).Symbols(ctx, items), nil
+}
+
+// callGraphCards answers find_callers (callers=true) and find_callees, returning
+// the response key alongside the projected page.
+func (s *Server) callGraphCards(ctx context.Context, raw json.RawMessage, callers bool) (string, []detail.Symbol, error) {
 	var req struct {
 		Symbol   string `json:"symbol"`
 		SymbolID int64  `json:"symbol_id"`
@@ -544,11 +523,11 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 		Detail   string `json:"detail"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	level, err := detail.Parse(req.Detail, defaultToolDetail)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	var (
 		items []graph.Symbol
@@ -561,9 +540,92 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 		items, err = s.query.FindCallees(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
 	}
 	if err != nil {
+		return "", nil, err
+	}
+	return key, s.projector(level).Symbols(ctx, items), nil
+}
+
+// impactRadiusData answers get_impact_radius, returning the traversal result
+// with its symbol nodes already projected.
+func (s *Server) impactRadiusData(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Symbols []string `json:"symbols"`
+		Files   []string `json:"files"`
+		Depth   int      `json:"depth"`
+		Detail  string   `json:"detail"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	return wrapData(key, s.projector(level).Symbols(ctx, items), nil)
+	level, err := detail.Parse(req.Detail, defaultToolDetail)
+	if err != nil {
+		return nil, err
+	}
+	data, err := s.query.ImpactRadius(ctx, s.repoID, req.Symbols, req.Files, req.Depth)
+	if err != nil {
+		return nil, err
+	}
+	return s.projectImpact(ctx, level, data), nil
+}
+
+// relatedTests answers find_related_tests.
+func (s *Server) relatedTests(ctx context.Context, raw json.RawMessage) ([]store.RelatedTest, error) {
+	var req struct {
+		Symbol string   `json:"symbol"`
+		File   string   `json:"file"`
+		Files  []string `json:"files"`
+		Limit  int      `json:"limit"`
+		Offset int      `json:"offset"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	// If multiple files provided, aggregate tests from all of them.
+	if len(req.Files) > 0 {
+		return s.query.RelatedTestsForFiles(ctx, s.repoID, req.Files, req.Limit, req.Offset)
+	}
+	return s.query.RelatedTests(ctx, s.repoID, req.Symbol, req.File, req.Limit, req.Offset)
+}
+
+// deadCode answers find_dead_code.
+func (s *Server) deadCode(ctx context.Context, raw json.RawMessage) ([]map[string]any, error) {
+	req, err := decodePageRequest(raw)
+	if err != nil {
+		return nil, err
+	}
+	return s.query.FindDeadCode(ctx, s.repoID, req.Limit, req.Offset)
+}
+
+// listFiles answers list_files.
+func (s *Server) listFiles(ctx context.Context, raw json.RawMessage) ([]map[string]any, error) {
+	var req struct {
+		PathFilter string `json:"path_filter"`
+		Limit      int    `json:"limit"`
+		Offset     int    `json:"offset"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	return s.query.ListFiles(ctx, s.repoID, req.PathFilter, req.Limit, req.Offset)
+}
+
+// traceDependencies answers trace_dependencies, including its depth clamp.
+func (s *Server) traceDependencies(ctx context.Context, raw json.RawMessage) ([]map[string]any, error) {
+	var req struct {
+		Symbol    string `json:"symbol"`
+		Direction string `json:"direction"`
+		Depth     int    `json:"depth"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	if req.Depth <= 0 {
+		req.Depth = 3
+	}
+	if req.Depth > 10 {
+		req.Depth = 10
+	}
+	return s.query.TraceDependencies(ctx, s.repoID, req.Symbol, req.Direction, req.Depth)
 }
 
 // projector builds the response-scoped renderer for one tool call. s.repoRoot is
@@ -742,12 +804,12 @@ func buildToolDefinitions() []map[string]any {
 	return []map[string]any{
 		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
 		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
-		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset", "detail"}, []string{"query"}),
-		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail"}, nil),
-		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail"}, nil),
-		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth", "detail"}, nil),
-		toolDef("find_related_tests", "Find likely related tests for a symbol, file, or set of changed files", []string{"symbol", "file", "files", "limit", "offset"}, nil),
-		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset", "detail"}, []string{"query"}),
+		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset", "detail", "format"}, []string{"query"}),
+		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail", "format"}, nil),
+		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail", "format"}, nil),
+		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth", "detail", "format"}, nil),
+		toolDef("find_related_tests", "Find likely related tests for a symbol, file, or set of changed files", []string{"symbol", "file", "files", "limit", "offset", "format"}, nil),
+		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset", "detail", "format"}, []string{"query"}),
 		toolDef("search_semantic", "Hybrid semantic search (vector similarity + FTS when embeddings available, token-overlap fallback)", []string{"query", "limit", "offset"}, []string{"query"}),
 		toolDef("graph_stats", "Return repository graph statistics", nil, nil),
 		toolDef("supported_languages", "List supported languages and file extensions", nil, nil),
@@ -755,10 +817,10 @@ func buildToolDefinitions() []map[string]any {
 		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}, nil),
 		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}, nil),
 		toolDef("context_for_task", "Return relevant files, symbols, and relationships for a natural-language task description, ranked and trimmed to a token budget", []string{"task", "max_files", "max_symbols", "include_tests", "include_callers", "max_tokens", "cursor"}, []string{"task"}),
-		toolDef("find_dead_code", "Find symbols with no callers or references (likely dead code)", []string{"limit", "offset"}, nil),
-		toolDef("list_files", "List indexed files in the repository, optionally filtered by path prefix", []string{"path_filter", "limit", "offset"}, nil),
+		toolDef("find_dead_code", "Find symbols with no callers or references (likely dead code)", []string{"limit", "offset", "format"}, nil),
+		toolDef("list_files", "List indexed files in the repository, optionally filtered by path prefix", []string{"path_filter", "limit", "offset", "format"}, nil),
 		toolDef("architecture_overview", "High-level repository architecture: languages, directories, key symbols, dependency patterns", nil, nil),
-		toolDef("trace_dependencies", "Trace transitive dependency chains from a symbol (upstream callers or downstream callees)", []string{"symbol", "direction", "depth"}, []string{"symbol"}),
+		toolDef("trace_dependencies", "Trace transitive dependency chains from a symbol (upstream callers or downstream callees)", []string{"symbol", "direction", "depth", "format"}, []string{"symbol"}),
 		toolDef("detect_frameworks", "Detect frameworks and libraries used in the repository", nil, nil),
 		toolDef("benchmark_tokens", "Estimate token savings from using codegraph vs reading raw files", []string{"task"}, nil),
 		toolDef("cross_language_links", "Find and create cross-language symbol references", nil, nil),
@@ -786,6 +848,21 @@ func detailProperty() map[string]any {
 		"default": string(defaultToolDetail),
 		"description": "How much of each symbol to return. card: identity and location, to choose and drill down. " +
 			"skeleton: +signature and members. excerpt: +bounded source. full: +complete source.",
+	}
+}
+
+// formatProperty is the JSON Schema for the output-encoding argument, shared by
+// every tool that accepts `format`.
+//
+// The description is one line on purpose. tools/list is itself part of every
+// session's token budget, and a per-tool copy of the compact grammar would cost
+// far more than the encoding saves; the grammar is documented once, in README.
+func formatProperty() map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"enum":        compactfmt.Names(),
+		"default":     string(defaultToolFormat),
+		"description": "Output encoding. compact: tabular, no repeated keys; best for bulk (detail=card).",
 	}
 }
 
@@ -820,6 +897,9 @@ func toolDef(name, description string, properties, required []string) map[string
 		props[prop] = map[string]any{"type": "string"}
 		if prop == "detail" {
 			props[prop] = detailProperty()
+		}
+		if prop == "format" {
+			props[prop] = formatProperty()
 		}
 		if prop == "max_tokens" {
 			props[prop] = contextMaxTokensProperty()
@@ -863,23 +943,23 @@ func decodePageRequest(raw json.RawMessage) (pageRequest, error) {
 var toolArgumentSpecs = map[string]toolArgSpec{
 	"index_repo":            {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
 	"update_graph":          {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
-	"find_symbol":           {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string"}, required: []string{"query"}},
-	"find_callers":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string"}},
-	"find_callees":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string"}},
-	"get_impact_radius":     {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer", "detail": "string"}},
-	"find_related_tests":    {properties: map[string]string{"symbol": "string", "file": "string", "files": "array", "limit": "integer", "offset": "integer"}},
-	"search_symbols":        {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string"}, required: []string{"query"}},
+	"find_symbol":           {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}, required: []string{"query"}},
+	"find_callers":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}},
+	"find_callees":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}},
+	"get_impact_radius":     {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer", "detail": "string", "format": "string"}},
+	"find_related_tests":    {properties: map[string]string{"symbol": "string", "file": "string", "files": "array", "limit": "integer", "offset": "integer", "format": "string"}},
+	"search_symbols":        {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}, required: []string{"query"}},
 	"search_semantic":       {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
 	"graph_stats":           {properties: map[string]string{}},
 	"supported_languages":   {properties: map[string]string{}},
 	"list_repos":            {properties: map[string]string{"limit": "integer", "offset": "integer"}},
 	"list_scans":            {properties: map[string]string{"limit": "integer", "offset": "integer"}},
 	"latest_scan_errors":    {properties: map[string]string{"limit": "integer", "offset": "integer"}},
-	"find_dead_code":        {properties: map[string]string{"limit": "integer", "offset": "integer"}},
+	"find_dead_code":        {properties: map[string]string{"limit": "integer", "offset": "integer", "format": "string"}},
 	"context_for_task":      {properties: map[string]string{"task": "string", "max_files": "integer", "max_symbols": "integer", "include_tests": "boolean", "include_callers": "boolean", "max_tokens": "integer", "cursor": "string"}, required: []string{"task"}},
-	"list_files":            {properties: map[string]string{"path_filter": "string", "limit": "integer", "offset": "integer"}},
+	"list_files":            {properties: map[string]string{"path_filter": "string", "limit": "integer", "offset": "integer", "format": "string"}},
 	"architecture_overview": {properties: map[string]string{}},
-	"trace_dependencies":    {properties: map[string]string{"symbol": "string", "direction": "string", "depth": "integer"}, required: []string{"symbol"}},
+	"trace_dependencies":    {properties: map[string]string{"symbol": "string", "direction": "string", "depth": "integer", "format": "string"}, required: []string{"symbol"}},
 	"detect_frameworks":     {properties: map[string]string{}},
 	"benchmark_tokens":      {properties: map[string]string{"task": "string"}},
 	"cross_language_links":  {properties: map[string]string{}},
@@ -921,13 +1001,32 @@ func validateToolArguments(name string, raw json.RawMessage) error {
 			return fmt.Errorf("required argument %q must not be empty", req)
 		}
 	}
-	// `detail` is the one enum-valued argument on this surface. Rejecting an
-	// unknown level here, rather than falling back to the default, keeps a typo
-	// from silently returning a different amount of information than asked for.
+	// `detail` and `format` are the two enum-valued arguments on this surface.
+	// Rejecting an unknown value here, rather than falling back to the default,
+	// keeps a typo from silently returning a different amount of information, or a
+	// different encoding, than the caller asked for.
+	level := defaultToolDetail
 	if raw, ok := args["detail"]; ok {
 		value, _ := raw.(string)
-		if _, err := detail.Parse(value, defaultToolDetail); err != nil {
+		parsed, err := detail.Parse(value, defaultToolDetail)
+		if err != nil {
 			return err
+		}
+		level = parsed
+	}
+	if raw, ok := args["format"]; ok {
+		value, _ := raw.(string)
+		format, err := compactfmt.ParseFormat(value, defaultToolFormat)
+		if err != nil {
+			return err
+		}
+		// A detail level compact cannot represent is refused before the query runs,
+		// so the caller gets one clear error instead of a document that quietly
+		// answers a cheaper question than the one asked.
+		if format == compactfmt.FormatCompact {
+			if err := detail.CompactSupported(level); err != nil {
+				return err
+			}
 		}
 	}
 	switch name {
