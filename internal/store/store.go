@@ -4112,7 +4112,9 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 			LEFT JOIN symbols s ON s.id = t.test_symbol_id
 			WHERE t.repo_id = ? AND t.target_file_id = ?
 			AND f.path LIKE '%_test.go'
-			ORDER BY t.score DESC, f.path, COALESCE(s.qualified_name, '')
+			-- Canonical-form tie-break: which tests survive LIMIT must not depend on
+			-- whether the index was written on Windows or on Linux.
+			ORDER BY t.score DESC, REPLACE(f.path, '\', '/'), COALESCE(s.qualified_name, '')
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
@@ -4127,7 +4129,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 			JOIN files f ON f.id = t.test_file_id
 			LEFT JOIN symbols s ON s.id = t.test_symbol_id
 			WHERE t.repo_id = ? AND t.target_symbol_id = ?
-			ORDER BY t.score DESC, f.path, COALESCE(s.qualified_name, '')
+			ORDER BY t.score DESC, REPLACE(f.path, '\', '/'), COALESCE(s.qualified_name, '')
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetID, safeLimit(limit), safeOffset(offset))
@@ -4171,7 +4173,13 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		-- so ties are the rule rather than the exception and a LIMIT/OFFSET page
 		-- boundary would fall in an arbitrary place. The grouping keys are
 		-- already computed, so using them as the tie-break is free.
-		ORDER BY score DESC, f.path ASC, s.qualified_name ASC
+		--
+		-- The tie-break sorts the canonical form of the path, not the stored one.
+		-- files.path is native, and backslash (0x5C) and slash (0x2F) sort either side of
+		-- the digits and capitals, so ordering the raw column would put a different
+		-- 30 rows through LIMIT on Windows than on Linux for the same repository --
+		-- a different seed set, and so a different ranked context.
+		ORDER BY score DESC, REPLACE(f.path, '\', '/') ASC, s.qualified_name ASC
 		LIMIT ?
 		OFFSET ?
 	`
@@ -4200,7 +4208,11 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"file":   item.file,
+			// Canonical (slash) form, like every other path this store hands out.
+			// `files.path` is native, so on Windows the raw column value would make
+			// this producer's `file` disagree with the `file` of every symbol-shaped
+			// result -- and with the key any consumer joins them on.
+			"file":   CanonicalRelPath(item.file),
 			"symbol": item.symbol,
 			"score":  item.score,
 			"why":    []string{"token_overlap"},
@@ -5823,15 +5835,28 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 		vec := bytesToFloat32(blob)
 		sim := cosineSimilarity(queryVec, vec)
 		if sim > 0 {
-			candidates = append(candidates, scored{file: filePath, symbol: qualName, kind: kind, score: sim})
+			// Canonical form: HybridSearch fuses these entries with SearchSymbols
+			// results keyed on `file + "::" + qualified_name`, and SearchSymbols
+			// reports the slash form. Left native, the two halves of the fusion
+			// would never meet on Windows and every hit would score as if it had
+			// been found by one searcher only.
+			candidates = append(candidates, scored{file: CanonicalRelPath(filePath), symbol: qualName, kind: kind, score: sim})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
+	// Equal cosine similarity is common for short, similar symbol texts; without
+	// the key tie-break the page a symbol lands on would depend on scan order.
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		if candidates[i].file != candidates[j].file {
+			return candidates[i].file < candidates[j].file
+		}
+		return candidates[i].symbol < candidates[j].symbol
 	})
 
 	end := min(offset+limit, len(candidates))
@@ -5909,8 +5934,18 @@ func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, qu
 	for _, e := range merged {
 		sorted = append(sorted, e)
 	}
+	// RRF scores tie often (two entries found at the same rank by the same
+	// searcher score identically), and the fused entries arrive from a map, so
+	// score alone would make both the page boundary and the order within a page
+	// depend on Go's map iteration. The grouping keys complete the order.
 	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].score > sorted[j].score
+		if sorted[i].score != sorted[j].score {
+			return sorted[i].score > sorted[j].score
+		}
+		if sorted[i].file != sorted[j].file {
+			return sorted[i].file < sorted[j].file
+		}
+		return sorted[i].symbol < sorted[j].symbol
 	})
 
 	limitVal := safeLimit(limit)
@@ -6237,18 +6272,50 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 			paths = append(paths, p)
 		}
 		if len(paths) > 0 {
-			placeholders := strings.TrimRight(strings.Repeat("?,", len(paths)), ",")
-			args := make([]any, 0, len(paths)+1)
-			args = append(args, repoID)
+			// SemanticSearch reports canonical (slash) paths; `files.path` holds the
+			// indexing host's native form. Bind both, or this predicate matches
+			// nothing on Windows and the benchmark reports a zero-byte context.
+			bound := make([]string, 0, len(paths)*2)
 			for _, p := range paths {
+				bound = append(bound, storedPathVariants(p)...)
+			}
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(bound)), ",")
+			args := make([]any, 0, len(bound)+1)
+			args = append(args, repoID)
+			for _, p := range bound {
 				args = append(args, p)
 			}
-			err = s.db.QueryRowContext(ctx,
-				`SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM files WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+placeholders+`)`,
+			// Rows, not aggregates: a database that holds both forms of one path (a
+			// graph.sqlite carried between hosts) would otherwise count that file
+			// twice and overstate the context it charges for. Folding on the canonical
+			// path counts each logical file once.
+			rows, err := s.db.QueryContext(ctx,
+				`SELECT path, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+placeholders+`)`,
 				args...,
-			).Scan(&contextFileCount, &contextBytes)
+			)
 			if err != nil {
 				return nil, fmt.Errorf("benchmark context bytes: %w", err)
+			}
+			sizes := map[string]int64{}
+			for rows.Next() {
+				var path string
+				var size int64
+				if err := rows.Scan(&path, &size); err != nil {
+					_ = rows.Close()
+					return nil, fmt.Errorf("benchmark context bytes: %w", err)
+				}
+				sizes[CanonicalRelPath(path)] = size
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("benchmark context bytes: %w", err)
+			}
+			if err := rows.Close(); err != nil {
+				return nil, fmt.Errorf("benchmark context bytes: %w", err)
+			}
+			for _, size := range sizes {
+				contextFileCount++
+				contextBytes += size
 			}
 		}
 	} else {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/agent"
@@ -136,8 +137,16 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 		}
 		result, err := s.callTool(ctx, params.Name, params.Arguments)
 		if err != nil {
+			// Marshal the error document rather than splicing the message into a
+			// JSON literal: a message containing a quote (an argument name, a
+			// symbol, a cursor) used to produce a payload the client could not
+			// parse at all, turning a clear tool error into a protocol error.
+			errPayload, marshalErr := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+			if marshalErr != nil {
+				errPayload = []byte(`{"ok":false,"error":"tool call failed"}`)
+			}
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-				"content": []map[string]any{{"type": "text", "text": `{"ok":false,"error":"` + escape(err.Error()) + `"}`}},
+				"content": []map[string]any{{"type": "text", "text": string(errPayload)}},
 				"isError": true,
 			}}, true
 		}
@@ -315,6 +324,8 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			MaxSymbols     int    `json:"max_symbols"`
 			IncludeTests   *bool  `json:"include_tests"`
 			IncludeCallers *bool  `json:"include_callers"`
+			MaxTokens      int    `json:"max_tokens"`
+			Cursor         string `json:"cursor"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
@@ -324,6 +335,8 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			MaxSymbols:     req.MaxSymbols,
 			IncludeTests:   true,
 			IncludeCallers: true,
+			MaxTokens:      req.MaxTokens,
+			Cursor:         req.Cursor,
 		}
 		if req.IncludeTests != nil {
 			opts.IncludeTests = *req.IncludeTests
@@ -741,7 +754,7 @@ func buildToolDefinitions() []map[string]any {
 		toolDef("list_repos", "List repositories known to the local graph store", []string{"limit", "offset"}, nil),
 		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}, nil),
 		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}, nil),
-		toolDef("context_for_task", "Return relevant files, symbols, and relationships for a natural-language task description", []string{"task", "max_files", "max_symbols", "include_tests", "include_callers"}, []string{"task"}),
+		toolDef("context_for_task", "Return relevant files, symbols, and relationships for a natural-language task description, ranked and trimmed to a token budget", []string{"task", "max_files", "max_symbols", "include_tests", "include_callers", "max_tokens", "cursor"}, []string{"task"}),
 		toolDef("find_dead_code", "Find symbols with no callers or references (likely dead code)", []string{"limit", "offset"}, nil),
 		toolDef("list_files", "List indexed files in the repository, optionally filtered by path prefix", []string{"path_filter", "limit", "offset"}, nil),
 		toolDef("architecture_overview", "High-level repository architecture: languages, directories, key symbols, dependency patterns", nil, nil),
@@ -782,12 +795,37 @@ func detailProperty() map[string]any {
 // the explicit request.
 const defaultToolDetail = detail.Card
 
+// contextMaxTokensProperty and contextCursorProperty document the two
+// context_for_task budget arguments. tools/list is itself part of every
+// session's token budget, so each is one sentence: what it does, what an agent
+// must repeat, and what it may change.
+func contextMaxTokensProperty() map[string]any {
+	return map[string]any{
+		"type":        "integer",
+		"default":     query.DefaultContextMaxTokens,
+		"description": "Estimated token budget for the response (bytes/4 estimate, not a provider token count). 0 uses the default; over " + strconv.Itoa(query.MaxContextMaxTokens) + " is clamped.",
+	}
+}
+
+func contextCursorProperty() map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": "Opaque next_cursor from a previous call, to fetch context that did not fit. Omit for the first page; replay the same task and options, max_tokens may change.",
+	}
+}
+
 func toolDef(name, description string, properties, required []string) map[string]any {
 	props := map[string]any{}
 	for _, prop := range properties {
 		props[prop] = map[string]any{"type": "string"}
 		if prop == "detail" {
 			props[prop] = detailProperty()
+		}
+		if prop == "max_tokens" {
+			props[prop] = contextMaxTokensProperty()
+		}
+		if prop == "cursor" {
+			props[prop] = contextCursorProperty()
 		}
 		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" || prop == "max_files" || prop == "max_symbols" || prop == "max_steps" || prop == "examples" {
 			props[prop] = map[string]any{"type": "integer"}
@@ -814,11 +852,6 @@ func toolDef(name, description string, properties, required []string) map[string
 	}
 }
 
-func escape(s string) string {
-	b, _ := json.Marshal(s)
-	return strings.Trim(string(b), `"`)
-}
-
 func decodePageRequest(raw json.RawMessage) (pageRequest, error) {
 	var req pageRequest
 	if err := json.Unmarshal(raw, &req); err != nil && len(raw) > 0 {
@@ -843,7 +876,7 @@ var toolArgumentSpecs = map[string]toolArgSpec{
 	"list_scans":            {properties: map[string]string{"limit": "integer", "offset": "integer"}},
 	"latest_scan_errors":    {properties: map[string]string{"limit": "integer", "offset": "integer"}},
 	"find_dead_code":        {properties: map[string]string{"limit": "integer", "offset": "integer"}},
-	"context_for_task":      {properties: map[string]string{"task": "string", "max_files": "integer", "max_symbols": "integer", "include_tests": "boolean", "include_callers": "boolean"}, required: []string{"task"}},
+	"context_for_task":      {properties: map[string]string{"task": "string", "max_files": "integer", "max_symbols": "integer", "include_tests": "boolean", "include_callers": "boolean", "max_tokens": "integer", "cursor": "string"}, required: []string{"task"}},
 	"list_files":            {properties: map[string]string{"path_filter": "string", "limit": "integer", "offset": "integer"}},
 	"architecture_overview": {properties: map[string]string{}},
 	"trace_dependencies":    {properties: map[string]string{"symbol": "string", "direction": "string", "depth": "integer"}, required: []string{"symbol"}},

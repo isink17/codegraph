@@ -255,7 +255,7 @@ See the [`examples/`](examples/) directory for more configuration samples.
 | `trace_dependencies` | Trace transitive dependency chains (upstream/downstream) |
 | `find_related_tests` | Find tests for a symbol, file, or set of changed files |
 | `find_dead_code` | Find symbols with no callers or references |
-| `context_for_task` | Build a focused context bundle for a natural-language task |
+| `context_for_task` | Build a focused, token-budgeted context bundle for a natural-language task |
 
 ### Architecture & Analysis
 
@@ -339,6 +339,47 @@ The tools that still return the pre-projection symbol shape -- `search_semantic`
 `find_dead_code`, `trace_dependencies`, `find_related_tests`, and
 `context_for_task` -- are unchanged, because their records are already card-sized
 and adding `detail` to them could only make a response larger.
+
+### Token budget and continuation (`context_for_task`)
+
+`context_for_task` is the selector at the front of that workflow: it ranks the
+context for a task and returns as much of it as a token budget pays for, with the
+identity needed to drill into anything it named.
+
+| Argument | Meaning |
+|---|---|
+| `max_tokens` | Budget for the serialized context document. Omitted or `0` uses 4000; negative is an error; anything above 200000 is clamped. |
+| `cursor` | Opaque `next_cursor` from a previous call, to fetch the context that did not fit. |
+
+The count is an estimate -- `ceil(bytes / 4)` over the response document itself,
+not a model provider's tokenizer. `estimated_tokens` is measured on the exact
+document returned, its file envelopes, counters and `next_cursor` included, so a
+page never overshoots the budget it advertises. The budget covers that document;
+the MCP result wrapper around it (`{"ok":true,"data":...}`) adds a further ~5
+estimated tokens.
+
+`max_files` bounds the production files the answer covers; the `test_files`
+section is bounded separately, by the tests linked to those files. Candidates are
+ranked before they are budgeted: direct semantic matches first, then callers and
+callees of those matches, then the tests that cover them. Only the strongest few
+matches are expanded through the graph, so a call's cost does not grow with the
+number of search hits, and a match the search itself rated near zero can fall
+behind a caller of the top match -- a match with real relevance never does. The
+order is a total order (score, relevance class, file path, stable identity), so
+two calls against the same graph return byte-identical pages and an offset cursor
+is safe.
+
+When context is withheld, the response carries `has_more`, `remaining_symbols`,
+and `next_cursor`. Replay the same `task` and the same ranking options with the
+cursor to continue; `max_tokens` may differ between pages. A cursor is refused --
+rather than silently skipping or repeating context -- if the repository, the task,
+a ranking option, the indexed generation, or the ranking itself has changed since
+it was issued. Start again without a cursor in that case.
+
+Each returned symbol carries `symbol_id`, `stable_key`, and `qualified_name`, and
+its `signature`/`doc_summary` are bounded card-sized values. Source is never
+embedded: pass the identity to `find_symbol` with `detail=excerpt` or
+`detail=full` when you need the code.
 
 The same four levels are available on the CLI as `--detail`. The CLI default is
 different on purpose: `codegraph find_symbol` and friends keep printing every

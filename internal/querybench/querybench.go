@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/isink17/codegraph/internal/latency"
+	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -192,6 +193,12 @@ func Run(ctx context.Context, s *store.Store, repoID int64, repoRoot string, opt
 func buildScenarios(s *store.Store, repoID int64, t store.QueryBenchTargets) []scenario {
 	const limit = 20
 
+	// context_for_task is a service-level aggregate (semantic search, graph
+	// expansion, ranking, budgeting), so it needs the query service rather than
+	// the store alone. A nil embedder keeps it on the deterministic token-overlap
+	// search path: no Ollama, no network, same questions on every run.
+	svc := query.New(s, nil)
+
 	needSymbol := func(name string) string {
 		if name == "" {
 			return "repository has no resolved edges, so no representative symbol could be selected"
@@ -287,6 +294,23 @@ func buildScenarios(s *store.Store, repoID int64, t store.QueryBenchTargets) []s
 			run: func(ctx context.Context) (int, error) {
 				out, err := s.FindDeadCode(ctx, repoID, limit, 0)
 				return len(out), err
+			},
+		},
+		{
+			// The task is the graph-derived search term, not an invented sentence,
+			// so the scenario asks the same question of the same index every run.
+			name:   "context_for_task",
+			target: t.SearchTerm,
+			skip:   needSymbol(t.SearchTerm),
+			run: func(ctx context.Context) (int, error) {
+				out, err := svc.ContextForTask(ctx, repoID, t.SearchTerm, query.ContextForTaskOptions{
+					IncludeCallers: true,
+					IncludeTests:   true,
+				})
+				if err != nil {
+					return 0, err
+				}
+				return out.ReturnedSymbols, nil
 			},
 		},
 		{
