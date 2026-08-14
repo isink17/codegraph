@@ -51,18 +51,32 @@ var compactCapableTools = map[string]bool{
 // already been validated by validateToolArguments; parsing again here keeps this
 // function honest if it is ever called first.
 func formatArgument(raw json.RawMessage) (compactfmt.Format, error) {
+	format, _, err := formatAndDetailArguments(raw)
+	return format, err
+}
+
+// formatAndDetailArguments reads the two enum-valued arguments in one pass.
+//
+// They are decoded together because the usage meter wants both and the encoding
+// choice wants one: reading them separately would add a second parse of the same
+// arguments object to every tool call, which is the sort of cost a meter is
+// supposed to expose, not create. The raw `detail` value is returned unresolved;
+// the caller decides what an omitted or invalid level means in its context.
+func formatAndDetailArguments(raw json.RawMessage) (compactfmt.Format, string, error) {
 	if len(raw) == 0 {
-		return defaultToolFormat, nil
+		return defaultToolFormat, "", nil
 	}
 	var req struct {
 		Format string `json:"format"`
+		Detail string `json:"detail"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		// A malformed arguments payload is reported by the tool's own decoding,
 		// with the message that call already produced before P15.
-		return defaultToolFormat, nil
+		return defaultToolFormat, "", nil
 	}
-	return compactfmt.ParseFormat(req.Format, defaultToolFormat)
+	format, err := compactfmt.ParseFormat(req.Format, defaultToolFormat)
+	return format, req.Detail, err
 }
 
 // callToolContent produces the model-visible text of one tool call: the JSON
@@ -72,13 +86,20 @@ func formatArgument(raw json.RawMessage) (compactfmt.Format, error) {
 // query and, for symbol results, the same detail projection -- compact is a
 // second serializer, never a second query or a second projection.
 func (s *Server) callToolContent(ctx context.Context, name string, raw json.RawMessage) (string, error) {
+	// The one place every model-visible tool call passes through exactly once,
+	// direct or forwarded. Attributing here is what makes a gateway call a single
+	// row named for the capability it reached, rather than a tool_call row plus a
+	// double-counted target.
+	rec := callMeterFrom(ctx)
+	desc := rec.observeTool(name)
 	if err := validateToolArguments(name, raw); err != nil {
 		return "", err
 	}
-	format, err := formatArgument(raw)
+	format, rawDetail, err := formatAndDetailArguments(raw)
 	if err != nil {
 		return "", err
 	}
+	rec.observeDimensions(meterDimensions(desc, string(format), rawDetail))
 	if format == compactfmt.FormatCompact {
 		return s.callToolCompact(ctx, name, raw)
 	}

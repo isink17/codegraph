@@ -19,6 +19,7 @@ import (
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
+	"github.com/isink17/codegraph/internal/usage"
 	"github.com/isink17/codegraph/internal/version"
 )
 
@@ -32,6 +33,9 @@ type Server struct {
 	errOut      io.Writer
 	agentCfg    agent.OllamaLLMConfig
 	toolMode    ToolMode
+	// usage is this server's local context meter. One server lifetime is one
+	// metering session; nothing about it is persisted, exported, or reported.
+	usage *usage.Meter
 }
 
 // NewServer builds an MCP server. cliRepoRoot is the raw `--repo-root` flag value
@@ -41,7 +45,12 @@ type Server struct {
 // The tool surface defaults to ToolModeFull, so a server built without an
 // explicit mode advertises exactly what it advertised before gateway mode existed.
 func NewServer(cliRepoRoot, repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
-	return &Server{cliRepoRoot: cliRepoRoot, repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q, errOut: errOut, toolMode: ToolModeFull}
+	return &Server{
+		cliRepoRoot: cliRepoRoot, repoRoot: repoRoot, repoID: repoID,
+		store: s, indexer: idx, query: q, errOut: errOut,
+		toolMode: ToolModeFull,
+		usage:    usage.New(string(ToolModeFull), nil),
+	}
 }
 
 // SetAgentConfig configures the LLM backend for the agentic_query tool.
@@ -63,6 +72,7 @@ func (s *Server) SetToolMode(mode ToolMode) error {
 		return err
 	}
 	s.toolMode = parsed
+	s.usage.SetToolMode(string(parsed))
 	return nil
 }
 
@@ -80,6 +90,15 @@ func (s *Server) toolDefinitions() []map[string]any {
 		return gatewayToolDefinitions
 	}
 	return staticToolDefinitions
+}
+
+// toolDefinitionsBytes is the serialized size of that payload, precomputed at
+// initialization so metering a `tools/list` costs a field read.
+func (s *Server) toolDefinitionsBytes() int {
+	if s.ToolMode() == ToolModeGateway {
+		return gatewayToolDefinitionsBytes
+	}
+	return staticToolDefinitionsBytes
 }
 
 type rpcRequest struct {
@@ -162,6 +181,9 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 	case "notifications/initialized":
 		return rpcResponse{}, false
 	case "tools/list":
+		// Discovery is charged before a session asks anything, so it is metered as
+		// a first-class event and every repeat call is counted again.
+		s.usage.RecordToolsList(len(req.Params), s.toolDefinitionsBytes())
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": s.toolDefinitions()}}, true
 	case "tools/call":
 		var params struct {
@@ -169,9 +191,24 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: err.Error()}}, true
+			// Undecodable params never name a tool, but the model still reads the
+			// rejection, so it is booked against the unknown bucket rather than lost.
+			// The error OBJECT is what it reads, measured the same way the tool error
+			// document below is -- only the JSON-RPC envelope around it is excluded.
+			rpcErr := rpcError{Code: -32602, Message: err.Error()}
+			errBytes, marshalErr := json.Marshal(rpcErr)
+			if marshalErr != nil {
+				errBytes = nil
+			}
+			s.usage.RecordToolCall(usage.Key{Tool: usage.UnknownTool, Via: usage.ViaDirect},
+				len(req.Params), len(errBytes), true)
+			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr}, true
 		}
-		text, err := s.callToolText(ctx, params.Name, params.Arguments)
+		// The arguments object is the model-authored half of the exchange, measured
+		// as the bytes that arrived. For a gateway call that object is the tool_call
+		// wrapper, which is exactly the indirection overhead the report should show.
+		rec := newCallMeter(params.Name)
+		text, err := s.callToolText(withCallMeter(ctx, rec), params.Name, params.Arguments)
 		if err != nil {
 			// Marshal the error document rather than splicing the message into a
 			// JSON literal: a message containing a quote (an argument name, a
@@ -181,11 +218,17 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 			if marshalErr != nil {
 				errPayload = []byte(`{"ok":false,"error":"tool call failed"}`)
 			}
+			// A failed call still spent context: the error document is what the model
+			// reads in place of a result, so it is measured the same way.
+			s.usage.RecordToolCall(rec.key(), len(params.Arguments), len(errPayload), true)
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 				"content": []map[string]any{{"type": "text", "text": string(errPayload)}},
 				"isError": true,
 			}}, true
 		}
+		// Measured after the content exists and before it is framed: len() of the
+		// text the model receives, not of the JSON-RPC line that carries it.
+		s.usage.RecordToolCall(rec.key(), len(params.Arguments), len(text), false)
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 			"content": []map[string]any{{"type": "text", "text": text}},
 			"isError": false,
@@ -208,6 +251,13 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 //
 // The MCP surface goes through callToolContent instead, which validates once and
 // then calls dispatchTool directly, so a tool call is never validated twice.
+//
+// Do not route this path through callToolContent. Beyond the double validation,
+// callToolContent is where the usage meter attributes a call: an inner tool run
+// by agentic_query's loop would overwrite the outer record's tool, format, and
+// detail, silently reporting an agentic_query call as whatever tool it happened
+// to run last. An inner call is not model-visible, and is correctly charged in
+// full to the agentic_query response that reports it.
 func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage) (map[string]any, error) {
 	if err := validateToolArguments(name, raw); err != nil {
 		return nil, err

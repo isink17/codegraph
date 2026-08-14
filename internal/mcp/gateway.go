@@ -65,6 +65,10 @@ func (s *Server) callToolText(ctx context.Context, name string, raw json.RawMess
 // a compact document is not re-encoded, a budgeted context is not re-budgeted, and
 // no result is wrapped in a JSON string inside JSON.
 func (s *Server) gatewayToolCall(ctx context.Context, raw json.RawMessage) (string, error) {
+	// Marked before the target is resolved: a gateway call that reaches no
+	// capability is still a gateway call, and stays charged to tool_call because
+	// tool_call is the only thing that ran.
+	callMeterFrom(ctx).markGateway()
 	var req struct {
 		Name string `json:"name"`
 		// Raw so the target's own decoder sees the caller's bytes. Decoding to a map
@@ -105,7 +109,8 @@ type toolSearchResult struct {
 
 // gatewayToolSearch answers tool_search: a deterministic, bounded, local name and
 // description search over the canonical registry. No index, no embeddings, no
-// network -- the corpus is 29 names and 29 one-line descriptions.
+// network -- the corpus is every non-meta registry entry, name and one-line
+// description.
 func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 	var req struct {
 		Query         string `json:"query"`
@@ -134,9 +139,14 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 
 	terms := searchTerms(query)
 	type scored struct {
-		desc  *toolDescriptor
-		score int
-		order int
+		desc *toolDescriptor
+		// demoted marks a hidden diagnostic on a query that is not its exact name.
+		// It orders below every real match instead of scoring below one: a penalty
+		// applied to the score would push weak matches under the score > 0 filter
+		// and make the tool undiscoverable rather than merely last.
+		demoted bool
+		score   int
+		order   int
 	}
 	matches := make([]scored, 0, len(toolRegistry))
 	for i := range toolRegistry {
@@ -147,12 +157,21 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 			continue
 		}
 		if score := toolSearchScore(desc, query, terms); score > 0 {
-			matches = append(matches, scored{desc: desc, score: score, order: i})
+			matches = append(matches, scored{
+				desc:    desc,
+				demoted: desc.hidden && query != desc.name,
+				score:   score,
+				order:   i,
+			})
 		}
 	}
-	// Score first, registry order second: the same query always returns the same
-	// list in the same order.
+	// Real tools first, then score, then registry order: the same query always
+	// returns the same list in the same order, and a diagnostic never displaces a
+	// capability an agent could actually navigate with.
 	sort.SliceStable(matches, func(a, b int) bool {
+		if matches[a].demoted != matches[b].demoted {
+			return !matches[a].demoted
+		}
 		if matches[a].score != matches[b].score {
 			return matches[a].score > matches[b].score
 		}

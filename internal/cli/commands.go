@@ -396,10 +396,11 @@ func newCommandList() []*command {
 		{
 			name:        "serve",
 			description: "start MCP server",
-			usageLines:  []string{"  serve [--repo-root <repo-path>] [--tool-mode full|gateway]"},
+			usageLines:  []string{"  serve [--repo-root <repo-path>] [--tool-mode full|gateway] [--usage-summary]"},
 			flags: []commandFlag{
 				{name: "--repo-root PATH", description: "repository root to serve (defaults to the git repo root)"},
 				{name: "--tool-mode MODE", description: "MCP tool surface: full (default, every tool) or gateway (small core plus tool_search/tool_call)"},
+				{name: "--usage-summary", description: "on exit, print this session's local context-usage report to stderr (never to stdout, never off-machine)"},
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runServe(ctx, cfg, stdout, stderr, args)
