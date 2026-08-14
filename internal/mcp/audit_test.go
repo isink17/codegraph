@@ -101,22 +101,28 @@ func TestAuditToolIsRegistered(t *testing.T) {
 	if _, ok := toolArgumentSpecs["audit"]; !ok {
 		t.Fatal("audit has no entry in toolArgumentSpecs, so every call would be rejected")
 	}
-	// Definitions and specs must cover exactly the same tool names.
-	for _, def := range buildToolDefinitions() {
-		name := def["name"].(string)
-		if _, ok := toolArgumentSpecs[name]; !ok {
-			t.Errorf("tool %q is advertised but has no argument spec", name)
+	// The canonical registry and the argument specs must cover exactly the same
+	// names. Full mode advertises every registry entry except the gateway meta
+	// tools, which are asserted separately by the gateway tests.
+	for _, desc := range toolRegistry {
+		if _, ok := toolArgumentSpecs[desc.name]; !ok {
+			t.Errorf("tool %q is in the registry but has no argument spec", desc.name)
 		}
 	}
 	for name := range toolArgumentSpecs {
-		matched := false
-		for _, def := range buildToolDefinitions() {
-			if def["name"] == name {
-				matched = true
-			}
+		if _, ok := toolByName[name]; !ok {
+			t.Errorf("tool %q has an argument spec but is not in the registry", name)
 		}
-		if !matched {
-			t.Errorf("tool %q has an argument spec but is not advertised", name)
+	}
+	for _, def := range buildToolDefinitions() {
+		name := def["name"].(string)
+		desc, ok := toolByName[name]
+		if !ok {
+			t.Errorf("tool %q is advertised but is not in the registry", name)
+			continue
+		}
+		if desc.handler == nil {
+			t.Errorf("tool %q is advertised but has no handler, so every call would be rejected", name)
 		}
 	}
 }

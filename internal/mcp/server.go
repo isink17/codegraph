@@ -31,18 +31,55 @@ type Server struct {
 	query       *query.Service
 	errOut      io.Writer
 	agentCfg    agent.OllamaLLMConfig
+	toolMode    ToolMode
 }
 
 // NewServer builds an MCP server. cliRepoRoot is the raw `--repo-root` flag value
 // provided to `codegraph serve` (empty when omitted). repoRoot is the resolved
 // active repository root for tools that operate on the initially opened repo.
+//
+// The tool surface defaults to ToolModeFull, so a server built without an
+// explicit mode advertises exactly what it advertised before gateway mode existed.
 func NewServer(cliRepoRoot, repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
-	return &Server{cliRepoRoot: cliRepoRoot, repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q, errOut: errOut}
+	return &Server{cliRepoRoot: cliRepoRoot, repoRoot: repoRoot, repoID: repoID, store: s, indexer: idx, query: q, errOut: errOut, toolMode: ToolModeFull}
 }
 
 // SetAgentConfig configures the LLM backend for the agentic_query tool.
 func (s *Server) SetAgentConfig(baseURL, model string) {
 	s.agentCfg = agent.OllamaLLMConfig{BaseURL: baseURL, Model: model}
+}
+
+// SetToolMode selects which tool surface `tools/list` advertises. An empty mode
+// is the default.
+//
+// Call it during setup, before Serve: the field is a plain one, so changing the
+// mode while Serve is reading from another goroutine is a data race. Nothing on
+// the tool surface calls this, which is the property that matters -- a gateway
+// client cannot promote itself to the full surface, because no tool can reach
+// this method.
+func (s *Server) SetToolMode(mode ToolMode) error {
+	parsed, err := ParseToolMode(string(mode))
+	if err != nil {
+		return err
+	}
+	s.toolMode = parsed
+	return nil
+}
+
+// ToolMode reports the surface this server advertises.
+func (s *Server) ToolMode() ToolMode {
+	if s.toolMode == "" {
+		return ToolModeFull
+	}
+	return s.toolMode
+}
+
+// toolDefinitions is the `tools/list` payload for this server's mode.
+func (s *Server) toolDefinitions() []map[string]any {
+	if s.ToolMode() == ToolModeGateway {
+		return gatewayToolDefinitions
+	}
+	return staticToolDefinitions
 }
 
 type rpcRequest struct {
@@ -73,8 +110,6 @@ type pageRequest struct {
 	Limit  int `json:"limit"`
 	Offset int `json:"offset"`
 }
-
-var staticToolDefinitions = buildToolDefinitions()
 
 // Serve reads JSON-RPC requests from `in` and writes responses to `out`,
 // framed per the MCP stdio transport: one JSON object per line, terminated
@@ -127,7 +162,7 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 	case "notifications/initialized":
 		return rpcResponse{}, false
 	case "tools/list":
-		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": staticToolDefinitions}}, true
+		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": s.toolDefinitions()}}, true
 	case "tools/call":
 		var params struct {
 			Name      string          `json:"name"`
@@ -136,7 +171,7 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) (rpcResponse, bool)
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: err.Error()}}, true
 		}
-		text, err := s.callToolContent(ctx, params.Name, params.Arguments)
+		text, err := s.callToolText(ctx, params.Name, params.Arguments)
 		if err != nil {
 			// Marshal the error document rather than splicing the message into a
 			// JSON literal: a message containing a quote (an argument name, a
@@ -191,249 +226,306 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 // dispatchTool routes a tool call to its handler and returns the JSON envelope.
 // Arguments must already be validated: every caller validates first, so doing it
 // here as well would parse the same payload twice on the hot path.
+//
+// Routing is a registry lookup, not a switch, so the advertised tool list and the
+// set of tools that can actually answer are the same set by construction.
 func (s *Server) dispatchTool(ctx context.Context, name string, raw json.RawMessage) (map[string]any, error) {
-	switch name {
-	case "audit":
-		return s.handleAudit(ctx, raw)
-	case "index_repo":
-		return s.handleIndex(ctx, raw, false)
-	case "update_graph":
-		return s.handleIndex(ctx, raw, true)
-	case "find_symbol":
-		cards, err := s.symbolMatches(ctx, raw, false)
-		return wrapData("matches", cards, err)
-	case "find_callers":
-		return s.handleCallGraph(ctx, raw, true)
-	case "find_callees":
-		return s.handleCallGraph(ctx, raw, false)
-	case "get_impact_radius":
-		data, err := s.impactRadiusData(ctx, raw)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": data}, nil
-	case "find_related_tests":
-		items, err := s.relatedTests(ctx, raw)
-		return wrapData("tests", items, err)
-	case "search_symbols":
-		cards, err := s.symbolMatches(ctx, raw, true)
-		return wrapData("matches", cards, err)
-	case "search_semantic":
-		var req struct {
-			Query  string `json:"query"`
-			Limit  int    `json:"limit"`
-			Offset int    `json:"offset"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		items, err := s.query.SemanticSearch(ctx, s.repoID, req.Query, req.Limit, req.Offset)
-		return wrapData("matches", items, err)
-	case "graph_stats":
-		stats, err := s.query.Stats(ctx, s.repoID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": stats}, nil
-	case "supported_languages":
-		return map[string]any{
-			"ok": true,
-			"data": map[string]any{
-				"languages": s.indexer.SupportedLanguages(),
-			},
-		}, nil
-	case "list_repos":
-		req, err := decodePageRequest(raw)
-		if err != nil {
-			return nil, err
-		}
-		items, err := s.store.ListRepos(ctx, req.Limit, req.Offset)
-		return wrapData("repos", items, err)
-	case "list_scans":
-		req, err := decodePageRequest(raw)
-		if err != nil {
-			return nil, err
-		}
-		items, err := s.store.ListScans(ctx, s.repoID, req.Limit, req.Offset)
-		return wrapData("scans", items, err)
-	case "latest_scan_errors":
-		req, err := decodePageRequest(raw)
-		if err != nil {
-			return nil, err
-		}
-		items, err := s.store.LatestScanErrors(ctx, s.repoID, req.Limit, req.Offset)
-		return wrapData("errors", items, err)
-	case "find_dead_code":
-		items, err := s.deadCode(ctx, raw)
-		return wrapData("dead_code", items, err)
-	case "list_files":
-		items, err := s.listFiles(ctx, raw)
-		return wrapData("files", items, err)
-	case "context_for_task":
-		var req struct {
-			Task           string `json:"task"`
-			MaxFiles       int    `json:"max_files"`
-			MaxSymbols     int    `json:"max_symbols"`
-			IncludeTests   *bool  `json:"include_tests"`
-			IncludeCallers *bool  `json:"include_callers"`
-			MaxTokens      int    `json:"max_tokens"`
-			Cursor         string `json:"cursor"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		opts := query.ContextForTaskOptions{
-			MaxFiles:       req.MaxFiles,
-			MaxSymbols:     req.MaxSymbols,
-			IncludeTests:   true,
-			IncludeCallers: true,
-			MaxTokens:      req.MaxTokens,
-			Cursor:         req.Cursor,
-		}
-		if req.IncludeTests != nil {
-			opts.IncludeTests = *req.IncludeTests
-		}
-		if req.IncludeCallers != nil {
-			opts.IncludeCallers = *req.IncludeCallers
-		}
-		result, err := s.query.ContextForTask(ctx, s.repoID, req.Task, opts)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": result}, nil
-	case "architecture_overview":
-		data, err := s.query.ArchitectureOverview(ctx, s.repoID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": data}, nil
-	case "trace_dependencies":
-		items, err := s.traceDependencies(ctx, raw)
-		return wrapData("dependencies", items, err)
-	case "detect_frameworks":
-		imports, err := s.query.AllImports(ctx, s.repoID)
-		if err != nil {
-			return nil, err
-		}
-		files, err := s.query.AllFilePaths(ctx, s.repoID)
-		if err != nil {
-			return nil, err
-		}
-		detections := framework.Detect(files, imports)
-		return map[string]any{"ok": true, "data": map[string]any{"frameworks": detections}}, nil
-	case "benchmark_tokens":
-		var req struct {
-			Task string `json:"task"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		data, err := s.query.BenchmarkTokens(ctx, s.repoID, req.Task)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": data}, nil
-	case "cross_language_links":
-		count, err := s.query.ResolveCrossLanguageLinks(ctx, s.repoID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": map[string]any{"links_created": count}}, nil
-	case "session_log":
-		var req struct {
-			EventType string `json:"event_type"`
-			Key       string `json:"key"`
-			Value     string `json:"value"`
-			Metadata  string `json:"metadata"`
-			SessionID string `json:"session_id"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		err := s.store.SessionLogEvent(ctx, s.repoID, req.SessionID, req.EventType, req.Key, req.Value, req.Metadata)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true}, nil
-	case "session_history":
-		var req struct {
-			SessionID string `json:"session_id"`
-			EventType string `json:"event_type"`
-			Limit     int    `json:"limit"`
-			Offset    int    `json:"offset"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		items, err := s.store.SessionGetHistory(ctx, s.repoID, req.SessionID, req.EventType, req.Limit, req.Offset)
-		return wrapData("events", items, err)
-	case "session_hot_files":
-		var req struct {
-			SessionID string `json:"session_id"`
-			Limit     int    `json:"limit"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		items, err := s.store.SessionGetHotFiles(ctx, s.repoID, req.SessionID, req.Limit)
-		return wrapData("hot_files", items, err)
-	case "session_context":
-		var req struct {
-			SessionID string `json:"session_id"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		data, err := s.store.SessionGetContext(ctx, s.repoID, req.SessionID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": data}, nil
-	case "graph_analytics":
-		var req struct {
-			Analysis string `json:"analysis"`
-			Limit    int    `json:"limit"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		if req.Limit <= 0 {
-			req.Limit = 20
-		}
-		switch req.Analysis {
-		case "pagerank":
-			items, err := s.query.PageRank(ctx, s.repoID, req.Limit)
-			return wrapData("pagerank", items, err)
-		case "coupling":
-			items, err := s.query.CouplingMetrics(ctx, s.repoID, req.Limit)
-			return wrapData("coupling", items, err)
-		case "cycles":
-			items, err := s.query.DetectCycles(ctx, s.repoID, req.Limit)
-			return wrapData("cycles", items, err)
-		default:
-			return nil, fmt.Errorf("unknown analysis type %q, expected: pagerank, coupling, cycles", req.Analysis)
-		}
-	case "agentic_query":
-		var req struct {
-			Query    string `json:"query"`
-			MaxSteps int    `json:"max_steps"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		llmFn := agent.NewOllamaLLM(s.agentCfg)
-		toolFn := func(ctx context.Context, name string, args json.RawMessage) (map[string]any, error) {
-			return s.callTool(ctx, name, args)
-		}
-		ag := agent.New(llmFn, toolFn, req.MaxSteps)
-		result, err := ag.Run(ctx, req.Query)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "data": result}, nil
-	default:
+	desc, ok := dispatchableTool(name)
+	if !ok {
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
+	return desc.handler(s, ctx, raw)
+}
+
+func (s *Server) handleFindSymbol(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	cards, err := s.symbolMatches(ctx, raw, false)
+	return wrapData("matches", cards, err)
+}
+
+func (s *Server) handleSearchSymbols(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	cards, err := s.symbolMatches(ctx, raw, true)
+	return wrapData("matches", cards, err)
+}
+
+func (s *Server) handleFindCallers(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	return s.handleCallGraph(ctx, raw, true)
+}
+
+func (s *Server) handleFindCallees(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	return s.handleCallGraph(ctx, raw, false)
+}
+
+func (s *Server) handleIndexRepo(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	return s.handleIndex(ctx, raw, false)
+}
+
+func (s *Server) handleUpdateGraph(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	return s.handleIndex(ctx, raw, true)
+}
+
+func (s *Server) handleImpactRadius(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	data, err := s.impactRadiusData(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": data}, nil
+}
+
+func (s *Server) handleRelatedTests(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	items, err := s.relatedTests(ctx, raw)
+	return wrapData("tests", items, err)
+}
+
+func (s *Server) handleSearchSemantic(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Query  string `json:"query"`
+		Limit  int    `json:"limit"`
+		Offset int    `json:"offset"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	items, err := s.query.SemanticSearch(ctx, s.repoID, req.Query, req.Limit, req.Offset)
+	return wrapData("matches", items, err)
+}
+
+func (s *Server) handleGraphStats(ctx context.Context, _ json.RawMessage) (map[string]any, error) {
+	stats, err := s.query.Stats(ctx, s.repoID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": stats}, nil
+}
+
+func (s *Server) handleSupportedLanguages(_ context.Context, _ json.RawMessage) (map[string]any, error) {
+	return map[string]any{
+		"ok": true,
+		"data": map[string]any{
+			"languages": s.indexer.SupportedLanguages(),
+		},
+	}, nil
+}
+
+func (s *Server) handleListRepos(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	req, err := decodePageRequest(raw)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.store.ListRepos(ctx, req.Limit, req.Offset)
+	return wrapData("repos", items, err)
+}
+
+func (s *Server) handleListScans(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	req, err := decodePageRequest(raw)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.store.ListScans(ctx, s.repoID, req.Limit, req.Offset)
+	return wrapData("scans", items, err)
+}
+
+func (s *Server) handleLatestScanErrors(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	req, err := decodePageRequest(raw)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.store.LatestScanErrors(ctx, s.repoID, req.Limit, req.Offset)
+	return wrapData("errors", items, err)
+}
+
+func (s *Server) handleDeadCode(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	items, err := s.deadCode(ctx, raw)
+	return wrapData("dead_code", items, err)
+}
+
+func (s *Server) handleListFiles(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	items, err := s.listFiles(ctx, raw)
+	return wrapData("files", items, err)
+}
+
+func (s *Server) handleContextForTask(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Task           string `json:"task"`
+		MaxFiles       int    `json:"max_files"`
+		MaxSymbols     int    `json:"max_symbols"`
+		IncludeTests   *bool  `json:"include_tests"`
+		IncludeCallers *bool  `json:"include_callers"`
+		MaxTokens      int    `json:"max_tokens"`
+		Cursor         string `json:"cursor"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	opts := query.ContextForTaskOptions{
+		MaxFiles:       req.MaxFiles,
+		MaxSymbols:     req.MaxSymbols,
+		IncludeTests:   true,
+		IncludeCallers: true,
+		MaxTokens:      req.MaxTokens,
+		Cursor:         req.Cursor,
+	}
+	if req.IncludeTests != nil {
+		opts.IncludeTests = *req.IncludeTests
+	}
+	if req.IncludeCallers != nil {
+		opts.IncludeCallers = *req.IncludeCallers
+	}
+	result, err := s.query.ContextForTask(ctx, s.repoID, req.Task, opts)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": result}, nil
+}
+
+func (s *Server) handleArchitectureOverview(ctx context.Context, _ json.RawMessage) (map[string]any, error) {
+	data, err := s.query.ArchitectureOverview(ctx, s.repoID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": data}, nil
+}
+
+func (s *Server) handleTraceDependencies(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	items, err := s.traceDependencies(ctx, raw)
+	return wrapData("dependencies", items, err)
+}
+
+func (s *Server) handleDetectFrameworks(ctx context.Context, _ json.RawMessage) (map[string]any, error) {
+	imports, err := s.query.AllImports(ctx, s.repoID)
+	if err != nil {
+		return nil, err
+	}
+	files, err := s.query.AllFilePaths(ctx, s.repoID)
+	if err != nil {
+		return nil, err
+	}
+	detections := framework.Detect(files, imports)
+	return map[string]any{"ok": true, "data": map[string]any{"frameworks": detections}}, nil
+}
+
+func (s *Server) handleBenchmarkTokens(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Task string `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	data, err := s.query.BenchmarkTokens(ctx, s.repoID, req.Task)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": data}, nil
+}
+
+func (s *Server) handleCrossLanguageLinks(ctx context.Context, _ json.RawMessage) (map[string]any, error) {
+	count, err := s.query.ResolveCrossLanguageLinks(ctx, s.repoID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": map[string]any{"links_created": count}}, nil
+}
+
+func (s *Server) handleSessionLog(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		EventType string `json:"event_type"`
+		Key       string `json:"key"`
+		Value     string `json:"value"`
+		Metadata  string `json:"metadata"`
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	if err := s.store.SessionLogEvent(ctx, s.repoID, req.SessionID, req.EventType, req.Key, req.Value, req.Metadata); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
+}
+
+func (s *Server) handleSessionHistory(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		EventType string `json:"event_type"`
+		Limit     int    `json:"limit"`
+		Offset    int    `json:"offset"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	items, err := s.store.SessionGetHistory(ctx, s.repoID, req.SessionID, req.EventType, req.Limit, req.Offset)
+	return wrapData("events", items, err)
+}
+
+func (s *Server) handleSessionHotFiles(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		Limit     int    `json:"limit"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	items, err := s.store.SessionGetHotFiles(ctx, s.repoID, req.SessionID, req.Limit)
+	return wrapData("hot_files", items, err)
+}
+
+func (s *Server) handleSessionContext(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	data, err := s.store.SessionGetContext(ctx, s.repoID, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": data}, nil
+}
+
+func (s *Server) handleGraphAnalytics(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Analysis string `json:"analysis"`
+		Limit    int    `json:"limit"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	if req.Limit <= 0 {
+		req.Limit = 20
+	}
+	switch req.Analysis {
+	case "pagerank":
+		items, err := s.query.PageRank(ctx, s.repoID, req.Limit)
+		return wrapData("pagerank", items, err)
+	case "coupling":
+		items, err := s.query.CouplingMetrics(ctx, s.repoID, req.Limit)
+		return wrapData("coupling", items, err)
+	case "cycles":
+		items, err := s.query.DetectCycles(ctx, s.repoID, req.Limit)
+		return wrapData("cycles", items, err)
+	default:
+		return nil, fmt.Errorf("unknown analysis type %q, expected: pagerank, coupling, cycles", req.Analysis)
+	}
+}
+
+func (s *Server) handleAgenticQuery(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Query    string `json:"query"`
+		MaxSteps int    `json:"max_steps"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	llmFn := agent.NewOllamaLLM(s.agentCfg)
+	toolFn := func(ctx context.Context, name string, args json.RawMessage) (map[string]any, error) {
+		return s.callTool(ctx, name, args)
+	}
+	ag := agent.New(llmFn, toolFn, req.MaxSteps)
+	result, err := ag.Run(ctx, req.Query)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": result}, nil
 }
 
 func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bool) (map[string]any, error) {
@@ -800,40 +892,6 @@ func writeResponse(w io.Writer, resp rpcResponse) error {
 	return err
 }
 
-func buildToolDefinitions() []map[string]any {
-	return []map[string]any{
-		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
-		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
-		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset", "detail", "format"}, []string{"query"}),
-		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail", "format"}, nil),
-		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail", "format"}, nil),
-		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth", "detail", "format"}, nil),
-		toolDef("find_related_tests", "Find likely related tests for a symbol, file, or set of changed files", []string{"symbol", "file", "files", "limit", "offset", "format"}, nil),
-		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset", "detail", "format"}, []string{"query"}),
-		toolDef("search_semantic", "Hybrid semantic search (vector similarity + FTS when embeddings available, token-overlap fallback)", []string{"query", "limit", "offset"}, []string{"query"}),
-		toolDef("graph_stats", "Return repository graph statistics", nil, nil),
-		toolDef("supported_languages", "List supported languages and file extensions", nil, nil),
-		toolDef("list_repos", "List repositories known to the local graph store", []string{"limit", "offset"}, nil),
-		toolDef("list_scans", "List recent scans for the active repository", []string{"limit", "offset"}, nil),
-		toolDef("latest_scan_errors", "List latest failed scans and error details", []string{"limit", "offset"}, nil),
-		toolDef("context_for_task", "Return relevant files, symbols, and relationships for a natural-language task description, ranked and trimmed to a token budget", []string{"task", "max_files", "max_symbols", "include_tests", "include_callers", "max_tokens", "cursor"}, []string{"task"}),
-		toolDef("find_dead_code", "Find symbols with no callers or references (likely dead code)", []string{"limit", "offset", "format"}, nil),
-		toolDef("list_files", "List indexed files in the repository, optionally filtered by path prefix", []string{"path_filter", "limit", "offset", "format"}, nil),
-		toolDef("architecture_overview", "High-level repository architecture: languages, directories, key symbols, dependency patterns", nil, nil),
-		toolDef("trace_dependencies", "Trace transitive dependency chains from a symbol (upstream callers or downstream callees)", []string{"symbol", "direction", "depth", "format"}, []string{"symbol"}),
-		toolDef("detect_frameworks", "Detect frameworks and libraries used in the repository", nil, nil),
-		toolDef("benchmark_tokens", "Estimate token savings from using codegraph vs reading raw files", []string{"task"}, nil),
-		toolDef("cross_language_links", "Find and create cross-language symbol references", nil, nil),
-		toolDef("session_log", "Log a session event (read, edit, decision, task, fact)", []string{"event_type", "key", "value", "metadata", "session_id"}, []string{"event_type"}),
-		toolDef("session_history", "Get session event history", []string{"session_id", "event_type", "limit", "offset"}, nil),
-		toolDef("session_hot_files", "Get most frequently accessed files in sessions", []string{"session_id", "limit"}, nil),
-		toolDef("session_context", "Get aggregated session context for pre-loading", []string{"session_id"}, nil),
-		toolDef("graph_analytics", "Run graph analytics: pagerank, coupling, or cycles", []string{"analysis", "limit"}, []string{"analysis"}),
-		toolDef("agentic_query", "Ask a question answered by an AI agent that reasons over the code graph (requires local Ollama)", []string{"query", "max_steps"}, []string{"query"}),
-		toolDef("audit", "Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only)", []string{"examples"}, nil),
-	}
-}
-
 // detailProperty is the JSON Schema for the progressive-disclosure argument.
 //
 // It is built once and shared by every tool that accepts `detail`, so the four
@@ -891,30 +949,28 @@ func contextCursorProperty() map[string]any {
 	}
 }
 
+// toolDef renders one tool's advertised definition. The four documented
+// properties get their shared schema; everything else is typed by argType, the
+// same function the validator consults, so a schema cannot advertise one type and
+// the validator enforce another.
 func toolDef(name, description string, properties, required []string) map[string]any {
 	props := map[string]any{}
 	for _, prop := range properties {
-		props[prop] = map[string]any{"type": "string"}
-		if prop == "detail" {
+		switch prop {
+		case "detail":
 			props[prop] = detailProperty()
-		}
-		if prop == "format" {
+		case "format":
 			props[prop] = formatProperty()
-		}
-		if prop == "max_tokens" {
+		case "max_tokens":
 			props[prop] = contextMaxTokensProperty()
-		}
-		if prop == "cursor" {
+		case "cursor":
 			props[prop] = contextCursorProperty()
-		}
-		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" || prop == "max_files" || prop == "max_symbols" || prop == "max_steps" || prop == "examples" {
-			props[prop] = map[string]any{"type": "integer"}
-		}
-		if prop == "force" || prop == "include_tests" || prop == "include_callers" {
-			props[prop] = map[string]any{"type": "boolean"}
-		}
-		if prop == "paths" || prop == "symbols" || prop == "files" {
-			props[prop] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+		default:
+			if argType(prop) == "array" {
+				props[prop] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+				continue
+			}
+			props[prop] = map[string]any{"type": argType(prop)}
 		}
 	}
 	schema := map[string]any{
@@ -938,38 +994,6 @@ func decodePageRequest(raw json.RawMessage) (pageRequest, error) {
 		return pageRequest{}, err
 	}
 	return req, nil
-}
-
-var toolArgumentSpecs = map[string]toolArgSpec{
-	"index_repo":            {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
-	"update_graph":          {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
-	"find_symbol":           {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}, required: []string{"query"}},
-	"find_callers":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}},
-	"find_callees":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}},
-	"get_impact_radius":     {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer", "detail": "string", "format": "string"}},
-	"find_related_tests":    {properties: map[string]string{"symbol": "string", "file": "string", "files": "array", "limit": "integer", "offset": "integer", "format": "string"}},
-	"search_symbols":        {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string", "format": "string"}, required: []string{"query"}},
-	"search_semantic":       {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
-	"graph_stats":           {properties: map[string]string{}},
-	"supported_languages":   {properties: map[string]string{}},
-	"list_repos":            {properties: map[string]string{"limit": "integer", "offset": "integer"}},
-	"list_scans":            {properties: map[string]string{"limit": "integer", "offset": "integer"}},
-	"latest_scan_errors":    {properties: map[string]string{"limit": "integer", "offset": "integer"}},
-	"find_dead_code":        {properties: map[string]string{"limit": "integer", "offset": "integer", "format": "string"}},
-	"context_for_task":      {properties: map[string]string{"task": "string", "max_files": "integer", "max_symbols": "integer", "include_tests": "boolean", "include_callers": "boolean", "max_tokens": "integer", "cursor": "string"}, required: []string{"task"}},
-	"list_files":            {properties: map[string]string{"path_filter": "string", "limit": "integer", "offset": "integer", "format": "string"}},
-	"architecture_overview": {properties: map[string]string{}},
-	"trace_dependencies":    {properties: map[string]string{"symbol": "string", "direction": "string", "depth": "integer", "format": "string"}, required: []string{"symbol"}},
-	"detect_frameworks":     {properties: map[string]string{}},
-	"benchmark_tokens":      {properties: map[string]string{"task": "string"}},
-	"cross_language_links":  {properties: map[string]string{}},
-	"session_log":           {properties: map[string]string{"event_type": "string", "key": "string", "value": "string", "metadata": "string", "session_id": "string"}, required: []string{"event_type"}},
-	"session_history":       {properties: map[string]string{"session_id": "string", "event_type": "string", "limit": "integer", "offset": "integer"}},
-	"session_hot_files":     {properties: map[string]string{"session_id": "string", "limit": "integer"}},
-	"session_context":       {properties: map[string]string{"session_id": "string"}},
-	"graph_analytics":       {properties: map[string]string{"analysis": "string", "limit": "integer"}, required: []string{"analysis"}},
-	"agentic_query":         {properties: map[string]string{"query": "string", "max_steps": "integer"}, required: []string{"query"}},
-	"audit":                 {properties: map[string]string{"examples": "integer"}},
 }
 
 func validateToolArguments(name string, raw json.RawMessage) error {
@@ -1070,6 +1094,10 @@ func validateArgType(name string, value any, expected string) error {
 	case "array":
 		if _, ok := value.([]any); !ok {
 			return fmt.Errorf("argument %q must be an array", name)
+		}
+	case "object":
+		if _, ok := value.(map[string]any); !ok {
+			return fmt.Errorf("argument %q must be an object", name)
 		}
 	}
 	return nil
