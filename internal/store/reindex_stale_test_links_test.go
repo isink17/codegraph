@@ -143,13 +143,17 @@ func TestReindexUnbindsTestLinkWhenTargetSymbolDisappears(t *testing.T) {
 	}
 
 	// Symbol-level RelatedTests surfaces nothing once the target symbol is gone:
-	// lookupSymbolID no longer finds it and returns sql.ErrNoRows, which
+	// lookupSymbolID no longer finds it and reports ErrSymbolNotFound, which
 	// RelatedTests propagates, so the (previously dangling) link was invisible
 	// either way. This is the reported user-visible symptom, and it is why the
-	// error tolerance below is intentional.
+	// error tolerance below is intentional. The sentinel is CodeGraph's own --
+	// it used to be a raw sql.ErrNoRows, which reached MCP clients verbatim.
 	relatedSym, err := f.store.RelatedTests(f.ctx, f.repoID, "Helper", "", 10, 0)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err != nil && !errors.Is(err, store.ErrSymbolNotFound) {
 		t.Fatalf("RelatedTests(symbol=Helper) post-removal error = %v", err)
+	}
+	if err != nil && errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("RelatedTests(symbol=Helper) leaked a driver error: %v", err)
 	}
 	if len(relatedSym) != 0 {
 		t.Fatalf("RelatedTests(symbol=Helper) post-removal = %d rows, want 0: %+v", len(relatedSym), relatedSym)

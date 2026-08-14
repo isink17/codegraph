@@ -29,6 +29,7 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/graphaudit"
 	"github.com/isink17/codegraph/internal/indexer"
+	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/logging"
 	"github.com/isink17/codegraph/internal/mcp"
 	"github.com/isink17/codegraph/internal/platform"
@@ -248,6 +249,12 @@ func runAudit(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	}
 	if *examples < 0 {
 		return fmt.Errorf("invalid --examples %d: want 0 or more", *examples)
+	}
+	// The same ceiling the MCP `audit` tool enforces. The argument multiplies
+	// per-finding example queries, so an unbounded value is a work multiplier
+	// rather than a bigger page.
+	if *examples > limits.MaxAuditExamples {
+		return fmt.Errorf("invalid --examples %d: want at most %d", *examples, limits.MaxAuditExamples)
 	}
 	opened, err := openIndexedRepoReadOnly(ctx, cfg, repoRootCandidate)
 	if err != nil {
@@ -1382,6 +1389,32 @@ func splitFlagArgs(fs *flag.FlagSet, args []string) (flagArgs, positional []stri
 	return flagArgs, positional
 }
 
+// checkQueryBounds applies internal/limits to the shared query flags. The
+// message names the flag and the range rather than clamping, so a script that
+// asks for more than CodeGraph will return is told, not quietly trimmed.
+func checkQueryBounds(limit, offset, depth int, detailFlag string) error {
+	// An unset --detail means the CLI's own legacy record, which is card-shaped
+	// for sizing purposes; a set one is validated later by detail.Parse.
+	level := strings.TrimSpace(detailFlag)
+	maxRows := limits.MaxPageForDetail(level)
+	if limit < 0 || limit > maxRows {
+		// Name the detail level only when the caller chose one; otherwise the
+		// message would blame an empty string for the ceiling.
+		because := ""
+		if level != "" {
+			because = fmt.Sprintf(" for --detail %s", level)
+		}
+		return fmt.Errorf("--limit must be between 0 and %d%s (0 uses the command default)", maxRows, because)
+	}
+	if offset < 0 {
+		return fmt.Errorf("--offset must be 0 or more")
+	}
+	if depth < 0 || depth > limits.MaxDepth {
+		return fmt.Errorf("--depth must be between 0 and %d", limits.MaxDepth)
+	}
+	return nil
+}
+
 func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, queryKind, cmdName string, args []string) error {
 	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -1398,6 +1431,18 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 	fs.Var(&files, "file", "file path (repeatable)")
 	flagArgs, positional := splitFlagArgs(fs, args)
 	if err := fs.Parse(flagArgs); err != nil {
+		return err
+	}
+	limitSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "limit" {
+			limitSet = true
+		}
+	})
+	// The same bounds the MCP tools enforce, in the same words: a query asked
+	// for on the command line and through an agent is one query, and its answer
+	// should not be a different size depending on which one asked.
+	if err := checkQueryBounds(*limit, *offset, *depth, *detailFlag); err != nil {
 		return err
 	}
 
@@ -1526,7 +1571,18 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if len(symbols) == 0 && len(files) == 0 {
 			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--file <path>]... [--depth N]", appname.BinaryName, cmdName)
 		}
-		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, *depth)
+		// impact is a document about one change rather than a browsing page, so
+		// an unspecified --limit means "as much as the ceiling allows", not the
+		// 20-row default the search commands share.
+		// An explicit --limit 0 spells "use the tool default" exactly as an
+		// omitted flag does, so both must land on the same number. Testing only
+		// limitSet let `--limit 0` fall through to the store's 20-row default
+		// while the MCP tool answered with 500.
+		impactLimit := *limit
+		if !limitSet || *limit == 0 {
+			impactLimit = limits.MaxPageForDetail(strings.TrimSpace(*detailFlag))
+		}
+		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, *depth, impactLimit, *offset)
 		if err != nil {
 			return err
 		}
@@ -1734,6 +1790,19 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	// Export is its own family: --limit 0 means "the whole repository", and it
+	// streams, so peak memory stays O(page) at any repository size. Only the
+	// paged form materialises, so only it needs a ceiling -- and the remedy is
+	// the cheaper path, not a smaller number.
+	if *limit < 0 {
+		return fmt.Errorf("--limit must be 0 or more; 0 exports the whole repository as a stream")
+	}
+	if *limit > limits.MaxExportPage {
+		return fmt.Errorf("--limit must be at most %d; use --limit 0 to export the whole repository as a stream", limits.MaxExportPage)
+	}
+	if *offset < 0 {
+		return fmt.Errorf("--offset must be 0 or more")
+	}
 	repoRoot := "."
 	if fs.NArg() > 0 {
 		repoRoot = fs.Arg(0)
@@ -1790,6 +1859,9 @@ func runVisualize(ctx context.Context, cfg config.Config, stdout io.Writer, args
 	depth := fs.Int("depth", 2, "traversal depth from focus symbol")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *depth < 0 || *depth > limits.MaxDepth {
+		return fmt.Errorf("--depth must be between 0 and %d", limits.MaxDepth)
 	}
 
 	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
@@ -2288,6 +2360,9 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 	limit := fs.Int("limit", 50, "maximum number of test results")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *limit < 0 || *limit > limits.MaxPage {
+		return fmt.Errorf("--limit must be between 0 and %d", limits.MaxPage)
 	}
 
 	repoRootCandidate := strings.TrimSpace(*repoRootFlag)

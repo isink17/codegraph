@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/isink17/codegraph/internal/latency"
+	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
 )
@@ -276,7 +277,7 @@ func buildScenarios(s *store.Store, repoID int64, t store.QueryBenchTargets) []s
 			target: t.CallerTarget,
 			skip:   needSymbol(t.CallerTarget),
 			run: func(ctx context.Context) (int, error) {
-				out, err := s.ImpactRadius(ctx, repoID, []string{t.CallerTarget}, nil, 2)
+				out, err := s.ImpactRadius(ctx, repoID, []string{t.CallerTarget}, nil, 2, limits.MaxPage, 0)
 				return impactSize(out), err
 			},
 		},
@@ -285,7 +286,7 @@ func buildScenarios(s *store.Store, repoID int64, t store.QueryBenchTargets) []s
 			target: t.CalleeSource,
 			skip:   needSymbol(t.CalleeSource),
 			run: func(ctx context.Context) (int, error) {
-				out, err := s.TraceDependencies(ctx, repoID, t.CalleeSource, "downstream", 3)
+				out, _, err := s.TraceDependencies(ctx, repoID, t.CalleeSource, "downstream", 3, limits.MaxPage, 0)
 				return len(out), err
 			},
 		},

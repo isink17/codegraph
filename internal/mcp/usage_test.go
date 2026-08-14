@@ -833,3 +833,57 @@ func TestSessionTotalsMatchTheSumOfParts(t *testing.T) {
 		t.Fatalf("invocation rows sum to %d calls, session says %d", viaCalls, report.Session.ToolCalls)
 	}
 }
+
+// TestOversizedRequestIsMetered covers the accounting side of P18. A rejected
+// request still crossed the wire in both directions, so it still costs context
+// and must still be counted -- once, under its own tool name.
+func TestOversizedRequestIsMetered(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeFull)
+	before := usageReport(t, server, true)
+	if hasRow(before, "search_symbols") {
+		t.Fatalf("reset left a search_symbols row: %+v", before.Tools)
+	}
+
+	isErr, text := callResult(t, server, "search_symbols", map[string]any{"query": "Helper", "limit": 100000000})
+	if !isErr {
+		t.Fatalf("oversized limit was accepted: %s", text)
+	}
+
+	after := usageReport(t, server, false)
+	row := toolRow(t, after, "search_symbols", usage.ViaDirect)
+	if row.Calls != 1 || row.Errors != 1 {
+		t.Fatalf("oversized-request row = %+v, want 1 call and 1 error", row)
+	}
+	if row.RequestBytes == 0 || row.RequestEstimatedTokens == 0 {
+		t.Fatalf("the rejected request was not charged for its own arguments: %+v", row)
+	}
+	if int(row.ResponseBytes) != len(text) {
+		t.Fatalf("metered error response = %d, actual = %d", row.ResponseBytes, len(text))
+	}
+}
+
+// TestOversizedRequestThroughTheGatewayIsNotDoubleCounted checks that the extra
+// validation P18 adds did not give the gateway a second place to charge for the
+// same rejection.
+func TestOversizedRequestThroughTheGatewayIsNotDoubleCounted(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+	usageReport(t, server, true)
+
+	if isErr, text := callResult(t, server, "tool_call", map[string]any{
+		"name":      "find_symbol",
+		"arguments": map[string]any{"query": "Helper", "limit": 100000000},
+	}); !isErr {
+		t.Fatalf("gateway accepted an oversized limit: %s", text)
+	}
+
+	report := usageReport(t, server, false)
+	var charged int
+	for _, row := range report.Tools {
+		if row.Name == "find_symbol" {
+			charged += row.Calls
+		}
+	}
+	if charged != 1 {
+		t.Fatalf("find_symbol was charged %d times for one rejected call: %+v", charged, report.Tools)
+	}
+}

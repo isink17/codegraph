@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/isink17/codegraph/internal/latency"
+	"github.com/isink17/codegraph/internal/limits"
 )
 
 // P12 latency suite for local graph queries against the ~100k-symbol fixture.
@@ -99,19 +100,19 @@ func bigGraphScenarios(f *bigGraphFixture) []queryScenario {
 			return len(out), err
 		}},
 		{"impact_radius_low_degree", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {
-			out, err := f.store.ImpactRadius(ctx, f.repoID, []string{f.LowTarget}, nil, 2)
+			out, err := f.store.ImpactRadius(ctx, f.repoID, []string{f.LowTarget}, nil, 2, limits.MaxPage, 0)
 			return impactSize(out), err
 		}},
 		{"impact_radius_file", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {
-			out, err := f.store.ImpactRadius(ctx, f.repoID, nil, []string{f.PlainFile}, 2)
+			out, err := f.store.ImpactRadius(ctx, f.repoID, nil, []string{f.PlainFile}, 2, limits.MaxPage, 0)
 			return impactSize(out), err
 		}},
 		{"impact_radius_hub", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {
-			out, err := f.store.ImpactRadius(ctx, f.repoID, []string{f.HubTarget}, nil, 2)
+			out, err := f.store.ImpactRadius(ctx, f.repoID, []string{f.HubTarget}, nil, 2, limits.MaxPage, 0)
 			return impactSize(out), err
 		}},
 		{"trace_dependencies_chain", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {
-			out, err := f.store.TraceDependencies(ctx, f.repoID, f.ChainHead, "downstream", 3)
+			out, _, err := f.store.TraceDependencies(ctx, f.repoID, f.ChainHead, "downstream", 3, limits.MaxPage, 0)
 			return len(out), err
 		}},
 		{"architecture_overview", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {

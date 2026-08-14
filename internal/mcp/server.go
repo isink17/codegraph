@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/graphaudit"
 	"github.com/isink17/codegraph/internal/indexer"
+	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
 	"github.com/isink17/codegraph/internal/usage"
@@ -436,8 +438,18 @@ func (s *Server) handleArchitectureOverview(ctx context.Context, _ json.RawMessa
 }
 
 func (s *Server) handleTraceDependencies(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
-	items, err := s.traceDependencies(ctx, raw)
-	return wrapData("dependencies", items, err)
+	items, total, offset, err := s.traceDependencies(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	// The chain is paged, so the response says how much of it this is. A bounded
+	// page that reported only its own rows would read as a complete traversal.
+	return map[string]any{"ok": true, "data": map[string]any{
+		"dependencies": items,
+		"total":        total,
+		"offset":       offset,
+		"truncated":    offset+len(items) < total,
+	}}, nil
 }
 
 func (s *Server) handleDetectFrameworks(ctx context.Context, _ json.RawMessage) (map[string]any, error) {
@@ -695,6 +707,8 @@ func (s *Server) impactRadiusData(ctx context.Context, raw json.RawMessage) (map
 		Files   []string `json:"files"`
 		Depth   int      `json:"depth"`
 		Detail  string   `json:"detail"`
+		Limit   int      `json:"limit"`
+		Offset  int      `json:"offset"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
@@ -703,7 +717,13 @@ func (s *Server) impactRadiusData(ctx context.Context, raw json.RawMessage) (map
 	if err != nil {
 		return nil, err
 	}
-	data, err := s.query.ImpactRadius(ctx, s.repoID, req.Symbols, req.Files, req.Depth)
+	// An omitted limit keeps the pre-P18 shape as far as the ceiling allows:
+	// the impact set is a document about one change, not a browsing page, so
+	// its default is the maximum rather than DefaultPage.
+	if req.Limit == 0 {
+		req.Limit = limits.MaxPageForDetail(string(level))
+	}
+	data, err := s.query.ImpactRadius(ctx, s.repoID, req.Symbols, req.Files, req.Depth, req.Limit, req.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -752,22 +772,37 @@ func (s *Server) listFiles(ctx context.Context, raw json.RawMessage) ([]map[stri
 }
 
 // traceDependencies answers trace_dependencies, including its depth clamp.
-func (s *Server) traceDependencies(ctx context.Context, raw json.RawMessage) ([]map[string]any, error) {
+func (s *Server) traceDependencies(ctx context.Context, raw json.RawMessage) ([]map[string]any, int, int, error) {
 	var req struct {
 		Symbol    string `json:"symbol"`
 		Direction string `json:"direction"`
 		Depth     int    `json:"depth"`
+		Limit     int    `json:"limit"`
+		Offset    int    `json:"offset"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	if req.Depth <= 0 {
 		req.Depth = 3
 	}
-	if req.Depth > 10 {
-		req.Depth = 10
+	// Depth above the maximum is rejected by validateToolArguments; the store
+	// keeps its own backstop. Neither clamps silently on the public path.
+	//
+	// An omitted limit yields the largest legal page rather than DefaultPage,
+	// so an existing caller's chain is unchanged as far as the ceiling allows.
+	if req.Limit == 0 {
+		req.Limit = limits.MaxPage
 	}
-	return s.query.TraceDependencies(ctx, s.repoID, req.Symbol, req.Direction, req.Depth)
+	offset := max(req.Offset, 0)
+	chain, total, err := s.query.TraceDependencies(ctx, s.repoID, req.Symbol, req.Direction, req.Depth, req.Limit, offset)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	// Report the offset the page actually starts at, which is what
+	// get_impact_radius reports too. An offset past the end of the chain would
+	// otherwise be echoed back as though rows had been skipped there.
+	return chain, total, min(offset, total), nil
 }
 
 // projector builds the response-scoped renderer for one tool call. s.repoRoot is
@@ -992,6 +1027,33 @@ func contextMaxTokensProperty() map[string]any {
 	}
 }
 
+// limitProperty advertises the row ceiling a tool actually enforces, so a
+// client can see the bound instead of discovering it by being rejected. The
+// two self-bounded tools publish their own maximum; everything else publishes
+// the shared card-detail ceiling.
+//
+// On a tool that also takes `detail`, `maximum` alone would be a half-truth:
+// it is exact at the default detail and too high at the richer levels, whose
+// rows carry source text. JSON Schema cannot express a bound that depends on
+// another property, so the dependency is stated in the description -- and only
+// on the tools where it actually applies, rather than charging every tool's
+// schema for a caveat that is not true of it.
+func limitProperty(tool string, scaledByDetail bool) map[string]any {
+	maxRows := limits.MaxPage
+	switch tool {
+	case "tool_search":
+		maxRows = maxToolSearchLimit
+	case "usage_stats":
+		maxRows = maxUsageToolRows
+	}
+	prop := map[string]any{"type": "integer", "minimum": 0, "maximum": maxRows}
+	if scaledByDetail {
+		prop["description"] = "Max " + strconv.Itoa(limits.MaxPageSkeleton) + " at detail=skeleton, " +
+			strconv.Itoa(limits.MaxPageSource) + " at excerpt/full."
+	}
+	return prop
+}
+
 func contextCursorProperty() map[string]any {
 	return map[string]any{
 		"type":        "string",
@@ -1015,6 +1077,22 @@ func toolDef(name, description string, properties, required []string) map[string
 			props[prop] = contextMaxTokensProperty()
 		case "cursor":
 			props[prop] = contextCursorProperty()
+		case "limit":
+			props[prop] = limitProperty(name, slices.Contains(properties, "detail"))
+		case "offset":
+			props[prop] = map[string]any{"type": "integer", "minimum": 0}
+		case "depth":
+			props[prop] = map[string]any{"type": "integer", "minimum": 0, "maximum": limits.MaxDepth}
+		// The rest of the bounded integers. They are published for the same
+		// reason limit and depth are: a client that reads the maximum and obeys
+		// it must never be rejected, and a bound only the validator knows about
+		// can only be found by tripping over it.
+		case "max_files", "max_symbols":
+			props[prop] = map[string]any{"type": "integer", "minimum": 0, "maximum": limits.MaxContextSelection}
+		case "examples":
+			props[prop] = map[string]any{"type": "integer", "minimum": 0, "maximum": limits.MaxAuditExamples}
+		case "max_steps":
+			props[prop] = map[string]any{"type": "integer", "minimum": 0, "maximum": limits.MaxAgentSteps}
 		default:
 			if argType(prop) == "array" {
 				props[prop] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
@@ -1103,6 +1181,9 @@ func validateToolArguments(name string, raw json.RawMessage) error {
 			}
 		}
 	}
+	if err := validateArgumentBounds(name, args, level); err != nil {
+		return err
+	}
 	switch name {
 	case "find_callers", "find_callees":
 		symbol, _ := args["symbol"].(string)
@@ -1122,6 +1203,84 @@ func validateToolArguments(name string, raw json.RawMessage) error {
 		files, _ := args["files"].([]any)
 		if len(symbols) == 0 && len(files) == 0 {
 			return fmt.Errorf("one of symbols or files is required")
+		}
+	}
+	return nil
+}
+
+// selfBoundedLimitTools own their `limit` policy and are deliberately not
+// routed through the shared one.
+//
+// `tool_search` caps at 20 and `usage_stats` at 200, and both clamp rather than
+// reject. Those are shipped contracts on a discovery tool and on a hidden
+// diagnostic; reinterpreting either as an error would change a working API for
+// no safety gain, since both are already bounded.
+var selfBoundedLimitTools = map[string]bool{
+	"tool_search": true,
+	"usage_stats": true,
+}
+
+// validateArgumentBounds enforces the numeric ranges in internal/limits before
+// a tool runs. It is called from validateToolArguments, which is the one gate
+// both the direct dispatch and the gateway's tool_call pass through, so a bound
+// cannot hold on one surface and not the other.
+//
+// Rejecting here rather than clamping is the point: a caller that asked for a
+// hundred million rows and silently received five hundred has been told
+// something false about its own request. Zero keeps its established meaning of
+// "use the default"; a negative row count has never had one.
+func validateArgumentBounds(name string, args map[string]any, level detail.Level) error {
+	intArg := func(key string) (int64, bool) {
+		raw, ok := args[key]
+		if !ok {
+			return 0, false
+		}
+		// A non-integer was already rejected by validateArgType, including a
+		// float too large for int64, so this conversion cannot silently wrap.
+		n, ok := asInt64(raw)
+		return n, ok
+	}
+
+	if n, ok := intArg("limit"); ok && !selfBoundedLimitTools[name] {
+		// The ceiling follows the detail level because the row cost does: a
+		// page of `full` records carries source text a `card` does not. The
+		// encoder chosen by `format` never enters into it.
+		maxRows := int64(limits.MaxPageForDetail(string(level)))
+		if n < 0 || n > maxRows {
+			return fmt.Errorf("argument %q must be between 0 and %d for detail %q (0 uses the tool default)", "limit", maxRows, level)
+		}
+	}
+	if n, ok := intArg("offset"); ok && n < 0 {
+		return fmt.Errorf("argument %q must be 0 or more", "offset")
+	}
+	if n, ok := intArg("depth"); ok && (n < 0 || n > int64(limits.MaxDepth)) {
+		return fmt.Errorf("argument %q must be between 0 and %d (0 uses the tool default)", "depth", limits.MaxDepth)
+	}
+	// max_files and max_symbols widen the candidate set context_for_task ranks.
+	// Only the upper bound is added here: their 0-means-default and
+	// negative-means-default behaviour is P14's, and the cursor fingerprint
+	// depends on it.
+	for _, key := range []string{"max_files", "max_symbols"} {
+		if n, ok := intArg(key); ok && n > int64(limits.MaxContextSelection) {
+			return fmt.Errorf("argument %q must be at most %d", key, limits.MaxContextSelection)
+		}
+	}
+	// examples keeps its own zero (counts only) and negative (error) semantics
+	// in the audit handler; this only stops the value from multiplying every
+	// finding's example queries without bound.
+	if n, ok := intArg("examples"); ok && n > int64(limits.MaxAuditExamples) {
+		return fmt.Errorf("argument %q must be at most %d", "examples", limits.MaxAuditExamples)
+	}
+	// Each agent step is a model call plus tool calls, so this bounds time and
+	// spend rather than response size.
+	if n, ok := intArg("max_steps"); ok && (n < 0 || n > int64(limits.MaxAgentSteps)) {
+		return fmt.Errorf("argument %q must be between 0 and %d", "max_steps", limits.MaxAgentSteps)
+	}
+	// symbols and files cost one lookup per element. `paths` on the indexing
+	// tools is deliberately absent: indexing is repository-scale by definition.
+	for _, key := range []string{"symbols", "files"} {
+		if items, ok := args[key].([]any); ok && len(items) > limits.MaxBatchItems {
+			return fmt.Errorf("argument %q must have at most %d items, got %d", key, limits.MaxBatchItems, len(items))
 		}
 	}
 	return nil

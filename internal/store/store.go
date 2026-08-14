@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
@@ -3826,6 +3827,11 @@ func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 		&stats.DirtyFiles,
 		&stats.LastScanID,
 	); err != nil {
+		// No repo row means the repository is not indexed. Reporting that in
+		// CodeGraph's own words keeps a driver string out of `graph_stats`.
+		if errors.Is(err, sql.ErrNoRows) {
+			return graph.Stats{}, fmt.Errorf("%w: repo %d", ErrRepoNotIndexed, repoID)
+		}
 		return graph.Stats{}, err
 	}
 	var indexedAt sql.NullString
@@ -3916,13 +3922,74 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 	return scanSymbols(rows)
 }
 
-func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth int) (map[string]any, error) {
+// ImpactRadius returns one page of the change-impact closure around a set of
+// seeds, with the full closure size reported alongside it.
+//
+// The page exists because the closure is bounded only by the graph: a deep
+// traversal from a hub symbol reaches most of a repository. Callers that need
+// the whole closure rather than a tool-sized answer use impactClosure directly.
+func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth, limit, offset int) (map[string]any, error) {
+	symbolList, fileList, err := s.impactClosure(ctx, repoID, symbols, files, depth)
+	if err != nil {
+		return nil, err
+	}
+
+	// The traversal closure is bounded only by the graph, so the response is
+	// paged like any other. `affected_symbols` keeps reporting the whole
+	// closure and `truncated` says plainly when the page is not all of it: a
+	// bounded page must never read as a complete impact set.
+	totalSymbols := len(symbolList)
+	pageSize := safeLimit(limit)
+	start := min(safeOffset(offset), totalSymbols)
+	end := min(start+pageSize, totalSymbols)
+	symbolPage := symbolList[start:end]
+
+	// Files follow the symbols actually returned, so the two halves of the
+	// response describe the same set.
+	pageFilesSet := make(map[string]struct{}, len(symbolPage))
+	pageFiles := make([]string, 0, len(symbolPage))
+	for _, sym := range symbolPage {
+		if _, ok := pageFilesSet[sym.FilePath]; ok {
+			continue
+		}
+		pageFilesSet[sym.FilePath] = struct{}{}
+		pageFiles = append(pageFiles, sym.FilePath)
+	}
+	sort.Strings(pageFiles)
+
+	return map[string]any{
+		"symbols": symbolPage,
+		"files":   pageFiles,
+		"summary": map[string]any{
+			"affected_symbols": totalSymbols,
+			"affected_files":   len(fileList),
+			"returned_symbols": len(symbolPage),
+			"returned_files":   len(pageFiles),
+			"offset":           start,
+			"truncated":        end < totalSymbols,
+		},
+	}, nil
+}
+
+// impactClosure computes the full change-impact closure: every symbol reachable
+// from the seeds within depth hops, and every file those symbols live in, both
+// in a stable order.
+//
+// It is deliberately unpaged. Bulk export asks for the whole subgraph and is
+// allowed to; only the tool surface on top of it is bounded.
+func (s *Store) impactClosure(ctx context.Context, repoID int64, symbols []string, files []string, depth int) ([]graph.Symbol, []string, error) {
 	affected := make(map[int64]graph.Symbol, len(symbols))
 	queue := make([]int64, 0, len(symbols))
 	for _, name := range symbols {
 		id, err := s.lookupSymbolID(ctx, repoID, name, 0)
 		if err != nil {
-			continue
+			// A seed that is not in the index contributes nothing, which is a
+			// reasonable answer for a mixed seed list. A database failure is
+			// not: swallowing it would return a plausible, wrong impact set.
+			if errors.Is(err, ErrSymbolNotFound) {
+				continue
+			}
+			return nil, nil, err
 		}
 		queue = append(queue, id)
 	}
@@ -3938,25 +4005,29 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 			WHERE s.repo_id = ? AND f.path = ?
 		`, repoID, file)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for rows.Next() {
 			sym, err := scanSymbol(rows)
 			if err != nil {
 				_ = rows.Close()
-				return nil, err
+				return nil, nil, err
 			}
 			affected[sym.ID] = sym
 			queue = append(queue, sym.ID)
 		}
 		_ = rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	if depth <= 0 {
 		depth = 2
 	}
+	// Defensive backstop only: public callers are rejected above MaxDepth
+	// before the traversal starts. Ten hops already reaches the connected
+	// closure of any real repository.
+	depth = min(depth, limits.MaxDepth)
 	seen := map[int64]struct{}{}
 	for level := 0; level < depth && len(queue) > 0; level++ {
 		currentSet := map[int64]struct{}{}
@@ -3980,7 +4051,7 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 		}
 		callers, err := s.impactNeighbors(ctx, repoID, current, true)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, sym := range callers {
 			affected[sym.ID] = sym
@@ -3990,7 +4061,7 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 		}
 		callees, err := s.impactNeighbors(ctx, repoID, current, false)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, sym := range callees {
 			affected[sym.ID] = sym
@@ -4025,14 +4096,7 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 		return symbolList[i].ID < symbolList[j].ID
 	})
 	sort.Strings(fileList)
-	return map[string]any{
-		"symbols": symbolList,
-		"files":   fileList,
-		"summary": map[string]any{
-			"affected_symbols": len(symbolList),
-			"affected_files":   len(fileList),
-		},
-	}, nil
+	return symbolList, fileList, nil
 }
 
 // impactNeighbors returns the neighbours of a frontier chunk, one row per edge.
@@ -4119,7 +4183,12 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 			OFFSET ?
 		`, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
 	} else {
-		targetID, err := s.lookupSymbolID(ctx, repoID, symbol, 0)
+		// targetID is declared separately so that the assignment below writes the
+		// function-scoped err. With `targetID, err := ...` the query's error was
+		// bound to a block-local err, leaving the outer one nil and rows nil --
+		// a dropped error followed by a nil dereference in the deferred Close.
+		var targetID int64
+		targetID, err = s.lookupSymbolID(ctx, repoID, symbol, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -4234,11 +4303,13 @@ func (s *Store) GraphSnapshot(ctx context.Context, repoID int64, focusSymbol str
 		return symbols, edges, nil
 	}
 
-	impact, err := s.ImpactRadius(ctx, repoID, []string{focusSymbol}, nil, depth)
+	// A focused export wants the whole subgraph, not a tool-sized page of it, so
+	// it takes the unpaged closure directly. Truncating here would silently
+	// drop nodes from a graph the caller asked to export in full.
+	impactSymbols, _, err := s.impactClosure(ctx, repoID, []string{focusSymbol}, nil, depth)
 	if err != nil {
 		return nil, nil, err
 	}
-	impactSymbols, _ := impact["symbols"].([]graph.Symbol)
 	if len(impactSymbols) == 0 {
 		return nil, nil, nil
 	}
@@ -4268,7 +4339,7 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 		ORDER BY s.id ASC
 		LIMIT ?
 		OFFSET ?
-	`, repoID, safeLimit(limit), safeOffset(offset))
+	`, repoID, exportLimit(limit), safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
@@ -4282,6 +4353,7 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 // previously O(repo) in `Symbol`-sized rows; this trims it to O(pageSize)
 // in plain strings).
 func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
+	pageSize := exportLimit(limit)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT qualified_name
 		FROM symbols
@@ -4289,12 +4361,15 @@ func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit,
 		ORDER BY qualified_name ASC
 		LIMIT ?
 		OFFSET ?
-	`, repoID, safeLimit(limit), safeOffset(offset))
+	`, repoID, pageSize, safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make([]string, 0, limit)
+	// Size the buffer from the normalized page size, never from the raw
+	// argument: a caller asking for a hundred million rows must not reserve a
+	// hundred million slots before the first row is read.
+	out := make([]string, 0, pageSize)
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
@@ -4316,7 +4391,7 @@ func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset
 		ORDER BY e.id ASC
 		LIMIT ?
 		OFFSET ?
-	`, repoID, safeLimit(limit), safeOffset(offset))
+	`, repoID, exportLimit(limit), safeOffset(offset))
 	if err != nil {
 		return nil, err
 	}
@@ -4770,13 +4845,37 @@ func chunkStrings(values []string, chunkSize int) [][]string {
 	return out
 }
 
+// ErrSymbolNotFound reports that a name was looked up and no symbol in the
+// index carries it. It is CodeGraph's own vocabulary on purpose: absence of a
+// symbol is an ordinary answer to a lookup, and a caller -- human or agent --
+// must be able to tell it apart from the database failing, which a raw
+// `sql: no rows in result set` cannot express.
+//
+// Wrap it with the name that was requested so the message stays actionable:
+//
+//	fmt.Errorf("%w: %q", ErrSymbolNotFound, symbol)
+var ErrSymbolNotFound = errors.New("symbol not found")
+
+// SymbolNotFoundError builds the wrapped not-found error for a requested name,
+// so every surface reports absence the same way.
+func SymbolNotFoundError(symbol string) error {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return ErrSymbolNotFound
+	}
+	return fmt.Errorf("%w: %q", ErrSymbolNotFound, symbol)
+}
+
 func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string, symbolID int64) (int64, error) {
 	ids, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
 		return 0, err
 	}
 	if len(ids) == 0 {
-		return 0, sql.ErrNoRows
+		// A name that matches several definitions is not reported here: the
+		// first candidate wins, in the deterministic order lookupSymbolIDs
+		// establishes. Only genuine absence is an error.
+		return 0, SymbolNotFoundError(symbol)
 	}
 	return ids[0], nil
 }
@@ -4977,11 +5076,14 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 
 // TraceDependencies performs a BFS traversal of the dependency graph starting
 // from the given symbol, returning the full chain up to maxDepth levels.
-func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth int) ([]map[string]any, error) {
+// It returns one page of the traversal plus the total number of nodes reached,
+// so a caller can report a bounded page without implying it is the whole chain.
+func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
 	if maxDepth <= 0 {
 		maxDepth = 3
 	}
-	maxDepth = min(maxDepth, 10)
+	// Defensive backstop only; public callers are rejected above MaxDepth.
+	maxDepth = min(maxDepth, limits.MaxDepth)
 	if direction == "" {
 		direction = "downstream"
 	}
@@ -4992,7 +5094,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 		`SELECT id, qualified_name, kind, name FROM symbols WHERE repo_id = ? AND (qualified_name LIKE ? OR name = ?)`,
 		repoID, pattern, symbol)
 	if err != nil {
-		return nil, fmt.Errorf("trace_dependencies seed query: %w", err)
+		return nil, 0, fmt.Errorf("trace_dependencies seed query: %w", err)
 	}
 	type symInfo struct {
 		id            int64
@@ -5005,13 +5107,13 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 		var si symInfo
 		if err := seedRows.Scan(&si.id, &si.qualifiedName, &si.kind, &si.name); err != nil {
 			seedRows.Close()
-			return nil, err
+			return nil, 0, err
 		}
 		seeds = append(seeds, si)
 	}
 	seedRows.Close()
 	if err := seedRows.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	type bfsEntry struct {
@@ -5089,7 +5191,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 
 	if direction == "downstream" || direction == "both" {
 		if err := bfs(seeds, "downstream"); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	if direction == "upstream" || direction == "both" {
@@ -5101,7 +5203,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 			}
 		}
 		if err := bfs(seeds, "upstream"); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
@@ -5113,8 +5215,16 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 		return results[i].qualifiedName < results[j].qualifiedName
 	})
 
-	out := make([]map[string]any, len(results))
-	for i, r := range results {
+	// The traversal has no natural size bound -- a hub symbol in a large
+	// repository reaches thousands of nodes at the default depth -- so the
+	// chain is paged after sorting, and the total travels with the page.
+	total := len(results)
+	pageStart := min(safeOffset(offset), total)
+	pageEnd := min(pageStart+safeLimit(limit), total)
+	page := results[pageStart:pageEnd]
+
+	out := make([]map[string]any, len(page))
+	for i, r := range page {
 		out[i] = map[string]any{
 			"symbol":    r.qualifiedName,
 			"kind":      r.kind,
@@ -5124,7 +5234,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 			"direction": r.dir,
 		}
 	}
-	return out, nil
+	return out, total, nil
 }
 
 func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
@@ -5228,7 +5338,13 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 			`SELECT s.qualified_name, s.kind, COALESCE(f.path, '') FROM symbols s LEFT JOIN files f ON f.id = s.file_id WHERE s.id = ?`, r.id).
 			Scan(&name, &kind, &path)
 		if err != nil {
-			continue
+			// A rank entry whose symbol row vanished mid-query is skipped; a
+			// real database failure is reported rather than hidden behind a
+			// short result page.
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil, err
 		}
 		prOut = append(prOut, map[string]any{
 			"symbol": name,
@@ -5387,15 +5503,23 @@ func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]ma
 	return dOut, nil
 }
 
+// safeLimit normalizes a page size for a query that answers a public tool. It
+// is the store's defensive backstop, not the public policy: MCP and the CLI
+// reject an out-of-range `limit` before a query runs, and this only bounds a
+// value that reached the store without passing through them.
 func safeLimit(limit int) int {
-	if limit <= 0 {
-		return 20
-	}
-	return limit
+	return limits.PageRows(limit)
+}
+
+// exportLimit normalizes a page size for the bulk exporters. They page with a
+// larger window than a query does, and `graph export --limit 0` means "stream
+// everything", so they cannot share the query-page ceiling.
+func exportLimit(limit int) int {
+	return limits.ExportRows(limit)
 }
 
 func safeOffset(offset int) int {
-	return max(offset, 0)
+	return limits.Offset(offset)
 }
 
 func normalizeRepoRelPath(path string) string {
@@ -6032,9 +6156,12 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	// would return a well-formed document full of zeroes instead of an error.
 	var exists int
 	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM repos WHERE id = ?`, repoID).Scan(&exists); err != nil {
-		// Keep the context the removed Stats call used to supply: this error is
-		// returned straight to an MCP client, and a bare "sql: no rows in result
-		// set" says nothing about which call failed. errors.Is still matches.
+		// This error is returned straight to an MCP client, so an absent repo
+		// row is reported in CodeGraph's vocabulary rather than the driver's.
+		// A genuine database failure keeps its own wording.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("architecture overview: %w: repo %d", ErrRepoNotIndexed, repoID)
+		}
 		return nil, fmt.Errorf("architecture overview: repo %d: %w", repoID, err)
 	}
 
@@ -6562,6 +6689,11 @@ func (s *Store) SessionGetHistory(ctx context.Context, repoID int64, sessionID s
 	if limit <= 0 {
 		limit = 50
 	}
+	// These two keep a larger default than the shared one, but they must still
+	// pass through the store's ceiling: the backstop is only a backstop if it
+	// has no exceptions.
+	limit = min(limit, limits.StoreMaxRows)
+	offset = safeOffset(offset)
 	query := `SELECT id, session_id, event_type, key, value, metadata, created_at FROM session_events WHERE repo_id = ?`
 	args := []any{repoID}
 	if sessionID != "" {
@@ -6604,6 +6736,7 @@ func (s *Store) SessionGetHotFiles(ctx context.Context, repoID int64, sessionID 
 	if limit <= 0 {
 		limit = 20
 	}
+	limit = min(limit, limits.StoreMaxRows)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT key AS file, COUNT(*) AS access_count, MAX(created_at) AS last_accessed
 		FROM session_events

@@ -166,7 +166,7 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 			return "", err
 		}
 	case "trace_dependencies":
-		items, err := s.traceDependencies(ctx, raw)
+		items, _, _, err := s.traceDependencies(ctx, raw)
 		if err != nil {
 			return "", err
 		}
@@ -209,7 +209,10 @@ func writeRelatedTests(doc *compactfmt.Document, tests []store.RelatedTest) {
 // describe the traversal, not any row in it.
 var (
 	impactFilesSchema   = compactfmt.Schema{Section: "files", Columns: []string{"file"}}
-	impactSummarySchema = compactfmt.Schema{Section: "summary", Columns: []string{"affected_symbols", "affected_files"}}
+	// The paging fields belong in the summary for the same reason the counts
+	// do: they describe the traversal rather than any row in it, and a compact
+	// consumer must be able to see that a page is not the whole closure.
+	impactSummarySchema = compactfmt.Schema{Section: "summary", Columns: []string{"affected_symbols", "affected_files", "returned_symbols", "returned_files", "offset", "truncated"}}
 )
 
 // writeImpactSections encodes a projected impact radius without flattening it.
@@ -246,9 +249,29 @@ func writeImpactSections(doc *compactfmt.Document, data map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("impact radius summary affected_files: %w", err)
 	}
+	returnedSymbols, err := intFromAny(summary["returned_symbols"])
+	if err != nil {
+		return fmt.Errorf("impact radius summary returned_symbols: %w", err)
+	}
+	returnedFiles, err := intFromAny(summary["returned_files"])
+	if err != nil {
+		return fmt.Errorf("impact radius summary returned_files: %w", err)
+	}
+	offset, err := intFromAny(summary["offset"])
+	if err != nil {
+		return fmt.Errorf("impact radius summary offset: %w", err)
+	}
+	truncated, ok := summary["truncated"].(bool)
+	if !ok {
+		return fmt.Errorf("impact radius summary truncated: unexpected shape %T", summary["truncated"])
+	}
 	doc.Section(impactSummarySchema).Row([]compactfmt.Cell{
 		compactfmt.Int64(affectedSymbols),
 		compactfmt.Int64(affectedFiles),
+		compactfmt.Int64(returnedSymbols),
+		compactfmt.Int64(returnedFiles),
+		compactfmt.Int64(offset),
+		compactfmt.Bool(truncated),
 	})
 	return nil
 }
