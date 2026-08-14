@@ -8,8 +8,35 @@ default, and larger representations are asked for explicitly.
 Query latency budget: local graph queries are measured against a deterministic ~100k-symbol
 fixture, the measured bottlenecks are fixed, and the measurement is reproducible from the CLI.
 
+Bounded task context: `context_for_task` returns real context again, ranked deterministically and
+trimmed to a token budget, with an opaque cursor for the context that did not fit.
+
 ### Added
 
+- **`max_tokens` and `cursor` on `context_for_task`.** `max_tokens` bounds the serialized
+  response (omitted or `0` uses 4000, negative is rejected, above 200000 is clamped) and is
+  measured on the exact document returned -- file envelopes, counters and cursor included -- so a
+  page never overshoots the budget it reports in `estimated_tokens`. (The budget covers the context
+  document; the MCP `{"ok":true,"data":...}` wrapper adds ~5 estimated tokens on top.) When context is withheld the
+  response carries `has_more`, `returned_symbols`, `remaining_symbols`, and an opaque
+  `next_cursor`; replaying it with the same task and ranking options continues the same ranked
+  stream with no duplicate and no gap. `max_tokens` may change between pages. A cursor is refused
+  with a clear error when the repository, the task, a ranking option, the indexed generation
+  (`scans.id`), or the ranking itself has changed since it was issued.
+- **Drill-down identity in `context_for_task` results.** Every returned symbol carries
+  `symbol_id` and `stable_key` alongside `qualified_name`, so any card can be passed straight to
+  `find_symbol`/`find_callers` at `detail=excerpt` or `detail=full`. `context_for_task` itself
+  still embeds no source, and its `signature`/`doc_summary` are bounded card-sized values.
+- **Deterministic candidate ranking for `context_for_task`.** One centralized scoring model
+  (relevance class, the search engine's own relevance, and a small capped file-support bonus) and
+  one total order (score, class, file path, stable identity). A strong task match always outranks
+  callers, callees, tests, and hub fan-in; a caller of the best seed outranks a barely relevant
+  search hit; tests rank last but stay reachable. Candidates are deduplicated by stable identity
+  and keep their strongest relevance label.
+- `internal/tokenest`: the one deterministic token estimator (`ceil(bytes/4)`), with no external
+  tokenizer and no network.
+- `context_for_task` is now a `bench-queries` scenario, using the same graph-derived search term
+  the other scenarios use rather than an invented task string.
 - **`detail` argument** on `find_symbol`, `search_symbols`, `find_callers`, `find_callees`, and
   `get_impact_radius`, with one vocabulary shared by every tool: `card` (identity and location),
   `skeleton` (+ signature, visibility, container, doc summary, member declarations), `excerpt`
@@ -74,6 +101,24 @@ fixture, the measured bottlenecks are fixed, and the measurement is reproducible
   holding several repositories the reported degrees summed across all of them.
 
 ### Fixed
+
+- **`context_for_task` returned no context at all.** Both semantic-search paths report a hit as
+  `{"file": ..., "symbol": ...}`, but seed parsing read a key named `name` that neither producer
+  has ever emitted, so every seed was dropped and the tool answered `{"files":null}` while
+  reporting success. Hits are now parsed through one adapter that pins both producer contracts
+  (and accepts the legacy `name` key, with `symbol` taking precedence), and each hit is resolved
+  to a real symbol row by `(file, qualified_name)`.
+- **Ambiguous caller/callee expansion for a seed.** Expansion used the seed's bare name, so a
+  task that matched `billing.Renew` could be given the callers of `subscription.Renew`. Expansion
+  now follows the resolved seed's `symbol_id`, and only widens to name-matched (unresolved) edges
+  when that name belongs to exactly one symbol in the repository.
+- Non-deterministic ordering in `HybridSearch` and `VectorSearch`: fused results were sorted by
+  score alone while being collected from a map, so tied entries -- the common case -- changed
+  places between runs and moved across page boundaries. Both now break ties on file path and
+  qualified name.
+- MCP tool errors whose message contained a double quote produced a response body the client
+  could not parse (the message was spliced into a JSON literal after a `strings.Trim` that ate
+  the closing escape). Error documents are now marshalled.
 
 - **Unstable pagination in symbol search.** `search_symbols`, `find_symbol` and
   `find_symbol --exact` applied `LIMIT`/`OFFSET` with no `ORDER BY`, so which rows a page returned

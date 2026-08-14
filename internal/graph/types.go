@@ -87,6 +87,21 @@ type TaskContext struct {
 	Task      string            `json:"task"`
 	Files     []TaskContextFile `json:"files"`
 	TestFiles []TaskContextFile `json:"test_files,omitempty"`
+
+	// EstimatedTokens is the estimated size of this response, measured on the
+	// serialized document itself. It is an estimate (bytes/4), not a model
+	// provider's token count.
+	EstimatedTokens int `json:"estimated_tokens"`
+	// MaxTokens is the budget this page was selected to fit.
+	MaxTokens int `json:"max_tokens"`
+	// HasMore reports that ranked context was withheld to fit the budget.
+	HasMore bool `json:"has_more"`
+	// NextCursor is an opaque continuation token, present only when HasMore.
+	NextCursor string `json:"next_cursor,omitempty"`
+	// ReturnedSymbols and RemainingSymbols count symbol records on this page and
+	// still withheld after it.
+	ReturnedSymbols  int `json:"returned_symbols"`
+	RemainingSymbols int `json:"remaining_symbols"`
 }
 
 type TaskContextFile struct {
@@ -103,4 +118,10 @@ type TaskContextSymbol struct {
 	DocSummary    string `json:"doc_summary,omitempty"`
 	Relevance     string `json:"relevance"` // "direct_match", "caller", "callee", "test"
 	QualifiedName string `json:"qualified_name"`
+
+	// SymbolID and StableKey are the drill-down identity: pass either to
+	// find_symbol/find_callers/find_callees to fetch this exact symbol at a
+	// higher detail level. context_for_task itself never carries source.
+	SymbolID  int64  `json:"symbol_id,omitempty"`
+	StableKey string `json:"stable_key,omitempty"`
 }

@@ -5830,8 +5830,16 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 		return nil, err
 	}
 
+	// Equal cosine similarity is common for short, similar symbol texts; without
+	// the key tie-break the page a symbol lands on would depend on scan order.
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		if candidates[i].file != candidates[j].file {
+			return candidates[i].file < candidates[j].file
+		}
+		return candidates[i].symbol < candidates[j].symbol
 	})
 
 	end := min(offset+limit, len(candidates))
@@ -5909,8 +5917,18 @@ func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, qu
 	for _, e := range merged {
 		sorted = append(sorted, e)
 	}
+	// RRF scores tie often (two entries found at the same rank by the same
+	// searcher score identically), and the fused entries arrive from a map, so
+	// score alone would make both the page boundary and the order within a page
+	// depend on Go's map iteration. The grouping keys complete the order.
 	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].score > sorted[j].score
+		if sorted[i].score != sorted[j].score {
+			return sorted[i].score > sorted[j].score
+		}
+		if sorted[i].file != sorted[j].file {
+			return sorted[i].file < sorted[j].file
+		}
+		return sorted[i].symbol < sorted[j].symbol
 	})
 
 	limitVal := safeLimit(limit)
