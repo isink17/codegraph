@@ -292,7 +292,30 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 const (
 	fullToolsListBytes  = 10703
 	fullToolsListTokens = 2676
+	// The gateway payload is pinned for the same reason, and became load-bearing
+	// once a registry row could be hidden from a list: a hidden tool that leaked
+	// into the gateway surface would show up here as a byte count, not as a name
+	// nobody happened to assert on.
+	gatewayToolsListBytes  = 3585
+	gatewayToolsListTokens = 897
 )
+
+// TestGatewayToolsListIsByteIdentical pins the reduced surface's exact size.
+func TestGatewayToolsListIsByteIdentical(t *testing.T) {
+	payload, err := json.Marshal(listedTools(t, newGatewayTestServer(t, ToolModeGateway)))
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if len(payload) != gatewayToolsListBytes {
+		t.Errorf("gateway tools/list = %d bytes, want %d.\n"+
+			"If the change is deliberate, update gatewayToolsListBytes/gatewayToolsListTokens "+
+			"and note the new per-session cost in the commit message.\n%s",
+			len(payload), gatewayToolsListBytes, payload)
+	}
+	if got := tokenest.FromBytes(len(payload)); got != gatewayToolsListTokens {
+		t.Errorf("gateway tools/list = %d estimated tokens, want %d", got, gatewayToolsListTokens)
+	}
+}
 
 // TestFullToolsListIsByteIdentical is the backward-compatibility guard the
 // name-only and ratio-only assertions cannot give: it fails on a changed
@@ -852,15 +875,19 @@ func TestRegistryIsTheOnlySourceOfTruth(t *testing.T) {
 	if len(toolByName) != len(toolRegistry) {
 		t.Fatalf("toolByName has %d entries, registry has %d", len(toolByName), len(toolRegistry))
 	}
-	var core, meta, hidden []string
+	// `unlisted` is a tool the gateway surface reaches through tool_call rather
+	// than advertising; `diagnostic` is a tool no surface advertises at all.
+	var core, meta, unlisted, diagnostic []string
 	for _, desc := range toolRegistry {
 		switch {
 		case desc.gatewayMeta:
 			meta = append(meta, desc.name)
+		case desc.hidden:
+			diagnostic = append(diagnostic, desc.name)
 		case desc.gatewayCore:
 			core = append(core, desc.name)
 		default:
-			hidden = append(hidden, desc.name)
+			unlisted = append(unlisted, desc.name)
 		}
 		spec, ok := toolArgumentSpecs[desc.name]
 		if !ok {
@@ -899,8 +926,13 @@ func TestRegistryIsTheOnlySourceOfTruth(t *testing.T) {
 	if !reflect.DeepEqual(meta, []string{"tool_search", "tool_call"}) {
 		t.Errorf("gateway meta tools = %v", meta)
 	}
-	if len(hidden) != len(preGatewayToolNames)-len(core) {
-		t.Errorf("hidden tools = %d, want %d", len(hidden), len(preGatewayToolNames)-len(core))
+	if len(unlisted) != len(preGatewayToolNames)-len(core) {
+		t.Errorf("gateway-unlisted tools = %d, want %d", len(unlisted), len(preGatewayToolNames)-len(core))
+	}
+	// Diagnostics are advertised nowhere, which is the property that keeps both
+	// tools/list payloads the size P16 left them.
+	if !reflect.DeepEqual(diagnostic, []string{"usage_stats"}) {
+		t.Errorf("hidden diagnostics = %v, want [usage_stats]", diagnostic)
 	}
 
 	// Every registry name has a category, so tool_search can rank it.
@@ -913,7 +945,7 @@ func TestRegistryIsTheOnlySourceOfTruth(t *testing.T) {
 	// The full definitions are exactly the non-meta registry rows, in order.
 	var wantFull []string
 	for _, desc := range toolRegistry {
-		if !desc.gatewayMeta {
+		if !desc.gatewayMeta && !desc.hidden {
 			wantFull = append(wantFull, desc.name)
 		}
 	}

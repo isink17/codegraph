@@ -34,6 +34,7 @@ import (
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
+	"github.com/isink17/codegraph/internal/usage"
 	"github.com/isink17/codegraph/internal/version"
 	"github.com/isink17/codegraph/internal/versioncheck"
 	"github.com/isink17/codegraph/internal/viz"
@@ -1546,10 +1547,19 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 }
 
 func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, args []string) error {
+	return runServeWith(ctx, cfg, os.Stdin, stdout, stderr, args)
+}
+
+// runServeWith is runServe with the transport reader injected, so a test can
+// drive a session to EOF and assert what each stream received. The split exists
+// for one property in particular: stdout carries MCP and must stay clean, and
+// that is only checkable if stdout is a buffer.
+func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, stderr io.Writer, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoRootFlag := fs.String("repo-root", "", "repository root")
 	toolModeFlag := fs.String("tool-mode", "", "MCP tool surface: full (default) or gateway")
+	usageSummaryFlag := fs.Bool("usage-summary", false, "on exit, print this session's local context-usage report to stderr")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1581,7 +1591,26 @@ func runServe(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, 
 			server.SetAgentConfig(repoCfg.Agent.BaseURL, repoCfg.Agent.Model)
 		}
 	}
-	return server.Serve(ctx, os.Stdin, stdout, stderr)
+	serveErr := server.Serve(ctx, in, stdout, stderr)
+	if *usageSummaryFlag {
+		// stderr only, once, at exit: stdout is the MCP transport, and a meter that
+		// wrote to it would corrupt every session it was measuring. The report is
+		// the same document usage_stats returns, for clients that cannot call a
+		// tool by name.
+		writeUsageSummary(stderr, server.UsageSnapshot())
+	}
+	return serveErr
+}
+
+// writeUsageSummary prints a session's usage report to w. A marshal failure is
+// dropped rather than reported: a diagnostic must never be the reason `serve`
+// fails.
+func writeUsageSummary(w io.Writer, report usage.Report) {
+	payload, err := json.Marshal(report)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "codegraph: usage summary (local estimate, not provider billing): %s\n", payload)
 }
 
 func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {

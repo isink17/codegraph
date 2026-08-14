@@ -517,6 +517,80 @@ change it. Restart with the other mode to switch.
 
 ---
 
+## Usage / Token Meter
+
+CodeGraph meters its own context cost so the savings above are observable rather
+than claimed. The meter is entirely local: it lives in the running MCP server,
+holds only numbers, and there is no telemetry, no network call, and no database
+write. One server lifetime is one session; restarting `serve` resets it.
+
+**`estimated_tokens` is a deterministic size estimate — `ceil(bytes / 4)` — not a
+provider's tokenizer and not billing usage.** Treat it as a stable way to compare
+two responses, not as a number to reconcile against an invoice.
+
+### What is measured
+
+Only the model-visible layer:
+
+| Event | Request | Response |
+|---|---|---|
+| `tools/list` | the params object | the serialized tool-definition array |
+| `tools/call` | the arguments object as sent | the tool content text, or the error document that replaced it |
+
+JSON-RPC ids, the result envelope, and stdio framing are excluded — they are
+bytes on a pipe, not bytes a model reads. A `format=compact` response is measured
+as the compact document itself, before any transport escaping.
+
+### Reading the report
+
+`usage_stats` is registered but advertised nowhere, so neither tool surface grows
+by a byte for having a meter. Call it by exact name in either mode:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call",
+ "params":{"name":"usage_stats","arguments":{}}}
+```
+
+In gateway mode it is also discoverable — `tool_search("usage tokens")` finds it,
+and `tool_call(name="usage_stats", arguments={})` runs it.
+
+The per-tool table is bounded: it returns the 25 most expensive rows by default
+alongside a `tools_total` count, and `limit` changes that. Session, discovery,
+and invocation totals always cover every call, so trimming loses detail, never
+accuracy.
+
+Pass `reset: true` to take a snapshot and clear the counters in one atomic step.
+That clears meter counters only — never graph or session data.
+
+The snapshot covers usage up to, but not including, the call that asked for it —
+a response cannot report its own size before it exists. That call is booked
+afterwards and appears in the next snapshot, including after a `reset`: the new
+window opens with the resetting call already in it.
+
+`codegraph serve --usage-summary` prints the same report to **stderr** once at
+exit, for clients that would rather not spend a tool call on it. It never touches
+stdout, which is the MCP transport.
+
+### Attribution
+
+A row names the canonical tool that ran, with a `via` dimension for how it was
+reached. A gateway `tool_call` is charged to its target, once:
+
+```json
+{"name": "search_symbols", "via": "direct",  "format": "json",    "detail": "card", "calls": 1, "response_estimated_tokens": 3048},
+{"name": "search_symbols", "via": "gateway", "format": "compact", "detail": "card", "calls": 1, "response_estimated_tokens": 1768}
+```
+
+`tool_search` is a real model-visible call and gets its own row. `format` and
+`detail` buckets appear only for tools that accept those arguments, and an
+omitted `detail` is reported as the real effective default (`card`), so
+"how much does `full` cost versus `card`?" is answerable from one session's data.
+Dimensions come from closed sets — a tool name from the registry, an invocation
+path, an encoding, a detail level — so nothing a caller types can become a metric
+label, and no argument, task string, or payload is ever retained.
+
+---
+
 ## CLI Reference
 
 ```bash
@@ -537,6 +611,7 @@ codegraph clean <path>                    # Clean database
 # MCP Server
 codegraph serve [--repo-root <path>]      # Start MCP server (auto-detects repo root)
 codegraph serve --tool-mode gateway       # Start with the reduced tool surface
+codegraph serve --usage-summary           # Print the local context-usage report to stderr on exit
 
 # Graph audit
 codegraph audit <path>                    # Audit the indexed graph for integrity/trust issues

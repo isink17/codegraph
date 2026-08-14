@@ -78,7 +78,21 @@ type toolDescriptor struct {
 	// answered at the text layer, above the JSON envelope, and cannot be reached
 	// through tool_call or through the in-process agent loop.
 	gatewayMeta bool
-	handler     toolHandler
+	// hidden keeps a tool out of BOTH `tools/list` payloads while leaving it fully
+	// callable by exact name and fully discoverable through tool_search.
+	//
+	// This is how a diagnostic earns a place on the surface without charging every
+	// session for its schema. A tool an agent needs on a normal task belongs in the
+	// list; a tool an agent reaches for when it is specifically asking about the
+	// tooling does not.
+	hidden  bool
+	handler toolHandler
+
+	// acceptsFormat and acceptsDetail are derived from properties in init(). The
+	// usage meter reads them so a tool is only bucketed by an argument it actually
+	// accepts.
+	acceptsFormat bool
+	acceptsDetail bool
 }
 
 // toolRegistry is the canonical tool table. Order is the order `tools/list`
@@ -268,6 +282,20 @@ var toolRegistry = []toolDescriptor{
 		handler:    (*Server).handleAudit,
 	},
 
+	// Hidden diagnostics. Callable and searchable, never advertised: the whole
+	// point of measuring context cost is not to add any.
+	{
+		name: "usage_stats",
+		// Deliberately short and specific. A long description would cost every
+		// tool_search result that mentions it, and generic words like graph, session,
+		// or context would rank a diagnostic against real navigation tools.
+		description: "Report this MCP session's own local token usage per tool. Diagnostic only.",
+		properties:  []string{"reset", "limit"},
+		category:    "overview",
+		hidden:      true,
+		handler:     (*Server).handleUsageStats,
+	},
+
 	// Gateway meta tools. Absent from full mode on purpose: adding them there
 	// would charge every default session for a surface it does not need.
 	{
@@ -316,11 +344,20 @@ func init() {
 		if desc.gatewayMeta && desc.gatewayCore {
 			panic("mcp: tool " + desc.name + " cannot be both a meta tool and a core tool")
 		}
+		if desc.hidden && (desc.gatewayCore || desc.gatewayMeta) {
+			panic("mcp: tool " + desc.name + " cannot be hidden and advertised at once")
+		}
 		toolByName[desc.name] = desc
 
 		props := make(map[string]string, len(desc.properties))
 		for _, prop := range desc.properties {
 			props[prop] = argType(prop)
+			switch prop {
+			case "format":
+				desc.acceptsFormat = true
+			case "detail":
+				desc.acceptsDetail = true
+			}
 		}
 		toolArgumentSpecs[desc.name] = toolArgSpec{properties: props, required: desc.required}
 	}
@@ -333,12 +370,13 @@ var staticToolDefinitions = buildToolDefinitions()
 // the core workflow tools in registry order, then the discovery tools.
 var gatewayToolDefinitions = buildGatewayToolDefinitions()
 
-// buildToolDefinitions renders the full tool surface. The gateway meta tools are
-// excluded, so this is byte for byte the list every pre-gateway client received.
+// buildToolDefinitions renders the full tool surface. The gateway meta tools and
+// the hidden diagnostics are excluded, so this is byte for byte the list every
+// pre-gateway client received.
 func buildToolDefinitions() []map[string]any {
 	defs := make([]map[string]any, 0, len(toolRegistry))
 	for _, desc := range toolRegistry {
-		if desc.gatewayMeta {
+		if desc.gatewayMeta || desc.hidden {
 			continue
 		}
 		defs = append(defs, desc.definition())
@@ -364,6 +402,28 @@ func buildGatewayToolDefinitions() []map[string]any {
 	return defs
 }
 
+// staticToolDefinitionsBytes and gatewayToolDefinitionsBytes are the serialized
+// sizes of the two advertised payloads, measured once at initialization.
+//
+// The usage meter reads these instead of marshalling a `tools/list` response a
+// second time to size it. The definitions are immutable after init, so the
+// measurement can never drift from what a client actually receives.
+var (
+	staticToolDefinitionsBytes  = definitionsBytes(staticToolDefinitions)
+	gatewayToolDefinitionsBytes = definitionsBytes(gatewayToolDefinitions)
+)
+
+// definitionsBytes measures a rendered tool list exactly as the byte-identity
+// guard measures it: the marshalled definition array, without the JSON-RPC
+// result envelope that carries it.
+func definitionsBytes(defs []map[string]any) int {
+	payload, err := json.Marshal(defs)
+	if err != nil {
+		panic("mcp: tool definitions are not serializable: " + err.Error())
+	}
+	return len(payload)
+}
+
 func (d toolDescriptor) definition() map[string]any {
 	return toolDef(d.name, d.description, d.properties, d.required)
 }
@@ -375,7 +435,7 @@ func argType(prop string) string {
 	switch prop {
 	case "limit", "offset", "symbol_id", "depth", "max_files", "max_symbols", "max_steps", "examples", "max_tokens":
 		return "integer"
-	case "force", "include_tests", "include_callers", "include_schema":
+	case "force", "include_tests", "include_callers", "include_schema", "reset":
 		return "boolean"
 	case "paths", "symbols", "files":
 		return "array"
