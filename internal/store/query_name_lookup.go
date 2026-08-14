@@ -257,26 +257,69 @@ func likeMatch(s, pattern string) bool {
 	return pi == len(pattern)
 }
 
+// trimLookupName is the normalization every name lookup applies before it
+// matches anything. It is named because two callers now have to agree on it:
+// lookupSymbolIDsByName keys its result on the trimmed form, so a caller that
+// looks the result up by the raw name silently gets nothing.
+func trimLookupName(name string) string {
+	return strings.TrimSpace(strings.TrimPrefix(name, "::"))
+}
+
 // lookupSymbolIDsForNames resolves every name through the same cascade
 // lookupSymbolIDs applies, and returns the union of the resulting ids in
 // first-seen order.
 func (s *Store) lookupSymbolIDsForNames(ctx context.Context, repoID int64, names []string) ([]int64, error) {
-	if len(names) == 0 {
-		return nil, nil
+	resolved, err := s.lookupSymbolIDsByName(ctx, repoID, names)
+	if err != nil || len(resolved) == 0 {
+		return nil, err
 	}
+	seen := map[int64]struct{}{}
+	var out []int64
+	for _, name := range dedupeLookupNames(names) {
+		for _, id := range resolved[name] {
+			if id == 0 {
+				continue
+			}
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+	}
+	return out, nil
+}
 
-	// Deduplicate while preserving order, so the returned id order matches the
-	// pre-P12 per-name loop for the same input.
+// dedupeLookupNames trims and deduplicates while preserving order, so the
+// returned id order matches the pre-P12 per-name loop for the same input.
+func dedupeLookupNames(names []string) []string {
 	ordered := make([]string, 0, len(names))
 	pending := make(map[string]bool, len(names))
 	for _, name := range names {
-		trimmed := strings.TrimSpace(strings.TrimPrefix(name, "::"))
+		trimmed := trimLookupName(name)
 		if trimmed == "" || pending[trimmed] {
 			continue
 		}
 		pending[trimmed] = true
 		ordered = append(ordered, trimmed)
 	}
+	return ordered
+}
+
+// lookupSymbolIDsByName runs the same cascade and keeps the per-name result
+// instead of flattening it.
+//
+// Batched context expansion needs the association: a seed's unresolved callee
+// names must resolve to that seed's callees, and merging thirty seeds' names
+// into one id union would give every seed everyone else's graph. The flat
+// lookupSymbolIDsForNames is now a thin wrapper over this, so the two cannot
+// diverge in cascade semantics.
+//
+// Keys are the trimmed names -- see trimLookupName.
+func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names []string) (map[string][]int64, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	ordered := dedupeLookupNames(names)
 	if len(ordered) == 0 {
 		return nil, nil
 	}
@@ -346,20 +389,7 @@ func (s *Store) lookupSymbolIDsForNames(ctx context.Context, repoID int64, names
 		}
 	}
 
-	seen := map[int64]struct{}{}
-	var out []int64
-	for _, name := range ordered {
-		for _, id := range resolved[name] {
-			if id == 0 {
-				continue
-			}
-			if _, ok := seen[id]; !ok {
-				seen[id] = struct{}{}
-				out = append(out, id)
-			}
-		}
-	}
-	return out, nil
+	return resolved, nil
 }
 
 // assignHits records ids for every still-unresolved name whose key appears in
@@ -394,7 +424,7 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 		for _, name := range chunk {
 			args = append(args, name)
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.neighborQuery(ctx, `
 			SELECT s.`+column+`, s.id
 			FROM symbols s
 			WHERE s.repo_id = ? AND s.`+column+` IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
@@ -437,7 +467,7 @@ func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts 
 		return nil, nil
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.neighborQuery(ctx, `
 		SELECT s.qualified_name, s.id
 		FROM symbols s
 		WHERE s.repo_id = ?

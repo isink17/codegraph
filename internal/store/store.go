@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -71,6 +72,17 @@ const (
 
 type Store struct {
 	db *sql.DB
+	// neighborStmts counts the statements the batched context-neighbour
+	// pipeline issues. The number is the load-bearing property of P19 -- it must
+	// not grow with the seed count -- and wall-clock cannot prove that, so the
+	// regression test reads this instead. One atomic add per database round
+	// trip.
+	//
+	// It is not scoped to that pipeline alone: the batch shares the name cascade
+	// (symbolIDsByColumn, symbolIDsBySuffixScan) with the public FindCallees, so
+	// a FindCallees call adds to it too. A test that reads the counter must
+	// reset it and then call only what it means to measure.
+	neighborStmts atomic.Int64
 }
 
 type OpenOptions struct {
@@ -5252,23 +5264,61 @@ func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
 
 // PageRank computes a simplified PageRank over the symbol dependency graph and
 // returns the top-N symbols sorted by rank descending.
+//
+// Determinism is a requirement here, not a nicety: a limited page that is not
+// reproducible cannot be compared across two calls, across the direct and
+// gateway MCP surfaces, or across two databases holding the same graph.
+//
+// The observed defect was selection and ordering. Equal scores are the common
+// case in a symbol graph -- every leaf has the same rank -- and the page was
+// cut before it was ordered, from a slice built by ranging a Go map, so both
+// which symbols made the LIMIT and what order they came back in were arbitrary.
+// Selection and ordering are now one sort with a semantic tie-break: file,
+// qualified name, kind, then position. Never the row id, so two databases that
+// hold the same graph inserted in different orders produce the same page.
+//
+// The summation order is fixed for a second, latent reason. Contributions were
+// accumulated while ranging a map, and floating-point addition is not
+// associative, so two nodes whose ranks are mathematically equal could differ
+// in their last bits -- and then the tie-break above would never see a tie to
+// break. It is now summed in symbol-id order, which is stable for a given
+// database.
+//
+// Be precise about the limit of that. Id order is insertion order, so two
+// databases holding the same graph could still sum in different orders. Making
+// the arithmetic itself graph-ordered would mean loading identity for every
+// node before ranking, which measured as more than double this function's
+// runtime on a 100k-symbol graph -- and no fixture in the suite reproduces the
+// defect it would close, including one built specifically to try. The
+// insertion-order tests pass on the id-ordered sum.
 func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
 	limit = safeLimit(limit)
 
 	// Step 1: load all resolved edges.
+	//
+	// No ORDER BY: the only order that matters is the order sources are summed
+	// in, and sorting 100k source ids in Go is a few milliseconds where making
+	// SQLite sort every edge row cost ~40ms on the same fixture. Per-source
+	// destination order is irrelevant, because every destination of one source
+	// receives the identical share.
 	rows2, err := s.db.QueryContext(ctx,
-		`SELECT src_symbol_id, dst_symbol_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NOT NULL`, repoID)
+		`SELECT src_symbol_id, dst_symbol_id FROM edges
+		 WHERE repo_id = ? AND dst_symbol_id IS NOT NULL`, repoID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows2.Close()
 
 	outLinks := map[int64][]int64{} // src -> list of dst
+	var srcOrder []int64            // sources in ascending id order
 	allNodes := map[int64]struct{}{}
 	for rows2.Next() {
 		var src, dst int64
 		if err := rows2.Scan(&src, &dst); err != nil {
 			return nil, err
+		}
+		if len(outLinks[src]) == 0 {
+			srcOrder = append(srcOrder, src)
 		}
 		outLinks[src] = append(outLinks[src], dst)
 		allNodes[src] = struct{}{}
@@ -5283,12 +5333,17 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 		return []map[string]any{}, nil
 	}
 
-	// Assign indices.
-	nodeIndex := make(map[int64]int, n)
+	// Node indices in id order. Iterating the node map here would make the
+	// slice layout -- and so the summation order below -- storage-dependent.
 	indexNode := make([]int64, 0, n)
 	for id := range allNodes {
-		nodeIndex[id] = len(indexNode)
 		indexNode = append(indexNode, id)
+	}
+	slices.Sort(indexNode)
+	slices.Sort(srcOrder)
+	nodeIndex := make(map[int64]int, n)
+	for i, id := range indexNode {
+		nodeIndex[id] = i
 	}
 
 	// Step 2: run PageRank.
@@ -5306,7 +5361,12 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 		for i := range newRank {
 			newRank[i] = base
 		}
-		for src, dsts := range outLinks {
+		// Ranging srcOrder, not outLinks: float addition is not associative, so
+		// map order here would perturb the scores themselves. srcOrder is sorted
+		// by symbol id -- see the function comment for what that does and does
+		// not guarantee.
+		for _, src := range srcOrder {
+			dsts := outLinks[src]
 			si := nodeIndex[src]
 			share := damping * rank[si] / float64(len(dsts))
 			for _, dst := range dsts {
@@ -5316,7 +5376,21 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 		rank, newRank = newRank, rank
 	}
 
-	// Step 3: sort by rank descending and pick top N.
+	// Step 3: find the score cut, then order everything that reaches it by
+	// identity and take the page.
+	//
+	// Selection and ordering have to be one decision. The pre-P19 shape cut the
+	// page first and ordered it afterwards, which makes the *membership*
+	// arbitrary among ties -- and ties are the common case, since every leaf
+	// scores the same. No amount of ordering afterwards repairs that.
+	//
+	// Identity is what orders the ties, and it is loaded only for the rows that
+	// reach the cut rather than for the whole graph. That matters: on a
+	// 100k-symbol graph a whole-graph identity load more than doubled this
+	// function's runtime. The candidate set is the page plus its ties -- a
+	// handful of extra rows normally, and as large as the graph only when the
+	// graph itself ties, which is exactly when the tie-break has to see all of
+	// it.
 	type ranked struct {
 		id    int64
 		score float64
@@ -5325,35 +5399,132 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 	for i, id := range indexNode {
 		results[i] = ranked{id: id, score: rank[i]}
 	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].score > results[j].score
-	})
-	results = results[:min(len(results), limit)]
-
-	// Step 4: load symbol info.
-	prOut := make([]map[string]any, 0, len(results))
-	for _, r := range results {
-		var name, kind, path string
-		err := s.db.QueryRowContext(ctx,
-			`SELECT s.qualified_name, s.kind, COALESCE(f.path, '') FROM symbols s LEFT JOIN files f ON f.id = s.file_id WHERE s.id = ?`, r.id).
-			Scan(&name, &kind, &path)
-		if err != nil {
-			// A rank entry whose symbol row vanished mid-query is skipped; a
-			// real database failure is reported rather than hidden behind a
-			// short result page.
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return nil, err
+	sort.Slice(results, func(i, j int) bool { return results[i].score > results[j].score })
+	cut := results[min(len(results), limit)-1].score
+	candidates := results
+	for i, r := range results {
+		if r.score < cut {
+			candidates = results[:i]
+			break
 		}
+	}
+
+	ids := make([]int64, 0, len(candidates))
+	for _, r := range candidates {
+		ids = append(ids, r.id)
+	}
+	identity, err := s.symbolIdentities(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	type rankedRow struct {
+		score float64
+		id    symbolIdentity
+	}
+	rowsOut := make([]rankedRow, 0, len(candidates))
+	for _, r := range candidates {
+		// A rank entry whose symbol row vanished mid-query is skipped, as it was
+		// before P19.
+		si, ok := identity[r.id]
+		if !ok {
+			continue
+		}
+		rowsOut = append(rowsOut, rankedRow{score: r.score, id: si})
+	}
+	sort.Slice(rowsOut, func(i, j int) bool {
+		if rowsOut[i].score != rowsOut[j].score {
+			return rowsOut[i].score > rowsOut[j].score
+		}
+		return lessSymbolIdentity(rowsOut[i].id, rowsOut[j].id)
+	})
+	rowsOut = rowsOut[:min(len(rowsOut), limit)]
+
+	prOut := make([]map[string]any, 0, len(rowsOut))
+	for _, r := range rowsOut {
 		prOut = append(prOut, map[string]any{
-			"symbol": name,
-			"kind":   kind,
-			"file":   path,
+			"symbol": r.id.QualifiedName,
+			"kind":   r.id.Kind,
+			"file":   r.id.Path,
 			"rank":   math.Round(r.score*1e6) / 1e6,
 		})
 	}
 	return prOut, nil
+}
+
+// symbolIdentity is the semantic identity of a symbol: everything needed to
+// order two of them without consulting a row id.
+type symbolIdentity struct {
+	QualifiedName string
+	Kind          string
+	Path          string
+	StartLine     int
+	StartCol      int
+}
+
+// lessSymbolIdentity is the canonical total order over symbol identities.
+//
+// Path first, then qualified name, then kind, then position. Position is the
+// backstop for two symbols that genuinely share a file, a name and a kind
+// (overloads); it is canonical source data, unlike the row id, so it orders the
+// same way in every database that holds the same graph.
+func lessSymbolIdentity(a, b symbolIdentity) bool {
+	if a.Path != b.Path {
+		return a.Path < b.Path
+	}
+	if a.QualifiedName != b.QualifiedName {
+		return a.QualifiedName < b.QualifiedName
+	}
+	if a.Kind != b.Kind {
+		return a.Kind < b.Kind
+	}
+	if a.StartLine != b.StartLine {
+		return a.StartLine < b.StartLine
+	}
+	return a.StartCol < b.StartCol
+}
+
+// symbolIdentities loads the identity of every given symbol id, chunked.
+//
+// It replaces a per-id SELECT: PageRank ran one round trip for each row it
+// returned, which is a page-sized N+1 on top of the real work.
+func (s *Store) symbolIdentities(ctx context.Context, ids []int64) (map[int64]symbolIdentity, error) {
+	out := make(map[int64]symbolIdentity, len(ids))
+	for _, chunk := range chunkInt64s(ids, sqliteInClauseBatchSize) {
+		// No repo_id predicate, deliberately. The per-id SELECT this replaces
+		// keyed on `s.id` alone, and `symbols.id` is the primary key, so adding
+		// the repository would only ever *remove* a row -- one reached through a
+		// cross-repository dst_symbol_id, which the schema does not forbid. That
+		// row used to appear in the page with its real name; dropping it here
+		// would silently retitle the change as a bug fix.
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT s.id, s.qualified_name, s.kind, COALESCE(f.path, ''), s.start_line, s.start_col
+			FROM symbols s
+			LEFT JOIN files f ON f.id = s.file_id
+			WHERE s.id IN (`+placeholders(len(chunk))+`)
+		`, int64SliceToAny(chunk)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var si symbolIdentity
+			if err := rows.Scan(&id, &si.QualifiedName, &si.Kind, &si.Path, &si.StartLine, &si.StartCol); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			si.Path = filepath.ToSlash(si.Path)
+			out[id] = si
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // CouplingMetrics computes file-level coupling based on cross-file edge counts.
@@ -5369,7 +5540,17 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 		JOIN files f2 ON f2.id = s2.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f1.id != f2.id
 		GROUP BY f1.path, f2.path
-		ORDER BY edge_count DESC
+		-- The tie-break is the pair of grouping keys, which is unique per row, so
+		-- the order is total. It sorts the *stored* form rather than the
+		-- canonical one: REPLACE() here cost ~6% of this query on a 100k-symbol
+		-- graph, and the two forms differ only on Windows, where files.path is
+		-- native. P23 makes files.path canonical and removes the distinction
+		-- globally; paying for it per row in the meantime is not worth it.
+		-- Edge counts tie constantly -- most coupled pairs share one or two
+		-- edges -- so score alone decides neither the order of the page nor its
+		-- membership. The grouping keys are already computed and are a total
+		-- order over the result, so they cost nothing as the tie-break.
+		ORDER BY edge_count DESC, f1.path ASC, f2.path ASC
 		LIMIT ?`, repoID, limit)
 	if err != nil {
 		return nil, err
@@ -5390,8 +5571,10 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 			coupling = "medium"
 		}
 		cOut = append(cOut, map[string]any{
-			"file_a":     fileA,
-			"file_b":     fileB,
+			// Slash form, like every other path this store hands out -- and like
+			// PageRank's `file`, so the three analyses of one tool agree.
+			"file_a":     filepath.ToSlash(fileA),
+			"file_b":     filepath.ToSlash(fileB),
 			"edge_count": edgeCount,
 			"coupling":   coupling,
 		})
@@ -5425,6 +5608,7 @@ func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]ma
 		if err := dRows.Scan(&src, &dst); err != nil {
 			return nil, err
 		}
+		src, dst = filepath.ToSlash(src), filepath.ToSlash(dst)
 		fileGraph[src] = append(fileGraph[src], dst)
 		allFiles[src] = struct{}{}
 		allFiles[dst] = struct{}{}
@@ -5486,6 +5670,22 @@ func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]ma
 		sortedFiles = append(sortedFiles, f)
 	}
 	sort.Strings(sortedFiles)
+	// And sort each node's successors, which the DFS walks in order.
+	//
+	// Sorted roots were enough to make the *starting points* stable but not the
+	// walk: successors were visited in whatever order the query yielded, and
+	// that decides which back edge is found first and so which cycles a limited
+	// page reports. Sorting here rather than with an ORDER BY on the query: the
+	// paths are already canonical by this point, so this orders the same way on
+	// every platform, and it measured ~28% cheaper than making SQLite do it.
+	//
+	// This is a guarantee rather than a demonstrated fix: removing it does not
+	// make the determinism tests fail, because the DISTINCT above happens to
+	// yield path order on the shapes tried. It costs one sort of a list that is
+	// already built.
+	for f := range fileGraph {
+		sort.Strings(fileGraph[f])
+	}
 
 	for _, f := range sortedFiles {
 		if color[f] == white && len(cycles) < limit {

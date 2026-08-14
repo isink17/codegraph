@@ -119,6 +119,22 @@ func bigGraphScenarios(f *bigGraphFixture) []queryScenario {
 			out, err := f.store.ArchitectureOverview(ctx, f.repoID)
 			return len(out), err
 		}},
+		// The three graph_analytics analyses are whole-graph by contract -- the
+		// limit bounds the answer, not the work -- so they are measured, not held
+		// to the budget. P19 added a symbol-identity load to PageRank to give its
+		// ties a semantic order; this is where the cost of that shows up.
+		{"analytics_pagerank", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {
+			out, err := f.store.PageRank(ctx, f.repoID, limit)
+			return len(out), err
+		}},
+		{"analytics_coupling", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {
+			out, err := f.store.CouplingMetrics(ctx, f.repoID, limit)
+			return len(out), err
+		}},
+		{"analytics_cycles", false, func(ctx context.Context, f *bigGraphFixture) (int, error) {
+			out, err := f.store.DetectCycles(ctx, f.repoID, limit)
+			return len(out), err
+		}},
 	}
 }
 

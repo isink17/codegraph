@@ -607,14 +607,20 @@ func TestToolCallMatchesDirectCallExactly(t *testing.T) {
 	// have nothing to do with the gateway.
 	server := newGatewayTestServer(t, ToolModeFull)
 
+	// Every case is held to byte equality. There used to be an `unstable` escape
+	// hatch here for graph_analytics pagerank, whose own output was not stable
+	// across two identical calls; P19 gave the analytics a semantic total order,
+	// so the waiver is gone and the tool is compared like any other.
+	//
+	// pagerank is the case that carries that: this fixture has enough symbols
+	// and edges to produce a real ranked page. The coupling and cycles cases
+	// below are close to vacuous here -- one row and none respectively -- and
+	// are present for shape, not for tie-breaking. Their tie-breaking is proved
+	// in internal/store/analytics_determinism_test.go, which builds graphs
+	// specifically to tie.
 	cases := []struct {
 		name string
 		args map[string]any
-		// unstable names a tool whose own output is not byte-stable across two
-		// identical calls, with the reason. Demanding byte equality across modes
-		// for such a tool would be a flaky test about SQLite row order, not a test
-		// about the gateway, so those cases assert shape instead.
-		unstable string
 	}{
 		{name: "audit", args: map[string]any{"examples": 2}},
 		{name: "architecture_overview", args: map[string]any{}},
@@ -629,8 +635,9 @@ func TestToolCallMatchesDirectCallExactly(t *testing.T) {
 		{name: "trace_dependencies", args: map[string]any{"symbol": "Helper", "depth": 2}},
 		{name: "context_for_task", args: map[string]any{"task": "change Helper", "max_tokens": 1200}},
 		{name: "graph_stats", args: map[string]any{}},
-		{name: "graph_analytics", args: map[string]any{"analysis": "pagerank", "limit": 3},
-			unstable: "equal pagerank scores are returned in whichever order SQLite picks"},
+		{name: "graph_analytics", args: map[string]any{"analysis": "pagerank", "limit": 3}},
+		{name: "graph_analytics", args: map[string]any{"analysis": "coupling", "limit": 5}},
+		{name: "graph_analytics", args: map[string]any{"analysis": "cycles", "limit": 5}},
 		{name: "session_log", args: map[string]any{"event_type": "read", "key": "main.go", "session_id": "parity"}},
 		{name: "session_history", args: map[string]any{"session_id": "parity", "limit": 5}},
 		{name: "list_scans", args: map[string]any{"limit": 2}},
@@ -663,46 +670,31 @@ func TestToolCallMatchesDirectCallExactly(t *testing.T) {
 			t.Errorf("%s: isError direct = %v, gateway = %v", label, directErr, gatewayErr)
 			continue
 		}
-		if tc.unstable != "" {
-			// Weaker but still meaningful: the gateway must not truncate the result,
-			// reshape the envelope, or change how many rows come back.
-			if directRows, gatewayRows := jsonRowCount(t, directText), jsonRowCount(t, gatewayText); directRows != gatewayRows {
-				t.Errorf("%s (%s): direct returned %d rows, gateway %d\ndirect : %s\ngateway: %s",
-					label, tc.unstable, directRows, gatewayRows, directText, gatewayText)
-			}
-			continue
-		}
 		if directText != gatewayText {
 			t.Errorf("%s: payload differs\ndirect : %s\ngateway: %s", label, directText, gatewayText)
 		}
 	}
 }
 
-// jsonRowCount reports how many rows the single data section of an envelope holds.
-// It is only used for the tools whose row order is not stable.
-func jsonRowCount(t *testing.T, text string) int {
-	t.Helper()
-	var envelope struct {
-		OK   bool                       `json:"ok"`
-		Data map[string]json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
-		t.Fatalf("payload is not a JSON envelope: %v (%s)", err, text)
-	}
-	if !envelope.OK {
-		t.Fatalf("envelope ok = false: %s", text)
-	}
-	if len(envelope.Data) != 1 {
-		t.Fatalf("envelope data has %d sections, want 1: %s", len(envelope.Data), text)
-	}
-	for _, raw := range envelope.Data {
-		var rows []json.RawMessage
-		if err := json.Unmarshal(raw, &rows); err != nil {
-			t.Fatalf("data section is not an array: %v (%s)", err, text)
+// Direct/gateway parity is only meaningful if the tool is stable against
+// itself: two identical direct calls that disagree would make the parity
+// assertion above a coin flip rather than a statement about the gateway. This
+// is the assumption the P16 waiver was hiding.
+func TestGraphAnalyticsRepeatedDirectCallsAreIdentical(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeFull)
+	for _, analysis := range []string{"pagerank", "coupling", "cycles"} {
+		args := map[string]any{"analysis": analysis, "limit": 5}
+		wantErr, want := callResult(t, server, "graph_analytics", args)
+		if wantErr {
+			t.Fatalf("graph_analytics %s returned an error: %s", analysis, want)
 		}
-		return len(rows)
+		for i := range 20 {
+			gotErr, got := callResult(t, server, "graph_analytics", args)
+			if gotErr || got != want {
+				t.Fatalf("graph_analytics %s call %d differs\nfirst: %s\nnow  : %s", analysis, i+2, want, got)
+			}
+		}
 	}
-	return 0
 }
 
 // TestToolCallDoesNotDoubleEncode asserts the shape of what comes back, not just
