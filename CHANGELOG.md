@@ -11,7 +11,27 @@ fixture, the measured bottlenecks are fixed, and the measurement is reproducible
 Bounded task context: `context_for_task` returns real context again, ranked deterministically and
 trimmed to a token budget, with an opaque cursor for the context that did not fit.
 
+Compact bulk encoding: bulk results can be asked for as a tabular text document that states its
+columns once instead of repeating a JSON key on every row.
+
 ### Added
+
+- **`format=json|compact` on nine bulk tools.** `find_symbol`, `search_symbols`, `find_callers`,
+  `find_callees`, `get_impact_radius`, `find_related_tests`, `find_dead_code`, `list_files`, and
+  `trace_dependencies` accept an optional `format`. The default is `json` and is byte-for-byte
+  what those tools returned before, so no existing client changes. `format=compact` returns a
+  `codegraph.compact/v1` document -- a version line, a tool line, and named sections of fixed
+  tab-separated columns -- which removes 38-51% of a bulk card page's estimated tokens
+  (`ceil(bytes / 4)`, not a provider tokenizer) measured on model-visible tool content against
+  this repository's own index. Compact encodes `detail=card`, the default; `skeleton`,
+  `excerpt`, and `full` with `format=compact` are rejected with a clear error rather than silently
+  answered with cards. `get_impact_radius` keeps its graph semantics as three sections
+  (`symbols`, `files`, `summary`) rather than flattening them. Escaping is exactly `\\`, `\t`,
+  `\n`, `\r`, `\@`, so tabs, newlines, Unicode, empty values, leading/trailing spaces, and literal
+  backslashes in paths round-trip unchanged, and output is LF-terminated on every platform.
+  `search_semantic` and `graph_analytics` stay JSON-only because their row shapes are not fixed,
+  and `context_for_task` stays JSON-only because its token budget is measured over the exact JSON
+  document it returns.
 
 - **`max_tokens` and `cursor` on `context_for_task`.** `max_tokens` bounds the serialized
   response (omitted or `0` uses 4000, negative is rejected, above 200000 is clamped) and is

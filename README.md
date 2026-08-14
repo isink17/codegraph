@@ -340,6 +340,76 @@ The tools that still return the pre-projection symbol shape -- `search_semantic`
 `context_for_task` -- are unchanged, because their records are already card-sized
 and adding `detail` to them could only make a response larger.
 
+### Compact output (`format`)
+
+`find_symbol`, `search_symbols`, `find_callers`, `find_callees`,
+`get_impact_radius`, `find_related_tests`, `find_dead_code`, `list_files`, and
+`trace_dependencies` accept an optional `format`:
+
+| `format` | Encoding |
+|---|---|
+| `json` (default) | the ordinary `{"ok":true,"data":...}` envelope |
+| `compact` | a tabular text document that states the columns once instead of repeating a key on every row |
+
+The default is unchanged: a call without `format` returns exactly the JSON it
+returned before. `compact` is worth asking for on bulk discovery, where repeated
+keys dominate the payload — on this repository's own index it removes 38–51% of a
+card page's estimated tokens (the `ceil(bytes / 4)` estimate, not a provider
+tokenizer) — and it only encodes `detail=card`, which is the default.
+`detail=skeleton`, `excerpt`, and `full` with `format=compact` are rejected rather
+than silently answered with cards: beyond a card the payload is source text and
+prose, where the keys are a rounding error. Errors are ordinary MCP tool errors in
+either encoding.
+
+A typical loop is discover cheaply, then drill into one symbol:
+
+```
+search_symbols(query="resolve", limit=50, format="compact")   # pick a symbol_id
+find_symbol(query="<qualified_name>", detail="excerpt")       # read the code
+```
+
+`search_semantic` and `graph_analytics` stay JSON-only: their row shapes are not
+fixed (a hybrid semantic hit carries a `kind` the fallback does not, and `why` is
+a list), so a fixed-column table would have to drop or nest a field.
+`context_for_task` stays JSON-only because its `estimated_tokens`/`max_tokens`
+contract budgets the exact JSON document it returns; compacting after budgeting
+would make the reported estimate describe a payload the caller never received.
+
+**compact/v1 grammar.** The format identifier is `codegraph.compact/v1`, and it is
+versioned independently of the CodeGraph release version.
+
+```
+@codegraph.compact/v1
+@tool search_symbols
+@section matches
+@columns symbol_id→stable_key→name→qualified_name→kind→language→file→line
+253→type:audit:CaseResult→CaseResult→audit.CaseResult→type→go→internal/audit/audit.go→158
+```
+
+(`→` is a literal tab above.)
+
+- **Lines** are separated by LF on every platform, and the document ends with a
+  single LF. Directives begin with `@`; every other line is a row.
+- **Fields** are separated by a tab. A row always has exactly as many cells as its
+  section has columns, in the order `@columns` gives.
+- **Sections** have stable names and a stable order, and each has its own columns.
+  `get_impact_radius` emits `symbols`, then `files`, then `summary`, so the
+  affected-file list and the two summary counts stay separate from the symbol rows
+  rather than being flattened into them.
+- **Escapes**, and nothing else — no trimming, no case folding, no path
+  rewriting: `\\` backslash, `\t` tab, `\n` line feed, `\r` carriage return, `\@`
+  at sign. Any other `\x` is a decode error. A path is opaque data, so a literal
+  backslash in a Windows-style name round-trips as itself.
+- **Values.** Text as-is; integers in decimal; floats in the shortest form that
+  parses back exactly; booleans as `true`/`false`.
+- **Empty and absent.** Columns are fixed, so there is no "key omitted": a field
+  JSON drops for being empty is an empty cell, which reads back as the same zero
+  value. A section with no rows is still a header, so an empty result is a valid
+  document.
+
+`compact` is an MCP encoding. The CLI is unchanged: its only `--format` is
+`graph export`'s `json|dot`, which means something else.
+
 ### Token budget and continuation (`context_for_task`)
 
 `context_for_task` is the selector at the front of that workflow: it ranks the
