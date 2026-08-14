@@ -38,8 +38,7 @@ type contextStoreOps interface {
 	LastScanID(ctx context.Context, repoID int64) (int64, error)
 	SymbolsForRefs(ctx context.Context, repoID int64, refs []store.SymbolRef) (map[store.SymbolRef]graph.Symbol, error)
 	SymbolNameCounts(ctx context.Context, repoID int64, names []string) (map[string]int, error)
-	FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error)
-	FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error)
+	FindContextNeighbors(ctx context.Context, repoID int64, seeds []store.ContextSeed, fanout int) ([]store.ContextNeighbors, error)
 	RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]store.RelatedTest, error)
 }
 
@@ -50,16 +49,20 @@ const (
 	contextNeighborFanout = 10
 	// contextExpansionSeeds bounds how many seeds are expanded through the graph.
 	//
-	// Expansion costs two queries per seed, and the caller leg has to walk the
-	// repository's unresolved-edge population to catch calls the resolver could
-	// not bind. Measured on this repository that is ~2ms a seed, so expanding all
-	// 30 default seeds cost ~130ms -- well past interactive for a tool an agent
-	// calls first. Expansion now covers the strongest seeds only: the seed stream
-	// is in search-relevance order, and a weak seed's neighbours score below a
-	// strong seed's by construction, so they were already the last records a
-	// budget would ever reach. Direct matches are unaffected -- all MaxSymbols of
-	// them stay in the candidate universe.
-	contextExpansionSeeds = 8
+	// It used to be 8, because expansion cost two queries per seed and the caller
+	// leg re-scanned the repository's unresolved-edge population for each one:
+	// per-seed cost was roughly constant, so the total was linear and 30 seeds
+	// were not interactive. P19's FindContextNeighbors answers the whole seed set
+	// in a fixed number of statements with one shared scan, which makes the
+	// marginal cost of a seed small enough that the default seed count fits.
+	//
+	// It is deliberately pinned to the default MaxSymbols rather than left
+	// unbounded. MaxSymbols is a public argument and P18 allows it well above the
+	// default; expansion work is bounded by *this* number so a large explicit
+	// MaxSymbols widens the direct-match set -- which is cheap, one batched
+	// lookup -- without widening graph expansion. Every seed past it is still in
+	// the candidate universe as a direct match.
+	contextExpansionSeeds = defaultContextMaxSymbols
 	// contextTestsPerFile bounds related tests fetched per returned file.
 	contextTestsPerFile = 10
 )
@@ -176,49 +179,56 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 	}
 
 	if opts.IncludeCallers {
-		// FindCallers/FindCallees take a symbol id and a name. The id half is
-		// exact. The name half also matches edges the resolver left unresolved,
-		// which is real caller evidence worth keeping -- but only when the name
-		// belongs to exactly one symbol in the repository. Where it does not, the
-		// name is dropped and expansion follows the seed's id alone, so a seed
-		// never inherits the graph of a same-named symbol in another package.
+		// Expansion evidence is per seed and typed -- see store.ContextSeed. The
+		// symbol id and the fully qualified name identify one symbol, so both are
+		// always safe. The bare short name and the dotted/scoped suffix do not:
+		// `Renew` fits billing.Renew and subscription.Renew equally. Those two legs
+		// are therefore admitted only for a short name that exactly one symbol in
+		// the repository carries.
 		//
-		// This is deliberately coarse: the name legs of those queries (exact
-		// dst_name, and the dotted-suffix LIKE) are all-or-nothing, so an ambiguous
-		// short name also costs the unambiguous `dst_name = qualified_name`
-		// evidence. Splitting them needs a qualified-name-only mode on both store
-		// queries; until then the safe direction is to lose recall, not to
-		// attribute another package's callers to this seed.
+		// Before P19 this was one lookup name that turned all three name legs on or
+		// off together, so an ambiguous short name also cost the unambiguous
+		// `dst_name = qualified_name` evidence. That is recall thrown away for no
+		// safety: the qualified name is not ambiguous.
+		//
+		// The ambiguity question is asked about the short name the *evidence* would
+		// match on -- LookupSymbolShortName(qualified_name) -- not about the
+		// symbol's `name` column, because that is the string the short and suffix
+		// patterns are built from.
 		expanded := seeds
 		if len(expanded) > contextExpansionSeeds {
 			expanded = expanded[:contextExpansionSeeds]
 		}
-		names := make([]string, 0, len(expanded))
-		for _, sd := range expanded {
-			names = append(names, sd.sym.Name)
+		shorts := make([]string, len(expanded))
+		for i, sd := range expanded {
+			shorts[i] = store.LookupSymbolShortName(sd.sym.QualifiedName)
 		}
-		counts, err := s.ctxStore.SymbolNameCounts(ctx, repoID, names)
+		counts, err := s.ctxStore.SymbolNameCounts(ctx, repoID, shorts)
 		if err != nil {
 			return nil, fmt.Errorf("seed name ambiguity: %w", err)
 		}
-		for _, sd := range expanded {
-			lookupName := ""
-			if counts[sd.sym.Name] == 1 {
-				lookupName = sd.sym.QualifiedName
+		storeSeeds := make([]store.ContextSeed, len(expanded))
+		for i, sd := range expanded {
+			storeSeeds[i] = store.ContextSeed{
+				SymbolID:           sd.sym.ID,
+				QualifiedName:      sd.sym.QualifiedName,
+				ShortName:          shorts[i],
+				AllowShortEvidence: shorts[i] != "" && counts[shorts[i]] == 1,
 			}
-			callers, err := s.ctxStore.FindCallers(ctx, repoID, lookupName, sd.sym.ID, contextNeighborFanout, 0)
-			if err != nil {
-				return nil, fmt.Errorf("expand callers of %s: %w", sd.sym.QualifiedName, err)
+		}
+		neighbors, err := s.ctxStore.FindContextNeighbors(ctx, repoID, storeSeeds, contextNeighborFanout)
+		if err != nil {
+			return nil, fmt.Errorf("expand seed neighbours: %w", err)
+		}
+		if len(neighbors) != len(expanded) {
+			return nil, fmt.Errorf("expand seed neighbours: got %d results for %d seeds", len(neighbors), len(expanded))
+		}
+		for i, n := range neighbors {
+			for _, c := range n.Callers {
+				set.add(contextCandidate{sym: c, relevance: relevanceCaller, taskSignal: expanded[i].signal})
 			}
-			for _, c := range callers {
-				set.add(contextCandidate{sym: c, relevance: relevanceCaller, taskSignal: sd.signal})
-			}
-			callees, err := s.ctxStore.FindCallees(ctx, repoID, lookupName, sd.sym.ID, contextNeighborFanout, 0)
-			if err != nil {
-				return nil, fmt.Errorf("expand callees of %s: %w", sd.sym.QualifiedName, err)
-			}
-			for _, c := range callees {
-				set.add(contextCandidate{sym: c, relevance: relevanceCallee, taskSignal: sd.signal})
+			for _, c := range n.Callees {
+				set.add(contextCandidate{sym: c, relevance: relevanceCallee, taskSignal: expanded[i].signal})
 			}
 		}
 	}

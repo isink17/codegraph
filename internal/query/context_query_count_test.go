@@ -12,6 +12,9 @@ import (
 type countingContextStore struct {
 	inner contextStoreOps
 	calls map[string]int
+	// seeds records every seed batch handed to the neighbour API, so a test can
+	// assert the evidence policy the ranking layer decided on.
+	seeds [][]store.ContextSeed
 }
 
 func newCountingStore(inner contextStoreOps) *countingContextStore {
@@ -33,14 +36,10 @@ func (c *countingContextStore) SymbolNameCounts(ctx context.Context, repoID int6
 	return c.inner.SymbolNameCounts(ctx, repoID, names)
 }
 
-func (c *countingContextStore) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	c.calls["FindCallers"]++
-	return c.inner.FindCallers(ctx, repoID, symbol, symbolID, limit, offset)
-}
-
-func (c *countingContextStore) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	c.calls["FindCallees"]++
-	return c.inner.FindCallees(ctx, repoID, symbol, symbolID, limit, offset)
+func (c *countingContextStore) FindContextNeighbors(ctx context.Context, repoID int64, seeds []store.ContextSeed, fanout int) ([]store.ContextNeighbors, error) {
+	c.calls["FindContextNeighbors"]++
+	c.seeds = append(c.seeds, seeds)
+	return c.inner.FindContextNeighbors(ctx, repoID, seeds, fanout)
 }
 
 func (c *countingContextStore) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]store.RelatedTest, error) {
@@ -81,17 +80,10 @@ func TestContextForTaskQueryCountIsBounded(t *testing.T) {
 	if got := counter.calls["SymbolNameCounts"]; got != 1 {
 		t.Fatalf("SymbolNameCounts calls = %d, want 1", got)
 	}
-	// Expansion is one call per expanded seed per direction, and expansion covers
-	// at most contextExpansionSeeds seeds however many the search returned. This
-	// is the bound that keeps a context request off the N+1 path.
-	if got := counter.calls["FindCallers"]; got > contextExpansionSeeds {
-		t.Fatalf("FindCallers calls = %d, want at most contextExpansionSeeds (%d)", got, contextExpansionSeeds)
-	}
-	if counter.calls["FindCallers"] != counter.calls["FindCallees"] {
-		t.Fatalf("callers/callees call counts differ: %d vs %d", counter.calls["FindCallers"], counter.calls["FindCallees"])
-	}
-	if want := min(seeds, contextExpansionSeeds); counter.calls["FindCallers"] < want {
-		t.Fatalf("FindCallers calls = %d for %d seeds, want at least %d", counter.calls["FindCallers"], seeds, want)
+	// Expansion is one batched call for the whole seed set, whatever the seed
+	// count. This is the bound that keeps a context request off the N+1 path.
+	if got := counter.calls["FindContextNeighbors"]; got != 1 {
+		t.Fatalf("FindContextNeighbors calls = %d, want exactly 1 for %d seeds", got, seeds)
 	}
 	// Related tests are fetched per returned file, not per candidate.
 	if got := counter.calls["RelatedTests"]; got > files+len(res.TestFiles) {
