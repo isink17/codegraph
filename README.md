@@ -296,6 +296,63 @@ See the [`examples/`](examples/) directory for more configuration samples.
 |---|---|
 | `agentic_query` | Ask a question answered by a local AI agent that reasons over the code graph (requires Ollama) |
 
+### Progressive disclosure (`detail`)
+
+`find_symbol`, `search_symbols`, `find_callers`, `find_callees`, and
+`get_impact_radius` accept an optional `detail` argument. It controls how much of
+each symbol comes back, and nothing else -- traversal results still report the
+same symbols, files, and counts at every level.
+
+| `detail` | What each symbol carries | Use it to |
+|---|---|---|
+| `card` (default) | name, qualified name, kind, language, file, line, symbol id, stable key | choose between candidates and drill down |
+| `skeleton` | + signature, visibility, container, doc summary, end line, member declarations | inspect an API or a type's shape |
+| `excerpt` | + source around the symbol: a few lines of context, capped tightly, marked `truncated` when the symbol is longer | read the implementation around a target |
+| `full` | + the same window with a far higher cap, so it always contains what `excerpt` returned, plus `range` and `file_id` | take everything, explicitly |
+
+`detail=full` returns every field these tools returned before progressive
+disclosure existed, under the same name and with the same value, so nothing became
+unreachable. The one difference: a field whose value is empty is omitted rather
+than sent as `""` or `0`, which is what every other level does too. A card carries `qualified_name`,
+`symbol_id`, and `file`+`line`, which are exactly the selectors these tools accept,
+so any card is enough to make the follow-up call.
+
+Source is read from disk only for `excerpt` and `full`, and only for the symbols
+actually being returned; `card` and `skeleton` touch no files. Rendered source is
+always LF-joined and confined to the repository root, and the file is compared
+against what the indexer recorded, so source read from a file that changed after
+indexing comes with a `source_note` saying so rather than silently misattributed.
+
+Everything that thins a response says so. `truncated` marks source cut by a line
+ceiling or clamped to a file that has since shrunk and reports the real range in
+`available_start_line`/`available_end_line`; `member_count` appears when a
+skeleton's member list was capped; and `skeleton_note` / `source_note` explain
+every other case -- a container whose members were not looked up, a symbol whose
+source was omitted, a parser that recorded no body range, a file that changed
+since indexing. The traversal tools have no result limit of their own, so one
+response looks up members for a bounded number of containers and renders source
+for a bounded number of symbols; the rest carry the matching note. Both bounds
+sit well above any paged request, so a `limit` you asked for is always honoured
+in full.
+
+The tools that still return the pre-projection symbol shape -- `search_semantic`,
+`find_dead_code`, `trace_dependencies`, `find_related_tests`, and
+`context_for_task` -- are unchanged, because their records are already card-sized
+and adding `detail` to them could only make a response larger.
+
+The same four levels are available on the CLI as `--detail`. The CLI default is
+different on purpose: `codegraph find_symbol` and friends keep printing every
+indexed field unless `--detail` is passed, because their JSON has always been
+consumed by scripts.
+
+**Language coverage.** `skeleton` members and `full` bodies need the parser to
+have recorded a symbol's end line. The tree-sitter parsers (the default `cgo`
+build) do; the regex fallback parsers used in `CGO_ENABLED=0` builds record only
+the declaration line, as does the pure-Go Python parser. For those, a skeleton
+says so in `skeleton_note` instead of listing members, and `full` returns a
+bounded window around the declaration with a `source_note` explaining why. Go
+built with either registry is unaffected.
+
 ---
 
 ## CLI Reference

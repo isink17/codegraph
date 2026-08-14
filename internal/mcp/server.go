@@ -10,7 +10,9 @@ import (
 
 	"github.com/isink17/codegraph/internal/agent"
 	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/detail"
 	"github.com/isink17/codegraph/internal/framework"
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/graphaudit"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/query"
@@ -169,12 +171,20 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			Query  string `json:"query"`
 			Limit  int    `json:"limit"`
 			Offset int    `json:"offset"`
+			Detail string `json:"detail"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
+		level, err := detail.Parse(req.Detail, defaultToolDetail)
+		if err != nil {
+			return nil, err
+		}
 		items, err := s.query.FindSymbol(ctx, s.repoID, req.Query, req.Limit, req.Offset)
-		return wrapData("matches", items, err)
+		if err != nil {
+			return nil, err
+		}
+		return wrapData("matches", s.projector(level).Symbols(ctx, items), nil)
 	case "find_callers":
 		return s.handleCallGraph(ctx, raw, true)
 	case "find_callees":
@@ -184,15 +194,20 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			Symbols []string `json:"symbols"`
 			Files   []string `json:"files"`
 			Depth   int      `json:"depth"`
+			Detail  string   `json:"detail"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		level, err := detail.Parse(req.Detail, defaultToolDetail)
+		if err != nil {
 			return nil, err
 		}
 		data, err := s.query.ImpactRadius(ctx, s.repoID, req.Symbols, req.Files, req.Depth)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"ok": true, "data": data}, nil
+		return map[string]any{"ok": true, "data": s.projectImpact(ctx, level, data)}, nil
 	case "find_related_tests":
 		var req struct {
 			Symbol string   `json:"symbol"`
@@ -216,12 +231,20 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			Query  string `json:"query"`
 			Limit  int    `json:"limit"`
 			Offset int    `json:"offset"`
+			Detail string `json:"detail"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
+		level, err := detail.Parse(req.Detail, defaultToolDetail)
+		if err != nil {
+			return nil, err
+		}
 		items, err := s.query.SearchSymbols(ctx, s.repoID, req.Query, req.Limit, req.Offset)
-		return wrapData("matches", items, err)
+		if err != nil {
+			return nil, err
+		}
+		return wrapData("matches", s.projector(level).Symbols(ctx, items), nil)
 	case "search_semantic":
 		var req struct {
 			Query  string `json:"query"`
@@ -505,13 +528,17 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 		SymbolID int64  `json:"symbol_id"`
 		Limit    int    `json:"limit"`
 		Offset   int    `json:"offset"`
+		Detail   string `json:"detail"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	level, err := detail.Parse(req.Detail, defaultToolDetail)
+	if err != nil {
+		return nil, err
+	}
 	var (
-		items any
-		err   error
+		items []graph.Symbol
 		key   = "callees"
 	)
 	if callers {
@@ -520,7 +547,76 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 	} else {
 		items, err = s.query.FindCallees(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
 	}
-	return wrapData(key, items, err)
+	if err != nil {
+		return nil, err
+	}
+	return wrapData(key, s.projector(level).Symbols(ctx, items), nil)
+}
+
+// projector builds the response-scoped renderer for one tool call. s.repoRoot is
+// the only filesystem root any rendered source can come from -- no tool argument
+// contributes a path.
+func (s *Server) projector(level detail.Level) *detail.Projector {
+	adapter := storeProjection{store: s.store, repoID: s.repoID}
+	return detail.NewProjector(level, s.repoRoot, adapter, adapter)
+}
+
+// storeProjection adapts the store to the two narrow contracts the rendering
+// layer needs. It lives here rather than on the store so that persistence does
+// not import presentation, and it binds the repository id once so the renderer
+// never has to carry one.
+type storeProjection struct {
+	store  *store.Store
+	repoID int64
+}
+
+func (a storeProjection) SymbolMembers(ctx context.Context, refs []detail.MemberRef) (map[int64][]graph.Symbol, error) {
+	ranges := make([]store.MemberRange, 0, len(refs))
+	for _, ref := range refs {
+		ranges = append(ranges, store.MemberRange{
+			SymbolID:  ref.SymbolID,
+			FileID:    ref.FileID,
+			StartLine: ref.StartLine,
+			EndLine:   ref.EndLine,
+		})
+	}
+	return a.store.SymbolMembers(ctx, a.repoID, ranges)
+}
+
+func (a storeProjection) FileStates(ctx context.Context, paths []string) (map[string]detail.FileState, error) {
+	states, err := a.store.FileSourceStates(ctx, a.repoID, paths)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]detail.FileState, len(states))
+	for path, state := range states {
+		out[path] = detail.FileState{
+			SizeBytes:     state.SizeBytes,
+			MtimeUnixNs:   state.MtimeUnixNs,
+			ContentSHA256: state.ContentSHA256,
+		}
+	}
+	return out, nil
+}
+
+// projectImpact rewrites an impact-radius result so its symbol nodes carry the
+// requested node detail.
+//
+// The traversal's own output -- the file list and the summary counts -- is
+// copied through untouched: node detail says how much of each symbol to show,
+// never how much of the graph to report. The input map is not modified, because
+// the same map shape is consumed in-process by graph export.
+func (s *Server) projectImpact(ctx context.Context, level detail.Level, data map[string]any) map[string]any {
+	symbols, ok := data["symbols"].([]graph.Symbol)
+	if !ok {
+		return data
+	}
+	out := make(map[string]any, len(data))
+	for key, value := range data {
+		out[key] = value
+	}
+	out["symbols"] = s.projector(level).Symbols(ctx, symbols)
+	return out
 }
 
 // handleAudit runs the production graph audit against the server's active
@@ -633,12 +729,12 @@ func buildToolDefinitions() []map[string]any {
 	return []map[string]any{
 		toolDef("index_repo", "Index a repository into the local code graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
 		toolDef("update_graph", "Update only changed repository files in the local graph", []string{"repo_root", "repo_path", "force", "paths"}, nil),
-		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset"}, []string{"query"}),
-		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
-		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset"}, nil),
-		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth"}, nil),
+		toolDef("find_symbol", "Find symbols by exact or fuzzy query", []string{"query", "limit", "offset", "detail"}, []string{"query"}),
+		toolDef("find_callers", "Find callers of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail"}, nil),
+		toolDef("find_callees", "Find callees of a symbol", []string{"symbol", "symbol_id", "limit", "offset", "detail"}, nil),
+		toolDef("get_impact_radius", "Estimate affected symbols and files around a change", []string{"symbols", "files", "depth", "detail"}, nil),
 		toolDef("find_related_tests", "Find likely related tests for a symbol, file, or set of changed files", []string{"symbol", "file", "files", "limit", "offset"}, nil),
-		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset"}, []string{"query"}),
+		toolDef("search_symbols", "Search symbol names, signatures, and docs", []string{"query", "limit", "offset", "detail"}, []string{"query"}),
 		toolDef("search_semantic", "Hybrid semantic search (vector similarity + FTS when embeddings available, token-overlap fallback)", []string{"query", "limit", "offset"}, []string{"query"}),
 		toolDef("graph_stats", "Return repository graph statistics", nil, nil),
 		toolDef("supported_languages", "List supported languages and file extensions", nil, nil),
@@ -663,10 +759,36 @@ func buildToolDefinitions() []map[string]any {
 	}
 }
 
+// detailProperty is the JSON Schema for the progressive-disclosure argument.
+//
+// It is built once and shared by every tool that accepts `detail`, so the four
+// level names and the guidance an agent reads cannot drift apart between tools.
+// The description is deliberately one line per level: `tools/list` is itself
+// part of every session's token budget, and a paragraph per tool would spend
+// more than the projection saves.
+func detailProperty() map[string]any {
+	return map[string]any{
+		"type":    "string",
+		"enum":    detail.Names(),
+		"default": string(defaultToolDetail),
+		"description": "How much of each symbol to return. card: identity and location, to choose and drill down. " +
+			"skeleton: +signature and members. excerpt: +bounded source. full: +complete source.",
+	}
+}
+
+// defaultToolDetail is the level every migrated MCP tool uses when `detail` is
+// omitted. Agents overwhelmingly call these tools to decide where to look next,
+// so the cheap representation is the right default and the expensive ones are
+// the explicit request.
+const defaultToolDetail = detail.Card
+
 func toolDef(name, description string, properties, required []string) map[string]any {
 	props := map[string]any{}
 	for _, prop := range properties {
 		props[prop] = map[string]any{"type": "string"}
+		if prop == "detail" {
+			props[prop] = detailProperty()
+		}
 		if prop == "limit" || prop == "offset" || prop == "symbol_id" || prop == "depth" || prop == "max_files" || prop == "max_symbols" || prop == "max_steps" || prop == "examples" {
 			props[prop] = map[string]any{"type": "integer"}
 		}
@@ -708,12 +830,12 @@ func decodePageRequest(raw json.RawMessage) (pageRequest, error) {
 var toolArgumentSpecs = map[string]toolArgSpec{
 	"index_repo":            {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
 	"update_graph":          {properties: map[string]string{"repo_root": "string", "repo_path": "string", "force": "boolean", "paths": "array"}},
-	"find_symbol":           {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
-	"find_callers":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
-	"find_callees":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer"}},
-	"get_impact_radius":     {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer"}},
+	"find_symbol":           {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string"}, required: []string{"query"}},
+	"find_callers":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string"}},
+	"find_callees":          {properties: map[string]string{"symbol": "string", "symbol_id": "integer", "limit": "integer", "offset": "integer", "detail": "string"}},
+	"get_impact_radius":     {properties: map[string]string{"symbols": "array", "files": "array", "depth": "integer", "detail": "string"}},
 	"find_related_tests":    {properties: map[string]string{"symbol": "string", "file": "string", "files": "array", "limit": "integer", "offset": "integer"}},
-	"search_symbols":        {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
+	"search_symbols":        {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer", "detail": "string"}, required: []string{"query"}},
 	"search_semantic":       {properties: map[string]string{"query": "string", "limit": "integer", "offset": "integer"}, required: []string{"query"}},
 	"graph_stats":           {properties: map[string]string{}},
 	"supported_languages":   {properties: map[string]string{}},
@@ -764,6 +886,15 @@ func validateToolArguments(name string, raw json.RawMessage) error {
 		}
 		if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
 			return fmt.Errorf("required argument %q must not be empty", req)
+		}
+	}
+	// `detail` is the one enum-valued argument on this surface. Rejecting an
+	// unknown level here, rather than falling back to the default, keeps a typo
+	// from silently returning a different amount of information than asked for.
+	if raw, ok := args["detail"]; ok {
+		value, _ := raw.(string)
+		if _, err := detail.Parse(value, defaultToolDetail); err != nil {
+			return err
 		}
 	}
 	switch name {

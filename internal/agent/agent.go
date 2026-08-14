@@ -50,9 +50,9 @@ var availableTools = []struct {
 	Name string
 	Desc string
 }{
-	{"find_symbol", "Find symbols by exact or fuzzy query. Args: {\"query\": \"...\"}"},
-	{"find_callers", "Find callers of a symbol. Args: {\"symbol\": \"...\"}"},
-	{"find_callees", "Find callees of a symbol. Args: {\"symbol\": \"...\"}"},
+	{"find_symbol", "Find symbols by exact or fuzzy query. Args: {\"query\": \"...\", \"detail\": \"card|skeleton|excerpt|full\"}. detail defaults to card (identity only); ask for skeleton or excerpt when you need the signature or the code."},
+	{"find_callers", "Find callers of a symbol. Args: {\"symbol\": \"...\", \"detail\": \"card|skeleton|excerpt|full\"}"},
+	{"find_callees", "Find callees of a symbol. Args: {\"symbol\": \"...\", \"detail\": \"card|skeleton|excerpt|full\"}"},
 	{"search_semantic", "Hybrid semantic search. Args: {\"query\": \"...\"}"},
 	{"context_for_task", "Return relevant files, symbols for a task. Args: {\"task\": \"...\"}"},
 	{"trace_dependencies", "Trace transitive dependency chains. Args: {\"symbol\": \"...\", \"direction\": \"upstream|downstream\", \"depth\": 3}"},
