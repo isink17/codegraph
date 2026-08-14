@@ -30,10 +30,13 @@ func (s *Store) FileSourceStates(ctx context.Context, repoID int64, paths []stri
 	wanted := make([]string, 0, len(paths))
 	seen := make(map[string]bool, len(paths))
 	for _, raw := range paths {
-		// `files.path` is stored slash-separated, so the lookup must normalise to
-		// slashes too. normalizeRepoRelPath is not usable here: it converts to the
-		// host separator, which on Windows would turn every path into one the
-		// table cannot match, silently returning no rows.
+		// Two forms are in play. The keys of the returned map are canonical
+		// (slash-separated), because that is the form every caller holds -- a
+		// symbol's FilePath, a related test's file. `files.path` itself is stored
+		// in the indexing host's native form (the indexer derives it with
+		// filepath.Rel/filepath.Clean), so the IN list below binds both forms;
+		// binding only the canonical one returned no rows at all on Windows, which
+		// made source-drift detection silently answer "not drifted".
 		normalized := gopath.Clean(filepath.ToSlash(strings.TrimSpace(raw)))
 		if normalized == "" || normalized == "." || seen[normalized] {
 			continue
@@ -50,10 +53,14 @@ func (s *Store) FileSourceStates(ctx context.Context, repoID int64, paths []stri
 		end := min(start+fileStateChunkSize, len(wanted))
 		chunk := wanted[start:end]
 
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoID)
+		bound := make([]string, 0, len(chunk)*2)
 		for _, path := range chunk {
+			bound = append(bound, storedPathVariants(path)...)
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(bound)), ",")
+		args := make([]any, 0, len(bound)+1)
+		args = append(args, repoID)
+		for _, path := range bound {
 			args = append(args, path)
 		}
 

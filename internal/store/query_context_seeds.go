@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -13,9 +14,53 @@ import (
 // and hybrid) group their results on exactly this pair, so it is the natural
 // join key back to a real symbol row -- and, unlike a bare name, it is not
 // ambiguous across packages.
+//
+// File is a repository-relative path in canonical form: forward slashes,
+// whatever the host's separator. Equality of two refs is therefore
+// platform-independent, and callers may build one from either form -- see
+// CanonicalRelPath.
 type SymbolRef struct {
 	File          string
 	QualifiedName string
+}
+
+// CanonicalRelPath is the logical form of a repository-relative path: forward
+// slashes, no leading "./".
+//
+// The repository has two path forms and both are legitimate. `files.path` is
+// stored in the host's native form, because the indexer derives it with
+// filepath.Rel/filepath.Clean; every value that leaves the store for a client is
+// slash-normalized instead (scanSymbol, RelatedTests, the export paths). On
+// Linux and macOS the two coincide, which is why mixing them was invisible; on
+// Windows `paymentsvc\service.go` and `paymentsvc/service.go` are different map
+// keys for the same file.
+//
+// Use this wherever a relative path is an identity -- a map key, a comparison, a
+// ranking tie-break -- and keep native form only for the SQL predicates that
+// have to match the stored bytes.
+// It deliberately does not trim whitespace and does not Clean: a leading or
+// trailing space is a legal part of a POSIX filename, and trimming one here
+// would silently fail to resolve that file. Argument hygiene belongs at the tool
+// boundary (normalizeRepoRelPath, FileSourceStates), not in the identity
+// function.
+func CanonicalRelPath(path string) string {
+	slashed := filepath.ToSlash(path)
+	if slashed == "" || slashed == "." {
+		return ""
+	}
+	return strings.TrimPrefix(slashed, "./")
+}
+
+// storedPathVariants returns the forms of a canonical relative path that a
+// `files.path` column may hold, so one SQL predicate matches regardless of which
+// host wrote the row. On a slash platform both variants are the same string and
+// the set collapses to one.
+func storedPathVariants(canonical string) []string {
+	native := filepath.FromSlash(canonical)
+	if native == canonical {
+		return []string{canonical}
+	}
+	return []string{canonical, native}
 }
 
 // SymbolsForRefs resolves search-result refs to full symbol rows in one query
@@ -34,15 +79,22 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 		return out, nil
 	}
 
+	// Two representations, kept apart deliberately: `wanted` (and the returned
+	// map) is keyed canonically, because that is what a scanned symbol carries and
+	// what every caller compares; the IN list binds the stored forms, because that
+	// is what the column holds.
 	wanted := make(map[SymbolRef]struct{}, len(refs))
 	pathSet := make(map[string]struct{}, len(refs))
 	nameSet := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
-		if ref.File == "" || ref.QualifiedName == "" {
+		canonical := CanonicalRelPath(ref.File)
+		if canonical == "" || ref.QualifiedName == "" {
 			continue
 		}
-		wanted[ref] = struct{}{}
-		pathSet[ref.File] = struct{}{}
+		wanted[SymbolRef{File: canonical, QualifiedName: ref.QualifiedName}] = struct{}{}
+		for _, variant := range storedPathVariants(canonical) {
+			pathSet[variant] = struct{}{}
+		}
 		nameSet[ref.QualifiedName] = struct{}{}
 	}
 	if len(wanted) == 0 {
@@ -92,7 +144,9 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 				return nil, err
 			}
 			for _, sym := range syms {
-				ref := SymbolRef{File: sym.FilePath, QualifiedName: sym.QualifiedName}
+				// scanSymbols already slash-normalizes FilePath; canonicalizing again
+				// costs nothing and keeps this independent of that.
+				ref := SymbolRef{File: CanonicalRelPath(sym.FilePath), QualifiedName: sym.QualifiedName}
 				if _, ok := wanted[ref]; !ok {
 					continue
 				}

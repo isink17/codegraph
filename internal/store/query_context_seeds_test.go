@@ -194,3 +194,79 @@ func TestSymbolsForRefsPrefersTheRowWithAStableKey(t *testing.T) {
 		}
 	}
 }
+
+// The stored form of `files.path` is whatever the indexing host wrote:
+// filepath.Rel/filepath.Clean produce native separators, so a Windows-indexed
+// row holds `billing\renew.go`. A canonical ref must still address it, and the
+// result must be keyed canonically.
+func TestSymbolsForRefsMatchesNativeStoredPaths(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	// Exactly what the indexer would have stored on this host.
+	storedPath := filepath.Clean(filepath.FromSlash("billing/renew.go"))
+	fileID, err := insertTestFile(ctx, s, repo.ID, storedPath)
+	if err != nil {
+		t.Fatalf("insertTestFile(%q) error = %v", storedPath, err)
+	}
+	if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, "Renew", "billing.Renew"); err != nil {
+		t.Fatalf("insertTestSymbol() error = %v", err)
+	}
+
+	canonical := SymbolRef{File: "billing/renew.go", QualifiedName: "billing.Renew"}
+	got, err := s.SymbolsForRefs(ctx, repo.ID, []SymbolRef{canonical})
+	if err != nil {
+		t.Fatalf("SymbolsForRefs() error = %v", err)
+	}
+	sym, ok := got[canonical]
+	if !ok {
+		t.Fatalf("canonical ref did not resolve a row stored as %q: %+v", storedPath, got)
+	}
+	if sym.FilePath != canonical.File {
+		t.Fatalf("resolved symbol path = %q, want the canonical %q", sym.FilePath, canonical.File)
+	}
+
+	// And the same ref supplied in the stored (native) form resolves the same row,
+	// still keyed canonically.
+	native := SymbolRef{File: storedPath, QualifiedName: canonical.QualifiedName}
+	fromNative, err := s.SymbolsForRefs(ctx, repo.ID, []SymbolRef{native})
+	if err != nil {
+		t.Fatalf("SymbolsForRefs(native) error = %v", err)
+	}
+	if fromNative[canonical].ID != sym.ID {
+		t.Fatalf("native ref resolved %+v, want symbol %d", fromNative, sym.ID)
+	}
+}
+
+// Canonicalization must not widen what a ref addresses: a different repository,
+// a parent-directory escape, or a case variant stays unresolved.
+func TestSymbolsForRefsDoesNotWidenPathMatching(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := seedRefsFixture(t)
+	other, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	ref := SymbolRef{File: "billing/renew.go", QualifiedName: "billing.Renew"}
+	if got, err := s.SymbolsForRefs(ctx, other.ID, []SymbolRef{ref}); err != nil || len(got) != 0 {
+		t.Fatalf("ref resolved against another repo: %v, %v", got, err)
+	}
+	for _, bad := range []string{"../billing/renew.go", "BILLING/renew.go", "/billing/renew.go"} {
+		got, err := s.SymbolsForRefs(ctx, repoID, []SymbolRef{{File: bad, QualifiedName: "billing.Renew"}})
+		if err != nil {
+			t.Fatalf("SymbolsForRefs(%q) error = %v", bad, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("path %q resolved to %v; canonicalization must not widen matching", bad, got)
+		}
+	}
+}

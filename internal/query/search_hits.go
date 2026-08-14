@@ -35,7 +35,12 @@ func parseSearchHits(results []map[string]any) []searchHit {
 	hits := make([]searchHit, 0, len(results))
 	for i, r := range results {
 		hit := searchHit{Rank: i}
-		hit.File, _ = r["file"].(string)
+		// Canonicalize the path here, at the one place both producers funnel
+		// through: a hit's file is an identity (it joins to a symbol row, keys
+		// dedup, and breaks ranking ties), and a native-separator value would make
+		// the same file two different identities on Windows.
+		rawFile, _ := r["file"].(string)
+		hit.File = store.CanonicalRelPath(rawFile)
 		// Precedence: the current `symbol` key wins; `name` is the legacy shape.
 		if v, ok := r["symbol"].(string); ok && v != "" {
 			hit.QualifiedName = v

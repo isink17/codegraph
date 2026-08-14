@@ -264,7 +264,10 @@ func (s *Service) testCandidates(ctx context.Context, repoID int64, production [
 			return nil, fmt.Errorf("related tests for %s: %w", path, err)
 		}
 		for _, t := range tests {
-			ref := store.SymbolRef{File: t.File, QualifiedName: t.Symbol}
+			// Canonical on the way in: SymbolsForRefs keys its result map
+			// canonically, so a raw producer path here would look up a key that is
+			// not there and lose every test candidate without an error.
+			ref := store.SymbolRef{File: store.CanonicalRelPath(t.File), QualifiedName: t.Symbol}
 			if _, ok := scores[ref]; !ok {
 				refs = append(refs, ref)
 			}
