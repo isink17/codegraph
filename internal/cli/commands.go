@@ -203,6 +203,7 @@ func newCommandList() []*command {
 				{name: "--exact", description: "match symbol name exactly"},
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
+				{name: "--detail", description: "detail level for symbol records: card|skeleton|excerpt|full"},
 			},
 			examples: []string{
 				"codegraph find_symbol . HelloWorld",
@@ -221,6 +222,7 @@ func newCommandList() []*command {
 				{name: "--symbol", description: "symbol name to query (repeatable; first wins)"},
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
+				{name: "--detail", description: "detail level for symbol records: card|skeleton|excerpt|full"},
 			},
 			examples: []string{
 				"codegraph find_callers . HelloWorld",
@@ -239,6 +241,7 @@ func newCommandList() []*command {
 				{name: "--symbol", description: "symbol name to query (repeatable; first wins)"},
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
+				{name: "--detail", description: "detail level for symbol records: card|skeleton|excerpt|full"},
 			},
 			examples: []string{
 				"codegraph find_callees . HelloWorld",
@@ -260,6 +263,7 @@ func newCommandList() []*command {
 				{name: "--symbol", description: "symbol name to query (repeatable)"},
 				{name: "--file", description: "file path to query (repeatable)"},
 				{name: "--depth", description: "limit traversal depth"},
+				{name: "--detail", description: "detail level for symbol records: card|skeleton|excerpt|full"},
 			},
 			examples: []string{
 				"codegraph get_impact_radius . HelloWorld",
@@ -278,6 +282,7 @@ func newCommandList() []*command {
 			flags: []commandFlag{
 				{name: "--limit", description: "limit results"},
 				{name: "--offset", description: "offset into result set"},
+				{name: "--detail", description: "detail level for symbol records: card|skeleton|excerpt|full"},
 			},
 			examples: []string{
 				"codegraph search_symbols . HelloWorld",

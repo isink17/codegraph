@@ -2,10 +2,39 @@
 
 ## Unreleased
 
+Progressive disclosure: symbol-shaped MCP results are returned at the smallest useful size by
+default, and larger representations are asked for explicitly.
+
 Query latency budget: local graph queries are measured against a deterministic ~100k-symbol
 fixture, the measured bottlenecks are fixed, and the measurement is reproducible from the CLI.
 
 ### Added
+
+- **`detail` argument** on `find_symbol`, `search_symbols`, `find_callers`, `find_callees`, and
+  `get_impact_radius`, with one vocabulary shared by every tool: `card` (identity and location),
+  `skeleton` (+ signature, visibility, container, doc summary, member declarations), `excerpt`
+  (+ bounded source around the symbol), `full` (+ the symbol's complete indexed source and the
+  `range`/`file_id` fields the pre-P13 payload carried). An unknown level is rejected rather than
+  silently downgraded.
+- **`--detail card|skeleton|excerpt|full`** on `find_symbol`, `search_symbols`, `find_callers`,
+  `find_callees`, and `get_impact_radius` on the CLI, with the same per-level semantics as MCP.
+- Source rendering for `excerpt` and `full`: files are read from disk on demand, confined to the
+  repository root (with symlinks resolved on both sides), CRLF-normalised, clamped to the file
+  that actually exists, and reported rather than failed when a file is gone or its indexed range
+  is stale. An excerpt longer than its ceiling, or a range clamped to a file that has shrunk, is
+  marked `truncated` and reports `available_start_line`/`available_end_line`. Source read from a
+  file whose size or mtime no longer matches the index carries a `source_note` instead of being
+  silently misattributed.
+- Explicit bounds on the expensive levels, all of them reported: a skeleton's member list is
+  capped and reports `member_count`; one response looks up members for a bounded number of
+  containers and renders source for a bounded number of symbols, the rest carrying a
+  `skeleton_note` or `source_note`; and one symbol's source is itself capped. Traversal tools
+  have no result limit of their own, so without these a single `get_impact_radius` at
+  `detail=full` would read the repository. Every bound sits well above any paged request, so an
+  explicit `limit` is always honoured in full.
+- `--detail` and the other query flags now take effect after the positional arguments as well as
+  before them. Go's flag package stopped at the first positional, so `find_symbol . Foo --exact`
+  silently dropped the flag.
 
 - **`codegraph bench-queries [PATH]`** (alias of `bench_queries`) — benchmarks the local graph
   queries against an already-indexed repository and prints a `codegraph.query_bench/v1` JSON
@@ -21,6 +50,11 @@ fixture, the measured bottlenecks are fixed, and the measurement is reproducible
 
 ### Changed
 
+- **MCP default response size.** `find_symbol`, `search_symbols`, `find_callers`, `find_callees`,
+  and `get_impact_radius` now default to `detail=card`, which is 54-74% smaller than the previous
+  payload on this repository. No response field became unreachable: `detail=full` returns
+  everything those tools returned before. The CLI default is deliberately unchanged, because its
+  JSON is script-facing.
 - **`find_callers` / `find_callees`** now dedupe, order and page inside SQLite instead of
   materialising the whole neighbourhood in Go. The result set and its ordering are unchanged.
   This also removes the `IN (?, ?, …)` list that grew with fan-in: the whole caller/callee set

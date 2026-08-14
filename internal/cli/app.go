@@ -21,6 +21,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/appname"
 	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/detail"
 	"github.com/isink17/codegraph/internal/doctor"
 	"github.com/isink17/codegraph/internal/embedding"
 	"github.com/isink17/codegraph/internal/export"
@@ -1271,6 +1272,92 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	return writeJSON(stdout, stats)
 }
 
+// cliProjection adapts the store to the rendering layer's contracts, the same
+// way the MCP server does. Both surfaces render through one projector, so a
+// level means the same thing whichever one asked for it.
+type cliProjection struct {
+	store  *store.Store
+	repoID int64
+}
+
+func (a cliProjection) SymbolMembers(ctx context.Context, refs []detail.MemberRef) (map[int64][]graph.Symbol, error) {
+	ranges := make([]store.MemberRange, 0, len(refs))
+	for _, ref := range refs {
+		ranges = append(ranges, store.MemberRange{
+			SymbolID:  ref.SymbolID,
+			FileID:    ref.FileID,
+			StartLine: ref.StartLine,
+			EndLine:   ref.EndLine,
+		})
+	}
+	return a.store.SymbolMembers(ctx, a.repoID, ranges)
+}
+
+func (a cliProjection) FileStates(ctx context.Context, paths []string) (map[string]detail.FileState, error) {
+	states, err := a.store.FileSourceStates(ctx, a.repoID, paths)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]detail.FileState, len(states))
+	for path, state := range states {
+		out[path] = detail.FileState{
+			SizeBytes:     state.SizeBytes,
+			MtimeUnixNs:   state.MtimeUnixNs,
+			ContentSHA256: state.ContentSHA256,
+		}
+	}
+	return out, nil
+}
+
+// splitFlagArgs separates flag arguments from positional ones, so that a flag
+// works wherever it is written.
+//
+// Go's flag package stops at the first non-flag argument, which meant
+// `find_symbol . Foo --detail card` -- the shape every help example implies --
+// silently dropped the flag and printed a different payload than the one asked
+// for. Splitting first fixes that for every flag on these commands.
+//
+// A token that looks like a flag but is not one this command defines stays a
+// positional, which is what it already was before the split: a query may
+// legitimately begin with `-`, and turning that into an error would break
+// invocations that work today. Everything after `--` is positional.
+func splitFlagArgs(fs *flag.FlagSet, args []string) (flagArgs, positional []string) {
+	defined := map[string]*flag.Flag{}
+	fs.VisitAll(func(f *flag.Flag) { defined[f.Name] = f })
+
+	isBool := func(f *flag.Flag) bool {
+		boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+		return ok && boolFlag.IsBoolFlag()
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			return flagArgs, positional
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			positional = append(positional, arg)
+			continue
+		}
+		name, _, hasInline := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		f, ok := defined[name]
+		if !ok {
+			positional = append(positional, arg)
+			continue
+		}
+		flagArgs = append(flagArgs, arg)
+		// A non-boolean flag written without `=` takes the next token as its
+		// value, and that token must travel with it rather than being read as a
+		// positional.
+		if !hasInline && !isBool(f) && i+1 < len(args) {
+			i++
+			flagArgs = append(flagArgs, args[i])
+		}
+	}
+	return flagArgs, positional
+}
+
 func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, queryKind, cmdName string, args []string) error {
 	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -1280,18 +1367,20 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 	depth := fs.Int("depth", 2, "impact depth")
 	limit := fs.Int("limit", 20, "result limit")
 	offset := fs.Int("offset", 0, "result offset")
+	detailFlag := fs.String("detail", "", "detail level for symbol records: "+strings.Join(detail.Names(), "|")+" (default: every indexed field, no source)")
 	var symbols stringListFlag
 	var files stringListFlag
 	fs.Var(&symbols, "symbol", "symbol name (repeatable)")
 	fs.Var(&files, "file", "file path (repeatable)")
-	if err := fs.Parse(args); err != nil {
+	flagArgs, positional := splitFlagArgs(fs, args)
+	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
 
 	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
 	queryValue := *queryFlag
 	symbol := ""
-	rest := fs.Args()
+	rest := positional
 	if repoRootCandidate == "" && len(rest) > 0 {
 		repoRootCandidate = rest[0]
 		rest = rest[1:]
@@ -1313,11 +1402,52 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 	if err != nil {
 		return err
 	}
-	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
 	defer app.Close()
+
+	// The CLI's default is deliberately not the MCP default. `codegraph
+	// find-symbol` is a human- and script-facing command whose JSON has always
+	// carried every indexed field, so omitting --detail keeps that shape byte
+	// for byte. Passing --detail opts into the same four-level projection the
+	// MCP tools use, with identical semantics at each level.
+	//
+	// project is nil when the flag is absent, which is how the two paths stay
+	// distinguishable without a second "legacy" level in the vocabulary.
+	// Presence is decided by whether the flag was set, not by its value, so
+	// `--detail ""` means the same here as it does over MCP: the default level.
+	detailSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "detail" {
+			detailSet = true
+		}
+	})
+	var project func([]graph.Symbol) any
+	if detailSet {
+		level, err := detail.Parse(*detailFlag, detail.Card)
+		if err != nil {
+			return err
+		}
+		adapter := cliProjection{store: app.Store, repoID: repoID}
+		project = func(items []graph.Symbol) any {
+			return detail.NewProjector(level, repo.RootPath, adapter, adapter).Symbols(ctx, items)
+		}
+	}
+	emit := func(key string, items []graph.Symbol) error {
+		if items == nil {
+			items = []graph.Symbol{}
+		}
+		var payload any = items
+		if project != nil {
+			payload = project(items)
+		}
+		return writeJSON(stdout, map[string]any{
+			key:     payload,
+			"count": len(items),
+		})
+	}
 
 	switch queryKind {
 	case "find-symbol":
@@ -1336,13 +1466,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		if items == nil {
-			items = []graph.Symbol{}
-		}
-		return writeJSON(stdout, map[string]any{
-			"matches": items,
-			"count":   len(items),
-		})
+		return emit("matches", items)
 	case "search":
 		if queryValue == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
@@ -1351,13 +1475,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		if items == nil {
-			items = []graph.Symbol{}
-		}
-		return writeJSON(stdout, map[string]any{
-			"matches": items,
-			"count":   len(items),
-		})
+		return emit("matches", items)
 	case "callers":
 		if symbol == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
@@ -1366,13 +1484,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		if items == nil {
-			items = []graph.Symbol{}
-		}
-		return writeJSON(stdout, map[string]any{
-			"callers": items,
-			"count":   len(items),
-		})
+		return emit("callers", items)
 	case "callees":
 		if symbol == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
@@ -1381,13 +1493,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		if items == nil {
-			items = []graph.Symbol{}
-		}
-		return writeJSON(stdout, map[string]any{
-			"callees": items,
-			"count":   len(items),
-		})
+		return emit("callees", items)
 	case "impact":
 		// Allow a positional symbol alongside --file, but do not override explicit --symbol flags.
 		if symbol != "" && len(symbols) == 0 {
@@ -1399,6 +1505,16 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		data, err := app.Query.ImpactRadius(ctx, repoID, symbols, files, *depth)
 		if err != nil {
 			return err
+		}
+		if project != nil {
+			if syms, ok := data["symbols"].([]graph.Symbol); ok {
+				projected := make(map[string]any, len(data))
+				for key, value := range data {
+					projected[key] = value
+				}
+				projected["symbols"] = project(syms)
+				data = projected
+			}
 		}
 		return writeJSON(stdout, data)
 	default:
