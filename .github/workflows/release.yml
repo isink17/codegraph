@@ -25,27 +25,33 @@ jobs:
 
   build:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
+          - runner: ubuntu-22.04
+            goos: linux
             goarch: amd64
             archive_ext: tar.gz
-          - goos: linux
+          - runner: ubuntu-22.04-arm
+            goos: linux
             goarch: arm64
             archive_ext: tar.gz
-          - goos: darwin
+          - runner: macos-15-intel
+            goos: darwin
             goarch: amd64
             archive_ext: tar.gz
-          - goos: darwin
+          - runner: macos-15
+            goos: darwin
             goarch: arm64
             archive_ext: tar.gz
-          - goos: windows
+          - runner: windows-2025
+            goos: windows
             goarch: amd64
             archive_ext: zip
-          - goos: windows
+          - runner: windows-11-arm
+            goos: windows
             goarch: arm64
             archive_ext: zip
 
@@ -67,6 +73,9 @@ jobs:
           go version
           go env GOOS GOARCH CGO_ENABLED GOPATH GOMODCACHE GOCACHE
 
+      - name: Run native tests
+        run: go test ./...
+
       - name: Build archive
         shell: bash
         run: |
@@ -80,7 +89,7 @@ jobs:
           fi
           archive_base="${binary}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
           mkdir -p "${dist}/${archive_base}"
-          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=0 go build -v -x -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
+          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=1 go build -v -x -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
           cp README.md "${dist}/${archive_base}/README.md"
           cp LICENSE "${dist}/${archive_base}/LICENSE"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
@@ -88,10 +97,12 @@ jobs:
               cd "${dist}/${archive_base}"
               zip -q -r "../${archive_base}.zip" .
             )
-            sha256sum "${dist}/${archive_base}.zip" > "${dist}/${archive_base}.zip.sha256"
+            if [ "${RUNNER_OS}" = "macOS" ]; then checksum="shasum -a 256"; else checksum="sha256sum"; fi
+            ${checksum} "${dist}/${archive_base}.zip" > "${dist}/${archive_base}.zip.sha256"
           else
             tar -C "${dist}" -czf "${dist}/${archive_base}.tar.gz" "${archive_base}"
-            sha256sum "${dist}/${archive_base}.tar.gz" > "${dist}/${archive_base}.tar.gz.sha256"
+            if [ "${RUNNER_OS}" = "macOS" ]; then checksum="shasum -a 256"; else checksum="sha256sum"; fi
+            ${checksum} "${dist}/${archive_base}.tar.gz" > "${dist}/${archive_base}.tar.gz.sha256"
           fi
 
       - name: Upload build artifacts

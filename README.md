@@ -112,6 +112,10 @@ All languages use tree-sitter for AST parsing:
 | PHP | `.php` |
 | C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc` |
 
+Release archives use native CGO builds, so shipped binaries include the tree-sitter
+parsers and expose relationship-graph edges. Explicit `CGO_ENABLED=0` builds use
+the reduced Go/Python plus heuristic parser registry and are not release-equivalent.
+
 > Node.js repos are supported; full tree-sitter node support is still in progress.
 
 ---
