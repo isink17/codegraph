@@ -159,5 +159,9 @@ const (
 	// constant so a strategy cannot be added that applies one rule and forgets
 	// the other.
 	resolverBindGateSQL = resolverBindableCandidateSQL + `
-		AND ` + resolverAmbiguousNamesSQL
+		AND ` + resolverAmbiguousNamesSQL + `
+		AND NOT EXISTS (
+			SELECT 1 FROM tmp_resolver_own_module_veto v
+			WHERE v.edge_id = edges.id
+		)`
 )
