@@ -4429,16 +4429,38 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 	var err error
 	if file != "" {
 		file = normalizeRepoRelPath(file)
-		if file == "" {
+		canonical := CanonicalRelPath(file)
+		if canonical == "" {
 			return []RelatedTest{}, nil
 		}
+		variants := storedPathVariants(canonical)
 		var targetFileID int64
-		if err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? LIMIT 1`, repoID, file).Scan(&targetFileID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return []RelatedTest{}, nil
-			}
+		args := make([]any, 0, len(variants)+1)
+		args = append(args, repoID)
+		for _, variant := range variants {
+			args = append(args, variant)
+		}
+		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path IN (`+sqlPlaceholders(len(variants))+`) ORDER BY id`, args...)
+		if err != nil {
 			return nil, err
 		}
+		var matches []int64
+		for lookupRows.Next() {
+			if err := lookupRows.Scan(&targetFileID); err != nil {
+				lookupRows.Close()
+				return nil, err
+			}
+			matches = append(matches, targetFileID)
+		}
+		if err := lookupRows.Err(); err != nil {
+			lookupRows.Close()
+			return nil, err
+		}
+		lookupRows.Close()
+		if len(matches) == 0 || len(matches) > 1 {
+			return []RelatedTest{}, nil
+		}
+		targetFileID = matches[0]
 		// Two evidence classes, deduplicated per (test file, test symbol) with the
 		// strongest surviving (P22.2):
 		//
@@ -4541,7 +4563,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 		if err := rows.Scan(&item.File, &item.Symbol, &item.Reason, &item.Score); err != nil {
 			return nil, err
 		}
-		item.File = filepath.ToSlash(item.File)
+		item.File = canonicalStoredPath(item.File)
 		out = append(out, item)
 	}
 	return out, rows.Err()

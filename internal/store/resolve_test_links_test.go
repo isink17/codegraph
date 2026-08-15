@@ -678,3 +678,30 @@ func TestProductionSiblingPath(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveTestLinksSiblingMatchesStoredSeparatorVariants(t *testing.T) {
+	cases := []struct {
+		name, testPath, targetPath, language string
+	}{
+		{"go slash", "a/shared_test.go", "a/shared.go", "go"},
+		{"go native", `a\shared_test.go`, `a\shared.go`, "go"},
+		{"go mixed", `a\shared_test.go`, "a/shared.go", "go"},
+		{"python slash", "pkg/test_utils.py", "pkg/utils.py", "python"},
+		{"python native", `pkg\test_utils.py`, `pkg\utils.py`, "python"},
+		{"python mixed", `pkg\test_utils.py`, "pkg/utils.py", "python"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestLinkFixture(t)
+			target := f.file(tc.targetPath, tc.language)
+			testFile := f.file(tc.testPath, tc.language)
+			link := f.link(testFile, "func:pkg::Shared")
+			if got := f.resolveAll(); got.FilesBound != 1 {
+				t.Fatalf("ResolveTestLinks() files bound = %d, want 1", got.FilesBound)
+			}
+			if gotSym, gotFile := f.target(link); gotSym != 0 || gotFile != target {
+				t.Fatalf("target = (%d, %d), want file-only target (0, %d)", gotSym, gotFile, target)
+			}
+		})
+	}
+}

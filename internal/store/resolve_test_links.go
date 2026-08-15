@@ -346,7 +346,7 @@ func recordTestLinkSiblings(ctx context.Context, tx *sql.Tx, repoID int64) error
 		if err := rows.Scan(&id, &filePath); err != nil {
 			return err
 		}
-		sibling := productionSiblingPath(filePath)
+		sibling := canonicalStoredPath(productionSiblingPath(filePath))
 		if sibling == "" {
 			continue
 		}
@@ -392,18 +392,29 @@ func recordTestLinkSiblings(ctx context.Context, tx *sql.Tx, repoID int64) error
 // chunks sized for the IN clause.
 func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []string) (map[string]int64, error) {
 	out := make(map[string]int64, len(paths))
-	unique := dedupeNonEmpty(paths)
+	ambiguous := make(map[string]bool, len(paths))
+	canonical := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p = canonicalStoredPath(p); p != "" {
+			canonical = append(canonical, p)
+		}
+	}
+	unique := dedupeNonEmpty(canonical)
 	for start := 0; start < len(unique); start += testLinkResolveChunkSize {
 		end := min(start+testLinkResolveChunkSize, len(unique))
-		chunk := unique[start:end]
-		args := make([]any, 0, len(chunk)+1)
+		canonicalChunk := unique[start:end]
+		stored := make([]string, 0, len(canonicalChunk)*3)
+		for _, p := range canonicalChunk {
+			stored = append(stored, storedPathVariants(p)...)
+		}
+		args := make([]any, 0, len(stored)+1)
 		args = append(args, repoID)
-		for _, p := range chunk {
+		for _, p := range stored {
 			args = append(args, p)
 		}
 		rows, err := tx.QueryContext(ctx, `
 			SELECT id, path FROM files
-			WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+sqlPlaceholders(len(chunk))+`)
+			WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+sqlPlaceholders(len(stored))+`)
 		`, args...)
 		if err != nil {
 			return nil, err
@@ -415,7 +426,16 @@ func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []st
 				rows.Close()
 				return nil, err
 			}
-			out[p] = id
+			key := canonicalStoredPath(p)
+			if ambiguous[key] {
+				continue
+			}
+			if previous, exists := out[key]; exists && previous != id {
+				delete(out, key)
+				ambiguous[key] = true
+				continue
+			}
+			out[key] = id
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()

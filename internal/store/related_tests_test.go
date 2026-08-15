@@ -66,6 +66,45 @@ func TestRelatedTests_FileScoped(t *testing.T) {
 	}
 }
 
+func TestRelatedTests_FileScopedMatchesWindowsStoredPath(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	target, err := insertTestFile(ctx, s, repo.ID, `pkg\utils.py`)
+	if err != nil {
+		t.Fatalf("insertTestFile(target) error = %v", err)
+	}
+	testFile, err := insertTestFile(ctx, s, repo.ID, `pkg\test_utils.py`)
+	if err != nil {
+		t.Fatalf("insertTestFile(test) error = %v", err)
+	}
+	testSym, err := insertTestSymbol(ctx, s, repo.ID, testFile, "test_utils", "test_utils")
+	if err != nil {
+		t.Fatalf("insertTestSymbol() error = %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score)
+		VALUES(?, ?, ?, ?, NULL, 'test_file_name_match', 0.8)
+	`, repo.ID, testFile, testSym, target); err != nil {
+		t.Fatalf("insert test_link: %v", err)
+	}
+
+	got, err := s.RelatedTests(ctx, repo.ID, "", "pkg/utils.py", 10, 0)
+	if err != nil {
+		t.Fatalf("RelatedTests() error = %v", err)
+	}
+	if len(got) != 1 || got[0].File != "pkg/test_utils.py" {
+		t.Fatalf("RelatedTests() = %+v, want canonical Python test path", got)
+	}
+}
+
 // callEvidenceFixture builds the P22.2 end-to-end shape: a production type with
 // two methods, and one test function per method, where each test's only
 // relation to its method is a resolved call edge (Go test names rarely spell a

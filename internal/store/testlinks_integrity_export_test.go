@@ -77,6 +77,8 @@ func (s *Store) TestLinksForTest(ctx context.Context, repoID int64) ([]TestLinkR
 		if err := rows.Scan(&r.TestFile, &r.TargetFile, &r.TargetSymbolID, &r.Reason, &r.Score); err != nil {
 			return nil, err
 		}
+		r.TestFile = canonicalStoredPath(r.TestFile)
+		r.TargetFile = canonicalStoredPath(r.TargetFile)
 		out = append(out, r)
 	}
 	return out, rows.Err()
