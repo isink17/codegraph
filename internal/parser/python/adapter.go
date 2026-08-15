@@ -19,6 +19,9 @@ var (
 type scope struct {
 	name   string
 	indent int
+	// symIdx is the index of the scope's declaration in ParsedFile.Symbols,
+	// so closing the scope can seal that symbol's body range.
+	symIdx int
 }
 
 type Adapter struct{}
@@ -49,6 +52,10 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	funcByStable := map[string]graph.Symbol{}
 	var classStack []scope
 	var funcStack []scope
+	// lastLine/lastLen track the most recent content line (not blank, not a
+	// comment). A scope popped by a dedent ends at that line: blank lines,
+	// comments and decorators between declarations belong to no body.
+	lastLine, lastLen := 0, 0
 
 	for i, line := range lines {
 		lineNo := i + 1
@@ -58,8 +65,9 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			continue
 		}
 
-		classStack = trimScopesAtIndent(classStack, indent)
-		funcStack = trimScopesAtIndent(funcStack, indent)
+		classStack = closeScopes(classStack, indent, lastLine, lastLen, pf.Symbols)
+		funcStack = closeScopes(funcStack, indent, lastLine, lastLen, pf.Symbols)
+		lastLine, lastLen = lineNo, len(line)
 
 		if m := classRE.FindStringSubmatch(line); len(m) == 2 {
 			name := m[1]
@@ -80,7 +88,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				StableKey: "class:" + module + ":" + name,
 			}
 			pf.Symbols = append(pf.Symbols, sym)
-			classStack = append(classStack, scope{name: name, indent: indent})
+			classStack = append(classStack, scope{name: name, indent: indent, symIdx: len(pf.Symbols) - 1})
 			continue
 		}
 
@@ -113,7 +121,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			}
 			pf.Symbols = append(pf.Symbols, sym)
 			funcByStable[stableKey] = sym
-			funcStack = append(funcStack, scope{name: stableKey, indent: indent})
+			funcStack = append(funcStack, scope{name: stableKey, indent: indent, symIdx: len(pf.Symbols) - 1})
 			continue
 		}
 
@@ -172,11 +180,25 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 	}
 
+	// EOF closes every open scope at the file's last content line.
+	closeScopes(classStack, -1, lastLine, lastLen, pf.Symbols)
+	closeScopes(funcStack, -1, lastLine, lastLen, pf.Symbols)
+
 	return pf, nil
 }
 
-func trimScopesAtIndent(stack []scope, indent int) []scope {
+// closeScopes pops every scope whose indent the current line dedents to (or
+// past) and seals the popped symbol's range at the last content line seen,
+// which by construction is the final line of that scope's body. Ranges are
+// inclusive on both ends. A declaration whose body never got a content line
+// keeps its single-line range.
+func closeScopes(stack []scope, indent, lastLine, lastLen int, symbols []graph.Symbol) []scope {
 	for len(stack) > 0 && indent <= stack[len(stack)-1].indent {
+		top := stack[len(stack)-1]
+		if r := &symbols[top.symIdx].Range; lastLine > r.EndLine {
+			r.EndLine = lastLine
+			r.EndCol = lastLen + 1
+		}
 		stack = stack[:len(stack)-1]
 	}
 	return stack
