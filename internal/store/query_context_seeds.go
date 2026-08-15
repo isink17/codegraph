@@ -51,16 +51,35 @@ func CanonicalRelPath(path string) string {
 	return strings.TrimPrefix(slashed, "./")
 }
 
-// storedPathVariants returns the forms of a canonical relative path that a
-// `files.path` column may hold, so one SQL predicate matches regardless of which
-// host wrote the row. On a slash platform both variants are the same string and
-// the set collapses to one.
+// canonicalStoredPath interprets either native separator spelling at the
+// compatibility boundary. CanonicalRelPath itself keeps POSIX identity rules;
+// this helper is only for bytes read from persisted files.path values.
+func canonicalStoredPath(path string) string {
+	return CanonicalRelPath(strings.ReplaceAll(path, `\`, `/`))
+}
+
+// storedPathVariants returns slash, current-host native, and Windows-native
+// forms a `files.path` column may hold. This keeps readers compatible with
+// existing databases until canonical persistence is handled by P23.
 func storedPathVariants(canonical string) []string {
 	native := filepath.FromSlash(canonical)
-	if native == canonical {
-		return []string{canonical}
+	windows := strings.ReplaceAll(canonical, "/", `\`)
+	variants := []string{canonical}
+	for _, variant := range []string{native, windows} {
+		if variant != canonical && !containsString(variants, variant) {
+			variants = append(variants, variant)
+		}
 	}
-	return []string{canonical, native}
+	return variants
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // SymbolsForRefs resolves search-result refs to full symbol rows in one query

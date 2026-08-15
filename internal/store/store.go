@@ -155,7 +155,11 @@ type ScanSummary struct {
 	// for the whole resolution pass.
 	ResolveTestLinksMS    int64 `json:"resolve_test_links_ms,omitempty"`
 	ResolveTestLinksBound int   `json:"resolve_test_links_bound,omitempty"`
-	DurationMS            int64 `json:"duration_ms"`
+	// ResolveTestLinksFileBound counts rows whose file-level target was set from
+	// the test file's conventional production sibling (P22.2) -- rows related to
+	// a file with the exact symbol unknown.
+	ResolveTestLinksFileBound int   `json:"resolve_test_links_file_bound,omitempty"`
+	DurationMS                int64 `json:"duration_ms"`
 }
 
 type ResolveEdgesForNamesStats struct {
@@ -1253,6 +1257,7 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			tx,
 			repoID,
 			fileID,
+			input.Path,
 			input.Parsed,
 			stats,
 		); err != nil {
@@ -1514,6 +1519,7 @@ func insertParsedFileGraph(
 	tx *sql.Tx,
 	repoID int64,
 	fileID int64,
+	filePath string,
 	parsed graph.ParsedFile,
 	stats *WriteStats,
 ) error {
@@ -1680,14 +1686,21 @@ func insertParsedFileGraph(
 
 	// P10 Pass 1: persist the test-link *fact* only. The target is recorded as
 	// the parser's stable key and left unbound; binding it against the symbol
-	// table is a Pass-2 operation (ResolveTestLinks*, resolve_test_links.go).
+	// table is a Pass-2 operation (ResolveTestLinks, resolve_test_links.go).
 	//
 	// Before P10 this loop looked each key up in `symbols` inside the write
 	// transaction, which made the result depend on whether the target file
 	// happened to be persisted earlier in the same indexing batch. `test_symbol_id`
 	// stays here because it names a symbol of *this* file, inserted a few lines
 	// above: it is intra-file and cannot be affected by batch order.
-	if len(parsed.TestLinks) > 0 {
+	//
+	// P22.2: only a test file may declare test links. The producers key on the
+	// function-name prefix alone, so a production file exporting
+	// `TestConnection()` would otherwise mint a link that Pass 2 could bind to a
+	// real production symbol -- a wrong test edge. IsTestFilePath is the single
+	// shared test-file policy (P7); the parser stays free of it because path
+	// classification is a store concern.
+	if len(parsed.TestLinks) > 0 && IsTestFilePath(filePath) {
 		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*testLinkInsertCols)
 		for _, link := range parsed.TestLinks {
 			var testSymbolID any
@@ -4416,29 +4429,89 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 	var err error
 	if file != "" {
 		file = normalizeRepoRelPath(file)
-		if file == "" {
+		canonical := CanonicalRelPath(file)
+		if canonical == "" {
 			return []RelatedTest{}, nil
 		}
+		variants := storedPathVariants(canonical)
 		var targetFileID int64
-		if err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? LIMIT 1`, repoID, file).Scan(&targetFileID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return []RelatedTest{}, nil
-			}
+		args := make([]any, 0, len(variants)+1)
+		args = append(args, repoID)
+		for _, variant := range variants {
+			args = append(args, variant)
+		}
+		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path IN (`+sqlPlaceholders(len(variants))+`) ORDER BY id`, args...)
+		if err != nil {
 			return nil, err
 		}
+		var matches []int64
+		for lookupRows.Next() {
+			if err := lookupRows.Scan(&targetFileID); err != nil {
+				lookupRows.Close()
+				return nil, err
+			}
+			matches = append(matches, targetFileID)
+		}
+		if err := lookupRows.Err(); err != nil {
+			lookupRows.Close()
+			return nil, err
+		}
+		lookupRows.Close()
+		if len(matches) == 0 || len(matches) > 1 {
+			return []RelatedTest{}, nil
+		}
+		targetFileID = matches[0]
+		// Two evidence classes, deduplicated per (test file, test symbol) with the
+		// strongest surviving (P22.2):
+		//
+		//   - persisted test_links rows whose file-level target is this file
+		//     (symbol-bound rows carry the symbol's file; sibling-bound rows carry
+		//     the filename-convention sibling)
+		//   - call evidence: a linked test function with a resolved call edge into
+		//     a symbol this file defines. Derived from `edges` at query time so it
+		//     follows edge lifecycle (P6) with no second materialised copy.
+		//
+		// The bare `reason`/`score` under MAX(pick) are SQLite's documented
+		// bare-column semantics: they come from the row that supplied the max.
+		// `pick` folds an explicit per-reason rank into the score so a score tie
+		// across evidence classes (a sibling-bound row keeps its producer score,
+		// so 'test_name_match'/0.8 and 'test_file_name_match'/0.8 can share one
+		// group) still selects one deterministic winner; rows that tie on `pick`
+		// share both score and reason, so the bare columns are identical either
+		// way. The call-evidence arm excludes tests declared by the seed file
+		// itself: a test file's own tests calling its own helpers are not
+		// "related tests" of that file.
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT f.path, COALESCE(s.qualified_name, ''), t.reason, t.score
-			FROM test_links t
-			JOIN files f ON f.id = t.test_file_id
-			LEFT JOIN symbols s ON s.id = t.test_symbol_id
-			WHERE t.repo_id = ? AND t.target_file_id = ?
-			AND f.path LIKE '%_test.go'
+			SELECT path, symbol, reason, score FROM (
+				SELECT path, symbol, reason, score,
+					MAX(CAST(ROUND(score * 1000) AS INTEGER) * 4 + reason_rank) AS pick
+				FROM (
+					SELECT f.path AS path, COALESCE(s.qualified_name, '') AS symbol,
+						t.reason AS reason, t.score AS score,
+						CASE t.reason WHEN 'test_name_match' THEN 2
+							WHEN '`+testLinkFileReason+`' THEN 1 ELSE 0 END AS reason_rank
+					FROM test_links t
+					JOIN files f ON f.id = t.test_file_id
+					LEFT JOIN symbols s ON s.id = t.test_symbol_id
+					WHERE t.repo_id = ? AND t.target_file_id = ?
+					UNION ALL
+					SELECT tf.path, ts.qualified_name, 'test_calls', 0.9, 3
+					FROM edges e
+					JOIN test_links tl ON tl.repo_id = e.repo_id AND tl.test_symbol_id = e.src_symbol_id
+					JOIN symbols ts ON ts.id = e.src_symbol_id
+					JOIN files tf ON tf.id = ts.file_id
+					WHERE e.repo_id = ? AND e.edge_kind = 'calls'
+					  AND ts.file_id != ?
+					  AND e.dst_symbol_id IN (SELECT id FROM symbols WHERE repo_id = ? AND file_id = ?)
+				)
+				GROUP BY path, symbol
+			)
 			-- Canonical-form tie-break: which tests survive LIMIT must not depend on
 			-- whether the index was written on Windows or on Linux.
-			ORDER BY t.score DESC, REPLACE(f.path, '\', '/'), COALESCE(s.qualified_name, '')
+			ORDER BY score DESC, REPLACE(path, '\', '/'), symbol
 			LIMIT ?
 			OFFSET ?
-		`, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
+		`, repoID, targetFileID, repoID, targetFileID, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
 	} else {
 		// targetID is declared separately so that the assignment below writes the
 		// function-scoped err. With `targetID, err := ...` the query's error was
@@ -4449,16 +4522,36 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 		if err != nil {
 			return nil, err
 		}
+		// Same two evidence classes as the file branch, seeded by one symbol:
+		// rows name-bound to it, plus linked test functions that call it. Same
+		// deterministic `pick` rule as the file branch.
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT f.path, COALESCE(s.qualified_name, ''), t.reason, t.score
-			FROM test_links t
-			JOIN files f ON f.id = t.test_file_id
-			LEFT JOIN symbols s ON s.id = t.test_symbol_id
-			WHERE t.repo_id = ? AND t.target_symbol_id = ?
-			ORDER BY t.score DESC, REPLACE(f.path, '\', '/'), COALESCE(s.qualified_name, '')
+			SELECT path, symbol, reason, score FROM (
+				SELECT path, symbol, reason, score,
+					MAX(CAST(ROUND(score * 1000) AS INTEGER) * 4 + reason_rank) AS pick
+				FROM (
+					SELECT f.path AS path, COALESCE(s.qualified_name, '') AS symbol,
+						t.reason AS reason, t.score AS score,
+						CASE t.reason WHEN 'test_name_match' THEN 2
+							WHEN '`+testLinkFileReason+`' THEN 1 ELSE 0 END AS reason_rank
+					FROM test_links t
+					JOIN files f ON f.id = t.test_file_id
+					LEFT JOIN symbols s ON s.id = t.test_symbol_id
+					WHERE t.repo_id = ? AND t.target_symbol_id = ?
+					UNION ALL
+					SELECT tf.path, ts.qualified_name, 'test_calls', 0.9, 3
+					FROM edges e
+					JOIN test_links tl ON tl.repo_id = e.repo_id AND tl.test_symbol_id = e.src_symbol_id
+					JOIN symbols ts ON ts.id = e.src_symbol_id
+					JOIN files tf ON tf.id = ts.file_id
+					WHERE e.repo_id = ? AND e.edge_kind = 'calls' AND e.dst_symbol_id = ?
+				)
+				GROUP BY path, symbol
+			)
+			ORDER BY score DESC, REPLACE(path, '\', '/'), symbol
 			LIMIT ?
 			OFFSET ?
-		`, repoID, targetID, safeLimit(limit), safeOffset(offset))
+		`, repoID, targetID, repoID, targetID, safeLimit(limit), safeOffset(offset))
 	}
 	if err != nil {
 		return nil, err
@@ -4470,7 +4563,7 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 		if err := rows.Scan(&item.File, &item.Symbol, &item.Reason, &item.Score); err != nil {
 			return nil, err
 		}
-		item.File = filepath.ToSlash(item.File)
+		item.File = canonicalStoredPath(item.File)
 		out = append(out, item)
 	}
 	return out, rows.Err()

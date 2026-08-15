@@ -135,8 +135,13 @@ func TestReindexUnbindsTestLinkWhenTargetSymbolDisappears(t *testing.T) {
 	if after.TargetFile != "helper.go" {
 		t.Fatalf("target_file_id lost: target file = %q, want helper.go", after.TargetFile)
 	}
-	if after.Reason != before.Reason || after.Score != before.Score {
-		t.Fatalf("test_link payload changed: %+v, want reason/score preserved from %+v", after, before)
+	// P22.2: with the symbol evidence gone, the surviving file relation is the
+	// filename-convention sibling, and the reason says so.
+	if after.Reason != "test_file_name_match" {
+		t.Fatalf("reason = %q, want test_file_name_match: %+v", after.Reason, after)
+	}
+	if after.Score != before.Score {
+		t.Fatalf("score changed: %+v, want preserved from %+v", after, before)
 	}
 	if targetID == 0 {
 		t.Fatalf("pre-removal target symbol id was 0")
@@ -244,12 +249,13 @@ func TestReindexTargetAndTestFileInOneBatch(t *testing.T) {
 
 	f.assertNoDanglingTestLinks()
 
-	// The row is rebuilt by the test file's own insert; the target no longer
-	// exists at all, so both target columns come back empty.
-	after := f.testLink("helper_test.go", "")
+	// The row is rebuilt by the test file's own insert; the target symbol no
+	// longer exists, and the file-level relation falls back to the sibling
+	// helper.go, which survives the batch (P22.2).
+	after := f.testLink("helper_test.go", "helper.go")
 	assertTargetUnbound(t, after)
-	if after.Reason != "test_name_match" {
-		t.Fatalf("reason = %q, want test_name_match: %+v", after.Reason, after)
+	if after.Reason != "test_file_name_match" {
+		t.Fatalf("reason = %q, want test_file_name_match: %+v", after.Reason, after)
 	}
 }
 
@@ -274,8 +280,11 @@ func TestReindexUnbindsMultipleTestLinksTargetingOneSymbol(t *testing.T) {
 	f.update()
 
 	f.assertNoDanglingTestLinks()
+	// helper_test.go keeps a file-level relation to helper.go (its sibling);
+	// extra_test.go has no sibling, so with the symbol evidence gone its file
+	// target clears too -- exactly what a fresh full index would produce (P22.2).
 	assertTargetUnbound(t, f.testLink("helper_test.go", "helper.go"))
-	assertTargetUnbound(t, f.testLink("extra_test.go", "helper.go"))
+	assertTargetUnbound(t, f.testLink("extra_test.go", ""))
 }
 
 // TestReindexUnbindsMultipleRemovedTargetsInOneBatch re-indexes two target

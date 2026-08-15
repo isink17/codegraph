@@ -199,6 +199,11 @@ func linkTestsGo(module string, pf *graph.ParsedFile) {
 		if sym.Kind != "function" || !strings.HasPrefix(sym.Name, "Test") {
 			continue
 		}
+		// TestMain is the harness hook (func TestMain(m *testing.M)); it tests
+		// nothing, and "Main" is a common exported production name.
+		if sym.Name == "TestMain" {
+			continue
+		}
 		target := strings.TrimPrefix(sym.Name, "Test")
 		if target == "" {
 			continue
@@ -215,7 +220,19 @@ func linkTestsGo(module string, pf *graph.ParsedFile) {
 }
 
 // linkTestsPython creates TestLinks for Python test functions.
+//
+// Python symbol stable keys scope to the defining file's module (its
+// basename), so a key minted with the *test* module (`func:test_utils::parse`)
+// can never match the production symbol (`func:utils::parse`). The target key
+// therefore strips the pytest/unittest filename affix from the module, which is
+// the same convention IsTestFilePath recognises. A test module with no affix
+// keeps its own name (an intra-file guess, the pre-P22.2 behaviour).
 func linkTestsPython(module string, pf *graph.ParsedFile) {
+	targetModule := strings.TrimPrefix(module, "test_")
+	targetModule = strings.TrimSuffix(targetModule, "_test")
+	if targetModule == "" {
+		targetModule = module
+	}
 	for _, sym := range pf.Symbols {
 		if sym.Kind != "function" || !strings.HasPrefix(sym.Name, "test_") {
 			continue
@@ -226,11 +243,11 @@ func linkTestsPython(module string, pf *graph.ParsedFile) {
 		}
 		pf.TestLinks = append(pf.TestLinks, graph.TestLink{
 			TestName:        sym.QualifiedName,
-			TargetName:      module + "." + target,
+			TargetName:      targetModule + "." + target,
 			Reason:          "test_name_match",
 			Score:           0.7,
 			TestSymbolKey:   sym.StableKey,
-			TargetStableKey: "func:" + module + "::" + target,
+			TargetStableKey: "func:" + targetModule + "::" + target,
 		})
 	}
 }

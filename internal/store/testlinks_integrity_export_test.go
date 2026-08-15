@@ -39,6 +39,23 @@ func (s *Store) CountDanglingTestLinkRefsForTest(ctx context.Context, repoID int
 	return n, err
 }
 
+// InsertLegacyTestLinkForTest writes a raw unbound test_links row declared by
+// the file at the given path, exactly as a pre-P22.2 producer would have --
+// including for files the shared test-file policy now rejects. Used by the
+// external store_test integration tests to simulate an upgraded database.
+func (s *Store) InsertLegacyTestLinkForTest(ctx context.Context, repoID int64, testFilePath, targetKey string) error {
+	var fileID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM files WHERE repo_id = ? AND path = ?`, repoID, testFilePath).Scan(&fileID); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score, target_stable_key)
+		VALUES(?, ?, NULL, NULL, NULL, 'test_name_match', 0.8, ?)
+	`, repoID, fileID, targetKey)
+	return err
+}
+
 // TestLinksForTest returns every test_links row in the repo, joined to file
 // paths, ordered for stable assertions.
 func (s *Store) TestLinksForTest(ctx context.Context, repoID int64) ([]TestLinkRow, error) {
@@ -60,6 +77,8 @@ func (s *Store) TestLinksForTest(ctx context.Context, repoID int64) ([]TestLinkR
 		if err := rows.Scan(&r.TestFile, &r.TargetFile, &r.TargetSymbolID, &r.Reason, &r.Score); err != nil {
 			return nil, err
 		}
+		r.TestFile = canonicalStoredPath(r.TestFile)
+		r.TargetFile = canonicalStoredPath(r.TargetFile)
 		out = append(out, r)
 	}
 	return out, rows.Err()
