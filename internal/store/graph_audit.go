@@ -33,10 +33,10 @@ import (
 // It is the only kind whose endpoints are expected to be in different
 // languages, and the only one not produced by a parser from a call site.
 //
-// The two INSERT statements in ResolveCrossLanguageLinks spell it inline inside
-// their SQL text; this constant names the same value for readers rather than
-// rewriting those statements, and edge_resolution_test.go pins the written
-// value.
+// ResolveCrossLanguageLinks binds this constant as a parameter on its single
+// insert and interpolates it into the graph-delete statements that retire these
+// rows, so the value has one definition; edge_resolution_test.go pins what is
+// actually written.
 const EdgeKindCrossLanguageRef = "cross_language_ref"
 
 // EdgeAuditExample identifies one violating edge. It carries identity only --

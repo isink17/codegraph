@@ -88,16 +88,20 @@ const (
 	// resolver_ambiguity.go, now visible instead of silent.
 	ResolutionStrategyBareTail = "bare_tail"
 
-	// ResolutionStrategyCrossLanguageSharedName: an explicit cross_language_ref
-	// edge created because two symbols in different languages share a bare name
-	// (length > 3, not in a stop-list). No call site asserted this link.
+	// ResolutionStrategyCrossLanguageSharedName: a cross_language_ref edge whose
+	// source file imports the destination's file across a language boundary, and
+	// whose source symbol shares its bare name with exactly one symbol in that
+	// imported file. The import bridge is the evidence; the shared name only
+	// picks which symbol inside the bridged file. A shared name without a bridge
+	// is coincidence and links nothing. See cross_language_links.go.
 	ResolutionStrategyCrossLanguageSharedName = "cross_language_shared_name"
 
-	// ResolutionStrategyCrossLanguageImportPath: an explicit cross_language_ref
-	// edge created because a file's import path matched another file's
-	// extension-stripped path in a different language, then every exported
-	// symbol pair across those two files was linked (capped at 50). No call
-	// site asserted this link either.
+	// ResolutionStrategyCrossLanguageImportPath: the same import bridge, where
+	// no name corresponds and the imported file holds exactly one link-eligible
+	// symbol, so the bridge alone leaves one candidate. Two candidates abstain.
+	//
+	// Neither strategy is asserted by a call site, which is why both sit in the
+	// lowest confidence tier.
 	ResolutionStrategyCrossLanguageImportPath = "cross_language_import_path"
 )
 
@@ -120,9 +124,9 @@ const (
 //	        but part of the identity was dropped to reach it.
 //
 //	low     The match came from a fuzzy or non-call predicate: the LIKE-based
-//	        dot_suffix fallback (case-insensitive, wildcard-permeable), or an
-//	        explicit cross-language link derived from name/import-path
-//	        coincidence rather than from any call site.
+//	        dot_suffix fallback (case-insensitive, wildcard-permeable), or a
+//	        cross-language link derived from a file-level import bridge rather
+//	        than from any call site.
 //
 // No tier means "wrong": every bind still had to be the unique language-compatible
 // candidate at its strategy's evidence level. The tier says how much of the
