@@ -27,8 +27,9 @@ package store
 //     because a single adapter owns those extensions -- that collapsing happens
 //     at parse time, not here.)
 //   - Explicit cross-language edges are out of scope: `ResolveCrossLanguageLinks`
-//     creates `cross_language_ref` edges from its own evidence and is unaffected
-//     by this gate.
+//     creates `cross_language_ref` edges from its own evidence -- a file-level
+//     import bridge, never a shared name on its own -- and is unaffected by this
+//     gate. See cross_language_links.go for what it accepts as evidence.
 //
 // Source language is read from `files.language` of the edge's own `file_id`;
 // destination language from `symbols.language`. Both are persisted canonical

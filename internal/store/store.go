@@ -1346,6 +1346,24 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 		return err
 	}
 
+	// Cross-language links are the exception to the unbind below: no call site
+	// asserted them, so an unbound one states nothing a later pass could use,
+	// and the implicit resolver -- which does not filter by edge_kind -- would
+	// rebind it to a same-language symbol, producing exactly the cross-language
+	// row with an implicit strategy the audit reports as a defect. Delete them
+	// instead; ResolveCrossLanguageLinks recreates the ones the import evidence
+	// still supports.
+	if err := execInChunks(
+		`DELETE FROM edges
+		WHERE repo_id = ? AND edge_kind = '`+EdgeKindCrossLanguageRef+`'
+		AND dst_symbol_id IN (SELECT id FROM symbols WHERE file_id IN (`,
+		`))`,
+		fileIDs,
+		repoID,
+	); err != nil {
+		return err
+	}
+
 	// Unbind inbound edges from other files before their destination symbols
 	// disappear, clearing the P4 provenance/confidence that described the now
 	// dead binding. The edge row itself (dst_name, kind, evidence) survives so a
@@ -1455,6 +1473,16 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM symbol_embeddings WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	// See deleteFileGraphsBatch: cross-language links are deleted rather than
+	// unbound, because an unbound one states nothing and would be rebound
+	// same-language by the implicit resolver.
+	if err := exec(`DELETE FROM edges
+		WHERE repo_id = ? AND edge_kind = '`+EdgeKindCrossLanguageRef+`'
+		AND dst_symbol_id IN (
+			SELECT id FROM symbols WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)
+		)`, repoID); err != nil {
 		return err
 	}
 	// See deleteFileGraphsBatch: unbind inbound edges (and clear their stale
@@ -6682,194 +6710,6 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 			"claude_sonnet_input": float64(contextTokens) * 3.0 / 1_000_000,
 		},
 	}, nil
-}
-
-// ResolveCrossLanguageLinks creates edges between symbols in different languages
-// that reference each other. It returns the total number of new edges created.
-func (s *Store) ResolveCrossLanguageLinks(ctx context.Context, repoID int64) (int, error) {
-	totalCreated := 0
-
-	// Strategy 1: Shared name matching across languages.
-	// Find symbols with identical names in different languages and create
-	// cross_language_ref edges, filtering out short/common names.
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT s1.id, s2.id, s1.name, s1.language, s2.language, s1.file_id, s2.file_id
-		FROM symbols s1
-		JOIN symbols s2 ON s1.name = s2.name AND s1.language != s2.language AND s1.repo_id = s2.repo_id
-		WHERE s1.repo_id = ?
-		AND s1.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
-		AND s2.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
-		AND length(s1.name) > 3
-		AND s1.name NOT IN ('main', 'init', 'new', 'get', 'set', 'run', 'start', 'stop', 'open', 'close', 'read', 'write', 'delete', 'update', 'create', 'test', 'setup', 'handle', 'process')
-		AND s1.id < s2.id
-	`, repoID)
-	if err != nil {
-		return 0, fmt.Errorf("cross-language shared name query: %w", err)
-	}
-	defer rows.Close()
-
-	type crossLink struct {
-		srcID   int64
-		dstID   int64
-		name    string
-		srcLang string
-		dstLang string
-		srcFile int64
-		dstFile int64
-	}
-	var links []crossLink
-	for rows.Next() {
-		var l crossLink
-		if err := rows.Scan(&l.srcID, &l.dstID, &l.name, &l.srcLang, &l.dstLang, &l.srcFile, &l.dstFile); err != nil {
-			return 0, fmt.Errorf("cross-language scan: %w", err)
-		}
-		links = append(links, l)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("cross-language rows: %w", err)
-	}
-
-	for _, l := range links {
-		evidence := "shared_name:" + l.srcLang + "→" + l.dstLang
-		// Check if this edge already exists to avoid duplicates.
-		var exists int
-		err := s.db.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM edges
-			WHERE repo_id = ? AND src_symbol_id = ? AND dst_symbol_id = ? AND edge_kind = 'cross_language_ref'
-		`, repoID, l.srcID, l.dstID).Scan(&exists)
-		if err != nil {
-			return totalCreated, fmt.Errorf("cross-language check existing: %w", err)
-		}
-		if exists > 0 {
-			continue
-		}
-		_, err = s.db.ExecContext(ctx, `
-			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line,
-			                  resolution_strategy, resolution_confidence)
-			VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0, ?, ?)
-		`, repoID, l.srcID, l.dstID, l.name, evidence, l.srcFile,
-			ResolutionStrategyCrossLanguageSharedName,
-			resolutionConfidenceFor(ResolutionStrategyCrossLanguageSharedName))
-		if err != nil {
-			return totalCreated, fmt.Errorf("cross-language insert: %w", err)
-		}
-		totalCreated++
-	}
-
-	// Strategy 2: Import-path based linking.
-	// Find file_imports that reference paths matching files in other languages,
-	// then link exported symbols between those files.
-	importRows, err := s.db.QueryContext(ctx, `
-		SELECT fi.file_id, fi.import_path, f.language
-		FROM file_imports fi
-		JOIN files f ON f.id = fi.file_id
-		WHERE f.repo_id = ? AND f.is_deleted = 0
-	`, repoID)
-	if err != nil {
-		return totalCreated, fmt.Errorf("cross-language imports query: %w", err)
-	}
-	defer importRows.Close()
-
-	type importInfo struct {
-		fileID     int64
-		importPath string
-		language   string
-	}
-	var imports []importInfo
-	for importRows.Next() {
-		var info importInfo
-		if err := importRows.Scan(&info.fileID, &info.importPath, &info.language); err != nil {
-			return totalCreated, fmt.Errorf("cross-language import scan: %w", err)
-		}
-		imports = append(imports, info)
-	}
-	if err := importRows.Err(); err != nil {
-		return totalCreated, fmt.Errorf("cross-language import rows: %w", err)
-	}
-
-	// Build a map of file paths (without extension) to file IDs and languages.
-	fileRows, err := s.db.QueryContext(ctx, `
-		SELECT id, path, language FROM files WHERE repo_id = ? AND is_deleted = 0
-	`, repoID)
-	if err != nil {
-		return totalCreated, fmt.Errorf("cross-language files query: %w", err)
-	}
-	defer fileRows.Close()
-
-	type fileInfo struct {
-		id       int64
-		language string
-	}
-	filesByBase := map[string][]fileInfo{}
-	for fileRows.Next() {
-		var id int64
-		var path, lang string
-		if err := fileRows.Scan(&id, &path, &lang); err != nil {
-			return totalCreated, fmt.Errorf("cross-language file scan: %w", err)
-		}
-		// Strip extension to get the base path for matching.
-		base := strings.TrimSuffix(path, filepath.Ext(path))
-		filesByBase[base] = append(filesByBase[base], fileInfo{id: id, language: lang})
-	}
-	if err := fileRows.Err(); err != nil {
-		return totalCreated, fmt.Errorf("cross-language file rows: %w", err)
-	}
-
-	for _, imp := range imports {
-		// Normalize import path: strip leading ./ or ../ prefixes and extensions.
-		normalized := imp.importPath
-		normalized = strings.TrimPrefix(normalized, "./")
-		normalized = strings.TrimPrefix(normalized, "../")
-		normalized = strings.TrimSuffix(normalized, filepath.Ext(normalized))
-
-		matches, ok := filesByBase[normalized]
-		if !ok {
-			continue
-		}
-		for _, match := range matches {
-			if match.language == imp.language {
-				continue // only cross-language links
-			}
-			// Link exported symbols from the importing file to the target file's symbols.
-			linkRows, err := s.db.QueryContext(ctx, `
-				SELECT src.id, dst.id, dst.name, src.file_id
-				FROM symbols src
-				JOIN symbols dst ON dst.file_id = ? AND src.repo_id = dst.repo_id
-				WHERE src.file_id = ? AND src.repo_id = ?
-				AND src.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
-				AND dst.kind IN ('function', 'method', 'class', 'type', 'struct', 'interface')
-				AND NOT EXISTS (
-					SELECT 1 FROM edges
-					WHERE repo_id = ? AND src_symbol_id = src.id AND dst_symbol_id = dst.id AND edge_kind = 'cross_language_ref'
-				)
-				LIMIT 50
-			`, match.id, imp.fileID, repoID, repoID)
-			if err != nil {
-				continue
-			}
-			for linkRows.Next() {
-				var srcID, dstID, srcFileID int64
-				var dstName string
-				if err := linkRows.Scan(&srcID, &dstID, &dstName, &srcFileID); err != nil {
-					continue
-				}
-				evidence := "import_path:" + imp.language + "→" + match.language
-				_, err = s.db.ExecContext(ctx, `
-					INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line,
-					                  resolution_strategy, resolution_confidence)
-					VALUES(?, ?, ?, ?, 'cross_language_ref', ?, ?, 0, ?, ?)
-				`, repoID, srcID, dstID, dstName, evidence, srcFileID,
-					ResolutionStrategyCrossLanguageImportPath,
-					resolutionConfidenceFor(ResolutionStrategyCrossLanguageImportPath))
-				if err == nil {
-					totalCreated++
-				}
-			}
-			linkRows.Close()
-		}
-	}
-
-	return totalCreated, nil
 }
 
 // --- Session Memory ---

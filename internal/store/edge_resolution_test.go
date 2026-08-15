@@ -465,20 +465,27 @@ func TestPurgeClearsResolutionMetadata(t *testing.T) {
 
 // TestCrossLanguageLinksCarryOwnProvenance covers the explicit cross-language
 // entrypoint, which creates already-bound rows rather than binding existing
-// ones. Its links come from name coincidence across languages, not from a call
-// site, so they get their own strategy values and the lowest tier -- they must
-// never be reported under an implicit-resolver strategy.
+// ones. Its links come from an import bridge rather than from a call site, so
+// they get their own strategy values and the lowest tier -- they must never be
+// reported under an implicit-resolver strategy.
 //
 // This is separate from the P2 rule that no *implicit* edge may cross a language
 // boundary; that rule is unchanged and covered by the gating tests.
 func TestCrossLanguageLinksCarryOwnProvenance(t *testing.T) {
 	f := newGateFixture(t)
 
-	// Shared-name strategy: same bare name, different languages.
+	// Shared-name strategy: the import bridge picks the file, the shared bare
+	// name picks the symbol inside it. The bridge is what makes the name
+	// evidence; see cross_language_links.go.
 	pyService := f.file(t, "src/py/service.py", "python")
 	f.symbol(t, pyService, "RenderReport", "service.RenderReport", "python")
 	tsService := f.file(t, "src/ts/service.ts", "typescript")
 	f.symbol(t, tsService, "RenderReport", "service.RenderReport", "typescript")
+	if _, err := f.store.db.ExecContext(f.ctx,
+		`INSERT INTO file_imports(repo_id, file_id, import_path) VALUES(?, ?, '../py/service')`,
+		f.repoID, tsService); err != nil {
+		t.Fatalf("insert file_import error = %v", err)
+	}
 
 	// Import-path strategy: a TS file importing a path whose extension-stripped
 	// form matches a Python file. The symbol names differ, so only the
