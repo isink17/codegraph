@@ -3264,19 +3264,19 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	uniquePaths := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		if path == "" {
+		scopePath := CanonicalRelPath(path)
+		if scopePath == "" {
 			continue
 		}
-		scopePath := strings.ReplaceAll(path, "\\", "/")
 		if _, ok := seenPaths[scopePath]; ok {
 			continue
 		}
 		seenPaths[scopePath] = struct{}{}
-		uniquePaths = append(uniquePaths, path)
+		uniquePaths = append(uniquePaths, scopePath)
 	}
 	modulePaths := make(map[string]struct{}, len(uniquePaths))
 	for _, path := range uniquePaths {
-		modulePaths[strings.ReplaceAll(path, "\\", "/")] = struct{}{}
+		modulePaths[path] = struct{}{}
 	}
 	var err error
 	if moduleVeto == nil {
@@ -3288,18 +3288,26 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 
 	const chunkSize = 400
 	fileIDs := make([]int64, 0, len(uniquePaths))
+	wantedPaths := make(map[string]struct{}, len(uniquePaths))
+	storedPaths := make([]string, 0, len(uniquePaths)*3)
+	for _, filePath := range uniquePaths {
+		canonical := filePath
+		wantedPaths[canonical] = struct{}{}
+		storedPaths = append(storedPaths, storedPathVariants(canonical)...)
+	}
+	seenFileIDs := make(map[int64]struct{}, len(uniquePaths))
 	// Source language per file is read once here (no per-edge lookup) and carried
 	// into resolveEdgeTargets, which applies the shared language gate.
 	languageByFileID := make(map[int64]string, len(uniquePaths))
-	for start := 0; start < len(uniquePaths); start += chunkSize {
-		end := min(start+chunkSize, len(uniquePaths))
-		chunk := uniquePaths[start:end]
+	for start := 0; start < len(storedPaths); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(storedPaths))
+		chunk := storedPaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id, language FROM files WHERE repo_id = ? AND replace(path, '\\', '/') IN (` + placeholders + `)`
+		query := `SELECT id, path, language FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
-		for _, path := range chunk {
-			args = append(args, strings.ReplaceAll(path, "\\", "/"))
+		for _, storedPath := range chunk {
+			args = append(args, storedPath)
 		}
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -3307,11 +3315,19 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		}
 		for rows.Next() {
 			var id int64
+			var storedPath string
 			var language string
-			if err := rows.Scan(&id, &language); err != nil {
+			if err := rows.Scan(&id, &storedPath, &language); err != nil {
 				_ = rows.Close()
 				return err
 			}
+			if _, ok := wantedPaths[canonicalStoredPath(storedPath)]; !ok {
+				continue
+			}
+			if _, ok := seenFileIDs[id]; ok {
+				continue
+			}
+			seenFileIDs[id] = struct{}{}
 			fileIDs = append(fileIDs, id)
 			languageByFileID[id] = language
 		}

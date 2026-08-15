@@ -73,7 +73,7 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 	}
 	byKey := map[string][]edgeFact{}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.id, e.dst_name, fi.import_path, replace(sf.path, '\\', '/')
+		SELECT e.id, e.dst_name, fi.import_path, sf.path
 		FROM edges e
 		JOIN files sf ON sf.id = e.file_id AND sf.repo_id = e.repo_id
 		JOIN file_imports fi ON fi.file_id = sf.id AND fi.repo_id = e.repo_id
@@ -90,6 +90,7 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		if err := rows.Scan(&id, &dst, &imported, &sourcePath); err != nil {
 			return 0, blocked, err
 		}
+		sourcePath = canonicalStoredPath(sourcePath)
 		dot := strings.LastIndexByte(dst, '.')
 		if dot <= 0 || dot == len(dst)-1 || dst[:dot] != imported {
 			continue
@@ -150,7 +151,7 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 	type candidate struct{ id int64 }
 	candidates := map[string][]candidate{}
 	rows, err = tx.QueryContext(ctx, `
-		SELECT t.package_dir, t.name, s.id, replace(f.path, '\\', '/')
+		SELECT t.package_dir, t.name, s.id, f.path
 		FROM tmp_resolver_own_module_targets t
 		JOIN files f ON f.repo_id = ? AND f.is_deleted = 0
 		JOIN symbols s ON s.repo_id = ? AND s.file_id = f.id AND s.name = t.name
@@ -168,6 +169,7 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		if err := rows.Scan(&dir, &name, &id, &filePath); err != nil {
 			return 0, blocked, err
 		}
+		filePath = canonicalStoredPath(filePath)
 		if path.Dir(filePath) != dir || IsTestFilePath(filePath) {
 			continue
 		}

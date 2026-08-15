@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
@@ -60,6 +61,103 @@ func TestResolveEdgesOwnModuleImportUsesPackageEvidence(t *testing.T) {
 	}
 	if !got.Valid || got.Int64 != target || strategy != ResolutionStrategyModuleImport {
 		t.Fatalf("resolution = (%v, %d, %q), want (%v, %d, %q)", got.Valid, got.Int64, strategy, true, target, ResolutionStrategyModuleImport)
+	}
+}
+
+func TestResolveEdgesOwnModuleImportPersistedPathSeparators(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		source string
+		target string
+	}{
+		{name: "slash slash", source: "cmd/main.go", target: "pkg/target.go"},
+		{name: "backslash backslash", source: `cmd\main.go`, target: `pkg\target.go`},
+		{name: "backslash slash", source: `cmd\main.go`, target: "pkg/target.go"},
+		{name: "slash backslash", source: "cmd/main.go", target: `pkg\target.go`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, entrypoint := range []string{"full", "paths", "names"} {
+				t.Run(entrypoint, func(t *testing.T) {
+					root := t.TempDir()
+					if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/project\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer s.Close()
+					repo, err := s.UpsertRepo(ctx, root)
+					if err != nil {
+						t.Fatal(err)
+					}
+					targetFile, err := insertTestFileLang(ctx, s, repo.ID, tc.target, "go")
+					if err != nil {
+						t.Fatal(err)
+					}
+					target, err := insertTestSymbolKind(ctx, s, repo.ID, targetFile, "New", "pkg.New", "function", "pkg", "go")
+					if err != nil {
+						t.Fatal(err)
+					}
+					otherPath := strings.Replace(tc.target, "pkg", "other", 1)
+					otherFile, err := insertTestFileLang(ctx, s, repo.ID, otherPath, "go")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := insertTestSymbolKind(ctx, s, repo.ID, otherFile, "New", "other.New", "function", "other", "go"); err != nil {
+						t.Fatal(err)
+					}
+					sourceFile, err := insertTestFileLang(ctx, s, repo.ID, tc.source, "go")
+					if err != nil {
+						t.Fatal(err)
+					}
+					source, err := insertTestSymbolKind(ctx, s, repo.ID, sourceFile, "main", "main", "function", "", "go")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := s.db.ExecContext(ctx, `INSERT INTO file_imports(repo_id, file_id, import_path) VALUES (?, ?, ?)`, repo.ID, sourceFile, "example.com/project/pkg"); err != nil {
+						t.Fatal(err)
+					}
+					edge, err := insertTestEdge(ctx, s, repo.ID, sourceFile, source, "example.com/project/pkg.New")
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					switch entrypoint {
+					case "full":
+						if _, err := s.ResolveEdges(ctx, repo.ID); err != nil {
+							t.Fatal(err)
+						}
+					case "paths":
+						if err := s.ResolveEdgesForPaths(ctx, repo.ID, []string{"cmd/main.go"}); err != nil {
+							t.Fatal(err)
+						}
+					case "names":
+						if _, err := s.ResolveEdgesForNames(ctx, repo.ID, []string{"New"}); err != nil {
+							t.Fatal(err)
+						}
+					}
+
+					var gotID sql.NullInt64
+					var strategy, confidence string
+					if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id, resolution_strategy, resolution_confidence FROM edges WHERE id = ?`, edge).Scan(&gotID, &strategy, &confidence); err != nil {
+						t.Fatal(err)
+					}
+					if !gotID.Valid || gotID.Int64 != target || strategy != ResolutionStrategyModuleImport || confidence != ResolutionConfidenceHigh {
+						t.Fatalf("%s resolution = (%v, %d, %q, %q), want (%v, %d, %q, %q)", entrypoint, gotID.Valid, gotID.Int64, strategy, confidence, true, target, ResolutionStrategyModuleImport, ResolutionConfidenceHigh)
+					}
+					callees, err := s.FindCallees(ctx, repo.ID, "main", 0, 20, 0)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(callees) != 1 || callees[0].QualifiedName != "pkg.New" {
+						t.Fatalf("%s callees = %v, want exactly pkg.New", entrypoint, callees)
+					}
+				})
+			}
+		})
 	}
 }
 
