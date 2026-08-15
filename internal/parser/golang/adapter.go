@@ -368,6 +368,11 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 		if sym.Kind != "function" || !strings.HasPrefix(sym.Name, "Test") {
 			continue
 		}
+		// TestMain is the harness hook (func TestMain(m *testing.M)); it tests
+		// nothing, and "Main" is a common exported production name.
+		if sym.Name == "TestMain" {
+			continue
+		}
 		target := strings.TrimPrefix(sym.Name, "Test")
 		if target == "" {
 			continue

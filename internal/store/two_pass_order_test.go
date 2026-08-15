@@ -208,9 +208,11 @@ func TestTwoPass_TestLinkAndEdgeAcrossEveryOrder(t *testing.T) {
 
 // TestTwoPass_AmbiguousTargetUnresolvedInEveryOrder is case E: two directories
 // declare the same Go package and the same function, so neither definition is
-// evidence. The point is not only that it stays unresolved but that it stays
-// unresolved *identically* in every order -- an order-sensitive resolver would
-// have bound whichever definition happened to be persisted first.
+// symbol evidence. The point is not only that the symbol stays unresolved but
+// that it stays unresolved *identically* in every order -- an order-sensitive
+// resolver would have bound whichever definition happened to be persisted
+// first. P22.2: the test file's own sibling still supplies the file-level
+// relation, which must be equally order-independent.
 func TestTwoPass_AmbiguousTargetUnresolvedInEveryOrder(t *testing.T) {
 	files := []orderFile{
 		{path: "a/helper.go", src: orderHelperSrc},
@@ -220,7 +222,7 @@ func TestTwoPass_AmbiguousTargetUnresolvedInEveryOrder(t *testing.T) {
 
 	snapshot := assertOrderIndependent(t, files)
 	requireLine(t, snapshot,
-		`testlink a/helper_test.go:pkg.TestHelper -> "func:pkg::Helper" => : [test_name_match/0.80]`)
+		`testlink a/helper_test.go:pkg.TestHelper -> "func:pkg::Helper" => a/helper.go: [test_file_name_match/0.80]`)
 }
 
 // TestTwoPass_ProductionTargetPreferredOverTestShadowInEveryOrder is case F:
