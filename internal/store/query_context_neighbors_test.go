@@ -175,12 +175,15 @@ func TestContextNeighborsBlocksShortAndSuffixEvidenceForAmbiguousName(t *testing
 	}
 }
 
-// A short name only one symbol carries keeps the full pre-P19 recall.
+// A short name only one symbol carries keeps the bare-name recall, and a
+// spelling that extends the seed's identity at a boundary keeps the suffix
+// recall. (`pkg.Settle` -- a foreign qualifier -- would have matched before
+// P22.1; it is exactly the `rows.Close` fabrication and stays out now.)
 func TestContextNeighborsKeepsShortAndSuffixRecallForUniqueName(t *testing.T) {
 	fx := newAmbiguityFixture(t)
 	fx.resolvedEdge(t, "caller.SettleResolved", "unique.Settle")
 	fx.unresolvedEdge(t, "caller.SettleShort", "Settle")
-	fx.unresolvedEdge(t, "caller.SettleSuffix", "pkg.Settle")
+	fx.unresolvedEdge(t, "caller.SettleSuffix", "x.unique.Settle")
 
 	got, err := fx.store.FindContextNeighbors(context.Background(), fx.repoID,
 		[]ContextSeed{fx.seed("unique.Settle", true)}, 10)
@@ -200,7 +203,7 @@ func TestContextNeighborsMatchesPublicFindCallers(t *testing.T) {
 	fx := newAmbiguityFixture(t)
 	fx.resolvedEdge(t, "caller.SettleResolved", "unique.Settle")
 	fx.unresolvedEdge(t, "caller.SettleShort", "Settle")
-	fx.unresolvedEdge(t, "caller.SettleSuffix", "pkg.Settle")
+	fx.unresolvedEdge(t, "caller.SettleSuffix", "x.unique.Settle")
 	ctx := context.Background()
 
 	want, err := fx.store.FindCallers(ctx, fx.repoID, "unique.Settle", fx.sym["unique.Settle"], 10, 0)

@@ -211,9 +211,9 @@ func TestContextNeighborsSplitOversizedSeedEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insertTestSymbol() error = %v", err)
 	}
-	// 600 distinct unresolved destination names, all suffix matches for
-	// "Widget", each from its own caller. 600 name pairs is well past
-	// contextStatementVarBudget/2.
+	// 600 distinct unresolved destination names, all extending the seed's
+	// identity "pkg.Widget" at a boundary, each from its own caller. 600 name
+	// pairs is well past contextStatementVarBudget/2.
 	const callers = 600
 	for i := range callers {
 		cid, err := insertTestSymbol(ctx, s, repo.ID, fileID,
@@ -224,7 +224,7 @@ func TestContextNeighborsSplitOversizedSeedEvidence(t *testing.T) {
 		if _, err := s.db.ExecContext(ctx, `
 			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
 			VALUES(?, ?, NULL, ?, 'call', '', ?, 1)
-		`, repo.ID, cid, fmt.Sprintf("mod%03d.Widget", i), fileID); err != nil {
+		`, repo.ID, cid, fmt.Sprintf("mod%03d.pkg.Widget", i), fileID); err != nil {
 			t.Fatalf("insert edge error = %v", err)
 		}
 	}

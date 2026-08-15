@@ -168,7 +168,7 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 	// Exact evidence first: the qualified name is unambiguous by construction,
 	// and the bare short name is admitted only where the caller vouched for it.
 	var names []namePair
-	shortsByIdx := map[int]string{}
+	qnamesByIdx := map[int]string{}
 	for _, i := range live {
 		sd := seeds[i]
 		if sd.QualifiedName != "" {
@@ -180,24 +180,31 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 		if sd.ShortName != sd.QualifiedName {
 			names = append(names, namePair{idx: i, name: sd.ShortName})
 		}
-		shortsByIdx[i] = sd.ShortName
+		// Qualified-suffix spellings of the seed's identity (`App.Close` for
+		// cli.App.Close) are a finite set, so they join the equality legs
+		// directly rather than being fished out of a scan.
+		for _, spelling := range boundaryProperSuffixes(sd.QualifiedName) {
+			if spelling != sd.QualifiedName && spelling != sd.ShortName {
+				names = append(names, namePair{idx: i, name: spelling})
+			}
+		}
+		qnamesByIdx[i] = sd.QualifiedName
 	}
 
-	// Suffix evidence. One scan of the distinct unresolved destination names
-	// serves every seed that asked for it; the per-name patterns are evaluated
-	// in Go by the same matcher the batched name cascade uses, so the matched
-	// set is identical to the two LIKEs the per-seed query ran.
+	// Extension evidence: unresolved spellings that extend the seed's identity
+	// at a separator boundary (`x.cli.App.Close`, `path/to/pkg.Func`). One scan
+	// of the distinct unresolved destination names serves every seed that asked
+	// for it, mirroring the escaped-LIKE legs FindCallers runs. Before P22.1
+	// this leg matched `%.` + bare short instead, which handed every seed named
+	// Close the callers of every other Close in the repository.
 	//
-	// Note what this trades. The per-seed query expressed the suffix as one
-	// LIKE; here each matching destination name becomes a bound variable, so a
-	// seed's evidence -- and therefore the number of page statements -- scales
-	// with how many unresolved names end in its short name, not with the seed
-	// count. It is not capped, because capping would drop candidates the public
-	// query would have considered and silently change which neighbours win the
-	// page. What bounds it in practice is the gate above it: AllowShortEvidence
-	// is only set for a short name exactly one symbol in the repository carries,
-	// which is not the shape that attracts hundreds of unresolved spellings.
-	suffix, err := s.suffixMatchedDstNames(ctx, repoID, shortsByIdx)
+	// Note what this trades. The per-seed query expressed the match as LIKEs;
+	// here each matching destination name becomes a bound variable, so a seed's
+	// evidence -- and therefore the number of page statements -- scales with how
+	// many unresolved spellings extend its identity, not with the seed count.
+	// It is not capped, because capping would drop candidates the public query
+	// would have considered and silently change which neighbours win the page.
+	suffix, err := s.extendingDstNames(ctx, repoID, qnamesByIdx)
 	if err != nil {
 		return err
 	}
@@ -271,31 +278,17 @@ func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []
 	})
 }
 
-// suffixMatchedDstNames returns, per seed, the unresolved destination names
-// whose value ends in that seed's short name after a "." or a "::".
+// extendingDstNames returns, per seed, the unresolved destination names that
+// extend that seed's qualified identity at a '.', "::" or '/' boundary,
+// ASCII-case-insensitively (the folding the escaped LIKE legs in FindCallers
+// apply).
 //
-// One DISTINCT scan for the whole batch. The pre-P19 shape ran the equivalent
-// LIKE pair inside the per-seed caller query, so the scan count tracked the
-// seed count; the matching itself is unchanged, and deliberately reuses
-// suffixMatcher so the two paths cannot drift apart in their handling of
-// LIKE's '_' and '%' metacharacters or its ASCII case folding.
-func (s *Store) suffixMatchedDstNames(ctx context.Context, repoID int64, shortsByIdx map[int]string) ([]namePair, error) {
-	if len(shortsByIdx) == 0 {
+// One DISTINCT scan for the whole batch, matched per seed in Go, so the scan
+// count stays independent of the seed count.
+func (s *Store) extendingDstNames(ctx context.Context, repoID int64, qnamesByIdx map[int]string) ([]namePair, error) {
+	if len(qnamesByIdx) == 0 {
 		return nil, nil
 	}
-	idxByShort := map[string][]int{}
-	var shorts []string
-	for idx, short := range shortsByIdx {
-		if len(idxByShort[short]) == 0 {
-			shorts = append(shorts, short)
-		}
-		idxByShort[short] = append(idxByShort[short], idx)
-	}
-	matcher := newSuffixMatcher(shorts)
-	if matcher.empty() {
-		return nil, nil
-	}
-
 	rows, err := s.neighborQuery(ctx, `
 		SELECT DISTINCT e.dst_name
 		FROM edges e
@@ -306,25 +299,31 @@ func (s *Store) suffixMatchedDstNames(ctx context.Context, repoID int64, shortsB
 	}
 	defer rows.Close()
 
+	// Deterministic seed order per matched name, so the emitted namePair order
+	// cannot depend on map iteration. Seed identities are folded once up
+	// front and each scanned row once, not once per (row, seed) pair.
+	idxs := make([]int, 0, len(qnamesByIdx))
+	for idx := range qnamesByIdx {
+		idxs = append(idxs, idx)
+	}
+	sort.Ints(idxs)
+	foldedByIdx := make(map[int]string, len(qnamesByIdx))
+	for idx, qname := range qnamesByIdx {
+		foldedByIdx[idx] = asciiLower(qname)
+	}
+
 	var out []namePair
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
-		// A name can match one seed through both separators; emit it once per
-		// seed. The page query's UNION would collapse the duplicate anyway, but
-		// not binding it twice keeps the variable count honest.
-		emitted := map[int]bool{}
-		matcher.match(asciiLower(name), func(short string) {
-			for _, idx := range idxByShort[short] {
-				if emitted[idx] {
-					continue
-				}
-				emitted[idx] = true
+		d := asciiLower(name)
+		for _, idx := range idxs {
+			if prefoldedExtendsAtBoundary(d, foldedByIdx[idx]) {
 				out = append(out, namePair{idx: idx, name: name})
 			}
-		})
+		}
 	}
 	return out, rows.Err()
 }
