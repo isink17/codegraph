@@ -109,6 +109,10 @@ const (
 	// Neither strategy is asserted by a call site, which is why both sit in the
 	// lowest confidence tier.
 	ResolutionStrategyCrossLanguageImportPath = "cross_language_import_path"
+
+	// ResolutionStrategyModuleImport binds a Go package-qualified edge after
+	// the source file import, declared module, and exact package directory agree.
+	ResolutionStrategyModuleImport = "module_import"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -159,6 +163,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyDotSuffix:               ResolutionConfidenceLow,
 	ResolutionStrategyCrossLanguageSharedName: ResolutionConfidenceLow,
 	ResolutionStrategyCrossLanguageImportPath: ResolutionConfidenceLow,
+	ResolutionStrategyModuleImport:            ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.

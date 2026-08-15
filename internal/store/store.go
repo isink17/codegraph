@@ -2566,6 +2566,14 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+		return 0, err
+	}
+	if n, err := s.resolveOwnModuleImports(ctx, tx, repoID); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	// Temp DDL is transactional in SQLite, so a rollback already discards these
 	// tables. The explicit drop before the commit below is what keeps populated
 	// tables off the pooled connection on the success path; this defer only
@@ -2577,6 +2585,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		}
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_targets`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_resolution`)
 	}()
 
 	// Strategy 1: Exact qualified name match.
@@ -2722,6 +2733,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable); err != nil {
 		return 0, err
 	}
+	_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
+	_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_targets`)
+	_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_resolution`)
 	vetoDropped = true
 
 	if err := tx.Commit(); err != nil {
@@ -3229,6 +3243,9 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if len(paths) == 0 {
 		return nil
 	}
+	if err := s.resolveOwnModuleImportsStandalone(ctx, repoID); err != nil {
+		return err
+	}
 	uniquePaths := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
@@ -3342,6 +3359,9 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		return stats, nil
 	}
 	stats.NamesUnique = len(unique)
+	if err := s.resolveOwnModuleImportsStandalone(ctx, repoID); err != nil {
+		return stats, err
+	}
 
 	// Candidate selection:
 	//
