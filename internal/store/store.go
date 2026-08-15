@@ -1,6 +1,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -1517,6 +1518,10 @@ func insertParsedFileGraph(
 	stats *WriteStats,
 ) error {
 	stableToID := make(map[string]int64, len(parsed.Symbols))
+	// symbolIDs[i] is the persisted id of parsed.Symbols[i]. Unlike stableToID
+	// it survives colliding stable keys, so edge attribution can name the exact
+	// declaration a call sits in.
+	symbolIDs := make([]int64, len(parsed.Symbols))
 	symbolTokenArgs := make([]any, 0, sqliteTokenValuesBatchRows*3)
 	symbolTokenWeights := make(map[string]float64, 64)
 	symbolFTSArgs := make([]any, 0, min(len(parsed.Symbols), sqliteSymbolFTSValuesBatchRows)*6)
@@ -1530,12 +1535,13 @@ func insertParsedFileGraph(
 		if err != nil {
 			return err
 		}
-		for _, sym := range batch {
-			symbolID, ok := batchStableToID[sym.StableKey]
+		for i, sym := range batch {
+			symbolID, ok := batchStableToID[symbolKeyOf(sym)]
 			if !ok || symbolID == 0 {
-				return fmt.Errorf("missing inserted id for stable_key=%q", sym.StableKey)
+				return fmt.Errorf("missing inserted id for stable_key=%q at %d:%d", sym.StableKey, sym.Range.StartLine, sym.Range.StartCol)
 			}
 			stableToID[sym.StableKey] = symbolID
+			symbolIDs[start+i] = symbolID
 			symbolFTSArgs = append(symbolFTSArgs, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
 			if len(symbolFTSArgs) >= sqliteSymbolFTSValuesBatchRows*6 {
 				if err := execSymbolFTSInsert(ctx, tx, symbolFTSArgs, stats); err != nil {
@@ -1615,7 +1621,7 @@ func insertParsedFileGraph(
 	}
 
 	if len(parsed.Edges) > 0 {
-		srcChooser := newSrcSymbolChooser(stableToID, parsed.Symbols)
+		srcChooser := newSrcSymbolChooser(symbolIDs, parsed.Symbols)
 		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*7)
 		for _, edge := range parsed.Edges {
 			srcID := srcChooser.Choose(edge.Line)
@@ -1705,9 +1711,28 @@ func insertParsedFileGraph(
 	return nil
 }
 
-func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID int64, symbols []graph.Symbol, stats *WriteStats) (map[string]int64, error) {
+// symbolRowKey identifies one inserted symbol row.
+//
+// stable_key alone is not enough: several adapters scope it to the module and
+// omit the signature, so `func:java:Calc:add` names every overload of `add` and
+// `func:typescript:http:request` names both a top-level `request` and a
+// `Agent.request` method. Those are separate rows in `symbols` — there is no
+// unique constraint on stable_key — and keying only by stable_key would discard
+// all but one of their ids. Adding the declaration's start position separates
+// them, so every symbol keeps the id of its own row.
+type symbolRowKey struct {
+	stableKey string
+	startLine int
+	startCol  int
+}
+
+func symbolKeyOf(sym graph.Symbol) symbolRowKey {
+	return symbolRowKey{stableKey: sym.StableKey, startLine: sym.Range.StartLine, startCol: sym.Range.StartCol}
+}
+
+func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID int64, symbols []graph.Symbol, stats *WriteStats) (map[symbolRowKey]int64, error) {
 	if len(symbols) == 0 {
-		return map[string]int64{}, nil
+		return map[symbolRowKey]int64{}, nil
 	}
 
 	args := make([]any, len(symbols)*18)
@@ -1740,15 +1765,15 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 	}
 	defer rows.Close()
 
-	out := make(map[string]int64, len(symbols))
+	out := make(map[symbolRowKey]int64, len(symbols))
 	rowCount := 0
 	for rows.Next() {
 		var id int64
-		var stableKey string
-		if err := rows.Scan(&id, &stableKey); err != nil {
+		var key symbolRowKey
+		if err := rows.Scan(&id, &key.stableKey, &key.startLine, &key.startCol); err != nil {
 			return nil, err
 		}
-		out[stableKey] = id
+		out[key] = id
 		rowCount++
 	}
 	if err := rows.Err(); err != nil {
@@ -1777,7 +1802,7 @@ func symbolInsertSQL(n int) string {
 	}
 	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2, dot_tail3) VALUES "
 	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-	const suffix = " RETURNING id, stable_key"
+	const suffix = " RETURNING id, stable_key, start_line, start_col"
 
 	var b strings.Builder
 	b.Grow(len(prefix) + n*(len(row)+1) + len(suffix))
@@ -1967,6 +1992,25 @@ func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 
 	return 0
 }
 
+// ownsSourceEdges reports whether a symbol kind is a code-bearing declaration
+// whose body can contain the calls and references recorded as edges, and which
+// may therefore be an edge's source symbol.
+//
+// Only "function" and "method" qualify. Every adapter emits one of those two
+// for free functions, methods, constructors and accessors: most languages fold
+// methods into "function" (both Go adapters, java, kotlin, csharp, ruby, php,
+// cpp, rust, swift, and the non-cgo heuristic fallback), while the TypeScript
+// and tree-sitter Python adapters emit "method". Every other kind the parsers
+// can produce ("class", "type", "struct", "interface", "enum", "trait",
+// "protocol", "actor", "object", "value") is a container or a declaration with
+// no body of its own, and must never absorb a call made inside a member.
+//
+// This is deliberately narrower than a general "is callable" test: it answers
+// only "can a reference at this line belong to this symbol's body?".
+func ownsSourceEdges(kind string) bool {
+	return kind == "function" || kind == "method"
+}
+
 type funcSpan struct {
 	start int
 	end   int
@@ -1974,14 +2018,21 @@ type funcSpan struct {
 }
 
 type srcSymbolChooser struct {
-	spans     []funcSpan
-	fallback  int64
-	monotonic bool
+	// spans holds every source-edge-owning symbol in the file, ordered by
+	// start line ascending and, within one start line, by end line
+	// descending. Choose relies on that order.
+	spans []funcSpan
+	// fallback owns references that sit inside no span at all. It is a
+	// top-level body owner, never a method: a module-level statement does not
+	// belong to some arbitrary method of some arbitrary class.
+	fallback int64
 }
 
-func newSrcSymbolChooser(stableToID map[string]int64, symbols []graph.Symbol) srcSymbolChooser {
-	// Pre-size to the upper bound of function symbols (capped to keep the
-	// allocation small for files with many non-function symbols). Avoids
+// newSrcSymbolChooser indexes a file's body-owning symbols by position.
+// symbolIDs[i] must be the persisted id of symbols[i].
+func newSrcSymbolChooser(symbolIDs []int64, symbols []graph.Symbol) srcSymbolChooser {
+	// Pre-size to the upper bound of body-owning symbols (capped to keep the
+	// allocation small for files with many container symbols). Avoids
 	// the 16->32->64 doubling sequence for files with >16 functions.
 	capHint := len(symbols)
 	if capHint > 64 {
@@ -1991,54 +2042,123 @@ func newSrcSymbolChooser(stableToID map[string]int64, symbols []graph.Symbol) sr
 		capHint = 8
 	}
 	out := srcSymbolChooser{
-		spans:     make([]funcSpan, 0, capHint),
-		monotonic: true,
+		spans: make([]funcSpan, 0, capHint),
 	}
-	lastStart := -1
-	for _, sym := range symbols {
-		if sym.Kind != "function" {
+	sorted := true
+	fallbackStart := 0
+	for i, sym := range symbols {
+		if !ownsSourceEdges(sym.Kind) {
 			continue
 		}
-		id := stableToID[sym.StableKey]
+		if i >= len(symbolIDs) {
+			break
+		}
+		id := symbolIDs[i]
 		if id == 0 {
 			continue
 		}
-		if out.fallback == 0 {
+		span := funcSpan{start: sym.Range.StartLine, end: sym.Range.EndLine, id: id}
+		if n := len(out.spans); sorted && n > 0 && spanLess(span, out.spans[n-1]) {
+			sorted = false
+		}
+		out.spans = append(out.spans, span)
+		// Only a top-level body owner may be the fallback. Master used the
+		// first symbol of kind "function"; keeping that pool unchanged means
+		// this fix never invents an edge for code that belongs to no body.
+		// Adapters that fold methods into "function" (Go among them) behave
+		// exactly as before.
+		if sym.Kind == "function" && (out.fallback == 0 || sym.Range.StartLine < fallbackStart) {
 			out.fallback = id
+			fallbackStart = sym.Range.StartLine
 		}
-		start := sym.Range.StartLine
-		if start < lastStart {
-			out.monotonic = false
-		}
-		lastStart = start
-		out.spans = append(out.spans, funcSpan{start: start, end: sym.Range.EndLine, id: id})
+	}
+	// Adapters emit symbols in AST-walk order, which is not always sorted by
+	// position (the Go adapters emit methods after top-level declarations).
+	// Sorting here makes Choose independent of emission order, so the same
+	// semantic file always yields the same source attribution.
+	if !sorted {
+		slices.SortFunc(out.spans, compareSpans)
 	}
 	return out
 }
 
+// spanLess orders spans by start line ascending, then by end line descending,
+// so that within one start line the innermost (shortest) span sorts last.
+func spanLess(a, b funcSpan) bool {
+	if a.start != b.start {
+		return a.start < b.start
+	}
+	return a.end > b.end
+}
+
+// compareSpans is spanLess as a three-way comparison, for slices.SortFunc.
+// It compares rather than subtracts so the result cannot depend on the range
+// of the line numbers involved.
+func compareSpans(a, b funcSpan) int {
+	if a.start != b.start {
+		return cmp.Compare(a.start, b.start)
+	}
+	return cmp.Compare(b.end, a.end)
+}
+
+// Choose returns the id of the innermost body-owning symbol containing line.
+//
+// "Innermost" means the greatest start line that still contains the line and,
+// among spans sharing that start line, the smallest end line.
+//
+// If two different symbols claim exactly the same span there is nothing left to
+// separate them, because edges carry a line but no column. Choose then keeps
+// looking outward for an owner it can name — an enclosing body genuinely
+// contains the line, even if it is coarser — and returns 0 if there is none,
+// rather than naming a symbol that does not contain the line at all.
+//
+// When no span contains the line — a top-level or file-scope reference — it
+// returns the file's fallback symbol, preserving the existing behaviour for
+// those edges rather than dropping them.
 func (c srcSymbolChooser) Choose(line int) int64 {
 	if len(c.spans) == 0 {
 		return 0
 	}
-	if !c.monotonic {
-		for _, span := range c.spans {
-			if line >= span.start && line <= span.end {
-				return span.id
-			}
-		}
-		return c.fallback
-	}
 	i := sort.Search(len(c.spans), func(i int) bool { return c.spans[i].start > line }) - 1
-	if i < 0 {
-		return c.fallback
-	}
-	// Spans are monotonic by start line, but can be nested/overlapping.
-	// Scan backward from the last start<=line and return the most-specific match.
+	// Spans are ordered by start line but can be nested or overlapping. Scan
+	// backward from the last start<=line: the first containing span found has
+	// the greatest start line and, within that start line, the smallest end.
+	tiedSomewhere := false
 	for j := i; j >= 0; j-- {
 		span := c.spans[j]
-		if line >= span.start && line <= span.end {
-			return span.id
+		if line < span.start || line > span.end {
+			continue
 		}
+		// Spans covering exactly these lines are contiguous under spanLess.
+		// Take the whole group rather than just the neighbour, so the answer
+		// cannot depend on the order equal spans happen to sit in. One
+		// declaration emitted twice shares an id and is not an ambiguity; two
+		// declarations on one span are.
+		lo, hi := j, j
+		for lo > 0 && c.spans[lo-1].start == span.start && c.spans[lo-1].end == span.end {
+			lo--
+		}
+		for hi+1 < len(c.spans) && c.spans[hi+1].start == span.start && c.spans[hi+1].end == span.end {
+			hi++
+		}
+		tied := false
+		for k := lo; k <= hi; k++ {
+			if c.spans[k].id != span.id {
+				tied = true
+				break
+			}
+		}
+		if tied {
+			tiedSomewhere = true
+			j = lo
+			continue
+		}
+		return span.id
+	}
+	if tiedSomewhere {
+		// Some symbol did own that line; the fallback is a different symbol
+		// that does not, so returning it would be a miswire, not a fallback.
+		return 0
 	}
 	return c.fallback
 }
