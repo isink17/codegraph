@@ -74,10 +74,16 @@ const (
 	// wildcards. (ResolveEdges Strategy 3c fallback.)
 	ResolutionStrategyDotSuffix = "dot_suffix"
 
-	// ResolutionStrategyBareTail: the Go-side binder's fallback, used by the
-	// path-scoped and name-targeted entrypoints only. The last dot-separated
-	// segment of dst_name (the whole dst_name when it has no dot) equalled the
-	// bare `name` of exactly one same-language symbol.
+	// ResolutionStrategyBareTail: the Go-side binder's weakest fallback, used
+	// by the path-scoped and name-targeted entrypoints only. A bare dst_name
+	// (or, for import-path spellings containing '/', its last dot-separated
+	// segment) equalled the bare `name` of exactly one same-language symbol.
+	//
+	// Member/scope-qualified spellings (a '.' or '::', no slash) never reach
+	// this fallback (P22.1): their qualifier is evidence, and discarding it
+	// bound `rows.Close()` on an external receiver to whatever unique project
+	// method happened to be called Close. Those spellings fall back to the
+	// dot_tail2/dot_tail3 equality lookups instead -- see binderFallback.
 	//
 	// This is deliberately NOT reported as exact_name even when dst_name has no
 	// dot: unlike Strategy 2 the lookup applies no symbol-kind restriction, so
@@ -181,12 +187,14 @@ func resolutionConfidenceFor(strategy string) string {
 // registered strategy.
 var binderStrategies = []string{
 	ResolutionStrategyExactQualified,
+	ResolutionStrategyDotTail2,
+	ResolutionStrategyDotTail3,
 	ResolutionStrategyBareTail,
 }
 
 // binderStrategyRank returns the index of a binder strategy in binderStrategies.
-// It panics on anything else: the binder has exactly these two evidence levels,
-// and a third appearing here without a rank would silently lose its provenance.
+// It panics on anything else: the binder has exactly these evidence levels,
+// and another appearing here without a rank would silently lose its provenance.
 func binderStrategyRank(strategy string) int {
 	for rank, candidate := range binderStrategies {
 		if candidate == strategy {

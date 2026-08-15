@@ -28,10 +28,17 @@ import (
 //	                  per-name SQL used
 //	stage 4        -- indexed equality on the short names
 //
-// The per-name semantics are unchanged: a name still takes the ids of the first
-// stage that yields any, and a name that resolves early never reaches a later
-// stage. What changes is that stage 3 costs one scan for the whole call instead
-// of one scan per name.
+// A name still takes the ids of the first stage that yields any, and a name
+// that resolves early never reaches a later stage; stage 3 costs one scan for
+// the whole call instead of one scan per name.
+//
+// This batched cascade serves EDGE EVIDENCE (unresolved dst_names feeding
+// FindCallees and context expansion), and since P22.1 it deliberately differs
+// from the single-name cascade `lookupSymbolIDs` runs for user-typed input:
+// member-qualified spellings (see memberQualifiedName) never degrade to their
+// bare tail here, because a call site's qualifier is evidence and discarding
+// it fabricates relationships (`rows.Close` claiming every project Close).
+// User input keeps the forgiving cascade.
 
 // nameLookupChunk bounds how many names go into a single IN list.
 const nameLookupChunk = 400
@@ -115,6 +122,14 @@ func newSuffixMatcher(shorts []string) *suffixMatcher {
 		folded := asciiLower(short)
 		m.original[folded] = append(m.original[folded], short)
 		switch {
+		case memberQualifiedName(short):
+			// Member-qualified full spellings are evidence, not patterns
+			// (P22.1): their '_' and '%' bytes match literally, exactly like
+			// the escaped LIKE legs FindCallers runs for the same rule.
+			// Treating `config.load_config` as a wildcard would let it claim
+			// `x.config.loadXconfig` -- a fabrication the caller side refuses.
+			m.literal[folded] = append(m.literal[folded], short)
+			addLen(len(folded))
 		case strings.ContainsRune(short, '%'):
 			m.percent = append(m.percent, folded)
 		case strings.ContainsRune(short, '_'):
@@ -265,9 +280,86 @@ func trimLookupName(name string) string {
 	return strings.TrimSpace(strings.TrimPrefix(name, "::"))
 }
 
-// lookupSymbolIDsForNames resolves every name through the same cascade
-// lookupSymbolIDs applies, and returns the union of the resulting ids in
-// first-seen order.
+// memberQualifiedName reports whether a destination name is member/scope-
+// qualified syntax whose qualifier is evidence: it contains a '.' or a "::"
+// and no '/'. Such a spelling must never degrade to its bare tail (P22.1) --
+// `rows.Close` does not spell any project symbol named Close; it spells a
+// member of `rows`. Import-path spellings (containing '/') keep the legacy
+// short-name fallback: they are package-qualified by construction and the
+// own-module import mapping that would resolve them properly is deferred.
+func memberQualifiedName(name string) bool {
+	return !strings.ContainsRune(name, '/') &&
+		(strings.ContainsRune(name, '.') || strings.Contains(name, "::"))
+}
+
+// lookupSuffixKey returns the string a name contributes to suffix evidence:
+// the full spelling for member-qualified names (so the qualifier stays part of
+// the match), the short name for everything else (unchanged legacy behavior).
+func lookupSuffixKey(name string) string {
+	if memberQualifiedName(name) {
+		return name
+	}
+	return lookupSymbolShortName(name)
+}
+
+// boundaryProperSuffixes returns the proper suffixes of a qualified spelling
+// cut at '.', "::", and '/' boundaries, keeping only suffixes that are still
+// qualified (contain a '.' or "::"). The bare tail is deliberately excluded:
+// a spelling that shares only its tail with an identity shares no qualifier
+// evidence with it.
+func boundaryProperSuffixes(qname string) []string {
+	var out []string
+	for i := 0; i < len(qname); i++ {
+		switch {
+		case qname[i] == ':' && i+1 < len(qname) && qname[i+1] == ':':
+			if s := qname[i+2:]; s != "" && memberSeparated(s) {
+				out = append(out, s)
+			}
+			i++
+		case qname[i] == '.' || qname[i] == '/':
+			if s := qname[i+1:]; s != "" && memberSeparated(s) {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// memberSeparated reports whether a spelling still carries a qualifier
+// separator.
+func memberSeparated(s string) bool {
+	return strings.ContainsRune(s, '.') || strings.Contains(s, "::")
+}
+
+// foldedExtendsAtBoundary reports whether dst spells a deeper form of qname:
+// dst ends with qname preceded by a '.', "::", or '/' boundary. Comparison is
+// ASCII case-insensitive, the folding SQLite's LIKE would have applied.
+func foldedExtendsAtBoundary(dst, qname string) bool {
+	return prefoldedExtendsAtBoundary(asciiLower(dst), asciiLower(qname))
+}
+
+// prefoldedExtendsAtBoundary is foldedExtendsAtBoundary over inputs the caller
+// has already folded, so a scan can fold each row once instead of once per
+// (row, identity) pair.
+func prefoldedExtendsAtBoundary(d, q string) bool {
+	if q == "" || len(d) <= len(q) {
+		return false
+	}
+	if !strings.HasSuffix(d, q) {
+		return false
+	}
+	switch boundary := d[:len(d)-len(q)]; {
+	case strings.HasSuffix(boundary, "::"), strings.HasSuffix(boundary, "."), strings.HasSuffix(boundary, "/"):
+		return true
+	}
+	return false
+}
+
+// lookupSymbolIDsForNames resolves every name through the batched
+// edge-evidence cascade (lookupSymbolIDsByName -- NOT the forgiving
+// single-name cascade lookupSymbolIDs runs for user input; member-qualified
+// spellings deliberately diverge, see the file header) and returns the union
+// of the resulting ids in first-seen order.
 func (s *Store) lookupSymbolIDsForNames(ctx context.Context, repoID int64, names []string) ([]int64, error) {
 	resolved, err := s.lookupSymbolIDsByName(ctx, repoID, names)
 	if err != nil || len(resolved) == 0 {
@@ -339,12 +431,23 @@ func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names [
 		remaining = assignHits(resolved, remaining, hits, func(name string) string { return name })
 	}
 
-	// Stage 3: qualified-name suffix match on the short name. One scan for all
-	// remaining names, whatever their spelling.
+	// Stage 3: qualified-name suffix evidence. One scan for all remaining
+	// names, whatever their spelling. Member-qualified names contribute their
+	// FULL spelling as the suffix (lookupSuffixKey), so `rows.Close` can only
+	// match a deeper identity that ends in `.rows.Close` -- never every symbol
+	// whose tail happens to be Close. They are additionally matched the other
+	// way around: an identity that IS a qualified suffix of the spelling
+	// (`other.pkg.Target` naming `pkg.Target`) is equality on qualified_name
+	// over the spelling's own boundary suffixes. Both directions preserve the
+	// qualifier; both were previously drowned in the bare-tail matches.
 	var shorts []string
 	seenShort := map[string]bool{}
+	var memberNames []string
 	for _, name := range remaining {
-		short := lookupSymbolShortName(name)
+		if memberQualifiedName(name) {
+			memberNames = append(memberNames, name)
+		}
+		short := lookupSuffixKey(name)
 		if short == "" || seenShort[short] {
 			continue
 		}
@@ -356,15 +459,27 @@ func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names [
 		if err != nil {
 			return nil, err
 		}
-		remaining = assignHits(resolved, remaining, hits, lookupSymbolShortName)
+		if deeper, err := s.memberSuffixSpellingHits(ctx, repoID, memberNames); err != nil {
+			return nil, err
+		} else {
+			for name, ids := range deeper {
+				hits[name] = mergeIDsPreservingOrder(hits[name], ids)
+			}
+		}
+		remaining = assignHits(resolved, remaining, hits, lookupSuffixKey)
 	}
 
 	// Stage 4: exact name match on the short name, for names whose short name
 	// actually differs from the name itself (the pre-P12 condition).
+	// Member-qualified names are excluded: equality on the bare tail is
+	// exactly the qualifier-discarding match stage 3 no longer performs.
 	if len(remaining) > 0 {
 		var stage4 []string
 		byShort := map[string][]string{}
 		for _, name := range remaining {
+			if memberQualifiedName(name) {
+				continue
+			}
 			short := lookupSymbolShortName(name)
 			if short == "" || short == name {
 				continue
@@ -448,6 +563,66 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 		}
 	}
 	return out, nil
+}
+
+// memberSuffixSpellingHits resolves the reverse direction of stage 3 for
+// member-qualified names: symbols whose full qualified_name is one of the
+// spelling's own boundary suffixes (`other.pkg.Target` names `pkg.Target`).
+// Indexed equality, one statement per chunk; ids arrive per name in
+// longest-suffix-first order so the result cannot depend on map iteration.
+func (s *Store) memberSuffixSpellingHits(ctx context.Context, repoID int64, memberNames []string) (map[string][]int64, error) {
+	if len(memberNames) == 0 {
+		return nil, nil
+	}
+	suffixesByName := make(map[string][]string, len(memberNames))
+	var lookups []string
+	seen := map[string]bool{}
+	for _, name := range memberNames {
+		suffixes := boundaryProperSuffixes(name)
+		suffixesByName[name] = suffixes
+		for _, suffix := range suffixes {
+			if !seen[suffix] {
+				seen[suffix] = true
+				lookups = append(lookups, suffix)
+			}
+		}
+	}
+	if len(lookups) == 0 {
+		return nil, nil
+	}
+	bySuffix, err := s.symbolIDsByColumn(ctx, repoID, "qualified_name", lookups)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]int64{}
+	for _, name := range memberNames {
+		for _, suffix := range suffixesByName[name] {
+			out[name] = mergeIDsPreservingOrder(out[name], bySuffix[suffix])
+		}
+		if len(out[name]) == 0 {
+			delete(out, name)
+		}
+	}
+	return out, nil
+}
+
+// mergeIDsPreservingOrder appends ids not already present, keeping first-seen
+// order deterministic.
+func mergeIDsPreservingOrder(base, extra []int64) []int64 {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[int64]bool, len(base))
+	for _, id := range base {
+		seen[id] = true
+	}
+	for _, id := range extra {
+		if !seen[id] {
+			seen[id] = true
+			base = append(base, id)
+		}
+	}
+	return base
 }
 
 // symbolIDsBySuffixScan performs stage 3 for every short name in one pass.

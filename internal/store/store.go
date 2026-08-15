@@ -3529,6 +3529,69 @@ type resolveEdgeTargetsOutcome struct {
 	unknownSrcLanguage int
 }
 
+// binderFallback decides which evidence level a dst_name may fall back to when
+// its exact qualified lookup finds nothing, and returns the lookup value plus
+// the symbols column it must be matched against ("" means no safe fallback --
+// the edge stays unresolved).
+//
+// The classification is by the dst_name's own syntax (P22.1):
+//
+//   - Bare names (`Close`) keep the kind-unrestricted bare-name lookup that has
+//     always backed bare_tail.
+//   - Import-path spellings (containing '/') also keep the legacy tail lookup:
+//     they are package-qualified by construction (only the import rewrite
+//     produces them), and telling own-module paths from external ones is the
+//     deferred own-module import-mapping work, not this slice.
+//   - Member/scope-qualified spellings (a '.' or '::', no slash) carry their
+//     qualifier as evidence. `rows.Close` does not mean a unique project
+//     method named Close; it means a member of `rows`, which CodeGraph may
+//     only bind when the destination's own identity confirms the qualifier.
+//     One dot falls back to the persisted dot_tail2, two dots to dot_tail3 --
+//     the same equality evidence the repo-wide strategies use. Deeper or
+//     ::-scoped spellings have no schema-backed tail and abstain (repo-wide
+//     keeps its low-confidence LIKE fallback for the multi-dot forms).
+//
+// Two known, deliberate gaps against the repo-wide strategies: the dot-tail
+// fallbacks do not consult the bare-level ambiguity veto (reachable only when
+// a symbol's bare `name` itself contains a dot -- the pre-existing
+// strategy-set gap class documented in resolver_ambiguity.go), and identities
+// containing '/' are not matched by the member fallbacks (no current adapter
+// emits slash-qualified `qualified_name`s; revisit with the own-module
+// import-path work).
+func binderFallback(dstName string) (lookup, column string) {
+	name := strings.TrimSpace(dstName)
+	if name == "" {
+		return "", ""
+	}
+	if strings.ContainsRune(name, '/') {
+		if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
+			return strings.TrimSpace(name[dot+1:]), "name"
+		}
+		return name, "name"
+	}
+	if strings.Contains(name, "::") {
+		return "", ""
+	}
+	switch strings.Count(name, ".") {
+	case 0:
+		return name, "name"
+	case 1:
+		return name, "dot_tail2"
+	case 2:
+		return name, "dot_tail3"
+	default:
+		return "", ""
+	}
+}
+
+func setToSlice(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for name := range set {
+		out = append(out, name)
+	}
+	return out
+}
+
 // resolveEdgeTargets is the single Go-side binder shared by the path-scoped and
 // name-targeted resolvers. Candidate lookups are keyed by (name, language) and
 // a target only binds when resolverLanguageCompatible allows it, which is the
@@ -3559,41 +3622,44 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, err
 	}
 
-	dotTail := func(name string) string {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return ""
-		}
-		if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
-			return strings.TrimSpace(name[dot+1:])
-		}
-		return name
-	}
-
 	shortSet := make(map[string]struct{}, len(targets))
+	tail2Set := map[string]struct{}{}
+	tail3Set := map[string]struct{}{}
 	for _, target := range targets {
 		key := symbolLangKey{name: target.dstName, language: target.srcLanguage}
 		if _, ok := byQualified.groups[key]; ok {
 			// The qualified name matched something in the caller's language, so
-			// the bare tail of the same name is never consulted: either the
-			// qualified evidence identifies one definition this caller may bind,
-			// or it identified candidates it may not, and falling back to
-			// strictly weaker evidence could only pick among the same set
-			// arbitrarily -- or, worse, retarget an explicit reference at an
-			// unrelated symbol. Mirrors the qualified-level veto rows in
-			// recordAmbiguousResolverNames.
+			// no weaker evidence level of the same name is ever consulted:
+			// either the qualified evidence identifies one definition this
+			// caller may bind, or it identified candidates it may not, and
+			// falling back to strictly weaker evidence could only pick among
+			// the same set arbitrarily -- or, worse, retarget an explicit
+			// reference at an unrelated symbol. Mirrors the qualified-level
+			// veto rows in recordAmbiguousResolverNames.
 			continue
 		}
-		short := dotTail(target.dstName)
-		if short != "" {
-			shortSet[short] = struct{}{}
+		fallbackName, column := binderFallback(target.dstName)
+		if fallbackName == "" {
+			continue
+		}
+		switch column {
+		case "name":
+			shortSet[fallbackName] = struct{}{}
+		case "dot_tail2":
+			tail2Set[fallbackName] = struct{}{}
+		case "dot_tail3":
+			tail3Set[fallbackName] = struct{}{}
 		}
 	}
-	shortNames := make([]string, 0, len(shortSet))
-	for name := range shortSet {
-		shortNames = append(shortNames, name)
+	byShort, err := s.resolveUniqueSymbolsByNames(ctx, repoID, setToSlice(shortSet), testFileIDs)
+	if err != nil {
+		return outcome, err
 	}
-	byShort, err := s.resolveUniqueSymbolsByNames(ctx, repoID, shortNames, testFileIDs)
+	byTail2, err := s.resolveSymbolCandidates(ctx, repoID, "dot_tail2", setToSlice(tail2Set), testFileIDs)
+	if err != nil {
+		return outcome, err
+	}
+	byTail3, err := s.resolveSymbolCandidates(ctx, repoID, "dot_tail3", setToSlice(tail3Set), testFileIDs)
 	if err != nil {
 		return outcome, err
 	}
@@ -3602,15 +3668,23 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	// stayed unresolved.
 	qualifiedNamesAnyLanguage := byQualified.names()
 	shortNamesAnyLanguage := byShort.names()
+	for name := range byTail2.names() {
+		shortNamesAnyLanguage[name] = struct{}{}
+	}
+	for name := range byTail3.names() {
+		shortNamesAnyLanguage[name] = struct{}{}
+	}
 
 	type edgeResolution struct {
 		edgeID int64
 		dstID  int64
 		// strategy names the evidence level that actually bound this edge, so
 		// the UPDATE below can persist it alongside dst_symbol_id. The binder
-		// has exactly two: the qualified-name lookup and the bare-tail
-		// fallback. See edge_resolution.go for why the fallback is not reported
-		// as exact_name even when dst_name has no dot.
+		// has four: the qualified-name lookup, the dot_tail2/dot_tail3
+		// member fallbacks, and the bare-tail fallback (binderFallback picks
+		// which one a dst_name may consult). See edge_resolution.go for why
+		// the bare fallback is not reported as exact_name even when dst_name
+		// has no dot.
 		strategy string
 	}
 	resolutions := make([]edgeResolution, 0, len(targets))
@@ -3619,7 +3693,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, err
 	}
 	for _, target := range targets {
-		short := dotTail(target.dstName)
+		fallbackName, fallbackColumn := binderFallback(target.dstName)
 		if target.srcLanguage == "" {
 			// Unknown source language: never guess a destination language.
 			// Candidate maps only contain non-empty languages, so this is also
@@ -3628,7 +3702,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			continue
 		}
 		qualifiedKey := symbolLangKey{name: target.dstName, language: target.srcLanguage}
-		shortKey := symbolLangKey{name: short, language: target.srcLanguage}
+		fallbackKey := symbolLangKey{name: fallbackName, language: target.srcLanguage}
 		// Which candidates this edge may bind depends on whether the *calling*
 		// file is a test file, exactly as resolverChosenCandidateSQL decides it
 		// for the repo-wide strategies. See resolver_testfile.go.
@@ -3637,9 +3711,22 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		matchedGroup, matched := byQualified.groups[qualifiedKey]
 		if !matched {
 			// Only when the qualified name matched nothing in this language may
-			// the weaker bare-tail evidence be consulted.
-			matchedGroup, matched = byShort.groups[shortKey]
-			strategy = ResolutionStrategyBareTail
+			// the fallback evidence level be consulted -- and which level that
+			// is depends on the dst_name's own syntax (binderFallback): bare
+			// names keep the kind-unrestricted name lookup, member spellings
+			// must confirm their qualifier against the destination's dot-tail
+			// identity, and spellings with no safe fallback abstain.
+			switch fallbackColumn {
+			case "name":
+				matchedGroup, matched = byShort.groups[fallbackKey]
+				strategy = ResolutionStrategyBareTail
+			case "dot_tail2":
+				matchedGroup, matched = byTail2.groups[fallbackKey]
+				strategy = ResolutionStrategyDotTail2
+			case "dot_tail3":
+				matchedGroup, matched = byTail3.groups[fallbackKey]
+				strategy = ResolutionStrategyDotTail3
+			}
 		}
 		dstID, ok := int64(0), false
 		if matched {
@@ -3660,7 +3747,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 				outcome.testShadowBlocked++
 			default:
 				_, qualifiedElsewhere := qualifiedNamesAnyLanguage[target.dstName]
-				_, shortElsewhere := shortNamesAnyLanguage[short]
+				_, shortElsewhere := shortNamesAnyLanguage[fallbackName]
 				if qualifiedElsewhere || shortElsewhere {
 					outcome.languageBlocked++
 				}
@@ -3875,8 +3962,14 @@ func (c symbolCandidates) names() map[string]struct{} {
 // The Go-side counting matches the repo-wide COUNT(*)/SUM(...) exactly, so the
 // two entrypoints agree on which names are undecidable; the recorded ids only
 // ever name the sole member of a group of one. `column` is a package-internal
-// literal, never caller input.
+// literal, never caller input, and must be one of the four identity columns
+// the binder matches on.
 func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, column string, names []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
+	switch column {
+	case "qualified_name", "name", "dot_tail2", "dot_tail3":
+	default:
+		panic("store: resolveSymbolCandidates called with unsupported column " + column)
+	}
 	out := symbolCandidates{groups: map[symbolLangKey]candidateGroup{}}
 	if len(names) == 0 {
 		return out, nil
@@ -3886,10 +3979,14 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 		end := min(start+chunkSize, len(names))
 		chunk := names[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		// The literal `column != ''` term restates what non-empty lookup names
+		// already imply; it is there so the partial dot-tail indexes
+		// (idx_symbols_repo_dot_tail2/3, predicate `!= ''`) stay usable when
+		// the names arrive as bound parameters.
 		query := `
 			SELECT ` + column + `, language, id, file_id
 			FROM symbols
-			WHERE repo_id = ? AND language != '' AND ` + column + ` IN (` + placeholders + `)
+			WHERE repo_id = ? AND language != '' AND ` + column + ` != '' AND ` + column + ` IN (` + placeholders + `)
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)

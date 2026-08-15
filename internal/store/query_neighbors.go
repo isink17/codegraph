@@ -76,6 +76,11 @@ func symbolPageSQL(candidateCTE string) string {
 
 // edgeIDBranches renders one `SELECT ... WHERE <col> IN (...)` branch per id
 // chunk, UNIONed together. UNION (not UNION ALL) so the CTE is already a set.
+//
+// DISTINCT inside each branch matters even though UNION dedupes across
+// branches: when this is the only branch the caller has (every other evidence
+// leg came up empty), no UNION runs, and two edges to the same destination
+// would otherwise surface the destination twice.
 func edgeIDBranches(repoID int64, ids []int64, selectCol, matchCol, extra string) (string, []any) {
 	var sb strings.Builder
 	args := make([]any, 0, len(ids)+len(ids)/neighborIDChunk+1)
@@ -83,7 +88,7 @@ func edgeIDBranches(repoID int64, ids []int64, selectCol, matchCol, extra string
 		if i > 0 {
 			sb.WriteString(" UNION ")
 		}
-		sb.WriteString("SELECT e.")
+		sb.WriteString("SELECT DISTINCT e.")
 		sb.WriteString(selectCol)
 		sb.WriteString(" FROM edges e WHERE e.repo_id = ? AND e.")
 		sb.WriteString(matchCol)
@@ -165,26 +170,145 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		args = append(args, a...)
 	}
 	if short != "" {
-		// Split rather than one four-way OR. A single OR-of-predicates is not
+		// Split rather than one many-way OR. A single OR-of-predicates is not
 		// seekable, so SQLite fell back to walking every edge in the repo
 		// through idx_edges_repo_src and fetching each row. Separated, the
 		// equality half seeks idx_edges_repo_unresolved_name_src directly and
 		// the LIKE half is confined to the unresolved population by the
-		// `dst_symbol_id IS NULL` equality. UNION makes the two halves one set,
+		// `dst_symbol_id IS NULL` equality. UNION makes the halves one set,
 		// so the candidate set is identical to the combined predicate's.
 		branches = append(branches, `SELECT e.src_symbol_id FROM edges e
 			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (?, ?)`)
 		args = append(args, repoID, symbol, short)
 
-		branches = append(branches, `SELECT e.src_symbol_id FROM edges e
-			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
-			  AND (e.dst_name LIKE ? OR e.dst_name LIKE ?)`)
-		args = append(args, repoID, "%::"+short, "%."+short)
+		// Suffix evidence (P22.1): an unresolved spelling claims this target
+		// only when one of the two extends the other at a separator boundary,
+		// so the qualifier stays part of the match. The pre-P22.1 legs matched
+		// `%.` + bare short, which let `rows.Close` claim every project Close.
+		//
+		// Direction one: the spelling is a qualified suffix of the target's
+		// identity (`App.Close` for cli.App.Close) -- a finite, indexed IN set
+		// built from the input and the resolved targets' qualified names.
+		// Direction two: the spelling extends an identity at a '.', '::' or
+		// '/' boundary (`x.cli.App.Close`, `path/to/pkg.Func`). One scan of
+		// the distinct unresolved destination names decides direction two for
+		// every identity at once -- the same shape context expansion uses --
+		// so neither the statement's compound-SELECT terms nor its bound
+		// variables grow with how many symbols share the input's bare name.
+		qnames := []string{symbol}
+		if targetQNames, err := s.qualifiedNamesByIDs(ctx, repoID, targetIDs); err != nil {
+			return nil, err
+		} else {
+			qnames = append(qnames, targetQNames...)
+		}
+		spellings, seen := []string{}, map[string]bool{symbol: true, short: true}
+		for _, qname := range qnames {
+			for _, spelling := range boundaryProperSuffixes(qname) {
+				if !seen[spelling] {
+					seen[spelling] = true
+					spellings = append(spellings, spelling)
+				}
+			}
+		}
+		extending, err := s.unresolvedDstNamesExtending(ctx, repoID, qnames)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range extending {
+			if !seen[name] {
+				seen[name] = true
+				spellings = append(spellings, name)
+			}
+		}
+		for start := 0; start < len(spellings); start += neighborIDChunk {
+			end := min(start+neighborIDChunk, len(spellings))
+			chunk := spellings[start:end]
+			branches = append(branches, `SELECT e.src_symbol_id FROM edges e
+				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
+				  AND e.dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`)
+			args = append(args, repoID)
+			for _, spelling := range chunk {
+				args = append(args, spelling)
+			}
+		}
 	}
 	if len(branches) == 0 {
 		return []graph.Symbol{}, nil
 	}
 	return s.symbolPage(ctx, repoID, strings.Join(branches, " UNION "), args, limit, offset)
+}
+
+// qualifiedNamesByIDs returns the distinct qualified names of the given
+// symbols, ordered by name so downstream statement text is deterministic.
+func (s *Store) qualifiedNamesByIDs(ctx context.Context, repoID int64, ids []int64) ([]string, error) {
+	var out []string
+	for _, chunk := range chunkInt64s(ids, neighborIDChunk) {
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		args = append(args, int64SliceToAny(chunk)...)
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT DISTINCT qualified_name FROM symbols
+			WHERE repo_id = ? AND id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
+			ORDER BY qualified_name`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var qname string
+			if err := rows.Scan(&qname); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, qname)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// unresolvedDstNamesExtending returns the distinct unresolved destination
+// names that extend any of the given identities at a '.', "::" or '/'
+// boundary, ASCII-case-insensitively, in scan order. One scan serves every
+// identity; each row is folded once.
+func (s *Store) unresolvedDstNamesExtending(ctx context.Context, repoID int64, qnames []string) ([]string, error) {
+	folded := make([]string, 0, len(qnames))
+	seen := map[string]bool{}
+	for _, qname := range qnames {
+		if f := asciiLower(qname); f != "" && !seen[f] {
+			seen[f] = true
+			folded = append(folded, f)
+		}
+	}
+	if len(folded) == 0 {
+		return nil, nil
+	}
+	rows, err := s.neighborQuery(ctx, `
+		SELECT DISTINCT e.dst_name
+		FROM edges e
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != ''
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		d := asciiLower(name)
+		for _, q := range folded {
+			if prefoldedExtendsAtBoundary(d, q) {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out, rows.Err()
 }
 
 // FindCallees returns the symbols the named symbol calls.

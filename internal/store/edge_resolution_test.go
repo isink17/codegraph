@@ -144,16 +144,20 @@ func TestBinderDecodesStrategyPerRow(t *testing.T) {
 	src := f.symbol(t, caller, "caller", "caller", "python")
 	// Matches a full qualified_name -> rank of exact_qualified.
 	qualifiedEdge := f.edge(t, caller, src, "config.load_config")
-	// Matches nothing qualified; only its dot-tail names a symbol -> rank of
-	// bare_tail.
-	tailEdge := f.edge(t, caller, src, "widgets.render_report")
+	// Matches nothing qualified; the destination's last two segments confirm
+	// the qualifier -> rank of dot_tail2.
+	tail2Edge := f.edge(t, caller, src, "path.render_report")
+	// Bare name, matches nothing qualified; only the kind-unrestricted name
+	// lookup can bind it -> rank of bare_tail.
+	bareEdge := f.edge(t, caller, src, "render_report")
 
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"src/py/caller.py"}); err != nil {
 		t.Fatalf("ResolveEdgesForPaths() error = %v", err)
 	}
 
 	f.assertResolvedWith(t, qualifiedEdge, qualifiedDst, ResolutionStrategyExactQualified)
-	f.assertResolvedWith(t, tailEdge, tailDst, ResolutionStrategyBareTail)
+	f.assertResolvedWith(t, tail2Edge, tailDst, ResolutionStrategyDotTail2)
+	f.assertResolvedWith(t, bareEdge, tailDst, ResolutionStrategyBareTail)
 }
 
 // TestResolveEdgesRecordsStrategyPerEvidenceLevel pins the provenance the
@@ -367,10 +371,15 @@ func TestScopedResolversRecordStrategy(t *testing.T) {
 			wantStrategy: ResolutionStrategyExactQualified,
 		},
 		{
-			name:         "bare_tail_fallback",
-			dstName:      "config.load_config",
+			// A member spelling only binds when the destination's own tail
+			// confirms the qualifier (P22.1). `config.load_config` against
+			// `some.other.path.load_config` would have been a bare-tail bind
+			// that discards `config`; it stays unresolved now, and the
+			// qualifier-confirmed spelling binds via dot_tail2.
+			name:         "dot_tail2_fallback",
+			dstName:      "path.load_config",
 			qualified:    "some.other.path.load_config",
-			wantStrategy: ResolutionStrategyBareTail,
+			wantStrategy: ResolutionStrategyDotTail2,
 		},
 		{
 			name:         "bare_name_uses_bare_tail",

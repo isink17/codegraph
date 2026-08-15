@@ -42,8 +42,12 @@ func qnames(syms []graph.Symbol) []string {
 	return out
 }
 
-// callersOracle recomputes the caller set the way the pre-P12 implementation
-// did: union the two evidence legs, deduplicate by id, load, sort in Go, page.
+// callersOracle recomputes the caller set independently of the production SQL:
+// union the resolved-edge leg with the P22.1 name-evidence rule (exact
+// spellings, boundary-suffix spellings of the target identities, and spellings
+// that extend an identity at a boundary), deduplicate by id, load, sort in Go,
+// page. The pre-P22.1 oracle matched `%.` + bare short here, which is exactly
+// the qualifier-discarding claim the production query no longer makes.
 func callersOracle(t *testing.T, s *Store, repoID int64, symbol string, limit, offset int) []graph.Symbol {
 	t.Helper()
 	ctx := context.Background()
@@ -76,10 +80,45 @@ func callersOracle(t *testing.T, s *Store, repoID int64, symbol string, limit, o
 		collect(`SELECT DISTINCT src_symbol_id FROM edges WHERE repo_id = ? AND dst_symbol_id = ?`, repoID, id)
 	}
 	if short != "" {
-		collect(`SELECT DISTINCT src_symbol_id FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL
-			  AND (dst_name = ? OR dst_name = ? OR dst_name LIKE ? OR dst_name LIKE ?)`,
-			repoID, symbol, short, "%::"+short, "%."+short)
+		qnames := []string{symbol}
+		targetQNames, err := s.qualifiedNamesByIDs(ctx, repoID, targetIDs)
+		if err != nil {
+			t.Fatalf("oracle qnames: %v", err)
+		}
+		qnames = append(qnames, targetQNames...)
+		claimed := map[string]bool{symbol: true, short: true}
+		for _, qname := range qnames {
+			for _, spelling := range boundaryProperSuffixes(qname) {
+				claimed[spelling] = true
+			}
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT src_symbol_id, dst_name FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL`, repoID)
+		if err != nil {
+			t.Fatalf("oracle name query: %v", err)
+		}
+		for rows.Next() {
+			var id int64
+			var dst string
+			if err := rows.Scan(&id, &dst); err != nil {
+				t.Fatalf("oracle name scan: %v", err)
+			}
+			match := claimed[dst]
+			for _, qname := range qnames {
+				if match {
+					break
+				}
+				match = foldedExtendsAtBoundary(dst, qname)
+			}
+			if match && !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatalf("oracle name rows: %v", err)
+		}
 	}
 
 	var syms []graph.Symbol
@@ -159,11 +198,11 @@ func seedCallerGraph(t *testing.T, s *Store, repoID int64) {
 			if _, err := insertTestEdge(ctx, s, repoID, fileID, id, "pkg.Target"); err != nil {
 				t.Fatalf("insert unresolved edge: %v", err)
 			}
-		case 2: // unresolved, dotted suffix
+		case 2: // unresolved, extends the target identity at a boundary
 			if _, err := insertTestEdge(ctx, s, repoID, fileID, id, "other.pkg.Target"); err != nil {
 				t.Fatalf("insert suffix edge: %v", err)
 			}
-		case 3: // unresolved, :: suffix
+		case 3: // unresolved, foreign scope qualifier: must NOT claim (P22.1)
 			if _, err := insertTestEdge(ctx, s, repoID, fileID, id, "ns::Target"); err != nil {
 				t.Fatalf("insert colon edge: %v", err)
 			}
@@ -288,98 +327,79 @@ func TestFindCalleesResolvedAndUnresolvedLegs(t *testing.T) {
 	}
 }
 
-// TestLookupSymbolIDsForNamesMatchesPerNameCascade is the parity test for the
-// batching: the batched result must equal the union of the unchanged
-// single-name cascade over the same names, for inputs that land in each stage.
-func TestLookupSymbolIDsForNamesMatchesPerNameCascade(t *testing.T) {
+// TestLookupSymbolIDsByNameMemberCallSemantics pins the batched edge-evidence
+// cascade per name. Since P22.1 it deliberately differs from the forgiving
+// single-name cascade (`lookupSymbolIDs`, user input): a member-qualified
+// spelling never degrades to its bare tail, so a foreign qualifier resolves to
+// nothing instead of to every symbol sharing the tail. Import-path spellings
+// (with '/') keep the legacy tail fallback -- the own-module class is deferred.
+func TestLookupSymbolIDsByNameMemberCallSemantics(t *testing.T) {
 	ctx := context.Background()
 	s, repoID := newQueryTestStore(t)
 	fileID, err := insertTestFile(ctx, s, repoID, "a.go")
 	if err != nil {
 		t.Fatalf("insertTestFile: %v", err)
 	}
-	seed := []struct{ name, qualified string }{
-		{"Alpha", "pkg.Alpha"},         // stage 1 (exact qualified)
-		{"Beta", "other.Beta"},         // stage 2 (exact name) / stage 3
-		{"Gamma", "deep.nested.Gamma"}, // stage 3 (dot suffix)
-		{"Delta", "ns::Delta"},         // stage 3 (:: suffix)
-		{"Epsilon", "pkg.Epsilon"},     // stage 4 (short name)
-		{"Percent", "pkg.Percent"},     // wildcard interaction
-		{"MixedCase", "pkg.mixedcase"}, // ASCII case folding in the LIKE
-		{"Shadow", "one.Shadow"},       // two candidates for one suffix
-		{"Shadow", "two.Shadow"},       //
-		// '_' is a LIKE metacharacter and the most common character in
-		// identifiers outside Go: both the literal and the wildcard reading
-		// have to behave exactly as the per-name SQL did.
+	ids := map[string]int64{}
+	for i, sd := range []struct{ name, qualified string }{
+		{"Alpha", "pkg.Alpha"},
+		{"Beta", "other.Beta"},
+		{"Gamma", "deep.nested.Gamma"},
+		{"Delta", "ns::Delta"},
+		{"Epsilon", "pkg.Epsilon"},
+		{"MixedCase", "pkg.mixedcase"},
+		{"Shadow", "one.Shadow"},
+		{"Shadow2", "two.Shadow"},
 		{"do_work", "pkg.do_work"},
-		{"doXwork", "pkg.doXwork"},
-		// lookupSymbolShortName splits on the last "::" first, so a short name
-		// can itself contain a '.'.
-		{"Bar", "pkg.Foo.Bar"},
-		// Two shorts that differ only in ASCII case must not collapse into one.
-		{"Fold", "left.Fold"},
-		{"fold", "right.fold"},
-	}
-	for i, sd := range seed {
-		if _, err := insertTestSymbol(ctx, s, repoID, fileID, sd.name, sd.qualified); err != nil {
+		{"Registry", "parser.NewRegistry"},
+	} {
+		id, err := insertTestSymbol(ctx, s, repoID, fileID, sd.name, sd.qualified)
+		if err != nil {
 			t.Fatalf("insertTestSymbol(%d): %v", i, err)
 		}
+		ids[sd.qualified] = id
 	}
 
-	names := []string{
-		"pkg.Alpha",
-		"Beta",
-		"whatever.Gamma",
-		"whatever::Delta",
-		"unknown.pkg.Epsilon",
-		"pkg.MIXEDCASE",
-		"anything.Shadow",
-		"nothing.AtAll",
-		"pkg.Perc%nt",
-		"vendor.do_work",
-		"ns::Foo.Bar",
-		"x.Fold",
-		"y.fold",
-		"",
-		"::pkg.Alpha",
+	cases := []struct {
+		name string
+		want []int64
+	}{
+		// Exact stages, unchanged.
+		{"pkg.Alpha", []int64{ids["pkg.Alpha"]}},
+		{"::pkg.Alpha", []int64{ids["pkg.Alpha"]}},
+		{"Beta", []int64{ids["other.Beta"]}},
+		// Member spelling whose qualifier a deeper identity confirms.
+		{"nested.Gamma", []int64{ids["deep.nested.Gamma"]}},
+		// Member spelling that extends an identity at a boundary: the
+		// identity is one of the spelling's own qualified suffixes.
+		{"x.deep.nested.Gamma", []int64{ids["deep.nested.Gamma"]}},
+		{"unknown.pkg.Epsilon", []int64{ids["pkg.Epsilon"]}},
+		// Foreign qualifiers: no identity confirms them, nothing resolves.
+		// Every one of these bound (or fanned out) via the bare tail before.
+		{"whatever.Gamma", nil},
+		{"whatever::Delta", nil},
+		{"rows.Close", nil},
+		{"pkg.MIXEDCASE", nil},
+		{"anything.Shadow", nil},
+		{"vendor.do_work", nil},
+		{"nothing.AtAll", nil},
+		// Import-path spelling: legacy tail fallback retained (deferred class).
+		{"github.com/org/repo/internal/parser.NewRegistry", []int64{ids["parser.NewRegistry"]}},
 	}
 
-	// Oracle: the unchanged single-name cascade, name by name.
-	seen := map[int64]bool{}
-	var want []int64
-	for _, name := range names {
-		ids, err := s.lookupSymbolIDs(ctx, repoID, name, 0)
-		if err != nil {
-			t.Fatalf("lookupSymbolIDs(%q): %v", name, err)
-		}
-		for _, id := range ids {
-			if id != 0 && !seen[id] {
-				seen[id] = true
-				want = append(want, id)
-			}
-		}
+	names := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		names = append(names, tc.name)
 	}
-
-	got, err := s.lookupSymbolIDsForNames(ctx, repoID, names)
+	resolved, err := s.lookupSymbolIDsByName(ctx, repoID, names)
 	if err != nil {
-		t.Fatalf("lookupSymbolIDsForNames: %v", err)
+		t.Fatalf("lookupSymbolIDsByName: %v", err)
 	}
-	sortedEqual := func(a, b []int64) bool {
-		if len(a) != len(b) {
-			return false
+	for _, tc := range cases {
+		got := resolved[trimLookupName(tc.name)]
+		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("lookupSymbolIDsByName[%q] = %v, want %v", tc.name, got, tc.want)
 		}
-		ac, bc := append([]int64(nil), a...), append([]int64(nil), b...)
-		sort.Slice(ac, func(i, j int) bool { return ac[i] < ac[j] })
-		sort.Slice(bc, func(i, j int) bool { return bc[i] < bc[j] })
-		for i := range ac {
-			if ac[i] != bc[i] {
-				return false
-			}
-		}
-		return true
-	}
-	if !sortedEqual(got, want) {
-		t.Fatalf("lookupSymbolIDsForNames = %v, want %v (per-name cascade)", got, want)
 	}
 }
 
