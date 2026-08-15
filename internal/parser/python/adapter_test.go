@@ -85,6 +85,16 @@ def multi():
 	assertSpan(t, pf, "mod.multi", 4, 8)
 }
 
+func TestCRLFRangesMatchLFRanges(t *testing.T) {
+	lf := parseSource(t, "def f():\n    return 1\n")
+	crlf := parseSource(t, "def f():\r\n    return 1\r\n")
+	want := symbolRange(t, lf, "mod.f")
+	got := symbolRange(t, crlf, "mod.f")
+	if got != want {
+		t.Fatalf("CRLF range = %+v, LF range = %+v", got, want)
+	}
+}
+
 func TestDecoratorsAndCommentsBetweenMethods(t *testing.T) {
 	const src = `class S:
     def a(self):

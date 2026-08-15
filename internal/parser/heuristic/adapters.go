@@ -222,6 +222,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 	for i, line := range lines {
 		lineNo := i + 1
+		line = strings.TrimSuffix(line, "\r")
 		normalized, nextState := stripForHeuristic(line, state, a.cStyle, a.hashStyle)
 		state = nextState
 		trimmed := strings.TrimSpace(normalized)

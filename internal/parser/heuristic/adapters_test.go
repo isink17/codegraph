@@ -46,6 +46,21 @@ func TestRubyIgnoresHeredocSymbols(t *testing.T) {
 	}
 }
 
+func TestCRLFRangesDoNotCountCarriageReturns(t *testing.T) {
+	adapter := NewTypeScriptJavaScript()
+	lf, err := adapter.Parse(context.Background(), "sample.ts", []byte("function RealFn() {\n}\n"))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	crlf, err := adapter.Parse(context.Background(), "sample.ts", []byte("function RealFn() {\r\n}\r\n"))
+	if err != nil {
+		t.Fatalf("Parse(CRLF) error = %v", err)
+	}
+	if len(lf.Symbols) != 1 || len(crlf.Symbols) != 1 || crlf.Symbols[0].Range != lf.Symbols[0].Range {
+		t.Fatalf("CRLF range = %+v, LF range = %+v", crlf.Symbols, lf.Symbols)
+	}
+}
+
 func hasSymbolName(parsed graph.ParsedFile, name string) bool {
 	for _, sym := range parsed.Symbols {
 		if sym.Name == name {

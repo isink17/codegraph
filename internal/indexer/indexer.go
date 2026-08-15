@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -887,7 +888,7 @@ func shouldSkipDir(rel string, excludes []string) bool {
 
 	// Always skip hardcoded directories - not overridable.
 	for _, skip := range config.HardcodedSkips {
-		if base == skip {
+		if base == skip || (runtime.GOOS == "windows" && strings.EqualFold(base, skip)) {
 			return true
 		}
 	}
@@ -1038,7 +1039,7 @@ func matchPattern(path, pattern string) bool {
 			return true
 		}
 	}
-	if ok, _ := filepath.Match(pattern, path); ok {
+	if ok, _ := pathpkg.Match(pattern, path); ok {
 		return true
 	}
 	if ok, _ := filepath.Match(pattern, filepath.Base(path)); ok {

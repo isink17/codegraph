@@ -544,6 +544,25 @@ func TestArchitectureOverviewTopDegreeAndTotals(t *testing.T) {
 	}
 }
 
+func TestListFilesMatchesMixedPersistedSeparators(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	fileID, err := insertTestFile(ctx, s, repoID, `pkg\win.go`)
+	if err != nil {
+		t.Fatalf("insertTestFile: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET path = ? WHERE id = ?`, `pkg\win.go`, fileID); err != nil {
+		t.Fatalf("set Windows path: %v", err)
+	}
+	rows, err := s.ListFiles(ctx, repoID, "pkg/", 20, 0)
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(rows) != 1 || rows[0]["path"] != filepath.ToSlash(`pkg\win.go`) {
+		t.Fatalf("ListFiles = %v, want canonical mixed-path row", rows)
+	}
+}
+
 // TestQueryPathsAreRepoIsolated pins that none of the rewritten paths can see
 // another repository's rows.
 func TestQueryPathsAreRepoIsolated(t *testing.T) {

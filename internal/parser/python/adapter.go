@@ -59,6 +59,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 	for i, line := range lines {
 		lineNo := i + 1
+		line = strings.TrimSuffix(line, "\r")
 		indent := lineIndent(line)
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
