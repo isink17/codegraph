@@ -12,48 +12,58 @@ import (
 )
 
 type goModule struct {
-	path string
-	root string
+	path    string
+	root    string
+	blocked bool
 }
 
-func (s *Store) resolveOwnModuleImportsStandalone(ctx context.Context, repoID int64) error {
+type ownModuleScope struct {
+	paths map[string]struct{}
+	names map[string]struct{}
+}
+
+func (s *Store) resolveOwnModuleImportsStandalone(ctx context.Context, repoID int64, scope *ownModuleScope) (map[int64]struct{}, error) {
+	blocked := map[int64]struct{}{}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return blocked, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
-		return err
+		return blocked, err
 	}
-	if _, err := s.resolveOwnModuleImports(ctx, tx, repoID); err != nil {
-		return err
+	var resolveErr error
+	_, blocked, resolveErr = s.resolveOwnModuleImports(ctx, tx, repoID, scope)
+	if resolveErr != nil {
+		return blocked, resolveErr
 	}
 	for _, table := range []string{"tmp_resolver_own_module_veto", "tmp_resolver_own_module_targets", "tmp_resolver_own_module_resolution"} {
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+table); err != nil {
-			return err
+			return blocked, err
 		}
 	}
-	return tx.Commit()
+	return blocked, tx.Commit()
 }
 
 // resolveOwnModuleImports is one batched, high-evidence pass. It deliberately
 // reads module declarations from the repository, not from the Go toolchain.
-func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID int64, scope *ownModuleScope) (int, map[int64]struct{}, error) {
+	blocked := map[int64]struct{}{}
 	modules, err := repoGoModules(ctx, tx, repoID)
 	if err != nil || len(modules) == 0 {
-		return 0, err
+		return 0, blocked, err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_own_module_veto`); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_targets(package_dir TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(package_dir, name))`); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_own_module_targets`); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 
 	type edgeFact struct {
@@ -63,7 +73,7 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 	}
 	byKey := map[string][]edgeFact{}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.id, e.dst_name, fi.import_path
+		SELECT e.id, e.dst_name, fi.import_path, replace(sf.path, '\\', '/')
 		FROM edges e
 		JOIN files sf ON sf.id = e.file_id AND sf.repo_id = e.repo_id
 		JOIN file_imports fi ON fi.file_id = sf.id AND fi.repo_id = e.repo_id
@@ -71,14 +81,14 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		  AND sf.language = 'go' AND instr(e.dst_name, '/') > 0
 	`, repoID)
 	if err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	seenEdges := map[int64]struct{}{}
 	for rows.Next() {
 		var id int64
-		var dst, imported string
-		if err := rows.Scan(&id, &dst, &imported); err != nil {
-			return 0, err
+		var dst, imported, sourcePath string
+		if err := rows.Scan(&id, &dst, &imported, &sourcePath); err != nil {
+			return 0, blocked, err
 		}
 		dot := strings.LastIndexByte(dst, '.')
 		if dot <= 0 || dot == len(dst)-1 || dst[:dot] != imported {
@@ -88,23 +98,41 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		if !ok {
 			continue
 		}
+		// Veto every mapped edge, even when scoped resolution will not bind it
+		// yet. Deleted targets must not fall through to unrelated same-name
+		// symbols during a later path/name pass.
+		seenEdges[id] = struct{}{}
+		if scope != nil {
+			if len(scope.paths) > 0 {
+				if _, ok := scope.paths[sourcePath]; !ok {
+					continue
+				}
+			}
+			if len(scope.names) > 0 {
+				if _, ok := scope.names[dst[dot+1:]]; !ok {
+					continue
+				}
+			}
+		}
 		fact := edgeFact{id: id, dir: dir, name: dst[dot+1:]}
 		key := dir + "\x00" + fact.name
 		byKey[key] = append(byKey[key], fact)
-		seenEdges[id] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if err := rows.Close(); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	vetoRows := make([][]any, 0, len(seenEdges))
 	for id := range seenEdges {
 		vetoRows = append(vetoRows, []any{id})
 	}
 	if err := insertModuleRows(ctx, tx, "tmp_resolver_own_module_veto", "edge_id", vetoRows); err != nil {
-		return 0, err
+		return 0, blocked, err
+	}
+	for id := range seenEdges {
+		blocked[id] = struct{}{}
 	}
 
 	targetRows := make([][]any, 0, len(byKey))
@@ -113,10 +141,10 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		targetRows = append(targetRows, []any{parts[0], parts[1]})
 	}
 	if err := insertModuleRows(ctx, tx, "tmp_resolver_own_module_targets", "package_dir, name", targetRows); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if len(byKey) == 0 {
-		return 0, nil
+		return 0, blocked, nil
 	}
 
 	type candidate struct{ id int64 }
@@ -127,17 +155,18 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		JOIN files f ON f.repo_id = ? AND f.is_deleted = 0
 		JOIN symbols s ON s.repo_id = ? AND s.file_id = f.id AND s.name = t.name
 		WHERE s.language = 'go'
-		  AND (s.container_name = '' OR s.qualified_name = s.container_name || '.' || s.name)
+		  AND s.container_name != ''
+		  AND s.qualified_name = s.container_name || '.' || s.name
 		  AND s.kind IN ('function', 'type', 'struct', 'interface')
 	`, repoID, repoID)
 	if err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	for rows.Next() {
 		var dir, name, filePath string
 		var id int64
 		if err := rows.Scan(&dir, &name, &id, &filePath); err != nil {
-			return 0, err
+			return 0, blocked, err
 		}
 		if path.Dir(filePath) != dir || IsTestFilePath(filePath) {
 			continue
@@ -146,17 +175,17 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		candidates[key] = append(candidates[key], candidate{id: id})
 	}
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if err := rows.Close(); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_resolution(edge_id INTEGER PRIMARY KEY, dst_symbol_id INTEGER NOT NULL)`); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_own_module_resolution`); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	resolved := 0
 	resolutionRows := make([][]any, 0, len(byKey))
@@ -171,7 +200,7 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		}
 	}
 	if err := insertModuleRows(ctx, tx, "tmp_resolver_own_module_resolution", "edge_id, dst_symbol_id", resolutionRows); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE edges
@@ -181,9 +210,9 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		FROM tmp_resolver_own_module_resolution r
 		WHERE edges.id = r.edge_id AND edges.dst_symbol_id IS NULL
 	`); err != nil {
-		return 0, err
+		return 0, blocked, err
 	}
-	return resolved, nil
+	return resolved, blocked, nil
 }
 
 func insertModuleRows(ctx context.Context, tx *sql.Tx, table, columns string, rows [][]any) error {
@@ -245,12 +274,15 @@ func repoGoModules(ctx context.Context, tx *sql.Tx, repoID int64) ([]goModule, e
 			return err
 		}
 		parsed, err := modfile.Parse(filePath, data, nil)
-		if err != nil || parsed.Module == nil || parsed.Module.Mod.Path == "" {
-			return nil
+		rel, relErr := filepath.Rel(root, filepath.Dir(filePath))
+		if relErr != nil {
+			return relErr
 		}
-		rel, err := filepath.Rel(root, filepath.Dir(filePath))
-		if err != nil {
-			return err
+		if err != nil || parsed.Module == nil || parsed.Module.Mod.Path == "" {
+			// A go.mod is a module boundary even when malformed. Letting a
+			// parent module claim this subtree would fabricate import evidence.
+			modules = append(modules, goModule{root: filepath.ToSlash(rel), blocked: true})
+			return nil
 		}
 		modules = append(modules, goModule{path: parsed.Module.Mod.Path, root: filepath.ToSlash(rel)})
 		return nil
@@ -264,6 +296,9 @@ func repoGoModules(ctx context.Context, tx *sql.Tx, repoID int64) ([]goModule, e
 func modulePackageDir(modules []goModule, importPath string) (string, bool) {
 	best := goModule{}
 	for _, module := range modules {
+		if module.blocked {
+			continue
+		}
 		if importPath != module.path && !strings.HasPrefix(importPath, module.path+"/") {
 			continue
 		}
@@ -278,11 +313,24 @@ func modulePackageDir(modules []goModule, importPath string) (string, bool) {
 	}
 	rel := strings.TrimPrefix(importPath, best.path)
 	rel = strings.TrimPrefix(rel, "/")
-	if best.root == "." || best.root == "" {
-		return rel, true
+	dir := rel
+	if best.root != "." && best.root != "" {
+		if rel == "" {
+			dir = best.root
+		} else {
+			dir = path.Join(best.root, rel)
+		}
 	}
-	if rel == "" {
-		return best.root, true
+	for _, module := range modules {
+		if !module.blocked || module.root == "" || module.root == "." {
+			continue
+		}
+		if dir == module.root || strings.HasPrefix(dir, module.root+"/") {
+			validNested := best.root == module.root || strings.HasPrefix(best.root, module.root+"/")
+			if !validNested {
+				return "", false
+			}
+		}
 	}
-	return path.Join(best.root, rel), true
+	return dir, true
 }

@@ -385,3 +385,63 @@ func writeFile(t *testing.T, path, content string) {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
 }
+
+func TestOwnModuleImportLifecycleAndFullUpdateParity(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.com/project\n")
+	writeFile(t, filepath.Join(root, "cmd", "main.go"), "package main\n\nimport \"example.com/project/pkg\"\n\nfunc main() { pkg.New() }\n")
+	writeFile(t, filepath.Join(root, "pkg", "target.go"), "package pkg\nfunc New() {}\n")
+	writeFile(t, filepath.Join(root, "other", "target.go"), "package other\nfunc New() {}\n")
+
+	open := func() (*store.Store, *Indexer) {
+		s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s, New(s, parser.NewRegistry(goparser.New()), nil)
+	}
+	s, idx := open()
+	defer s.Close()
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callees, err := s.FindCallees(ctx, repo.ID, "main", 0, 20, 0)
+	if err != nil || len(callees) != 1 || callees[0].QualifiedName != "pkg.New" {
+		t.Fatalf("initial callees = (%v, %v), want pkg.New", callees, err)
+	}
+	if err := os.Remove(filepath.Join(root, "pkg", "target.go")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if unresolved, err := s.CountUnresolvedEdgesByDstName(ctx, repo.ID, "example.com/project/pkg.New"); err != nil || unresolved != 1 {
+		t.Fatalf("after deletion unresolved edge count = (%d, %v), want 1", unresolved, err)
+	}
+	writeFile(t, filepath.Join(root, "pkg", "target.go"), "package pkg\nfunc New() {}\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	callees, err = s.FindCallees(ctx, repo.ID, "main", 0, 20, 0)
+	if err != nil || len(callees) != 1 || callees[0].QualifiedName != "pkg.New" {
+		t.Fatalf("after recreation callees = (%v, %v), want pkg.New", callees, err)
+	}
+	fresh, freshIdx := open()
+	defer fresh.Close()
+	if _, err := freshIdx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	freshRepo, err := fresh.UpsertRepo(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshCallees, err := fresh.FindCallees(ctx, freshRepo.ID, "main", 0, 20, 0)
+	if err != nil || len(freshCallees) != len(callees) || freshCallees[0].QualifiedName != callees[0].QualifiedName {
+		t.Fatalf("full/update callees differ: update=%v full=%v err=%v", callees, freshCallees, err)
+	}
+}

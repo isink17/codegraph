@@ -640,32 +640,32 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		for path := range changedPathSet {
 			changedPaths = append(changedPaths, path)
 		}
-		if err := i.store.ResolveEdgesForPaths(ctx, repo.ID, changedPaths); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
-		}
-		summary.ResolveMode = "paths"
-
 		// Correctness: partial runs can introduce symbols that should resolve previously-unresolved
-		// edges in other files. Do a narrow cross-file pass keyed by the introduced symbol names,
-		// without falling back to repo-wide resolution.
+		// edges in other files. Share own-module discovery across path and name passes.
+		var stats store.ResolveEdgesForNamesStats
 		if len(changedSymbolNameSet) > 0 {
 			names := make([]string, 0, len(changedSymbolNameSet))
 			for name := range changedSymbolNameSet {
 				names = append(names, name)
 			}
 			crossStart := time.Now()
-			stats, err := i.store.ResolveEdgesForNamesWithStats(ctx, repo.ID, names)
+			stats, err = i.store.ResolveEdgesForPathsAndNames(ctx, repo.ID, changedPaths, names)
 			if err != nil {
 				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 				return summary, err
 			}
-			if stats != (store.ResolveEdgesForNamesStats{}) {
-				summary.ResolveCrossFile = &stats
-			}
-			summary.ResolveCrossFileTargets = stats.TargetsSelected
-			summary.ResolveCrossFileMS = time.Since(crossStart).Milliseconds()
 			summary.ResolveMode = "paths+names"
+			summary.ResolveCrossFileMS = time.Since(crossStart).Milliseconds()
+		} else {
+			if _, err := i.store.ResolveEdgesForPathsAndNames(ctx, repo.ID, changedPaths, nil); err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			summary.ResolveMode = "paths"
+		}
+		if stats != (store.ResolveEdgesForNamesStats{}) {
+			summary.ResolveCrossFile = &stats
+			summary.ResolveCrossFileTargets = stats.TargetsSelected
 		}
 	} else {
 		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {

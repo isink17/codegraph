@@ -2569,7 +2569,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
-	if n, err := s.resolveOwnModuleImports(ctx, tx, repoID); err != nil {
+	if n, _, err := s.resolveOwnModuleImports(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
@@ -3240,11 +3240,26 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 }
 
 func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []string) error {
+	return s.resolveEdgesForPaths(ctx, repoID, paths, nil)
+}
+
+// ResolveEdgesForPathsAndNames shares one module discovery pass across the two
+// incremental resolver scopes. Own-module edges are resolved repo-wide first;
+// path/name scopes then handle remaining evidence without another WalkDir.
+func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, paths, names []string) (ResolveEdgesForNamesStats, error) {
+	moduleVeto, err := s.resolveOwnModuleImportsStandalone(ctx, repoID, nil)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	if err := s.resolveEdgesForPaths(ctx, repoID, paths, moduleVeto); err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto)
+}
+
+func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []string, moduleVeto map[int64]struct{}) error {
 	if len(paths) == 0 {
 		return nil
-	}
-	if err := s.resolveOwnModuleImportsStandalone(ctx, repoID); err != nil {
-		return err
 	}
 	uniquePaths := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
@@ -3252,11 +3267,23 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		if path == "" {
 			continue
 		}
-		if _, ok := seenPaths[path]; ok {
+		scopePath := strings.ReplaceAll(path, "\\", "/")
+		if _, ok := seenPaths[scopePath]; ok {
 			continue
 		}
-		seenPaths[path] = struct{}{}
+		seenPaths[scopePath] = struct{}{}
 		uniquePaths = append(uniquePaths, path)
+	}
+	modulePaths := make(map[string]struct{}, len(uniquePaths))
+	for _, path := range uniquePaths {
+		modulePaths[strings.ReplaceAll(path, "\\", "/")] = struct{}{}
+	}
+	var err error
+	if moduleVeto == nil {
+		moduleVeto, err = s.resolveOwnModuleImportsStandalone(ctx, repoID, &ownModuleScope{paths: modulePaths})
+		if err != nil {
+			return err
+		}
 	}
 
 	const chunkSize = 400
@@ -3268,11 +3295,11 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		end := min(start+chunkSize, len(uniquePaths))
 		chunk := uniquePaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id, language FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
+		query := `SELECT id, language FROM files WHERE repo_id = ? AND replace(path, '\\', '/') IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, path := range chunk {
-			args = append(args, path)
+			args = append(args, strings.ReplaceAll(path, "\\", "/"))
 		}
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -3318,7 +3345,7 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		}
 		targets = append(targets, chunkTargets...)
 	}
-	_, err := s.resolveEdgeTargets(ctx, repoID, targets)
+	_, err = s.resolveEdgeTargets(ctx, repoID, targets, moduleVeto)
 	return err
 }
 
@@ -3337,6 +3364,10 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 }
 
 func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string) (ResolveEdgesForNamesStats, error) {
+	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, nil)
+}
+
+func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string, moduleVeto map[int64]struct{}) (ResolveEdgesForNamesStats, error) {
 	var stats ResolveEdgesForNamesStats
 	if len(names) == 0 {
 		return stats, nil
@@ -3359,8 +3390,19 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		return stats, nil
 	}
 	stats.NamesUnique = len(unique)
-	if err := s.resolveOwnModuleImportsStandalone(ctx, repoID); err != nil {
-		return stats, err
+	moduleNames := make(map[string]struct{}, len(unique))
+	for _, name := range unique {
+		moduleNames[name] = struct{}{}
+		if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
+			moduleNames[name[dot+1:]] = struct{}{}
+		}
+	}
+	var err error
+	if moduleVeto == nil {
+		moduleVeto, err = s.resolveOwnModuleImportsStandalone(ctx, repoID, &ownModuleScope{names: moduleNames})
+		if err != nil {
+			return stats, err
+		}
 	}
 
 	// Candidate selection:
@@ -3481,7 +3523,7 @@ func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	}
 	stats.TargetsSelected = len(targets)
 	resolveStarted := time.Now()
-	outcome, err := s.resolveEdgeTargets(ctx, repoID, targets)
+	outcome, err := s.resolveEdgeTargets(ctx, repoID, targets, moduleVeto)
 	if err != nil {
 		return stats, err
 	}
@@ -3631,13 +3673,16 @@ func setToSlice(set map[string]struct{}) []string {
 // name-targeted resolvers. Candidate lookups are keyed by (name, language) and
 // a target only binds when resolverLanguageCompatible allows it, which is the
 // same rule the repo-wide SQL strategies apply.
-func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget) (resolveEdgeTargetsOutcome, error) {
+func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget, moduleVeto map[int64]struct{}) (resolveEdgeTargetsOutcome, error) {
 	var outcome resolveEdgeTargetsOutcome
 	if len(targets) == 0 {
 		return outcome, nil
 	}
 	qualifiedSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
+		if _, blocked := moduleVeto[target.edgeID]; blocked {
+			continue
+		}
 		if target.dstName != "" {
 			qualifiedSet[target.dstName] = struct{}{}
 		}
@@ -3728,6 +3773,9 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, err
 	}
 	for _, target := range targets {
+		if _, blocked := moduleVeto[target.edgeID]; blocked {
+			continue
+		}
 		fallbackName, fallbackColumn := binderFallback(target.dstName)
 		if target.srcLanguage == "" {
 			// Unknown source language: never guess a destination language.
