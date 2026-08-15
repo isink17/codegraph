@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/isink17/codegraph/releases/latest"><img src="https://img.shields.io/github/v/release/isink17/codegraph?color=00ff88&style=flat-square&label=release" alt="Latest Release"/></a>
   <a href="https://pkg.go.dev/github.com/isink17/codegraph"><img src="https://img.shields.io/badge/go-1.23+-00d4ff?style=flat-square&logo=go&logoColor=white" alt="Go version"/></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--MIT-ffaa44?style=flat-square" alt="License"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-ffaa44?style=flat-square" alt="License"/></a>
   <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-8899aa?style=flat-square" alt="Platforms"/>
   <img src="https://img.shields.io/badge/MCP%20tools-29-00ff88?style=flat-square" alt="MCP Tools"/>
 </p>
@@ -237,6 +237,24 @@ startup_timeout_sec = 60
 </details>
 
 See the [`examples/`](examples/) directory for more configuration samples.
+
+---
+
+## Agent Skill
+
+[`skills/codegraph`](skills/codegraph/SKILL.md) is an [Agent Skills](https://agentskills.io)–compatible
+skill that teaches coding agents the efficient CodeGraph workflow: narrow graph
+context first, targeted drill-down, caller/callee and impact reasoning, source
+verification. Install it with the [`skills` CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add isink17/codegraph --skill codegraph                       # pick agents interactively
+npx skills add isink17/codegraph --skill codegraph -a claude-code -a codex
+npx skills add isink17/codegraph --skill codegraph -g                    # global instead of per-project
+```
+
+It works with any client that supports Agent Skills; the skill itself covers
+both MCP modes (`full` and `gateway`) and the CLI fallback.
 
 ---
 
@@ -884,6 +902,6 @@ This rebuild path needs exclusive access to the repo database. If it fails becau
 
 ## License
 
-This project is licensed under the **Functional Source License, Version 1.1, MIT Future License** (`FSL-1.1-MIT`).
+This project is licensed under the **Functional Source License, Version 1.1, Apache 2.0 Future License** (`FSL-1.1-Apache-2.0`).
 
 On the second anniversary of each version's release, that version converts to the MIT License. See [`LICENSE`](LICENSE) for full terms.
