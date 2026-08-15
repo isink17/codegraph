@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 )
 
 // architectureTopN is how many entry points / hub symbols the architecture
@@ -64,7 +65,7 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"qualified_name": qname, "kind": kind, "file": path, countKey: degree,
+			"qualified_name": qname, "kind": kind, "file": filepath.ToSlash(path), countKey: degree,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -104,7 +105,7 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"qualified_name": qname, "kind": kind, "file": path, countKey: 0,
+			"qualified_name": qname, "kind": kind, "file": filepath.ToSlash(path), countKey: 0,
 		})
 	}
 	return out, rows.Err()

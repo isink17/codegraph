@@ -346,10 +346,12 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
 		return applyPragmas(db, isNewDB, opts.PerformanceProfile)
 	}); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	s := &Store{db: db}
 	if err := s.Migrate(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -4911,6 +4913,7 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 			value := dstID.Int64
 			edge.DstSymbolID = &value
 		}
+		edge.FilePath = filepath.ToSlash(edge.FilePath)
 		out = append(out, edge)
 		evidence = append(evidence, item)
 	}
@@ -5522,6 +5525,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 					rows.Close()
 					return err
 				}
+				si.file = filepath.ToSlash(si.file)
 				if visited[si.id] {
 					continue
 				}
@@ -6097,10 +6101,13 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 	query := `SELECT path, language, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`
 	args := []any{repoID}
 	if pathFilter != "" {
-		query += ` AND path LIKE ?`
-		args = append(args, pathFilter+"%")
+		variants := storedPathVariants(CanonicalRelPath(pathFilter))
+		query += ` AND (` + strings.TrimRight(strings.Repeat("path LIKE ? OR ", len(variants)), " OR ") + `)`
+		for _, variant := range variants {
+			args = append(args, variant+"%")
+		}
 	}
-	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
+	query += ` ORDER BY REPLACE(path, char(92), '/') ASC LIMIT ? OFFSET ?`
 	args = append(args, safeLimit(limit), safeOffset(offset))
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -6117,7 +6124,7 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"path":       path,
+			"path":       filepath.ToSlash(path),
 			"language":   language,
 			"size_bytes": sizeBytes,
 		})
@@ -6150,7 +6157,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Test%'
 		  AND s.name NOT LIKE 'Benchmark%'
 		  AND s.name NOT LIKE 'Example%'
-		ORDER BY f.path, s.start_line
+		ORDER BY REPLACE(f.path, char(92), '/'), s.start_line
 		LIMIT ? OFFSET ?
 	`, repoID, repoID, safeLimit(limit), safeOffset(offset))
 	if err != nil {
@@ -6170,7 +6177,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 			"symbol":     qualifiedName,
 			"kind":       kind,
 			"name":       name,
-			"file":       path,
+			"file":       filepath.ToSlash(path),
 			"language":   language,
 			"start_line": startLine,
 			"end_line":   endLine,
@@ -6730,7 +6737,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	topDirs := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT SUBSTR(path, 1, INSTR(path||'/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC LIMIT 20`,
+			`SELECT SUBSTR(REPLACE(path, char(92), '/') , 1, INSTR(REPLACE(path, char(92), '/') || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC LIMIT 20`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: directories: %w", err)
@@ -6864,6 +6871,7 @@ func (s *Store) AllImports(ctx context.Context, repoID int64) (map[string][]stri
 		if err := rows.Scan(&path, &importPath); err != nil {
 			return nil, err
 		}
+		path = filepath.ToSlash(path)
 		result[path] = append(result[path], importPath)
 	}
 	if err := rows.Err(); err != nil {
@@ -6877,7 +6885,7 @@ func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT path FROM files
 		WHERE repo_id = ? AND is_deleted = 0
-		ORDER BY path`, repoID)
+		ORDER BY REPLACE(path, char(92), '/')`, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -6889,7 +6897,7 @@ func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error
 		if err := rows.Scan(&path); err != nil {
 			return nil, err
 		}
-		paths = append(paths, path)
+		paths = append(paths, filepath.ToSlash(path))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

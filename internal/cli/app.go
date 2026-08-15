@@ -2084,7 +2084,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			continue
 		}
 		dbPath := filepath.Join(cfg.DBDir, entry.Name())
-		sizeBefore := fileSize(dbPath)
+		sizeBefore := fileSize(dbPath) + fileSize(dbPath+"-wal") + fileSize(dbPath+"-shm")
 		res := dbResult{Path: dbPath, SizeBefore: sizeBefore}
 		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
 		if err != nil {
@@ -2103,7 +2103,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		}
 		if !ok {
 			_ = s.Close()
-			if err := os.Remove(dbPath); err == nil {
+			if err := removeSQLiteFiles(dbPath); err == nil {
 				res.Action = "deleted_orphan"
 				res.ReclaimedBytes = sizeBefore
 				reclaimed += sizeBefore
@@ -2117,7 +2117,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		res.CanonicalRepo = repo.CanonicalPath
 		if _, err := os.Stat(repo.CanonicalPath); err != nil {
 			_ = s.Close()
-			if err := os.Remove(dbPath); err == nil {
+			if err := removeSQLiteFiles(dbPath); err == nil {
 				res.Action = "deleted_orphan"
 				res.ReclaimedBytes = sizeBefore
 				reclaimed += sizeBefore
@@ -2214,6 +2214,15 @@ func fileSize(path string) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+func removeSQLiteFiles(path string) error {
+	for _, candidate := range []string{path + "-wal", path + "-shm", path} {
+		if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 type App struct {
