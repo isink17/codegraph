@@ -155,6 +155,20 @@ func (s *Store) symbolPage(ctx context.Context, repoID int64, candidateCTE strin
 // `dst_symbol_id` is bound to the target, and unresolved edges whose `dst_name`
 // spells it. The second leg is what surfaces callers the resolver could not
 // bind; dropping it would silently shrink the answer.
+//
+// The two legs answer different questions, and P22.7 gates only the second. A
+// bound `dst_symbol_id` is a decision something already made on evidence --
+// including ResolveCrossLanguageLinks' explicit `cross_language_ref` links,
+// which are foreign-language on purpose and must keep surfacing. An unresolved
+// `dst_name` is a spelling, and a spelling written in another language does not
+// name this symbol, exactly as the resolver refuses to bind it.
+//
+// "Another language" is measured against the languages of the symbols the input
+// actually matched, as a set. This query has always answered for every symbol a
+// name matches, so an ambiguous name that names a Go symbol and a Python one
+// keeps returning both languages' callers -- each of them a real caller of one
+// of the matched targets. The gate is at its tightest when the input identifies
+// one symbol, which is the form `TestExactSymbolIDStaysExact` pins.
 func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	targetIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
@@ -170,6 +184,26 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		args = append(args, a...)
 	}
 	if short != "" {
+		// One read of the targets answers both name-evidence rules: their
+		// persisted languages (P22.7) and, for the Go ones, the package scopes a
+		// bare spelling could name them from (P22.6).
+		//
+		// No target row means no language evidence at all -- the name is not in
+		// the index, and the honest answer to "who spells this" is still every
+		// writer. Inventing a language there would be the guess this phase
+		// removes, in the other direction.
+		targetScopes, err := symbolScopesByIDs(ctx, neighborQuerier{s}, repoID, targetIDs)
+		if err != nil {
+			return nil, err
+		}
+		targetLangs := symbolLanguagesOf(targetScopes)
+		// The name legs are collected separately from the bound-destination leg
+		// so the language gate can be applied once to their union, rather than
+		// once per branch. The writer lookup is an integer-primary-key seek, and
+		// the union already has to be materialised, so paying for it once keeps
+		// the gate off the per-chunk path entirely.
+		var nameBranches []string
+		var nameArgs []any
 		// Split rather than one many-way OR. A single OR-of-predicates is not
 		// seekable, so SQLite fell back to walking every edge in the repo
 		// through idx_edges_repo_src and fetching each row. Separated, the
@@ -198,31 +232,28 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 			}
 		}
 		if len(qualifiedExact) > 0 {
-			branches = append(branches, `SELECT e.src_symbol_id FROM edges e
+			nameBranches = append(nameBranches, `SELECT e.src_symbol_id AS src FROM edges e
 				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
 				  AND e.dst_name IN (`+placeholders(len(qualifiedExact))+`)`)
-			args = append(args, repoID)
+			nameArgs = append(nameArgs, repoID)
 			for _, spelling := range qualifiedExact {
-				args = append(args, spelling)
+				nameArgs = append(nameArgs, spelling)
 			}
 		}
 		if len(bareExact) > 0 {
-			scopeKeys, err := s.goBareTargetScopes(ctx, repoID, targetIDs)
-			if err != nil {
-				return nil, err
-			}
-			branches = append(branches, `SELECT e.src_symbol_id FROM edges e
+			scopeKeys := goBareTargetScopes(targetScopes)
+			nameBranches = append(nameBranches, `SELECT e.src_symbol_id AS src FROM edges e
 				JOIN symbols src ON src.id = e.src_symbol_id
 				JOIN files srcf ON srcf.id = src.file_id
 				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
 				  AND e.dst_name IN (`+placeholders(len(bareExact))+`)
 				  AND `+sqlGoBareSourceScope(len(scopeKeys)))
-			args = append(args, repoID)
+			nameArgs = append(nameArgs, repoID)
 			for _, spelling := range bareExact {
-				args = append(args, spelling)
+				nameArgs = append(nameArgs, spelling)
 			}
 			for _, key := range scopeKeys {
-				args = append(args, key)
+				nameArgs = append(nameArgs, key)
 			}
 		}
 
@@ -268,13 +299,30 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		for start := 0; start < len(spellings); start += neighborIDChunk {
 			end := min(start+neighborIDChunk, len(spellings))
 			chunk := spellings[start:end]
-			branches = append(branches, `SELECT e.src_symbol_id FROM edges e
+			nameBranches = append(nameBranches, `SELECT e.src_symbol_id AS src FROM edges e
 				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
 				  AND e.dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`)
-			args = append(args, repoID)
+			nameArgs = append(nameArgs, repoID)
 			for _, spelling := range chunk {
-				args = append(args, spelling)
+				nameArgs = append(nameArgs, spelling)
 			}
+		}
+
+		if len(nameBranches) > 0 {
+			nameSQL := strings.Join(nameBranches, " UNION ")
+			if len(targetLangs) > 0 {
+				// P22.7: only a writer in one of the target's own languages may
+				// claim it by name. With no target row there is no language to
+				// require, and the union stands as it did.
+				nameSQL = `SELECT nl.src FROM (` + nameSQL + `) nl
+					JOIN symbols srclang ON srclang.id = nl.src
+					WHERE srclang.language IN (` + placeholders(len(targetLangs)) + `)`
+				for _, language := range targetLangs {
+					nameArgs = append(nameArgs, language)
+				}
+			}
+			branches = append(branches, nameSQL)
+			args = append(args, nameArgs...)
 		}
 	}
 	if len(branches) == 0 {
@@ -380,15 +428,16 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 	if len(dstNames) > 0 {
 		// P22.6: a bare spelling written in a Go file names something in that
 		// file's own package, so it is resolved inside that package rather than
-		// through the repo-wide cascade. Non-Go sources, and every
-		// qualifier-bearing spelling, keep the cascade unchanged.
+		// through the repo-wide cascade. P22.7: every other spelling reaches the
+		// cascade tagged with the persisted language of the symbol that wrote
+		// it, so a Python call can only be answered by a Python declaration.
 		unscoped, scoped, err := s.splitGoBareCalleeNames(ctx, repoID, srcIDs, dstNames, namesBySrc)
 		if err != nil {
 			return nil, err
 		}
 		var fallbackIDs []int64
 		if len(unscoped) > 0 {
-			fallbackIDs, err = s.lookupSymbolIDsForNames(ctx, repoID, unscoped)
+			fallbackIDs, err = s.lookupSymbolIDsForNameLanguages(ctx, repoID, unscoped)
 			if err != nil {
 				return nil, err
 			}

@@ -143,13 +143,25 @@ func goPackageLevelDeclaration(qualifiedName, name string) bool {
 	return pkg != "" && name != "" && qualifiedName == pkg+"."+name
 }
 
-// goSymbolScope is one symbol's answer to both questions this rule asks.
+// goSymbolScope is one symbol's answer to both questions this rule asks, plus
+// the persisted language every implicit name lookup has to agree with (P22.7).
+//
+// The language rides along rather than being read by a second query because
+// every caller of these helpers needs both facts about the same symbols, and
+// the neighbour pipeline's statement count is a pinned invariant.
 type goSymbolScope struct {
-	// key is the symbol's package scope, or goPackageScopeUnknown.
+	// language is the symbol's persisted `symbols.language`, or "" when no
+	// symbol row answered. Only `go` makes the P22.6 package rule apply.
+	language string
+	// key is the symbol's package scope, or goPackageScopeUnknown. It is only
+	// meaningful when language is `go`.
 	key string
 	// packageLevel reports whether a bare call could name this symbol at all.
 	packageLevel bool
 }
+
+// isGo reports whether the P22.6 Go package rule governs this symbol.
+func (s goSymbolScope) isGo() bool { return s.language == "go" }
 
 // -- SQL twins -------------------------------------------------------------
 //
@@ -407,10 +419,14 @@ func goBareCandidateGroups(ctx context.Context, q queryContexter, repoID int64, 
 	return out, nil
 }
 
-// goSymbolScopesByIDs loads the package scope of each of the given symbols.
-// Symbols that are not Go are omitted, so a caller can tell "not a Go symbol"
-// from "Go symbol whose scope is unknown".
-func goSymbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, ids []int64) (map[int64]goSymbolScope, error) {
+// symbolScopesByIDs loads the persisted language of each of the given symbols,
+// and for the Go ones their package scope.
+//
+// Every language is loaded, not only Go (P22.7): the language is the evidence
+// every implicit name lookup gates on, and a symbol missing from the result is
+// a symbol with no row at all -- which fails closed on both rules rather than
+// meaning "not Go".
+func symbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, ids []int64) (map[int64]goSymbolScope, error) {
 	out := make(map[int64]goSymbolScope, len(ids))
 	if len(ids) == 0 {
 		return out, nil
@@ -420,10 +436,10 @@ func goSymbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, id
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
-			SELECT s.id, s.qualified_name, s.name, f.path
+			SELECT s.id, s.language, s.qualified_name, s.name, f.path
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
-			WHERE s.repo_id = ? AND s.language = 'go'
+			WHERE s.repo_id = ?
 			  AND s.id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
 		`, args...)
 		if err != nil {
@@ -434,6 +450,27 @@ func goSymbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, id
 		}
 	}
 	return out, nil
+}
+
+// symbolLanguagesOf returns the distinct persisted languages of a scope map, in
+// a sorted order so generated statement text and bound arguments are a function
+// of the graph rather than of map iteration. Symbols with no persisted language
+// contribute nothing: an unknown language is not evidence of a shared one.
+func symbolLanguagesOf(scopes map[int64]goSymbolScope) []string {
+	seen := make(map[string]struct{}, len(scopes))
+	out := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		if scope.language == "" {
+			continue
+		}
+		if _, ok := seen[scope.language]; ok {
+			continue
+		}
+		seen[scope.language] = struct{}{}
+		out = append(out, scope.language)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // goSymbolScopesByEdgeSource loads the package scope of each edge's source
@@ -448,7 +485,7 @@ func goSymbolScopesByEdgeSource(ctx context.Context, q queryContexter, repoID in
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
-			SELECT e.id, s.qualified_name, s.name, f.path
+			SELECT e.id, s.language, s.qualified_name, s.name, f.path
 			FROM edges e
 			JOIN symbols s ON s.id = e.src_symbol_id
 			JOIN files f ON f.id = s.file_id
@@ -469,11 +506,12 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 	defer rows.Close()
 	for rows.Next() {
 		var key int64
-		var qualifiedName, name, filePath string
-		if err := rows.Scan(&key, &qualifiedName, &name, &filePath); err != nil {
+		var language, qualifiedName, name, filePath string
+		if err := rows.Scan(&key, &language, &qualifiedName, &name, &filePath); err != nil {
 			return err
 		}
 		out[key] = goSymbolScope{
+			language:     language,
 			key:          goPackageScopeKey(filePath, qualifiedName),
 			packageLevel: goPackageLevelDeclaration(qualifiedName, name),
 		}
@@ -488,15 +526,11 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 //
 // The result is sorted so statement text and bound arguments are a function of
 // the input, never of map iteration.
-func (s *Store) goBareTargetScopes(ctx context.Context, repoID int64, ids []int64) ([]string, error) {
-	scopes, err := goSymbolScopesByIDs(ctx, neighborQuerier{s}, repoID, ids)
-	if err != nil {
-		return nil, err
-	}
+func goBareTargetScopes(scopes map[int64]goSymbolScope) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(scopes))
 	for _, scope := range scopes {
-		if !scope.packageLevel || scope.key == goPackageScopeUnknown {
+		if !scope.isGo() || !scope.packageLevel || scope.key == goPackageScopeUnknown {
 			continue
 		}
 		if _, ok := seen[scope.key]; ok {
@@ -506,17 +540,20 @@ func (s *Store) goBareTargetScopes(ctx context.Context, repoID int64, ids []int6
 		out = append(out, scope.key)
 	}
 	sort.Strings(out)
-	return out, nil
+	return out
 }
 
-// contextSeedGoScopes loads the Go package scope of every live seed that has a
-// resolved symbol id, keyed by seed index.
+// contextSeedScopes loads the persisted language -- and, for Go seeds, the
+// package scope -- of every live seed that has a resolved symbol id, keyed by
+// seed index.
 //
-// A seed with no id contributes nothing, and is therefore treated as not-Go by
-// goBareSeedScope. That is not a hole: AllowShortEvidence is derived from a
-// count over `symbols`, so a seed with no symbol row never carries bare
-// short-name evidence in the first place.
-func (s *Store) contextSeedGoScopes(ctx context.Context, repoID int64, seeds []ContextSeed, live []int) (map[int]goSymbolScope, error) {
+// A seed with no id contributes nothing, and is therefore treated as not-Go and
+// as having no language evidence. That is not a hole on either rule: for P22.6,
+// AllowShortEvidence is derived from a count over `symbols`, so a seed with no
+// symbol row never carries bare short-name evidence in the first place; for
+// P22.7, a seed CodeGraph cannot identify has no language to constrain its name
+// evidence with, and inventing one is the guess the phase removes.
+func (s *Store) contextSeedScopes(ctx context.Context, repoID int64, seeds []ContextSeed, live []int) (map[int]goSymbolScope, error) {
 	ids := make([]int64, 0, len(live))
 	idxsByID := make(map[int64][]int, len(live))
 	for _, i := range live {
@@ -529,7 +566,7 @@ func (s *Store) contextSeedGoScopes(ctx context.Context, repoID int64, seeds []C
 		}
 		idxsByID[id] = append(idxsByID[id], i)
 	}
-	byID, err := goSymbolScopesByIDs(ctx, neighborQuerier{s}, repoID, ids)
+	byID, err := symbolScopesByIDs(ctx, neighborQuerier{s}, repoID, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -552,8 +589,8 @@ func (s *Store) contextSeedGoScopes(ctx context.Context, repoID int64, seeds []C
 // package, or a method, which Go spells through a receiver. Then the evidence
 // is dropped rather than widened.
 func goBareTargetSeedScope(scopes map[int]goSymbolScope, idx int, name string) (scope string, gated, ok bool) {
-	seed, isGo := scopes[idx]
-	if !isGo || !goBareCallName(name) {
+	seed := scopes[idx]
+	if !seed.isGo() || !goBareCallName(name) {
 		return "", false, false
 	}
 	if !seed.packageLevel || seed.key == goPackageScopeUnknown {
@@ -567,8 +604,8 @@ func goBareTargetSeedScope(scopes map[int]goSymbolScope, idx int, name string) (
 // itself package-level or a method is irrelevant -- a method body writes bare
 // calls into its own package just as a function does.
 func goBareSourceSeedScope(scopes map[int]goSymbolScope, idx int, name string) (scope string, gated, ok bool) {
-	seed, isGo := scopes[idx]
-	if !isGo || !goBareCallName(name) {
+	seed := scopes[idx]
+	if !seed.isGo() || !goBareCallName(name) {
 		return "", false, false
 	}
 	if seed.key == goPackageScopeUnknown {
@@ -589,64 +626,64 @@ func goBareSourceSeedScope(scopes map[int]goSymbolScope, idx int, name string) (
 // A name can be in both halves: `Helper` written bare by a Go function and also
 // written as `pkg.Helper` by a Python file is two different pieces of evidence,
 // so the two sets are tracked independently.
-func (s *Store) splitGoBareCalleeNames(ctx context.Context, repoID int64, srcIDs []int64, allNames []string, namesBySrc map[int64][]string) ([]string, []int64, error) {
-	srcScopes, err := goSymbolScopesByIDs(ctx, neighborQuerier{s}, repoID, srcIDs)
+//
+// The unscoped half carries, per name, the persisted languages of the sources
+// that spelled it (P22.7). That is the evidence the repo-wide cascade needs in
+// order not to answer a Python call with a Go declaration, and it is why the
+// half is returned as []nameLanguages rather than as bare strings.
+func (s *Store) splitGoBareCalleeNames(ctx context.Context, repoID int64, srcIDs []int64, allNames []string, namesBySrc map[int64][]string) ([]nameLanguages, []int64, error) {
+	srcScopes, err := symbolScopesByIDs(ctx, neighborQuerier{s}, repoID, srcIDs)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(srcScopes) == 0 {
-		// No Go source symbol: nothing to scope.
-		return allNames, nil, nil
-	}
 
-	// A bare name is scoped only where every source that spelled it is a Go
-	// symbol with a known package. Any other writer keeps the name in the
-	// unscoped half, so this can never remove evidence another language owns.
+	// A bare name is package-scoped only for the Go writers with a known
+	// package. Every other writer keeps the name in the unscoped half, tagged
+	// with its own language, so the Go rule can never consume evidence another
+	// language owns -- and the language rule then decides that half.
 	bareScopes := map[string]map[string]struct{}{}
-	bareUnscoped := map[string]struct{}{}
-	bareDropped := map[string]struct{}{}
+	unscopedLangs := map[string]map[string]struct{}{}
 	for src, names := range namesBySrc {
-		scope, isGo := srcScopes[src]
+		scope := srcScopes[src]
 		for _, name := range names {
-			if !goBareCallName(name) {
+			if goBareCallName(name) && scope.isGo() {
+				if scope.key == goPackageScopeUnknown {
+					// A Go writer with no provable package contributes nothing.
+					// Another writer of the same name still contributes through
+					// its own branch.
+					continue
+				}
+				if bareScopes[name] == nil {
+					bareScopes[name] = map[string]struct{}{}
+				}
+				bareScopes[name][scope.key] = struct{}{}
 				continue
 			}
-			if !isGo {
-				bareUnscoped[name] = struct{}{}
-				continue
+			// Every other spelling stays on the repo-wide cascade, but tagged
+			// with the language of the symbol that wrote it. A source with no
+			// persisted language contributes no language and therefore no
+			// candidate -- an unknown language fails closed rather than being
+			// guessed.
+			if unscopedLangs[name] == nil {
+				unscopedLangs[name] = map[string]struct{}{}
 			}
-			if scope.key == goPackageScopeUnknown {
-				bareDropped[name] = struct{}{}
-				continue
-			}
-			if bareScopes[name] == nil {
-				bareScopes[name] = map[string]struct{}{}
-			}
-			bareScopes[name][scope.key] = struct{}{}
+			unscopedLangs[name][scope.language] = struct{}{}
 		}
 	}
 
-	unscoped := make([]string, 0, len(allNames))
+	unscoped := make([]nameLanguages, 0, len(allNames))
 	scopedNames := make([]string, 0, len(allNames))
 	for _, name := range allNames {
-		_, scoped := bareScopes[name]
-		if scoped {
+		if _, scoped := bareScopes[name]; scoped {
 			scopedNames = append(scopedNames, name)
 		}
-		if _, dropped := bareDropped[name]; dropped {
-			// Some Go writer of this bare name has no provable package. That
-			// writer contributes nothing; another writer that does have a scope
-			// still contributes through scopedNames above.
-			if _, alsoUnscoped := bareUnscoped[name]; !alsoUnscoped {
-				continue
-			}
+		// A name reaches the repo-wide cascade only through the writers that
+		// are entitled to it: a bare Go spelling is answered by its own package
+		// instead, and a Go writer with no provable package is answered by
+		// nothing at all.
+		if langs, ok := unscopedLangs[name]; ok {
+			unscoped = append(unscoped, nameLanguages{name: name, languages: sortedLanguages(langs)})
 		}
-		if scoped {
-			if _, alsoUnscoped := bareUnscoped[name]; !alsoUnscoped {
-				continue
-			}
-		}
-		unscoped = append(unscoped, name)
 	}
 	if len(scopedNames) == 0 {
 		return unscoped, nil, nil

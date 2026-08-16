@@ -254,10 +254,17 @@ func TestGoBuiltinBareCallDoesNotBindForeignProjectSymbol(t *testing.T) {
 	assertNoCaller(t, calleeNamesOf(t, f, "a.Caller"), "b.len", "FindCallees")
 }
 
-// A non-Go writer of the same bare name keeps the evidence it had: this rule is
-// about Go's scoping, and Python has its own. All three surfaces must agree --
-// FindCallers, FindCallees and the batched context expansion.
-func TestGoBareScopeLeavesOtherLanguagesAlone(t *testing.T) {
+// The Go package rule (P22.6) and the language rule (P22.7) are independent,
+// and each refuses a different writer of the same bare spelling. The Go writer
+// in another package is refused because Go does not resolve a bare name that
+// way; the Python writer is refused because a Python call does not name a Go
+// declaration at all. What survives is the writer both rules allow -- the same
+// package, the same language -- on all three surfaces.
+//
+// Before P22.7 this test asserted the opposite for the Python writer, because
+// the shared name cascade carried no language gate: P22.6 deliberately left
+// that class alone and recorded it as its own finding.
+func TestGoBareScopeAndLanguageGateRefuseDifferentWriters(t *testing.T) {
 	f := newPolyglotFixture(t)
 	f.mkdir("a")
 	f.mkdir("graph")
@@ -268,42 +275,65 @@ func TestGoBareScopeLeavesOtherLanguagesAlone(t *testing.T) {
 	f.write("py/handler.py", "def handler():\n    return countTags()\n")
 	f.index()
 
-	// The Go writer in another package is refused; the Python writer is not
-	// governed by this rule and keeps whatever the name cascade gave it.
 	assertUnbound(t, f.edge("a/caller.go", "countTags"))
+	assertUnbound(t, f.edge("py/handler.py", "countTags"))
+
+	// graph.Select survives, but on the BOUND leg: its same-package call is
+	// resolved by go_package_scope, so it never reaches the name-evidence leg.
+	// The positive for the gated name leg itself lives in
+	// TestFindCallersBareNameStaysInTargetLanguage and
+	// TestFindContextNeighborsStaysInSeedLanguage, whose Go caller edge is
+	// deliberately left unresolved.
 	callers := callerNamesOf(t, f, "graph.countTags")
 	assertNoCaller(t, callers, "a.Caller", "FindCallers")
-	if !containsName(callers, "handler.handler") {
-		t.Fatalf("FindCallers(graph.countTags) = %v, want the python caller kept", callers)
+	assertNoCaller(t, callers, "handler.handler", "FindCallers")
+	if !containsName(callers, "graph.Select") {
+		t.Fatalf("FindCallers(graph.countTags) = %v, want the same-package Go caller kept", callers)
 	}
 	ctxCallers := contextCallerNamesOf(t, f, "graph.countTags")
 	assertNoCaller(t, ctxCallers, "a.Caller", "context callers")
-	if !containsName(ctxCallers, "handler.handler") {
-		t.Fatalf("context callers of graph.countTags = %v, want the python caller kept "+
+	assertNoCaller(t, ctxCallers, "handler.handler", "context callers")
+	if !containsName(ctxCallers, "graph.Select") {
+		t.Fatalf("context callers of graph.countTags = %v, want the same-package Go caller kept "+
 			"(FindCallers returned %v)", ctxCallers, callers)
 	}
+	callees := calleeNamesOf(t, f, "handler.handler")
+	assertNoCaller(t, callees, "graph.countTags", "FindCallees")
 }
 
-// A Go method cannot be named by any bare Go call, but a non-Go writer that
-// spells the method's short name is still the evidence it always was. The
-// batched pipeline must not drop the whole leg just because no Go writer
-// qualifies.
-func TestGoBareScopeKeepsNonGoEvidenceForAMethodSeed(t *testing.T) {
+// A method seed's short-name leg is gated but not deleted: the batched pipeline
+// must keep whatever writers both rules allow. No bare GO spelling names a Go
+// method (P22.6), and since P22.7 no foreign-language spelling names it either,
+// so a Go method seed's leg is legitimately empty -- while a Python method seed
+// keeps its Python writer through the same leg.
+func TestMethodSeedShortNameLegKeepsSameLanguageWriters(t *testing.T) {
 	f := newPolyglotFixture(t)
 	f.mkdir("cli")
 	f.mkdir("py")
 	f.write("cli/app.go", "package cli\n\ntype App struct{}\n\nfunc (a App) Close() error { return nil }\n")
+	// Two python classes declare Close, so the resolver refuses to bind the
+	// bare call and the short-name evidence leg is what the assertions below
+	// actually exercise.
+	f.write("py/app.py", "class App:\n    def Close(self):\n        return 0\n\n"+
+		"class Other:\n    def Close(self):\n        return 1\n")
 	f.write("py/shutdown.py", "def shutdown():\n    return Close()\n")
 	f.index()
 
-	callers := callerNamesOf(t, f, "cli.App.Close")
-	if !containsName(callers, "shutdown.shutdown") {
-		t.Fatalf("FindCallers(cli.App.Close) = %v, want the python caller kept", callers)
+	assertUnbound(t, f.edge("py/shutdown.py", "Close"))
+
+	goCallers := callerNamesOf(t, f, "cli.App.Close")
+	assertNoCaller(t, goCallers, "shutdown.shutdown", "FindCallers")
+	goCtx := contextCallerNamesOf(t, f, "cli.App.Close")
+	assertNoCaller(t, goCtx, "shutdown.shutdown", "context callers")
+
+	pyCallers := callerNamesOf(t, f, "app.App.Close")
+	if !containsName(pyCallers, "shutdown.shutdown") {
+		t.Fatalf("FindCallers(app.App.Close) = %v, want the python caller kept", pyCallers)
 	}
-	ctxCallers := contextCallerNamesOf(t, f, "cli.App.Close")
-	if !containsName(ctxCallers, "shutdown.shutdown") {
-		t.Fatalf("context callers of cli.App.Close = %v, want the python caller kept "+
-			"(FindCallers returned %v)", ctxCallers, callers)
+	pyCtx := contextCallerNamesOf(t, f, "app.App.Close")
+	if !containsName(pyCtx, "shutdown.shutdown") {
+		t.Fatalf("context callers of app.App.Close = %v, want the python caller kept "+
+			"(FindCallers returned %v)", pyCtx, pyCallers)
 	}
 }
 
@@ -396,11 +426,14 @@ func TestGoBareScopeKeepsPerSeedCalleeAnswers(t *testing.T) {
 		t.Fatalf("mod.driver callees = %v, want both python helpers -- the Go seed's "+
 			"package gate must not consume another seed's name evidence", pyCallees)
 	}
-	// Not asserted here: the python seed also picks up the Go `a.helper`
-	// symbols, because lookupSymbolIDsByName's stage-2 equality carries no
-	// language gate. That is a pre-existing cross-language leak in the shared
-	// name cascade, unchanged by P22.6 and recorded as its own finding -- this
-	// test is about per-seed association, not about that gate.
+	// P22.7: the python seed no longer picks up the Go `a.helper` either. Its
+	// spelling reaches the shared cascade tagged with the seed's own persisted
+	// language, so stage-2 equality can only answer it with python symbols.
+	for _, name := range pyCallees {
+		if name == "a.helper" {
+			t.Fatalf("mod.driver callees = %v: a python seed reached a Go symbol by name", pyCallees)
+		}
+	}
 }
 
 func contextSeedFor(t *testing.T, f *reindexFixture, qualified string) store.ContextSeed {
