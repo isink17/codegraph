@@ -212,7 +212,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					producerErr <- err
 					return
 				}
-				if info.IsDir() {
+				// Same rule as entryFileInfo below: only regular files are
+				// repository content. os.Stat resolves a link first, so a
+				// candidate that is (or points at) a directory, FIFO, socket,
+				// or device is skipped rather than read.
+				if !info.Mode().IsRegular() {
 					continue
 				}
 				adapter := i.registry.AdapterFor(rel)
@@ -238,7 +242,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return
 		}
 
-		producerErr <- filepath.WalkDir(opts.RepoRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		producerErr <- walkDir(opts.RepoRoot, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
@@ -259,9 +263,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			if shouldSkipFile(rel, opts.Include, opts.Exclude) {
 				return nil
 			}
-			info, err := d.Info()
+			info, err := entryFileInfo(path, d)
 			if err != nil {
 				return err
+			}
+			if info == nil {
+				return nil
 			}
 			adapter := i.registry.AdapterFor(rel)
 			language := ""
@@ -834,6 +841,70 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	result.parsed = parsed
 	result.action = "replace"
 	return result
+}
+
+// walkDir is filepath.WalkDir, indirected so tests can inject a deterministic
+// traversal failure. A failure here means the scan cannot know what the
+// repository contains, so it must reach the caller as an error rather than a
+// shorter successful scan.
+//
+// Production never assigns to it. Tests that do must not run in parallel with
+// any other test in this package that indexes.
+var walkDir = filepath.WalkDir
+
+// entryFileInfo returns the FileInfo the file pipeline should use for entry
+// `d`, or (nil, nil) when the entry is one the scan deliberately skips.
+//
+// Only regular files are repository content. Everything else is skipped by an
+// explicit rule rather than carried into the pipeline, because the pipeline
+// reads whatever it is handed: a directory made hashFile return EISDIR
+// ("read <path>: is a directory"), and a FIFO would make it block forever.
+// A deliberate skip is not a traversal failure — the walk keeps visiting the
+// remaining entries either way.
+//
+// Symlinks are never followed as traversal targets. WalkDir reports a link
+// with fs.ModeSymlink and does not descend into it, so before this check a
+// link to a directory reached the file pipeline and failed the entire scan on
+// EISDIR — one link truncated the repository. Not following also keeps
+// traversal inside the repository, makes a self-referential link harmless, and
+// keeps one physical file from being indexed under two logical paths. A link
+// that cannot be classified at all (broken, looping, unreadable target) is
+// skipped for the same reason: under a no-follow policy its target is not
+// repository content.
+//
+// A link whose target is a regular file is still indexed, under its own
+// repo-relative path and never the target's — including a target outside the
+// repository, whose content then enters the graph at an in-repo logical path.
+// That is the pre-existing file-symlink contract and is left as it stands; the
+// no-escape rule this phase adds is about traversal, not about content reached
+// through a single explicit link. Such an entry is described by the target's
+// metadata: d.Info() reports the link's own size and mtime, which silently
+// defeats both the max-file-size cap and the size/mtime change check for the
+// bytes os.ReadFile actually reads.
+//
+// A regular file that vanishes between readdir and the lazy lstat behind
+// d.Info() is likewise not a traversal failure: it is gone, so the scan is not
+// missing anything it should have seen, and MarkMissingDeleted retires the row.
+func entryFileInfo(path string, d fs.DirEntry) (fs.FileInfo, error) {
+	switch {
+	case d.Type().IsRegular():
+		info, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return info, nil
+	case d.Type()&fs.ModeSymlink != 0:
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, nil
+		}
+		return info, nil
+	default:
+		return nil, nil
+	}
 }
 
 func shouldSkipIndexByExtension(relPath string) bool {
