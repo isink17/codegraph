@@ -149,8 +149,8 @@ func TestBinderDecodesStrategyPerRow(t *testing.T) {
 	// Matches nothing qualified; the destination's last two segments confirm
 	// the qualifier -> rank of dot_tail2.
 	tail2Edge := f.edge(t, caller, src, "path.render_report")
-	// Bare name, matches nothing qualified; only the kind-unrestricted name
-	// lookup can bind it -> rank of bare_tail.
+	// Bare name, matches nothing qualified; only the bare-name level can bind
+	// it -> rank of exact_name.
 	bareEdge := f.edge(t, caller, src, "render_report")
 
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"src/py/caller.py"}); err != nil {
@@ -159,7 +159,7 @@ func TestBinderDecodesStrategyPerRow(t *testing.T) {
 
 	f.assertResolvedWith(t, qualifiedEdge, qualifiedDst, ResolutionStrategyExactQualified)
 	f.assertResolvedWith(t, tail2Edge, tailDst, ResolutionStrategyDotTail2)
-	f.assertResolvedWith(t, bareEdge, tailDst, ResolutionStrategyBareTail)
+	f.assertResolvedWith(t, bareEdge, tailDst, ResolutionStrategyExactName)
 }
 
 // TestResolveEdgesRecordsStrategyPerEvidenceLevel pins the provenance the
@@ -384,10 +384,13 @@ func TestScopedResolversRecordStrategy(t *testing.T) {
 			wantStrategy: ResolutionStrategyDotTail2,
 		},
 		{
-			name:         "bare_name_uses_bare_tail",
+			// P22.8: the bare-name level is one rule shared with the repo-wide
+			// resolver -- same candidate kinds, same strategy -- so every entry
+			// point reports exact_name for it.
+			name:         "bare_name_uses_exact_name",
 			dstName:      "load_config",
 			qualified:    "config.load_config",
-			wantStrategy: ResolutionStrategyBareTail,
+			wantStrategy: ResolutionStrategyExactName,
 		},
 	}
 
