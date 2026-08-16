@@ -151,7 +151,7 @@ func (s *Store) FindContextNeighbors(ctx context.Context, repoID int64, seeds []
 
 	// Both directions need the same fact -- each seed's Go package -- so it is
 	// read once for the batch rather than once per direction.
-	seedScopes, err := s.contextSeedGoScopes(ctx, repoID, seeds, live)
+	seedScopes, err := s.contextSeedScopes(ctx, repoID, seeds, live)
 	if err != nil {
 		return nil, err
 	}
@@ -190,11 +190,23 @@ type idPair struct {
 // The middle state is why a bool is needed rather than an empty-string
 // sentinel: "unnameable by Go" and "ungated" are different answers, and
 // collapsing them would drop every non-Go caller of a Go method seed.
+//
+// `language` is the seed's own persisted language (P22.7) and gates the leg
+// independently of `gated`: a spelling written in another language does not
+// name this seed, whatever its syntax. An empty language means the seed has no
+// symbol row to read one from, and then the leg keeps the evidence it had --
+// a language CodeGraph does not know is not a language it may invent.
+//
+// Since P22.7 the middle state (gated, scope == "") can match no writer at all,
+// because the non-Go escape it used to preserve is exactly the class P22.7
+// removed. expandContextCallers therefore stops emitting that leg, and the bool
+// survives only to distinguish "no package requirement" from "this package".
 type namePair struct {
-	idx   int
-	name  string
-	gated bool
-	scope string
+	idx      int
+	name     string
+	language string
+	gated    bool
+	scope    string
 }
 
 // expandContextCallers fills the Callers field of every live seed.
@@ -205,29 +217,32 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 	qnamesByIdx := map[int]string{}
 	for _, i := range live {
 		sd := seeds[i]
+		language := seedScopes[i].language
 		if sd.QualifiedName != "" {
-			names = append(names, namePair{idx: i, name: sd.QualifiedName})
+			names = append(names, namePair{idx: i, name: sd.QualifiedName, language: language})
 		}
 		if !sd.AllowShortEvidence || sd.ShortName == "" {
 			continue
 		}
 		if sd.ShortName != sd.QualifiedName {
-			// A gated seed still emits its leg: the gate narrows which writers
-			// count, it does not delete the evidence. Dropping the leg here
-			// would lose every non-Go caller of a Go method seed, which
-			// FindCallers keeps.
+			// A gated seed whose package cannot be proven -- a Go method, or an
+			// unprovable package -- can be named by nobody: no bare Go spelling
+			// reaches it (P22.6) and no foreign-language spelling names it
+			// either (P22.7). Emitting the leg would bind five variables and
+			// probe `edges` for a predicate that is false by construction, so
+			// it is skipped. Every other seed keeps its leg; the gate narrows
+			// which writers count, it does not delete the evidence.
 			scope, gated, ok := goBareTargetSeedScope(seedScopes, i, sd.ShortName)
-			if !ok {
-				scope = ""
+			if !gated || ok {
+				names = append(names, namePair{idx: i, name: sd.ShortName, language: language, gated: gated, scope: scope})
 			}
-			names = append(names, namePair{idx: i, name: sd.ShortName, gated: gated, scope: scope})
 		}
 		// Qualified-suffix spellings of the seed's identity (`App.Close` for
 		// cli.App.Close) are a finite set, so they join the equality legs
 		// directly rather than being fished out of a scan.
 		for _, spelling := range boundaryProperSuffixes(sd.QualifiedName) {
 			if spelling != sd.QualifiedName && spelling != sd.ShortName {
-				names = append(names, namePair{idx: i, name: spelling})
+				names = append(names, namePair{idx: i, name: spelling, language: language})
 			}
 		}
 		qnamesByIdx[i] = sd.QualifiedName
@@ -246,7 +261,7 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 	// many unresolved spellings extend its identity, not with the seed count.
 	// It is not capped, because capping would drop candidates the public query
 	// would have considered and silently change which neighbours win the page.
-	suffix, err := s.extendingDstNames(ctx, repoID, qnamesByIdx)
+	suffix, err := s.extendingDstNames(ctx, repoID, qnamesByIdx, seedScopes)
 	if err != nil {
 		return err
 	}
@@ -302,8 +317,9 @@ func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []
 		// entitled to its own answer. Sharing a `seen` map would let whichever
 		// seed the rows happened to arrive from first decide the other's
 		// evidence -- a result that depends on row order, not on the graph.
-		distinct := make([]string, 0, len(unresolved))
-		seenUnscoped := map[string]bool{}
+		distinct := make([]nameLanguages, 0, len(unresolved))
+		distinctAt := map[string]int{}
+		distinctLangs := map[string]map[string]struct{}{}
 		var scopedNames []string
 		seenScoped := map[string]bool{}
 		scopeKeys := map[string]struct{}{}
@@ -319,12 +335,21 @@ func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []
 				}
 				continue
 			}
-			if !seenUnscoped[np.name] {
-				seenUnscoped[np.name] = true
-				distinct = append(distinct, np.name)
+			// The spelling reaches the repo-wide cascade tagged with the
+			// language of the seed that wrote it (P22.7), so two seeds in
+			// different languages spelling one name stay two questions rather
+			// than collapsing into a shared answer.
+			if _, ok := distinctAt[np.name]; !ok {
+				distinctAt[np.name] = len(distinct)
+				distinct = append(distinct, nameLanguages{name: np.name})
+				distinctLangs[np.name] = map[string]struct{}{}
 			}
+			distinctLangs[np.name][seedScopes[np.idx].language] = struct{}{}
 		}
-		resolved, err := s.lookupSymbolIDsByName(ctx, repoID, distinct)
+		for name, at := range distinctAt {
+			distinct[at].languages = sortedLanguages(distinctLangs[name])
+		}
+		resolved, err := s.lookupSymbolIDsByNameLanguage(ctx, repoID, distinct)
 		if err != nil {
 			return err
 		}
@@ -349,7 +374,8 @@ func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []
 				}
 				continue
 			}
-			for _, id := range resolved[trimLookupName(np.name)] {
+			key := symbolLangKey{name: trimLookupName(np.name), language: seedScopes[np.idx].language}
+			for _, id := range resolved[key] {
 				if id != 0 {
 					fallback = append(fallback, idPair{idx: np.idx, id: id})
 				}
@@ -369,7 +395,7 @@ func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []
 //
 // One DISTINCT scan for the whole batch, matched per seed in Go, so the scan
 // count stays independent of the seed count.
-func (s *Store) extendingDstNames(ctx context.Context, repoID int64, qnamesByIdx map[int]string) ([]namePair, error) {
+func (s *Store) extendingDstNames(ctx context.Context, repoID int64, qnamesByIdx map[int]string, seedScopes map[int]goSymbolScope) ([]namePair, error) {
 	if len(qnamesByIdx) == 0 {
 		return nil, nil
 	}
@@ -405,7 +431,7 @@ func (s *Store) extendingDstNames(ctx context.Context, repoID int64, qnamesByIdx
 		d := asciiLower(name)
 		for _, idx := range idxs {
 			if prefoldedExtendsAtBoundary(d, foldedByIdx[idx]) {
-				out = append(out, namePair{idx: idx, name: name})
+				out = append(out, namePair{idx: idx, name: name, language: seedScopes[idx].language})
 			}
 		}
 	}
@@ -495,22 +521,40 @@ func callerCandidateSQL(legs candidateLegs) (string, int) {
 		// caller expansion from ~75ms to ~3ms, and the cost it removes grows
 		// with the unresolved population rather than with the answer.
 		//
-		// nm.gated is 0 for every spelling P22.6 does not govern, which is why
-		// the package check is a disjunct rather than a join condition: it costs
-		// nothing for the names it does not govern. When it is 1 the predicate is
-		// sqlGoBareSourceScope's, written out per row -- non-Go writers keep the
-		// evidence they had, and a Go writer must be in the seed's own package.
-		// An empty nm.scope under gating means no Go writer qualifies at all.
+		// Two rules decide which writer may claim a seed by name, and one
+		// correlated lookup of the writer decides both.
+		//
+		// nm.lang is the seed's own persisted language (P22.7): a writer in
+		// another language did not name this seed. It is '' only for a seed
+		// CodeGraph could not identify, and then the leg keeps the evidence it
+		// had -- a language we do not know is not one we may invent. That is
+		// also the only case the leading disjunct short-circuits, so the EXISTS
+		// is the normal path, not a rare one.
+		//
+		// nm.gated is 1 only for a bare spelling against a Go seed (see
+		// goBareTargetSeedScope), which implies nm.lang = 'go'; the extra
+		// requirement is then P22.6's, that the writer live in the seed's own
+		// package. There is deliberately no `src.language <> 'go'` escape any
+		// more: before P22.7 that disjunct let non-Go writers through, and
+		// P22.7's whole point is that they were never really callers. A gated
+		// leg with an empty scope can match nobody at all and is not emitted
+		// (expandContextCallers).
+		//
+		// `files` is joined inside the innermost EXISTS rather than beside
+		// `symbols`, so only the gated branch pays for it: the package key is
+		// the one thing that needs the writer's path.
 		branches = append(branches, `SELECT nm.idx, e.src_symbol_id
 			FROM nm CROSS JOIN edges e ON e.dst_name = nm.dname
 			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
-			  AND (nm.gated = 0 OR EXISTS (
+			  AND ((nm.gated = 0 AND nm.lang = '') OR EXISTS (
 			        SELECT 1 FROM symbols src
-			        JOIN files srcf ON srcf.id = src.file_id
 			        WHERE src.id = e.src_symbol_id
-			          AND (src.language <> 'go'
-			               OR (nm.scope <> ''
-			                   AND `+sqlGoPackageScopeKey("srcf.path", "src.qualified_name")+` = nm.scope))))`)
+			          AND (nm.lang = '' OR src.language = nm.lang)
+			          AND (nm.gated = 0
+			               OR (nm.scope <> '' AND EXISTS (
+			                     SELECT 1 FROM files srcf
+			                     WHERE srcf.id = src.file_id
+			                       AND `+sqlGoPackageScopeKey("srcf.path", "src.qualified_name")+` = nm.scope)))))`)
 		repoArgs++
 	}
 	return strings.Join(branches, " UNION "), repoArgs
@@ -551,12 +595,19 @@ type neighborWork struct {
 
 // Bound variables per evidence row, by leg. An id row binds (idx, id); a name
 // row binds (idx, dname, gated, scope) since P22.6 added the package-scope
-// policy columns.
+// policy columns, plus (lang) since P22.7 added the language gate.
 // splitNeighborWork budgets in variables rather than rows precisely because the
 // legs no longer cost the same.
+//
+// A wider name row means fewer of them per statement: at
+// contextStatementVarBudget = 700 a statement now holds 140 name rows rather
+// than 175, so a seed with very large suffix evidence is split across ~25% more
+// page statements. The statement count is still driven by evidence volume
+// rather than by seed count, which is the invariant P19 pinned, and P22.7 also
+// stops emitting the leg for seeds no writer can name.
 const (
 	neighborIDVars   = 2
-	neighborNameVars = 4
+	neighborNameVars = 5
 )
 
 // vars counts bound variables, not rows.
@@ -742,12 +793,12 @@ func (s *Store) pageNeighborChunk(
 				if n.gated {
 					gated = 1
 				}
-				rows = append(rows, "(?,?,?,?)")
-				cteArgs = append(cteArgs, int64(w.idx), n.name, gated, n.scope)
+				rows = append(rows, "(?,?,?,?,?)")
+				cteArgs = append(cteArgs, int64(w.idx), n.name, gated, n.scope, n.language)
 			}
 		}
 		if len(rows) > 0 {
-			ctes = append(ctes, "nm(idx, dname, gated, scope) AS (VALUES "+strings.Join(rows, ",")+")")
+			ctes = append(ctes, "nm(idx, dname, gated, scope, lang) AS (VALUES "+strings.Join(rows, ",")+")")
 			legs.names = true
 		}
 	}

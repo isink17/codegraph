@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -39,6 +40,27 @@ import (
 // bare tail here, because a call site's qualifier is evidence and discarding
 // it fabricates relationships (`rows.Close` claiming every project Close).
 // User input keeps the forgiving cascade.
+//
+// P22.7 makes the split explicit in the type system. There are two contracts,
+// and conflating them is the defect this file used to carry:
+//
+//	DISCOVERY  a user types a name and asks what the repository calls that.
+//	           No language is supplied and none may be invented, so every
+//	           language's answer is a legitimate result. `lookupSymbolIDs`
+//	           (store.go) owns this, and nothing here narrows it.
+//	IDENTITY   a persisted source spelled a name and CodeGraph is deciding
+//	           WHICH project symbol that spelling denotes. The source's
+//	           persisted language is evidence, and a candidate in another
+//	           language is not the thing that was named -- exactly the P2 rule
+//	           the resolver applies to implicit bindings.
+//
+// Everything below is the identity contract. It takes `[]nameLanguages` rather
+// than `[]string` so a caller cannot reach it without saying whose language the
+// spelling carries, and a name whose languages are empty resolves to nothing:
+// an unknown source language fails closed rather than matching everything.
+// Explicit cross-language links are unaffected -- they are `cross_language_ref`
+// edges with a bound `dst_symbol_id`, created by ResolveCrossLanguageLinks from
+// import-bridge evidence, and no name cascade runs for them.
 
 // nameLookupChunk bounds how many names go into a single IN list.
 const nameLookupChunk = 400
@@ -355,20 +377,57 @@ func prefoldedExtendsAtBoundary(d, q string) bool {
 	return false
 }
 
-// lookupSymbolIDsForNames resolves every name through the batched
-// edge-evidence cascade (lookupSymbolIDsByName -- NOT the forgiving
-// single-name cascade lookupSymbolIDs runs for user input; member-qualified
-// spellings deliberately diverge, see the file header) and returns the union
-// of the resulting ids in first-seen order.
-func (s *Store) lookupSymbolIDsForNames(ctx context.Context, repoID int64, names []string) ([]int64, error) {
-	resolved, err := s.lookupSymbolIDsByName(ctx, repoID, names)
+// nameLanguages is one lookup name together with the persisted languages of the
+// sources that spelled it -- the evidence that decides which candidates may
+// answer it.
+//
+// It is a distinct type, and every identity-side entry point takes a slice of
+// it, so a caller physically cannot ask this cascade a question without saying
+// whose language the spelling carries. An empty `languages` is a legitimate
+// answer meaning "the source has no persisted language", and it resolves to
+// nothing rather than to everything.
+type nameLanguages struct {
+	name      string
+	languages []string
+}
+
+// symbolIDLang is a candidate symbol id tagged with its own persisted language,
+// so the per-name language decision can be made once over rows the batched
+// statements already had to read.
+type symbolIDLang struct {
+	id       int64
+	language string
+}
+
+// sortedLanguages renders a language set in a deterministic order. Languages
+// are semantic strings, so ordering by them can never make an answer depend on
+// a row id or on insertion order.
+func sortedLanguages(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for lang := range set {
+		if lang == "" {
+			continue
+		}
+		out = append(out, lang)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// lookupSymbolIDsForNameLanguages resolves every (name, source language) pair
+// through the batched edge-evidence cascade (lookupSymbolIDsByNameLanguage --
+// NOT the forgiving language-agnostic cascade lookupSymbolIDs runs for user
+// input; member-qualified spellings deliberately diverge, see the file header)
+// and returns the union of the resulting ids in first-seen order.
+func (s *Store) lookupSymbolIDsForNameLanguages(ctx context.Context, repoID int64, names []nameLanguages) ([]int64, error) {
+	resolved, err := s.lookupSymbolIDsByNameLanguage(ctx, repoID, names)
 	if err != nil || len(resolved) == 0 {
 		return nil, err
 	}
 	seen := map[int64]struct{}{}
 	var out []int64
-	for _, name := range dedupeLookupNames(names) {
-		for _, id := range resolved[name] {
+	for _, key := range dedupeNameLanguages(names) {
+		for _, id := range resolved[key] {
 			if id == 0 {
 				continue
 			}
@@ -381,50 +440,72 @@ func (s *Store) lookupSymbolIDsForNames(ctx context.Context, repoID int64, names
 	return out, nil
 }
 
-// dedupeLookupNames trims and deduplicates while preserving order, so the
-// returned id order matches the pre-P12 per-name loop for the same input.
-func dedupeLookupNames(names []string) []string {
-	ordered := make([]string, 0, len(names))
-	pending := make(map[string]bool, len(names))
-	for _, name := range names {
-		trimmed := trimLookupName(name)
-		if trimmed == "" || pending[trimmed] {
+// dedupeNameLanguages trims and deduplicates (name, language) pairs while
+// preserving input order, so the returned id order is a function of the caller's
+// evidence order and not of map iteration.
+func dedupeNameLanguages(names []nameLanguages) []symbolLangKey {
+	ordered := make([]symbolLangKey, 0, len(names))
+	pending := make(map[symbolLangKey]bool, len(names))
+	for _, entry := range names {
+		trimmed := trimLookupName(entry.name)
+		if trimmed == "" {
 			continue
 		}
-		pending[trimmed] = true
-		ordered = append(ordered, trimmed)
+		for _, language := range entry.languages {
+			if language == "" {
+				// No persisted language is not a wildcard: it is an absence,
+				// and an absent source language may not select a candidate.
+				continue
+			}
+			key := symbolLangKey{name: trimmed, language: language}
+			if pending[key] {
+				continue
+			}
+			pending[key] = true
+			ordered = append(ordered, key)
+		}
 	}
 	return ordered
 }
 
-// lookupSymbolIDsByName runs the same cascade and keeps the per-name result
-// instead of flattening it.
+// lookupSymbolIDsByNameLanguage runs the same cascade and keeps the per-pair
+// result instead of flattening it.
 //
 // Batched context expansion needs the association: a seed's unresolved callee
 // names must resolve to that seed's callees, and merging thirty seeds' names
 // into one id union would give every seed everyone else's graph. The flat
-// lookupSymbolIDsForNames is now a thin wrapper over this, so the two cannot
-// diverge in cascade semantics.
+// lookupSymbolIDsForNameLanguages is now a thin wrapper over this, so the two
+// cannot diverge in cascade semantics.
 //
-// Keys are the trimmed names -- see trimLookupName.
-func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names []string) (map[string][]int64, error) {
+// The key is (trimmed name, source language) rather than the name alone,
+// because the same spelling written by a Python seed and by a Go seed is two
+// different questions with two different right answers. Keying on the name
+// would hand whichever seed asked first the other's candidates back.
+//
+// The cascade is evaluated per pair, not per name: `Foo` may be answered by
+// exact-name equality in one language and only by suffix evidence in another,
+// and each language is entitled to the strongest evidence IT has.
+func (s *Store) lookupSymbolIDsByNameLanguage(ctx context.Context, repoID int64, names []nameLanguages) (map[symbolLangKey][]int64, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
-	ordered := dedupeLookupNames(names)
+	ordered := dedupeNameLanguages(names)
 	if len(ordered) == 0 {
 		return nil, nil
 	}
-
-	resolved := make(map[string][]int64, len(ordered))
+	resolved := make(map[symbolLangKey][]int64, len(ordered))
 	remaining := ordered
 
 	// Stages 1 and 2: exact qualified_name, then exact name.
+	//
+	// The language set is recomputed from what is still unresolved at each
+	// stage, so a stage never reads candidate rows in a language no remaining
+	// pair could accept.
 	for _, column := range []string{"qualified_name", "name"} {
 		if len(remaining) == 0 {
 			break
 		}
-		hits, err := s.symbolIDsByColumn(ctx, repoID, column, remaining)
+		hits, err := s.symbolIDsByColumn(ctx, repoID, column, lookupKeyNames(remaining), lookupKeyLanguages(remaining))
 		if err != nil {
 			return nil, err
 		}
@@ -443,11 +524,13 @@ func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names [
 	var shorts []string
 	seenShort := map[string]bool{}
 	var memberNames []string
-	for _, name := range remaining {
-		if memberQualifiedName(name) {
-			memberNames = append(memberNames, name)
+	seenMember := map[string]bool{}
+	for _, key := range remaining {
+		if memberQualifiedName(key.name) && !seenMember[key.name] {
+			seenMember[key.name] = true
+			memberNames = append(memberNames, key.name)
 		}
-		short := lookupSuffixKey(name)
+		short := lookupSuffixKey(key.name)
 		if short == "" || seenShort[short] {
 			continue
 		}
@@ -455,15 +538,16 @@ func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names [
 		shorts = append(shorts, short)
 	}
 	if len(shorts) > 0 {
-		hits, err := s.symbolIDsBySuffixScan(ctx, repoID, shorts)
+		languages := lookupKeyLanguages(remaining)
+		hits, err := s.symbolIDsBySuffixScan(ctx, repoID, shorts, languages)
 		if err != nil {
 			return nil, err
 		}
-		if deeper, err := s.memberSuffixSpellingHits(ctx, repoID, memberNames); err != nil {
+		if deeper, err := s.memberSuffixSpellingHits(ctx, repoID, memberNames, languages); err != nil {
 			return nil, err
 		} else {
 			for name, ids := range deeper {
-				hits[name] = mergeIDsPreservingOrder(hits[name], ids)
+				hits[name] = mergeCandidatesPreservingOrder(hits[name], ids)
 			}
 		}
 		remaining = assignHits(resolved, remaining, hits, lookupSuffixKey)
@@ -475,29 +559,34 @@ func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names [
 	// exactly the qualifier-discarding match stage 3 no longer performs.
 	if len(remaining) > 0 {
 		var stage4 []string
-		byShort := map[string][]string{}
-		for _, name := range remaining {
-			if memberQualifiedName(name) {
+		seenStage4 := map[string]bool{}
+		byShort := map[string][]symbolLangKey{}
+		for _, key := range remaining {
+			if memberQualifiedName(key.name) {
 				continue
 			}
-			short := lookupSymbolShortName(name)
-			if short == "" || short == name {
+			short := lookupSymbolShortName(key.name)
+			if short == "" || short == key.name {
 				continue
 			}
-			if len(byShort[short]) == 0 {
+			if !seenStage4[short] {
+				seenStage4[short] = true
 				stage4 = append(stage4, short)
 			}
-			byShort[short] = append(byShort[short], name)
+			byShort[short] = append(byShort[short], key)
 		}
 		if len(stage4) > 0 {
-			hits, err := s.symbolIDsByColumn(ctx, repoID, "name", stage4)
+			hits, err := s.symbolIDsByColumn(ctx, repoID, "name", stage4, lookupKeyLanguages(remaining))
 			if err != nil {
 				return nil, err
 			}
-			for short, ids := range hits {
-				for _, name := range byShort[short] {
-					if _, done := resolved[name]; !done {
-						resolved[name] = ids
+			for _, short := range stage4 {
+				for _, key := range byShort[short] {
+					if _, done := resolved[key]; done {
+						continue
+					}
+					if ids := candidateIDsInLanguage(hits[short], key.language); len(ids) > 0 {
+						resolved[key] = ids
 					}
 				}
 			}
@@ -507,55 +596,125 @@ func (s *Store) lookupSymbolIDsByName(ctx context.Context, repoID int64, names [
 	return resolved, nil
 }
 
-// assignHits records ids for every still-unresolved name whose key appears in
-// hits, and returns the names that remain unresolved.
-func assignHits(resolved map[string][]int64, remaining []string, hits map[string][]int64, key func(string) string) []string {
+// lookupKeyNames returns the distinct names of a pair set, preserving order.
+func lookupKeyNames(keys []symbolLangKey) []string {
+	out := make([]string, 0, len(keys))
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if seen[key.name] {
+			continue
+		}
+		seen[key.name] = true
+		out = append(out, key.name)
+	}
+	return out
+}
+
+// lookupKeyLanguages returns the distinct languages of a pair set in sorted
+// order. It narrows the candidate rows each statement reads to the languages
+// some caller actually asked about; the exact per-pair decision is still made
+// against each candidate's own language.
+func lookupKeyLanguages(keys []symbolLangKey) []string {
+	set := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		set[key.language] = struct{}{}
+	}
+	return sortedLanguages(set)
+}
+
+// candidateIDsInLanguage keeps the candidates whose persisted language is the
+// one the spelling's source was written in. This is the whole gate: a candidate
+// in another language is not the symbol that was named.
+func candidateIDsInLanguage(candidates []symbolIDLang, language string) []int64 {
+	if language == "" {
+		return nil
+	}
+	var out []int64
+	for _, cand := range candidates {
+		if cand.language == language {
+			out = append(out, cand.id)
+		}
+	}
+	return out
+}
+
+// assignHits records ids for every still-unresolved pair whose key appears in
+// hits with a same-language candidate, and returns the pairs that remain
+// unresolved.
+func assignHits(resolved map[symbolLangKey][]int64, remaining []symbolLangKey, hits map[string][]symbolIDLang, key func(string) string) []symbolLangKey {
 	if len(hits) == 0 {
 		return remaining
 	}
 	out := remaining[:0:0]
-	for _, name := range remaining {
-		if ids, ok := hits[key(name)]; ok && len(ids) > 0 {
-			resolved[name] = ids
+	for _, pair := range remaining {
+		if ids := candidateIDsInLanguage(hits[key(pair.name)], pair.language); len(ids) > 0 {
+			resolved[pair] = ids
 			continue
 		}
-		out = append(out, name)
+		out = append(out, pair)
 	}
 	return out
 }
 
 // symbolIDsByColumn resolves names against an indexed equality column,
-// returning column value -> ids.
-func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column string, names []string) (map[string][]int64, error) {
+// returning column value -> candidates. Rows outside `languages` are excluded
+// in SQL, which can only shrink the read set; the per-name language decision is
+// still made in Go, because different names in one batch can carry different
+// source languages.
+//
+// When the batch asks about ONE language the SQL predicate is already exact, so
+// the column is not read back at all and every row is tagged with the language
+// that was asked for. That is the common shape -- one repository, one seed
+// language -- and it keeps the statement reading exactly the columns it read
+// before P22.7.
+func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column string, names, languages []string) (map[string][]symbolIDLang, error) {
 	if column != "qualified_name" && column != "name" {
 		return nil, nil
 	}
-	out := map[string][]int64{}
+	if len(languages) == 0 {
+		return map[string][]symbolIDLang{}, nil
+	}
+	single := len(languages) == 1
+	langColumn := ", s.language"
+	if single {
+		langColumn = ""
+	}
+	out := map[string][]symbolIDLang{}
 	for start := 0; start < len(names); start += nameLookupChunk {
 		end := min(start+nameLookupChunk, len(names))
 		chunk := names[start:end]
-		args := make([]any, 0, len(chunk)+1)
+		args := make([]any, 0, len(chunk)+len(languages)+1)
 		args = append(args, repoID)
 		for _, name := range chunk {
 			args = append(args, name)
 		}
+		for _, language := range languages {
+			args = append(args, language)
+		}
 		rows, err := s.neighborQuery(ctx, `
-			SELECT s.`+column+`, s.id
+			SELECT s.`+column+`, s.id`+langColumn+`
 			FROM symbols s
 			WHERE s.repo_id = ? AND s.`+column+` IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
+			  AND s.language IN (`+strings.TrimRight(strings.Repeat("?,", len(languages)), ",")+`)
 			ORDER BY s.`+column+` ASC, s.id ASC
 		`, args...)
 		if err != nil {
 			return nil, err
 		}
+		var key, language string
+		var id int64
+		dest := []any{&key, &id}
+		if !single {
+			dest = append(dest, &language)
+		} else {
+			language = languages[0]
+		}
 		for rows.Next() {
-			var key string
-			var id int64
-			if err := rows.Scan(&key, &id); err != nil {
+			if err := rows.Scan(dest...); err != nil {
 				rows.Close()
 				return nil, err
 			}
-			out[key] = append(out[key], id)
+			out[key] = append(out[key], symbolIDLang{id: id, language: language})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -570,7 +729,7 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 // spelling's own boundary suffixes (`other.pkg.Target` names `pkg.Target`).
 // Indexed equality, one statement per chunk; ids arrive per name in
 // longest-suffix-first order so the result cannot depend on map iteration.
-func (s *Store) memberSuffixSpellingHits(ctx context.Context, repoID int64, memberNames []string) (map[string][]int64, error) {
+func (s *Store) memberSuffixSpellingHits(ctx context.Context, repoID int64, memberNames, languages []string) (map[string][]symbolIDLang, error) {
 	if len(memberNames) == 0 {
 		return nil, nil
 	}
@@ -590,20 +749,39 @@ func (s *Store) memberSuffixSpellingHits(ctx context.Context, repoID int64, memb
 	if len(lookups) == 0 {
 		return nil, nil
 	}
-	bySuffix, err := s.symbolIDsByColumn(ctx, repoID, "qualified_name", lookups)
+	bySuffix, err := s.symbolIDsByColumn(ctx, repoID, "qualified_name", lookups, languages)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string][]int64{}
+	out := map[string][]symbolIDLang{}
 	for _, name := range memberNames {
 		for _, suffix := range suffixesByName[name] {
-			out[name] = mergeIDsPreservingOrder(out[name], bySuffix[suffix])
+			out[name] = mergeCandidatesPreservingOrder(out[name], bySuffix[suffix])
 		}
 		if len(out[name]) == 0 {
 			delete(out, name)
 		}
 	}
 	return out, nil
+}
+
+// mergeCandidatesPreservingOrder appends candidates whose ids are not already
+// present, keeping first-seen order deterministic.
+func mergeCandidatesPreservingOrder(base, extra []symbolIDLang) []symbolIDLang {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[int64]bool, len(base))
+	for _, cand := range base {
+		seen[cand.id] = true
+	}
+	for _, cand := range extra {
+		if !seen[cand.id] {
+			seen[cand.id] = true
+			base = append(base, cand)
+		}
+	}
+	return base
 }
 
 // mergeIDsPreservingOrder appends ids not already present, keeping first-seen
@@ -627,37 +805,68 @@ func mergeIDsPreservingOrder(base, extra []int64) []int64 {
 
 // symbolIDsBySuffixScan performs stage 3 for every short name in one pass.
 //
-// It reads (qualified_name, id) for the repository -- a covering scan of
-// idx_symbols_repo_qname -- and evaluates both LIKE patterns for every short
-// name against each row. One scan replaces one-scan-per-name.
+// It reads (qualified_name, id, language) for the repository's requested
+// languages and evaluates both LIKE patterns for every short name against each
+// row. One scan replaces one-scan-per-name.
 //
 // The scan deliberately does not join `files`, which the per-name SQL did. The
 // join could only ever exclude a symbol whose `file_id` names no row, which
 // `PRAGMA foreign_keys = ON` makes unreachable, and the page query that
 // consumes these ids joins `files` again anyway -- so the observable result is
-// the same and the scan stays covering.
-func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts []string) (map[string][]int64, error) {
+// the same.
+//
+// P22.7 added a language predicate. `idx_symbols_repo_qname` does not carry
+// `language`, so the scan is no longer index-only
+// (`SEARCH s USING INDEX idx_symbols_repo_qname (repo_id=?)`, not `USING
+// COVERING INDEX`); it was measured neutral on the 100k fixture, because the
+// predicate drops at least as many rows as the row fetch costs. Making it
+// covering again would need `language` in the index -- a migration, and a
+// decision for whatever phase wants one.
+//
+// The column is only read back when the batch asks about more than one
+// language. With one language the SQL predicate already answers the question,
+// so every row is tagged with the requested language and nothing extra is
+// scanned.
+func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts, languages []string) (map[string][]symbolIDLang, error) {
 	matcher := newSuffixMatcher(shorts)
-	if matcher.empty() {
-		return nil, nil
+	if matcher.empty() || len(languages) == 0 {
+		// An empty map, never nil: the caller merges into this result in place.
+		return map[string][]symbolIDLang{}, nil
 	}
 
+	single := len(languages) == 1
+	langColumn := ", s.language"
+	if single {
+		langColumn = ""
+	}
+	args := make([]any, 0, len(languages)+1)
+	args = append(args, repoID)
+	for _, language := range languages {
+		args = append(args, language)
+	}
 	rows, err := s.neighborQuery(ctx, `
-		SELECT s.qualified_name, s.id
+		SELECT s.qualified_name, s.id`+langColumn+`
 		FROM symbols s
 		WHERE s.repo_id = ?
-	`, repoID)
+		  AND s.language IN (`+strings.TrimRight(strings.Repeat("?,", len(languages)), ",")+`)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := map[string][]int64{}
+	out := map[string][]symbolIDLang{}
 	lastID := map[string]int64{}
+	var qname, language string
+	var id int64
+	dest := []any{&qname, &id}
+	if !single {
+		dest = append(dest, &language)
+	} else {
+		language = languages[0]
+	}
 	for rows.Next() {
-		var qname string
-		var id int64
-		if err := rows.Scan(&qname, &id); err != nil {
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
 		folded := asciiLower(qname)
@@ -667,7 +876,7 @@ func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts 
 				return
 			}
 			lastID[short] = id
-			out[short] = append(out[short], id)
+			out[short] = append(out[short], symbolIDLang{id: id, language: language})
 		})
 	}
 	return out, rows.Err()

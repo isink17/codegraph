@@ -387,18 +387,18 @@ func TestLookupSymbolIDsByNameMemberCallSemantics(t *testing.T) {
 		{"github.com/org/repo/internal/parser.NewRegistry", []int64{ids["parser.NewRegistry"]}},
 	}
 
-	names := make([]string, 0, len(cases))
+	names := make([]nameLanguages, 0, len(cases))
 	for _, tc := range cases {
-		names = append(names, tc.name)
+		names = append(names, nameLanguages{name: tc.name, languages: []string{"go"}})
 	}
-	resolved, err := s.lookupSymbolIDsByName(ctx, repoID, names)
+	resolved, err := s.lookupSymbolIDsByNameLanguage(ctx, repoID, names)
 	if err != nil {
-		t.Fatalf("lookupSymbolIDsByName: %v", err)
+		t.Fatalf("lookupSymbolIDsByNameLanguage: %v", err)
 	}
 	for _, tc := range cases {
-		got := resolved[trimLookupName(tc.name)]
+		got := resolved[symbolLangKey{name: trimLookupName(tc.name), language: "go"}]
 		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
-			t.Errorf("lookupSymbolIDsByName[%q] = %v, want %v", tc.name, got, tc.want)
+			t.Errorf("lookupSymbolIDsByNameLanguage[%q] = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -617,9 +617,12 @@ func TestQueryPathsAreRepoIsolated(t *testing.T) {
 		}
 	}
 
-	ids, err := s.lookupSymbolIDsForNames(ctx, repoA, []string{"pkg.Target", "x.Target"})
+	ids, err := s.lookupSymbolIDsForNameLanguages(ctx, repoA, []nameLanguages{
+		{name: "pkg.Target", languages: []string{"go"}},
+		{name: "x.Target", languages: []string{"go"}},
+	})
 	if err != nil {
-		t.Fatalf("lookupSymbolIDsForNames: %v", err)
+		t.Fatalf("lookupSymbolIDsForNameLanguages: %v", err)
 	}
 	for _, id := range ids {
 		var owner int64
@@ -627,7 +630,7 @@ func TestQueryPathsAreRepoIsolated(t *testing.T) {
 			t.Fatalf("owner lookup: %v", err)
 		}
 		if owner != repoA {
-			t.Fatalf("lookupSymbolIDsForNames returned a symbol from repo %d", owner)
+			t.Fatalf("lookupSymbolIDsForNameLanguages returned a symbol from repo %d", owner)
 		}
 	}
 }
