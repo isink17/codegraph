@@ -262,7 +262,9 @@ func TestFindCallersMemberCallClaims(t *testing.T) {
 		{"MemberSpelling", "App.Close", true},     // suffix spelling of the target's identity
 		{"FullSpelling", "cli.App.Close", true},   // exact qualified spelling
 		{"DeeperSpelling", "x.cli.App.Close", true}, // extends the target's identity at a boundary
-		{"BareSpelling", "Close", true},           // bare short name: existing product semantics, unchanged
+		// Bare short name: Go spells a method call through a receiver, so a bare
+		// `Close` in package `callers` names nothing in package `cli` (P22.6).
+		{"BareSpelling", "Close", false},
 	}
 	srcFile := f.file(t, "src/go/callers.go", "go")
 	bySrc := map[string]int64{}

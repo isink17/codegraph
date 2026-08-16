@@ -187,7 +187,7 @@ func TestTwoPass_EdgeBindsInEitherFileOrder(t *testing.T) {
 
 	snapshot := assertOrderIndependent(t, files)
 	requireLine(t, snapshot,
-		`edge caller.go:pkg.Caller -calls-> "Callee" => callee.go:pkg.Callee [exact_name/high]`)
+		`edge caller.go:pkg.Caller -calls-> "Callee" => callee.go:pkg.Callee [go_package_scope/high]`)
 }
 
 // TestTwoPass_TestLinkAndEdgeAcrossEveryOrder walks all six orders of a
@@ -203,7 +203,7 @@ func TestTwoPass_TestLinkAndEdgeAcrossEveryOrder(t *testing.T) {
 	requireLine(t, snapshot,
 		`testlink helper_test.go:pkg.TestHelper -> "func:pkg::Helper" => helper.go:pkg.Helper [test_name_match/0.80]`)
 	requireLine(t, snapshot,
-		`edge caller.go:pkg.Caller -calls-> "Helper" => helper.go:pkg.Helper [exact_name/high]`)
+		`edge caller.go:pkg.Caller -calls-> "Helper" => helper.go:pkg.Helper [go_package_scope/high]`)
 }
 
 // TestTwoPass_AmbiguousTargetUnresolvedInEveryOrder is case E: two directories
@@ -237,7 +237,7 @@ func TestTwoPass_ProductionTargetPreferredOverTestShadowInEveryOrder(t *testing.
 
 	snapshot := assertOrderIndependent(t, files)
 	requireLine(t, snapshot,
-		`edge caller.go:pkg.Caller -calls-> "Shared" => helper.go:pkg.Shared [exact_name/high]`)
+		`edge caller.go:pkg.Caller -calls-> "Shared" => helper.go:pkg.Shared [go_package_scope/high]`)
 }
 
 // TestTwoPass_UnresolvedExternalTargetInEveryOrder is case H: a call to a

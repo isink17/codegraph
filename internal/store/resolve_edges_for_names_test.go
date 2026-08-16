@@ -30,11 +30,13 @@ func TestResolveEdgesForNames_ExactName(t *testing.T) {
 		t.Fatalf("insertTestFile(b.go) error = %v", err)
 	}
 
-	dstID, err := insertTestSymbol(ctx, s, repo.ID, fileA, "Foo", "Foo")
+	// Qualified names carry the package the way both Go adapters emit them, so
+	// the P22.6 package-scope rule sees a real same-package call.
+	dstID, err := insertTestSymbol(ctx, s, repo.ID, fileA, "Foo", "pkg.Foo")
 	if err != nil {
 		t.Fatalf("insertTestSymbol(dst) error = %v", err)
 	}
-	srcID, err := insertTestSymbol(ctx, s, repo.ID, fileB, "Bar", "Bar")
+	srcID, err := insertTestSymbol(ctx, s, repo.ID, fileB, "Bar", "pkg.Bar")
 	if err != nil {
 		t.Fatalf("insertTestSymbol(src) error = %v", err)
 	}

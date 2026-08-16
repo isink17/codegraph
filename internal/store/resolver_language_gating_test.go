@@ -248,9 +248,9 @@ func gateScenarios() []gateScenario {
 				f.symbol(t, pyTwo, "render", "render", "python")
 
 				goDef := f.file(t, "src/go/render.go", "go")
-				dst := f.symbol(t, goDef, "render", "render", "go")
+				dst := f.symbol(t, goDef, "render", "gopkg.render", "go")
 				goFile := f.file(t, "src/go/caller.go", "go")
-				src := f.symbol(t, goFile, "Caller", "Caller", "go")
+				src := f.symbol(t, goFile, "Caller", "gopkg.Caller", "go")
 				return f.edge(t, goFile, src, "render"), dst, "src/go/caller.go", "render"
 			},
 		},
@@ -380,12 +380,12 @@ func TestResolveEdgesForNamesStats_CountOnlyRealResolutions(t *testing.T) {
 	f := newGateFixture(t)
 
 	goDef := f.file(t, "src/go/helpers.go", "go")
-	wantDst := f.symbol(t, goDef, "Shared", "Shared", "go")
+	wantDst := f.symbol(t, goDef, "Shared", "gopkg.Shared", "go")
 	swiftDef := f.file(t, "src/swift/Helpers.swift", "swift")
 	f.symbol(t, swiftDef, "Shared", "Shared", "swift")
 
 	goCaller := f.file(t, "src/go/caller.go", "go")
-	goSrc := f.symbol(t, goCaller, "GoCaller", "GoCaller", "go")
+	goSrc := f.symbol(t, goCaller, "GoCaller", "gopkg.GoCaller", "go")
 	goEdge := f.edge(t, goCaller, goSrc, "Shared")
 
 	pyCaller := f.file(t, "src/py/caller.py", "python")

@@ -2574,6 +2574,15 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	} else {
 		totalResolved += n
 	}
+	// Go bare calls are answered by their own package before any repo-wide
+	// strategy runs, and resolverGoBareScopeSQL keeps those strategies off them
+	// afterwards. See go_package_scope.go for why package scope cannot be
+	// expressed as a filter on a repo-wide candidate group.
+	if n, err := s.resolveGoPackageScopedBareNames(ctx, tx, repoID); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	// Temp DDL is transactional in SQLite, so a rollback already discards these
 	// tables. The explicit drop before the commit below is what keeps populated
 	// tables off the pooled connection on the success path; this defer only
@@ -2588,6 +2597,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_targets`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_resolution`)
+		for _, table := range goBareScopeTables {
+			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+table)
+		}
 	}()
 
 	// Strategy 1: Exact qualified name match.
@@ -3694,9 +3706,31 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if len(targets) == 0 {
 		return outcome, nil
 	}
+	// P22.6: a bare spelling in a Go file is answered by the calling symbol's own
+	// package and by nothing else, so those targets take a separate lookup and
+	// never consult the repo-wide candidate maps below. This is the Go-side twin
+	// of resolveGoPackageScopedBareNames; the two must agree edge for edge.
+	goBare := make(map[int64]struct{}, len(targets))
+	goBareNameSet := map[string]struct{}{}
+	goBareEdgeIDs := make([]int64, 0, len(targets))
+	for _, target := range targets {
+		if _, blocked := moduleVeto[target.edgeID]; blocked {
+			continue
+		}
+		if target.srcLanguage != "go" || !goBareCallName(target.dstName) {
+			continue
+		}
+		goBare[target.edgeID] = struct{}{}
+		goBareEdgeIDs = append(goBareEdgeIDs, target.edgeID)
+		goBareNameSet[target.dstName] = struct{}{}
+	}
+
 	qualifiedSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		if _, blocked := moduleVeto[target.edgeID]; blocked {
+			continue
+		}
+		if _, bare := goBare[target.edgeID]; bare {
 			continue
 		}
 		if target.dstName != "" {
@@ -3718,10 +3752,28 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, err
 	}
 
+	goBareScopes, err := goSymbolScopesByEdgeSource(ctx, s.db, repoID, goBareEdgeIDs)
+	if err != nil {
+		return outcome, err
+	}
+	goBareScopeKeys := make(map[string]struct{}, len(goBareScopes))
+	for _, scope := range goBareScopes {
+		if scope.key != goPackageScopeUnknown {
+			goBareScopeKeys[scope.key] = struct{}{}
+		}
+	}
+	goBareGroups, err := goBareCandidateGroups(ctx, s.db, repoID, goBareScopeKeys, setToSlice(goBareNameSet), testFileIDs)
+	if err != nil {
+		return outcome, err
+	}
+
 	shortSet := make(map[string]struct{}, len(targets))
 	tail2Set := map[string]struct{}{}
 	tail3Set := map[string]struct{}{}
 	for _, target := range targets {
+		if _, bare := goBare[target.edgeID]; bare {
+			continue
+		}
 		key := symbolLangKey{name: target.dstName, language: target.srcLanguage}
 		if _, ok := byQualified.groups[key]; ok {
 			// The qualified name matched something in the caller's language, so
@@ -3806,6 +3858,36 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		// file is a test file, exactly as resolverChosenCandidateSQL decides it
 		// for the repo-wide strategies. See resolver_testfile.go.
 		_, callerIsTest := testFileIDs[target.srcFileID]
+		if _, bare := goBare[target.edgeID]; bare {
+			// One evidence level, one candidate set: the calling symbol's own Go
+			// package. No fallback, because there is nothing weaker a bare Go
+			// identifier is entitled to.
+			var matchedGroup candidateGroup
+			var matched bool
+			if scope, known := goBareScopes[target.edgeID]; known && scope.key != goPackageScopeUnknown {
+				matchedGroup, matched = goBareGroups[goScopeName{scope: scope.key, name: target.dstName}]
+			}
+			dstID, ok := int64(0), false
+			if matched {
+				dstID, ok = matchedGroup.chosen(callerIsTest)
+			}
+			if !ok || dstID == 0 {
+				outcome.unresolved++
+				switch {
+				case matched && matchedGroup.ambiguousFor(callerIsTest):
+					outcome.ambiguityBlocked++
+				case matched:
+					outcome.testShadowBlocked++
+				}
+				continue
+			}
+			resolutions = append(resolutions, edgeResolution{
+				edgeID:   target.edgeID,
+				dstID:    dstID,
+				strategy: ResolutionStrategyGoPackageScope,
+			})
+			continue
+		}
 		strategy := ResolutionStrategyExactQualified
 		matchedGroup, matched := byQualified.groups[qualifiedKey]
 		if !matched {
@@ -5457,33 +5539,43 @@ func (s *Store) symbolsByIDs(ctx context.Context, repoID int64, ids []int64, lim
 }
 
 // queryUnresolvedDstNamesBySrcIDs returns the distinct unresolved destination
-// names of a set of source symbols.
+// names of a set of source symbols, both flattened in first-seen order and
+// grouped by the source symbol that spelled them.
+//
+// The grouping is what lets a bare Go spelling be scoped to the package of the
+// symbol that actually wrote it (P22.6): merging every source's names into one
+// set first would leave nothing to scope against once several sources of an
+// ambiguous name live in different packages.
 //
 // The id list is chunked: an ambiguous short name in a large repository can
 // resolve to thousands of source symbols, and splicing all of them into one
 // `IN (?, ?, ...)` would exceed SQLITE_MAX_VARIABLE_NUMBER on drivers still
 // built with the historical 999-variable limit.
-func (s *Store) queryUnresolvedDstNamesBySrcIDs(ctx context.Context, repoID int64, srcIDs []int64) ([]string, error) {
+func (s *Store) queryUnresolvedDstNamesBySrcIDs(ctx context.Context, repoID int64, srcIDs []int64) ([]string, map[int64][]string, error) {
 	if len(srcIDs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	seen := map[string]struct{}{}
 	var names []string
+	bySrc := map[int64][]string{}
 	for _, chunk := range chunkInt64s(srcIDs, sqliteInClauseBatchSize) {
 		ph := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT DISTINCT e.dst_name FROM edges e
-			 WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''`,
+			`SELECT DISTINCT e.src_symbol_id, e.dst_name FROM edges e
+			 WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''
+			 ORDER BY e.src_symbol_id ASC, e.dst_name ASC`,
 			append([]any{repoID}, int64SliceToAny(chunk)...)...)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for rows.Next() {
+			var src int64
 			var name string
-			if err := rows.Scan(&name); err != nil {
+			if err := rows.Scan(&src, &name); err != nil {
 				rows.Close()
-				return nil, err
+				return nil, nil, err
 			}
+			bySrc[src] = append(bySrc[src], name)
 			if _, ok := seen[name]; ok {
 				continue
 			}
@@ -5492,10 +5584,10 @@ func (s *Store) queryUnresolvedDstNamesBySrcIDs(ctx context.Context, repoID int6
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return names, nil
+	return names, bySrc, nil
 }
 
 func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, error) {

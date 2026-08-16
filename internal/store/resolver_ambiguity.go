@@ -145,23 +145,30 @@ const (
 		WHERE a.dst_name = edges.dst_name AND a.dst_language = f.language
 		AND a.caller_is_test = CASE WHEN ` + resolverCallerIsTestSQL + ` THEN 1 ELSE 0 END
 	)`
+)
 
-	// resolverBindableCandidateSQL is what a repo-wide strategy must satisfy to
-	// write a destination at all: the P2 language gate, plus the requirement
-	// that the candidate group actually holds an id this caller kind may bind
-	// (P7). The exact-qualified strategy carries this without the veto below.
-	resolverBindableCandidateSQL = resolverLanguageGateSQL + `
-		AND (` + resolverChosenCandidateSQL + `) IS NOT NULL`
+// resolverBindableCandidateSQL is what a repo-wide strategy must satisfy to
+// write a destination at all: the P2 language gate, the requirement that the
+// candidate group actually holds an id this caller kind may bind (P7), and the
+// P22.6 Go bare-name package-scope rule. The exact-qualified strategy carries
+// this without the veto below.
+//
+// The Go scope rule sits here rather than beside the own-module veto because it
+// is a property of the *chosen candidate*, not of the edge alone: a strategy
+// that reaches a foreign-package candidate for a bare Go call must bind
+// nothing, whichever strategy it is. See go_package_scope.go.
+var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
+		AND (` + resolverChosenCandidateSQL + `) IS NOT NULL
+		AND ` + resolverGoBareScopeSQL
 
-	// resolverBindGateSQL is what every repo-wide strategy's UPDATE must
-	// satisfy before it may write a destination: the P2 language gate, the P7
-	// caller-kind candidate choice, and the P3 ambiguity veto. It is one
-	// constant so a strategy cannot be added that applies one rule and forgets
-	// the other.
-	resolverBindGateSQL = resolverBindableCandidateSQL + `
+// resolverBindGateSQL is what every repo-wide strategy's UPDATE must
+// satisfy before it may write a destination: the P2 language gate, the P7
+// caller-kind candidate choice, the P22.6 Go package-scope rule, and the P3
+// ambiguity veto. It is one value so a strategy cannot be added that applies
+// one rule and forgets the other.
+var resolverBindGateSQL = resolverBindableCandidateSQL + `
 		AND ` + resolverAmbiguousNamesSQL + `
 		AND NOT EXISTS (
 			SELECT 1 FROM tmp_resolver_own_module_veto v
 			WHERE v.edge_id = edges.id
 		)`
-)

@@ -1,8 +1,10 @@
 package query
 
 import (
+	"context"
 	"encoding/json"
 	"math/rand"
+	"sort"
 	"strings"
 	"testing"
 
@@ -218,12 +220,17 @@ func TestSameNameSeedExpandsOwnGraph(t *testing.T) {
 	if _, ok := names["billing.Renew"]; !ok {
 		t.Fatalf("expected billing.Renew as the seed: %v", names)
 	}
-	if rel, ok := names["subscription.SubscriptionDriver"]; ok {
-		t.Fatalf("subscription.SubscriptionDriver leaked in as %q: the other Renew's caller was followed", rel)
-	}
 	if rel, ok := names["subscription.Renew"]; ok && rel != relevanceDirectMatch {
 		t.Fatalf("subscription.Renew appeared as %q rather than as its own search hit", rel)
 	}
+	// The association itself, not the proxy this test used to assert. Before
+	// P22.6 both bare `Renew` calls were unresolved and only the ambiguous-
+	// short-name gate kept them apart, so "SubscriptionDriver is absent" stood
+	// in for "the other Renew's caller was not followed". Now the edges
+	// themselves are right, and SubscriptionDriver legitimately arrives through
+	// subscription.Renew's own graph -- so the claim is checked directly.
+	assertCallersAre(t, fx, "billing.Renew", []string{"billing.BillingDriver", "billing.TestRenew"})
+	assertCallersAre(t, fx, "subscription.Renew", []string{"subscription.SubscriptionDriver"})
 }
 
 // Regression: a stable key is scoped to a package or a file's base name, not to a
@@ -269,5 +276,25 @@ func TestBandOverlapIsBoundedToWeakDirectMatches(t *testing.T) {
 	worstCallee := cand(relevanceCallee, "b.go", "b.Cold", 0).baseScore()
 	if bestTest > worstCallee {
 		t.Fatalf("the best test (%v) must not outrank implementation context (%v)", bestTest, worstCallee)
+	}
+}
+
+// assertCallersAre pins the store's caller answer for a symbol, in qualified-name
+// order.
+func assertCallersAre(t *testing.T, fx *contextFixture, symbol string, want []string) {
+	t.Helper()
+	syms, err := fx.store.FindCallers(context.Background(), fx.repoID, symbol, 0, 50, 0)
+	if err != nil {
+		t.Fatalf("FindCallers(%q) error = %v", symbol, err)
+	}
+	var got []string
+	for _, sym := range syms {
+		got = append(got, sym.QualifiedName)
+	}
+	sort.Strings(got)
+	sorted := append([]string(nil), want...)
+	sort.Strings(sorted)
+	if strings.Join(got, ",") != strings.Join(sorted, ",") {
+		t.Fatalf("FindCallers(%q) = %v, want %v", symbol, got, sorted)
 	}
 }

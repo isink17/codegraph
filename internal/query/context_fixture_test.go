@@ -80,6 +80,19 @@ func HandleCheckout(id string) error {
 // Log writes a message. Called from everywhere in the fixture.
 func Log(msg string) {}
 `)
+	// A related test that is not itself a caller. Every other _test.go here calls
+	// the symbol it covers, and since P22.6 those same-package bare calls resolve,
+	// which makes those files ordinary callers rather than test-section entries.
+	writeFixtureFile(t, repoRoot, "util/hub_test.go", `package util
+
+import "testing"
+
+func TestLog(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+}
+`)
 	writeFixtureFile(t, repoRoot, "billing/renew.go", `package billing
 
 import "example.test/fixture/util"

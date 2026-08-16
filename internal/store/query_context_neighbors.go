@@ -61,6 +61,15 @@ func (s *Store) neighborQuery(ctx context.Context, query string, args ...any) (*
 	return s.db.QueryContext(ctx, query, args...)
 }
 
+// neighborQuerier adapts neighborQuery to the queryContexter the shared
+// Go-package-scope helpers take, so the sentence above stays true of them too:
+// a round trip the neighbour pipeline makes is a round trip the probe counts.
+type neighborQuerier struct{ s *Store }
+
+func (q neighborQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.s.neighborQuery(ctx, query, args...)
+}
+
 // contextNeighborStatements returns how many statements the batched
 // context-neighbour pipeline has issued on this store, and
 // resetContextNeighborStatements zeroes it. Both exist for the regression test
@@ -140,10 +149,17 @@ func (s *Store) FindContextNeighbors(ctx context.Context, repoID int64, seeds []
 		return out, nil
 	}
 
-	if err := s.expandContextCallers(ctx, repoID, seeds, live, fanout, out); err != nil {
+	// Both directions need the same fact -- each seed's Go package -- so it is
+	// read once for the batch rather than once per direction.
+	seedScopes, err := s.contextSeedGoScopes(ctx, repoID, seeds, live)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.expandContextCallees(ctx, repoID, seeds, live, fanout, out); err != nil {
+
+	if err := s.expandContextCallers(ctx, repoID, seeds, live, fanout, seedScopes, out); err != nil {
+		return nil, err
+	}
+	if err := s.expandContextCallees(ctx, repoID, seeds, live, fanout, seedScopes, out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -157,14 +173,32 @@ type idPair struct {
 	id  int64
 }
 
-// namePair is a (seed index, destination name) association.
+// namePair is a (seed index, destination name) association carrying the P22.6
+// evidence policy for that spelling.
+//
+// Three states, matching sqlGoBareSourceScope exactly so the batched pipeline
+// and the public FindCallers answer the same question:
+//
+//	gated == false            any writer may spell this name (every
+//	                          qualifier-bearing spelling, and every non-Go seed)
+//	gated, scope == ""        no bare Go call can name this seed at all -- it is
+//	                          a method, or its package is unprovable -- so only
+//	                          non-Go writers count
+//	gated, scope == key       non-Go writers count, and so do Go writers in the
+//	                          seed's own package
+//
+// The middle state is why a bool is needed rather than an empty-string
+// sentinel: "unnameable by Go" and "ungated" are different answers, and
+// collapsing them would drop every non-Go caller of a Go method seed.
 type namePair struct {
-	idx  int
-	name string
+	idx   int
+	name  string
+	gated bool
+	scope string
 }
 
 // expandContextCallers fills the Callers field of every live seed.
-func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, out []ContextNeighbors) error {
+func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, seedScopes map[int]goSymbolScope, out []ContextNeighbors) error {
 	// Exact evidence first: the qualified name is unambiguous by construction,
 	// and the bare short name is admitted only where the caller vouched for it.
 	var names []namePair
@@ -178,7 +212,15 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 			continue
 		}
 		if sd.ShortName != sd.QualifiedName {
-			names = append(names, namePair{idx: i, name: sd.ShortName})
+			// A gated seed still emits its leg: the gate narrows which writers
+			// count, it does not delete the evidence. Dropping the leg here
+			// would lose every non-Go caller of a Go method seed, which
+			// FindCallers keeps.
+			scope, gated, ok := goBareTargetSeedScope(seedScopes, i, sd.ShortName)
+			if !ok {
+				scope = ""
+			}
+			names = append(names, namePair{idx: i, name: sd.ShortName, gated: gated, scope: scope})
 		}
 		// Qualified-suffix spellings of the seed's identity (`App.Close` for
 		// cli.App.Close) are a finite set, so they join the equality legs
@@ -231,7 +273,7 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 // association is preserved the whole way: flattening the names of thirty seeds
 // into one set and giving every seed the union would be a correctness bug, not
 // a batching win.
-func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, out []ContextNeighbors) error {
+func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, seedScopes map[int]goSymbolScope, out []ContextNeighbors) error {
 	srcIDs := make([]idPair, 0, len(live))
 	bySymbol := map[int64][]int{}
 	for _, i := range live {
@@ -250,13 +292,35 @@ func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []
 		return err
 	}
 
+	// P22.6: a bare callee spelling written in a Go file resolves inside that
+	// file's package, exactly as FindCallees now does it. Splitting the names
+	// per seed keeps one seed's package from answering another seed's bare call.
 	var fallback []idPair
 	if len(unresolved) > 0 {
+		// Two independent name sets, not one: the same spelling can be a bare Go
+		// call from one seed and an ordinary name from another, and each seed is
+		// entitled to its own answer. Sharing a `seen` map would let whichever
+		// seed the rows happened to arrive from first decide the other's
+		// evidence -- a result that depends on row order, not on the graph.
 		distinct := make([]string, 0, len(unresolved))
-		seen := map[string]bool{}
+		seenUnscoped := map[string]bool{}
+		var scopedNames []string
+		seenScoped := map[string]bool{}
+		scopeKeys := map[string]struct{}{}
 		for _, np := range unresolved {
-			if !seen[np.name] {
-				seen[np.name] = true
+			if scope, gated, ok := goBareSourceSeedScope(seedScopes, np.idx, np.name); gated {
+				if !ok {
+					continue
+				}
+				scopeKeys[scope] = struct{}{}
+				if !seenScoped[np.name] {
+					seenScoped[np.name] = true
+					scopedNames = append(scopedNames, np.name)
+				}
+				continue
+			}
+			if !seenUnscoped[np.name] {
+				seenUnscoped[np.name] = true
 				distinct = append(distinct, np.name)
 			}
 		}
@@ -264,7 +328,27 @@ func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []
 		if err != nil {
 			return err
 		}
+		orderedKeys := make([]string, 0, len(scopeKeys))
+		for key := range scopeKeys {
+			orderedKeys = append(orderedKeys, key)
+		}
+		sort.Strings(orderedKeys)
+		byScope, err := goPackageScopedSymbolIDs(ctx, neighborQuerier{s}, repoID, orderedKeys, scopedNames)
+		if err != nil {
+			return err
+		}
 		for _, np := range unresolved {
+			if scope, gated, ok := goBareSourceSeedScope(seedScopes, np.idx, np.name); gated {
+				if !ok {
+					continue
+				}
+				for _, id := range byScope[scope][np.name] {
+					if id != 0 {
+						fallback = append(fallback, idPair{idx: np.idx, id: id})
+					}
+				}
+				continue
+			}
 			for _, id := range resolved[trimLookupName(np.name)] {
 				if id != 0 {
 					fallback = append(fallback, idPair{idx: np.idx, id: id})
@@ -349,6 +433,7 @@ func (s *Store) unresolvedDstNamesBySeed(ctx context.Context, repoID int64, srcI
 			FROM edges e
 			WHERE e.repo_id = ? AND e.src_symbol_id IN (`+placeholders(len(chunk))+`)
 			  AND e.dst_symbol_id IS NULL AND e.dst_name != ''
+			ORDER BY e.src_symbol_id ASC, e.dst_name ASC
 		`, args...)
 		if err != nil {
 			return nil, err
@@ -409,9 +494,23 @@ func callerCandidateSQL(legs candidateLegs) (string, int) {
 		// edges, 12k of them unresolved) pinning the order took thirty-seed
 		// caller expansion from ~75ms to ~3ms, and the cost it removes grows
 		// with the unresolved population rather than with the answer.
+		//
+		// nm.gated is 0 for every spelling P22.6 does not govern, which is why
+		// the package check is a disjunct rather than a join condition: it costs
+		// nothing for the names it does not govern. When it is 1 the predicate is
+		// sqlGoBareSourceScope's, written out per row -- non-Go writers keep the
+		// evidence they had, and a Go writer must be in the seed's own package.
+		// An empty nm.scope under gating means no Go writer qualifies at all.
 		branches = append(branches, `SELECT nm.idx, e.src_symbol_id
 			FROM nm CROSS JOIN edges e ON e.dst_name = nm.dname
-			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL`)
+			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
+			  AND (nm.gated = 0 OR EXISTS (
+			        SELECT 1 FROM symbols src
+			        JOIN files srcf ON srcf.id = src.file_id
+			        WHERE src.id = e.src_symbol_id
+			          AND (src.language <> 'go'
+			               OR (nm.scope <> ''
+			                   AND `+sqlGoPackageScopeKey("srcf.path", "src.qualified_name")+` = nm.scope))))`)
 		repoArgs++
 	}
 	return strings.Join(branches, " UNION "), repoArgs
@@ -446,11 +545,24 @@ func calleeCandidateSQL(legs candidateLegs) (string, int) {
 type neighborWork struct {
 	idx      int
 	ids      []int64
-	names    []string
+	names    []namePair
 	fallback []int64
 }
 
-func (w neighborWork) vars() int { return 2 * (len(w.ids) + len(w.names) + len(w.fallback)) }
+// Bound variables per evidence row, by leg. An id row binds (idx, id); a name
+// row binds (idx, dname, gated, scope) since P22.6 added the package-scope
+// policy columns.
+// splitNeighborWork budgets in variables rather than rows precisely because the
+// legs no longer cost the same.
+const (
+	neighborIDVars   = 2
+	neighborNameVars = 4
+)
+
+// vars counts bound variables, not rows.
+func (w neighborWork) vars() int {
+	return neighborIDVars*(len(w.ids)+len(w.fallback)) + neighborNameVars*len(w.names)
+}
 
 func (w neighborWork) empty() bool { return w.vars() == 0 }
 
@@ -505,7 +617,7 @@ func (s *Store) pagePartitionedNeighbors(
 				}
 			}
 			var part neighborWork
-			part, remaining = splitNeighborWork(remaining, (contextStatementVarBudget-vars)/2)
+			part, remaining = splitNeighborWork(remaining, contextStatementVarBudget-vars)
 			if part.empty() {
 				// No room left in this statement for even one row.
 				if err := flush(); err != nil {
@@ -527,25 +639,34 @@ func (s *Store) pagePartitionedNeighbors(
 	return nil
 }
 
-// splitNeighborWork takes at most maxRows evidence rows off w, in a fixed leg
-// order, and returns the taken part and what is left.
-func splitNeighborWork(w neighborWork, maxRows int) (neighborWork, neighborWork) {
-	if maxRows <= 0 {
-		return neighborWork{idx: w.idx}, w
-	}
+// splitNeighborWork takes as much of w as fits in maxVars bound variables, in a
+// fixed leg order, and returns the taken part and what is left.
+//
+// The budget is in variables, not rows, because the legs cost different amounts
+// (neighborIDVars vs neighborNameVars). Counting rows and assuming two variables
+// each would let one all-names part bind twice the budget -- 1400 variables at
+// contextStatementVarBudget = 700, past the 999-variable ceiling a cgo build
+// still enforces.
+func splitNeighborWork(w neighborWork, maxVars int) (neighborWork, neighborWork) {
 	part := neighborWork{idx: w.idx}
-	take := func(n int) int {
-		room := maxRows - (len(part.ids) + len(part.names) + len(part.fallback))
-		return min(max(room, 0), n)
+	room := maxVars
+	take := func(n, cost int) int {
+		if room < cost {
+			return 0
+		}
+		return min(room/cost, n)
 	}
-	if n := take(len(w.ids)); n > 0 {
+	if n := take(len(w.ids), neighborIDVars); n > 0 {
 		part.ids, w.ids = w.ids[:n], w.ids[n:]
+		room -= n * neighborIDVars
 	}
-	if n := take(len(w.names)); n > 0 {
+	if n := take(len(w.names), neighborNameVars); n > 0 {
 		part.names, w.names = w.names[:n], w.names[n:]
+		room -= n * neighborNameVars
 	}
-	if n := take(len(w.fallback)); n > 0 {
+	if n := take(len(w.fallback), neighborIDVars); n > 0 {
 		part.fallback, w.fallback = w.fallback[:n], w.fallback[n:]
+		room -= n * neighborIDVars
 	}
 	return part, w
 }
@@ -617,12 +738,16 @@ func (s *Store) pageNeighborChunk(
 		var rows []string
 		for _, w := range chunk {
 			for _, n := range w.names {
-				rows = append(rows, "(?,?)")
-				cteArgs = append(cteArgs, int64(w.idx), n)
+				gated := int64(0)
+				if n.gated {
+					gated = 1
+				}
+				rows = append(rows, "(?,?,?,?)")
+				cteArgs = append(cteArgs, int64(w.idx), n.name, gated, n.scope)
 			}
 		}
 		if len(rows) > 0 {
-			ctes = append(ctes, "nm(idx, dname) AS (VALUES "+strings.Join(rows, ",")+")")
+			ctes = append(ctes, "nm(idx, dname, gated, scope) AS (VALUES "+strings.Join(rows, ",")+")")
 			legs.names = true
 		}
 	}
@@ -719,22 +844,22 @@ func groupIDPairs(pairs []idPair) map[int][]int64 {
 	return out
 }
 
-func groupNamePairs(pairs []namePair) map[int][]string {
-	out := map[int][]string{}
+func groupNamePairs(pairs []namePair) map[int][]namePair {
+	out := map[int][]namePair{}
 	seen := map[namePair]bool{}
 	for _, p := range pairs {
 		if seen[p] {
 			continue
 		}
 		seen[p] = true
-		out[p.idx] = append(out[p.idx], p.name)
+		out[p.idx] = append(out[p.idx], p)
 	}
 	return out
 }
 
 // seedOrder lists every seed index that has any evidence, ascending, so chunk
 // membership is a function of the input and not of Go map iteration.
-func seedOrder(ids map[int][]int64, names map[int][]string, fallback map[int][]int64) []int {
+func seedOrder(ids map[int][]int64, names map[int][]namePair, fallback map[int][]int64) []int {
 	present := map[int]bool{}
 	for idx := range ids {
 		present[idx] = true

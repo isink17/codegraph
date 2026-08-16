@@ -177,9 +177,54 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		// the LIKE half is confined to the unresolved population by the
 		// `dst_symbol_id IS NULL` equality. UNION makes the halves one set,
 		// so the candidate set is identical to the combined predicate's.
-		branches = append(branches, `SELECT e.src_symbol_id FROM edges e
-			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (?, ?)`)
-		args = append(args, repoID, symbol, short)
+		//
+		// The exact spellings are split once more, by whether they are bare
+		// (P22.6). A qualified spelling names this target wherever it is
+		// written; a bare one only does so from inside the target's own Go
+		// package, so its leg carries the package-scope predicate. Without the
+		// split, a bare `countTags` unresolved in package `profile` claimed
+		// `graph.countTags` -- the same fabrication the resolver now refuses.
+		var bareExact, qualifiedExact []string
+		seenExact := map[string]bool{}
+		for _, spelling := range []string{symbol, short} {
+			if spelling == "" || seenExact[spelling] {
+				continue
+			}
+			seenExact[spelling] = true
+			if goBareCallName(spelling) {
+				bareExact = append(bareExact, spelling)
+			} else {
+				qualifiedExact = append(qualifiedExact, spelling)
+			}
+		}
+		if len(qualifiedExact) > 0 {
+			branches = append(branches, `SELECT e.src_symbol_id FROM edges e
+				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
+				  AND e.dst_name IN (`+placeholders(len(qualifiedExact))+`)`)
+			args = append(args, repoID)
+			for _, spelling := range qualifiedExact {
+				args = append(args, spelling)
+			}
+		}
+		if len(bareExact) > 0 {
+			scopeKeys, err := s.goBareTargetScopes(ctx, repoID, targetIDs)
+			if err != nil {
+				return nil, err
+			}
+			branches = append(branches, `SELECT e.src_symbol_id FROM edges e
+				JOIN symbols src ON src.id = e.src_symbol_id
+				JOIN files srcf ON srcf.id = src.file_id
+				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
+				  AND e.dst_name IN (`+placeholders(len(bareExact))+`)
+				  AND `+sqlGoBareSourceScope(len(scopeKeys)))
+			args = append(args, repoID)
+			for _, spelling := range bareExact {
+				args = append(args, spelling)
+			}
+			for _, key := range scopeKeys {
+				args = append(args, key)
+			}
+		}
 
 		// Suffix evidence (P22.1): an unresolved spelling claims this target
 		// only when one of the two extends the other at a separator boundary,
@@ -328,15 +373,27 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 	resolvedSQL, args := edgeIDBranches(repoID, srcIDs, "dst_symbol_id", "src_symbol_id", "e.dst_symbol_id IS NOT NULL")
 	branches := []string{resolvedSQL}
 
-	dstNames, err := s.queryUnresolvedDstNamesBySrcIDs(ctx, repoID, srcIDs)
+	dstNames, namesBySrc, err := s.queryUnresolvedDstNamesBySrcIDs(ctx, repoID, srcIDs)
 	if err != nil {
 		return nil, err
 	}
 	if len(dstNames) > 0 {
-		fallbackIDs, err := s.lookupSymbolIDsForNames(ctx, repoID, dstNames)
+		// P22.6: a bare spelling written in a Go file names something in that
+		// file's own package, so it is resolved inside that package rather than
+		// through the repo-wide cascade. Non-Go sources, and every
+		// qualifier-bearing spelling, keep the cascade unchanged.
+		unscoped, scoped, err := s.splitGoBareCalleeNames(ctx, repoID, srcIDs, dstNames, namesBySrc)
 		if err != nil {
 			return nil, err
 		}
+		var fallbackIDs []int64
+		if len(unscoped) > 0 {
+			fallbackIDs, err = s.lookupSymbolIDsForNames(ctx, repoID, unscoped)
+			if err != nil {
+				return nil, err
+			}
+		}
+		fallbackIDs = mergeIDsPreservingOrder(fallbackIDs, scoped)
 		for _, chunk := range chunkInt64s(fallbackIDs, neighborIDChunk) {
 			sql, a := valueBranches(chunk)
 			branches = append(branches, sql)
