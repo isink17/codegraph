@@ -611,6 +611,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
+		// A deleted file leaves the import index, so the changed-path passes
+		// below cannot find the files that used to see through it -- deleting a
+		// package barrel would otherwise strand every binding it re-exported.
+		// See store/resolver_type_scope.go.
+		if err := i.store.RevalidateTypeScopeAfterDeletion(ctx, repo.ID); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
 	}
 
 	// ---------------------------------------------------------------------
@@ -629,6 +637,17 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// changed batch's introduced symbols for an incremental run.
 	// ---------------------------------------------------------------------
 	resolveStart := time.Now()
+
+	// Runs before the dispatch below, not inside it: a repository indexed by an
+	// older release holds bindings the current resolver refuses, no strategy
+	// reconsiders an already-bound edge, and a run over an unchanged tree
+	// resolves nothing at all -- so an upgrade would otherwise never converge.
+	// Guarded by a per-repository settings key, so it costs one indexed SELECT
+	// on every run after the first. See store/resolver_type_scope.go.
+	if err := i.store.RepairResolverBindingsOnce(ctx, repo.ID); err != nil {
+		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+		return summary, err
+	}
 
 	if len(changedPathSet) == 0 {
 		summary.ResolveMS = 0

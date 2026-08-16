@@ -218,13 +218,18 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 	for _, i := range live {
 		sd := seeds[i]
 		language := seedScopes[i].language
-		if sd.QualifiedName != "" {
+		// The qualified leg carries the type gate too, because a top-level C++
+		// class or enum HAS a bare qualified_name (`Message`, `Color`), so for
+		// exactly the seeds this rule exists for the short leg below never runs.
+		// blocksBareNameTypeClaim tests the spelling, so a dotted qualified name
+		// and every ungated language are untouched.
+		if sd.QualifiedName != "" && !seedScopes[i].blocksBareNameTypeClaim(sd.QualifiedName) {
 			names = append(names, namePair{idx: i, name: sd.QualifiedName, language: language})
 		}
 		if !sd.AllowShortEvidence || sd.ShortName == "" {
 			continue
 		}
-		if sd.ShortName != sd.QualifiedName {
+		if sd.ShortName != sd.QualifiedName && !seedScopes[i].blocksBareNameTypeClaim(sd.ShortName) {
 			// A gated seed whose package cannot be proven -- a Go method, or an
 			// unprovable package -- can be named by nobody: no bare Go spelling
 			// reaches it (P22.6) and no foreign-language spelling names it
@@ -232,6 +237,11 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 			// probe `edges` for a predicate that is false by construction, so
 			// it is skipped. Every other seed keeps its leg; the gate narrows
 			// which writers count, it does not delete the evidence.
+			//
+			// A type seed drops the bare leg outright (P22.9,
+			// resolver_type_scope.go): a bare spelling that really names this
+			// class is already bound and arrives through the id leg, so what
+			// this leg would add is the population the resolver refused.
 			scope, gated, ok := goBareTargetSeedScope(seedScopes, i, sd.ShortName)
 			if !gated || ok {
 				names = append(names, namePair{idx: i, name: sd.ShortName, language: language, gated: gated, scope: scope})

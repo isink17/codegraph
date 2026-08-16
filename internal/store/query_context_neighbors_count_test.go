@@ -41,7 +41,49 @@ func newSeedScaleFixture(t *testing.T, seeds int) (*Store, int64, []ContextSeed)
 		}
 	}
 
-	out := make([]ContextSeed, 0, seeds)
+	// One seed in a language P22.9 governs, with a bare unresolved callee, so the
+	// cascade's gated/ungated split actually runs -- an all-Go fixture leaves the
+	// gated half empty and the bound below would not cover it.
+	pyFileID, err := insertTestFileLang(ctx, s, repo.ID, "a.py", "python")
+	if err != nil {
+		t.Fatalf("insertTestFileLang() error = %v", err)
+	}
+	pySeedID, err := insertTestSymbolLang(ctx, s, repo.ID, pyFileID, "PySeed", "pkg.PySeed", "python")
+	if err != nil {
+		t.Fatalf("insertTestSymbolLang() error = %v", err)
+	}
+	pyCallerID, err := insertTestSymbolLang(ctx, s, repo.ID, pyFileID, "PyCaller", "pkg.PyCaller", "python")
+	if err != nil {
+		t.Fatalf("insertTestSymbolLang() error = %v", err)
+	}
+	pyCalleeID, err := insertTestSymbolLang(ctx, s, repo.ID, pyFileID, "PyCallee", "pkg.PyCallee", "python")
+	if err != nil {
+		t.Fatalf("insertTestSymbolLang() error = %v", err)
+	}
+	for _, e := range []struct {
+		src, dst int64
+		name     string
+	}{
+		{pyCallerID, pySeedID, "pkg.PySeed"},
+		{pySeedID, pyCalleeID, "pkg.PyCallee"},
+		{pySeedID, 0, "PyBare"},
+	} {
+		var dstArg any
+		if e.dst != 0 {
+			dstArg = e.dst
+		}
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
+			VALUES(?, ?, ?, ?, 'call', '', ?, 1)
+		`, repo.ID, e.src, dstArg, e.name, pyFileID); err != nil {
+			t.Fatalf("insert python edge error = %v", err)
+		}
+	}
+
+	out := make([]ContextSeed, 0, seeds+1)
+	out = append(out, ContextSeed{
+		SymbolID: pySeedID, QualifiedName: "pkg.PySeed", ShortName: "PySeed", AllowShortEvidence: true,
+	})
 	for i := range seeds {
 		qname := fmt.Sprintf("pkg%02d.Seed%02d", i, i)
 		short := fmt.Sprintf("Seed%02d", i)
@@ -66,6 +108,11 @@ func newSeedScaleFixture(t *testing.T, seeds int) (*Store, int64, []ContextSeed)
 		// An unresolved caller edge naming the seed, so the suffix scan has
 		// something to walk.
 		edge(callerID, 0, "other."+short)
+		// A BARE unresolved destination as well. P22.9 splits the cascade's
+		// equality stages by whether the spelling carries a qualifier, so a
+		// fixture that is entirely qualified would never exercise the split and
+		// the bound below would not cover it.
+		edge(seedID, 0, fmt.Sprintf("Bare%02d", i))
 
 		out = append(out, ContextSeed{
 			SymbolID: seedID, QualifiedName: qname, ShortName: short, AllowShortEvidence: true,
@@ -84,10 +131,13 @@ func newSeedScaleFixture(t *testing.T, seeds int) (*Store, int64, []ContextSeed)
 // grown a per-seed loop again.
 func TestContextNeighborStatementsDoNotScaleWithSeeds(t *testing.T) {
 	// The fixed pipeline is: one seed package-scope lookup (P22.6), one shared
-	// suffix scan, one unresolved-destination query, the name cascade (at most
-	// four statements), and one page statement per chunk per direction. Two
-	// chunks' worth of headroom.
-	const bound = 13
+	// suffix scan, one unresolved-destination query, the name cascade, and one
+	// page statement per chunk per direction. The cascade is four evidence
+	// stages, and since P22.9 its two equality stages each split by whether the
+	// spelling carries a qualifier and by whether the source language is one
+	// whose visibility the type rule decides -- so it is bounded by statements,
+	// not by names, and never by seeds. Two chunks' worth of headroom on top.
+	const bound = 16
 	ctx := context.Background()
 
 	counts := map[int]int64{}
@@ -122,8 +172,10 @@ func TestContextNeighborStatementsChunkCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
-	if len(got) != seeds {
-		t.Fatalf("got %d result slots for %d seeds", len(got), seeds)
+	// seeds+1: the fixture adds one python seed so the cascade's gated/ungated
+	// split runs (an all-Go fixture never reaches it).
+	if len(got) != seeds+1 {
+		t.Fatalf("got %d result slots for %d seeds", len(got), seeds+1)
 	}
 	for i, n := range got {
 		if len(n.Callers) == 0 || len(n.Callees) == 0 {

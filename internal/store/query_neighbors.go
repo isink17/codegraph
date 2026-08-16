@@ -218,6 +218,22 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		// package, so its leg carries the package-scope predicate. Without the
 		// split, a bare `countTags` unresolved in package `profile` claimed
 		// `graph.countTags` -- the same fabrication the resolver now refuses.
+		//
+		// P22.9 narrows the bare half by what the input matched: in a language
+		// whose visibility this rule decides, a bare spelling may not claim a
+		// type. Every relationship of that shape the evidence supports is
+		// already a bound `dst_symbol_id` and arrives through the id leg above,
+		// so what this leg would still add is exactly the population the
+		// resolver refused -- `pathlib.Path` claiming a project `class Path`
+		// among it.
+		//
+		// The narrowing is per LANGUAGE, not over the whole match set: an input
+		// matching a Python class and a Kotlin class must lose the Python
+		// writers and keep the Kotlin ones, because Kotlin resolves a bare class
+		// name across files with no import at all. When every matched language
+		// is type-only the leg has nobody left to serve and is dropped.
+		// See resolver_type_scope.go.
+		bareLangs := languagesExcept(targetLangs, typeOnlyGatedLanguages(targetScopes))
 		var bareExact, qualifiedExact []string
 		seenExact := map[string]bool{}
 		for _, spelling := range []string{symbol, short} {
@@ -226,6 +242,9 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 			}
 			seenExact[spelling] = true
 			if goBareCallName(spelling) {
+				if len(targetLangs) > 0 && len(bareLangs) == 0 {
+					continue
+				}
 				bareExact = append(bareExact, spelling)
 			} else {
 				qualifiedExact = append(qualifiedExact, spelling)
@@ -242,18 +261,28 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		}
 		if len(bareExact) > 0 {
 			scopeKeys := goBareTargetScopes(targetScopes)
+			// `bareLangs` rather than the union's `targetLangs`: this leg alone
+			// drops the languages whose matched targets are all types (P22.9).
+			// The outer language gate below still applies and is a superset.
+			bareLangFilter := ""
+			if len(bareLangs) > 0 {
+				bareLangFilter = ` AND src.language IN (` + placeholders(len(bareLangs)) + `)`
+			}
 			nameBranches = append(nameBranches, `SELECT e.src_symbol_id AS src FROM edges e
 				JOIN symbols src ON src.id = e.src_symbol_id
 				JOIN files srcf ON srcf.id = src.file_id
 				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
 				  AND e.dst_name IN (`+placeholders(len(bareExact))+`)
-				  AND `+sqlGoBareSourceScope(len(scopeKeys)))
+				  AND `+sqlGoBareSourceScope(len(scopeKeys))+bareLangFilter)
 			nameArgs = append(nameArgs, repoID)
 			for _, spelling := range bareExact {
 				nameArgs = append(nameArgs, spelling)
 			}
 			for _, key := range scopeKeys {
 				nameArgs = append(nameArgs, key)
+			}
+			for _, language := range bareLangs {
+				nameArgs = append(nameArgs, language)
 			}
 		}
 
