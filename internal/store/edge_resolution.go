@@ -1,6 +1,9 @@
 package store
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // Explainable edge resolution (P4).
 //
@@ -74,24 +77,24 @@ const (
 	// wildcards. (ResolveEdges Strategy 3c fallback.)
 	ResolutionStrategyDotSuffix = "dot_suffix"
 
-	// ResolutionStrategyBareTail: the Go-side binder's weakest fallback, used
-	// by the path-scoped and name-targeted entrypoints only. A bare dst_name
-	// (or, for import-path spellings containing '/', its last dot-separated
-	// segment) equalled the bare `name` of exactly one same-language symbol.
+	// ResolutionStrategyBareTail: RETIRED by P22.8; no resolver produces it any
+	// more. The constant survives because old databases still carry the label
+	// and migration 027 has to name it.
 	//
-	// Member/scope-qualified spellings (a '.' or '::', no slash) never reach
-	// this fallback (P22.1): their qualifier is evidence, and discarding it
-	// bound `rows.Close()` on an external receiver to whatever unique project
-	// method happened to be called Close. Those spellings fall back to the
-	// dot_tail2/dot_tail3 equality lookups instead -- see binderFallback.
+	// It was the Go-side binder's weakest fallback, on the path-scoped and
+	// name-targeted entrypoints only: a bare dst_name -- or, for import-path
+	// spellings containing '/', its last dot-separated segment -- equalled the
+	// bare `name` of exactly one same-language symbol, with no symbol-kind
+	// restriction.
 	//
-	// This is deliberately NOT reported as exact_name even when dst_name has no
-	// dot: unlike Strategy 2 the lookup applies no symbol-kind restriction, so
-	// it can bind a kind the repo-wide bare-name strategy would never have
-	// considered. Reporting the weaker strategy under the stronger name would
-	// misstate the evidence. The resulting full-vs-incremental provenance
-	// difference is the pre-existing strategy-set gap documented in
-	// resolver_ambiguity.go, now visible instead of silent.
+	// Both halves of that were wrong once P22.5 landed. The slash half degraded
+	// `database/sql.Open` to `Open` and bound the project's own unique `Open`,
+	// which no import evidence ever named; own-module import paths are resolved
+	// by module_import from real evidence and everything else points outside the
+	// repository (binderFallback). The bare half differed from the repo-wide
+	// bare-name strategy only by dropping its kind restriction, which made the
+	// two pipelines disagree about whether a name was ambiguous -- so the binder
+	// now applies the same restriction and reports the same strategy.
 	ResolutionStrategyBareTail = "bare_tail"
 
 	// ResolutionStrategyCrossLanguageSharedName: a cross_language_ref edge whose
@@ -138,7 +141,7 @@ const (
 //	        was discarded to make the match.
 //
 //	medium  The match required either truncating the destination's identity to
-//	        a suffix/tail (slash_suffix, dot_tail2, dot_tail3, bare_tail) or
+//	        a suffix/tail (slash_suffix, dot_tail2, dot_tail3) or
 //	        accepting an owner the call site never named (receiver_method). Still
 //	        a unique same-language candidate under an exact equality predicate,
 //	        but part of the identity was dropped to reach it.
@@ -209,8 +212,35 @@ var binderStrategies = []string{
 	ResolutionStrategyExactQualified,
 	ResolutionStrategyDotTail2,
 	ResolutionStrategyDotTail3,
-	ResolutionStrategyBareTail,
+	ResolutionStrategyExactName,
 	ResolutionStrategyGoPackageScope,
+}
+
+// incrementallyRedecidableStrategies is every strategy an incremental resolve
+// can arrive at again on its own: the Go-side binder's levels, plus the
+// own-module import pass that ResolveEdgesForPathsAndNames runs beside it.
+//
+// It exists because invalidateNameEvidenceBindings must never clear a binding
+// nothing can restore. `receiver_method`, `slash_suffix` and `dot_suffix` are
+// produced by ResolveEdges alone, which runs on a full index and never again,
+// so clearing one of those would delete a destination permanently -- turning a
+// parity fix into a new divergence in the other direction, and a worse one,
+// because the fresh index keeps the binding the update just destroyed.
+//
+// Derived from binderStrategies so a new binder level joins it automatically.
+var incrementallyRedecidableStrategies = append(
+	append([]string{}, binderStrategies...),
+	ResolutionStrategyModuleImport,
+)
+
+// sqlStrategyInList renders a strategy set as a SQL literal list. Strategy
+// names are compile-time constants matching [a-z_]+, never user input.
+func sqlStrategyInList(strategies []string) string {
+	quoted := make([]string, 0, len(strategies))
+	for _, strategy := range strategies {
+		quoted = append(quoted, "'"+strategy+"'")
+	}
+	return "(" + strings.Join(quoted, ", ") + ")"
 }
 
 // binderStrategyRank returns the index of a binder strategy in binderStrategies.

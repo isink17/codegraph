@@ -156,18 +156,27 @@ func TestBinderMemberCallRespectsTestShadow(t *testing.T) {
 	assertUnresolvedNoMetadata(t, f, edgeID)
 }
 
-// TestBinderKeepsBareAndImportPathFallbacks is the recall guard for the two
-// dst_name classes the member rule must NOT touch: bare names (free-function
-// calls) and import-path spellings (own-module class, deferred).
-func TestBinderKeepsBareAndImportPathFallbacks(t *testing.T) {
+// TestBinderKeepsBareFallbackAndDropsImportPathTail is the recall guard for the
+// bare-name class the member rule must NOT touch (free-function calls), and the
+// contract for the import-path class beside it.
+//
+// P22.1 left import-path spellings on the tail fallback because telling
+// own-module paths from external ones was deferred. P22.5 built that evidence
+// (module_import maps the path against the repository's own go.mod files), so
+// P22.8 stopped degrading them: a path that does not map into the module names
+// something outside the repository, and the project's own same-tailed symbol is
+// not it. `TestOwnModuleImportResolvesOnEveryEntryPoint` is the recall guard for
+// the half that does map.
+func TestBinderKeepsBareFallbackAndDropsImportPathTail(t *testing.T) {
 	cases := []struct {
 		name      string
 		dstName   string
 		qualified string
 		symName   string
+		wantBound bool
 	}{
-		{"bare_free_function", "load_config", "config.load_config", "load_config"},
-		{"import_path_tail", "github.com/org/repo/internal/parser.NewRegistry", "parser.NewRegistry", "NewRegistry"},
+		{"bare_free_function", "load_config", "config.load_config", "load_config", true},
+		{"import_path_tail", "github.com/org/repo/internal/parser.NewRegistry", "parser.NewRegistry", "NewRegistry", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,7 +190,11 @@ func TestBinderKeepsBareAndImportPathFallbacks(t *testing.T) {
 			if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"src/py/caller.py"}); err != nil {
 				t.Fatalf("ResolveEdgesForPaths() error = %v", err)
 			}
-			assertResolvedWithStrategy(t, f, edgeID, want, ResolutionStrategyBareTail)
+			if !tc.wantBound {
+				assertUnresolvedNoMetadata(t, f, edgeID)
+				return
+			}
+			assertResolvedWithStrategy(t, f, edgeID, want, ResolutionStrategyExactName)
 		})
 	}
 }
@@ -382,6 +395,12 @@ func TestFindCalleesMemberSpellingIsLiteral(t *testing.T) {
 // bindings the retired member bare-tail fallback wrote; re-applying migration
 // 023 must clear exactly that class -- dotted slash-free bare_tail rows --
 // and leave bare, import-path, and dot_tail2 bindings untouched.
+//
+// P22.8 note: this resets version 23 only, so 027 stays recorded and does not
+// re-run. On a real upgrade 027 runs after 023 and does clear `slashKept` (an
+// import-path spelling degraded to its tail is exactly the class 027 retires)
+// and relabels `bareKept`. What this test pins is narrower and still true: 023
+// must not touch either of them for the MEMBER rule's reason.
 func TestMigration023ClearsMemberBareTailBindings(t *testing.T) {
 	f := newGateFixture(t)
 	defs := f.file(t, "src/go/app.go", "go")

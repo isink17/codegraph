@@ -195,10 +195,16 @@ type ResolveEdgesForNamesStats struct {
 	// UnknownSrcLanguage counts selected edges whose source file has no
 	// persisted language. Implicit resolution fails closed for them regardless
 	// of whether a destination existed.
-	UnknownSrcLanguage int   `json:"unknown_src_language,omitempty"`
-	ExactSelectMS      int64 `json:"exact_select_ms,omitempty"`
-	SuffixSelectMS     int64 `json:"suffix_select_ms,omitempty"`
-	ResolveTargetsMS   int64 `json:"resolve_targets_ms,omitempty"`
+	UnknownSrcLanguage int `json:"unknown_src_language,omitempty"`
+	// InvalidateMS is the time invalidateNameEvidenceBindings spent clearing
+	// bindings this batch may have made ambiguous, and InvalidatedBindings how
+	// many it cleared. Without them the phase is invisible and the other timers
+	// under-report the update.
+	InvalidateMS        int64 `json:"invalidate_ms,omitempty"`
+	InvalidatedBindings int   `json:"invalidated_bindings,omitempty"`
+	ExactSelectMS       int64 `json:"exact_select_ms,omitempty"`
+	SuffixSelectMS      int64 `json:"suffix_select_ms,omitempty"`
+	ResolveTargetsMS    int64 `json:"resolve_targets_ms,omitempty"`
 }
 
 type ScanPhaseTiming struct {
@@ -3259,6 +3265,16 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 // incremental resolver scopes. Own-module edges are resolved repo-wide first;
 // path/name scopes then handle remaining evidence without another WalkDir.
 func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, paths, names []string) (ResolveEdgesForNamesStats, error) {
+	// Invalidate before anything re-binds: a binding this batch may have made
+	// ambiguous has to be reconsidered, not merely left alone. It runs first so
+	// the module pass below can immediately re-bind the own-module edges it
+	// clears, instead of finding them vetoed and unresolved.
+	invalidateStarted := time.Now()
+	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	invalidateMS := time.Since(invalidateStarted).Milliseconds()
 	moduleVeto, err := s.resolveOwnModuleImportsStandalone(ctx, repoID, nil)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -3266,7 +3282,253 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, moduleVeto); err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
-	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto)
+	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto)
+	stats.InvalidateMS += invalidateMS
+	stats.InvalidatedBindings += invalidated
+	return stats, err
+}
+
+// invalidateNameEvidenceBindings unbinds implicit bindings whose uniqueness
+// evidence this batch may have changed (P22.8).
+//
+// Every implicit strategy binds only when its candidate set holds exactly one
+// eligible symbol. That is a property of the whole repository, not of one file,
+// so a declaration arriving anywhere can invalidate a binding made anywhere
+// else. The incremental resolver was additive: an edge lost its destination
+// only when that destination disappeared (deleteFileGraphs), so a binding made
+// while a name was unique survived the arrival of a second declaration and the
+// graph ended up asserting a relationship a fresh index refuses. That is
+// indexing history acting as semantic evidence, which is exactly what a
+// content-addressed graph must never do.
+//
+// The scope is the batch's own names, not the repository: a declaration ARRIVING
+// under a name puts that name in `names`, and a declaration disappearing already
+// unbinds the edges that pointed at it (deleteFileGraphs). See
+// ResolveEdgesForPathsAndNames for the ordering that lets the following passes
+// re-decide every cleared edge.
+//
+// One direction is deliberately still open, and predates this pass: when a
+// declaration is REMOVED, edges that were unresolved *because* it made the name
+// ambiguous do not become resolved until something else mentions that name. The
+// indexer collects `changedSymbolNameSet` from the new parse only
+// (indexer.go), so the vanished name is in no batch. Closing it means feeding
+// the replaced file's previous symbol names into the same pass; it is recorded
+// as its own finding rather than smuggled in here.
+//
+// Two exclusions, for opposite reasons:
+//
+//   - `cross_language_ref` edges are explicit P19b links, bound by their own
+//     pass from import-bridge evidence. An implicit name pass neither owns nor
+//     can restore them. The strategy predicate below already excludes their two
+//     strategies, so the edge_kind guard is a second, independent line: this
+//     pass must not become the one place that can silently delete a proven
+//     cross-language relationship because someone widened a list.
+//   - Strategies outside incrementallyRedecidableStrategies -- `receiver_method`,
+//     `slash_suffix`, `dot_suffix` -- are produced by the repo-wide ResolveEdges
+//     alone. Clearing one would delete a destination that no incremental pass
+//     can rebuild, so the update would end up MISSING an edge the fresh index
+//     keeps: a new divergence, in the more damaging direction. Their bindings
+//     can therefore still go stale in the way described above; that is the
+//     pre-existing behaviour, and narrowing it is a separate decision from
+//     this one.
+func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string) (int, error) {
+	wanted := make(map[string]struct{}, len(names))
+	unique := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := wanted[name]; ok {
+			continue
+		}
+		wanted[name] = struct{}{}
+		unique = append(unique, name)
+	}
+	if len(unique) == 0 {
+		return 0, nil
+	}
+
+	// Only a name that is now declared MORE THAN ONCE can have invalidated
+	// anything. Every implicit strategy binds on uniqueness, so a name with a
+	// single declaration left cannot have made a binding ambiguous: either that
+	// declaration is the binding's own destination, or the binding pointed at a
+	// symbol that no longer exists -- and a vanished destination is unbound by
+	// deleteFileGraphs, not here.
+	//
+	// This is a superset test (it ignores language and kind, and counts
+	// qualified-name bindings under their bare tail), which is what it has to
+	// be: over-approximating costs an extra re-decision that reaches the same
+	// answer, while under-approximating would leave a stale binding. It is one
+	// indexed query on idx_symbols_repo_name, and on the overwhelmingly common
+	// single-file save it comes back empty and skips the work below entirely --
+	// which took a one-file mitmproxy update from +25ms to nothing measurable.
+	contested, err := s.namesWithSeveralDeclarations(ctx, repoID, unique)
+	if err != nil {
+		return 0, err
+	}
+	if len(contested) == 0 {
+		return 0, nil
+	}
+	wanted = make(map[string]struct{}, len(contested))
+	for _, name := range contested {
+		wanted[name] = struct{}{}
+	}
+	unique = contested
+
+	// Two selections, mirroring the name pass exactly so that everything
+	// cleared is also reconsidered: indexed equality on the whole spelling,
+	// then one pass over the qualified bound population for `.<name>` tails.
+	// Migration 028 keeps the second one off a full table scan.
+	stale := map[int64]struct{}{}
+	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(unique))
+		chunk := unique[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, name := range chunk {
+			args = append(args, name)
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT id FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+			  AND edge_kind != '`+EdgeKindCrossLanguageRef+`'
+			  AND resolution_strategy IN `+sqlStrategyInList(incrementallyRedecidableStrategies)+`
+			  AND dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
+		`, args...)
+		if err != nil {
+			return 0, err
+		}
+		if err := scanEdgeIDsInto(rows, stale); err != nil {
+			return 0, err
+		}
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, dst_name FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+		  AND edge_kind != '`+EdgeKindCrossLanguageRef+`'
+		  AND resolution_strategy IN `+sqlStrategyInList(incrementallyRedecidableStrategies)+`
+		  AND dst_name != '' AND instr(dst_name, '.') > 0
+	`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var id int64
+		var dstName string
+		if err := rows.Scan(&id, &dstName); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
+			if _, ok := wanted[dstName[dot+1:]]; ok {
+				stale[id] = struct{}{}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(stale) == 0 {
+		return 0, nil
+	}
+
+	ids := make([]int64, 0, len(stale))
+	for id := range stale {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	// One transaction for the whole unbind. The passes that rebind these edges
+	// run afterwards in their own transactions, so a partially committed clear
+	// would leave destinations dropped with nothing scheduled to restore them
+	// until some later batch happened to mention the same names again.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, chunk := range chunkInt64s(ids, sqliteInClauseBatchSize) {
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		args = append(args, int64SliceToAny(chunk)...)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE repo_id = ? AND id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
+		`, args...); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
+// namesWithSeveralDeclarations returns those of `names` that more than one
+// symbol in the repository declares. Order follows the input, so the caller's
+// later statement text is a function of its own argument and not of row order.
+func (s *Store) namesWithSeveralDeclarations(ctx context.Context, repoID int64, names []string) ([]string, error) {
+	contested := make(map[string]struct{}, len(names))
+	for start := 0; start < len(names); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(names))
+		chunk := names[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, name := range chunk {
+			args = append(args, name)
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT name FROM symbols
+			WHERE repo_id = ? AND name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
+			GROUP BY name
+			HAVING COUNT(*) > 1
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			contested[name] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]string, 0, len(contested))
+	for _, name := range names {
+		if _, ok := contested[name]; ok {
+			out = append(out, name)
+			delete(contested, name)
+		}
+	}
+	return out, nil
+}
+
+// scanEdgeIDsInto collects edge ids from a query into set.
+func scanEdgeIDsInto(rows *sql.Rows, set map[int64]struct{}) error {
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		set[id] = struct{}{}
+	}
+	return rows.Err()
 }
 
 func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []string, moduleVeto map[int64]struct{}) error {
@@ -3418,6 +3680,18 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		return stats, nil
 	}
 	stats.NamesUnique = len(unique)
+	if moduleVeto == nil {
+		// Standalone entry point: no caller ran the invalidation pass, so this
+		// one owns it. It must precede the module pass below for the ordering
+		// reason ResolveEdgesForPathsAndNames documents.
+		invalidateStarted := time.Now()
+		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique)
+		if err != nil {
+			return stats, err
+		}
+		stats.InvalidateMS = time.Since(invalidateStarted).Milliseconds()
+		stats.InvalidatedBindings = invalidated
+	}
 	moduleNames := make(map[string]struct{}, len(unique))
 	for _, name := range unique {
 		moduleNames[name] = struct{}{}
@@ -3641,12 +3915,24 @@ type resolveEdgeTargetsOutcome struct {
 //
 // The classification is by the dst_name's own syntax (P22.1):
 //
-//   - Bare names (`Close`) keep the kind-unrestricted bare-name lookup that has
-//     always backed bare_tail.
-//   - Import-path spellings (containing '/') also keep the legacy tail lookup:
-//     they are package-qualified by construction (only the import rewrite
-//     produces them), and telling own-module paths from external ones is the
-//     deferred own-module import-mapping work, not this slice.
+//   - Bare names (`Close`) use the bare-name lookup, restricted to the kinds a
+//     call edge can denote -- the same candidate set and the same reported
+//     strategy (exact_name) as the repo-wide bare-name pass, since P22.8.
+//   - Import-path spellings (containing '/') abstain (P22.8). They are
+//     package-qualified by construction, and the package they name is decided
+//     by explicit evidence: resolveOwnModuleImports maps the import path
+//     against the repository's own `go.mod` files and binds the exact package
+//     target (module_import), vetoing everything weaker for that edge. An
+//     import path that does NOT map into the module names something outside
+//     the repository -- `database/sql.Open` is stdlib, `github.com/acme/lib.Open`
+//     is a dependency -- and the project's own unique `Open` is simply not what
+//     was called. Degrading to the tail was the pre-P22.5 stopgap this comment
+//     used to defer; it survived into P22.8 as the single largest source of
+//     full-index/incremental divergence, and it never produced a binding the
+//     repo-wide resolver agreed with (measured: 0 on CodeGraph, pprof and
+//     mitmproxy, against 18 wrong ones). Non-Go parsers also emit slash-bearing
+//     spellings for ordinary expressions (`(dir / "x").open`), where the tail is
+//     not an identifier the call names either.
 //   - Member/scope-qualified spellings (a '.' or '::', no slash) carry their
 //     qualifier as evidence. `rows.Close` does not mean a unique project
 //     method named Close; it means a member of `rows`, which CodeGraph may
@@ -3656,23 +3942,19 @@ type resolveEdgeTargetsOutcome struct {
 //     ::-scoped spellings have no schema-backed tail and abstain (repo-wide
 //     keeps its low-confidence LIKE fallback for the multi-dot forms).
 //
-// Two known, deliberate gaps against the repo-wide strategies: the dot-tail
+// One known, deliberate gap against the repo-wide strategies: the dot-tail
 // fallbacks do not consult the bare-level ambiguity veto (reachable only when
-// a symbol's bare `name` itself contains a dot -- the pre-existing
-// strategy-set gap class documented in resolver_ambiguity.go), and identities
-// containing '/' are not matched by the member fallbacks (no current adapter
-// emits slash-qualified `qualified_name`s; revisit with the own-module
-// import-path work).
+// a symbol's bare `name` itself contains a dot -- the pre-existing strategy-set
+// gap class documented in resolver_ambiguity.go). The slash-qualified identity
+// case is closed: no adapter emits slash-qualified `qualified_name`s, and the
+// slash-qualified *spelling* is owned by module_import (P22.5).
 func binderFallback(dstName string) (lookup, column string) {
 	name := strings.TrimSpace(dstName)
 	if name == "" {
 		return "", ""
 	}
 	if strings.ContainsRune(name, '/') {
-		if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
-			return strings.TrimSpace(name[dot+1:]), "name"
-		}
-		return name, "name"
+		return "", ""
 	}
 	if strings.Contains(name, "::") {
 		return "", ""
@@ -3828,11 +4110,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		dstID  int64
 		// strategy names the evidence level that actually bound this edge, so
 		// the UPDATE below can persist it alongside dst_symbol_id. The binder
-		// has four: the qualified-name lookup, the dot_tail2/dot_tail3
-		// member fallbacks, and the bare-tail fallback (binderFallback picks
-		// which one a dst_name may consult). See edge_resolution.go for why
-		// the bare fallback is not reported as exact_name even when dst_name
-		// has no dot.
+		// has five: the Go package-scoped bare pass (P22.6), the qualified-name
+		// lookup, the dot_tail2/dot_tail3 member fallbacks, and the bare-name
+		// lookup (binderFallback picks which one a dst_name may consult).
+		// binderStrategies is the registered set.
 		strategy string
 	}
 	resolutions := make([]edgeResolution, 0, len(targets))
@@ -3894,13 +4175,13 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			// Only when the qualified name matched nothing in this language may
 			// the fallback evidence level be consulted -- and which level that
 			// is depends on the dst_name's own syntax (binderFallback): bare
-			// names keep the kind-unrestricted name lookup, member spellings
+			// names use the kind-restricted name lookup, member spellings
 			// must confirm their qualifier against the destination's dot-tail
 			// identity, and spellings with no safe fallback abstain.
 			switch fallbackColumn {
 			case "name":
 				matchedGroup, matched = byShort.groups[fallbackKey]
-				strategy = ResolutionStrategyBareTail
+				strategy = ResolutionStrategyExactName
 			case "dot_tail2":
 				matchedGroup, matched = byTail2.groups[fallbackKey]
 				strategy = ResolutionStrategyDotTail2
@@ -4042,6 +4323,10 @@ func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64
 // language gate must not let an unrelated foreign-language definition of the
 // same name discard an otherwise valid same-language target. Symbols with no
 // persisted language are excluded (fail closed).
+// resolveUniqueSymbolsByNames groups bare-name candidates. It is the one
+// column resolveSymbolCandidates kind-restricts, because the bare-name level is
+// the one the repo-wide resolver also restricts (resolverBareNameKindsSQL) --
+// the qualified and dot-tail levels carry their qualifier as evidence instead.
 func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, names []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
 	return s.resolveSymbolCandidates(ctx, repoID, "name", names, testFileIDs)
 }
@@ -4164,10 +4449,21 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 		// already imply; it is there so the partial dot-tail indexes
 		// (idx_symbols_repo_dot_tail2/3, predicate `!= ''`) stay usable when
 		// the names arrive as bound parameters.
+		// The bare-name level restricts candidates to the kinds a call edge can
+		// denote, exactly as the repo-wide bare-name strategy does
+		// (resolverBareNameKindsSQL). Before P22.8 the binder applied no such
+		// restriction, so the two pipelines disagreed about which candidates
+		// existed -- and therefore about whether the name was ambiguous at all.
+		// The qualified and dot-tail levels carry their qualifier as evidence
+		// and are not kind-restricted on either side.
+		kindFilter := ""
+		if column == "name" {
+			kindFilter = ` AND kind IN ` + resolverBareNameKindsSQL
+		}
 		query := `
 			SELECT ` + column + `, language, id, file_id
 			FROM symbols
-			WHERE repo_id = ? AND language != '' AND ` + column + ` != '' AND ` + column + ` IN (` + placeholders + `)
+			WHERE repo_id = ? AND language != '' AND ` + column + ` != '' AND ` + column + ` IN (` + placeholders + `)` + kindFilter + `
 		`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
