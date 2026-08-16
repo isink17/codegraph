@@ -113,6 +113,16 @@ const (
 	// ResolutionStrategyModuleImport binds a Go package-qualified edge after
 	// the source file import, declared module, and exact package directory agree.
 	ResolutionStrategyModuleImport = "module_import"
+
+	// ResolutionStrategyGoPackageScope: the edge is a bare call in a Go file and
+	// the destination is the sole package-level declaration of that name in the
+	// calling symbol's own Go package -- the only thing a bare Go identifier can
+	// name (P22.6, go_package_scope.go). It is a distinct strategy rather than a
+	// narrowed exact_name because its candidate set is a package, not the
+	// repository: a name that is ambiguous repo-wide can still be unambiguous
+	// here, and a name that is unique repo-wide reaches nothing from outside its
+	// package.
+	ResolutionStrategyGoPackageScope = "go_package_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -164,6 +174,11 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyCrossLanguageSharedName: ResolutionConfidenceLow,
 	ResolutionStrategyCrossLanguageImportPath: ResolutionConfidenceLow,
 	ResolutionStrategyModuleImport:            ResolutionConfidenceHigh,
+
+	// The name is matched in full against `symbols.name`, and the destination's
+	// package is proven rather than assumed, so nothing about either identity is
+	// discarded to reach the match.
+	ResolutionStrategyGoPackageScope: ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -195,6 +210,7 @@ var binderStrategies = []string{
 	ResolutionStrategyDotTail2,
 	ResolutionStrategyDotTail3,
 	ResolutionStrategyBareTail,
+	ResolutionStrategyGoPackageScope,
 }
 
 // binderStrategyRank returns the index of a binder strategy in binderStrategies.

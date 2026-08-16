@@ -83,10 +83,11 @@ func newSeedScaleFixture(t *testing.T, seeds int) (*Store, int64, []ContextSeed)
 // If this test starts failing at the higher seed counts, the batch API has
 // grown a per-seed loop again.
 func TestContextNeighborStatementsDoNotScaleWithSeeds(t *testing.T) {
-	// The fixed pipeline is: one shared suffix scan, one unresolved-destination
-	// query, the name cascade (at most four statements), and one page statement
-	// per chunk per direction. Two chunks' worth of headroom.
-	const bound = 12
+	// The fixed pipeline is: one seed package-scope lookup (P22.6), one shared
+	// suffix scan, one unresolved-destination query, the name cascade (at most
+	// four statements), and one page statement per chunk per direction. Two
+	// chunks' worth of headroom.
+	const bound = 13
 	ctx := context.Background()
 
 	counts := map[int]int64{}
@@ -261,5 +262,53 @@ func TestContextNeighborsSplitOversizedSeedEvidence(t *testing.T) {
 	// did not fire and the merge above was never exercised.
 	if stmts := s.contextNeighborStatements(); stmts < 5 {
 		t.Fatalf("%d statements; the evidence did not split, so the merge path is untested", stmts)
+	}
+}
+
+// A statement's bound-variable count is what the driver enforces, and the legs
+// no longer cost the same: an id row binds two values, a name row three (P22.6
+// added the package-scope column). Budgeting in rows and assuming two variables
+// each would build a 1050-variable statement out of a 700-variable budget, past
+// the 999 ceiling a cgo build still has.
+func TestSplitNeighborWorkBudgetsVariablesNotRows(t *testing.T) {
+	names := make([]namePair, 1000)
+	for i := range names {
+		names[i] = namePair{idx: 1, name: fmt.Sprintf("n%03d", i), scope: "pkg/"}
+	}
+	ids := make([]int64, 1000)
+	for i := range ids {
+		ids[i] = int64(i + 1)
+	}
+
+	for _, tc := range []struct {
+		name string
+		work neighborWork
+	}{
+		{"names only", neighborWork{idx: 1, names: names}},
+		{"ids only", neighborWork{idx: 1, ids: ids}},
+		{"mixed", neighborWork{idx: 1, ids: ids, names: names, fallback: ids}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remaining := tc.work
+			total, parts := 0, 0
+			for !remaining.empty() {
+				var part neighborWork
+				part, remaining = splitNeighborWork(remaining, contextStatementVarBudget)
+				if part.empty() {
+					t.Fatalf("split made no progress with a full budget")
+				}
+				if v := part.vars(); v > contextStatementVarBudget {
+					t.Fatalf("part binds %d variables, budget is %d", v, contextStatementVarBudget)
+				}
+				total += part.vars()
+				parts++
+				if parts > 10000 {
+					t.Fatalf("split did not terminate")
+				}
+			}
+			if total != tc.work.vars() {
+				t.Fatalf("split lost evidence: %d variables across parts, input had %d", total, tc.work.vars())
+			}
+		})
 	}
 }

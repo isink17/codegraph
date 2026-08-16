@@ -50,6 +50,9 @@ func newAmbiguityFixture(t *testing.T) *ambiguityFixture {
 		"billing.Renew", "subscription.Renew", "unique.Settle",
 		"caller.Resolved", "caller.Qualified", "caller.Short", "caller.Suffix",
 		"caller.SettleResolved", "caller.SettleShort", "caller.SettleSuffix",
+		// A bare Go call only names something in its own package (P22.6), so the
+		// bare-short recall case needs a caller inside unique.Settle's package.
+		"unique.SettleShort", "unique.Resolved",
 	} {
 		fx.add(t, qname)
 	}
@@ -175,13 +178,19 @@ func TestContextNeighborsBlocksShortAndSuffixEvidenceForAmbiguousName(t *testing
 	}
 }
 
-// A short name only one symbol carries keeps the bare-name recall, and a
-// spelling that extends the seed's identity at a boundary keeps the suffix
-// recall. (`pkg.Settle` -- a foreign qualifier -- would have matched before
-// P22.1; it is exactly the `rows.Close` fabrication and stays out now.)
+// A short name only one symbol carries keeps the bare-name recall for a caller
+// in the target's own Go package, and a spelling that extends the seed's
+// identity at a boundary keeps the suffix recall. (`pkg.Settle` -- a foreign
+// qualifier -- would have matched before P22.1; it is exactly the `rows.Close`
+// fabrication and stays out now.)
+//
+// The bare spelling written from another package stays out too (P22.6): repo-
+// wide uniqueness of `Settle` says nothing about whether package `caller` can
+// see `unique.Settle`.
 func TestContextNeighborsKeepsShortAndSuffixRecallForUniqueName(t *testing.T) {
 	fx := newAmbiguityFixture(t)
 	fx.resolvedEdge(t, "caller.SettleResolved", "unique.Settle")
+	fx.unresolvedEdge(t, "unique.SettleShort", "Settle")
 	fx.unresolvedEdge(t, "caller.SettleShort", "Settle")
 	fx.unresolvedEdge(t, "caller.SettleSuffix", "x.unique.Settle")
 
@@ -190,7 +199,7 @@ func TestContextNeighborsKeepsShortAndSuffixRecallForUniqueName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
-	want := []string{"caller.SettleResolved", "caller.SettleShort", "caller.SettleSuffix"}
+	want := []string{"caller.SettleResolved", "caller.SettleSuffix", "unique.SettleShort"}
 	if !equalStrings(callerNames(got[0]), want) {
 		t.Fatalf("callers = %v, want %v", callerNames(got[0]), want)
 	}
@@ -248,18 +257,20 @@ func TestContextNeighborsDoesNotDedupeAcrossSeeds(t *testing.T) {
 // and the short-name edge is one caller.
 func TestContextNeighborsDedupesEvidenceWithinASeed(t *testing.T) {
 	fx := newAmbiguityFixture(t)
-	fx.resolvedEdge(t, "caller.Resolved", "unique.Settle")
-	fx.unresolvedEdge(t, "caller.Resolved", "unique.Settle")
-	fx.unresolvedEdge(t, "caller.Resolved", "Settle")
-	fx.unresolvedEdge(t, "caller.Resolved", "pkg.Settle")
+	// The caller lives in the target's own package, so the bare-name arm is
+	// real evidence rather than a leg P22.6 drops before dedup can be tested.
+	fx.resolvedEdge(t, "unique.Resolved", "unique.Settle")
+	fx.unresolvedEdge(t, "unique.Resolved", "unique.Settle")
+	fx.unresolvedEdge(t, "unique.Resolved", "Settle")
+	fx.unresolvedEdge(t, "unique.Resolved", "pkg.Settle")
 
 	got, err := fx.store.FindContextNeighbors(context.Background(), fx.repoID,
 		[]ContextSeed{fx.seed("unique.Settle", true)}, 10)
 	if err != nil {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
-	if !equalStrings(callerNames(got[0]), []string{"caller.Resolved"}) {
-		t.Fatalf("callers = %v, want one [caller.Resolved]", callerNames(got[0]))
+	if !equalStrings(callerNames(got[0]), []string{"unique.Resolved"}) {
+		t.Fatalf("callers = %v, want one [unique.Resolved]", callerNames(got[0]))
 	}
 }
 
