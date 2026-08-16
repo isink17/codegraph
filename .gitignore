@@ -1,5 +1,4 @@
 .DS_Store
-.claude/
 .codegraph/
 .codegraph-home*/
 .gocache/
@@ -16,9 +15,15 @@ coverage.out
 TODO.md
 GEMINI.md
 ANALYSIS.md
-codegraph
-codegraph.exe
+/codegraph
+/codegraph.exe
 codegraph.sqlite
 codegraph.sqlite-shm
 codegraph.sqlite-wal
 OPTIMIZATIONS.md
+
+# Local AI development tooling
+.codex/
+.claude/
+CLAUDE.md
+.agentkit/
