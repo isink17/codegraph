@@ -73,6 +73,43 @@ func (i *Indexer) SupportedLanguages() []parser.LanguageSupport {
 	return i.registry.SupportedLanguages()
 }
 
+// cppProbeSource is parsed once per full run to answer one question: does this
+// binary's C/C++ adapter produce call edges? A capability flag on the Adapter
+// interface would be a second place for the answer to be wrong; asking the
+// adapter is the answer itself.
+const cppProbeSource = "void cg_probe_callee() {}\nvoid cg_probe_caller() { cg_probe_callee(); }\n"
+
+// cppAdapterEmitsCalls reports whether the registry's C/C++ adapter builds a
+// call graph. The tree-sitter adapter (cgo) does; the heuristic fallback used
+// by the non-cgo build emits symbols only. P22.11's upgrade reparses C/C++
+// files, which rebuilds their call edges under the first and would delete them
+// under the second.
+func cppAdapterEmitsCalls(ctx context.Context, registry *parser.Registry) bool {
+	if registry == nil {
+		return false
+	}
+	adapter := registry.AdapterFor("cg_probe.cpp")
+	if adapter == nil {
+		return false
+	}
+	probe, err := adapter.Parse(ctx, "cg_probe.cpp", []byte(cppProbeSource))
+	if err != nil {
+		return false
+	}
+	for _, edge := range probe.Edges {
+		if edge.Kind == "calls" {
+			return true
+		}
+	}
+	return false
+}
+
+// languageAllowed reports whether a run's `languages` allowlist admits a
+// language. An empty allowlist admits everything, matching processFileTask.
+func languageAllowed(allowed []string, language string) bool {
+	return len(allowed) == 0 || slices.Contains(allowed, language)
+}
+
 func (i *Indexer) Index(ctx context.Context, opts Options) (store.ScanSummary, error) {
 	return i.run(ctx, opts)
 }
@@ -105,6 +142,47 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	scanKind := opts.ScanKind
 	if scanKind == "" {
 		scanKind = "index"
+	}
+	// P22.11: a repository indexed by an older release holds C/C++ call edges
+	// whose destination lost its receiver (`v.size()` persisted as `size`), and
+	// the wrong binding that produced. Unlike every earlier resolver upgrade
+	// this cannot be repaired by clearing bindings -- the persisted fact itself
+	// is lossy -- so the files have to reach the parser again. Marking them here
+	// rather than next to the other repair in Pass 2 is deliberate: change
+	// detection reads the file metadata below, so a marker written after that
+	// point would not take effect until the *next* run, leaving a known-wrong
+	// edge class live for one more update.
+	//
+	// Three shapes are skipped, each because the mark could not be honoured by
+	// the run that writes it:
+	//
+	//   - a path-scoped run walks only the caller's paths, so most marked files
+	//     would never be visited. The watcher drains this way on every ordinary
+	//     flush (watcher.go sets Options.Paths), so a repository that is only
+	//     ever watched keeps the old edges until someone runs `codegraph index`
+	//     or `codegraph update` -- a forced rescan is enough, an incremental
+	//     flush is not.
+	//   - a `languages` allowlist that excludes cpp makes processFileTask stop
+	//     at the allowlist check, before it reads the file, so the cleared
+	//     metadata would never be replaced and `file_state` would report the
+	//     sentinel mtime for the life of the index.
+	//   - no C/C++ adapter that produces call edges at all: the non-cgo build
+	//     falls back to the heuristic adapter, which emits none, so reparsing
+	//     there would delete a C++ call graph instead of rebuilding it.
+	//
+	// The pending check runs before the capability probe so a repository that is
+	// already upgraded costs one indexed SELECT rather than a parse.
+	// See store/cpp_receiver_upgrade.go.
+	if len(opts.Paths) == 0 && languageAllowed(opts.Languages, "cpp") {
+		pending, err := i.store.CppReceiverUpgradePending(ctx, repo.ID)
+		if err != nil {
+			return store.ScanSummary{}, err
+		}
+		if pending && cppAdapterEmitsCalls(ctx, i.registry) {
+			if err := i.store.MarkCppFilesForReparseOnce(ctx, repo.ID); err != nil {
+				return store.ScanSummary{}, err
+			}
+		}
 	}
 	scanID, started, err := i.store.BeginScan(ctx, repo.ID, scanKind)
 	if err != nil {

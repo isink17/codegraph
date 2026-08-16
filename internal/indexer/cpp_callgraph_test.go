@@ -15,10 +15,24 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
-func TestCppCallGraphMemberAndQualifiedNames(t *testing.T) {
-	ctx := context.Background()
-	repoRoot := t.TempDir()
-	source := `class ApmMap {
+// legacy80Source is the fixture from #80. It is kept verbatim, because the
+// value of the report was the shape of the code, not the expectation that was
+// derived from it.
+//
+// What changed in P22.11 is the contract, not the fixture. #80 pinned
+// `pcsApmMap->LoadWorldMap()` and `map.LoadWorldMap()` as callers of
+// `ApmMap::LoadWorldMap`. Both are correct *at the source level* -- and neither
+// is provable from anything CodeGraph models. The adapter extracts no field or
+// parameter declarations, so nothing in the graph connects the variable
+// `pcsApmMap` (or `map`) to the type `ApmMap`; the relation held only because
+// the receiver was discarded and `LoadWorldMap` happened to name one thing in
+// this repository. The same discard bound `v.size()` on a `std::vector` to a
+// project `size` method in fmt and googletest, which is the identical inference
+// with a wrong answer. A test may pin history; it may not pin an unsound rule,
+// so the expectation is now: the receiver survives, and a receiver CodeGraph
+// cannot type stays unresolved. TestCppCallGraphQualifiedCallResolves covers
+// the C++ calls that do carry evidence.
+const legacy80Source = `class ApmMap {
 public:
     bool LoadWorldMap(char* pFileName, bool bDecryption = false);
 };
@@ -46,26 +60,46 @@ bool Internal(char* pFileName, bool bDecryption) {
     return LoadWorldMap(pFileName, bDecryption);
 }
 `
-	if err := os.WriteFile(filepath.Join(repoRoot, "fixture.cpp"), []byte(source), 0o644); err != nil {
-		t.Fatalf("WriteFile(fixture.cpp) error = %v", err)
-	}
 
+// indexCppFixture writes files into a fresh repo, indexes them with only the
+// C/C++ adapter registered, and returns the store and repo.
+func indexCppFixture(t *testing.T, files map[string]string) (*store.Store, graph.Repo) {
+	t.Helper()
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	for name, src := range files {
+		path := filepath.Join(repoRoot, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", name, err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", name, err)
+		}
+	}
 	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
 	s, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("store.Open() error = %v", err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { s.Close() })
 
 	idx := New(s, parser.NewRegistry(tsparser.NewCpp()), nil)
 	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-
 	repo, err := s.UpsertRepo(ctx, repoRoot)
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
+	return s, repo
+}
+
+// TestCppCallGraphSymbolIdentities keeps the half of #80 that was always sound:
+// an out-of-line `bool ApmMap::LoadWorldMap(...)` definition is one symbol
+// whose qualified name is `ApmMap::LoadWorldMap`, not `ApmMap.ApmMap::…`.
+func TestCppCallGraphSymbolIdentities(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": legacy80Source})
 
 	symbols, err := s.SearchSymbols(ctx, repo.ID, "LoadWorldMap", 20, 0)
 	if err != nil {
@@ -88,52 +122,166 @@ bool Internal(char* pFileName, bool bDecryption) {
 	if exact[0].QualifiedName != "ApmMap::LoadWorldMap" {
 		t.Fatalf("qualified_name = %q, want ApmMap::LoadWorldMap", exact[0].QualifiedName)
 	}
+}
+
+// TestCppCallGraphUnprovenReceiverStaysUnresolved is the replacement contract
+// for #80: the receiver reaches the graph, and no surface turns it back into a
+// bare-name claim on `ApmMap::LoadWorldMap`.
+func TestCppCallGraphUnprovenReceiverStaysUnresolved(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": legacy80Source})
+
+	// The parser's receiver survives into the persisted destination identity.
+	for _, dst := range []string{"pcsApmMap.LoadWorldMap", "map.LoadWorldMap"} {
+		n, err := s.CountUnresolvedEdgesByDstName(ctx, repo.ID, dst)
+		if err != nil {
+			t.Fatalf("CountUnresolvedEdgesByDstName(%s) error = %v", dst, err)
+		}
+		if n != 1 {
+			t.Fatalf("unresolved edges for %q = %d, want 1 (receiver must be kept and must not bind)", dst, n)
+		}
+	}
+
+	// FindCallers/FindCallees must not rebuild the refused relation from the
+	// name evidence either -- a receiver-bearing spelling shares no qualifier
+	// with `ApmMap::LoadWorldMap` (P22.1).
+	callers, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 20, 0)
+	if err != nil {
+		t.Fatalf("FindCallers() error = %v", err)
+	}
+	if hasSymbolQName(callers, "AgcmMinimap::F") {
+		t.Fatalf("FindCallers rebuilt the unproven `pcsApmMap->` relation: %+v", callers)
+	}
+	if hasSymbolQName(callers, "fixture::Direct") {
+		t.Fatalf("FindCallers rebuilt the unproven `map.` relation: %+v", callers)
+	}
+	callees, err := s.FindCallees(ctx, repo.ID, "AgcmMinimap::F", 0, 20, 0)
+	if err != nil {
+		t.Fatalf("FindCallees() error = %v", err)
+	}
+	if hasSymbolQName(callees, "ApmMap::LoadWorldMap") {
+		t.Fatalf("FindCallees rebuilt the unproven `pcsApmMap->` relation: %+v", callees)
+	}
+
+	// #80 also queried the bare and leading-`::` spellings, and those are the
+	// shapes a user actually types. A bare identity shares no qualifier with
+	// `pcsApmMap.LoadWorldMap`, so the suffix leg must not extend it either --
+	// only the genuinely unqualified call site in `Internal` may answer.
+	for _, spelling := range []string{"LoadWorldMap", "::LoadWorldMap"} {
+		bare, err := s.FindCallers(ctx, repo.ID, spelling, 0, 20, 0)
+		if err != nil {
+			t.Fatalf("FindCallers(%s) error = %v", spelling, err)
+		}
+		if !hasSymbolQName(bare, "fixture::Internal") {
+			t.Fatalf("FindCallers(%s) lost the bare call site: %+v", spelling, bare)
+		}
+		for _, unproven := range []string{"AgcmMinimap::F", "fixture::Direct"} {
+			if hasSymbolQName(bare, unproven) {
+				t.Fatalf("FindCallers(%s) rebuilt the unproven relation via %s: %+v", spelling, unproven, bare)
+			}
+		}
+	}
+}
+
+// TestCppCallGraphQualifiedCallResolves is the positive control: C++ calls
+// whose target CodeGraph can actually prove keep their recall. A `::`-qualified
+// call names a type and a member, and that spelling matches the destination's
+// own identity, so it binds with no receiver-type inference anywhere.
+func TestCppCallGraphQualifiedCallResolves(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": `class ApmMap {
+public:
+    bool LoadWorldMap(char* pFileName, bool bDecryption = false);
+};
+
+bool ApmMap::LoadWorldMap(char* pFileName, bool bDecryption) {
+    return true;
+}
+
+bool Qualified() {
+    return ApmMap::LoadWorldMap(nullptr, false);
+}
+
+bool AlsoQualified() {
+    return ApmMap::LoadWorldMap(nullptr, true);
+}
+`})
+
+	n, err := s.CountUnresolvedEdgesByDstName(ctx, repo.ID, "ApmMap::LoadWorldMap")
+	if err != nil {
+		t.Fatalf("CountUnresolvedEdgesByDstName() error = %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("%d qualified ApmMap::LoadWorldMap calls left unresolved, want 0", n)
+	}
 
 	callers, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 20, 0)
 	if err != nil {
-		t.Fatalf("FindCallers(ApmMap::LoadWorldMap) error = %v", err)
+		t.Fatalf("FindCallers() error = %v", err)
 	}
-	unresolved, err := s.CountUnresolvedEdgesByDstName(ctx, repo.ID, "LoadWorldMap")
+	for _, want := range []string{"fixture::Qualified", "fixture::AlsoQualified"} {
+		if !hasSymbolQName(callers, want) {
+			t.Fatalf("FindCallers(ApmMap::LoadWorldMap) missing %s, got %+v", want, callers)
+		}
+	}
+	callees, err := s.FindCallees(ctx, repo.ID, "Qualified", 0, 20, 0)
 	if err != nil {
-		t.Fatalf("CountUnresolvedEdgesByDstName(LoadWorldMap) error = %v", err)
-	}
-	if unresolved == 0 {
-		t.Fatalf("expected unresolved LoadWorldMap edges for fallback resolution")
-	}
-	if !hasSymbolQName(callers, "AgcmMinimap::F") {
-		t.Fatalf("FindCallers(ApmMap::LoadWorldMap) missing AgcmMinimap::F, got %+v", callers)
-	}
-
-	callees, err := s.FindCallees(ctx, repo.ID, "AgcmMinimap::F", 0, 20, 0)
-	if err != nil {
-		t.Fatalf("FindCallees(AgcmMinimap::F) error = %v", err)
+		t.Fatalf("FindCallees() error = %v", err)
 	}
 	if !hasSymbolQName(callees, "ApmMap::LoadWorldMap") {
-		t.Fatalf("FindCallees(AgcmMinimap::F) missing ApmMap::LoadWorldMap, got %+v", callees)
+		t.Fatalf("FindCallees(Qualified) missing ApmMap::LoadWorldMap, got %+v", callees)
 	}
 
-	shortCallers, err := s.FindCallers(ctx, repo.ID, "LoadWorldMap", 0, 20, 0)
+	// Pagination over the two evidence-backed callers.
+	p0, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 1, 0)
 	if err != nil {
-		t.Fatalf("FindCallers(LoadWorldMap) error = %v", err)
+		t.Fatalf("FindCallers page0: %v", err)
 	}
-	if len(shortCallers) == 0 {
-		t.Fatalf("FindCallers(LoadWorldMap) returned no callers")
+	p1, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 1, 1)
+	if err != nil {
+		t.Fatalf("FindCallers page1: %v", err)
 	}
+	if len(p0) != 1 || len(p1) != 1 {
+		t.Fatalf("FindCallers pagination: got %d and %d, want 1 and 1", len(p0), len(p1))
+	}
+	if p0[0].ID == p1[0].ID {
+		t.Fatalf("FindCallers pagination returned duplicate: %q on both pages", p0[0].QualifiedName)
+	}
+}
 
-	directCallees, err := s.FindCallees(ctx, repo.ID, "Direct", 0, 20, 0)
-	if err != nil {
-		t.Fatalf("FindCallees(Direct) error = %v", err)
-	}
-	if !hasSymbolQName(directCallees, "ApmMap::LoadWorldMap") {
-		t.Fatalf("FindCallees(Direct) missing ApmMap::LoadWorldMap, got %+v", directCallees)
-	}
+// TestCppCallGraphCalleePagination pins callee pagination on evidence-backed
+// destinations.
+func TestCppCallGraphCalleePagination(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": `class ApmMap {
+public:
+    bool LoadWorldMap(char* pFileName);
+    bool SaveWorldMap(char* pFileName);
+};
 
-	leadingCallers, err := s.FindCallers(ctx, repo.ID, "::LoadWorldMap", 0, 20, 0)
+bool ApmMap::LoadWorldMap(char* pFileName) { return true; }
+bool ApmMap::SaveWorldMap(char* pFileName) { return true; }
+
+bool MultiCallee() {
+    ApmMap::LoadWorldMap("x");
+    ApmMap::SaveWorldMap("x");
+    return true;
+}
+`})
+
+	cp0, err := s.FindCallees(ctx, repo.ID, "MultiCallee", 0, 1, 0)
 	if err != nil {
-		t.Fatalf("FindCallers(::LoadWorldMap) error = %v", err)
+		t.Fatalf("FindCallees page0: %v", err)
 	}
-	if len(leadingCallers) == 0 {
-		t.Fatalf("FindCallers(::LoadWorldMap) returned no callers")
+	cp1, err := s.FindCallees(ctx, repo.ID, "MultiCallee", 0, 1, 1)
+	if err != nil {
+		t.Fatalf("FindCallees page1: %v", err)
+	}
+	if len(cp0) != 1 || len(cp1) != 1 {
+		t.Fatalf("FindCallees pagination: got %d and %d, want 1 and 1", len(cp0), len(cp1))
+	}
+	if cp0[0].ID == cp1[0].ID {
+		t.Fatalf("FindCallees pagination returned duplicate: %q on both pages", cp0[0].QualifiedName)
 	}
 }
 
@@ -144,108 +292,4 @@ func hasSymbolQName(symbols []graph.Symbol, qname string) bool {
 		}
 	}
 	return false
-}
-
-func TestCppCallGraphPagination(t *testing.T) {
-	ctx := context.Background()
-	repoRoot := t.TempDir()
-	source := `class ApmMap {
-public:
-    bool LoadWorldMap(char* pFileName, bool bDecryption = false);
-    bool SaveWorldMap(char* pFileName);
-};
-
-class AgcmMinimap {
-    ApmMap* pcsApmMap;
-public:
-    bool F() {
-        if (pcsApmMap->LoadWorldMap("x", false)) {
-            return true;
-        }
-        return false;
-    }
-};
-
-bool ApmMap::LoadWorldMap(char* pFileName, bool bDecryption) {
-    return true;
-}
-
-bool ApmMap::SaveWorldMap(char* pFileName) {
-    return true;
-}
-
-bool Direct(ApmMap& map) {
-    return map.LoadWorldMap("x", false);
-}
-
-bool Internal(char* pFileName, bool bDecryption) {
-    return LoadWorldMap(pFileName, bDecryption);
-}
-
-bool MultiCallee(ApmMap& map) {
-    map.LoadWorldMap("x", false);
-    map.SaveWorldMap("x");
-    return true;
-}
-`
-	if err := os.WriteFile(filepath.Join(repoRoot, "fixture.cpp"), []byte(source), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
-	s, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer s.Close()
-
-	idx := New(s, parser.NewRegistry(tsparser.NewCpp()), nil)
-	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
-		t.Fatalf("Index: %v", err)
-	}
-
-	repo, err := s.UpsertRepo(ctx, repoRoot)
-	if err != nil {
-		t.Fatalf("UpsertRepo: %v", err)
-	}
-
-	// FindCallers pagination: LoadWorldMap has 3 callers (F, Direct, Internal).
-	p0, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 1, 0)
-	if err != nil {
-		t.Fatalf("FindCallers page0: %v", err)
-	}
-	if len(p0) != 1 {
-		t.Fatalf("FindCallers(limit=1,offset=0): want 1, got %d: %+v", len(p0), p0)
-	}
-
-	p1, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 1, 1)
-	if err != nil {
-		t.Fatalf("FindCallers page1: %v", err)
-	}
-	if len(p1) != 1 {
-		t.Fatalf("FindCallers(limit=1,offset=1): want 1, got %d: %+v", len(p1), p1)
-	}
-	if p0[0].ID == p1[0].ID {
-		t.Fatalf("FindCallers pagination returned duplicate: %q on both pages", p0[0].QualifiedName)
-	}
-
-	// FindCallees pagination: MultiCallee calls LoadWorldMap and SaveWorldMap (2 callees).
-	cp0, err := s.FindCallees(ctx, repo.ID, "MultiCallee", 0, 1, 0)
-	if err != nil {
-		t.Fatalf("FindCallees page0: %v", err)
-	}
-	if len(cp0) != 1 {
-		t.Fatalf("FindCallees(limit=1,offset=0): want 1, got %d: %+v", len(cp0), cp0)
-	}
-
-	cp1, err := s.FindCallees(ctx, repo.ID, "MultiCallee", 0, 1, 1)
-	if err != nil {
-		t.Fatalf("FindCallees page1: %v", err)
-	}
-	if len(cp1) != 1 {
-		t.Fatalf("FindCallees(limit=1,offset=1): want 1, got %d: %+v", len(cp1), cp1)
-	}
-	if cp0[0].ID == cp1[0].ID {
-		t.Fatalf("FindCallees pagination returned duplicate: %q on both pages", cp0[0].QualifiedName)
-	}
 }
