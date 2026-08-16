@@ -315,7 +315,22 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 				}
 			}
 		}
-		extending, err := s.unresolvedDstNamesExtending(ctx, repoID, qnames)
+		// Direction two seeds only on qualifier-bearing identities. A bare seed
+		// is extended by every receiver spelling that ends in it, which is the
+		// bare-tail match P22.1 retired -- `pcsApmMap.LoadWorldMap` extends
+		// `LoadWorldMap` and would name `AgcmMinimap::F` a caller of
+		// `ApmMap::LoadWorldMap`, on nothing but the tail. Direction one already
+		// applies the same rule (boundaryProperSuffixes drops the bare tail);
+		// this is the other half of it. `qnames` still carries the bare input
+		// for direction one and for the exact legs above, where an equal
+		// spelling is evidence rather than a suffix of one.
+		extendSeeds := make([]string, 0, len(qnames))
+		for _, qname := range qnames {
+			if memberSeparated(qname) {
+				extendSeeds = append(extendSeeds, qname)
+			}
+		}
+		extending, err := s.unresolvedDstNamesExtending(ctx, repoID, extendSeeds)
 		if err != nil {
 			return nil, err
 		}

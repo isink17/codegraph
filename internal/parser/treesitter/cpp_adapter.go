@@ -215,6 +215,7 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if callName == "" || cppSkipFuncs[callName] {
 			continue
 		}
+		dstName := cppMemberDstName(receiver, callName)
 		line := int(call.StartPoint().Row) + 1
 		evidence := callKind + ":" + nodeText(fnNode, content)
 		if receiver != "" {
@@ -222,7 +223,7 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
-			DstName:     callName,
+			DstName:     dstName,
 			Kind:        "calls",
 			Evidence:    evidence,
 			Line:        line,
@@ -234,6 +235,48 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+// cppMemberDstName is the persisted destination identity of a call. For an
+// instance call it keeps the receiver: `p.foo()` and `p->foo()` both spell
+// `p.foo`, so the qualifier the source actually wrote survives into
+// `edges.dst_name` instead of living only in `evidence`.
+//
+// Why the qualifier has to survive: without it the destination is the bare tail
+// `foo`, and the repo-wide resolver answers a bare name with whichever project
+// symbol named `foo` happens to be unique -- so `v.size()` on a std::vector
+// bound a project `size` method (measured: 281 such bindings in fmt, 207 in
+// googletest, roughly half of a hand sample wrong and the rest correct only by
+// coincidence). Keeping the receiver moves the spelling into the member-
+// qualified class P22.1 already defines, where a qualifier may only bind when
+// the destination's own identity confirms it.
+//
+// The receiver is a *variable* spelling, never a type, so this composition can
+// only ever make a destination harder to bind -- deliberately. C++ symbol
+// identities are `::`-separated (`A::parse`), so `a.parse` matches no identity
+// at any evidence level and the edge stays honestly unresolved. Recall for
+// calls CodeGraph can actually prove -- `Type::foo()`, `ns::Type::foo()` -- is
+// untouched: those never had a receiver and keep their full `::` spelling.
+//
+// `->` is normalized to '.' rather than persisted raw, so no new separator
+// grammar enters the identity space and the existing '.'-keyed member rules in
+// the resolver and the query surfaces apply unchanged. All whitespace is
+// dropped, so a member call split across lines cannot produce a newline-bearing
+// identity.
+//
+// Scope: this covers the two receiver branches of cppCallTarget only. A call
+// whose spelling contains "::" takes the scope-qualified branch and is
+// persisted verbatim, so `this->Base::foo()` keeps its arrow and a multi-line
+// `d\n  .Base::foo()` keeps its newline. That predates P22.11 and is left
+// alone: those spellings already carry a "::" qualifier, which is what both the
+// resolver's member rule and the query surfaces key on, so they fail closed
+// exactly as intended -- and rewriting them would change identities this phase
+// has no evidence about. TestCppCallDstNameKeepsReceiver pins the shape.
+func cppMemberDstName(receiver, name string) string {
+	if strings.TrimSpace(receiver) == "" {
+		return name
+	}
+	return strings.Join(strings.Fields(strings.ReplaceAll(receiver, "->", ".")+"."+name), "")
 }
 
 func cppQualifiedName(container, name string) string {
