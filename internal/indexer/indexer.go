@@ -139,6 +139,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	// Asked before pass 1 writes anything, because that is the only moment an
+	// empty graph still means "this repository has never been indexed". It gates
+	// the one-time resolver repairs below: a first index produces the current
+	// rules' answer by construction, so running a repair resolve against it
+	// would only duplicate its own resolve pass.
+	hadExistingGraph, err := i.store.RepoHasExistingGraph(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
 	scanKind := opts.ScanKind
 	if scanKind == "" {
 		scanKind = "index"
@@ -412,6 +421,30 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
 	changedSymbolNameSet := make(map[string]struct{}, 256)
+	// Names the repository STOPS declaring in this run (P22.12). Uniqueness is a
+	// repo-wide property, so removing a declaration can make an edge in an
+	// untouched file decidable, exactly as adding one can make it undecidable.
+	// The new parse cannot mention a vanished name, so it is read off the store
+	// before the write that drops it.
+	//
+	// Only collected for the incremental dispatch below: a full index resolves
+	// repo-wide and re-decides everything anyway, so the extra read would be
+	// pure cost.
+	removedSymbolNameSet := make(map[string]struct{}, 64)
+	incrementalResolve := pathScoped || scanKind == "update"
+	collectRemovedNames := func(paths []string) error {
+		if !incrementalResolve || len(paths) == 0 {
+			return nil
+		}
+		names, err := i.store.PreviousSymbolNamesForPaths(ctx, repo.ID, paths)
+		if err != nil {
+			return err
+		}
+		for _, name := range names {
+			removedSymbolNameSet[name] = struct{}{}
+		}
+		return nil
+	}
 
 	var writeMetadataDur time.Duration
 	var writeReplaceDur time.Duration
@@ -465,6 +498,18 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	flushReplace := func() error {
 		if len(replaceBatch) == 0 {
 			return nil
+		}
+		// Before the replace, not after: ReplaceFileGraphsBatchWithStats drops the
+		// old symbol rows inside its own transaction. One query per batch, so no
+		// per-file lookup. A failure here aborts the run before anything is
+		// written, and a failure in the write below leaves the collected names
+		// unused -- neither can half-apply.
+		replacedPaths := make([]string, 0, len(replaceBatch))
+		for _, input := range replaceBatch {
+			replacedPaths = append(replacedPaths, input.Path)
+		}
+		if err := collectRemovedNames(replacedPaths); err != nil {
+			return err
 		}
 		started := time.Now()
 		fileIDs, err := i.store.ReplaceFileGraphsBatchWithStats(ctx, repo.ID, scanID, replaceBatch, &writeStats)
@@ -692,6 +737,23 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 
 	if summary.FilesDeleted > 0 {
+		// The purge below removes these files' symbols. Read the names they
+		// declared while the rows are still there: a deleted declaration changes
+		// uniqueness for edges in files this scan never looked at, and the only
+		// key those edges can be found by is the name.
+		//
+		// Unconditional, unlike the per-batch collection above: this is one
+		// query, and a run whose ONLY change is a deletion has no changed path
+		// to dispatch on, so without it the resolve below would be skipped
+		// entirely -- on a full index as well as on an update.
+		removed, err := i.store.PreviousSymbolNamesForDeletedInScan(ctx, repo.ID, scanID)
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		for _, name := range removed {
+			removedSymbolNameSet[name] = struct{}{}
+		}
 		if _, err := i.store.PurgeDeletedFileGraphsForScan(ctx, repo.ID, scanID); err != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
@@ -729,15 +791,28 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// resolves nothing at all -- so an upgrade would otherwise never converge.
 	// Guarded by a per-repository settings key, so it costs one indexed SELECT
 	// on every run after the first. See store/resolver_type_scope.go.
-	if err := i.store.RepairResolverBindingsOnce(ctx, repo.ID); err != nil {
+	// `repairResolvedRepoWide` is what keeps the first scan after an upgrade from
+	// resolving the whole repository twice: a repair that had to clear bindings
+	// re-resolves inside its own transaction, and the repo-wide dispatch below
+	// would then repeat exactly that work.
+	repairResolvedRepoWide := false
+	if hadExistingGraph {
+		repairResolvedRepoWide, err = i.store.RepairResolverBindingsOnce(ctx, repo.ID)
+	} else {
+		// Nothing an older release could have written. Record the repairs as
+		// done so no later update pays for a repo-wide resolve that can only
+		// reproduce what this run already decided.
+		err = i.store.MarkResolverBindingsRepaired(ctx, repo.ID)
+	}
+	if err != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 		return summary, err
 	}
 
-	if len(changedPathSet) == 0 {
+	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
 		summary.ResolveMS = 0
 		summary.ResolveMode = "none"
-	} else if len(candidateSet) > 0 || scanKind == "update" {
+	} else if incrementalResolve {
 		// For path-scoped updates (Options.Paths) and incremental update runs, limit edge
 		// resolution to the changed files. Full index runs still do repo-wide resolution.
 		changedPaths := make([]string, 0, len(changedPathSet))
@@ -747,9 +822,19 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		// Correctness: partial runs can introduce symbols that should resolve previously-unresolved
 		// edges in other files. Share own-module discovery across path and name passes.
 		var stats store.ResolveEdgesForNamesStats
-		if len(changedSymbolNameSet) > 0 {
-			names := make([]string, 0, len(changedSymbolNameSet))
+		if len(changedSymbolNameSet) > 0 || len(removedSymbolNameSet) > 0 {
+			// OLD union NEW. A declaration arriving under a name and a
+			// declaration leaving it are the same event to the resolver -- the
+			// name's candidate population changed -- and a rename is both at
+			// once, so feeding only one side leaves half of every rename stale.
+			names := make([]string, 0, len(changedSymbolNameSet)+len(removedSymbolNameSet))
 			for name := range changedSymbolNameSet {
+				names = append(names, name)
+			}
+			for name := range removedSymbolNameSet {
+				if _, alsoNew := changedSymbolNameSet[name]; alsoNew {
+					continue
+				}
 				names = append(names, name)
 			}
 			crossStart := time.Now()
@@ -771,6 +856,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.ResolveCrossFile = &stats
 			summary.ResolveCrossFileTargets = stats.TargetsSelected
 		}
+	} else if repairResolvedRepoWide {
+		// The repair above already ran this exact pass over the same graph:
+		// every file is persisted before Pass 2 starts, so a second repo-wide
+		// resolve could only reach the same answer.
+		summary.ResolveMode = "repo"
 	} else {
 		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
@@ -799,9 +889,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		summary.ResolveTestLinksFileBound = testLinkStats.FilesBound
 		summary.ResolveTestLinksMS = time.Since(testLinkStart).Milliseconds()
 		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
-		if len(changedPathSet) == 0 {
+		if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
 			// Edge resolution did not run; the timings above are the test-link
-			// pass alone, and the mode should say so instead of "none".
+			// pass alone, and the mode should say so instead of "none". The
+			// removed-name condition matches the dispatch above: since P22.12 a
+			// deletion-only run DOES resolve, and reporting `test_links` there
+			// would deny work that happened.
 			summary.ResolveMode = "test_links"
 		}
 	}

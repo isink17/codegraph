@@ -897,7 +897,7 @@ func (s *Store) clearOutOfScopeTypeBindings(
 		  AND e.edge_kind <> '` + EdgeKindCrossLanguageRef + `'`
 	if ids != nil {
 		selectStale += `
-		  AND e.resolution_strategy IN ` + sqlStrategyInList(incrementallyRedecidableStrategies)
+		  AND e.resolution_strategy IN ` + sqlQuotedList(incrementallyRedecidableStrategies)
 	}
 
 	var stale []int64
@@ -1061,30 +1061,106 @@ const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v1"
 // surfaces already refuse the name-evidence form of the same claim, leaving the
 // graph inconsistent with itself.
 func (s *Store) repairTypeScopeBindingsOnce(ctx context.Context, repoID int64) error {
-	key := typeScopeRepairSettingKey + "." + strconv.FormatInt(repoID, 10)
+	_, err := s.runResolverRepairOnce(ctx, repoID, typeScopeRepair)
+	return err
+}
+
+// resolverRepair is one one-time, per-repository convergence step: the settings
+// key that records it and the work it does.
+//
+// The list below is the ONLY place the set is written down. Enumerating the
+// repairs in one function and their keys in another is how a repair gets added
+// to the runner and forgotten by the marker writer -- which would silently make
+// every freshly indexed repository pay a repo-wide resolve on its second scan.
+type resolverRepair struct {
+	key string
+	run func(*Store, context.Context, int64) error
+	// resolvesRepoWide says the repair leaves the repository fully re-resolved,
+	// so a caller that was about to run its own repo-wide pass can skip it.
+	resolvesRepoWide bool
+}
+
+var (
+	typeScopeRepair = resolverRepair{
+		key: typeScopeRepairSettingKey,
+		run: (*Store).RevalidateTypeScopeAfterDeletion,
+	}
+	bareNameLevelRepair = resolverRepair{
+		key:              bareNameLevelRepairSettingKey,
+		run:              (*Store).repairBareNameLevelBindings,
+		resolvesRepoWide: true,
+	}
+	// Ordered: the bare-name re-resolve should see the bindings the type-scope
+	// repair already cleared.
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair}
+)
+
+// runResolverRepairOnce performs one repair unless its marker is already set,
+// and writes the marker only after it succeeds -- so a failure re-runs rather
+// than marking a repository converged that is not. Keyed per repository,
+// because one database holds several. It reports whether the repair actually
+// ran.
+func (s *Store) runResolverRepairOnce(ctx context.Context, repoID int64, repair resolverRepair) (bool, error) {
+	key := repair.key + "." + strconv.FormatInt(repoID, 10)
 	var done string
 	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&done)
 	switch {
 	case err == nil && done == "1":
-		return nil
+		return false, nil
 	case err != nil && !errors.Is(err, sql.ErrNoRows):
-		return err
+		return false, err
 	}
-	if err := s.RevalidateTypeScopeAfterDeletion(ctx, repoID); err != nil {
-		return err
+	if err := repair.run(s, ctx, repoID); err != nil {
+		return false, err
 	}
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO settings(key, value) VALUES(?, '1')
-		 ON CONFLICT(key) DO UPDATE SET value = '1'`, key)
-	return err
+	return true, s.markRepairDone(ctx, repair.key, repoID)
 }
 
 // RepairResolverBindingsOnce brings a repository's persisted bindings up to the
 // current resolver's rules, once. It is the public entrypoint the indexer calls
 // before deciding which resolve pass to run, so an upgrade converges even on a
 // run that parses nothing.
-func (s *Store) RepairResolverBindingsOnce(ctx context.Context, repoID int64) error {
-	return s.repairTypeScopeBindingsOnce(ctx, repoID)
+//
+// It reports whether a repair left the repository fully re-resolved, so the
+// caller can skip a repo-wide pass that would only repeat the work.
+func (s *Store) RepairResolverBindingsOnce(ctx context.Context, repoID int64) (bool, error) {
+	resolvedRepoWide := false
+	for _, repair := range resolverRepairs {
+		ran, err := s.runResolverRepairOnce(ctx, repoID, repair)
+		if err != nil {
+			return false, err
+		}
+		if ran && repair.resolvesRepoWide {
+			resolvedRepoWide = true
+		}
+	}
+	return resolvedRepoWide, nil
+}
+
+// MarkResolverBindingsRepaired records a repository as already converged
+// without doing any work.
+//
+// It is what a FIRST index calls. Such a repository holds nothing an older
+// release wrote, and its own resolve pass produces the current rules' answer by
+// construction -- so the repairs have nothing to find, and leaving their markers
+// unset would make the next ordinary update pay for a repo-wide resolve that
+// can only reproduce what the index just decided. See RepoHasExistingGraph.
+func (s *Store) MarkResolverBindingsRepaired(ctx context.Context, repoID int64) error {
+	for _, repair := range resolverRepairs {
+		if err := s.markRepairDone(ctx, repair.key, repoID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// markRepairDone writes one repair's per-repository marker.
+func (s *Store) markRepairDone(ctx context.Context, prefix string, repoID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO settings(key, value) VALUES(?, '1')
+		 ON CONFLICT(key) DO UPDATE SET value = '1'`,
+		prefix+"."+strconv.FormatInt(repoID, 10))
+	return err
 }
 
 // RevalidateTypeScopeAfterDeletion re-decides every bare-name type binding in a

@@ -233,9 +233,10 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyModuleImport,
 )
 
-// sqlStrategyInList renders a strategy set as a SQL literal list. Strategy
-// names are compile-time constants matching [a-z_]+, never user input.
-func sqlStrategyInList(strategies []string) string {
+// sqlQuotedList renders a fixed set of identifiers as a SQL literal list.
+// Strategy names and symbol kinds are compile-time constants matching [a-z_]+,
+// never user input.
+func sqlQuotedList(strategies []string) string {
 	quoted := make([]string, 0, len(strategies))
 	for _, strategy := range strategies {
 		quoted = append(quoted, "'"+strategy+"'")

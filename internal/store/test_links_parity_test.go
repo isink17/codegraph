@@ -119,10 +119,12 @@ func TestTestLinksAmbiguityRemovedByDeletionRebinds(t *testing.T) {
 	if summary.FilesDeleted != 1 {
 		t.Fatalf("FilesDeleted = %d, want 1", summary.FilesDeleted)
 	}
-	// Deletion-only update: edge resolution did not run, so the reported mode
-	// names the pass that did.
-	if summary.ResolveMode != "test_links" {
-		t.Fatalf("ResolveMode = %q, want test_links", summary.ResolveMode)
+	// Since P22.12 a deletion-only update DOES resolve edges: the names the
+	// deleted file used to declare are fed to the name pass, because removing a
+	// declaration can make an edge elsewhere decidable. The reported mode has to
+	// say so -- `test_links` would deny work that happened.
+	if summary.ResolveMode != "paths+names" {
+		t.Fatalf("ResolveMode = %q, want paths+names", summary.ResolveMode)
 	}
 
 	f.assertNoDanglingTestLinks()
