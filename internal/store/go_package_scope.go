@@ -153,6 +153,12 @@ type goSymbolScope struct {
 	// language is the symbol's persisted `symbols.language`, or "" when no
 	// symbol row answered. Only `go` makes the P22.6 package rule apply.
 	language string
+	// kind is the symbol's persisted `symbols.kind`. P22.6 does not read it;
+	// it is loaded here because this is the one target-metadata read the public
+	// query surfaces already make, and P22.9's bare-name type rule needs it
+	// (resolver_type_scope.go). A second query for one column would cost more
+	// than the column.
+	kind string
 	// key is the symbol's package scope, or goPackageScopeUnknown. It is only
 	// meaningful when language is `go`.
 	key string
@@ -436,7 +442,7 @@ func symbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, ids 
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
-			SELECT s.id, s.language, s.qualified_name, s.name, f.path
+			SELECT s.id, s.language, s.kind, s.qualified_name, s.name, f.path
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ?
@@ -485,7 +491,7 @@ func goSymbolScopesByEdgeSource(ctx context.Context, q queryContexter, repoID in
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
-			SELECT e.id, s.language, s.qualified_name, s.name, f.path
+			SELECT e.id, s.language, s.kind, s.qualified_name, s.name, f.path
 			FROM edges e
 			JOIN symbols s ON s.id = e.src_symbol_id
 			JOIN files f ON f.id = s.file_id
@@ -506,12 +512,13 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 	defer rows.Close()
 	for rows.Next() {
 		var key int64
-		var language, qualifiedName, name, filePath string
-		if err := rows.Scan(&key, &language, &qualifiedName, &name, &filePath); err != nil {
+		var language, kind, qualifiedName, name, filePath string
+		if err := rows.Scan(&key, &language, &kind, &qualifiedName, &name, &filePath); err != nil {
 			return err
 		}
 		out[key] = goSymbolScope{
 			language:     language,
+			kind:         kind,
 			key:          goPackageScopeKey(filePath, qualifiedName),
 			packageLevel: goPackageLevelDeclaration(qualifiedName, name),
 		}

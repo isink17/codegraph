@@ -2442,8 +2442,12 @@ func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
 		return err
 	}
 	// The veto predicate reads the test-file set to decide which caller kind a
-	// row applies to, so a strategy that ensures one table needs the other too.
-	return ensureResolverTestFilesTable(ctx, tx)
+	// row applies to, so a strategy that ensures one table needs the other too --
+	// and the bind gate reads the import scope (P22.9) for the same reason.
+	if err := ensureResolverTestFilesTable(ctx, tx); err != nil {
+		return err
+	}
+	return ensureResolverImportScopeTable(ctx, tx)
 }
 
 // prepareResolverTables builds the two per-resolve temp relations every
@@ -2462,8 +2466,12 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable); err != nil {
 		return err
 	}
-	// Both tables exist even on the early return below, so a strategy that runs
-	// anyway reads them as "no test files, no vetoed names" rather than failing.
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable); err != nil {
+		return err
+	}
+	// All three tables exist even on the early return below, so a strategy that
+	// runs anyway reads them as "no test files, no vetoed names, no imports"
+	// rather than failing.
 	if err := ensureResolverAmbiguousNamesTable(ctx, tx); err != nil {
 		return err
 	}
@@ -2481,6 +2489,9 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 		return nil
 	}
 	if err := s.recordResolverTestFiles(ctx, tx, repoID); err != nil {
+		return err
+	}
+	if err := s.recordResolverImportScope(ctx, tx, repoID); err != nil {
 		return err
 	}
 	return s.recordAmbiguousResolverNames(ctx, tx, repoID)
@@ -2556,6 +2567,12 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 }
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
+	// Pre-P22.9 bindings this rule refuses are cleared once per repository, so an
+	// upgraded database converges instead of keeping relationships no strategy
+	// here would reconsider. See resolver_type_scope.go.
+	if err := s.repairTypeScopeBindingsOnce(ctx, repoID); err != nil {
+		return 0, err
+	}
 	totalResolved := 0
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2600,6 +2617,7 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		}
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_targets`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_resolution`)
@@ -2749,6 +2767,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable); err != nil {
 		return 0, err
 	}
 	_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
@@ -3258,7 +3279,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 }
 
 func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []string) error {
-	return s.resolveEdgesForPaths(ctx, repoID, paths, nil)
+	return s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil)
 }
 
 // ResolveEdgesForPathsAndNames shares one module discovery pass across the two
@@ -3269,6 +3290,20 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	// ambiguous has to be reconsidered, not merely left alone. It runs first so
 	// the module pass below can immediately re-bind the own-module edges it
 	// clears, instead of finding them vetoed and unresolved.
+	// A changed file's IMPORT list is evidence too since P22.9, and it changes
+	// the answer for files the batch does not otherwise mention -- so the names
+	// whose visibility those edits could have flipped join the batch before
+	// anything is invalidated. See typeScopeNamesForChangedPaths.
+	if err := s.repairTypeScopeBindingsOnce(ctx, repoID); err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	scopes := newImportScopeCache(s, repoID)
+	scopeNames, err := s.typeScopeNamesForChangedPaths(ctx, repoID, paths, scopes)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, scopeNames)
+
 	invalidateStarted := time.Now()
 	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names)
 	if err != nil {
@@ -3279,10 +3314,10 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
-	if err := s.resolveEdgesForPaths(ctx, repoID, paths, moduleVeto); err != nil {
+	if err := s.resolveEdgesForPaths(ctx, repoID, paths, moduleVeto, scopes); err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
-	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto)
+	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto, scopes)
 	stats.InvalidateMS += invalidateMS
 	stats.InvalidatedBindings += invalidated
 	return stats, err
@@ -3531,7 +3566,7 @@ func scanEdgeIDsInto(rows *sql.Rows, set map[int64]struct{}) error {
 	return rows.Err()
 }
 
-func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []string, moduleVeto map[int64]struct{}) error {
+func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []string, moduleVeto map[int64]struct{}, scopes *importScopeCache) error {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -3635,7 +3670,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		}
 		targets = append(targets, chunkTargets...)
 	}
-	_, err = s.resolveEdgeTargets(ctx, repoID, targets, moduleVeto)
+	_, err = s.resolveEdgeTargets(ctx, repoID, targets, moduleVeto, scopes)
 	return err
 }
 
@@ -3654,10 +3689,10 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 }
 
 func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string) (ResolveEdgesForNamesStats, error) {
-	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, nil)
+	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, nil, nil)
 }
 
-func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string, moduleVeto map[int64]struct{}) (ResolveEdgesForNamesStats, error) {
+func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string, moduleVeto map[int64]struct{}, scopes *importScopeCache) (ResolveEdgesForNamesStats, error) {
 	var stats ResolveEdgesForNamesStats
 	if len(names) == 0 {
 		return stats, nil
@@ -3825,7 +3860,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	}
 	stats.TargetsSelected = len(targets)
 	resolveStarted := time.Now()
-	outcome, err := s.resolveEdgeTargets(ctx, repoID, targets, moduleVeto)
+	outcome, err := s.resolveEdgeTargets(ctx, repoID, targets, moduleVeto, scopes)
 	if err != nil {
 		return stats, err
 	}
@@ -3983,7 +4018,7 @@ func setToSlice(set map[string]struct{}) []string {
 // name-targeted resolvers. Candidate lookups are keyed by (name, language) and
 // a target only binds when resolverLanguageCompatible allows it, which is the
 // same rule the repo-wide SQL strategies apply.
-func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget, moduleVeto map[int64]struct{}) (resolveEdgeTargetsOutcome, error) {
+func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget, moduleVeto map[int64]struct{}, scopes *importScopeCache) (resolveEdgeTargetsOutcome, error) {
 	var outcome resolveEdgeTargetsOutcome
 	if len(targets) == 0 {
 		return outcome, nil
@@ -4093,6 +4128,18 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if err != nil {
 		return outcome, err
 	}
+	// The P22.9 import scope, built only when a type candidate is actually in
+	// play. It costs one scan of `files` and one of `file_imports`, and the
+	// overwhelming majority of incremental batches resolve nothing but callables,
+	// so the guard keeps that off the common path entirely.
+	var importScope map[int64]map[int64]struct{}
+	if len(byQualified.typeSymbolFiles) > 0 || len(byShort.typeSymbolFiles) > 0 {
+		importScope, err = scopes.get(ctx, s, repoID)
+		if err != nil {
+			return outcome, err
+		}
+	}
+
 	// Names that exist somewhere in the repo, in any language and whether or not
 	// they are ambiguous there. Used only to report honestly why a candidate
 	// stayed unresolved.
@@ -4193,6 +4240,23 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		dstID, ok := int64(0), false
 		if matched {
 			dstID, ok = matchedGroup.chosen(callerIsTest)
+		}
+		if ok && dstID != 0 && typeScopeGatedLanguage(target.srcLanguage) && goBareCallName(target.dstName) &&
+			(byQualified.typeTargetOutOfScope(dstID, target.srcFileID, importScope) ||
+				byShort.typeTargetOutOfScope(dstID, target.srcFileID, importScope)) {
+			// A bare spelling naming a type the calling file neither declares nor
+			// imports. Repository-global uniqueness is not scope evidence for a
+			// class name (P22.9, resolver_type_scope.go), and there is nothing
+			// weaker to fall back to, so the edge stays unresolved -- exactly what
+			// resolverBareNameTypeScopeSQL does on the full path.
+			//
+			// Gated on the spelling rather than on the strategy so the two levels a
+			// bare name can reach (a qualified_name that happens to be bare, and
+			// the bare-name lookup) are both covered; goBareCallName is the Go twin
+			// of the SQL guard's sqlNotBareName and is not Go-specific despite the
+			// name.
+			outcome.unresolved++
+			continue
 		}
 		if !ok || dstID == 0 {
 			outcome.unresolved++
@@ -4399,6 +4463,29 @@ func (g candidateGroup) ambiguousFor(callerIsTest bool) bool {
 // arbitrarily.
 type symbolCandidates struct {
 	groups map[symbolLangKey]candidateGroup
+
+	// typeSymbolFiles is the declaring file of every candidate whose kind is a
+	// type (resolver_type_scope.go). It is what lets the binder ask the same
+	// question the repo-wide resolverBareNameTypeScopeSQL asks -- without a
+	// second query, since these rows are already being scanned.
+	typeSymbolFiles map[int64]int64
+}
+
+// typeTargetOutOfScope reports whether binding `symbolID` from a caller in
+// `callerFileID` would assert a bare-name relationship to a type the caller's
+// file neither declares nor imports. It is the Go-side twin of
+// resolverBareNameTypeScopeSQL and must answer identically;
+// resolver_type_scope_test.go pins that against the SQL path on the same graph.
+//
+// Non-type candidates are never in the map, so the common case is a single map
+// lookup on the already-chosen id.
+func (c symbolCandidates) typeTargetOutOfScope(symbolID, callerFileID int64, importScope map[int64]map[int64]struct{}) bool {
+	declaringFileID, isType := c.typeSymbolFiles[symbolID]
+	if !isType || declaringFileID == callerFileID {
+		return false
+	}
+	_, imported := importScope[callerFileID][declaringFileID]
+	return !imported
 }
 
 // names reports every name that matched a symbol in any language, ambiguous or
@@ -4436,7 +4523,10 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 	default:
 		panic("store: resolveSymbolCandidates called with unsupported column " + column)
 	}
-	out := symbolCandidates{groups: map[symbolLangKey]candidateGroup{}}
+	out := symbolCandidates{
+		groups:          map[symbolLangKey]candidateGroup{},
+		typeSymbolFiles: map[int64]int64{},
+	}
 	if len(names) == 0 {
 		return out, nil
 	}
@@ -4461,7 +4551,7 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 			kindFilter = ` AND kind IN ` + resolverBareNameKindsSQL
 		}
 		query := `
-			SELECT ` + column + `, language, id, file_id
+			SELECT ` + column + `, language, id, file_id, kind
 			FROM symbols
 			WHERE repo_id = ? AND language != '' AND ` + column + ` != '' AND ` + column + ` IN (` + placeholders + `)` + kindFilter + `
 		`
@@ -4479,13 +4569,22 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 			var language string
 			var id int64
 			var fileID int64
-			if err := rows.Scan(&name, &language, &id, &fileID); err != nil {
+			var kind string
+			if err := rows.Scan(&name, &language, &id, &fileID, &kind); err != nil {
 				_ = rows.Close()
 				return symbolCandidates{}, err
 			}
 			key := symbolLangKey{name: name, language: language}
 			_, isTest := testFileIDs[fileID]
 			out.groups[key] = out.groups[key].add(id, isTest)
+			// Recorded at every level, because whether the P22.9 scope rule applies
+			// is decided by the edge's *spelling*, not by which level matched: a
+			// bare dst_name can equal a symbol's qualified_name as easily as its
+			// name. The binder's goBareCallName guard is what keeps qualifier-
+			// bearing spellings out, mirroring sqlNotBareName on the SQL side.
+			if isTypeSymbolKind(kind) {
+				out.typeSymbolFiles[id] = fileID
+			}
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()

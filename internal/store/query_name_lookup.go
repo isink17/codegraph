@@ -505,9 +505,43 @@ func (s *Store) lookupSymbolIDsByNameLanguage(ctx context.Context, repoID int64,
 		if len(remaining) == 0 {
 			break
 		}
-		hits, err := s.symbolIDsByColumn(ctx, repoID, column, lookupKeyNames(remaining), lookupKeyLanguages(remaining))
-		if err != nil {
-			return nil, err
+		// P22.9: a BARE spelling may not claim a type. The spellings are split
+		// so the exclusion follows the syntax rather than the stage -- a
+		// qualifier-bearing spelling keeps every candidate it had, in both
+		// stages, because the qualifier is evidence the source itself wrote.
+		//
+		// This is the identity contract, not discovery: the caller is a
+		// persisted source that spelled a name, so it must answer what the
+		// resolver would have bound (resolver_type_scope.go). Without it a
+		// Kotlin `A()` still reached `class A.A` through find_callees and
+		// context expansion after the resolver had refused it.
+		// The split is by spelling AND by language, because the exclusion only
+		// applies where CodeGraph can decide cross-file visibility: a bare
+		// Kotlin or Swift spelling keeps every candidate it had, since those
+		// languages make a class visible across files with no import at all.
+		bare, qualified := splitBareNameLanguages(remaining)
+		bareGated, bareUngated := splitTypeScopeGatedLanguages(lookupKeyLanguages(bare))
+		hits := map[string][]symbolIDLang{}
+		for _, part := range []struct {
+			names           []string
+			languages       []string
+			excludeTypeKind bool
+		}{
+			{lookupKeyNames(qualified), lookupKeyLanguages(qualified), false},
+			{lookupKeyNames(bare), bareGated, true},
+			{lookupKeyNames(bare), bareUngated, false},
+		} {
+			if len(part.names) == 0 || len(part.languages) == 0 {
+				continue
+			}
+			partHits, err := s.symbolIDsByColumn(ctx, repoID, column,
+				part.names, part.languages, part.excludeTypeKind)
+			if err != nil {
+				return nil, err
+			}
+			for name, candidates := range partHits {
+				hits[name] = mergeCandidatesPreservingOrder(hits[name], candidates)
+			}
 		}
 		remaining = assignHits(resolved, remaining, hits, func(name string) string { return name })
 	}
@@ -557,6 +591,15 @@ func (s *Store) lookupSymbolIDsByNameLanguage(ctx context.Context, repoID int64,
 	// actually differs from the name itself (the pre-P12 condition).
 	// Member-qualified names are excluded: equality on the bare tail is
 	// exactly the qualifier-discarding match stage 3 no longer performs.
+	//
+	// Every key that reaches this stage has a short name DIFFERENT from its own
+	// spelling, so the spelling is qualifier-bearing and the stage degrades it to
+	// a bare tail. That is deliberately stricter than the resolver, which exempts
+	// qualifier-bearing spellings: the exemption there is about a spelling that
+	// MATCHED with its qualifier intact, and this stage matched without it. A
+	// qualified spelling that really named a class was bound by qualified
+	// evidence and never reaches here, so a bare-tail match on a class is the
+	// same fabrication stage 3 stopped performing for member spellings (P22.1).
 	if len(remaining) > 0 {
 		var stage4 []string
 		seenStage4 := map[string]bool{}
@@ -576,9 +619,22 @@ func (s *Store) lookupSymbolIDsByNameLanguage(ctx context.Context, repoID int64,
 			byShort[short] = append(byShort[short], key)
 		}
 		if len(stage4) > 0 {
-			hits, err := s.symbolIDsByColumn(ctx, repoID, "name", stage4, lookupKeyLanguages(remaining))
-			if err != nil {
-				return nil, err
+			gated, ungated := splitTypeScopeGatedLanguages(lookupKeyLanguages(remaining))
+			hits := map[string][]symbolIDLang{}
+			for _, part := range []struct {
+				languages       []string
+				excludeTypeKind bool
+			}{{gated, true}, {ungated, false}} {
+				if len(part.languages) == 0 {
+					continue
+				}
+				partHits, err := s.symbolIDsByColumn(ctx, repoID, "name", stage4, part.languages, part.excludeTypeKind)
+				if err != nil {
+					return nil, err
+				}
+				for name, candidates := range partHits {
+					hits[name] = mergeCandidatesPreservingOrder(hits[name], candidates)
+				}
 			}
 			for _, short := range stage4 {
 				for _, key := range byShort[short] {
@@ -667,7 +723,12 @@ func assignHits(resolved map[symbolLangKey][]int64, remaining []symbolLangKey, h
 // that was asked for. That is the common shape -- one repository, one seed
 // language -- and it keeps the statement reading exactly the columns it read
 // before P22.7.
-func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column string, names, languages []string) (map[string][]symbolIDLang, error) {
+// `excludeTypeKinds` drops type declarations from the candidate set. It is set
+// only for bare spellings (P22.9, resolver_type_scope.go); a bare name that
+// really denotes a class has already been bound by the resolver and reaches the
+// answer through the destination id, so a bare-name candidate of type kind here
+// is by construction one the resolver refused.
+func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column string, names, languages []string, excludeTypeKinds bool) (map[string][]symbolIDLang, error) {
 	if column != "qualified_name" && column != "name" {
 		return nil, nil
 	}
@@ -691,11 +752,15 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 		for _, language := range languages {
 			args = append(args, language)
 		}
+		kindFilter := ""
+		if excludeTypeKinds {
+			kindFilter = ` AND s.kind NOT IN ` + typeSymbolKindsSQL
+		}
 		rows, err := s.neighborQuery(ctx, `
 			SELECT s.`+column+`, s.id`+langColumn+`
 			FROM symbols s
 			WHERE s.repo_id = ? AND s.`+column+` IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
-			  AND s.language IN (`+strings.TrimRight(strings.Repeat("?,", len(languages)), ",")+`)
+			  AND s.language IN (`+strings.TrimRight(strings.Repeat("?,", len(languages)), ",")+`)`+kindFilter+`
 			ORDER BY s.`+column+` ASC, s.id ASC
 		`, args...)
 		if err != nil {
@@ -749,7 +814,7 @@ func (s *Store) memberSuffixSpellingHits(ctx context.Context, repoID int64, memb
 	if len(lookups) == 0 {
 		return nil, nil
 	}
-	bySuffix, err := s.symbolIDsByColumn(ctx, repoID, "qualified_name", lookups, languages)
+	bySuffix, err := s.symbolIDsByColumn(ctx, repoID, "qualified_name", lookups, languages, false)
 	if err != nil {
 		return nil, err
 	}
@@ -845,7 +910,7 @@ func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts,
 		args = append(args, language)
 	}
 	rows, err := s.neighborQuery(ctx, `
-		SELECT s.qualified_name, s.id`+langColumn+`
+		SELECT s.qualified_name, s.id, s.kind`+langColumn+`
 		FROM symbols s
 		WHERE s.repo_id = ?
 		  AND s.language IN (`+strings.TrimRight(strings.Repeat("?,", len(languages)), ",")+`)
@@ -857,9 +922,9 @@ func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts,
 
 	out := map[string][]symbolIDLang{}
 	lastID := map[string]int64{}
-	var qname, language string
+	var qname, kind, language string
 	var id int64
-	dest := []any{&qname, &id}
+	dest := []any{&qname, &id, &kind}
 	if !single {
 		dest = append(dest, &language)
 	} else {
@@ -870,7 +935,15 @@ func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts,
 			return nil, err
 		}
 		folded := asciiLower(qname)
+		isType := isTypeSymbolKind(kind)
 		matcher.match(folded, func(short string) {
+			// P22.9: a BARE short reaching a type through `%.short` is the
+			// bare-tail fabrication in its class/constructor form -- it is how
+			// `A` still claimed `A.A` after the resolver had refused it. A
+			// member-qualified spelling keeps its qualifier and its candidates.
+			if isType && typeScopeGatedLanguage(language) && goBareCallName(short) {
+				return
+			}
 			// Both separators can match the same row; keep one id per short.
 			if seen, ok := lastID[short]; ok && seen == id {
 				return
@@ -880,4 +953,33 @@ func (s *Store) symbolIDsBySuffixScan(ctx context.Context, repoID int64, shorts,
 		})
 	}
 	return out, rows.Err()
+}
+
+// splitBareNameLanguages partitions lookup keys by whether their spelling
+// carries a qualifier, preserving input order in both halves so statement text
+// stays a function of the input. Only the bare half is subject to P22.9's
+// type-target exclusion.
+func splitBareNameLanguages(keys []symbolLangKey) (bare, qualified []symbolLangKey) {
+	for _, key := range keys {
+		if goBareCallName(key.name) {
+			bare = append(bare, key)
+		} else {
+			qualified = append(qualified, key)
+		}
+	}
+	return bare, qualified
+}
+
+// splitTypeScopeGatedLanguages partitions a language list into the ones P22.9
+// governs and the rest, preserving order so statement text stays a function of
+// the input.
+func splitTypeScopeGatedLanguages(languages []string) (gated, ungated []string) {
+	for _, language := range languages {
+		if typeScopeGatedLanguage(language) {
+			gated = append(gated, language)
+		} else {
+			ungated = append(ungated, language)
+		}
+	}
+	return gated, ungated
 }
