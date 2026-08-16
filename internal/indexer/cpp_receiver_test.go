@@ -5,7 +5,9 @@ package indexer
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,19 +32,80 @@ type cppRepo struct {
 	store  *store.Store
 	idx    *Indexer
 	repo   graph.Repo
+	// reg is the parser registry openStore rebuilds the Indexer with, so a test
+	// that installs a different one keeps it across a projection.
+	reg *parser.Registry
+	// live counts handles opened through openStore minus those successfully
+	// released through closeStore. It guards helper-mediated swaps only -- code
+	// that assigns r.store directly is invisible to it, which is why the
+	// lifecycle regression asserts r.store == nil after cleanup as well.
+	live int
 }
 
 func newCppRepo(t *testing.T) *cppRepo {
 	t.Helper()
-	r := &cppRepo{t: t, root: t.TempDir(), dbPath: filepath.Join(t.TempDir(), "graph.sqlite")}
+	r := &cppRepo{
+		t:      t,
+		root:   t.TempDir(),
+		dbPath: filepath.Join(t.TempDir(), "graph.sqlite"),
+		reg:    parser.NewRegistry(tsparser.NewCpp()),
+	}
+	// A method value, not a closure over the handle open right now. projection()
+	// closes the Store and opens a new one against the same file, so a closure
+	// capturing the first handle leaves the last one open: on POSIX the pinned
+	// file unlinks anyway and the leak is invisible, on Windows t.TempDir's
+	// RemoveAll fails with a sharing violation. Both t.TempDir calls above are
+	// already registered and testing runs cleanups LIFO, so this one runs before
+	// either directory is removed.
+	t.Cleanup(r.closeStore)
+	r.openStore()
+	return r
+}
+
+// openStore opens the repository's database and makes it the handle every other
+// helper uses. Opening while one is already open is the bug this file had, so
+// it is an error rather than a silent second handle.
+func (r *cppRepo) openStore() {
+	r.t.Helper()
+	if r.store != nil {
+		r.t.Fatalf("openStore: a Store is already open for %s", r.dbPath)
+	}
 	s, err := store.Open(r.dbPath)
 	if err != nil {
-		t.Fatalf("store.Open() error = %v", err)
+		r.t.Fatalf("store.Open() error = %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
 	r.store = s
-	r.idx = New(s, parser.NewRegistry(tsparser.NewCpp()), nil)
-	return r
+	r.idx = New(s, r.reg, nil)
+	r.live++
+}
+
+// closeStore releases the current handle and leaves the repository with none.
+// Safe to call twice: the test-end cleanup is a no-op after an explicit close.
+// Reported with Errorf, not Fatalf, so a failure during teardown does not skip
+// the remaining cleanups -- and `live` is only decremented once Close actually
+// succeeded, because a Close that failed may still hold the file.
+func (r *cppRepo) closeStore() {
+	r.t.Helper()
+	s := r.store
+	if s == nil {
+		return
+	}
+	r.store, r.idx = nil, nil
+	if err := s.Close(); err != nil {
+		r.t.Errorf("store.Close() error = %v", err)
+		return
+	}
+	r.live--
+}
+
+// useRegistry swaps the parser registry the repository indexes with, and keeps
+// it across a projection's close/reopen.
+func (r *cppRepo) useRegistry(reg *parser.Registry) {
+	r.t.Helper()
+	r.reg = reg
+	if r.store != nil {
+		r.idx = New(r.store, reg, nil)
+	}
 }
 
 func (r *cppRepo) write(name, src string) {
@@ -76,20 +139,19 @@ func (r *cppRepo) run(scanKind string) {
 // Two indexes of the same tree must produce the same one however they got there.
 func (r *cppRepo) projection() []string {
 	r.t.Helper()
-	r.store.Close()
+	// The raw handle below reads the same file, so the Store is released for the
+	// duration and reopened through the same owner afterwards -- never two live
+	// handles, and never a handle the test-end cleanup cannot see. Deferred
+	// cleanups run LIFO, so the order is rows, then the raw sql.DB, then the
+	// Store reopen.
+	r.closeStore()
+	defer r.openStore()
+
 	db, err := sql.Open("sqlite", r.dbPath)
 	if err != nil {
 		r.t.Fatalf("sql.Open() error = %v", err)
 	}
-	defer func() {
-		db.Close()
-		s, err := store.Open(r.dbPath)
-		if err != nil {
-			r.t.Fatalf("store.Open() reopen error = %v", err)
-		}
-		r.store = s
-		r.idx = New(s, parser.NewRegistry(tsparser.NewCpp()), nil)
-	}()
+	defer db.Close()
 
 	rows, err := db.Query(`
 		SELECT f.path, e.line, e.dst_name, e.evidence,
@@ -573,7 +635,7 @@ func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
 	// Make the database look like one an older release wrote, so the upgrade is
 	// still pending, then swap in the registry a non-cgo build would use.
 	clearCppUpgradeMarker(t, r.dbPath)
-	r.idx = New(r.store, parser.NewRegistry(heuristicparser.NewCAndCpp()), nil)
+	r.useRegistry(parser.NewRegistry(heuristicparser.NewCAndCpp()))
 	r.run("update")
 	after := r.projection()
 	if strings.Join(after, "\n") != strings.Join(before, "\n") {
@@ -631,4 +693,51 @@ func cppFileMeta(t *testing.T, dbPath, path string) (int64, string) {
 		t.Fatalf("file meta error = %v", err)
 	}
 	return mtime, hash
+}
+
+// TestCppRepoHelperReleasesDatabaseHandles is the regression for the Windows CI
+// failure on PR #112. The four tests that call projection() were the four that
+// failed, because projection() swapped cppRepo's Store while the test-end
+// cleanup still held the handle it was given at construction: the reopened one
+// was never closed, and t.TempDir's RemoveAll then hit
+// "The process cannot access the file because it is being used by another
+// process". POSIX unlinks an open file happily, which is why it passed there.
+//
+// The repository lives in a subtest so the assertions run *after* its cleanups
+// have, which is the only way to test the mechanism that actually broke -- an
+// explicit closeStore() before asserting would bypass the registered cleanup
+// and pass under the original bug. Two properties, because neither alone
+// separates both shapes: `store == nil` fails on every OS if the cleanup closes
+// anything other than the current handle (a closure over a captured handle
+// never clears the field), and `live == 0` fails if a helper-mediated swap
+// opens without releasing. The subtest's own TempDir RemoveAll is the real
+// proof, and only on Windows, where an open SQLite handle makes it a sharing
+// violation.
+func TestCppRepoHelperReleasesDatabaseHandles(t *testing.T) {
+	var r *cppRepo
+	t.Run("repo", func(t *testing.T) {
+		r = newCppRepo(t)
+		r.write("a.cpp", "struct A { int size() { return 1; } };\nvoid caller(A* a) {\n    a->size();\n}\n")
+		r.run("index")
+
+		if got := r.projection(); len(got) == 0 {
+			t.Fatalf("projection returned nothing; fixture produced no call edges")
+		}
+		// Twice: the second call exercises the reopened handle, which is exactly
+		// the one the old cleanup could not see.
+		if got := r.projection(); len(got) == 0 {
+			t.Fatalf("second projection returned nothing")
+		}
+		r.run("update")
+	})
+
+	if r.store != nil {
+		t.Fatalf("test-end cleanup left a Store open on %s", r.dbPath)
+	}
+	if r.live != 0 {
+		t.Fatalf("%d Store handle(s) opened through the helper were never released", r.live)
+	}
+	if _, err := os.Stat(filepath.Dir(r.dbPath)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("subtest TempDir %s survived cleanup: %v", filepath.Dir(r.dbPath), err)
+	}
 }
