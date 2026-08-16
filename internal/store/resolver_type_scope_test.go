@@ -1048,7 +1048,7 @@ func TestTypeScopeRepairClearsNonRedecidableStrategies(t *testing.T) {
 		t.Fatalf("seed stale binding error = %v", err)
 	}
 
-	if err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
 		t.Fatalf("RepairResolverBindingsOnce() error = %v", err)
 	}
 	if got, ok := f.dstSymbolID(t, edgeID); ok {
@@ -1074,7 +1074,7 @@ func TestTypeScopeRepairSparesCrossLanguageLinks(t *testing.T) {
 		t.Fatalf("insert cross-language edge error = %v", err)
 	}
 
-	if err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
 		t.Fatalf("RepairResolverBindingsOnce() error = %v", err)
 	}
 	if _, ok := f.dstSymbolID(t, edgeID); !ok {

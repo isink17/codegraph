@@ -1,5 +1,11 @@
 package store
 
+import (
+	"context"
+	"database/sql"
+	"slices"
+)
+
 // Resolver ambiguity determinism (P3).
 //
 // P2 established *which* candidates an implicit strategy may consider: only
@@ -77,7 +83,39 @@ package store
 // call edge can denote. It is the candidate set the repo-wide bare-name
 // strategy has always used; it is named here only because the ambiguity veto
 // below has to count exactly the same symbols.
-const resolverBareNameKindsSQL = `('function', 'method', 'class', 'type', 'struct', 'interface')`
+var resolverBareNameKindsSQL = sqlQuotedList(resolverBareNameKinds)
+
+// resolverBareNameKinds is that list, and the only place it is written down.
+// The SQL spelling above is rendered from it, and the Go-side predicate below
+// reads it directly, so the two pipelines cannot drift apart.
+var resolverBareNameKinds = []string{"function", "method", "class", "type", "struct", "interface"}
+
+// resolverBareNameKindBindable reports whether the bare-name STRATEGY may write
+// a symbol of this kind as a destination. It is the Go twin of
+// resolverBareNameKindsSQL and must answer identically;
+// resolver_kind_parity_test.go pins the two against each other.
+func resolverBareNameKindBindable(kind string) bool {
+	return slices.Contains(resolverBareNameKinds, kind)
+}
+
+// resolverBareNameLevelKindsSQL is the bare-name LEVEL's population: every
+// symbol some strategy at that level could bind -- the kinds `exact_name` binds
+// (resolverBareNameKindsSQL) plus the container-bearing symbols of any kind that
+// `receiver_method` binds. It is deliberately wider than
+// resolverBareNameKindsSQL, and the difference is not an accident to be tidied
+// away -- see the veto commentary below for why a candidate may make a level
+// undecidable without being a destination `exact_name` could have chosen.
+//
+// The Go-side binder loads exactly this population and marks the narrower half
+// bindable, so the two pipelines agree on what "ambiguous" means at this level
+// without the binder gaining destinations it has no strategy for.
+//
+// `alias` is the table qualifier the surrounding query uses for `symbols`
+// (`"s."`, or empty when the columns are unqualified).
+func resolverBareNameLevelKindsSQL(alias string) string {
+	return `(` + alias + `kind IN ` + resolverBareNameKindsSQL +
+		` OR ` + alias + `container_name != '')`
+}
 
 // Cross-strategy ambiguity veto.
 //
@@ -175,3 +213,52 @@ var resolverBindGateSQL = resolverBindableCandidateSQL + `
 			SELECT 1 FROM tmp_resolver_own_module_veto v
 			WHERE v.edge_id = edges.id
 		)`
+
+// -- one-time convergence for databases written before P22.12 -----------------
+
+// bareNameLevelRepairSettingKey records that a repository's persisted bindings
+// have been re-decided against the P22.12 bare-name level.
+//
+// Two pre-P22.12 defects leave a lasting mark on a database, and neither heals
+// on its own:
+//
+//   - WRONG bindings. The incremental binder counted only the callable half of
+//     the bare-name level, so it bound names the repo-wide veto refuses. No
+//     strategy reconsiders an already-bound edge, and invalidateNameEvidenceBindings
+//     only reaches names some batch mentions, so an unchanged tree keeps them.
+//   - MISSING bindings. An edge left unresolved because a declaration made its
+//     name ambiguous stayed unresolved after that declaration was removed,
+//     because the removal contributed no name to any batch. A no-change update
+//     has no old-name event either, so the under-resolution is permanent.
+//
+// The repair is the smallest thing that answers both: drop this repository's
+// `exact_name` bindings and run the repo-wide resolver once. Clearing is safe
+// precisely because the re-resolve follows in the same call -- every binding the
+// current rules still allow is rebuilt with the same strategy and confidence a
+// fresh index would give it, and the resolve also decides the unresolved edges
+// the second defect stranded. Restating the veto here to clear a narrower set
+// would duplicate the rule, which is the drift resolver_testfile.go forbids.
+//
+// Keyed per repository (one database holds several) and written only after the
+// resolve succeeds, so a failure re-runs rather than marking a repository
+// converged that is not.
+const bareNameLevelRepairSettingKey = "resolver.bare_name_level_repaired.v1"
+
+// repairBareNameLevelBindings re-decides a repository's bare-name bindings. The
+// once-per-repository guard lives in runResolverRepairOnce.
+func (s *Store) repairBareNameLevelBindings(ctx context.Context, repoID int64) error {
+	// One transaction for the pair. Clearing and re-resolving in two commits
+	// would let a cancellation between them leave the repository with every
+	// `exact_name` binding gone and nothing put back.
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET `+resolverClearResolutionSQL+`
+			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+			  AND resolution_strategy = ?
+		`, repoID, ResolutionStrategyExactName)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
+}

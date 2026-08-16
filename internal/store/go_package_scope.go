@@ -412,7 +412,7 @@ func goBareCandidateGroups(ctx context.Context, q queryContexter, repoID int64, 
 				continue
 			}
 			_, isTest := testFileIDs[fileID]
-			out[key] = out[key].add(id, isTest)
+			out[key] = out[key].add(id, isTest, true)
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()

@@ -2200,6 +2200,112 @@ func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (i
 	return int(n), nil
 }
 
+// RepoHasExistingGraph reports whether this repository already holds
+// relationships from an earlier scan.
+//
+// It is the "was this database written by an earlier run?" question the
+// one-time resolver repairs need (resolver_ambiguity.go,
+// resolver_type_scope.go): a repository being indexed for the very first time
+// cannot hold bindings an older release made, and running a repo-wide repair
+// resolve against it would only duplicate the index run's own resolve pass. The
+// indexer therefore asks BEFORE pass 1 writes anything, when an empty answer
+// still means "no prior graph".
+func (s *Store) RepoHasExistingGraph(ctx context.Context, repoID int64) (bool, error) {
+	var present int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM edges WHERE repo_id = ? LIMIT 1`, repoID).Scan(&present)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return true, nil
+}
+
+// PreviousSymbolNamesForPaths returns the distinct symbol names the given files
+// declare RIGHT NOW, before a write replaces or removes them (P22.12).
+//
+// Uniqueness is a repository-wide property, so a name a file stops declaring
+// changes the answer for edges in files the batch never touches. Those edges are
+// reachable only by name, and after the write the name is gone -- so it has to
+// be read while it still exists. See ResolveEdgesForPathsAndNames for what the
+// names are then used for: they are trigger keys for re-decision, never
+// permission to widen what a candidate may be.
+//
+// One indexed query per chunk of paths, matching `files.path` exactly the way
+// MarkFilesDeletedBatch does. Symbols in already-deleted files are skipped: they
+// are not part of the current facts and their graph rows are purged.
+func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	names := map[string]struct{}{}
+	for start := 0; start < len(paths); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(paths))
+		chunk := paths[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		// Driven from `files`, not from `symbols`: a `symbols.repo_id` predicate
+		// makes SQLite scan the repository's whole symbol table before joining,
+		// which turns a one-file save into a full-table read. The subquery form
+		// takes idx_files_repo_path and then idx_symbols_file_start.
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT DISTINCT s.name
+			FROM symbols s
+			WHERE s.name != '' AND s.file_id IN (
+				SELECT id FROM files
+				WHERE repo_id = ? AND is_deleted = 0
+				  AND path IN (`+sqlitePlaceholders(len(chunk))+`)
+			)
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		if err := scanNamesInto(rows, names); err != nil {
+			return nil, err
+		}
+	}
+	return setToSlice(names), nil
+}
+
+// PreviousSymbolNamesForDeletedInScan is the same fact for files this scan just
+// marked deleted. Their rows survive until PurgeDeletedFileGraphsForScan runs,
+// which is the window this reads in -- MarkMissingDeleted never tells its caller
+// which paths went away, so asking by scan is the only cheap way to see them.
+func (s *Store) PreviousSymbolNamesForDeletedInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT s.name
+		FROM symbols s
+		WHERE s.name != '' AND s.file_id IN (
+			SELECT id FROM files
+			WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
+		)
+	`, repoID, scanID)
+	if err != nil {
+		return nil, err
+	}
+	names := map[string]struct{}{}
+	if err := scanNamesInto(rows, names); err != nil {
+		return nil, err
+	}
+	return setToSlice(names), nil
+}
+
+func scanNamesInto(rows *sql.Rows, out map[string]struct{}) error {
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		out[name] = struct{}{}
+	}
+	return rows.Err()
+}
+
 func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64, paths []string) (int, error) {
 	if len(paths) == 0 {
 		return 0, nil
@@ -2552,7 +2658,7 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 			  ON s.repo_id = ?
 			 AND s.name = n.dst_name
 			` + resolverCandidateJoinSQL + `
-			WHERE (s.kind IN ` + resolverBareNameKindsSQL + ` OR s.container_name != '')
+			WHERE ` + resolverBareNameLevelKindsSQL("s.") + `
 			AND s.language != ''
 			GROUP BY n.dst_name, s.language
 		) g
@@ -2573,6 +2679,19 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	if err := s.repairTypeScopeBindingsOnce(ctx, repoID); err != nil {
 		return 0, err
 	}
+	return s.resolveEdgesWithPreStep(ctx, repoID, nil)
+}
+
+// resolveEdgesWithPreStep is ResolveEdges with an optional statement run inside
+// its transaction before any strategy does.
+//
+// It exists for the one-time repairs (resolver_ambiguity.go): a repair that
+// clears bindings and then re-resolves must not be two commits, because a
+// cancellation or an error between them would leave the repository with the
+// bindings gone and nothing put back -- visibly under-resolved on every query
+// until some later scan happens to succeed. Inside one transaction the pair is
+// all-or-nothing.
+func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre func(context.Context, *sql.Tx) error) (int, error) {
 	totalResolved := 0
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2581,6 +2700,11 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	defer func() {
 		_ = tx.Rollback()
 	}()
+	if pre != nil {
+		if err := pre(ctx, tx); err != nil {
+			return 0, err
+		}
+	}
 
 	// Record, once, which files are test files (P7) and which names are already
 	// undecidable at the broadest evidence levels, so no later strategy can bind
@@ -3342,13 +3466,14 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 // ResolveEdgesForPathsAndNames for the ordering that lets the following passes
 // re-decide every cleared edge.
 //
-// One direction is deliberately still open, and predates this pass: when a
-// declaration is REMOVED, edges that were unresolved *because* it made the name
-// ambiguous do not become resolved until something else mentions that name. The
-// indexer collects `changedSymbolNameSet` from the new parse only
-// (indexer.go), so the vanished name is in no batch. Closing it means feeding
-// the replaced file's previous symbol names into the same pass; it is recorded
-// as its own finding rather than smuggled in here.
+// The opposite direction -- a declaration REMOVED -- is answered outside this
+// function, and deliberately so (P22.12). The indexer now also collects the
+// names a replaced or deleted file previously declared and passes OLD union NEW
+// to ResolveEdgesForPathsAndNames, so a vanished name reaches the resolver. It
+// does not reach THIS pass in any meaningful way, and must not: a name with a
+// single declaration left cannot have made anything ambiguous, which is exactly
+// what namesWithSeveralDeclarations filters out below. Removal is answered by
+// re-deciding unresolved edges, not by clearing bound ones.
 //
 // Two exclusions, for opposite reasons:
 //
@@ -3428,7 +3553,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 			SELECT id FROM edges
 			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
 			  AND edge_kind != '`+EdgeKindCrossLanguageRef+`'
-			  AND resolution_strategy IN `+sqlStrategyInList(incrementallyRedecidableStrategies)+`
+			  AND resolution_strategy IN `+sqlQuotedList(incrementallyRedecidableStrategies)+`
 			  AND dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
 		`, args...)
 		if err != nil {
@@ -3443,7 +3568,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		SELECT id, dst_name FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
 		  AND edge_kind != '`+EdgeKindCrossLanguageRef+`'
-		  AND resolution_strategy IN `+sqlStrategyInList(incrementallyRedecidableStrategies)+`
+		  AND resolution_strategy IN `+sqlQuotedList(incrementallyRedecidableStrategies)+`
 		  AND dst_name != '' AND instr(dst_name, '.') > 0
 	`, repoID)
 	if err != nil {
@@ -4266,11 +4391,17 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 				// Report it as ambiguity rather than as a language block, which
 				// it is not.
 				outcome.ambiguityBlocked++
-			case matched:
+			case matched && !matchedGroup.levelReachableFor(callerIsTest):
 				// The name matched, and every match was a test definition this
 				// production caller may not bind. Not ambiguity and not a
 				// language block: a production call is never wired into a test.
 				outcome.testShadowBlocked++
+			case matched:
+				// The level decided, but through a kind no strategy this binder
+				// runs can bind -- a lone container-bearing enum, which only the
+				// repo-wide `receiver_method` strategy owns. Neither ambiguity
+				// nor a test shadow, and counting it as either would misreport
+				// why the edge stayed unresolved.
 			default:
 				_, qualifiedElsewhere := qualifiedNamesAnyLanguage[target.dstName]
 				_, shortElsewhere := shortNamesAnyLanguage[fallbackName]
@@ -4387,10 +4518,12 @@ func (s *Store) resolveSymbolsByQualifiedNames(ctx context.Context, repoID int64
 // language gate must not let an unrelated foreign-language definition of the
 // same name discard an otherwise valid same-language target. Symbols with no
 // persisted language are excluded (fail closed).
-// resolveUniqueSymbolsByNames groups bare-name candidates. It is the one
-// column resolveSymbolCandidates kind-restricts, because the bare-name level is
-// the one the repo-wide resolver also restricts (resolverBareNameKindsSQL) --
-// the qualified and dot-tail levels carry their qualifier as evidence instead.
+// resolveUniqueSymbolsByNames groups bare-name candidates. It is the one column
+// resolveSymbolCandidates treats as two populations: the level's candidates
+// (resolverBareNameLevelKindsSQL, what makes the name ambiguous) and the
+// narrower half this strategy may bind (resolverBareNameKindsSQL, the
+// `bindable` flag). The qualified and dot-tail levels carry their qualifier as
+// evidence instead, and every candidate they match is bindable.
 func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, names []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
 	return s.resolveSymbolCandidates(ctx, repoID, "name", names, testFileIDs)
 }
@@ -4404,17 +4537,44 @@ func (s *Store) resolveUniqueSymbolsByNames(ctx context.Context, repoID int64, n
 // keeping the first-seen id past that point would store a value derived from SQL
 // row order, which is precisely the tie-break P3 removed, one careless read away
 // from returning.
+//
+// Two populations, not one (P22.12). What an evidence level's candidates ARE is
+// a property of the level; what THIS strategy may bind out of them is narrower.
+// They coincide everywhere except the bare-name level, where the repo-wide
+// resolver reaches the same symbols through two strategies -- `exact_name`,
+// restricted to resolverBareNameKindsSQL, and `receiver_method`, restricted to
+// container-bearing symbols of any kind -- and recordAmbiguousResolverNames
+// therefore counts their union. See resolver_ambiguity.go.
 type candidateGroup struct {
 	candidates           int
 	productionCandidates int
 	anySymbolID          int64
 	productionSymbolID   int64
+
+	// levelCandidates/levelProductionCandidates count every symbol the evidence
+	// level reached, including kinds this strategy may not bind. They are the
+	// Go-side twin of the veto rows recordAmbiguousResolverNames writes, and are
+	// always >= their bindable counterparts above.
+	levelCandidates           int
+	levelProductionCandidates int
 }
 
 // add folds one candidate into the group. Order of calls does not affect the
 // result: the counts are order-free, and an id survives only in the case where
 // there is exactly one row it could have come from.
-func (g candidateGroup) add(symbolID int64, isTest bool) candidateGroup {
+//
+// `bindable` says whether this strategy may write the candidate as a
+// destination. A candidate that is not bindable still counts toward the level,
+// because another strategy at the same evidence level could own it and the
+// repo-wide veto counts it for exactly that reason.
+func (g candidateGroup) add(symbolID int64, isTest, bindable bool) candidateGroup {
+	g.levelCandidates++
+	if !isTest {
+		g.levelProductionCandidates++
+	}
+	if !bindable {
+		return g
+	}
 	g.candidates++
 	switch g.candidates {
 	case 1:
@@ -4436,23 +4596,52 @@ func (g candidateGroup) add(symbolID int64, isTest bool) candidateGroup {
 }
 
 // chosen returns the destination a caller of the given kind may bind, mirroring
-// resolverChosenCandidateSQL exactly: a test caller binds the sole candidate, a
-// production caller binds the sole *production* candidate.
+// resolverBindGateSQL exactly: the sole candidate this caller kind may bind
+// (resolverChosenCandidateSQL), and no veto row for the level
+// (resolverAmbiguousNamesSQL).
 func (g candidateGroup) chosen(callerIsTest bool) (int64, bool) {
+	if g.levelUndecidedFor(callerIsTest) {
+		return 0, false
+	}
 	if callerIsTest {
 		return g.anySymbolID, g.anySymbolID != 0
 	}
 	return g.productionSymbolID, g.productionSymbolID != 0
 }
 
-// ambiguousFor reports whether this group holds several candidates of the kind
-// the caller may bind. It is the Go-side twin of the veto rows
-// recordAmbiguousResolverNames writes for that caller kind.
+// levelUndecidedFor is the Go-side twin of one veto row: the level matched
+// something, and this caller kind had no single candidate there. A test caller
+// needs the level to hold exactly one candidate, a production caller exactly one
+// production candidate -- the same two readings recordAmbiguousResolverNames
+// emits rows for.
+func (g candidateGroup) levelUndecidedFor(callerIsTest bool) bool {
+	if callerIsTest {
+		return g.levelCandidates != 1
+	}
+	return g.levelProductionCandidates != 1
+}
+
+// ambiguousFor reports whether the evidence level held several candidates this
+// caller could not tell apart. It backs the honest "why did this stay
+// unresolved" counter, so it names the level's population rather than the
+// narrower bindable one.
 func (g candidateGroup) ambiguousFor(callerIsTest bool) bool {
 	if callerIsTest {
-		return g.candidates > 1
+		return g.levelCandidates > 1
 	}
-	return g.productionCandidates > 1
+	return g.levelProductionCandidates > 1
+}
+
+// levelReachableFor reports whether the level held any candidate this caller
+// kind is allowed to consider at all, ignoring uniqueness. A production caller
+// for which it is false faced nothing but test definitions -- the P7 test
+// shadow -- which is a different unresolved reason from a level that decided
+// itself through a kind no strategy here owns.
+func (g candidateGroup) levelReachableFor(callerIsTest bool) bool {
+	if callerIsTest {
+		return g.levelCandidates > 0
+	}
+	return g.levelProductionCandidates > 0
 }
 
 // symbolCandidates is the outcome of one candidate lookup: every
@@ -4539,16 +4728,27 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 		// already imply; it is there so the partial dot-tail indexes
 		// (idx_symbols_repo_dot_tail2/3, predicate `!= ''`) stay usable when
 		// the names arrive as bound parameters.
-		// The bare-name level restricts candidates to the kinds a call edge can
-		// denote, exactly as the repo-wide bare-name strategy does
-		// (resolverBareNameKindsSQL). Before P22.8 the binder applied no such
-		// restriction, so the two pipelines disagreed about which candidates
-		// existed -- and therefore about whether the name was ambiguous at all.
-		// The qualified and dot-tail levels carry their qualifier as evidence
-		// and are not kind-restricted on either side.
+		// The bare-name level is the one place where "what the level matched" and
+		// "what this strategy may bind" differ, and both have to be loaded.
+		//
+		// The repo-wide resolver reaches the bare-name level through two
+		// strategies: `exact_name`, restricted to resolverBareNameKindsSQL, and
+		// `receiver_method`, restricted to container-bearing symbols of any kind.
+		// recordAmbiguousResolverNames therefore counts their union when it
+		// decides whether the level is undecidable, while `exact_name` binds only
+		// the kind-restricted half. Loading only that half -- which is what the
+		// binder did before P22.12 -- made a name declared once as a callable and
+		// once as a container-bearing enum look unique here and ambiguous there,
+		// so the same tree resolved differently after an update than after an
+		// index. resolverBareNameLevelKindsSQL is the level; the `bindable` flag
+		// below is the strategy. See resolver_ambiguity.go.
+		//
+		// The qualified and dot-tail levels carry their qualifier as evidence and
+		// are not kind-restricted on either side, so every candidate they match
+		// is bindable.
 		kindFilter := ""
 		if column == "name" {
-			kindFilter = ` AND kind IN ` + resolverBareNameKindsSQL
+			kindFilter = ` AND ` + resolverBareNameLevelKindsSQL("")
 		}
 		query := `
 			SELECT ` + column + `, language, id, file_id, kind
@@ -4576,7 +4776,7 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 			}
 			key := symbolLangKey{name: name, language: language}
 			_, isTest := testFileIDs[fileID]
-			out.groups[key] = out.groups[key].add(id, isTest)
+			out.groups[key] = out.groups[key].add(id, isTest, column != "name" || resolverBareNameKindBindable(kind))
 			// Recorded at every level, because whether the P22.9 scope rule applies
 			// is decided by the edge's *spelling*, not by which level matched: a
 			// bare dst_name can equal a symbol's qualified_name as easily as its
