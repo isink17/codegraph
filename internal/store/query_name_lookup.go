@@ -744,10 +744,25 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 	for start := 0; start < len(names); start += nameLookupChunk {
 		end := min(start+nameLookupChunk, len(names))
 		chunk := names[start:end]
-		args := make([]any, 0, len(chunk)+len(languages)+1)
+		hasGlobal := false
+		for _, name := range chunk {
+			if strings.HasPrefix(name, "::") {
+				hasGlobal = true
+				break
+			}
+		}
+		args := make([]any, 0, len(chunk)*2+len(languages)+1)
 		args = append(args, repoID)
 		for _, name := range chunk {
 			args = append(args, name)
+		}
+		if column == "qualified_name" && hasGlobal {
+			for _, name := range chunk {
+				args = append(args, name)
+			}
+			for _, name := range chunk {
+				args = append(args, name)
+			}
 		}
 		for _, language := range languages {
 			args = append(args, language)
@@ -756,10 +771,16 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 		if excludeTypeKinds {
 			kindFilter = ` AND s.kind NOT IN ` + typeSymbolKindsSQL
 		}
+		keyExpr := `s.` + column
+		match := `s.` + column + ` IN (` + strings.TrimRight(strings.Repeat("?,", len(chunk)), ",") + `)`
+		if column == "qualified_name" && hasGlobal {
+			keyExpr = `CASE WHEN '::' || s.qualified_name IN (` + strings.TrimRight(strings.Repeat("?,", len(chunk)), ",") + `) THEN '::' || s.qualified_name ELSE s.qualified_name END`
+			match = `(` + match + ` OR ('::' || s.qualified_name IN (` + strings.TrimRight(strings.Repeat("?,", len(chunk)), ",") + `) AND s.language = 'cpp' AND instr(s.qualified_name, '::') = 0))`
+		}
 		rows, err := s.neighborQuery(ctx, `
-			SELECT s.`+column+`, s.id`+langColumn+`
+			SELECT `+keyExpr+`, s.id`+langColumn+`
 			FROM symbols s
-			WHERE s.repo_id = ? AND s.`+column+` IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
+			WHERE s.repo_id = ? AND `+match+`
 			  AND s.language IN (`+strings.TrimRight(strings.Repeat("?,", len(languages)), ",")+`)`+kindFilter+`
 			ORDER BY s.`+column+` ASC, s.id ASC
 		`, args...)

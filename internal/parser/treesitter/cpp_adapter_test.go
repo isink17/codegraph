@@ -20,6 +20,79 @@ import (
 // produces an ERROR node).
 func cppLanguageForTest() *sitter.Language { return cpp.GetLanguage() }
 
+func TestCppQualifiedIdentityNamespaceGlobalAndFriend(t *testing.T) {
+	src := `namespace alpha {
+  void foo() {}
+  class X { void member() {} friend void helper() {} };
+}
+namespace alpha::beta { void foo() {} }
+namespace { void hidden() {} }
+void global() {}
+void caller() { ::global(); alpha::foo(); alpha::beta::foo(); }
+`
+	syms := parseCppSymbols(t, "src/a.cpp", src)
+	want := map[string]string{
+		"foo@alpha":       "alpha::foo",
+		"foo@alpha::beta": "alpha::beta::foo",
+		"X":               "alpha::X",
+		"member":          "alpha::X::member",
+		"helper":          "alpha::helper",
+		"hidden":          "(anonymous@src/a.cpp)::hidden",
+		"global":          "global",
+		"caller":          "caller",
+	}
+	got := map[string]string{}
+	for _, sym := range syms {
+		key := sym.Name
+		if sym.Name == "foo" {
+			key += "@" + sym.ContainerName
+		}
+		got[key] = sym.QualifiedName
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("qualified identities = %#v, want %#v", got, want)
+	}
+	var calls []string
+	for _, edge := range mustParseCpp(t, "src/a.cpp", src).Edges {
+		if edge.Kind == "calls" {
+			calls = append(calls, edge.DstName)
+		}
+	}
+	if !reflect.DeepEqual(calls, []string{"::global", "alpha::foo", "alpha::beta::foo"}) {
+		t.Fatalf("qualified call identities = %q", calls)
+	}
+}
+
+func TestCppAnonymousAndInlineNamespaceIdentity(t *testing.T) {
+	src := `inline namespace v1 { void inline_fn() {} }
+namespace a { namespace b { void nested() {} } }
+`
+	first := parseCppSymbols(t, "a.cpp", src)
+	second := parseCppSymbols(t, "b.cpp", `namespace { void hidden() {} }`)
+	if got := first[0].QualifiedName; got != "v1::inline_fn" {
+		t.Fatalf("inline namespace identity = %q, want v1::inline_fn", got)
+	}
+	if got := first[1].QualifiedName; got != "a::b::nested" {
+		t.Fatalf("nested namespace identity = %q, want a::b::nested", got)
+	}
+	if got := second[0].QualifiedName; got != "(anonymous@b.cpp)::hidden" {
+		t.Fatalf("anonymous namespace identity = %q, want file-scoped identity", got)
+	}
+	nested := parseCppSymbols(t, "a.cpp", `namespace a::b { void nested() {} }`)
+	if nested[0].QualifiedName != first[1].QualifiedName || nested[0].StableKey != first[1].StableKey {
+		t.Fatalf("nested namespace syntax differs: brace=%+v compact=%+v", first[1], nested[0])
+	}
+}
+
+func mustParseCpp(t *testing.T, path, src string) graph.ParsedFile {
+	t.Helper()
+	pf, err := NewCpp().Parse(context.Background(), path, []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pf
+}
+
 // TestCppCallDstNameKeepsReceiver pins the persisted destination identity for
 // every C++ call syntax the adapter emits (P22.11).
 //
@@ -78,7 +151,7 @@ void Obj::caller() {
 		"o.foo",          // instance dot
 		"p.foo",          // pointer arrow, normalized to '.'
 		"ns::Type::sfoo", // namespace + type, scope qualifier untouched
-		"bare",           // leading '::' global qualification
+		"::bare",         // leading '::' global qualification
 		"this.foo",       // this-> receiver: kept, and not a type
 		"o.kid.foo",      // chained member
 		"p.child().foo",  // outer call of a chain (outer node first)
@@ -242,12 +315,12 @@ void defined(T) {}
 		// The range and the doc comment anchor on the `template <...>` wrapper,
 		// because that is where the declaration -- and its documentation --
 		// actually starts in the source.
-		"function plain tpl::plain tpl 2:1-3:15",
-		"class Box tpl::Box tpl 5:1-8:3",
+		"function plain plain  2:1-3:15",
+		"class Box Box  5:1-8:3",
 		// Member of a templated class: the class still owns it.
 		"function run Box::run Box 7:3-7:16",
 		// A definition keeps its body range.
-		"function defined tpl::defined tpl 9:1-10:19",
+		"function defined defined  9:1-10:19",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("template symbols = %#v, want %#v", got, want)
@@ -283,8 +356,8 @@ extern "C" void single();
 		}
 	}
 	want := []string{
-		"function braced ext::braced ext 2:1-2:15",
-		"function single ext::single ext 4:12-4:26",
+		"function braced braced  2:1-2:15",
+		"function single single  4:12-4:26",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("linkage symbols = %#v, want %#v", got, want)
@@ -317,14 +390,12 @@ void nsFn();
 		got = append(got, sym.Kind+" "+sym.QualifiedName+" in "+sym.ContainerName)
 	}
 	want := []string{
-		"class own::Cls in own",
+		"class Cls in ",
 		"function Cls::wrapped in Cls",
 		"function Cls::plain in Cls",
-		"struct own::Str in own",
+		"struct Str in ",
 		"function Str::wrapped in Str",
-		// P22.16 owns real namespace identity; the current model files a
-		// namespace member under the module, wrapped or not.
-		"function own::nsFn in own",
+		"function ns::nsFn in ns",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("container ownership = %#v, want %#v", got, want)
@@ -354,7 +425,7 @@ func TestCppClassMemberDeclarationStaysOut(t *testing.T) {
 	for _, sym := range parseCppSymbols(t, "decl.cpp", src) {
 		got = append(got, sym.Kind+" "+sym.QualifiedName)
 	}
-	want := []string{"class decl::Cls", "function Cls::definition"}
+	want := []string{"class Cls", "function Cls::definition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("class-body symbols = %#v, want %#v (member declarations are P22.17)", got, want)
 	}
@@ -380,7 +451,7 @@ void deep(T);
 	for _, sym := range syms {
 		got = append(got, symbolIdentity(sym))
 	}
-	want := []string{"function deep nest::deep nest 5:1-6:14"}
+	want := []string{"function deep ns::deep ns 5:1-6:14"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("nested-wrapper symbols = %#v, want %#v", got, want)
 	}
@@ -469,7 +540,7 @@ void dup() { first(); }
 	dupCount := func(ids []string) int {
 		n := 0
 		for _, id := range ids {
-			if strings.Contains(id, "::dup ") {
+			if strings.Contains(id, " dup ") {
 				n++
 			}
 		}
@@ -544,7 +615,7 @@ int main(int argc, char** argv) {
 	for _, sym := range parseCppSymbols(t, "recover.cpp", src) {
 		got = append(got, symbolIdentity(sym))
 	}
-	want := []string{"function main recover::main recover 4:1-7:2"}
+	want := []string{"function main main  4:1-7:2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("recovered symbols = %#v, want %#v", got, want)
 	}
@@ -572,11 +643,11 @@ struct S {
 		got = append(got, sym.Kind+" "+sym.QualifiedName+" in "+sym.ContainerName)
 	}
 	want := []string{
-		"function c::guarded in c",
-		"function c::ifdefed in c",
-		"function c::elsed in c",
-		"function c::externed in c",
-		"struct c::S in c",
+		"function guarded in ",
+		"function ifdefed in ",
+		"function elsed in ",
+		"function externed in ",
+		"struct S in ",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("C symbols = %#v, want %#v", got, want)
@@ -622,17 +693,15 @@ class Host {
 	for _, sym := range parseCppSymbols(t, "out.cpp", src) {
 		names[sym.Name] = true
 	}
-	// Embedded/Typedefed sit inside a leaf `declaration`/`type_definition`;
-	// `friended` is declared at the enclosing namespace scope, not on Host, so
-	// emitting it here would attach a wrong container (P22.16 owns namespaces).
-	for _, name := range []string{"Embedded", "Typedefed", "friended"} {
+	// Embedded/Typedefed sit inside a leaf `declaration`/`type_definition`.
+	for _, name := range []string{"Embedded", "Typedefed"} {
 		if names[name] {
 			t.Errorf("%q is emitted; the taxonomy records it as out of scope", name)
 		}
 	}
 	// The explicit instantiation must not duplicate the template it names.
-	if got := len(names); !names["Tpl"] || !names["m"] || !names["Host"] || got != 3 {
-		t.Errorf("emitted names = %v, want exactly Tpl, m, Host", names)
+	if got := len(names); !names["Tpl"] || !names["m"] || !names["Host"] || !names["friended"] || got != 4 {
+		t.Errorf("emitted names = %v, want exactly Tpl, m, Host, friended", names)
 	}
 }
 

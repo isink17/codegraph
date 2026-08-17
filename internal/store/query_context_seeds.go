@@ -136,14 +136,30 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 		pathChunk := paths[pathStart:min(pathStart+refChunk, len(paths))]
 		for nameStart := 0; nameStart < len(names); nameStart += refChunk {
 			nameChunk := names[nameStart:min(nameStart+refChunk, len(names))]
+			hasGlobal := false
+			for _, name := range nameChunk {
+				if strings.HasPrefix(name, "::") {
+					hasGlobal = true
+					break
+				}
+			}
 
-			args := make([]any, 0, len(pathChunk)+len(nameChunk)+1)
+			args := make([]any, 0, len(pathChunk)+len(nameChunk)*2+1)
 			args = append(args, repoID)
 			for _, p := range pathChunk {
 				args = append(args, p)
 			}
 			for _, n := range nameChunk {
 				args = append(args, n)
+			}
+			if hasGlobal {
+				for _, n := range nameChunk {
+					args = append(args, n)
+				}
+			}
+			nameMatch := `s.qualified_name IN (` + placeholders(len(nameChunk)) + `)`
+			if hasGlobal {
+				nameMatch = `(` + nameMatch + ` OR (s.language = 'cpp' AND s.container_name = '' AND '::' || s.qualified_name IN (` + placeholders(len(nameChunk)) + `)))`
 			}
 			query := `
 				SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
@@ -152,7 +168,7 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 				JOIN files f ON f.id = s.file_id
 				WHERE s.repo_id = ?
 				  AND f.path IN (` + placeholders(len(pathChunk)) + `)
-				  AND s.qualified_name IN (` + placeholders(len(nameChunk)) + `)
+				  AND ` + nameMatch + `
 			`
 			rows, err := s.db.QueryContext(ctx, query, args...)
 			if err != nil {

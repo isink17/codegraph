@@ -2248,17 +2248,31 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 		for _, path := range chunk {
 			args = append(args, path)
 		}
+		args = append(args, repoID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
 		// Driven from `files`, not from `symbols`: a `symbols.repo_id` predicate
 		// makes SQLite scan the repository's whole symbol table before joining,
 		// which turns a one-file save into a full-table read. The subquery form
 		// takes idx_files_repo_path and then idx_symbols_file_start.
 		rows, err := s.db.QueryContext(ctx, `
-			SELECT DISTINCT s.name
+			SELECT name FROM (
+			SELECT DISTINCT s.name AS name
 			FROM symbols s
 			WHERE s.name != '' AND s.file_id IN (
 				SELECT id FROM files
 				WHERE repo_id = ? AND is_deleted = 0
 				  AND path IN (`+sqlitePlaceholders(len(chunk))+`)
+			)
+			UNION
+			SELECT DISTINCT s.qualified_name AS name
+			FROM symbols s
+			WHERE s.qualified_name != '' AND s.file_id IN (
+				SELECT id FROM files
+				WHERE repo_id = ? AND is_deleted = 0
+				  AND path IN (`+sqlitePlaceholders(len(chunk))+`)
+			)
 			)
 		`, args...)
 		if err != nil {
@@ -2277,13 +2291,22 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 // which paths went away, so asking by scan is the only cheap way to see them.
 func (s *Store) PreviousSymbolNamesForDeletedInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT s.name
+		SELECT name FROM (
+		SELECT DISTINCT s.name AS name
 		FROM symbols s
 		WHERE s.name != '' AND s.file_id IN (
 			SELECT id FROM files
 			WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
 		)
-	`, repoID, scanID)
+		UNION
+		SELECT DISTINCT s.qualified_name AS name
+		FROM symbols s
+		WHERE s.qualified_name != '' AND s.file_id IN (
+			SELECT id FROM files
+			WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
+		)
+		)
+	`, repoID, scanID, repoID, scanID)
 	if err != nil {
 		return nil, err
 	}
@@ -2626,21 +2649,18 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 	candidateCounts := `COUNT(*) AS candidates,
 			SUM(CASE WHEN tf.file_id IS NULL THEN 1 ELSE 0 END) AS production_candidates`
 	ambiguityQueries := []string{
-		`
+		resolverQualifiedLookupSQL + `
 		INSERT OR IGNORE INTO ` + resolverAmbiguousNamesTable + `(dst_name, dst_language, caller_is_test)
 		SELECT g.dst_name, g.dst_language, k.caller_is_test
 		FROM (
 			SELECT n.dst_name AS dst_name, s.language AS dst_language, ` + candidateCounts + `
-			FROM (
-				SELECT DISTINCT dst_name
-				FROM edges
-				WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-			) n
-			JOIN symbols s
+			FROM qualified_names n
+			CROSS JOIN symbols s
 			  ON s.repo_id = ?
-			 AND s.qualified_name = n.dst_name
+				 AND s.qualified_name = n.lookup_name
 			` + resolverCandidateJoinSQL + `
 			WHERE s.language != ''
+			` + resolverQualifiedLookupFilter + `
 			GROUP BY n.dst_name, s.language
 		) g
 		` + vetoScopes,
@@ -2763,21 +2783,17 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	// several definitions share must not veto the one definition that owns the
 	// fully qualified name. The Go-side binder makes the same call: it consults
 	// the qualified candidates first and only then the bare tail.
-	res, err := tx.ExecContext(ctx, `
-		WITH distinct_names AS (
-			SELECT DISTINCT dst_name
-			FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-		),
+	res, err := tx.ExecContext(ctx, resolverQualifiedLookupSQL+`,
 		resolutions AS (
 			SELECT n.dst_name AS dst_name, s.language AS dst_language,
 				`+resolverCandidateAggregatesSQL+`
-			FROM distinct_names n
-			JOIN symbols s
+			FROM qualified_names n
+			CROSS JOIN symbols s
 			  ON s.repo_id = ?
-			 AND s.qualified_name = n.dst_name
+				 AND s.qualified_name = n.lookup_name
 			`+resolverCandidateJoinSQL+`
 			WHERE s.language != ''
+			`+resolverQualifiedLookupFilter+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
 		)
@@ -3855,6 +3871,10 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	moduleNames := make(map[string]struct{}, len(unique))
 	for _, name := range unique {
 		moduleNames[name] = struct{}{}
+		if scope := strings.LastIndex(name, "::"); scope >= 0 && scope+2 < len(name) {
+			moduleNames[name[scope+2:]] = struct{}{}
+			seen[name[scope+2:]] = struct{}{}
+		}
 		if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
 			moduleNames[name[dot+1:]] = struct{}{}
 		}
@@ -3934,13 +3954,15 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 
 	// Suffix matching requires looking at qualified dst_name values. Keep this
 	// as a single pass over the qualified unresolved set (no repeated LIKE
-	// queries), but avoid scanning simple dst_name values entirely.
+	// queries), but avoid scanning simple dst_name values entirely. C++ uses
+	// `::` rather than `.`, so its final component must join the same update
+	// batch when a declaration arrives after its caller.
 	suffixStarted := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT e.id, e.dst_name, f.language, e.file_id
 		FROM edges e
 		JOIN files f ON f.id = e.file_id
-		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND instr(e.dst_name, '.') > 0
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND (instr(e.dst_name, '.') > 0 OR instr(e.dst_name, '::') > 0)
 	`, repoID)
 	if err != nil {
 		return stats, err
@@ -3958,8 +3980,12 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		if _, ok := targetByID[id]; ok {
 			continue
 		}
-		if dot := strings.LastIndexByte(dstName, '.'); dot >= 0 && dot+1 < len(dstName) {
-			if _, ok := seen[dstName[dot+1:]]; ok {
+		last := strings.LastIndexByte(dstName, '.')
+		if scope := strings.LastIndex(dstName, "::"); scope > last {
+			last = scope
+		}
+		if last >= 0 && last+1 < len(dstName) {
+			if _, ok := seen[dstName[last+1:]]; ok {
 				targetByID[id] = edgeTarget{
 					edgeID:      id,
 					dstName:     dstName,
@@ -4762,6 +4788,13 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 	for start := 0; start < len(names); start += chunkSize {
 		end := min(start+chunkSize, len(names))
 		chunk := names[start:end]
+		hasGlobal := false
+		for _, name := range chunk {
+			if strings.HasPrefix(name, "::") {
+				hasGlobal = true
+				break
+			}
+		}
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		// The literal `column != ''` term restates what non-empty lookup names
 		// already imply; it is there so the partial dot-tail indexes
@@ -4789,15 +4822,28 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 		if column == "name" {
 			kindFilter = ` AND ` + resolverBareNameLevelKindsSQL("")
 		}
+		match := column + ` IN (` + placeholders + `)`
+		if column == "qualified_name" {
+			match = `(` + match + ` AND NOT (language = 'cpp' AND instr(qualified_name, '::') = 0 AND ` + column + ` NOT LIKE '::%')`
+			if hasGlobal {
+				match += ` OR (language = 'cpp' AND instr(qualified_name, '::') = 0 AND '::' || qualified_name IN (` + placeholders + `))`
+			}
+			match += `)`
+		}
 		query := `
 			SELECT ` + column + `, language, id, file_id, kind
 			FROM symbols
-			WHERE repo_id = ? AND language != '' AND ` + column + ` != '' AND ` + column + ` IN (` + placeholders + `)` + kindFilter + `
+			WHERE repo_id = ? AND language != '' AND ` + column + ` != '' AND ` + match + kindFilter + `
 		`
-		args := make([]any, 0, len(chunk)+1)
+		args := make([]any, 0, len(chunk)*2+1)
 		args = append(args, repoID)
 		for _, name := range chunk {
 			args = append(args, name)
+		}
+		if column == "qualified_name" && hasGlobal {
+			for _, name := range chunk {
+				args = append(args, name)
+			}
 		}
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {

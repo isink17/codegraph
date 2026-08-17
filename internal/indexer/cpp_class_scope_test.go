@@ -220,10 +220,10 @@ func TestCppBareCallKeepsFreeFunctionRecall(t *testing.T) {
 		"struct A {\n    void member() { helper(); }\n};\n")
 	r.run("index")
 
-	wantBound(t, r.boundTargets("helper"), "a::helper", "a::helper")
-	callers := r.callers("a::helper")
-	if len(callers) != 2 || callers[0] != "A::member" || callers[1] != "a::caller" {
-		t.Fatalf("FindCallers(a::helper) = %v, want [A::member a::caller]", callers)
+	wantBound(t, r.boundTargets("helper"), "helper", "helper")
+	callers := r.callers("helper")
+	if len(callers) != 2 || callers[0] != "A::member" || callers[1] != "caller" {
+		t.Fatalf("FindCallers(helper) = %v, want [A::member caller]", callers)
 	}
 }
 

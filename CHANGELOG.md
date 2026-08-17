@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+C++ qualified identity now preserves namespace nesting, file-scoped anonymous namespaces, friend
+function ownership at enclosing namespace scope, and explicit leading `::` call spelling. C++
+qualified-name/stable-key projections changed; development databases require a fresh index. No
+migration or repair marker is provided.
+
 Progressive disclosure: symbol-shaped MCP results are returned at the smallest useful size by
 default, and larger representations are asked for explicitly.
 

@@ -225,7 +225,7 @@ bool AlsoQualified() {
 	if err != nil {
 		t.Fatalf("FindCallers() error = %v", err)
 	}
-	for _, want := range []string{"fixture::Qualified", "fixture::AlsoQualified"} {
+	for _, want := range []string{"Qualified", "AlsoQualified"} {
 		if !hasSymbolQName(callers, want) {
 			t.Fatalf("FindCallers(ApmMap::LoadWorldMap) missing %s, got %+v", want, callers)
 		}
@@ -252,6 +252,37 @@ bool AlsoQualified() {
 	}
 	if p0[0].ID == p1[0].ID {
 		t.Fatalf("FindCallers pagination returned duplicate: %q on both pages", p0[0].QualifiedName)
+	}
+}
+
+func TestCppNamespaceAndGlobalQualifiedCalls(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": `
+namespace a { void foo() {} }
+namespace b { void foo() {} void bare() { foo(); } }
+void global() {}
+void caller() { a::foo(); ::global(); }
+`})
+	if n, err := s.CountUnresolvedEdgesByDstName(ctx, repo.ID, "a::foo"); err != nil || n != 0 {
+		t.Fatalf("a::foo unresolved = %d, err = %v", n, err)
+	}
+	if n, err := s.CountUnresolvedEdgesByDstName(ctx, repo.ID, "::global"); err != nil || n != 0 {
+		t.Fatalf("::global unresolved = %d, err = %v", n, err)
+	}
+	callees, err := s.FindCallees(ctx, repo.ID, "b::bare", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasSymbolQName(callees, "a::foo") {
+		t.Fatalf("bare b::bare call crossed into a::foo: %+v", callees)
+	}
+	callers, err := s.FindCallers(ctx, repo.ID, "a::foo", 0, 20, 0)
+	if err != nil || !hasSymbolQName(callers, "caller") {
+		t.Fatalf("FindCallers(a::foo) = %+v, err = %v", callers, err)
+	}
+	global, err := s.FindCallers(ctx, repo.ID, "::global", 0, 20, 0)
+	if err != nil || !hasSymbolQName(global, "caller") {
+		t.Fatalf("FindCallers(::global) = %+v, err = %v", global, err)
 	}
 }
 

@@ -617,6 +617,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					continue
 				}
 				changedSymbolNameSet[sym.Name] = struct{}{}
+				if sym.QualifiedName != "" {
+					changedSymbolNameSet[sym.QualifiedName] = struct{}{}
+				}
 			}
 			summary.FilesChanged++
 			summary.FilesIndexed++
