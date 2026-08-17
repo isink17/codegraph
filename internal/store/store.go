@@ -5006,7 +5006,7 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 		FROM page p
 		CROSS JOIN symbols s ON s.id = p.id
 		JOIN files f ON f.id = s.file_id
-			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 	`, repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		rows, err = s.db.QueryContext(ctx, `
@@ -5037,7 +5037,7 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND (s.name = ? OR s.qualified_name = ?)
-		ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, query, query, safeLimit(limit), safeOffset(offset))
