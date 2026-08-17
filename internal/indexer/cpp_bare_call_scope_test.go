@@ -57,7 +57,7 @@ void caller() {
 }
 `)
 	r.run("index")
-	if got, want := cppTargets(r, "helper"), []string{"only::helper"}; !equalStrings(got, want) {
+	if got, want := cppTargets(r, "helper"), []string{"helper"}; !equalStrings(got, want) {
 		t.Fatalf("same-file bare call targets = %v, want %v", got, want)
 	}
 }
@@ -76,7 +76,7 @@ void caller() {
 }
 `)
 	r.run("index")
-	if got, want := cppTargets(r, "foo"), []string{"foo::foo"}; !equalStrings(got, want) {
+	if got, want := cppTargets(r, "foo"), []string{"foo"}; !equalStrings(got, want) {
 		t.Fatalf("direct-include bare call targets = %v, want %v", got, want)
 	}
 }
@@ -113,10 +113,10 @@ void dotted() {
 }
 `)
 	r.run("index")
-	if got, want := cppTargets(r, "near2"), []string{"foo::near2"}; !equalStrings(got, want) {
+	if got, want := cppTargets(r, "near2"), []string{"near2"}; !equalStrings(got, want) {
 		t.Fatalf("`./foo.h` include targets = %v, want %v", got, want)
 	}
-	if got, want := cppTargets(r, "near"), []string{"foo::near"}; !equalStrings(got, want) {
+	if got, want := cppTargets(r, "near"), []string{"near"}; !equalStrings(got, want) {
 		t.Fatalf("same-directory include targets = %v, want %v", got, want)
 	}
 	if got := cppTargets(r, "far"); !equalStrings(got, []string{"<unresolved>"}) {
@@ -142,10 +142,10 @@ func TestCppBareCallUnrelatedFileStaysUnresolved(t *testing.T) {
 		t.Fatalf("unrelated cross-file bare call targets = %v, want [<unresolved>]", got)
 	}
 	// The query surfaces must not rebuild what the resolver refused (section 19).
-	if got := r.callers("other::lonely"); len(got) != 0 {
+	if got := r.callers("lonely"); len(got) != 0 {
 		t.Fatalf("FindCallers rebuilt the refused relation: %v", got)
 	}
-	callees, err := r.store.FindCallees(context.Background(), r.repo.ID, "caller::caller", 0, 20, 0)
+	callees, err := r.store.FindCallees(context.Background(), r.repo.ID, "caller", 0, 20, 0)
 	if err != nil {
 		t.Fatalf("FindCallees() error = %v", err)
 	}
@@ -179,16 +179,26 @@ void far() {
 }
 `)
 	r.run("index")
-	sym, err := r.store.FindSymbolExact(context.Background(), r.repo.ID, "own::Message", 5, 0)
+	sym, err := r.store.FindSymbolExact(context.Background(), r.repo.ID, "Message", 5, 0)
 	if err != nil {
 		t.Fatalf("FindSymbolExact() error = %v", err)
 	}
 	if len(sym) == 0 {
-		t.Fatalf("fixture did not produce own::Message")
+		t.Fatalf("fixture did not produce Message")
+	}
+	var ownID int64
+	for _, candidate := range sym {
+		if candidate.FilePath == "own.cpp" {
+			ownID = candidate.ID
+			break
+		}
+	}
+	if ownID == 0 {
+		t.Fatalf("fixture did not produce own.cpp Message: %+v", sym)
 	}
 	neighbors, err := r.store.FindContextNeighbors(context.Background(), r.repo.ID, []store.ContextSeed{{
-		SymbolID:           sym[0].ID,
-		QualifiedName:      "own::Message",
+		SymbolID:           ownID,
+		QualifiedName:      "Message",
 		ShortName:          "Message",
 		AllowShortEvidence: true,
 	}}, 20)
@@ -207,7 +217,7 @@ void far() {
 	}
 	found := false
 	for _, c := range callers {
-		if c == "own::near" {
+		if c == "near" {
 			found = true
 		}
 	}
@@ -218,8 +228,8 @@ void far() {
 	// FindCallers builds its own legs, and a cpp TYPE target reaches them through
 	// typeOnlyGatedLanguages: subtracting cpp there would drop the bare leg
 	// outright and lose the same-file writer this scope exists to keep.
-	direct := r.callers("own::Message")
-	if !slices.Contains(direct, "own::near") {
+	direct := r.callers("Message")
+	if !slices.Contains(direct, "near") {
 		t.Fatalf("FindCallers lost the same-file writer of a cpp type: %v", direct)
 	}
 	if slices.Contains(direct, "other::far") {
@@ -318,7 +328,7 @@ void localcaller(void) {
 	if got := cppTargets(r, "ctarget"); !equalStrings(got, []string{"<unresolved>"}) {
 		t.Fatalf("C cross-file bare call targets = %v, want [<unresolved>]", got)
 	}
-	if got, want := cppTargets(r, "localhelper"), []string{"local::localhelper"}; !equalStrings(got, want) {
+	if got, want := cppTargets(r, "localhelper"), []string{"localhelper"}; !equalStrings(got, want) {
 		t.Fatalf("C same-file bare call targets = %v, want %v", got, want)
 	}
 }
@@ -394,7 +404,7 @@ void caller() {
 
 	r.write("caller.cpp", withInclude)
 	r.run("update")
-	if got, want := cppTargets(r, "visible"), []string{"dep::visible"}; !equalStrings(got, want) {
+	if got, want := cppTargets(r, "visible"), []string{"visible"}; !equalStrings(got, want) {
 		t.Fatalf("step 2 (include added) targets = %v, want %v", got, want)
 	}
 	assertCppFreshParity(t, "include added", r, map[string]string{"dep.h": target, "caller.cpp": withInclude})
@@ -420,7 +430,7 @@ void caller() {
 	r.write("dep.h", "inline void moved() {}\n")
 	r.write("caller.cpp", caller)
 	r.run("index")
-	if got, want := cppTargets(r, "moved"), []string{"dep::moved"}; !equalStrings(got, want) {
+	if got, want := cppTargets(r, "moved"), []string{"moved"}; !equalStrings(got, want) {
 		t.Fatalf("step 1 targets = %v, want %v", got, want)
 	}
 

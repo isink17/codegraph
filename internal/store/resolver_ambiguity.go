@@ -6,6 +6,13 @@ import (
 	"slices"
 )
 
+// resolverCppQualifiedMatch preserves an explicit C++ global-scope qualifier
+// while symbols keep the ordinary global identity (`Foo`). Other languages
+// never enter this branch.
+func resolverCppQualifiedMatch(symbolAlias, spelling string) string {
+	return "((" + symbolAlias + `.qualified_name = ` + spelling + ` AND NOT (` + symbolAlias + `.language = 'cpp' AND instr(` + symbolAlias + `.qualified_name, '::') = 0 AND substr(` + spelling + `, 1, 2) != '::')) OR (` + symbolAlias + `.language = 'cpp' AND instr(` + symbolAlias + `.qualified_name, '::') = 0 AND substr(` + spelling + `, 1, 2) = '::' AND ` + symbolAlias + `.qualified_name = substr(` + spelling + `, 3)))`
+}
+
 // Resolver ambiguity determinism (P3).
 //
 // P2 established *which* candidates an implicit strategy may consider: only

@@ -52,7 +52,7 @@ func (a *CppAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 	}
 
 	cppExtractImports(root, content, &pf)
-	cppExtractSymbols(root, module, "", content, &pf)
+	cppExtractSymbols(root, module, "", "", filepath.ToSlash(path), content, &pf)
 	cppExtractCalls(root, content, &pf)
 	linkTestsGeneric(module, &pf)
 	return pf, nil
@@ -162,9 +162,8 @@ var cppSkipFuncs = map[string]bool{
 //	    class rather than a wrapper fix. Its `type_descriptor` child is listed
 //	    below only because the census found it; the parent is the real decision.
 //	friend_declaration
-//	    `friend void f() { ... }` inside a class declares `f` at the *enclosing
-//	    namespace* scope, not on the class. Emitting it here would attach a
-//	    knowingly wrong container; real namespace identity is P22.16.
+//	    A friend function is declared at the enclosing namespace scope, not on
+//	    the lexical class. It is handled explicitly below with that owner.
 //	template_instantiation
 //	    `template class Foo<int>;` instantiates an existing template. It
 //	    declares no new name, so entering it would duplicate the template.
@@ -184,7 +183,7 @@ var cppTransparentDeclWrappers = map[string]bool{
 	"ERROR":                 true,
 }
 
-func cppExtractSymbols(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer, fileScope string, content []byte, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
@@ -197,17 +196,17 @@ func cppExtractSymbols(node *sitter.Node, module, container string, content []by
 				cppAddFunctionFromDeclarator(child, fnDecl, module, container, content, pf)
 			}
 		case "struct_specifier":
-			cppAddType(child, module, "struct", content, pf)
+			cppAddType(child, module, container, namespaceContainer, "struct", fileScope, content, pf)
 		case "class_specifier":
-			cppAddType(child, module, "class", content, pf)
+			cppAddType(child, module, container, namespaceContainer, "class", fileScope, content, pf)
 		case "enum_specifier":
-			cppAddType(child, module, "enum", content, pf)
+			cppAddType(child, module, container, namespaceContainer, "enum", fileScope, content, pf)
 		case "union_specifier":
 			// Symmetric with the three above: a named union at declaration
 			// scope is a named type. (Neither fmt nor googletest has one --
 			// their unions are all anonymous members -- but the switch would
 			// otherwise be silently missing one of C's four tagged types.)
-			cppAddType(child, module, "union", content, pf)
+			cppAddType(child, module, container, namespaceContainer, "union", fileScope, content, pf)
 		case "namespace_definition":
 			// The `body` field always attaches when the node exists at all:
 			// probed `namespace n {` unterminated, `namespace n` with no
@@ -217,7 +216,25 @@ func cppExtractSymbols(node *sitter.Node, module, container string, content []by
 			// namespace_definition without a body. So there is no fallback
 			// here; an unfalsifiable one would be untestable code.
 			if body := childByFieldName(child, "body"); body != nil {
-				cppExtractSymbols(body, module, container, content, pf)
+				namespace := cppNamespaceName(child, content)
+				if namespace == "" {
+					namespace = "(anonymous@" + fileScope + ")"
+				}
+				namespace = cppScopeName(container, namespace)
+				cppExtractSymbols(body, module, namespace, namespace, fileScope, content, pf)
+			}
+		case "friend_declaration":
+			// The lexical class is not the semantic owner of a friend. The
+			// current container is the enclosing namespace (or global scope).
+			friendContainer := namespaceContainer
+			for i := range int(child.NamedChildCount()) {
+				friend := child.NamedChild(i)
+				switch friend.Type() {
+				case "function_definition":
+					cppAddFunction(friend, module, friendContainer, content, pf)
+				case "function_declarator":
+					cppAddFunctionFromDeclarator(child, friend, module, friendContainer, content, pf)
+				}
 			}
 		default:
 			// A transparent wrapper contributes no identity, so the enclosing
@@ -228,10 +245,22 @@ func cppExtractSymbols(node *sitter.Node, module, container string, content []by
 			// and each node still has exactly one parent, so every declaration
 			// is reached along exactly one path and emitted exactly once.
 			if cppTransparentDeclWrappers[child.Type()] {
-				cppExtractSymbols(child, module, container, content, pf)
+				cppExtractSymbols(child, module, container, namespaceContainer, fileScope, content, pf)
 			}
 		}
 	}
+}
+
+func cppScopeName(container, name string) string {
+	container = strings.TrimSpace(container)
+	name = strings.TrimSpace(name)
+	if container == "" {
+		return name
+	}
+	if name == container || strings.HasPrefix(name, container+"::") {
+		return name
+	}
+	return container + "::" + name
 }
 
 // cppDeclarationAnchor is the node a symbol's range and doc comment are taken
@@ -270,10 +299,7 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 		return
 	}
 
-	effectiveContainer := module
-	if container != "" && container != module {
-		effectiveContainer = container
-	}
+	effectiveContainer := container
 	qualified := cppQualifiedName(effectiveContainer, name)
 	anchor := cppDeclarationAnchor(node)
 
@@ -286,7 +312,7 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(anchor),
 		DocSummary:    prevCommentText(anchor, content),
-		StableKey:     cppStableKey("func", module, effectiveContainer, name),
+		StableKey:     cppStableKey("func", module, qualified),
 	})
 }
 
@@ -301,10 +327,7 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 		return
 	}
 
-	effectiveContainer := module
-	if container != "" && container != module {
-		effectiveContainer = container
-	}
+	effectiveContainer := container
 	qualified := cppQualifiedName(effectiveContainer, name)
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
@@ -316,11 +339,11 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(anchor),
 		DocSummary:    prevCommentText(anchor, content),
-		StableKey:     cppStableKey("func", module, effectiveContainer, name),
+		StableKey:     cppStableKey("func", module, qualified),
 	})
 }
 
-func cppAddType(node *sitter.Node, module, kind string, content []byte, pf *graph.ParsedFile) {
+func cppAddType(node *sitter.Node, module, container, namespaceContainer, kind, fileScope string, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
@@ -335,17 +358,17 @@ func cppAddType(node *sitter.Node, module, kind string, content []byte, pf *grap
 		Language:      "cpp",
 		Kind:          kind,
 		Name:          name,
-		QualifiedName: cppQualifiedName(module, name),
-		ContainerName: module,
+		QualifiedName: cppQualifiedName(container, name),
+		ContainerName: container,
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(anchor),
 		DocSummary:    prevCommentText(anchor, content),
-		StableKey:     cppStableKey("type", module, module, name),
+		StableKey:     cppStableKey("type", module, cppQualifiedName(container, name)),
 	})
 
 	body := childByFieldName(node, "body")
 	if body != nil {
-		cppExtractSymbols(body, module, name, content, pf)
+		cppExtractSymbols(body, module, cppQualifiedName(container, name), namespaceContainer, fileScope, content, pf)
 	}
 }
 
@@ -438,26 +461,16 @@ func cppQualifiedName(container, name string) string {
 	return container + "::" + name
 }
 
-func cppStableKey(prefix, module, container, name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
+func cppStableKey(prefix, module, qualified string) string {
+	qualified = strings.TrimSpace(qualified)
+	if qualified == "" {
 		return ""
-	}
-	key := name
-	if !strings.Contains(name, "::") {
-		container = strings.TrimSpace(container)
-		if container != "" {
-			key = container + "::" + name
-		}
 	}
 	module = strings.TrimSpace(module)
 	if module == "" {
-		return prefix + ":cpp:" + key
+		return prefix + ":cpp:" + qualified
 	}
-	if strings.HasPrefix(key, module+"::") {
-		key = strings.TrimPrefix(key, module+"::")
-	}
-	return prefix + ":cpp:" + module + ":" + key
+	return prefix + ":cpp:" + module + ":" + qualified
 }
 
 func cppCallTarget(fnNode *sitter.Node, content []byte) (name, kind, receiver string) {
@@ -467,7 +480,7 @@ func cppCallTarget(fnNode *sitter.Node, content []byte) (name, kind, receiver st
 	}
 	switch {
 	case strings.HasPrefix(raw, "::"):
-		return strings.TrimPrefix(raw, "::"), "static_qualified", ""
+		return raw, "static_qualified", ""
 	case strings.Contains(raw, "::"):
 		return raw, "static_qualified", ""
 	case strings.Contains(raw, "->"):
@@ -479,6 +492,14 @@ func cppCallTarget(fnNode *sitter.Node, content []byte) (name, kind, receiver st
 	default:
 		return raw, "direct", ""
 	}
+}
+
+func cppNamespaceName(node *sitter.Node, content []byte) string {
+	name := childByFieldName(node, "name")
+	if name == nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(strings.TrimSpace(nodeText(name, content))), "")
 }
 
 func splitCallTarget(text, sep string) (string, string) {
