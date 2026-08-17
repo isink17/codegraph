@@ -74,6 +74,53 @@ func BenchmarkStoreFindCallers_Hub(b *testing.B) {
 	}
 }
 
+// BenchmarkStoreFindCallers_UnknownName measures the P22.14 path: a spelling
+// that indexes no symbol, so the bare name leg carries no target-derived scope
+// predicate and every unresolved writer of the name is a row. It is the only
+// path whose candidate set the fix can grow.
+func BenchmarkStoreFindCallers_UnknownName(b *testing.B) {
+	ctx := context.Background()
+	dbPath := filepath.Join(b.TempDir(), "graph.sqlite")
+	s, err := Open(dbPath)
+	if err != nil {
+		b.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	repo, err := s.UpsertRepo(ctx, b.TempDir())
+	if err != nil {
+		b.Fatalf("UpsertRepo() error = %v", err)
+	}
+	fileID, err := insertTestFileLang(ctx, s, repo.ID, "pkg/a.go", "go")
+	if err != nil {
+		b.Fatalf("insertTestFileLang() error = %v", err)
+	}
+
+	const n = 2000
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("Fn_%d", i)
+		id, err := insertTestSymbolLang(ctx, s, repo.ID, fileID, name, "pkg."+name, "go")
+		if err != nil {
+			b.Fatalf("insertTestSymbolLang() error = %v", err)
+		}
+		if _, err := insertTestEdge(ctx, s, repo.ID, fileID, id, "MissingThing"); err != nil {
+			b.Fatalf("insertTestEdge() error = %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		callers, err := s.FindCallers(ctx, repo.ID, "MissingThing", 0, 20, 0)
+		if err != nil {
+			b.Fatalf("FindCallers() error = %v", err)
+		}
+		if len(callers) == 0 {
+			b.Fatalf("expected non-empty callers")
+		}
+	}
+}
+
 func BenchmarkStoreFindCallees_Hub(b *testing.B) {
 	ctx := context.Background()
 	dbPath := filepath.Join(b.TempDir(), "graph.sqlite")

@@ -169,6 +169,13 @@ func (s *Store) symbolPage(ctx context.Context, repoID int64, candidateCTE strin
 // keeps returning both languages' callers -- each of them a real caller of one
 // of the matched targets. The gate is at its tightest when the input identifies
 // one symbol, which is the form `TestExactSymbolIDStaysExact` pins.
+//
+// The bare-name leg's scope predicate (P22.6/P22.13) is target-derived in the
+// same way, and P22.14 draws the same line under it: an input that matched no
+// symbol has no package or file to scope against, so the predicate is omitted
+// rather than asked for zero scopes, and the unresolved writers stay as name
+// evidence. An input that DID match keeps the predicate, including when its
+// targets yield no scope at all -- that is a refusal, not an absence.
 func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	targetIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
@@ -261,6 +268,28 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		}
 		if len(bareExact) > 0 {
 			scopeKeys := goBareTargetScopes(targetScopes)
+			// P22.14: the scope predicate is target-derived evidence, so it
+			// only exists when a target does. Zero scope keys has two causes
+			// and they are opposite answers: a matched target whose own rules
+			// say no bare spelling reaches it (a Go method, a C/C++ symbol with
+			// no file) is a refusal and keeps the predicate, which then admits
+			// only writers in ungated languages; no matched target at all is an
+			// absence of evidence, and gating on it deleted precisely the
+			// unresolved Go and C/C++ writers this leg exists to surface. The
+			// same reasoning already governs `bareLangFilter` above.
+			//
+			// `scopeKeys` is empty in the second case by construction, so the
+			// bound arguments stay in step with the rendered statement.
+			//
+			// The test is `targetIDs`, not the rows they loaded: an explicit
+			// `symbol_id` is an assertion of identity, and a stale one whose
+			// row is gone must stay refused rather than fail open into the
+			// unknown-name contract. Only a lookup that matched nothing at all
+			// is an absence of evidence.
+			bareScopeFilter := ""
+			if len(targetIDs) > 0 {
+				bareScopeFilter = ` AND ` + sqlGoBareSourceScope(len(scopeKeys))
+			}
 			// `bareLangs` rather than the union's `targetLangs`: this leg alone
 			// drops the languages whose matched targets are all types (P22.9).
 			// The outer language gate below still applies and is a superset.
@@ -273,7 +302,7 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 				JOIN files srcf ON srcf.id = src.file_id
 				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
 				  AND e.dst_name IN (`+placeholders(len(bareExact))+`)
-				  AND `+sqlGoBareSourceScope(len(scopeKeys))+bareLangFilter)
+				  `+bareScopeFilter+bareLangFilter)
 			nameArgs = append(nameArgs, repoID)
 			for _, spelling := range bareExact {
 				nameArgs = append(nameArgs, spelling)

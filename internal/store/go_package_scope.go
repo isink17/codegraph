@@ -298,6 +298,11 @@ func sqlGoBareSourceScope(n int) string {
 	if n == 0 {
 		// No scoped destination to match: Go and C/C++ sources contribute
 		// nothing, but the leg still serves every other language.
+		//
+		// This is a refusal, so callers may only render it once a target
+		// identity exists. A query that matched no symbol has no scope to
+		// derive and must omit the predicate entirely rather than ask for
+		// zero keys (P22.14); FindCallers is where that branch lives.
 		return `(` + gated + `)`
 	}
 	return `((` + gated + `) OR ` +

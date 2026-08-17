@@ -353,18 +353,20 @@ func TestGoBareScopeKeepsSamePackageContextCaller(t *testing.T) {
 	}
 }
 
-// FindCallers on a bare name that indexes no symbol at all cannot prove the
-// target is a package-level Go declaration, so Go writers of that spelling are
-// not claimed. This is a deliberate recall change on a public surface; it is
-// pinned so it cannot drift back silently.
-func TestGoBareScopeUnknownTargetClaimsNoGoCaller(t *testing.T) {
+// FindCallers on a bare name that indexes no symbol at all has no target to
+// derive a package scope from, so P22.14 keeps the Go writer as unresolved name
+// evidence rather than deleting it. Nothing is bound: the answer says who
+// spells `neverDeclared`, not what it names. P22.6's scope rule takes over the
+// moment a target identity exists -- see
+// TestFindCallersTargetLifecycleSwitchesContract.
+func TestGoBareScopeUnknownTargetKeepsGoWriterAsNameEvidence(t *testing.T) {
 	f := newReindexFixture(t)
 	f.mkdir("a")
 	f.write("a/caller.go", "package a\n\nfunc Caller() { neverDeclared() }\n")
 	f.index()
 
-	if got := callerNamesOf(t, f, "neverDeclared"); len(got) != 0 {
-		t.Fatalf("FindCallers(neverDeclared) = %v, want none", got)
+	if got := callerNamesOf(t, f, "neverDeclared"); !containsName(got, "a.Caller") {
+		t.Fatalf("FindCallers(neverDeclared) = %v, want a.Caller", got)
 	}
 }
 
