@@ -6,12 +6,27 @@ import (
 	"slices"
 )
 
-// resolverCppQualifiedMatch preserves an explicit C++ global-scope qualifier
-// while symbols keep the ordinary global identity (`Foo`). Other languages
-// never enter this branch.
-func resolverCppQualifiedMatch(symbolAlias, spelling string) string {
-	return "((" + symbolAlias + `.qualified_name = ` + spelling + ` AND NOT (` + symbolAlias + `.language = 'cpp' AND instr(` + symbolAlias + `.qualified_name, '::') = 0 AND substr(` + spelling + `, 1, 2) != '::')) OR (` + symbolAlias + `.language = 'cpp' AND instr(` + symbolAlias + `.qualified_name, '::') = 0 AND substr(` + spelling + `, 1, 2) = '::' AND ` + symbolAlias + `.qualified_name = substr(` + spelling + `, 3)))`
-}
+// resolverQualifiedLookupSQL derives a small lookup relation from unresolved
+// spellings. The symbol side remains an equality on qualified_name, so SQLite
+// can use idx_symbols_repo_qname before applying the C++ evidence filters.
+const resolverQualifiedLookupSQL = `
+		WITH distinct_names AS (
+			SELECT DISTINCT dst_name
+			FROM edges
+			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
+		), qualified_names AS (
+			SELECT dst_name, dst_name AS lookup_name, 1 AS bare_name, 0 AS global_only
+			FROM distinct_names
+			WHERE dst_name NOT LIKE '::%'
+			UNION ALL
+			SELECT dst_name, substr(dst_name, 3), 0, 1
+			FROM distinct_names
+			WHERE dst_name LIKE '::%'
+		)`
+
+const resolverQualifiedLookupFilter = `
+				AND NOT (s.language = 'cpp' AND n.bare_name = 1 AND s.qualified_name NOT LIKE '%::%')
+				AND (n.global_only = 0 OR (s.language = 'cpp' AND s.qualified_name NOT LIKE '%::%'))`
 
 // Resolver ambiguity determinism (P3).
 //

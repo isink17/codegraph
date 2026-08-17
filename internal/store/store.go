@@ -2649,21 +2649,18 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 	candidateCounts := `COUNT(*) AS candidates,
 			SUM(CASE WHEN tf.file_id IS NULL THEN 1 ELSE 0 END) AS production_candidates`
 	ambiguityQueries := []string{
-		`
+		resolverQualifiedLookupSQL + `
 		INSERT OR IGNORE INTO ` + resolverAmbiguousNamesTable + `(dst_name, dst_language, caller_is_test)
 		SELECT g.dst_name, g.dst_language, k.caller_is_test
 		FROM (
 			SELECT n.dst_name AS dst_name, s.language AS dst_language, ` + candidateCounts + `
-			FROM (
-				SELECT DISTINCT dst_name
-				FROM edges
-				WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-			) n
-			JOIN symbols s
+			FROM qualified_names n
+			CROSS JOIN symbols s
 			  ON s.repo_id = ?
-				 AND ` + resolverCppQualifiedMatch("s", "n.dst_name") + `
+				 AND s.qualified_name = n.lookup_name
 			` + resolverCandidateJoinSQL + `
 			WHERE s.language != ''
+			` + resolverQualifiedLookupFilter + `
 			GROUP BY n.dst_name, s.language
 		) g
 		` + vetoScopes,
@@ -2786,21 +2783,17 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	// several definitions share must not veto the one definition that owns the
 	// fully qualified name. The Go-side binder makes the same call: it consults
 	// the qualified candidates first and only then the bare tail.
-	res, err := tx.ExecContext(ctx, `
-		WITH distinct_names AS (
-			SELECT DISTINCT dst_name
-			FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-		),
+	res, err := tx.ExecContext(ctx, resolverQualifiedLookupSQL+`,
 		resolutions AS (
 			SELECT n.dst_name AS dst_name, s.language AS dst_language,
 				`+resolverCandidateAggregatesSQL+`
-			FROM distinct_names n
-			JOIN symbols s
+			FROM qualified_names n
+			CROSS JOIN symbols s
 			  ON s.repo_id = ?
-				 AND `+resolverCppQualifiedMatch("s", "n.dst_name")+`
+				 AND s.qualified_name = n.lookup_name
 			`+resolverCandidateJoinSQL+`
 			WHERE s.language != ''
+			`+resolverQualifiedLookupFilter+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
 		)
