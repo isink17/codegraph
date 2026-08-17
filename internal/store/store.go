@@ -4265,6 +4265,35 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 	}
 
+	// P22.15: a bare C/C++ spelling may not claim another class's member
+	// (cpp_class_scope.go). Both halves are batched -- one indexed lookup per
+	// distinct bare name, one per chunk of bare C/C++ edges -- and both are built
+	// only when the batch actually holds such an edge, so a Go-only or
+	// Python-only update pays nothing for the rule.
+	var cppMemberTargets, cppCallerClasses map[int64]string
+	cppBareEdgeIDs := make([]int64, 0, len(targets))
+	cppBareNameSet := map[string]struct{}{}
+	for _, target := range targets {
+		if _, blocked := moduleVeto[target.edgeID]; blocked {
+			continue
+		}
+		if !bareNameScopeAllKinds(target.srcLanguage) || !goBareCallName(target.dstName) {
+			continue
+		}
+		cppBareEdgeIDs = append(cppBareEdgeIDs, target.edgeID)
+		cppBareNameSet[target.dstName] = struct{}{}
+	}
+	if len(cppBareEdgeIDs) > 0 {
+		cppMemberTargets, err = cppClassScopesByName(ctx, s.db, repoID, setToSlice(cppBareNameSet))
+		if err != nil {
+			return outcome, err
+		}
+		cppCallerClasses, err = cppCallerClassScopesByEdge(ctx, s.db, repoID, cppBareEdgeIDs)
+		if err != nil {
+			return outcome, err
+		}
+	}
+
 	// Names that exist somewhere in the repo, in any language and whether or not
 	// they are ambiguous there. Used only to report honestly why a candidate
 	// stayed unresolved.
@@ -4380,6 +4409,16 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			// the bare-name lookup) are both covered; goBareCallName is the Go twin
 			// of the SQL guard's sqlNotBareName and is not Go-specific despite the
 			// name.
+			outcome.unresolved++
+			continue
+		}
+		if ok && dstID != 0 && bareNameScopeAllKinds(target.srcLanguage) && goBareCallName(target.dstName) &&
+			cppMemberTargetOutOfClassScope(target.edgeID, dstID, cppMemberTargets, cppCallerClasses) {
+			// A bare C/C++ spelling naming a member of a class the calling symbol
+			// is not a member of. Same file is not class evidence and neither is an
+			// include, so there is nothing weaker to fall back to and the edge stays
+			// unresolved -- exactly what resolverCppBareMemberScopeSQL does on the
+			// full path (P22.15, cpp_class_scope.go).
 			outcome.unresolved++
 			continue
 		}

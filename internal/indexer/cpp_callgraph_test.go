@@ -165,17 +165,23 @@ func TestCppCallGraphUnprovenReceiverStaysUnresolved(t *testing.T) {
 
 	// #80 also queried the bare and leading-`::` spellings, and those are the
 	// shapes a user actually types. A bare identity shares no qualifier with
-	// `pcsApmMap.LoadWorldMap`, so the suffix leg must not extend it either --
-	// only the genuinely unqualified call site in `Internal` may answer.
+	// `pcsApmMap.LoadWorldMap`, so the suffix leg must not extend it either.
+	//
+	// The genuinely unqualified call site in `Internal` may not answer either,
+	// and that is the P22.15 closeout (cpp_class_scope.go): `Internal` is a FREE
+	// function, `ApmMap::LoadWorldMap` is a class member, and an unqualified call
+	// in a free function does not reach a member in C++ -- the graph held that
+	// relation only because `LoadWorldMap` happened to name one thing in this
+	// repository, which is the same non-evidence the receiver half of this test
+	// already refuses. The resolver never bound this edge (`exact_name` matches
+	// `symbols.name`, which is `ApmMap::LoadWorldMap` here); the claim existed
+	// only on the query surface's short-name leg, so this is where it dies.
 	for _, spelling := range []string{"LoadWorldMap", "::LoadWorldMap"} {
 		bare, err := s.FindCallers(ctx, repo.ID, spelling, 0, 20, 0)
 		if err != nil {
 			t.Fatalf("FindCallers(%s) error = %v", spelling, err)
 		}
-		if !hasSymbolQName(bare, "fixture::Internal") {
-			t.Fatalf("FindCallers(%s) lost the bare call site: %+v", spelling, bare)
-		}
-		for _, unproven := range []string{"AgcmMinimap::F", "fixture::Direct"} {
+		for _, unproven := range []string{"AgcmMinimap::F", "fixture::Direct", "fixture::Internal"} {
 			if hasSymbolQName(bare, unproven) {
 				t.Fatalf("FindCallers(%s) rebuilt the unproven relation via %s: %+v", spelling, unproven, bare)
 			}
