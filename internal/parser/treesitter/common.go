@@ -154,24 +154,16 @@ func prevCommentText(node *sitter.Node, content []byte) string {
 	if node == nil {
 		return ""
 	}
-	parent := node.Parent()
-	if parent == nil {
-		return ""
-	}
-	// Find our index in parent.
-	idx := -1
-	for i := range int(parent.ChildCount()) {
-		if parent.Child(i) == node {
-			idx = i
-			break
-		}
-	}
-	if idx <= 0 {
-		return ""
-	}
+	// Walk the sibling chain backwards rather than scanning the parent's
+	// children for our own index. Both see the same siblings -- PrevSibling
+	// returns anonymous nodes too -- but the scan is O(parent fanout) per
+	// symbol, and every Child(i) is a cgo call. P22.15 made that quadratic
+	// visible: it let the extractor enter tree-sitter `ERROR` recovery nodes,
+	// which are the widest-fanout parents the grammar produces (the single
+	// ERROR over googletest's `gtest_unittest.cc` has 914 direct children), so
+	// every one of that file's 729 symbols paid a 914-step cgo scan.
 	var lines []string
-	for i := idx - 1; i >= 0; i-- {
-		prev := parent.Child(i)
+	for prev := node.PrevSibling(); prev != nil; prev = prev.PrevSibling() {
 		t := prev.Type()
 		if t != "comment" && t != "block_comment" && t != "line_comment" {
 			break

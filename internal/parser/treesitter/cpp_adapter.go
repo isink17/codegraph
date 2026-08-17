@@ -79,6 +79,111 @@ var cppSkipFuncs = map[string]bool{
 	"catch": true, "sizeof": true, "return": true,
 }
 
+// cppTransparentDeclWrappers are the C/C++ nodes that *hold* declarations
+// without owning any part of a declaration's identity (P22.15).
+//
+// cppExtractSymbols walks declaration scopes, not whole subtrees: it inspects
+// the direct children of a scope and recurses only where recursion is
+// structurally intentional. That is deliberate -- descending into every
+// descendant would file-scope the locals of every function body -- but before
+// P22.15 the only scopes it could enter were a namespace body and a class or
+// struct body, so any declaration sitting one syntax wrapper deeper was
+// invisible to the graph. Measured on `googletest/test/gtest_unittest.cc`
+// (7870 lines): 15 symbols, none after line 314.
+//
+// Each node below is *transparent*: the declarations inside it are declarations
+// of the enclosing scope, so recursion passes `module` and `container` through
+// unchanged and the wrapper itself never becomes a symbol or a container.
+//
+//	preproc_if / preproc_ifdef / preproc_elif / preproc_else
+//	    A conditional arm. CodeGraph is source-graph tooling with no build
+//	    configuration, so it cannot know which arm a compiler would take -- and
+//	    picking one by source order would be a guess. Every arm's declarations
+//	    are therefore emitted; when two arms declare the same name the resolver's
+//	    bare-name ambiguity veto (resolver_ambiguity.go) already refuses the
+//	    call, which is the fail-closed answer, independent of branch order.
+//	    `#ifndef` is also a preproc_ifdef, and an `#else`/`#elif` arm is a child
+//	    of the arm it follows, so nesting is handled by the recursion itself.
+//	template_declaration
+//	    `template <...> <declaration>`. The wrapper carries the parameter list;
+//	    the declaration inside is the symbol. No instantiation or type
+//	    resolution is implied -- the declaration merely becomes visible.
+//	linkage_specification
+//	    `extern "C" { ... }` and `extern "C" void f();`. `"C"` is a linkage
+//	    label, never a container, so nothing about identity changes.
+//	declaration_list
+//	    The braced body of a namespace or of a linkage specification. The
+//	    namespace case reaches it through its own `body` field; listing it here
+//	    is what lets `extern "C" { ... }` compose.
+//	ERROR
+//	    Tree-sitter's recovery node, and the reason gtest_unittest.cc stopped at
+//	    line 314: the file's anonymous namespace is reparented under a single
+//	    ERROR spanning lines 317-7870. Recovery is unavoidable in real C/C++
+//	    because the grammar parses preprocessor directives structurally --
+//	    `#if __has_warning("...")` is not a preprocessor expression it accepts,
+//	    a macro invocation used as a statement is a declaration missing its `;`,
+//	    and `googlemock/src/gmock_main.cc` opens a brace inside one `#ifdef` and
+//	    closes it inside another. The declarations under such a node are real
+//	    source declarations; only the *shape* around them is unparsed. Entering
+//	    it acts only on the node types the switch below names, and each still
+//	    has to supply the fields the emitters require. It is not free of cost:
+//	    an unmatched `{` inside the region is a plain child of the ERROR node,
+//	    sibling to the declarations after it, so a declaration the source wrote
+//	    inside that brace can be emitted at file scope. That is accepted --
+//	    the alternative is losing every declaration in the region -- and it is
+//	    bounded to files the grammar could not parse at all.
+//
+// Deliberately NOT transparent, with the reason recorded rather than
+// rediscovered later (the full parent/child census of fmt + googletest is the
+// source of this list):
+//
+//	compound_statement, function_definition, for_statement, init_statement,
+//	condition_clause, case_statement
+//	    Executable bodies. A declaration inside one is a local, and emitting it
+//	    at file or class scope would claim an ownership the source does not
+//	    have.
+//	declaration, type_definition, parameter_declaration
+//	    Leaf declarations. They can *embed* a named type (`struct S { ... } s;`,
+//	    `typedef struct { ... } S;`), which is a separate extraction gap from the
+//	    wrapper class this phase owns, and one whose bodiless forms
+//	    (`class Foo* p;`) are references rather than definitions.
+//	field_declaration
+//	    The node a *bodiless* class member takes: `class C { void m(); };`
+//	    parses to `field_declaration`, while `void m() {}` parses to
+//	    `function_definition`. So the wrapper traversal below restores a
+//	    guarded member *definition* to its class, but a guarded member
+//	    *declaration* is still not emitted at all -- the same header-declaration
+//	    /`.cc`-definition gap P22.17 owns, reached through a different node.
+//	    TestCppClassMemberDeclarationStaysOut pins the current answer so it is a
+//	    recorded gap rather than a surprise.
+//	alias_declaration
+//	    `using Alias = T;`. A named type CodeGraph does not model at all yet
+//	    (500+ occurrences in fmt and googletest), so emitting it is a new symbol
+//	    class rather than a wrapper fix. Its `type_descriptor` child is listed
+//	    below only because the census found it; the parent is the real decision.
+//	friend_declaration
+//	    `friend void f() { ... }` inside a class declares `f` at the *enclosing
+//	    namespace* scope, not on the class. Emitting it here would attach a
+//	    knowingly wrong container; real namespace identity is P22.16.
+//	template_instantiation
+//	    `template class Foo<int>;` instantiates an existing template. It
+//	    declares no new name, so entering it would duplicate the template.
+//	namespace_alias_definition
+//	    `namespace n = m;` declares an alias for a namespace, and CodeGraph does
+//	    not model namespaces as symbols at all yet (P22.16).
+//	dependent_type, placeholder_type_specifier, type_descriptor
+//	    Type expressions, not declaration scopes.
+var cppTransparentDeclWrappers = map[string]bool{
+	"preproc_if":            true,
+	"preproc_ifdef":         true,
+	"preproc_elif":          true,
+	"preproc_else":          true,
+	"template_declaration":  true,
+	"linkage_specification": true,
+	"declaration_list":      true,
+	"ERROR":                 true,
+}
+
 func cppExtractSymbols(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
@@ -97,13 +202,49 @@ func cppExtractSymbols(node *sitter.Node, module, container string, content []by
 			cppAddType(child, module, "class", content, pf)
 		case "enum_specifier":
 			cppAddType(child, module, "enum", content, pf)
+		case "union_specifier":
+			// Symmetric with the three above: a named union at declaration
+			// scope is a named type. (Neither fmt nor googletest has one --
+			// their unions are all anonymous members -- but the switch would
+			// otherwise be silently missing one of C's four tagged types.)
+			cppAddType(child, module, "union", content, pf)
 		case "namespace_definition":
-			body := childByFieldName(child, "body")
-			if body != nil {
+			// The `body` field always attaches when the node exists at all:
+			// probed `namespace n {` unterminated, `namespace n` with no
+			// brace, and a brace opened inside an `#ifdef`, and the grammar
+			// either attaches a `declaration_list` or degrades the `namespace`
+			// keyword to loose ERROR children -- it never yields a
+			// namespace_definition without a body. So there is no fallback
+			// here; an unfalsifiable one would be untestable code.
+			if body := childByFieldName(child, "body"); body != nil {
 				cppExtractSymbols(body, module, container, content, pf)
+			}
+		default:
+			// A transparent wrapper contributes no identity, so the enclosing
+			// scope is passed through untouched -- a class member behind an
+			// `#if` keeps the class as its container. Recursion is
+			// compositional rather than one level deep: a wrapper may hold
+			// another wrapper (`#if` > `namespace` > `extern "C"` > `template`),
+			// and each node still has exactly one parent, so every declaration
+			// is reached along exactly one path and emitted exactly once.
+			if cppTransparentDeclWrappers[child.Type()] {
+				cppExtractSymbols(child, module, container, content, pf)
 			}
 		}
 	}
+}
+
+// cppDeclarationAnchor is the node a symbol's range and doc comment are taken
+// from. It is the declaration itself, except under `template <...>`: there the
+// wrapper carries the parameter list, the declaration's own previous sibling is
+// always that parameter list, and the doc comment sits before the wrapper. So
+// anchoring on the declaration would start the range after `template <...>` and
+// silently drop every templated symbol's documentation.
+func cppDeclarationAnchor(node *sitter.Node) *sitter.Node {
+	if parent := node.Parent(); parent != nil && parent.Type() == "template_declaration" {
+		return parent
+	}
+	return node
 }
 
 func cppAddFunction(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
@@ -134,6 +275,7 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 		effectiveContainer = container
 	}
 	qualified := cppQualifiedName(effectiveContainer, name)
+	anchor := cppDeclarationAnchor(node)
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "cpp",
@@ -142,13 +284,14 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Visibility:    heuristicVisibility(name),
-		Range:         nodeRange(node),
-		DocSummary:    prevCommentText(node, content),
+		Range:         nodeRange(anchor),
+		DocSummary:    prevCommentText(anchor, content),
 		StableKey:     cppStableKey("func", module, effectiveContainer, name),
 	})
 }
 
 func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+	anchor := cppDeclarationAnchor(decl)
 	nameNode := childByFieldName(fnDecl, "declarator")
 	if nameNode == nil {
 		return
@@ -171,8 +314,8 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Visibility:    heuristicVisibility(name),
-		Range:         nodeRange(decl),
-		DocSummary:    prevCommentText(decl, content),
+		Range:         nodeRange(anchor),
+		DocSummary:    prevCommentText(anchor, content),
 		StableKey:     cppStableKey("func", module, effectiveContainer, name),
 	})
 }
@@ -186,6 +329,7 @@ func cppAddType(node *sitter.Node, module, kind string, content []byte, pf *grap
 	if name == "" {
 		return
 	}
+	anchor := cppDeclarationAnchor(node)
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "cpp",
@@ -194,8 +338,8 @@ func cppAddType(node *sitter.Node, module, kind string, content []byte, pf *grap
 		QualifiedName: cppQualifiedName(module, name),
 		ContainerName: module,
 		Visibility:    heuristicVisibility(name),
-		Range:         nodeRange(node),
-		DocSummary:    prevCommentText(node, content),
+		Range:         nodeRange(anchor),
+		DocSummary:    prevCommentText(anchor, content),
 		StableKey:     cppStableKey("type", module, module, name),
 	})
 
