@@ -110,7 +110,11 @@ func (r *cppRepo) useRegistry(reg *parser.Registry) {
 
 func (r *cppRepo) write(name, src string) {
 	r.t.Helper()
-	if err := os.WriteFile(filepath.Join(r.root, name), []byte(src), 0o644); err != nil {
+	path := filepath.Join(r.root, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		r.t.Fatalf("MkdirAll(%s) error = %v", name, err)
+	}
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
 		r.t.Fatalf("WriteFile(%s) error = %v", name, err)
 	}
 }

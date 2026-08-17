@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
-	"github.com/isink17/codegraph/internal/graph"
+	"database/sql"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 // Regression coverage for P22.9 bare-name type-target scope.
@@ -500,32 +502,40 @@ func TestImportSpecifierPath(t *testing.T) {
 		name      string
 		importer  string
 		specifier string
+		language  string
 		want      string
 		ok        bool
 	}{
-		{"absolute_dotted_module", "app/caller.py", "mitmproxy.http", "mitmproxy/http", true},
-		{"bare_module", "app/caller.py", "os", "os", true},
-		{"python_relative_sibling", "app/pkg/__init__.py", ".tcp", "app/pkg/tcp", true},
-		{"python_relative_parent", "app/pkg/sub/mod.py", "..util", "app/pkg/util", true},
-		{"python_relative_package", "app/pkg/__init__.py", ".", "app/pkg", true},
-		{"js_relative", "src/build.ts", "./one", "src/one", true},
-		{"js_parent_relative", "src/sub/build.ts", "../one", "src/one", true},
-		{"path_shaped", "src/build.ts", "src/shared/model.ts", "src/shared/model.ts", true},
-		{"c_include", "test/all.cc", "gtest/gtest.h", "gtest/gtest.h", true},
-		{"java_package_qualified", "Main.java", "app.Ledger", "app/Ledger", true},
-		{"empty", "a.py", "", "", false},
-		{"rust_scoped", "a.rs", "std::fs", "", false},
-		{"quoted_noise", "a.py", `numpy as np`, "", false},
-		{"escapes_repo", "a.py", "../../outside", "", false},
+		{"absolute_dotted_module", "app/caller.py", "mitmproxy.http", "python", "mitmproxy/http", true},
+		{"bare_module", "app/caller.py", "os", "python", "os", true},
+		{"python_relative_sibling", "app/pkg/__init__.py", ".tcp", "python", "app/pkg/tcp", true},
+		{"python_relative_parent", "app/pkg/sub/mod.py", "..util", "python", "app/pkg/util", true},
+		{"python_relative_package", "app/pkg/__init__.py", ".", "python", "app/pkg", true},
+		{"js_relative", "src/build.ts", "./one", "typescript", "src/one", true},
+		{"js_parent_relative", "src/sub/build.ts", "../one", "typescript", "src/one", true},
+		{"path_shaped", "src/build.ts", "src/shared/model.ts", "typescript", "src/shared/model.ts", true},
+		{"c_include", "test/all.cc", "gtest/gtest.h", "cpp", "gtest/gtest.h", true},
+		// P22.13: a single-segment `#include` is a path, not a dotted module.
+		{"c_include_single_segment", "src/caller.cpp", "foo.h", "cpp", "foo.h", true},
+		{"c_include_dot_relative", "src/caller.cpp", "./foo.h", "cpp", "src/foo.h", true},
+		{"java_package_qualified", "Main.java", "app.Ledger", "java", "app/Ledger", true},
+		// The C-family reading is gated on the importing file's LANGUAGE: these
+		// two carry a C-family extension by coincidence and must stay dotted.
+		{"java_class_named_c", "Main.java", "app.C", "java", "app/C", true},
+		{"python_module_named_cc", "app/caller.py", "pkg.cc", "python", "pkg/cc", true},
+		{"empty", "a.py", "", "python", "", false},
+		{"rust_scoped", "a.rs", "std::fs", "rust", "", false},
+		{"quoted_noise", "a.py", `numpy as np`, "python", "", false},
+		{"escapes_repo", "a.py", "../../outside", "python", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := importSpecifierPath(tc.importer, tc.specifier)
+			got, ok := importSpecifierPath(tc.importer, tc.specifier, tc.language)
 			if ok != tc.ok {
-				t.Fatalf("importSpecifierPath(%q, %q) ok = %v; want %v", tc.importer, tc.specifier, ok, tc.ok)
+				t.Fatalf("importSpecifierPath(%q, %q, %q) ok = %v; want %v", tc.importer, tc.specifier, tc.language, ok, tc.ok)
 			}
 			if ok && got != tc.want {
-				t.Fatalf("importSpecifierPath(%q, %q) = %q; want %q", tc.importer, tc.specifier, got, tc.want)
+				t.Fatalf("importSpecifierPath(%q, %q, %q) = %q; want %q", tc.importer, tc.specifier, tc.language, got, tc.want)
 			}
 		})
 	}
@@ -1189,5 +1199,89 @@ func TestTypeScopeQueryGateIsPerLanguage(t *testing.T) {
 	}
 	if !containsSymbolID(callers, ktWriter) {
 		t.Fatalf("FindCallers(Foo) dropped the kotlin writer, whose language this rule does not govern: %+v", callers)
+	}
+}
+
+// TestBareNameScopeAllKindsSQLMatchesGoTwin pins bareNameScopeAllKindsSQL
+// against bareNameScopeAllKindsLanguages, and pins the kind predicate the two
+// rules share: in C and C++ every kind is scoped, in Python and TypeScript only
+// the type-denoting ones, and nowhere else at all.
+func TestBareNameScopeAllKindsSQLMatchesGoTwin(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	values := ""
+	for language := range bareNameScopeAllKindsLanguages {
+		if values != "" {
+			values += ","
+		}
+		values += "('" + language + "')"
+	}
+	rows, err := f.store.db.QueryContext(context.Background(),
+		`WITH langs(l) AS (VALUES `+values+`) SELECT l FROM langs WHERE l IN `+bareNameScopeAllKindsSQL)
+	if err != nil {
+		t.Fatalf("query error = %v", err)
+	}
+	defer rows.Close()
+	inSQL := 0
+	for rows.Next() {
+		inSQL++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error = %v", err)
+	}
+	if inSQL != len(bareNameScopeAllKindsLanguages) {
+		t.Fatalf("SQL all-kinds set has %d of the Go twin's %d members", inSQL, len(bareNameScopeAllKindsLanguages))
+	}
+
+	for _, tc := range []struct {
+		language, kind string
+		want           bool
+	}{
+		{"cpp", "function", true},
+		{"cpp", "method", true},
+		{"cpp", "class", true},
+		{"cpp", "variable", true},
+		{"python", "class", true},
+		{"python", "function", false},
+		{"typescript", "interface", true},
+		{"typescript", "function", false},
+		{"go", "function", false},
+		{"go", "class", false},
+		{"kotlin", "class", false},
+		{"", "function", false},
+	} {
+		if got := bareNameScopeCoversKind(tc.language, tc.kind); got != tc.want {
+			t.Fatalf("bareNameScopeCoversKind(%q, %q) = %v, want %v", tc.language, tc.kind, got, tc.want)
+		}
+	}
+}
+
+// TestBareScopeKeySQLMatchesGoTwin pins sqlBareScopeKey against bareScopeKey on
+// the shapes both sides have to agree about: a Go package, a C/C++ file, an
+// ungated language, and the abstentions.
+func TestBareScopeKeySQLMatchesGoTwin(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	cases := []struct{ path, qname, language string }{
+		{"internal/store/store.go", "store.Open", "go"},
+		{"store.go", "store.Open", "go"},
+		{"internal/store/store.go", "Open", "go"},
+		{"src/gtest.cc", "gtest::ShouldUseColor", "cpp"},
+		{"only.c", "only::helper", "cpp"},
+		{"", "only::helper", "cpp"},
+		{"app/models.py", "models.Thing", "python"},
+		{"A.kt", "A", "kotlin"},
+		{"x.go", "store.Open", ""},
+	}
+	for _, tc := range cases {
+		var got string
+		if err := f.store.db.QueryRowContext(context.Background(),
+			`SELECT `+sqlBareScopeKey(":path", ":qname", ":lang"),
+			sql.Named("path", tc.path), sql.Named("qname", tc.qname),
+			sql.Named("lang", tc.language)).Scan(&got); err != nil {
+			t.Fatalf("sqlBareScopeKey(%q, %q, %q) error = %v", tc.path, tc.qname, tc.language, err)
+		}
+		if want := bareScopeKey(tc.language, tc.path, tc.qname); got != want {
+			t.Fatalf("sqlBareScopeKey(%q, %q, %q) = %q, Go twin = %q",
+				tc.path, tc.qname, tc.language, got, want)
+		}
 	}
 }
