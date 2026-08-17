@@ -177,6 +177,84 @@ func isTypeSymbolKind(kind string) bool {
 	return ok
 }
 
+// -- P22.13: the same rule, every kind, for C and C++ ------------------------
+//
+// P22.9 restricted the rule above to TYPE kinds and recorded the callable half
+// as a finding. P22.11 then gave C++ member calls their receivers back, and what
+// survived was measured here on fmt and googletest: 1351 resolved bare C/C++
+// call edges, 1058 of them same-file, 293 cross-file. Of those 293, 3 are
+// reachable from an include the caller itself wrote; the other 290 were decided
+// by nothing but repository-global uniqueness of the name.
+//
+// 17 of them are wrong, and each one is wrong in the same way -- the caller's
+// own file declares the name, the parser emitted no symbol for that
+// declaration, so the name looked repository-unique and a distant file won it:
+//
+//	gtest_unittest.cc      `TestEq1(2)`     -> googletest-output-test_.cc TestEq1
+//	gtest_unittest.cc      `AddFailure(..)` -> googletest-output-test_.cc
+//	                                          ExpectFailureTest::AddFailure  (x5)
+//	gmock-spec-builders_test.cc `Delete(a)` -> gmock-nice-strict_test.cc
+//	                                          MockFoo::Delete  (x2, an ACTION_P)
+//	fmt test/scan.h        `set(buf)`       -> base.h buffer::set
+//	fmt format-impl-test.cc `compare(n1,n2)`-> base.h basic_string_view::compare
+//	                                          (the real target is format.h's
+//	                                          bigint friend)  (x6)
+//	fmt base.h             `get()`          -> os.h buffered_file::get
+//	fmt posix-mock-test.cc `::GetFileSize(..)` -> gmock-gtest-all.cc GetFileSize
+//
+// The other 276 are source-correct, and only the 3 include-backed ones are
+// provable: C and C++ put the DECLARATION in a header and the DEFINITION in a
+// translation unit, and CodeGraph emits a symbol only for the definition, so
+// "the caller includes the file that declares it" is a fact the graph does not
+// hold for the normal cross-TU call. gtest_unittest.cc includes
+// `src/gtest-internal-inl.h`, which declares `ShouldUseColor`; the definition it
+// binds lives in `src/gtest.cc`, which it does not include and does not need to.
+//
+// So the tradeoff is stated plainly rather than hidden: applying the rule
+// removes 17 wrong bindings and 273 source-correct ones. It is applied anyway,
+// because the 273 are not evidence CodeGraph has -- they are one string being
+// unique, which is the same non-evidence P22.6 removed for Go and P22.9 removed
+// for types, and the trust policy is that a missing edge is recoverable while a
+// confidently wrong one is not. The 1058 same-file bindings, which ARE evidence
+// every language admits, are untouched.
+//
+// Only `cpp` (the adapter's language for C and C++ alike) widens. Python and
+// TypeScript keep the type-kind restriction: their callable half is a different
+// population with different evidence, and this phase measured neither.
+var bareNameScopeAllKindsLanguages = map[string]struct{}{
+	"cpp": {},
+}
+
+// bareNameScopeAllKindsSQL is the SQL twin of bareNameScopeAllKindsLanguages.
+// TestBareNameScopeAllKindsSQLMatchesGoTwin pins that they agree.
+const bareNameScopeAllKindsSQL = `('cpp')`
+
+// bareNameScopeAllKinds reports whether the bare-name scope rule governs every
+// symbol kind in this language rather than only the type-denoting ones.
+func bareNameScopeAllKinds(language string) bool {
+	_, ok := bareNameScopeAllKindsLanguages[language]
+	return ok
+}
+
+// bareNameScopeCoversKind reports whether a bare spelling in `language` is
+// forbidden from binding a symbol of `kind` outside its own visibility. It is
+// the single Go-side answer the resolver's binder and all four query surfaces
+// read, so none of them can apply a narrower or wider kind set than the SQL.
+func bareNameScopeCoversKind(language, kind string) bool {
+	if !typeScopeGatedLanguage(language) {
+		return false
+	}
+	return bareNameScopeAllKinds(language) || isTypeSymbolKind(kind)
+}
+
+// sqlBareNameScopeCoversKind renders bareNameScopeCoversKind for a candidate
+// alias, given the edge's own file joined as `f`. The language test comes first
+// so the kind list is not consulted at all for C and C++.
+func sqlBareNameScopeCoversKind(alias string) string {
+	return `(f.language IN ` + bareNameScopeAllKindsSQL +
+		` OR ` + alias + `.kind IN ` + typeSymbolKindsSQL + `)`
+}
+
 // resolverBareNameTypeScopeSQL is the repo-wide half of the rule. It is a
 // predicate on the *chosen* candidate rather than on the edge, for the same
 // reason resolverGoBareScopeSQL is: whichever id the caller-kind chooser landed
@@ -206,7 +284,7 @@ var resolverBareNameTypeScopeSQL = `(
 		OR NOT EXISTS (
 			SELECT 1 FROM symbols ts
 			WHERE ts.id = (` + resolverChosenCandidateSQL + `)
-			AND ts.kind IN ` + typeSymbolKindsSQL + `
+			AND ` + sqlBareNameScopeCoversKind("ts") + `
 			AND ts.file_id <> edges.file_id
 			AND NOT EXISTS (
 				SELECT 1 FROM ` + resolverImportScopeTable + ` isc
@@ -306,7 +384,7 @@ func importScopeForRepo(ctx context.Context, q queryContexter, repoID int64) (ma
 		return nil, err
 	}
 	rows, err := q.QueryContext(ctx, `
-		SELECT fi.file_id, fi.import_path FROM file_imports fi
+		SELECT fi.file_id, fi.import_path, f.language FROM file_imports fi
 		JOIN files f ON f.id = fi.file_id
 		WHERE f.repo_id = ?
 	`, repoID)
@@ -318,12 +396,12 @@ func importScopeForRepo(ctx context.Context, q queryContexter, repoID int64) (ma
 	reExports := map[int64]map[int64]struct{}{}
 	for rows.Next() {
 		var fileID int64
-		var specifier string
-		if err := rows.Scan(&fileID, &specifier); err != nil {
+		var specifier, language string
+		if err := rows.Scan(&fileID, &specifier, &language); err != nil {
 			return nil, err
 		}
 		relative := isRelativeImportSpecifier(specifier)
-		for _, targetID := range index.lookup(pathByID[fileID], specifier) {
+		for _, targetID := range index.lookup(pathByID[fileID], specifier, language) {
 			if targetID == fileID {
 				continue
 			}
@@ -417,13 +495,27 @@ func loadImportFileIndex(ctx context.Context, q queryContexter, repoID int64) (i
 	return index, pathByID, nil
 }
 
-// lookup returns every file id the specifier may name, seen from importerPath.
-func (i importFileIndex) lookup(importerPath, specifier string) []int64 {
-	resolved, ok := importSpecifierPath(importerPath, specifier)
+// lookup returns every file id the specifier may name, seen from importerPath
+// in a file of `language`.
+func (i importFileIndex) lookup(importerPath, specifier, language string) []int64 {
+	resolved, ok := importSpecifierPath(importerPath, specifier, language)
 	if !ok {
 		return nil
 	}
 	var out []int64
+	// A quoted `#include "foo.h"` names the includer's OWN directory first --
+	// that is the rule the language actually has, and it is an exact path, not a
+	// tail. Tried before anything else so the commonest C and C++ form does not
+	// depend on the suffix buckets at all.
+	//
+	// `sameDirectory` drives off the specifier's own shape, so `"./foo.h"` and
+	// `"foo.h"` -- the same statement in two spellings -- take the same path
+	// here and withhold the same tail below.
+	sameDirectory := cFamilyIncludeSpecifier(language, specifier) &&
+		!strings.Contains(strings.TrimPrefix(strings.TrimSpace(specifier), "./"), "/")
+	if sameDirectory {
+		out = append(out, i.byPath[path.Join(path.Dir(importerPath), path.Base(resolved))]...)
+	}
 	// `pkg/mod` names pkg/mod.py, pkg/mod.ts, ... ; `pkg/mod/__init__` is
 	// Python's package form; and the same tail under a source root is the Java
 	// and Kotlin form. Exact path last, for specifiers that carry the extension.
@@ -436,11 +528,45 @@ func (i importFileIndex) lookup(importerPath, specifier string) []int64 {
 		// `#include "gtest/gtest.h"` names `test/gtest/gtest/gtest.h` under a
 		// vendored include root exactly the way a module specifier names a file
 		// under a source root.
+		//
+		// The extension-stripped tail is deliberately NOT offered for a
+		// same-directory C-family specifier. `#include "sample1.h"` would tail-
+		// match every `*/sample1.*` in the repository -- including a `.cc` that
+		// nothing includes -- and P22.13 measured that as the loosest evidence in
+		// the whole rule: it is what let one common header name grant bind scope
+		// repository-wide. A multi-segment specifier keeps it, because its tail
+		// is the include-root form the paragraph above describes. The
+		// same-directory probe at the top of this function is what serves the
+		// single-segment case instead.
 		stripped := strings.TrimSuffix(resolved, ext)
-		out = append(out, i.byBase[stripped]...)
-		out = append(out, i.bySuffix[stripped]...)
+		if !sameDirectory {
+			out = append(out, i.byBase[stripped]...)
+			out = append(out, i.bySuffix[stripped]...)
+		}
 	}
 	return out
+}
+
+// cFamilyIncludeSpecifier reports whether a specifier should be read as a
+// `#include` path rather than as a dotted module name: it must be written in a
+// C or C++ file AND carry a C-family extension. The language half is what keeps
+// a Java `import app.C` or a Python `import pkg.cc` on the dotted reading,
+// where `path.Ext` alone would have moved them.
+func cFamilyIncludeSpecifier(language, specifier string) bool {
+	if !bareNameScopeAllKinds(language) {
+		return false
+	}
+	_, ok := cFamilyIncludeExtensions[strings.ToLower(path.Ext(strings.TrimSpace(specifier)))]
+	return ok
+}
+
+// cFamilyIncludeExtensions are the extensions a `#include` specifier can carry.
+// It mirrors CppAdapter.Extensions plus the `.inc` spelling projects use for
+// textual includes; the store cannot import the parser packages, and a
+// mismatched entry only ever costs or grants include SCOPE, never a target.
+var cFamilyIncludeExtensions = map[string]struct{}{
+	".h": {}, ".hpp": {}, ".hh": {}, ".hxx": {}, ".ipp": {}, ".inc": {},
+	".c": {}, ".cc": {}, ".cpp": {}, ".cxx": {},
 }
 
 // importSpecifierPath turns an import specifier into a repository-relative
@@ -454,7 +580,7 @@ func (i importFileIndex) lookup(importerPath, specifier string) []int64 {
 // whether one specific declaring file is in scope -- never to pick a target.
 // Turning them away instead would drop Python, Java and Kotlin out of the rule
 // entirely, which is most of the population it exists to protect.
-func importSpecifierPath(importerPath, specifier string) (string, bool) {
+func importSpecifierPath(importerPath, specifier, language string) (string, bool) {
 	spec := filepath.ToSlash(strings.TrimSpace(specifier))
 	if spec == "" || strings.ContainsAny(spec, " \t\"'()[]{}<>*:;,") {
 		return "", false
@@ -481,6 +607,18 @@ func importSpecifierPath(importerPath, specifier string) (string, bool) {
 	case strings.Contains(spec, "/"):
 		spec = path.Clean(spec)
 	default:
+		// A single-segment `#include "foo.h"` is a PATH that happens to carry a
+		// dot, not a dotted module name, and reading its extension as a separator
+		// turned it into `foo/h`, which no file answers -- so the whole
+		// same-directory include form, the commonest one in C and C++, resolved to
+		// nothing. Gated on the IMPORTING FILE's language, not on the extension
+		// alone: `path.Ext("app.C")` is `.C`, so a Java `import app.C` would
+		// otherwise stop being read as `app/C`.
+		if cFamilyIncludeSpecifier(language, spec) {
+			ext := path.Ext(spec)
+			spec = path.Clean(strings.ReplaceAll(strings.TrimSuffix(spec, ext), ".", "/") + ext)
+			break
+		}
 		// An absolute dotted or bare module name: `mitmproxy.http`, `app.Ledger`,
 		// `os`.
 		spec = path.Clean(strings.ReplaceAll(spec, ".", "/"))
@@ -563,7 +701,20 @@ func insertResolverImportScope(ctx context.Context, tx *sql.Tx, scope map[int64]
 // blocksBareNameTypeClaim reports whether `spelling`, matched against this
 // symbol through unresolved-edge name evidence, would claim a type the caller
 // never named. It is the query-side twin of resolverBareNameTypeScopeSQL.
+//
+// P22.13 does NOT answer it by dropping the leg for C and C++. A bare cpp
+// spelling keeps its leg and gets a SCOPE instead (bareScopeKey,
+// go_package_scope.go): the writer must be in the target's own file, which is
+// the same-file half of the resolution rule and the only half a name-evidence
+// leg can still be asked about. That has to hold for a cpp CLASS seed as much
+// as for a cpp function seed -- a bare `Message()` in the file that declares
+// `class Message` is the same provable evidence either way -- so an all-kinds
+// language is excluded here and answered by the scope instead. Python and
+// TypeScript have no such scope and keep the outright refusal.
 func (s goSymbolScope) blocksBareNameTypeClaim(spelling string) bool {
+	if bareNameScopeAllKinds(s.language) {
+		return false
+	}
 	return typeScopeGatedLanguage(s.language) && goBareCallName(spelling) && isTypeSymbolKind(s.kind)
 }
 
@@ -588,7 +739,11 @@ func typeOnlyGatedLanguages(scopes map[int64]goSymbolScope) map[string]struct{} 
 		if scope.language == "" {
 			continue
 		}
-		eligible := isTypeSymbolKind(scope.kind) && typeScopeGatedLanguage(scope.language)
+		// An all-kinds language (P22.13) is never "type-only" here: its bare leg
+		// is not dropped but scoped, by sqlGoBareSourceScope, so subtracting it
+		// would refuse the same-file writers that scope exists to keep.
+		eligible := isTypeSymbolKind(scope.kind) && typeScopeGatedLanguage(scope.language) &&
+			!bareNameScopeAllKinds(scope.language)
 		if seen, ok := typeOnly[scope.language]; ok {
 			typeOnly[scope.language] = seen && eligible
 			continue
@@ -721,6 +876,7 @@ func typeScopeEdgeNames(ctx context.Context, q queryContexter, repoID int64, fil
 		rows, err := q.QueryContext(ctx, `
 			SELECT DISTINCT e.dst_name
 			FROM edges e
+			JOIN files f ON f.id = e.file_id
 			LEFT JOIN symbols t ON t.id = e.dst_symbol_id
 			WHERE e.repo_id = ?
 			  AND e.file_id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
@@ -728,7 +884,7 @@ func typeScopeEdgeNames(ctx context.Context, q queryContexter, repoID int64, fil
 			  AND instr(e.dst_name, '.') = 0
 			  AND instr(e.dst_name, '/') = 0
 			  AND instr(e.dst_name, ':') = 0
-			  AND (e.dst_symbol_id IS NULL OR t.kind IN `+typeSymbolKindsSQL+`)
+			  AND (e.dst_symbol_id IS NULL OR `+sqlBareNameScopeCoversKind("t")+`)
 			ORDER BY e.dst_name
 		`, args...)
 		if err != nil {
@@ -892,7 +1048,7 @@ func (s *Store) clearOutOfScopeTypeBindings(
 		  AND instr(e.dst_name, '/') = 0
 		  AND instr(e.dst_name, ':') = 0
 		  AND f.language IN ` + typeScopeGatedLanguagesSQL + `
-		  AND t.kind IN ` + typeSymbolKindsSQL + `
+		  AND ` + sqlBareNameScopeCoversKind("t") + `
 		  AND t.file_id <> e.file_id
 		  AND e.edge_kind <> '` + EdgeKindCrossLanguageRef + `'`
 	if ids != nil {
@@ -1049,7 +1205,13 @@ func (c *importScopeCache) get(ctx context.Context, s *Store, repoID int64) (map
 // Keyed per repository, because one database holds several. The key is written
 // only after the clear succeeds, so a failure re-runs rather than marking a
 // repository repaired that is not.
-const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v1"
+//
+// The version is part of the key, and P22.13 bumped it: widening the rule to
+// every C/C++ kind means the pass has to run once more, and every database
+// written since P22.9 already carries `.v1`. A second repair entry running the
+// same function under a second key would have made a pre-P22.9 database pay for
+// two identical repo-wide scans, the second one provably finding nothing.
+const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v2"
 
 // repairTypeScopeBindingsOnce clears this repository's pre-P22.9 bindings the
 // first time any resolve runs against it, and does nothing afterwards.
@@ -1062,6 +1224,37 @@ const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v1"
 // graph inconsistent with itself.
 func (s *Store) repairTypeScopeBindingsOnce(ctx context.Context, repoID int64) error {
 	_, err := s.runResolverRepairOnce(ctx, repoID, typeScopeRepair)
+	return err
+}
+
+// repairTypeScopeBindings re-decides this repository's bare-name scope bindings
+// in BOTH directions, in one transaction.
+//
+// Clearing alone was enough while the rule only narrowed: P22.9 refused
+// bindings, and refusing needs no re-resolve. P22.13 also WIDENS -- a quoted
+// single-segment `#include "foo.h"` used to resolve to the module path `foo/h`
+// and grant no import scope at all, so an older binary left edges unresolved
+// that the current rule can prove. Those edges are never reconsidered by
+// clearing, and an upgrade over an unchanged tree resolves nothing at all
+// (the indexer short-circuits to ResolveMode "none"), so the repository would
+// stay permanently divergent from a fresh index on the commonest C and C++
+// include form.
+//
+// So the repair is clear-then-resolve, the same shape and the same reason as
+// repairBareNameLevelBindings: two commits would let a cancellation between
+// them leave the repository with bindings gone and nothing put back.
+// RevalidateTypeScopeAfterDeletion stays clear-only, because the deletion path
+// that calls it has a resolve of its own following.
+func (s *Store) repairTypeScopeBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		scope, err := importScopeForRepo(ctx, tx, repoID)
+		if err != nil {
+			return err
+		}
+		_, err = s.clearOutOfScopeTypeBindings(ctx, tx, repoID, nil, scope)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
 	return err
 }
 
@@ -1082,8 +1275,9 @@ type resolverRepair struct {
 
 var (
 	typeScopeRepair = resolverRepair{
-		key: typeScopeRepairSettingKey,
-		run: (*Store).RevalidateTypeScopeAfterDeletion,
+		key:              typeScopeRepairSettingKey,
+		run:              (*Store).repairTypeScopeBindings,
+		resolvesRepoWide: true,
 	}
 	bareNameLevelRepair = resolverRepair{
 		key:              bareNameLevelRepairSettingKey,

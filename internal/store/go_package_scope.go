@@ -134,6 +134,76 @@ func goPackageScopeKey(filePath, qualifiedName string) string {
 	return storedPathDir(filePath) + pkg
 }
 
+// -- P22.13: the same shape, one file wide, for C and C++ --------------------
+//
+// P22.6 gave a bare Go call a SCOPE instead of the repository, and P22.13 needs
+// the same thing for a bare C or C++ call. The scope CodeGraph can prove there
+// is the file: a declaration in another translation unit is visible only
+// through a header the caller included, and the graph holds no symbol for a
+// header declaration (only definitions are emitted), so "the caller's own file"
+// is where the evidence stops. The import half of the resolver rule
+// (resolver_type_scope.go) is not restated here because a relationship it
+// admits is BOUND, and a bound destination reaches every query surface through
+// the id leg rather than through a name leg.
+//
+// The key is the stored path under a `file:` prefix, which no Go package key
+// can collide with (a Go key is `<dir><pkg>`, and a stored path holding a
+// literal `file:` prefix would still have to match a real file's path to
+// matter). Paths compare as stored, for the reason recorded above.
+
+// cppFileScopePrefix namespaces a file-shaped scope key away from Go's
+// directory-and-package keys.
+const cppFileScopePrefix = "file:"
+
+// bareScopeGatedLanguage reports whether a bare spelling written in (or naming
+// a symbol in) this language is confined to a scope narrower than the
+// repository.
+func bareScopeGatedLanguage(language string) bool {
+	return language == "go" || bareNameScopeAllKinds(language)
+}
+
+// bareScopeGated is the goSymbolScope form of bareScopeGatedLanguage.
+func (s goSymbolScope) bareScopeGated() bool { return bareScopeGatedLanguage(s.language) }
+
+// bareScopeKey identifies the scope a bare spelling may reach from or into: the
+// Go package for Go, the file for C and C++, and goPackageScopeUnknown for
+// every language this rule does not govern.
+func bareScopeKey(language, filePath, qualifiedName string) string {
+	switch {
+	case language == "go":
+		return goPackageScopeKey(filePath, qualifiedName)
+	case bareNameScopeAllKinds(language):
+		if filePath == "" {
+			return goPackageScopeUnknown
+		}
+		return cppFileScopePrefix + filePath
+	default:
+		return goPackageScopeUnknown
+	}
+}
+
+// bareScopeNameable reports whether a bare spelling could name this symbol at
+// all from inside its own scope. Go answers "only a package-level declaration";
+// C and C++ answer "any declaration in the file", because an unqualified call
+// inside a member function reaches its own class's members and CodeGraph models
+// no enclosing-class fact to narrow it with.
+func bareScopeNameable(language, qualifiedName, name string) bool {
+	if bareNameScopeAllKinds(language) {
+		return name != ""
+	}
+	return goPackageLevelDeclaration(qualifiedName, name)
+}
+
+// sqlBareScopeKey renders bareScopeKey. TestBareScopeKeySQLMatchesGoTwin pins
+// the two against each other.
+func sqlBareScopeKey(pathExpr, qnameExpr, langExpr string) string {
+	return `(CASE
+		WHEN ` + langExpr + ` = 'go' THEN ` + sqlGoPackageScopeKey(pathExpr, qnameExpr) + `
+		WHEN ` + langExpr + ` IN ` + bareNameScopeAllKindsSQL + ` THEN
+			(CASE WHEN ` + pathExpr + ` = '' THEN '' ELSE '` + cppFileScopePrefix + `' || ` + pathExpr + ` END)
+		ELSE '' END)`
+}
+
 // goPackageLevelDeclaration reports whether a symbol is declared at package
 // level, which is the only thing a bare Go call can name. A method's qualified
 // name carries its receiver between the package and the name, so it fails this
@@ -159,15 +229,13 @@ type goSymbolScope struct {
 	// (resolver_type_scope.go). A second query for one column would cost more
 	// than the column.
 	kind string
-	// key is the symbol's package scope, or goPackageScopeUnknown. It is only
-	// meaningful when language is `go`.
+	// key is the symbol's bare-name scope (bareScopeKey), or
+	// goPackageScopeUnknown. It is the Go package for a Go symbol and the file
+	// for a C/C++ one; every other language has no such scope.
 	key string
 	// packageLevel reports whether a bare call could name this symbol at all.
 	packageLevel bool
 }
-
-// isGo reports whether the P22.6 Go package rule governs this symbol.
-func (s goSymbolScope) isGo() bool { return s.language == "go" }
 
 // -- SQL twins -------------------------------------------------------------
 //
@@ -226,13 +294,14 @@ func sqlGoPackageLevelDeclaration(alias string) string {
 // It requires the surrounding statement to expose the edge's source symbol as
 // `src` and that symbol's file as `srcf`.
 func sqlGoBareSourceScope(n int) string {
+	gated := `src.language <> 'go' AND src.language NOT IN ` + bareNameScopeAllKindsSQL
 	if n == 0 {
-		// No Go destination scope to match: Go sources contribute nothing, but
-		// the leg still serves every other language.
-		return `src.language <> 'go'`
+		// No scoped destination to match: Go and C/C++ sources contribute
+		// nothing, but the leg still serves every other language.
+		return `(` + gated + `)`
 	}
-	return `(src.language <> 'go' OR ` +
-		sqlGoPackageScopeKey("srcf.path", "src.qualified_name") +
+	return `((` + gated + `) OR ` +
+		sqlBareScopeKey("srcf.path", "src.qualified_name", "src.language") +
 		` IN (` + strings.TrimRight(strings.Repeat("?,", n), ",") + `))`
 }
 
@@ -519,17 +588,17 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 		out[key] = goSymbolScope{
 			language:     language,
 			kind:         kind,
-			key:          goPackageScopeKey(filePath, qualifiedName),
-			packageLevel: goPackageLevelDeclaration(qualifiedName, name),
+			key:          bareScopeKey(language, filePath, qualifiedName),
+			packageLevel: bareScopeNameable(language, qualifiedName, name),
 		}
 	}
 	return rows.Err()
 }
 
-// goBareTargetScopes returns the Go package scopes from which a bare call could
-// name one of the given symbols: the scopes of the package-level Go symbols
-// among them. Non-Go targets and Go methods contribute nothing, because no bare
-// Go spelling names them.
+// goBareTargetScopes returns the scopes from which a bare call could name one
+// of the given symbols: the Go package of each package-level Go symbol, and the
+// file of each C/C++ symbol. A target in an ungated language contributes
+// nothing, and neither does a Go method, because no bare Go spelling names it.
 //
 // The result is sorted so statement text and bound arguments are a function of
 // the input, never of map iteration.
@@ -537,7 +606,7 @@ func goBareTargetScopes(scopes map[int64]goSymbolScope) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(scopes))
 	for _, scope := range scopes {
-		if !scope.isGo() || !scope.packageLevel || scope.key == goPackageScopeUnknown {
+		if !scope.bareScopeGated() || !scope.packageLevel || scope.key == goPackageScopeUnknown {
 			continue
 		}
 		if _, ok := seen[scope.key]; ok {
@@ -587,17 +656,18 @@ func (s *Store) contextSeedScopes(ctx context.Context, repoID int64, seeds []Con
 }
 
 // goBareTargetSeedScope answers, for a seed used as a CALL TARGET and a
-// spelling that might name it, whether the P22.6 rule governs the pair and if
-// so which package scope the writer must be in.
+// spelling that might name it, whether a bare-name scope rule governs the pair
+// -- P22.6's for Go, P22.13's for C and C++ -- and if so which scope the writer
+// must be in: the seed's package, or the seed's file.
 //
-// gated is false for a non-Go seed or a qualifier-bearing spelling: the caller
-// keeps whatever evidence it had. gated is true and ok is false when the rule
-// applies but the seed cannot be named by a bare call at all -- an unprovable
-// package, or a method, which Go spells through a receiver. Then the evidence
-// is dropped rather than widened.
+// gated is false for a seed in an ungated language or a qualifier-bearing
+// spelling: the caller keeps whatever evidence it had. gated is true and ok is
+// false when the rule applies but the seed cannot be named by a bare call at
+// all -- an unprovable package, or a method, which Go spells through a
+// receiver. Then the evidence is dropped rather than widened.
 func goBareTargetSeedScope(scopes map[int]goSymbolScope, idx int, name string) (scope string, gated, ok bool) {
 	seed := scopes[idx]
-	if !seed.isGo() || !goBareCallName(name) {
+	if !seed.bareScopeGated() || !goBareCallName(name) {
 		return "", false, false
 	}
 	if !seed.packageLevel || seed.key == goPackageScopeUnknown {
@@ -607,12 +677,13 @@ func goBareTargetSeedScope(scopes map[int]goSymbolScope, idx int, name string) (
 }
 
 // goBareSourceSeedScope is the callee-direction twin: the seed is the symbol
-// that WROTE the spelling, so only its package matters. Whether the writer is
+// that WROTE the spelling, so only its own scope matters. Whether the writer is
 // itself package-level or a method is irrelevant -- a method body writes bare
-// calls into its own package just as a function does.
+// calls into its own package (or its own translation unit) just as a function
+// does.
 func goBareSourceSeedScope(scopes map[int]goSymbolScope, idx int, name string) (scope string, gated, ok bool) {
 	seed := scopes[idx]
-	if !seed.isGo() || !goBareCallName(name) {
+	if !seed.bareScopeGated() || !goBareCallName(name) {
 		return "", false, false
 	}
 	if seed.key == goPackageScopeUnknown {
@@ -653,7 +724,7 @@ func (s *Store) splitGoBareCalleeNames(ctx context.Context, repoID int64, srcIDs
 	for src, names := range namesBySrc {
 		scope := srcScopes[src]
 		for _, name := range names {
-			if goBareCallName(name) && scope.isGo() {
+			if goBareCallName(name) && scope.bareScopeGated() {
 				if scope.key == goPackageScopeUnknown {
 					// A Go writer with no provable package contributes nothing.
 					// Another writer of the same name still contributes through
@@ -726,14 +797,16 @@ func (s *Store) splitGoBareCalleeNames(ctx context.Context, repoID int64, srcIDs
 	return unscoped, ids, nil
 }
 
-// goPackageScopedSymbolIDs resolves bare Go call names inside a fixed set of
-// package scopes: the only lookup a bare Go spelling is entitled to.
+// goPackageScopedSymbolIDs resolves bare call names inside a fixed set of
+// scopes: the only lookup a bare spelling is entitled to. The scope is the Go
+// package for Go and the file for C and C++ (bareScopeKey), so one function
+// serves both rules and neither can gain a scope the other forgot.
 //
 // Result is keyed by scope key then by name, so a caller holding several seeds
-// in several packages never merges one package's answer into another's.
-// Ambiguity inside one package is left to the caller (the resolver refuses it;
+// in several scopes never merges one scope's answer into another's.
+// Ambiguity inside one scope is left to the caller (the resolver refuses it;
 // the query surfaces keep the pre-existing "name evidence lists everything it
-// matched" behaviour, now confined to the calling package).
+// matched" behaviour, now confined to the calling scope).
 func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int64, scopeKeys, names []string) (map[string]map[string][]int64, error) {
 	out := map[string]map[string][]int64{}
 	if len(scopeKeys) == 0 || len(names) == 0 {
@@ -761,10 +834,10 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 		// (idx_symbols_repo_name), and a package holds few symbols of any one
 		// name, so this reads a handful of rows per name.
 		rows, err := q.QueryContext(ctx, `
-			SELECT s.id, s.name, s.qualified_name, f.path
+			SELECT s.id, s.name, s.qualified_name, s.language, f.path
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
-			WHERE s.repo_id = ? AND s.language = 'go'
+			WHERE s.repo_id = ? AND (s.language = 'go' OR s.language IN `+bareNameScopeAllKindsSQL+`)
 			  AND s.name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
 			ORDER BY s.id ASC
 		`, args...)
@@ -773,15 +846,15 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 		}
 		for rows.Next() {
 			var id int64
-			var name, qualifiedName, filePath string
-			if err := rows.Scan(&id, &name, &qualifiedName, &filePath); err != nil {
+			var name, qualifiedName, language, filePath string
+			if err := rows.Scan(&id, &name, &qualifiedName, &language, &filePath); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			if !goPackageLevelDeclaration(qualifiedName, name) {
+			if !bareScopeNameable(language, qualifiedName, name) {
 				continue
 			}
-			key := goPackageScopeKey(filePath, qualifiedName)
+			key := bareScopeKey(language, filePath, qualifiedName)
 			if _, ok := scopeSet[key]; !ok {
 				continue
 			}

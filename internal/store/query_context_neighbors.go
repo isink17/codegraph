@@ -173,23 +173,27 @@ type idPair struct {
 	id  int64
 }
 
-// namePair is a (seed index, destination name) association carrying the P22.6
-// evidence policy for that spelling.
+// namePair is a (seed index, destination name) association carrying the
+// bare-name scope policy for that spelling: P22.6's for Go, P22.13's for C and
+// C++.
 //
 // Three states, matching sqlGoBareSourceScope exactly so the batched pipeline
 // and the public FindCallers answer the same question:
 //
 //	gated == false            any writer may spell this name (every
-//	                          qualifier-bearing spelling, and every non-Go seed)
-//	gated, scope == ""        no bare Go call can name this seed at all -- it is
-//	                          a method, or its package is unprovable -- so only
-//	                          non-Go writers count
-//	gated, scope == key       non-Go writers count, and so do Go writers in the
-//	                          seed's own package
+//	                          qualifier-bearing spelling, and every seed in a
+//	                          language no scope rule governs)
+//	gated, scope == ""        no bare call can name this seed at all -- a Go
+//	                          method, or an unprovable Go package, or a C/C++
+//	                          symbol with no file path -- so only writers in
+//	                          other languages count
+//	gated, scope == key       writers in other languages count, and so do
+//	                          same-language writers inside the seed's own scope:
+//	                          its Go package, or its C/C++ file (bareScopeKey)
 //
 // The middle state is why a bool is needed rather than an empty-string
-// sentinel: "unnameable by Go" and "ungated" are different answers, and
-// collapsing them would drop every non-Go caller of a Go method seed.
+// sentinel: "unnameable by a bare call" and "ungated" are different answers,
+// and collapsing them would drop every non-Go caller of a Go method seed.
 //
 // `language` is the seed's own persisted language (P22.7) and gates the leg
 // independently of `gated`: a spelling written in another language does not
@@ -224,7 +228,17 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 		// blocksBareNameTypeClaim tests the spelling, so a dotted qualified name
 		// and every ungated language are untouched.
 		if sd.QualifiedName != "" && !seedScopes[i].blocksBareNameTypeClaim(sd.QualifiedName) {
-			names = append(names, namePair{idx: i, name: sd.QualifiedName, language: language})
+			// The scope rules are applied to this leg as well, not only to the
+			// short one below. A top-level C++ type HAS a bare qualified_name
+			// (`Message`, `Color`), so for exactly the seeds those rules exist
+			// for this is the only leg that runs, and leaving it ungated let a
+			// refused relation back in through context_for_task. A
+			// qualifier-bearing spelling is ungated by goBareTargetSeedScope
+			// itself, so every Go seed and every dotted identity is untouched.
+			scope, gated, ok := goBareTargetSeedScope(seedScopes, i, sd.QualifiedName)
+			if !gated || ok {
+				names = append(names, namePair{idx: i, name: sd.QualifiedName, language: language, gated: gated, scope: scope})
+			}
 		}
 		if !sd.AllowShortEvidence || sd.ShortName == "" {
 			continue
@@ -541,17 +555,20 @@ func callerCandidateSQL(legs candidateLegs) (string, int) {
 		// also the only case the leading disjunct short-circuits, so the EXISTS
 		// is the normal path, not a rare one.
 		//
-		// nm.gated is 1 only for a bare spelling against a Go seed (see
-		// goBareTargetSeedScope), which implies nm.lang = 'go'; the extra
-		// requirement is then P22.6's, that the writer live in the seed's own
-		// package. There is deliberately no `src.language <> 'go'` escape any
-		// more: before P22.7 that disjunct let non-Go writers through, and
-		// P22.7's whole point is that they were never really callers. A gated
-		// leg with an empty scope can match nobody at all and is not emitted
-		// (expandContextCallers).
+		// nm.gated is 1 only for a bare spelling against a scope-gated seed (see
+		// goBareTargetSeedScope): a Go one, where the extra requirement is
+		// P22.6's -- the writer lives in the seed's own package -- or a C/C++
+		// one, where P22.13's is that the writer lives in the seed's own file.
+		// nm.lang is the seed's language in both cases, and the key expression
+		// is bareScopeKey, so the two rules cannot be given different keys here
+		// than the resolver and FindCallers give them. There is deliberately no
+		// `src.language <> 'go'` escape any more: before P22.7 that disjunct let
+		// non-Go writers through, and P22.7's whole point is that they were
+		// never really callers. A gated leg with an empty scope can match nobody
+		// at all and is not emitted (expandContextCallers).
 		//
 		// `files` is joined inside the innermost EXISTS rather than beside
-		// `symbols`, so only the gated branch pays for it: the package key is
+		// `symbols`, so only the gated branch pays for it: the scope key is
 		// the one thing that needs the writer's path.
 		branches = append(branches, `SELECT nm.idx, e.src_symbol_id
 			FROM nm CROSS JOIN edges e ON e.dst_name = nm.dname
@@ -564,7 +581,7 @@ func callerCandidateSQL(legs candidateLegs) (string, int) {
 			               OR (nm.scope <> '' AND EXISTS (
 			                     SELECT 1 FROM files srcf
 			                     WHERE srcf.id = src.file_id
-			                       AND `+sqlGoPackageScopeKey("srcf.path", "src.qualified_name")+` = nm.scope)))))`)
+			                       AND `+sqlBareScopeKey("srcf.path", "src.qualified_name", "src.language")+` = nm.scope)))))`)
 		repoArgs++
 	}
 	return strings.Join(branches, " UNION "), repoArgs

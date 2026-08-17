@@ -4782,7 +4782,7 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 			// bare dst_name can equal a symbol's qualified_name as easily as its
 			// name. The binder's goBareCallName guard is what keeps qualifier-
 			// bearing spellings out, mirroring sqlNotBareName on the SQL side.
-			if isTypeSymbolKind(kind) {
+			if bareNameScopeCoversKind(language, kind) {
 				out.typeSymbolFiles[id] = fileID
 			}
 		}

@@ -332,6 +332,16 @@ func TestBareNameBindableKindsMatchSQLList(t *testing.T) {
 func TestBareNameLevelSoleContainerBearingNonCallableIsRepoWideOnly(t *testing.T) {
 	build := func(t *testing.T) (*parityFixture, int64) {
 		f := newParityFixture(t, "")
+		// A converged repository, which is what an incremental entrypoint always
+		// runs against in production: a first index marks the one-time repairs
+		// (RepoHasExistingGraph / MarkResolverBindingsRepaired). Without this the
+		// paths+names entrypoint would pay the P22.13 type-scope repair, which
+		// re-resolves repo-wide and would answer with the FULL pipeline's binding
+		// rather than the binder's -- measuring the repair, not the divergence
+		// this test exists to pin.
+		if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+			t.Fatalf("MarkResolverBindingsRepaired: %v", err)
+		}
 		defs := f.file(t, "app/models.py", "python")
 		f.symbolIn(t, defs, "helper", "Base.helper", "value", "Base", "python")
 		callerFile := f.file(t, "app/main.py", "python")

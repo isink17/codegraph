@@ -219,3 +219,99 @@ func TestResolverRepairsShareOneList(t *testing.T) {
 		}
 	}
 }
+
+// Upgrade coverage for P22.13 (resolver_type_scope.go).
+//
+// A database written before the bare-name scope rule covered C and C++
+// CALLABLES keeps every such binding: the type-scope repair's marker is already
+// set, so only the new marker makes the widened rule run once. Without it an
+// upgraded repository keeps asserting a relationship its own resolver refuses.
+func TestUpgradeRepairClearsOutOfScopeCppCallableBinding(t *testing.T) {
+	f := newParityFixture(t, "")
+	targetFile := f.file(t, "lib/other.h", "cpp")
+	targetID := f.symbol(t, targetFile, "lonely", "other::lonely", "function", "cpp")
+	callerFile := f.file(t, "app/caller.cpp", "cpp")
+	caller := f.symbol(t, callerFile, "caller", "caller::caller", "function", "cpp")
+	edge := f.edge(t, callerFile, caller, "lonely")
+	// Exactly what an older binary wrote: repository-global uniqueness of the
+	// spelling, with no include connecting the two files.
+	f.setBinding(t, edge, targetID, ResolutionStrategyExactName, ResolutionConfidenceHigh)
+
+	// The upgrade this test is about: the P22.12 bare-name repair is already
+	// marked done on such a database, so only the bumped type-scope key can make
+	// anything run. Marking it here is what stops that repair's repo-wide
+	// re-resolve from masking the one under test.
+	if err := f.store.markRepairDone(f.ctx, bareNameLevelRepair.key, f.repoID); err != nil {
+		t.Fatalf("markRepairDone(%s): %v", bareNameLevelRepair.key, err)
+	}
+
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatalf("RepairResolverBindingsOnce: %v", err)
+	}
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("after repair: want unresolved, got %s", got)
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatalf("second RepairResolverBindingsOnce: %v", err)
+	}
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("after second repair: want unresolved, got %s", got)
+	}
+}
+
+// A FIRST index pays for none of it: MarkResolverBindingsRepaired must cover
+// every repair in the list, so adding one cannot silently make every freshly
+// indexed repository re-resolve on its second scan.
+func TestMarkResolverBindingsRepairedCoversEveryRepair(t *testing.T) {
+	f := newParityFixture(t, "")
+	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+		t.Fatalf("MarkResolverBindingsRepaired: %v", err)
+	}
+	for _, repair := range resolverRepairs {
+		ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, repair)
+		if err != nil {
+			t.Fatalf("runResolverRepairOnce(%s): %v", repair.key, err)
+		}
+		if ran {
+			t.Fatalf("repair %s ran on a repository already marked repaired", repair.key)
+		}
+	}
+}
+
+// The other direction, and the one clearing alone cannot answer: P22.13 also
+// WIDENED the rule. A quoted single-segment `#include "foo.h"` used to resolve
+// to the module path `foo/h` and grant no import scope, so an older binary left
+// this edge unresolved. An upgrade over an unchanged tree resolves nothing by
+// itself, so the repair has to re-resolve, not merely clear.
+func TestUpgradeRepairBindsEdgeTheWidenedIncludeScopeNowProves(t *testing.T) {
+	f := newParityFixture(t, "")
+	headerFile := f.file(t, "src/foo.h", "cpp")
+	f.symbol(t, headerFile, "widget", "foo::widget", "function", "cpp")
+	callerFile := f.file(t, "src/caller.cpp", "cpp")
+	f.imports(t, callerFile, "foo.h")
+	caller := f.symbol(t, callerFile, "caller", "caller::caller", "function", "cpp")
+	edge := f.edge(t, callerFile, caller, "widget")
+
+	// The pre-P22.13 state: the older binary could not prove the include, so the
+	// edge is unresolved and the P22.12 repair is already marked done.
+	if err := f.store.markRepairDone(f.ctx, bareNameLevelRepair.key, f.repoID); err != nil {
+		t.Fatalf("markRepairDone(%s): %v", bareNameLevelRepair.key, err)
+	}
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("precondition: want the edge unresolved, got %s", got)
+	}
+
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatalf("RepairResolverBindingsOnce: %v", err)
+	}
+	if got, want := f.binding(t, edge), "foo::widget|exact_name|high"; got != want {
+		t.Fatalf("after repair: got %q, want %q", got, want)
+	}
+	// Idempotent, and the marker means the second call does nothing.
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatalf("second RepairResolverBindingsOnce: %v", err)
+	}
+	if got, want := f.binding(t, edge), "foo::widget|exact_name|high"; got != want {
+		t.Fatalf("after second repair: got %q, want %q", got, want)
+	}
+}
