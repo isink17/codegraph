@@ -188,19 +188,22 @@ const (
 // resolverBindableCandidateSQL is what a repo-wide strategy must satisfy to
 // write a destination at all: the P2 language gate, the requirement that the
 // candidate group actually holds an id this caller kind may bind (P7), the
-// P22.6 Go bare-name package-scope rule, and the P22.9 bare-name type-target
-// scope rule. The exact-qualified strategy carries this without the veto below.
+// P22.6 Go bare-name package-scope rule, the P22.9 bare-name type-target
+// scope rule, and the P22.15 rule that a bare C/C++ call may not claim a class
+// member without class evidence. The exact-qualified strategy carries this
+// without the veto below.
 //
-// The two scope rules sit here rather than beside the own-module veto because
+// The three scope rules sit here rather than beside the own-module veto because
 // they are properties of the *chosen candidate*, not of the edge alone: a
-// strategy that reaches a foreign-package candidate for a bare Go call, or a
-// class the calling file neither declares nor imports for any bare call, must
-// bind nothing, whichever strategy it is. See go_package_scope.go and
-// resolver_type_scope.go.
+// strategy that reaches a foreign-package candidate for a bare Go call, a class
+// the calling file neither declares nor imports for any bare call, or another
+// class's member for a bare C/C++ call, must bind nothing, whichever strategy
+// it is. See go_package_scope.go, resolver_type_scope.go and cpp_class_scope.go.
 var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
 		AND (` + resolverChosenCandidateSQL + `) IS NOT NULL
 		AND ` + resolverGoBareScopeSQL + `
-		AND ` + resolverBareNameTypeScopeSQL
+		AND ` + resolverBareNameTypeScopeSQL + `
+		AND ` + resolverCppBareMemberScopeSQL
 
 // resolverBindGateSQL is what every repo-wide strategy's UPDATE must
 // satisfy before it may write a destination: the P2 language gate, the P7

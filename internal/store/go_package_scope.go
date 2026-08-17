@@ -185,8 +185,15 @@ func bareScopeKey(language, filePath, qualifiedName string) string {
 // bareScopeNameable reports whether a bare spelling could name this symbol at
 // all from inside its own scope. Go answers "only a package-level declaration";
 // C and C++ answer "any declaration in the file", because an unqualified call
-// inside a member function reaches its own class's members and CodeGraph models
-// no enclosing-class fact to narrow it with.
+// inside a member function reaches its own class's members as well as the
+// translation unit's free functions.
+//
+// It stays a FILE answer on purpose. The class half is a separate question --
+// which class the WRITER is in -- and it is answered by cppClassScope
+// (cpp_class_scope.go) at the two places that hold the writer: the resolver, and
+// a name-evidence leg that refuses the claim outright. Folding the class into
+// this predicate would refuse a member's call to a file-local free function,
+// which is the P22.13 recall this rule exists to keep.
 func bareScopeNameable(language, qualifiedName, name string) bool {
 	if bareNameScopeAllKinds(language) {
 		return name != ""
@@ -235,6 +242,18 @@ type goSymbolScope struct {
 	key string
 	// packageLevel reports whether a bare call could name this symbol at all.
 	packageLevel bool
+	// classScope is the C/C++ class this symbol is a member of, or "" when it is
+	// not a class member (sqlCppClassScope). It is what makes the P22.15 rule
+	// answerable on a name-evidence leg: a bare spelling that reaches a class
+	// member is a claim about the WRITER's class, which no name leg can prove, so
+	// the leg is refused rather than widened. Empty for every other language.
+	classScope string
+}
+
+// cppClassMember reports whether a bare name-evidence leg would claim a C/C++
+// class member through this symbol.
+func (s goSymbolScope) cppClassMember() bool {
+	return bareNameScopeAllKinds(s.language) && s.classScope != ""
 }
 
 // -- SQL twins -------------------------------------------------------------
@@ -516,7 +535,8 @@ func symbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, ids 
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
-			SELECT s.id, s.language, s.kind, s.qualified_name, s.name, f.path
+			SELECT s.id, s.language, s.kind, s.qualified_name, s.name, f.path,
+			       `+sqlCppClassScopeIfCpp("s")+`
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ?
@@ -565,7 +585,8 @@ func goSymbolScopesByEdgeSource(ctx context.Context, q queryContexter, repoID in
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
-			SELECT e.id, s.language, s.kind, s.qualified_name, s.name, f.path
+			SELECT e.id, s.language, s.kind, s.qualified_name, s.name, f.path,
+			       `+sqlCppClassScopeIfCpp("s")+`
 			FROM edges e
 			JOIN symbols s ON s.id = e.src_symbol_id
 			JOIN files f ON f.id = s.file_id
@@ -586,8 +607,8 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 	defer rows.Close()
 	for rows.Next() {
 		var key int64
-		var language, kind, qualifiedName, name, filePath string
-		if err := rows.Scan(&key, &language, &kind, &qualifiedName, &name, &filePath); err != nil {
+		var language, kind, qualifiedName, name, filePath, classScope string
+		if err := rows.Scan(&key, &language, &kind, &qualifiedName, &name, &filePath, &classScope); err != nil {
 			return err
 		}
 		out[key] = goSymbolScope{
@@ -595,6 +616,7 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 			kind:         kind,
 			key:          bareScopeKey(language, filePath, qualifiedName),
 			packageLevel: bareScopeNameable(language, qualifiedName, name),
+			classScope:   classScope,
 		}
 	}
 	return rows.Err()
@@ -605,6 +627,14 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 // file of each C/C++ symbol. A target in an ungated language contributes
 // nothing, and neither does a Go method, because no bare Go spelling names it.
 //
+// A C/C++ CLASS MEMBER contributes nothing either (P22.15): the file is not the
+// scope that decides such a call, the caller's class is, and a name-evidence leg
+// carries no class fact -- so the target is dropped rather than answered from
+// file evidence it does not have. When every matched target is one, the caller
+// renders sqlGoBareSourceScope(0), which refuses the leg for C/C++ writers; that
+// is the same population the resolver refused, and a relationship the class rule
+// DOES admit was bound and is answered through the id leg instead.
+//
 // The result is sorted so statement text and bound arguments are a function of
 // the input, never of map iteration.
 func goBareTargetScopes(scopes map[int64]goSymbolScope) []string {
@@ -612,6 +642,9 @@ func goBareTargetScopes(scopes map[int64]goSymbolScope) []string {
 	out := make([]string, 0, len(scopes))
 	for _, scope := range scopes {
 		if !scope.bareScopeGated() || !scope.packageLevel || scope.key == goPackageScopeUnknown {
+			continue
+		}
+		if scope.cppClassMember() {
 			continue
 		}
 		if _, ok := seen[scope.key]; ok {
@@ -676,6 +709,12 @@ func goBareTargetSeedScope(scopes map[int]goSymbolScope, idx int, name string) (
 		return "", false, false
 	}
 	if !seed.packageLevel || seed.key == goPackageScopeUnknown {
+		return "", true, false
+	}
+	if seed.cppClassMember() {
+		// P22.15: a bare spelling reaching a C/C++ class member is a claim about
+		// the writer's class, which this leg holds no fact for. Dropped, not
+		// widened to the file.
 		return "", true, false
 	}
 	return seed.key, true, true
@@ -839,7 +878,8 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 		// (idx_symbols_repo_name), and a package holds few symbols of any one
 		// name, so this reads a handful of rows per name.
 		rows, err := q.QueryContext(ctx, `
-			SELECT s.id, s.name, s.qualified_name, s.language, f.path
+			SELECT s.id, s.name, s.qualified_name, s.language, f.path,
+			       `+sqlCppClassScopeIfCpp("s")+`
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ? AND (s.language = 'go' OR s.language IN `+bareNameScopeAllKindsSQL+`)
@@ -851,12 +891,27 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 		}
 		for rows.Next() {
 			var id int64
-			var name, qualifiedName, language, filePath string
-			if err := rows.Scan(&id, &name, &qualifiedName, &language, &filePath); err != nil {
+			var name, qualifiedName, language, filePath, classScope string
+			if err := rows.Scan(&id, &name, &qualifiedName, &language, &filePath, &classScope); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
 			if !bareScopeNameable(language, qualifiedName, name) {
+				continue
+			}
+			// P22.15: the writer's file is not evidence that the writer is inside
+			// this candidate's class, so a C/C++ class member is not answerable from
+			// a bare name-evidence leg. Refused in the callee direction as well as
+			// the caller direction even though this path DOES hold the writer's own
+			// class (symbolScopesByIDs loads it): the caller direction's leg is
+			// driven by target scope keys with no writer identity in them, and one
+			// direction answering what the other refuses is a worse contract than
+			// both losing the same edges. What is lost is the same-class pair that
+			// the repository-wide bare-name ambiguity level left unresolved -- a
+			// pair the rule itself admits is BOUND, and a bound destination arrives
+			// through the id leg. Recovering the ambiguity-blocked remainder needs
+			// scope-partitioned candidate counting (P22.17.C).
+			if (goSymbolScope{language: language, classScope: classScope}).cppClassMember() {
 				continue
 			}
 			key := bareScopeKey(language, filePath, qualifiedName)
