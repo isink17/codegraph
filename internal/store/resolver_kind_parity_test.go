@@ -171,6 +171,37 @@ func TestBareNameLevelVetoIsInsertionOrderIndependent(t *testing.T) {
 	}
 }
 
+// Equivalent C++ declarations must not be selected by insertion order. The
+// semantic projection is refusal: three indistinguishable declarations do not
+// identify one definition.
+func TestCppEquivalentDeclarationsInsertionOrderIndependent(t *testing.T) {
+	for _, order := range []string{"a-first", "b-first"} {
+		t.Run(order, func(t *testing.T) {
+			f := newParityFixture(t, "")
+			a := f.file(t, "a.h", "cpp")
+			b := f.file(t, "b.h", "cpp")
+			addA := func() { f.symbolIn(t, a, "foo", "foo", "function", "", "cpp") }
+			addB := func() { f.symbolIn(t, b, "foo", "foo", "function", "", "cpp") }
+			if order == "a-first" {
+				addA()
+				addB()
+			} else {
+				addB()
+				addA()
+			}
+			definition := f.file(t, "foo.cpp", "cpp")
+			f.symbolIn(t, definition, "foo", "foo", "function", "", "cpp")
+			callerFile := f.file(t, "caller.cpp", "cpp")
+			caller := f.symbolIn(t, callerFile, "caller", "caller", "function", "", "cpp")
+			edge := f.edge(t, callerFile, caller, "foo")
+			f.resolveVia(t, "full", []string{"caller.cpp"}, []string{"foo"})
+			if got := f.binding(t, edge); got != "<unresolved>" {
+				t.Fatalf("%s: equivalent declaration order selected %s", order, got)
+			}
+		})
+	}
+}
+
 // The C++ shape the class was found on: `enum align` nested in one class and a
 // member function `align` in another. Both declare the identifier `align`, and
 // the bare spelling names neither, on any entry point.
