@@ -240,6 +240,39 @@ int use(struct S v) { return v.n + get(&v); }
 	}
 }
 
+func TestCppEnumValueInitializationIsNotACall(t *testing.T) {
+	pf := mustParseCpp(t, "enum.cpp", `enum E { A };
+void real() {}
+void caller() { E(); A(); real(); }
+`)
+	var calls []string
+	for _, edge := range pf.Edges {
+		if edge.Kind == "calls" {
+			calls = append(calls, edge.DstName)
+		}
+	}
+	if !reflect.DeepEqual(calls, []string{"real"}) {
+		t.Fatalf("enum value initialization calls = %q, want [real]", calls)
+	}
+}
+
+func TestCppConstructorDeclarationIsNotACall(t *testing.T) {
+	src := `#define API
+class API Message { public: Message(); };
+void caller() { Message(); }
+	`
+	pf := mustParseCpp(t, "constructor.cpp", src)
+	var calls []string
+	for _, edge := range pf.Edges {
+		if edge.Kind == "calls" {
+			calls = append(calls, edge.DstName)
+		}
+	}
+	if !reflect.DeepEqual(calls, []string{"Message"}) {
+		t.Fatalf("constructor declaration calls = %q, want [Message]", calls)
+	}
+}
+
 // symbolIdentity renders one emitted symbol as
 // `kind name qualified_name container_name start-end` so a fixture can pin
 // identity, ownership and range together.

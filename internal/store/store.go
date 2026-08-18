@@ -2557,6 +2557,7 @@ type edgeTarget struct {
 	// resolve instead of once per edge.
 	srcFileID int64
 	dstName   string
+	evidence  string
 }
 
 // ensureResolverAmbiguousNamesTable makes the veto table exist for the current
@@ -3977,7 +3978,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		// caller's own file id travels with it so resolveEdgeTargets can classify
 		// it against the repo's test-file set.
 		query := `
-			SELECT e.id, e.dst_name, f.language, e.file_id
+			SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
 			FROM edges e
 			JOIN files f ON f.id = e.file_id
 			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)`
@@ -3996,7 +3997,8 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			var dstName string
 			var srcLanguage string
 			var srcFileID int64
-			if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID); err != nil {
+			var evidence string
+			if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence); err != nil {
 				_ = rows.Close()
 				return stats, err
 			}
@@ -4005,6 +4007,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 				dstName:     dstName,
 				srcLanguage: srcLanguage,
 				srcFileID:   srcFileID,
+				evidence:    evidence,
 			}
 			stats.ExactHits++
 		}
@@ -4026,7 +4029,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	// batch when a declaration arrives after its caller.
 	suffixStarted := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT e.id, e.dst_name, f.language, e.file_id
+		SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
 		FROM edges e
 		JOIN files f ON f.id = e.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND (instr(e.dst_name, '.') > 0 OR instr(e.dst_name, '::') > 0)
@@ -4039,7 +4042,8 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		var dstName string
 		var srcLanguage string
 		var srcFileID int64
-		if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID); err != nil {
+		var evidence string
+		if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence); err != nil {
 			_ = rows.Close()
 			return stats, err
 		}
@@ -4058,6 +4062,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 					dstName:     dstName,
 					srcLanguage: srcLanguage,
 					srcFileID:   srcFileID,
+					evidence:    evidence,
 				}
 				stats.SuffixHits++
 			}
@@ -4247,11 +4252,41 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		outcome.resolved += n
 	}
 	remaining := targets[:0]
+	cppIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
 		if target.srcLanguage == "cpp" && (goBareCallName(target.dstName) || strings.Contains(target.dstName, "::")) {
+			cppIDs = append(cppIDs, target.edgeID)
 			continue
 		}
 		remaining = append(remaining, target)
+	}
+	if len(cppIDs) > 0 {
+		stillUnresolved := map[int64]struct{}{}
+		for _, chunk := range chunkInt64s(cppIDs, sqliteInClauseBatchSize) {
+			args := append([]any{repoID}, int64SliceToAny(chunk)...)
+			rows, err := s.db.QueryContext(ctx, `SELECT id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`, args...)
+			if err != nil {
+				return outcome, err
+			}
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					return outcome, err
+				}
+				stillUnresolved[id] = struct{}{}
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return outcome, err
+			}
+			rows.Close()
+		}
+		for _, target := range targets {
+			if _, ok := stillUnresolved[target.edgeID]; ok {
+				remaining = append(remaining, target)
+			}
+		}
 	}
 	targets = remaining
 	if len(targets) == 0 {
@@ -4266,6 +4301,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	goBareEdgeIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
 		if _, blocked := moduleVeto[target.edgeID]; blocked {
+			continue
+		}
+		if strings.HasPrefix(target.evidence, "macro_unexpanded:") {
+			outcome.unresolved++
 			continue
 		}
 		if target.srcLanguage != "go" || !goBareCallName(target.dstName) {
@@ -4402,11 +4441,11 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if err != nil {
 			return outcome, err
 		}
-		cppNamespaceTargets, err = cppNamespaceScopesByName(ctx, s.db, repoID, setToSlice(cppBareNameSet), cppMemberTargets)
+		cppNamespaceTargets, err = cppNamespaceScopesByName(ctx, s.db, repoID, setToSlice(cppBareNameSet))
 		if err != nil {
 			return outcome, err
 		}
-		cppCallerNamespaces, err = cppNamespaceScopesByEdge(ctx, s.db, repoID, cppBareEdgeIDs, cppCallerClasses)
+		cppCallerNamespaces, err = cppNamespaceScopesByEdge(ctx, s.db, repoID, cppBareEdgeIDs)
 		if err != nil {
 			return outcome, err
 		}

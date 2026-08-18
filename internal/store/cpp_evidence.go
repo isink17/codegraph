@@ -14,12 +14,13 @@ import (
 // Definitions remain separate rows so locations, duplicate definitions and
 // overloads stay observable and fail closed.
 type cppEvidenceCandidate struct {
-	id        int64
-	fileID    int64
-	kind      string
-	name      string
-	qualified string
-	signature string
+	id         int64
+	fileID     int64
+	kind       string
+	name       string
+	qualified  string
+	signature  string
+	visibility string
 }
 
 type cppEvidenceExecutor interface {
@@ -28,7 +29,7 @@ type cppEvidenceExecutor interface {
 
 func unresolvedCppEvidenceTargets(ctx context.Context, q queryContexter, repoID int64) ([]edgeTarget, error) {
 	rows, err := q.QueryContext(ctx, `
-		SELECT e.id, e.dst_name, e.file_id
+		SELECT e.id, e.dst_name, e.file_id, e.evidence
 		FROM edges e JOIN files f ON f.id = e.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND f.language = 'cpp'`, repoID)
 	if err != nil {
@@ -38,7 +39,7 @@ func unresolvedCppEvidenceTargets(ctx context.Context, q queryContexter, repoID 
 	var out []edgeTarget
 	for rows.Next() {
 		var target edgeTarget
-		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID); err != nil {
+		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID, &target.evidence); err != nil {
 			return nil, err
 		}
 		target.srcLanguage = "cpp"
@@ -68,11 +69,12 @@ func (s *Store) resolveCppEvidenceEdges(ctx context.Context, repoID int64, targe
 
 func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cppEvidenceExecutor, repoID int64, targets []edgeTarget) (int, error) {
 	cppTargets := make([]edgeTarget, 0, len(targets))
-	bareTargets := make([]edgeTarget, 0, len(targets))
 	nameSet := map[string]struct{}{}
-	bareNameSet := map[string]struct{}{}
-	bareEdgeIDs := make([]int64, 0, len(targets))
+	edgeIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
+		if strings.HasPrefix(target.evidence, "macro_unexpanded:") {
+			continue
+		}
 		if target.srcLanguage != "cpp" || !goBareCallName(target.dstName) && !strings.Contains(target.dstName, "::") {
 			continue
 		}
@@ -80,11 +82,8 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		nameSet[target.dstName] = struct{}{}
 		if strings.HasPrefix(target.dstName, "::") {
 			nameSet[strings.TrimPrefix(target.dstName, "::")] = struct{}{}
-		} else if !strings.Contains(target.dstName, "::") {
-			bareTargets = append(bareTargets, target)
-			bareNameSet[target.dstName] = struct{}{}
-			bareEdgeIDs = append(bareEdgeIDs, target.edgeID)
 		}
+		edgeIDs = append(edgeIDs, target.edgeID)
 	}
 	if len(cppTargets) == 0 {
 		return 0, nil
@@ -111,7 +110,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		args[i+1+len(names)] = name
 	}
 	rows, err := q.QueryContext(ctx, `
-		SELECT id, file_id, kind, name, qualified_name, signature
+		SELECT id, file_id, kind, name, qualified_name, signature, visibility
 		FROM symbols
 		WHERE repo_id = ? AND language = 'cpp'
 		  AND (name IN (`+placeholders+`) OR qualified_name IN (`+placeholders+`))`, args...)
@@ -122,7 +121,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 	declarations := map[string][]int64{}
 	for rows.Next() {
 		var c cppEvidenceCandidate
-		if err := rows.Scan(&c.id, &c.fileID, &c.kind, &c.name, &c.qualified, &c.signature); err != nil {
+		if err := rows.Scan(&c.id, &c.fileID, &c.kind, &c.name, &c.qualified, &c.signature, &c.visibility); err != nil {
 			return 0, err
 		}
 		if c.kind == "declaration" {
@@ -159,7 +158,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 			qualifiedArgs = append(qualifiedArgs, qualified)
 		}
 		rows, err := q.QueryContext(ctx, `
-			SELECT id, file_id, kind, name, qualified_name, signature
+			SELECT id, file_id, kind, name, qualified_name, signature, visibility
 			FROM symbols
 			WHERE repo_id = ? AND language = 'cpp' AND qualified_name IN (`+qualifiedPlaceholders+`)`, qualifiedArgs...)
 		if err != nil {
@@ -171,7 +170,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		}
 		for rows.Next() {
 			var candidate cppEvidenceCandidate
-			if err := rows.Scan(&candidate.id, &candidate.fileID, &candidate.kind, &candidate.name, &candidate.qualified, &candidate.signature); err != nil {
+			if err := rows.Scan(&candidate.id, &candidate.fileID, &candidate.kind, &candidate.name, &candidate.qualified, &candidate.signature, &candidate.visibility); err != nil {
 				rows.Close()
 				return 0, err
 			}
@@ -191,28 +190,23 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		}
 	}
 
-	bareNames := make([]string, 0, len(bareNameSet))
-	for name := range bareNameSet {
-		bareNames = append(bareNames, name)
-	}
-	sort.Strings(bareNames)
-	classScopes, err := cppClassScopesByName(ctx, q, repoID, bareNames)
+	classScopes, err := cppClassScopesByName(ctx, q, repoID, names)
 	if err != nil {
 		return 0, err
 	}
-	namespaceScopes, err := cppNamespaceScopesByName(ctx, q, repoID, bareNames, classScopes)
+	namespaceScopes, err := cppNamespaceScopesByName(ctx, q, repoID, names)
 	if err != nil {
 		return 0, err
 	}
-	callerClasses, err := cppCallerClassScopesByEdge(ctx, q, repoID, bareEdgeIDs)
+	callerClasses, err := cppCallerClassScopesByEdge(ctx, q, repoID, edgeIDs)
 	if err != nil {
 		return 0, err
 	}
-	callerNamespaces, err := cppNamespaceScopesByEdge(ctx, q, repoID, bareEdgeIDs, callerClasses)
+	callerNamespaces, err := cppNamespaceScopesByEdge(ctx, q, repoID, edgeIDs)
 	if err != nil {
 		return 0, err
 	}
-	if err := augmentCppOutOfLineScopes(ctx, q, repoID, bareTargets, candidates, imports, classScopes, callerClasses, callerNamespaces, namespaceScopes); err != nil {
+	if err := augmentCppOutOfLineScopes(ctx, q, repoID, cppTargets, candidates, imports, classScopes, callerClasses, callerNamespaces, namespaceScopes); err != nil {
 		return 0, err
 	}
 	byName := map[string][]cppEvidenceCandidate{}
@@ -239,7 +233,29 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		if isQualified {
 			pool = byQualified[strings.TrimPrefix(edge.dstName, "::")]
 		}
+		if !isQualified {
+			hiddenFriendVisible := false
+			for _, candidate := range pool {
+				if candidate.visibility != "hidden_friend" {
+					continue
+				}
+				if candidate.fileID == edge.srcFileID {
+					hiddenFriendVisible = true
+					break
+				}
+				if _, ok := imports[edge.srcFileID][candidate.fileID]; ok {
+					hiddenFriendVisible = true
+					break
+				}
+			}
+			if hiddenFriendVisible {
+				continue
+			}
+		}
 		for _, candidate := range pool {
+			if candidate.kind == "enum" || candidate.visibility == "hidden_friend" {
+				continue
+			}
 			if _, isTest := testFiles[candidate.fileID]; isTest {
 				if _, callerIsTest := testFiles[edge.srcFileID]; !callerIsTest {
 					continue
@@ -273,6 +289,17 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 			eligible = append(eligible, candidate)
 		}
 		if len(eligible) != 1 {
+			continue
+		}
+		// A single indexed definition is not proof of a unique C++ callable:
+		// declarations may expose several overload signatures. Argument-type
+		// resolution is not modeled here, so keep only a semantically unique
+		// qualified family. Duplicate rows of one signature are harmless.
+		familySignatures := map[string]struct{}{}
+		for _, candidate := range byQualified[eligible[0].qualified] {
+			familySignatures[candidate.signature] = struct{}{}
+		}
+		if len(familySignatures) != 1 {
 			continue
 		}
 		strategy := ResolutionStrategyExactName
