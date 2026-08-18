@@ -112,3 +112,52 @@ func TestCppQualifiedDefinitionRenameReconsidersUntouchedCaller(t *testing.T) {
 		"target.h": "namespace b { void foo(); }\n", "target.cpp": "namespace b { void foo() {} }\n", "caller.cpp": caller,
 	})
 }
+
+// TestCppBareCallSameNamespaceBindsDespiteForeignNamespaceSibling pins G: a
+// candidate in another namespace is skipped, never a veto. Without it the
+// same-namespace target stops binding as soon as any visible same-spelling
+// candidate lives elsewhere, and no other fixture puts a visible
+// foreign-namespace candidate beside an eligible same-namespace one.
+//
+// The assertion reads the edge projection rather than FindCallees on purpose:
+// the query surface's same-file same-namespace name leg reports b::foo even
+// when the edge is unresolved, so a FindCallees assertion cannot see the
+// difference. The namespace body is spread over several lines because a
+// single-line `namespace b { ... }` yields no call edge from the adapter.
+func TestCppBareCallSameNamespaceBindsDespiteForeignNamespaceSibling(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("fixture.cpp", "namespace a { void foo() {} }\nnamespace b {\nvoid foo() {}\nvoid caller() { foo(); }\n}\n")
+	r.run("index")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"b::foo"}) {
+		t.Fatalf("targets = %v, want [b::foo]", got)
+	}
+}
+
+// TestCppOutOfLineClassHeaderRenameReconsidersUnchangedImplementation pins the
+// C/C++ OLD-union-NEW name reconsideration in invalidateNameEvidenceBindings.
+//
+// The declaration-deletion fixture above does not reach it: there the binding
+// is already cleared by clearOutOfScopeTypeBindings, and a rewritten target
+// file replaces its symbol rows so the delete path unbinds anyway. This rule is
+// load-bearing only when the bound target row survives untouched and its
+// eligibility changed through another file -- an out-of-line definition whose
+// class is declared in a header.
+func TestCppOutOfLineClassHeaderRenameReconsidersUnchangedImplementation(t *testing.T) {
+	implementation := "#include \"a.h\"\nvoid A::foo() {}\nvoid A::caller() { foo(); }\n"
+	r := newCppRepo(t)
+	r.write("a.h", "class A { public: void foo(); void caller(); };\n")
+	r.write("a.cpp", implementation)
+	r.run("index")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"A::foo"}) {
+		t.Fatalf("initial targets = %v, want [A::foo]", got)
+	}
+
+	r.write("a.h", "class C { public: void foo(); void caller(); };\n")
+	r.run("update")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("after header class rename targets = %v, want unresolved", got)
+	}
+	assertCppFreshParity(t, "header class rename", r, map[string]string{
+		"a.h": "class C { public: void foo(); void caller(); };\n", "a.cpp": implementation,
+	})
+}
