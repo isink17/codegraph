@@ -286,6 +286,22 @@ void caller() { a::foo(); ::global(); }
 	}
 }
 
+func TestCppLeadingGlobalQualifierRejectsNamespaceCollision(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": `
+namespace n { void Foo() {} }
+void Foo() {}
+void caller() { ::Foo(); }
+`})
+	callees, err := s.FindCallees(ctx, repo.ID, "caller", 0, 20, 0)
+	if err != nil {
+		t.Fatalf("FindCallees() error = %v", err)
+	}
+	if !hasSymbolQName(callees, "Foo") || hasSymbolQName(callees, "n::Foo") {
+		t.Fatalf("FindCallees(caller) = %+v, want only global Foo", callees)
+	}
+}
+
 func TestCppBareCallNamespaceEligibility(t *testing.T) {
 	tests := []struct {
 		name           string
