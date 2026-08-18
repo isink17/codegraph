@@ -26,6 +26,7 @@ const resolverQualifiedLookupSQL = `
 
 const resolverQualifiedLookupFilter = `
 				AND NOT (s.language = 'cpp' AND n.bare_name = 1 AND s.qualified_name NOT LIKE '%::%')
+				AND NOT (n.bare_name = 1 AND s.kind = 'enum')
 				AND (n.global_only = 0 OR (s.language = 'cpp' AND s.qualified_name NOT LIKE '%::%'))`
 
 // Resolver ambiguity determinism (P3).
@@ -135,8 +136,8 @@ func resolverBareNameKindBindable(kind string) bool {
 // `alias` is the table qualifier the surrounding query uses for `symbols`
 // (`"s."`, or empty when the columns are unqualified).
 func resolverBareNameLevelKindsSQL(alias string) string {
-	return `(` + alias + `kind IN ` + resolverBareNameKindsSQL +
-		` OR ` + alias + `container_name != '')`
+	return `(NOT (` + alias + `language = 'cpp' AND ` + alias + `visibility = 'hidden_friend') AND (` + alias + `kind IN ` + resolverBareNameKindsSQL +
+		` OR ` + alias + `container_name != ''))`
 }
 
 // Cross-strategy ambiguity veto.

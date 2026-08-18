@@ -242,8 +242,10 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 				switch friend.Type() {
 				case "function_definition":
 					cppAddFunction(friend, module, friendContainer, content, pf)
+					cppMarkHiddenFriend(pf)
 				case "function_declarator":
 					cppAddFunctionFromDeclarator(child, friend, module, friendContainer, content, pf)
+					cppMarkHiddenFriend(pf)
 				}
 			}
 		default:
@@ -313,6 +315,10 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 	qualified := cppQualifiedName(effectiveContainer, name)
 	anchor := cppDeclarationAnchor(node)
 
+	visibility := heuristicVisibility(name)
+	if cppHasAncestor(node, "friend_declaration") {
+		visibility = "hidden_friend"
+	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "cpp",
 		Kind:          "function",
@@ -320,7 +326,7 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Signature:     cppFunctionSignature(fnDecl, content),
-		Visibility:    heuristicVisibility(name),
+		Visibility:    visibility,
 		Range:         nodeRange(anchor),
 		DocSummary:    prevCommentText(anchor, content),
 		StableKey:     cppStableKey("func", module, qualified),
@@ -341,6 +347,10 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 	effectiveContainer := container
 	qualified := cppQualifiedName(effectiveContainer, name)
 
+	visibility := heuristicVisibility(name)
+	if cppHasAncestor(decl, "friend_declaration") {
+		visibility = "hidden_friend"
+	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "cpp",
 		Kind:          "declaration",
@@ -348,7 +358,7 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Signature:     cppFunctionSignature(fnDecl, content),
-		Visibility:    heuristicVisibility(name),
+		Visibility:    visibility,
 		Range:         nodeRange(anchor),
 		DocSummary:    prevCommentText(anchor, content),
 		StableKey:     cppStableKey("decl", module, qualified),
@@ -411,6 +421,9 @@ func cppAddType(node *sitter.Node, module, container, namespaceContainer, kind, 
 }
 
 func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+	enumValues := cppEnumValueNames(root, content)
+	typeAliases := cppTypeAliasNames(root, content)
+	macros := cppMacroNames(root, content)
 	for _, call := range findDescendants(root, "call_expression") {
 		fnNode := childByFieldName(call, "function")
 		if fnNode == nil {
@@ -420,9 +433,16 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if callName == "" || cppSkipFuncs[callName] {
 			continue
 		}
+		if cppCallInRecoveredDeclaration(call, content) || cppCallNamesNonCallableType(fnNode, content, pf.Symbols, enumValues, typeAliases) || cppCallInHiddenFriendScope(call, callName, content) {
+			continue
+		}
+		macroOrigin := cppCallInsideMacro(call, content, macros)
 		dstName := cppMemberDstName(receiver, callName)
 		line := int(call.StartPoint().Row) + 1
 		evidence := callKind + ":" + nodeText(fnNode, content)
+		if macroOrigin {
+			evidence = "macro_unexpanded:" + evidence
+		}
 		if receiver != "" {
 			evidence = callKind + ":" + receiver + ":" + nodeText(fnNode, content)
 		}
@@ -440,6 +460,134 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+func cppCallInHiddenFriendScope(call *sitter.Node, name string, content []byte) bool {
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		if node.Type() != "class_specifier" && node.Type() != "struct_specifier" {
+			continue
+		}
+		text := nodeText(node, content)
+		return strings.Contains(text, "friend") && strings.Contains(text, name)
+	}
+	return false
+}
+
+func cppMarkHiddenFriend(pf *graph.ParsedFile) {
+	if len(pf.Symbols) > 0 {
+		pf.Symbols[len(pf.Symbols)-1].Visibility = "hidden_friend"
+	}
+}
+
+// cppCallInRecoveredDeclaration rejects call_expression nodes that tree-sitter
+// recovers from a declaration-shaped class body (notably `Message();` behind a
+// declaration macro). A real function body has a body field; the recovery node
+// does not, so this remains syntax-based and does not guess from symbol names.
+func cppCallInRecoveredDeclaration(call *sitter.Node, content []byte) bool {
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		if node.Type() == "field_declaration" || node.Type() == "declaration" {
+			return true
+		}
+		if node.Type() == "labeled_statement" {
+			label := childByFieldName(node, "label")
+			if label != nil {
+				switch strings.TrimSpace(nodeText(label, content)) {
+				case "public", "private", "protected":
+					return true
+				}
+			}
+		}
+		if node.Type() == "function_definition" {
+			return childByFieldName(node, "body") == nil
+		}
+	}
+	return false
+}
+
+func cppCallNamesNonCallableType(fnNode *sitter.Node, content []byte, symbols []graph.Symbol, enumValues, typeAliases map[string]struct{}) bool {
+	if fnNode.Type() != "identifier" {
+		return false
+	}
+	name := strings.TrimSpace(nodeText(fnNode, content))
+	if name == "" {
+		return false
+	}
+	for _, symbol := range symbols {
+		if symbol.Name == name && symbol.Kind == "enum" {
+			return true
+		}
+	}
+	_, ok := enumValues[name]
+	if ok {
+		return true
+	}
+	_, ok = typeAliases[name]
+	return ok
+}
+
+func cppHasAncestor(node *sitter.Node, typ string) bool {
+	for node != nil {
+		if node.Type() == typ {
+			return true
+		}
+		node = node.Parent()
+	}
+	return false
+}
+
+func cppEnumValueNames(root *sitter.Node, content []byte) map[string]struct{} {
+	values := map[string]struct{}{}
+	for _, enumerator := range findDescendants(root, "enumerator") {
+		name := childByFieldName(enumerator, "name")
+		if name != nil {
+			values[strings.TrimSpace(nodeText(name, content))] = struct{}{}
+		}
+	}
+	return values
+}
+
+func cppTypeAliasNames(root *sitter.Node, content []byte) map[string]struct{} {
+	aliases := map[string]struct{}{}
+	for _, node := range findDescendants(root, "alias_declaration") {
+		name := childByFieldName(node, "name")
+		if name != nil {
+			aliases[strings.TrimSpace(nodeText(name, content))] = struct{}{}
+		}
+	}
+	return aliases
+}
+
+func cppMacroNames(root *sitter.Node, content []byte) map[string]struct{} {
+	macros := map[string]struct{}{}
+	nodes := append(findDescendants(root, "preproc_def"), findDescendants(root, "preproc_function_def")...)
+	for _, node := range nodes {
+		text := strings.TrimSpace(nodeText(node, content))
+		fields := strings.Fields(strings.TrimPrefix(text, "#define"))
+		if len(fields) == 0 {
+			continue
+		}
+		name := strings.TrimSpace(strings.SplitN(fields[0], "(", 2)[0])
+		if name != "" {
+			macros[name] = struct{}{}
+		}
+	}
+	return macros
+}
+
+func cppCallInsideMacro(call *sitter.Node, content []byte, macros map[string]struct{}) bool {
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		if node.Type() != "call_expression" {
+			continue
+		}
+		fn := childByFieldName(node, "function")
+		if fn != nil {
+			name := strings.TrimSpace(nodeText(fn, content))
+			if _, ok := macros[name]; ok || (name != "" && strings.ToUpper(name) == name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // cppMemberDstName is the persisted destination identity of a call. For an
