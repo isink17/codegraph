@@ -320,20 +320,17 @@ void caller() {
 	}
 }
 
-// TestCppBareCallIncludedPlusUnrelatedCandidate records what CodeGraph does
-// when one candidate is included and another, invisible one exists elsewhere.
-//
-// The ambiguity veto (P3) counts candidates repository-wide, before any scope
-// rule runs, so the edge is refused even though only one candidate is visible.
-// That is a RECALL limitation, not a correctness one, and closing it means a
-// scope-partitioned resolve pass of the shape resolveGoPackageScopedBareNames
-// gives Go -- recorded as a P22 finding rather than guessed at here. The
-// fixture pins today's answer so the finding cannot drift silently.
+// TestCppBareCallIncludedPlusUnrelatedCandidate proves ambiguity is evaluated
+// after C/C++ visibility: the included declaration is eligible and the other
+// repository candidate is not.
 func TestCppBareCallIncludedPlusUnrelatedCandidate(t *testing.T) {
 	r := newCppRepo(t)
-	r.write("a.h", `inline void shared() {}
+	r.write("a.h", `void shared();
 `)
-	r.write("z.h", `inline void shared() {}
+	r.write("a.cpp", `#include "a.h"
+void shared() {}
+`)
+	r.write("z.cpp", `namespace b { void shared() {} }
 `)
 	r.write("caller.cpp", `#include "a.h"
 
@@ -342,9 +339,40 @@ void caller() {
 }
 `)
 	r.run("index")
-	if got := cppTargets(r, "shared"); !equalStrings(got, []string{"<unresolved>"}) {
-		t.Fatalf("included-plus-unrelated bare call targets = %v, want [<unresolved>] "+
-			"(repo-wide ambiguity veto; see the P22 finding)", got)
+	if got, want := cppTargets(r, "shared"), []string{"shared"}; !equalStrings(got, want) {
+		t.Fatalf("included-plus-unrelated bare call targets = %v, want %v", got, want)
+	}
+}
+
+func TestCppBareCallHeaderDeclarationReachesDefinition(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("foo.h", "void foo();\n")
+	r.write("foo.cpp", "#include \"foo.h\"\nvoid foo() {}\n")
+	r.write("caller.cpp", "#include \"foo.h\"\nvoid caller() { foo(); }\n")
+	r.run("index")
+	if got, want := cppTargets(r, "foo"), []string{"foo"}; !equalStrings(got, want) {
+		t.Fatalf("header declaration targets = %v, want %v", got, want)
+	}
+}
+
+func TestCppBareCallHeaderDoesNotBridgeSameStemImplementation(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("foo.h", "void foo();\n")
+	r.write("foo.cpp", "void unrelated() {}\n")
+	r.write("caller.cpp", "#include \"foo.h\"\nvoid caller() { foo(); }\n")
+	r.run("index")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("header-only declaration incorrectly reached same-stem implementation: %v", got)
+	}
+}
+
+func TestCppBareCallHeaderClassDeclarationReachesOutOfLineDefinition(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("a.h", "class A { public: void foo(); void caller(); };\n")
+	r.write("a.cpp", "#include \"a.h\"\nvoid A::foo() {}\nvoid A::caller() { foo(); }\n")
+	r.run("index")
+	if got, want := cppTargets(r, "foo"), []string{"A::foo"}; !equalStrings(got, want) {
+		t.Fatalf("header class declaration targets = %v, want %v", got, want)
 	}
 }
 
@@ -391,9 +419,8 @@ public:
 bool Api::run() { return true; }
 bool Api::member() { return true; }
 `)
-	// `Other::run` is deliberately reachable through NO include at all: a
-	// qualifier the source itself wrote is evidence, and this rule governs bare
-	// spellings only. Widening sqlNotBareName to swallow `::` fails here.
+	// `Other::run` has no visible declaration, so qualified identity alone does
+	// not bridge translation units.
 	r.write("far.cpp", `bool Other::run() { return true; }
 `)
 	r.write("caller.cpp", `#include "api.h"
@@ -406,10 +433,11 @@ void caller(Api* p, Api& v) {
 }
 `)
 	r.run("index")
-	for _, spelling := range []string{"Api::run", "Other::run"} {
-		if got, want := cppTargets(r, spelling), []string{spelling}; !equalStrings(got, want) {
-			t.Fatalf("qualified call %q targets = %v, want %v", spelling, got, want)
-		}
+	if got, want := cppTargets(r, "Api::run"), []string{"Api::run"}; !equalStrings(got, want) {
+		t.Fatalf("qualified call Api::run targets = %v, want %v", got, want)
+	}
+	if got := cppTargets(r, "Other::run"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("qualified call without declaration targets = %v, want unresolved", got)
 	}
 	for _, spelling := range []string{"p.member", "v.member"} {
 		if got := cppTargets(r, spelling); !equalStrings(got, []string{"<unresolved>"}) {

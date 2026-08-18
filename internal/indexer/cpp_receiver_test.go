@@ -578,13 +578,13 @@ func TestCppQualifiedCallAmbiguityFailsClosed(t *testing.T) {
 		t.Fatalf("ambiguous Dup::run (other order) unresolved = %d, want 1", got)
 	}
 
-	// With one declaration the same spelling is evidence and does bind.
+	// A definition in another translation unit still needs a visible declaration.
 	unique := newCppRepo(t)
 	unique.write("one.cpp", "struct Dup { int run(); };\nint Dup::run() { return 1; }\n")
 	unique.write("call.cpp", "void call() {\n    Dup::run();\n}\n")
 	unique.run("index")
-	if got := unique.unresolved("Dup::run"); got != 0 {
-		t.Fatalf("unique Dup::run unresolved = %d, want 0", got)
+	if got := unique.unresolved("Dup::run"); got != 1 {
+		t.Fatalf("undeclared cross-TU Dup::run unresolved = %d, want 1", got)
 	}
 }
 

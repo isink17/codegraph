@@ -230,22 +230,14 @@ func TestCppBareCallKeepsFreeFunctionRecall(t *testing.T) {
 // TestCppBareCallMemberAndFreeFunctionFailsClosed is §15 and §16 together, and
 // it records a limitation rather than hiding it.
 //
-// Source-wise a free `caller()` may only reach the free `foo`, and the member is
-// not a candidate for it at all. CodeGraph refuses the call instead: the
-// repo-wide ambiguity veto and the candidate chooser both count candidates per
-// NAME over the whole repository, with no notion of the caller's class, so a
-// name claimed by both a member and a free function is undecidable at that
-// level. Partitioning the candidate set by scope is P22.17 work and is not
-// started here.
-//
-// What is load-bearing today is the direction of the failure: unresolved, never
-// the member, and never a first-row pick.
+// Source-wise a free `caller()` reaches the free `foo`; the member is not an
+// eligible candidate and must not veto it.
 func TestCppBareCallMemberAndFreeFunctionFailsClosed(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A {\n    void foo() {}\n};\nvoid foo() {}\nvoid caller() { foo(); }\n")
 	r.run("index")
 
-	wantBound(t, r.boundTargets("foo"))
+	wantBound(t, r.boundTargets("foo"), "foo")
 	if got := r.callers("A::foo"); len(got) != 0 {
 		t.Fatalf("FindCallers(A::foo) = %v, want none", got)
 	}
@@ -294,13 +286,10 @@ func TestCppBareCallClassScopeLifecycle(t *testing.T) {
 		want  []string
 	}{
 		{"a: own class only", map[string]string{"a.cpp": withFoo}, []string{"A::foo"}},
-		// b: another class declares the same name. The eligible binding must not
-		// become the ineligible one; the repo-wide bare-name ambiguity level then
-		// refuses both, which is the level documented in
-		// TestCppBareCallMemberAndFreeFunctionFailsClosed.
-		{"b: other class appears", map[string]string{"a.cpp": withFoo, "b.cpp": otherClass}, nil},
+		// b/d: an unrelated class does not veto the eligible same-class member.
+		{"b: other class appears", map[string]string{"a.cpp": withFoo, "b.cpp": otherClass}, []string{"A::foo"}},
 		{"c: own member removed", map[string]string{"a.cpp": withoutFoo, "b.cpp": otherClass}, nil},
-		{"d: own member restored", map[string]string{"a.cpp": withFoo, "b.cpp": otherClass}, nil},
+		{"d: own member restored", map[string]string{"a.cpp": withFoo, "b.cpp": otherClass}, []string{"A::foo"}},
 		{"e: other class gone", map[string]string{"a.cpp": withFoo}, []string{"A::foo"}},
 		{"f: caller moved to another class", map[string]string{"a.cpp": callerInB}, nil},
 	}

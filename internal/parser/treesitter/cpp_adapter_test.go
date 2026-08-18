@@ -315,7 +315,7 @@ void defined(T) {}
 		// The range and the doc comment anchor on the `template <...>` wrapper,
 		// because that is where the declaration -- and its documentation --
 		// actually starts in the source.
-		"function plain plain  2:1-3:15",
+		"declaration plain plain  2:1-3:15",
 		"class Box Box  5:1-8:3",
 		// Member of a templated class: the class still owns it.
 		"function run Box::run Box 7:3-7:16",
@@ -356,8 +356,8 @@ extern "C" void single();
 		}
 	}
 	want := []string{
-		"function braced braced  2:1-2:15",
-		"function single single  4:12-4:26",
+		"declaration braced braced  2:1-2:15",
+		"declaration single single  4:12-4:26",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("linkage symbols = %#v, want %#v", got, want)
@@ -395,7 +395,7 @@ void nsFn();
 		"function Cls::plain in Cls",
 		"struct Str in ",
 		"function Str::wrapped in Str",
-		"function ns::nsFn in ns",
+		"declaration ns::nsFn in ns",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("container ownership = %#v, want %#v", got, want)
@@ -425,9 +425,9 @@ func TestCppClassMemberDeclarationStaysOut(t *testing.T) {
 	for _, sym := range parseCppSymbols(t, "decl.cpp", src) {
 		got = append(got, sym.Kind+" "+sym.QualifiedName)
 	}
-	want := []string{"class Cls", "function Cls::definition"}
+	want := []string{"class Cls", "declaration Cls::wrappedDecl", "declaration Cls::plainDecl", "function Cls::definition"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("class-body symbols = %#v, want %#v (member declarations are P22.17)", got, want)
+		t.Fatalf("class-body symbols = %#v, want %#v", got, want)
 	}
 }
 
@@ -451,7 +451,7 @@ void deep(T);
 	for _, sym := range syms {
 		got = append(got, symbolIdentity(sym))
 	}
-	want := []string{"function deep ns::deep ns 5:1-6:14"}
+	want := []string{"declaration deep ns::deep ns 5:1-6:14"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("nested-wrapper symbols = %#v, want %#v", got, want)
 	}
@@ -643,10 +643,10 @@ struct S {
 		got = append(got, sym.Kind+" "+sym.QualifiedName+" in "+sym.ContainerName)
 	}
 	want := []string{
-		"function guarded in ",
-		"function ifdefed in ",
-		"function elsed in ",
-		"function externed in ",
+		"declaration guarded in ",
+		"declaration ifdefed in ",
+		"declaration elsed in ",
+		"declaration externed in ",
 		"struct S in ",
 	}
 	if !reflect.DeepEqual(got, want) {
