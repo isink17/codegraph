@@ -260,8 +260,10 @@ func TestCppNamespaceAndGlobalQualifiedCalls(t *testing.T) {
 	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": `
 namespace a { void foo() {} }
 namespace b { void bare() { foo(); } }
+namespace n { void Foo() {} }
+void Foo() {}
 void global() {}
-void caller() { a::foo(); ::global(); }
+void caller() { a::foo(); ::Foo(); ::global(); }
 `})
 	if n, err := s.CountUnresolvedEdgesByDstName(ctx, repo.ID, "a::foo"); err != nil || n != 0 {
 		t.Fatalf("a::foo unresolved = %d, err = %v", n, err)
@@ -283,6 +285,26 @@ void caller() { a::foo(); ::global(); }
 	global, err := s.FindCallers(ctx, repo.ID, "::global", 0, 20, 0)
 	if err != nil || !hasSymbolQName(global, "caller") {
 		t.Fatalf("FindCallers(::global) = %+v, err = %v", global, err)
+	}
+	callees, err = s.FindCallees(ctx, repo.ID, "caller", 0, 20, 0)
+	if err != nil || !hasSymbolQName(callees, "Foo") || hasSymbolQName(callees, "n::Foo") {
+		t.Fatalf("FindCallees(caller) global Foo = %+v, err = %v", callees, err)
+	}
+}
+
+func TestCppQualifiedNameRenameReconsidersUntouchedCaller(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("target.h", "namespace b { void foo(); }\n")
+	r.write("target.cpp", "namespace a { void foo() {} }\n")
+	r.write("caller.cpp", "#include \"target.h\"\nvoid caller() { b::foo(); }\n")
+	r.run("index")
+	if got := r.unresolved("b::foo"); got != 1 {
+		t.Fatalf("initial b::foo unresolved = %d, want 1", got)
+	}
+	r.write("target.cpp", "namespace b { void foo() {} }\n")
+	r.run("update")
+	if got := r.boundTargets("b::foo"); len(got) != 1 || got[0] != "b::foo" {
+		t.Fatalf("after namespace rename b::foo = %v, want [b::foo]", got)
 	}
 }
 

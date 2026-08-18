@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -187,10 +188,14 @@ func sqlCppNamespaceScope(alias string) string {
 // cppNamespaceScopesByName loads namespace identity for all C/C++ candidates
 // reachable by a bare spelling. The lookup is batched by indexed name/qname;
 // no edge performs its own symbol query.
-func cppNamespaceScopesByName(ctx context.Context, q queryContexter, repoID int64, names []string) (map[int64]string, error) {
+func cppNamespaceScopesByName(ctx context.Context, q queryContexter, repoID int64, names []string, classScopes map[int64]string) (map[int64]string, error) {
 	out := map[int64]string{}
 	if len(names) == 0 {
 		return out, nil
+	}
+	classNames, err := cppClassQualifiedNames(ctx, q, repoID, classScopes)
+	if err != nil {
+		return nil, err
 	}
 	sorted := append([]string(nil), names...)
 	sort.Strings(sorted)
@@ -204,7 +209,7 @@ func cppNamespaceScopesByName(ctx context.Context, q queryContexter, repoID int6
 				args = append(args, name)
 			}
 		}
-		rows, err := q.QueryContext(ctx, `SELECT s.id, `+sqlCppNamespaceScope("s")+`
+		rows, err := q.QueryContext(ctx, `SELECT s.id, s.qualified_name, s.container_name
 			FROM symbols s WHERE s.repo_id = ? AND s.language IN `+bareNameScopeAllKindsSQL+`
 			AND (s.name IN (`+placeholders+`) OR s.qualified_name IN (`+placeholders+`))`, args...)
 		if err != nil {
@@ -212,12 +217,12 @@ func cppNamespaceScopesByName(ctx context.Context, q queryContexter, repoID int6
 		}
 		for rows.Next() {
 			var id int64
-			var scope string
-			if err := rows.Scan(&id, &scope); err != nil {
+			var qualified, container string
+			if err := rows.Scan(&id, &qualified, &container); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			out[id] = scope
+			out[id] = cppNamespaceForScope(qualified, container, classScopes[id], classNames)
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -230,11 +235,15 @@ func cppNamespaceScopesByName(ctx context.Context, q queryContexter, repoID int6
 	return out, nil
 }
 
-func cppNamespaceScopesByEdge(ctx context.Context, q queryContexter, repoID int64, edgeIDs []int64) (map[int64]string, error) {
+func cppNamespaceScopesByEdge(ctx context.Context, q queryContexter, repoID int64, edgeIDs []int64, classScopes map[int64]string) (map[int64]string, error) {
 	out := make(map[int64]string, len(edgeIDs))
+	classNames, err := cppClassQualifiedNames(ctx, q, repoID, classScopes)
+	if err != nil {
+		return nil, err
+	}
 	for _, chunk := range chunkInt64s(edgeIDs, sqliteInClauseBatchSize) {
 		args := append([]any{repoID}, int64SliceToAny(chunk)...)
-		rows, err := q.QueryContext(ctx, `SELECT e.id, `+sqlCppNamespaceScope("s")+`
+		rows, err := q.QueryContext(ctx, `SELECT e.id, s.qualified_name, s.container_name
 			FROM edges e JOIN symbols s ON s.id = e.src_symbol_id
 			WHERE e.repo_id = ? AND s.language IN `+bareNameScopeAllKindsSQL+`
 			AND e.id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`, args...)
@@ -243,12 +252,12 @@ func cppNamespaceScopesByEdge(ctx context.Context, q queryContexter, repoID int6
 		}
 		for rows.Next() {
 			var id int64
-			var scope string
-			if err := rows.Scan(&id, &scope); err != nil {
+			var qualified, container string
+			if err := rows.Scan(&id, &qualified, &container); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			out[id] = scope
+			out[id] = cppNamespaceForScope(qualified, container, classScopes[id], classNames)
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -259,6 +268,57 @@ func cppNamespaceScopesByEdge(ctx context.Context, q queryContexter, repoID int6
 		}
 	}
 	return out, nil
+}
+
+func cppNamespaceForScope(qualified, container, classID string, classNames map[int64]string) string {
+	if classID != "" {
+		if owner := classNames[parseInt64(classID)]; owner != "" {
+			if i := strings.LastIndex(owner, "::"); i >= 0 {
+				return "cpp:" + owner[:i]
+			}
+		}
+		return "cpp:"
+	}
+	return "cpp:" + container
+}
+
+func cppClassQualifiedNames(ctx context.Context, q queryContexter, repoID int64, classScopes map[int64]string) (map[int64]string, error) {
+	ids := make([]int64, 0, len(classScopes))
+	for _, classID := range classScopes {
+		if id := parseInt64(classID); id != 0 {
+			ids = append(ids, id)
+		}
+	}
+	out := make(map[int64]string, len(ids))
+	for _, chunk := range chunkInt64s(ids, sqliteInClauseBatchSize) {
+		args := append([]any{repoID}, int64SliceToAny(chunk)...)
+		rows, err := q.QueryContext(ctx, `SELECT id, qualified_name FROM symbols WHERE repo_id = ? AND id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var qualified string
+			if err := rows.Scan(&id, &qualified); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[id] = qualified
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func parseInt64(value string) int64 {
+	id, _ := strconv.ParseInt(value, 10, 64)
+	return id
 }
 
 func cppNamespaceTargetOutOfScope(edgeID, dstID int64, targets, callers map[int64]string) bool {
@@ -415,31 +475,33 @@ func cppCallerClassScopesByEdge(ctx context.Context, q queryContexter, repoID in
 	if len(edgeIDs) == 0 {
 		return out, nil
 	}
+	sourceByEdge := make(map[int64]int64, len(edgeIDs))
+	sourceIDs := make([]int64, 0, len(edgeIDs))
+	seenSources := make(map[int64]struct{}, len(edgeIDs))
 	for _, chunk := range chunkInt64s(edgeIDs, sqliteInClauseBatchSize) {
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
-			SELECT e.id, `+sqlCppClassScope("s")+`
+			SELECT e.id, e.src_symbol_id
 			FROM edges e
-			JOIN symbols s ON s.id = e.src_symbol_id
-			WHERE e.repo_id = ? AND s.language IN `+bareNameScopeAllKindsSQL+`
+			WHERE e.repo_id = ?
 			  AND e.id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
 		`, args...)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
-			var edgeID int64
-			var class string
-			if err := rows.Scan(&edgeID, &class); err != nil {
+			var edgeID, sourceID int64
+			if err := rows.Scan(&edgeID, &sourceID); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			if class == "" {
-				continue
+			sourceByEdge[edgeID] = sourceID
+			if _, ok := seenSources[sourceID]; !ok {
+				seenSources[sourceID] = struct{}{}
+				sourceIDs = append(sourceIDs, sourceID)
 			}
-			out[edgeID] = class
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -447,6 +509,42 @@ func cppCallerClassScopesByEdge(ctx context.Context, q queryContexter, repoID in
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err
+		}
+	}
+	classBySource := make(map[int64]string, len(sourceIDs))
+	for _, chunk := range chunkInt64s(sourceIDs, sqliteInClauseBatchSize) {
+		args := append([]any{repoID}, int64SliceToAny(chunk)...)
+		rows, err := q.QueryContext(ctx, `
+			SELECT s.id, `+sqlCppClassScope("s")+`
+			FROM symbols s
+			WHERE s.repo_id = ? AND s.language IN `+bareNameScopeAllKindsSQL+`
+			  AND s.id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var sourceID int64
+			var class string
+			if err := rows.Scan(&sourceID, &class); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if class != "" {
+				classBySource[sourceID] = class
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	for edgeID, sourceID := range sourceByEdge {
+		if class := classBySource[sourceID]; class != "" {
+			out[edgeID] = class
 		}
 	}
 	return out, nil

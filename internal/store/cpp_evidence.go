@@ -68,8 +68,10 @@ func (s *Store) resolveCppEvidenceEdges(ctx context.Context, repoID int64, targe
 
 func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cppEvidenceExecutor, repoID int64, targets []edgeTarget) (int, error) {
 	cppTargets := make([]edgeTarget, 0, len(targets))
+	bareTargets := make([]edgeTarget, 0, len(targets))
 	nameSet := map[string]struct{}{}
-	edgeIDs := make([]int64, 0, len(targets))
+	bareNameSet := map[string]struct{}{}
+	bareEdgeIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
 		if target.srcLanguage != "cpp" || !goBareCallName(target.dstName) && !strings.Contains(target.dstName, "::") {
 			continue
@@ -78,8 +80,11 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		nameSet[target.dstName] = struct{}{}
 		if strings.HasPrefix(target.dstName, "::") {
 			nameSet[strings.TrimPrefix(target.dstName, "::")] = struct{}{}
+		} else if !strings.Contains(target.dstName, "::") {
+			bareTargets = append(bareTargets, target)
+			bareNameSet[target.dstName] = struct{}{}
+			bareEdgeIDs = append(bareEdgeIDs, target.edgeID)
 		}
-		edgeIDs = append(edgeIDs, target.edgeID)
 	}
 	if len(cppTargets) == 0 {
 		return 0, nil
@@ -186,23 +191,28 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		}
 	}
 
-	classScopes, err := cppClassScopesByName(ctx, q, repoID, names)
+	bareNames := make([]string, 0, len(bareNameSet))
+	for name := range bareNameSet {
+		bareNames = append(bareNames, name)
+	}
+	sort.Strings(bareNames)
+	classScopes, err := cppClassScopesByName(ctx, q, repoID, bareNames)
 	if err != nil {
 		return 0, err
 	}
-	namespaceScopes, err := cppNamespaceScopesByName(ctx, q, repoID, names)
+	namespaceScopes, err := cppNamespaceScopesByName(ctx, q, repoID, bareNames, classScopes)
 	if err != nil {
 		return 0, err
 	}
-	callerClasses, err := cppCallerClassScopesByEdge(ctx, q, repoID, edgeIDs)
+	callerClasses, err := cppCallerClassScopesByEdge(ctx, q, repoID, bareEdgeIDs)
 	if err != nil {
 		return 0, err
 	}
-	callerNamespaces, err := cppNamespaceScopesByEdge(ctx, q, repoID, edgeIDs)
+	callerNamespaces, err := cppNamespaceScopesByEdge(ctx, q, repoID, bareEdgeIDs, callerClasses)
 	if err != nil {
 		return 0, err
 	}
-	if err := augmentCppOutOfLineScopes(ctx, q, repoID, cppTargets, candidates, imports, classScopes, callerClasses, callerNamespaces, namespaceScopes); err != nil {
+	if err := augmentCppOutOfLineScopes(ctx, q, repoID, bareTargets, candidates, imports, classScopes, callerClasses, callerNamespaces, namespaceScopes); err != nil {
 		return 0, err
 	}
 	byName := map[string][]cppEvidenceCandidate{}

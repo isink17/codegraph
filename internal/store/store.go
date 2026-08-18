@@ -4402,11 +4402,11 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if err != nil {
 			return outcome, err
 		}
-		cppNamespaceTargets, err = cppNamespaceScopesByName(ctx, s.db, repoID, setToSlice(cppBareNameSet))
+		cppNamespaceTargets, err = cppNamespaceScopesByName(ctx, s.db, repoID, setToSlice(cppBareNameSet), cppMemberTargets)
 		if err != nil {
 			return outcome, err
 		}
-		cppCallerNamespaces, err = cppNamespaceScopesByEdge(ctx, s.db, repoID, cppBareEdgeIDs)
+		cppCallerNamespaces, err = cppNamespaceScopesByEdge(ctx, s.db, repoID, cppBareEdgeIDs, cppCallerClasses)
 		if err != nil {
 			return outcome, err
 		}
