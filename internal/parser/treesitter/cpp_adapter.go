@@ -190,7 +190,17 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 		case "function_definition":
 			cppAddFunction(child, module, container, content, pf)
 		case "declaration":
-			// Could be a function declaration or variable.
+			// Could be a function declaration or variable. Declarations are
+			// evidence rows, not definition targets; the resolver connects them
+			// to a definition by language plus qualified identity.
+			fnDecl := firstChild(child, "function_declarator")
+			if fnDecl != nil {
+				cppAddFunctionFromDeclarator(child, fnDecl, module, container, content, pf)
+			}
+		case "field_declaration":
+			// A bodiless method declaration is a direct function_declarator.
+			// Function-pointer fields are wrapped by pointer_declarator and are
+			// intentionally not callable symbols.
 			fnDecl := firstChild(child, "function_declarator")
 			if fnDecl != nil {
 				cppAddFunctionFromDeclarator(child, fnDecl, module, container, content, pf)
@@ -309,6 +319,7 @@ func cppAddFunction(node *sitter.Node, module, container string, content []byte,
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
+		Signature:     cppFunctionSignature(fnDecl, content),
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(anchor),
 		DocSummary:    prevCommentText(anchor, content),
@@ -332,15 +343,42 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "cpp",
-		Kind:          "function",
+		Kind:          "declaration",
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
+		Signature:     cppFunctionSignature(fnDecl, content),
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(anchor),
 		DocSummary:    prevCommentText(anchor, content),
-		StableKey:     cppStableKey("func", module, qualified),
+		StableKey:     cppStableKey("decl", module, qualified),
 	})
+}
+
+func cppFunctionSignature(fnDecl *sitter.Node, content []byte) string {
+	raw := strings.TrimSpace(nodeText(fnDecl, content))
+	linkage := ""
+	inClassDeclaration := false
+	for node := fnDecl; node != nil; node = node.Parent() {
+		text := strings.TrimSpace(nodeText(node, content))
+		if node.Type() == "field_declaration" {
+			inClassDeclaration = true
+		}
+		if strings.HasPrefix(text, "static ") || strings.HasPrefix(text, "static\n") {
+			if !inClassDeclaration {
+				linkage = "static:"
+			}
+			break
+		}
+		if node.Type() == "linkage_specification" && strings.Contains(text, `"C"`) {
+			linkage = "extern_c:"
+			break
+		}
+	}
+	if i := strings.IndexByte(raw, '('); i >= 0 {
+		return linkage + strings.TrimSpace(raw[i:])
+	}
+	return linkage
 }
 
 func cppAddType(node *sitter.Node, module, container, namespaceContainer, kind, fileScope string, content []byte, pf *graph.ParsedFile) {

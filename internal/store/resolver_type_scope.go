@@ -339,9 +339,10 @@ func (s *Store) recordResolverImportScope(ctx context.Context, tx *sql.Tx, repoI
 // `app.Ledger` names `src/main/java/app/Ledger.java` in Java layouts as surely
 // as `mitmproxy.http` names `mitmproxy/http.py`.
 type importFileIndex struct {
-	byPath   map[string][]int64
-	byBase   map[string][]int64
-	bySuffix map[string][]int64
+	byPath         map[string][]int64
+	byBase         map[string][]int64
+	bySuffix       map[string][]int64
+	byHeaderSuffix map[string][]int64
 }
 
 // importScopeForRepo returns, for each file, the set of file ids it can see.
@@ -448,9 +449,10 @@ func isRelativeImportSpecifier(specifier string) bool {
 // `files` produces.
 func loadImportFileIndex(ctx context.Context, q queryContexter, repoID int64) (importFileIndex, map[int64]string, error) {
 	index := importFileIndex{
-		byPath:   map[string][]int64{},
-		byBase:   map[string][]int64{},
-		bySuffix: map[string][]int64{},
+		byPath:         map[string][]int64{},
+		byBase:         map[string][]int64{},
+		bySuffix:       map[string][]int64{},
+		byHeaderSuffix: map[string][]int64{},
 	}
 	pathByID := map[int64]string{}
 	rows, err := q.QueryContext(ctx, `SELECT id, path FROM files WHERE repo_id = ? AND is_deleted = 0`, repoID)
@@ -486,6 +488,9 @@ func loadImportFileIndex(ctx context.Context, q queryContexter, repoID int64) (i
 		for i := 0; i < len(base); i++ {
 			if base[i] == '/' {
 				index.bySuffix[base[i+1:]] = append(index.bySuffix[base[i+1:]], id)
+				if isCHeaderExtension(path.Ext(filePath)) {
+					index.byHeaderSuffix[base[i+1:]] = append(index.byHeaderSuffix[base[i+1:]], id)
+				}
 			}
 		}
 	}
@@ -524,27 +529,27 @@ func (i importFileIndex) lookup(importerPath, specifier, language string) []int6
 	out = append(out, i.byBase[resolved+"/__init__"]...)
 	out = append(out, i.bySuffix[resolved]...)
 	if ext := path.Ext(resolved); ext != "" {
-		// A specifier that carries an extension is still a tail: C and C++
-		// `#include "gtest/gtest.h"` names `test/gtest/gtest/gtest.h` under a
-		// vendored include root exactly the way a module specifier names a file
-		// under a source root.
-		//
-		// The extension-stripped tail is deliberately NOT offered for a
-		// same-directory C-family specifier. `#include "sample1.h"` would tail-
-		// match every `*/sample1.*` in the repository -- including a `.cc` that
-		// nothing includes -- and P22.13 measured that as the loosest evidence in
-		// the whole rule: it is what let one common header name grant bind scope
-		// repository-wide. A multi-segment specifier keeps it, because its tail
-		// is the include-root form the paragraph above describes. The
-		// same-directory probe at the top of this function is what serves the
-		// single-segment case instead.
+		// C-family includes keep the written extension. Stripping `.h` to match
+		// `.cc`/`.cpp` is an implementation-file guess, not include evidence.
+		// Other languages retain their module-tail behavior.
 		stripped := strings.TrimSuffix(resolved, ext)
-		if !sameDirectory {
+		if cFamilyIncludeSpecifier(language, specifier) && !sameDirectory {
+			out = append(out, i.byHeaderSuffix[strings.TrimSuffix(resolved, ext)]...)
+		} else if !sameDirectory {
 			out = append(out, i.byBase[stripped]...)
 			out = append(out, i.bySuffix[stripped]...)
 		}
 	}
 	return out
+}
+
+func isCHeaderExtension(ext string) bool {
+	switch strings.ToLower(ext) {
+	case ".h", ".hpp", ".hh", ".hxx", ".ipp":
+		return true
+	default:
+		return false
+	}
 }
 
 // cFamilyIncludeSpecifier reports whether a specifier should be read as a

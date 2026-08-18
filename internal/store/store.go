@@ -2747,6 +2747,13 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	if targets, err := unresolvedCppEvidenceTargets(ctx, tx, repoID); err != nil {
+		return 0, err
+	} else if n, err := resolveCppEvidenceEdgesWith(ctx, tx, tx, repoID, targets); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
@@ -3561,14 +3568,56 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	if err != nil {
 		return 0, err
 	}
-	if len(contested) == 0 {
+	// C/C++ declaration evidence changes visibility even when the remaining
+	// name is unique: a bound caller can lose its only header proof after a
+	// declaration is removed or renamed. Reconsider such edges on every OLD ∪
+	// NEW name, while retaining the contested-name fast path for other languages.
+	cppArgs := make([]any, 1, len(unique)+1)
+	cppArgs[0] = repoID
+	for _, name := range unique {
+		cppArgs = append(cppArgs, name)
+	}
+	cppRows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT e.dst_name
+		FROM edges e JOIN files f ON f.id = e.file_id
+		WHERE e.repo_id = ? AND f.language = 'cpp' AND e.dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(unique)), ",")+`)`, cppArgs...)
+	if err != nil {
+		return 0, err
+	}
+	cppNames := map[string]struct{}{}
+	for cppRows.Next() {
+		var name string
+		if err := cppRows.Scan(&name); err != nil {
+			cppRows.Close()
+			return 0, err
+		}
+		cppNames[name] = struct{}{}
+	}
+	if err := cppRows.Err(); err != nil {
+		cppRows.Close()
+		return 0, err
+	}
+	if err := cppRows.Close(); err != nil {
+		return 0, err
+	}
+	if len(contested) == 0 && len(cppNames) == 0 {
 		return 0, nil
 	}
-	wanted = make(map[string]struct{}, len(contested))
-	for _, name := range contested {
+	allNames := append([]string(nil), contested...)
+	seenNames := make(map[string]struct{}, len(allNames))
+	for _, name := range allNames {
+		seenNames[name] = struct{}{}
+	}
+	for name := range cppNames {
+		if _, ok := seenNames[name]; !ok {
+			allNames = append(allNames, name)
+		}
+	}
+	unique = allNames
+	wanted = make(map[string]struct{}, len(unique))
+	for _, name := range unique {
 		wanted[name] = struct{}{}
 	}
-	unique = contested
 
 	// Two selections, mirroring the name pass exactly so that everything
 	// cleared is also reconsidered: indexed equality on the whole spelling,
@@ -4189,6 +4238,22 @@ func setToSlice(set map[string]struct{}) []string {
 // same rule the repo-wide SQL strategies apply.
 func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget, moduleVeto map[int64]struct{}, scopes *importScopeCache) (resolveEdgeTargetsOutcome, error) {
 	var outcome resolveEdgeTargetsOutcome
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	if n, err := s.resolveCppEvidenceEdges(ctx, repoID, targets); err != nil {
+		return outcome, err
+	} else {
+		outcome.resolved += n
+	}
+	remaining := targets[:0]
+	for _, target := range targets {
+		if target.srcLanguage == "cpp" && (goBareCallName(target.dstName) || strings.Contains(target.dstName, "::")) {
+			continue
+		}
+		remaining = append(remaining, target)
+	}
+	targets = remaining
 	if len(targets) == 0 {
 		return outcome, nil
 	}
