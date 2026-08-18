@@ -62,6 +62,47 @@ void caller() {
 	}
 }
 
+func TestCppBareCallNamespaceLifecycle(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("target.h", `namespace a { inline void foo() {} }`)
+	r.write("caller.cpp", `#include "target.h"
+namespace b { void caller() { foo(); } }`)
+	r.run("index")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("initial foreign namespace target = %v, want unresolved", got)
+	}
+	if got := r.callers("a::foo"); len(got) != 0 {
+		t.Fatalf("FindCallers rebuilt initial refusal: %v", got)
+	}
+	r.write("caller.cpp", `#include "target.h"
+namespace a { void caller() { foo(); } }`)
+	r.run("update")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"a::foo"}) {
+		t.Fatalf("same-namespace move target = %v, want [a::foo]", got)
+	}
+	r.write("caller.cpp", `#include "target.h"
+namespace b { void caller() { foo(); } }`)
+	r.run("update")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("move back foreign namespace target = %v, want unresolved", got)
+	}
+	r.write("target.h", `namespace c { inline void foo() {} }`)
+	r.run("update")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("renamed namespace target = %v, want unresolved", got)
+	}
+	r.write("target.h", `namespace b { inline void foo() {} }`)
+	r.run("update")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"b::foo"}) {
+		t.Fatalf("added same-namespace target = %v, want [b::foo]", got)
+	}
+	r.remove("target.h")
+	r.run("update")
+	if got := cppTargets(r, "foo"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("removed target fell through = %v, want unresolved", got)
+	}
+}
+
 // TestCppBareCallDirectIncludeResolves is the include positive control: the
 // caller's own `#include` names the file that declares the target, which is
 // evidence the source itself wrote (P22.13 section 8).

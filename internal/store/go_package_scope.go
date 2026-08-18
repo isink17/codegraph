@@ -134,7 +134,7 @@ func goPackageScopeKey(filePath, qualifiedName string) string {
 	return storedPathDir(filePath) + pkg
 }
 
-// -- P22.13: the same shape, one file wide, for C and C++ --------------------
+// -- P22.13/P22.16: the same shape for C and C++ -----------------------------
 //
 // P22.6 gave a bare Go call a SCOPE instead of the repository, and P22.13 needs
 // the same thing for a bare C or C++ call. The scope CodeGraph can prove there
@@ -146,10 +146,9 @@ func goPackageScopeKey(filePath, qualifiedName string) string {
 // admits is BOUND, and a bound destination reaches every query surface through
 // the id leg rather than through a name leg.
 //
-// The key is the stored path under a `file:` prefix, which no Go package key
-// can collide with (a Go key is `<dir><pkg>`, and a stored path holding a
-// literal `file:` prefix would still have to match a real file's path to
-// matter). Paths compare as stored, for the reason recorded above.
+// P22.16 narrows C++ bare lookup to the parser-owned namespace identity. The
+// file remains useful evidence for C and same-namespace declarations, but it
+// cannot import a foreign C++ namespace.
 
 // cppFileScopePrefix namespaces a file-shaped scope key away from Go's
 // directory-and-package keys.
@@ -209,6 +208,11 @@ func sqlBareScopeKey(pathExpr, qnameExpr, langExpr string) string {
 		WHEN ` + langExpr + ` IN ` + bareNameScopeAllKindsSQL + ` THEN
 			(CASE WHEN ` + pathExpr + ` = '' THEN '' ELSE '` + cppFileScopePrefix + `' || ` + pathExpr + ` END)
 		ELSE '' END)`
+}
+
+func sqlBareScopeKeyForSymbol(alias, pathExpr string) string {
+	return `(CASE WHEN ` + alias + `.language = 'go' THEN ` + sqlGoPackageScopeKey(pathExpr, alias+`.qualified_name`) +
+		` ELSE (CASE WHEN ` + pathExpr + ` = '' THEN '' ELSE '` + cppFileScopePrefix + `' || ` + pathExpr + ` || '|' || ` + sqlCppNamespaceScope(alias) + ` END) END)`
 }
 
 // goPackageLevelDeclaration reports whether a symbol is declared at package
@@ -271,7 +275,7 @@ func sqlNotBareName(expr string) string {
 
 // sqlStoredPathDir renders storedPathDir. rtrim(X, Y) strips trailing characters
 // that occur in Y, and Y here is exactly X's non-separator characters, so what
-// survives is the prefix through the last '/' or '\' -- or '' when the path has
+// survives is the prefix through the last '/' or '\' -- or ” when the path has
 // neither.
 func sqlStoredPathDir(expr string) string {
 	return `rtrim(` + expr + `, replace(replace(` + expr + `, '/', ''), '\', ''))`
@@ -285,13 +289,13 @@ func sqlGoHasPackageName(expr string) string {
 }
 
 // sqlGoPackageNameOf renders goPackageNameOf. substr(x, 1, 0) and substr(x, 1, -1)
-// are both '', so a name with no package segment yields '' on this side too.
+// are both ”, so a name with no package segment yields ” on this side too.
 func sqlGoPackageNameOf(expr string) string {
 	return `substr(` + expr + `, 1, instr(` + expr + `, '.') - 1)`
 }
 
 // sqlGoPackageScopeKey renders goPackageScopeKey, including its abstention: a
-// name with no package segment is goPackageScopeUnknown ('') and must not
+// name with no package segment is goPackageScopeUnknown (”) and must not
 // become a bare directory, which would make every such symbol share one scope.
 func sqlGoPackageScopeKey(pathExpr, qnameExpr string) string {
 	return `(CASE WHEN ` + sqlGoHasPackageName(qnameExpr) + `
@@ -325,7 +329,7 @@ func sqlGoBareSourceScope(n int) string {
 		return `(` + gated + `)`
 	}
 	return `((` + gated + `) OR ` +
-		sqlBareScopeKey("srcf.path", "src.qualified_name", "src.language") +
+		sqlBareScopeKeyForSymbol("src", "srcf.path") +
 		` IN (` + strings.TrimRight(strings.Repeat("?,", n), ",") + `))`
 }
 
@@ -398,7 +402,7 @@ func (s *Store) resolveGoPackageScopedBareNames(ctx context.Context, tx *sql.Tx,
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != ''
 		  AND f.language = 'go' AND src.language = 'go'
 		  AND NOT `+sqlNotBareName("e.dst_name")+`
-		  AND ` + sqlGoHasPackageName("src.qualified_name") + `
+		  AND `+sqlGoHasPackageName("src.qualified_name")+`
 	`, repoID); err != nil {
 		return 0, err
 	}
@@ -536,7 +540,7 @@ func symbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, ids 
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
 			SELECT s.id, s.language, s.kind, s.qualified_name, s.name, f.path,
-			       `+sqlCppClassScopeIfCpp("s")+`
+			       `+sqlCppClassScopeIfCpp("s")+`, `+sqlCppNamespaceScope("s")+`
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ?
@@ -586,7 +590,7 @@ func goSymbolScopesByEdgeSource(ctx context.Context, q queryContexter, repoID in
 		args = append(args, int64SliceToAny(chunk)...)
 		rows, err := q.QueryContext(ctx, `
 			SELECT e.id, s.language, s.kind, s.qualified_name, s.name, f.path,
-			       `+sqlCppClassScopeIfCpp("s")+`
+			       `+sqlCppClassScopeIfCpp("s")+`, `+sqlCppNamespaceScope("s")+`
 			FROM edges e
 			JOIN symbols s ON s.id = e.src_symbol_id
 			JOIN files f ON f.id = s.file_id
@@ -607,14 +611,22 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 	defer rows.Close()
 	for rows.Next() {
 		var key int64
-		var language, kind, qualifiedName, name, filePath, classScope string
-		if err := rows.Scan(&key, &language, &kind, &qualifiedName, &name, &filePath, &classScope); err != nil {
+		var language, kind, qualifiedName, name, filePath, classScope, namespaceScope string
+		if err := rows.Scan(&key, &language, &kind, &qualifiedName, &name, &filePath, &classScope, &namespaceScope); err != nil {
 			return err
 		}
 		out[key] = goSymbolScope{
-			language:     language,
-			kind:         kind,
-			key:          bareScopeKey(language, filePath, qualifiedName),
+			language: language,
+			kind:     kind,
+			key: func() string {
+				if language == "go" {
+					return bareScopeKey(language, filePath, qualifiedName)
+				}
+				if filePath == "" {
+					return goPackageScopeUnknown
+				}
+				return cppFileScopePrefix + filePath + "|" + namespaceScope
+			}(),
 			packageLevel: bareScopeNameable(language, qualifiedName, name),
 			classScope:   classScope,
 		}
@@ -843,7 +855,7 @@ func (s *Store) splitGoBareCalleeNames(ctx context.Context, repoID int64, srcIDs
 
 // goPackageScopedSymbolIDs resolves bare call names inside a fixed set of
 // scopes: the only lookup a bare spelling is entitled to. The scope is the Go
-// package for Go and the file for C and C++ (bareScopeKey), so one function
+// package for Go and a file-plus-namespace key for C and C++, so one function
 // serves both rules and neither can gain a scope the other forgot.
 //
 // Result is keyed by scope key then by name, so a caller holding several seeds
@@ -879,7 +891,7 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 		// name, so this reads a handful of rows per name.
 		rows, err := q.QueryContext(ctx, `
 			SELECT s.id, s.name, s.qualified_name, s.language, f.path,
-			       `+sqlCppClassScopeIfCpp("s")+`
+			       `+sqlCppClassScopeIfCpp("s")+`, `+sqlCppNamespaceScope("s")+`
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ? AND (s.language = 'go' OR s.language IN `+bareNameScopeAllKindsSQL+`)
@@ -891,8 +903,8 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 		}
 		for rows.Next() {
 			var id int64
-			var name, qualifiedName, language, filePath, classScope string
-			if err := rows.Scan(&id, &name, &qualifiedName, &language, &filePath, &classScope); err != nil {
+			var name, qualifiedName, language, filePath, classScope, namespaceScope string
+			if err := rows.Scan(&id, &name, &qualifiedName, &language, &filePath, &classScope, &namespaceScope); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
@@ -915,6 +927,12 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 				continue
 			}
 			key := bareScopeKey(language, filePath, qualifiedName)
+			if language != "go" {
+				if filePath == "" {
+					continue
+				}
+				key = cppFileScopePrefix + filePath + "|" + namespaceScope
+			}
 			if _, ok := scopeSet[key]; !ok {
 				continue
 			}

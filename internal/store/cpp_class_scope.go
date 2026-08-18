@@ -98,7 +98,7 @@ var cppClassMemberKinds = map[string]struct{}{
 }
 
 // sqlCppClassScope renders the CLASS SYMBOL a C/C++ symbol is a member of, as
-// its `symbols.id` rendered as text, or '' when the symbol is not a class member
+// its `symbols.id` rendered as text, or ” when the symbol is not a class member
 // at all. Two arms, one per form the adapter emits.
 //
 // The value is the class ROW, not the class name, and that is the whole point:
@@ -167,6 +167,109 @@ func sqlCppClassScope(alias string) string {
 	return `COALESCE(` + inClass + `, ` + outOfLine + `, '')`
 }
 
+// sqlCppNamespaceScope renders the parser-owned namespace identity for a C/C++
+// symbol. Namespace-level symbols carry it in container_name; class members
+// inherit it from the qualified identity of their owning class. The cpp: prefix
+// gives global scope a real, distinct key instead of treating it as unknown.
+func sqlCppNamespaceScope(alias string) string {
+	classID := sqlCppClassScope(alias)
+	classNamespace := `(SELECT CASE WHEN instr(cc.qualified_name, '::') = 0
+		THEN 'cpp:'
+		ELSE 'cpp:' || substr(cc.qualified_name, 1,
+			length(cc.qualified_name) - length(cc.name) - 2)
+		END FROM symbols cc WHERE cc.id = CAST(` + classID + ` AS INTEGER))`
+	return `(CASE WHEN ` + alias + `.language IN ` + bareNameScopeAllKindsSQL + ` THEN
+		CASE WHEN ` + classID + ` <> '' THEN ` + classNamespace + `
+		ELSE 'cpp:' || ` + alias + `.container_name END
+	ELSE '' END)`
+}
+
+// cppNamespaceScopesByName loads namespace identity for all C/C++ candidates
+// reachable by a bare spelling. The lookup is batched by indexed name/qname;
+// no edge performs its own symbol query.
+func cppNamespaceScopesByName(ctx context.Context, q queryContexter, repoID int64, names []string) (map[int64]string, error) {
+	out := map[int64]string{}
+	if len(names) == 0 {
+		return out, nil
+	}
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	for start := 0; start < len(sorted); start += nameLookupChunk {
+		chunk := sorted[start:min(start+nameLookupChunk, len(sorted))]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, 0, 2*len(chunk)+1)
+		args = append(args, repoID)
+		for range 2 {
+			for _, name := range chunk {
+				args = append(args, name)
+			}
+		}
+		rows, err := q.QueryContext(ctx, `SELECT s.id, `+sqlCppNamespaceScope("s")+`
+			FROM symbols s WHERE s.repo_id = ? AND s.language IN `+bareNameScopeAllKindsSQL+`
+			AND (s.name IN (`+placeholders+`) OR s.qualified_name IN (`+placeholders+`))`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var scope string
+			if err := rows.Scan(&id, &scope); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[id] = scope
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func cppNamespaceScopesByEdge(ctx context.Context, q queryContexter, repoID int64, edgeIDs []int64) (map[int64]string, error) {
+	out := make(map[int64]string, len(edgeIDs))
+	for _, chunk := range chunkInt64s(edgeIDs, sqliteInClauseBatchSize) {
+		args := append([]any{repoID}, int64SliceToAny(chunk)...)
+		rows, err := q.QueryContext(ctx, `SELECT e.id, `+sqlCppNamespaceScope("s")+`
+			FROM edges e JOIN symbols s ON s.id = e.src_symbol_id
+			WHERE e.repo_id = ? AND s.language IN `+bareNameScopeAllKindsSQL+`
+			AND e.id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var scope string
+			if err := rows.Scan(&id, &scope); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[id] = scope
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func cppNamespaceTargetOutOfScope(edgeID, dstID int64, targets, callers map[int64]string) bool {
+	target, ok := targets[dstID]
+	if !ok || target == "" {
+		return true
+	}
+	caller, ok := callers[edgeID]
+	return !ok || caller == "" || caller != target
+}
+
 // sqlCppClassScopeIfCpp is sqlCppClassScope behind a language test, for the
 // query-side loaders: they read every language's symbols in one statement, and
 // the derivation is meaningless -- but not free -- for a Go or Python row.
@@ -190,7 +293,7 @@ func sqlCppClassScopeIfCpp(alias string) string {
 // alone would be answered one strategy later.
 //
 // The caller's class comes from `edges.src_symbol_id`. An edge with no source
-// symbol has no class, so the COALESCE fails closed rather than matching ''
+// symbol has no class, so the COALESCE fails closed rather than matching ”
 // against a member's non-empty class.
 //
 // Ordering is what keeps this cheap: the language test and sqlNotBareName
@@ -210,6 +313,22 @@ var resolverCppBareMemberScopeSQL = `(
 				SELECT ` + sqlCppClassScope("cs") + `
 				FROM symbols cs WHERE cs.id = edges.src_symbol_id
 			), '')
+		)
+	)`
+
+const resolverCppNamespaceScopesTable = `tmp_resolver_cpp_namespace_scopes`
+
+// resolverCppBareNamespaceScopeSQL refuses a namespace-level target unless its
+// parser-owned namespace is the caller's namespace. File/include visibility is
+// weaker evidence and cannot override this identity check.
+var resolverCppBareNamespaceScopeSQL = `(
+		f.language NOT IN ` + bareNameScopeAllKindsSQL + `
+		OR ` + sqlNotBareName("edges.dst_name") + `
+		OR NOT EXISTS (
+			SELECT 1 FROM ` + resolverCppNamespaceScopesTable + ` ts
+			JOIN ` + resolverCppNamespaceScopesTable + ` cs ON cs.symbol_id = edges.src_symbol_id
+			WHERE ts.symbol_id = (` + resolverChosenCandidateSQL + `)
+			AND ts.scope <> cs.scope
 		)
 	)`
 
