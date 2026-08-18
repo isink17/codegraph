@@ -2565,6 +2565,9 @@ type edgeTarget struct {
 // ensures it rather than assuming ResolveEdges ran first. An empty table vetoes
 // nothing, which is the correct reading for a strategy invoked in isolation.
 func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+resolverCppNamespaceScopesTable+`(symbol_id INTEGER PRIMARY KEY, scope TEXT NOT NULL) WITHOUT ROWID`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+resolverAmbiguousNamesTable+
 		`(dst_name TEXT NOT NULL, dst_language TEXT NOT NULL, caller_is_test INTEGER NOT NULL,
 			PRIMARY KEY(dst_name, dst_language, caller_is_test)) WITHOUT ROWID`); err != nil {
@@ -2589,6 +2592,17 @@ func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
 // no edge is waiting on. The tables still exist (empty), which every strategy
 // reads as "no test files, no vetoed names".
 func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID int64) error {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+resolverCppNamespaceScopesTable+`(symbol_id INTEGER PRIMARY KEY, scope TEXT NOT NULL) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO `+resolverCppNamespaceScopesTable+`(symbol_id, scope)
+		SELECT s.id, `+sqlCppNamespaceScope("s")+` FROM symbols s
+		WHERE s.repo_id = ? AND s.language IN `+bareNameScopeAllKindsSQL, repoID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable); err != nil {
 		return err
 	}
@@ -2762,6 +2776,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_targets`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_resolution`)
@@ -2910,6 +2925,9 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
 		return 0, err
 	}
 	_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
@@ -4297,6 +4315,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	// only when the batch actually holds such an edge, so a Go-only or
 	// Python-only update pays nothing for the rule.
 	var cppMemberTargets, cppCallerClasses map[int64]string
+	var cppNamespaceTargets, cppCallerNamespaces map[int64]string
 	cppBareEdgeIDs := make([]int64, 0, len(targets))
 	cppBareNameSet := map[string]struct{}{}
 	for _, target := range targets {
@@ -4315,6 +4334,14 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			return outcome, err
 		}
 		cppCallerClasses, err = cppCallerClassScopesByEdge(ctx, s.db, repoID, cppBareEdgeIDs)
+		if err != nil {
+			return outcome, err
+		}
+		cppNamespaceTargets, err = cppNamespaceScopesByName(ctx, s.db, repoID, setToSlice(cppBareNameSet))
+		if err != nil {
+			return outcome, err
+		}
+		cppCallerNamespaces, err = cppNamespaceScopesByEdge(ctx, s.db, repoID, cppBareEdgeIDs)
 		if err != nil {
 			return outcome, err
 		}
@@ -4435,6 +4462,11 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			// the bare-name lookup) are both covered; goBareCallName is the Go twin
 			// of the SQL guard's sqlNotBareName and is not Go-specific despite the
 			// name.
+			outcome.unresolved++
+			continue
+		}
+		if ok && dstID != 0 && bareNameScopeAllKinds(target.srcLanguage) && goBareCallName(target.dstName) &&
+			cppNamespaceTargetOutOfScope(target.edgeID, dstID, cppNamespaceTargets, cppCallerNamespaces) {
 			outcome.unresolved++
 			continue
 		}

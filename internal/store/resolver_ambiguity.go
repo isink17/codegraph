@@ -225,6 +225,7 @@ var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
 		AND (` + resolverChosenCandidateSQL + `) IS NOT NULL
 		AND ` + resolverGoBareScopeSQL + `
 		AND ` + resolverBareNameTypeScopeSQL + `
+		AND ` + resolverCppBareNamespaceScopeSQL + `
 		AND ` + resolverCppBareMemberScopeSQL
 
 // resolverBindGateSQL is what every repo-wide strategy's UPDATE must

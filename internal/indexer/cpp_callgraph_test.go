@@ -259,7 +259,7 @@ func TestCppNamespaceAndGlobalQualifiedCalls(t *testing.T) {
 	ctx := context.Background()
 	s, repo := indexCppFixture(t, map[string]string{"fixture.cpp": `
 namespace a { void foo() {} }
-namespace b { void foo() {} void bare() { foo(); } }
+namespace b { void bare() { foo(); } }
 void global() {}
 void caller() { a::foo(); ::global(); }
 `})
@@ -283,6 +283,65 @@ void caller() { a::foo(); ::global(); }
 	global, err := s.FindCallers(ctx, repo.ID, "::global", 0, 20, 0)
 	if err != nil || !hasSymbolQName(global, "caller") {
 		t.Fatalf("FindCallers(::global) = %+v, err = %v", global, err)
+	}
+}
+
+func TestCppBareCallNamespaceEligibility(t *testing.T) {
+	tests := []struct {
+		name           string
+		files          map[string]string
+		caller, target string
+		want           bool
+	}{
+		{
+			name: "same namespace",
+			files: map[string]string{"fixture.cpp": `namespace a {
+void foo() {}
+void caller() { foo(); }
+}`},
+			caller: "a::caller", target: "a::foo", want: true,
+		},
+		{
+			name: "different namespace",
+			files: map[string]string{"fixture.cpp": `namespace a { void foo() {} }
+namespace b { void caller() { foo(); } }`},
+			caller: "b::caller", target: "a::foo",
+		},
+		{
+			name: "same file does not cross namespace",
+			files: map[string]string{"fixture.cpp": `namespace a { void foo() {} }
+namespace b { void caller() { foo(); } }`},
+			caller: "b::caller", target: "a::foo",
+		},
+		{
+			name: "include does not cross namespace",
+			files: map[string]string{
+				"a.h": `namespace a { inline void foo() {} }`,
+				"caller.cpp": `#include "a.h"
+namespace b { void caller() { foo(); } }`,
+			},
+			caller: "b::caller", target: "a::foo",
+		},
+		{
+			name: "global caller does not claim namespace",
+			files: map[string]string{"fixture.cpp": `namespace a { void foo() {} }
+void caller() { foo(); }`},
+			caller: "caller", target: "a::foo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, repo := indexCppFixture(t, tt.files)
+			callees, err := s.FindCallees(ctx, repo.ID, tt.caller, 0, 20, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := hasSymbolQName(callees, tt.target)
+			if got != tt.want {
+				t.Fatalf("FindCallees(%q) target %q = %v, want %v; got %+v", tt.caller, tt.target, got, tt.want, callees)
+			}
+		})
 	}
 }
 

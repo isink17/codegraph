@@ -581,7 +581,7 @@ func callerCandidateSQL(legs candidateLegs) (string, int) {
 			               OR (nm.scope <> '' AND EXISTS (
 			                     SELECT 1 FROM files srcf
 			                     WHERE srcf.id = src.file_id
-			                       AND `+sqlBareScopeKey("srcf.path", "src.qualified_name", "src.language")+` = nm.scope)))))`)
+				                       AND `+sqlBareScopeKeyForSymbol("src", "srcf.path")+` = nm.scope)))))`)
 		repoArgs++
 	}
 	return strings.Join(branches, " UNION "), repoArgs
