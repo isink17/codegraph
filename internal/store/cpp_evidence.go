@@ -141,7 +141,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 			if declarationSignatures[c.qualified] == nil {
 				declarationSignatures[c.qualified] = map[string]struct{}{}
 			}
-			declarationSignatures[c.qualified][cppNormalizedSignature(c.signature)] = struct{}{}
+			declarationSignatures[c.qualified][c.signature] = struct{}{}
 			continue
 		}
 		candidates = append(candidates, c)
@@ -315,7 +315,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 			familySignatures[signature] = struct{}{}
 		}
 		for _, candidate := range byQualified[eligible[0].qualified] {
-			familySignatures[cppNormalizedSignature(candidate.signature)] = struct{}{}
+			familySignatures[candidate.signature] = struct{}{}
 		}
 		if len(familySignatures) != 1 {
 			continue
@@ -365,134 +365,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 }
 
 func cppEvidenceKey(qualified, signature string) string {
-	return qualified + "\x00" + cppNormalizedSignature(signature)
-}
-
-// cppNormalizedSignature compares declaration/definition evidence at the
-// callable-type level. Parameter names and default expressions are not part of
-// overload identity, while the remaining spelling is kept conservative so
-// distinct types still fail closed.
-func cppNormalizedSignature(signature string) string {
-	s := strings.TrimSpace(signature)
-	open := strings.IndexByte(s, '(')
-	if open < 0 {
-		return s
-	}
-	close := matchingDelimiter(s, open, '(', ')')
-	if close < 0 {
-		return compactCppSignature(s)
-	}
-	params := splitCppParameters(s[open+1 : close])
-	var b strings.Builder
-	b.WriteString(s[:open+1])
-	for i, param := range params {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(normalizeCppParameter(param))
-	}
-	b.WriteByte(')')
-	b.WriteString(compactCppSignature(s[close+1:]))
-	return b.String()
-}
-
-func splitCppParameters(s string) []string {
-	var out []string
-	start, depth := 0, 0
-	for i, r := range s {
-		switch r {
-		case '(', '[', '{', '<':
-			depth++
-		case ')', ']', '}', '>':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				out = append(out, s[start:i])
-				start = i + 1
-			}
-		}
-	}
-	if strings.TrimSpace(s[start:]) != "" {
-		out = append(out, s[start:])
-	}
-	return out
-}
-
-func normalizeCppParameter(s string) string {
-	s = strings.TrimSpace(s)
-	depth := 0
-	cut := -1
-	for i, r := range s {
-		switch r {
-		case '(', '[', '{', '<':
-			depth++
-		case ')', ']', '}', '>':
-			if depth > 0 {
-				depth--
-			}
-		case '=':
-			if depth == 0 {
-				cut = i
-				break
-			}
-		}
-		if cut >= 0 {
-			break
-		}
-	}
-	if cut >= 0 {
-		s = strings.TrimSpace(s[:cut])
-	}
-	// A trailing identifier after a type is the parameter name. Built-in type
-	// words are retained, so `const char*` is not mistaken for a named arg.
-	fields := strings.Fields(s)
-	if len(fields) > 1 {
-		last := fields[len(fields)-1]
-		if isCppIdentifier(last) && !cppTypeWord[last] && !strings.HasSuffix(fields[len(fields)-2], "::") {
-			s = strings.TrimSpace(s[:strings.LastIndex(s, last)])
-		}
-	}
-	return compactCppSignature(s)
-}
-
-var cppTypeWord = map[string]bool{"const": true, "volatile": true, "void": true, "bool": true, "char": true, "short": true, "int": true, "long": true, "float": true, "double": true, "signed": true, "unsigned": true, "auto": true, "...": true}
-
-func isCppIdentifier(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i, r := range s {
-		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
-			return false
-		}
-	}
-	return true
-}
-func compactCppSignature(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r != ' ' && r != '\t' && r != '\n' && r != '\r' {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-func matchingDelimiter(s string, open int, left, right rune) int {
-	depth := 0
-	for i, r := range s[open:] {
-		if r == left {
-			depth++
-		}
-		if r == right {
-			depth--
-			if depth == 0 {
-				return open + i
-			}
-		}
-	}
-	return -1
+	return qualified + "\x00" + signature
 }
 
 func augmentCppOutOfLineScopes(ctx context.Context, q queryContexter, repoID int64, edges []edgeTarget, candidates []cppEvidenceCandidate, imports map[int64]map[int64]struct{}, classScopes, callerClasses, callerNamespaces, namespaceScopes map[int64]string) error {

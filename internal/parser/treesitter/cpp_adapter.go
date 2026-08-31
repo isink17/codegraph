@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -461,7 +462,6 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 }
 
 func cppFunctionSignature(fnDecl *sitter.Node, content []byte) string {
-	raw := strings.TrimSpace(nodeText(fnDecl, content))
 	linkage := ""
 	inClassDeclaration := false
 	for node := fnDecl; node != nil; node = node.Parent() {
@@ -480,10 +480,151 @@ func cppFunctionSignature(fnDecl *sitter.Node, content []byte) string {
 			break
 		}
 	}
-	if i := strings.IndexByte(raw, '('); i >= 0 {
-		return linkage + strings.TrimSpace(raw[i:])
+	parameters := childByFieldName(fnDecl, "parameters")
+	if parameters == nil {
+		return linkage
 	}
-	return linkage
+	var b strings.Builder
+	b.WriteString(linkage)
+	b.WriteByte('(')
+	first := true
+	for i := range int(parameters.ChildCount()) {
+		parameter := parameters.Child(i)
+		if parameter.Type() == "..." {
+			if !first {
+				b.WriteByte(',')
+			}
+			first = false
+			b.WriteString("...")
+			continue
+		}
+		if parameter.Type() != "parameter_declaration" && parameter.Type() != "optional_parameter_declaration" && parameter.Type() != "variadic_parameter_declaration" {
+			continue
+		}
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+		b.WriteString(cppCanonicalParameter(parameter, content))
+	}
+	b.WriteByte(')')
+	if parameters.EndByte() < fnDecl.EndByte() {
+		b.WriteString(cppCompactSignatureText(content[parameters.EndByte():fnDecl.EndByte()]))
+	}
+	return b.String()
+}
+
+type cppSignatureRemoval struct{ start, end uint32 }
+
+// cppCanonicalParameter removes only AST-identified parameter names and the
+// default-value subtree. The remaining source preserves the complete
+// declarator shape, including nested function-pointer parameters.
+func cppCanonicalParameter(parameter *sitter.Node, content []byte) string {
+	var removals []cppSignatureRemoval
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node.Type() == "optional_parameter_declaration" {
+			if def := childByFieldName(node, "default_value"); def != nil {
+				removals = append(removals, cppSignatureRemoval{def.StartByte(), def.EndByte()})
+			}
+			for i := range int(node.ChildCount()) {
+				if equal := node.Child(i); equal.Type() == "=" {
+					removals = append(removals, cppSignatureRemoval{equal.StartByte(), equal.EndByte()})
+				}
+			}
+		}
+		if node.Type() == "parameter_declaration" || node.Type() == "optional_parameter_declaration" {
+			if name := cppDeclaratorName(childByFieldName(node, "declarator")); name != nil {
+				removals = append(removals, cppSignatureRemoval{name.StartByte(), name.EndByte()})
+			}
+		}
+		defaultNode := childByFieldName(node, "default_value")
+		for i := range int(node.NamedChildCount()) {
+			child := node.NamedChild(i)
+			if child == defaultNode {
+				continue
+			}
+			walk(child)
+		}
+	}
+	walk(parameter)
+	return cppRemoveSignatureRanges(nodeText(parameter, content), parameter.StartByte(), removals)
+}
+
+func cppDeclaratorName(node *sitter.Node) *sitter.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Type() == "identifier" || node.Type() == "field_identifier" {
+		return node
+	}
+	declarator := childByFieldName(node, "declarator")
+	if declarator != nil {
+		if declarator.Type() == "type_identifier" && node.Type() == "pointer_type_declarator" {
+			return declarator
+		}
+		if name := cppDeclaratorName(declarator); name != nil {
+			return name
+		}
+	}
+	if name := childByFieldName(node, "name"); name != nil {
+		if name := cppDeclaratorName(name); name != nil {
+			return name
+		}
+	}
+	for i := range int(node.NamedChildCount()) {
+		child := node.NamedChild(i)
+		if child.Type() == "parameter_list" {
+			continue
+		}
+		if name := cppDeclaratorName(child); name != nil {
+			return name
+		}
+	}
+	return nil
+}
+
+func cppRemoveSignatureRanges(text string, base uint32, removals []cppSignatureRemoval) string {
+	if len(removals) == 0 {
+		return cppCompactSignatureText([]byte(text))
+	}
+	sort.Slice(removals, func(i, j int) bool { return removals[i].start < removals[j].start })
+	var b strings.Builder
+	var cursor = base
+	for _, removal := range removals {
+		if removal.start < cursor || removal.end > base+uint32(len(text)) {
+			continue
+		}
+		b.WriteString(text[cursor-base : removal.start-base])
+		cursor = removal.end
+	}
+	b.WriteString(text[cursor-base:])
+	return cppCompactSignatureText([]byte(b.String()))
+}
+
+func cppCompactSignatureText(text []byte) string {
+	s := string(text)
+	var b strings.Builder
+	var last byte
+	for i := 0; i < len(s); {
+		if s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r' {
+			b.WriteByte(s[i])
+			last = s[i]
+			i++
+			continue
+		}
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+			i++
+		}
+		if b.Len() > 0 && i < len(s) && isCppSignatureWord(last) && isCppSignatureWord(s[i]) {
+			b.WriteByte(' ')
+		}
+	}
+	return b.String()
+}
+
+func isCppSignatureWord(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
 func cppAddType(node *sitter.Node, module, container, namespaceContainer, kind, fileScope string, content []byte, pf *graph.ParsedFile) {

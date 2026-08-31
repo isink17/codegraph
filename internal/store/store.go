@@ -3863,7 +3863,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		end := min(start+chunkSize, len(fileIDs))
 		chunk := fileIDs[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id, dst_name, file_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
+		query := `SELECT id, dst_name, file_id, evidence FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, id := range chunk {
@@ -4102,7 +4102,7 @@ func scanEdgeTargets(rows *sql.Rows, languageByFileID map[int64]string) ([]edgeT
 	var targets []edgeTarget
 	for rows.Next() {
 		var target edgeTarget
-		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID); err != nil {
+		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID, &target.evidence); err != nil {
 			return nil, err
 		}
 		target.srcLanguage = languageByFileID[target.srcFileID]

@@ -93,6 +93,46 @@ func mustParseCpp(t *testing.T, path, src string) graph.ParsedFile {
 	return pf
 }
 
+func TestCppFunctionSignatureCanonicalDeclarators(t *testing.T) {
+	src := `
+void pointer_a(int *value); void pointer_b(int *renamed);
+void pointer_c(int*value); void pointer_d(int*renamed);
+void reference_a(const Foo &value); void reference_b(const Foo &other);
+void rvalue_a(Foo&&value); void rvalue_b(Foo&&other);
+void array_a(int values[3]); void array_b(int other[3]);
+void callback_a(void (*cb)(int)); void callback_b(void (*handler)(int));
+void member_callback_a(void (C::*cb)(int)); void member_callback_b(void (C::*handler)(int));
+void string_a(const char* text = ","); void string_b(const char* text = ")");
+void brace_a(Config c = Config{1, 2}); void brace_b(Config c);
+void lambda_a(Callback cb = [] { return 1; }); void lambda_b(Callback cb);
+void distinct_a(int); void distinct_b(const char*);
+void qualifier_a() const; void qualifier_b();
+void ref_qualifier_a() &; void ref_qualifier_b() &&;
+void variadic_a(int, ...); void variadic_b(int);
+`
+	syms := parseCppSymbols(t, "a.cpp", src)
+	byName := map[string]string{}
+	for _, sym := range syms {
+		byName[sym.Name] = sym.Signature
+	}
+	for _, pair := range [][2]string{
+		{"pointer_a", "pointer_b"}, {"pointer_c", "pointer_d"},
+		{"reference_a", "reference_b"}, {"rvalue_a", "rvalue_b"},
+		{"array_a", "array_b"}, {"callback_a", "callback_b"},
+		{"member_callback_a", "member_callback_b"}, {"string_a", "string_b"},
+		{"brace_a", "brace_b"}, {"lambda_a", "lambda_b"},
+	} {
+		if byName[pair[0]] != byName[pair[1]] {
+			t.Errorf("%s=%q, %s=%q; want equal", pair[0], byName[pair[0]], pair[1], byName[pair[1]])
+		}
+	}
+	for _, pair := range [][2]string{{"distinct_a", "distinct_b"}, {"qualifier_a", "qualifier_b"}, {"ref_qualifier_a", "ref_qualifier_b"}, {"variadic_a", "variadic_b"}} {
+		if byName[pair[0]] == byName[pair[1]] {
+			t.Errorf("%s and %s unexpectedly share %q", pair[0], pair[1], byName[pair[0]])
+		}
+	}
+}
+
 // TestCppCallDstNameKeepsReceiver pins the persisted destination identity for
 // every C++ call syntax the adapter emits (P22.11).
 //
