@@ -109,6 +109,16 @@ void distinct_a(int); void distinct_b(const char*);
 void qualifier_a() const; void qualifier_b();
 void ref_qualifier_a() &; void ref_qualifier_b() &&;
 void variadic_a(int, ...); void variadic_b(int);
+template <class... Args> void pack_a(Args... args);
+template <class... Args> void pack_b(Args... values);
+template <class... Args> void pack_c(Args...);
+void comment_a(int /* value */); void comment_b(int renamed);
+void tokens_a(unsigned /* comment */ long value); void tokens_b(unsigned long renamed);
+void ptr_a(const Foo /*x*/ *value); void ptr_b(const Foo *renamed);
+void comment_suffix_a() /* comment */ const; void comment_suffix_b() const;
+void line_comment_a(int // value
+); void line_comment_b(int);
+void boundary_a(unsigned long value); void boundary_b(unsignedlong renamed);
 `
 	syms := parseCppSymbols(t, "a.cpp", src)
 	byName := map[string]string{}
@@ -121,12 +131,16 @@ void variadic_a(int, ...); void variadic_b(int);
 		{"array_a", "array_b"}, {"callback_a", "callback_b"},
 		{"member_callback_a", "member_callback_b"}, {"string_a", "string_b"},
 		{"brace_a", "brace_b"}, {"lambda_a", "lambda_b"},
+		{"pack_a", "pack_b"}, {"pack_a", "pack_c"},
+		{"comment_a", "comment_b"}, {"tokens_a", "tokens_b"},
+		{"ptr_a", "ptr_b"}, {"comment_suffix_a", "comment_suffix_b"},
+		{"line_comment_a", "line_comment_b"},
 	} {
 		if byName[pair[0]] != byName[pair[1]] {
 			t.Errorf("%s=%q, %s=%q; want equal", pair[0], byName[pair[0]], pair[1], byName[pair[1]])
 		}
 	}
-	for _, pair := range [][2]string{{"distinct_a", "distinct_b"}, {"qualifier_a", "qualifier_b"}, {"ref_qualifier_a", "ref_qualifier_b"}, {"variadic_a", "variadic_b"}} {
+	for _, pair := range [][2]string{{"distinct_a", "distinct_b"}, {"qualifier_a", "qualifier_b"}, {"ref_qualifier_a", "ref_qualifier_b"}, {"variadic_a", "variadic_b"}, {"boundary_a", "boundary_b"}} {
 		if byName[pair[0]] == byName[pair[1]] {
 			t.Errorf("%s and %s unexpectedly share %q", pair[0], pair[1], byName[pair[0]])
 		}

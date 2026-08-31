@@ -509,7 +509,7 @@ func cppFunctionSignature(fnDecl *sitter.Node, content []byte) string {
 	}
 	b.WriteByte(')')
 	if parameters.EndByte() < fnDecl.EndByte() {
-		b.WriteString(cppCompactSignatureText(content[parameters.EndByte():fnDecl.EndByte()]))
+		b.WriteString(cppSignatureWithoutComments(fnDecl, content, parameters.EndByte(), fnDecl.EndByte()))
 	}
 	return b.String()
 }
@@ -523,6 +523,10 @@ func cppCanonicalParameter(parameter *sitter.Node, content []byte) string {
 	var removals []cppSignatureRemoval
 	var walk func(*sitter.Node)
 	walk = func(node *sitter.Node) {
+		if node.Type() == "comment" {
+			removals = append(removals, cppSignatureRemoval{node.StartByte(), node.EndByte()})
+			return
+		}
 		if node.Type() == "optional_parameter_declaration" {
 			if def := childByFieldName(node, "default_value"); def != nil {
 				removals = append(removals, cppSignatureRemoval{def.StartByte(), def.EndByte()})
@@ -533,7 +537,7 @@ func cppCanonicalParameter(parameter *sitter.Node, content []byte) string {
 				}
 			}
 		}
-		if node.Type() == "parameter_declaration" || node.Type() == "optional_parameter_declaration" {
+		if node.Type() == "parameter_declaration" || node.Type() == "optional_parameter_declaration" || node.Type() == "variadic_parameter_declaration" {
 			if name := cppDeclaratorName(childByFieldName(node, "declarator")); name != nil {
 				removals = append(removals, cppSignatureRemoval{name.StartByte(), name.EndByte()})
 			}
@@ -549,6 +553,22 @@ func cppCanonicalParameter(parameter *sitter.Node, content []byte) string {
 	}
 	walk(parameter)
 	return cppRemoveSignatureRanges(nodeText(parameter, content), parameter.StartByte(), removals)
+}
+
+func cppSignatureWithoutComments(node *sitter.Node, content []byte, start, end uint32) string {
+	var removals []cppSignatureRemoval
+	var walk func(*sitter.Node)
+	walk = func(current *sitter.Node) {
+		if current.Type() == "comment" {
+			removals = append(removals, cppSignatureRemoval{current.StartByte(), current.EndByte()})
+			return
+		}
+		for i := range int(current.NamedChildCount()) {
+			walk(current.NamedChild(i))
+		}
+	}
+	walk(node)
+	return cppRemoveSignatureRanges(string(content[start:end]), start, removals)
 }
 
 func cppDeclaratorName(node *sitter.Node) *sitter.Node {
@@ -596,6 +616,11 @@ func cppRemoveSignatureRanges(text string, base uint32, removals []cppSignatureR
 			continue
 		}
 		b.WriteString(text[cursor-base : removal.start-base])
+		if removal.start > base && removal.end < base+uint32(len(text)) &&
+			isCppSignatureWord(text[removal.start-base-1]) &&
+			isCppSignatureWord(text[removal.end-base]) {
+			b.WriteByte(' ')
+		}
 		cursor = removal.end
 	}
 	b.WriteString(text[cursor-base:])

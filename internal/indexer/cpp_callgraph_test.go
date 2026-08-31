@@ -212,6 +212,9 @@ func TestCppCallGraphCanonicalDeclarationShapes(t *testing.T) {
 		{"default_header", "void foo(int value = 42);\n", "#include \"foo.h\"\nvoid foo(int renamed) {}\n", "foo();"},
 		{"string_default", "void foo(const char* value = \",\");\n", "#include \"foo.h\"\nvoid foo(const char* renamed) {}\n", "foo();"},
 		{"pointer_declarator", "void foo(int *value);\n", "#include \"foo.h\"\nvoid foo(int *renamed) {}\n", "foo(1);"},
+		{"comment_parameter", "void foo(int /* value */);\n", "#include \"foo.h\"\nvoid foo(int renamed) {}\n", "foo(1);"},
+		{"comment_tokens", "void foo(unsigned /* x */ long value);\n", "#include \"foo.h\"\nvoid foo(unsigned long renamed) {}\n", "foo(1);"},
+		{"comment_pointer", "void foo(const Foo /* x */ *value);\n", "#include \"foo.h\"\nvoid foo(const Foo *renamed) {}\n", "foo(nil);"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
