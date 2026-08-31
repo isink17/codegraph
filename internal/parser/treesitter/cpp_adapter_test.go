@@ -301,6 +301,28 @@ void caller() { Foo value = make_foo(); }
 	t.Fatal("initializer call was suppressed")
 }
 
+func TestCppConditionDeclarationCallSurvivesDeclarationGuard(t *testing.T) {
+	p := mustParseCpp(t, "condition_initializer.cpp", `struct State {};
+struct A {
+  int next(State&);
+  void apply(State& state) {
+    while (int i = next(state)) { (void)i; }
+    if (int i = next(state)) { (void)i; }
+    int i = next(state);
+  }
+};
+`)
+	var got int
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "next" {
+			got++
+		}
+	}
+	if got != 3 {
+		t.Fatalf("condition/declaration initializer calls = %d, want 3", got)
+	}
+}
+
 func TestCppDefaultArgumentCallSurvivesDeclarationGuard(t *testing.T) {
 	p := mustParseCpp(t, "default_argument.cpp", `int helper();
 void caller(int value = helper());

@@ -742,6 +742,11 @@ func cppMarkHiddenFriend(pf *graph.ParsedFile) {
 func cppCallInRecoveredDeclaration(call *sitter.Node, content []byte) bool {
 	for node := call.Parent(); node != nil; node = node.Parent() {
 		if node.Type() == "field_declaration" || node.Type() == "declaration" {
+			// C++ permits a declaration as a control-flow condition. Its value
+			// initializer is executable code, not a recovered declarator.
+			if condition := node.Parent(); condition != nil && condition.Type() == "condition_clause" && childByFieldName(condition, "value") == node {
+				return false
+			}
 			// An initializer is a declaration syntactically, but its call is a
 			// real expression. Only reject calls recovered as declarators.
 			if decl := cppAncestor(call, "init_declarator"); decl != nil {
