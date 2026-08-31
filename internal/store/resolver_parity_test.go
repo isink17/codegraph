@@ -188,6 +188,52 @@ func TestImportPathSpellingNeverBindsProjectTail(t *testing.T) {
 	}
 }
 
+// A template-like C++ spelling is valid evidence for a type-like target even
+// though punctuation makes it unlike a bare identifier. Scoped resolution must
+// route it through the same C++ evidence binder as a full resolve.
+func TestCppTemplateLikeSpellingParityAcrossEntryPoints(t *testing.T) {
+	const spelling = "Action<R(Args...)>"
+	entries := []string{"full", "paths", "names", "paths+names"}
+	var want string
+	for _, entry := range entries {
+		t.Run(entry, func(t *testing.T) {
+			f := newCppClassFixture(t)
+			file := f.file(t, "action.cpp", "cpp")
+			dst := f.declare(t, file, spelling, "ns::"+spelling, "class", "ns", 1, 4)
+			caller := f.declare(t, file, "caller", "ns::caller", "function", "ns", 5, 8)
+			edge := f.edge(t, file, caller, spelling)
+			var err error
+			switch entry {
+			case "full":
+				_, err = f.store.ResolveEdges(f.ctx, f.repoID)
+			case "paths":
+				err = f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"action.cpp"})
+			case "names":
+				_, err = f.store.ResolveEdgesForNames(f.ctx, f.repoID, []string{spelling})
+			case "paths+names":
+				_, err = f.store.ResolveEdgesForPathsAndNames(f.ctx, f.repoID, []string{"action.cpp"}, []string{spelling})
+			}
+			if err != nil {
+				t.Fatalf("%s failed: %v", entry, err)
+			}
+			gotID, resolved := f.dstSymbolID(t, edge)
+			if !resolved {
+				t.Fatalf("%s failed to resolve template-like C++ evidence", entry)
+			}
+			strategy, confidence := f.resolutionMetadata(t, edge)
+			got := f.qualifiedNameOf(t, gotID) + "|" + strategy + "|" + confidence
+			if want == "" {
+				want = got
+			} else if got != want {
+				t.Fatalf("%s produced %q, want %q", entry, got, want)
+			}
+			if gotID != dst {
+				t.Fatalf("%s resolved to %s, want %s", entry, f.qualifiedNameOf(t, gotID), f.qualifiedNameOf(t, dst))
+			}
+		})
+	}
+}
+
 // The same spelling shape, but the import IS the module's own package: P22.5's
 // evidence must keep resolving it, identically on every entry point.
 func TestOwnModuleImportResolvesOnEveryEntryPoint(t *testing.T) {

@@ -219,7 +219,8 @@ const resolverCandidateAggregatesSQL = `CASE WHEN COUNT(*) = 1 THEN MIN(s.id) EN
 // resolverCandidateJoinSQL LEFT JOINs the test-file set onto the candidate
 // symbols aliased `s`, supplying the `tf` alias resolverCandidateAggregatesSQL
 // reads.
-const resolverCandidateJoinSQL = `LEFT JOIN ` + resolverTestFilesTable + ` tf ON tf.file_id = s.file_id`
+const resolverCandidateJoinSQL = `LEFT JOIN ` + resolverTestFilesTable + ` tf ON tf.file_id = s.file_id
+			AND NOT (s.language = 'cpp' AND s.visibility = 'hidden_friend')`
 
 // resolverCandidateHavingSQL keeps only candidate groups that some caller kind
 // can actually use. It replaces P3's `HAVING COUNT(*) = 1`: a group of one is

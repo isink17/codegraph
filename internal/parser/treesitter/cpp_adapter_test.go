@@ -218,6 +218,118 @@ void A::c() {
 	}
 }
 
+func TestCppMacroReceiverEvidenceSurvives(t *testing.T) {
+	p := mustParseCpp(t, "macro_receiver.cpp", `struct A { void foo(); };
+#define WRAP(x) x
+void caller(A obj) { WRAP(obj.foo()); }
+`)
+	for _, edge := range p.Edges {
+		if edge.DstName == "obj.foo" {
+			if !strings.HasPrefix(edge.Evidence, "macro_unexpanded:") {
+				t.Fatalf("macro receiver evidence = %q, want macro_unexpanded prefix", edge.Evidence)
+			}
+			return
+		}
+	}
+	t.Fatal("macro receiver call was not extracted")
+}
+
+func TestCppInitializerCallSurvivesDeclarationGuard(t *testing.T) {
+	p := mustParseCpp(t, "initializer.cpp", `struct Foo {};
+Foo make_foo();
+void caller() { Foo value = make_foo(); }
+`)
+	for _, edge := range p.Edges {
+		if edge.DstName == "make_foo" {
+			return
+		}
+	}
+	t.Fatal("initializer call was suppressed")
+}
+
+func TestCppDefaultArgumentCallSurvivesDeclarationGuard(t *testing.T) {
+	p := mustParseCpp(t, "default_argument.cpp", `int helper();
+void caller(int value = helper());
+`)
+	for _, edge := range p.Edges {
+		if edge.DstName == "helper" {
+			return
+		}
+	}
+	t.Fatal("default-argument call was suppressed")
+}
+
+func TestCppTypeAliasFunctionalCastIsNotACall(t *testing.T) {
+	p := mustParseCpp(t, "alias.cpp", `using Alias = int;
+void caller() { Alias(1); }
+`)
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" {
+			t.Fatalf("type-alias functional cast emitted call: %+v", edge)
+		}
+	}
+}
+
+func TestCppHiddenFriendSameSpellingDoesNotSuppressMemberCall(t *testing.T) {
+	p := mustParseCpp(t, "hidden_friend_same_spelling.cpp", `struct A {
+  friend bool compare(const A&, const A&) { return true; }
+  void compare() {}
+  void caller() { this->compare(); }
+};
+`)
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "this.compare" {
+			return
+		}
+	}
+	t.Fatal("same-spelling member call was suppressed by hidden friend")
+}
+
+func TestCppConstructorDeclarationIsNotARecoveredCall(t *testing.T) {
+	p := mustParseCpp(t, "constructor_decl.cpp", `class Message {
+ public:
+  Message();
+};
+void make() { Message(); }
+`)
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "Message" && edge.Line == 3 {
+			t.Fatalf("constructor declaration emitted call: %+v", edge)
+		}
+	}
+	var expression bool
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "Message" && edge.Line == 5 {
+			expression = true
+		}
+	}
+	if !expression {
+		t.Fatal("constructor expression was suppressed")
+	}
+}
+
+func TestCppNonCallableNamesAreLexicallyScoped(t *testing.T) {
+	p := mustParseCpp(t, "scoped_non_callable.cpp", `namespace a {
+enum foo { value };
+using alias = int;
+}
+namespace b {
+void foo() {}
+void alias() {}
+void caller() { foo(); alias(); }
+}
+`)
+	var calls []string
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" {
+			calls = append(calls, edge.DstName)
+		}
+	}
+	if !reflect.DeepEqual(calls, []string{"foo", "alias"}) {
+		t.Fatalf("cross-namespace calls = %q, want [foo alias]", calls)
+	}
+}
+
 // TestCppCFieldAccessIsNotACall guards the C control: the adapter also serves
 // `.c`, where `x.field` is a struct member read and never a call.
 func TestCppCFieldAccessIsNotACall(t *testing.T) {

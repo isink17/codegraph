@@ -166,3 +166,15 @@ void caller() { WRAP(dup(1)); }
 		t.Fatalf("macro-wrapped call targets = %v, want unresolved", got)
 	}
 }
+
+func TestCppMacroWrappedReceiverCallStaysUnresolvedWithoutExpansion(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("fixture.cpp", `struct A { void foo() {} };
+#define WRAP(x) x
+void caller(A obj) { WRAP(obj.foo()); }
+`)
+	r.run("index")
+	if got := cppTargets(r, "obj.foo"); !equalStrings(got, []string{"<unresolved>"}) {
+		t.Fatalf("macro receiver targets = %v, want unresolved", got)
+	}
+}

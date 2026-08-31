@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -189,6 +190,13 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 		switch child.Type() {
 		case "function_definition":
 			cppAddFunction(child, module, container, content, pf)
+			if body := childByFieldName(child, "body"); body != nil {
+				for _, class := range findDescendants(child, "class_specifier") {
+					if cppBraceDepth(content, body.StartByte(), class.StartByte()) == 0 {
+						cppAddType(class, module, container, namespaceContainer, "class", fileScope, content, pf)
+					}
+				}
+			}
 		case "declaration":
 			// Could be a function declaration or variable. Declarations are
 			// evidence rows, not definition targets; the resolver connects them
@@ -197,6 +205,22 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 			if fnDecl != nil {
 				cppAddFunctionFromDeclarator(child, fnDecl, module, container, content, pf)
 			}
+			for j := range int(child.NamedChildCount()) {
+				embedded := child.NamedChild(j)
+				if childByFieldName(child, "declarator") != nil {
+					continue
+				}
+				switch embedded.Type() {
+				case "struct_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "struct", fileScope, content, pf)
+				case "class_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "class", fileScope, content, pf)
+				case "enum_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "enum", fileScope, content, pf)
+				case "union_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "union", fileScope, content, pf)
+				}
+			}
 		case "field_declaration":
 			// A bodiless method declaration is a direct function_declarator.
 			// Function-pointer fields are wrapped by pointer_declarator and are
@@ -204,6 +228,19 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 			fnDecl := firstChild(child, "function_declarator")
 			if fnDecl != nil {
 				cppAddFunctionFromDeclarator(child, fnDecl, module, container, content, pf)
+			}
+			if childByFieldName(child, "declarator") == nil {
+				for j := range int(child.NamedChildCount()) {
+					embedded := child.NamedChild(j)
+					switch embedded.Type() {
+					case "struct_specifier":
+						cppAddType(embedded, module, container, namespaceContainer, "struct", fileScope, content, pf)
+					case "class_specifier":
+						cppAddType(embedded, module, container, namespaceContainer, "class", fileScope, content, pf)
+					case "union_specifier":
+						cppAddType(embedded, module, container, namespaceContainer, "union", fileScope, content, pf)
+					}
+				}
 			}
 		case "struct_specifier":
 			cppAddType(child, module, container, namespaceContainer, "struct", fileScope, content, pf)
@@ -261,6 +298,64 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 			}
 		}
 	}
+}
+
+func cppBraceDepth(content []byte, start, end uint32) int {
+	depth := 0
+	lineComment, blockComment, quoted, escaped := false, false, byte(0), false
+	for i := int(start); i < int(end); i++ {
+		b := content[i]
+		if lineComment {
+			if b == '\n' {
+				lineComment = false
+			}
+			continue
+		}
+		if blockComment {
+			if b == '*' && i+1 < int(end) && content[i+1] == '/' {
+				blockComment = false
+				i++
+			}
+			continue
+		}
+		if quoted != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if b == '\\' {
+				escaped = true
+				continue
+			}
+			if b == quoted {
+				quoted = 0
+			}
+			continue
+		}
+		if b == '/' && i+1 < int(end) && content[i+1] == '/' {
+			lineComment = true
+			i++
+			continue
+		}
+		if b == '/' && i+1 < int(end) && content[i+1] == '*' {
+			blockComment = true
+			i++
+			continue
+		}
+		if b == '"' || b == '\'' {
+			quoted = b
+			continue
+		}
+		switch b {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return depth
 }
 
 func cppScopeName(container, name string) string {
@@ -415,13 +510,16 @@ func cppAddType(node *sitter.Node, module, container, namespaceContainer, kind, 
 	})
 
 	body := childByFieldName(node, "body")
+	if body == nil {
+		body = firstChild(node, "field_declaration_list")
+	}
 	if body != nil {
 		cppExtractSymbols(body, module, cppQualifiedName(container, name), namespaceContainer, fileScope, content, pf)
 	}
 }
 
 func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
-	enumValues := cppEnumValueNames(root, content)
+	enumValues, enumTypes := cppEnumNames(root, content)
 	typeAliases := cppTypeAliasNames(root, content)
 	macros := cppMacroNames(root, content)
 	for _, call := range findDescendants(root, "call_expression") {
@@ -433,18 +531,17 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if callName == "" || cppSkipFuncs[callName] {
 			continue
 		}
-		if cppCallInRecoveredDeclaration(call, content) || cppCallNamesNonCallableType(fnNode, content, pf.Symbols, enumValues, typeAliases) || cppCallInHiddenFriendScope(call, callName, content) {
+		if cppCallInRecoveredDeclaration(call, content) || cppCallNamesNonCallableType(call, fnNode, content, enumValues, enumTypes, typeAliases) || cppCallInHiddenFriendScope(call) {
 			continue
 		}
-		macroOrigin := cppCallInsideMacro(call, content, macros)
 		dstName := cppMemberDstName(receiver, callName)
 		line := int(call.StartPoint().Row) + 1
 		evidence := callKind + ":" + nodeText(fnNode, content)
-		if macroOrigin {
-			evidence = "macro_unexpanded:" + evidence
-		}
 		if receiver != "" {
 			evidence = callKind + ":" + receiver + ":" + nodeText(fnNode, content)
+		}
+		if cppCallInsideMacro(call, content, macros) {
+			evidence = "macro_unexpanded:" + evidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
@@ -462,15 +559,8 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 	}
 }
 
-func cppCallInHiddenFriendScope(call *sitter.Node, name string, content []byte) bool {
-	for node := call.Parent(); node != nil; node = node.Parent() {
-		if node.Type() != "class_specifier" && node.Type() != "struct_specifier" {
-			continue
-		}
-		text := nodeText(node, content)
-		return strings.Contains(text, "friend") && strings.Contains(text, name)
-	}
-	return false
+func cppCallInHiddenFriendScope(call *sitter.Node) bool {
+	return cppHasAncestor(call, "friend_declaration")
 }
 
 func cppMarkHiddenFriend(pf *graph.ParsedFile) {
@@ -486,6 +576,17 @@ func cppMarkHiddenFriend(pf *graph.ParsedFile) {
 func cppCallInRecoveredDeclaration(call *sitter.Node, content []byte) bool {
 	for node := call.Parent(); node != nil; node = node.Parent() {
 		if node.Type() == "field_declaration" || node.Type() == "declaration" {
+			// An initializer is a declaration syntactically, but its call is a
+			// real expression. Only reject calls recovered as declarators.
+			if decl := cppAncestor(call, "init_declarator"); decl != nil {
+				value := childByFieldName(decl, "value")
+				if value != nil && call.StartByte() >= value.StartByte() && call.EndByte() <= value.EndByte() {
+					return false
+				}
+			}
+			if cppHasAncestor(call, "parameter_declaration") || cppHasAncestor(call, "optional_parameter_declaration") {
+				return false
+			}
 			return true
 		}
 		if node.Type() == "labeled_statement" {
@@ -504,7 +605,16 @@ func cppCallInRecoveredDeclaration(call *sitter.Node, content []byte) bool {
 	return false
 }
 
-func cppCallNamesNonCallableType(fnNode *sitter.Node, content []byte, symbols []graph.Symbol, enumValues, typeAliases map[string]struct{}) bool {
+func cppAncestor(node *sitter.Node, typ string) *sitter.Node {
+	for node = node.Parent(); node != nil; node = node.Parent() {
+		if node.Type() == typ {
+			return node
+		}
+	}
+	return nil
+}
+
+func cppCallNamesNonCallableType(call, fnNode *sitter.Node, content []byte, enumValues, enumTypes, typeAliases map[string][]*sitter.Node) bool {
 	if fnNode.Type() != "identifier" {
 		return false
 	}
@@ -512,17 +622,58 @@ func cppCallNamesNonCallableType(fnNode *sitter.Node, content []byte, symbols []
 	if name == "" {
 		return false
 	}
-	for _, symbol := range symbols {
-		if symbol.Name == name && symbol.Kind == "enum" {
-			return true
+	callScope := cppLexicalScope(call, content)
+	return cppHasVisibleNonCallableScope(callScope, enumValues[name], content) ||
+		cppHasVisibleNonCallableScope(callScope, enumTypes[name], content) ||
+		cppHasVisibleNonCallableScope(callScope, typeAliases[name], content)
+}
+
+func cppHasVisibleNonCallableScope(callScope []string, declarations []*sitter.Node, content []byte) bool {
+	for _, declaration := range declarations {
+		declScope := cppLexicalScope(declaration, content)
+		if len(declScope) <= len(callScope) {
+			match := true
+			for i := range declScope {
+				if declScope[i] != callScope[i] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
 		}
 	}
-	_, ok := enumValues[name]
-	if ok {
-		return true
+	return false
+}
+
+// cppLexicalScope returns semantic scope owners from outermost to innermost.
+// Declaration names alone are insufficient: a type in namespace a must not
+// veto a callable with the same spelling in namespace b.
+func cppLexicalScope(node *sitter.Node, content []byte) []string {
+	var reversed []string
+	for current := node; current != nil; current = current.Parent() {
+		var key string
+		switch current.Type() {
+		case "namespace_definition":
+			name := childByFieldName(current, "name")
+			if name != nil {
+				key = current.Type() + ":" + strings.Join(strings.Fields(nodeText(name, content)), "")
+			}
+			if key == "" {
+				key = current.Type() + ":" + strconv.FormatUint(uint64(current.StartByte()), 10)
+			}
+		case "class_specifier", "struct_specifier", "union_specifier", "function_definition", "compound_statement":
+			key = current.Type() + ":" + strconv.FormatUint(uint64(current.StartByte()), 10)
+		}
+		if key != "" {
+			reversed = append(reversed, key)
+		}
 	}
-	_, ok = typeAliases[name]
-	return ok
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	return reversed
 }
 
 func cppHasAncestor(node *sitter.Node, typ string) bool {
@@ -535,23 +686,32 @@ func cppHasAncestor(node *sitter.Node, typ string) bool {
 	return false
 }
 
-func cppEnumValueNames(root *sitter.Node, content []byte) map[string]struct{} {
-	values := map[string]struct{}{}
+func cppEnumNames(root *sitter.Node, content []byte) (map[string][]*sitter.Node, map[string][]*sitter.Node) {
+	values := map[string][]*sitter.Node{}
+	types := map[string][]*sitter.Node{}
+	for _, enum := range findDescendants(root, "enum_specifier") {
+		name := childByFieldName(enum, "name")
+		if name != nil {
+			types[strings.TrimSpace(nodeText(name, content))] = append(types[strings.TrimSpace(nodeText(name, content))], enum)
+		}
+	}
 	for _, enumerator := range findDescendants(root, "enumerator") {
 		name := childByFieldName(enumerator, "name")
 		if name != nil {
-			values[strings.TrimSpace(nodeText(name, content))] = struct{}{}
+			key := strings.TrimSpace(nodeText(name, content))
+			values[key] = append(values[key], enumerator)
 		}
 	}
-	return values
+	return values, types
 }
 
-func cppTypeAliasNames(root *sitter.Node, content []byte) map[string]struct{} {
-	aliases := map[string]struct{}{}
+func cppTypeAliasNames(root *sitter.Node, content []byte) map[string][]*sitter.Node {
+	aliases := map[string][]*sitter.Node{}
 	for _, node := range findDescendants(root, "alias_declaration") {
 		name := childByFieldName(node, "name")
 		if name != nil {
-			aliases[strings.TrimSpace(nodeText(name, content))] = struct{}{}
+			key := strings.TrimSpace(nodeText(name, content))
+			aliases[key] = append(aliases[key], node)
 		}
 	}
 	return aliases

@@ -171,6 +171,43 @@ func TestBareNameLevelVetoIsInsertionOrderIndependent(t *testing.T) {
 	}
 }
 
+// Equivalent C++ declarations must not be selected by insertion order. The
+// semantic projection is refusal: three indistinguishable declarations do not
+// identify one definition.
+func TestCppEquivalentDeclarationsInsertionOrderIndependent(t *testing.T) {
+	for _, entry := range []string{"full", "paths", "names", "paths+names"} {
+		for _, order := range []string{"a-first", "b-first"} {
+			t.Run(entry+"/"+order, func(t *testing.T) {
+				f := newParityFixture(t, "")
+				a := f.file(t, "a.h", "cpp")
+				b := f.file(t, "b.h", "cpp")
+				addA := func() { f.symbolIn(t, a, "foo", "foo", "declaration", "", "cpp") }
+				addB := func() { f.symbolIn(t, b, "foo", "foo", "declaration", "", "cpp") }
+				if order == "a-first" {
+					addA()
+					addB()
+				} else {
+					addB()
+					addA()
+				}
+				definitionA := f.file(t, "a.cpp", "cpp")
+				f.symbolIn(t, definitionA, "foo", "foo", "function", "", "cpp")
+				definitionB := f.file(t, "b.cpp", "cpp")
+				f.symbolIn(t, definitionB, "foo", "foo", "function", "", "cpp")
+				callerFile := f.file(t, "caller.cpp", "cpp")
+				caller := f.symbolIn(t, callerFile, "caller", "caller", "function", "", "cpp")
+				f.imports(t, callerFile, "a.h")
+				f.imports(t, callerFile, "b.h")
+				edge := f.edge(t, callerFile, caller, "foo")
+				f.resolveVia(t, entry, []string{"caller.cpp"}, []string{"foo"})
+				if got := f.binding(t, edge); got != "<unresolved>" {
+					t.Fatalf("%s: equivalent declaration order selected %s", order, got)
+				}
+			})
+		}
+	}
+}
+
 // The C++ shape the class was found on: `enum align` nested in one class and a
 // member function `align` in another. Both declare the identifier `align`, and
 // the bare spelling names neither, on any entry point.

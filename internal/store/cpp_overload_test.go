@@ -9,7 +9,7 @@ func TestCppEvidenceRefusesUnmodeledOverloadChoice(t *testing.T) {
 		definitions  []string
 		wantBound    bool
 	}{
-		{name: "distinct_signatures_refused", declarations: []string{"(int)", "(const char*)"}, definitions: []string{"(int)", "(const char*)"}},
+		{name: "distinct_signatures_refused", declarations: []string{"(int)", "(const char*)"}, definitions: []string{"(int)"}},
 		{name: "one_signature_resolves", declarations: []string{"(int)"}, definitions: []string{"(int)"}, wantBound: true},
 		{name: "duplicate_same_signature_resolves", declarations: []string{"(int)", "(int)"}, definitions: []string{"(int)"}, wantBound: true},
 	}
