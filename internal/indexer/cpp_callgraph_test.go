@@ -189,6 +189,22 @@ func TestCppCallGraphUnprovenReceiverStaysUnresolved(t *testing.T) {
 	}
 }
 
+func TestCppCallGraphRenamedParametersUseDeclarationEvidence(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{
+		"foo.h":      "void foo(int value);\n",
+		"foo.cpp":    "#include \"foo.h\"\nvoid foo(int renamed) {}\n",
+		"caller.cpp": "#include \"foo.h\"\nvoid caller() { foo(1); }\n",
+	})
+	callees, err := s.FindCallees(ctx, repo.ID, "caller", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasSymbolQName(callees, "foo") {
+		t.Fatalf("renamed-parameter call did not resolve: %+v", callees)
+	}
+}
+
 // TestCppCallGraphQualifiedCallResolves is the positive control: C++ calls
 // whose target CodeGraph can actually prove keep their recall. A `::`-qualified
 // call names a type and a member, and that spelling matches the destination's
