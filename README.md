@@ -268,14 +268,14 @@ both MCP modes (`full` and `gateway`) and the CLI fallback.
 
 | Tool | Description |
 |---|---|
-| `find_symbol` | Find symbols by exact or fuzzy query |
+| `find_symbol` | Find symbols by exact or substring query |
 | `search_symbols` | Search symbol names, signatures, and docs (FTS5) |
 | `search_semantic` | Hybrid semantic search (vector + FTS when embeddings enabled) |
-| `find_callers` | Find what calls a given function |
-| `find_callees` | Find what a given function calls |
-| `get_impact_radius` | Estimate affected symbols and files around a change |
-| `trace_dependencies` | Trace transitive dependency chains (upstream/downstream) |
-| `find_related_tests` | Find tests for a symbol, file, or set of changed files |
+| `find_callers` | Find resolved callers of an indexed symbol |
+| `find_callees` | Find resolved callees of an indexed symbol |
+| `get_impact_radius` | Estimate resolved dependency impact and report uncertainty |
+| `trace_dependencies` | Trace resolved dependency edges from an exact symbol |
+| `find_related_tests` | Find likely related tests for a symbol, file, or changed files |
 | `find_dead_code` | Find symbols with no callers or references |
 | `context_for_task` | Build a focused, token-budgeted context bundle for a natural-language task |
 
@@ -351,11 +351,10 @@ ceiling or clamped to a file that has since shrunk and reports the real range in
 skeleton's member list was capped; and `skeleton_note` / `source_note` explain
 every other case -- a container whose members were not looked up, a symbol whose
 source was omitted, a parser that recorded no body range, a file that changed
-since indexing. The traversal tools have no result limit of their own, so one
-response looks up members for a bounded number of containers and renders source
-for a bounded number of symbols; the rest carry the matching note. Both bounds
-sit well above any paged request, so a `limit` you asked for is always honoured
-in full.
+since indexing. Results are still bounded pages: one response looks up members
+for a bounded number of containers and renders source for a bounded number of
+symbols; the rest carry the matching note. Both bounds sit well above any paged
+request, so a `limit` you asked for is always honoured in full.
 
 The tools that still return the pre-projection symbol shape -- `search_semantic`,
 `find_dead_code`, `trace_dependencies`, `find_related_tests`, and
@@ -415,9 +414,9 @@ versioned independently of the CodeGraph release version.
 - **Fields** are separated by a tab. A row always has exactly as many cells as its
   section has columns, in the order `@columns` gives.
 - **Sections** have stable names and a stable order, and each has its own columns.
-  `get_impact_radius` emits `symbols`, then `files`, then `summary`, so the
-  affected-file list and the two summary counts stay separate from the symbol rows
-  rather than being flattened into them.
+  `get_impact_radius` emits `symbols`, then `files`, then `summary`, plus seed
+  presence metadata, so traversal counts stay separate from symbol rows rather
+  than being flattened into them.
 - **Escapes**, and nothing else — no trimming, no case folding, no path
   rewriting: `\\` backslash, `\t` tab, `\n` line feed, `\r` carriage return, `\@`
   at sign. Any other `\x` is a decode error. A path is opaque data, so a literal
@@ -432,11 +431,40 @@ versioned independently of the CodeGraph release version.
 `compact` is an MCP encoding. The CLI is unchanged: its only `--format` is
 `graph export`'s `json|dot`, which means something else.
 
+### Query contract
+
+Relationship tools report only persisted, resolved edges. Unresolved spellings
+are evidence, not confirmed relationships. For `find_callers`, an unknown name
+may therefore produce `unresolved_hints` separately from `callers`; those hints
+do not identify callers of a known indexed symbol.
+
+When `symbol_id` is accepted, a non-zero value is the authoritative identity in
+the current repository. The `symbol` string is used to resolve a target only
+when `symbol_id` is not provided; a stale or foreign ID is not rescued by the
+string.
+
+Presence is independent of the current page: `matched` means a search query has
+at least one match, while `target_found` means the requested relationship,
+test, or trace target resolved and its result may still be empty. A missing
+related-test or trace target is a successful result with `target_found: false`.
+
+`get_impact_radius` returns `seed_presence` with `requested`, `found`, and
+`missing`. Its `summary.unresolved_edges` and `summary.unresolved_names` count
+unresolved outgoing evidence in the full resolved impact closure; they do not
+expand traversal, map names to candidates, or change with page size/offset.
+
+`trace_dependencies` resolves one exact semantic seed and follows resolved
+edges only. Ambiguous exact short-name lookup fails closed; missing is distinct.
+Its `total` is the full canonical traversal size before pagination, `offset` is
+the effective (clamped) page offset, and `truncated` says whether more canonical
+rows remain after the returned page. There is no CLI trace command.
+
 ### Token budget and continuation (`context_for_task`)
 
 `context_for_task` is the selector at the front of that workflow: it ranks the
 context for a task and returns as much of it as a token budget pays for, with the
-identity needed to drill into anything it named.
+identity needed to drill into anything it named. Any caller/callee context is
+based on resolved relationship edges, not guessed name matches.
 
 | Argument | Meaning |
 |---|---|
@@ -587,20 +615,14 @@ The MCP schema is the machine-readable source: every bounded argument publishes
 its `minimum` and `maximum`, so a client can read the limit instead of
 discovering it by being refused. The CLI enforces the same numbers.
 
-### Missing things are CodeGraph errors
-
-Asking about something that is not in the index produces CodeGraph's own error,
-never the database driver's:
-
-```
-symbol not found: "ParseConfig"
-```
+### Missing things and errors
 
 An empty result and a missing entity are different answers and stay different:
 
 - a search with no matches is a valid empty result, not an error;
 - an indexed symbol that genuinely has no related tests returns an empty list;
-- a name that several definitions share is still resolved, not reported missing;
+- an exact trace seed whose short name several definitions share fails closed as
+  ambiguous; this is distinct from a missing seed;
 - a real database failure stays a database error and is never relabelled
   "not found".
 

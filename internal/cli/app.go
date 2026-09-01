@@ -1575,7 +1575,11 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		return writeJSON(stdout, map[string]any{"callers": items, "target_found": result.TargetFound, "count": len(items)})
+		payload := map[string]any{"callers": items, "target_found": result.TargetFound, "count": len(items)}
+		if len(result.UnresolvedHints) > 0 {
+			payload["unresolved_hints"] = result.UnresolvedHints
+		}
+		return writeJSON(stdout, payload)
 	case "callees":
 		if symbol == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
