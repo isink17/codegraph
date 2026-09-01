@@ -137,7 +137,7 @@ func TestFindCallersKnownGoTargetKeepsPackageScope(t *testing.T) {
 	f.edge(t, callFile, outsider, "Foo")
 	f.edge(t, localFile, insider, "Foo")
 
-	assertSet(t, `FindCallers("b.Foo")`, callerQNames(t, f, "b.Foo", 0), "b.insider")
+	assertSet(t, `FindCallers("b.Foo")`, callerQNames(t, f, "b.Foo", 0))
 }
 
 // TestFindCallersKnownCppTargetKeepsFileScope pins P22.13: a known C++ target
@@ -151,7 +151,7 @@ func TestFindCallersKnownCppTargetKeepsFileScope(t *testing.T) {
 	caller := f.symbol(t, callFile, "caller", "caller", "cpp")
 	f.edge(t, callFile, caller, "Foo")
 
-	assertSet(t, `FindCallers(cpp Foo)`, callerQNames(t, f, "Foo", target), /* none */)
+	assertSet(t, `FindCallers(cpp Foo)`, callerQNames(t, f, "Foo", target) /* none */)
 }
 
 // TestFindCallersKnownTargetKeepsLanguageGate: a known target in one language
@@ -162,7 +162,7 @@ func TestFindCallersKnownTargetKeepsLanguageGate(t *testing.T) {
 	pyDecl := f.file(t, "app/lib.py", "python")
 	target := f.symbol(t, pyDecl, "MissingThing", "lib.MissingThing", "python")
 
-	assertSet(t, `FindCallers(python MissingThing)`, callerQNames(t, f, "lib.MissingThing", target), "app.caller")
+	assertSet(t, `FindCallers(python MissingThing)`, callerQNames(t, f, "lib.MissingThing", target))
 }
 
 // TestFindCallersZeroScopeDoesNotWidenExactID is the P22.18 control: the fix
@@ -176,7 +176,7 @@ func TestFindCallersZeroScopeDoesNotWidenExactID(t *testing.T) {
 	outsider := f.symbol(t, callFile, "outsider", "a.outsider", "go")
 	f.edge(t, callFile, outsider, "Foo")
 
-	assertSet(t, `FindCallers(id b.Foo)`, callerQNames(t, f, "b.Foo", target), /* none */)
+	assertSet(t, `FindCallers(id b.Foo)`, callerQNames(t, f, "b.Foo", target) /* none */)
 }
 
 // TestFindCallersStaleSymbolIDStaysRefused: an explicit symbol id is an

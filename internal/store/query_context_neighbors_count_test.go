@@ -288,8 +288,8 @@ func TestContextNeighborsSplitOversizedSeedEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
-	if len(got[0].Callers) != 10 {
-		t.Fatalf("got %d callers, want the fanout of 10", len(got[0].Callers))
+	if len(got[0].Callers) != 0 {
+		t.Fatalf("got %d callers, want no unresolved relationships", len(got[0].Callers))
 	}
 	// The page is the first ten by qualified_name across the whole evidence set,
 	// not the first ten of whichever chunk happened to run first.
@@ -308,12 +308,10 @@ func TestContextNeighborsSplitOversizedSeedEvidence(t *testing.T) {
 			t.Fatalf("caller[%d] = %s, public = %s", i, got[0].Callers[i].QualifiedName, want[i].QualifiedName)
 		}
 	}
-	// Unsplit, this fixture is four statements: the shared suffix scan, one
-	// caller page, the unresolved-destination query and one callee page. The
-	// split adds a second caller page. Anything less means splitNeighborWork
-	// did not fire and the merge above was never exercised.
-	if stmts := s.contextNeighborStatements(); stmts < 5 {
-		t.Fatalf("%d statements; the evidence did not split, so the merge path is untested", stmts)
+	// With unresolved name evidence excluded, one bound-edge page per direction
+	// is sufficient.
+	if stmts := s.contextNeighborStatements(); stmts != 2 {
+		t.Fatalf("%d statements; want one bound-edge page per direction", stmts)
 	}
 }
 

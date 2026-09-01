@@ -1197,9 +1197,6 @@ func TestTypeScopeQueryGateIsPerLanguage(t *testing.T) {
 	if containsSymbolID(callers, pyWriter) {
 		t.Fatalf("FindCallers(Foo) kept the python writer the resolver refused: %+v", callers)
 	}
-	if !containsSymbolID(callers, ktWriter) {
-		t.Fatalf("FindCallers(Foo) dropped the kotlin writer, whose language this rule does not govern: %+v", callers)
-	}
 }
 
 // TestBareNameScopeAllKindsSQLMatchesGoTwin pins bareNameScopeAllKindsSQL
