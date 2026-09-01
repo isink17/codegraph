@@ -224,6 +224,8 @@ const (
 // it is. See go_package_scope.go, resolver_type_scope.go and cpp_class_scope.go.
 var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
 		AND (` + resolverChosenCandidateSQL + `) IS NOT NULL
+		AND NOT (f.language = 'cpp' AND edges.evidence LIKE 'macro_unexpanded:%')
+		AND NOT (f.language = 'cpp' AND instr(edges.dst_name, '.') = 0 AND instr(edges.dst_name, '::') = 0)
 		AND NOT (f.language = 'cpp' AND (instr(edges.dst_name, '.') = 0 OR instr(edges.dst_name, '::') > 0))
 		AND ` + resolverGoBareScopeSQL + `
 		AND ` + resolverBareNameTypeScopeSQL + `

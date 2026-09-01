@@ -3863,7 +3863,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		end := min(start+chunkSize, len(fileIDs))
 		chunk := fileIDs[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id, dst_name, file_id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
+		query := `SELECT id, dst_name, file_id, evidence FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, id := range chunk {
@@ -4102,7 +4102,7 @@ func scanEdgeTargets(rows *sql.Rows, languageByFileID map[int64]string) ([]edgeT
 	var targets []edgeTarget
 	for rows.Next() {
 		var target edgeTarget
-		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID); err != nil {
+		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID, &target.evidence); err != nil {
 			return nil, err
 		}
 		target.srcLanguage = languageByFileID[target.srcFileID]
@@ -4229,6 +4229,16 @@ func binderFallback(dstName string) (lookup, column string) {
 	}
 }
 
+// binderFallbackForTarget keeps exact C++ type-like spellings on the same
+// name-evidence level as the repo-wide resolver. Their punctuation is part of
+// the symbol name, not a dot-tail qualifier.
+func binderFallbackForTarget(target edgeTarget) (lookup, column string) {
+	if target.srcLanguage == "cpp" && cppEvidenceTarget(target) && !strings.Contains(target.dstName, "::") {
+		return target.dstName, "name"
+	}
+	return binderFallback(target.dstName)
+}
+
 func setToSlice(set map[string]struct{}) []string {
 	out := make([]string, 0, len(set))
 	for name := range set {
@@ -4254,7 +4264,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	remaining := targets[:0]
 	cppIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
-		if target.srcLanguage == "cpp" && (goBareCallName(target.dstName) || strings.Contains(target.dstName, "::")) {
+		if cppEvidenceTarget(target) {
 			cppIDs = append(cppIDs, target.edgeID)
 			continue
 		}
@@ -4376,7 +4386,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			// veto rows in recordAmbiguousResolverNames.
 			continue
 		}
-		fallbackName, column := binderFallback(target.dstName)
+		fallbackName, column := binderFallbackForTarget(target)
 		if fallbackName == "" {
 			continue
 		}
@@ -4483,7 +4493,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if _, blocked := moduleVeto[target.edgeID]; blocked {
 			continue
 		}
-		fallbackName, fallbackColumn := binderFallback(target.dstName)
+		fallbackName, fallbackColumn := binderFallbackForTarget(target)
 		if target.srcLanguage == "" {
 			// Unknown source language: never guess a destination language.
 			// Candidate maps only contain non-empty languages, so this is also

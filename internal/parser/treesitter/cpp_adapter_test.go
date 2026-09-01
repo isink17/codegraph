@@ -93,6 +93,60 @@ func mustParseCpp(t *testing.T, path, src string) graph.ParsedFile {
 	return pf
 }
 
+func TestCppFunctionSignatureCanonicalDeclarators(t *testing.T) {
+	src := `
+void pointer_a(int *value); void pointer_b(int *renamed);
+void pointer_c(int*value); void pointer_d(int*renamed);
+void reference_a(const Foo &value); void reference_b(const Foo &other);
+void rvalue_a(Foo&&value); void rvalue_b(Foo&&other);
+void array_a(int values[3]); void array_b(int other[3]);
+void callback_a(void (*cb)(int)); void callback_b(void (*handler)(int));
+void member_callback_a(void (C::*cb)(int)); void member_callback_b(void (C::*handler)(int));
+void string_a(const char* text = ","); void string_b(const char* text = ")");
+void brace_a(Config c = Config{1, 2}); void brace_b(Config c);
+void lambda_a(Callback cb = [] { return 1; }); void lambda_b(Callback cb);
+void distinct_a(int); void distinct_b(const char*);
+void qualifier_a() const; void qualifier_b();
+void ref_qualifier_a() &; void ref_qualifier_b() &&;
+void variadic_a(int, ...); void variadic_b(int);
+template <class... Args> void pack_a(Args... args);
+template <class... Args> void pack_b(Args... values);
+template <class... Args> void pack_c(Args...);
+void comment_a(int /* value */); void comment_b(int renamed);
+void tokens_a(unsigned /* comment */ long value); void tokens_b(unsigned long renamed);
+void ptr_a(const Foo /*x*/ *value); void ptr_b(const Foo *renamed);
+void comment_suffix_a() /* comment */ const; void comment_suffix_b() const;
+void line_comment_a(int // value
+); void line_comment_b(int);
+void boundary_a(unsigned long value); void boundary_b(unsignedlong renamed);
+`
+	syms := parseCppSymbols(t, "a.cpp", src)
+	byName := map[string]string{}
+	for _, sym := range syms {
+		byName[sym.Name] = sym.Signature
+	}
+	for _, pair := range [][2]string{
+		{"pointer_a", "pointer_b"}, {"pointer_c", "pointer_d"},
+		{"reference_a", "reference_b"}, {"rvalue_a", "rvalue_b"},
+		{"array_a", "array_b"}, {"callback_a", "callback_b"},
+		{"member_callback_a", "member_callback_b"}, {"string_a", "string_b"},
+		{"brace_a", "brace_b"}, {"lambda_a", "lambda_b"},
+		{"pack_a", "pack_b"}, {"pack_a", "pack_c"},
+		{"comment_a", "comment_b"}, {"tokens_a", "tokens_b"},
+		{"ptr_a", "ptr_b"}, {"comment_suffix_a", "comment_suffix_b"},
+		{"line_comment_a", "line_comment_b"},
+	} {
+		if byName[pair[0]] != byName[pair[1]] {
+			t.Errorf("%s=%q, %s=%q; want equal", pair[0], byName[pair[0]], pair[1], byName[pair[1]])
+		}
+	}
+	for _, pair := range [][2]string{{"distinct_a", "distinct_b"}, {"qualifier_a", "qualifier_b"}, {"ref_qualifier_a", "ref_qualifier_b"}, {"variadic_a", "variadic_b"}, {"boundary_a", "boundary_b"}} {
+		if byName[pair[0]] == byName[pair[1]] {
+			t.Errorf("%s and %s unexpectedly share %q", pair[0], pair[1], byName[pair[0]])
+		}
+	}
+}
+
 // TestCppCallDstNameKeepsReceiver pins the persisted destination identity for
 // every C++ call syntax the adapter emits (P22.11).
 //
@@ -215,6 +269,140 @@ void A::c() {
 		if seen[name] != ev {
 			t.Errorf("evidence for %q = %q, want %q", name, seen[name], ev)
 		}
+	}
+}
+
+func TestCppMacroReceiverEvidenceSurvives(t *testing.T) {
+	p := mustParseCpp(t, "macro_receiver.cpp", `struct A { void foo(); };
+#define WRAP(x) x
+void caller(A obj) { WRAP(obj.foo()); }
+`)
+	for _, edge := range p.Edges {
+		if edge.DstName == "obj.foo" {
+			if !strings.HasPrefix(edge.Evidence, "macro_unexpanded:") {
+				t.Fatalf("macro receiver evidence = %q, want macro_unexpanded prefix", edge.Evidence)
+			}
+			return
+		}
+	}
+	t.Fatal("macro receiver call was not extracted")
+}
+
+func TestCppInitializerCallSurvivesDeclarationGuard(t *testing.T) {
+	p := mustParseCpp(t, "initializer.cpp", `struct Foo {};
+Foo make_foo();
+void caller() { Foo value = make_foo(); }
+`)
+	for _, edge := range p.Edges {
+		if edge.DstName == "make_foo" {
+			return
+		}
+	}
+	t.Fatal("initializer call was suppressed")
+}
+
+func TestCppConditionDeclarationCallSurvivesDeclarationGuard(t *testing.T) {
+	p := mustParseCpp(t, "condition_initializer.cpp", `struct State {};
+struct A {
+  int next(State&);
+  void apply(State& state) {
+    while (int i = next(state)) { (void)i; }
+    if (int i = next(state)) { (void)i; }
+    int i = next(state);
+  }
+};
+`)
+	var got int
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "next" {
+			got++
+		}
+	}
+	if got != 3 {
+		t.Fatalf("condition/declaration initializer calls = %d, want 3", got)
+	}
+}
+
+func TestCppDefaultArgumentCallSurvivesDeclarationGuard(t *testing.T) {
+	p := mustParseCpp(t, "default_argument.cpp", `int helper();
+void caller(int value = helper());
+`)
+	for _, edge := range p.Edges {
+		if edge.DstName == "helper" {
+			return
+		}
+	}
+	t.Fatal("default-argument call was suppressed")
+}
+
+func TestCppTypeAliasFunctionalCastIsNotACall(t *testing.T) {
+	p := mustParseCpp(t, "alias.cpp", `using Alias = int;
+void caller() { Alias(1); }
+`)
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" {
+			t.Fatalf("type-alias functional cast emitted call: %+v", edge)
+		}
+	}
+}
+
+func TestCppHiddenFriendSameSpellingDoesNotSuppressMemberCall(t *testing.T) {
+	p := mustParseCpp(t, "hidden_friend_same_spelling.cpp", `struct A {
+  friend bool compare(const A&, const A&) { return true; }
+  void compare() {}
+  void caller() { this->compare(); }
+};
+`)
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "this.compare" {
+			return
+		}
+	}
+	t.Fatal("same-spelling member call was suppressed by hidden friend")
+}
+
+func TestCppConstructorDeclarationIsNotARecoveredCall(t *testing.T) {
+	p := mustParseCpp(t, "constructor_decl.cpp", `class Message {
+ public:
+  Message();
+};
+void make() { Message(); }
+`)
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "Message" && edge.Line == 3 {
+			t.Fatalf("constructor declaration emitted call: %+v", edge)
+		}
+	}
+	var expression bool
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" && edge.DstName == "Message" && edge.Line == 5 {
+			expression = true
+		}
+	}
+	if !expression {
+		t.Fatal("constructor expression was suppressed")
+	}
+}
+
+func TestCppNonCallableNamesAreLexicallyScoped(t *testing.T) {
+	p := mustParseCpp(t, "scoped_non_callable.cpp", `namespace a {
+enum foo { value };
+using alias = int;
+}
+namespace b {
+void foo() {}
+void alias() {}
+void caller() { foo(); alias(); }
+}
+`)
+	var calls []string
+	for _, edge := range p.Edges {
+		if edge.Kind == "calls" {
+			calls = append(calls, edge.DstName)
+		}
+	}
+	if !reflect.DeepEqual(calls, []string{"foo", "alias"}) {
+		t.Fatalf("cross-namespace calls = %q, want [foo alias]", calls)
 	}
 }
 

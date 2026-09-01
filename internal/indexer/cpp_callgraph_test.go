@@ -189,6 +189,50 @@ func TestCppCallGraphUnprovenReceiverStaysUnresolved(t *testing.T) {
 	}
 }
 
+func TestCppCallGraphRenamedParametersUseDeclarationEvidence(t *testing.T) {
+	ctx := context.Background()
+	s, repo := indexCppFixture(t, map[string]string{
+		"foo.h":      "void foo(int value);\n",
+		"foo.cpp":    "#include \"foo.h\"\nvoid foo(int renamed) {}\n",
+		"caller.cpp": "#include \"foo.h\"\nvoid caller() { foo(1); }\n",
+	})
+	callees, err := s.FindCallees(ctx, repo.ID, "caller", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasSymbolQName(callees, "foo") {
+		t.Fatalf("renamed-parameter call did not resolve: %+v", callees)
+	}
+}
+
+func TestCppCallGraphCanonicalDeclarationShapes(t *testing.T) {
+	tests := []struct {
+		name, header, definition, call string
+	}{
+		{"default_header", "void foo(int value = 42);\n", "#include \"foo.h\"\nvoid foo(int renamed) {}\n", "foo();"},
+		{"string_default", "void foo(const char* value = \",\");\n", "#include \"foo.h\"\nvoid foo(const char* renamed) {}\n", "foo();"},
+		{"pointer_declarator", "void foo(int *value);\n", "#include \"foo.h\"\nvoid foo(int *renamed) {}\n", "foo(1);"},
+		{"comment_parameter", "void foo(int /* value */);\n", "#include \"foo.h\"\nvoid foo(int renamed) {}\n", "foo(1);"},
+		{"comment_tokens", "void foo(unsigned /* x */ long value);\n", "#include \"foo.h\"\nvoid foo(unsigned long renamed) {}\n", "foo(1);"},
+		{"comment_pointer", "void foo(const Foo /* x */ *value);\n", "#include \"foo.h\"\nvoid foo(const Foo *renamed) {}\n", "foo(nil);"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, repo := indexCppFixture(t, map[string]string{
+				"foo.h": tt.header, "foo.cpp": tt.definition,
+				"caller.cpp": "#include \"foo.h\"\nvoid caller() { " + tt.call + " }\n",
+			})
+			callees, err := s.FindCallees(context.Background(), repo.ID, "caller", 0, 20, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hasSymbolQName(callees, "foo") {
+				t.Fatalf("canonical declaration shape did not resolve: %+v", callees)
+			}
+		})
+	}
+}
+
 // TestCppCallGraphQualifiedCallResolves is the positive control: C++ calls
 // whose target CodeGraph can actually prove keep their recall. A `::`-qualified
 // call names a type and a member, and that spelling matches the destination's

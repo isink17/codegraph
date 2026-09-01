@@ -5,6 +5,8 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -189,6 +191,13 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 		switch child.Type() {
 		case "function_definition":
 			cppAddFunction(child, module, container, content, pf)
+			if body := childByFieldName(child, "body"); body != nil {
+				for _, class := range findDescendants(child, "class_specifier") {
+					if cppBraceDepth(content, body.StartByte(), class.StartByte()) == 0 {
+						cppAddType(class, module, container, namespaceContainer, "class", fileScope, content, pf)
+					}
+				}
+			}
 		case "declaration":
 			// Could be a function declaration or variable. Declarations are
 			// evidence rows, not definition targets; the resolver connects them
@@ -197,6 +206,22 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 			if fnDecl != nil {
 				cppAddFunctionFromDeclarator(child, fnDecl, module, container, content, pf)
 			}
+			for j := range int(child.NamedChildCount()) {
+				embedded := child.NamedChild(j)
+				if childByFieldName(child, "declarator") != nil {
+					continue
+				}
+				switch embedded.Type() {
+				case "struct_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "struct", fileScope, content, pf)
+				case "class_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "class", fileScope, content, pf)
+				case "enum_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "enum", fileScope, content, pf)
+				case "union_specifier":
+					cppAddType(embedded, module, container, namespaceContainer, "union", fileScope, content, pf)
+				}
+			}
 		case "field_declaration":
 			// A bodiless method declaration is a direct function_declarator.
 			// Function-pointer fields are wrapped by pointer_declarator and are
@@ -204,6 +229,19 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 			fnDecl := firstChild(child, "function_declarator")
 			if fnDecl != nil {
 				cppAddFunctionFromDeclarator(child, fnDecl, module, container, content, pf)
+			}
+			if childByFieldName(child, "declarator") == nil {
+				for j := range int(child.NamedChildCount()) {
+					embedded := child.NamedChild(j)
+					switch embedded.Type() {
+					case "struct_specifier":
+						cppAddType(embedded, module, container, namespaceContainer, "struct", fileScope, content, pf)
+					case "class_specifier":
+						cppAddType(embedded, module, container, namespaceContainer, "class", fileScope, content, pf)
+					case "union_specifier":
+						cppAddType(embedded, module, container, namespaceContainer, "union", fileScope, content, pf)
+					}
+				}
 			}
 		case "struct_specifier":
 			cppAddType(child, module, container, namespaceContainer, "struct", fileScope, content, pf)
@@ -261,6 +299,64 @@ func cppExtractSymbols(node *sitter.Node, module, container, namespaceContainer,
 			}
 		}
 	}
+}
+
+func cppBraceDepth(content []byte, start, end uint32) int {
+	depth := 0
+	lineComment, blockComment, quoted, escaped := false, false, byte(0), false
+	for i := int(start); i < int(end); i++ {
+		b := content[i]
+		if lineComment {
+			if b == '\n' {
+				lineComment = false
+			}
+			continue
+		}
+		if blockComment {
+			if b == '*' && i+1 < int(end) && content[i+1] == '/' {
+				blockComment = false
+				i++
+			}
+			continue
+		}
+		if quoted != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if b == '\\' {
+				escaped = true
+				continue
+			}
+			if b == quoted {
+				quoted = 0
+			}
+			continue
+		}
+		if b == '/' && i+1 < int(end) && content[i+1] == '/' {
+			lineComment = true
+			i++
+			continue
+		}
+		if b == '/' && i+1 < int(end) && content[i+1] == '*' {
+			blockComment = true
+			i++
+			continue
+		}
+		if b == '"' || b == '\'' {
+			quoted = b
+			continue
+		}
+		switch b {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return depth
 }
 
 func cppScopeName(container, name string) string {
@@ -366,7 +462,6 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 }
 
 func cppFunctionSignature(fnDecl *sitter.Node, content []byte) string {
-	raw := strings.TrimSpace(nodeText(fnDecl, content))
 	linkage := ""
 	inClassDeclaration := false
 	for node := fnDecl; node != nil; node = node.Parent() {
@@ -385,10 +480,176 @@ func cppFunctionSignature(fnDecl *sitter.Node, content []byte) string {
 			break
 		}
 	}
-	if i := strings.IndexByte(raw, '('); i >= 0 {
-		return linkage + strings.TrimSpace(raw[i:])
+	parameters := childByFieldName(fnDecl, "parameters")
+	if parameters == nil {
+		return linkage
 	}
-	return linkage
+	var b strings.Builder
+	b.WriteString(linkage)
+	b.WriteByte('(')
+	first := true
+	for i := range int(parameters.ChildCount()) {
+		parameter := parameters.Child(i)
+		if parameter.Type() == "..." {
+			if !first {
+				b.WriteByte(',')
+			}
+			first = false
+			b.WriteString("...")
+			continue
+		}
+		if parameter.Type() != "parameter_declaration" && parameter.Type() != "optional_parameter_declaration" && parameter.Type() != "variadic_parameter_declaration" {
+			continue
+		}
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+		b.WriteString(cppCanonicalParameter(parameter, content))
+	}
+	b.WriteByte(')')
+	if parameters.EndByte() < fnDecl.EndByte() {
+		b.WriteString(cppSignatureWithoutComments(fnDecl, content, parameters.EndByte(), fnDecl.EndByte()))
+	}
+	return b.String()
+}
+
+type cppSignatureRemoval struct{ start, end uint32 }
+
+// cppCanonicalParameter removes only AST-identified parameter names and the
+// default-value subtree. The remaining source preserves the complete
+// declarator shape, including nested function-pointer parameters.
+func cppCanonicalParameter(parameter *sitter.Node, content []byte) string {
+	var removals []cppSignatureRemoval
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node.Type() == "comment" {
+			removals = append(removals, cppSignatureRemoval{node.StartByte(), node.EndByte()})
+			return
+		}
+		if node.Type() == "optional_parameter_declaration" {
+			if def := childByFieldName(node, "default_value"); def != nil {
+				removals = append(removals, cppSignatureRemoval{def.StartByte(), def.EndByte()})
+			}
+			for i := range int(node.ChildCount()) {
+				if equal := node.Child(i); equal.Type() == "=" {
+					removals = append(removals, cppSignatureRemoval{equal.StartByte(), equal.EndByte()})
+				}
+			}
+		}
+		if node.Type() == "parameter_declaration" || node.Type() == "optional_parameter_declaration" || node.Type() == "variadic_parameter_declaration" {
+			if name := cppDeclaratorName(childByFieldName(node, "declarator")); name != nil {
+				removals = append(removals, cppSignatureRemoval{name.StartByte(), name.EndByte()})
+			}
+		}
+		defaultNode := childByFieldName(node, "default_value")
+		for i := range int(node.NamedChildCount()) {
+			child := node.NamedChild(i)
+			if child == defaultNode {
+				continue
+			}
+			walk(child)
+		}
+	}
+	walk(parameter)
+	return cppRemoveSignatureRanges(nodeText(parameter, content), parameter.StartByte(), removals)
+}
+
+func cppSignatureWithoutComments(node *sitter.Node, content []byte, start, end uint32) string {
+	var removals []cppSignatureRemoval
+	var walk func(*sitter.Node)
+	walk = func(current *sitter.Node) {
+		if current.Type() == "comment" {
+			removals = append(removals, cppSignatureRemoval{current.StartByte(), current.EndByte()})
+			return
+		}
+		for i := range int(current.NamedChildCount()) {
+			walk(current.NamedChild(i))
+		}
+	}
+	walk(node)
+	return cppRemoveSignatureRanges(string(content[start:end]), start, removals)
+}
+
+func cppDeclaratorName(node *sitter.Node) *sitter.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Type() == "identifier" || node.Type() == "field_identifier" {
+		return node
+	}
+	declarator := childByFieldName(node, "declarator")
+	if declarator != nil {
+		if declarator.Type() == "type_identifier" && node.Type() == "pointer_type_declarator" {
+			return declarator
+		}
+		if name := cppDeclaratorName(declarator); name != nil {
+			return name
+		}
+	}
+	if name := childByFieldName(node, "name"); name != nil {
+		if name := cppDeclaratorName(name); name != nil {
+			return name
+		}
+	}
+	for i := range int(node.NamedChildCount()) {
+		child := node.NamedChild(i)
+		if child.Type() == "parameter_list" {
+			continue
+		}
+		if name := cppDeclaratorName(child); name != nil {
+			return name
+		}
+	}
+	return nil
+}
+
+func cppRemoveSignatureRanges(text string, base uint32, removals []cppSignatureRemoval) string {
+	if len(removals) == 0 {
+		return cppCompactSignatureText([]byte(text))
+	}
+	sort.Slice(removals, func(i, j int) bool { return removals[i].start < removals[j].start })
+	var b strings.Builder
+	var cursor = base
+	for _, removal := range removals {
+		if removal.start < cursor || removal.end > base+uint32(len(text)) {
+			continue
+		}
+		b.WriteString(text[cursor-base : removal.start-base])
+		if removal.start > base && removal.end < base+uint32(len(text)) &&
+			isCppSignatureWord(text[removal.start-base-1]) &&
+			isCppSignatureWord(text[removal.end-base]) {
+			b.WriteByte(' ')
+		}
+		cursor = removal.end
+	}
+	b.WriteString(text[cursor-base:])
+	return cppCompactSignatureText([]byte(b.String()))
+}
+
+func cppCompactSignatureText(text []byte) string {
+	s := string(text)
+	var b strings.Builder
+	var last byte
+	for i := 0; i < len(s); {
+		if s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r' {
+			b.WriteByte(s[i])
+			last = s[i]
+			i++
+			continue
+		}
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+			i++
+		}
+		if b.Len() > 0 && i < len(s) && isCppSignatureWord(last) && isCppSignatureWord(s[i]) {
+			b.WriteByte(' ')
+		}
+	}
+	return b.String()
+}
+
+func isCppSignatureWord(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
 func cppAddType(node *sitter.Node, module, container, namespaceContainer, kind, fileScope string, content []byte, pf *graph.ParsedFile) {
@@ -415,13 +676,16 @@ func cppAddType(node *sitter.Node, module, container, namespaceContainer, kind, 
 	})
 
 	body := childByFieldName(node, "body")
+	if body == nil {
+		body = firstChild(node, "field_declaration_list")
+	}
 	if body != nil {
 		cppExtractSymbols(body, module, cppQualifiedName(container, name), namespaceContainer, fileScope, content, pf)
 	}
 }
 
 func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
-	enumValues := cppEnumValueNames(root, content)
+	enumValues, enumTypes := cppEnumNames(root, content)
 	typeAliases := cppTypeAliasNames(root, content)
 	macros := cppMacroNames(root, content)
 	for _, call := range findDescendants(root, "call_expression") {
@@ -433,18 +697,17 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if callName == "" || cppSkipFuncs[callName] {
 			continue
 		}
-		if cppCallInRecoveredDeclaration(call, content) || cppCallNamesNonCallableType(fnNode, content, pf.Symbols, enumValues, typeAliases) || cppCallInHiddenFriendScope(call, callName, content) {
+		if cppCallInRecoveredDeclaration(call, content) || cppCallNamesNonCallableType(call, fnNode, content, enumValues, enumTypes, typeAliases) || cppCallInHiddenFriendScope(call) {
 			continue
 		}
-		macroOrigin := cppCallInsideMacro(call, content, macros)
 		dstName := cppMemberDstName(receiver, callName)
 		line := int(call.StartPoint().Row) + 1
 		evidence := callKind + ":" + nodeText(fnNode, content)
-		if macroOrigin {
-			evidence = "macro_unexpanded:" + evidence
-		}
 		if receiver != "" {
 			evidence = callKind + ":" + receiver + ":" + nodeText(fnNode, content)
+		}
+		if cppCallInsideMacro(call, content, macros) {
+			evidence = "macro_unexpanded:" + evidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
@@ -462,15 +725,8 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 	}
 }
 
-func cppCallInHiddenFriendScope(call *sitter.Node, name string, content []byte) bool {
-	for node := call.Parent(); node != nil; node = node.Parent() {
-		if node.Type() != "class_specifier" && node.Type() != "struct_specifier" {
-			continue
-		}
-		text := nodeText(node, content)
-		return strings.Contains(text, "friend") && strings.Contains(text, name)
-	}
-	return false
+func cppCallInHiddenFriendScope(call *sitter.Node) bool {
+	return cppHasAncestor(call, "friend_declaration")
 }
 
 func cppMarkHiddenFriend(pf *graph.ParsedFile) {
@@ -486,6 +742,22 @@ func cppMarkHiddenFriend(pf *graph.ParsedFile) {
 func cppCallInRecoveredDeclaration(call *sitter.Node, content []byte) bool {
 	for node := call.Parent(); node != nil; node = node.Parent() {
 		if node.Type() == "field_declaration" || node.Type() == "declaration" {
+			// C++ permits a declaration as a control-flow condition. Its value
+			// initializer is executable code, not a recovered declarator.
+			if condition := node.Parent(); condition != nil && condition.Type() == "condition_clause" && childByFieldName(condition, "value") == node {
+				return false
+			}
+			// An initializer is a declaration syntactically, but its call is a
+			// real expression. Only reject calls recovered as declarators.
+			if decl := cppAncestor(call, "init_declarator"); decl != nil {
+				value := childByFieldName(decl, "value")
+				if value != nil && call.StartByte() >= value.StartByte() && call.EndByte() <= value.EndByte() {
+					return false
+				}
+			}
+			if cppHasAncestor(call, "parameter_declaration") || cppHasAncestor(call, "optional_parameter_declaration") {
+				return false
+			}
 			return true
 		}
 		if node.Type() == "labeled_statement" {
@@ -504,7 +776,16 @@ func cppCallInRecoveredDeclaration(call *sitter.Node, content []byte) bool {
 	return false
 }
 
-func cppCallNamesNonCallableType(fnNode *sitter.Node, content []byte, symbols []graph.Symbol, enumValues, typeAliases map[string]struct{}) bool {
+func cppAncestor(node *sitter.Node, typ string) *sitter.Node {
+	for node = node.Parent(); node != nil; node = node.Parent() {
+		if node.Type() == typ {
+			return node
+		}
+	}
+	return nil
+}
+
+func cppCallNamesNonCallableType(call, fnNode *sitter.Node, content []byte, enumValues, enumTypes, typeAliases map[string][]*sitter.Node) bool {
 	if fnNode.Type() != "identifier" {
 		return false
 	}
@@ -512,17 +793,58 @@ func cppCallNamesNonCallableType(fnNode *sitter.Node, content []byte, symbols []
 	if name == "" {
 		return false
 	}
-	for _, symbol := range symbols {
-		if symbol.Name == name && symbol.Kind == "enum" {
-			return true
+	callScope := cppLexicalScope(call, content)
+	return cppHasVisibleNonCallableScope(callScope, enumValues[name], content) ||
+		cppHasVisibleNonCallableScope(callScope, enumTypes[name], content) ||
+		cppHasVisibleNonCallableScope(callScope, typeAliases[name], content)
+}
+
+func cppHasVisibleNonCallableScope(callScope []string, declarations []*sitter.Node, content []byte) bool {
+	for _, declaration := range declarations {
+		declScope := cppLexicalScope(declaration, content)
+		if len(declScope) <= len(callScope) {
+			match := true
+			for i := range declScope {
+				if declScope[i] != callScope[i] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
 		}
 	}
-	_, ok := enumValues[name]
-	if ok {
-		return true
+	return false
+}
+
+// cppLexicalScope returns semantic scope owners from outermost to innermost.
+// Declaration names alone are insufficient: a type in namespace a must not
+// veto a callable with the same spelling in namespace b.
+func cppLexicalScope(node *sitter.Node, content []byte) []string {
+	var reversed []string
+	for current := node; current != nil; current = current.Parent() {
+		var key string
+		switch current.Type() {
+		case "namespace_definition":
+			name := childByFieldName(current, "name")
+			if name != nil {
+				key = current.Type() + ":" + strings.Join(strings.Fields(nodeText(name, content)), "")
+			}
+			if key == "" {
+				key = current.Type() + ":" + strconv.FormatUint(uint64(current.StartByte()), 10)
+			}
+		case "class_specifier", "struct_specifier", "union_specifier", "function_definition", "compound_statement":
+			key = current.Type() + ":" + strconv.FormatUint(uint64(current.StartByte()), 10)
+		}
+		if key != "" {
+			reversed = append(reversed, key)
+		}
 	}
-	_, ok = typeAliases[name]
-	return ok
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	return reversed
 }
 
 func cppHasAncestor(node *sitter.Node, typ string) bool {
@@ -535,23 +857,32 @@ func cppHasAncestor(node *sitter.Node, typ string) bool {
 	return false
 }
 
-func cppEnumValueNames(root *sitter.Node, content []byte) map[string]struct{} {
-	values := map[string]struct{}{}
+func cppEnumNames(root *sitter.Node, content []byte) (map[string][]*sitter.Node, map[string][]*sitter.Node) {
+	values := map[string][]*sitter.Node{}
+	types := map[string][]*sitter.Node{}
+	for _, enum := range findDescendants(root, "enum_specifier") {
+		name := childByFieldName(enum, "name")
+		if name != nil {
+			types[strings.TrimSpace(nodeText(name, content))] = append(types[strings.TrimSpace(nodeText(name, content))], enum)
+		}
+	}
 	for _, enumerator := range findDescendants(root, "enumerator") {
 		name := childByFieldName(enumerator, "name")
 		if name != nil {
-			values[strings.TrimSpace(nodeText(name, content))] = struct{}{}
+			key := strings.TrimSpace(nodeText(name, content))
+			values[key] = append(values[key], enumerator)
 		}
 	}
-	return values
+	return values, types
 }
 
-func cppTypeAliasNames(root *sitter.Node, content []byte) map[string]struct{} {
-	aliases := map[string]struct{}{}
+func cppTypeAliasNames(root *sitter.Node, content []byte) map[string][]*sitter.Node {
+	aliases := map[string][]*sitter.Node{}
 	for _, node := range findDescendants(root, "alias_declaration") {
 		name := childByFieldName(node, "name")
 		if name != nil {
-			aliases[strings.TrimSpace(nodeText(name, content))] = struct{}{}
+			key := strings.TrimSpace(nodeText(name, content))
+			aliases[key] = append(aliases[key], node)
 		}
 	}
 	return aliases

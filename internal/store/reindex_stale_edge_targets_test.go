@@ -32,7 +32,7 @@ func newReindexFixture(t *testing.T) *reindexFixture {
 	repoRoot := t.TempDir()
 
 	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
-	s, err := store.Open(dbPath)
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: "fast"})
 	if err != nil {
 		t.Fatalf("store.Open() error = %v", err)
 	}

@@ -27,6 +27,16 @@ type cppEvidenceExecutor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
+// cppEvidenceTarget is the shared routing predicate for C++ spellings whose
+// identity can be checked by declaration/definition evidence. Template-like
+// spellings are included even when punctuation makes them unlike a bare name.
+func cppEvidenceTarget(target edgeTarget) bool {
+	return target.srcLanguage == "cpp" &&
+		(goBareCallName(target.dstName) ||
+			strings.Contains(target.dstName, "::") ||
+			strings.ContainsAny(target.dstName, "<>()"))
+}
+
 func unresolvedCppEvidenceTargets(ctx context.Context, q queryContexter, repoID int64) ([]edgeTarget, error) {
 	rows, err := q.QueryContext(ctx, `
 		SELECT e.id, e.dst_name, e.file_id, e.evidence
@@ -75,7 +85,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		if strings.HasPrefix(target.evidence, "macro_unexpanded:") {
 			continue
 		}
-		if target.srcLanguage != "cpp" || !goBareCallName(target.dstName) && !strings.Contains(target.dstName, "::") {
+		if !cppEvidenceTarget(target) {
 			continue
 		}
 		cppTargets = append(cppTargets, target)
@@ -119,6 +129,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 	}
 	var candidates []cppEvidenceCandidate
 	declarations := map[string][]int64{}
+	declarationSignatures := map[string]map[string]struct{}{}
 	for rows.Next() {
 		var c cppEvidenceCandidate
 		if err := rows.Scan(&c.id, &c.fileID, &c.kind, &c.name, &c.qualified, &c.signature, &c.visibility); err != nil {
@@ -127,6 +138,10 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		if c.kind == "declaration" {
 			key := cppEvidenceKey(c.qualified, c.signature)
 			declarations[key] = append(declarations[key], c.fileID)
+			if declarationSignatures[c.qualified] == nil {
+				declarationSignatures[c.qualified] = map[string]struct{}{}
+			}
+			declarationSignatures[c.qualified][c.signature] = struct{}{}
 			continue
 		}
 		candidates = append(candidates, c)
@@ -296,6 +311,9 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		// resolution is not modeled here, so keep only a semantically unique
 		// qualified family. Duplicate rows of one signature are harmless.
 		familySignatures := map[string]struct{}{}
+		for signature := range declarationSignatures[eligible[0].qualified] {
+			familySignatures[signature] = struct{}{}
+		}
 		for _, candidate := range byQualified[eligible[0].qualified] {
 			familySignatures[candidate.signature] = struct{}{}
 		}
@@ -346,7 +364,9 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 	return len(resolutions), nil
 }
 
-func cppEvidenceKey(qualified, signature string) string { return qualified + "\x00" + signature }
+func cppEvidenceKey(qualified, signature string) string {
+	return qualified + "\x00" + signature
+}
 
 func augmentCppOutOfLineScopes(ctx context.Context, q queryContexter, repoID int64, edges []edgeTarget, candidates []cppEvidenceCandidate, imports map[int64]map[int64]struct{}, classScopes, callerClasses, callerNamespaces, namespaceScopes map[int64]string) error {
 	prefixes := map[string]struct{}{}
