@@ -260,23 +260,18 @@ func TestUnknownLanguageSingularLookupIsSemanticAndDeterministic(t *testing.T) {
 
 // TestExactSymbolIDStaysExact pins that supplying an id identifies the symbol
 // on its own: the answer is that symbol's neighbourhood, gated by that symbol's
-// language.
-//
-// It does NOT claim the id is never widened. FindCallers still runs its
-// short-name evidence legs for whatever `symbol` string it was handed, so an id
-// plus an ambiguous bare name can still surface a caller of a DIFFERENT
-// same-language symbol of that name. That widening predates P22.7 and is
-// unchanged by it -- master answers identically -- and only its cross-language
-// half is closed here. Narrowing the same-language half means deciding what an
-// id-plus-name call should mean, which is its own decision.
+// language. Caller spelling cannot widen the answer to another same-language
+// symbol.
 func TestExactSymbolIDStaysExact(t *testing.T) {
 	f := newLangFixture(t)
 
-	callers, err := f.store.FindCallers(f.ctx, f.repoID, "SharedName", f.goTarget, 20, 0)
-	if err != nil {
-		t.Fatalf("FindCallers(id=goTarget) error = %v", err)
+	for _, spelling := range []string{"gofoo.SharedName", "SharedName", "other.SharedName", "::SharedName", ""} {
+		callers, err := f.store.FindCallers(f.ctx, f.repoID, spelling, f.goTarget, 20, 0)
+		if err != nil {
+			t.Fatalf("FindCallers(%q, id=goTarget) error = %v", spelling, err)
+		}
+		assertQNames(t, "FindCallers("+spelling+", id=gofoo.SharedName)", callers, "gofoo.GoCaller")
 	}
-	assertQNames(t, "FindCallers(SharedName, id=gofoo.SharedName)", callers, "gofoo.GoCaller")
 
 	callees, err := f.store.FindCallees(f.ctx, f.repoID, "SharedName", f.pyCaller, 20, 0)
 	if err != nil {
