@@ -270,11 +270,11 @@ func TestFindCallersMemberCallClaims(t *testing.T) {
 		dstName string
 		claimed bool
 	}{
-		{"ExternalReceiver", "rows.Close", false}, // foreign qualifier: never a caller of cli.App.Close
-		{"ScopedForeign", "ns::Close", false},     // foreign scope qualifier
-		{"MemberSpelling", "App.Close", true},     // suffix spelling of the target's identity
-		{"FullSpelling", "cli.App.Close", true},   // exact qualified spelling
-		{"DeeperSpelling", "x.cli.App.Close", true}, // extends the target's identity at a boundary
+		{"ExternalReceiver", "rows.Close", false},    // foreign qualifier: never a caller of cli.App.Close
+		{"ScopedForeign", "ns::Close", false},        // foreign scope qualifier
+		{"MemberSpelling", "App.Close", false},       // unresolved suffix remains evidence
+		{"FullSpelling", "cli.App.Close", false},     // unresolved exact spelling remains evidence
+		{"DeeperSpelling", "x.cli.App.Close", false}, // unresolved extension remains evidence
 		// Bare short name: Go spells a method call through a receiver, so a bare
 		// `Close` in package `callers` names nothing in package `cli` (P22.6).
 		{"BareSpelling", "Close", false},
@@ -317,9 +317,9 @@ func TestFindCalleesMemberCallFallback(t *testing.T) {
 
 	srcFile := f.file(t, "src/go/db.go", "go")
 	src := f.symbol(t, srcFile, "Query", "db.Query", "go")
-	f.edge(t, srcFile, src, "rows.Close")   // unknown receiver: no callee may be fabricated
-	f.edge(t, srcFile, src, "App.Close")    // qualifier confirmed by cli.App.Close only
-	f.edge(t, srcFile, src, "d.Query")      // unknown receiver, tail spells the caller itself
+	f.edge(t, srcFile, src, "rows.Close") // unknown receiver: no callee may be fabricated
+	f.edge(t, srcFile, src, "App.Close")  // qualifier confirmed by cli.App.Close only
+	f.edge(t, srcFile, src, "d.Query")    // unknown receiver, tail spells the caller itself
 
 	got, err := f.store.FindCallees(f.ctx, f.repoID, "db.Query", 0, 100, 0)
 	if err != nil {
@@ -329,8 +329,8 @@ func TestFindCalleesMemberCallFallback(t *testing.T) {
 	for _, sym := range got {
 		names = append(names, sym.QualifiedName)
 	}
-	if want := "[cli.App.Close]"; fmt.Sprint(names) != want {
-		t.Fatalf("FindCallees = %v, want %s (rows.Close and d.Query must resolve to nothing)", names, want)
+	if want := "[]"; fmt.Sprint(names) != want {
+		t.Fatalf("FindCallees = %v, want %s", names, want)
 	}
 }
 
@@ -372,7 +372,7 @@ func TestFindCalleesMemberSpellingIsLiteral(t *testing.T) {
 	f := newGateFixture(t)
 	defs := f.file(t, "src/py/defs.py", "python")
 	f.symbol(t, defs, "loadXconfig", "x.config.loadXconfig", "python")
-	want := f.symbol(t, defs, "load_config", "x.config.load_config", "python")
+	f.symbol(t, defs, "load_config", "x.config.load_config", "python")
 
 	caller := f.file(t, "src/py/caller.py", "python")
 	src := f.symbol(t, caller, "caller", "caller", "python")
@@ -382,12 +382,12 @@ func TestFindCalleesMemberSpellingIsLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindCallees: %v", err)
 	}
-	if len(got) != 1 || got[0].ID != want {
+	if len(got) != 0 {
 		names := make([]string, 0, len(got))
 		for _, sym := range got {
 			names = append(names, sym.QualifiedName)
 		}
-		t.Fatalf("FindCallees = %v, want exactly x.config.load_config", names)
+		t.Fatalf("FindCallees = %v, want no unresolved relationship", names)
 	}
 }
 

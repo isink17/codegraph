@@ -148,7 +148,7 @@ func TestContextNeighborsKeepsQualifiedEvidenceForAmbiguousShortName(t *testing.
 	if err != nil {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
-	want := []string{"caller.Qualified", "caller.Resolved"}
+	want := []string{"caller.Resolved"}
 	if !equalStrings(callerNames(got[0]), want) {
 		t.Fatalf("callers = %v, want %v (resolved + exact qualified, no short, no suffix)",
 			callerNames(got[0]), want)
@@ -199,7 +199,7 @@ func TestContextNeighborsKeepsShortAndSuffixRecallForUniqueName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
-	want := []string{"caller.SettleResolved", "caller.SettleSuffix", "unique.SettleShort"}
+	want := []string{"caller.SettleResolved"}
 	if !equalStrings(callerNames(got[0]), want) {
 		t.Fatalf("callers = %v, want %v", callerNames(got[0]), want)
 	}
@@ -289,10 +289,10 @@ func TestContextNeighborsKeepsCalleeAssociationPerSeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
-	if want := []string{"caller.Resolved", "unique.Settle"}; !equalStrings(calleeNames(got[0]), want) {
+	if want := []string{"caller.Resolved"}; !equalStrings(calleeNames(got[0]), want) {
 		t.Fatalf("billing.Renew callees = %v, want %v", calleeNames(got[0]), want)
 	}
-	if want := []string{"caller.Qualified"}; !equalStrings(calleeNames(got[1]), want) {
+	if want := []string{}; !equalStrings(calleeNames(got[1]), want) {
 		t.Fatalf("subscription.Renew callees = %v, want %v", calleeNames(got[1]), want)
 	}
 }

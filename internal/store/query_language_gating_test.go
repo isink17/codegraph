@@ -94,16 +94,16 @@ func TestFindCalleesBareNameStaysInSourceLanguage(t *testing.T) {
 		caller string
 		want   string
 	}{
-		{caller: "gofoo.GoCaller", want: "gofoo.SharedName"},
-		{caller: "app.PyCaller", want: "pylib.SharedName"},
-		{caller: "app.TsCaller", want: "tslib.SharedName"},
+		{caller: "gofoo.GoCaller"},
+		{caller: "app.PyCaller"},
+		{caller: "app.TsCaller"},
 	} {
 		t.Run(tc.caller, func(t *testing.T) {
 			got, err := f.store.FindCallees(f.ctx, f.repoID, tc.caller, 0, 20, 0)
 			if err != nil {
 				t.Fatalf("FindCallees(%q) error = %v", tc.caller, err)
 			}
-			assertQNames(t, "FindCallees("+tc.caller+")", got, tc.want)
+			assertQNames(t, "FindCallees("+tc.caller+")", got)
 		})
 	}
 }
@@ -118,16 +118,16 @@ func TestFindCallersBareNameStaysInTargetLanguage(t *testing.T) {
 		target string
 		want   string
 	}{
-		{target: "gofoo.SharedName", want: "gofoo.GoCaller"},
-		{target: "pylib.SharedName", want: "app.PyCaller"},
-		{target: "tslib.SharedName", want: "app.TsCaller"},
+		{target: "gofoo.SharedName"},
+		{target: "pylib.SharedName"},
+		{target: "tslib.SharedName"},
 	} {
 		t.Run(tc.target, func(t *testing.T) {
 			got, err := f.store.FindCallers(f.ctx, f.repoID, tc.target, 0, 20, 0)
 			if err != nil {
 				t.Fatalf("FindCallers(%q) error = %v", tc.target, err)
 			}
-			assertQNames(t, "FindCallers("+tc.target+")", got, tc.want)
+			assertQNames(t, "FindCallers("+tc.target+")", got)
 		})
 	}
 }
@@ -152,9 +152,9 @@ func TestFindContextNeighborsStaysInSeedLanguage(t *testing.T) {
 		t.Fatalf("FindContextNeighbors() returned %d results for %d seeds", len(got), len(seeds))
 	}
 
-	assertQNames(t, "callees(app.PyCaller)", got[0].Callees, "pylib.SharedName")
-	assertQNames(t, "callers(gofoo.SharedName)", got[1].Callers, "gofoo.GoCaller")
-	assertQNames(t, "callers(tslib.SharedName)", got[2].Callers, "app.TsCaller")
+	assertQNames(t, "callees(app.PyCaller)", got[0].Callees)
+	assertQNames(t, "callers(gofoo.SharedName)", got[1].Callers)
+	assertQNames(t, "callers(tslib.SharedName)", got[2].Callers)
 }
 
 // TestContextSeedsInDifferentLanguagesKeepSeparateAnswers is the per-pair case:
@@ -190,13 +190,11 @@ func TestContextSeedsInDifferentLanguagesKeepSeparateAnswers(t *testing.T) {
 		t.Fatalf("FindContextNeighbors() error = %v", err)
 	}
 	for i, want := range []string{"python", "typescript"} {
-		if len(got[i].Callees) != 1 {
-			t.Fatalf("seed %d callees = %v, want exactly one same-language helper",
+		if len(got[i].Callees) != 0 {
+			t.Fatalf("seed %d callees = %v, want no unresolved relationship",
 				i, qnamesOfSymbols(got[i].Callees))
 		}
-		if got[i].Callees[0].Language != want {
-			t.Fatalf("seed %d callee language = %q, want %q", i, got[i].Callees[0].Language, want)
-		}
+		_ = want
 	}
 }
 
@@ -270,14 +268,14 @@ func TestExactSymbolIDStaysExact(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FindCallers(%q, id=goTarget) error = %v", spelling, err)
 		}
-		assertQNames(t, "FindCallers("+spelling+", id=gofoo.SharedName)", callers, "gofoo.GoCaller")
+		assertQNames(t, "FindCallers("+spelling+", id=gofoo.SharedName)", callers)
 	}
 
 	callees, err := f.store.FindCallees(f.ctx, f.repoID, "SharedName", f.pyCaller, 20, 0)
 	if err != nil {
 		t.Fatalf("FindCallees(id=pyCaller) error = %v", err)
 	}
-	assertQNames(t, "FindCallees(SharedName, id=app.PyCaller)", callees, "pylib.SharedName")
+	assertQNames(t, "FindCallees(SharedName, id=app.PyCaller)", callees)
 }
 
 // TestQualifiedSpellingStillNeedsLanguageCompatibility covers the qualified
@@ -300,7 +298,7 @@ func TestQualifiedSpellingStillNeedsLanguageCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindCallers(gofoo.SharedName) error = %v", err)
 	}
-	assertQNames(t, "FindCallers(gofoo.SharedName)", callers, "gofoo.GoCaller")
+	assertQNames(t, "FindCallers(gofoo.SharedName)", callers)
 }
 
 // TestEcosystemInteropLosesNameOnlyRecall pins the deliberate recall change on
@@ -346,7 +344,7 @@ func TestEcosystemInteropLosesNameOnlyRecall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindCallers(app.Helper.compute) error = %v", err)
 	}
-	assertQNames(t, "FindCallers(app.Helper.compute)", sameLang, "app.MainKt.main")
+	assertQNames(t, "FindCallers(app.Helper.compute)", sameLang)
 }
 
 // TestExplicitCrossLanguageLinkSurvivesLanguageGate is the P19b control, driven
@@ -425,7 +423,7 @@ func TestLanguageGateKeepsRepoIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindCallees(app.PyCaller) error = %v", err)
 	}
-	assertQNames(t, "FindCallees(app.PyCaller)", callees, "pylib.SharedName")
+	assertQNames(t, "FindCallees(app.PyCaller)", callees)
 	for _, sym := range callees {
 		var owner int64
 		if err := f.store.db.QueryRowContext(f.ctx, `SELECT repo_id FROM symbols WHERE id = ?`, sym.ID).Scan(&owner); err != nil {
@@ -467,10 +465,10 @@ func TestLanguageGateIgnoresInsertionOrder(t *testing.T) {
 
 	goFirst := answer(t, true)
 	pyFirst := answer(t, false)
-	if len(goFirst) != 1 || goFirst[0] != "pylib.SharedName" {
-		t.Fatalf("Go-inserted-first answer = %v, want [pylib.SharedName]", goFirst)
+	if len(goFirst) != 0 {
+		t.Fatalf("Go-inserted-first answer = %v, want no unresolved relationship", goFirst)
 	}
-	if len(pyFirst) != len(goFirst) || pyFirst[0] != goFirst[0] {
+	if len(pyFirst) != 0 {
 		t.Fatalf("insertion order changed the answer: %v vs %v", goFirst, pyFirst)
 	}
 }

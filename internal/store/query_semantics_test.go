@@ -55,8 +55,6 @@ func callersOracle(t *testing.T, s *Store, repoID int64, symbol string, limit, o
 	if err != nil {
 		t.Fatalf("lookupSymbolIDs: %v", err)
 	}
-	short := lookupSymbolShortName(symbol)
-
 	seen := map[int64]bool{}
 	var ids []int64
 	collect := func(query string, args ...any) {
@@ -78,47 +76,6 @@ func callersOracle(t *testing.T, s *Store, repoID int64, symbol string, limit, o
 	}
 	for _, id := range targetIDs {
 		collect(`SELECT DISTINCT src_symbol_id FROM edges WHERE repo_id = ? AND dst_symbol_id = ?`, repoID, id)
-	}
-	if short != "" {
-		qnames := []string{symbol}
-		targetQNames, err := s.qualifiedNamesByIDs(ctx, repoID, targetIDs)
-		if err != nil {
-			t.Fatalf("oracle qnames: %v", err)
-		}
-		qnames = append(qnames, targetQNames...)
-		claimed := map[string]bool{symbol: true, short: true}
-		for _, qname := range qnames {
-			for _, spelling := range boundaryProperSuffixes(qname) {
-				claimed[spelling] = true
-			}
-		}
-		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT src_symbol_id, dst_name FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL`, repoID)
-		if err != nil {
-			t.Fatalf("oracle name query: %v", err)
-		}
-		for rows.Next() {
-			var id int64
-			var dst string
-			if err := rows.Scan(&id, &dst); err != nil {
-				t.Fatalf("oracle name scan: %v", err)
-			}
-			match := claimed[dst]
-			for _, qname := range qnames {
-				if match {
-					break
-				}
-				match = foldedExtendsAtBoundary(dst, qname)
-			}
-			if match && !seen[id] {
-				seen[id] = true
-				ids = append(ids, id)
-			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			t.Fatalf("oracle name rows: %v", err)
-		}
 	}
 
 	var syms []graph.Symbol
@@ -322,7 +279,7 @@ func TestFindCalleesResolvedAndUnresolvedLegs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindCallees: %v", err)
 	}
-	if want := "[pkg.Bound pkg.ByName]"; fmt.Sprint(qnames(got)) != want {
+	if want := "[pkg.Bound]"; fmt.Sprint(qnames(got)) != want {
 		t.Fatalf("FindCallees = %v, want %s", qnames(got), want)
 	}
 }

@@ -79,26 +79,9 @@ func (q neighborQuerier) QueryContext(ctx context.Context, query string, args ..
 func (s *Store) contextNeighborStatements() int64      { return s.neighborStmts.Load() }
 func (s *Store) resetContextNeighborStatements() int64 { return s.neighborStmts.Swap(0) }
 
-// ContextSeed is one symbol to expand, with the evidence policy that applies to
-// it.
-//
-// The distinction the fields encode is the whole point. Callers of a symbol
-// come from four places: an edge bound to the symbol id, an unresolved edge
-// spelling the fully qualified name, an unresolved edge spelling the bare short
-// name, and an unresolved edge whose destination *ends* in the short name. The
-// first two identify one symbol. The last two do not: `Renew` and `x.Renew` fit
-// billing.Renew and subscription.Renew equally, so attributing them to either
-// is a guess.
-//
-// So the id and the qualified name are always safe evidence, and the short-name
-// legs are gated on AllowShortEvidence -- which the caller sets only when the
-// short name belongs to exactly one symbol in the repository. Before P19 the
-// gate was a single empty lookup name that switched off all three name legs at
-// once, which threw away the exact-qualified evidence too.
-//
-// ShortName must be the short name the suffix patterns would be built from --
-// LookupSymbolShortName(QualifiedName) -- because that, not the symbol's `name`
-// column, is what the evidence legs actually match on.
+// ContextSeed is one persisted symbol identity to expand. The name fields are
+// retained for callers that construct seeds, but relationship expansion uses
+// SymbolID only; unresolved spellings are not promoted in context.
 type ContextSeed struct {
 	SymbolID      int64
 	QualifiedName string
@@ -149,17 +132,10 @@ func (s *Store) FindContextNeighbors(ctx context.Context, repoID int64, seeds []
 		return out, nil
 	}
 
-	// Both directions need the same fact -- each seed's Go package -- so it is
-	// read once for the batch rather than once per direction.
-	seedScopes, err := s.contextSeedScopes(ctx, repoID, seeds, live)
-	if err != nil {
+	if err := s.expandContextCallers(ctx, repoID, seeds, live, fanout, out); err != nil {
 		return nil, err
 	}
-
-	if err := s.expandContextCallers(ctx, repoID, seeds, live, fanout, seedScopes, out); err != nil {
-		return nil, err
-	}
-	if err := s.expandContextCallees(ctx, repoID, seeds, live, fanout, seedScopes, out); err != nil {
+	if err := s.expandContextCallees(ctx, repoID, seeds, live, fanout, out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -214,91 +190,14 @@ type namePair struct {
 }
 
 // expandContextCallers fills the Callers field of every live seed.
-func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, seedScopes map[int]goSymbolScope, out []ContextNeighbors) error {
-	// Exact evidence first: the qualified name is unambiguous by construction,
-	// and the bare short name is admitted only where the caller vouched for it.
-	var names []namePair
-	qnamesByIdx := map[int]string{}
-	for _, i := range live {
-		sd := seeds[i]
-		language := seedScopes[i].language
-		// The qualified leg carries the type gate too, because a top-level C++
-		// class or enum HAS a bare qualified_name (`Message`, `Color`), so for
-		// exactly the seeds this rule exists for the short leg below never runs.
-		// blocksBareNameTypeClaim tests the spelling, so a dotted qualified name
-		// and every ungated language are untouched.
-		if sd.QualifiedName != "" && !seedScopes[i].blocksBareNameTypeClaim(sd.QualifiedName) {
-			// The scope rules are applied to this leg as well, not only to the
-			// short one below. A top-level C++ type HAS a bare qualified_name
-			// (`Message`, `Color`), so for exactly the seeds those rules exist
-			// for this is the only leg that runs, and leaving it ungated let a
-			// refused relation back in through context_for_task. A
-			// qualifier-bearing spelling is ungated by goBareTargetSeedScope
-			// itself, so every Go seed and every dotted identity is untouched.
-			scope, gated, ok := goBareTargetSeedScope(seedScopes, i, sd.QualifiedName)
-			if !gated || ok {
-				names = append(names, namePair{idx: i, name: sd.QualifiedName, language: language, gated: gated, scope: scope})
-			}
-		}
-		if !sd.AllowShortEvidence || sd.ShortName == "" {
-			continue
-		}
-		if sd.ShortName != sd.QualifiedName && !seedScopes[i].blocksBareNameTypeClaim(sd.ShortName) {
-			// A gated seed whose package cannot be proven -- a Go method, or an
-			// unprovable package -- can be named by nobody: no bare Go spelling
-			// reaches it (P22.6) and no foreign-language spelling names it
-			// either (P22.7). Emitting the leg would bind five variables and
-			// probe `edges` for a predicate that is false by construction, so
-			// it is skipped. Every other seed keeps its leg; the gate narrows
-			// which writers count, it does not delete the evidence.
-			//
-			// A type seed drops the bare leg outright (P22.9,
-			// resolver_type_scope.go): a bare spelling that really names this
-			// class is already bound and arrives through the id leg, so what
-			// this leg would add is the population the resolver refused.
-			scope, gated, ok := goBareTargetSeedScope(seedScopes, i, sd.ShortName)
-			if !gated || ok {
-				names = append(names, namePair{idx: i, name: sd.ShortName, language: language, gated: gated, scope: scope})
-			}
-		}
-		// Qualified-suffix spellings of the seed's identity (`App.Close` for
-		// cli.App.Close) are a finite set, so they join the equality legs
-		// directly rather than being fished out of a scan.
-		for _, spelling := range boundaryProperSuffixes(sd.QualifiedName) {
-			if spelling != sd.QualifiedName && spelling != sd.ShortName {
-				names = append(names, namePair{idx: i, name: spelling, language: language})
-			}
-		}
-		qnamesByIdx[i] = sd.QualifiedName
-	}
-
-	// Extension evidence: unresolved spellings that extend the seed's identity
-	// at a separator boundary (`x.cli.App.Close`, `path/to/pkg.Func`). One scan
-	// of the distinct unresolved destination names serves every seed that asked
-	// for it, mirroring the escaped-LIKE legs FindCallers runs. Before P22.1
-	// this leg matched `%.` + bare short instead, which handed every seed named
-	// Close the callers of every other Close in the repository.
-	//
-	// Note what this trades. The per-seed query expressed the match as LIKEs;
-	// here each matching destination name becomes a bound variable, so a seed's
-	// evidence -- and therefore the number of page statements -- scales with how
-	// many unresolved spellings extend its identity, not with the seed count.
-	// It is not capped, because capping would drop candidates the public query
-	// would have considered and silently change which neighbours win the page.
-	suffix, err := s.extendingDstNames(ctx, repoID, qnamesByIdx, seedScopes)
-	if err != nil {
-		return err
-	}
-	names = append(names, suffix...)
-
+func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, out []ContextNeighbors) error {
 	ids := make([]idPair, 0, len(live))
 	for _, i := range live {
 		if seeds[i].SymbolID != 0 {
 			ids = append(ids, idPair{idx: i, id: seeds[i].SymbolID})
 		}
 	}
-
-	return s.pagePartitionedNeighbors(ctx, repoID, ids, names, nil, fanout, callerCandidateSQL, func(idx int, syms []graph.Symbol) {
+	return s.pagePartitionedNeighbors(ctx, repoID, ids, nil, nil, fanout, callerCandidateSQL, func(idx int, syms []graph.Symbol) {
 		out[idx].Callers = syms
 	})
 }
@@ -312,102 +211,14 @@ func (s *Store) expandContextCallers(ctx context.Context, repoID int64, seeds []
 // association is preserved the whole way: flattening the names of thirty seeds
 // into one set and giving every seed the union would be a correctness bug, not
 // a batching win.
-func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, seedScopes map[int]goSymbolScope, out []ContextNeighbors) error {
-	srcIDs := make([]idPair, 0, len(live))
-	bySymbol := map[int64][]int{}
+func (s *Store) expandContextCallees(ctx context.Context, repoID int64, seeds []ContextSeed, live []int, fanout int, out []ContextNeighbors) error {
+	ids := make([]idPair, 0, len(live))
 	for _, i := range live {
-		if seeds[i].SymbolID == 0 {
-			continue
-		}
-		srcIDs = append(srcIDs, idPair{idx: i, id: seeds[i].SymbolID})
-		bySymbol[seeds[i].SymbolID] = append(bySymbol[seeds[i].SymbolID], i)
-	}
-	if len(srcIDs) == 0 {
-		return nil
-	}
-
-	unresolved, err := s.unresolvedDstNamesBySeed(ctx, repoID, srcIDs, bySymbol)
-	if err != nil {
-		return err
-	}
-
-	// P22.6: a bare callee spelling written in a Go file resolves inside that
-	// file's package, exactly as FindCallees now does it. Splitting the names
-	// per seed keeps one seed's package from answering another seed's bare call.
-	var fallback []idPair
-	if len(unresolved) > 0 {
-		// Two independent name sets, not one: the same spelling can be a bare Go
-		// call from one seed and an ordinary name from another, and each seed is
-		// entitled to its own answer. Sharing a `seen` map would let whichever
-		// seed the rows happened to arrive from first decide the other's
-		// evidence -- a result that depends on row order, not on the graph.
-		distinct := make([]nameLanguages, 0, len(unresolved))
-		distinctAt := map[string]int{}
-		distinctLangs := map[string]map[string]struct{}{}
-		var scopedNames []string
-		seenScoped := map[string]bool{}
-		scopeKeys := map[string]struct{}{}
-		for _, np := range unresolved {
-			if scope, gated, ok := goBareSourceSeedScope(seedScopes, np.idx, np.name); gated {
-				if !ok {
-					continue
-				}
-				scopeKeys[scope] = struct{}{}
-				if !seenScoped[np.name] {
-					seenScoped[np.name] = true
-					scopedNames = append(scopedNames, np.name)
-				}
-				continue
-			}
-			// The spelling reaches the repo-wide cascade tagged with the
-			// language of the seed that wrote it (P22.7), so two seeds in
-			// different languages spelling one name stay two questions rather
-			// than collapsing into a shared answer.
-			if _, ok := distinctAt[np.name]; !ok {
-				distinctAt[np.name] = len(distinct)
-				distinct = append(distinct, nameLanguages{name: np.name})
-				distinctLangs[np.name] = map[string]struct{}{}
-			}
-			distinctLangs[np.name][seedScopes[np.idx].language] = struct{}{}
-		}
-		for name, at := range distinctAt {
-			distinct[at].languages = sortedLanguages(distinctLangs[name])
-		}
-		resolved, err := s.lookupSymbolIDsByNameLanguage(ctx, repoID, distinct)
-		if err != nil {
-			return err
-		}
-		orderedKeys := make([]string, 0, len(scopeKeys))
-		for key := range scopeKeys {
-			orderedKeys = append(orderedKeys, key)
-		}
-		sort.Strings(orderedKeys)
-		byScope, err := goPackageScopedSymbolIDs(ctx, neighborQuerier{s}, repoID, orderedKeys, scopedNames)
-		if err != nil {
-			return err
-		}
-		for _, np := range unresolved {
-			if scope, gated, ok := goBareSourceSeedScope(seedScopes, np.idx, np.name); gated {
-				if !ok {
-					continue
-				}
-				for _, id := range byScope[scope][np.name] {
-					if id != 0 {
-						fallback = append(fallback, idPair{idx: np.idx, id: id})
-					}
-				}
-				continue
-			}
-			key := symbolLangKey{name: trimLookupName(np.name), language: seedScopes[np.idx].language}
-			for _, id := range resolved[key] {
-				if id != 0 {
-					fallback = append(fallback, idPair{idx: np.idx, id: id})
-				}
-			}
+		if seeds[i].SymbolID != 0 {
+			ids = append(ids, idPair{idx: i, id: seeds[i].SymbolID})
 		}
 	}
-
-	return s.pagePartitionedNeighbors(ctx, repoID, srcIDs, nil, fallback, fanout, calleeCandidateSQL, func(idx int, syms []graph.Symbol) {
+	return s.pagePartitionedNeighbors(ctx, repoID, ids, nil, nil, fanout, calleeCandidateSQL, func(idx int, syms []graph.Symbol) {
 		out[idx].Callees = syms
 	})
 }

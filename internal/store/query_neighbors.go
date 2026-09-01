@@ -151,10 +151,9 @@ func (s *Store) symbolPage(ctx context.Context, repoID int64, candidateCTE strin
 // FindCallers returns the symbols that call the named symbol, ordered by
 // qualified_name, start_line, start_col, id.
 //
-// Two evidence sources are unioned, exactly as before P12: edges whose
-// `dst_symbol_id` is bound to the target, and unresolved edges whose `dst_name`
-// spells it. The second leg is what surfaces callers the resolver could not
-// bind; dropping it would silently shrink the answer.
+// For a known target, only edges whose `dst_symbol_id` is bound to that target
+// are relationships. If no indexed target matches, unresolved `dst_name`
+// spellings are returned as discovery hints.
 //
 // The two legs answer different questions, and P22.7 gates only the second. A
 // bound `dst_symbol_id` is a decision something already made on evidence --
@@ -206,7 +205,9 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		branches = append(branches, sql)
 		args = append(args, a...)
 	}
-	if short != "" {
+	// An unresolved spelling is a hint only when no indexed target exists.
+	// Once a target is known, only its persisted edge identity is authoritative.
+	if len(targetIDs) == 0 && short != "" {
 		// One read of the targets answers both name-evidence rules: their
 		// persisted languages (P22.7) and, for the Go ones, the package scopes a
 		// bare spelling could name them from (P22.6).
@@ -493,11 +494,9 @@ func (s *Store) unresolvedDstNamesExtending(ctx context.Context, repoID int64, q
 	return out, rows.Err()
 }
 
-// FindCallees returns the symbols the named symbol calls.
-//
-// Resolved edges are followed directly. Unresolved ones fall back to a name
-// lookup, which is the same cascade a single-symbol lookup uses; that fallback
-// is what lets a callee show up before the resolver has bound its edge.
+// FindCallees returns the symbols the named symbol calls. Only persisted
+// destination identities are semantic relationships; unresolved destinations
+// remain evidence and are not promoted by query-time name lookup.
 func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	srcIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
@@ -508,35 +507,5 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 	}
 
 	resolvedSQL, args := edgeIDBranches(repoID, srcIDs, "dst_symbol_id", "src_symbol_id", "e.dst_symbol_id IS NOT NULL")
-	branches := []string{resolvedSQL}
-
-	dstNames, namesBySrc, err := s.queryUnresolvedDstNamesBySrcIDs(ctx, repoID, srcIDs)
-	if err != nil {
-		return nil, err
-	}
-	if len(dstNames) > 0 {
-		// P22.6: a bare spelling written in a Go file names something in that
-		// file's own package, so it is resolved inside that package rather than
-		// through the repo-wide cascade. P22.7: every other spelling reaches the
-		// cascade tagged with the persisted language of the symbol that wrote
-		// it, so a Python call can only be answered by a Python declaration.
-		unscoped, scoped, err := s.splitGoBareCalleeNames(ctx, repoID, srcIDs, dstNames, namesBySrc)
-		if err != nil {
-			return nil, err
-		}
-		var fallbackIDs []int64
-		if len(unscoped) > 0 {
-			fallbackIDs, err = s.lookupSymbolIDsForNameLanguages(ctx, repoID, unscoped)
-			if err != nil {
-				return nil, err
-			}
-		}
-		fallbackIDs = mergeIDsPreservingOrder(fallbackIDs, scoped)
-		for _, chunk := range chunkInt64s(fallbackIDs, neighborIDChunk) {
-			sql, a := valueBranches(chunk)
-			branches = append(branches, sql)
-			args = append(args, a...)
-		}
-	}
-	return s.symbolPage(ctx, repoID, strings.Join(branches, " UNION "), args, limit, offset)
+	return s.symbolPage(ctx, repoID, resolvedSQL, args, limit, offset)
 }

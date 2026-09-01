@@ -18,7 +18,7 @@ func TestFindCallersExactIDConflictingRawNameStaysInTargetScope(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FindCallers(%q) error = %v", spelling, err)
 		}
-		assertQNames(t, "conflicting raw exact callers", got, "b.caller")
+		assertQNames(t, "conflicting raw exact callers", got)
 	}
 }
 
