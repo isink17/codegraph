@@ -279,9 +279,5 @@ func (s *Store) filePresent(ctx context.Context, repoID int64, file string) (boo
 }
 
 func (s *Store) TraceDependenciesResult(ctx context.Context, repoID int64, symbol, direction string, maxDepth, limit, offset int) (TraceResult, error) {
-	items, total, found, err := s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
-	if err != nil {
-		return TraceResult{}, err
-	}
-	return TraceResult{TargetFound: found, Dependencies: items, Total: total}, nil
+	return s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 }

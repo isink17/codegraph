@@ -313,6 +313,8 @@ type TraceResult struct {
 	TargetFound  bool             `json:"target_found"`
 	Dependencies []map[string]any `json:"dependencies"`
 	Total        int              `json:"total"`
+	Offset       int              `json:"offset"`
+	Truncated    bool             `json:"truncated"`
 }
 
 type ExportEdge struct {
@@ -6630,11 +6632,11 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 // It returns one page of the traversal plus the total number of nodes reached,
 // so a caller can report a bounded page without implying it is the whole chain.
 func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
-	items, total, _, err := s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
-	return items, total, err
+	result, err := s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
+	return result.Dependencies, result.Total, err
 }
 
-func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, bool, error) {
+func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) (TraceResult, error) {
 	if maxDepth <= 0 {
 		maxDepth = 3
 	}
@@ -6648,34 +6650,39 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 	// A singular trace must not silently widen into several unrelated seeds.
 	seedName := strings.TrimSpace(strings.TrimPrefix(symbol, "::"))
 	seedRows, err := s.db.QueryContext(ctx,
-		`SELECT id, qualified_name, kind, name FROM symbols WHERE repo_id = ? AND qualified_name = ?
+		`SELECT s.id, s.qualified_name, s.kind, s.name, f.path
+			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
+			WHERE s.repo_id = ? AND s.qualified_name = ?
 			UNION ALL
-		 SELECT id, qualified_name, kind, name FROM symbols WHERE repo_id = ? AND qualified_name <> ? AND name = ?`,
+		 SELECT s.id, s.qualified_name, s.kind, s.name, f.path
+			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
+			WHERE s.repo_id = ? AND s.qualified_name <> ? AND s.name = ?`,
 		repoID, seedName, repoID, seedName, seedName)
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("trace_dependencies seed query: %w", err)
+		return TraceResult{}, fmt.Errorf("trace_dependencies seed query: %w", err)
 	}
 	type symInfo struct {
 		id            int64
 		qualifiedName string
 		kind          string
 		name          string
+		file          string
 	}
 	var seeds []symInfo
 	for seedRows.Next() {
 		var si symInfo
-		if err := seedRows.Scan(&si.id, &si.qualifiedName, &si.kind, &si.name); err != nil {
+		if err := seedRows.Scan(&si.id, &si.qualifiedName, &si.kind, &si.name, &si.file); err != nil {
 			seedRows.Close()
-			return nil, 0, false, err
+			return TraceResult{}, err
 		}
 		seeds = append(seeds, si)
 	}
 	seedRows.Close()
 	if err := seedRows.Err(); err != nil {
-		return nil, 0, false, err
+		return TraceResult{}, err
 	}
 	if len(seeds) > 1 {
-		return nil, 0, false, SymbolAmbiguousError(symbol, len(seeds))
+		return TraceResult{}, SymbolAmbiguousError(symbol, len(seeds))
 	}
 
 	type bfsEntry struct {
@@ -6704,7 +6711,7 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 			})
 			results = append(results, bfsEntry{
 				id: seed.id, qualifiedName: seed.qualifiedName,
-				kind: seed.kind, name: seed.name, depth: 0, dir: dir,
+				kind: seed.kind, name: seed.name, file: filepath.ToSlash(seed.file), depth: 0, dir: dir,
 			})
 		}
 
@@ -6756,7 +6763,7 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 
 	if direction == "downstream" || direction == "both" {
 		if err := bfs(seeds, "downstream"); err != nil {
-			return nil, 0, false, err
+			return TraceResult{}, err
 		}
 	}
 	if direction == "upstream" || direction == "both" {
@@ -6768,16 +6775,28 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 			}
 		}
 		if err := bfs(seeds, "upstream"); err != nil {
-			return nil, 0, false, err
+			return TraceResult{}, err
 		}
 	}
 
-	// Sort by depth ascending, then by symbol name.
+	// Sort by the complete public row, with an explicit direction rank.
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].depth != results[j].depth {
 			return results[i].depth < results[j].depth
 		}
-		return results[i].qualifiedName < results[j].qualifiedName
+		if results[i].qualifiedName != results[j].qualifiedName {
+			return results[i].qualifiedName < results[j].qualifiedName
+		}
+		if results[i].file != results[j].file {
+			return results[i].file < results[j].file
+		}
+		if results[i].kind != results[j].kind {
+			return results[i].kind < results[j].kind
+		}
+		if results[i].name != results[j].name {
+			return results[i].name < results[j].name
+		}
+		return traceDirectionRank(results[i].dir) < traceDirectionRank(results[j].dir)
 	})
 
 	// The traversal has no natural size bound -- a hub symbol in a large
@@ -6799,7 +6818,25 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 			"direction": r.dir,
 		}
 	}
-	return out, total, len(seeds) > 0, nil
+	return TraceResult{
+		TargetFound:  len(seeds) > 0,
+		Dependencies: out,
+		Total:        total,
+		Offset:       pageStart,
+		Truncated:    pageEnd < total,
+	}, nil
+}
+
+// traceDirectionRank is the public ordering contract: downstream precedes upstream.
+func traceDirectionRank(direction string) int {
+	switch direction {
+	case "downstream":
+		return 0
+	case "upstream":
+		return 1
+	default:
+		return 2
+	}
 }
 
 func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {

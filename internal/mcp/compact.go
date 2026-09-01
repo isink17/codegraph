@@ -207,8 +207,7 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 		if err := writeMapRows(doc, "dependencies", traceColumns, items); err != nil {
 			return "", err
 		}
-		pageOffset := max(req.Offset, 0)
-		writePresence(doc, map[string]any{"target_found": result.TargetFound, "total": result.Total, "offset": pageOffset, "truncated": pageOffset+len(items) < result.Total})
+		writePresence(doc, map[string]any{"target_found": result.TargetFound, "total": result.Total, "offset": result.Offset, "truncated": result.Truncated})
 		// The compact dependency rows retain the existing total/truncation schema;
 		// presence is carried in the same metadata section.
 	default:
