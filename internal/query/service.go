@@ -43,16 +43,32 @@ func (s *Service) FindSymbolExact(ctx context.Context, repoID int64, query strin
 	return s.store.FindSymbolExact(ctx, repoID, query, limit, offset)
 }
 
+func (s *Service) FindSymbolExactResult(ctx context.Context, repoID int64, query string, limit, offset int) (store.SymbolSearchResult, error) {
+	return s.store.FindSymbolExactResult(ctx, repoID, query, limit, offset)
+}
+
 func (s *Service) SearchSymbols(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
 	return s.store.SearchSymbols(ctx, repoID, query, limit, offset)
+}
+
+func (s *Service) SearchSymbolsResult(ctx context.Context, repoID int64, query string, limit, offset int) (store.SymbolSearchResult, error) {
+	return s.store.SearchSymbolsResult(ctx, repoID, query, limit, offset)
 }
 
 func (s *Service) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	return s.store.FindCallers(ctx, repoID, symbol, symbolID, limit, offset)
 }
 
+func (s *Service) FindCallersResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (store.NeighborResult, error) {
+	return s.store.FindCallersResult(ctx, repoID, symbol, symbolID, limit, offset)
+}
+
 func (s *Service) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	return s.store.FindCallees(ctx, repoID, symbol, symbolID, limit, offset)
+}
+
+func (s *Service) FindCalleesResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (store.NeighborResult, error) {
+	return s.store.FindCalleesResult(ctx, repoID, symbol, symbolID, limit, offset)
 }
 
 func (s *Service) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth, limit, offset int) (map[string]any, error) {
@@ -61,6 +77,30 @@ func (s *Service) ImpactRadius(ctx context.Context, repoID int64, symbols []stri
 
 func (s *Service) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]store.RelatedTest, error) {
 	return s.store.RelatedTests(ctx, repoID, symbol, file, limit, offset)
+}
+
+func (s *Service) RelatedTestsResult(ctx context.Context, repoID int64, symbol, file string, limit, offset int) (store.RelatedTestsResult, error) {
+	return s.store.RelatedTestsResult(ctx, repoID, symbol, file, limit, offset)
+}
+
+func (s *Service) RelatedTestsForFilesResult(ctx context.Context, repoID int64, files []string, limit, offset int) (store.RelatedTestsForFilesResult, error) {
+	tests, err := s.RelatedTestsForFiles(ctx, repoID, files, limit, offset)
+	if err != nil {
+		return store.RelatedTestsForFilesResult{}, err
+	}
+	present, err := s.store.RelatedTestFilesPresent(ctx, repoID, files)
+	if err != nil {
+		return store.RelatedTestsForFilesResult{}, err
+	}
+	result := store.RelatedTestsForFilesResult{Requested: len(files), Tests: tests}
+	for i, found := range present {
+		if found {
+			result.Found++
+		} else {
+			result.Missing = append(result.Missing, files[i])
+		}
+	}
+	return result, nil
 }
 
 func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files []string, limit, offset int) ([]store.RelatedTest, error) {
@@ -150,6 +190,10 @@ func (s *Service) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limi
 
 func (s *Service) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
 	return s.store.TraceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
+}
+
+func (s *Service) TraceDependenciesResult(ctx context.Context, repoID int64, symbol, direction string, maxDepth, limit, offset int) (store.TraceResult, error) {
+	return s.store.TraceDependenciesResult(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 }
 
 func (s *Service) BenchmarkTokens(ctx context.Context, repoID int64, task string) (map[string]any, error) {

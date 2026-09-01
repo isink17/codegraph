@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/isink17/codegraph/internal/compactfmt"
 	"github.com/isink17/codegraph/internal/detail"
+	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -124,17 +126,26 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 	doc := compactfmt.NewDocument(name)
 	switch name {
 	case "find_symbol", "search_symbols":
-		cards, err := s.symbolMatches(ctx, raw, name == "search_symbols")
+		matched, cards, err := s.symbolMatches(ctx, raw, name == "search_symbols")
 		if err != nil {
 			return "", err
 		}
 		detail.WriteCards(doc, "matches", cards)
+		writePresence(doc, map[string]any{"matched": matched})
 	case "find_callers", "find_callees":
-		key, cards, err := s.callGraphCards(ctx, raw, name == "find_callers")
+		key, result, err := s.callGraphCards(ctx, raw, name == "find_callers")
 		if err != nil {
 			return "", err
 		}
+		cards := s.projector(defaultToolDetail).Symbols(ctx, result.Callers)
+		if name == "find_callees" {
+			cards = s.projector(defaultToolDetail).Symbols(ctx, result.Callees)
+		}
 		detail.WriteCards(doc, key, cards)
+		writePresence(doc, map[string]any{"target_found": result.TargetFound})
+		if len(result.UnresolvedHints) > 0 {
+			detail.WriteCards(doc, "unresolved_hints", s.projector(defaultToolDetail).Symbols(ctx, result.UnresolvedHints))
+		}
 	case "get_impact_radius":
 		data, err := s.impactRadiusData(ctx, raw)
 		if err != nil {
@@ -144,11 +155,17 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 			return "", err
 		}
 	case "find_related_tests":
-		tests, err := s.relatedTests(ctx, raw)
+		result, err := s.relatedTests(ctx, raw)
 		if err != nil {
 			return "", err
 		}
-		writeRelatedTests(doc, tests)
+		if single, ok := result.(store.RelatedTestsResult); ok {
+			writeRelatedTests(doc, single.Tests)
+			writePresence(doc, map[string]any{"target_found": single.TargetFound})
+		} else if multi, ok := result.(store.RelatedTestsForFilesResult); ok {
+			writeRelatedTests(doc, multi.Tests)
+			writePresence(doc, map[string]any{"requested": multi.Requested, "found": multi.Found, "missing": multi.Missing})
+		}
 	case "find_dead_code":
 		items, err := s.deadCode(ctx, raw)
 		if err != nil {
@@ -166,13 +183,34 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 			return "", err
 		}
 	case "trace_dependencies":
-		items, _, _, err := s.traceDependencies(ctx, raw)
+		var req struct {
+			Symbol    string `json:"symbol"`
+			Direction string `json:"direction"`
+			Depth     int    `json:"depth"`
+			Limit     int    `json:"limit"`
+			Offset    int    `json:"offset"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return "", err
+		}
+		if req.Depth <= 0 {
+			req.Depth = 3
+		}
+		if req.Limit == 0 {
+			req.Limit = limits.MaxPage
+		}
+		result, err := s.query.TraceDependenciesResult(ctx, s.repoID, req.Symbol, req.Direction, req.Depth, req.Limit, max(req.Offset, 0))
+		items := result.Dependencies
 		if err != nil {
 			return "", err
 		}
 		if err := writeMapRows(doc, "dependencies", traceColumns, items); err != nil {
 			return "", err
 		}
+		pageOffset := max(req.Offset, 0)
+		writePresence(doc, map[string]any{"target_found": result.TargetFound, "total": result.Total, "offset": pageOffset, "truncated": pageOffset+len(items) < result.Total})
+		// The compact dependency rows retain the existing total/truncation schema;
+		// presence is carried in the same metadata section.
 	default:
 		// compactCapableTools said yes and this switch has no arm: a tool was
 		// advertised with `format` and never given an encoder. Saying so beats
@@ -180,6 +218,24 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 		return "", fmt.Errorf("tool %q is registered for compact but has no encoder", name)
 	}
 	return doc.Encode()
+}
+
+var presenceSchema = compactfmt.Schema{Section: "presence", Columns: []string{"matched", "target_found", "requested", "found", "missing", "total", "offset", "truncated"}}
+
+func writePresence(doc *compactfmt.Document, values map[string]any) {
+	sec := doc.Section(presenceSchema)
+	cells := make([]compactfmt.Cell, len(presenceSchema.Columns))
+	for i, col := range presenceSchema.Columns {
+		switch v := values[col].(type) {
+		case bool:
+			cells[i] = compactfmt.Bool(v)
+		case int:
+			cells[i] = compactfmt.Int(v)
+		case []string:
+			cells[i] = compactfmt.Str(strings.Join(v, ","))
+		}
+	}
+	sec.Row(cells)
 }
 
 // relatedTestColumns mirrors store.RelatedTest field for field. A test asserts
@@ -208,11 +264,12 @@ func writeRelatedTests(doc *compactfmt.Document, tests []store.RelatedTest) {
 // they are different things: a file list is not a symbol, and the summary counts
 // describe the traversal, not any row in it.
 var (
-	impactFilesSchema   = compactfmt.Schema{Section: "files", Columns: []string{"file"}}
+	impactFilesSchema = compactfmt.Schema{Section: "files", Columns: []string{"file"}}
 	// The paging fields belong in the summary for the same reason the counts
 	// do: they describe the traversal rather than any row in it, and a compact
 	// consumer must be able to see that a page is not the whole closure.
-	impactSummarySchema = compactfmt.Schema{Section: "summary", Columns: []string{"affected_symbols", "affected_files", "returned_symbols", "returned_files", "offset", "truncated"}}
+	impactSummarySchema  = compactfmt.Schema{Section: "summary", Columns: []string{"affected_symbols", "affected_files", "returned_symbols", "returned_files", "offset", "truncated"}}
+	impactPresenceSchema = compactfmt.Schema{Section: "presence", Columns: []string{"requested", "found", "missing"}}
 )
 
 // writeImpactSections encodes a projected impact radius without flattening it.
@@ -273,6 +330,20 @@ func writeImpactSections(doc *compactfmt.Document, data map[string]any) error {
 		compactfmt.Int64(offset),
 		compactfmt.Bool(truncated),
 	})
+	if presence, ok := data["seed_presence"].(store.ImpactSeedPresence); ok {
+		doc.Section(impactPresenceSchema).Row([]compactfmt.Cell{compactfmt.Int64(int64(presence.Requested)), compactfmt.Int64(int64(presence.Found)), compactfmt.Str(strings.Join(presence.Missing, ","))})
+	} else if presence, ok := data["seed_presence"].(map[string]any); ok {
+		requested, err := intFromAny(presence["requested"])
+		if err != nil {
+			return err
+		}
+		found, err := intFromAny(presence["found"])
+		if err != nil {
+			return err
+		}
+		missing, _ := presence["missing"].([]string)
+		doc.Section(impactPresenceSchema).Row([]compactfmt.Cell{compactfmt.Int64(requested), compactfmt.Int64(found), compactfmt.Str(strings.Join(missing, ","))})
+	}
 	return nil
 }
 

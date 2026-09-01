@@ -285,6 +285,36 @@ type RelatedTest struct {
 	Score  float64 `json:"score"`
 }
 
+type SymbolSearchResult struct {
+	Matched bool           `json:"matched"`
+	Matches []graph.Symbol `json:"matches"`
+}
+
+type NeighborResult struct {
+	TargetFound     bool           `json:"target_found"`
+	Callers         []graph.Symbol `json:"callers"`
+	Callees         []graph.Symbol `json:"callees"`
+	UnresolvedHints []graph.Symbol `json:"unresolved_hints,omitempty"`
+}
+
+type RelatedTestsResult struct {
+	TargetFound bool          `json:"target_found"`
+	Tests       []RelatedTest `json:"tests"`
+}
+
+type RelatedTestsForFilesResult struct {
+	Requested int           `json:"requested"`
+	Found     int           `json:"found"`
+	Missing   []string      `json:"missing"`
+	Tests     []RelatedTest `json:"tests"`
+}
+
+type TraceResult struct {
+	TargetFound  bool             `json:"target_found"`
+	Dependencies []map[string]any `json:"dependencies"`
+	Total        int              `json:"total"`
+}
+
 type ExportEdge struct {
 	ID               int64  `json:"edge_id"`
 	SrcSymbolID      int64  `json:"src_symbol_id"`
@@ -5193,7 +5223,7 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 // traversal from a hub symbol reaches most of a repository. Callers that need
 // the whole closure rather than a tool-sized answer use impactClosure directly.
 func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth, limit, offset int) (map[string]any, error) {
-	symbolList, fileList, err := s.impactClosure(ctx, repoID, symbols, files, depth)
+	symbolList, fileList, presence, err := s.impactClosureWithPresence(ctx, repoID, symbols, files, depth)
 	if err != nil {
 		return nil, err
 	}
@@ -5222,8 +5252,9 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 	sort.Strings(pageFiles)
 
 	return map[string]any{
-		"symbols": symbolPage,
-		"files":   pageFiles,
+		"symbols":       symbolPage,
+		"files":         pageFiles,
+		"seed_presence": presence,
 		"summary": map[string]any{
 			"affected_symbols": totalSymbols,
 			"affected_files":   len(fileList),
@@ -5242,20 +5273,25 @@ func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string
 // It is deliberately unpaged. Bulk export asks for the whole subgraph and is
 // allowed to; only the tool surface on top of it is bounded.
 func (s *Store) impactClosure(ctx context.Context, repoID int64, symbols []string, files []string, depth int) ([]graph.Symbol, []string, error) {
+	symbolsOut, filesOut, _, err := s.impactClosureWithPresence(ctx, repoID, symbols, files, depth)
+	return symbolsOut, filesOut, err
+}
+
+func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, symbols []string, files []string, depth int) ([]graph.Symbol, []string, ImpactSeedPresence, error) {
 	affected := make(map[int64]graph.Symbol, len(symbols))
 	queue := make([]int64, 0, len(symbols))
-	for _, name := range symbols {
-		id, err := s.lookupSymbolID(ctx, repoID, name, 0)
-		if err != nil {
-			// A seed that is not in the index contributes nothing, which is a
-			// reasonable answer for a mixed seed list. A database failure is
-			// not: swallowing it would return a plausible, wrong impact set.
-			if errors.Is(err, ErrSymbolNotFound) {
-				continue
-			}
-			return nil, nil, err
+	presence := ImpactSeedPresence{Requested: len(symbols) + len(files)}
+	ids, found, err := s.lookupImpactSymbolSeeds(ctx, repoID, symbols)
+	if err != nil {
+		return nil, nil, ImpactSeedPresence{}, err
+	}
+	for i, name := range symbols {
+		if !found[i] {
+			presence.Missing = append(presence.Missing, name)
+			continue
 		}
-		queue = append(queue, id)
+		presence.Found++
+		queue = append(queue, ids[i])
 	}
 	for _, file := range files {
 		file = normalizeRepoRelPath(file)
@@ -5269,20 +5305,27 @@ func (s *Store) impactClosure(ctx context.Context, repoID int64, symbols []strin
 			WHERE s.repo_id = ? AND f.path = ?
 		`, repoID, file)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, ImpactSeedPresence{}, err
 		}
+		fileFound := false
 		for rows.Next() {
 			sym, err := scanSymbol(rows)
 			if err != nil {
 				_ = rows.Close()
-				return nil, nil, err
+				return nil, nil, ImpactSeedPresence{}, err
 			}
+			fileFound = true
 			affected[sym.ID] = sym
 			queue = append(queue, sym.ID)
 		}
 		_ = rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, nil, err
+			return nil, nil, ImpactSeedPresence{}, err
+		}
+		if fileFound {
+			presence.Found++
+		} else {
+			presence.Missing = append(presence.Missing, file)
 		}
 	}
 	if depth <= 0 {
@@ -5315,7 +5358,7 @@ func (s *Store) impactClosure(ctx context.Context, repoID int64, symbols []strin
 		}
 		callers, err := s.impactNeighbors(ctx, repoID, current, true)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, ImpactSeedPresence{}, err
 		}
 		for _, sym := range callers {
 			affected[sym.ID] = sym
@@ -5325,7 +5368,7 @@ func (s *Store) impactClosure(ctx context.Context, repoID int64, symbols []strin
 		}
 		callees, err := s.impactNeighbors(ctx, repoID, current, false)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, ImpactSeedPresence{}, err
 		}
 		for _, sym := range callees {
 			affected[sym.ID] = sym
@@ -5360,7 +5403,7 @@ func (s *Store) impactClosure(ctx context.Context, repoID int64, symbols []strin
 		return symbolList[i].ID < symbolList[j].ID
 	})
 	sort.Strings(fileList)
-	return symbolList, fileList, nil
+	return symbolList, fileList, presence, nil
 }
 
 // impactNeighbors returns the neighbours of a frontier chunk, one row per edge.
@@ -5419,6 +5462,10 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 }
 
 func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]RelatedTest, error) {
+	return s.relatedTests(ctx, repoID, symbol, file, limit, offset, 0, false)
+}
+
+func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int, resolvedTargetID int64, targetResolved bool) ([]RelatedTest, error) {
 	var rows *sql.Rows
 	var err error
 	if file != "" {
@@ -5512,9 +5559,13 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 		// bound to a block-local err, leaving the outer one nil and rows nil --
 		// a dropped error followed by a nil dereference in the deferred Close.
 		var targetID int64
-		targetID, err = s.lookupSymbolID(ctx, repoID, symbol, 0)
-		if err != nil {
-			return nil, err
+		if !targetResolved {
+			targetID, err = s.lookupSymbolID(ctx, repoID, symbol, 0)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			targetID = resolvedTargetID
 		}
 		// Same two evidence classes as the file branch, seeded by one symbol:
 		// rows name-bound to it, plus linked test functions that call it. Same
@@ -6225,6 +6276,69 @@ func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string,
 	return ids[0], nil
 }
 
+// lookupImpactSymbolSeeds applies the user-input cascade to every requested
+// seed in one statement per bind-sized chunk. The row rank is the same
+// qualified, short, suffix, short-name precedence as lookupSymbolIDs.
+func (s *Store) lookupImpactSymbolSeeds(ctx context.Context, repoID int64, symbols []string) ([]int64, []bool, error) {
+	ids := make([]int64, len(symbols))
+	found := make([]bool, len(symbols))
+	const chunkSize = 300
+	for start := 0; start < len(symbols); start += chunkSize {
+		end := min(start+chunkSize, len(symbols))
+		var values strings.Builder
+		args := make([]any, 0, (end-start)*2+1)
+		for i := start; i < end; i++ {
+			if values.Len() > 0 {
+				values.WriteString(",")
+			}
+			values.WriteString("(?,?,?)")
+			name := strings.TrimSpace(strings.TrimPrefix(symbols[i], "::"))
+			args = append(args, i, name, lookupSymbolShortName(name))
+		}
+		args = append(args, repoID)
+		rows, err := s.db.QueryContext(ctx, `WITH requested(ord, name, short) AS (VALUES `+values.String()+`), candidates AS (
+			SELECT req.ord, s.id,
+			       CASE
+			         WHEN s.qualified_name = req.name THEN 0
+			         WHEN s.name = req.name THEN 1
+			         WHEN req.short <> '' AND (s.qualified_name LIKE '%::' || req.short OR s.qualified_name LIKE '%.' || req.short) THEN 2
+			         WHEN req.short <> req.name AND req.short <> '' AND s.name = req.short THEN 3
+			         ELSE 4
+			       END AS rank,
+			       s.qualified_name, f.path, s.start_line, s.start_col
+			FROM requested req
+			JOIN symbols s ON s.repo_id = ? AND (
+				s.qualified_name = req.name OR s.name = req.name OR
+				(req.short <> '' AND (s.qualified_name LIKE '%::' || req.short OR s.qualified_name LIKE '%.' || req.short)) OR
+				(req.short <> req.name AND req.short <> '' AND s.name = req.short)
+			)
+			JOIN files f ON f.id = s.file_id
+		)
+		SELECT ord, id FROM candidates
+		ORDER BY ord, rank, qualified_name, path, start_line, start_col, id`, args...)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var ord int
+			var id int64
+			if err := rows.Scan(&ord, &id); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			if !found[ord] {
+				ids[ord], found[ord] = id, true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		rows.Close()
+	}
+	return ids, found, nil
+}
+
 func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string, symbolID int64) ([]int64, error) {
 	if symbolID != 0 {
 		identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, symbolID)
@@ -6441,6 +6555,11 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 // It returns one page of the traversal plus the total number of nodes reached,
 // so a caller can report a bounded page without implying it is the whole chain.
 func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
+	items, total, _, err := s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
+	return items, total, err
+}
+
+func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, bool, error) {
 	if maxDepth <= 0 {
 		maxDepth = 3
 	}
@@ -6456,7 +6575,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 		`SELECT id, qualified_name, kind, name FROM symbols WHERE repo_id = ? AND (qualified_name LIKE ? OR name = ?)`,
 		repoID, pattern, symbol)
 	if err != nil {
-		return nil, 0, fmt.Errorf("trace_dependencies seed query: %w", err)
+		return nil, 0, false, fmt.Errorf("trace_dependencies seed query: %w", err)
 	}
 	type symInfo struct {
 		id            int64
@@ -6469,13 +6588,13 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 		var si symInfo
 		if err := seedRows.Scan(&si.id, &si.qualifiedName, &si.kind, &si.name); err != nil {
 			seedRows.Close()
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 		seeds = append(seeds, si)
 	}
 	seedRows.Close()
 	if err := seedRows.Err(); err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 
 	type bfsEntry struct {
@@ -6554,7 +6673,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 
 	if direction == "downstream" || direction == "both" {
 		if err := bfs(seeds, "downstream"); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 	}
 	if direction == "upstream" || direction == "both" {
@@ -6566,7 +6685,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 			}
 		}
 		if err := bfs(seeds, "upstream"); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 	}
 
@@ -6597,7 +6716,7 @@ func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol stri
 			"direction": r.dir,
 		}
 	}
-	return out, total, nil
+	return out, total, len(seeds) > 0, nil
 }
 
 func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {

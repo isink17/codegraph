@@ -290,13 +290,19 @@ func (s *Server) dispatchTool(ctx context.Context, name string, raw json.RawMess
 }
 
 func (s *Server) handleFindSymbol(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
-	cards, err := s.symbolMatches(ctx, raw, false)
-	return wrapData("matches", cards, err)
+	matched, cards, err := s.symbolMatches(ctx, raw, false)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": map[string]any{"matched": matched, "matches": cards}}, nil
 }
 
 func (s *Server) handleSearchSymbols(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
-	cards, err := s.symbolMatches(ctx, raw, true)
-	return wrapData("matches", cards, err)
+	matched, cards, err := s.symbolMatches(ctx, raw, true)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": map[string]any{"matched": matched, "matches": cards}}, nil
 }
 
 func (s *Server) handleFindCallers(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
@@ -324,8 +330,11 @@ func (s *Server) handleImpactRadius(ctx context.Context, raw json.RawMessage) (m
 }
 
 func (s *Server) handleRelatedTests(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
-	items, err := s.relatedTests(ctx, raw)
-	return wrapData("tests", items, err)
+	result, err := s.relatedTests(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": result}, nil
 }
 
 func (s *Server) handleSearchSemantic(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
@@ -438,17 +447,35 @@ func (s *Server) handleArchitectureOverview(ctx context.Context, _ json.RawMessa
 }
 
 func (s *Server) handleTraceDependencies(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
-	items, total, offset, err := s.traceDependencies(ctx, raw)
+	var req struct {
+		Symbol    string `json:"symbol"`
+		Direction string `json:"direction"`
+		Depth     int    `json:"depth"`
+		Limit     int    `json:"limit"`
+		Offset    int    `json:"offset"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	if req.Depth <= 0 {
+		req.Depth = 3
+	}
+	if req.Limit == 0 {
+		req.Limit = limits.MaxPage
+	}
+	result, err := s.query.TraceDependenciesResult(ctx, s.repoID, req.Symbol, req.Direction, req.Depth, req.Limit, max(req.Offset, 0))
 	if err != nil {
 		return nil, err
 	}
+	offset := min(max(req.Offset, 0), result.Total)
 	// The chain is paged, so the response says how much of it this is. A bounded
 	// page that reported only its own rows would read as a complete traversal.
 	return map[string]any{"ok": true, "data": map[string]any{
-		"dependencies": items,
-		"total":        total,
+		"target_found": result.TargetFound,
+		"dependencies": result.Dependencies,
+		"total":        result.Total,
 		"offset":       offset,
-		"truncated":    offset+len(items) < total,
+		"truncated":    offset+len(result.Dependencies) < result.Total,
 	}}, nil
 }
 
@@ -628,8 +655,25 @@ func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bo
 }
 
 func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, callers bool) (map[string]any, error) {
-	key, cards, err := s.callGraphCards(ctx, raw, callers)
-	return wrapData(key, cards, err)
+	_, result, err := s.callGraphCards(ctx, raw, callers)
+	if err != nil {
+		return nil, err
+	}
+	data := map[string]any{"target_found": result.TargetFound}
+	var detailReq struct {
+		Detail string `json:"detail"`
+	}
+	_ = json.Unmarshal(raw, &detailReq)
+	level, _ := detail.Parse(detailReq.Detail, defaultToolDetail)
+	if callers {
+		data["callers"] = s.projector(level).Symbols(ctx, result.Callers)
+		if len(result.UnresolvedHints) > 0 {
+			data["unresolved_hints"] = s.projector(level).Symbols(ctx, result.UnresolvedHints)
+		}
+	} else {
+		data["callees"] = s.projector(level).Symbols(ctx, result.Callees)
+	}
+	return map[string]any{"ok": true, "data": data}, nil
 }
 
 // The helpers below answer one tool each and return the tool's typed result.
@@ -640,7 +684,7 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 
 // symbolMatches answers find_symbol (search=false) and search_symbols
 // (search=true).
-func (s *Server) symbolMatches(ctx context.Context, raw json.RawMessage, search bool) ([]detail.Symbol, error) {
+func (s *Server) symbolMatches(ctx context.Context, raw json.RawMessage, search bool) (bool, []detail.Symbol, error) {
 	var req struct {
 		Query  string `json:"query"`
 		Limit  int    `json:"limit"`
@@ -648,27 +692,22 @@ func (s *Server) symbolMatches(ctx context.Context, raw json.RawMessage, search 
 		Detail string `json:"detail"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
+		return false, nil, err
 	}
 	level, err := detail.Parse(req.Detail, defaultToolDetail)
 	if err != nil {
-		return nil, err
+		return false, nil, err
 	}
-	var items []graph.Symbol
-	if search {
-		items, err = s.query.SearchSymbols(ctx, s.repoID, req.Query, req.Limit, req.Offset)
-	} else {
-		items, err = s.query.FindSymbol(ctx, s.repoID, req.Query, req.Limit, req.Offset)
-	}
+	result, err := s.query.SearchSymbolsResult(ctx, s.repoID, req.Query, req.Limit, req.Offset)
 	if err != nil {
-		return nil, err
+		return false, nil, err
 	}
-	return s.projector(level).Symbols(ctx, items), nil
+	return result.Matched, s.projector(level).Symbols(ctx, result.Matches), nil
 }
 
 // callGraphCards answers find_callers (callers=true) and find_callees, returning
 // the response key alongside the projected page.
-func (s *Server) callGraphCards(ctx context.Context, raw json.RawMessage, callers bool) (string, []detail.Symbol, error) {
+func (s *Server) callGraphCards(ctx context.Context, raw json.RawMessage, callers bool) (string, store.NeighborResult, error) {
 	var req struct {
 		Symbol   string `json:"symbol"`
 		SymbolID int64  `json:"symbol_id"`
@@ -677,26 +716,25 @@ func (s *Server) callGraphCards(ctx context.Context, raw json.RawMessage, caller
 		Detail   string `json:"detail"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return "", nil, err
+		return "", store.NeighborResult{}, err
 	}
 	level, err := detail.Parse(req.Detail, defaultToolDetail)
 	if err != nil {
-		return "", nil, err
+		return "", store.NeighborResult{}, err
 	}
-	var (
-		items []graph.Symbol
-		key   = "callees"
-	)
+	var result store.NeighborResult
+	key := "callees"
 	if callers {
 		key = "callers"
-		items, err = s.query.FindCallers(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
+		result, err = s.query.FindCallersResult(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
 	} else {
-		items, err = s.query.FindCallees(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
+		result, err = s.query.FindCalleesResult(ctx, s.repoID, req.Symbol, req.SymbolID, req.Limit, req.Offset)
 	}
 	if err != nil {
-		return "", nil, err
+		return "", store.NeighborResult{}, err
 	}
-	return key, s.projector(level).Symbols(ctx, items), nil
+	_ = level
+	return key, result, nil
 }
 
 // impactRadiusData answers get_impact_radius, returning the traversal result
@@ -731,7 +769,7 @@ func (s *Server) impactRadiusData(ctx context.Context, raw json.RawMessage) (map
 }
 
 // relatedTests answers find_related_tests.
-func (s *Server) relatedTests(ctx context.Context, raw json.RawMessage) ([]store.RelatedTest, error) {
+func (s *Server) relatedTests(ctx context.Context, raw json.RawMessage) (any, error) {
 	var req struct {
 		Symbol string   `json:"symbol"`
 		File   string   `json:"file"`
@@ -744,9 +782,9 @@ func (s *Server) relatedTests(ctx context.Context, raw json.RawMessage) ([]store
 	}
 	// If multiple files provided, aggregate tests from all of them.
 	if len(req.Files) > 0 {
-		return s.query.RelatedTestsForFiles(ctx, s.repoID, req.Files, req.Limit, req.Offset)
+		return s.query.RelatedTestsForFilesResult(ctx, s.repoID, req.Files, req.Limit, req.Offset)
 	}
-	return s.query.RelatedTests(ctx, s.repoID, req.Symbol, req.File, req.Limit, req.Offset)
+	return s.query.RelatedTestsResult(ctx, s.repoID, req.Symbol, req.File, req.Limit, req.Offset)
 }
 
 // deadCode answers find_dead_code.

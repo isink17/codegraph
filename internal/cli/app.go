@@ -1528,9 +1528,25 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 			err   error
 		)
 		if *exact {
-			items, err = app.Query.FindSymbolExact(ctx, repoID, queryValue, *limit, *offset)
+			result, resultErr := app.Query.FindSymbolExactResult(ctx, repoID, queryValue, *limit, *offset)
+			items, err = result.Matches, resultErr
+			if err == nil {
+				payload := map[string]any{"matches": items, "matched": result.Matched, "count": len(items)}
+				if project != nil {
+					payload["matches"] = project(items)
+				}
+				return writeJSON(stdout, payload)
+			}
 		} else {
-			items, err = app.Query.FindSymbol(ctx, repoID, queryValue, *limit, *offset)
+			result, resultErr := app.Query.SearchSymbolsResult(ctx, repoID, queryValue, *limit, *offset)
+			items, err = result.Matches, resultErr
+			if err == nil {
+				payload := map[string]any{"matches": items, "matched": result.Matched, "count": len(items)}
+				if project != nil {
+					payload["matches"] = project(items)
+				}
+				return writeJSON(stdout, payload)
+			}
 		}
 		if err != nil {
 			return err
@@ -1540,29 +1556,36 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if queryValue == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <query> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
-		items, err := app.Query.SearchSymbols(ctx, repoID, queryValue, *limit, *offset)
+		result, err := app.Query.SearchSymbolsResult(ctx, repoID, queryValue, *limit, *offset)
 		if err != nil {
 			return err
 		}
-		return emit("matches", items)
+		items := result.Matches
+		payload := map[string]any{"matches": items, "matched": result.Matched, "count": len(items)}
+		if project != nil {
+			payload["matches"] = project(items)
+		}
+		return writeJSON(stdout, payload)
 	case "callers":
 		if symbol == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
-		items, err := app.Query.FindCallers(ctx, repoID, symbol, 0, *limit, *offset)
+		result, err := app.Query.FindCallersResult(ctx, repoID, symbol, 0, *limit, *offset)
+		items := result.Callers
 		if err != nil {
 			return err
 		}
-		return emit("callers", items)
+		return writeJSON(stdout, map[string]any{"callers": items, "target_found": result.TargetFound, "count": len(items)})
 	case "callees":
 		if symbol == "" {
 			return fmt.Errorf("usage: %s %s <repo-path> <symbol> [--limit N] [--offset N]", appname.BinaryName, cmdName)
 		}
-		items, err := app.Query.FindCallees(ctx, repoID, symbol, 0, *limit, *offset)
+		result, err := app.Query.FindCalleesResult(ctx, repoID, symbol, 0, *limit, *offset)
+		items := result.Callees
 		if err != nil {
 			return err
 		}
-		return emit("callees", items)
+		return writeJSON(stdout, map[string]any{"callees": items, "target_found": result.TargetFound, "count": len(items)})
 	case "impact":
 		// Allow a positional symbol alongside --file, but do not override explicit --symbol flags.
 		if symbol != "" && len(symbols) == 0 {
