@@ -93,6 +93,71 @@ func TestQueryPresenceContractIsPageIndependent(t *testing.T) {
 	}
 }
 
+func TestFindCalleesPresenceSurvivesHighOffset(t *testing.T) {
+	s, repoID := newQueryTestStore(t)
+	ctx := testContext()
+	fileID, err := insertTestFile(ctx, s, repoID, "callee_presence.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := insertTestSymbol(ctx, s, repoID, fileID, "Target", "pkg.Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calleeID, err := insertTestSymbol(ctx, s, repoID, fileID, "Callee", "pkg.Callee")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeID, err := insertTestEdge(ctx, s, repoID, fileID, targetID, "pkg.Callee")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, calleeID, edgeID); err != nil {
+		t.Fatal(err)
+	}
+
+	control := must(s.FindCalleesResult(ctx, repoID, "Target", 0, 1, 0))
+	if !control.TargetFound || len(control.Callees) != 1 || control.Callees[0].ID != calleeID {
+		t.Fatalf("callee control = %+v, want found with one callee", control)
+	}
+	highOffset := must(s.FindCalleesResult(ctx, repoID, "Target", 0, 1, 100))
+	if !highOffset.TargetFound || len(highOffset.Callees) != 0 {
+		t.Fatalf("callee high-offset = %+v, want found-empty", highOffset)
+	}
+}
+
+func TestRelatedTestsPresenceSurvivesHighOffset(t *testing.T) {
+	f := newTestLinkFixture(t)
+	targetFile := f.file("target.go", "go")
+	targetID := f.symbolWithKey(targetFile, "Target", "go", "func:Target")
+	testFile := f.file("target_test.go", "go")
+	testID := f.symbolWithKey(testFile, "TestTarget", "go", "func:TestTarget")
+	if _, err := f.store.db.ExecContext(f.ctx, `
+		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score)
+		VALUES(?, ?, ?, ?, ?, 'test_name_match', 0.8)
+	`, f.repoID, testFile, testID, targetFile, targetID); err != nil {
+		t.Fatal(err)
+	}
+
+	control := must(f.store.RelatedTestsResult(f.ctx, f.repoID, "Target", "", 1, 0))
+	if !control.TargetFound || len(control.Tests) != 1 || control.Tests[0].Symbol != "TestTarget" {
+		t.Fatalf("related-test control = %+v, want found with one test", control)
+	}
+	highOffset := must(f.store.RelatedTestsResult(f.ctx, f.repoID, "Target", "", 1, 100))
+	if !highOffset.TargetFound || len(highOffset.Tests) != 0 {
+		t.Fatalf("related-test high-offset = %+v, want found-empty", highOffset)
+	}
+
+	fileControl := must(f.store.RelatedTestsResult(f.ctx, f.repoID, "", "target.go", 1, 0))
+	if !fileControl.TargetFound || len(fileControl.Tests) != 1 {
+		t.Fatalf("related-test file control = %+v, want found with one test", fileControl)
+	}
+	fileHighOffset := must(f.store.RelatedTestsResult(f.ctx, f.repoID, "", "target.go", 1, 100))
+	if !fileHighOffset.TargetFound || len(fileHighOffset.Tests) != 0 {
+		t.Fatalf("related-test file high-offset = %+v, want found-empty", fileHighOffset)
+	}
+}
+
 func TestImpactSeedBatchKeepsQualifiedAndRepositoryResolution(t *testing.T) {
 	s, repoID := newQueryTestStore(t)
 	ctx := testContext()

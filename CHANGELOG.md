@@ -23,8 +23,8 @@ columns once instead of repeating a JSON key on every row.
 
 - **`format=json|compact` on nine bulk tools.** `find_symbol`, `search_symbols`, `find_callers`,
   `find_callees`, `get_impact_radius`, `find_related_tests`, `find_dead_code`, `list_files`, and
-  `trace_dependencies` accept an optional `format`. The default is `json` and is byte-for-byte
-  what those tools returned before, so no existing client changes. `format=compact` returns a
+  `trace_dependencies` accept an optional `format`. The default is `json`; newer releases may
+  add metadata fields, so clients should ignore unknown additive fields. `format=compact` returns a
   `codegraph.compact/v1` document -- a version line, a tool line, and named sections of fixed
   tab-separated columns -- which removes 38-51% of a bulk card page's estimated tokens
   (`ceil(bytes / 4)`, not a provider tokenizer) measured on model-visible tool content against

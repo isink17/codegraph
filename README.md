@@ -372,8 +372,10 @@ and adding `detail` to them could only make a response larger.
 | `json` (default) | the ordinary `{"ok":true,"data":...}` envelope |
 | `compact` | a tabular text document that states the columns once instead of repeating a key on every row |
 
-The default is unchanged: a call without `format` returns exactly the JSON it
-returned before. `compact` is worth asking for on bulk discovery, where repeated
+`format` is optional and defaults to JSON. The JSON form remains the standard
+response format, but newer releases may add presence, uncertainty, or pagination
+metadata fields; clients should ignore unknown additive fields. `compact` is worth
+asking for on bulk discovery, where repeated
 keys dominate the payload — on this repository's own index it removes 38–51% of a
 card page's estimated tokens (the `ceil(bytes / 4)` estimate, not a provider
 tokenizer) — and it only encodes `detail=card`, which is the default.
