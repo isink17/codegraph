@@ -467,15 +467,14 @@ func (s *Server) handleTraceDependencies(ctx context.Context, raw json.RawMessag
 	if err != nil {
 		return nil, err
 	}
-	offset := min(max(req.Offset, 0), result.Total)
 	// The chain is paged, so the response says how much of it this is. A bounded
 	// page that reported only its own rows would read as a complete traversal.
 	return map[string]any{"ok": true, "data": map[string]any{
 		"target_found": result.TargetFound,
 		"dependencies": result.Dependencies,
 		"total":        result.Total,
-		"offset":       offset,
-		"truncated":    offset+len(result.Dependencies) < result.Total,
+		"offset":       result.Offset,
+		"truncated":    result.Truncated,
 	}}, nil
 }
 
@@ -833,14 +832,14 @@ func (s *Server) traceDependencies(ctx context.Context, raw json.RawMessage) ([]
 		req.Limit = limits.MaxPage
 	}
 	offset := max(req.Offset, 0)
-	chain, total, err := s.query.TraceDependencies(ctx, s.repoID, req.Symbol, req.Direction, req.Depth, req.Limit, offset)
+	result, err := s.query.TraceDependenciesResult(ctx, s.repoID, req.Symbol, req.Direction, req.Depth, req.Limit, offset)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	// Report the offset the page actually starts at, which is what
 	// get_impact_radius reports too. An offset past the end of the chain would
 	// otherwise be echoed back as though rows had been skipped there.
-	return chain, total, min(offset, total), nil
+	return result.Dependencies, result.Total, result.Offset, nil
 }
 
 // projector builds the response-scoped renderer for one tool call. s.repoRoot is
