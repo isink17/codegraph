@@ -137,8 +137,8 @@ func TestImpactSeedBatchKeepsQualifiedAndRepositoryResolution(t *testing.T) {
 		t.Fatalf("qualified seed presence = %+v", qualifiedPresence)
 	}
 	qualifiedSymbols := qualified["symbols"].([]graph.Symbol)
-	if len(qualifiedSymbols) != 1 || qualifiedSymbols[0].ID != otherID {
-		t.Fatalf("qualified seed traversal = %+v, want neighbor %d", qualifiedSymbols, otherID)
+	if len(qualifiedSymbols) != 2 || !hasSymbolID(qualifiedSymbols, wantID) || !hasSymbolID(qualifiedSymbols, otherID) {
+		t.Fatalf("qualified seed traversal = %+v, want seed %d and neighbor %d", qualifiedSymbols, wantID, otherID)
 	}
 
 	bare := must(s.ImpactRadius(ctx, repoID, []string{"Shared", "pkg.two.Shared", "Absent", "Shared"}, nil, 0, 10, 0))

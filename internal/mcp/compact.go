@@ -268,7 +268,7 @@ var (
 	// The paging fields belong in the summary for the same reason the counts
 	// do: they describe the traversal rather than any row in it, and a compact
 	// consumer must be able to see that a page is not the whole closure.
-	impactSummarySchema  = compactfmt.Schema{Section: "summary", Columns: []string{"affected_symbols", "affected_files", "returned_symbols", "returned_files", "offset", "truncated"}}
+	impactSummarySchema  = compactfmt.Schema{Section: "summary", Columns: []string{"affected_symbols", "affected_files", "returned_symbols", "returned_files", "unresolved_edges", "unresolved_names", "offset", "truncated"}}
 	impactPresenceSchema = compactfmt.Schema{Section: "presence", Columns: []string{"requested", "found", "missing"}}
 )
 
@@ -314,6 +314,14 @@ func writeImpactSections(doc *compactfmt.Document, data map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("impact radius summary returned_files: %w", err)
 	}
+	unresolvedEdges, err := intFromAny(summary["unresolved_edges"])
+	if err != nil {
+		return fmt.Errorf("impact radius summary unresolved_edges: %w", err)
+	}
+	unresolvedNames, err := intFromAny(summary["unresolved_names"])
+	if err != nil {
+		return fmt.Errorf("impact radius summary unresolved_names: %w", err)
+	}
 	offset, err := intFromAny(summary["offset"])
 	if err != nil {
 		return fmt.Errorf("impact radius summary offset: %w", err)
@@ -327,6 +335,8 @@ func writeImpactSections(doc *compactfmt.Document, data map[string]any) error {
 		compactfmt.Int64(affectedFiles),
 		compactfmt.Int64(returnedSymbols),
 		compactfmt.Int64(returnedFiles),
+		compactfmt.Int64(unresolvedEdges),
+		compactfmt.Int64(unresolvedNames),
 		compactfmt.Int64(offset),
 		compactfmt.Bool(truncated),
 	})
