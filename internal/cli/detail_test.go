@@ -119,6 +119,40 @@ func TestCLIDetailFlagSharesMCPSemantics(t *testing.T) {
 	}
 }
 
+func TestCLIQueryPresenceDistinguishesEmptyAndMissing(t *testing.T) {
+	repoRoot := detailCLIRepo(t)
+
+	run := func(args ...string) map[string]any {
+		var out, errOut bytes.Buffer
+		if err := Run(context.Background(), args, &out, &errOut); err != nil {
+			t.Fatalf("Run(%v) error = %v", args, err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(%v) error = %v\n%s", args, err, out.String())
+		}
+		return payload
+	}
+
+	searchEmpty := run("search", "--limit", "1", "--offset", "100", repoRoot, "HelloWorld")
+	searchMissing := run("search", repoRoot, "NoSuchSymbol")
+	if searchEmpty["matched"] != true || searchMissing["matched"] != false {
+		t.Fatalf("search presence empty=%v missing=%v", searchEmpty, searchMissing)
+	}
+
+	callersEmpty := run("callers", repoRoot, "main")
+	callersMissing := run("callers", repoRoot, "NoSuchSymbol")
+	if callersEmpty["target_found"] != true || callersMissing["target_found"] != false {
+		t.Fatalf("caller presence empty=%v missing=%v", callersEmpty, callersMissing)
+	}
+
+	impactMissing := run("impact", repoRoot, "NoSuchSymbol")
+	seedPresence, ok := impactMissing["seed_presence"].(map[string]any)
+	if !ok || seedPresence["found"] != float64(0) || seedPresence["requested"] != float64(1) {
+		t.Fatalf("impact presence = %v", impactMissing)
+	}
+}
+
 // TestCLIDetailWorksAfterPositionalArguments covers the spelling the help
 // examples imply. Go's flag package stops at the first non-flag argument, so a
 // trailing --detail used to be dropped without a word, which is worse than an

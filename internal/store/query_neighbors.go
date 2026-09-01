@@ -196,6 +196,10 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 			return nil, err
 		}
 	}
+	return s.findCallersResolved(ctx, repoID, symbol, targetIDs, limit, offset)
+}
+
+func (s *Store) findCallersResolved(ctx context.Context, repoID int64, symbol string, targetIDs []int64, limit, offset int) ([]graph.Symbol, error) {
 	short := lookupSymbolShortName(strings.TrimSpace(strings.TrimPrefix(symbol, "::")))
 
 	var branches []string
@@ -502,6 +506,10 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 	if err != nil {
 		return nil, err
 	}
+	return s.findCalleesResolved(ctx, repoID, srcIDs, limit, offset)
+}
+
+func (s *Store) findCalleesResolved(ctx context.Context, repoID int64, srcIDs []int64, limit, offset int) ([]graph.Symbol, error) {
 	if len(srcIDs) == 0 {
 		return []graph.Symbol{}, nil
 	}

@@ -1,53 +1,37 @@
 package mcp
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 )
 
-// TestMissingSymbolIsACodeGraphError is the P16 finding P18 closes. Asking for
-// the related tests of a symbol that is not indexed used to answer with the
-// SQLite driver's own words.
-func TestMissingSymbolIsACodeGraphError(t *testing.T) {
+// Missing related-test targets are successful domain results, not driver errors.
+func TestMissingSymbolIsSuccessfulEmptyPresence(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
-	msg := callError(t, server, "find_related_tests", map[string]any{"symbol": "NoSuchSymbolAnywhere"})
-	if strings.Contains(msg, noDriverErrorSubstring) {
-		t.Fatalf("error leaked the driver message: %q", msg)
-	}
-	if !strings.Contains(msg, "not found") {
-		t.Fatalf("error = %q, want it to say the symbol was not found", msg)
-	}
-	if !strings.Contains(msg, "NoSuchSymbolAnywhere") {
-		t.Fatalf("error = %q, want it to name the symbol that was requested", msg)
+	isErr, text := callResult(t, server, "find_related_tests", map[string]any{"symbol": "NoSuchSymbolAnywhere"})
+	if isErr || !strings.Contains(text, `"target_found":false`) || !strings.Contains(text, `"tests":[]`) {
+		t.Fatalf("missing related test target = %v, %s", isErr, text)
 	}
 }
 
-// TestMissingSymbolReadsTheSameThroughTheGateway keeps P16's parity exact: the
-// canonical handler owns the error, so the gateway cannot phrase it differently.
+// Direct and gateway responses preserve the same missing-target state.
 func TestMissingSymbolReadsTheSameThroughTheGateway(t *testing.T) {
-	direct := callError(t, newGatewayTestServer(t, ToolModeFull), "find_related_tests", map[string]any{"symbol": "NoSuchSymbolAnywhere"})
+	_, direct := callResult(t, newGatewayTestServer(t, ToolModeFull), "find_related_tests", map[string]any{"symbol": "NoSuchSymbolAnywhere"})
 
 	gateway := newGatewayTestServer(t, ToolModeGateway)
 	isErr, text := callResult(t, gateway, "tool_call", map[string]any{
 		"name":      "find_related_tests",
 		"arguments": map[string]any{"symbol": "NoSuchSymbolAnywhere"},
 	})
-	if !isErr {
-		t.Fatalf("gateway accepted a missing symbol: %s", text)
+	if isErr {
+		t.Fatalf("gateway rejected a missing symbol: %s", text)
 	}
-	var envelope struct {
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if envelope.Error != direct {
-		t.Fatalf("gateway error = %q, direct error = %q", envelope.Error, direct)
+	if !strings.Contains(text, `"target_found":false`) || !strings.Contains(direct, `"target_found":false`) {
+		t.Fatalf("gateway/direct missing presence mismatch: %q / %q", text, direct)
 	}
 }
 
-// TestEmptyIsNotMissing draws the line P18 must not blur. A search with no
+// TestEmptyIsNotMissing draws the contract boundary. A search with no
 // matches, and an indexed symbol that simply has no tests, are both ordinary
 // answers -- not errors.
 func TestEmptyIsNotMissing(t *testing.T) {
@@ -69,11 +53,8 @@ func TestEmptyIsNotMissing(t *testing.T) {
 	}
 }
 
-// TestUnknownSymbolKeepsItsExistingShapeOnTraversals records a deliberate limit
-// of P18's scope. These tools answer an unknown symbol with an empty result
-// today; P18 normalizes the surface that leaked a driver string, and does not
-// convert working empty answers into errors. The inconsistency is recorded as
-// follow-up work rather than fixed here.
+// Unknown traversal inputs are ordinary empty domain results and never driver
+// errors.
 func TestUnknownSymbolKeepsItsExistingShapeOnTraversals(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
 	for _, tc := range []struct {

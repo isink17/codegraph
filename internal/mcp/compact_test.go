@@ -334,7 +334,7 @@ func TestCompactImpactRadiusKeepsGraphSemantics(t *testing.T) {
 	for _, section := range decoded.Sections {
 		names = append(names, section.Name)
 	}
-	if want := []string{"symbols", "files", "summary"}; !reflect.DeepEqual(names, want) {
+	if want := []string{"symbols", "files", "summary", "presence"}; !reflect.DeepEqual(names, want) {
 		t.Fatalf("sections = %v, want %v", names, want)
 	}
 	assertSectionMatchesJSON(t, "impact symbols", decoded.Section("symbols"), envelope.Data.Symbols, numericCardColumns)
@@ -542,7 +542,7 @@ func TestCompactDoesNotMaterializeSource(t *testing.T) {
 	if strings.Contains(text, "total +=") {
 		t.Fatalf("compact card output carries source: %s", text)
 	}
-	if lines := strings.Count(text, "\n"); lines > 6 {
+	if lines := strings.Count(text, "\n"); lines > 8 {
 		t.Fatalf("compact card page has %d lines, so it is not card-shaped:\n%s", lines, text)
 	}
 }
@@ -675,6 +675,11 @@ func TestImpactSectionsCoverEveryTraversalKey(t *testing.T) {
 		sectionNames = append(sectionNames, section.Name)
 	}
 	sort.Strings(dataKeys)
+	for i, key := range dataKeys {
+		if key == "seed_presence" {
+			dataKeys[i] = "presence"
+		}
+	}
 	sorted := append([]string(nil), sectionNames...)
 	sort.Strings(sorted)
 	if !reflect.DeepEqual(dataKeys, sorted) {
