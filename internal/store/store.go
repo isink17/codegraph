@@ -6227,7 +6227,14 @@ func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string,
 
 func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string, symbolID int64) ([]int64, error) {
 	if symbolID != 0 {
-		return []int64{symbolID}, nil
+		identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, symbolID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+		return []int64{identity.ID}, nil
 	}
 	symbol = strings.TrimSpace(strings.TrimPrefix(symbol, "::"))
 	if symbol == "" {
@@ -6799,11 +6806,40 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 // symbolIdentity is the semantic identity of a symbol: everything needed to
 // order two of them without consulting a row id.
 type symbolIdentity struct {
+	ID            int64
+	RepoID        int64
+	Name          string
 	QualifiedName string
+	Language      string
 	Kind          string
 	Path          string
 	StartLine     int
 	StartCol      int
+}
+
+// lookupSymbolIdentity validates an explicit symbol id against its repository
+// and returns the persisted identity used by exact-id query semantics.
+func (s *Store) lookupSymbolIdentity(ctx context.Context, repoID, symbolID int64) (symbolIdentity, bool, error) {
+	var identity symbolIdentity
+	err := s.db.QueryRowContext(ctx, `
+		SELECT s.id, s.repo_id, s.name, s.qualified_name, s.language,
+		       s.kind, COALESCE(f.path, ''), s.start_line, s.start_col
+		FROM symbols s
+		LEFT JOIN files f ON f.id = s.file_id
+		WHERE s.repo_id = ? AND s.id = ?
+	`, repoID, symbolID).Scan(
+		&identity.ID, &identity.RepoID, &identity.Name,
+		&identity.QualifiedName, &identity.Language, &identity.Kind,
+		&identity.Path, &identity.StartLine, &identity.StartCol,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return symbolIdentity{}, false, nil
+	}
+	if err != nil {
+		return symbolIdentity{}, false, err
+	}
+	identity.Path = filepath.ToSlash(identity.Path)
+	return identity, true, nil
 }
 
 // lessSymbolIdentity is the canonical total order over symbol identities.

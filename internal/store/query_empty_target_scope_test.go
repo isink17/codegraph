@@ -134,7 +134,7 @@ func TestFindCallersKnownGoTargetKeepsPackageScope(t *testing.T) {
 	f.symbol(t, declFile, "Foo", "b.Foo", "go")
 	outsider := f.symbol(t, callFile, "outsider", "a.outsider", "go")
 	insider := f.symbol(t, localFile, "insider", "b.insider", "go")
-	f.edge(t, callFile, outsider, "Foo")
+	f.edge(t, callFile, outsider, "b.Foo")
 	f.edge(t, localFile, insider, "Foo")
 
 	assertSet(t, `FindCallers("b.Foo")`, callerQNames(t, f, "b.Foo", 0), "b.insider")
@@ -151,7 +151,7 @@ func TestFindCallersKnownCppTargetKeepsFileScope(t *testing.T) {
 	caller := f.symbol(t, callFile, "caller", "caller", "cpp")
 	f.edge(t, callFile, caller, "Foo")
 
-	assertSet(t, `FindCallers(cpp Foo)`, callerQNames(t, f, "Foo", target), /* none */)
+	assertSet(t, `FindCallers(cpp Foo)`, callerQNames(t, f, "Foo", target) /* none */)
 }
 
 // TestFindCallersKnownTargetKeepsLanguageGate: a known target in one language
@@ -176,7 +176,7 @@ func TestFindCallersZeroScopeDoesNotWidenExactID(t *testing.T) {
 	outsider := f.symbol(t, callFile, "outsider", "a.outsider", "go")
 	f.edge(t, callFile, outsider, "Foo")
 
-	assertSet(t, `FindCallers(id b.Foo)`, callerQNames(t, f, "b.Foo", target), /* none */)
+	assertSet(t, `FindCallers(id b.Foo)`, callerQNames(t, f, "b.Foo", target) /* none */)
 }
 
 // TestFindCallersStaleSymbolIDStaysRefused: an explicit symbol id is an
@@ -190,12 +190,12 @@ func TestFindCallersStaleSymbolIDStaysRefused(t *testing.T) {
 
 	target := f.symbol(t, declFile, "Foo", "b.Foo", "go")
 	outsider := f.symbol(t, callFile, "outsider", "a.outsider", "go")
-	f.edge(t, callFile, outsider, "Foo")
+	f.edge(t, callFile, outsider, "b.Foo")
 	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM symbols WHERE id = ?`, target); err != nil {
 		t.Fatalf("DELETE symbol error = %v", err)
 	}
 
-	assertSet(t, `FindCallers(stale id)`, callerQNames(t, f, "Foo", target) /* none */)
+	assertSet(t, `FindCallers(stale id)`, callerQNames(t, f, "b.Foo", target) /* none */)
 }
 
 // TestFindCallersGoMethodTargetKeepsRefusal is the gated-language half of the

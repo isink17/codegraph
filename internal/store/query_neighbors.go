@@ -177,9 +177,25 @@ func (s *Store) symbolPage(ctx context.Context, repoID int64, candidateCTE strin
 // evidence. An input that DID match keeps the predicate, including when its
 // targets yield no scope at all -- that is a refusal, not an absence.
 func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	targetIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
-	if err != nil {
-		return nil, err
+	var targetIDs []int64
+	var err error
+	if symbolID != 0 {
+		identity, ok, lookupErr := s.lookupSymbolIdentity(ctx, repoID, symbolID)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		if !ok {
+			return []graph.Symbol{}, nil
+		}
+		// An explicit id is authoritative. All later name/suffix evidence is
+		// derived from this persisted identity, never from caller spelling.
+		symbol = identity.QualifiedName
+		targetIDs = []int64{identity.ID}
+	} else {
+		targetIDs, err = s.lookupSymbolIDs(ctx, repoID, symbol, 0)
+		if err != nil {
+			return nil, err
+		}
 	}
 	short := lookupSymbolShortName(strings.TrimSpace(strings.TrimPrefix(symbol, "::")))
 
