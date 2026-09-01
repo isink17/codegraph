@@ -46,7 +46,7 @@ func newParityFixture(t *testing.T, moduleLine string) *parityFixture {
 			t.Fatalf("write go.mod: %v", err)
 		}
 	}
-	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "graph.sqlite"), OpenOptions{PerformanceProfile: "fast"})
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

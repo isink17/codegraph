@@ -26,7 +26,7 @@ type testLinkFixture struct {
 func newTestLinkFixture(t *testing.T) *testLinkFixture {
 	t.Helper()
 	ctx := context.Background()
-	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "graph.sqlite"), OpenOptions{PerformanceProfile: "fast"})
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

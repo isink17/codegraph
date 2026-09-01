@@ -24,7 +24,7 @@ type gateFixture struct {
 func newGateFixture(t *testing.T) *gateFixture {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
-	s, err := Open(dbPath)
+	s, err := OpenWithOptions(dbPath, OpenOptions{PerformanceProfile: "fast"})
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
