@@ -220,7 +220,7 @@ func newCommandList() []*command {
 		{
 			name:        "find_callers",
 			aliases:     []string{"callers"},
-			description: "find callers of a symbol",
+			description: "find resolved callers of an indexed symbol",
 			usageLines:  []string{"  find_callers <repo-path> <symbol>"},
 			flags: []commandFlag{
 				{name: "--symbol", description: "symbol name to query (repeatable; first wins)"},
@@ -239,7 +239,7 @@ func newCommandList() []*command {
 		{
 			name:        "find_callees",
 			aliases:     []string{"callees"},
-			description: "find callees of a symbol",
+			description: "find resolved callees of an indexed symbol",
 			usageLines:  []string{"  find_callees <repo-path> <symbol>"},
 			flags: []commandFlag{
 				{name: "--symbol", description: "symbol name to query (repeatable; first wins)"},
@@ -258,7 +258,7 @@ func newCommandList() []*command {
 		{
 			name:        "get_impact_radius",
 			aliases:     []string{"impact"},
-			description: "compute impact radius",
+			description: "compute resolved dependency impact; report unresolved uncertainty separately",
 			usageLines: []string{
 				"  get_impact_radius <repo-path> <symbol>",
 				"  get_impact_radius <repo-path> [--symbol <name>]... [--file <path>]... [--depth N]",
