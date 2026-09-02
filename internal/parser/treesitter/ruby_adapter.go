@@ -40,7 +40,9 @@ func (a *RubyAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	rubyExtractImports(root, content, &pf)
 	rubyExtractSymbols(root, module, "", content, &pf)
 	rubyExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:ruby:" + testTargetModule(module, "_test", "_spec") + ":" + target
+	})
 	return pf, nil
 }
 

@@ -54,7 +54,9 @@ func (a *TypeScriptAdapter) Parse(ctx context.Context, path string, content []by
 	tsExtractImports(root, content, &pf)
 	tsExtractSymbols(root, module, "", content, &pf)
 	tsExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:typescript:" + testTargetModule(module, ".test", ".spec") + ":" + target
+	})
 	return pf, nil
 }
 

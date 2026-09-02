@@ -40,7 +40,9 @@ func (a *PHPAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 	phpExtractImports(root, content, &pf)
 	phpExtractSymbols(root, module, "", content, &pf)
 	phpExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:php:" + testTargetModule(module, "Test", "Tests") + ":" + target
+	})
 	return pf, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	sitter "github.com/smacker/go-tree-sitter"
 
@@ -249,8 +250,9 @@ func linkTestsPython(module string, pf *graph.ParsedFile) {
 }
 
 // linkTestsGeneric creates TestLinks for languages that follow common test
-// naming patterns (test/Test prefix).
-func linkTestsGeneric(module string, pf *graph.ParsedFile) {
+// naming patterns. The adapter supplies the production function-key grammar;
+// generic code must not invent a key namespace of its own.
+func linkTestsGeneric(module string, pf *graph.ParsedFile, targetKey func(string) string) {
 	for i, sym := range pf.Symbols {
 		if sym.Kind != "function" {
 			continue
@@ -259,10 +261,10 @@ func linkTestsGeneric(module string, pf *graph.ParsedFile) {
 		switch {
 		case strings.HasPrefix(sym.Name, "test_"):
 			target = strings.TrimPrefix(sym.Name, "test_")
-		case strings.HasPrefix(sym.Name, "Test"):
-			target = strings.TrimPrefix(sym.Name, "Test")
-		case strings.HasPrefix(sym.Name, "test"):
-			target = strings.TrimPrefix(sym.Name, "test")
+		case strings.HasPrefix(sym.Name, "Test") && testNameUpperBoundary(sym.Name[4:]):
+			target = sym.Name[4:]
+		case strings.HasPrefix(sym.Name, "test") && testNameLowerBoundary(sym.Name[4:]):
+			target = sym.Name[4:]
 		default:
 			continue
 		}
@@ -275,8 +277,39 @@ func linkTestsGeneric(module string, pf *graph.ParsedFile) {
 			Reason:          "test_name_match",
 			Score:           0.7,
 			TestSymbolKey:   sym.StableKey,
-			TargetStableKey: "func:" + module + "::" + target,
+			TargetStableKey: targetKey(target),
 			TestSymbolIndex: intRef(i),
 		})
 	}
+}
+
+func testNameLowerBoundary(suffix string) bool {
+	if suffix == "" {
+		return false
+	}
+	if suffix[0] == '_' {
+		return len(suffix) > 1
+	}
+	r, _ := utf8.DecodeRuneInString(suffix)
+	return unicode.IsUpper(r)
+}
+
+func testNameUpperBoundary(suffix string) bool {
+	if suffix == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(suffix)
+	return unicode.IsUpper(r)
+}
+
+func testTargetModule(module string, suffixes ...string) string {
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(module, suffix) && len(module) > len(suffix) {
+			return strings.TrimSuffix(module, suffix)
+		}
+	}
+	if strings.HasPrefix(module, "test_") && len(module) > len("test_") {
+		return strings.TrimPrefix(module, "test_")
+	}
+	return module
 }

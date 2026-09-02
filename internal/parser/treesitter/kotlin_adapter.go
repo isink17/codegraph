@@ -41,7 +41,9 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	kotlinExtractImports(root, content, &pf)
 	kotlinExtractSymbols(root, module, "", content, &pf)
 	kotlinExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
+	})
 	return pf, nil
 }
 

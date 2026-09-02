@@ -40,7 +40,9 @@ func (a *SwiftAdapter) Parse(ctx context.Context, path string, content []byte) (
 	swiftExtractImports(root, content, &pf)
 	swiftExtractSymbols(root, module, "", content, &pf)
 	swiftExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:swift:" + testTargetModule(module, "Test", "Tests") + ":" + target
+	})
 	return pf, nil
 }
 

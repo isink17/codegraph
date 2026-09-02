@@ -40,7 +40,9 @@ func (a *CSharpAdapter) Parse(ctx context.Context, path string, content []byte) 
 	csExtractImports(root, content, &pf)
 	csExtractSymbols(root, module, "", content, &pf)
 	csExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:csharp:" + testTargetModule(module, "Test", "Tests") + ":" + target
+	})
 	return pf, nil
 }
 
