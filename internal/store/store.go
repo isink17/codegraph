@@ -1744,8 +1744,13 @@ func insertParsedFileGraph(
 		testLinkArgs := make([]any, 0, min(len(parsed.TestLinks), sqliteTestLinkValuesBatchRows)*testLinkInsertCols)
 		for _, link := range parsed.TestLinks {
 			var testSymbolID any
-			if id := stableToID[link.TestSymbolKey]; id != 0 {
-				testSymbolID = id
+			if link.TestSymbolIndex != nil {
+				index := *link.TestSymbolIndex
+				if index >= 0 && index < len(symbolIDs) && symbolIDs[index] != 0 &&
+					parsed.Symbols[index].Kind == "function" &&
+					parsed.Symbols[index].StableKey == link.TestSymbolKey {
+					testSymbolID = symbolIDs[index]
+				}
 			}
 			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, nil, nil, link.Reason, link.Score, link.TargetStableKey)
 			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*testLinkInsertCols {

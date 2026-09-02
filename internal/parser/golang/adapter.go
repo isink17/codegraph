@@ -14,6 +14,8 @@ import (
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
+func intRef(i int) *int { return &i }
+
 type Adapter struct{}
 
 func New() *Adapter {
@@ -364,7 +366,7 @@ func toRange(fset *token.FileSet, start, end token.Pos) graph.Position {
 }
 
 func linkTests(pkg string, pf *graph.ParsedFile) {
-	for _, sym := range pf.Symbols {
+	for i, sym := range pf.Symbols {
 		if sym.Kind != "function" || !strings.HasPrefix(sym.Name, "Test") {
 			continue
 		}
@@ -384,6 +386,7 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 			Score:           0.8,
 			TestSymbolKey:   sym.StableKey,
 			TargetStableKey: "func:" + pkg + "::" + target,
+			TestSymbolIndex: intRef(i),
 		})
 	}
 }

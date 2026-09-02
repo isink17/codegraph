@@ -68,6 +68,10 @@ type TestLink struct {
 	Score           float64
 	TestSymbolKey   string
 	TargetStableKey string
+	// TestSymbolIndex is an ephemeral reference to the exact symbol in the
+	// ParsedFile that emitted this link. It is consumed while persisting the
+	// file and is never a durable or public identity.
+	TestSymbolIndex *int `json:"-"`
 }
 
 type Stats struct {
