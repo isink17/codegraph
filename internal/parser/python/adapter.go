@@ -12,13 +12,14 @@ import (
 
 var (
 	classRE = regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	defRE   = regexp.MustCompile(`^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	defRE   = regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
 	callRE  = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
 )
 
 type scope struct {
 	name   string
 	indent int
+	kind   string
 	// symIdx is the index of the scope's declaration in ParsedFile.Symbols,
 	// so closing the scope can seal that symbol's body range.
 	symIdx int
@@ -49,9 +50,8 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		Language:   "python",
 		FileTokens: texttoken.Weights(content),
 	}
-	funcByStable := map[string]graph.Symbol{}
-	var classStack []scope
-	var funcStack []scope
+	var scopes []scope
+	maskedLines := maskPythonLines(lines)
 	// lastLine/lastLen track the most recent content line (not blank, not a
 	// comment). A scope popped by a dedent ends at that line: blank lines,
 	// comments and decorators between declarations belong to no body.
@@ -60,25 +60,30 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	for i, line := range lines {
 		lineNo := i + 1
 		line = strings.TrimSuffix(line, "\r")
+		masked := strings.TrimSuffix(maskedLines[i], "\r")
 		indent := lineIndent(line)
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		if strings.TrimSpace(masked) == "" {
 			continue
 		}
 
-		classStack = closeScopes(classStack, indent, lastLine, lastLen, pf.Symbols)
-		funcStack = closeScopes(funcStack, indent, lastLine, lastLen, pf.Symbols)
+		scopes = closeScopes(scopes, indent, lastLine, lastLen, pf.Symbols)
 		lastLine, lastLen = lineNo, len(line)
 
-		if m := classRE.FindStringSubmatch(line); len(m) == 2 {
+		if m := classRE.FindStringSubmatch(masked); len(m) == 2 {
 			name := m[1]
-			qualified := module + "." + name
+			path := scopeNames(scopes)
+			qualified := qualifiedName(module, append(path, name))
+			container := module
+			if len(path) > 0 {
+				container = strings.Join(path, ".")
+			}
 			sym := graph.Symbol{
 				Language:      "python",
 				Kind:          "class",
 				Name:          name,
 				QualifiedName: qualified,
-				ContainerName: module,
+				ContainerName: container,
 				Visibility:    visibility(name),
 				Range: graph.Position{
 					StartLine: lineNo,
@@ -89,24 +94,30 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				StableKey: "class:" + module + ":" + name,
 			}
 			pf.Symbols = append(pf.Symbols, sym)
-			classStack = append(classStack, scope{name: name, indent: indent, symIdx: len(pf.Symbols) - 1})
+			scopes = append(scopes, scope{name: name, indent: indent, kind: "class", symIdx: len(pf.Symbols) - 1})
 			continue
 		}
 
-		if m := defRE.FindStringSubmatch(line); len(m) == 2 {
+		if m := defRE.FindStringSubmatch(masked); len(m) == 2 {
 			name := m[1]
+			path := scopeNames(scopes)
 			container := module
-			qualified := module + "." + name
+			kind := "function"
+			if len(path) > 0 {
+				container = strings.Join(path, ".")
+			}
+			if len(scopes) > 0 && scopes[len(scopes)-1].kind == "class" {
+				kind = "method"
+			}
+			qualified := qualifiedName(module, append(path, name))
 			stableKey := "func:" + module + "::" + name
-			if len(classStack) > 0 {
-				container = classStack[len(classStack)-1].name
-				qualified = module + "." + container + "." + name
-				stableKey = "func:" + module + ":" + container + ":" + name
+			if len(path) > 0 {
+				stableKey = "func:" + module + ":" + strings.Join(path, ".") + ":" + name
 			}
 			sig := strings.TrimSpace(trimmed)
 			sym := graph.Symbol{
 				Language:      "python",
-				Kind:          "function",
+				Kind:          kind,
 				Name:          name,
 				QualifiedName: qualified,
 				ContainerName: container,
@@ -121,8 +132,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				StableKey: stableKey,
 			}
 			pf.Symbols = append(pf.Symbols, sym)
-			funcByStable[stableKey] = sym
-			funcStack = append(funcStack, scope{name: stableKey, indent: indent, symIdx: len(pf.Symbols) - 1})
+			scopes = append(scopes, scope{name: name, indent: indent, kind: "function", symIdx: len(pf.Symbols) - 1})
 			continue
 		}
 
@@ -145,14 +155,10 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			}
 		}
 
-		if len(funcStack) == 0 {
+		if lastFunction(scopes) < 0 {
 			continue
 		}
-		srcStable := funcStack[len(funcStack)-1].name
-		if _, ok := funcByStable[srcStable]; !ok {
-			continue
-		}
-		for _, m := range callRE.FindAllStringSubmatch(line, -1) {
+		for _, m := range callRE.FindAllStringSubmatch(masked, -1) {
 			if len(m) != 2 {
 				continue
 			}
@@ -182,8 +188,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 
 	// EOF closes every open scope at the file's last content line.
-	closeScopes(classStack, -1, lastLine, lastLen, pf.Symbols)
-	closeScopes(funcStack, -1, lastLine, lastLen, pf.Symbols)
+	closeScopes(scopes, -1, lastLine, lastLen, pf.Symbols)
 
 	return pf, nil
 }
@@ -203,6 +208,97 @@ func closeScopes(stack []scope, indent, lastLine, lastLen int, symbols []graph.S
 		stack = stack[:len(stack)-1]
 	}
 	return stack
+}
+
+func scopeNames(scopes []scope) []string {
+	names := make([]string, 0, len(scopes))
+	for _, s := range scopes {
+		names = append(names, s.name)
+	}
+	return names
+}
+
+func qualifiedName(module string, path []string) string {
+	if len(path) == 0 {
+		return module
+	}
+	return module + "." + strings.Join(path, ".")
+}
+
+func lastFunction(scopes []scope) int {
+	for i := len(scopes) - 1; i >= 0; i-- {
+		if scopes[i].kind == "function" {
+			return i
+		}
+	}
+	return -1
+}
+
+type pythonLexState struct {
+	quote   byte
+	triple  bool
+	escaped bool
+}
+
+func maskPythonLines(lines []string) []string {
+	state := pythonLexState{}
+	masked := make([]string, len(lines))
+	for i, line := range lines {
+		masked[i] = maskPythonLine(line, &state)
+	}
+	return masked
+}
+
+func maskPythonLine(line string, state *pythonLexState) string {
+	var b strings.Builder
+	b.Grow(len(line))
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if state.quote != 0 {
+			if state.triple {
+				if i+2 < len(line) && line[i] == state.quote && line[i+1] == state.quote && line[i+2] == state.quote {
+					b.WriteString("   ")
+					i += 2
+					state.quote, state.triple = 0, false
+				} else {
+					b.WriteByte(' ')
+				}
+				continue
+			}
+			if state.escaped {
+				state.escaped = false
+				b.WriteByte(' ')
+				continue
+			}
+			if ch == '\\' {
+				state.escaped = true
+				b.WriteByte(' ')
+				continue
+			}
+			b.WriteByte(' ')
+			if ch == state.quote {
+				state.quote = 0
+			}
+			continue
+		}
+		if ch == '#' {
+			b.WriteString(strings.Repeat(" ", len(line)-i))
+			break
+		}
+		if ch == '\'' || ch == '"' {
+			state.quote = ch
+			if i+2 < len(line) && line[i+1] == ch && line[i+2] == ch {
+				state.triple = true
+				b.WriteString("   ")
+				i += 2
+			} else {
+				b.WriteByte(' ')
+			}
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
 }
 
 func lineIndent(line string) int {
