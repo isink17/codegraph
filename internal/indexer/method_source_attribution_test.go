@@ -36,6 +36,7 @@ export class Service {
 
   oneLiner(): number { return target(); }
 }
+
 `
 	s, repoID := indexSource(t, tsparser.NewTypeScript(), "svc.ts", src)
 
@@ -184,6 +185,8 @@ export class Service {
     return helperB();
   }
 }
+
+helperA();
 `
 	if err := os.WriteFile(path, []byte(before), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
@@ -209,13 +212,17 @@ export class Service {
 	if err := os.WriteFile(path, []byte(after), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	if _, err := idx.Update(ctx, Options{RepoRoot: repoRoot}); err != nil {
+	summary, err := idx.Update(ctx, Options{RepoRoot: repoRoot})
+	if err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 
 	// The stale edge is gone and the new one belongs to the same method.
 	assertCallers(t, s, repo.ID, "svc.helperA")
 	assertCallers(t, s, repo.ID, "svc.helperB", "svc.Service.run")
+	if summary.WriteStats == nil || summary.WriteStats.EdgeSourceDroppedUnattributable == 0 {
+		t.Fatalf("Update WriteStats = %+v, want dropped module-scope source", summary.WriteStats)
+	}
 	assertCallees(t, s, repo.ID, "svc.Service.run", "svc.helperB")
 	assertCallees(t, s, repo.ID, "svc.Service.idle")
 
@@ -331,9 +338,8 @@ f();
 `
 		s, repoID := indexSource(t, tsparser.NewTypeScript(), "mix.ts", src)
 
-		// The module-level call falls back to the top-level function, exactly
-		// as it did before P20b — never to A.m.
-		assertCallers(t, s, repoID, "mix.f", "mix.f")
+		// The module-level call has no provable callable owner.
+		assertCallers(t, s, repoID, "mix.f")
 		assertCallees(t, s, repoID, "mix.A.m")
 	})
 }

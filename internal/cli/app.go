@@ -1021,6 +1021,8 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 		if summary.WriteStats != nil {
 			out["write_tx_count"] = summary.WriteStats.TxCount
 			out["total_exec_statements"] = summary.WriteStats.TotalExecStatements
+			out["edge_source_dropped_unattributable"] = summary.WriteStats.EdgeSourceDroppedUnattributable
+			out["edge_source_fallback_attributed"] = summary.WriteStats.EdgeSourceFallbackAttributed
 		}
 		return out
 	}

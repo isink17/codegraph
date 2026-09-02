@@ -54,8 +54,8 @@ func TestSrcSymbolChooserChoose_NestedFunctions(t *testing.T) {
 
 // A call inside a method body belongs to that method, not to the first
 // function in the file. This is the P20b defect: kinds other than "function"
-// were skipped entirely, so every method-body call fell through to the
-// fallback symbol.
+// were skipped entirely, so every method-body call fell through to an unrelated
+// source symbol.
 func TestSrcSymbolChooserChoose_MethodOwnsItsBody(t *testing.T) {
 	c := chooserFor(
 		fn("helper", 1, 3, 1),
@@ -94,8 +94,8 @@ func TestSrcSymbolChooserChoose_ContainerNeverOwnsEdges(t *testing.T) {
 			if got := c.Choose(15); got == 1 {
 				t.Fatalf("Choose(15) = %d: %q container must never own a source edge", got, kind)
 			}
-			if got := c.Choose(15); got != 3 {
-				t.Fatalf("Choose(15) = %d, want 3 (top-level fallback)", got)
+			if got := c.Choose(15); got != 0 {
+				t.Fatalf("Choose(15) = %d, want 0 (outside span)", got)
 			}
 		})
 	}
@@ -176,7 +176,7 @@ func TestSrcSymbolChooserChoose_IndependentOfEmissionOrder(t *testing.T) {
 		case line >= 60 && line <= 70:
 			expect = 3
 		default:
-			expect = 4 // fallback: the earliest top-level function
+			expect = 0 // outside every owner span
 		}
 		if want[i] != expect {
 			t.Fatalf("Choose(%d) = %d, want %d", line, want[i], expect)
@@ -234,14 +234,14 @@ func TestSrcSymbolChooserChoose_SameNamedDeclarationsKeepOwnBodies(t *testing.T)
 // Two distinct symbols on exactly the same span cannot be told apart: edges
 // carry a line but no column. The chooser must not guess between them.
 func TestSrcSymbolChooserChoose_IdenticalSpansAbstain(t *testing.T) {
-	t.Run("falls out to the enclosing owner", func(t *testing.T) {
+	t.Run("fails closed", func(t *testing.T) {
 		c := chooserFor(
 			fn("outer", 1, 20, 1),
 			meth("C.a", 10, 10, 2),
 			meth("C.b", 10, 10, 3),
 		)
-		if got := c.Choose(10); got != 1 {
-			t.Fatalf("Choose(10) = %d, want 1 (outer): tied spans must yield to an unambiguous enclosing owner", got)
+		if got := c.Choose(10); got != 0 {
+			t.Fatalf("Choose(10) = %d, want 0: tied spans must fail closed", got)
 		}
 	})
 
@@ -254,9 +254,8 @@ func TestSrcSymbolChooserChoose_IdenticalSpansAbstain(t *testing.T) {
 		if got := c.Choose(10); got != 0 {
 			t.Fatalf("Choose(10) = %d, want 0: with no enclosing owner the chooser must abstain, not fall back to an unrelated symbol", got)
 		}
-		// The fallback still applies to lines no symbol claims.
-		if got := c.Choose(30); got != 1 {
-			t.Fatalf("Choose(30) = %d, want 1 (fallback)", got)
+		if got := c.Choose(30); got != 0 {
+			t.Fatalf("Choose(30) = %d, want 0 (outside span)", got)
 		}
 	})
 
@@ -292,8 +291,8 @@ func TestSrcSymbolChooserChoose_TiedGroupLargerThanTwo(t *testing.T) {
 		for _, idx := range order {
 			owners = append(owners, base[idx])
 		}
-		if got := chooserFor(owners...).Choose(10); got != 1 {
-			t.Fatalf("order %v: Choose(10) = %d, want 1 (m.outer); a tied group of three must not resolve to one of its members", order, got)
+		if got := chooserFor(owners...).Choose(10); got != 0 {
+			t.Fatalf("order %v: Choose(10) = %d, want 0; a tied group must fail closed", order, got)
 		}
 	}
 }
@@ -310,33 +309,30 @@ func TestSrcSymbolChooserChoose_DuplicateEmissionOfOneSymbol(t *testing.T) {
 	}
 }
 
-// A reference outside every body-owning span keeps the file's fallback symbol.
-// Top-level and file-scope calls must not be dropped.
-func TestSrcSymbolChooserChoose_TopLevelKeepsFallback(t *testing.T) {
+// A reference outside every body-owning span has no provable source owner.
+func TestSrcSymbolChooserChoose_TopLevelHasNoOwner(t *testing.T) {
 	c := chooserFor(
 		fn("alpha", 1, 2, 1),
 		fn("beta", 4, 5, 2),
 	)
 
-	if got := c.Choose(7); got != 1 {
-		t.Fatalf("Choose(7) = %d, want 1 (fallback); a top-level reference must keep an edge", got)
+	if got := c.Choose(7); got != 0 {
+		t.Fatalf("Choose(7) = %d, want 0 (outside span)", got)
 	}
-	if got := c.Choose(0); got != 1 {
-		t.Fatalf("Choose(0) = %d, want 1 (fallback)", got)
+	if got := c.Choose(0); got != 0 {
+		t.Fatalf("Choose(0) = %d, want 0 (outside span)", got)
 	}
 }
 
-// The fallback is the earliest top-level body owner by position, not the first
-// one emitted. A method must never be the fallback: a statement at module
-// scope does not belong to some arbitrary method of some arbitrary class.
-func TestSrcSymbolChooserChoose_FallbackIsEarliestTopLevelFunction(t *testing.T) {
+// No body owner may be used for a statement at module scope.
+func TestSrcSymbolChooserChoose_OutsideSpanHasNoOwner(t *testing.T) {
 	t.Run("earliest by position, not by emission", func(t *testing.T) {
 		c := chooserFor(
 			fn("late", 40, 44, 9),
 			fn("early", 5, 9, 3),
 		)
-		if got := c.Choose(100); got != 3 {
-			t.Fatalf("Choose(100) = %d, want 3 (earliest by position)", got)
+		if got := c.Choose(100); got != 0 {
+			t.Fatalf("Choose(100) = %d, want 0 (outside span)", got)
 		}
 	})
 
@@ -359,8 +355,8 @@ func TestSrcSymbolChooserChoose_FallbackIsEarliestTopLevelFunction(t *testing.T)
 			meth("App.helper", 2, 4, 5),
 			fn("top", 10, 12, 7),
 		)
-		if got := c.Choose(50); got != 7 {
-			t.Fatalf("Choose(50) = %d, want 7 (top-level function)", got)
+		if got := c.Choose(50); got != 0 {
+			t.Fatalf("Choose(50) = %d, want 0 (outside span)", got)
 		}
 	})
 }
@@ -399,8 +395,8 @@ func TestSrcSymbolChooserChoose_ToleratesShortIDSlice(t *testing.T) {
 	if got := c.Choose(3); got != 7 {
 		t.Fatalf("Choose(3) = %d, want 7", got)
 	}
-	if got := c.Choose(12); got != 7 {
-		t.Fatalf("Choose(12) = %d, want 7 (fallback); the second symbol has no id", got)
+	if got := c.Choose(12); got != 0 {
+		t.Fatalf("Choose(12) = %d, want 0 (outside span)", got)
 	}
 }
 
@@ -418,8 +414,8 @@ func TestSrcSymbolChooserChoose_ZeroWidthSpansDoNotSwallowFollowingLines(t *test
 	}
 	// Line 9 is inside second's body in the source but outside its recorded
 	// span, so it falls back rather than being claimed by second.
-	if got := c.Choose(9); got != 1 {
-		t.Fatalf("Choose(9) = %d, want 1 (fallback)", got)
+	if got := c.Choose(9); got != 0 {
+		t.Fatalf("Choose(9) = %d, want 0 (outside span)", got)
 	}
 }
 
