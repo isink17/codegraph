@@ -123,9 +123,10 @@ type TaskContextSymbol struct {
 	Relevance     string `json:"relevance"` // "direct_match", "caller", "callee", "test"
 	QualifiedName string `json:"qualified_name"`
 
-	// SymbolID and StableKey are the drill-down identity: pass either to
-	// find_symbol/find_callers/find_callees to fetch this exact symbol at a
-	// higher detail level. context_for_task itself never carries source.
+	// SymbolID is the exact drill-down identity: pass it to
+	// find_symbol/find_callers/find_callees to fetch this symbol at a higher
+	// detail level. StableKey is semantic metadata and may collide; it is not a
+	// general exact selector. context_for_task itself never carries source.
 	SymbolID  int64  `json:"symbol_id,omitempty"`
 	StableKey string `json:"stable_key,omitempty"`
 }

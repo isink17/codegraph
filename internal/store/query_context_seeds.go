@@ -9,11 +9,9 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 )
 
-// SymbolRef identifies a symbol the way semantic search reports it: by
-// containing file path and qualified name. Both semantic paths (token overlap
-// and hybrid) group their results on exactly this pair, so it is the natural
-// join key back to a real symbol row -- and, unlike a bare name, it is not
-// ambiguous across packages.
+// SymbolRef is the legacy textual reference used by callers that do not carry
+// an exact symbol ID. It can be ambiguous for overloads in one file; context
+// seed resolution uses SymbolsForIDs instead.
 //
 // File is a repository-relative path in canonical form: forward slashes,
 // whatever the host's separator. Equality of two refs is therefore

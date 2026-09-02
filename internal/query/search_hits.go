@@ -6,7 +6,8 @@ import "github.com/isink17/codegraph/internal/store"
 //
 // Both search paths -- Store.SemanticSearch (token overlap) and
 // Store.HybridSearch (FTS + vector, RRF-fused) -- return []map[string]any with
-// the keys `file`, `symbol`, `score`, `why`, and (hybrid only) `kind`. That
+// exact `symbol_id` plus the keys `file`, `symbol`, `score`, `why`, and
+// (hybrid only) `kind` (and vector `signature`). That
 // stringly contract is what let context_for_task read a key named `name` that no
 // producer has ever emitted, silently dropping every seed. Every consumer inside
 // this package now goes through parseSearchHits, and searchHitContractKeys
