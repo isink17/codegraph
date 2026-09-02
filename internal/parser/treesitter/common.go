@@ -13,6 +13,8 @@ import (
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
+func intRef(i int) *int { return &i }
+
 // nodeText returns the source text spanned by a tree-sitter node.
 func nodeText(node *sitter.Node, content []byte) string {
 	if node == nil {
@@ -187,7 +189,7 @@ func prevCommentText(node *sitter.Node, content []byte) string {
 
 // linkTestsGo creates TestLinks for Go test functions.
 func linkTestsGo(module string, pf *graph.ParsedFile) {
-	for _, sym := range pf.Symbols {
+	for i, sym := range pf.Symbols {
 		if sym.Kind != "function" || !strings.HasPrefix(sym.Name, "Test") {
 			continue
 		}
@@ -207,6 +209,7 @@ func linkTestsGo(module string, pf *graph.ParsedFile) {
 			Score:           0.8,
 			TestSymbolKey:   sym.StableKey,
 			TargetStableKey: "func:" + module + "::" + target,
+			TestSymbolIndex: intRef(i),
 		})
 	}
 }
@@ -225,7 +228,7 @@ func linkTestsPython(module string, pf *graph.ParsedFile) {
 	if targetModule == "" {
 		targetModule = module
 	}
-	for _, sym := range pf.Symbols {
+	for i, sym := range pf.Symbols {
 		if sym.Kind != "function" || !strings.HasPrefix(sym.Name, "test_") {
 			continue
 		}
@@ -240,6 +243,7 @@ func linkTestsPython(module string, pf *graph.ParsedFile) {
 			Score:           0.7,
 			TestSymbolKey:   sym.StableKey,
 			TargetStableKey: "func:" + targetModule + "::" + target,
+			TestSymbolIndex: intRef(i),
 		})
 	}
 }
@@ -247,7 +251,7 @@ func linkTestsPython(module string, pf *graph.ParsedFile) {
 // linkTestsGeneric creates TestLinks for languages that follow common test
 // naming patterns (test/Test prefix).
 func linkTestsGeneric(module string, pf *graph.ParsedFile) {
-	for _, sym := range pf.Symbols {
+	for i, sym := range pf.Symbols {
 		if sym.Kind != "function" {
 			continue
 		}
@@ -272,6 +276,7 @@ func linkTestsGeneric(module string, pf *graph.ParsedFile) {
 			Score:           0.7,
 			TestSymbolKey:   sym.StableKey,
 			TargetStableKey: "func:" + module + "::" + target,
+			TestSymbolIndex: intRef(i),
 		})
 	}
 }

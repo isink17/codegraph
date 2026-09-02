@@ -5,11 +5,14 @@ import "context"
 // TestLinkRow is a test-only projection of a test_links row, used by the
 // external store_test integration tests that drive the real indexer.
 type TestLinkRow struct {
-	TestFile       string
-	TargetFile     string
-	TargetSymbolID *int64
-	Reason         string
-	Score          float64
+	TestFile        string
+	TestSymbolID    *int64
+	TestSymbolName  string
+	TargetStableKey string
+	TargetFile      string
+	TargetSymbolID  *int64
+	Reason          string
+	Score           float64
 }
 
 // CountDanglingTestLinkRefsForTest reports how many test_links rows in the repo
@@ -60,9 +63,10 @@ func (s *Store) InsertLegacyTestLinkForTest(ctx context.Context, repoID int64, t
 // paths, ordered for stable assertions.
 func (s *Store) TestLinksForTest(ctx context.Context, repoID int64) ([]TestLinkRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT tf.path, COALESCE(gf.path, ''), t.target_symbol_id, t.reason, t.score
+		SELECT tf.path, t.test_symbol_id, COALESCE(ts.name, ''), t.target_stable_key, COALESCE(gf.path, ''), t.target_symbol_id, t.reason, t.score
 		FROM test_links t
 		JOIN files tf ON tf.id = t.test_file_id
+		LEFT JOIN symbols ts ON ts.id = t.test_symbol_id
 		LEFT JOIN files gf ON gf.id = t.target_file_id
 		WHERE t.repo_id = ?
 		ORDER BY tf.path, COALESCE(gf.path, ''), t.reason
@@ -74,7 +78,7 @@ func (s *Store) TestLinksForTest(ctx context.Context, repoID int64) ([]TestLinkR
 	var out []TestLinkRow
 	for rows.Next() {
 		var r TestLinkRow
-		if err := rows.Scan(&r.TestFile, &r.TargetFile, &r.TargetSymbolID, &r.Reason, &r.Score); err != nil {
+		if err := rows.Scan(&r.TestFile, &r.TestSymbolID, &r.TestSymbolName, &r.TargetStableKey, &r.TargetFile, &r.TargetSymbolID, &r.Reason, &r.Score); err != nil {
 			return nil, err
 		}
 		r.TestFile = canonicalStoredPath(r.TestFile)
