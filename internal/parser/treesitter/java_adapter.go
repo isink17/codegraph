@@ -40,7 +40,9 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	javaExtractImports(root, content, &pf)
 	javaExtractSymbols(root, module, "", content, &pf)
 	javaExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:java:" + testTargetModule(module, "Test", "Tests") + ":" + target
+	})
 	return pf, nil
 }
 

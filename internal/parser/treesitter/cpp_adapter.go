@@ -56,7 +56,9 @@ func (a *CppAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 	cppExtractImports(root, content, &pf)
 	cppExtractSymbols(root, module, "", "", filepath.ToSlash(path), content, &pf)
 	cppExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return cppStableKey("func", testTargetModule(module, "_test"), target)
+	})
 	return pf, nil
 }
 

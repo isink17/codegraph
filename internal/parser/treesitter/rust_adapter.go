@@ -40,7 +40,9 @@ func (a *RustAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	rustExtractImports(root, content, &pf)
 	rustExtractSymbols(root, module, "", content, &pf)
 	rustExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf)
+	linkTestsGeneric(module, &pf, func(target string) string {
+		return "func:rust:" + testTargetModule(module, "_test") + ":" + target
+	})
 	return pf, nil
 }
 
