@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -5174,7 +5175,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			FROM symbol_fts fts
 			JOIN symbols s ON s.id = fts.symbol_id
 			WHERE s.repo_id = ? AND symbol_fts MATCH ?
-			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
+			         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 			LIMIT ?
 			OFFSET ?
 		)
@@ -5186,7 +5188,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 		FROM page p
 		CROSS JOIN symbols s ON s.id = p.id
 		JOIN files f ON f.id = s.file_id
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
+		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 	`, repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		rows, err = s.db.QueryContext(ctx, `
@@ -5195,7 +5198,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id
 			WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
-			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
+			         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 			LIMIT ?
 			OFFSET ?
 		`, repoID, "%"+query+"%", "%"+query+"%", safeLimit(limit), safeOffset(offset))
@@ -5703,12 +5707,12 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(tokenList)), ",")
 	sqlQuery := `
-		SELECT f.path, COALESCE(s.qualified_name, ''), SUM(st.weight) AS score
+		SELECT s.id, f.path, COALESCE(s.qualified_name, ''), SUM(st.weight) AS score
 		FROM symbol_tokens st
 		JOIN symbols s ON s.id = st.symbol_id
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND st.token IN (` + placeholders + `)
-		GROUP BY f.path, s.qualified_name
+		GROUP BY s.id, f.path, s.qualified_name
 		-- Score alone is not a total order: weights come from a small fixed set,
 		-- so ties are the rule rather than the exception and a LIMIT/OFFSET page
 		-- boundary would fall in an arbitrary place. The grouping keys are
@@ -5719,7 +5723,9 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		-- the digits and capitals, so ordering the raw column would put a different
 		-- 30 rows through LIMIT on Windows than on Linux for the same repository --
 		-- a different seed set, and so a different ranked context.
-		ORDER BY score DESC, REPLACE(f.path, '\', '/') ASC, s.qualified_name ASC
+		ORDER BY score DESC, REPLACE(f.path, '\', '/') ASC, s.qualified_name ASC, s.kind ASC,
+		         s.container_name ASC, s.signature ASC, s.stable_key ASC, s.start_line ASC, s.start_col ASC,
+		         s.end_line ASC, s.end_col ASC
 		LIMIT ?
 		OFFSET ?
 	`
@@ -5737,6 +5743,7 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	defer rows.Close()
 
 	type candidate struct {
+		id     int64
 		file   string
 		symbol string
 		score  float64
@@ -5744,10 +5751,11 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	out := make([]map[string]any, 0, limitVal)
 	for rows.Next() {
 		var item candidate
-		if err := rows.Scan(&item.file, &item.symbol, &item.score); err != nil {
+		if err := rows.Scan(&item.id, &item.file, &item.symbol, &item.score); err != nil {
 			return nil, err
 		}
 		out = append(out, map[string]any{
+			"symbol_id": item.id,
 			// Canonical (slash) form, like every other path this store hands out.
 			// `files.path` is native, so on Windows the raw column value would make
 			// this producer's `file` disagree with the `file` of every symbol-shaped
@@ -7606,10 +7614,12 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 	defer rows.Close()
 
 	type scored struct {
-		file   string
-		symbol string
-		kind   string
-		score  float64
+		id        int64
+		file      string
+		symbol    string
+		kind      string
+		signature string
+		score     float64
 	}
 
 	var candidates []scored
@@ -7629,7 +7639,7 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 			// reports the slash form. Left native, the two halves of the fusion
 			// would never meet on Windows and every hit would score as if it had
 			// been found by one searcher only.
-			candidates = append(candidates, scored{file: CanonicalRelPath(filePath), symbol: qualName, kind: kind, score: sim})
+			candidates = append(candidates, scored{id: symbolID, file: CanonicalRelPath(filePath), symbol: qualName, kind: kind, signature: sig, score: sim})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -7645,7 +7655,13 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 		if candidates[i].file != candidates[j].file {
 			return candidates[i].file < candidates[j].file
 		}
-		return candidates[i].symbol < candidates[j].symbol
+		if candidates[i].symbol != candidates[j].symbol {
+			return candidates[i].symbol < candidates[j].symbol
+		}
+		if candidates[i].kind != candidates[j].kind {
+			return candidates[i].kind < candidates[j].kind
+		}
+		return candidates[i].signature < candidates[j].signature
 	})
 
 	end := min(offset+limit, len(candidates))
@@ -7657,11 +7673,13 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 	out := make([]map[string]any, 0, len(candidates))
 	for _, c := range candidates {
 		out = append(out, map[string]any{
-			"file":   c.file,
-			"symbol": c.symbol,
-			"kind":   c.kind,
-			"score":  c.score,
-			"why":    []string{"vector_similarity"},
+			"symbol_id": c.id,
+			"file":      c.file,
+			"symbol":    c.symbol,
+			"kind":      c.kind,
+			"signature": c.signature,
+			"score":     c.score,
+			"why":       []string{"vector_similarity"},
 		})
 	}
 	return out, nil
@@ -7685,19 +7703,21 @@ func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, qu
 
 	// Build RRF scores keyed by "file::symbol"
 	type entry struct {
-		file   string
-		symbol string
-		kind   string
-		score  float64
-		why    []string
+		id        int64
+		file      string
+		symbol    string
+		kind      string
+		signature string
+		score     float64
+		why       []string
 	}
 	merged := map[string]*entry{}
 
 	for rank, sym := range ftsResults {
-		key := sym.FilePath + "::" + sym.QualifiedName
+		key := strconv.FormatInt(sym.ID, 10)
 		e, ok := merged[key]
 		if !ok {
-			e = &entry{file: sym.FilePath, symbol: sym.QualifiedName, kind: sym.Kind}
+			e = &entry{id: sym.ID, file: sym.FilePath, symbol: sym.QualifiedName, kind: sym.Kind, signature: sym.Signature}
 			merged[key] = e
 		}
 		e.score += 1.0 / float64(fusionK+rank+1)
@@ -7705,13 +7725,20 @@ func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, qu
 	}
 
 	for rank, vm := range vecResults {
-		key := vm["file"].(string) + "::" + vm["symbol"].(string)
+		id, ok := vm["symbol_id"].(int64)
+		if !ok || id == 0 {
+			continue
+		}
+		key := strconv.FormatInt(id, 10)
 		e, ok := merged[key]
 		if !ok {
+			signature, _ := vm["signature"].(string)
 			e = &entry{
-				file:   vm["file"].(string),
-				symbol: vm["symbol"].(string),
-				kind:   vm["kind"].(string),
+				id:        id,
+				file:      vm["file"].(string),
+				symbol:    vm["symbol"].(string),
+				kind:      vm["kind"].(string),
+				signature: signature,
 			}
 			merged[key] = e
 		}
@@ -7734,7 +7761,13 @@ func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, qu
 		if sorted[i].file != sorted[j].file {
 			return sorted[i].file < sorted[j].file
 		}
-		return sorted[i].symbol < sorted[j].symbol
+		if sorted[i].symbol != sorted[j].symbol {
+			return sorted[i].symbol < sorted[j].symbol
+		}
+		if sorted[i].kind != sorted[j].kind {
+			return sorted[i].kind < sorted[j].kind
+		}
+		return sorted[i].signature < sorted[j].signature
 	})
 
 	limitVal := safeLimit(limit)
@@ -7748,11 +7781,13 @@ func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, qu
 	out := make([]map[string]any, 0, len(sorted))
 	for _, e := range sorted {
 		out = append(out, map[string]any{
-			"file":   e.file,
-			"symbol": e.symbol,
-			"kind":   e.kind,
-			"score":  e.score,
-			"why":    e.why,
+			"symbol_id": e.id,
+			"file":      e.file,
+			"symbol":    e.symbol,
+			"kind":      e.kind,
+			"signature": e.signature,
+			"score":     e.score,
+			"why":       e.why,
 		})
 	}
 	return out, nil

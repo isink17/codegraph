@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
@@ -116,8 +117,7 @@ type contextCandidate struct {
 	score       float64
 }
 
-// identity is the candidate's stable semantic identity, used for dedup and as
-// the final ordering tie-break.
+// identity is the semantic ordering identity. It is independent of DB row ID.
 //
 // The file path is part of it even when stable_key is present: a stable key is
 // scoped to a package or to a file's base name, not to a path, so two files can
@@ -127,10 +127,25 @@ type contextCandidate struct {
 // stable key would silently drop one of the two from the answer and from the
 // counters.
 func (c contextCandidate) identity() string {
-	if c.sym.StableKey != "" {
-		return c.sym.FilePath + "\x00" + c.sym.StableKey
+	return c.semanticIdentity()
+}
+
+// exactDedupKey is the only identity used to merge candidates.
+func (c contextCandidate) exactDedupKey() string {
+	if c.sym.ID <= 0 {
+		return ""
 	}
-	return c.sym.FilePath + "\x00" + c.sym.QualifiedName + "\x00" + c.sym.Name
+	return strconv.FormatInt(c.sym.ID, 10)
+}
+
+// semanticIdentity orders distinct persisted symbols without depending on DB
+// insertion IDs. It is also the identity used by the ranking fingerprint.
+func (c contextCandidate) semanticIdentity() string {
+	fields := []string{c.sym.FilePath, c.sym.Language, c.sym.Kind, c.sym.QualifiedName,
+		c.sym.ContainerName, c.sym.Signature, c.sym.StableKey,
+		strconv.Itoa(c.sym.Range.StartLine), strconv.Itoa(c.sym.Range.StartCol),
+		strconv.Itoa(c.sym.Range.EndLine), strconv.Itoa(c.sym.Range.EndCol)}
+	return strings.Join(fields, "\x00")
 }
 
 // baseScore is the score without the file-support bonus. Dedup compares this,
@@ -164,10 +179,10 @@ func newCandidateSet() *candidateSet {
 }
 
 func (cs *candidateSet) add(c contextCandidate) {
-	if c.sym.FilePath == "" || (c.sym.QualifiedName == "" && c.sym.Name == "") {
+	if c.sym.ID <= 0 || c.sym.FilePath == "" || (c.sym.QualifiedName == "" && c.sym.Name == "") {
 		return
 	}
-	key := c.identity()
+	key := c.exactDedupKey()
 	idx, seen := cs.byIdentity[key]
 	if !seen {
 		cs.byIdentity[key] = len(cs.items)
@@ -232,7 +247,7 @@ func lessCandidate(a, b contextCandidate) bool {
 	if a.sym.FilePath != b.sym.FilePath {
 		return a.sym.FilePath < b.sym.FilePath
 	}
-	return a.identity() < b.identity()
+	return a.semanticIdentity() < b.semanticIdentity()
 }
 
 // rankingFingerprint hashes the ordered candidate stream. A continuation whose
@@ -244,7 +259,7 @@ func rankingFingerprint(items []contextCandidate) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte("codegraph/context-rank/v1\n"))
 	for _, c := range items {
-		_, _ = h.Write([]byte(c.identity()))
+		_, _ = h.Write([]byte(c.semanticIdentity()))
 		_, _ = h.Write([]byte{'|'})
 		_, _ = h.Write([]byte(c.relevance))
 		_, _ = h.Write([]byte{'|'})

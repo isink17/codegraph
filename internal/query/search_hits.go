@@ -20,9 +20,18 @@ type searchHit struct {
 	// Rank is the hit's zero-based position in the producer's ordered output.
 	Rank int
 	Why  []string
-	// SymbolID is set only when a producer already resolved identity. Neither
-	// current producer does; seeds are resolved via store.SymbolsForRefs.
+	// SymbolID is the exact persisted identity emitted by both search producers.
 	SymbolID int64
+}
+
+// hitRefs remains available to path-resolution tests and legacy callers; the
+// ContextForTask seed path uses exact SymbolID instead.
+func hitRefs(hits []searchHit) []store.SymbolRef {
+	refs := make([]store.SymbolRef, 0, len(hits))
+	for _, h := range hits {
+		refs = append(refs, store.SymbolRef{File: h.File, QualifiedName: h.QualifiedName})
+	}
+	return refs
 }
 
 // searchHitContractKeys names the keys parseSearchHits reads. `symbol` is the
@@ -69,15 +78,6 @@ func parseSearchHits(results []map[string]any) []searchHit {
 		hits = append(hits, hit)
 	}
 	return hits
-}
-
-// refs returns the (file, qualified name) pairs to resolve to symbol rows.
-func hitRefs(hits []searchHit) []store.SymbolRef {
-	refs := make([]store.SymbolRef, 0, len(hits))
-	for _, h := range hits {
-		refs = append(refs, store.SymbolRef{File: h.File, QualifiedName: h.QualifiedName})
-	}
-	return refs
 }
 
 func asFloat(v any) float64 {

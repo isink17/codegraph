@@ -36,6 +36,7 @@ type ContextForTaskOptions struct {
 // directly.
 type contextStoreOps interface {
 	LastScanID(ctx context.Context, repoID int64) (int64, error)
+	SymbolsForIDs(ctx context.Context, repoID int64, ids []int64) (map[int64]graph.Symbol, error)
 	SymbolsForRefs(ctx context.Context, repoID int64, refs []store.SymbolRef) (map[store.SymbolRef]graph.Symbol, error)
 	SymbolNameCounts(ctx context.Context, repoID int64, names []string) (map[string]int, error)
 	FindContextNeighbors(ctx context.Context, repoID int64, seeds []store.ContextSeed, fanout int) ([]store.ContextNeighbors, error)
@@ -72,8 +73,8 @@ const (
 // token budget.
 //
 // It is a selector, not a source dump: every returned symbol carries symbol_id
-// and stable_key so a caller can fetch source from find_symbol at
-// detail=excerpt or detail=full. Context that did not fit the budget is not
+// as its exact drill-down identity; stable_key is semantic metadata and may
+// collide. Context that did not fit the budget is not
 // lost -- next_cursor continues the same ranked stream.
 func (s *Service) ContextForTask(ctx context.Context, repoID int64, task string, opts ContextForTaskOptions) (*graph.TaskContext, error) {
 	if opts.MaxFiles <= 0 {
@@ -152,9 +153,13 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 	}
 	hits := parseSearchHits(rawHits)
 
-	// One batched lookup turns (file, qualified_name) hits into real symbol rows:
-	// identity for drill-down, and the exact node to expand the graph from.
-	resolved, err := s.ctxStore.SymbolsForRefs(ctx, repoID, hitRefs(hits))
+	ids := make([]int64, 0, len(hits))
+	for _, hit := range hits {
+		if hit.SymbolID > 0 {
+			ids = append(ids, hit.SymbolID)
+		}
+	}
+	resolved, err := s.ctxStore.SymbolsForIDs(ctx, repoID, ids)
 	if err != nil {
 		return nil, fmt.Errorf("resolve seed symbols: %w", err)
 	}
@@ -168,10 +173,10 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 	}
 	seeds := make([]seed, 0, len(hits))
 	for i, hit := range hits {
-		sym, ok := resolved[store.SymbolRef{File: hit.File, QualifiedName: hit.QualifiedName}]
+		sym, ok := resolved[hit.SymbolID]
 		if !ok {
-			// The hit named no row we can identify (an aggregate over symbols
-			// without a qualified name, or a row deleted since the search).
+			// Missing exact IDs are stale or malformed search evidence. Never pick
+			// another overload by resolving the hit's textual fields.
 			continue
 		}
 		set.add(contextCandidate{sym: sym, relevance: relevanceDirectMatch, taskSignal: signals[i]})
