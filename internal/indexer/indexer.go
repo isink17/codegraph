@@ -512,7 +512,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return err
 		}
 		started := time.Now()
-		fileIDs, err := i.store.ReplaceFileGraphsBatchWithStats(ctx, repo.ID, scanID, replaceBatch, &writeStats)
+		result, err := i.store.ReplaceFileGraphsBatchWithSymbolIDs(ctx, repo.ID, scanID, replaceBatch, &writeStats)
 		if err != nil {
 			return err
 		}
@@ -520,7 +520,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		writeReplaceDur += time.Since(started)
 		if !embedding.IsNoop(i.embedder) {
 			embedStarted := time.Now()
-			i.embedReplaceBatch(ctx, repo.ID, fileIDs, replaceBatch)
+			i.embedReplaceBatch(ctx, repo.ID, result, replaceBatch)
 			embedDur += time.Since(embedStarted)
 		}
 		replaceBatch = replaceBatch[:0]
@@ -1312,77 +1312,10 @@ func matchPattern(path, pattern string) bool {
 	return false
 }
 
-// embedFileSymbols computes and stores embeddings for all symbols in a parsed file.
-func (i *Indexer) embedFileSymbols(ctx context.Context, repoID int64, relPath string, parsed graph.ParsedFile) {
-	if len(parsed.Symbols) == 0 {
-		return
-	}
-
-	texts := make([]string, len(parsed.Symbols))
-	keys := make([]string, len(parsed.Symbols))
-	for j, sym := range parsed.Symbols {
-		texts[j] = embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary)
-		keys[j] = sym.StableKey
-	}
-
-	vectors, err := i.embedder.EmbedBatch(ctx, texts)
-	if err != nil {
-		return // best-effort: don't fail indexing on embedding errors
-	}
-
-	fileID, err := i.store.FileIDByPath(ctx, repoID, relPath)
-	if err != nil || fileID == 0 {
-		return
-	}
-
-	symbolMap := make(map[string][]float32, len(keys))
-	for j, key := range keys {
-		if vectors[j] != nil {
-			symbolMap[key] = vectors[j]
-		}
-	}
-	if len(symbolMap) > 0 {
-		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
-	}
-}
-
-func (i *Indexer) embedFileSymbolsWithFileID(ctx context.Context, repoID int64, fileID int64, parsed graph.ParsedFile) {
-	if len(parsed.Symbols) == 0 || fileID == 0 {
-		return
-	}
-
-	texts := make([]string, len(parsed.Symbols))
-	keys := make([]string, len(parsed.Symbols))
-	for j, sym := range parsed.Symbols {
-		texts[j] = embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary)
-		keys[j] = sym.StableKey
-	}
-
-	vectors, err := i.embedder.EmbedBatch(ctx, texts)
-	if err != nil {
-		return // best-effort: don't fail indexing on embedding errors
-	}
-
-	symbolMap := make(map[string][]float32, len(keys))
-	for j, key := range keys {
-		if vectors[j] != nil {
-			symbolMap[key] = vectors[j]
-		}
-	}
-	if len(symbolMap) > 0 {
-		_ = i.store.UpsertSymbolEmbeddings(ctx, repoID, fileID, "", symbolMap)
-	}
-}
-
-func (i *Indexer) embedReplaceBatch(ctx context.Context, repoID int64, fileIDs []int64, inputs []store.ReplaceFileGraphInput) {
-	type keyRef struct {
-		fileID    int64
-		stableKey string
-	}
-
+func (i *Indexer) embedReplaceBatch(ctx context.Context, repoID int64, result store.ReplaceFileGraphResult, inputs []store.ReplaceFileGraphInput) {
 	totalSyms := 0
 	for idx := range inputs {
-		if idx >= len(fileIDs) {
+		if idx >= len(result.FileIDs) || idx >= len(result.SymbolIDs) {
 			break
 		}
 		totalSyms += len(inputs[idx].Parsed.Symbols)
@@ -1392,18 +1325,20 @@ func (i *Indexer) embedReplaceBatch(ctx context.Context, repoID int64, fileIDs [
 	}
 
 	texts := make([]string, 0, totalSyms)
-	keys := make([]keyRef, 0, totalSyms)
+	symbolIDs := make([]int64, 0, totalSyms)
+	fileIDs := make([]int64, 0, totalSyms)
 	for idx, input := range inputs {
-		if idx >= len(fileIDs) {
+		if idx >= len(result.FileIDs) || idx >= len(result.SymbolIDs) {
 			break
 		}
-		fileID := fileIDs[idx]
+		fileID := result.FileIDs[idx]
 		if fileID == 0 || len(input.Parsed.Symbols) == 0 {
 			continue
 		}
-		for _, sym := range input.Parsed.Symbols {
+		for symbolIndex, sym := range input.Parsed.Symbols {
 			texts = append(texts, embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary))
-			keys = append(keys, keyRef{fileID: fileID, stableKey: sym.StableKey})
+			symbolIDs = append(symbolIDs, result.SymbolIDs[idx][symbolIndex])
+			fileIDs = append(fileIDs, fileID)
 		}
 	}
 	if len(texts) == 0 {
@@ -1423,14 +1358,14 @@ func (i *Indexer) embedReplaceBatch(ctx context.Context, repoID int64, fileIDs [
 			if vec == nil {
 				continue
 			}
-			ref := keys[start+j]
-			if ref.fileID == 0 || ref.stableKey == "" {
+			symbolID := symbolIDs[start+j]
+			if symbolID == 0 {
 				continue
 			}
 			upserts = append(upserts, store.SymbolEmbeddingUpsert{
-				FileID:    ref.fileID,
-				StableKey: ref.stableKey,
-				Vector:    vec,
+				SymbolID: symbolID,
+				FileID:   fileIDs[start+j],
+				Vector:   vec,
 			})
 		}
 	}

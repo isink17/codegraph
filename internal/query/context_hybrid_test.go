@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/isink17/codegraph/internal/embedding"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 // embedderForTest is the seam the fixture uses for the HybridSearch path. It is
@@ -74,22 +75,17 @@ func (fx *contextFixture) seedEmbeddings(t testing.TB, emb embedderForTest) {
 	if len(symbols) == 0 {
 		t.Fatal("fixture has no symbols to embed")
 	}
-	byFile := map[int64]map[string][]float32{}
+	items := make([]store.SymbolEmbeddingUpsert, 0, len(symbols))
 	for _, sym := range symbols {
 		text := embedding.FormatSymbolText(sym.Kind, sym.QualifiedName, sym.Signature, sym.DocSummary)
 		vec, err := emb.Embed(ctx, text)
 		if err != nil {
 			t.Fatalf("Embed() error = %v", err)
 		}
-		if byFile[sym.FileID] == nil {
-			byFile[sym.FileID] = map[string][]float32{}
-		}
-		byFile[sym.FileID][sym.StableKey] = vec
+		items = append(items, store.SymbolEmbeddingUpsert{SymbolID: sym.ID, FileID: sym.FileID, Vector: vec})
 	}
-	for fileID, m := range byFile {
-		if err := fx.store.UpsertSymbolEmbeddings(ctx, fx.repoID, fileID, "test-bow", m); err != nil {
-			t.Fatalf("UpsertSymbolEmbeddings() error = %v", err)
-		}
+	if err := fx.store.UpsertSymbolEmbeddings(ctx, fx.repoID, "test-bow", items); err != nil {
+		t.Fatalf("UpsertSymbolEmbeddings() error = %v", err)
 	}
 	has, err := fx.store.HasEmbeddings(ctx, fx.repoID)
 	if err != nil || !has {

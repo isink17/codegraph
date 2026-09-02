@@ -1237,12 +1237,28 @@ func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path
 }
 
 func (s *Store) ReplaceFileGraphsBatch(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput) ([]int64, error) {
-	return s.ReplaceFileGraphsBatchWithStats(ctx, repoID, scanID, inputs, nil)
+	result, err := s.replaceFileGraphsBatchWithStats(ctx, repoID, scanID, inputs, nil)
+	return result.FileIDs, err
 }
 
 func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput, stats *WriteStats) ([]int64, error) {
+	result, err := s.replaceFileGraphsBatchWithStats(ctx, repoID, scanID, inputs, stats)
+	return result.FileIDs, err
+}
+
+type ReplaceFileGraphResult struct {
+	FileIDs   []int64
+	SymbolIDs [][]int64
+}
+
+func (s *Store) ReplaceFileGraphsBatchWithSymbolIDs(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput, stats *WriteStats) (ReplaceFileGraphResult, error) {
+	return s.replaceFileGraphsBatchWithStats(ctx, repoID, scanID, inputs, stats)
+}
+
+func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, scanID int64, inputs []ReplaceFileGraphInput, stats *WriteStats) (ReplaceFileGraphResult, error) {
+	var result ReplaceFileGraphResult
 	if len(inputs) == 0 {
-		return nil, nil
+		return result, nil
 	}
 	if stats != nil {
 		stats.TxCount++
@@ -1250,7 +1266,7 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
 	upsertFileStmt, err := tx.PrepareContext(ctx, `
@@ -1270,7 +1286,7 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return result, err
 	}
 	defer upsertFileStmt.Close()
 
@@ -1280,19 +1296,20 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 		var fileID int64
 		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
-			return nil, err
+			return result, err
 		}
 		fileIDs = append(fileIDs, fileID)
 	}
 
 	if err := deleteFileGraphsBatch(ctx, tx, repoID, fileIDs, stats); err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return result, err
 	}
 
+	symbolIDs := make([][]int64, len(inputs))
 	for idx, input := range inputs {
 		fileID := fileIDs[idx]
-		if err := insertParsedFileGraph(
+		ids, err := insertParsedFileGraph(
 			ctx,
 			tx,
 			repoID,
@@ -1300,16 +1317,18 @@ func (s *Store) ReplaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			input.Path,
 			input.Parsed,
 			stats,
-		); err != nil {
+		)
+		if err != nil {
 			_ = tx.Rollback()
-			return nil, err
+			return result, err
 		}
+		symbolIDs[idx] = ids
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return result, err
 	}
-	return fileIDs, nil
+	return ReplaceFileGraphResult{FileIDs: fileIDs, SymbolIDs: symbolIDs}, nil
 }
 
 // deleteFileGraphsBatch drops every row owned by the given files, including the
@@ -1562,7 +1581,7 @@ func insertParsedFileGraph(
 	filePath string,
 	parsed graph.ParsedFile,
 	stats *WriteStats,
-) error {
+) ([]int64, error) {
 	stableToID := make(map[string]int64, len(parsed.Symbols))
 	// symbolIDs[i] is the persisted id of parsed.Symbols[i]. Unlike stableToID
 	// it survives colliding stable keys, so edge attribution can name the exact
@@ -1579,19 +1598,19 @@ func insertParsedFileGraph(
 		batch := parsed.Symbols[start:end]
 		batchStableToID, err := insertSymbolsBatchReturning(ctx, tx, repoID, fileID, batch, stats)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for i, sym := range batch {
 			symbolID, ok := batchStableToID[symbolKeyOf(sym)]
 			if !ok || symbolID == 0 {
-				return fmt.Errorf("missing inserted id for stable_key=%q at %d:%d", sym.StableKey, sym.Range.StartLine, sym.Range.StartCol)
+				return nil, fmt.Errorf("missing inserted id for stable_key=%q at %d:%d", sym.StableKey, sym.Range.StartLine, sym.Range.StartCol)
 			}
 			stableToID[sym.StableKey] = symbolID
 			symbolIDs[start+i] = symbolID
 			symbolFTSArgs = append(symbolFTSArgs, repoID, symbolID, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
 			if len(symbolFTSArgs) >= sqliteSymbolFTSValuesBatchRows*6 {
 				if err := execSymbolFTSInsert(ctx, tx, symbolFTSArgs, stats); err != nil {
-					return err
+					return nil, err
 				}
 				symbolFTSArgs = symbolFTSArgs[:0]
 			}
@@ -1609,7 +1628,7 @@ func insertParsedFileGraph(
 				symbolTokenArgs = append(symbolTokenArgs, symbolID, token, weight)
 				if len(symbolTokenArgs) >= sqliteTokenValuesBatchRows*3 {
 					if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
-						return err
+						return nil, err
 					}
 					symbolTokenArgs = symbolTokenArgs[:0]
 				}
@@ -1618,12 +1637,12 @@ func insertParsedFileGraph(
 	}
 	if len(symbolFTSArgs) > 0 {
 		if err := execSymbolFTSInsert(ctx, tx, symbolFTSArgs, stats); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if len(symbolTokenArgs) > 0 {
 		if err := execTokenTriplesInsert(ctx, tx, "symbol_tokens", "symbol_id", symbolTokenArgs, stats); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
@@ -1654,14 +1673,14 @@ func insertParsedFileGraph(
 			)
 			if len(referenceArgs) >= sqliteReferenceValuesBatchRows*11 {
 				if err := execReferencesInsert(ctx, tx, referenceArgs, stats); err != nil {
-					return err
+					return nil, err
 				}
 				referenceArgs = referenceArgs[:0]
 			}
 		}
 		if len(referenceArgs) > 0 {
 			if err := execReferencesInsert(ctx, tx, referenceArgs, stats); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -1677,14 +1696,14 @@ func insertParsedFileGraph(
 			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line)
 			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*7 {
 				if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
-					return err
+					return nil, err
 				}
 				edgeArgs = edgeArgs[:0]
 			}
 		}
 		if len(edgeArgs) > 0 {
 			if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -1695,14 +1714,14 @@ func insertParsedFileGraph(
 			importArgs = append(importArgs, repoID, fileID, imp)
 			if len(importArgs) >= sqliteImportValuesBatchRows*3 {
 				if err := execImportsInsert(ctx, tx, importArgs, stats); err != nil {
-					return err
+					return nil, err
 				}
 				importArgs = importArgs[:0]
 			}
 		}
 		if len(importArgs) > 0 {
 			if err := execImportsInsert(ctx, tx, importArgs, stats); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -1712,14 +1731,14 @@ func insertParsedFileGraph(
 			fileTokenArgs = append(fileTokenArgs, fileID, token, weight)
 			if len(fileTokenArgs) >= sqliteTokenValuesBatchRows*3 {
 				if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs, stats); err != nil {
-					return err
+					return nil, err
 				}
 				fileTokenArgs = fileTokenArgs[:0]
 			}
 		}
 		if len(fileTokenArgs) > 0 {
 			if err := execTokenTriplesInsert(ctx, tx, "file_tokens", "file_id", fileTokenArgs, stats); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -1755,18 +1774,18 @@ func insertParsedFileGraph(
 			testLinkArgs = append(testLinkArgs, repoID, fileID, testSymbolID, nil, nil, link.Reason, link.Score, link.TargetStableKey)
 			if len(testLinkArgs) >= sqliteTestLinkValuesBatchRows*testLinkInsertCols {
 				if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
-					return err
+					return nil, err
 				}
 				testLinkArgs = testLinkArgs[:0]
 			}
 		}
 		if len(testLinkArgs) > 0 {
 			if err := execTestLinksInsert(ctx, tx, testLinkArgs, stats); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	return nil
+	return symbolIDs, nil
 }
 
 // symbolRowKey identifies one inserted symbol row.
@@ -7470,116 +7489,15 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 
 // --- Embedding methods ---
 
-// UpsertSymbolEmbeddings stores vector embeddings for symbols in a file.
-// symbolMap maps stable_key -> embedding vector.
-func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID, fileID int64, modelName string, symbolMap map[string][]float32) error {
-	if len(symbolMap) == 0 {
-		return nil
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	stableKeys := make([]string, 0, len(symbolMap))
-	for k := range symbolMap {
-		stableKeys = append(stableKeys, k)
-	}
-
-	// Resolve symbol ids in chunks to avoid per-row subqueries during embedding writes.
-	// Keep under sqliteDefaultMaxVariables.
-	stableToID := make(map[string]int64, len(stableKeys))
-	for start := 0; start < len(stableKeys); start += sqliteInClauseBatchSize {
-		end := min(start+sqliteInClauseBatchSize, len(stableKeys))
-		chunk := stableKeys[start:end]
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, fileID)
-		for _, k := range chunk {
-			args = append(args, k)
-		}
-		rows, err := tx.QueryContext(ctx, query, args...)
-		if err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		for rows.Next() {
-			var stableKey string
-			var id int64
-			if err := rows.Scan(&stableKey, &id); err != nil {
-				_ = rows.Close()
-				_ = tx.Rollback()
-				return err
-			}
-			stableToID[stableKey] = id
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			_ = tx.Rollback()
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-
-	const embedCols = 7
-	embedArgs := make([]any, 0, sqliteEmbeddingValuesBatchRows*embedCols)
-	flush := func() error {
-		if len(embedArgs) == 0 {
-			return nil
-		}
-		rows := len(embedArgs) / embedCols
-		var b strings.Builder
-		b.WriteString(`INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at) VALUES `)
-		for i := 0; i < rows; i++ {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString("(?,?,?,?,?,?,?)")
-		}
-		b.WriteString(`
-			ON CONFLICT(symbol_id) DO UPDATE SET
-				embedding = excluded.embedding,
-				dimensions = excluded.dimensions,
-				model_name = excluded.model_name,
-				updated_at = excluded.updated_at
-		`)
-		if _, err := tx.ExecContext(ctx, b.String(), embedArgs...); err != nil {
-			return err
-		}
-		embedArgs = embedArgs[:0]
-		return nil
-	}
-
-	for stableKey, vec := range symbolMap {
-		symbolID := stableToID[stableKey]
-		if symbolID == 0 {
-			continue
-		}
-		blob := float32ToBytes(vec)
-		embedArgs = append(embedArgs, symbolID, fileID, repoID, blob, len(vec), modelName, now)
-		if len(embedArgs) >= sqliteEmbeddingValuesBatchRows*embedCols {
-			if err := flush(); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-		}
-	}
-	if err := flush(); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+// UpsertSymbolEmbeddings stores vectors against exact persisted symbol IDs.
+func (s *Store) UpsertSymbolEmbeddings(ctx context.Context, repoID int64, modelName string, items []SymbolEmbeddingUpsert) error {
+	return s.UpsertSymbolEmbeddingsBatch(ctx, repoID, modelName, items)
 }
 
 type SymbolEmbeddingUpsert struct {
-	FileID    int64
-	StableKey string
-	Vector    []float32
+	SymbolID int64
+	FileID   int64
+	Vector   []float32
 }
 
 func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, modelName string, items []SymbolEmbeddingUpsert) error {
@@ -7592,22 +7510,14 @@ func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, m
 		return err
 	}
 	defer tx.Rollback()
-	if err != nil {
-		return err
-	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	type vecRef struct {
-		stableKey string
-		vector    []float32
-	}
-	byFile := map[int64][]vecRef{}
+	valid := 0
 	for _, item := range items {
-		if item.FileID == 0 || item.StableKey == "" || len(item.Vector) == 0 {
-			continue
+		if item.SymbolID != 0 && item.FileID != 0 && len(item.Vector) > 0 {
+			valid++
 		}
-		byFile[item.FileID] = append(byFile[item.FileID], vecRef{stableKey: item.StableKey, vector: item.Vector})
 	}
-	if len(byFile) == 0 {
+	if valid == 0 {
 		_ = tx.Rollback()
 		return nil
 	}
@@ -7641,70 +7551,13 @@ func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, m
 		return nil
 	}
 
-	// Resolve symbol ids per file in chunks, then multi-row upsert embeddings.
-	// Keep well under sqliteDefaultMaxVariables.
-	for fileID, vecs := range byFile {
-		if len(vecs) == 0 {
+	for _, item := range items {
+		if item.SymbolID == 0 || item.FileID == 0 || len(item.Vector) == 0 {
 			continue
 		}
-		stableToVec := make(map[string][]float32, len(vecs))
-		stableKeys := make([]string, 0, len(vecs))
-		for _, v := range vecs {
-			if v.stableKey == "" || len(v.vector) == 0 {
-				continue
-			}
-			// If the same stable key appears multiple times, the last one wins; vectors should be identical anyway.
-			if _, ok := stableToVec[v.stableKey]; !ok {
-				stableKeys = append(stableKeys, v.stableKey)
-			}
-			stableToVec[v.stableKey] = v.vector
-		}
-		for start := 0; start < len(stableKeys); start += sqliteInClauseBatchSize {
-			end := min(start+sqliteInClauseBatchSize, len(stableKeys))
-			chunk := stableKeys[start:end]
-			placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-			query := `SELECT stable_key, id FROM symbols WHERE file_id = ? AND stable_key IN (` + placeholders + `)`
-			args := make([]any, 0, len(chunk)+1)
-			args = append(args, fileID)
-			for _, k := range chunk {
-				args = append(args, k)
-			}
-			rows, err := tx.QueryContext(ctx, query, args...)
-			if err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-			for rows.Next() {
-				var stableKey string
-				var symbolID int64
-				if err := rows.Scan(&stableKey, &symbolID); err != nil {
-					_ = rows.Close()
-					_ = tx.Rollback()
-					return err
-				}
-				vec := stableToVec[stableKey]
-				if symbolID == 0 || len(vec) == 0 {
-					continue
-				}
-				embedArgs = append(embedArgs, symbolID, fileID, repoID, float32ToBytes(vec), len(vec), modelName, now)
-				if len(embedArgs) >= sqliteEmbeddingValuesBatchRows*embedCols {
-					if err := rows.Close(); err != nil {
-						_ = tx.Rollback()
-						return err
-					}
-					if err := flush(); err != nil {
-						_ = tx.Rollback()
-						return err
-					}
-					continue
-				}
-			}
-			if err := rows.Err(); err != nil {
-				_ = rows.Close()
-				_ = tx.Rollback()
-				return err
-			}
-			if err := rows.Close(); err != nil {
+		embedArgs = append(embedArgs, item.SymbolID, item.FileID, repoID, float32ToBytes(item.Vector), len(item.Vector), modelName, now)
+		if len(embedArgs) >= sqliteEmbeddingValuesBatchRows*embedCols {
+			if err := flush(); err != nil {
 				_ = tx.Rollback()
 				return err
 			}

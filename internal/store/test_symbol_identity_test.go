@@ -73,6 +73,50 @@ func TestPersistedTestSymbolIdentitySurvivesStableKeyCollision(t *testing.T) {
 	}
 }
 
+func TestSymbolEmbeddingIdentitySurvivesStableKeyCollision(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.ReplaceFileGraphsBatchWithSymbolIDs(ctx, repo.ID, 1, []store.ReplaceFileGraphInput{{
+		Path: "symbols.go", Language: "go", ContentHash: "embedding-identity",
+		Parsed: graph.ParsedFile{Language: "go", Symbols: []graph.Symbol{
+			{Language: "go", Kind: "function", Name: "A", QualifiedName: "pkg.A", StableKey: "same", Range: graph.Position{StartLine: 1, EndLine: 2}},
+			{Language: "go", Kind: "function", Name: "B", QualifiedName: "pkg.B", StableKey: "same", Range: graph.Position{StartLine: 4, EndLine: 5}},
+		}},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.SymbolIDs) != 1 || len(result.SymbolIDs[0]) != 2 || result.SymbolIDs[0][0] == result.SymbolIDs[0][1] {
+		t.Fatalf("persisted symbol IDs = %+v", result.SymbolIDs)
+	}
+	if err := s.UpsertSymbolEmbeddings(ctx, repo.ID, "test", []store.SymbolEmbeddingUpsert{
+		{SymbolID: result.SymbolIDs[0][1], FileID: result.FileIDs[0], Vector: []float32{0, 1}},
+		{SymbolID: result.SymbolIDs[0][0], FileID: result.FileIDs[0], Vector: []float32{1, 0}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		query []float32
+		want  string
+	}{{[]float32{1, 0}, "pkg.A"}, {[]float32{0, 1}, "pkg.B"}} {
+		rows, err := s.VectorSearch(ctx, repo.ID, tc.query, 1, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0]["symbol"] != tc.want {
+			t.Fatalf("VectorSearch(%v) = %+v, want %s", tc.query, rows, tc.want)
+		}
+	}
+}
+
 func TestPersistedTestSymbolIdentityMissingReferenceFailsClosed(t *testing.T) {
 	rows := persistCollisionFixture(t, collisionSymbols(), []graph.TestLink{{
 		TestName: "A", TestSymbolKey: "same", TargetStableKey: "target-A", Reason: "test_name_match",
