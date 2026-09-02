@@ -241,8 +241,10 @@ type WriteStats struct {
 	ReferenceInsertBatches int `json:"reference_insert_batches,omitempty"`
 	ReferenceInsertRows    int `json:"reference_insert_rows,omitempty"`
 
-	EdgeInsertBatches int `json:"edge_insert_batches,omitempty"`
-	EdgeInsertRows    int `json:"edge_insert_rows,omitempty"`
+	EdgeInsertBatches               int `json:"edge_insert_batches,omitempty"`
+	EdgeInsertRows                  int `json:"edge_insert_rows,omitempty"`
+	EdgeSourceDroppedUnattributable int `json:"edge_source_dropped_unattributable,omitempty"`
+	EdgeSourceFallbackAttributed    int `json:"edge_source_fallback_attributed,omitempty"`
 
 	ImportInsertBatches int `json:"import_insert_batches,omitempty"`
 	ImportInsertRows    int `json:"import_insert_rows,omitempty"`
@@ -1645,17 +1647,12 @@ func insertParsedFileGraph(
 			return nil, err
 		}
 	}
-	contextSymbolID := firstFunctionID(stableToID, parsed.Symbols)
 	if len(parsed.References) > 0 {
 		referenceArgs := make([]any, 0, min(len(parsed.References), sqliteReferenceValuesBatchRows)*11)
 		for _, ref := range parsed.References {
 			var symbolID any
 			if ref.SymbolID != nil {
 				symbolID = *ref.SymbolID
-			}
-			var contextID any
-			if contextSymbolID != 0 {
-				contextID = contextSymbolID
 			}
 			referenceArgs = append(
 				referenceArgs,
@@ -1669,7 +1666,7 @@ func insertParsedFileGraph(
 				ref.Range.StartCol,
 				ref.Range.EndLine,
 				ref.Range.EndCol,
-				contextID,
+				nil,
 			)
 			if len(referenceArgs) >= sqliteReferenceValuesBatchRows*11 {
 				if err := execReferencesInsert(ctx, tx, referenceArgs, stats); err != nil {
@@ -1689,8 +1686,12 @@ func insertParsedFileGraph(
 		srcChooser := newSrcSymbolChooser(symbolIDs, parsed.Symbols)
 		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*7)
 		for _, edge := range parsed.Edges {
-			srcID := srcChooser.Choose(edge.Line)
+			attribution := srcChooser.attribute(edge.Line)
+			srcID := attribution.id
 			if srcID == 0 {
+				if stats != nil {
+					stats.EdgeSourceDroppedUnattributable++
+				}
 				continue
 			}
 			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line)
@@ -2060,15 +2061,6 @@ func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *Write
 	return execBatchInsert(ctx, tx, "file_imports", "repo_id, file_id, import_path", 3, args, stats)
 }
 
-func firstFunctionID(stableToID map[string]int64, symbols []graph.Symbol) int64 {
-	for _, sym := range symbols {
-		if sym.Kind == "function" {
-			return stableToID[sym.StableKey]
-		}
-	}
-	return 0
-}
-
 // ownsSourceEdges reports whether a symbol kind is a code-bearing declaration
 // whose body can contain the calls and references recorded as edges, and which
 // may therefore be an edge's source symbol.
@@ -2099,10 +2091,6 @@ type srcSymbolChooser struct {
 	// start line ascending and, within one start line, by end line
 	// descending. Choose relies on that order.
 	spans []funcSpan
-	// fallback owns references that sit inside no span at all. It is a
-	// top-level body owner, never a method: a module-level statement does not
-	// belong to some arbitrary method of some arbitrary class.
-	fallback int64
 }
 
 // newSrcSymbolChooser indexes a file's body-owning symbols by position.
@@ -2122,7 +2110,6 @@ func newSrcSymbolChooser(symbolIDs []int64, symbols []graph.Symbol) srcSymbolCho
 		spans: make([]funcSpan, 0, capHint),
 	}
 	sorted := true
-	fallbackStart := 0
 	for i, sym := range symbols {
 		if !ownsSourceEdges(sym.Kind) {
 			continue
@@ -2139,15 +2126,6 @@ func newSrcSymbolChooser(symbolIDs []int64, symbols []graph.Symbol) srcSymbolCho
 			sorted = false
 		}
 		out.spans = append(out.spans, span)
-		// Only a top-level body owner may be the fallback. Master used the
-		// first symbol of kind "function"; keeping that pool unchanged means
-		// this fix never invents an edge for code that belongs to no body.
-		// Adapters that fold methods into "function" (Go among them) behave
-		// exactly as before.
-		if sym.Kind == "function" && (out.fallback == 0 || sym.Range.StartLine < fallbackStart) {
-			out.fallback = id
-			fallbackStart = sym.Range.StartLine
-		}
 	}
 	// Adapters emit symbols in AST-walk order, which is not always sorted by
 	// position (the Go adapters emit methods after top-level declarations).
@@ -2184,23 +2162,37 @@ func compareSpans(a, b funcSpan) int {
 // among spans sharing that start line, the smallest end line.
 //
 // If two different symbols claim exactly the same span there is nothing left to
-// separate them, because edges carry a line but no column. Choose then keeps
-// looking outward for an owner it can name — an enclosing body genuinely
-// contains the line, even if it is coarser — and returns 0 if there is none,
-// rather than naming a symbol that does not contain the line at all.
+// separate them, because edges carry a line but no column. Choose fails closed
+// rather than naming an ambiguous or unrelated symbol.
 //
 // When no span contains the line — a top-level or file-scope reference — it
-// returns the file's fallback symbol, preserving the existing behaviour for
-// those edges rather than dropping them.
+// returns no owner rather than fabricating a caller.
 func (c srcSymbolChooser) Choose(line int) int64 {
+	return c.attribute(line).id
+}
+
+type sourceAttributionKind uint8
+
+const (
+	sourceAttributionExact sourceAttributionKind = iota + 1
+	sourceAttributionAmbiguous
+	sourceAttributionOutsideSpan
+	sourceAttributionNoOwner
+)
+
+type sourceAttribution struct {
+	kind sourceAttributionKind
+	id   int64
+}
+
+func (c srcSymbolChooser) attribute(line int) sourceAttribution {
 	if len(c.spans) == 0 {
-		return 0
+		return sourceAttribution{kind: sourceAttributionNoOwner}
 	}
 	i := sort.Search(len(c.spans), func(i int) bool { return c.spans[i].start > line }) - 1
 	// Spans are ordered by start line but can be nested or overlapping. Scan
 	// backward from the last start<=line: the first containing span found has
 	// the greatest start line and, within that start line, the smallest end.
-	tiedSomewhere := false
 	for j := i; j >= 0; j-- {
 		span := c.spans[j]
 		if line < span.start || line > span.end {
@@ -2226,18 +2218,11 @@ func (c srcSymbolChooser) Choose(line int) int64 {
 			}
 		}
 		if tied {
-			tiedSomewhere = true
-			j = lo
-			continue
+			return sourceAttribution{kind: sourceAttributionAmbiguous}
 		}
-		return span.id
+		return sourceAttribution{kind: sourceAttributionExact, id: span.id}
 	}
-	if tiedSomewhere {
-		// Some symbol did own that line; the fallback is a different symbol
-		// that does not, so returning it would be a miswire, not a fallback.
-		return 0
-	}
-	return c.fallback
+	return sourceAttribution{kind: sourceAttributionOutsideSpan}
 }
 
 func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (int, error) {
