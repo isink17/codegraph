@@ -57,8 +57,16 @@ type ParsedFile struct {
 	References []Reference
 	Edges      []Edge
 	Imports    []string
+	ReExports  []ReExport
 	FileTokens map[string]float64
 	TestLinks  []TestLink
+}
+
+type ReExport struct {
+	Source       string
+	Name         string
+	ExportedName string
+	Wildcard     bool
 }
 
 type TestLink struct {

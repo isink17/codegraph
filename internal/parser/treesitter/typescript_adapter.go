@@ -73,6 +73,45 @@ func tsExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			}
 		}
 	}
+	for _, export := range findDescendants(root, "export_statement") {
+		src := childByFieldName(export, "source")
+		if src == nil {
+			src = firstChild(export, "string")
+		}
+		if src == nil {
+			continue
+		}
+		source := strings.Trim(nodeText(src, content), `"'`)
+		if source == "" {
+			continue
+		}
+		clause := childByFieldName(export, "export_clause")
+		if clause == nil {
+			clause = firstChild(export, "export_clause")
+		}
+		if clause != nil {
+			for _, spec := range findDescendants(clause, "export_specifier") {
+				name := nodeText(childByFieldName(spec, "name"), content)
+				alias := nodeText(childByFieldName(spec, "alias"), content)
+				if name == "" {
+					continue
+				}
+				if alias == "" {
+					alias = name
+				}
+				pf.ReExports = append(pf.ReExports, graph.ReExport{Source: source, Name: name, ExportedName: alias})
+			}
+		}
+		if wildcard := firstChild(export, "*"); wildcard != nil {
+			pf.ReExports = append(pf.ReExports, graph.ReExport{Source: source, Wildcard: true})
+		} else if wildcard := firstChild(export, "namespace_export"); wildcard != nil {
+			alias := nodeText(childByFieldName(wildcard, "name"), content)
+			if alias == "" {
+				alias = nodeText(firstChild(wildcard, "identifier"), content)
+			}
+			pf.ReExports = append(pf.ReExports, graph.ReExport{Source: source, ExportedName: alias, Wildcard: true})
+		}
+	}
 	// require() calls
 	for _, call := range findDescendants(root, "call_expression") {
 		fnNode := childByFieldName(call, "function")
@@ -261,7 +300,10 @@ func tsExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if fnNode == nil {
 			continue
 		}
-		name := nodeText(fnNode, content)
+		name, ok := tsCalleeName(fnNode, content)
+		if !ok {
+			continue
+		}
 		baseName := name
 		if idx := strings.LastIndexByte(name, '.'); idx >= 0 {
 			baseName = name[idx+1:]
@@ -283,5 +325,33 @@ func tsExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			QualifiedName: name,
 			Range:         nodeRange(call),
 		})
+	}
+}
+
+func tsCalleeName(node *sitter.Node, content []byte) (string, bool) {
+	if node == nil {
+		return "", false
+	}
+	switch node.Type() {
+	case "identifier", "property_identifier", "private_property_identifier":
+		name := nodeText(node, content)
+		return name, name != ""
+	case "member_expression":
+		object := childByFieldName(node, "object")
+		property := childByFieldName(node, "property")
+		if object == nil || property == nil || node.ChildByFieldName("optional") != nil || node.ChildByFieldName("optional_chain") != nil {
+			return "", false
+		}
+		left, ok := tsCalleeName(object, content)
+		if !ok || property.Type() != "property_identifier" {
+			return "", false
+		}
+		right := nodeText(property, content)
+		if right == "" {
+			return "", false
+		}
+		return left + "." + right, true
+	default:
+		return "", false
 	}
 }
