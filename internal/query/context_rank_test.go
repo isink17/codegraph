@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"encoding/json"
+	"hash/fnv"
 	"math/rand"
 	"sort"
 	"strings"
@@ -12,9 +13,11 @@ import (
 )
 
 func cand(relevance, path, name string, signal float64) contextCandidate {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(path + "\x00" + name))
 	return contextCandidate{
 		sym: graph.Symbol{
-			ID:            1,
+			ID:            int64(h.Sum64() & 0x7fffffffffffffff),
 			Name:          strings.TrimPrefix(name, path+"."),
 			QualifiedName: name,
 			FilePath:      path,
@@ -255,6 +258,24 @@ func TestIdentityKeepsSameStableKeyInDifferentFiles(t *testing.T) {
 	ranked := set.finalize()
 	if len(ranked) != 2 {
 		t.Fatalf("candidates = %d, want 2: %+v", len(ranked), ranked)
+	}
+}
+
+func TestCandidateSetDeduplicatesByExactID(t *testing.T) {
+	a := contextCandidate{sym: graph.Symbol{ID: 101, FilePath: "f.java", QualifiedName: "Calculator.add", StableKey: "func:java:Calculator.add", Signature: "(int,int)"}, relevance: relevanceDirectMatch, taskSignal: 1}
+	b := contextCandidate{sym: graph.Symbol{ID: 202, FilePath: "f.java", QualifiedName: "Calculator.add", StableKey: a.sym.StableKey, Signature: "(String,String)"}, relevance: relevanceDirectMatch, taskSignal: 1}
+	set := newCandidateSet()
+	set.add(a)
+	set.add(b)
+	set.add(contextCandidate{sym: a.sym, relevance: relevanceCaller, taskSignal: 0.1})
+	got := set.finalize()
+	if len(got) != 2 {
+		t.Fatalf("candidates = %d, want 2", len(got))
+	}
+	for _, c := range got {
+		if c.sym.ID == a.sym.ID && c.relevance != relevanceDirectMatch {
+			t.Fatalf("exact candidate A was not updated with strongest evidence: %+v", c)
+		}
 	}
 }
 

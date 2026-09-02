@@ -24,6 +24,33 @@ type SymbolRef struct {
 	QualifiedName string
 }
 
+// SymbolsForIDs loads exact symbol rows in repo-scoped batches. Missing or
+// foreign-repository IDs are absent; callers must not rediscover them by name.
+func (s *Store) SymbolsForIDs(ctx context.Context, repoID int64, ids []int64) (map[int64]graph.Symbol, error) {
+	out := make(map[int64]graph.Symbol, len(ids))
+	unique := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				unique = append(unique, id)
+			}
+		}
+	}
+	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
+		chunk := unique[start:min(start+sqliteInClauseBatchSize, len(unique))]
+		rows, err := s.symbolsByIDs(ctx, repoID, chunk, len(chunk), 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, sym := range rows {
+			out[sym.ID] = sym
+		}
+	}
+	return out, nil
+}
+
 // CanonicalRelPath is the logical form of a repository-relative path: forward
 // slashes, no leading "./".
 //

@@ -31,6 +31,11 @@ func (c *countingContextStore) SymbolsForRefs(ctx context.Context, repoID int64,
 	return c.inner.SymbolsForRefs(ctx, repoID, refs)
 }
 
+func (c *countingContextStore) SymbolsForIDs(ctx context.Context, repoID int64, ids []int64) (map[int64]graph.Symbol, error) {
+	c.calls["SymbolsForIDs"]++
+	return c.inner.SymbolsForIDs(ctx, repoID, ids)
+}
+
 func (c *countingContextStore) SymbolNameCounts(ctx context.Context, repoID int64, names []string) (map[string]int, error) {
 	c.calls["SymbolNameCounts"]++
 	return c.inner.SymbolNameCounts(ctx, repoID, names)
