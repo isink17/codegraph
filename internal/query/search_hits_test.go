@@ -91,6 +91,9 @@ func TestLiveProducersSatisfyTheAdapter(t *testing.T) {
 			if hit.File == "" || hit.QualifiedName == "" {
 				t.Fatalf("%s: adapter produced an unusable hit %+v", name, hit)
 			}
+			if hit.SymbolID <= 0 {
+				t.Fatalf("%s: adapter lost exact symbol_id for %+v", name, hit)
+			}
 		}
 	}
 }

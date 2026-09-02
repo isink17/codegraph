@@ -334,8 +334,8 @@ const (
 
 // taskSymbol projects one candidate to the public compact record. It carries
 // identity, location, and bounded declaration metadata only: source belongs to
-// the P13 detail levels of find_symbol and friends, reachable from symbol_id or
-// stable_key.
+// the P13 detail levels of find_symbol and friends, reached through the exact
+// symbol_id. stable_key remains semantic metadata and may collide.
 func taskSymbol(cand contextCandidate) graph.TaskContextSymbol {
 	return graph.TaskContextSymbol{
 		Name:          cand.sym.Name,
