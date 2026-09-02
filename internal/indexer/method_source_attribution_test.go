@@ -70,6 +70,26 @@ class Service:
 	assertCallers(t, s, repoID, "svc.target", "svc.Service.run")
 }
 
+func TestNestedPythonFunctionOwnsItsBodyEdges(t *testing.T) {
+	const src = `def leaf():
+    pass
+
+def outer():
+    def inner():
+        leaf()
+    outer_leaf()
+
+def outer_leaf():
+    pass
+`
+	s, repoID := indexSource(t, tsparser.NewPython(), "nested.py", src)
+
+	assertCallers(t, s, repoID, "nested.leaf", "nested.outer.inner")
+	assertCallers(t, s, repoID, "nested.outer_leaf", "nested.outer")
+	assertCallees(t, s, repoID, "nested.outer.inner", "nested.leaf")
+	assertCallees(t, s, repoID, "nested.outer", "nested.outer_leaf")
+}
+
 // A file containing only a class still produces edges: before P20b it had no
 // symbol of kind "function", so the chooser returned no source at all and
 // every call in it was silently discarded.

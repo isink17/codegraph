@@ -123,7 +123,107 @@ func TestNestedDefRanges(t *testing.T) {
 	pf := parseSource(t, src)
 
 	assertSpan(t, pf, "mod.outer", 1, 4)
-	assertSpan(t, pf, "mod.inner", 2, 3)
+	assertSpan(t, pf, "mod.outer.inner", 2, 3)
+}
+
+func TestAsyncAndNestedNames(t *testing.T) {
+	const src = `class Outer:
+    async def fetch(self):
+        work()
+        def inner():
+            leaf()
+
+def outer():
+    def inner():
+        leaf()
+`
+	p := parseSource(t, src)
+	assertSpan(t, p, "mod.Outer.fetch", 2, 5)
+	assertSpan(t, p, "mod.Outer.fetch.inner", 4, 5)
+	assertSpan(t, p, "mod.outer", 7, 9)
+	assertSpan(t, p, "mod.outer.inner", 8, 9)
+	for _, sym := range p.Symbols {
+		if sym.QualifiedName == "mod.Outer.fetch.inner" && sym.Kind == "method" {
+			t.Fatal("nested function was classified as a method")
+		}
+	}
+}
+
+func TestKindFollowsImmediateOwner(t *testing.T) {
+	const src = `def top():
+    pass
+
+class C:
+    def method(self):
+        pass
+
+    async def fetch(self):
+        pass
+
+class Outer:
+    class Inner:
+        def method(self):
+            pass
+
+def outer():
+    def inner():
+        pass
+    class Local:
+        def method(self):
+            pass
+`
+	p := parseSource(t, src)
+	want := map[string]string{
+		"mod.top":                "function",
+		"mod.C.method":           "method",
+		"mod.C.fetch":            "method",
+		"mod.Outer.Inner.method": "method",
+		"mod.outer":              "function",
+		"mod.outer.inner":        "function",
+		"mod.outer.Local.method": "method",
+	}
+	for qname, kind := range want {
+		found := false
+		for _, sym := range p.Symbols {
+			if sym.QualifiedName == qname {
+				found = true
+				if sym.Kind != kind {
+					t.Fatalf("%s kind = %q, want %q", qname, sym.Kind, kind)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("missing symbol %s", qname)
+		}
+	}
+}
+
+func TestCallsIgnoreStringsCommentsAndTripleStrings(t *testing.T) {
+	const src = `def f():
+	value = "fake_call()"
+	other = 'also_fake()'
+	x = 1  # comment_fake()
+	"""
+	def fake():
+	triple_fake()
+	"""
+	real_call()
+`
+	p := parseSource(t, src)
+	for _, sym := range p.Symbols {
+		if sym.Name == "fake" {
+			t.Fatal("fabricated declaration from triple string")
+		}
+	}
+	for _, edge := range p.Edges {
+		switch edge.DstName {
+		case "fake_call", "also_fake", "comment_fake", "triple_fake":
+			t.Fatalf("fabricated call %q", edge.DstName)
+		case "real_call":
+			return
+		}
+	}
+	t.Fatal("real_call was not emitted")
 }
 
 // Every edge the adapter emits must land inside the span of some emitted
@@ -149,7 +249,7 @@ def helper():
 	for _, edge := range pf.Edges {
 		owned := false
 		for _, sym := range pf.Symbols {
-			if sym.Kind != "function" {
+			if sym.Kind != "function" && sym.Kind != "method" {
 				continue
 			}
 			if edge.Line >= sym.Range.StartLine && edge.Line <= sym.Range.EndLine {

@@ -41,7 +41,7 @@ func (a *PythonAdapter) Parse(ctx context.Context, path string, content []byte) 
 	pyExtractImports(root, content, &pf)
 
 	// ---- top-level symbols ----
-	pyExtractSymbols(root, module, "", content, &pf)
+	pyExtractSymbols(root, module, pyScope{}, content, &pf)
 
 	// ---- call edges (all call nodes in the file) ----
 	pyExtractCalls(root, content, &pf)
@@ -66,36 +66,46 @@ func pyExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 	}
 }
 
-func pyExtractSymbols(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+type pyScope struct {
+	path      []string
+	ownerKind string
+}
+
+func pyExtractSymbols(node *sitter.Node, module string, scope pyScope, content []byte, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
 		case "class_definition":
-			pyExtractClass(child, module, content, pf)
+			pyExtractClass(child, module, scope, content, pf)
 		case "function_definition":
-			pyExtractFunction(child, module, container, content, pf)
+			pyExtractFunction(child, module, scope, content, pf)
 		case "decorated_definition":
 			// The actual definition is a child of the decorated_definition.
 			inner := firstChild(child, "class_definition")
 			if inner != nil {
-				pyExtractClass(inner, module, content, pf)
+				pyExtractClass(inner, module, scope, content, pf)
 				continue
 			}
 			inner = firstChild(child, "function_definition")
 			if inner != nil {
-				pyExtractFunction(inner, module, container, content, pf)
+				pyExtractFunction(inner, module, scope, content, pf)
 			}
 		}
 	}
 }
 
-func pyExtractClass(node *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
+func pyExtractClass(node *sitter.Node, module string, scope pyScope, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
 	}
 	name := nodeText(nameNode, content)
-	qualified := module + "." + name
+	path := append(append([]string(nil), scope.path...), name)
+	qualified := module + "." + strings.Join(path, ".")
+	container := module
+	if len(scope.path) > 0 {
+		container = strings.Join(scope.path, ".")
+	}
 	doc := pyDocstring(node, content)
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
@@ -103,7 +113,7 @@ func pyExtractClass(node *sitter.Node, module string, content []byte, pf *graph.
 		Kind:          "class",
 		Name:          name,
 		QualifiedName: qualified,
-		ContainerName: module,
+		ContainerName: container,
 		Visibility:    pyVisibility(name),
 		Range:         nodeRange(node),
 		DocSummary:    doc,
@@ -113,29 +123,29 @@ func pyExtractClass(node *sitter.Node, module string, content []byte, pf *graph.
 	// Extract methods inside the class body.
 	body := childByFieldName(node, "body")
 	if body != nil {
-		pyExtractSymbols(body, module, name, content, pf)
+		pyExtractSymbols(body, module, pyScope{path: path, ownerKind: "class"}, content, pf)
 	}
 }
 
-func pyExtractFunction(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+func pyExtractFunction(node *sitter.Node, module string, scope pyScope, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
 	}
 	name := nodeText(nameNode, content)
 	kind := "function"
-	if container != "" && container != module {
+	if scope.ownerKind == "class" {
 		kind = "method"
 	}
 	effectiveContainer := module
-	if container != "" {
-		effectiveContainer = container
+	if len(scope.path) > 0 {
+		effectiveContainer = strings.Join(scope.path, ".")
 	}
-	qualified := module + "." + name
+	path := append(append([]string(nil), scope.path...), name)
+	qualified := module + "." + strings.Join(path, ".")
 	stableKey := "func:" + module + "::" + name
-	if container != "" && container != module {
-		qualified = module + "." + container + "." + name
-		stableKey = "func:" + module + ":" + container + ":" + name
+	if len(scope.path) > 0 {
+		stableKey = "func:" + module + ":" + strings.Join(scope.path, ".") + ":" + name
 	}
 
 	// Build signature including decorators.
@@ -154,6 +164,11 @@ func pyExtractFunction(node *sitter.Node, module, container string, content []by
 		DocSummary:    doc,
 		StableKey:     stableKey,
 	})
+
+	body := childByFieldName(node, "body")
+	if body != nil {
+		pyExtractSymbols(body, module, pyScope{path: path, ownerKind: "function"}, content, pf)
+	}
 }
 
 func pySignature(node *sitter.Node, content []byte) string {
@@ -169,6 +184,9 @@ func pySignature(node *sitter.Node, content []byte) string {
 		}
 	}
 
+	if strings.HasPrefix(strings.TrimSpace(nodeText(node, content)), "async ") {
+		b.WriteString("async ")
+	}
 	b.WriteString("def ")
 	nameNode := childByFieldName(node, "name")
 	if nameNode != nil {
@@ -228,7 +246,7 @@ func pyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			SrcSymbolID: 0,
 			DstName:     name,
 			Kind:        "calls",
-			Evidence:    nodeText(fnNode, content),
+			Evidence:    name,
 			Line:        line,
 		})
 		pf.References = append(pf.References, graph.Reference{
@@ -245,8 +263,17 @@ func pyCallName(fnNode *sitter.Node, content []byte) string {
 	case "identifier":
 		return nodeText(fnNode, content)
 	case "attribute":
-		return nodeText(fnNode, content)
+		object := childByFieldName(fnNode, "object")
+		attribute := childByFieldName(fnNode, "attribute")
+		if object == nil || attribute == nil {
+			return ""
+		}
+		prefix := pyCallName(object, content)
+		if prefix == "" {
+			return ""
+		}
+		return prefix + "." + nodeText(attribute, content)
 	default:
-		return nodeText(fnNode, content)
+		return ""
 	}
 }

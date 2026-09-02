@@ -105,7 +105,7 @@ def helper_outer():
 `
 	s, repoID := indexSource(t, pyparser.New(), "n.py", src)
 
-	assertCallers(t, s, repoID, "n.helper_inner", "n.inner")
+	assertCallers(t, s, repoID, "n.helper_inner", "n.outer.inner")
 	assertCallers(t, s, repoID, "n.helper_outer", "n.outer")
 }
 
