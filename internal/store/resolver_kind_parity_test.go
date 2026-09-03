@@ -353,20 +353,13 @@ func TestBareNameBindableKindsMatchSQLList(t *testing.T) {
 	}
 }
 
-// A KNOWN, DELIBERATE divergence, pinned so it is not mistaken for parity.
-//
-// P22.12 made the two pipelines agree on what the bare-name level's candidates
-// ARE. It did not give the incremental binder the `receiver_method` strategy,
-// which is the one that can BIND a container-bearing non-callable. So a name
-// whose only declaration is such a symbol resolves on a full index and stays
-// unresolved on an incremental one -- the same shape as the repo-wide-only
-// strategy class P22.8 recorded and deferred, and unchanged by this phase
-// (master answers identically, because its binder never loaded the candidate
-// at all).
+// A bare call cannot prove a receiver method. A container-bearing non-callable
+// therefore remains unresolved on every entrypoint; receiver_method is legacy
+// provenance only.
 //
 // A non-type kind is used on purpose: for `enum` and friends P22.9's scope rule
 // refuses the binding for its own reason and hides the gap.
-func TestBareNameLevelSoleContainerBearingNonCallableIsRepoWideOnly(t *testing.T) {
+func TestBareNameLevelSoleContainerBearingNonCallableStaysUnresolved(t *testing.T) {
 	build := func(t *testing.T) (*parityFixture, int64) {
 		f := newParityFixture(t, "")
 		// A converged repository, which is what an incremental entrypoint always
@@ -388,8 +381,8 @@ func TestBareNameLevelSoleContainerBearingNonCallableIsRepoWideOnly(t *testing.T
 
 	f, edge := build(t)
 	f.resolveVia(t, "full", []string{"app/main.py"}, []string{"helper"})
-	if got, want := f.binding(t, edge), "Base.helper|receiver_method|medium"; got != want {
-		t.Fatalf("full index: got %q, want %q -- the fixture no longer reaches receiver_method", got, want)
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("full index: got %q, want unresolved legacy receiver_method", got)
 	}
 
 	for _, entry := range []string{"paths", "names", "paths+names"} {
@@ -397,8 +390,7 @@ func TestBareNameLevelSoleContainerBearingNonCallableIsRepoWideOnly(t *testing.T
 			f, edge := build(t)
 			f.resolveVia(t, entry, []string{"app/main.py"}, []string{"helper"})
 			if got := f.binding(t, edge); got != "<unresolved>" {
-				t.Fatalf("%s: got %q. If the binder gained the receiver_method level, this "+
-					"deferred divergence is closed -- delete this test and say so.", entry, got)
+				t.Fatalf("%s: got %q, want unresolved", entry, got)
 			}
 		})
 	}

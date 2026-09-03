@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -517,8 +518,6 @@ func TestIncrementalBatchPreservesEveryFullIndexStrategy(t *testing.T) {
 	}{
 		{"exact_qualified", "config.load", "config.load", "function", "", ResolutionStrategyExactQualified},
 		{"exact_name", "load", "config.load", "function", "", ResolutionStrategyExactName},
-		{"receiver_method", "grow", "Buf.grow", "value", "Buf", ResolutionStrategyReceiverMethod},
-		{"slash_suffix", "pkg.Func", "github.com/org/repo/pkg.Func", "function", "", ResolutionStrategySlashSuffix},
 		{"dot_tail2", "path.load", "some.other.path.load", "function", "", ResolutionStrategyDotTail2},
 		{"dot_tail3", "y.path.load", "some.other.y.path.load", "function", "", ResolutionStrategyDotTail3},
 		{"dot_suffix", "w.x.y.z", "v.w.x.y.z", "function", "", ResolutionStrategyDotSuffix},
@@ -563,6 +562,160 @@ func TestIncrementalBatchPreservesEveryFullIndexStrategy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDotSuffixIncrementalUniqueAmbiguousRecovery(t *testing.T) {
+	f := newParityFixture(t, "")
+	defs := f.file(t, "app/defs.py", "python")
+	f.symbol(t, defs, "run", "root.a.b.c.run", "function", "python")
+	callerFile := f.file(t, "app/main.py", "python")
+	caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+	edge := f.edge(t, callerFile, caller, "a.b.c.run")
+	f.resolveVia(t, "full", nil, nil)
+	if got, want := f.binding(t, edge), "root.a.b.c.run|dot_suffix|low"; got != want {
+		t.Fatalf("unique: got %q, want %q", got, want)
+	}
+
+	competitorFile := f.file(t, "app/other.py", "python")
+	competitor := f.symbol(t, competitorFile, "run", "other.a.b.c.run", "function", "python")
+	f.resolveVia(t, "paths+names", []string{"app/other.py"}, []string{"run"})
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("competitor added: got %q, want unresolved", got)
+	}
+
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM symbols WHERE id = ?`, competitor); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "paths+names", []string{"app/other.py"}, []string{"run"})
+	if got, want := f.binding(t, edge), "root.a.b.c.run|dot_suffix|low"; got != want {
+		t.Fatalf("competitor removed: got %q, want %q", got, want)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET qualified_name = 'renamed.other' WHERE qualified_name = 'root.a.b.c.run'`); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "paths+names", []string{"app/defs.py"}, []string{"run"})
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("target renamed: got %q, want unresolved", got)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM symbols WHERE qualified_name = 'renamed.other'`); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "paths+names", []string{"app/defs.py"}, []string{"run"})
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("target deleted: got %q, want unresolved", got)
+	}
+}
+
+func TestInactiveLegacyStrategiesConvergeOnIncrementalEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, strategy, confidence, dstName, qualified, kind, container string
+	}{
+		{"receiver_method", ResolutionStrategyReceiverMethod, ResolutionConfidenceMedium, "Run", "T.Run", "value", "T"},
+		{"slash_suffix", ResolutionStrategySlashSuffix, ResolutionConfidenceMedium, "pkg.Func", "github.com/acme/pkg.Func", "function", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newParityFixture(t, "")
+			defs := f.file(t, "app/defs.py", "python")
+			dst := f.symbolIn(t, defs, tc.dstName[strings.LastIndex(tc.dstName, ".")+1:], tc.qualified, tc.kind, tc.container, "python")
+			callerFile := f.file(t, "app/main.py", "python")
+			caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+			edge := f.edge(t, callerFile, caller, tc.dstName)
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id = ?, resolution_strategy = ?, resolution_confidence = ? WHERE id = ?`, dst, tc.strategy, tc.confidence, edge); err != nil {
+				t.Fatal(err)
+			}
+			f.resolveVia(t, "paths+names", []string{"app/defs.py"}, []string{tc.dstName})
+			if got := f.binding(t, edge); strings.Contains(got, "|"+tc.strategy+"|") {
+				t.Fatalf("legacy %s remained sticky: %q", tc.strategy, got)
+			}
+		})
+	}
+}
+
+func TestDotSuffixIncrementalRedecisionIsRepositoryScoped(t *testing.T) {
+	f := newParityFixture(t, "")
+	otherRoot := t.TempDir()
+	other, err := f.store.UpsertRepo(f.ctx, otherRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	add := func(repoID int64, path, qualified string) (int64, int64) {
+		file, err := insertTestFileLang(f.ctx, f.store, repoID, path, "python")
+		if err != nil {
+			t.Fatal(err)
+		}
+		symbol, err := insertTestSymbolKind(f.ctx, f.store, repoID, file, "run", qualified, "function", "", "python")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file, symbol
+	}
+	add(f.repoID, "a/defs.py", "root.a.b.c.run")
+	callerAFile, callerA := add(f.repoID, "a/main.py", "main")
+	edgeA := f.edge(t, callerAFile, callerA, "a.b.c.run")
+	add(other.ID, "b/defs.py", "other.a.b.c.run")
+	callerBFile, callerB := add(other.ID, "b/main.py", "main")
+	edgeB, err := insertTestEdge(f.ctx, f.store, other.ID, callerBFile, callerB, "a.b.c.run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ResolveEdges(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ResolveEdges(f.ctx, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	beforeB := legacyBinding(t, f.store, f.ctx, edgeB)
+
+	competitorFile, err := insertTestFileLang(f.ctx, f.store, f.repoID, "a/other.py", "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertTestSymbolKind(f.ctx, f.store, f.repoID, competitorFile, "run", "other.a.b.c.run", "function", "", "python"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ResolveEdgesForPathsAndNames(f.ctx, f.repoID, []string{"a/other.py"}, []string{"run"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.binding(t, edgeA); got != "<unresolved>" {
+		t.Fatalf("repo A competitor did not invalidate dot_suffix: %q", got)
+	}
+	if got := legacyBinding(t, f.store, f.ctx, edgeB); got != beforeB {
+		t.Fatalf("repo B changed after repo A mutation: %q -> %q", beforeB, got)
+	}
+	var dstRepo int64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COALESCE(d.repo_id, 0) FROM edges e LEFT JOIN symbols d ON d.id = e.dst_symbol_id WHERE e.id = ?`, edgeA).Scan(&dstRepo); err != nil {
+		t.Fatal(err)
+	}
+	if dstRepo != 0 && dstRepo != f.repoID {
+		t.Fatalf("repo A edge crossed into repo %d", dstRepo)
+	}
+}
+
+func TestInactiveSlashSuffixIsNotProduced(t *testing.T) {
+	f := newParityFixture(t, "")
+	defs := f.file(t, "pkg/format.go", "go")
+	f.symbol(t, defs, "Format", "github.com/acme/pkg.Format", "function", "go")
+	callerFile := f.file(t, "cmd/main.go", "go")
+	caller := f.symbol(t, callerFile, "main", "main", "function", "go")
+	edge := f.edge(t, callerFile, caller, "pkg.Format")
+	f.resolveVia(t, "full", nil, nil)
+	if got := f.binding(t, edge); strings.Contains(got, "|"+ResolutionStrategySlashSuffix+"|") {
+		t.Fatalf("inactive slash_suffix was produced: %q", got)
+	}
+}
+
+func legacyBinding(t *testing.T, s *Store, ctx context.Context, edgeID int64) string {
+	t.Helper()
+	var qname sql.NullString
+	var strategy, confidence string
+	if err := s.db.QueryRowContext(ctx, `SELECT d.qualified_name, e.resolution_strategy, e.resolution_confidence FROM edges e LEFT JOIN symbols d ON d.id = e.dst_symbol_id WHERE e.id = ?`, edgeID).Scan(&qname, &strategy, &confidence); err != nil {
+		t.Fatal(err)
+	}
+	if !qname.Valid {
+		return "<unresolved>"
+	}
+	return qname.String + "|" + strategy + "|" + confidence
 }
 
 // qualifiedOf renders a symbol's identity for an expectation string.

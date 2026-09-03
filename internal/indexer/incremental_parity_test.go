@@ -48,7 +48,7 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewPython(), tsparser.NewCpp())
+	return parser.NewRegistry(goparser.New(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava())
 }
 
 func newLifecycleRepo(t *testing.T, files tree) *lifecycleRepo {
@@ -553,4 +553,50 @@ func TestFullIndexAfterDeletionOnlyStillReconsiders(t *testing.T) {
 		t.Fatalf("deletion-only full index: want a binding to helpers_a.Foo, got %s", got)
 	}
 	r.assertFreshParity(t, "deletion-only full index")
+}
+
+func TestJavaDotSuffixFreshParityAcrossTargetStates(t *testing.T) {
+	const caller = "class Caller { void run() { A.B.C.m(); } }\n"
+	const target = "class A { class B { class C { static void m() {} } } }\n"
+	const renamed = "class X { class Y { class Z { static void m() {} } } }\n"
+
+	r := newLifecycleRepo(t, tree{"Caller.java": caller, "Target.java": target})
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, "Target.java") || !strings.Contains(got, "dot_suffix/low") {
+		t.Fatalf("unique dot-suffix state: %s", got)
+	}
+	r.assertFreshParity(t, "unique")
+
+	r.write(t, "Competitor.java", target)
+	r.update(t, "Competitor.java")
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("competitor should make dot-suffix ambiguous: %s", got)
+	}
+	r.assertFreshParity(t, "competitor added")
+
+	r.remove(t, "Competitor.java")
+	r.update(t, "Competitor.java")
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, "Target.java") || !strings.Contains(got, "dot_suffix/low") {
+		t.Fatalf("competitor removal should recover dot-suffix: %s", got)
+	}
+	r.assertFreshParity(t, "competitor removed")
+
+	r.remove(t, "Target.java")
+	r.update(t, "Target.java")
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); strings.Contains(got, "Target.java") {
+		t.Fatalf("deleted target survived: %s", got)
+	}
+	r.assertFreshParity(t, "target deleted")
+
+	r.write(t, "Target.java", target)
+	r.update(t, "Target.java")
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, "Target.java") {
+		t.Fatalf("target recreation should restore dot-suffix: %s", got)
+	}
+
+	r.write(t, "Target.java", renamed)
+	r.update(t, "Target.java")
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); strings.Contains(got, "Target.java") {
+		t.Fatalf("renamed target retained old binding: %s", got)
+	}
+	r.assertFreshParity(t, "target renamed")
 }
