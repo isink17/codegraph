@@ -70,6 +70,7 @@ func tsExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			val := strings.Trim(nodeText(src, content), `"'`)
 			if val != "" {
 				pf.Imports = append(pf.Imports, val)
+				addTypeScriptImport(nodeText(imp, content), &pf.Scope.Imports)
 			}
 		}
 	}
@@ -102,6 +103,7 @@ func tsExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 				pf.ReExports = append(pf.ReExports, graph.ReExport{Source: source, Name: name, ExportedName: alias})
 			}
 		}
+		addTypeScriptReExport(nodeText(export, content), &pf.Scope.Imports)
 		if wildcard := firstChild(export, "*"); wildcard != nil {
 			pf.ReExports = append(pf.ReExports, graph.ReExport{Source: source, Wildcard: true})
 		} else if wildcard := firstChild(export, "namespace_export"); wildcard != nil {
