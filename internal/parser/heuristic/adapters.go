@@ -216,6 +216,15 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		Language:   a.language,
 		FileTokens: texttoken.Weights(content),
 	}
+	if a.language == "kotlin" {
+		pf.Scope.Package = heuristicKotlinPackage(content)
+		for _, line := range lines {
+			if strings.HasPrefix(strings.TrimSpace(line), "import ") {
+				addHeuristicKotlinScope(line, &pf.Scope.Imports)
+			}
+		}
+		module = pf.Scope.Package
+	}
 
 	depth := 0
 	classScopes := []classScope{}
@@ -270,8 +279,15 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				container = strings.Join(names, ".")
 			}
 			qualified := module + "." + name
+			if a.language == "kotlin" {
+				qualified = heuristicQualified(module, name)
+			}
 			if container != module {
-				qualified = module + "." + container + "." + name
+				if a.language == "kotlin" {
+					qualified = heuristicQualified(module, container+"."+name)
+				} else {
+					qualified = module + "." + container + "." + name
+				}
 			}
 			stablePrefix := "func"
 			emittedKind := sym.kind
@@ -318,6 +334,43 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 	}
 	return pf, nil
+}
+
+func heuristicQualified(pkg, name string) string {
+	return strings.Trim(strings.TrimSpace(pkg)+"."+strings.TrimSpace(name), ".")
+}
+
+var heuristicKotlinPackageRE = regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)`)
+
+func heuristicKotlinPackage(content []byte) string {
+	for _, line := range strings.Split(string(content), "\n") {
+		if m := heuristicKotlinPackageRE.FindStringSubmatch(line); len(m) == 2 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+func addHeuristicKotlinScope(line string, out *[]graph.ScopeImport) {
+	parts := strings.Fields(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "import")))
+	if len(parts) == 0 {
+		return
+	}
+	path := parts[0]
+	wildcard := strings.HasSuffix(path, ".*")
+	name := strings.TrimSuffix(path, ".*")
+	imported := name
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		imported = name[i+1:]
+	}
+	local := imported
+	if wildcard {
+		imported, local = "", ""
+	}
+	if len(parts) >= 3 && parts[1] == "as" {
+		local = parts[2]
+	}
+	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: imported, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard})
 }
 
 func extSet(exts ...string) map[string]struct{} {

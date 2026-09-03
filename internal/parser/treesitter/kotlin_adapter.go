@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -32,7 +33,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 		return graph.ParsedFile{}, err
 	}
 
-	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	module := packageEvidence(content, "kotlin")
 	pf := graph.ParsedFile{
 		Language:   "kotlin",
 		Scope:      graph.ScopeEvidence{Package: packageEvidence(content, "kotlin")},
@@ -86,10 +87,10 @@ func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byt
 	}
 	name := nodeText(nameNode, content)
 
-	qualified := module + "." + name
+	qualified := kotlinQualified(module, name)
 	container := module
 	if parent != "" {
-		qualified = module + "." + parent + "." + name
+		qualified = kotlinQualified(module, parent+"."+name)
 		container = parent
 	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
@@ -98,10 +99,10 @@ func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byt
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: container,
-		Visibility:    heuristicVisibility(name),
+		Visibility:    kotlinVisibility(node, content),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
-		StableKey:     "type:kotlin:" + module + ":" + strings.TrimPrefix(qualified, module+"."),
+		StableKey:     "type:kotlin:" + qualified,
 	})
 
 	body := childByFieldName(node, "body")
@@ -130,9 +131,9 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 	if container != "" && container != module {
 		effectiveContainer = container
 	}
-	qualified := module + "." + name
+	qualified := kotlinQualified(module, name)
 	if container != "" && container != module {
-		qualified = module + "." + container + "." + name
+		qualified = kotlinQualified(module, container+"."+name)
 	}
 	sig := kotlinDeclarationSignature(node, content)
 
@@ -143,11 +144,35 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Signature:     sig,
-		Visibility:    heuristicVisibility(name),
+		Visibility:    kotlinVisibility(node, content),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
-		StableKey:     "func:kotlin:" + module + ":" + name,
+		StableKey:     "func:kotlin:" + qualified,
 	})
+}
+
+func kotlinQualified(pkg, name string) string {
+	return strings.Trim(strings.TrimSpace(pkg)+"."+strings.TrimSpace(name), ".")
+}
+
+func kotlinVisibility(node *sitter.Node, content []byte) string {
+	text := string(content[node.StartByte():node.EndByte()])
+	if brace := strings.IndexByte(text, '{'); brace >= 0 {
+		text = text[:brace]
+	}
+	if eq := strings.IndexByte(text, '='); eq >= 0 {
+		text = text[:eq]
+	}
+	if regexp.MustCompile(`\bprivate\b`).MatchString(text) {
+		return "private"
+	}
+	if regexp.MustCompile(`\bprotected\b`).MatchString(text) {
+		return "protected"
+	}
+	if regexp.MustCompile(`\binternal\b`).MatchString(text) {
+		return "internal"
+	}
+	return "public"
 }
 
 func kotlinDeclarationSignature(node *sitter.Node, content []byte) string {

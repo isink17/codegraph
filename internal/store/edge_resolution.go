@@ -133,6 +133,8 @@ const (
 	ResolutionStrategyJavaImportScope        = "java_import_scope"
 	ResolutionStrategyJavaStaticImport       = "java_static_import"
 	ResolutionStrategyJavaConstructor        = "java_constructor"
+	ResolutionStrategyKotlinPackageScope     = "kotlin_package_scope"
+	ResolutionStrategyKotlinImportScope      = "kotlin_import_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -196,6 +198,8 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyJavaImportScope:        ResolutionConfidenceHigh,
 	ResolutionStrategyJavaStaticImport:       ResolutionConfidenceHigh,
 	ResolutionStrategyJavaConstructor:        ResolutionConfidenceHigh,
+	ResolutionStrategyKotlinPackageScope:     ResolutionConfidenceHigh,
+	ResolutionStrategyKotlinImportScope:      ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -247,6 +251,8 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyJavaImportScope,
 	ResolutionStrategyJavaStaticImport,
 	ResolutionStrategyJavaConstructor,
+	ResolutionStrategyKotlinPackageScope,
+	ResolutionStrategyKotlinImportScope,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.

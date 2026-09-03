@@ -13,6 +13,7 @@ import (
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
 	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
+	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -48,7 +49,154 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewRust())
+	return parser.NewRegistry(goparser.New(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust())
+}
+
+func TestKotlinPackageScopeProductSemantics(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"a/Helper.kt": `package a
+fun helper() {}`,
+		"b/Helper.kt": `package b
+fun helper() {}`,
+		"a/Caller.kt": `package a
+fun run() { helper() }`,
+		"c/Caller.kt": `package c
+fun run() { helper() }`,
+	})
+	if got := r.edgeState(t, "a/Caller.kt", "helper"); !strings.Contains(got, "a/Helper.kt:a.helper") {
+		t.Fatalf("same-package Kotlin call = %s", got)
+	}
+	if got := r.edgeState(t, "c/Caller.kt", "helper"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("foreign-package Kotlin call = %s", got)
+	}
+}
+
+func TestKotlinPackageScopeAcceptanceMatrix(t *testing.T) {
+	cases := []struct {
+		name   string
+		dst    string
+		base   tree
+		mutate func(*lifecycleRepo, *testing.T)
+		want   string
+	}{
+		{"A same-package", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package a\nfun run() { helper() }"}, func(*lifecycleRepo, *testing.T) {}, "a.kt"},
+		{"B import added", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.kt", "package b\nimport a.helper\nfun run() { helper() }")
+			r.update(t, "caller.kt")
+		}, "a.kt"},
+		{"C import removed", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nimport a.helper\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.kt", "package b\nfun run() { helper() }")
+			r.update(t, "caller.kt")
+		}, ":: [/]"},
+		{"D alias changed", "new", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nimport a.helper as old\nfun run() { old() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.kt", "package b\nimport a.helper as new\nfun run() { new() }")
+			r.update(t, "caller.kt")
+		}, "a.kt"},
+		{"E stale alias", "old", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nimport a.helper as old\nfun run() { old() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.kt", "package b\nimport a.helper as new\nfun run() { old() }")
+			r.update(t, "caller.kt")
+		}, ":: [/]"},
+		{"F wildcard competitor", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package c\nimport a.*\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.kt", "package b\nfun helper() {}")
+			r.write(t, "caller.kt", "package c\nimport a.*\nimport b.*\nfun run() { helper() }")
+			r.update(t, "b.kt", "caller.kt")
+		}, ":: [/]"},
+		{"G wildcard competitor removed", "helper", tree{"a.kt": "package a\nfun helper() {}", "b.kt": "package b\nfun helper() {}", "caller.kt": "package c\nimport a.*\nimport b.*\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.kt", "package c\nimport a.*\nfun run() { helper() }")
+			r.update(t, "caller.kt")
+		}, "a.kt"},
+		{"H package changed", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nimport a.helper\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a.kt", "package z\nfun helper() {}")
+			r.update(t, "a.kt")
+		}, ":: [/]"},
+		{"I target renamed", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nimport a.helper\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a.kt", "package a\nfun renamed() {}")
+			r.update(t, "a.kt")
+		}, ":: [/]"},
+		{"J target deleted", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nimport a.helper\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) { r.remove(t, "a.kt"); r.update(t) }, ":: [/]"},
+		{"K object member", "Util.run", tree{"util.kt": "package a\nobject Util { fun run() {} }", "caller.kt": "package b\nimport a.Util\nfun call() { Util.run() }"}, func(*lifecycleRepo, *testing.T) {}, "util.kt"},
+		{"L owner moved", "Util.run", tree{"util.kt": "package a\nobject Util { fun run() {} }", "caller.kt": "package b\nimport a.Util\nfun call() { Util.run() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "util.kt", "package z\nobject Util { fun run() {} }")
+			r.update(t, "util.kt")
+		}, ":: [/]"},
+		{"M visibility changed", "helper", tree{"a.kt": "package a\nfun helper() {}", "caller.kt": "package b\nimport a.helper\nfun run() { helper() }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a.kt", "package a\nprivate fun helper() {}")
+			r.update(t, "a.kt")
+		}, ":: [/]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newLifecycleRepo(t, tc.base)
+			tc.mutate(r, t)
+			r.assertFreshParity(t, tc.name)
+			if got := r.edgeState(t, "caller.kt", tc.dst); !strings.Contains(got, tc.want) {
+				t.Fatalf("want %q, got %s; projection=%v", tc.want, got, r.projection(t))
+			}
+		})
+	}
+}
+
+func TestKotlinPackageScopeQuerySurface(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"a.kt":      "package a\nfun helper() {}",
+		"caller.kt": "package b\nimport a.helper as h\nfun run() { h() }",
+	})
+	result, err := query.New(r.store, nil).FindCalleesResult(r.ctx, r.repoID, "b.run", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Callees) != 1 || result.Callees[0].QualifiedName != "a.helper" {
+		t.Fatalf("query alias result = %+v", result)
+	}
+	if got := r.edgeState(t, "caller.kt", "h"); !strings.Contains(got, "a.kt:a.helper [kotlin_import_scope/high]") {
+		t.Fatalf("alias provenance = %s", got)
+	}
+
+	r = newLifecycleRepo(t, tree{
+		"a.kt":      "package a\nfun helper() {}",
+		"b.kt":      "package b\nfun helper() {}",
+		"caller.kt": "package c\nimport a.*\nimport b.*\nfun run() { helper() }",
+	})
+	result, err = query.New(r.store, nil).FindCalleesResult(r.ctx, r.repoID, "c.run", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Callees) != 0 {
+		t.Fatalf("ambiguous query result = %+v", result)
+	}
+}
+
+func TestKotlinPackageScopeMultiRepoIsolation(t *testing.T) {
+	files := tree{
+		"a.kt":      "package a\nfun helper() {}",
+		"caller.kt": "package b\nimport a.helper\nfun run() { helper() }",
+	}
+	a := newLifecycleRepo(t, files)
+	b := newLifecycleRepo(t, files)
+	wantB := b.projection(t)
+	a.write(t, "a.kt", "package z\nfun helper() {}")
+	summary := a.update(t, "a.kt")
+	if summary.ResolveMode == "repo" {
+		t.Fatalf("local Kotlin update used repo-wide resolution: %+v", summary)
+	}
+	if got := b.projection(t); !equalStrings(got, wantB) {
+		t.Fatalf("repo B changed after repo A update: got %v want %v", got, wantB)
+	}
+}
+
+func TestKotlinDefaultPackageIsNotGlobal(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"helper.kt":  "fun helper() {}",
+		"default.kt": "fun run() { helper() }",
+		"named.kt":   "package named\nfun run() { helper() }",
+	})
+	if got := r.edgeState(t, "default.kt", "helper"); !strings.Contains(got, "helper.kt:helper") {
+		t.Fatalf("default-package binding = %s", got)
+	}
+	if got := r.edgeState(t, "named.kt", "helper"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("named package saw default package = %s", got)
+	}
+	r.assertFreshParity(t, "default package")
 }
 
 func TestRustModuleScopeResolvesOnlyDeclaredModule(t *testing.T) {
