@@ -216,20 +216,15 @@ var binderStrategies = []string{
 	ResolutionStrategyGoPackageScope,
 }
 
-// incrementallyRedecidableStrategies is every strategy an incremental resolve
-// can arrive at again on its own: the Go-side binder's levels, plus the
-// own-module import pass that ResolveEdgesForPathsAndNames runs beside it.
-//
-// It exists because invalidateNameEvidenceBindings must never clear a binding
-// nothing can restore. `receiver_method`, `slash_suffix` and `dot_suffix` are
-// produced by ResolveEdges alone, which runs on a full index and never again,
-// so clearing one of those would delete a destination permanently -- turning a
-// parity fix into a new divergence in the other direction, and a worse one,
-// because the fresh index keeps the binding the update just destroyed.
-//
-// Derived from binderStrategies so a new binder level joins it automatically.
+// incrementallyRedecidableStrategies is every strategy whose bindings may be
+// invalidated by an incremental evidence change. Legacy strategies remain in
+// this set so old rows can converge; only dot_suffix is re-created by the
+// incremental resolver.
 var incrementallyRedecidableStrategies = append(
 	append([]string{}, binderStrategies...),
+	ResolutionStrategyReceiverMethod,
+	ResolutionStrategySlashSuffix,
+	ResolutionStrategyDotSuffix,
 	ResolutionStrategyModuleImport,
 )
 

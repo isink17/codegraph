@@ -202,40 +202,6 @@ func TestResolveEdgesRecordsStrategyPerEvidenceLevel(t *testing.T) {
 			wantStrategy: ResolutionStrategyExactName,
 		},
 		{
-			// The only symbol carrying this bare name is a container member of a
-			// kind the bare-name strategy does not consider (resolverBareNameKindsSQL
-			// covers callables and types, not properties), so the receiver
-			// strategy is the one that binds it. Its container came from the
-			// destination -- the call site never named a receiver -- which is why
-			// receiver_method sits a tier below exact_name.
-			name: "receiver_method",
-			build: func(t *testing.T, f *gateFixture) (int64, int64) {
-				defs := f.file(t, "src/py/service.py", "python")
-				want := f.symbolWithContainer(t, defs, "handle", "Service.handle", "property", "Service", "python")
-
-				caller := f.file(t, "src/py/caller.py", "python")
-				src := f.symbol(t, caller, "caller", "caller", "python")
-				return f.edge(t, caller, src, "handle"), want
-			},
-			wantStrategy: ResolutionStrategyReceiverMethod,
-		},
-		{
-			// `pkg.Format` is not any symbol's name or qualified_name; it is the
-			// after-last-slash portion of exactly one Go symbol's qualified name.
-			name: "slash_suffix",
-			build: func(t *testing.T, f *gateFixture) (int64, int64) {
-				defs := f.file(t, "src/go/pkg/util.go", "go")
-				want := f.symbol(t, defs, "Format", "github.com/org/repo/pkg.Format", "go")
-				other := f.file(t, "src/go/other/util.go", "go")
-				f.symbol(t, other, "Render", "github.com/org/repo/other.Render", "go")
-
-				caller := f.file(t, "src/go/caller.go", "go")
-				src := f.symbol(t, caller, "Caller", "Caller", "go")
-				return f.edge(t, caller, src, "pkg.Format"), want
-			},
-			wantStrategy: ResolutionStrategySlashSuffix,
-		},
-		{
 			// One dot, no slash, and no slash-suffix candidate: the only match is
 			// the destination's last two dot segments.
 			name: "dot_tail2",

@@ -2934,7 +2934,8 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething),
 	// language-gated. Several receivers declaring the same method name are
 	// indistinguishable without receiver-type evidence, so they bind nothing.
-	res, err = tx.ExecContext(ctx, `
+	if false { // receiver_method is legacy-only; bare calls do not prove a receiver.
+		res, err = tx.ExecContext(ctx, `
 		WITH distinct_names AS (
 			SELECT DISTINCT dst_name
 			FROM edges
@@ -2961,11 +2962,12 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		AND r.dst_name = edges.dst_name
 		AND `+resolverBindGateSQL+`
 	`, repoID, repoID, repoID)
-	if err != nil {
-		return 0, err
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		totalResolved += int(n)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			totalResolved += int(n)
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable); err != nil {
@@ -3350,7 +3352,8 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			return 0, err
 		}
 
-		updateRes, err := tx.ExecContext(ctx, `
+		if false { // slash_suffix is legacy-only; current parsers cannot prove it.
+			updateRes, err := tx.ExecContext(ctx, `
 			UPDATE edges
 			`+resolverSetResolvedSQL(ResolutionStrategySlashSuffix)+`
 			FROM tmp_symbol_slash_suffix r, files f
@@ -3359,22 +3362,23 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			AND r.dst_name = edges.dst_name
 			AND `+resolverBindGateSQL+`
 		`, repoID)
-		if err != nil {
-			return 0, err
+			if err != nil {
+				return 0, err
+			}
+			if _, err := tx.ExecContext(ctx, `DROP TABLE temp.tmp_symbol_slash_suffix`); err != nil {
+				return 0, err
+			}
+			droppedSlashSuffix = true
+			if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_suffix`); err != nil {
+				return 0, err
+			}
+			droppedNeeded = true
+			n, err := updateRes.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			totalResolved += int(n)
 		}
-		if _, err := tx.ExecContext(ctx, `DROP TABLE temp.tmp_symbol_slash_suffix`); err != nil {
-			return 0, err
-		}
-		droppedSlashSuffix = true
-		if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_suffix`); err != nil {
-			return 0, err
-		}
-		droppedNeeded = true
-		n, err := updateRes.RowsAffected()
-		if err != nil {
-			return 0, err
-		}
-		totalResolved += int(n)
 	}
 
 	// Dot-tail2 path: this branch matches `last-2-dot-segments(afterSlash)`.
@@ -3526,9 +3530,56 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto, scopes)
+	if err == nil && (len(paths) > 0 || len(names) > 0) {
+		var n int
+		n, err = s.resolveDotSuffixIncrementally(ctx, repoID)
+		stats.TargetsResolved += n
+	}
 	stats.InvalidateMS += invalidateMS
 	stats.InvalidatedBindings += invalidated
 	return stats, err
+}
+
+// resolveDotSuffixIncrementally reruns only the active weak strategy after the
+// ordinary incremental passes. Its candidate population is the repository's
+// unresolved dotted edges; stronger strategies have already had first refusal.
+// The transaction-local resolver tables keep the full and incremental SQL
+// predicates identical, while no repo-wide resolver pass is repeated.
+func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+		return 0, err
+	}
+	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID)
+	if err != nil {
+		return 0, err
+	}
+	for _, table := range []string{
+		resolverAmbiguousNamesTable, resolverTestFilesTable,
+		resolverImportScopeTable, resolverCppNamespaceScopesTable,
+		"tmp_resolver_own_module_veto", "tmp_resolver_own_module_targets",
+		"tmp_resolver_own_module_resolution",
+	} {
+		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+table); err != nil {
+			return 0, err
+		}
+	}
+	for _, table := range goBareScopeTables {
+		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+table); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // invalidateNameEvidenceBindings unbinds implicit bindings whose uniqueness
@@ -3643,10 +3694,26 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	if err := cppRows.Close(); err != nil {
 		return 0, err
 	}
-	if len(contested) == 0 && len(cppNames) == 0 {
-		return 0, nil
+	legacyStale := map[int64]struct{}{}
+	legacyArgs := make([]any, 0, len(unique)+1)
+	legacyArgs = append(legacyArgs, repoID)
+	for _, name := range unique {
+		legacyArgs = append(legacyArgs, name)
 	}
-	allNames := append([]string(nil), contested...)
+	legacyRows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM edges
+		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+		AND resolution_strategy IN ('receiver_method', 'slash_suffix')
+		  AND dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(unique)), ",")+
+		`)`, legacyArgs...)
+	if err != nil {
+		return 0, err
+	}
+	if err := scanEdgeIDsInto(legacyRows, legacyStale); err != nil {
+		return 0, err
+	}
+	allNames := append([]string(nil), unique...)
+	allNames = append(allNames, contested...)
 	seenNames := make(map[string]struct{}, len(allNames))
 	for _, name := range allNames {
 		seenNames[name] = struct{}{}
@@ -3667,6 +3734,9 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	// then one pass over the qualified bound population for `.<name>` tails.
 	// Migration 028 keeps the second one off a full table scan.
 	stale := map[int64]struct{}{}
+	for id := range legacyStale {
+		stale[id] = struct{}{}
+	}
 	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
 		end := min(start+sqliteInClauseBatchSize, len(unique))
 		chunk := unique[start:end]
