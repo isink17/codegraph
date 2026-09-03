@@ -43,6 +43,7 @@ func NewJava() *Adapter {
 		},
 		symbols: []symbolPattern{
 			{kind: "type", re: regexp.MustCompile(`\b(class|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
+			{kind: "constructor", re: regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*\{`), nameGroup: 1},
 			{kind: "function", re: regexp.MustCompile(`^\s*(?:public|protected|private|static|final|native|synchronized|abstract|\s)*[A-Za-z0-9_<>\[\], ?]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:\{|throws|$)`), nameGroup: 1},
 		},
 		cStyle: true,
@@ -257,25 +258,40 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 					continue
 				}
 			}
+			if sym.kind == "constructor" && (a.language != "java" || len(classScopes) == 0 || classScopes[len(classScopes)-1].name != name) {
+				continue
+			}
 			container := module
 			if len(classScopes) > 0 {
-				container = classScopes[len(classScopes)-1].name
+				names := make([]string, 0, len(classScopes))
+				for _, scope := range classScopes {
+					names = append(names, scope.name)
+				}
+				container = strings.Join(names, ".")
 			}
 			qualified := module + "." + name
 			if container != module {
 				qualified = module + "." + container + "." + name
 			}
 			stablePrefix := "func"
-			if sym.kind != "function" {
+			emittedKind := sym.kind
+			if sym.kind == "constructor" {
+				emittedKind = "function"
+			}
+			if emittedKind == "type" {
 				stablePrefix = "type"
 			}
 			stableKey := stablePrefix + ":" + a.language + ":" + module + ":" + name
+			if container != module {
+				stableKey = stablePrefix + ":" + a.language + ":" + module + ":" + container + ":" + name
+			}
 			pf.Symbols = append(pf.Symbols, graph.Symbol{
 				Language:      a.language,
-				Kind:          sym.kind,
+				Kind:          emittedKind,
 				Name:          name,
 				QualifiedName: qualified,
 				ContainerName: container,
+				Signature:     heuristicCallableSignature(sym.kind, trimmed),
 				Visibility:    visibility(name),
 				Range: graph.Position{
 					StartLine: lineNo,
@@ -285,7 +301,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				},
 				StableKey: stableKey,
 			})
-			if sym.kind != "function" {
+			if sym.kind == "type" {
 				opens := strings.Count(line, "{")
 				scopeDepth := depth + opens
 				if scopeDepth <= depth {
@@ -332,6 +348,29 @@ func visibility(name string) string {
 		return "private"
 	}
 	return "module"
+}
+
+func heuristicSignature(declaration string) string {
+	end := len(declaration)
+	if close := strings.LastIndex(declaration, ")"); close >= 0 {
+		end = close + 1
+		if tail := declaration[end:]; strings.HasPrefix(strings.TrimSpace(tail), ":") {
+			if eq := strings.Index(tail, "="); eq >= 0 {
+				end += eq
+			}
+		}
+		if brace := strings.IndexAny(declaration[end:], "{"); brace >= 0 {
+			end += brace
+		}
+	}
+	return strings.TrimSpace(declaration[:end])
+}
+
+func heuristicCallableSignature(kind, declaration string) string {
+	if kind != "function" && kind != "constructor" {
+		return ""
+	}
+	return heuristicSignature(declaration)
 }
 
 func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (string, stripState) {

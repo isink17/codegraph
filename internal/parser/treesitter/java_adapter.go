@@ -38,7 +38,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	}
 
 	javaExtractImports(root, content, &pf)
-	javaExtractSymbols(root, module, "", content, &pf)
+	javaExtractSymbols(root, module, "", "module", content, &pf)
 	javaExtractCalls(root, content, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:java:" + testTargetModule(module, "Test", "Tests") + ":" + target
@@ -56,44 +56,58 @@ func javaExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile)
 	}
 }
 
-func javaExtractSymbols(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+func javaExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
 		case "class_declaration", "interface_declaration", "enum_declaration", "record_declaration":
-			javaAddType(child, module, content, pf)
+			javaAddType(child, module, container, content, pf)
 		case "method_declaration", "constructor_declaration":
-			javaAddMethod(child, module, container, content, pf)
+			if ownerKind == "type" {
+				javaAddMethod(child, module, container, content, pf)
+			}
 		case "class_body", "interface_body", "enum_body":
 			// Recurse into bodies — the container is set by the parent type.
-			javaExtractSymbols(child, module, container, content, pf)
+			javaExtractSymbols(child, module, container, ownerKind, content, pf)
 		}
 	}
 }
 
-func javaAddType(node *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
+func javaAddType(node *sitter.Node, module, parent string, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
 	}
 	name := nodeText(nameNode, content)
 
+	qualified := module + "." + name
+	if parent != "" {
+		qualified = module + "." + parent + "." + name
+	}
+	container := module
+	if parent != "" {
+		container = parent
+	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "java",
 		Kind:          "type",
 		Name:          name,
-		QualifiedName: module + "." + name,
-		ContainerName: module,
+		QualifiedName: qualified,
+		ContainerName: container,
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
-		StableKey:     "type:java:" + module + ":" + name,
+		StableKey:     "type:java:" + module + ":" + strings.TrimPrefix(qualified, module+"."),
 	})
 
 	// Recurse into the body with this type as container.
 	body := childByFieldName(node, "body")
 	if body != nil {
-		javaExtractSymbols(body, module, name, content, pf)
+		nextContainer := name
+		if parent != "" {
+			nextContainer = parent + "." + name
+		}
+		javaExtractSymbols(body, module, nextContainer, "type", content, pf)
 	}
 }
 
@@ -112,6 +126,9 @@ func javaAddMethod(node *sitter.Node, module, container string, content []byte, 
 		qualified = module + "." + container + "." + name
 	}
 	stableKey := "func:java:" + module + ":" + name
+	if container != "" && container != module {
+		stableKey = "func:java:" + module + ":" + container + ":" + name
+	}
 
 	vis := javaMethodVisibility(node, content)
 
@@ -122,10 +139,19 @@ func javaAddMethod(node *sitter.Node, module, container string, content []byte, 
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Visibility:    vis,
+		Signature:     javaDeclarationSignature(node, content),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     stableKey,
 	})
+}
+
+func javaDeclarationSignature(node *sitter.Node, content []byte) string {
+	end := node.EndByte()
+	if body := childByFieldName(node, "body"); body != nil {
+		end = body.StartByte()
+	}
+	return strings.TrimSpace(string(content[node.StartByte():end]))
 }
 
 func javaMethodVisibility(node *sitter.Node, content []byte) string {
@@ -151,10 +177,9 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			continue
 		}
 		name := nodeText(nameNode, content)
-		obj := childByFieldName(call, "object")
-		fullName := name
-		if obj != nil {
-			fullName = nodeText(obj, content) + "." + name
+		fullName := javaCallName(call, name, content)
+		if fullName == "" {
+			continue
 		}
 		line := int(call.StartPoint().Row) + 1
 		pf.Edges = append(pf.Edges, graph.Edge{
@@ -170,5 +195,18 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			QualifiedName: fullName,
 			Range:         nodeRange(call),
 		})
+	}
+}
+
+func javaCallName(call *sitter.Node, name string, content []byte) string {
+	obj := childByFieldName(call, "object")
+	if obj == nil {
+		return name
+	}
+	switch obj.Type() {
+	case "identifier", "field_access", "scoped_identifier", "this", "super":
+		return nodeText(obj, content) + "." + name
+	default:
+		return ""
 	}
 }
