@@ -34,6 +34,9 @@ func TestTarget_Builtin(t *testing.T) {
 		{"go make", Evidence{Language: "go", DstName: "make"}},
 		{"go append", Evidence{Language: "go", DstName: "append"}},
 		{"go conversion", Evidence{Language: "go", DstName: "int64"}},
+		{"typescript JSON member", Evidence{Language: "typescript", DstName: "JSON.stringify"}},
+		{"typescript Array member", Evidence{Language: "typescript", DstName: "Array.isArray"}},
+		{"typescript Math member", Evidence{Language: "typescript", DstName: "Math.max"}},
 		// Unrelated imports in the file are not evidence against a builtin: a
 		// predeclared identifier needs no import.
 		{"builtin alongside imports", Evidence{Language: "python", DstName: "sorted", Imports: []string{"os", "requests"}}},
@@ -84,16 +87,46 @@ func TestBuiltinCandidate_OnlyForLanguagesWithAValidatedSet(t *testing.T) {
 	if name, ok := BuiltinCandidate("python", "sorted"); !ok || name != "sorted" {
 		t.Fatalf(`BuiltinCandidate("python", "sorted") = (%q, %v), want ("sorted", true)`, name, ok)
 	}
+	for _, tc := range []struct{ dst, root string }{{"JSON.stringify", "JSON"}, {"Array.isArray", "Array"}} {
+		if root, ok := BuiltinCandidate("typescript", tc.dst); !ok || root != tc.root {
+			t.Errorf("BuiltinCandidate(typescript, %q) = (%q, %v), want (%q, true)", tc.dst, root, ok, tc.root)
+		}
+	}
 	// `sorted` is not a Go builtin, and Swift has no builtin set at all.
 	for _, tc := range []struct{ language, name string }{
 		{"go", "sorted"},
 		{"swift", "sorted"},
 		{"rust", "len"},
 		{"typescript", "print"},
+		{"typescript", "myArray.map"},
 		{"", "len"},
 	} {
 		if _, ok := BuiltinCandidate(tc.language, tc.name); ok {
 			t.Errorf("BuiltinCandidate(%q, %q) = true, want false", tc.language, tc.name)
+		}
+	}
+}
+
+func TestTarget_TypeScriptBuiltinShadowingAndRuntimeGlobals(t *testing.T) {
+	if got := Target(Evidence{Language: "typescript", DstName: "Array.isArray", ProjectDefinesTarget: true}); got != Unknown {
+		t.Fatalf("shadowed Array = %q, want %q", got, Unknown)
+	}
+	for _, dst := range []string{"console.log", "Buffer.from", "process.exit"} {
+		if got := Target(Evidence{Language: "typescript", DstName: dst}); got != Unknown {
+			t.Errorf("runtime global %q = %q, want %q", dst, got, Unknown)
+		}
+	}
+}
+
+func TestTarget_CppStdlibRequiresExplicitStdNamespace(t *testing.T) {
+	for _, dst := range []string{"std::move", "std::sort", "::std::move"} {
+		if got := Target(Evidence{Language: "cpp", DstName: dst}); got != Stdlib {
+			t.Errorf("cpp %q = %q, want %q", dst, got, Stdlib)
+		}
+	}
+	for _, dst := range []string{"move", "sort", "my::std::thing"} {
+		if got := Target(Evidence{Language: "cpp", DstName: dst}); got != Unknown {
+			t.Errorf("cpp %q = %q, want %q", dst, got, Unknown)
 		}
 	}
 }
@@ -324,9 +357,9 @@ func TestTarget_LanguagesWithoutRulesAlwaysReturnUnknown(t *testing.T) {
 // language CodeGraph persists must either have documented gaps or be added here
 // deliberately, so coverage cannot widen or narrow silently.
 func TestConservativeGapsCoverEveryParsedLanguage(t *testing.T) {
-	parsed := []string{
-		"cpp", "csharp", "go", "java", "kotlin", "php", "python", "ruby",
-		"rust", "swift", "typescript",
+	parsed := make([]string, 0, len(Capabilities()))
+	for _, capability := range Capabilities() {
+		parsed = append(parsed, capability.Language)
 	}
 	for _, language := range parsed {
 		if conservativeGaps[language] == "" {
@@ -356,6 +389,43 @@ func TestConservativeGapsCoverEveryParsedLanguage(t *testing.T) {
 	// builtin rule and the import rules cannot become folklore.
 	if shadowingGap == "" {
 		t.Error("shadowingGap is empty; the builtin-only abstention must stay documented")
+	}
+}
+
+func TestCapabilitiesAreCompleteAndDeterministic(t *testing.T) {
+	capabilities := Capabilities()
+	if len(capabilities) != len(canonicalLanguages) {
+		t.Fatalf("capability count = %d, want %d", len(capabilities), len(canonicalLanguages))
+	}
+	seen := map[string]bool{}
+	for i, capability := range capabilities {
+		if seen[capability.Language] {
+			t.Fatalf("duplicate capability %q", capability.Language)
+		}
+		seen[capability.Language] = true
+		if i > 0 && capabilities[i-1].Language >= capability.Language {
+			t.Fatalf("capabilities not sorted: %q before %q", capabilities[i-1].Language, capability.Language)
+		}
+		if !capability.Project || !capability.Unknown {
+			t.Errorf("%q lacks universal project/unknown capability: %+v", capability.Language, capability)
+		}
+	}
+	if !seen["cpp"] || !seen["typescript"] {
+		t.Fatal("newly covered languages missing from capability table")
+	}
+	want := map[string][3]bool{
+		"cpp": {false, true, false}, "go": {true, true, false},
+		"java": {false, true, false}, "kotlin": {false, false, false},
+		"csharp": {false, false, false}, "php": {false, false, false},
+		"python": {true, true, false}, "ruby": {false, false, false},
+		"rust": {false, true, false}, "swift": {false, false, false},
+		"typescript": {true, true, true},
+	}
+	for _, capability := range capabilities {
+		got := [3]bool{capability.Builtin, capability.Stdlib, capability.External}
+		if got != want[capability.Language] {
+			t.Errorf("capability %q = %v, want %v", capability.Language, got, want[capability.Language])
+		}
 	}
 }
 

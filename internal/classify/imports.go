@@ -35,6 +35,17 @@ var importRules = map[string]importRule{
 	"java":       classifyJava,
 	"rust":       classifyRust,
 	"typescript": classifyTypeScript,
+	"cpp":        classifyCpp,
+}
+
+// classifyCpp trusts only an explicit top-level std namespace in the persisted
+// destination. Header delimiters and using-directives are not retained as
+// enough evidence to distinguish a project declaration from the library.
+func classifyCpp(dstName string, _ []string) string {
+	if firstSegment(strings.TrimPrefix(dstName, "::"), "::") == "std" {
+		return Stdlib
+	}
+	return Unknown
 }
 
 // classifyGo relies on the strongest linkage evidence in the repository: both Go
