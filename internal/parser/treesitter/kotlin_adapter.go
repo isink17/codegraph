@@ -39,7 +39,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	}
 
 	kotlinExtractImports(root, content, &pf)
-	kotlinExtractSymbols(root, module, "", content, &pf)
+	kotlinExtractSymbols(root, module, "", "module", content, &pf)
 	kotlinExtractCalls(root, content, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
@@ -56,23 +56,25 @@ func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFil
 	}
 }
 
-func kotlinExtractSymbols(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
 		case "class_declaration":
-			kotlinAddType(child, module, "class", content, pf)
+			kotlinAddType(child, module, container, "class", content, pf)
 		case "object_declaration":
-			kotlinAddType(child, module, "object", content, pf)
+			kotlinAddType(child, module, container, "object", content, pf)
 		case "interface_declaration":
-			kotlinAddType(child, module, "interface", content, pf)
+			kotlinAddType(child, module, container, "interface", content, pf)
 		case "function_declaration":
-			kotlinAddFunction(child, module, container, content, pf)
+			if ownerKind == "type" || ownerKind == "module" {
+				kotlinAddFunction(child, module, container, content, pf)
+			}
 		}
 	}
 }
 
-func kotlinAddType(node *sitter.Node, module, kind string, content []byte, pf *graph.ParsedFile) {
+func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		nameNode = firstChild(node, "type_identifier")
@@ -82,16 +84,22 @@ func kotlinAddType(node *sitter.Node, module, kind string, content []byte, pf *g
 	}
 	name := nodeText(nameNode, content)
 
+	qualified := module + "." + name
+	container := module
+	if parent != "" {
+		qualified = module + "." + parent + "." + name
+		container = parent
+	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "kotlin",
 		Kind:          kind,
 		Name:          name,
-		QualifiedName: module + "." + name,
-		ContainerName: module,
+		QualifiedName: qualified,
+		ContainerName: container,
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
-		StableKey:     "type:kotlin:" + module + ":" + name,
+		StableKey:     "type:kotlin:" + module + ":" + strings.TrimPrefix(qualified, module+"."),
 	})
 
 	body := childByFieldName(node, "body")
@@ -99,7 +107,11 @@ func kotlinAddType(node *sitter.Node, module, kind string, content []byte, pf *g
 		body = firstChild(node, "class_body")
 	}
 	if body != nil {
-		kotlinExtractSymbols(body, module, name, content, pf)
+		nextContainer := name
+		if parent != "" {
+			nextContainer = parent + "." + name
+		}
+		kotlinExtractSymbols(body, module, nextContainer, "type", content, pf)
 	}
 }
 
@@ -120,6 +132,7 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 	if container != "" && container != module {
 		qualified = module + "." + container + "." + name
 	}
+	sig := kotlinDeclarationSignature(node, content)
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "kotlin",
@@ -127,11 +140,20 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
+		Signature:     sig,
 		Visibility:    heuristicVisibility(name),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "func:kotlin:" + module + ":" + name,
 	})
+}
+
+func kotlinDeclarationSignature(node *sitter.Node, content []byte) string {
+	end := node.EndByte()
+	if body := childByFieldName(node, "body"); body != nil {
+		end = body.StartByte()
+	}
+	return strings.TrimSpace(string(content[node.StartByte():end]))
 }
 
 func kotlinExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {

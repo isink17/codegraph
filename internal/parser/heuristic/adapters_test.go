@@ -61,6 +61,42 @@ func TestCRLFRangesDoNotCountCarriageReturns(t *testing.T) {
 	}
 }
 
+func TestJVMHeuristicKeepsNestedContainersAndHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		adapter *Adapter
+		content string
+		want    string
+	}{
+		{"java", NewJava(), "class Outer {\n class Inner {\n  void run(int value) {}\n }\n}\n", "sample.Outer.Inner.run"},
+		{"kotlin", NewKotlin(), "class Outer {\n class Inner {\n  fun run(value: Int): Int = value\n }\n}\n", "sample.Outer.Inner.run"},
+	} {
+		p, err := tc.adapter.Parse(context.Background(), "sample."+map[string]string{"java": "java", "kotlin": "kt"}[tc.name], []byte(tc.content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found bool
+		for _, s := range p.Symbols {
+			if s.QualifiedName == tc.want {
+				found = true
+				if s.ContainerName != "Outer.Inner" || s.Signature == "" {
+					t.Errorf("%s symbol = %+v", tc.name, s)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%s missing %s: %+v", tc.name, tc.want, p.Symbols)
+		}
+	}
+	p, err := NewJava().Parse(context.Background(), "Foo.java", []byte("class Foo {\n Foo(int x) {}\n}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Symbols) != 2 || p.Symbols[1].Kind != "function" || p.Symbols[1].Signature == "" {
+		t.Fatalf("constructor = %+v", p.Symbols)
+	}
+}
+
 func hasSymbolName(parsed graph.ParsedFile, name string) bool {
 	for _, sym := range parsed.Symbols {
 		if sym.Name == name {
