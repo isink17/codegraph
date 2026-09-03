@@ -129,6 +129,10 @@ const (
 	ResolutionStrategyRustModuleScope        = "rust_module_scope"
 	ResolutionStrategyRustUseScope           = "rust_use_scope"
 	ResolutionStrategyRustAssociatedFunction = "rust_associated_function"
+	ResolutionStrategyJavaPackageScope       = "java_package_scope"
+	ResolutionStrategyJavaImportScope        = "java_import_scope"
+	ResolutionStrategyJavaStaticImport       = "java_static_import"
+	ResolutionStrategyJavaConstructor        = "java_constructor"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -188,6 +192,10 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyRustModuleScope:        ResolutionConfidenceHigh,
 	ResolutionStrategyRustUseScope:           ResolutionConfidenceHigh,
 	ResolutionStrategyRustAssociatedFunction: ResolutionConfidenceHigh,
+	ResolutionStrategyJavaPackageScope:       ResolutionConfidenceHigh,
+	ResolutionStrategyJavaImportScope:        ResolutionConfidenceHigh,
+	ResolutionStrategyJavaStaticImport:       ResolutionConfidenceHigh,
+	ResolutionStrategyJavaConstructor:        ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -235,6 +243,10 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyRustModuleScope,
 	ResolutionStrategyRustUseScope,
 	ResolutionStrategyRustAssociatedFunction,
+	ResolutionStrategyJavaPackageScope,
+	ResolutionStrategyJavaImportScope,
+	ResolutionStrategyJavaStaticImport,
+	ResolutionStrategyJavaConstructor,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.

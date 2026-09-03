@@ -69,3 +69,52 @@ func TestTypedScopeEvidenceReplacementAndRepoIsolation(t *testing.T) {
 		t.Fatalf("deleted file left %d typed rows", count)
 	}
 }
+
+func TestJavaStaticEvidencePersistsAndReplaces(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	repo, err := s.UpsertRepo(ctx, filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	static, nonstatic := true, false
+	pf := graph.ParsedFile{Language: "java", Symbols: []graph.Symbol{
+		{Name: "run", Kind: "function", Language: "java", Static: &static, StableKey: "run"},
+		{Name: "walk", Kind: "function", Language: "java", Static: &nonstatic, StableKey: "walk"},
+	}}
+	if err := s.ReplaceFileGraph(ctx, repo.ID, 1, "Util.java", "java", 1, 1, "one", pf); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.db.Query(`SELECT name,is_static FROM symbols WHERE repo_id=? ORDER BY name`, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]int{}
+	for rows.Next() {
+		var name string
+		var value int
+		if err := rows.Scan(&name, &value); err != nil {
+			t.Fatal(err)
+		}
+		got[name] = value
+	}
+	if got["run"] != 1 || got["walk"] != 0 {
+		t.Fatalf("persisted static evidence = %v", got)
+	}
+	pf.Symbols[0].Static = &nonstatic
+	if err := s.ReplaceFileGraph(ctx, repo.ID, 2, "Util.java", "java", 1, 2, "two", pf); err != nil {
+		t.Fatal(err)
+	}
+	var value int
+	if err := s.db.QueryRow(`SELECT is_static FROM symbols WHERE repo_id=? AND name='run'`, repo.ID).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != 0 {
+		t.Fatalf("replacement left stale static evidence %d", value)
+	}
+}

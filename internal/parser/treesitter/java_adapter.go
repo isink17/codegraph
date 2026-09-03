@@ -31,7 +31,6 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 		return graph.ParsedFile{}, err
 	}
 
-	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	pf := graph.ParsedFile{
 		Language:   "java",
 		Scope:      graph.ScopeEvidence{Package: packageEvidence(content, "java")},
@@ -39,10 +38,10 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	}
 
 	javaExtractImports(root, content, &pf)
-	javaExtractSymbols(root, module, "", "module", content, &pf)
+	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
 	javaExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf, func(target string) string {
-		return "func:java:" + testTargetModule(module, "Test", "Tests") + ":" + target
+	linkTestsGeneric(pf.Scope.Package, &pf, func(target string) string {
+		return "func:java:" + testTargetModule(pf.Scope.Package, "Test", "Tests") + ":" + target
 	})
 	return pf, nil
 }
@@ -51,10 +50,16 @@ func javaExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile)
 	for _, imp := range findDescendants(root, "import_declaration") {
 		// The scoped_identifier child holds the full import path.
 		scoped := firstChild(imp, "scoped_identifier")
+		importText := nodeText(imp, content)
 		if scoped != nil {
-			pf.Imports = append(pf.Imports, nodeText(scoped, content))
-			addJavaScope(nodeText(imp, content), &pf.Scope.Imports)
+			importText = nodeText(scoped, content)
 		}
+		if importText != "" {
+			pf.Imports = append(pf.Imports, importText)
+		}
+		// Wildcard imports may expose only an identifier child; retain the full
+		// declaration text so the scope evidence keeps the `.*` fact.
+		addJavaScope(nodeText(imp, content), &pf.Scope.Imports)
 	}
 }
 
@@ -82,9 +87,9 @@ func javaAddType(node *sitter.Node, module, parent string, content []byte, pf *g
 	}
 	name := nodeText(nameNode, content)
 
-	qualified := module + "." + name
+	qualified := javaQName(module, name)
 	if parent != "" {
-		qualified = module + "." + parent + "." + name
+		qualified = javaQName(module, parent+"."+name)
 	}
 	container := module
 	if parent != "" {
@@ -96,10 +101,10 @@ func javaAddType(node *sitter.Node, module, parent string, content []byte, pf *g
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: container,
-		Visibility:    heuristicVisibility(name),
+		Visibility:    javaTypeVisibility(node, content),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
-		StableKey:     "type:java:" + module + ":" + strings.TrimPrefix(qualified, module+"."),
+		StableKey:     "type:java:" + javaStablePrefix(module) + strings.TrimPrefix(qualified, javaPrefix(module)),
 	})
 
 	// Recurse into the body with this type as container.
@@ -123,29 +128,50 @@ func javaAddMethod(node *sitter.Node, module, container string, content []byte, 
 	if container != "" {
 		effectiveContainer = container
 	}
-	qualified := module + "." + name
+	qualified := javaQName(module, name)
 	if container != "" && container != module {
-		qualified = module + "." + container + "." + name
+		qualified = javaQName(module, container+"."+name)
 	}
-	stableKey := "func:java:" + module + ":" + name
+	stableKey := "func:java:" + javaStablePrefix(module) + name
 	if container != "" && container != module {
-		stableKey = "func:java:" + module + ":" + container + ":" + name
+		stableKey = "func:java:" + javaStablePrefix(module) + container + ":" + name
 	}
 
 	vis := javaMethodVisibility(node, content)
 
+	kind := "function"
+	if node.Type() == "constructor_declaration" {
+		kind = "constructor"
+	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "java",
-		Kind:          "function",
+		Kind:          kind,
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Visibility:    vis,
+		Static:        javaStatic(node, content),
 		Signature:     javaDeclarationSignature(node, content),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     stableKey,
 	})
+}
+
+func javaPrefix(pkg string) string {
+	if pkg == "" {
+		return ""
+	}
+	return pkg + "."
+}
+
+func javaQName(pkg, name string) string { return javaPrefix(pkg) + name }
+
+func javaStablePrefix(pkg string) string {
+	if pkg == "" {
+		return ""
+	}
+	return pkg + ":"
 }
 
 func javaDeclarationSignature(node *sitter.Node, content []byte) string {
@@ -172,7 +198,50 @@ func javaMethodVisibility(node *sitter.Node, content []byte) string {
 	return "package"
 }
 
+func javaStatic(node *sitter.Node, content []byte) *bool {
+	if node.Type() != "method_declaration" && node.Type() != "constructor_declaration" {
+		return nil
+	}
+	static := false
+	for _, mod := range findChildren(node, "modifiers") {
+		for _, word := range strings.Fields(nodeText(mod, content)) {
+			if word == "static" {
+				static = true
+				break
+			}
+		}
+	}
+	return &static
+}
+
+func javaTypeVisibility(node *sitter.Node, content []byte) string {
+	return javaVisibility(node, content)
+}
+
+func javaVisibility(node *sitter.Node, content []byte) string {
+	for _, mod := range findChildren(node, "modifiers") {
+		text := nodeText(mod, content)
+		for _, visibility := range []string{"public", "private", "protected"} {
+			if strings.Contains(text, visibility) {
+				return visibility
+			}
+		}
+	}
+	return "package"
+}
+
 func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+	for _, creation := range findDescendants(root, "object_creation_expression") {
+		typeNode := childByFieldName(creation, "type")
+		if typeNode == nil {
+			continue
+		}
+		name := nodeText(typeNode, content)
+		if name == "" {
+			continue
+		}
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: nodeText(creation, content), Line: int(creation.StartPoint().Row) + 1})
+	}
 	for _, call := range findDescendants(root, "method_invocation") {
 		nameNode := childByFieldName(call, "name")
 		if nameNode == nil {

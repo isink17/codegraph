@@ -19,7 +19,7 @@ class Caller { void run() { A.B.C.m(); } }
 	}
 	for _, edge := range edges {
 		if edge.DstName == "A.B.C.m" {
-			if edge.DstSymbolID == nil || edge.ResolutionStrategy != "dot_suffix" || edge.ResolutionConfidence != "low" {
+			if edge.DstSymbolID == nil || edge.ResolutionStrategy != "java_package_scope" || edge.ResolutionConfidence != "high" {
 				t.Fatalf("dot-suffix edge = %+v", edge)
 			}
 			return

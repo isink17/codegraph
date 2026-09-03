@@ -55,7 +55,7 @@ class Foo { Foo(int x) {} void make() { new Foo(1); factory().run(); } }`
 			if q == "Foo.Foo" && s.Signature == "" {
 				t.Error("empty constructor signature")
 			}
-			if q == "Foo.Foo" && (s.Kind != "function" || s.Name != "Foo" || s.QualifiedName != "Sample.Foo.Foo" || s.Signature != "Foo(int x)") {
+			if q == "Foo.Foo" && (s.Kind != "constructor" || s.Name != "Foo" || s.QualifiedName != "Foo.Foo" || s.Signature != "Foo(int x)") {
 				t.Errorf("constructor metadata = %+v", s)
 			}
 		}
@@ -67,6 +67,11 @@ class Foo { Foo(int x) {} void make() { new Foo(1); factory().run(); } }`
 	}
 	if !seen["Calculator.add#int"] || !seen["Calculator.add#String"] {
 		t.Fatalf("overload signatures missing: %v", seen)
+	}
+	for _, s := range p.Symbols {
+		if s.Name == "run" && s.Static == nil {
+			t.Fatal("Java method staticness was not represented")
+		}
 	}
 	var calls []string
 	for _, e := range p.Edges {
@@ -81,6 +86,23 @@ class Foo { Foo(int x) {} void make() { new Foo(1); factory().run(); } }`
 	}
 	if len(calls) != 1 || calls[0] != "factory" {
 		t.Fatalf("Java calls = %v, want [factory]", calls)
+	}
+}
+
+func TestJavaStaticDeclarationEvidence(t *testing.T) {
+	p, err := NewJava().Parse(context.Background(), "Util.java", []byte(`class Util { static void run() {} void walk() {} }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]*bool{}
+	for _, s := range p.Symbols {
+		got[s.Name] = s.Static
+	}
+	if got["run"] == nil || !*got["run"] {
+		t.Fatalf("run static evidence = %v, want true", got["run"])
+	}
+	if got["walk"] == nil || *got["walk"] {
+		t.Fatalf("walk static evidence = %v, want false", got["walk"])
 	}
 }
 
