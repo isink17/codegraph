@@ -66,7 +66,14 @@ func addKotlinScope(text string, out *[]graph.ScopeImport) {
 	if wildcard {
 		local = ""
 	}
-	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: local, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard})
+	imported := local
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		imported = name[i+1:]
+	}
+	if wildcard {
+		imported = ""
+	}
+	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: imported, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard})
 }
 
 func addRustScope(text string, public bool, owner string, out *[]graph.ScopeImport) {

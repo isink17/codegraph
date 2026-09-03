@@ -231,7 +231,8 @@ var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
 		AND ` + resolverBareNameTypeScopeSQL + `
 		AND ` + resolverCppBareNamespaceScopeSQL + `
 		AND ` + resolverCppBareMemberScopeSQL + `
-		AND NOT EXISTS (SELECT 1 FROM tmp_java_scope_veto jsv WHERE jsv.edge_id = edges.id)`
+		AND NOT EXISTS (SELECT 1 FROM tmp_java_scope_veto jsv WHERE jsv.edge_id = edges.id)` + `
+		AND NOT EXISTS (SELECT 1 FROM tmp_kotlin_scope_veto ksv WHERE ksv.edge_id = edges.id)`
 
 // resolverBindGateSQL is what every repo-wide strategy's UPDATE must
 // satisfy before it may write a destination: the P2 language gate, the P7

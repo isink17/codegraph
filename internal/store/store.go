@@ -1759,7 +1759,7 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Language == "java" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" {
+	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path) VALUES(?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath); err != nil {
 			return nil, err
 		}
@@ -2677,6 +2677,9 @@ func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_java_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_kotlin_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+resolverCppNamespaceScopesTable+`(symbol_id INTEGER PRIMARY KEY, scope TEXT NOT NULL) WITHOUT ROWID`); err != nil {
 		return err
 	}
@@ -2705,6 +2708,9 @@ func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
 // reads as "no test files, no vetoed names".
 func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID int64) error {
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
@@ -2867,6 +2873,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	if n, err := resolveKotlinScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	}
@@ -2907,6 +2918,8 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_resolution`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_targets`)
@@ -4631,6 +4644,58 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 		targets = remaining
 	}
+	kotlinIDs := make(map[int64]struct{})
+	kotlinFiles := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage == "kotlin" {
+			kotlinFiles[target.srcFileID] = struct{}{}
+		}
+	}
+	if len(kotlinFiles) > 0 {
+		ids := make([]string, 0, len(kotlinFiles))
+		for id := range kotlinFiles {
+			ids = append(ids, strconv.FormatInt(id, 10))
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT file_id FROM file_scope_evidence WHERE repo_id=? AND language='kotlin' AND file_id IN (`+strings.Join(ids, ",")+`)`, repoID)
+		if err != nil {
+			return outcome, err
+		}
+		seenKotlinFiles := map[int64]struct{}{}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return outcome, err
+			}
+			seenKotlinFiles[id] = struct{}{}
+		}
+		if err := rows.Close(); err != nil {
+			return outcome, err
+		}
+		for _, target := range targets {
+			if _, ok := seenKotlinFiles[target.srcFileID]; ok {
+				kotlinIDs[target.edgeID] = struct{}{}
+			}
+		}
+	}
+	if len(kotlinIDs) > 0 {
+		n, err := resolveKotlinScope(ctx, s.db, repoID, kotlinIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if target.srcLanguage != "kotlin" {
+				remaining = append(remaining, target)
+				continue
+			}
+			if _, scoped := kotlinIDs[target.edgeID]; !scoped {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
+	}
 	if len(targets) == 0 {
 		return outcome, nil
 	}
@@ -4819,6 +4884,12 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	resolutions := make([]edgeResolution, 0, len(targets))
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return outcome, err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_kotlin_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return outcome, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_kotlin_scope_veto`); err != nil {
 		return outcome, err
 	}
 	for _, target := range targets {

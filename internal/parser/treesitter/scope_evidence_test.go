@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
@@ -31,6 +32,9 @@ func TestTypedScopeEvidenceFixtures(t *testing.T) {
 			}
 			var v []string
 			for _, i := range x.Scope.Imports {
+				if i.LocalName == "Bar" && i.ImportedName != "Foo" {
+					return nil, "", fmt.Errorf("alias imported name = %q", i.ImportedName)
+				}
 				v = append(v, i.LocalName)
 			}
 			return v, x.Scope.Package, nil
@@ -116,5 +120,22 @@ func TestRustPubUseIsReexportEvidence(t *testing.T) {
 	}
 	if len(p.Scope.Imports) != 1 || !p.Scope.Imports[0].ReExport {
 		t.Fatalf("imports=%+v", p.Scope.Imports)
+	}
+}
+
+func TestKotlinPackageOwnsDeclarationIdentity(t *testing.T) {
+	p, err := NewKotlin().Parse(context.Background(), "Helper.kt", []byte("package a.b\nfun helper() {}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Scope.Package != "a.b" || len(p.Symbols) != 1 || p.Symbols[0].QualifiedName != "a.b.helper" {
+		t.Fatalf("package identity = package %q symbols %+v", p.Scope.Package, p.Symbols)
+	}
+	p, err = NewKotlin().Parse(context.Background(), "Default.kt", []byte("fun helper() {}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Scope.Package != "" || len(p.Symbols) != 1 || p.Symbols[0].QualifiedName != "helper" {
+		t.Fatalf("default package identity = package %q symbols %+v", p.Scope.Package, p.Symbols)
 	}
 }

@@ -69,7 +69,7 @@ func TestJVMHeuristicKeepsNestedContainersAndHeaders(t *testing.T) {
 		want    string
 	}{
 		{"java", NewJava(), "class Outer {\n class Inner {\n  void run(int value) {}\n }\n}\n", "sample.Outer.Inner.run"},
-		{"kotlin", NewKotlin(), "class Outer {\n class Inner {\n  fun run(value: Int): Int = value\n }\n}\n", "sample.Outer.Inner.run"},
+		{"kotlin", NewKotlin(), "class Outer {\n class Inner {\n  fun run(value: Int): Int = value\n }\n}\n", "Outer.Inner.run"},
 	} {
 		p, err := tc.adapter.Parse(context.Background(), "sample."+map[string]string{"java": "java", "kotlin": "kt"}[tc.name], []byte(tc.content))
 		if err != nil {
