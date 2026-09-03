@@ -1169,10 +1169,11 @@ func clearEdgeResolutions(ctx context.Context, q execQuerier, edgeIDs []int64) (
 // A nil cache is valid and means "build your own", which keeps the standalone
 // entrypoints (ResolveEdgesForPaths, ResolveEdgesForNames) working unchanged.
 type importScopeCache struct {
-	store  *Store
-	repoID int64
-	scope  map[int64]map[int64]struct{}
-	loaded bool
+	store     *Store
+	repoID    int64
+	scope     map[int64]map[int64]struct{}
+	rustRoots map[string]struct{}
+	loaded    bool
 }
 
 // newImportScopeCache returns a cache for one repo's resolve.

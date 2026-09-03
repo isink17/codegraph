@@ -208,11 +208,18 @@ type ResolveEdgesForNamesStats struct {
 	// bindings this batch may have made ambiguous, and InvalidatedBindings how
 	// many it cleared. Without them the phase is invisible and the other timers
 	// under-report the update.
-	InvalidateMS        int64 `json:"invalidate_ms,omitempty"`
-	InvalidatedBindings int   `json:"invalidated_bindings,omitempty"`
-	ExactSelectMS       int64 `json:"exact_select_ms,omitempty"`
-	SuffixSelectMS      int64 `json:"suffix_select_ms,omitempty"`
-	ResolveTargetsMS    int64 `json:"resolve_targets_ms,omitempty"`
+	InvalidateMS             int64 `json:"invalidate_ms,omitempty"`
+	InvalidatedBindings      int   `json:"invalidated_bindings,omitempty"`
+	ExactSelectMS            int64 `json:"exact_select_ms,omitempty"`
+	SuffixSelectMS           int64 `json:"suffix_select_ms,omitempty"`
+	ResolveTargetsMS         int64 `json:"resolve_targets_ms,omitempty"`
+	RustAffectedCrates       int   `json:"rust_affected_crates,omitempty"`
+	RustAffectedModules      int   `json:"rust_affected_modules,omitempty"`
+	RustAffectedEdges        int   `json:"rust_affected_edges,omitempty"`
+	RustCandidateRows        int   `json:"rust_candidate_rows,omitempty"`
+	RustReExportNodesVisited int   `json:"rust_reexport_nodes_visited,omitempty"`
+	RustBatchInvalidationOps int   `json:"rust_batch_invalidation_ops,omitempty"`
+	RustBatchApplyOps        int   `json:"rust_batch_apply_ops,omitempty"`
 }
 
 type ScanPhaseTiming struct {
@@ -1414,6 +1421,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM scope_import_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM rust_module_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM file_scope_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -1548,6 +1558,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM scope_import_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM rust_module_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM file_scope_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -1746,24 +1759,33 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Scope.Package != "" {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name) VALUES(?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package); err != nil {
+	if parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path) VALUES(?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath); err != nil {
+			return nil, err
+		}
+	}
+	if len(parsed.Scope.Modules) > 0 {
+		args := make([]any, 0, len(parsed.Scope.Modules)*7)
+		for _, module := range parsed.Scope.Modules {
+			args = append(args, repoID, fileID, module.OwnerModule, module.Name, module.ExternalPath, boolInt(module.Inline), module.Visibility)
+		}
+		if err := execBatchInsert(ctx, tx, "rust_module_evidence", "repo_id, file_id, owner_module, module_name, external_path, is_inline, visibility", 7, args, stats); err != nil {
 			return nil, err
 		}
 	}
 	if len(parsed.Scope.Imports) > 0 {
-		args := make([]any, 0, min(len(parsed.Scope.Imports), sqliteImportValuesBatchRows)*12)
+		args := make([]any, 0, min(len(parsed.Scope.Imports), sqliteImportValuesBatchRows)*13)
 		for _, evidence := range parsed.Scope.Imports {
-			args = append(args, repoID, fileID, parsed.Language, evidence.SourceSpecifier, evidence.ImportedName, evidence.LocalName, evidence.Kind, boolInt(evidence.Wildcard), boolInt(evidence.Static), boolInt(evidence.ReExport), boolInt(evidence.NamespaceExport), boolInt(evidence.TypeOnly))
-			if len(args) >= sqliteImportValuesBatchRows*12 {
-				if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only", 12, args, stats); err != nil {
+			args = append(args, repoID, fileID, parsed.Language, evidence.SourceSpecifier, evidence.ImportedName, evidence.LocalName, evidence.Kind, boolInt(evidence.Wildcard), boolInt(evidence.Static), boolInt(evidence.ReExport), boolInt(evidence.NamespaceExport), boolInt(evidence.TypeOnly), evidence.OwnerModule)
+			if len(args) >= sqliteImportValuesBatchRows*13 {
+				if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only, owner_module", 13, args, stats); err != nil {
 					return nil, err
 				}
 				args = args[:0]
 			}
 		}
 		if len(args) > 0 {
-			if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only", 12, args, stats); err != nil {
+			if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only, owner_module", 13, args, stats); err != nil {
 				return nil, err
 			}
 		}
@@ -2831,6 +2853,9 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	}
 	if targets, err := unresolvedCppEvidenceTargets(ctx, tx, repoID); err != nil {
 		return 0, err
 	} else if n, err := resolveCppEvidenceEdgesWith(ctx, tx, tx, repoID, targets); err != nil {
@@ -3551,6 +3576,19 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	scopes := newImportScopeCache(s, repoID)
+	var err error
+	scopes.rustRoots, err = s.rustRootsForPaths(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	if err := s.invalidateRustBindingsForRoots(ctx, repoID, scopes.rustRoots); err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	rustNames, err := s.rustNamesForChangedPaths(ctx, repoID, scopes.rustRoots)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, rustNames)
 	scopeNames, err := s.typeScopeNamesForChangedPaths(ctx, repoID, paths, scopes)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -4077,6 +4115,26 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		return stats, nil
 	}
 	stats.NamesUnique = len(unique)
+	rustFilter := ""
+	var rustFilterArgs []any
+	if scopes != nil {
+		if len(scopes.rustRoots) == 0 {
+			rustFilter = " AND f.language <> 'rust'"
+		} else {
+			roots := make([]string, 0, len(scopes.rustRoots))
+			for root := range scopes.rustRoots {
+				roots = append(roots, root)
+			}
+			slices.Sort(roots)
+			parts := make([]string, 0, len(roots)*2)
+			for _, root := range roots {
+				dir := root[:strings.LastIndex(root, "/")+1]
+				parts = append(parts, "se.crate_root=? OR (se.crate_root='' AND (f.path=? OR f.path LIKE ?))")
+				rustFilterArgs = append(rustFilterArgs, root, root, dir+"%")
+			}
+			rustFilter = " AND (f.language <> 'rust' OR (" + strings.Join(parts, " OR ") + "))"
+		}
+	}
 	if moduleVeto == nil {
 		// Standalone entry point: no caller ran the invalidation pass, so this
 		// one owns it. It must precede the module pass below for the ordering
@@ -4134,12 +4192,14 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
 			FROM edges e
 			JOIN files f ON f.id = e.file_id
-			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)`
+			LEFT JOIN file_scope_evidence se ON se.file_id=f.id AND se.repo_id=f.repo_id
+			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)` + rustFilter
 		args := make([]any, 1+len(chunk))
 		args[0] = repoID
 		for i, name := range chunk {
 			args[i+1] = name
 		}
+		args = append(args, rustFilterArgs...)
 
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -4185,8 +4245,8 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
 		FROM edges e
 		JOIN files f ON f.id = e.file_id
-		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND (instr(e.dst_name, '.') > 0 OR instr(e.dst_name, '::') > 0)
-	`, repoID)
+		LEFT JOIN file_scope_evidence se ON se.file_id=f.id AND se.repo_id=f.repo_id
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND (instr(e.dst_name, '.') > 0 OR instr(e.dst_name, '::') > 0)`+rustFilter, append([]any{repoID}, rustFilterArgs...)...)
 	if err != nil {
 		return stats, err
 	}
@@ -4246,6 +4306,13 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	stats.AmbiguityBlocked = outcome.ambiguityBlocked
 	stats.TestShadowBlocked = outcome.testShadowBlocked
 	stats.UnknownSrcLanguage = outcome.unknownSrcLanguage
+	stats.RustAffectedCrates = outcome.rustStats.AffectedCrates
+	stats.RustAffectedModules = outcome.rustStats.AffectedModules
+	stats.RustAffectedEdges = outcome.rustStats.AffectedEdges
+	stats.RustCandidateRows = outcome.rustStats.CandidateRows
+	stats.RustReExportNodesVisited = outcome.rustStats.ReExportNodesVisited
+	stats.RustBatchInvalidationOps = outcome.rustStats.BatchInvalidationOps
+	stats.RustBatchApplyOps = outcome.rustStats.BatchApplyOps
 	stats.ResolveTargetsMS = time.Since(resolveStarted).Milliseconds()
 	return stats, nil
 }
@@ -4317,6 +4384,7 @@ type resolveEdgeTargetsOutcome struct {
 	// production code may be wired into.
 	testShadowBlocked  int
 	unknownSrcLanguage int
+	rustStats          RustResolutionStats
 }
 
 // binderFallback decides which evidence level a dst_name may fall back to when
@@ -4408,6 +4476,43 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	var outcome resolveEdgeTargetsOutcome
 	if len(targets) == 0 {
 		return outcome, nil
+	}
+	rustIDs := map[int64]struct{}{}
+	for _, target := range targets {
+		if target.srcLanguage == "rust" {
+			rustIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(rustIDs) > 0 {
+		// The changed-file path pass has already selected the crate root. Keep
+		// that selection on the rewritten caller evidence before the standalone
+		// Rust pass derives its bounded file set.
+		if scopes != nil && len(scopes.rustRoots) == 1 {
+			var root string
+			for candidate := range scopes.rustRoots {
+				root = candidate
+			}
+			for _, target := range targets {
+				if target.srcLanguage != "rust" {
+					continue
+				}
+				if _, err := s.db.ExecContext(ctx, `UPDATE file_scope_evidence SET crate_root=? WHERE repo_id=? AND file_id=? AND crate_root=''`, root, repoID, target.srcFileID); err != nil {
+					return outcome, err
+				}
+			}
+		}
+		bound, err := s.resolveRustModuleScopeStandaloneWithStats(ctx, repoID, rustIDs, &outcome.rustStats)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += len(bound)
+		remaining := targets[:0]
+		for _, target := range targets {
+			if target.srcLanguage != "rust" {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
 	}
 	if n, err := s.resolveCppEvidenceEdges(ctx, repoID, targets); err != nil {
 		return outcome, err

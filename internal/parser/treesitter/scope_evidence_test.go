@@ -79,3 +79,42 @@ func TestTypedScopeEvidenceFixtures(t *testing.T) {
 		})
 	}
 }
+
+func TestRustScopeEvidenceKeepsInlineOwnersAndAliasTargets(t *testing.T) {
+	p, err := NewRust().Parse(context.Background(), "lib.rs", []byte(`
+mod outer {
+    use crate::a::f as local_f;
+    mod inner { use crate::b::f; fn run() { f(); } }
+}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Scope.ModulePath != "crate" {
+		t.Fatalf("module path = %q", p.Scope.ModulePath)
+	}
+	var owners, imported string
+	for _, imp := range p.Scope.Imports {
+		if imp.LocalName == "local_f" {
+			owners, imported = imp.OwnerModule, imp.ImportedName
+		}
+	}
+	if owners != "crate::outer" || imported != "f" {
+		t.Fatalf("alias evidence = (%q, %q)", owners, imported)
+	}
+	for _, imp := range p.Scope.Imports {
+		if imp.LocalName == "f" && imp.OwnerModule != "crate::outer::inner" {
+			t.Fatalf("nested owner = %q", imp.OwnerModule)
+		}
+	}
+}
+
+func TestRustPubUseIsReexportEvidence(t *testing.T) {
+	p, err := NewRust().Parse(context.Background(), "lib.rs", []byte("pub use crate::a::f as g;"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Scope.Imports) != 1 || !p.Scope.Imports[0].ReExport {
+		t.Fatalf("imports=%+v", p.Scope.Imports)
+	}
+}

@@ -54,10 +54,10 @@ func resolverLanguageCompatible(srcLanguage, dstLanguage string) bool {
 //   - `files` is joined in as `f`
 //   - the candidate relation is joined in as `r` and exposes `dst_language`
 //
-// Candidate relations are always built with `language != ''`, and the join to
+// Candidate relations are always built with `language != ”`, and the join to
 // `files` drops edges whose file row is missing, so an unknown language on
 // either side yields no match rather than a guess.
-const resolverLanguageGateSQL = `f.id = edges.file_id AND r.dst_language = f.language`
+const resolverLanguageGateSQL = `f.id = edges.file_id AND r.dst_language = f.language AND f.language <> 'rust'`
 
 // symbolLangKey keys candidate lookups by (name, language) so that Go-side
 // resolution can only ever pick a same-language destination.

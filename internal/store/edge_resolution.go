@@ -125,7 +125,10 @@ const (
 	// repository: a name that is ambiguous repo-wide can still be unambiguous
 	// here, and a name that is unique repo-wide reaches nothing from outside its
 	// package.
-	ResolutionStrategyGoPackageScope = "go_package_scope"
+	ResolutionStrategyGoPackageScope         = "go_package_scope"
+	ResolutionStrategyRustModuleScope        = "rust_module_scope"
+	ResolutionStrategyRustUseScope           = "rust_use_scope"
+	ResolutionStrategyRustAssociatedFunction = "rust_associated_function"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -181,7 +184,10 @@ var resolutionConfidenceByStrategy = map[string]string{
 	// The name is matched in full against `symbols.name`, and the destination's
 	// package is proven rather than assumed, so nothing about either identity is
 	// discarded to reach the match.
-	ResolutionStrategyGoPackageScope: ResolutionConfidenceHigh,
+	ResolutionStrategyGoPackageScope:         ResolutionConfidenceHigh,
+	ResolutionStrategyRustModuleScope:        ResolutionConfidenceHigh,
+	ResolutionStrategyRustUseScope:           ResolutionConfidenceHigh,
+	ResolutionStrategyRustAssociatedFunction: ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -226,6 +232,9 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategySlashSuffix,
 	ResolutionStrategyDotSuffix,
 	ResolutionStrategyModuleImport,
+	ResolutionStrategyRustModuleScope,
+	ResolutionStrategyRustUseScope,
+	ResolutionStrategyRustAssociatedFunction,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.
