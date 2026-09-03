@@ -98,6 +98,9 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyCrossLanguageImportPath,
 		ResolutionStrategyModuleImport,
 		ResolutionStrategyGoPackageScope,
+		ResolutionStrategyRustModuleScope,
+		ResolutionStrategyRustUseScope,
+		ResolutionStrategyRustAssociatedFunction,
 	}
 	if len(all) != len(resolutionConfidenceByStrategy) {
 		t.Fatalf("strategy constants = %d, registered confidences = %d; every strategy needs exactly one tier", len(all), len(resolutionConfidenceByStrategy))

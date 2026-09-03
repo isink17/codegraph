@@ -66,8 +66,10 @@ type ParsedFile struct {
 // ScopeEvidence contains syntax-proven facts used by later language-specific
 // resolvers. It deliberately contains no destination identity.
 type ScopeEvidence struct {
-	Package string
-	Imports []ScopeImport
+	Package    string
+	ModulePath string
+	Imports    []ScopeImport
+	Modules    []RustModule
 }
 
 type ScopeImport struct {
@@ -80,6 +82,15 @@ type ScopeImport struct {
 	ReExport        bool
 	NamespaceExport bool
 	TypeOnly        bool
+	OwnerModule     string
+}
+
+type RustModule struct {
+	Name         string
+	OwnerModule  string
+	ExternalPath string
+	Inline       bool
+	Visibility   string
 }
 
 const (

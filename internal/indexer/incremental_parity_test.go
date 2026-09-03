@@ -48,7 +48,252 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava())
+	return parser.NewRegistry(goparser.New(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewRust())
+}
+
+func TestRustModuleScopeResolvesOnlyDeclaredModule(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib.rs":   `mod a; fn run() { crate::a::helper(); }`,
+		"a.rs":     `pub fn helper() {}`,
+		"other.rs": `pub fn helper() {}`,
+	})
+	if got := r.edgeState(t, "lib.rs", "crate::a::helper"); !strings.Contains(got, "a.rs:crate::a::helper") {
+		t.Fatalf("crate-qualified Rust call = %s", got)
+	}
+}
+
+func TestRustModuleScopeReexportsAndVisibility(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib.rs": `mod source; mod barrel; mod sibling; fn run() {
+			crate::barrel::public_helper();
+			crate::source::private_helper();
+			crate::sibling::private_helper();
+		}`,
+		"source.rs":  `pub fn public_helper() {} fn private_helper() {}`,
+		"barrel.rs":  `pub use crate::source::public_helper as public_helper;`,
+		"sibling.rs": `fn private_helper() {}`,
+	})
+	if got := r.edgeState(t, "lib.rs", "crate::barrel::public_helper"); !strings.Contains(got, "source.rs:crate::source::public_helper") {
+		t.Fatalf("re-export = %s", got)
+	}
+	for _, name := range []string{"crate::source::private_helper", "crate::sibling::private_helper"} {
+		if got := r.edgeState(t, "lib.rs", name); !strings.Contains(got, ":: [/]") {
+			t.Fatalf("inaccessible %s = %s", name, got)
+		}
+	}
+}
+
+func TestRustModuleScopeProductSemantics(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"src/lib.rs":     `mod source; mod b; mod c; mod s1; mod s2; mod barrel; mod cycle_a; mod cycle_b; fn run() { crate::c::public_helper(); crate::barrel::helper(); crate::cycle_a::x(); crate::ghost::helper(); }`,
+		"src/source.rs":  `pub fn helper() {}`,
+		"src/b.rs":       `pub use crate::source::helper as h;`,
+		"src/c.rs":       `pub use crate::b::h as public_helper;`,
+		"src/s1.rs":      `pub fn helper() {}`,
+		"src/s2.rs":      `pub fn helper() {}`,
+		"src/barrel.rs":  `pub use crate::s1::*; pub use crate::s2::*;`,
+		"src/cycle_a.rs": `pub use crate::cycle_b::x;`,
+		"src/cycle_b.rs": `pub use crate::cycle_a::x;`,
+		"src/ghost.rs":   `pub fn helper() {}`,
+		"alt/main.rs":    `mod util; fn run() { crate::util::run(); }`,
+		"alt/util.rs":    `pub fn run() {}`,
+	})
+	if got := r.edgeState(t, "src/lib.rs", "crate::c::public_helper"); !strings.Contains(got, "source.rs:crate::source::helper") {
+		t.Fatalf("multi-hop alias = %s", got)
+	}
+	for _, name := range []string{"crate::barrel::helper", "crate::cycle_a::x", "crate::ghost::helper"} {
+		if got := r.edgeState(t, "src/lib.rs", name); !strings.Contains(got, ":: [/]") {
+			t.Fatalf("Rust fail-closed %s = %s", name, got)
+		}
+	}
+	if got := r.edgeState(t, "alt/main.rs", "crate::util::run"); !strings.Contains(got, "alt/util.rs:crate::util::run") {
+		t.Fatalf("independent bin crate = %s", got)
+	}
+}
+
+func TestRustModuleScopeKeepsCrateRootsIsolated(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"src/lib.rs":  `mod util; fn run() { crate::util::helper(); }`,
+		"src/util.rs": `pub fn helper() {}`,
+		"alt/main.rs": `mod util; fn run() { crate::util::helper(); }`,
+		"alt/util.rs": `pub fn helper() {}`,
+	})
+	if got := r.edgeState(t, "src/lib.rs", "crate::util::helper"); !strings.Contains(got, "src/util.rs") {
+		t.Fatalf("src crate binding = %s", got)
+	}
+	if got := r.edgeState(t, "alt/main.rs", "crate::util::helper"); !strings.Contains(got, "alt/util.rs") {
+		t.Fatalf("alt crate binding = %s", got)
+	}
+}
+
+func TestRustModuleScopeAcceptanceMatrix(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   tree
+		mutate func(*lifecycleRepo, *testing.T)
+		check  func(*lifecycleRepo, *testing.T)
+	}{
+		{"A same-module unique", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "helper", "a.rs")
+		}},
+		{"B eligible competitor added", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::*; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.rs", "pub fn helper() {}")
+			r.write(t, "lib.rs", "mod a; mod b; mod caller;")
+			r.update(t, "b.rs", "lib.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "helper", "a.rs")
+		}},
+		{"C competitor removed", tree{
+			"lib.rs":    "mod a; mod b; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"b.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::*; use crate::b::*; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.remove(t, "b.rs")
+			r.write(t, "lib.rs", "mod a; mod caller;")
+			r.update(t)
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "helper", "a.rs")
+		}},
+		{"D explicit use added", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.rs", "use crate::a::helper; fn run() { helper(); }")
+			r.update(t, "caller.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "helper", "a.rs")
+		}},
+		{"E explicit use removed", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.rs", "fn run() { helper(); }")
+			r.update(t, "caller.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+		}},
+		{"F alias changed", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper as old; fn run() { old(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.rs", "use crate::a::helper as new; fn run() { new(); }")
+			r.update(t, "caller.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "new", "a.rs")
+		}},
+		{"F2 alias changed, stale call", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper as old; fn run() { old(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "caller.rs", "use crate::a::helper as new; fn run() { old(); }")
+			r.update(t, "caller.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "old")
+		}},
+		{"G target renamed", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a.rs", "pub fn renamed() {}")
+			r.update(t, "a.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+		}},
+		{"H target deleted", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.remove(t, "a.rs")
+			r.update(t)
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+		}},
+		{"I mod declaration removed", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "lib.rs", "mod caller;")
+			r.update(t, "lib.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+		}},
+		{"J module moved", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.remove(t, "a.rs")
+			r.write(t, "b.rs", "pub fn helper() {}")
+			r.write(t, "lib.rs", "mod b; mod caller;")
+			r.write(t, "caller.rs", "use crate::b::helper; fn run() { helper(); }")
+			r.update(t)
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "helper", "b.rs")
+		}},
+		{"K visibility restricted", tree{
+			"lib.rs":    "mod a; mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a.rs", "fn helper() {}")
+			r.update(t, "a.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+		}},
+		{"L pub-use add/remove", tree{
+			"lib.rs":    "mod source; mod barrel; mod caller;",
+			"source.rs": "pub fn helper() {}",
+			"barrel.rs": "",
+			"caller.rs": "use crate::barrel::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+			r.write(t, "barrel.rs", "pub use crate::source::helper;")
+			r.update(t, "barrel.rs")
+			assertRustResolved(t, r, "caller.rs", "helper", "source.rs")
+			r.write(t, "barrel.rs", "")
+			r.update(t, "barrel.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newLifecycleRepo(t, tc.base)
+			tc.mutate(r, t)
+			r.assertFreshParity(t, tc.name)
+			tc.check(r, t)
+		})
+	}
+}
+
+func assertRustResolved(t *testing.T, r *lifecycleRepo, src, name, target string) {
+	t.Helper()
+	if got := r.edgeState(t, src, name); !strings.Contains(got, target) {
+		t.Fatalf("%s %s: want target %q, got %s", src, name, target, got)
+	}
+}
+
+func assertRustUnresolved(t *testing.T, r *lifecycleRepo, src, name string) {
+	t.Helper()
+	if got := r.edgeState(t, src, name); !strings.Contains(got, ":: [/") {
+		t.Fatalf("%s %s: want unresolved, got %s", src, name, got)
+	}
 }
 
 func newLifecycleRepo(t *testing.T, files tree) *lifecycleRepo {
