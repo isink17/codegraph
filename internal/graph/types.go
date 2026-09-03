@@ -14,19 +14,21 @@ type Position struct {
 }
 
 type Symbol struct {
-	ID            int64    `json:"symbol_id"`
-	FileID        int64    `json:"file_id"`
-	Language      string   `json:"language"`
-	Kind          string   `json:"kind"`
-	Name          string   `json:"name"`
-	QualifiedName string   `json:"qualified_name"`
-	ContainerName string   `json:"container_name,omitempty"`
-	Signature     string   `json:"signature,omitempty"`
-	Visibility    string   `json:"visibility,omitempty"`
-	Range         Position `json:"range"`
-	DocSummary    string   `json:"doc_summary,omitempty"`
-	StableKey     string   `json:"stable_key"`
-	FilePath      string   `json:"file,omitempty"`
+	ID            int64  `json:"symbol_id"`
+	FileID        int64  `json:"file_id"`
+	Language      string `json:"language"`
+	Kind          string `json:"kind"`
+	Name          string `json:"name"`
+	QualifiedName string `json:"qualified_name"`
+	ContainerName string `json:"container_name,omitempty"`
+	Signature     string `json:"signature,omitempty"`
+	Visibility    string `json:"visibility,omitempty"`
+	// Static is nil when the parser cannot prove declaration staticness.
+	Static     *bool    `json:"static,omitempty"`
+	Range      Position `json:"range"`
+	DocSummary string   `json:"doc_summary,omitempty"`
+	StableKey  string   `json:"stable_key"`
+	FilePath   string   `json:"file,omitempty"`
 }
 
 type Reference struct {

@@ -64,9 +64,9 @@ const (
 	// 124*8=992 variables, staying under sqliteDefaultMaxVariables.
 	sqliteTestLinkValuesBatchRows = 124
 
-	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 18 parameters.
-	// 55*18=990 variables, staying under sqliteDefaultMaxVariables.
-	sqliteSymbolValuesBatchRows = 55
+	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 19 parameters.
+	// 52*19=988 variables, staying under sqliteDefaultMaxVariables.
+	sqliteSymbolValuesBatchRows = 52
 	// sqliteSymbolFTSValuesBatchRows controls multi-row inserts into symbol_fts where each row uses 6 parameters.
 	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteSymbolFTSValuesBatchRows = 150
@@ -1759,7 +1759,7 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" {
+	if parsed.Language == "java" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path) VALUES(?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath); err != nil {
 			return nil, err
 		}
@@ -1877,7 +1877,7 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		return map[symbolRowKey]int64{}, nil
 	}
 
-	args := make([]any, len(symbols)*18)
+	args := make([]any, len(symbols)*19)
 	argIdx := 0
 	for _, sym := range symbols {
 		args[argIdx+0] = repoID
@@ -1889,16 +1889,19 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		args[argIdx+6] = sym.ContainerName
 		args[argIdx+7] = sym.Signature
 		args[argIdx+8] = sym.Visibility
-		args[argIdx+9] = sym.Range.StartLine
-		args[argIdx+10] = sym.Range.StartCol
-		args[argIdx+11] = sym.Range.EndLine
-		args[argIdx+12] = sym.Range.EndCol
-		args[argIdx+13] = sym.DocSummary
-		args[argIdx+14] = sym.StableKey
-		args[argIdx+15] = qualifiedSuffix(sym.QualifiedName)
-		args[argIdx+16] = dotTail2(sym.QualifiedName)
-		args[argIdx+17] = dotTail3(sym.QualifiedName)
-		argIdx += 18
+		if sym.Static != nil {
+			args[argIdx+9] = boolInt(*sym.Static)
+		}
+		args[argIdx+10] = sym.Range.StartLine
+		args[argIdx+11] = sym.Range.StartCol
+		args[argIdx+12] = sym.Range.EndLine
+		args[argIdx+13] = sym.Range.EndCol
+		args[argIdx+14] = sym.DocSummary
+		args[argIdx+15] = sym.StableKey
+		args[argIdx+16] = qualifiedSuffix(sym.QualifiedName)
+		args[argIdx+17] = dotTail2(sym.QualifiedName)
+		args[argIdx+18] = dotTail3(sym.QualifiedName)
+		argIdx += 19
 	}
 
 	rows, err := tx.QueryContext(ctx, symbolInsertSQL(len(symbols)), args...)
@@ -1942,8 +1945,8 @@ func symbolInsertSQL(n int) string {
 	if v, ok := symbolInsertSQLCache.Load(n); ok {
 		return v.(string)
 	}
-	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2, dot_tail3) VALUES "
-	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, is_static, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2, dot_tail3) VALUES "
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 	const suffix = " RETURNING id, stable_key, start_line, start_col"
 
 	var b strings.Builder
@@ -2141,7 +2144,7 @@ func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *Write
 // This is deliberately narrower than a general "is callable" test: it answers
 // only "can a reference at this line belong to this symbol's body?".
 func ownsSourceEdges(kind string) bool {
-	return kind == "function" || kind == "method"
+	return kind == "function" || kind == "method" || kind == "constructor"
 }
 
 type funcSpan struct {
@@ -2671,6 +2674,9 @@ type edgeTarget struct {
 // ensures it rather than assuming ResolveEdges ran first. An empty table vetoes
 // nothing, which is the correct reading for a strategy invoked in isolation.
 func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_java_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+resolverCppNamespaceScopesTable+`(symbol_id INTEGER PRIMARY KEY, scope TEXT NOT NULL) WITHOUT ROWID`); err != nil {
 		return err
 	}
@@ -2698,6 +2704,9 @@ func ensureResolverAmbiguousNamesTable(ctx context.Context, tx *sql.Tx) error {
 // no edge is waiting on. The tables still exist (empty), which every strategy
 // reads as "no test files, no vetoed names".
 func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID int64) error {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
 		return err
 	}
@@ -2853,6 +2862,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	if n, err := resolveJavaScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	}
@@ -2892,6 +2906,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverTestFilesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_targets`)
@@ -3043,6 +3058,9 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`); err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
@@ -4557,6 +4575,62 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 	}
 	targets = remaining
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	javaIDs := make(map[int64]struct{})
+	javaFiles := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage != "java" {
+			continue
+		}
+		javaFiles[target.srcFileID] = struct{}{}
+	}
+	if len(javaFiles) > 0 {
+		ids := make([]string, 0, len(javaFiles))
+		for id := range javaFiles {
+			ids = append(ids, strconv.FormatInt(id, 10))
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT file_id FROM file_scope_evidence WHERE repo_id=? AND file_id IN (`+strings.Join(ids, ",")+`)`, repoID)
+		if err != nil {
+			return outcome, err
+		}
+		seenFiles := map[int64]struct{}{}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return outcome, err
+			}
+			seenFiles[id] = struct{}{}
+		}
+		if err := rows.Close(); err != nil {
+			return outcome, err
+		}
+		for _, target := range targets {
+			if _, ok := seenFiles[target.srcFileID]; ok {
+				javaIDs[target.edgeID] = struct{}{}
+			}
+		}
+	}
+	if len(javaIDs) > 0 {
+		n, err := resolveJavaScope(ctx, s.db, repoID, javaIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if target.srcLanguage != "java" {
+				remaining = append(remaining, target)
+				continue
+			}
+			if _, scoped := javaIDs[target.edgeID]; !scoped {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
+	}
 	if len(targets) == 0 {
 		return outcome, nil
 	}

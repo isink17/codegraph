@@ -30,3 +30,13 @@ func TestJavaChainedCallPreservesInnerCall(t *testing.T) {
 		t.Fatalf("calls = %d, want 1", calls)
 	}
 }
+
+func TestJavaConstructorInvocationIsDistinct(t *testing.T) {
+	p, err := NewJava().Parse(context.Background(), "C.java", []byte(`class C { void f() { new a.b.Foo(1); } }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Edges) != 1 || p.Edges[0].Kind != "constructs" || p.Edges[0].DstName != "a.b.Foo" {
+		t.Fatalf("constructor edges = %+v", p.Edges)
+	}
+}

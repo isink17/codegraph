@@ -806,7 +806,7 @@ func TestJavaDotSuffixFreshParityAcrossTargetStates(t *testing.T) {
 	const renamed = "class X { class Y { class Z { static void m() {} } } }\n"
 
 	r := newLifecycleRepo(t, tree{"Caller.java": caller, "Target.java": target})
-	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, "Target.java") || !strings.Contains(got, "dot_suffix/low") {
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, "Target.java") || !strings.Contains(got, "java_package_scope/high") {
 		t.Fatalf("unique dot-suffix state: %s", got)
 	}
 	r.assertFreshParity(t, "unique")
@@ -820,7 +820,7 @@ func TestJavaDotSuffixFreshParityAcrossTargetStates(t *testing.T) {
 
 	r.remove(t, "Competitor.java")
 	r.update(t, "Competitor.java")
-	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, "Target.java") || !strings.Contains(got, "dot_suffix/low") {
+	if got := r.edgeState(t, "Caller.java", "A.B.C.m"); !strings.Contains(got, "Target.java") || !strings.Contains(got, "java_package_scope/high") {
 		t.Fatalf("competitor removal should recover dot-suffix: %s", got)
 	}
 	r.assertFreshParity(t, "competitor removed")
@@ -844,4 +844,77 @@ func TestJavaDotSuffixFreshParityAcrossTargetStates(t *testing.T) {
 		t.Fatalf("renamed target retained old binding: %s", got)
 	}
 	r.assertFreshParity(t, "target renamed")
+}
+
+func TestJavaPackageConstructorIncrementalMatrix(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   tree
+		mutate func(*lifecycleRepo, *testing.T)
+		want   string
+	}{
+		{"A same-class", tree{"A.java": "class A { void helper() {}\nvoid run() { helper(); }\n}"}, func(*lifecycleRepo, *testing.T) {}, "A.java"},
+		{"B same-package", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "a/C.java": "package a; class C { void x() {\n Foo.run();\n } }"}, func(*lifecycleRepo, *testing.T) {}, "a/Foo.java"},
+		{"C import added", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "b/C.java": "package b; class C { void x() {\n Foo.run();\n } }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b/C.java", "package b; import a.Foo; class C { void x() {\n Foo.run();\n } }")
+			r.update(t, "b/C.java")
+		}, "a/Foo.java"},
+		{"D import removed", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "b/C.java": "package b; import a.Foo; class C { void x() {\n Foo.run();\n } }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b/C.java", "package b; class C { void x() {\n Foo.run();\n } }")
+			r.update(t, "b/C.java")
+		}, ":: [/]"},
+		{"E wildcard competitor", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "b/C.java": "package b; import a.*; class C { void x() {\n Foo.run();\n } }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "c/Foo.java", `package c; public class Foo { public static void run() {} }`)
+			r.write(t, "b/C.java", "package b; import a.*; import c.*; class C { void x() {\n Foo.run();\n } }")
+			r.update(t, "c/Foo.java", "b/C.java")
+		}, ":: [/]"},
+		{"F wildcard competitor removed", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "c/Foo.java": `package c; public class Foo { public static void run() {} }`, "b/C.java": "package b; import a.*; import c.*; class C { void x() {\n Foo.run();\n } }"}, func(r *lifecycleRepo, t *testing.T) { r.remove(t, "c/Foo.java"); r.update(t, "c/Foo.java") }, "a/Foo.java"},
+		{"G static lifecycle", tree{"a/U.java": `package a; public class U { public void run() {} }`, "b/C.java": `package b; import static a.U.run; class C { void x() { run(); } }`}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a/U.java", `package a; public class U { public static void run() {} }`)
+			r.update(t, "a/U.java")
+		}, "a/U.java"},
+		{"H package changed", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "a/C.java": `package a; class C { void x() { Foo.run(); } }`}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a/Foo.java", `package b; public class Foo { public static void run() {} }`)
+			r.update(t, "a/Foo.java")
+		}, ":: [/]"},
+		{"I type renamed", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "a/C.java": `package a; class C { void x() { Foo.run(); } }`}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a/Foo.java", `package a; public class Bar { public static void run() {} }`)
+			r.update(t, "a/Foo.java")
+		}, ":: [/]"},
+		{"J member deleted", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "a/C.java": `package a; class C { void x() { Foo.run(); } }`}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a/Foo.java", `package a; public class Foo { }`)
+			r.update(t, "a/Foo.java")
+		}, ":: [/]"},
+		{"K constructor added", tree{"a/Foo.java": `package a; public class Foo { }`, "a/C.java": "package a; class C { void x() {\n new Foo();\n } }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a/Foo.java", `package a; public class Foo { public Foo() {} }`)
+			r.update(t, "a/Foo.java")
+		}, "a/Foo.java"},
+		{"L constructor overload ambiguity", tree{"a/Foo.java": `package a; public class Foo { public Foo(int x) {} }`, "a/C.java": "package a; class C { void x() {\n new Foo(1);\n } }"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a/Foo.java", `package a; public class Foo { public Foo(int x) {} public Foo(String x) {} }`)
+			r.update(t, "a/Foo.java")
+		}, ":: [/]"},
+		{"M visibility changed", tree{"a/Foo.java": `package a; public class Foo { public static void run() {} }`, "b/C.java": `package b; import a.Foo; class C { void x() { Foo.run(); } }`}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "a/Foo.java", `package a; public class Foo { static void run() {} }`)
+			r.update(t, "a/Foo.java")
+		}, ":: [/]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newLifecycleRepo(t, tc.base)
+			tc.mutate(r, t)
+			r.assertFreshParity(t, tc.name)
+			got := r.projection(t)
+			matched := false
+			for _, line := range got {
+				if strings.Contains(line, `-calls->`) || strings.Contains(line, `-constructs->`) {
+					if strings.Contains(line, tc.want) {
+						matched = true
+					}
+				}
+			}
+			if !matched {
+				t.Fatalf("%s: expected %q in %v", tc.name, tc.want, got)
+			}
+		})
+	}
 }
