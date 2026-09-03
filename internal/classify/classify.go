@@ -191,15 +191,28 @@ func nameUsedAsMember(callSite, name string) bool {
 // Evidence.ProjectDefinesTarget lookup for exactly those names and no others --
 // keeping the language sets in this package rather than in a caller's query.
 //
-// Only an unqualified name can be a builtin: `x.len()` is a method call, not
-// Go's `len`.
+// Go and Python builtins must be unqualified. TypeScript additionally accepts
+// a qualified name when its first component is a curated ECMAScript intrinsic
+// root (`JSON.stringify`), never based on the member tail.
 func BuiltinCandidate(language, dstName string) (string, bool) {
 	name := strings.TrimSpace(dstName)
-	if name == "" || strings.ContainsAny(name, ".:/->") {
+	if name == "" {
 		return "", false
 	}
 	builtins, ok := builtinsByLanguage[language]
 	if !ok {
+		return "", false
+	}
+	if language == "typescript" {
+		root, _, qualified := strings.Cut(name, ".")
+		if qualified {
+			if builtins[root] {
+				return root, true
+			}
+			return "", false
+		}
+	}
+	if strings.ContainsAny(name, ".:/->") {
 		return "", false
 	}
 	if !builtins[name] {

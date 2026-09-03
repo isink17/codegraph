@@ -80,6 +80,27 @@ func (f *classifyFixture) assertClassification(t *testing.T, dstName, want strin
 	return edge
 }
 
+func TestTargetClassification_TypeScriptIntrinsicShadowIsBatchedAndLanguageScoped(t *testing.T) {
+	f := newClassifyFixture(t)
+
+	tsFile := f.file(t, "src/ts/caller.ts", "typescript")
+	tsSymbol := f.symbol(t, tsFile, "run", "caller.run", "typescript")
+	f.edge(t, tsFile, tsSymbol, "Array.isArray")
+	f.edge(t, tsFile, tsSymbol, "JSON.stringify")
+
+	// A same-spelled symbol in another language is not shadow evidence.
+	goFile := f.file(t, "src/go/array.go", "go")
+	f.symbol(t, goFile, "Array", "array.Array", "go")
+	if got := f.assertClassification(t, "Array.isArray", classify.Builtin).TargetClassification; got != classify.Builtin {
+		t.Fatalf("cross-language Array shadow = %q", got)
+	}
+	f.assertClassification(t, "JSON.stringify", classify.Builtin)
+
+	shadowFile := f.file(t, "src/ts/shadow.ts", "typescript")
+	f.symbol(t, shadowFile, "Array", "shadow.Array", "typescript")
+	f.assertClassification(t, "Array.isArray", classify.Unknown)
+}
+
 // TestTargetClassification_PythonBuiltinSurvivesCrossLanguageNameCollision is
 // the adversarial audit's case A at the store level: Python calls the builtin
 // `sorted`, and the only project definition of that name is an unrelated Swift

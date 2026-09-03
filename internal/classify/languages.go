@@ -12,15 +12,34 @@ package classify
 // unarguable. A name is left out when including it would require an assumption
 // about how the project is built, packaged, or deployed.
 
-// builtinsByLanguage holds predeclared identifiers that are callable with no
-// import and no project definition. Only languages whose parser actually emits
-// such calls as edges appear here; the rest classify builtins as `unknown`
-// rather than pretending to a set that was never validated.
+// builtinsByLanguage holds callable language intrinsics that need no import and
+// no project definition. Only languages whose parser actually emits such calls
+// as edges appear here; the rest classify builtins as `unknown`.
 //
 // A language's absence from this map means "no builtin rule", not "no builtins".
 var builtinsByLanguage = map[string]map[string]bool{
-	"go":     goBuiltins,
-	"python": pythonBuiltins,
+	"go":         goBuiltins,
+	"python":     pythonBuiltins,
+	"typescript": typescriptBuiltins,
+}
+
+// typescriptBuiltins contains ECMAScript globals whose identity is guaranteed
+// by the language/runtime specification. Runtime-specific globals such as
+// console, Buffer, and process are intentionally absent: a .ts/.js file does
+// not prove that it targets Node or a browser.
+var typescriptBuiltins = map[string]bool{
+	"Array": true, "BigInt": true, "Boolean": true, "Date": true,
+	"Error": true, "EvalError": true, "FinalizationRegistry": true,
+	"Function": true, "Map": true, "Number": true, "Object": true,
+	"Promise": true, "Proxy": true, "RangeError": true, "ReferenceError": true,
+	"RegExp": true, "Set": true, "String": true, "Symbol": true,
+	"SyntaxError": true, "TypeError": true, "URIError": true, "WeakMap": true,
+	"WeakRef": true, "WeakSet": true, "JSON": true, "Math": true,
+	"Reflect": true, "Intl": true,
+	// Directly callable ECMAScript globals.
+	"decodeURI": true, "decodeURIComponent": true, "encodeURI": true,
+	"encodeURIComponent": true, "eval": true, "isFinite": true, "isNaN": true,
+	"parseFloat": true, "parseInt": true,
 }
 
 // goBuiltins is the complete predeclared identifier set from the Go spec's
@@ -209,6 +228,14 @@ var nodeCoreModules = map[string]bool{
 	"sys": true, "timers": true, "tls": true, "trace_events": true,
 	"tty": true, "url": true, "util": true, "v8": true, "vm": true,
 	"wasi": true, "worker_threads": true, "zlib": true,
+}
+
+// canonicalLanguages is the persisted language vocabulary used by the
+// default parser registries. Capabilities() exposes it as a deterministic
+// coverage table; internal/cli tests compare that table with the live registry.
+var canonicalLanguages = []string{
+	"cpp", "csharp", "go", "java", "kotlin", "php", "python", "ruby",
+	"rust", "swift", "typescript",
 }
 
 // shadowingGap documents the one asymmetry in how project evidence is used.

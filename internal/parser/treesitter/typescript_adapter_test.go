@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -30,6 +31,27 @@ func TestTypeScriptCallEvidenceUsesSemanticCalleeNames(t *testing.T) {
 	pf, err := NewTypeScript().Parse(context.Background(), "fixture.ts", []byte(multiLine))
 	if err != nil || len(pf.Edges) != 1 || pf.Edges[0].Line != 2 || len(pf.References) != 1 || pf.References[0].Range.StartLine != 2 {
 		t.Fatalf("source attribution = edges %#v references %#v err=%v", pf.Edges, pf.References, err)
+	}
+}
+
+func TestTypeScriptIntrinsicCallEvidencePreservesQualifiedNames(t *testing.T) {
+	p, err := NewTypeScript().Parse(context.Background(), "intrinsics.ts", []byte(`function run(x: unknown) {
+  JSON.stringify(x);
+  Array.isArray(x);
+  Object.keys(x as object);
+  Math.max(1, 2);
+  Promise.resolve(x);
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, edge := range p.Edges {
+		got = append(got, edge.DstName)
+	}
+	want := []string{"JSON.stringify", "Array.isArray", "Object.keys", "Math.max", "Promise.resolve"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("intrinsic calls = %v, want %v", got, want)
 	}
 }
 
