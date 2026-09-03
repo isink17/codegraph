@@ -970,11 +970,11 @@ func cppQualifiedName(container, name string) string {
 	if name == "" {
 		return ""
 	}
-	if strings.Contains(name, "::") {
-		return name
-	}
 	container = strings.TrimSpace(container)
 	if container == "" {
+		return name
+	}
+	if strings.HasPrefix(name, "::") || name == container || strings.HasPrefix(name, container+"::") {
 		return name
 	}
 	return container + "::" + name

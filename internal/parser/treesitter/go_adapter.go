@@ -165,7 +165,7 @@ func goMethodSymbol(fn *sitter.Node, pkg string, content []byte) graph.Symbol {
 
 	return graph.Symbol{
 		Language:      "go",
-		Kind:          "function",
+		Kind:          "method",
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: recv,
@@ -194,9 +194,17 @@ func goReceiverType(fn *sitter.Node, content []byte) string {
 			typeNode = params[0].Child(int(params[0].ChildCount()) - 1)
 		}
 	}
-	text := nodeText(typeNode, content)
-	text = strings.TrimPrefix(text, "*")
-	return text
+	return goReceiverName(nodeText(typeNode, content))
+}
+
+func goReceiverName(text string) string {
+	text = strings.TrimSpace(strings.TrimPrefix(text, "*"))
+	text = strings.TrimSpace(strings.TrimPrefix(text, "("))
+	text = strings.TrimSpace(strings.TrimSuffix(text, ")"))
+	if i := strings.IndexByte(text, '['); i >= 0 {
+		text = text[:i]
+	}
+	return strings.TrimSpace(text)
 }
 
 func goTypeSymbol(typeSpec *sitter.Node, pkg string, content []byte) graph.Symbol {
@@ -324,15 +332,22 @@ func goCallName(fnNode *sitter.Node, content []byte, imports map[string]string) 
 		left := childByFieldName(fnNode, "operand")
 		right := childByFieldName(fnNode, "field")
 		if left == nil || right == nil {
-			return nodeText(fnNode, content)
+			return ""
 		}
-		leftText := nodeText(left, content)
+		leftText := goCallName(left, content, imports)
+		if leftText == "" {
+			return ""
+		}
 		rightText := nodeText(right, content)
 		if importPath, ok := imports[leftText]; ok {
 			return importPath + "." + rightText
 		}
 		return leftText + "." + rightText
+	case "parenthesized_expression":
+		return goCallName(fnNode.NamedChild(0), content, imports)
+	case "type_instantiation_expression":
+		return goCallName(childByFieldName(fnNode, "function"), content, imports)
 	default:
-		return nodeText(fnNode, content)
+		return ""
 	}
 }
