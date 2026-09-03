@@ -57,10 +57,38 @@ type ParsedFile struct {
 	References []Reference
 	Edges      []Edge
 	Imports    []string
+	Scope      ScopeEvidence
 	ReExports  []ReExport
 	FileTokens map[string]float64
 	TestLinks  []TestLink
 }
+
+// ScopeEvidence contains syntax-proven facts used by later language-specific
+// resolvers. It deliberately contains no destination identity.
+type ScopeEvidence struct {
+	Package string
+	Imports []ScopeImport
+}
+
+type ScopeImport struct {
+	SourceSpecifier string
+	ImportedName    string
+	LocalName       string
+	Kind            string
+	Wildcard        bool
+	Static          bool
+	ReExport        bool
+	NamespaceExport bool
+	TypeOnly        bool
+}
+
+const (
+	ScopeImportNamed      = "named"
+	ScopeImportDefault    = "default"
+	ScopeImportNamespace  = "namespace"
+	ScopeImportSideEffect = "side_effect"
+	ScopeImportUse        = "use"
+)
 
 type ReExport struct {
 	Source       string

@@ -34,6 +34,7 @@ func (a *RustAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	pf := graph.ParsedFile{
 		Language:   "rust",
+		Scope:      graph.ScopeEvidence{},
 		FileTokens: computeFileTokens(content),
 	}
 
@@ -51,6 +52,8 @@ func rustExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile)
 		arg := childByFieldName(use, "argument")
 		if arg != nil {
 			pf.Imports = append(pf.Imports, nodeText(arg, content))
+			public := use.StartByte() >= 4 && strings.HasSuffix(string(content[:use.StartByte()]), "pub ")
+			addRustScope(nodeText(use, content), public, &pf.Scope.Imports)
 		}
 	}
 }

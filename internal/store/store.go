@@ -87,6 +87,13 @@ type Store struct {
 	neighborStmts atomic.Int64
 }
 
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
 type OpenOptions struct {
 	PerformanceProfile string
 }
@@ -1404,6 +1411,12 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM file_imports WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM scope_import_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+	if err := execInChunks(`DELETE FROM file_scope_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM file_tokens WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -1532,6 +1545,12 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM file_imports WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM scope_import_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM file_scope_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM file_tokens WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -1723,6 +1742,28 @@ func insertParsedFileGraph(
 		}
 		if len(importArgs) > 0 {
 			if err := execImportsInsert(ctx, tx, importArgs, stats); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if parsed.Scope.Package != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name) VALUES(?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package); err != nil {
+			return nil, err
+		}
+	}
+	if len(parsed.Scope.Imports) > 0 {
+		args := make([]any, 0, min(len(parsed.Scope.Imports), sqliteImportValuesBatchRows)*12)
+		for _, evidence := range parsed.Scope.Imports {
+			args = append(args, repoID, fileID, parsed.Language, evidence.SourceSpecifier, evidence.ImportedName, evidence.LocalName, evidence.Kind, boolInt(evidence.Wildcard), boolInt(evidence.Static), boolInt(evidence.ReExport), boolInt(evidence.NamespaceExport), boolInt(evidence.TypeOnly))
+			if len(args) >= sqliteImportValuesBatchRows*12 {
+				if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only", 12, args, stats); err != nil {
+					return nil, err
+				}
+				args = args[:0]
+			}
+		}
+		if len(args) > 0 {
+			if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only", 12, args, stats); err != nil {
 				return nil, err
 			}
 		}

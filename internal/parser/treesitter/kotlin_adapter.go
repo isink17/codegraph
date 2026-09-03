@@ -35,6 +35,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	pf := graph.ParsedFile{
 		Language:   "kotlin",
+		Scope:      graph.ScopeEvidence{Package: packageEvidence(content, "kotlin")},
 		FileTokens: computeFileTokens(content),
 	}
 
@@ -53,6 +54,7 @@ func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFil
 		if ident != nil {
 			pf.Imports = append(pf.Imports, nodeText(ident, content))
 		}
+		addKotlinScope(nodeText(imp, content), &pf.Scope.Imports)
 	}
 }
 

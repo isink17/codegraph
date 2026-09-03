@@ -34,6 +34,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	pf := graph.ParsedFile{
 		Language:   "java",
+		Scope:      graph.ScopeEvidence{Package: packageEvidence(content, "java")},
 		FileTokens: computeFileTokens(content),
 	}
 
@@ -52,6 +53,7 @@ func javaExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile)
 		scoped := firstChild(imp, "scoped_identifier")
 		if scoped != nil {
 			pf.Imports = append(pf.Imports, nodeText(scoped, content))
+			addJavaScope(nodeText(imp, content), &pf.Scope.Imports)
 		}
 	}
 }
