@@ -63,6 +63,31 @@ void caller() { ::global(); alpha::foo(); alpha::beta::foo(); }
 	}
 }
 
+func TestCppOutOfLineDefinitionKeepsLexicalNamespace(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{"nested", `namespace ns { struct A { void f(); }; void A::f() {} }`, []string{"ns::A::f", "ns::A::f"}},
+		{"explicit", `void ns::A::f() {}`, []string{"ns::A::f"}},
+		{"already-scoped", `namespace ns { void ns::A::f() {} }`, []string{"ns::A::f"}},
+		{"deep", `namespace outer { namespace inner { struct B { void g(); }; void B::g() {} } }`, []string{"outer::inner::B::g", "outer::inner::B::g"}},
+	}
+	for _, tc := range cases {
+		syms := parseCppSymbols(t, tc.name+".cpp", tc.src)
+		var got []string
+		for _, sym := range syms {
+			if strings.HasSuffix(sym.QualifiedName, "::f") || strings.HasSuffix(sym.QualifiedName, "::g") {
+				got = append(got, sym.QualifiedName)
+			}
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%s identities = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestCppAnonymousAndInlineNamespaceIdentity(t *testing.T) {
 	src := `inline namespace v1 { void inline_fn() {} }
 namespace a { namespace b { void nested() {} } }

@@ -157,13 +157,17 @@ func buildFuncSymbol(fset *token.FileSet, pkg string, fn *ast.FuncDecl, doc stri
 	qualified := pkg + "." + name
 	container := pkg
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
-		recv := renderExpr(fn.Recv.List[0].Type)
+		recv := receiverName(fn.Recv.List[0].Type)
 		container = recv
 		qualified = pkg + "." + recv + "." + name
 	}
+	kind := "function"
+	if fn.Recv != nil && len(fn.Recv.List) > 0 {
+		kind = "method"
+	}
 	return graph.Symbol{
 		Language:      "go",
-		Kind:          "function",
+		Kind:          kind,
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: container,
@@ -208,7 +212,7 @@ func buildValueSymbol(fset *token.FileSet, pkg string, ident *ast.Ident, doc str
 
 func stableFuncKey(pkg string, fn *ast.FuncDecl) string {
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
-		return "func:" + pkg + ":" + renderExpr(fn.Recv.List[0].Type) + ":" + fn.Name.Name
+		return "func:" + pkg + ":" + receiverName(fn.Recv.List[0].Type) + ":" + fn.Name.Name
 	}
 	return "func:" + pkg + "::" + fn.Name.Name
 }
@@ -228,13 +232,43 @@ func callName(expr ast.Expr, imports map[string]string) string {
 	case *ast.Ident:
 		return e.Name
 	case *ast.SelectorExpr:
-		left := renderExpr(e.X)
+		left := callName(e.X, imports)
+		if left == "" {
+			return ""
+		}
 		if importPath, ok := imports[left]; ok {
 			return importPath + "." + e.Sel.Name
 		}
 		return left + "." + e.Sel.Name
+	case *ast.ParenExpr:
+		return callName(e.X, imports)
+	case *ast.IndexListExpr:
+		return callName(e.X, imports)
 	default:
-		return renderExpr(expr)
+		return ""
+	}
+}
+
+func receiverName(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		left := receiverName(e.X)
+		if left == "" {
+			return ""
+		}
+		return left + "." + e.Sel.Name
+	case *ast.ParenExpr:
+		return receiverName(e.X)
+	case *ast.StarExpr:
+		return receiverName(e.X)
+	case *ast.IndexExpr:
+		return receiverName(e.X)
+	case *ast.IndexListExpr:
+		return receiverName(e.X)
+	default:
+		return ""
 	}
 }
 
@@ -340,6 +374,16 @@ func printer(buf *bytes.Buffer, expr ast.Expr) error {
 		_ = printer(buf, e.X)
 		buf.WriteByte('[')
 		_ = printer(buf, e.Index)
+		buf.WriteByte(']')
+	case *ast.IndexListExpr:
+		_ = printer(buf, e.X)
+		buf.WriteByte('[')
+		for i, index := range e.Indices {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			_ = printer(buf, index)
+		}
 		buf.WriteByte(']')
 	default:
 		buf.WriteString(fmt.Sprintf("%T", expr))
