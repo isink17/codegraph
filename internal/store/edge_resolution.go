@@ -135,6 +135,7 @@ const (
 	ResolutionStrategyJavaConstructor        = "java_constructor"
 	ResolutionStrategyKotlinPackageScope     = "kotlin_package_scope"
 	ResolutionStrategyKotlinImportScope      = "kotlin_import_scope"
+	ResolutionStrategyTypeScriptModuleScope  = "typescript_module_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -200,6 +201,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyJavaConstructor:        ResolutionConfidenceHigh,
 	ResolutionStrategyKotlinPackageScope:     ResolutionConfidenceHigh,
 	ResolutionStrategyKotlinImportScope:      ResolutionConfidenceHigh,
+	ResolutionStrategyTypeScriptModuleScope:  ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -232,6 +234,7 @@ var binderStrategies = []string{
 	ResolutionStrategyDotTail3,
 	ResolutionStrategyExactName,
 	ResolutionStrategyGoPackageScope,
+	ResolutionStrategyTypeScriptModuleScope,
 }
 
 // incrementallyRedecidableStrategies is every strategy whose bindings may be

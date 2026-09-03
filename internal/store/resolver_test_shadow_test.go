@@ -53,11 +53,17 @@ func testShadowScenarios() []ambiguityScenario {
 			build: func(t *testing.T, f *gateFixture) (int64, int64, string, string) {
 				production := f.file(t, "src/app/parseUrl.ts", "typescript")
 				want := f.symbol(t, production, "parseUrl", "app.parseUrl", "typescript")
+				if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind,is_reexport) VALUES(?,?,?,?,?,?,?,?)`, f.repoID, production, "typescript", "", "parseUrl", "parseUrl", "named", 1); err != nil {
+					t.Fatal(err)
+				}
 				shadow := f.file(t, "src/app/parseUrl.spec.ts", "typescript")
 				f.symbol(t, shadow, "parseUrl", "app.spec.parseUrl", "typescript")
 
 				caller := f.file(t, "src/app/router.ts", "typescript")
 				src := f.symbol(t, caller, "route", "app.route", "typescript")
+				if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,?,?,?,?,?)`, f.repoID, caller, "typescript", "./parseUrl", "parseUrl", "parseUrl", "named"); err != nil {
+					t.Fatal(err)
+				}
 				return f.edge(t, caller, src, "parseUrl"), want, "src/app/router.ts", "parseUrl"
 			},
 		},

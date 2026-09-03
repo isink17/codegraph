@@ -133,6 +133,10 @@ func addTypeScriptImport(text string, out *[]graph.ScopeImport) {
 		return
 	}
 	clause := strings.TrimSpace(strings.TrimSuffix(head[:from], "from"))
+	if comma := strings.Index(clause, ","); comma > 0 && strings.Contains(clause[comma+1:], "{") {
+		*out = append(*out, graph.ScopeImport{SourceSpecifier: source, ImportedName: "default", LocalName: strings.TrimSpace(clause[:comma]), Kind: graph.ScopeImportDefault, TypeOnly: typeOnly})
+		clause = strings.TrimSpace(clause[comma+1:])
+	}
 	if strings.HasPrefix(clause, "{") {
 		for _, item := range strings.Split(strings.Trim(clause, "{} "), ",") {
 			p := strings.Fields(strings.TrimSpace(item))

@@ -997,7 +997,11 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	parsed := graph.ParsedFile{Language: task.language}
 	if task.adapter != nil {
 		parseStarted := time.Now()
-		parsed, err = task.adapter.Parse(ctx, task.path, content)
+		parsePath := task.path
+		if task.language == "typescript" {
+			parsePath = task.rel
+		}
+		parsed, err = task.adapter.Parse(ctx, parsePath, content)
 		result.parseDur = time.Since(parseStarted)
 		if err != nil {
 			if parseErrorPolicy == "best_effort" {

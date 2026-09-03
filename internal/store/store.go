@@ -2713,6 +2713,9 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
 		return err
 	}
@@ -2737,6 +2740,9 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	// runs anyway reads them as "no test files, no vetoed names, no imports"
 	// rather than failing.
 	if err := ensureResolverAmbiguousNamesTable(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+tsScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return err
 	}
 
@@ -2878,6 +2884,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	if n, err := resolveTypeScriptScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	}
@@ -2919,6 +2930,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_resolution`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
@@ -3620,6 +3632,11 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	names = mergeResolverNames(names, rustNames)
+	tsNames, err := s.invalidateTypeScriptScopeBindings(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, tsNames)
 	scopeNames, err := s.typeScopeNamesForChangedPaths(ctx, repoID, paths, scopes)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -4691,6 +4708,26 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 				continue
 			}
 			if _, scoped := kotlinIDs[target.edgeID]; !scoped {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
+	}
+	tsIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage == "typescript" {
+			tsIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(tsIDs) > 0 {
+		n, err := resolveTypeScriptScope(ctx, s.db, repoID, tsIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if target.srcLanguage != "typescript" {
 				remaining = append(remaining, target)
 			}
 		}
