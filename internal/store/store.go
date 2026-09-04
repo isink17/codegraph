@@ -1421,6 +1421,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM scope_import_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM rust_module_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -1558,6 +1561,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM scope_import_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM rust_module_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -1786,6 +1792,25 @@ func insertParsedFileGraph(
 		}
 		if len(args) > 0 {
 			if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only, owner_module", 13, args, stats); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if parsed.Language == "typescript" {
+		args := make([]any, 0, len(parsed.Scope.Imports)*4)
+		seen := make(map[string]struct{}, len(parsed.Scope.Imports))
+		for _, evidence := range parsed.Scope.Imports {
+			for _, candidate := range typescriptModuleCandidatePaths(filePath, evidence.SourceSpecifier) {
+				key := evidence.SourceSpecifier + "\x00" + candidate
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				args = append(args, repoID, fileID, evidence.SourceSpecifier, candidate)
+			}
+		}
+		if len(args) > 0 {
+			if err := execBatchInsert(ctx, tx, "scope_module_candidate_evidence", "repo_id, source_file_id, source_specifier, candidate_path", 4, args, stats); err != nil {
 				return nil, err
 			}
 		}
@@ -2713,6 +2738,9 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
 		return err
 	}
@@ -2737,6 +2765,9 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	// runs anyway reads them as "no test files, no vetoed names, no imports"
 	// rather than failing.
 	if err := ensureResolverAmbiguousNamesTable(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+tsScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return err
 	}
 
@@ -2878,6 +2909,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	if n, err := resolveTypeScriptScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	}
@@ -2919,6 +2955,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_resolution`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
@@ -3620,6 +3657,11 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	names = mergeResolverNames(names, rustNames)
+	tsNames, err := s.invalidateTypeScriptScopeBindings(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, tsNames)
 	scopeNames, err := s.typeScopeNamesForChangedPaths(ctx, repoID, paths, scopes)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -4691,6 +4733,26 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 				continue
 			}
 			if _, scoped := kotlinIDs[target.edgeID]; !scoped {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
+	}
+	tsIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage == "typescript" {
+			tsIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(tsIDs) > 0 {
+		n, err := resolveTypeScriptScope(ctx, s.db, repoID, tsIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if target.srcLanguage != "typescript" {
 				remaining = append(remaining, target)
 			}
 		}

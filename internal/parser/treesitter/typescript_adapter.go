@@ -45,7 +45,7 @@ func (a *TypeScriptAdapter) Parse(ctx context.Context, path string, content []by
 		return graph.ParsedFile{}, err
 	}
 
-	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	module := strings.TrimSuffix(filepath.ToSlash(path), filepath.Ext(path))
 	pf := graph.ParsedFile{
 		Language:   "typescript",
 		FileTokens: computeFileTokens(content),
@@ -80,6 +80,18 @@ func tsExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			src = firstChild(export, "string")
 		}
 		if src == nil {
+			if clause := childByFieldName(export, "export_clause"); clause != nil {
+				for _, spec := range findDescendants(clause, "export_specifier") {
+					name := nodeText(childByFieldName(spec, "name"), content)
+					alias := nodeText(childByFieldName(spec, "alias"), content)
+					if name != "" {
+						if alias == "" {
+							alias = name
+						}
+						pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{ImportedName: name, LocalName: alias, Kind: graph.ScopeImportNamed, ReExport: true})
+					}
+				}
+			}
 			continue
 		}
 		source := strings.Trim(nodeText(src, content), `"'`)
@@ -139,11 +151,11 @@ func tsExtractSymbols(node *sitter.Node, module, container string, content []byt
 		case "function_declaration":
 			tsAddFunction(child, module, container, false, content, pf)
 		case "class_declaration":
-			tsAddClass(child, module, content, pf)
+			tsAddClass(child, module, false, content, pf)
 		case "interface_declaration":
-			tsAddType(child, module, "interface", content, pf)
+			tsAddType(child, module, "interface", false, content, pf)
 		case "type_alias_declaration":
-			tsAddType(child, module, "type", content, pf)
+			tsAddType(child, module, "type", false, content, pf)
 		case "export_statement":
 			tsExtractExportedSymbol(child, module, container, content, pf)
 		case "lexical_declaration", "variable_declaration":
@@ -155,21 +167,39 @@ func tsExtractSymbols(node *sitter.Node, module, container string, content []byt
 }
 
 func tsExtractExportedSymbol(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+	isDefault := strings.Contains(nodeText(node, content), "export default")
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
 		case "function_declaration":
 			tsAddFunction(child, module, container, true, content, pf)
+			if isDefault {
+				if name := nodeText(childByFieldName(child, "name"), content); name != "" {
+					pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{ImportedName: "default", LocalName: name, Kind: graph.ScopeImportDefault, ReExport: true})
+				}
+			}
 		case "class_declaration":
-			tsAddClass(child, module, content, pf)
+			tsAddClass(child, module, true, content, pf)
+			if isDefault {
+				if name := nodeText(childByFieldName(child, "name"), content); name != "" {
+					pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{ImportedName: "default", LocalName: name, Kind: graph.ScopeImportDefault, ReExport: true})
+				}
+			}
 		case "interface_declaration":
-			tsAddType(child, module, "interface", content, pf)
+			tsAddType(child, module, "interface", true, content, pf)
 		case "type_alias_declaration":
-			tsAddType(child, module, "type", content, pf)
+			tsAddType(child, module, "type", true, content, pf)
 		case "lexical_declaration", "variable_declaration":
 			tsExtractArrowFunctions(child, module, container, true, content, pf)
 		}
 	}
+}
+
+func tsVisibility(exported bool) string {
+	if exported {
+		return "public"
+	}
+	return "private"
 }
 
 func tsAddFunction(node *sitter.Node, module, container string, exported bool, content []byte, pf *graph.ParsedFile) {
@@ -189,7 +219,7 @@ func tsAddFunction(node *sitter.Node, module, container string, exported bool, c
 	if container != "" && container != module {
 		qualified = module + "." + container + "." + name
 	}
-	vis := heuristicVisibility(name)
+	vis := "private"
 	if exported {
 		vis = "public"
 	}
@@ -207,7 +237,7 @@ func tsAddFunction(node *sitter.Node, module, container string, exported bool, c
 	})
 }
 
-func tsAddClass(node *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
+func tsAddClass(node *sitter.Node, module string, exported bool, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
@@ -220,7 +250,7 @@ func tsAddClass(node *sitter.Node, module string, content []byte, pf *graph.Pars
 		Name:          name,
 		QualifiedName: module + "." + name,
 		ContainerName: module,
-		Visibility:    "public",
+		Visibility:    tsVisibility(exported),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "type:typescript:" + module + ":" + name,
@@ -232,7 +262,7 @@ func tsAddClass(node *sitter.Node, module string, content []byte, pf *graph.Pars
 	}
 }
 
-func tsAddType(node *sitter.Node, module, kind string, content []byte, pf *graph.ParsedFile) {
+func tsAddType(node *sitter.Node, module, kind string, exported bool, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
@@ -245,7 +275,7 @@ func tsAddType(node *sitter.Node, module, kind string, content []byte, pf *graph
 		Name:          name,
 		QualifiedName: module + "." + name,
 		ContainerName: module,
-		Visibility:    "public",
+		Visibility:    tsVisibility(exported),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "type:typescript:" + module + ":" + name,
