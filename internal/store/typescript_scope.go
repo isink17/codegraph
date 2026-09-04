@@ -191,11 +191,22 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 				paths = append(paths, p)
 			}
 			sort.Strings(paths)
-			pathArgs := []any{repoID}
+			storedPaths := map[string]struct{}{}
 			for _, p := range paths {
+				for _, variant := range storedPathVariants(p) {
+					storedPaths[variant] = struct{}{}
+				}
+			}
+			variants := make([]string, 0, len(storedPaths))
+			for p := range storedPaths {
+				variants = append(variants, p)
+			}
+			sort.Strings(variants)
+			pathArgs := []any{repoID}
+			for _, p := range variants {
 				pathArgs = append(pathArgs, p)
 			}
-			fileRows, qerr := q.QueryContext(ctx, `SELECT id,path FROM files WHERE repo_id=? AND is_deleted=0 AND path IN (`+tsPlaceholders(len(paths))+`)`, pathArgs...)
+			fileRows, qerr := q.QueryContext(ctx, `SELECT id,path FROM files WHERE repo_id=? AND is_deleted=0 AND path IN (`+tsPlaceholders(len(variants))+`)`, pathArgs...)
 			if qerr != nil {
 				return 0, qerr
 			}

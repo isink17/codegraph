@@ -202,6 +202,56 @@ func TestTypeScriptModuleCandidatePaths(t *testing.T) {
 	}
 }
 
+func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetFile, err := insertTestFileLang(ctx, s, repo.ID, `ts\a.ts`, "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := insertTestSymbolLang(ctx, s, repo.ID, targetFile, "helper", "a.helper", "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE symbols SET visibility='public' WHERE id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	callerFile, err := insertTestFileLang(ctx, s, repo.ID, `ts\b.ts`, "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller, err := insertTestSymbolLang(ctx, s, repo.ID, callerFile, "run", "b.run", "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,?,?,?,?,?)`, repo.ID, callerFile, "typescript", "./a", "helper", "helper", "named"); err != nil {
+		t.Fatal(err)
+	}
+	edge, err := insertTestEdge(ctx, s, repo.ID, callerFile, caller, "helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveTypeScriptScope(ctx, s.db, repo.ID, map[int64]struct{}{edge: {}}); err != nil {
+		t.Fatal(err)
+	}
+	var got sql.NullInt64
+	var strategy string
+	if err := s.db.QueryRow(`SELECT dst_symbol_id,resolution_strategy FROM edges WHERE id=?`, edge).Scan(&got, &strategy); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Valid || got.Int64 != int64(target) || strategy != ResolutionStrategyTypeScriptModuleScope {
+		t.Fatalf("scoped Windows-path resolution=(%v,%d,%q), want target %d/%q", got.Valid, got.Int64, strategy, target, ResolutionStrategyTypeScriptModuleScope)
+	}
+}
+
 func TestTypeScriptCandidateReverseLookupInvalidatesUnchangedCaller(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
