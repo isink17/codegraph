@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -80,6 +82,39 @@ func TestV2MissingMigrationMetadataWithUserTableRejected(t *testing.T) {
 	}
 }
 
+func TestV2LockedFormatValidationRejectsFutureMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	setUserVersion(t, path, DatabaseFormatUserVersion+1)
+	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(SQLiteDriverName(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDatabaseFormat(context.Background(), conn, path); err == nil {
+		t.Fatal("locked validation accepted future marker")
+	}
+	if _, err := conn.ExecContext(context.Background(), `ROLLBACK`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestV2FutureUserVersionDoesNotMutate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
 	s, err := Open(path)
@@ -93,11 +128,7 @@ func TestV2FutureUserVersionDoesNotMutate(t *testing.T) {
 		t.Fatal("future database opened")
 	}
 	got := snapshotSQLiteArtifacts(t, path)
-	for name, before := range want {
-		if string(got[name]) != string(before) {
-			t.Fatalf("artifact mutated: %s", name)
-		}
-	}
+	assertSQLiteArtifactsEqual(t, want, got)
 }
 
 func TestV2FutureMigrationDoesNotOpen(t *testing.T) {
@@ -120,9 +151,11 @@ func TestV2FutureMigrationDoesNotOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
+	want := snapshotSQLiteArtifacts(t, path)
 	if _, err := Open(path); err == nil {
 		t.Fatal("future migration database opened")
 	}
+	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
 }
 
 func TestV2MalformedMigrationMetadataRejected(t *testing.T) {
@@ -145,9 +178,11 @@ func TestV2MalformedMigrationMetadataRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
+	want := snapshotSQLiteArtifacts(t, path)
 	if _, err := Open(path); err == nil {
 		t.Fatal("malformed migration metadata opened")
 	}
+	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
 }
 
 func setUserVersion(t *testing.T, path string, version int) {
@@ -187,14 +222,36 @@ func createSQLiteShell(t *testing.T, path, statement string) {
 	}
 }
 
-func snapshotSQLiteArtifacts(t *testing.T, path string) map[string][]byte {
+type sqliteArtifact struct {
+	exists bool
+	data   []byte
+}
+
+func snapshotSQLiteArtifacts(t *testing.T, path string) map[string]sqliteArtifact {
 	t.Helper()
-	out := map[string][]byte{}
+	out := map[string]sqliteArtifact{}
 	for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
 		data, err := os.ReadFile(candidate)
 		if err == nil {
-			out[candidate] = data
+			out[candidate] = sqliteArtifact{exists: true, data: data}
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("read artifact %s: %v", candidate, err)
 		}
 	}
 	return out
+}
+
+func assertSQLiteArtifactsEqual(t *testing.T, want, got map[string]sqliteArtifact) {
+	t.Helper()
+	for path, before := range want {
+		after := got[path]
+		if before.exists != after.exists || !bytes.Equal(before.data, after.data) {
+			t.Fatalf("artifact mutated: %s", path)
+		}
+	}
+	for path, after := range got {
+		if _, ok := want[path]; !ok && after.exists {
+			t.Fatalf("new artifact created: %s", path)
+		}
+	}
 }

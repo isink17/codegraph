@@ -56,6 +56,9 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 	if st.Size() == 0 {
 		return nil, fmt.Errorf("%w: graph database at %s is empty", ErrRepoNotIndexed, dbPath)
 	}
+	if err := validateExistingDatabase(dbPath); err != nil {
+		return nil, err
+	}
 	// isNewDB=false keeps the one-time creation pragmas out of the DSN;
 	// readOnly=true adds mode=ro.
 	dsn, err := BuildSQLiteDSN(dbPath, opts, false, true)
@@ -75,10 +78,6 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 	if err := db.QueryRow(`SELECT 1`).Scan(&probe); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("open %s read-only: %w", dbPath, err)
-	}
-	if err := validateExistingDatabase(dbPath); err != nil {
-		_ = db.Close()
-		return nil, err
 	}
 	return &Store{db: db}, nil
 }
