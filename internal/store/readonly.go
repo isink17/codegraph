@@ -76,6 +76,10 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("open %s read-only: %w", dbPath, err)
 	}
+	if err := validateExistingDatabase(dbPath); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 

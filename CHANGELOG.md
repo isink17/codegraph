@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+v2 development uses separate SQLite storage: repo-local `.codegraph/codegraph.v2.sqlite`; custom/global stores use deterministic `codegraph.v2-<repo-hash>.sqlite` names. Legacy v1 `codegraph.sqlite` databases are not automatically migrated or modified; first v2 index may require a full rebuild, and v1/v2 databases can coexist safely.
+
 C++ qualified identity now preserves namespace nesting, file-scoped anonymous namespaces, friend
 function ownership at enclosing namespace scope, and explicit leading `::` call spelling. C++
 qualified-name/stable-key projections changed; development databases require a fresh index. No

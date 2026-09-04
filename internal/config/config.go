@@ -17,11 +17,12 @@ const ignoreFileName = ".codegraphignore"
 const RepoArtifactsDir = ".codegraph"
 const RepoDBDir = "repo"
 const repoDBExcludePattern = "codegraph.sqlite*"
+const repoDBV2ExcludePattern = "codegraph.v2.sqlite*"
 
 const repoArtifactsExcludePattern = RepoArtifactsDir + "/**"
 
 var HardcodedSkips = []string{".git", RepoArtifactsDir, "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pnpm-store", ".yarn", ".parcel-cache"}
-var DefaultExcludes = []string{repoArtifactsExcludePattern, ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "vendor/**", "dist/**", "build/**", "coverage/**", "out/**", ".cache/**", repoDBExcludePattern}
+var DefaultExcludes = []string{repoArtifactsExcludePattern, ".codegraph-home/**", ".codegraph-home2/**", ".gocache/**", ".gomodcache/**", ".tmp/**", "vendor/**", "dist/**", "build/**", "coverage/**", "out/**", ".cache/**", repoDBExcludePattern, repoDBV2ExcludePattern}
 
 type Config struct {
 	DefaultLogLevel      string        `json:"default_log_level"`
@@ -144,6 +145,10 @@ func IsRepoDBDir(dbDir string) bool {
 
 func RepoDBExcludePattern() string {
 	return repoDBExcludePattern
+}
+
+func RepoDBExcludePatterns() []string {
+	return []string{repoDBExcludePattern, repoDBV2ExcludePattern}
 }
 
 func isLegacyGlobalDBDir(dbDir string, paths platform.Paths) bool {

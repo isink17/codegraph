@@ -45,7 +45,7 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
                import resolution  session memory      hybrid search
 ```
 
-`codegraph index .` walks your repo, parses every file with tree-sitter, resolves imports using four strategies (exact, name, suffix, method-receiver), and writes a fully-linked symbol graph into a local `codegraph.sqlite`. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no cloud, no Docker, no API keys.
+`codegraph index .` walks your repo, parses every file with tree-sitter, resolves imports using four strategies (exact, name, suffix, method-receiver), and writes a fully-linked symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no cloud, no Docker, no API keys.
 
 ---
 

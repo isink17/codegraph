@@ -23,7 +23,7 @@ func benchRepo(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 	repoRoot := t.TempDir()
-	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
+	dbPath := filepath.Join(repoRoot, ".codegraph", store.RepoDatabaseFileName)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestBenchQueriesDoesNotWriteToTheDatabase(t *testing.T) {
 	quietStartup(t)
 	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "home"))
 	repoRoot := benchRepo(t)
-	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
+	dbPath := filepath.Join(repoRoot, ".codegraph", store.RepoDatabaseFileName)
 
 	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, true)
 	if err != nil {

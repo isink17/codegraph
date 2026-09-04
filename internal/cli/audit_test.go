@@ -33,7 +33,7 @@ func quietStartup(t *testing.T) {
 func indexedRepo(t *testing.T, seed func(t *testing.T, db *sql.DB, repoID int64)) (string, string) {
 	t.Helper()
 	repoRoot := t.TempDir()
-	dbPath := filepath.Join(repoRoot, config.RepoArtifactsDir, "codegraph.sqlite")
+	dbPath := filepath.Join(repoRoot, config.RepoArtifactsDir, store.RepoDatabaseFileName)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
