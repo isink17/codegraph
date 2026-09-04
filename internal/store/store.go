@@ -292,7 +292,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 }
 
 func BuildSQLiteDSN(path string, opts OpenOptions, isNewDB bool, readOnly bool) (string, error) {
-	pragmas := buildPragmas(isNewDB, opts.PerformanceProfile)
+	pragmas := buildPragmas(isNewDB, opts.PerformanceProfile, readOnly)
 	values := url.Values{}
 	if readOnly {
 		values.Set("mode", "ro")
@@ -331,14 +331,16 @@ func withSQLiteBusyRetry(timeout, interval time.Duration, fn func() error) error
 	}
 }
 
-func buildPragmas(isNewDB bool, profile string) []string {
+func buildPragmas(isNewDB bool, profile string, readOnly bool) []string {
 	base := []string{
-		`journal_mode(WAL)`,
 		`busy_timeout(5000)`,
 		`foreign_keys(ON)`,
 		`cache_size(-65536)`,
 	}
-	if isNewDB {
+	if !readOnly {
+		base = append([]string{`journal_mode(WAL)`}, base...)
+	}
+	if isNewDB && !readOnly {
 		// auto_vacuum is only reliably applied for a brand-new DB before any tables are created.
 		// For existing DBs, switching auto_vacuum requires VACUUM; we avoid doing that implicitly.
 		base = append(base, `auto_vacuum(INCREMENTAL)`)
