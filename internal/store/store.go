@@ -469,18 +469,39 @@ func validateExistingDatabase(path string) error {
 	if userVersion != 0 && userVersion != DatabaseFormatUserVersion {
 		return fmt.Errorf("unsupported database format user_version=%d at %s", userVersion, path)
 	}
+	return validateMigrationMetadata(context.Background(), db, path)
+}
+
+type migrationMetadataQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateMigrationMetadata(ctx context.Context, db migrationMetadataQuerier, path string) error {
 	var tableCount int
-	if err := db.QueryRow(`SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&tableCount); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&tableCount); err != nil {
 		return fmt.Errorf("validate database metadata %s: %w", path, err)
 	}
 	if tableCount == 0 {
+		var userObjects int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(1)
+			FROM sqlite_master
+			WHERE name NOT LIKE 'sqlite_%'
+			  AND type IN ('table', 'index', 'view', 'trigger')
+		`).Scan(&userObjects); err != nil {
+			return fmt.Errorf("validate database metadata %s: %w", path, err)
+		}
+		if userObjects == 0 {
+			return nil
+		}
 		return fmt.Errorf("invalid database metadata at %s: schema_migrations table missing", path)
 	}
 	versions, ceiling, err := migrationVersions()
 	if err != nil {
 		return err
 	}
-	rows, err := db.Query(`SELECT version FROM schema_migrations ORDER BY version`)
+	rows, err := db.QueryContext(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
 	if err != nil {
 		return fmt.Errorf("read database migrations %s: %w", path, err)
 	}
@@ -652,6 +673,10 @@ func (s *Store) Migrate() error {
 			_, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`)
 			return err
 		}); err != nil {
+			return err
+		}
+		if err := validateMigrationMetadata(ctx, conn, "database"); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
 

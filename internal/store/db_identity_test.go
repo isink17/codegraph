@@ -62,6 +62,24 @@ func TestV2ZeroUserVersionRecovery(t *testing.T) {
 	}
 }
 
+func TestV2EmptyBootstrapShellAllowed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	createSQLiteShell(t, path, "")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("empty bootstrap shell rejected: %v", err)
+	}
+	s.Close()
+}
+
+func TestV2MissingMigrationMetadataWithUserTableRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	createSQLiteShell(t, path, "CREATE TABLE foreign_table (id INTEGER)")
+	if _, err := Open(path); err == nil {
+		t.Fatal("database with user table and no migration metadata opened")
+	}
+}
+
 func TestV2FutureUserVersionDoesNotMutate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
 	s, err := Open(path)
@@ -145,6 +163,27 @@ func setUserVersion(t *testing.T, path string, version int) {
 	defer db.Close()
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func createSQLiteShell(t *testing.T, path, statement string) {
+	t.Helper()
+	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(SQLiteDriverName(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatal(err)
+	}
+	if statement != "" {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
