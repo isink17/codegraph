@@ -41,7 +41,7 @@ func checkDatabaseCompatibility(path string, opts OpenOptions) error {
 		return fmt.Errorf("%w: %v", ErrDatabaseUnsupported, err)
 	}
 	defer cleanup()
-	dsn, err := BuildSQLiteDSN(inspectPath, opts, false, true)
+	dsn, err := BuildSQLiteDSN(inspectPath, opts, false, inspectPath == path)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrDatabaseUnsupported, err)
 	}
