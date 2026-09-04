@@ -340,6 +340,7 @@ type ExportEdge struct {
 	SrcQualifiedName string `json:"src_qualified_name"`
 	DstSymbolID      *int64 `json:"dst_symbol_id,omitempty"`
 	DstQualifiedName string `json:"dst_qualified_name,omitempty"`
+	DstKind          string `json:"dst_kind,omitempty"`
 	DstName          string `json:"dst_name,omitempty"`
 	Kind             string `json:"kind"`
 	FilePath         string `json:"file,omitempty"`
@@ -6447,6 +6448,7 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 			&edge.SrcQualifiedName,
 			&dstID,
 			&edge.DstQualifiedName,
+			&edge.DstKind,
 			&edge.DstName,
 			&edge.Kind,
 			&edge.FilePath,

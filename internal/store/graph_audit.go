@@ -239,7 +239,7 @@ func unresolvedClassificationColumnsFor(caps GraphAuditCapabilities) string {
 		return exportEdgeColumnsSQL
 	}
 	return `e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, ` +
-		`COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, ` +
+		`COALESCE(dst.qualified_name, ''), COALESCE(dst.kind, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, ` +
 		`'', '', e.file_id, COALESCE(f.language, ''), e.evidence`
 }
 

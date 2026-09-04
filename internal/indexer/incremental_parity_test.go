@@ -76,6 +76,41 @@ func TestTypeScriptModuleAcceptanceLifecycle(t *testing.T) {
 	r.assertFreshParity(t, "named import removed")
 }
 
+func TestMixedScopedLanguagesDoNotCrossBind(t *testing.T) {
+	files := tree{
+		"rust/lib.rs":      "mod helper; fn run() { crate::helper::run(); }\n",
+		"rust/helper.rs":   "pub fn run() {}\n",
+		"java/a/Foo.java":  "package a; public class Foo { public static void run() {} }\n",
+		"java/b/Call.java": "package b; import a.Foo; class Call { void run() { Foo.run(); } }\n",
+		"kotlin/a.kt":      "package a\nfun helper() {}\n",
+		"kotlin/b.kt":      "package b\nimport a.helper\nfun run() { helper() }\n",
+		"ts/a.ts":          "export function helper() {}\n",
+		"ts/b.ts":          "import { helper } from \"./a\"\nfunction run() { helper() }\n",
+	}
+	r := newLifecycleRepo(t, files)
+	other := newLifecycleRepo(t, files)
+	wantOther := other.projection(t)
+	checks := []struct {
+		path, name, target string
+	}{
+		{"rust/lib.rs", "crate::helper::run", "rust/helper.rs"},
+		{"java/b/Call.java", "Foo.run", "java/a/Foo.java"},
+		{"kotlin/b.kt", "helper", "kotlin/a.kt"},
+		{"ts/b.ts", "helper", "ts/a.ts"},
+	}
+	for _, check := range checks {
+		if got := r.edgeState(t, check.path, check.name); !strings.Contains(got, check.target) {
+			t.Fatalf("%s %s cross-language resolution = %s", check.path, check.name, got)
+		}
+	}
+	r.write(t, "kotlin/a.kt", "package z\nfun helper() {}\n")
+	r.update(t, "kotlin/a.kt")
+	if got := other.projection(t); !equalStrings(got, wantOther) {
+		t.Fatalf("second repository changed after first repository update: got %v want %v", got, wantOther)
+	}
+	r.assertFreshParity(t, "mixed scoped languages")
+}
+
 func TestTypeScriptNamespaceAndReExportParity(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"a.ts": "export function foo() {}\n",
@@ -401,7 +436,7 @@ func TestKotlinPackageScopeQuerySurface(t *testing.T) {
 	if len(result.Callees) != 1 || result.Callees[0].QualifiedName != "a.helper" {
 		t.Fatalf("query alias result = %+v", result)
 	}
-	if got := r.edgeState(t, "caller.kt", "h"); !strings.Contains(got, "a.kt:a.helper [kotlin_import_scope/high]") {
+	if got := r.edgeState(t, "caller.kt", "h"); !strings.Contains(got, "a.kt:a.helper(function) [kotlin_import_scope/high]") {
 		t.Fatalf("alias provenance = %s", got)
 	}
 
@@ -776,7 +811,7 @@ func (r *lifecycleRepo) projection(t *testing.T) []string {
 	for _, e := range edges {
 		dst := "::"
 		if e.DstSymbolID != nil {
-			dst = symbolFile[*e.DstSymbolID] + ":" + e.DstQualifiedName
+			dst = symbolFile[*e.DstSymbolID] + ":" + e.DstQualifiedName + "(" + e.DstKind + ")"
 		}
 		lines = append(lines, "edge "+filepath.ToSlash(e.FilePath)+":"+e.SrcQualifiedName+
 			" -"+e.Kind+`-> "`+e.DstName+`" => `+dst+

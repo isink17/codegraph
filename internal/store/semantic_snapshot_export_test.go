@@ -23,7 +23,7 @@ func (s *Store) SemanticGraphForTest(ctx context.Context, repoID int64) ([]strin
 
 	edgeRows, err := s.db.QueryContext(ctx, `
 		SELECT sf.path, ss.qualified_name, e.edge_kind, e.dst_name,
-			COALESCE(df.path, ''), COALESCE(ds.qualified_name, ''),
+			COALESCE(df.path, ''), COALESCE(ds.qualified_name, ''), COALESCE(ds.kind, ''),
 			e.resolution_strategy, e.resolution_confidence
 		FROM edges e
 		JOIN symbols ss ON ss.id = e.src_symbol_id
@@ -37,12 +37,12 @@ func (s *Store) SemanticGraphForTest(ctx context.Context, repoID int64) ([]strin
 	}
 	defer edgeRows.Close()
 	for edgeRows.Next() {
-		var srcFile, srcName, kind, dstName, dstFile, dstQName, strategy, confidence string
-		if err := edgeRows.Scan(&srcFile, &srcName, &kind, &dstName, &dstFile, &dstQName, &strategy, &confidence); err != nil {
+		var srcFile, srcName, kind, dstName, dstFile, dstQName, dstKind, strategy, confidence string
+		if err := edgeRows.Scan(&srcFile, &srcName, &kind, &dstName, &dstFile, &dstQName, &dstKind, &strategy, &confidence); err != nil {
 			return nil, err
 		}
-		lines = append(lines, fmt.Sprintf("edge %s:%s -%s-> %q => %s:%s [%s/%s]",
-			srcFile, srcName, kind, dstName, dstFile, dstQName, strategy, confidence))
+		lines = append(lines, fmt.Sprintf("edge %s:%s -%s-> %q => %s:%s(%s) [%s/%s]",
+			srcFile, srcName, kind, dstName, dstFile, dstQName, dstKind, strategy, confidence))
 	}
 	if err := edgeRows.Err(); err != nil {
 		return nil, err
