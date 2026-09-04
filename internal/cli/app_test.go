@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,8 +13,55 @@ import (
 	"testing"
 
 	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/store"
 	"github.com/isink17/codegraph/internal/version"
 )
+
+func TestOpenApp_RejectsNewerDatabaseBeforeRepoWrite(t *testing.T) {
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DBDir = filepath.Join(t.TempDir(), "db")
+	dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, _, err = openApp(context.Background(), cfg, repoRoot)
+	if !errors.Is(err, store.ErrDatabaseNewer) {
+		t.Fatalf("openApp() error = %v, want ErrDatabaseNewer", err)
+	}
+}
 
 func TestRunInstallCreatesConfigAndPrintsSnippets(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
@@ -345,8 +394,12 @@ func TestRemoveRepoDBFilesWrapsInUseError(t *testing.T) {
 		t.Fatalf("MkdirAll(.codegraph) error = %v", err)
 	}
 	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
-	if err := os.WriteFile(dbPath, []byte("db"), 0o644); err != nil {
-		t.Fatalf("WriteFile(db) error = %v", err)
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open(db) error = %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("store.Close(db) error = %v", err)
 	}
 	prevRemove := repoDBRemove
 	repoDBRemove = func(string) error { return os.ErrPermission }
@@ -354,7 +407,7 @@ func TestRemoveRepoDBFilesWrapsInUseError(t *testing.T) {
 		repoDBRemove = prevRemove
 	})
 
-	_, err := removeRepoDBFiles(config.Config{DBDir: config.RepoDBDir}, repoRoot, repoRoot)
+	_, err = removeRepoDBFiles(config.Config{DBDir: config.RepoDBDir}, repoRoot, repoRoot)
 	if err == nil {
 		t.Fatalf("removeRepoDBFiles error = nil")
 	}

@@ -1993,6 +1993,11 @@ func removeRepoDBFiles(cfg config.Config, repoRoot, canonical string) ([]string,
 	if err != nil {
 		return nil, err
 	}
+	for _, path := range paths {
+		if err := store.CheckDatabaseCompatibility(path, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile}); err != nil {
+			return nil, err
+		}
+	}
 	removed := make([]string, 0, len(paths)*3)
 	seen := map[string]struct{}{}
 	for _, path := range paths {

@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.2.1
+
+Protected v1 database compatibility baseline.
+
+### Fixed
+
+- Existing databases are inspected read-only before writable SQLite setup. Databases with a migration above 018 or a non-zero `PRAGMA user_version` are rejected with: `database created by a newer CodeGraph version; upgrade CodeGraph before opening it`.
+
+### Upgrade Notes
+
+- v1.2.1 is the protected v1 bridge baseline. v2 databases must use a non-zero `PRAGMA user_version` and a physically separate path, such as `.codegraph/codegraph.v2.sqlite`; v2 → v1 is unsupported.
+- v1.2.0 and older binaries may modify a v2 database if manually configured to open it. That limitation is unchanged; the protected guarantee begins with v1.2.1.
+
 ## v1.2.0 - 12-05-2026
 
 C++ call graph support, DB rebuild, asset filtering, pagination correctness, and version UX improvements.

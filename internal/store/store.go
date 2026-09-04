@@ -253,9 +253,6 @@ func Open(path string) (*Store, error) {
 }
 
 func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
 	isNewDB := false
 	if st, err := os.Stat(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -265,6 +262,14 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		}
 	} else if st.Size() == 0 {
 		isNewDB = true
+	}
+	if !isNewDB {
+		if err := CheckDatabaseCompatibility(path, opts); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
 	}
 	dsn, err := BuildSQLiteDSN(path, opts, isNewDB, false)
 	if err != nil {
