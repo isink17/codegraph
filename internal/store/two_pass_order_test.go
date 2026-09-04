@@ -187,7 +187,7 @@ func TestTwoPass_EdgeBindsInEitherFileOrder(t *testing.T) {
 
 	snapshot := assertOrderIndependent(t, files)
 	requireLine(t, snapshot,
-		`edge caller.go:pkg.Caller -calls-> "Callee" => callee.go:pkg.Callee [go_package_scope/high]`)
+		`edge caller.go:pkg.Caller -calls-> "Callee" => callee.go:pkg.Callee(function) [go_package_scope/high]`)
 }
 
 // TestTwoPass_TestLinkAndEdgeAcrossEveryOrder walks all six orders of a
@@ -203,7 +203,7 @@ func TestTwoPass_TestLinkAndEdgeAcrossEveryOrder(t *testing.T) {
 	requireLine(t, snapshot,
 		`testlink helper_test.go:pkg.TestHelper -> "func:pkg::Helper" => helper.go:pkg.Helper [test_name_match/0.80]`)
 	requireLine(t, snapshot,
-		`edge caller.go:pkg.Caller -calls-> "Helper" => helper.go:pkg.Helper [go_package_scope/high]`)
+		`edge caller.go:pkg.Caller -calls-> "Helper" => helper.go:pkg.Helper(function) [go_package_scope/high]`)
 }
 
 // TestTwoPass_AmbiguousTargetUnresolvedInEveryOrder is case E: two directories
@@ -237,7 +237,7 @@ func TestTwoPass_ProductionTargetPreferredOverTestShadowInEveryOrder(t *testing.
 
 	snapshot := assertOrderIndependent(t, files)
 	requireLine(t, snapshot,
-		`edge caller.go:pkg.Caller -calls-> "Shared" => helper.go:pkg.Shared [go_package_scope/high]`)
+		`edge caller.go:pkg.Caller -calls-> "Shared" => helper.go:pkg.Shared(function) [go_package_scope/high]`)
 }
 
 // TestTwoPass_UnresolvedExternalTargetInEveryOrder is case H: a call to a
@@ -251,7 +251,7 @@ func TestTwoPass_UnresolvedExternalTargetInEveryOrder(t *testing.T) {
 
 	snapshot := assertOrderIndependent(t, files)
 	requireLine(t, snapshot,
-		`edge caller.go:pkg.Caller -calls-> "NotDefinedAnywhere" => : [/]`)
+		`edge caller.go:pkg.Caller -calls-> "NotDefinedAnywhere" => :() [/]`)
 }
 
 // TestTwoPass_Pass1LeavesTargetsUnbound pins the stage boundary itself rather
@@ -302,7 +302,7 @@ func TestTwoPass_Pass1LeavesTargetsUnbound(t *testing.T) {
 	requireLine(t, snapshot,
 		`testlink helper_test.go:pkg.TestHelper -> "func:pkg::Helper" => : [test_name_match/0.80]`)
 	requireLine(t, snapshot,
-		`edge helper_test.go:pkg.TestHelper -calls-> "Helper" => : [/]`)
+		`edge helper_test.go:pkg.TestHelper -calls-> "Helper" => :() [/]`)
 
 	// And Pass 2 alone is enough to bind both.
 	if _, err := s.ResolveEdges(ctx, repo.ID); err != nil {

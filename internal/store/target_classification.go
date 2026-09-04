@@ -77,7 +77,7 @@ type exportEdgeEvidence struct {
 // missing file row yields an empty language and the classifier falls back to
 // `unknown` -- the same fail-closed behaviour as the P2 language gate.
 const exportEdgeColumnsSQL = `e.id, e.src_symbol_id, COALESCE(src.qualified_name, ''), e.dst_symbol_id, ` +
-	`COALESCE(dst.qualified_name, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, ` +
+	`COALESCE(dst.qualified_name, ''), COALESCE(dst.kind, ''), e.dst_name, e.edge_kind, COALESCE(f.path, ''), e.line, ` +
 	`e.resolution_strategy, e.resolution_confidence, e.file_id, COALESCE(f.language, ''), e.evidence`
 
 // classifyExportEdges fills TargetClassification for every edge in the page.
