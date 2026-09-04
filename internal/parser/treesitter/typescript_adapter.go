@@ -219,7 +219,7 @@ func tsAddFunction(node *sitter.Node, module, container string, exported bool, c
 	if container != "" && container != module {
 		qualified = module + "." + container + "." + name
 	}
-	vis := heuristicVisibility(name)
+	vis := "private"
 	if exported {
 		vis = "public"
 	}

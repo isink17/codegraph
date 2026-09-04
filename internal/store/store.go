@@ -1421,6 +1421,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM scope_import_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM rust_module_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -1558,6 +1561,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM scope_import_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM rust_module_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -1786,6 +1792,25 @@ func insertParsedFileGraph(
 		}
 		if len(args) > 0 {
 			if err := execBatchInsert(ctx, tx, "scope_import_evidence", "repo_id, file_id, language, source_specifier, imported_name, local_name, import_kind, wildcard, is_static, is_reexport, is_namespace_export, is_type_only, owner_module", 13, args, stats); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if parsed.Language == "typescript" {
+		args := make([]any, 0, len(parsed.Scope.Imports)*4)
+		seen := make(map[string]struct{}, len(parsed.Scope.Imports))
+		for _, evidence := range parsed.Scope.Imports {
+			for _, candidate := range typescriptModuleCandidatePaths(filePath, evidence.SourceSpecifier) {
+				key := evidence.SourceSpecifier + "\x00" + candidate
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				args = append(args, repoID, fileID, evidence.SourceSpecifier, candidate)
+			}
+		}
+		if len(args) > 0 {
+			if err := execBatchInsert(ctx, tx, "scope_module_candidate_evidence", "repo_id, source_file_id, source_specifier, candidate_path", 4, args, stats); err != nil {
 				return nil, err
 			}
 		}

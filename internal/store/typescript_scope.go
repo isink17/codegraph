@@ -24,12 +24,33 @@ type tsScopeImport struct {
 	wildcard, reexport, namespace, typeOnly bool
 }
 type tsScopeSymbol struct {
-	id, file               int64
-	name, visibility, kind string
+	id, file                      int64
+	name, qname, visibility, kind string
 }
 type tsScopeExport struct {
 	symbols   []int64
 	namespace int64
+}
+
+func typescriptModuleCandidatePaths(sourceFile, specifier string) []string {
+	if !strings.HasPrefix(specifier, "./") && !strings.HasPrefix(specifier, "../") {
+		return nil
+	}
+	if strings.HasSuffix(specifier, "/") {
+		return nil
+	}
+	base := path.Clean(path.Join(path.Dir(canonicalStoredPath(sourceFile)), specifier))
+	if base == "." || base == ".." || strings.HasPrefix(base, "../") {
+		return nil
+	}
+	switch strings.ToLower(path.Ext(base)) {
+	case "":
+		return []string{base + ".ts", base + ".tsx"}
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs":
+		return []string{base}
+	default:
+		return nil
+	}
 }
 
 // resolveTypeScriptScope is the sole TS/JS implicit resolver. It loads all
@@ -89,7 +110,21 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 
 	files := map[int64]tsScopeFile{}
 	byPath := map[string]int64{}
-	rows, err = q.QueryContext(ctx, `SELECT id,path FROM files WHERE repo_id=? AND is_deleted=0`, repoID)
+	fileIDs := make(map[int64]struct{})
+	if len(only) > 0 {
+		for _, e := range edges {
+			fileIDs[e.file] = struct{}{}
+		}
+	}
+	fileWhere, fileArgs := ``, []any{repoID}
+	if len(fileIDs) > 0 {
+		ids := sortedIDs(fileIDs)
+		fileWhere = ` AND id IN (` + tsPlaceholders(len(ids)) + `)`
+		for _, id := range ids {
+			fileArgs = append(fileArgs, id)
+		}
+	}
+	rows, err = q.QueryContext(ctx, `SELECT id,path FROM files WHERE repo_id=? AND is_deleted=0`+fileWhere, fileArgs...)
 	if err != nil {
 		return 0, err
 	}
@@ -106,16 +141,105 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 	if err := rows.Close(); err != nil {
 		return 0, err
 	}
+	// A scoped pass grows from the selected caller files through relative
+	// module evidence. This keeps files outside the affected module component
+	// out of memory and out of the candidate population.
+	if len(only) > 0 {
+		for {
+			frontier := make([]int64, 0)
+			for id := range fileIDs {
+				frontier = append(frontier, id)
+			}
+			for id := range fileIDs {
+				delete(fileIDs, id)
+			}
+			if len(frontier) == 0 {
+				break
+			}
+			args := []any{repoID}
+			for _, id := range frontier {
+				args = append(args, id)
+			}
+			impRows, qerr := q.QueryContext(ctx, `SELECT file_id,source_specifier FROM scope_import_evidence WHERE repo_id=? AND language='typescript' AND file_id IN (`+tsPlaceholders(len(frontier))+`)`, args...)
+			if qerr != nil {
+				return 0, qerr
+			}
+			candidatePaths := map[string]struct{}{}
+			for impRows.Next() {
+				var file int64
+				var spec string
+				if qerr = impRows.Scan(&file, &spec); qerr != nil {
+					impRows.Close()
+					return 0, qerr
+				}
+				from, ok := files[file]
+				if !ok {
+					continue
+				}
+				for _, candidate := range typescriptModuleCandidatePaths(from.path, spec) {
+					candidatePaths[candidate] = struct{}{}
+				}
+			}
+			if qerr = impRows.Close(); qerr != nil {
+				return 0, qerr
+			}
+			if len(candidatePaths) == 0 {
+				continue
+			}
+			paths := make([]string, 0, len(candidatePaths))
+			for p := range candidatePaths {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+			pathArgs := []any{repoID}
+			for _, p := range paths {
+				pathArgs = append(pathArgs, p)
+			}
+			fileRows, qerr := q.QueryContext(ctx, `SELECT id,path FROM files WHERE repo_id=? AND is_deleted=0 AND path IN (`+tsPlaceholders(len(paths))+`)`, pathArgs...)
+			if qerr != nil {
+				return 0, qerr
+			}
+			for fileRows.Next() {
+				var f tsScopeFile
+				if qerr = fileRows.Scan(&f.id, &f.path); qerr != nil {
+					fileRows.Close()
+					return 0, qerr
+				}
+				f.path = canonicalStoredPath(f.path)
+				byPath[f.path] = f.id
+				if _, exists := files[f.id]; !exists {
+					files[f.id] = f
+					fileIDs[f.id] = struct{}{}
+				}
+			}
+			if qerr = fileRows.Close(); qerr != nil {
+				return 0, qerr
+			}
+		}
+	}
 
 	symbols := map[int64]tsScopeSymbol{}
 	byFileName := map[int64]map[string][]int64{}
-	rows, err = q.QueryContext(ctx, `SELECT s.id,s.file_id,s.name,s.visibility,s.kind FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='typescript' AND f.is_deleted=0`, repoID)
+	byFileQName := map[int64]map[string][]int64{}
+	symbolWhere, symbolArgs := ``, []any{repoID}
+	if len(only) > 0 {
+		ids := make([]int64, 0, len(files))
+		for id := range files {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		symbolWhere = ` AND s.file_id IN (` + tsPlaceholders(len(ids)) + `)`
+		for _, id := range ids {
+			symbolArgs = append(symbolArgs, id)
+		}
+	}
+	rows, err = q.QueryContext(ctx, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.visibility,s.kind FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='typescript' AND f.is_deleted=0`+symbolWhere, symbolArgs...)
 	if err != nil {
 		return 0, err
 	}
 	for rows.Next() {
 		var s tsScopeSymbol
-		if err := rows.Scan(&s.id, &s.file, &s.name, &s.visibility, &s.kind); err != nil {
+		if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.visibility, &s.kind); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -124,13 +248,30 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			byFileName[s.file] = map[string][]int64{}
 		}
 		byFileName[s.file][s.name] = append(byFileName[s.file][s.name], s.id)
+		if byFileQName[s.file] == nil {
+			byFileQName[s.file] = map[string][]int64{}
+		}
+		byFileQName[s.file][s.qname] = append(byFileQName[s.file][s.qname], s.id)
 	}
 	if err := rows.Close(); err != nil {
 		return 0, err
 	}
 
 	imports := map[int64][]tsScopeImport{}
-	rows, err = q.QueryContext(ctx, `SELECT file_id,source_specifier,imported_name,local_name,import_kind,wildcard,is_reexport,is_namespace_export,is_type_only FROM scope_import_evidence WHERE repo_id=? AND language='typescript'`, repoID)
+	defaultNames := map[int64]map[string]struct{}{}
+	importWhere, importArgs := ``, []any{repoID}
+	if len(only) > 0 {
+		ids := make([]int64, 0, len(files))
+		for id := range files {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		importWhere = ` AND file_id IN (` + tsPlaceholders(len(ids)) + `)`
+		for _, id := range ids {
+			importArgs = append(importArgs, id)
+		}
+	}
+	rows, err = q.QueryContext(ctx, `SELECT file_id,source_specifier,imported_name,local_name,import_kind,wildcard,is_reexport,is_namespace_export,is_type_only FROM scope_import_evidence WHERE repo_id=? AND language='typescript'`+importWhere, importArgs...)
 	if err != nil {
 		return 0, err
 	}
@@ -146,6 +287,12 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		i.namespace = n != 0
 		i.typeOnly = t != 0
 		imports[i.file] = append(imports[i.file], i)
+		if i.reexport && i.source == "" && i.imported == "default" && i.local != "" {
+			if defaultNames[i.file] == nil {
+				defaultNames[i.file] = map[string]struct{}{}
+			}
+			defaultNames[i.file][i.local] = struct{}{}
+		}
 	}
 	if err := rows.Close(); err != nil {
 		return 0, err
@@ -175,9 +322,6 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 	}
 	var export func(int64, string, map[string]bool) tsScopeExport
 	export = func(mod int64, name string, seen map[string]bool) tsScopeExport {
-		if name == "default" {
-			return tsScopeExport{}
-		}
 		key := intKey(mod, name)
 		if seen[key] {
 			return tsScopeExport{}
@@ -193,7 +337,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 				explicit = append(explicit, i)
 			} else if i.wildcard {
 				stars = append(stars, i)
-			} else if i.local == name {
+			} else if i.local == name || (i.source == "" && i.imported == name) {
 				explicit = append(explicit, i)
 			}
 		}
@@ -201,8 +345,27 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			var out tsScopeExport
 			for _, i := range list {
 				if i.source == "" {
-					for _, id := range byFileName[mod][i.imported] {
+					localName := i.imported
+					if localName == "default" {
+						localName = i.local
+					}
+					for _, id := range byFileName[mod][localName] {
 						out.symbols = append(out.symbols, id)
+					}
+					if len(byFileName[mod][localName]) == 0 {
+						for _, imported := range imports[mod] {
+							if imported.local != localName || imported.source == "" || imported.reexport || imported.typeOnly || imported.kind == "side_effect" {
+								continue
+							}
+							target, ok := resolveModule(mod, imported.source)
+							if ok {
+								x := export(target, imported.imported, cloneSeen(seen))
+								out.symbols = append(out.symbols, x.symbols...)
+								if x.namespace != 0 {
+									out.namespace = x.namespace
+								}
+							}
+						}
 					}
 					continue
 				}
@@ -214,7 +377,11 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 					out.namespace = target
 					continue
 				}
-				x := export(target, i.imported, cloneSeen(seen))
+				exportedName := i.imported
+				if i.wildcard {
+					exportedName = name
+				}
+				x := export(target, exportedName, cloneSeen(seen))
 				out.symbols = append(out.symbols, x.symbols...)
 				if x.namespace != 0 {
 					out.namespace = x.namespace
@@ -227,6 +394,11 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		}
 		var direct tsScopeExport
 		for _, id := range byFileName[mod][name] {
+			if name != "default" {
+				if _, isDefault := defaultNames[mod][name]; isDefault {
+					continue
+				}
+			}
 			if symbols[id].visibility == "public" {
 				direct.symbols = append(direct.symbols, id)
 			}
@@ -235,6 +407,9 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		if len(direct.symbols) > 0 {
 			return direct
 		}
+		if name == "default" {
+			return tsScopeExport{}
+		}
 		return collect(stars)
 	}
 	results := map[int64]int64{}
@@ -242,6 +417,9 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		var target tsScopeExport
 		parts := strings.Split(e.name, ".")
 		if len(parts) > 1 {
+			for _, id := range byFileQName[e.file][e.name] {
+				target.symbols = append(target.symbols, id)
+			}
 			local := parts[0]
 			member := strings.Join(parts[1:], ".")
 			for _, i := range imports[e.file] {
@@ -250,7 +428,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 						target = export(m, member, map[string]bool{})
 					}
 				}
-				if i.local == local && !i.typeOnly && i.kind != "namespace" && i.kind != "side_effect" {
+				if i.local == local && !i.typeOnly && i.kind != "namespace" {
 					if m, ok := resolveModule(e.file, i.source); ok {
 						target = export(m, i.imported, map[string]bool{})
 						if target.namespace != 0 {
@@ -363,70 +541,70 @@ func pairPlaceholders(n int) string {
 }
 
 // invalidateTypeScriptScopeBindings clears the dependent module component for
-// changed source files. The component is built from persisted relative import
-// evidence, so removed or renamed exports cannot leave an old binding behind.
+// changed source files. Candidate paths are persisted by the caller, so this
+// reverse lookup remains useful when a target is absent or ambiguous.
 func (s *Store) invalidateTypeScriptScopeBindings(ctx context.Context, repoID int64, paths []string) ([]string, error) {
 	changed, err := fileIDsByPaths(ctx, s.db, repoID, paths)
-	if err != nil || len(changed) == 0 {
-		return nil, err
-	}
-	files := map[int64]tsScopeFile{}
-	byPath := map[string]int64{}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,path FROM files WHERE repo_id=? AND language='typescript' AND is_deleted=0`, repoID)
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var f tsScopeFile
-		if err := rows.Scan(&f.id, &f.path); err != nil {
-			rows.Close()
-			return nil, err
+	affected := make(map[int64]struct{}, len(changed))
+	for _, id := range changed {
+		affected[id] = struct{}{}
+	}
+	frontier := make([]string, 0, len(paths))
+	seenPaths := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		p = CanonicalRelPath(p)
+		if p != "" {
+			seenPaths[p] = struct{}{}
+			frontier = append(frontier, p)
 		}
-		f.path = canonicalStoredPath(f.path)
-		files[f.id] = f
-		byPath[f.path] = f.id
 	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	reverse := map[int64][]int64{}
-	rows, err = s.db.QueryContext(ctx, `SELECT file_id,source_specifier FROM scope_import_evidence WHERE repo_id=? AND language='typescript' AND (source_specifier LIKE './%' OR source_specifier LIKE '../%')`, repoID)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var file int64
-		var spec string
-		if err := rows.Scan(&file, &spec); err != nil {
-			rows.Close()
-			return nil, err
+	seenModules := make(map[int64]struct{}, len(changed))
+	for len(frontier) > 0 {
+		args := make([]any, 0, len(frontier)+1)
+		args = append(args, repoID)
+		for _, p := range frontier {
+			args = append(args, p)
 		}
-		base := path.Clean(path.Join(path.Dir(files[file].path), spec))
-		if path.Ext(base) == "" {
-			for _, ext := range []string{".ts", ".tsx"} {
-				if id, ok := byPath[base+ext]; ok {
-					reverse[id] = append(reverse[id], file)
+		rows, qerr := s.db.QueryContext(ctx, `
+			SELECT c.source_file_id, f.path
+			FROM scope_module_candidate_evidence c
+			JOIN files f ON f.id=c.source_file_id AND f.repo_id=c.repo_id
+			WHERE c.repo_id=? AND c.candidate_path IN (`+tsPlaceholders(len(frontier))+`)
+		`, args...)
+		if qerr != nil {
+			return nil, qerr
+		}
+		next := make([]string, 0)
+		for rows.Next() {
+			var fileID int64
+			var filePath string
+			if qerr = rows.Scan(&fileID, &filePath); qerr != nil {
+				rows.Close()
+				return nil, qerr
+			}
+			affected[fileID] = struct{}{}
+			if _, ok := seenModules[fileID]; ok {
+				continue
+			}
+			seenModules[fileID] = struct{}{}
+			modulePath := canonicalStoredPath(filePath)
+			if modulePath != "" {
+				if _, ok := seenPaths[modulePath]; !ok {
+					seenPaths[modulePath] = struct{}{}
+					next = append(next, modulePath)
 				}
 			}
-		} else if id, ok := byPath[base]; ok {
-			reverse[id] = append(reverse[id], file)
 		}
+		if qerr = rows.Close(); qerr != nil {
+			return nil, qerr
+		}
+		frontier = next
 	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	affected := map[int64]struct{}{}
-	queue := append([]int64(nil), changed...)
-	for len(queue) > 0 {
-		m := queue[0]
-		queue = queue[1:]
-		if _, ok := affected[m]; ok {
-			continue
-		}
-		affected[m] = struct{}{}
-		for _, viewer := range reverse[m] {
-			queue = append(queue, viewer)
-		}
+	if len(affected) == 0 {
+		return nil, nil
 	}
 	ids := make([]int64, 0, len(affected))
 	for id := range affected {
@@ -438,7 +616,7 @@ func (s *Store) invalidateTypeScriptScopeBindings(ctx context.Context, repoID in
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT e.id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='typescript' AND e.edge_kind <> 'cross_language_ref' AND e.file_id IN (`+tsPlaceholders(len(ids))+`)`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT e.id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='typescript' AND e.edge_kind <> 'cross_language_ref' AND e.file_id IN (`+tsPlaceholders(len(ids))+`)`, args...)
 	if err != nil {
 		return nil, err
 	}

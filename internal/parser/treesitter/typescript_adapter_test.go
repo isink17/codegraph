@@ -86,6 +86,16 @@ export { helper };`
 	}
 }
 
+func TestTypeScriptStarReExportEvidence(t *testing.T) {
+	p, err := NewTypeScript().Parse(context.Background(), "barrel.ts", []byte(`export * from "./a";`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Scope.Imports) != 1 || !p.Scope.Imports[0].Wildcard || !p.Scope.Imports[0].ReExport || p.Scope.Imports[0].SourceSpecifier != "./a" {
+		t.Fatalf("star scope evidence = %#v", p.Scope.Imports)
+	}
+}
+
 func TestTypeScriptCallEvidenceJavaScriptParity(t *testing.T) {
 	for _, path := range []string{"fixture.js", "fixture.ts"} {
 		pf, err := NewTypeScript().Parse(context.Background(), path, []byte("function run() { client\n  .request('/health'); factory()(); }"))

@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -49,7 +50,259 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust())
+	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust())
+}
+
+func TestTypeScriptModuleAcceptanceLifecycle(t *testing.T) {
+	base := tree{
+		"a.ts": "export function foo() {}\n",
+		"b.ts": "function run() { foo(); }\n",
+	}
+	r := newLifecycleRepo(t, base)
+	if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, ":: [/") {
+		t.Fatalf("unimported call bound: %s", got)
+	}
+	r.write(t, "b.ts", "import { foo } from \"./a\";\nfunction run() { foo(); }\n")
+	r.update(t, "b.ts")
+	if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, "a.ts:a.foo") {
+		t.Fatalf("named import: %s", got)
+	}
+	r.assertFreshParity(t, "named import added")
+	r.write(t, "b.ts", "function run() { foo(); }\n")
+	r.update(t, "b.ts")
+	if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, ":: [/") {
+		t.Fatalf("removed import remained bound: %s", got)
+	}
+	r.assertFreshParity(t, "named import removed")
+}
+
+func TestTypeScriptNamespaceAndReExportParity(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"a.ts": "export function foo() {}\n",
+		"b.ts": "export { foo as bar } from \"./a\";\n",
+		"c.ts": "import { bar } from \"./b\";\nfunction run() { bar(); }\n",
+	})
+	if got := r.edgeState(t, "c.ts", "bar"); !strings.Contains(got, "a.ts:a.foo") {
+		t.Fatalf("aliased re-export: %s", got)
+	}
+	r.assertFreshParity(t, "aliased re-export")
+	r.write(t, "c.ts", "import * as ns from \"./a\";\nfunction run() { ns.foo(); }\n")
+	r.update(t, "c.ts")
+	if got := r.edgeState(t, "c.ts", "ns.foo"); !strings.Contains(got, "a.ts:a.foo") {
+		t.Fatalf("namespace import: %s", got)
+	}
+	r.assertFreshParity(t, "namespace import")
+}
+
+func TestTypeScriptModuleQuerySurface(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"a.ts": "export function foo() {}\n",
+		"b.ts": "import { foo as bar } from \"./a\";\nfunction run() { bar(); }\n",
+	})
+	result, err := query.New(r.store, nil).FindCalleesResult(r.ctx, r.repoID, "b.run", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Callees) != 1 || result.Callees[0].QualifiedName != "a.foo" || filepath.ToSlash(result.Callees[0].FilePath) != "a.ts" {
+		t.Fatalf("TypeScript query result = %+v", result.Callees)
+	}
+}
+
+func TestTypeScriptModuleCandidateLifecycle(t *testing.T) {
+	t.Run("target addition and deletion", func(t *testing.T) {
+		r := newLifecycleRepo(t, tree{"b.ts": "import { foo } from \"./a\";\nfunction run() { foo(); }\n"})
+		if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, ":: [/") {
+			t.Fatalf("initial = %s", got)
+		}
+		r.write(t, "a.ts", "export function foo() {}\n")
+		r.update(t, "a.ts")
+		if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, "a.ts:a.foo") {
+			t.Fatalf("addition = %s", got)
+		}
+		r.assertFreshParity(t, "target addition")
+		r.remove(t, "a.ts")
+		r.update(t, "a.ts")
+		if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, ":: [/") {
+			t.Fatalf("deletion = %s", got)
+		}
+		r.assertFreshParity(t, "target deletion")
+	})
+	t.Run("ambiguity transitions", func(t *testing.T) {
+		r := newLifecycleRepo(t, tree{"a.ts": "export function foo() {}\n", "b.ts": "import { foo } from \"./a\";\nfunction run() { foo(); }\n"})
+		if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, "a.ts:a.foo") {
+			t.Fatalf("unique = %s", got)
+		}
+		r.write(t, "a.tsx", "export function foo() {}\n")
+		r.update(t, "a.tsx")
+		if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, ":: [/") {
+			t.Fatalf("competitor addition = %s", got)
+		}
+		r.assertFreshParity(t, "ambiguity addition")
+		r.remove(t, "a.tsx")
+		r.update(t, "a.tsx")
+		if got := r.edgeState(t, "b.ts", "foo"); !strings.Contains(got, "a.ts:a.foo") {
+			t.Fatalf("competitor deletion = %s", got)
+		}
+		r.assertFreshParity(t, "ambiguity deletion")
+	})
+	t.Run("target and caller moves", func(t *testing.T) {
+		r := newLifecycleRepo(t, tree{"a.ts": "export function foo() {}\n", "sub/b.ts": "import { foo } from \"../a\";\nfunction run() { foo(); }\n"})
+		r.remove(t, "a.ts")
+		r.write(t, "c.ts", "export function foo() {}\n")
+		r.write(t, "sub/b.ts", "import { foo } from \"../c\";\nfunction run() { foo(); }\n")
+		r.update(t)
+		if got := r.edgeState(t, "sub/b.ts", "foo"); !strings.Contains(got, "c.ts:c.foo") {
+			t.Fatalf("target move = %s", got)
+		}
+		r.remove(t, "sub/b.ts")
+		r.write(t, "deep/b.ts", "import { foo } from \"../c\";\nfunction run() { foo(); }\n")
+		r.update(t)
+		if got := r.edgeState(t, "deep/b.ts", "foo"); !strings.Contains(got, "c.ts:c.foo") {
+			t.Fatalf("caller move = %s", got)
+		}
+		r.assertFreshParity(t, "caller move")
+	})
+}
+
+func TestTypeScriptModuleQueryAcceptance(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"a.ts": "export function foo() {}\nexport function bar() {}\n",
+		"b.ts": "export * from \"./a\";\n",
+		"c.ts": "import { foo as alias } from \"./b\";\nimport * as ns from \"./a\";\nfunction run() { alias(); ns.bar(); obj.foo(); }\n",
+	})
+	q := query.New(r.store, nil)
+	got, err := q.FindCalleesResult(r.ctx, r.repoID, "c.run", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Callees) != 2 {
+		t.Fatalf("query callees = %+v, want named+namespace only", got.Callees)
+	}
+	for _, callee := range got.Callees {
+		if (callee.QualifiedName != "a.foo" && callee.QualifiedName != "a.bar") || filepath.ToSlash(callee.FilePath) != "a.ts" {
+			t.Fatalf("query target = %+v", callee)
+		}
+	}
+	r.write(t, "b.ts", "")
+	r.update(t, "b.ts")
+	got, err = q.FindCalleesResult(r.ctx, r.repoID, "c.run", 0, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Callees) != 1 || got.Callees[0].QualifiedName != "a.bar" {
+		t.Fatalf("query after re-export removal = %+v", got.Callees)
+	}
+}
+
+func TestTypeScriptModuleIsolationAcceptance(t *testing.T) {
+	base := tree{"a.ts": "export function foo() {}\n", "b.ts": "import { foo } from \"./a\";\nfunction run() { foo(); }\n"}
+	a := newLifecycleRepo(t, base)
+	b := newLifecycleRepo(t, base)
+	before := b.projection(t)
+	a.write(t, "a.ts", "export function bar() {}\n")
+	a.update(t, "a.ts")
+	if got := a.edgeState(t, "b.ts", "foo"); !strings.Contains(got, ":: [/") {
+		t.Fatalf("repo A stale target = %s", got)
+	}
+	if got := b.projection(t); !reflect.DeepEqual(got, before) {
+		t.Fatalf("repo B changed: before=%v after=%v", before, got)
+	}
+	a.assertFreshParity(t, "repo A isolation")
+
+	a.write(t, "unrelated/a.ts", "export function foo() {}\n")
+	a.write(t, "unrelated/b.ts", "function run() { foo(); }\n")
+	a.update(t)
+	if got := a.edgeState(t, "b.ts", "foo"); !strings.Contains(got, ":: [/") {
+		t.Fatalf("unrelated export rescued import = %s", got)
+	}
+	if got := a.edgeState(t, "unrelated/b.ts", "foo"); !strings.Contains(got, ":: [/") {
+		t.Fatalf("unrelated unimported call bound = %s", got)
+	}
+}
+
+func TestTypeScriptDefaultImportLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"a.ts": "export default function foo() {}\n",
+		"b.ts": "import x from \"./a\";\nfunction run() { x(); }\n",
+	})
+	if got := r.edgeState(t, "b.ts", "x"); !strings.Contains(got, "a.ts:a.foo") {
+		t.Fatalf("default import = %s", got)
+	}
+	r.write(t, "a.ts", "function foo() {}\n")
+	r.update(t, "a.ts")
+	if got := r.edgeState(t, "b.ts", "x"); !strings.Contains(got, ":: [/") {
+		t.Fatalf("removed default export = %s", got)
+	}
+	r.assertFreshParity(t, "default export removal")
+}
+
+func TestTypeScriptModuleAcceptanceMatrix(t *testing.T) {
+	tests := []struct {
+		name, dst, want string
+		base            tree
+		mutate          func(*lifecycleRepo, *testing.T)
+	}{
+		{"A same-file", "foo", "b.ts:b.foo", tree{"b.ts": "function foo() {}\nfunction run() { foo(); }\n"}, func(*lifecycleRepo, *testing.T) {}},
+		{"B import added", "foo", "a.ts:a.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "function run() { foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.ts", "import { foo } from \"./a\";\nfunction run() { foo(); }\n")
+			r.update(t, "b.ts")
+		}},
+		{"C import removed", "foo", ":: [", tree{"a.ts": "export function foo() {}\n", "b.ts": "import { foo } from \"./a\";\nfunction run() { foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.ts", "function run() { foo(); }\n")
+			r.update(t, "b.ts")
+		}},
+		{"D alias changed", "baz", "a.ts:a.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "import { foo as bar } from \"./a\";\nfunction run() { bar(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.ts", "import { foo as baz } from \"./a\";\nfunction run() { baz(); }\n")
+			r.update(t, "b.ts")
+		}},
+		{"E stale alias", "bar", ":: [", tree{"a.ts": "export function foo() {}\n", "b.ts": "import { foo as bar } from \"./a\";\nfunction run() { bar(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.ts", "import { foo as baz } from \"./a\";\nfunction run() { bar(); }\n")
+			r.update(t, "b.ts")
+		}},
+		{"F namespace", "mod.foo", "a.ts:a.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "import * as ns from \"./a\";\nfunction run() { ns.foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.ts", "import * as mod from \"./a\";\nfunction run() { mod.foo(); }\n")
+			r.update(t, "b.ts")
+		}},
+		{"G module path", "foo", "c.ts:c.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "import { foo } from \"./a\";\nfunction run() { foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.remove(t, "a.ts")
+			r.write(t, "c.ts", "export function foo() {}\n")
+			r.write(t, "b.ts", "import { foo } from \"./c\";\nfunction run() { foo(); }\n")
+			r.update(t)
+		}},
+		{"H named re-export", "foo", "a.ts:a.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "", "c.ts": "import { foo } from \"./b\";\nfunction run() { foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.ts", "export { foo } from \"./a\";\n")
+			r.update(t, "b.ts")
+		}},
+		{"I aliased re-export", "baz", "a.ts:a.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "export { foo as baz } from \"./a\";\n", "c.ts": "import { baz } from \"./b\";\nfunction run() { baz(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "b.ts", "export { foo as baz } from \"./a\";\n")
+			r.update(t, "b.ts")
+		}},
+		{"J star competitor added", "foo", ":: [", tree{"a.ts": "export function foo() {}\n", "b.ts": "export function foo() {}\n", "barrel.ts": "export * from \"./a\";\n", "c.ts": "import { foo } from \"./barrel\";\nfunction run() { foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "barrel.ts", "export * from \"./a\";\nexport * from \"./b\";\n")
+			r.update(t, "barrel.ts")
+		}},
+		{"K star competitor removed", "foo", "a.ts:a.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "export function foo() {}\n", "barrel.ts": "export * from \"./a\";\nexport * from \"./b\";\n", "c.ts": "import { foo } from \"./barrel\";\nfunction run() { foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "barrel.ts", "export * from \"./a\";\n")
+			r.update(t, "barrel.ts")
+		}},
+		{"L target delete", "foo", ":: [", tree{"a.ts": "export function foo() {}\n", "b.ts": "import { foo } from \"./a\";\nfunction run() { foo(); }\n"}, func(r *lifecycleRepo, t *testing.T) { r.remove(t, "a.ts"); r.update(t) }},
+		{"M cycle", "foo", ":: [", tree{"a.ts": "export { foo } from \"./b\";\n", "b.ts": "export { foo } from \"./a\";\n", "c.ts": "import { foo } from \"./a\";\nfunction run() { foo(); }\n"}, func(*lifecycleRepo, *testing.T) {}},
+		{"N explicit over star", "foo", "a.ts:a.foo", tree{"a.ts": "export function foo() {}\n", "b.ts": "export function foo() {}\n", "barrel.ts": "export { foo } from \"./a\"; export * from \"./b\";\n", "c.ts": "import { foo } from \"./barrel\";\nfunction run() { foo(); }\n"}, func(*lifecycleRepo, *testing.T) {}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newLifecycleRepo(t, tc.base)
+			tc.mutate(r, t)
+			r.assertFreshParity(t, tc.name)
+			got := r.edgeState(t, "c.ts", tc.dst)
+			if got == "<no edge>" {
+				got = r.edgeState(t, "b.ts", tc.dst)
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("want %q, got %s; projection=%v", tc.want, got, r.projection(t))
+			}
+		})
+	}
 }
 
 func TestKotlinPackageScopeProductSemantics(t *testing.T) {

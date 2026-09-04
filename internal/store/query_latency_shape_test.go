@@ -33,8 +33,28 @@ func TestBigGraphFixtureShape(t *testing.T) {
 	if f.Unresolved == 0 {
 		t.Fatal("fixture has no unresolved edges; classification paths would be untested")
 	}
-	if ratio := float64(f.Resolved) / float64(f.Edges); ratio < 0.80 {
-		t.Fatalf("resolved edge ratio = %.3f, want >= 0.80", ratio)
+	// The TS half of this synthetic fixture intentionally uses package-like
+	// names without typed relative-module evidence. Those edges are not part
+	// of the supported resolver population; counting them as a quality loss
+	// rewards the weak exact-name binding this test must reject.
+	var unsupportedTS int64
+	if err := f.store.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM edges e
+		JOIN files sf ON sf.id=e.file_id
+		JOIN symbols dst ON dst.repo_id=e.repo_id AND dst.qualified_name=e.dst_name
+		WHERE e.repo_id=? AND sf.language='typescript'
+		  AND dst.language='typescript' AND dst.file_id<>e.file_id
+		  AND e.dst_name NOT LIKE 'extlib.%'`, f.repoID).Scan(&unsupportedTS); err != nil {
+		t.Fatalf("unsupported TS population: %v", err)
+	}
+	if unsupportedTS != 32128 {
+		t.Fatalf("unsupported TS population = %d, want deterministic fixture count 32128", unsupportedTS)
+	}
+	eligible := int64(f.Edges) - unsupportedTS
+	resolvedEligible := int64(f.Resolved)
+	if ratio := float64(resolvedEligible) / float64(eligible); ratio < 0.80 {
+		t.Fatalf("supported resolved edge ratio = %.3f (%d/%d), want >= 0.80", ratio, resolvedEligible, eligible)
 	}
 	if f.TestLinks == 0 {
 		t.Fatal("fixture has no test links")
