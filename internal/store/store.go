@@ -32,6 +32,11 @@ import (
 var migrationFS embed.FS
 
 const (
+	// DatabaseFormatUserVersion identifies v2 databases. Schema evolution still
+	// uses schema_migrations; this marker identifies the database generation.
+	DatabaseFormatUserVersion = 2
+	RepoDatabaseFileName      = "codegraph.v2.sqlite"
+
 	// sqliteDefaultMaxVariables is SQLite's commonly configured parameter limit (often 999).
 	// Keep batch sizes below this to avoid "too many SQL variables" errors.
 	sqliteDefaultMaxVariables = 999
@@ -391,6 +396,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	} else if st.Size() == 0 {
 		isNewDB = true
 	}
+	if !isNewDB {
+		if err := validateExistingDatabase(path); err != nil {
+			return nil, err
+		}
+	}
 	dsn, err := BuildSQLiteDSN(path, opts, isNewDB, false)
 	if err != nil {
 		return nil, err
@@ -410,7 +420,108 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, DatabaseFormatUserVersion)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+func migrationVersions() (map[int]struct{}, int, error) {
+	entries, err := fs.ReadDir(migrationFS, "schema")
+	if err != nil {
+		return nil, 0, err
+	}
+	versions := make(map[int]struct{}, len(entries))
+	ceiling := 0
+	for _, entry := range entries {
+		var version int
+		if _, err := fmt.Sscanf(entry.Name(), "%d_", &version); err != nil {
+			continue
+		}
+		versions[version] = struct{}{}
+		if version > ceiling {
+			ceiling = version
+		}
+	}
+	return versions, ceiling, nil
+}
+
+func MigrationCeiling() (int, error) {
+	_, ceiling, err := migrationVersions()
+	return ceiling, err
+}
+
+func validateExistingDatabase(path string) error {
+	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var userVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+		return fmt.Errorf("read database format %s: %w", path, err)
+	}
+	if userVersion != 0 && userVersion != DatabaseFormatUserVersion {
+		return fmt.Errorf("unsupported database format user_version=%d at %s", userVersion, path)
+	}
+	return validateMigrationMetadata(context.Background(), db, path)
+}
+
+type migrationMetadataQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateMigrationMetadata(ctx context.Context, db migrationMetadataQuerier, path string) error {
+	var tableCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&tableCount); err != nil {
+		return fmt.Errorf("validate database metadata %s: %w", path, err)
+	}
+	if tableCount == 0 {
+		var userObjects int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(1)
+			FROM sqlite_master
+			WHERE name NOT LIKE 'sqlite_%'
+			  AND type IN ('table', 'index', 'view', 'trigger')
+		`).Scan(&userObjects); err != nil {
+			return fmt.Errorf("validate database metadata %s: %w", path, err)
+		}
+		if userObjects == 0 {
+			return nil
+		}
+		return fmt.Errorf("invalid database metadata at %s: schema_migrations table missing", path)
+	}
+	versions, ceiling, err := migrationVersions()
+	if err != nil {
+		return err
+	}
+	rows, err := db.QueryContext(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		return fmt.Errorf("read database migrations %s: %w", path, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return fmt.Errorf("read database migrations %s: %w", path, err)
+		}
+		if version <= 0 {
+			return fmt.Errorf("invalid migration version %d at %s", version, path)
+		}
+		if _, ok := versions[version]; !ok || version > ceiling {
+			return fmt.Errorf("database migration %d exceeds embedded migration ceiling %d at %s", version, ceiling, path)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read database migrations %s: %w", path, err)
+	}
+	return nil
 }
 
 func BuildSQLiteDSN(path string, opts OpenOptions, isNewDB bool, readOnly bool) (string, error) {
@@ -564,6 +675,10 @@ func (s *Store) Migrate() error {
 		}); err != nil {
 			return err
 		}
+		if err := validateMigrationMetadata(ctx, conn, "database"); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+			return err
+		}
 
 		exists, err := hasMigrationConn(ctx, conn, version)
 		if err != nil {
@@ -633,9 +748,9 @@ func CanonicalRepoPath(path string) (string, error) {
 	return filepath.Clean(abs), nil
 }
 
-func DBFileNameForRepo(repoRoot string) string {
+func V2DBFileNameForRepo(repoRoot string) string {
 	sum := sha256.Sum256([]byte(repoRoot))
-	return hex.EncodeToString(sum[:8]) + ".sqlite"
+	return "codegraph.v2-" + hex.EncodeToString(sum[:8]) + ".sqlite"
 }
 
 func (s *Store) UpsertRepo(ctx context.Context, rootPath string) (graph.Repo, error) {

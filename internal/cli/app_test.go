@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/isink17/codegraph/internal/config"
+	"github.com/isink17/codegraph/internal/store"
 	"github.com/isink17/codegraph/internal/version"
 )
 
@@ -255,7 +256,7 @@ func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
 		t.Fatalf("second Run(index) error = %v", err)
 	}
 
-	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
+	dbPath := filepath.Join(repoRoot, ".codegraph", store.RepoDatabaseFileName)
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("expected repo database at %q: %v", dbPath, err)
 	}
@@ -344,7 +345,7 @@ func TestRemoveRepoDBFilesWrapsInUseError(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(repoRoot, ".codegraph"), 0o755); err != nil {
 		t.Fatalf("MkdirAll(.codegraph) error = %v", err)
 	}
-	dbPath := filepath.Join(repoRoot, ".codegraph", "codegraph.sqlite")
+	dbPath := filepath.Join(repoRoot, ".codegraph", store.RepoDatabaseFileName)
 	if err := os.WriteFile(dbPath, []byte("db"), 0o644); err != nil {
 		t.Fatalf("WriteFile(db) error = %v", err)
 	}

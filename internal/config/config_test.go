@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+func TestRepoDBExcludePatternsCoverV1AndV2Artifacts(t *testing.T) {
+	patterns := RepoDBExcludePatterns()
+	if len(patterns) != 2 || patterns[0] != "codegraph.sqlite*" || patterns[1] != "codegraph.v2.sqlite*" {
+		t.Fatalf("RepoDBExcludePatterns() = %#v", patterns)
+	}
+}
+
 func TestLoadMigratesLegacyGlobalDBDirToRepo(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
 	t.Setenv("CODEGRAPH_HOME", home)

@@ -1174,8 +1174,10 @@ func shouldSkipDir(rel string, excludes []string) bool {
 }
 
 func shouldSkipFile(rel string, includes, excludes []string) bool {
-	if matchPattern(rel, config.RepoDBExcludePattern()) {
-		return true
+	for _, pattern := range config.RepoDBExcludePatterns() {
+		if matchPattern(rel, pattern) {
+			return true
+		}
 	}
 	if matchesIgnore(rel, excludes) {
 		return true

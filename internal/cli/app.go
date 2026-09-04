@@ -203,11 +203,18 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 		if err != nil {
 			return err
 		}
-		p, err := dbPathForRepo(cfg, repoRoot, canonical)
+		candidates, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
 		if err != nil {
 			return err
 		}
-		dbPath = p
+		for _, candidate := range candidates {
+			if st, statErr := os.Stat(candidate); statErr == nil && st.Size() > 0 {
+				dbPath = candidate
+				break
+			} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+				return statErr
+			}
+		}
 	}
 
 	report, err := doctor.RunWithOptions(doctor.Options{Fix: *fix, DBPath: dbPath, Deep: *deep})
@@ -2109,7 +2116,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		return err
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".sqlite") {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".sqlite") || !strings.HasPrefix(strings.ToLower(entry.Name()), "codegraph.v2-") {
 			continue
 		}
 		dbPath := filepath.Join(cfg.DBDir, entry.Name())
@@ -2246,7 +2253,7 @@ func fileSize(path string) int64 {
 }
 
 func removeSQLiteFiles(path string) error {
-	for _, candidate := range []string{path + "-wal", path + "-shm", path} {
+	for _, candidate := range []string{path + "-wal", path + "-shm", path + "-journal", path} {
 		if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -2307,8 +2314,6 @@ func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
 	})
 }
 
-const repoDBFileName = "codegraph.sqlite"
-
 var repoDBRemove = os.Remove
 
 func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error) {
@@ -2338,12 +2343,9 @@ func repoDBPathsForRepo(cfg config.Config, repoRoot, canonical string) ([]string
 		if err != nil {
 			return nil, err
 		}
-		return []string{
-			filepath.Join(absRoot, config.RepoArtifactsDir, repoDBFileName),
-			filepath.Join(absRoot, repoDBFileName),
-		}, nil
+		return []string{filepath.Join(absRoot, config.RepoArtifactsDir, store.RepoDatabaseFileName)}, nil
 	}
-	return []string{filepath.Join(cfg.DBDir, store.DBFileNameForRepo(canonical))}, nil
+	return []string{filepath.Join(cfg.DBDir, store.V2DBFileNameForRepo(canonical))}, nil
 }
 
 func removeRepoDBFiles(cfg config.Config, repoRoot, canonical string) ([]string, error) {
@@ -2354,7 +2356,7 @@ func removeRepoDBFiles(cfg config.Config, repoRoot, canonical string) ([]string,
 	removed := make([]string, 0, len(paths)*3)
 	seen := map[string]struct{}{}
 	for _, path := range paths {
-		for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
 			if _, ok := seen[candidate]; ok {
 				continue
 			}
