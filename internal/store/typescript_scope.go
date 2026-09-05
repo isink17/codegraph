@@ -582,7 +582,7 @@ func (s *Store) invalidateTypeScriptScopeBindings(ctx context.Context, repoID in
 		rows, qerr := s.db.QueryContext(ctx, `
 			SELECT c.source_file_id, f.path
 			FROM scope_module_candidate_evidence c
-			JOIN files f ON f.id=c.source_file_id AND f.repo_id=c.repo_id
+			JOIN files f ON f.id=c.source_file_id AND f.repo_id=c.repo_id AND f.language='typescript'
 			WHERE c.repo_id=? AND c.candidate_path IN (`+tsPlaceholders(len(frontier))+`)
 		`, args...)
 		if qerr != nil {

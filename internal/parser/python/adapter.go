@@ -13,7 +13,10 @@ import (
 var (
 	classRE = regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	defRE   = regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-	callRE  = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	// callRE keeps the whole dotted receiver chain a call site actually wrote,
+	// so `helpers.load()` stays distinguishable from a bare `load()`. The chain
+	// is syntax, not a claim about what `helpers` is.
+	callRE = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)
 )
 
 type scope struct {
@@ -52,10 +55,21 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 	var scopes []scope
 	maskedLines := maskPythonLines(lines)
+	// Import syntax is read from the masked source before the line walk, so a
+	// statement spanning several physical lines is still one binding and its
+	// lines never reach call extraction. The bindings themselves are emitted
+	// inside the walk, where the enclosing lexical scope is known.
+	stmts, importLines := importStatements(maskedLines)
+	seenModules := make(map[string]struct{}, len(stmts))
 	// lastLine/lastLen track the most recent content line (not blank, not a
 	// comment). A scope popped by a dedent ends at that line: blank lines,
 	// comments and decorators between declarations belong to no body.
 	lastLine, lastLen := 0, 0
+	// open tracks bracket depth carried over from previous lines. A line that
+	// continues an open bracket carries no indentation meaning -- the `):`
+	// closing a signature split over several lines is not a dedent out of the
+	// declaration it belongs to -- and it declares nothing of its own.
+	open := 0
 
 	for i, line := range lines {
 		lineNo := i + 1
@@ -63,7 +77,16 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		masked := strings.TrimSuffix(maskedLines[i], "\r")
 		indent := lineIndent(line)
 		trimmed := strings.TrimSpace(line)
+		continued := open > 0
+		open += bracketDelta(masked)
+		if open < 0 {
+			open = 0
+		}
 		if strings.TrimSpace(masked) == "" {
+			continue
+		}
+		if continued {
+			lastLine, lastLen = lineNo, len(line)
 			continue
 		}
 
@@ -136,34 +159,38 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			continue
 		}
 
-		if strings.HasPrefix(trimmed, "import ") {
-			imports := strings.Split(strings.TrimPrefix(trimmed, "import "), ",")
-			for _, imp := range imports {
-				imp = strings.TrimSpace(imp)
-				if imp != "" {
-					pf.Imports = append(pf.Imports, imp)
+		if importLines[i] {
+			// A class body is not a scope Python name lookup passes through, so
+			// an import written in one reaches nothing this resolver can see.
+			if len(scopes) > 0 && scopes[len(scopes)-1].kind == "class" {
+				continue
+			}
+			for _, binding := range ImportBindings(stmts[i]) {
+				binding.OwnerModule = strings.Join(scopeNames(scopes), ".")
+				pf.Scope.Imports = append(pf.Scope.Imports, binding)
+				if _, ok := seenModules[binding.SourceSpecifier]; !ok {
+					seenModules[binding.SourceSpecifier] = struct{}{}
+					pf.Imports = append(pf.Imports, binding.SourceSpecifier)
 				}
 			}
-		}
-		if strings.HasPrefix(trimmed, "from ") && strings.Contains(trimmed, " import ") {
-			parts := strings.SplitN(strings.TrimPrefix(trimmed, "from "), " import ", 2)
-			if len(parts) == 2 {
-				modulePath := strings.TrimSpace(parts[0])
-				if modulePath != "" {
-					pf.Imports = append(pf.Imports, modulePath)
-				}
-			}
+			continue
 		}
 
 		if lastFunction(scopes) < 0 {
 			continue
 		}
-		for _, m := range callRE.FindAllStringSubmatch(masked, -1) {
-			if len(m) != 2 {
+		for _, loc := range callRE.FindAllStringSubmatchIndex(masked, -1) {
+			if len(loc) != 4 {
 				continue
 			}
-			name := m[1]
-			if isPythonKeyword(name) {
+			// A chain whose head is itself a call or a subscript (`f().run()`,
+			// `items[0]()`) has no name the parser can state truthfully, so it
+			// emits nothing rather than the tail alone.
+			if start := loc[2]; start > 0 && strings.IndexByte(").]", masked[start-1]) >= 0 {
+				continue
+			}
+			name := masked[loc[2]:loc[3]]
+			if !strings.Contains(name, ".") && isPythonKeyword(name) {
 				continue
 			}
 			pf.Edges = append(pf.Edges, graph.Edge{
@@ -189,8 +216,41 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 	// EOF closes every open scope at the file's last content line.
 	closeScopes(scopes, -1, lastLine, lastLen, pf.Symbols)
+	addPythonLocalBindings(module, lines, &pf)
 
 	return pf, nil
+}
+
+// addPythonLocalBindings records what each lexical scope binds itself: the
+// module, and every function or method body now that their ranges are sealed.
+// Class bodies are not scopes a name lookup passes through in Python, so they
+// contribute nothing -- LocalBindings skips them from the module scan, and a
+// method scans only its own body.
+func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile) {
+	emit := func(owner, source string) {
+		for _, binding := range LocalBindings(source, owner != "") {
+			kind := graph.ScopeImportLocalBinding
+			if binding.Declaration {
+				kind = graph.ScopeImportNestedDeclaration
+			}
+			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+				LocalName:   binding.Name,
+				Kind:        kind,
+				OwnerModule: owner,
+			})
+		}
+	}
+	emit("", strings.Join(lines, "\n"))
+	for _, sym := range pf.Symbols {
+		if sym.Kind != "function" && sym.Kind != "method" {
+			continue
+		}
+		start, end := sym.Range.StartLine-1, sym.Range.EndLine
+		if start < 0 || end > len(lines) || start >= end {
+			continue
+		}
+		emit(strings.TrimPrefix(sym.QualifiedName, module+"."), strings.Join(lines[start:end], "\n"))
+	}
 }
 
 // closeScopes pops every scope whose indent the current line dedents to (or
@@ -329,7 +389,9 @@ func visibility(name string) string {
 
 func isPythonKeyword(name string) bool {
 	switch name {
-	case "if", "for", "while", "return", "print", "with", "class", "def", "try", "except", "elif":
+	case "if", "for", "while", "return", "print", "with", "class", "def", "try", "except", "elif",
+		"and", "or", "not", "in", "is", "lambda", "yield", "await", "assert", "del", "raise",
+		"global", "nonlocal", "pass", "else", "finally", "import", "from":
 		return true
 	default:
 		return false

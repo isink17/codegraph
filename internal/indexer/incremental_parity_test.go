@@ -1199,13 +1199,20 @@ func TestRemovedDeclarationDoesNotBypassTypeScope(t *testing.T) {
 	r.assertFreshParity(t, "after removal")
 }
 
-// The positive control for the test above: with the import present, the removal
-// is exactly what makes the edge decidable, and the update must notice.
+// The positive control for the test above: the import makes the survivor
+// visible, so the removal is exactly what makes the edge decidable, and the
+// update must notice.
+//
+// The import is a wildcard because P22.26 declines to claim that form -- what
+// `from x import *` publishes is `__all__`, which the syntax does not state --
+// so the decision stays with the repository-wide type-scope rule this test is
+// the control for. The explicit form is covered by
+// TestPythonImportScopeLifecycle, where the Python pass owns it outright.
 func TestRemovedDeclarationResolvesImportedTypeTarget(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"models_a.py": "class Widget:\n    pass\n",
 		"models_b.py": "class Widget:\n    pass\n",
-		"main.py":     "from models_a import Widget\n\n\ndef run():\n    return Widget()\n",
+		"main.py":     "from models_a import *\n\n\ndef run():\n    return Widget()\n",
 	})
 	if got := r.edgeState(t, "main.py", "Widget"); !strings.Contains(got, ":: [/]") {
 		t.Fatalf("initial state: want unresolved, got %s", got)

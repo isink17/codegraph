@@ -2369,17 +2369,32 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Language == "typescript" {
+	if parsed.Language == "typescript" || parsed.Language == "python" {
+		modulePaths := typescriptModuleCandidatePaths
+		if parsed.Language == "python" {
+			modulePaths = pythonModuleCandidatePaths
+		}
 		args := make([]any, 0, len(parsed.Scope.Imports)*4)
 		seen := make(map[string]struct{}, len(parsed.Scope.Imports))
-		for _, evidence := range parsed.Scope.Imports {
-			for _, candidate := range typescriptModuleCandidatePaths(filePath, evidence.SourceSpecifier) {
-				key := evidence.SourceSpecifier + "\x00" + candidate
+		add := func(specifier string) {
+			for _, candidate := range modulePaths(filePath, specifier) {
+				key := specifier + "\x00" + candidate
 				if _, ok := seen[key]; ok {
 					continue
 				}
 				seen[key] = struct{}{}
-				args = append(args, repoID, fileID, evidence.SourceSpecifier, candidate)
+				args = append(args, repoID, fileID, specifier, candidate)
+			}
+		}
+		for _, evidence := range parsed.Scope.Imports {
+			add(evidence.SourceSpecifier)
+			// `from pkg import helpers` resolves against `pkg.helpers` when the
+			// imported name turns out to be a submodule, so that spelling needs
+			// a reverse-lookup row too: `pkg/helpers.py` appearing later must
+			// reach this file on an incremental update.
+			if parsed.Language == "python" && evidence.Kind == graph.ScopeImportNamed &&
+				!evidence.Wildcard && evidence.ImportedName != "" && evidence.SourceSpecifier != "" {
+				add(pythonSubmoduleSpecifier(evidence.SourceSpecifier, evidence.ImportedName))
 			}
 		}
 		if len(args) > 0 {
@@ -2995,6 +3010,39 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 // marked deleted. Their rows survive until PurgeDeletedFileGraphsForScan runs,
 // which is the window this reads in -- MarkMissingDeleted never tells its caller
 // which paths went away, so asking by scan is the only cheap way to see them.
+// DeletedPathsInScan lists the repository-relative paths a scan marked deleted.
+//
+// A deleted file's path is evidence in its own right, and it is the only key
+// some of it can be found by: an empty `__init__.py` declares no symbol, so the
+// name-based invalidation below cannot notice it leaving, yet whether that file
+// exists decides which directories are Python packages -- and therefore what
+// every absolute import beneath it resolves against. The same is true of a
+// TypeScript module deleted without taking a declaration with it.
+//
+// Callers must read this before PurgeDeletedFileGraphsForScan, which removes
+// the rows.
+func (s *Store) DeletedPathsInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT path FROM files
+		WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
+	`, repoID, scanID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		if canonical := CanonicalRelPath(strings.ReplaceAll(p, `\`, `/`)); canonical != "" {
+			out = append(out, canonical)
+		}
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) PreviousSymbolNamesForDeletedInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT name FROM (
@@ -3314,6 +3362,12 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeVeto); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeResolution); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
 		return err
 	}
@@ -3341,6 +3395,9 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+tsScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+pyScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return err
 	}
 
@@ -3487,6 +3544,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	if n, _, err := resolvePythonScope(ctx, tx, repoID, nil, true); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	}
@@ -3529,6 +3591,8 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeVeto)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeResolution)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_resolution`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
@@ -4235,6 +4299,11 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	names = mergeResolverNames(names, tsNames)
+	pyNames, err := s.invalidatePythonScopeBindings(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, pyNames)
 	scopeNames, err := s.typeScopeNamesForChangedPaths(ctx, repoID, paths, scopes)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -4280,6 +4349,13 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+		return 0, err
+	}
+	// This entrypoint runs a repo-wide strategy without running any language
+	// scope pass, so the Python claims it must not overrule are recorded here.
+	// Same decision code as the pass itself -- there is no second definition of
+	// "claimed" to drift.
+	if err := recordPythonScopeClaims(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
 	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID)
@@ -5326,6 +5402,30 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		remaining = targets[:0]
 		for _, target := range targets {
 			if target.srcLanguage != "typescript" {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
+	}
+	pyIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage == "python" {
+			pyIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(pyIDs) > 0 {
+		// Unlike TypeScript, Python scope does not own every edge in its
+		// language: a bare call the calling file neither imports nor declares
+		// carries no module evidence at all, and stays with the generic
+		// strategies. Only what the pass handled is withheld from them.
+		n, handled, err := resolvePythonScope(ctx, s.db, repoID, pyIDs, false)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, done := handled[target.edgeID]; !done {
 				remaining = append(remaining, target)
 			}
 		}

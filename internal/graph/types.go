@@ -101,6 +101,19 @@ const (
 	ScopeImportNamespace  = "namespace"
 	ScopeImportSideEffect = "side_effect"
 	ScopeImportUse        = "use"
+
+	// ScopeImportLocalBinding is negative scope evidence rather than an import:
+	// it records that a lexical scope binds a name itself (a parameter, an
+	// assignment, a nested declaration), so a resolver can tell that an import
+	// of that name does not reach a call site below it. OwnerModule carries the
+	// scope, LocalName the bound name, and SourceSpecifier is empty.
+	ScopeImportLocalBinding = "local_binding"
+
+	// ScopeImportNestedDeclaration is a local binding a nested `def` or `class`
+	// makes in the function that encloses it. It shadows an import of the same
+	// name the way any other local does, but the name it binds is a symbol this
+	// graph holds, so it is not a reason to refuse every other strategy.
+	ScopeImportNestedDeclaration = "nested_decl"
 )
 
 type ReExport struct {

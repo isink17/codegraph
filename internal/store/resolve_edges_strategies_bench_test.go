@@ -66,6 +66,15 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnly(b *testing.B) {
 		if err != nil {
 			b.Fatalf("BeginTx() error = %v", err)
 		}
+		// The strategies read the per-resolve veto relations, so a benchmark
+		// that drives one directly has to build them exactly as ResolveEdges
+		// does. Untimed: it is setup, not the strategy under measurement.
+		if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+			b.Fatalf("prepareResolverTables() error = %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+			b.Fatalf("create own-module veto: %v", err)
+		}
 		b.StartTimer()
 		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
@@ -135,6 +144,15 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 		if err != nil {
 			b.Fatalf("BeginTx() error = %v", err)
 		}
+		// The strategies read the per-resolve veto relations, so a benchmark
+		// that drives one directly has to build them exactly as ResolveEdges
+		// does. Untimed: it is setup, not the strategy under measurement.
+		if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+			b.Fatalf("prepareResolverTables() error = %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+			b.Fatalf("create own-module veto: %v", err)
+		}
 		b.StartTimer()
 		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
@@ -203,6 +221,15 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			b.Fatalf("BeginTx() error = %v", err)
+		}
+		// The strategies read the per-resolve veto relations, so a benchmark
+		// that drives one directly has to build them exactly as ResolveEdges
+		// does. Untimed: it is setup, not the strategy under measurement.
+		if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+			b.Fatalf("prepareResolverTables() error = %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
 		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
@@ -276,6 +303,15 @@ func BenchmarkResolveEdgesByDotSuffixLargeScale(b *testing.B) {
 		if err != nil {
 			b.Fatalf("BeginTx() error = %v", err)
 		}
+		// The strategies read the per-resolve veto relations, so a benchmark
+		// that drives one directly has to build them exactly as ResolveEdges
+		// does. Untimed: it is setup, not the strategy under measurement.
+		if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+			b.Fatalf("prepareResolverTables() error = %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+			b.Fatalf("create own-module veto: %v", err)
+		}
 		b.StartTimer()
 		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
 			b.Fatalf("resolveEdgesByDotSuffix() error = %v", err)
@@ -343,6 +379,15 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnlyLargeScale(b *testing.B) {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			b.Fatalf("BeginTx() error = %v", err)
+		}
+		// The strategies read the per-resolve veto relations, so a benchmark
+		// that drives one directly has to build them exactly as ResolveEdges
+		// does. Untimed: it is setup, not the strategy under measurement.
+		if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+			b.Fatalf("prepareResolverTables() error = %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
 		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
@@ -419,6 +464,15 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2LargeScale(b *testing.B) {
 		if err != nil {
 			b.Fatalf("BeginTx() error = %v", err)
 		}
+		// The strategies read the per-resolve veto relations, so a benchmark
+		// that drives one directly has to build them exactly as ResolveEdges
+		// does. Untimed: it is setup, not the strategy under measurement.
+		if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+			b.Fatalf("prepareResolverTables() error = %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+			b.Fatalf("create own-module veto: %v", err)
+		}
 		b.StartTimer()
 		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
@@ -474,6 +528,15 @@ func BenchmarkResolveEdgesBySlashSuffix_NoUnresolved(b *testing.B) {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			b.Fatalf("BeginTx() error = %v", err)
+		}
+		// The strategies read the per-resolve veto relations, so a benchmark
+		// that drives one directly has to build them exactly as ResolveEdges
+		// does. Untimed: it is setup, not the strategy under measurement.
+		if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+			b.Fatalf("prepareResolverTables() error = %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
 		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {

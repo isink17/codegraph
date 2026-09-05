@@ -85,6 +85,15 @@ func BenchmarkResolveEdgesByDotSuffix_ThreeDot(b *testing.B) {
 				if err != nil {
 					b.Fatalf("BeginTx() error = %v", err)
 				}
+				// The strategy reads the per-resolve veto relations, so a
+				// benchmark that drives it directly has to build them exactly as
+				// ResolveEdges does. Untimed: setup, not the strategy measured.
+				if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
+					b.Fatalf("prepareResolverTables() error = %v", err)
+				}
+				if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+					b.Fatalf("create own-module veto: %v", err)
+				}
 				b.StartTimer()
 				if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
 					b.Fatalf("resolveEdgesByDotSuffix() error = %v", err)
