@@ -2369,11 +2369,15 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Language == "typescript" {
+	if parsed.Language == "typescript" || parsed.Language == "python" {
+		modulePaths := typescriptModuleCandidatePaths
+		if parsed.Language == "python" {
+			modulePaths = pythonModuleCandidatePaths
+		}
 		args := make([]any, 0, len(parsed.Scope.Imports)*4)
 		seen := make(map[string]struct{}, len(parsed.Scope.Imports))
 		for _, evidence := range parsed.Scope.Imports {
-			for _, candidate := range typescriptModuleCandidatePaths(filePath, evidence.SourceSpecifier) {
+			for _, candidate := range modulePaths(filePath, evidence.SourceSpecifier) {
 				key := evidence.SourceSpecifier + "\x00" + candidate
 				if _, ok := seen[key]; ok {
 					continue
@@ -3314,6 +3318,12 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeVeto); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeResolution); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable); err != nil {
 		return err
 	}
@@ -3343,6 +3353,9 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+tsScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+pyScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return err
+	}
 
 	var hasUnresolved int
 	if err := tx.QueryRowContext(ctx, `
@@ -3360,6 +3373,13 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 		return err
 	}
 	if err := s.recordResolverImportScope(ctx, tx, repoID); err != nil {
+		return err
+	}
+	// The Python import veto is populated here rather than by resolvePythonScope
+	// so that every transaction running a repo-wide strategy carries it --
+	// including resolveDotSuffixIncrementally, which reruns the weakest strategy
+	// without repeating any language scope pass.
+	if err := recordPythonScopeVeto(ctx, tx, repoID); err != nil {
 		return err
 	}
 	return s.recordAmbiguousResolverNames(ctx, tx, repoID)
@@ -3487,6 +3507,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	if n, _, err := resolvePythonScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	}
@@ -3529,6 +3554,8 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeVeto)
+		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeResolution)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_resolution`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverCppNamespaceScopesTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_veto`)
@@ -4235,6 +4262,11 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	names = mergeResolverNames(names, tsNames)
+	pyNames, err := s.invalidatePythonScopeBindings(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, pyNames)
 	scopeNames, err := s.typeScopeNamesForChangedPaths(ctx, repoID, paths, scopes)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -5326,6 +5358,30 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		remaining = targets[:0]
 		for _, target := range targets {
 			if target.srcLanguage != "typescript" {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
+	}
+	pyIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage == "python" {
+			pyIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(pyIDs) > 0 {
+		// Unlike TypeScript, Python scope does not own every edge in its
+		// language: a bare call the calling file neither imports nor declares
+		// carries no module evidence at all, and stays with the generic
+		// strategies. Only what the pass handled is withheld from them.
+		n, handled, err := resolvePythonScope(ctx, s.db, repoID, pyIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, done := handled[target.edgeID]; !done {
 				remaining = append(remaining, target)
 			}
 		}

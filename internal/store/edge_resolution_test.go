@@ -108,6 +108,8 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyKotlinPackageScope,
 		ResolutionStrategyKotlinImportScope,
 		ResolutionStrategyTypeScriptModuleScope,
+		ResolutionStrategyPythonImportScope,
+		ResolutionStrategyPythonModuleScope,
 	}
 	if len(all) != len(resolutionConfidenceByStrategy) {
 		t.Fatalf("strategy constants = %d, registered confidences = %d; every strategy needs exactly one tier", len(all), len(resolutionConfidenceByStrategy))

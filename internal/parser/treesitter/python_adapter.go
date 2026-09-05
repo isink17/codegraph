@@ -5,12 +5,14 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
-	python "github.com/smacker/go-tree-sitter/python"
+	sitterpython "github.com/smacker/go-tree-sitter/python"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser/python"
 )
 
 // PythonAdapter parses Python source files using tree-sitter.
@@ -26,7 +28,7 @@ func (a *PythonAdapter) Supports(path string) bool {
 }
 
 func (a *PythonAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
-	root, err := parse(ctx, python.GetLanguage(), content)
+	root, err := parse(ctx, sitterpython.GetLanguage(), content)
 	if err != nil {
 		return graph.ParsedFile{}, err
 	}
@@ -50,18 +52,20 @@ func (a *PythonAdapter) Parse(ctx context.Context, path string, content []byte) 
 	return pf, nil
 }
 
+// pyExtractImports hands each import statement's own source text to the shared
+// binding parser, so this adapter and the regex adapter record the same module
+// spelling, imported name and local binding for the same statement.
 func pyExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
-	for _, imp := range findDescendants(root, "import_statement") {
-		// import foo, bar
-		for _, nameNode := range findDescendants(imp, "dotted_name") {
-			pf.Imports = append(pf.Imports, nodeText(nameNode, content))
-		}
-	}
-	for _, imp := range findDescendants(root, "import_from_statement") {
-		// from foo import bar
-		nameNode := childByFieldName(imp, "module_name")
-		if nameNode != nil {
-			pf.Imports = append(pf.Imports, nodeText(nameNode, content))
+	nodes := append(findDescendants(root, "import_statement"), findDescendants(root, "import_from_statement")...)
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].StartByte() < nodes[j].StartByte() })
+	seen := make(map[string]struct{}, len(nodes))
+	for _, imp := range nodes {
+		for _, binding := range python.ImportBindings(nodeText(imp, content)) {
+			pf.Scope.Imports = append(pf.Scope.Imports, binding)
+			if _, ok := seen[binding.SourceSpecifier]; !ok {
+				seen[binding.SourceSpecifier] = struct{}{}
+				pf.Imports = append(pf.Imports, binding.SourceSpecifier)
+			}
 		}
 	}
 }

@@ -13,7 +13,10 @@ import (
 var (
 	classRE = regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	defRE   = regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-	callRE  = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	// callRE keeps the whole dotted receiver chain a call site actually wrote,
+	// so `helpers.load()` stays distinguishable from a bare `load()`. The chain
+	// is syntax, not a claim about what `helpers` is.
+	callRE = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)
 )
 
 type scope struct {
@@ -52,6 +55,20 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 	var scopes []scope
 	maskedLines := maskPythonLines(lines)
+	// Import syntax is read from the masked source before the line walk, so a
+	// statement spanning several physical lines is still one binding and its
+	// lines never reach call extraction.
+	stmts, importLines := importStatements(maskedLines)
+	seenModules := make(map[string]struct{}, len(stmts))
+	for _, stmt := range stmts {
+		for _, binding := range ImportBindings(stmt) {
+			pf.Scope.Imports = append(pf.Scope.Imports, binding)
+			if _, ok := seenModules[binding.SourceSpecifier]; !ok {
+				seenModules[binding.SourceSpecifier] = struct{}{}
+				pf.Imports = append(pf.Imports, binding.SourceSpecifier)
+			}
+		}
+	}
 	// lastLine/lastLen track the most recent content line (not blank, not a
 	// comment). A scope popped by a dedent ends at that line: blank lines,
 	// comments and decorators between declarations belong to no body.
@@ -136,34 +153,25 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			continue
 		}
 
-		if strings.HasPrefix(trimmed, "import ") {
-			imports := strings.Split(strings.TrimPrefix(trimmed, "import "), ",")
-			for _, imp := range imports {
-				imp = strings.TrimSpace(imp)
-				if imp != "" {
-					pf.Imports = append(pf.Imports, imp)
-				}
-			}
-		}
-		if strings.HasPrefix(trimmed, "from ") && strings.Contains(trimmed, " import ") {
-			parts := strings.SplitN(strings.TrimPrefix(trimmed, "from "), " import ", 2)
-			if len(parts) == 2 {
-				modulePath := strings.TrimSpace(parts[0])
-				if modulePath != "" {
-					pf.Imports = append(pf.Imports, modulePath)
-				}
-			}
+		if importLines[i] {
+			continue
 		}
 
 		if lastFunction(scopes) < 0 {
 			continue
 		}
-		for _, m := range callRE.FindAllStringSubmatch(masked, -1) {
-			if len(m) != 2 {
+		for _, loc := range callRE.FindAllStringSubmatchIndex(masked, -1) {
+			if len(loc) != 4 {
 				continue
 			}
-			name := m[1]
-			if isPythonKeyword(name) {
+			// A chain whose head is itself a call or a subscript (`f().run()`,
+			// `items[0]()`) has no name the parser can state truthfully, so it
+			// emits nothing rather than the tail alone.
+			if start := loc[2]; start > 0 && strings.IndexByte(").]", masked[start-1]) >= 0 {
+				continue
+			}
+			name := masked[loc[2]:loc[3]]
+			if !strings.Contains(name, ".") && isPythonKeyword(name) {
 				continue
 			}
 			pf.Edges = append(pf.Edges, graph.Edge{
@@ -329,7 +337,9 @@ func visibility(name string) string {
 
 func isPythonKeyword(name string) bool {
 	switch name {
-	case "if", "for", "while", "return", "print", "with", "class", "def", "try", "except", "elif":
+	case "if", "for", "while", "return", "print", "with", "class", "def", "try", "except", "elif",
+		"and", "or", "not", "in", "is", "lambda", "yield", "await", "assert", "del", "raise",
+		"global", "nonlocal", "pass", "else", "finally", "import", "from":
 		return true
 	default:
 		return false

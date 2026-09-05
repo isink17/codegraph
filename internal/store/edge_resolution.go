@@ -136,6 +136,17 @@ const (
 	ResolutionStrategyKotlinPackageScope     = "kotlin_package_scope"
 	ResolutionStrategyKotlinImportScope      = "kotlin_import_scope"
 	ResolutionStrategyTypeScriptModuleScope  = "typescript_module_scope"
+
+	// ResolutionStrategyPythonImportScope: the call's leading name is bound by
+	// an import statement in the calling Python file, that import names exactly
+	// one repository module file, and that file declares exactly one top-level
+	// symbol under the requested name. See python_scope.go.
+	ResolutionStrategyPythonImportScope = "python_import_scope"
+
+	// ResolutionStrategyPythonModuleScope: the call is a bare name that the
+	// calling Python file itself declares exactly once at module level, and no
+	// import in that file binds the name.
+	ResolutionStrategyPythonModuleScope = "python_module_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -202,6 +213,12 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyKotlinPackageScope:     ResolutionConfidenceHigh,
 	ResolutionStrategyKotlinImportScope:      ResolutionConfidenceHigh,
 	ResolutionStrategyTypeScriptModuleScope:  ResolutionConfidenceHigh,
+
+	// Both Python strategies match the name in full against `symbols.name` in a
+	// file the import syntax (or the module itself) proves, so nothing about
+	// either identity is discarded to reach the match.
+	ResolutionStrategyPythonImportScope: ResolutionConfidenceHigh,
+	ResolutionStrategyPythonModuleScope: ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -256,6 +273,8 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyJavaConstructor,
 	ResolutionStrategyKotlinPackageScope,
 	ResolutionStrategyKotlinImportScope,
+	ResolutionStrategyPythonImportScope,
+	ResolutionStrategyPythonModuleScope,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.
