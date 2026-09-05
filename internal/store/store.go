@@ -2372,7 +2372,14 @@ func insertParsedFileGraph(
 	if parsed.Language == "typescript" || parsed.Language == "python" {
 		modulePaths := typescriptModuleCandidatePaths
 		if parsed.Language == "python" {
-			modulePaths = pythonModuleCandidatePaths
+			// At index time the repository's package structure is not known, so
+			// the persisted candidates are the superset every plausible root
+			// could name. Resolution narrows it; invalidation only needs the
+			// superset. See pythonAncestorRoots.
+			roots := pythonAncestorRoots(filePath)
+			modulePaths = func(source, specifier string) []string {
+				return pythonModuleCandidatePaths(source, specifier, roots)
+			}
 		}
 		args := make([]any, 0, len(parsed.Scope.Imports)*4)
 		seen := make(map[string]struct{}, len(parsed.Scope.Imports))
@@ -2999,6 +3006,39 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 // marked deleted. Their rows survive until PurgeDeletedFileGraphsForScan runs,
 // which is the window this reads in -- MarkMissingDeleted never tells its caller
 // which paths went away, so asking by scan is the only cheap way to see them.
+// DeletedPathsInScan lists the repository-relative paths a scan marked deleted.
+//
+// A deleted file's path is evidence in its own right, and it is the only key
+// some of it can be found by: an empty `__init__.py` declares no symbol, so the
+// name-based invalidation below cannot notice it leaving, yet whether that file
+// exists decides which directories are Python packages -- and therefore what
+// every absolute import beneath it resolves against. The same is true of a
+// TypeScript module deleted without taking a declaration with it.
+//
+// Callers must read this before PurgeDeletedFileGraphsForScan, which removes
+// the rows.
+func (s *Store) DeletedPathsInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT path FROM files
+		WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
+	`, repoID, scanID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		if canonical := CanonicalRelPath(strings.ReplaceAll(p, `\`, `/`)); canonical != "" {
+			out = append(out, canonical)
+		}
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) PreviousSymbolNamesForDeletedInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT name FROM (
@@ -3375,13 +3415,6 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if err := s.recordResolverImportScope(ctx, tx, repoID); err != nil {
 		return err
 	}
-	// The Python import veto is populated here rather than by resolvePythonScope
-	// so that every transaction running a repo-wide strategy carries it --
-	// including resolveDotSuffixIncrementally, which reruns the weakest strategy
-	// without repeating any language scope pass.
-	if err := recordPythonScopeVeto(ctx, tx, repoID); err != nil {
-		return err
-	}
 	return s.recordAmbiguousResolverNames(ctx, tx, repoID)
 }
 
@@ -3507,7 +3540,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
-	if n, _, err := resolvePythonScope(ctx, tx, repoID, nil); err != nil {
+	if n, _, err := resolvePythonScope(ctx, tx, repoID, nil, true); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
@@ -4312,6 +4345,13 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
+		return 0, err
+	}
+	// This entrypoint runs a repo-wide strategy without running any language
+	// scope pass, so the Python claims it must not overrule are recorded here.
+	// Same decision code as the pass itself -- there is no second definition of
+	// "claimed" to drift.
+	if err := recordPythonScopeClaims(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
 	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID)
@@ -5374,7 +5414,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		// language: a bare call the calling file neither imports nor declares
 		// carries no module evidence at all, and stays with the generic
 		// strategies. Only what the pass handled is withheld from them.
-		n, handled, err := resolvePythonScope(ctx, s.db, repoID, pyIDs)
+		n, handled, err := resolvePythonScope(ctx, s.db, repoID, pyIDs, false)
 		if err != nil {
 			return outcome, err
 		}

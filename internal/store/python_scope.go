@@ -5,6 +5,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 const (
@@ -25,20 +27,11 @@ const (
 //	pkg/__init__.py     <- pkg
 //
 // A relative import is anchored at the importing file's package and nowhere
-// else, so it yields one candidate pair or none. An absolute import has no
-// single anchor -- a repository may or may not use a src-layout root -- so it
-// yields the same pair under the importing file's directory and under every
-// ancestor up to the repository root. Two of those existing at once is a
-// layout the resolver cannot decide, and it binds nothing rather than pick.
-//
-// ponytail: an absolute import costs 2*(depth+1) candidates whether or not the
-// module is repository-local, and those are persisted per import at index time
-// (scope_module_candidate_evidence). Third-party imports pay it for nothing. If
-// a deep tree's candidate table measures large, the lever is to stop the
-// ancestor walk at the first root that actually holds the first segment as a
-// directory -- which needs a repository file index this pure function does not
-// have, so it belongs in the caller, not here.
-func pythonModuleCandidatePaths(sourceFile, specifier string) []string {
+// else, so it yields one candidate pair or none, and `roots` does not apply to
+// it. An absolute import is resolved only against the roots it is given -- a
+// caller's own package directory is not one, because `import helpers` inside
+// `pkg/` has not meant `pkg.helpers` since Python 3. See pythonImportRoots.
+func pythonModuleCandidatePaths(sourceFile, specifier string, roots []string) []string {
 	if specifier == "" {
 		return nil
 	}
@@ -56,20 +49,14 @@ func pythonModuleCandidatePaths(sourceFile, specifier string) []string {
 			}
 		}
 	}
-	dir := path.Dir(canonicalStoredPath(sourceFile))
-	if dir == "." || dir == "/" {
-		dir = ""
-	}
 	if dots > 0 {
+		dir := pythonParentDir(canonicalStoredPath(sourceFile))
 		// `.x` is the importing file's own package; each further dot climbs one.
 		for i := 1; i < dots; i++ {
 			if dir == "" {
 				return nil
 			}
-			dir = path.Dir(dir)
-			if dir == "." || dir == "/" {
-				dir = ""
-			}
+			dir = pythonParentDir(dir)
 		}
 		return pythonModuleFiles(dir, segments)
 	}
@@ -77,14 +64,78 @@ func pythonModuleCandidatePaths(sourceFile, specifier string) []string {
 		return nil
 	}
 	var out []string
-	for {
-		out = append(out, pythonModuleFiles(dir, segments)...)
-		if dir == "" {
-			return out
+	seen := make(map[string]struct{}, len(roots)*2)
+	for _, root := range roots {
+		for _, candidate := range pythonModuleFiles(root, segments) {
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			out = append(out, candidate)
 		}
-		dir = path.Dir(dir)
-		if dir == "." || dir == "/" {
-			dir = ""
+	}
+	return out
+}
+
+func pythonParentDir(p string) string {
+	dir := path.Dir(p)
+	if dir == "." || dir == "/" {
+		return ""
+	}
+	return dir
+}
+
+// pythonImportRoots names the directories an absolute import written in
+// `sourceFile` may be resolved against.
+//
+// There are at most two, and neither is guessed. The repository root is always
+// one. The other is the importing file's own package root: climb out of the
+// packages the file sits in -- a directory is a package when it holds an
+// `__init__.py` -- and stop at the first directory that is not one. That is
+// `sys.path[0]` for a script and the directory a `src/` layout puts on the path
+// for a package, and it is exactly what makes `import helpers` from inside
+// `pkg/` reach a top-level `helpers.py` rather than `pkg/helpers.py`.
+//
+// Roots that a repository states rather than implies -- a `pyproject.toml`
+// `packages` table, a `setup.cfg` `package_dir` -- are not read here. Adding
+// one would need those files parsed and persisted at index time; until then an
+// import that only such a root could satisfy stays unresolved.
+//
+// A PEP 420 namespace package leaves no `__init__.py`, so its directory reads
+// as a root here and an absolute import written inside it keeps the
+// implicit-relative meaning this rule removes for ordinary packages. There is
+// no repository evidence that separates a namespace package from a plain
+// source directory, and inventing one would trade a missing edge for a wrong
+// one.
+func pythonImportRoots(sourceFile string, packageDirs map[string]struct{}) []string {
+	dir := pythonParentDir(canonicalStoredPath(sourceFile))
+	for dir != "" {
+		if _, isPackage := packageDirs[dir]; !isPackage {
+			break
+		}
+		dir = pythonParentDir(dir)
+	}
+	if dir == "" {
+		return []string{""}
+	}
+	return []string{"", dir}
+}
+
+// pythonAncestorRoots is the superset used when candidate paths are persisted
+// at index time, where the package structure of the repository is not known.
+// Invalidation only needs candidates to be a superset of what resolution will
+// consider: extra rows cost an extra reconsideration, never a stale binding.
+//
+// ponytail: this is 2*(depth+1) rows per absolute import whether or not the
+// module is repository-local, so third-party imports pay for nothing. If a deep
+// tree's candidate table measures large, the lever is to persist the package
+// structure alongside it and narrow this to pythonImportRoots.
+func pythonAncestorRoots(sourceFile string) []string {
+	roots := []string{}
+	for dir := pythonParentDir(canonicalStoredPath(sourceFile)); ; dir = pythonParentDir(dir) {
+		roots = append(roots, dir)
+		if dir == "" {
+			return roots
 		}
 	}
 }
@@ -109,13 +160,134 @@ func pythonModuleFiles(dir string, segments []string) []string {
 }
 
 type pyScopeImport struct {
-	source, imported, local, kind string
-	wildcard                      bool
+	source, imported, local, kind, owner string
+	wildcard                             bool
+}
+
+// pyBinding is one spelling an import puts in scope, flattened out of the
+// evidence row so the resolver matches names rather than re-deriving forms.
+//
+// `import a.b` yields two: `a.b`, which reaches the module the statement named,
+// and `a`, which reaches the top package it actually bound. `import a.b as x`
+// yields only `x`, reaching `a.b` -- which is why ImportedName records what the
+// local name is bound to and not merely whether an alias was written.
+type pyBinding struct {
+	prefix   string // the local spelling that reaches this module
+	owner    string // lexical scope the import was written in
+	kind     string
+	source   string // module specifier the prefix reaches
+	imported string // named imports only: the symbol asked for
+}
+
+// pyScopeLocal is negative evidence: a lexical scope binds this name itself, so
+// an import of the same name written no nearer does not reach a call below it.
+type pyScopeLocal struct {
+	owner, name string
 }
 
 type pyScopeEdge struct {
-	id, file int64
-	name     string
+	id, file, src int64
+	name          string
+}
+
+// pythonScopeVisible reports whether evidence owned by lexical scope `owner`
+// reaches a call site in scope `at`. Scopes are dotted declaration paths, and
+// "" is the module.
+func pythonScopeVisible(owner, at string) bool {
+	return owner == "" || owner == at || strings.HasPrefix(at, owner+".")
+}
+
+// pythonCallScope is the lexical scope of the symbol a call was written in: its
+// qualified name with the module prefix removed.
+//
+// The module is derived from the file path exactly as the parsers derive it, so
+// a file whose basename holds a dot (`settings.local.py`) yields the same scope
+// spelling the parser recorded as an owner. Without the path it falls back to
+// dropping one segment, which is right for every ordinary basename.
+func pythonCallScope(qualified, filePath string) string {
+	if filePath != "" {
+		module := strings.TrimSuffix(path.Base(filePath), path.Ext(filePath))
+		if module != "" {
+			if rest, ok := strings.CutPrefix(qualified, module+"."); ok {
+				return rest
+			}
+			if qualified == module {
+				return ""
+			}
+		}
+	}
+	if i := strings.IndexByte(qualified, '.'); i >= 0 {
+		return qualified[i+1:]
+	}
+	return ""
+}
+
+func pythonLeadingSegment(name string) string {
+	if i := strings.IndexByte(name, '.'); i >= 0 {
+		return name[:i]
+	}
+	return name
+}
+
+// pythonBindingsOf flattens one file's import rows into access spellings.
+func pythonBindingsOf(imports []pyScopeImport) []pyBinding {
+	out := make([]pyBinding, 0, len(imports))
+	for _, imp := range imports {
+		if imp.wildcard || imp.kind == graph.ScopeImportLocalBinding {
+			continue
+		}
+		if imp.kind != "namespace" {
+			if imp.local == "" {
+				continue
+			}
+			out = append(out, pyBinding{prefix: imp.local, owner: imp.owner, kind: imp.kind, source: imp.source, imported: imp.imported})
+			continue
+		}
+		// Aliased when the bound module is not the bare name the statement
+		// would otherwise have put in scope.
+		if imp.imported != imp.local {
+			out = append(out, pyBinding{prefix: imp.local, owner: imp.owner, kind: "namespace", source: imp.source})
+			continue
+		}
+		out = append(out, pyBinding{prefix: imp.source, owner: imp.owner, kind: "namespace", source: imp.source})
+		if imp.local != imp.source {
+			// `import a.b` also binds `a`, which reaches the package itself.
+			out = append(out, pyBinding{prefix: imp.local, owner: imp.owner, kind: "namespace", source: imp.local})
+		}
+	}
+	return out
+}
+
+// pythonScopeDecision is one edge's answer: which module and symbol its
+// lexical scope proves it meant, and whether anything claimed the name at all.
+type pythonScopeDecision struct {
+	// spec is the import specifier naming the module to look in, and want the
+	// symbol name to look for. Both empty on a claimed but undecidable edge:
+	// it is vetoed and bound to nothing.
+	spec, want string
+	paths      []string
+}
+
+// pythonScopeAnswers is what one pass over the Python evidence decides.
+type pythonScopeAnswers struct {
+	// claimed is every edge whose leading name the calling scope already gives
+	// a meaning -- an import it can see, or a local binding of its own. A
+	// repository-wide same-name match is a false edge for all of them, decided
+	// or not.
+	claimed map[int64]struct{}
+	// imported and sameModule are the edges this pass can bind, by strategy.
+	imported, sameModule map[int64]int64
+}
+
+func (a pythonScopeAnswers) handled() map[int64]struct{} {
+	out := make(map[int64]struct{}, len(a.claimed)+len(a.sameModule))
+	for id := range a.claimed {
+		out[id] = struct{}{}
+	}
+	for id := range a.sameModule {
+		out[id] = struct{}{}
+	}
+	return out
 }
 
 // resolvePythonScope binds Python call edges that repository-local import
@@ -124,49 +296,139 @@ type pyScopeEdge struct {
 //
 // Two evidence levels, both exact:
 //
-//   - python_import_scope: the call's leading name is bound by an import in the
-//     calling file, that import names exactly one repository module file, and
-//     that file declares exactly one top-level symbol under the requested name.
+//   - python_import_scope: the call's leading name is bound by an import
+//     visible in the call's own lexical scope, nothing nearer shadows it, that
+//     import names exactly one repository module file, and that file declares
+//     exactly one top-level symbol under the requested name.
 //   - python_module_scope: the call is a bare name the calling file itself
-//     declares exactly once at module level, and no import in the file binds
-//     that name.
+//     declares exactly once at module level, with no import and no local
+//     binding of that name in scope.
 //
 // Anything else stays unresolved on purpose. An import that names a module
 // outside the repository, a module the layout cannot single out, or a symbol
 // the target module does not declare, is still evidence: it says the call site
 // meant *that* module, so binding a same-named symbol somewhere else would be a
-// false edge. Those edges are vetoed rather than handed on.
-func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}) (int, map[int64]struct{}, error) {
+// false edge. So is a parameter or an assignment of the same name -- the call
+// site gave it a meaning that is not a repository symbol at all. Those edges
+// are vetoed rather than handed on.
+func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}, recordClaims bool) (int, map[int64]struct{}, error) {
+	answers, err := pythonScopeDecide(ctx, q, repoID, only, false)
+	if err != nil {
+		return 0, nil, err
+	}
+	if recordClaims {
+		// Only the transaction-scoped caller needs the table: the repo-wide
+		// strategies that run after it read the veto from there. The
+		// incremental entrypoint reads the returned set instead, and writing a
+		// temp table it never queries would leave rows on the pooled
+		// connection for nothing.
+		if err := pythonScopeRecordClaims(ctx, q, answers.claimed); err != nil {
+			return 0, nil, err
+		}
+	}
+	total := 0
+	for _, group := range []struct {
+		results  map[int64]int64
+		strategy string
+	}{
+		{answers.imported, ResolutionStrategyPythonImportScope},
+		{answers.sameModule, ResolutionStrategyPythonModuleScope},
+	} {
+		n, err := pythonScopeApply(ctx, q, group.results, group.strategy)
+		if err != nil {
+			return 0, nil, err
+		}
+		total += n
+	}
+	return total, answers.handled(), nil
+}
+
+// recordPythonScopeClaims fills the veto table without binding anything, for
+// the transactions that run a repo-wide strategy without running the Python
+// pass -- resolveDotSuffixIncrementally. It is the same decision code, so there
+// is no second implementation of "claimed" to keep in step with the first.
+func recordPythonScopeClaims(ctx context.Context, q execQuerier, repoID int64) error {
+	answers, err := pythonScopeDecide(ctx, q, repoID, nil, true)
+	if err != nil {
+		return err
+	}
+	return pythonScopeRecordClaims(ctx, q, answers.claimed)
+}
+
+func pythonScopeRecordClaims(ctx context.Context, q execQuerier, claims map[int64]struct{}) error {
+	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+pyScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	claimed := make([]int64, 0, len(claims))
+	for id := range claims {
+		claimed = append(claimed, id)
+	}
+	sort.Slice(claimed, func(i, j int) bool { return claimed[i] < claimed[j] })
+	for start := 0; start < len(claimed); start += 400 {
+		end := min(start+400, len(claimed))
+		args := make([]any, 0, end-start)
+		for _, id := range claimed[start:end] {
+			args = append(args, id)
+		}
+		if _, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO `+pyScopeVeto+`(edge_id) VALUES `+valuePlaceholders(end-start), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pythonScopeDecide walks the Python evidence once. With claimsOnly it stops
+// after the claim decision, which needs no module lookup and no symbol load --
+// that is all the veto-only caller reads, and the two passes it skips are the
+// expensive ones.
+func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}, claimsOnly bool) (pythonScopeAnswers, error) {
+	answers := pythonScopeAnswers{
+		claimed:    map[int64]struct{}{},
+		imported:   map[int64]int64{},
+		sameModule: map[int64]int64{},
+	}
 	edges, err := pythonScopeEdges(ctx, q, repoID, only)
 	if err != nil || len(edges) == 0 {
-		return 0, nil, err
+		return answers, err
 	}
 
 	callerIDs := make(map[int64]struct{}, len(edges))
+	srcIDs := make(map[int64]struct{}, len(edges))
 	for _, e := range edges {
 		callerIDs[e.file] = struct{}{}
+		if e.src != 0 {
+			srcIDs[e.src] = struct{}{}
+		}
 	}
 	callerPaths, err := pythonScopeFilePaths(ctx, q, repoID, sortedIDs(callerIDs))
 	if err != nil {
-		return 0, nil, err
+		return answers, err
 	}
-	imports, err := pythonScopeImports(ctx, q, repoID, sortedIDs(callerIDs))
+	imports, locals, err := pythonScopeImports(ctx, q, repoID, sortedIDs(callerIDs))
 	if err != nil {
-		return 0, nil, err
+		return answers, err
+	}
+	scopes, err := pythonScopeCallScopes(ctx, q, repoID, sortedIDs(srcIDs), callerPaths)
+	if err != nil {
+		return answers, err
+	}
+	packageDirs, err := pythonScopePackageDirs(ctx, q, repoID)
+	if err != nil {
+		return answers, err
 	}
 
-	// Pass 1: decide, per edge, which import binding (if any) claims its leading
-	// name, and what module file and symbol name that binding asks for. Both are
-	// decidable from syntax alone, so the module candidates every claim needs
-	// are collected in this single walk.
-	type decision struct {
-		// spec is the import specifier naming the module to look in, and want
-		// the symbol name to look for. Both empty means the edge is claimed but
-		// undecidable: it is vetoed and bound to nothing.
-		spec, want string
-		paths      []string
+	bindings := make(map[int64][]pyBinding, len(imports))
+	roots := make(map[int64][]string, len(callerPaths))
+	for file, list := range imports {
+		bindings[file] = pythonBindingsOf(list)
 	}
-	decisions := make(map[int64]decision, len(edges))
+	for file, p := range callerPaths {
+		roots[file] = pythonImportRoots(p, packageDirs)
+	}
+
+	// Pass 1: decide, per edge, what its own lexical scope says its leading
+	// name means, and collect the module candidates every claim needs.
+	decisions := make(map[int64]pythonScopeDecision, len(edges))
 	wildcardFiles := make(map[int64]bool, len(imports))
 	candidates := map[string]struct{}{}
 	for file, list := range imports {
@@ -177,11 +439,18 @@ func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only m
 		}
 	}
 	for _, e := range edges {
-		binding, member, ok := pythonBindingFor(imports[e.file], e.name)
-		if !ok {
+		at := scopes[e.src]
+		binding, member, claimed := pythonBindingFor(bindings[e.file], at, e.name)
+		if pythonNameIsShadowed(locals[e.file], at, pythonLeadingSegment(e.name), binding.owner, claimed) {
+			// The call site bound the name itself. Whatever it holds, it is not
+			// a repository symbol this resolver can name.
+			answers.claimed[e.id] = struct{}{}
 			continue
 		}
-		var d decision
+		if !claimed {
+			continue
+		}
+		var d pythonScopeDecision
 		switch {
 		case binding.kind == "namespace":
 			// `import pkg.helpers` / `import pkg.helpers as h`: the binding is
@@ -189,31 +458,36 @@ func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only m
 			// `h.a.b()` would need `a` resolved as a submodule of a submodule,
 			// which this pass does not model.
 			if pythonSingleSegment(member) {
-				d = decision{spec: binding.source, want: member}
+				d = pythonScopeDecision{spec: binding.source, want: member}
 			}
 		case member == "":
 			// `from pkg.helpers import load [as alias]`: the local name is the
 			// imported symbol itself.
-			d = decision{spec: binding.source, want: binding.imported}
+			d = pythonScopeDecision{spec: binding.source, want: binding.imported}
 		case pythonSingleSegment(member):
 			// `from pkg import helpers` + `helpers.load()`: the imported name is
 			// a submodule of the imported package as often as it is an object
 			// with attributes, and only the submodule reading names something
 			// this graph holds. Look for `pkg.helpers` and take `load` from it.
-			d = decision{spec: pythonSubmoduleSpecifier(binding.source, binding.imported), want: member}
+			d = pythonScopeDecision{spec: pythonSubmoduleSpecifier(binding.source, binding.imported), want: member}
 		}
 		if d.spec != "" {
-			d.paths = pythonModuleCandidatePaths(callerPaths[e.file], d.spec)
+			d.paths = pythonModuleCandidatePaths(callerPaths[e.file], d.spec, roots[e.file])
 			for _, candidate := range d.paths {
 				candidates[candidate] = struct{}{}
 			}
 		}
 		decisions[e.id] = d
+		answers.claimed[e.id] = struct{}{}
+	}
+
+	if claimsOnly {
+		return answers, nil
 	}
 
 	moduleFiles, err := pythonScopeFileIDsByPath(ctx, q, repoID, candidates)
 	if err != nil {
-		return 0, nil, err
+		return answers, err
 	}
 
 	// Pass 2: turn each decision into at most one target file, then load the
@@ -223,7 +497,11 @@ func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only m
 	for _, e := range edges {
 		d, ok := decisions[e.id]
 		if !ok {
-			symbolFiles[e.file] = struct{}{}
+			// A claimed edge with no decision is already answered; only the
+			// unclaimed ones can still reach their own module's declarations.
+			if _, claimed := answers.claimed[e.id]; !claimed {
+				symbolFiles[e.file] = struct{}{}
+			}
 			continue
 		}
 		var found int64
@@ -242,15 +520,16 @@ func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only m
 	}
 	topLevel, err := pythonScopeTopLevelSymbols(ctx, q, repoID, sortedIDs(symbolFiles))
 	if err != nil {
-		return 0, nil, err
+		return answers, err
 	}
 
 	// Pass 3: bind.
-	imported := map[int64]int64{}
-	sameModule := map[int64]int64{}
 	for _, e := range edges {
-		d, claimed := decisions[e.id]
-		if !claimed {
+		d, decided := decisions[e.id]
+		if !decided {
+			if _, claimed := answers.claimed[e.id]; claimed {
+				continue
+			}
 			if strings.Contains(e.name, ".") || wildcardFiles[e.file] {
 				continue
 			}
@@ -258,7 +537,7 @@ func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only m
 			// stays with the repository-wide type-scope rule (P22.9), which
 			// refuses a class a call site cannot be shown to have meant.
 			if g := topLevel[e.file][e.name]; g != nil && g.declarations == 1 && len(g.functions) == 1 {
-				sameModule[e.id] = g.functions[0]
+				answers.sameModule[e.id] = g.functions[0]
 			}
 			continue
 		}
@@ -267,34 +546,30 @@ func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only m
 			continue
 		}
 		if g := topLevel[file][d.want]; g != nil && g.declarations == 1 && len(g.topLevel) == 1 {
-			imported[e.id] = g.topLevel[0]
+			answers.imported[e.id] = g.topLevel[0]
 		}
 	}
+	return answers, nil
+}
 
-	// handled is what the generic strategies must not touch afterwards: every
-	// edge an import claimed (decided or not) plus every edge this pass bound.
-	handled := make(map[int64]struct{}, len(decisions)+len(sameModule))
-	for id := range decisions {
-		handled[id] = struct{}{}
-	}
-	for id := range sameModule {
-		handled[id] = struct{}{}
-	}
-	total := 0
-	for _, group := range []struct {
-		results  map[int64]int64
-		strategy string
-	}{
-		{imported, ResolutionStrategyPythonImportScope},
-		{sameModule, ResolutionStrategyPythonModuleScope},
-	} {
-		n, err := pythonScopeApply(ctx, q, group.results, group.strategy)
-		if err != nil {
-			return 0, nil, err
+// pythonNameIsShadowed reports whether the call site, or a scope between it and
+// the import, binds the leading name itself.
+//
+// "Between" includes the import's own scope: `h = factory()` beside
+// `import pkg.helpers as h` rebinds it either way round, and which of the two
+// runs last is control flow this resolver does not model. When no import
+// claimed the name at all, any visible local binding of it still shadows the
+// module's own declarations.
+func pythonNameIsShadowed(locals []pyScopeLocal, at, name, importOwner string, claimed bool) bool {
+	for _, local := range locals {
+		if local.name != name || !pythonScopeVisible(local.owner, at) {
+			continue
 		}
-		total += n
+		if !claimed || len(local.owner) >= len(importOwner) {
+			return true
+		}
 	}
-	return total, handled, nil
+	return false
 }
 
 // pythonSingleSegment reports whether a member spelling names one attribute --
@@ -313,39 +588,45 @@ func pythonSubmoduleSpecifier(source, imported string) string {
 	return source + "." + imported
 }
 
-// pythonBindingFor picks the import that claims a call's leading name. The
-// longest matching local binding wins -- `import pkg.helpers` binds the whole
-// dotted spelling, and that is a stronger claim on `pkg.helpers.load` than a
-// bare `pkg` binding would be. Two different bindings claiming the same name is
-// not a tie to break: it reports a claim with no decidable target, so the edge
-// is vetoed and left unresolved.
-func pythonBindingFor(imports []pyScopeImport, name string) (pyScopeImport, string, bool) {
-	var best pyScopeImport
-	bestLen, matches := 0, 0
-	for _, imp := range imports {
-		if imp.wildcard || imp.local == "" {
+// pythonBindingFor picks the import that claims a call's leading name, out of
+// the ones the call's own lexical scope can see.
+//
+// Nearest scope wins, because that is how Python resolves the leading name: a
+// function-local import shadows a module-level one, and a module-level import
+// is invisible to a call in a file that never runs it. Within one scope the
+// longest matching spelling wins -- `import pkg.helpers` binds both `pkg` and
+// `pkg.helpers`, and the latter is the stronger claim on `pkg.helpers.load`.
+//
+// Two different imports claiming the same spelling at the same distance is not
+// a tie to break: it reports a claim with no decidable target, so the edge is
+// vetoed and left unresolved.
+func pythonBindingFor(bindings []pyBinding, at, name string) (pyBinding, string, bool) {
+	var best pyBinding
+	bestOwner, bestPrefix, matches := -1, 0, 0
+	for _, b := range bindings {
+		if b.prefix == "" || !pythonScopeVisible(b.owner, at) {
 			continue
 		}
-		if name != imp.local && !strings.HasPrefix(name, imp.local+".") {
+		if name != b.prefix && !strings.HasPrefix(name, b.prefix+".") {
 			continue
 		}
-		if len(imp.local) > bestLen {
-			best, bestLen, matches = imp, len(imp.local), 1
-			continue
-		}
-		if len(imp.local) == bestLen && (imp.source != best.source || imp.imported != best.imported || imp.kind != best.kind) {
+		switch {
+		case len(b.owner) > bestOwner || (len(b.owner) == bestOwner && len(b.prefix) > bestPrefix):
+			best, bestOwner, bestPrefix, matches = b, len(b.owner), len(b.prefix), 1
+		case len(b.owner) == bestOwner && len(b.prefix) == bestPrefix &&
+			(b.source != best.source || b.imported != best.imported || b.kind != best.kind):
 			matches++
 		}
 	}
-	if bestLen == 0 {
-		return pyScopeImport{}, "", false
+	if bestOwner < 0 {
+		return pyBinding{}, "", false
 	}
 	if matches != 1 {
 		// Claimed, undecidable: report the claim with an unusable member so the
 		// caller vetoes the edge and binds nothing.
-		return pyScopeImport{kind: "ambiguous"}, "", true
+		return pyBinding{owner: best.owner, kind: "ambiguous"}, "", true
 	}
-	return best, strings.TrimPrefix(name[bestLen:], "."), true
+	return best, strings.TrimPrefix(name[bestPrefix:], "."), true
 }
 
 func pythonScopeEdges(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}) ([]pyScopeEdge, error) {
@@ -357,7 +638,7 @@ func pythonScopeEdges(ctx context.Context, q execQuerier, repoID int64, only map
 			args = append(args, id)
 		}
 	}
-	rows, err := q.QueryContext(ctx, `SELECT e.id,e.file_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='python' AND f.is_deleted=0 AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND e.edge_kind <> 'cross_language_ref'`+where, args...)
+	rows, err := q.QueryContext(ctx, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='python' AND f.is_deleted=0 AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND e.edge_kind <> 'cross_language_ref'`+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -365,7 +646,7 @@ func pythonScopeEdges(ctx context.Context, q execQuerier, repoID int64, only map
 	var edges []pyScopeEdge
 	for rows.Next() {
 		var e pyScopeEdge
-		if err := rows.Scan(&e.id, &e.file, &e.name); err != nil {
+		if err := rows.Scan(&e.id, &e.file, &e.src, &e.name); err != nil {
 			return nil, err
 		}
 		edges = append(edges, e)
@@ -387,20 +668,75 @@ func pythonScopeFilePaths(ctx context.Context, q execQuerier, repoID int64, ids 
 	return out, err
 }
 
-func pythonScopeImports(ctx context.Context, q execQuerier, repoID int64, ids []int64) (map[int64][]pyScopeImport, error) {
-	out := make(map[int64][]pyScopeImport, len(ids))
-	err := chunkedInt64Query(ctx, q, ids, `SELECT file_id,source_specifier,imported_name,local_name,import_kind,wildcard FROM scope_import_evidence WHERE repo_id=? AND language='python' AND file_id IN (`, repoID, func(scan func(...any) error) error {
+// pythonScopeImports loads one file's scope evidence, separating the import
+// bindings from the negative evidence about what each lexical scope binds
+// itself. Both live in scope_import_evidence: the table records syntax-proven
+// scope facts, and `import_kind` says which kind of fact a row is.
+//
+// `owner_module` carries the lexical scope for Python. The column was added for
+// Rust module ownership (migration 030) and every Rust reader filters on
+// `language='rust'`, so the two meanings never meet.
+func pythonScopeImports(ctx context.Context, q execQuerier, repoID int64, ids []int64) (map[int64][]pyScopeImport, map[int64][]pyScopeLocal, error) {
+	imports := make(map[int64][]pyScopeImport, len(ids))
+	locals := make(map[int64][]pyScopeLocal, len(ids))
+	err := chunkedInt64Query(ctx, q, ids, `SELECT file_id,source_specifier,imported_name,local_name,import_kind,wildcard,owner_module FROM scope_import_evidence WHERE repo_id=? AND language='python' AND file_id IN (`, repoID, func(scan func(...any) error) error {
 		var file int64
 		var imp pyScopeImport
 		var wildcard int
-		if err := scan(&file, &imp.source, &imp.imported, &imp.local, &imp.kind, &wildcard); err != nil {
+		if err := scan(&file, &imp.source, &imp.imported, &imp.local, &imp.kind, &wildcard, &imp.owner); err != nil {
 			return err
 		}
+		if imp.kind == graph.ScopeImportLocalBinding {
+			if imp.local != "" {
+				locals[file] = append(locals[file], pyScopeLocal{owner: imp.owner, name: imp.local})
+			}
+			return nil
+		}
 		imp.wildcard = wildcard != 0
-		out[file] = append(out[file], imp)
+		imports[file] = append(imports[file], imp)
+		return nil
+	})
+	return imports, locals, err
+}
+
+// pythonScopeCallScopes maps each call's source symbol to the lexical scope it
+// was written in, so evidence can be filtered to what that scope can see.
+func pythonScopeCallScopes(ctx context.Context, q execQuerier, repoID int64, ids []int64, filePaths map[int64]string) (map[int64]string, error) {
+	out := make(map[int64]string, len(ids))
+	err := chunkedInt64Query(ctx, q, ids, `SELECT id,file_id,qualified_name FROM symbols WHERE repo_id=? AND language='python' AND id IN (`, repoID, func(scan func(...any) error) error {
+		var id, file int64
+		var qualified string
+		if err := scan(&id, &file, &qualified); err != nil {
+			return err
+		}
+		out[id] = pythonCallScope(qualified, filePaths[file])
 		return nil
 	})
 	return out, err
+}
+
+// pythonScopePackageDirs is the set of directories the repository makes Python
+// packages by putting an `__init__.py` in them. One query per repository: it is
+// the evidence pythonImportRoots needs, and it is small.
+func pythonScopePackageDirs(ctx context.Context, q execQuerier, repoID int64) (map[string]struct{}, error) {
+	rows, err := q.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND is_deleted=0 AND language='python' AND (path LIKE '%\_\_init\_\_.py' ESCAPE '\')`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]struct{}{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		canonical := canonicalStoredPath(p)
+		if path.Base(canonical) != "__init__.py" {
+			continue
+		}
+		out[pythonParentDir(canonical)] = struct{}{}
+	}
+	return out, rows.Err()
 }
 
 // pySymbolGroup is what one file declares under one name.
@@ -492,34 +828,6 @@ func pythonScopeFileIDsByPath(ctx context.Context, q execQuerier, repoID int64, 
 		}
 	}
 	return out, nil
-}
-
-// recordPythonScopeVeto marks every Python call edge whose leading name an
-// import statement in the calling file binds. Claiming is what matters, not
-// resolving: once the file's syntax says a name came from a specific module, a
-// repo-wide same-name match elsewhere is a false edge whether or not
-// resolvePythonScope could decide the real target.
-//
-// It is the SQL twin of pythonBindingFor's claim test and must stay one: the
-// Go pass decides destinations, this decides who else may not. Set-based, one
-// statement per repository -- never per edge. `substr` rather than `LIKE`
-// because a local binding may legitimately contain `_`, which LIKE would treat
-// as a wildcard.
-func recordPythonScopeVeto(ctx context.Context, q execQuerier, repoID int64) error {
-	_, err := q.ExecContext(ctx, `
-		INSERT OR IGNORE INTO `+pyScopeVeto+`(edge_id)
-		SELECT e.id
-		FROM edges e
-		JOIN files f ON f.id = e.file_id AND f.language = 'python' AND f.is_deleted = 0
-		JOIN scope_import_evidence i
-		  ON i.repo_id = e.repo_id AND i.file_id = e.file_id AND i.language = 'python'
-		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != ''
-		  AND e.edge_kind <> 'cross_language_ref'
-		  AND i.wildcard = 0 AND i.local_name != ''
-		  AND (e.dst_name = i.local_name
-		    OR substr(e.dst_name, 1, length(i.local_name) + 1) = i.local_name || '.')
-	`, repoID)
-	return err
 }
 
 // chunkedInt64Query runs one query per bounded slice of ids, so evidence is
@@ -650,6 +958,38 @@ func (s *Store) invalidatePythonScopeBindings(ctx context.Context, repoID int64,
 			return nil, qerr
 		}
 	}
+	// An `__init__.py` appearing or disappearing changes which directories are
+	// packages, and therefore which roots an absolute import in the subtree
+	// below it resolves against. That dependency is not a module candidate, so
+	// it has no reverse-lookup row -- the subtree is swept directly.
+	for _, p := range canonical {
+		if path.Base(p) != "__init__.py" {
+			continue
+		}
+		dir := pythonParentDir(p)
+		prefix := dir + "/"
+		if dir == "" {
+			prefix = ""
+		}
+		rows, qerr := s.db.QueryContext(ctx, `
+			SELECT id FROM files
+			WHERE repo_id = ? AND is_deleted = 0 AND language = 'python' AND path LIKE ? ESCAPE '\'
+		`, repoID, escapeSQLLikePrefix(prefix)+`%`)
+		if qerr != nil {
+			return nil, qerr
+		}
+		for rows.Next() {
+			var id int64
+			if qerr = rows.Scan(&id); qerr != nil {
+				rows.Close()
+				return nil, qerr
+			}
+			affected[id] = struct{}{}
+		}
+		if qerr = rows.Close(); qerr != nil {
+			return nil, qerr
+		}
+	}
 	if len(affected) == 0 {
 		return nil, nil
 	}
@@ -680,4 +1020,11 @@ func (s *Store) invalidatePythonScopeBindings(ctx context.Context, repoID int64,
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// escapeSQLLikePrefix makes a stored path safe as a LIKE prefix: `_` and `%`
+// are legal in a filename and wildcards in a pattern.
+func escapeSQLLikePrefix(prefix string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`)
+	return replacer.Replace(prefix)
 }

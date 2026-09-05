@@ -404,3 +404,34 @@ func pythonProjectionDiff(want, got []string) string {
 	sort.Strings(only)
 	return strings.Join(only, "\n")
 }
+
+// callEdgeTargets renders one file's call edges keyed by the calling symbol, so
+// a test can assert which call site reached which destination rather than
+// relying on projection order.
+func (r *pyRepo) callEdgeTargets(t *testing.T, srcPath string) map[string]string {
+	t.Helper()
+	symbols, err := r.store.ExportSymbolsPage(r.ctx, r.repoID, 100000, 0)
+	if err != nil {
+		t.Fatalf("export symbols: %v", err)
+	}
+	symbolFile := make(map[int64]string, len(symbols))
+	for _, sym := range symbols {
+		symbolFile[sym.ID] = filepath.ToSlash(sym.FilePath)
+	}
+	edges, err := r.store.ExportEdgesPage(r.ctx, r.repoID, 100000, 0)
+	if err != nil {
+		t.Fatalf("export edges: %v", err)
+	}
+	out := map[string]string{}
+	for _, e := range edges {
+		if filepath.ToSlash(e.FilePath) != srcPath {
+			continue
+		}
+		dst := "<unresolved>"
+		if e.DstSymbolID != nil {
+			dst = symbolFile[*e.DstSymbolID] + ":" + e.DstQualifiedName
+		}
+		out[e.SrcQualifiedName] = dst + " [" + e.ResolutionStrategy + "]"
+	}
+	return out
+}

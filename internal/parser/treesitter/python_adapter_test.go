@@ -4,7 +4,13 @@ package treesitter
 
 import (
 	"context"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser/python"
 )
 
 func TestPythonNestedScopesAndAsync(t *testing.T) {
@@ -93,5 +99,58 @@ func TestPythonDecoratedAsyncSignature(t *testing.T) {
 	}
 	if len(p.Symbols) != 1 || p.Symbols[0].Signature != "@retry\nasync def fetch()" {
 		t.Fatalf("symbols = %+v", p.Symbols)
+	}
+}
+
+// The two Python adapters must record the same scope evidence for the same
+// source: which import is written in which lexical scope, and what each scope
+// binds itself. A resolver that trusts one and not the other would decide
+// differently under cgo and without it.
+func TestPythonScopeEvidenceMatchesRegexAdapter(t *testing.T) {
+	const src = `import pkg.helpers as h
+from . import sibling
+from pkg.helpers import load as read
+
+
+CONFIG = {}
+
+
+def f(arg):
+    import other.helpers as h
+    value = 1
+    for item in arg:
+        pass
+    return h.load()
+
+
+class Service:
+    attr = 1
+
+    def method(self, name):
+        with open(name) as fh:
+            return read(fh)
+`
+	tree, err := NewPython().Parse(context.Background(), "mod.py", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	regex, err := python.New().Parse(context.Background(), "mod.py", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	render := func(pf graph.ParsedFile) []string {
+		out := make([]string, 0, len(pf.Scope.Imports))
+		for _, b := range pf.Scope.Imports {
+			out = append(out, strings.Join([]string{b.Kind, b.OwnerModule, b.LocalName, b.ImportedName, b.SourceSpecifier}, "|"))
+		}
+		sort.Strings(out)
+		return out
+	}
+	got, want := render(tree), render(regex)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("tree-sitter scope evidence:\n%v\nregex:\n%v", got, want)
+	}
+	if len(got) == 0 {
+		t.Fatal("no scope evidence recorded")
 	}
 }

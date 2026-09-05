@@ -45,6 +45,9 @@ func (a *PythonAdapter) Parse(ctx context.Context, path string, content []byte) 
 	// ---- top-level symbols ----
 	pyExtractSymbols(root, module, pyScope{}, content, &pf)
 
+	// ---- lexical bindings that shadow an import ----
+	pyExtractLocalBindings(root, module, content, &pf)
+
 	// ---- call edges (all call nodes in the file) ----
 	pyExtractCalls(root, content, &pf)
 
@@ -60,13 +63,80 @@ func pyExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].StartByte() < nodes[j].StartByte() })
 	seen := make(map[string]struct{}, len(nodes))
 	for _, imp := range nodes {
+		if pyInClassBody(imp) {
+			// A class body is not a scope Python name lookup passes through, so
+			// an import written in one reaches nothing this resolver can see.
+			continue
+		}
+		owner := pyLexicalOwner(imp, content)
 		for _, binding := range python.ImportBindings(nodeText(imp, content)) {
+			binding.OwnerModule = owner
 			pf.Scope.Imports = append(pf.Scope.Imports, binding)
 			if _, ok := seen[binding.SourceSpecifier]; !ok {
 				seen[binding.SourceSpecifier] = struct{}{}
 				pf.Imports = append(pf.Imports, binding.SourceSpecifier)
 			}
 		}
+	}
+}
+
+// pyInClassBody reports whether the nearest enclosing declaration is a class.
+func pyInClassBody(node *sitter.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.Type() {
+		case "class_definition":
+			return true
+		case "function_definition":
+			return false
+		}
+	}
+	return false
+}
+
+// pyLexicalOwner names the scope a node was written in, as the dotted path of
+// enclosing declarations -- the same spelling a symbol's qualified name carries
+// after its module. A node at module level is owned by "".
+func pyLexicalOwner(node *sitter.Node, content []byte) string {
+	var parts []string
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.Type() {
+		case "function_definition", "class_definition":
+			if name := childByFieldName(parent, "name"); name != nil {
+				parts = append(parts, nodeText(name, content))
+			}
+		}
+	}
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return strings.Join(parts, ".")
+}
+
+// pyExtractLocalBindings records what each lexical scope binds itself, using
+// the same text scan the regex adapter uses so the two adapters cannot disagree
+// about a shadow. Class bodies are not scopes a Python name lookup passes
+// through, so only the module and each function body are scanned.
+func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
+	emit := func(owner, source string) {
+		for _, name := range python.LocalBindings(source, owner != "") {
+			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+				LocalName:   name,
+				Kind:        graph.ScopeImportLocalBinding,
+				OwnerModule: owner,
+			})
+		}
+	}
+	emit("", string(content))
+	for _, fn := range findDescendants(root, "function_definition") {
+		name := childByFieldName(fn, "name")
+		if name == nil {
+			continue
+		}
+		owner := pyLexicalOwner(fn, content)
+		if owner != "" {
+			owner += "."
+		}
+		emit(owner+nodeText(name, content), nodeText(fn, content))
 	}
 }
 

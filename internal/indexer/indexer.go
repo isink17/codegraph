@@ -757,6 +757,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		for _, name := range removed {
 			removedSymbolNameSet[name] = struct{}{}
 		}
+		// A deleted path is evidence too, and a file that declared nothing has
+		// no name to be found by. See store.DeletedPathsInScan.
+		removedPaths, err := i.store.DeletedPathsInScan(ctx, repo.ID, scanID)
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		for _, path := range removedPaths {
+			changedPathSet[path] = struct{}{}
+		}
 		if _, err := i.store.PurgeDeletedFileGraphsForScan(ctx, repo.ID, scanID); err != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err

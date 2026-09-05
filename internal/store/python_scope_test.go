@@ -12,56 +12,82 @@ import (
 func TestPythonModuleCandidatePaths(t *testing.T) {
 	tests := []struct {
 		name, source, specifier string
+		roots                   []string
 		want                    []string
 	}{
 		{
-			// An absolute import has no single anchor, so every ancestor of the
-			// importing file is offered as a root. Two of them existing at once
-			// is what the resolver refuses to decide.
-			name:   "absolute offers every ancestor root",
-			source: "src/app/main.py", specifier: "pkg.helpers",
+			// Absolute imports see only the roots they are given -- never the
+			// caller's own package directory.
+			name:   "absolute against the repository root",
+			source: "src/app/main.py", specifier: "pkg.helpers", roots: []string{""},
+			want: []string{"pkg/helpers.py", "pkg/helpers/__init__.py"},
+		},
+		{
+			name:   "absolute against a src layout root",
+			source: "src/app/main.py", specifier: "pkg.helpers", roots: []string{"", "src"},
 			want: []string{
-				"src/app/pkg/helpers.py", "src/app/pkg/helpers/__init__.py",
-				"src/pkg/helpers.py", "src/pkg/helpers/__init__.py",
 				"pkg/helpers.py", "pkg/helpers/__init__.py",
+				"src/pkg/helpers.py", "src/pkg/helpers/__init__.py",
 			},
 		},
 		{
-			name:   "absolute at the repository root",
-			source: "main.py", specifier: "pkg",
-			want: []string{"pkg.py", "pkg/__init__.py"},
-		},
-		{
 			name:   "relative one level is anchored at the importing package",
-			source: "pkg/app.py", specifier: ".helpers",
+			source: "pkg/app.py", specifier: ".helpers", roots: []string{""},
 			want: []string{"pkg/helpers.py", "pkg/helpers/__init__.py"},
 		},
 		{
 			name:   "relative two levels climbs once",
-			source: "pkg/deep/app.py", specifier: "..common.helpers",
+			source: "pkg/deep/app.py", specifier: "..common.helpers", roots: []string{""},
 			want: []string{"pkg/common/helpers.py", "pkg/common/helpers/__init__.py"},
 		},
 		{
 			name:   "bare relative names a package, never a module file",
-			source: "pkg/app.py", specifier: ".",
+			source: "pkg/app.py", specifier: ".", roots: []string{""},
 			want: []string{"pkg/__init__.py"},
 		},
 		{
 			name:   "relative above the repository root has no candidate",
-			source: "app.py", specifier: "..helpers",
+			source: "app.py", specifier: "..helpers", roots: []string{""},
 			want: nil,
 		},
 		{
 			name:   "malformed specifier has no candidate",
-			source: "app.py", specifier: "pkg..helpers",
+			source: "app.py", specifier: "pkg..helpers", roots: []string{""},
 			want: nil,
 		},
-		{name: "empty specifier", source: "app.py", specifier: "", want: nil},
+		{name: "empty specifier", source: "app.py", specifier: "", roots: []string{""}, want: nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pythonModuleCandidatePaths(tc.source, tc.specifier); !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("pythonModuleCandidatePaths(%q, %q) = %v, want %v", tc.source, tc.specifier, got, tc.want)
+			if got := pythonModuleCandidatePaths(tc.source, tc.specifier, tc.roots); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("pythonModuleCandidatePaths(%q, %q, %v) = %v, want %v", tc.source, tc.specifier, tc.roots, got, tc.want)
+			}
+		})
+	}
+}
+
+// A caller's own package directory is not an import root: `import helpers`
+// inside `pkg/` has not meant `pkg.helpers` since Python 3.
+func TestPythonImportRoots(t *testing.T) {
+	tests := []struct {
+		name, source string
+		packages     []string
+		want         []string
+	}{
+		{"repository root for a file in no package", "app.py", nil, []string{""}},
+		{"a script's own directory is its root", "scripts/run.py", nil, []string{"", "scripts"}},
+		{"a package directory is never a root", "pkg/main.py", []string{"pkg"}, []string{""}},
+		{"climbs out of nested packages", "pkg/deep/main.py", []string{"pkg", "pkg/deep"}, []string{""}},
+		{"a src layout puts src on the path", "src/pkg/main.py", []string{"src/pkg"}, []string{"", "src"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			packages := map[string]struct{}{}
+			for _, dir := range tc.packages {
+				packages[dir] = struct{}{}
+			}
+			if got := pythonImportRoots(tc.source, packages); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("pythonImportRoots(%q, %v) = %v, want %v", tc.source, tc.packages, got, tc.want)
 			}
 		})
 	}
@@ -70,8 +96,9 @@ func TestPythonModuleCandidatePaths(t *testing.T) {
 // Module identity is a path. Two modules sharing a basename must never share a
 // candidate, whichever direction the import is written in.
 func TestPythonModuleCandidatePathsSeparateSameBasename(t *testing.T) {
-	foo := pythonModuleCandidatePaths("app.py", "foo.utils")
-	bar := pythonModuleCandidatePaths("app.py", "bar.utils")
+	roots := []string{""}
+	foo := pythonModuleCandidatePaths("app.py", "foo.utils", roots)
+	bar := pythonModuleCandidatePaths("app.py", "bar.utils", roots)
 	for _, a := range foo {
 		for _, b := range bar {
 			if a == b {
@@ -81,25 +108,71 @@ func TestPythonModuleCandidatePathsSeparateSameBasename(t *testing.T) {
 	}
 }
 
-func TestPythonBindingFor(t *testing.T) {
-	imports := []pyScopeImport{
-		{source: "pkg.helpers", imported: "load", local: "read_config", kind: "named"},
-		{source: "pkg.helpers", local: "pkg.helpers", kind: "namespace"},
-		{source: "other", local: "other", kind: "namespace"},
-	}
+// `import a.b` binds `a`, not `a.b`, and the resolver derives both spellings
+// that reach a module from that truthful record rather than from a corrupted
+// LocalName.
+func TestPythonBindingsOfNamespaceImports(t *testing.T) {
 	tests := []struct {
-		name, call, wantSource, wantMember string
-		wantClaimed                        bool
+		name string
+		imp  pyScopeImport
+		want []pyBinding
 	}{
-		{"alias binds exactly", "read_config", "pkg.helpers", "", true},
-		{"dotted module binds its whole path", "pkg.helpers.load", "pkg.helpers", "load", true},
-		{"module member", "other.run", "other", "run", true},
-		{"unclaimed name", "sorted", "", "", false},
-		{"prefix that is not a binding", "pkg_helpers.load", "", "", false},
+		{
+			name: "unaliased dotted import binds the package and reaches the module",
+			imp:  pyScopeImport{source: "a.b", imported: "a", local: "a", kind: "namespace"},
+			want: []pyBinding{
+				{prefix: "a.b", kind: "namespace", source: "a.b"},
+				{prefix: "a", kind: "namespace", source: "a"},
+			},
+		},
+		{
+			name: "aliased dotted import binds only the alias",
+			imp:  pyScopeImport{source: "a.b", imported: "a.b", local: "x", kind: "namespace"},
+			want: []pyBinding{{prefix: "x", kind: "namespace", source: "a.b"}},
+		},
+		{
+			name: "alias equal to the package is still an alias",
+			imp:  pyScopeImport{source: "a.b", imported: "a.b", local: "a", kind: "namespace"},
+			want: []pyBinding{{prefix: "a", kind: "namespace", source: "a.b"}},
+		},
+		{
+			name: "plain import binds one spelling",
+			imp:  pyScopeImport{source: "a", imported: "a", local: "a", kind: "namespace"},
+			want: []pyBinding{{prefix: "a", kind: "namespace", source: "a"}},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, member, claimed := pythonBindingFor(imports, tc.call)
+			if got := pythonBindingsOf([]pyScopeImport{tc.imp}); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("pythonBindingsOf(%+v) = %+v, want %+v", tc.imp, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPythonBindingFor(t *testing.T) {
+	bindings := pythonBindingsOf([]pyScopeImport{
+		{source: "pkg.helpers", imported: "load", local: "read_config", kind: "named"},
+		{source: "pkg.helpers", imported: "pkg", local: "pkg", kind: "namespace"},
+		{source: "other", imported: "other", local: "other", kind: "namespace"},
+		{source: "local.mod", imported: "local.mod", local: "read_config", kind: "named", owner: "run"},
+	})
+	tests := []struct {
+		name, at, call, wantSource, wantMember string
+		wantClaimed                            bool
+	}{
+		{"alias binds exactly", "", "read_config", "pkg.helpers", "", true},
+		{"dotted module binds its whole path", "", "pkg.helpers.load", "pkg.helpers", "load", true},
+		{"dotted module also binds its package", "", "pkg.other", "pkg", "other", true},
+		{"module member", "", "other.run", "other", "run", true},
+		{"unclaimed name", "", "sorted", "", "", false},
+		{"prefix that is not a binding", "", "pkg_helpers.load", "", "", false},
+		{"a nearer import wins", "run", "read_config", "local.mod", "", true},
+		{"a function-local import is invisible elsewhere", "other_fn", "read_config", "pkg.helpers", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, member, claimed := pythonBindingFor(bindings, tc.at, tc.call)
 			if claimed != tc.wantClaimed {
 				t.Fatalf("claimed = %v, want %v", claimed, tc.wantClaimed)
 			}
@@ -110,19 +183,47 @@ func TestPythonBindingFor(t *testing.T) {
 	}
 }
 
-// Two imports binding one name is not a tie to break: the call is claimed, and
-// nothing about it is decidable.
+// Two imports binding one name at one distance is not a tie to break: the call
+// is claimed, and nothing about it is decidable.
 func TestPythonBindingForRefusesCompetingBindings(t *testing.T) {
-	imports := []pyScopeImport{
+	bindings := pythonBindingsOf([]pyScopeImport{
 		{source: "a.mod", imported: "load", local: "load", kind: "named"},
 		{source: "b.mod", imported: "load", local: "load", kind: "named"},
-	}
-	got, _, claimed := pythonBindingFor(imports, "load")
+	})
+	got, _, claimed := pythonBindingFor(bindings, "", "load")
 	if !claimed {
 		t.Fatal("competing bindings must still claim the edge")
 	}
 	if got.source != "" {
 		t.Fatalf("competing bindings resolved to %q; want no decidable target", got.source)
+	}
+}
+
+func TestPythonNameIsShadowed(t *testing.T) {
+	locals := []pyScopeLocal{
+		{owner: "run", name: "h"},
+		{owner: "", name: "cfg"},
+		{owner: "outer", name: "p"},
+	}
+	tests := []struct {
+		name, at, bound, importOwner string
+		claimed                      bool
+		want                         bool
+	}{
+		{"parameter shadows a module import", "run", "h", "", true, true},
+		{"an unrelated scope does not shadow", "other", "h", "", true, false},
+		{"an enclosing scope shadows a nested call", "outer.inner", "p", "", true, true},
+		{"a nearer import beats a module-level binding", "run", "cfg", "run", true, false},
+		{"a module binding shadows a module import", "run", "cfg", "", true, true},
+		{"an unclaimed name is shadowed by any visible binding", "run", "h", "", false, true},
+		{"nothing binds it", "run", "other_name", "", true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pythonNameIsShadowed(locals, tc.at, tc.bound, tc.importOwner, tc.claimed); got != tc.want {
+				t.Fatalf("pythonNameIsShadowed(%q, %q, %q, %v) = %v, want %v", tc.at, tc.bound, tc.importOwner, tc.claimed, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -186,7 +287,7 @@ func TestPythonScopeQueryShapeIsBatched(t *testing.T) {
 			}
 		}
 		counter := &countingQuerier{inner: s.db}
-		bound, _, err := resolvePythonScope(ctx, counter, repo.ID, nil)
+		bound, _, err := resolvePythonScope(ctx, counter, repo.ID, nil, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -203,12 +304,11 @@ func TestPythonScopeQueryShapeIsBatched(t *testing.T) {
 	}
 }
 
-// TestPythonScopeVetoMatchesBindingClaim pins the twin. recordPythonScopeVeto
-// decides in SQL who the generic strategies may not answer for; pythonBindingFor
-// decides in Go which edges this pass takes responsibility for. A divergence
-// would not fail anywhere else -- it would show up as a silently lost or
-// silently false edge in the transactions that run the veto without the pass.
-func TestPythonScopeVetoMatchesBindingClaim(t *testing.T) {
+// TestPythonScopeClaimsSurviveIntoTheWeakStrategy pins what the veto is for:
+// resolveDotSuffixIncrementally runs a repo-wide strategy without running the
+// Python pass, and must still refuse an edge the calling file's own import
+// already gave a meaning.
+func TestPythonScopeClaimsSurviveIntoTheWeakStrategy(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -219,88 +319,51 @@ func TestPythonScopeVetoMatchesBindingClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := insertTestFileLang(ctx, s, repo.ID, "app.py", "python")
+	// A decoy whose qualified name ends in the spelling the call uses. Nothing
+	// imports it, and the caller's import names a module that has no `load`.
+	decoy, err := insertTestFileLang(ctx, s, repo.ID, "decoy.py", "python")
 	if err != nil {
 		t.Fatal(err)
 	}
-	src, err := insertTestSymbolLang(ctx, s, repo.ID, file, "run", "app.run", "python")
+	if _, err := insertTestSymbolLang(ctx, s, repo.ID, decoy, "load", "decoy.helpers.load", "python"); err != nil {
+		t.Fatal(err)
+	}
+	target, err := insertTestFileLang(ctx, s, repo.ID, "pkg/helpers.py", "python")
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence := []pyScopeImport{
-		{source: "pkg.helpers", imported: "load", local: "load", kind: "named"},
-		{source: "pkg.helpers", local: "pkg.helpers", kind: "namespace"},
-		{source: "some_pkg", imported: "load_it", local: "load_it", kind: "named"},
-		{source: "star", kind: "named"}, // wildcard binds no local name
-		{source: "a.mod", imported: "dup", local: "dup", kind: "named"},
-		{source: "b.mod", imported: "dup", local: "dup", kind: "named"}, // competing
-	}
-	for _, imp := range evidence {
-		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind,wildcard) VALUES(?,?,?,?,?,?,?,?)`,
-			repo.ID, file, "python", imp.source, imp.imported, imp.local, imp.kind, boolInt(imp.local == "")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Spellings chosen for the ways a prefix test can go wrong: an underscore
-	// (which LIKE would treat as a wildcard), a longer name sharing a prefix,
-	// and a member on a dotted module binding.
-	names := []string{
-		"load", "load.attr", "load_it", "loadx", "pkg.helpers.load", "pkg.helpersx.load",
-		"dup", "only_here", "sorted", "star",
-	}
-	edgeName := map[int64]string{}
-	for _, name := range names {
-		id, err := insertTestEdge(ctx, s, repo.ID, file, src, name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		edgeName[id] = name
-	}
-
-	if _, err := s.db.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+pyScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+	if _, err := insertTestSymbolLang(ctx, s, repo.ID, target, "other", "helpers.other", "python"); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = s.db.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeVeto) }()
-	if err := recordPythonScopeVeto(ctx, s.db, repo.ID); err != nil {
-		t.Fatal(err)
-	}
-	gotSQL := map[string]bool{}
-	rows, err := s.db.QueryContext(ctx, `SELECT edge_id FROM `+pyScopeVeto)
+	caller, err := insertTestFileLang(ctx, s, repo.ID, "app.py", "python")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			t.Fatal(err)
-		}
-		gotSQL[edgeName[id]] = true
-	}
-	if err := rows.Close(); err != nil {
+	src, err := insertTestSymbolLang(ctx, s, repo.ID, caller, "run", "app.run", "python")
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	wantGo := map[string]bool{}
-	for _, name := range names {
-		if _, _, claimed := pythonBindingFor(evidence, name); claimed {
-			wantGo[name] = true
-		}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind,wildcard,owner_module) VALUES(?,?,?,?,?,?,?,0,'')`,
+		repo.ID, caller, "python", "pkg.helpers", "pkg", "pkg", "namespace"); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(gotSQL, wantGo) {
-		t.Fatalf("veto set = %v, binding claims = %v", gotSQL, wantGo)
+	edge, err := insertTestEdge(ctx, s, repo.ID, caller, src, "pkg.helpers.load")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The twin is only interesting if it actually separates the spellings.
-	for _, name := range []string{"load", "load.attr", "load_it", "pkg.helpers.load", "dup"} {
-		if !wantGo[name] {
-			t.Fatalf("%q should be claimed", name)
-		}
+	if _, err := s.ResolveEdges(ctx, repo.ID); err != nil {
+		t.Fatal(err)
 	}
-	for _, name := range []string{"loadx", "pkg.helpersx.load", "only_here", "sorted"} {
-		if wantGo[name] {
-			t.Fatalf("%q must not be claimed", name)
-		}
+	if _, err := s.resolveDotSuffixIncrementally(ctx, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	var got sql.NullInt64
+	if err := s.db.QueryRow(`SELECT dst_symbol_id FROM edges WHERE id=?`, edge).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Valid {
+		t.Fatalf("a claimed edge was bound by the weak strategy to symbol %d", got.Int64)
 	}
 }
 
@@ -337,7 +400,7 @@ func TestPythonScopeLeavesUnclaimedEdgesToGenericStrategies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bound, handled, err := resolvePythonScope(ctx, s.db, repo.ID, nil)
+	bound, handled, err := resolvePythonScope(ctx, s.db, repo.ID, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
