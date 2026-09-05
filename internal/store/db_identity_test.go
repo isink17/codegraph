@@ -307,10 +307,12 @@ func TestOpenReadOnlyUsesAcceptedSnapshot(t *testing.T) {
 	defer writer.Close()
 	beforeSnapshots := validationSnapshotCalls.Load()
 	beforeTemp := validationTempDirCount(t)
+	want := snapshotSQLiteArtifacts(t, path)
 	ro, err := OpenReadOnly(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
 	if _, err := writer.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -349,6 +351,88 @@ func TestOpenReadOnlyFailedSnapshotCleansTempDirectory(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlySnapshotStableAcrossSourceWALChanges(t *testing.T) {
+	path := createReadOnlyProbeDatabase(t)
+	ro, err := OpenReadOnly(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`UPDATE readonly_probe SET value = 'new'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(999, '')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	var value string
+	if err := ro.db.QueryRow(`SELECT value FROM readonly_probe`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "old" {
+		t.Fatalf("read-only value = %q, want old snapshot", value)
+	}
+	var userVersion, futureMigrations int
+	if err := ro.db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.db.QueryRow(`SELECT COUNT(1) FROM schema_migrations WHERE version = 999`).Scan(&futureMigrations); err != nil {
+		t.Fatal(err)
+	}
+	if userVersion != DatabaseFormatUserVersion || futureMigrations != 0 {
+		t.Fatalf("read-only metadata = user_version %d, future migrations %d; want 2, 0", userVersion, futureMigrations)
+	}
+}
+
+func TestOpenReadOnlySnapshotStableAcrossRollbackJournalWrite(t *testing.T) {
+	path := createReadOnlyProbeDatabase(t)
+	ro, err := OpenReadOnly(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	writer, err := sql.Open(sqliteDriverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`PRAGMA journal_mode=DELETE`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := writer.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE readonly_probe SET value = 'rollback-new'`); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var value string
+	if err := ro.db.QueryRow(`SELECT value FROM readonly_probe`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "old" {
+		t.Fatalf("read-only value = %q, want old snapshot", value)
+	}
+}
+
 func TestV2NoSidecarValidationDoesNotCreateSidecars(t *testing.T) {
 	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
 	s, err := Open(path)
@@ -372,6 +456,10 @@ func TestV2NoSidecarValidationDoesNotCreateSidecars(t *testing.T) {
 	if err := validateExistingDatabase(path); err != nil {
 		t.Fatal(err)
 	}
+	if got := validationSnapshotCalls.Load() - beforeSnapshots; got != 0 {
+		t.Fatalf("validation snapshot calls = %d, want 0", got)
+	}
+	beforeSnapshots = validationSnapshotCalls.Load()
 	ro, err := OpenReadOnly(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -379,10 +467,35 @@ func TestV2NoSidecarValidationDoesNotCreateSidecars(t *testing.T) {
 	if err := ro.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got := validationSnapshotCalls.Load() - beforeSnapshots; got != 0 {
-		t.Fatalf("snapshot calls = %d, want 0", got)
+	if got := validationSnapshotCalls.Load() - beforeSnapshots; got != 1 {
+		t.Fatalf("read-only snapshot calls = %d, want 1", got)
 	}
 	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+}
+
+func createReadOnlyProbeDatabase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE readonly_probe(value TEXT)`); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO readonly_probe(value) VALUES('old')`); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestStoreCleanupRunsOnceAfterDatabaseClose(t *testing.T) {

@@ -44,9 +44,9 @@ var ErrRepoNotIndexed = errors.New("store: repository is not indexed")
 //
 // It returns ErrRepoNotIndexed (wrapped, so errors.Is matches) when dbPath does
 // not exist or is a zero-byte placeholder. It never creates a database, never
-// creates its parent directory, and never migrates. A sidecar-free database is
-// validated and served through one immutable handle; databases with sidecars
-// are validated and served from one disposable snapshot.
+// creates its parent directory, and never migrates. It validates and serves
+// every database from one disposable snapshot, so source changes cannot alter
+// the accepted read-only state during Store lifetime.
 func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 	st, err := os.Stat(dbPath)
 	if err != nil {
@@ -58,35 +58,6 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 	if st.Size() == 0 {
 		return nil, fmt.Errorf("%w: graph database at %s is empty", ErrRepoNotIndexed, dbPath)
 	}
-	for attempt := 0; attempt < 3; attempt++ {
-		artifacts, err := readSQLiteInspectionArtifacts(dbPath)
-		if err != nil {
-			return nil, err
-		}
-		if len(artifacts) == 1 {
-			db, err := openImmutableValidated(dbPath, opts)
-			if err != nil {
-				return nil, err
-			}
-			current, err := readSQLiteInspectionArtifacts(dbPath)
-			if err != nil {
-				_ = db.Close()
-				return nil, err
-			}
-			if sqliteInspectionArtifactsEqual(artifacts, current) {
-				return &Store{db: db}, nil
-			}
-			_ = db.Close()
-			continue
-		}
-		break
-	}
-	if artifacts, err := readSQLiteInspectionArtifacts(dbPath); err != nil {
-		return nil, err
-	} else if len(artifacts) == 1 {
-		return nil, fmt.Errorf("database %s changed while opening read-only", dbPath)
-	}
-
 	snapshotPath, cleanup, err := createSQLiteValidationSnapshot(dbPath)
 	if err != nil {
 		return nil, err
