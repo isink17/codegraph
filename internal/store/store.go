@@ -420,10 +420,6 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, DatabaseFormatUserVersion)); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	return s, nil
 }
 
@@ -453,7 +449,7 @@ func MigrationCeiling() (int, error) {
 }
 
 func validateExistingDatabase(path string) error {
-	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
+	dsn, err := buildSQLiteValidationDSN(path)
 	if err != nil {
 		return err
 	}
@@ -462,19 +458,38 @@ func validateExistingDatabase(path string) error {
 		return err
 	}
 	defer db.Close()
-	var userVersion int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
-		return fmt.Errorf("read database format %s: %w", path, err)
+	return validateDatabaseFormat(context.Background(), db, path)
+}
+
+func buildSQLiteValidationDSN(path string) (string, error) {
+	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
+	if err != nil {
+		return "", err
 	}
-	if userVersion != 0 && userVersion != DatabaseFormatUserVersion {
-		return fmt.Errorf("unsupported database format user_version=%d at %s", userVersion, path)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", err
 	}
-	return validateMigrationMetadata(context.Background(), db, path)
+	query := u.Query()
+	query.Set("immutable", "1")
+	u.RawQuery = query.Encode()
+	return u.String(), nil
 }
 
 type migrationMetadataQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateDatabaseFormat(ctx context.Context, db migrationMetadataQuerier, path string) error {
+	var userVersion int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
+		return fmt.Errorf("read database format %s: %w", path, err)
+	}
+	if userVersion != 0 && userVersion != DatabaseFormatUserVersion {
+		return fmt.Errorf("unsupported database format user_version=%d at %s", userVersion, path)
+	}
+	return validateMigrationMetadata(ctx, db, path)
 }
 
 func validateMigrationMetadata(ctx context.Context, db migrationMetadataQuerier, path string) error {
@@ -675,7 +690,7 @@ func (s *Store) Migrate() error {
 		}); err != nil {
 			return err
 		}
-		if err := validateMigrationMetadata(ctx, conn, "database"); err != nil {
+		if err := validateDatabaseFormat(ctx, conn, "database"); err != nil {
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
@@ -708,6 +723,31 @@ func (s *Store) Migrate() error {
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return err
 		}
+	}
+	if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
+		_, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := validateDatabaseFormat(ctx, conn, "database"); err != nil {
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		return err
+	}
+	var userVersion int
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		return err
+	}
+	if userVersion == 0 {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, DatabaseFormatUserVersion)); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+			return err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		return err
 	}
 	return nil
 }
