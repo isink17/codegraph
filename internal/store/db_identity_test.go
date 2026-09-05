@@ -62,7 +62,7 @@ func TestSQLiteArtifactMemoryBounded(t *testing.T) {
 }
 
 func TestSQLiteArtifactFingerprintDetectsChanges(t *testing.T) {
-	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+	for _, suffix := range []string{"", "-wal", "-journal"} {
 		t.Run("artifact="+suffix, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "source.sqlite")
 			for _, name := range []string{path, path + suffix} {

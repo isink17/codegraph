@@ -699,9 +699,40 @@ func sqliteInspectionFileInfoEqual(left, right os.FileInfo) bool {
 	return os.SameFile(left, right) && left.Size() == right.Size() && left.ModTime().Equal(right.ModTime())
 }
 
+// sqlitePersistentArtifactSuffixes name the files that carry committed database
+// content: the database itself, the write-ahead log, and the rollback journal.
+// Together they define the logical state a snapshot has to reproduce, so these
+// are the files that get fingerprinted for stability and copied into a snapshot.
+//
+// The WAL-index (`-shm`) is deliberately absent. SQLite documents it as a
+// transient shared-memory coordination file that holds no database content: it
+// is an index into the WAL plus reader marks and locks, and SQLite rebuilds it
+// from the WAL whenever the first connection finds no valid index. A snapshot
+// that carries the database and the WAL therefore carries the whole committed
+// state, and the private copy simply builds its own index.
+//
+// Reading the source `-shm` is not merely unnecessary, it is actively wrong: on
+// Windows the live WAL-index is memory-mapped and carries byte-range locks, so
+// opening and reading it fails with a sharing violation while any connection is
+// active. Excluding it removes the need for the read rather than tolerating its
+// failure.
+var sqlitePersistentArtifactSuffixes = []string{"", "-wal", "-journal"}
+
+// sqliteTransientArtifactSuffix is the WAL-index. It is never fingerprinted,
+// copied, or opened by validation -- see sqlitePersistentArtifactSuffixes.
+const sqliteTransientArtifactSuffix = "-shm"
+
+func sqlitePersistentArtifactPaths(path string) []string {
+	paths := make([]string, 0, len(sqlitePersistentArtifactSuffixes))
+	for _, suffix := range sqlitePersistentArtifactSuffixes {
+		paths = append(paths, path+suffix)
+	}
+	return paths
+}
+
 func readSQLiteInspectionArtifacts(path string) (map[string]sqliteInspectionArtifact, error) {
-	artifacts := make(map[string]sqliteInspectionArtifact, 4)
-	for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+	artifacts := make(map[string]sqliteInspectionArtifact, len(sqlitePersistentArtifactSuffixes))
+	for _, candidate := range sqlitePersistentArtifactPaths(path) {
 		artifact, err := streamSQLiteInspectionArtifact(candidate, nil)
 		if err == nil {
 			artifacts[candidate] = artifact
@@ -771,7 +802,9 @@ func vacuumSQLiteSnapshot(path string, artifacts map[string]sqliteInspectionArti
 		keepSnapshot = true
 		return snapshotPath, cleanup, nil
 	}
-	for _, sourcePath := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+	// Only persistent artifacts are copied. SQLite rebuilds the private
+	// WAL-index inside the temporary directory from the copied WAL.
+	for _, sourcePath := range sqlitePersistentArtifactPaths(path) {
 		artifact, ok := artifacts[sourcePath]
 		if !ok {
 			continue
