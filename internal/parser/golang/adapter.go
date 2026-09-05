@@ -70,6 +70,9 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 	}
 
+	locals := newGoLocalIndex(collectGoLocals(fset, file, importAliases))
+	pf.Scope.GoLocals = locals.bindings
+
 	contextStack := []*graph.Symbol{}
 	enterFuncStack := []bool{}
 	symbolByKey := map[string]*graph.Symbol{}
@@ -126,7 +129,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			if len(contextStack) == 0 {
 				return true
 			}
-			name := callName(node.Fun, importAliases)
+			name := callName(fset, node.Fun, importAliases, locals)
 			if name == "" {
 				return true
 			}
@@ -227,12 +230,24 @@ func visibility(name string) string {
 	return "package"
 }
 
-func callName(expr ast.Expr, imports map[string]string) string {
+// callName renders a call's destination spelling. A selector whose qualifier is
+// an import alias is rewritten to the import path, which is what makes
+// `fmt.Println` reach the standard library rather than a local `fmt`.
+//
+// A qualifier the file's own lexical scope binds is never that import, however
+// many import aliases happen to share its spelling, so the rewrite is skipped
+// and the qualifier is kept verbatim. The resulting `x.Method` spelling is what
+// the Go receiver-scope resolver reads, and what the local-qualifier veto stops
+// every generic strategy from binding by coincidence.
+func callName(fset *token.FileSet, expr ast.Expr, imports map[string]string, locals goLocalIndex) string {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		return e.Name
 	case *ast.SelectorExpr:
-		left := callName(e.X, imports)
+		if id, ok := e.X.(*ast.Ident); ok && locals.boundAt(id.Name, fset.Position(id.Pos()).Line) {
+			return id.Name + "." + e.Sel.Name
+		}
+		left := callName(fset, e.X, imports, locals)
 		if left == "" {
 			return ""
 		}
@@ -241,9 +256,9 @@ func callName(expr ast.Expr, imports map[string]string) string {
 		}
 		return left + "." + e.Sel.Name
 	case *ast.ParenExpr:
-		return callName(e.X, imports)
+		return callName(fset, e.X, imports, locals)
 	case *ast.IndexListExpr:
-		return callName(e.X, imports)
+		return callName(fset, e.X, imports, locals)
 	default:
 		return ""
 	}

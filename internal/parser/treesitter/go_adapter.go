@@ -107,8 +107,12 @@ func (a *GoAdapter) Parse(ctx context.Context, path string, content []byte) (gra
 		}
 	}
 
+	// ---- lexical bindings ----
+	locals := newGoLocalIndex(goCollectLocals(root, content, importAliases))
+	pf.Scope.GoLocals = locals.bindings
+
 	// ---- call edges ----
-	goExtractCalls(root, content, importAliases, &pf)
+	goExtractCalls(root, content, importAliases, locals, &pf)
 
 	linkTestsGo(pkgName, &pf)
 	return pf, nil
@@ -297,13 +301,13 @@ func goFuncSignature(fn *sitter.Node, content []byte) string {
 	return b.String()
 }
 
-func goExtractCalls(root *sitter.Node, content []byte, imports map[string]string, pf *graph.ParsedFile) {
+func goExtractCalls(root *sitter.Node, content []byte, imports map[string]string, locals goLocalIndex, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
 		fnNode := childByFieldName(call, "function")
 		if fnNode == nil {
 			continue
 		}
-		name := goCallName(fnNode, content, imports)
+		name := goCallName(fnNode, content, imports, locals)
 		if name == "" {
 			continue
 		}
@@ -324,7 +328,14 @@ func goExtractCalls(root *sitter.Node, content []byte, imports map[string]string
 	}
 }
 
-func goCallName(fnNode *sitter.Node, content []byte, imports map[string]string) string {
+// goCallName renders a call's destination spelling. A selector whose qualifier
+// is an import alias is rewritten to the import path; a qualifier the file's own
+// lexical scope binds is kept verbatim, however many import aliases share its
+// spelling. See callName in internal/parser/golang, which must agree with this.
+func goCallName(fnNode *sitter.Node, content []byte, imports map[string]string, locals goLocalIndex) string {
+	if fnNode == nil {
+		return ""
+	}
 	switch fnNode.Type() {
 	case "identifier":
 		return nodeText(fnNode, content)
@@ -334,20 +345,51 @@ func goCallName(fnNode *sitter.Node, content []byte, imports map[string]string) 
 		if left == nil || right == nil {
 			return ""
 		}
-		leftText := goCallName(left, content, imports)
+		rightText := nodeText(right, content)
+		if left.Type() == "identifier" {
+			leftText := nodeText(left, content)
+			if locals.boundAt(leftText, int(left.StartPoint().Row)+1) {
+				return leftText + "." + rightText
+			}
+		}
+		leftText := goCallName(left, content, imports, locals)
 		if leftText == "" {
 			return ""
 		}
-		rightText := nodeText(right, content)
 		if importPath, ok := imports[leftText]; ok {
 			return importPath + "." + rightText
 		}
 		return leftText + "." + rightText
 	case "parenthesized_expression":
-		return goCallName(fnNode.NamedChild(0), content, imports)
+		return goCallName(fnNode.NamedChild(0), content, imports, locals)
 	case "type_instantiation_expression":
-		return goCallName(childByFieldName(fnNode, "function"), content, imports)
+		return goCallName(childByFieldName(fnNode, "function"), content, imports, locals)
 	default:
 		return ""
 	}
+}
+
+// goLocalIndex answers "is this name locally bound at this line" without a scan
+// per call site. It is the tree-sitter twin of the type of the same name in
+// internal/parser/golang.
+type goLocalIndex struct {
+	bindings []graph.GoLocalBinding
+	byName   map[string][]graph.GoLocalBinding
+}
+
+func newGoLocalIndex(bindings []graph.GoLocalBinding) goLocalIndex {
+	idx := goLocalIndex{bindings: bindings, byName: make(map[string][]graph.GoLocalBinding, len(bindings))}
+	for _, b := range bindings {
+		idx.byName[b.Name] = append(idx.byName[b.Name], b)
+	}
+	return idx
+}
+
+func (i goLocalIndex) boundAt(name string, line int) bool {
+	for _, b := range i.byName[name] {
+		if line >= b.ScopeStartLine && line <= b.ScopeEndLine {
+			return true
+		}
+	}
+	return false
 }

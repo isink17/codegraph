@@ -228,6 +228,7 @@ var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
 		AND NOT (f.language = 'cpp' AND instr(edges.dst_name, '.') = 0 AND instr(edges.dst_name, '::') = 0)
 		AND NOT (f.language = 'cpp' AND (instr(edges.dst_name, '.') = 0 OR instr(edges.dst_name, '::') > 0))
 		AND ` + resolverGoBareScopeSQL + `
+		AND ` + resolverGoLocalQualifierSQL + `
 		AND ` + resolverBareNameTypeScopeSQL + `
 		AND ` + resolverCppBareNamespaceScopeSQL + `
 		AND ` + resolverCppBareMemberScopeSQL + `

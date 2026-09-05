@@ -580,12 +580,28 @@ func candidateIndex(symbols map[int64]symbolInfo) map[string][]string {
 		add(qualifiedSuffix(sym.QualifiedName), sym)
 		add(dotTail2(sym.QualifiedName), sym)
 		add(dotTail3(sym.QualifiedName), sym)
+		add(goReceiverCandidateKey(sym), sym)
 	}
 	out := make(map[string][]string, len(byName))
 	for name, set := range byName {
 		out[name] = sortedKeys(set)
 	}
 	return out
+}
+
+// goReceiverCandidateKey is the harness's model of go_receiver_scope's reach: a
+// Go method is selectable for a `Qualifier.Method` spelling on the strength of
+// its own name, whatever the qualifier is spelled, because the qualifier names a
+// local whose type the resolver reads from evidence this harness does not load.
+//
+// It is deliberately wider than the resolver -- which also demands a proven type
+// and a proven package -- because over-reporting ambiguity is the safe error
+// here and under-reporting it is the one that hides a miswire.
+func goReceiverCandidateKey(sym symbolInfo) string {
+	if sym.Language != "go" || sym.Kind != "method" || sym.Name == "" {
+		return ""
+	}
+	return "go\x00method\x00" + sym.Name
 }
 
 // candidatesFor returns the candidate definitions for a call name, including
@@ -595,6 +611,11 @@ func candidatesFor(candidates map[string][]string, symbols map[int64]symbolInfo,
 	set := map[string]struct{}{}
 	for _, cand := range candidates[dstName] {
 		set[cand] = struct{}{}
+	}
+	if qualifier, method, ok := goSelectorSpelling(dstName); ok && qualifier != "" {
+		for _, cand := range candidates["go\x00method\x00"+method] {
+			set[cand] = struct{}{}
+		}
 	}
 	for _, sym := range symbols {
 		if strings.HasSuffix(sym.QualifiedName, "."+dstName) {
@@ -649,6 +670,23 @@ func dotTail3(qname string) string {
 		rest = rest[idx+1:]
 	}
 	return rest
+}
+
+// goSelectorSpelling mirrors store.goSelectorQualifier: the single-dot,
+// unqualified shape a Go local receiver call produces.
+func goSelectorSpelling(dstName string) (qualifier, method string, ok bool) {
+	if strings.ContainsAny(dstName, "/:") {
+		return "", "", false
+	}
+	dot := strings.IndexByte(dstName, '.')
+	if dot <= 0 || dot == len(dstName)-1 {
+		return "", "", false
+	}
+	qualifier, method = dstName[:dot], dstName[dot+1:]
+	if strings.ContainsRune(method, '.') {
+		return "", "", false
+	}
+	return qualifier, method, true
 }
 
 func edgeMetrics(edges []EdgeObservation) Metrics {

@@ -72,6 +72,47 @@ type ScopeEvidence struct {
 	ModulePath string
 	Imports    []ScopeImport
 	Modules    []RustModule
+	GoLocals   []GoLocalBinding
+}
+
+// GoLocalBinding is one syntax-proven Go lexical binding: a name that some
+// block in the file binds itself, over the line range that block spans.
+//
+// It exists to answer two separate questions, and conflating them is the bug it
+// was written for. The first is whether a selector qualifier is local at all --
+// `Name` plus the range answers that, and a local qualifier can never be an
+// imported package no matter what the file's import aliases say. The second is
+// what that local's type is, which the type fields answer only when the syntax
+// states it outright. A binding with an empty TypeName is still a complete
+// answer to the first question, and no answer at all to the second: it vetoes,
+// and it binds nothing.
+//
+// The range is the whole enclosing block, not the span from the declaration
+// onwards. That over-suppresses a use textually above its own `:=` (which Go
+// would reject anyway) and costs nothing a correct program relies on, and it is
+// the one scope rule both Go adapters can compute identically.
+type GoLocalBinding struct {
+	Name           string
+	ScopeStartLine int
+	ScopeEndLine   int
+
+	// TypeName is the bare type name with pointer stars, parentheses and type
+	// arguments stripped: `*Store` and `Store[K,V]` both give `Store`. Empty
+	// means the syntax did not prove a type.
+	TypeName string
+
+	// TypePackage is the qualifier as written in the type expression -- `pkg`
+	// in `var x pkg.Type` -- and is empty for a type named without one, which
+	// in Go means the file's own package.
+	TypePackage string
+
+	// TypeImportPath is TypePackage resolved through the file's import aliases,
+	// empty when TypePackage is empty or matches no import.
+	TypeImportPath string
+
+	// Pointer records that the proven type was a pointer expression. It is the
+	// only method-set input this evidence carries.
+	Pointer bool
 }
 
 type ScopeImport struct {

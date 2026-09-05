@@ -24,7 +24,7 @@ import (
 // FixtureVersion identifies the fixture contents. Bump it whenever a case is
 // added, removed, or its source files change, so a recorded baseline cannot be
 // compared against a different fixture by accident.
-const FixtureVersion = "p1-adversarial-v1"
+const FixtureVersion = "p22.28-go-receiver-v1"
 
 // Expectation is the fixture's declared verdict for a case: what a correct
 // resolver is allowed to do with the call edge.
@@ -158,6 +158,40 @@ func Cases() []Case {
 			Note:          "Production code calls load_config_e; a production definition (src/py/config_e.py) and a test definition (tests/py/test_config_e.py) share the name, both python, both plain functions. P7 gives the resolver evidence that separates them -- the call site is production code, so the test definition is not a candidate for it at all -- which makes the production definition the uniquely valid target. Binding the test definition is still a false edge, and the expectation moved from expected_ambiguous only because the rule exists, not because the report stopped counting shadow candidates.",
 		},
 		{
+			ID:           "G",
+			Title:        "go package alias shadowed by a parameter",
+			Expect:       ExpectValid,
+			SrcFile:      "src/go/caller_g.go",
+			DstName:      "helpers.RunG",
+			ValidTargets: []string{"fixture.ThingG.RunG"},
+			Note:         "The parameter `helpers` shadows the file's import alias of the same name. Before P22.28 the parser rewrote the qualifier to the import path and the edge bound into that package with module_import/high -- a binding no Go compiler would agree with. The only correct target is the method on the parameter's proven type.",
+		},
+		{
+			ID:      "H",
+			Title:   "go package alias genuinely unshadowed (control for case G)",
+			Expect:  ExpectUnresolved,
+			SrcFile: "src/go/caller_h.go",
+			DstName: "example.com/audit/helpers_h.RunH",
+			Note:    "The same spelling with nothing shadowing it. The qualifier is the import binding, so the rewrite to the import path must still happen; the package lies outside the fixture, so nothing may be selected. This case fails if P22.28 suppressed the rewrite for real imports as well as shadowed ones.",
+		},
+		{
+			ID:      "I",
+			Title:   "go local receiver of unproven type stays unresolved",
+			Expect:  ExpectUnresolved,
+			SrcFile: "src/go/caller_i.go",
+			DstName: "helpers.RunI",
+			Note:    "A range variable is local -- so it is not the import alias it is spelled like -- but its type comes from the ranged expression, which is inference this slice does not do. The evidence proves what the call is not, and nothing about what it is, so no strategy may answer it.",
+		},
+		{
+			ID:               "J",
+			Title:            "go receiver method with two identical candidates",
+			Expect:           ExpectAmbiguous,
+			SrcFile:          "src/go/caller_j.go",
+			DstName:          "recv.RunJ",
+			CompetingTargets: []string{"fixture.ThingJ.RunJ", "fixture.ThingJ.RunJ"},
+			Note:             "Two declarations of the same method on the same type in the same package. The receiver type is proven, so the only thing separating the candidates would be a tie-break; go_receiver_scope has none and must abstain.",
+		},
+		{
 			ID:      "F",
 			Title:   "honest-negative control (no project definition anywhere)",
 			Expect:  ExpectUnresolved,
@@ -180,6 +214,10 @@ func ExpectedDefinitions() []ExpectedDefinition {
 		{CaseID: "D", Name: "parse_d", Language: "java", File: "src/java/ShapesD.java"},
 		{CaseID: "E", Name: "load_config_e", Language: "python", File: "src/py/config_e.py"},
 		{CaseID: "E", Name: "load_config_e", Language: "python", File: "tests/py/test_config_e.py"},
+		{CaseID: "G", Name: "RunG", Language: "go", File: "src/go/caller_g.go"},
+		{CaseID: "I", Name: "RunI", Language: "go", File: "src/go/caller_i.go"},
+		{CaseID: "J", Name: "RunJ", Language: "go", File: "src/go/caller_j.go"},
+		{CaseID: "J", Name: "RunJ", Language: "go", File: "src/go/dup_j.go"},
 	}
 }
 
@@ -231,6 +269,59 @@ function serialize_c($x) {
 }
 `,
 
+	// Case G: a parameter shadows the file's own import alias. The call must
+	// reach the method on the parameter's type, never the imported package.
+	"src/go/caller_g.go": `package fixture
+
+import helpers "example.com/audit/helpers_g"
+
+type ThingG struct{}
+
+func (t *ThingG) RunG() {}
+
+func CallerG(helpers *ThingG) {
+	helpers.RunG()
+}
+`,
+	// Case H: the same spelling, unshadowed. The rewrite to the import path
+	// must still happen.
+	"src/go/caller_h.go": `package fixture
+
+import helpers "example.com/audit/helpers_h"
+
+func CallerH() {
+	helpers.RunH()
+}
+`,
+	// Case I: a local whose type the syntax does not state. Local, therefore
+	// not the import; untyped, therefore not anything else either.
+	"src/go/caller_i.go": `package fixture
+
+type ThingI struct{}
+
+func (t *ThingI) RunI() {}
+
+func CallerI(items []ThingI) {
+	for _, helpers := range items {
+		helpers.RunI()
+	}
+}
+`,
+	// Case J: two identical candidates for one proven receiver type.
+	"src/go/caller_j.go": `package fixture
+
+type ThingJ struct{}
+
+func (t *ThingJ) RunJ() {}
+
+func CallerJ(recv *ThingJ) {
+	recv.RunJ()
+}
+`,
+	"src/go/dup_j.go": `package fixture
+
+func (t *ThingJ) RunJ() {}
+`,
 	// Case D: Go emits a dotted dst_name whose only suffix match is Java.
 	"src/go/caller_d.go": `package fixture
 
