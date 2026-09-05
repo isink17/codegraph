@@ -217,7 +217,12 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 		}
 	}
 
-	report, err := doctor.RunWithOptions(doctor.Options{Fix: *fix, DBPath: dbPath, Deep: *deep})
+	report, err := doctor.RunWithOptions(doctor.Options{
+		Fix:       *fix,
+		DBPath:    dbPath,
+		Deep:      *deep,
+		Languages: newDefaultRegistry().SupportedLanguages(),
+	})
 	if err != nil {
 		return err
 	}

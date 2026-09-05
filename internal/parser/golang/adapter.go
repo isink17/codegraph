@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
+	cgparser "github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
@@ -448,4 +449,10 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 			TestSymbolIndex: intRef(i),
 		})
 	}
+}
+
+// Profile identifies the non-cgo Go adapter, which parses with go/ast and does
+// build a call graph. See cgparser.Profile for the versioning rule.
+func (a *Adapter) Profile() cgparser.Profile {
+	return cgparser.Profile{ID: "go-ast:go:v1", EmitsCallEdges: true}
 }

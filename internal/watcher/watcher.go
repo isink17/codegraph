@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -41,6 +42,10 @@ type Watcher struct {
 	drainPaths  atomic.Int64
 	updateRuns  atomic.Int64
 	updatePaths atomic.Int64
+
+	// profileConverges counts the full passes this watcher ran because a
+	// path-scoped flush could not safely convert a language's parser profile.
+	profileConverges atomic.Int64
 }
 
 type WatchStats struct {
@@ -59,6 +64,10 @@ type WatchStats struct {
 	DrainPaths  int64 `json:"drain_paths"`
 	UpdateRuns  int64 `json:"update_runs"`
 	UpdatePaths int64 `json:"update_paths"`
+
+	// ProfileConverges counts the full passes forced by a parser-profile
+	// transition a path-scoped flush could not safely make.
+	ProfileConverges int64 `json:"profile_converges,omitempty"`
 
 	QueueExecs   int64 `json:"queue_execs"`
 	QueueSkipped int64 `json:"queue_skipped"`
@@ -86,6 +95,8 @@ func (w *Watcher) Stats() WatchStats {
 		DrainPaths:  w.drainPaths.Load(),
 		UpdateRuns:  w.updateRuns.Load(),
 		UpdatePaths: w.updatePaths.Load(),
+
+		ProfileConverges: w.profileConverges.Load(),
 
 		QueueExecs:   w.queueExecs.Load(),
 		QueueSkipped: w.queueSkipped.Load(),
@@ -127,6 +138,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	w.drainPaths.Store(0)
 	w.updateRuns.Store(0)
 	w.updatePaths.Store(0)
+	w.profileConverges.Store(0)
 	if debounce <= 0 {
 		debounce = 750 * time.Millisecond
 	}
@@ -227,8 +239,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		} else {
 			opts.Paths = paths
 		}
-		_, err = w.indexer.Update(ctx, opts)
-		if err != nil {
+		if err := w.updateConverging(ctx, repoRoot, opts); err != nil {
 			return err
 		}
 		if len(paths) > 0 {
@@ -425,4 +436,27 @@ func (w *Watcher) queueDirtyWithRetry(ctx context.Context, repoID int64, path, r
 		}
 	}
 	return fmt.Errorf("queue dirty file %s: %w", path, lastErr)
+}
+
+// updateConverging runs one watcher update, upgrading a path-scoped run to a
+// full pass when parser-profile safety refuses the incremental one.
+//
+// Without this, every existing user upgrading past migration 036 would watch
+// their watcher die: the first flush against an already-indexed repository is
+// path-scoped, the repository's provenance is unknown or stale, and a returned
+// error aborts the run for good while the claimed paths stay in flight. The
+// scan is asking for exactly one full convergence pass, which the watcher is
+// perfectly able to perform -- and the flushed paths are inside the full walk,
+// so the caller can still retire them afterwards.
+//
+// A refused DOWNGRADE is not upgraded here: re-running it as a full pass would
+// be refused again, and correctly so. It reaches the caller as an error.
+func (w *Watcher) updateConverging(ctx context.Context, repoRoot string, opts indexer.Options) error {
+	_, err := w.indexer.Update(ctx, opts)
+	if !errors.Is(err, indexer.ErrParserProfileTransitionRequired) {
+		return err
+	}
+	w.profileConverges.Add(1)
+	_, err = w.indexer.Update(ctx, indexer.Options{RepoRoot: repoRoot, ScanKind: "watch_config"})
+	return err
 }

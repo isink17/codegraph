@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
@@ -396,4 +397,10 @@ func isPythonKeyword(name string) bool {
 	default:
 		return false
 	}
+}
+
+// Profile identifies the dedicated non-cgo Python adapter, which is
+// regex-driven but does build a call graph. See parser.Profile.
+func (a *Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: "python-regex:python:v1", EmitsCallEdges: true}
 }

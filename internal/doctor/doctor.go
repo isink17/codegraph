@@ -14,23 +14,25 @@ import (
 	"github.com/isink17/codegraph/internal/appname"
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/gotool"
+	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/store"
 )
 
 type Report struct {
-	GOOS            string    `json:"goos"`
-	ConfigPath      string    `json:"config_path"`
-	ConfigExists    bool      `json:"config_exists"`
-	DataDir         string    `json:"data_dir"`
-	CacheDir        string    `json:"cache_dir"`
-	CodegraphOnPath bool      `json:"codegraph_on_path"`
-	CodegraphPath   string    `json:"codegraph_path,omitempty"`
-	SQLiteDriver    string    `json:"sqlite_driver"`
-	DB              *DBInfo   `json:"db,omitempty"`
-	Deep            *DeepInfo `json:"deep,omitempty"`
-	AppliedFixes    []string  `json:"applied_fixes"`
-	Recommendations []string  `json:"recommendations"`
+	GOOS            string      `json:"goos"`
+	ConfigPath      string      `json:"config_path"`
+	ConfigExists    bool        `json:"config_exists"`
+	DataDir         string      `json:"data_dir"`
+	CacheDir        string      `json:"cache_dir"`
+	CodegraphOnPath bool        `json:"codegraph_on_path"`
+	CodegraphPath   string      `json:"codegraph_path,omitempty"`
+	SQLiteDriver    string      `json:"sqlite_driver"`
+	DB              *DBInfo     `json:"db,omitempty"`
+	Parser          *ParserInfo `json:"parser,omitempty"`
+	Deep            *DeepInfo   `json:"deep,omitempty"`
+	AppliedFixes    []string    `json:"applied_fixes"`
+	Recommendations []string    `json:"recommendations"`
 }
 
 type DBInfo struct {
@@ -62,6 +64,9 @@ type Options struct {
 	Fix    bool
 	DBPath string
 	Deep   bool
+	// Languages is the running binary's parser registry view. Passed in rather
+	// than built here so doctor stays free of a build-tagged registry import.
+	Languages []parser.LanguageSupport
 }
 
 func RunWithOptions(opts Options) (Report, error) {
@@ -136,6 +141,9 @@ func RunWithOptions(opts Options) (Report, error) {
 		}
 	}
 
+	parserInfo, parserRecommendations := inspectParser(context.Background(), opts.Languages, opts.DBPath)
+	recommendations = append(recommendations, parserRecommendations...)
+
 	return Report{
 		GOOS:            runtime.GOOS,
 		ConfigPath:      filepath.Clean(configPath),
@@ -146,6 +154,7 @@ func RunWithOptions(opts Options) (Report, error) {
 		CodegraphPath:   binaryPath,
 		SQLiteDriver:    store.SQLiteDriverName(),
 		DB:              dbInfo,
+		Parser:          parserInfo,
 		Deep:            deepInfo,
 		AppliedFixes:    appliedFixes,
 		Recommendations: recommendations,
