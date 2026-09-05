@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -78,7 +79,8 @@ const (
 )
 
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	cleanup func() error
 	// neighborStmts counts the statements the batched context-neighbour
 	// pipeline issues. The number is the load-bearing property of P19 -- it must
 	// not grow with the seed count -- and wall-clock cannot prove that, so the
@@ -449,7 +451,12 @@ func MigrationCeiling() (int, error) {
 }
 
 func validateExistingDatabase(path string) error {
-	dsn, err := buildSQLiteValidationDSN(path)
+	snapshotPath, cleanup, err := createSQLiteValidationSnapshot(path)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	dsn, err := buildSQLiteValidationDSN(snapshotPath)
 	if err != nil {
 		return err
 	}
@@ -462,6 +469,113 @@ func validateExistingDatabase(path string) error {
 }
 
 func buildSQLiteValidationDSN(path string) (string, error) {
+	return BuildSQLiteDSN(path, OpenOptions{}, false, true)
+}
+
+func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
+	// ponytail: three retries bound unstable sidecar copying; a continuously busy database fails closed.
+	for attempt := 0; attempt < 3; attempt++ {
+		artifacts, err := readSQLiteInspectionArtifacts(path)
+		if err != nil {
+			return "", nil, err
+		}
+		snapshotPath, cleanup, err := vacuumSQLiteSnapshot(path, artifacts)
+		if err != nil {
+			return "", nil, err
+		}
+		current, err := readSQLiteInspectionArtifacts(path)
+		if err != nil {
+			_ = cleanup()
+			return "", nil, err
+		}
+		if sqliteInspectionArtifactsEqual(artifacts, current) {
+			return snapshotPath, cleanup, nil
+		}
+		_ = cleanup()
+	}
+	return "", nil, fmt.Errorf("database %s changed while creating validation snapshot", path)
+}
+
+type sqliteInspectionArtifact struct {
+	exists bool
+	data   []byte
+}
+
+func readSQLiteInspectionArtifacts(path string) (map[string]sqliteInspectionArtifact, error) {
+	artifacts := make(map[string]sqliteInspectionArtifact, 4)
+	for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+		data, err := os.ReadFile(candidate)
+		if err == nil {
+			artifacts[candidate] = sqliteInspectionArtifact{exists: true, data: data}
+			continue
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("read database artifact %s: %w", candidate, err)
+		}
+	}
+	return artifacts, nil
+}
+
+func sqliteInspectionArtifactsEqual(left, right map[string]sqliteInspectionArtifact) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for path, want := range left {
+		got, ok := right[path]
+		if !ok || want.exists != got.exists || !bytes.Equal(want.data, got.data) {
+			return false
+		}
+	}
+	return true
+}
+
+func vacuumSQLiteSnapshot(path string, artifacts map[string]sqliteInspectionArtifact) (string, func() error, error) {
+	dir, err := os.MkdirTemp("", "codegraph-validation-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() error { return os.RemoveAll(dir) }
+	inputPath := filepath.Join(dir, "input.sqlite")
+	snapshotPath := filepath.Join(dir, "snapshot.sqlite")
+	if len(artifacts) > 1 {
+		for _, sourcePath := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+			artifact, ok := artifacts[sourcePath]
+			if !ok {
+				continue
+			}
+			targetPath := inputPath + strings.TrimPrefix(sourcePath, path)
+			if err := os.WriteFile(targetPath, artifact.data, 0o600); err != nil {
+				_ = cleanup()
+				return "", nil, fmt.Errorf("copy database artifact %s: %w", sourcePath, err)
+			}
+		}
+	}
+	sourcePath := path
+	var dsn string
+	if len(artifacts) > 1 {
+		sourcePath = inputPath
+		dsn, err = BuildSQLiteDSN(sourcePath, OpenOptions{}, false, true)
+	} else {
+		dsn, err = buildSQLiteImmutableDSN(sourcePath)
+	}
+	if err != nil {
+		_ = cleanup()
+		return "", nil, err
+	}
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		_ = cleanup()
+		return "", nil, err
+	}
+	defer db.Close()
+	if _, err := db.Exec(`VACUUM INTO ` + sqliteStringLiteral(snapshotPath)); err != nil {
+		_ = cleanup()
+		return "", nil, fmt.Errorf("snapshot database %s: %w", path, err)
+	}
+	return snapshotPath, cleanup, nil
+}
+
+func buildSQLiteImmutableDSN(path string) (string, error) {
 	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
 	if err != nil {
 		return "", err
@@ -474,6 +588,10 @@ func buildSQLiteValidationDSN(path string) (string, error) {
 	query.Set("immutable", "1")
 	u.RawQuery = query.Encode()
 	return u.String(), nil
+}
+
+func sqliteStringLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 type migrationMetadataQuerier interface {
@@ -663,7 +781,11 @@ func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	if s.cleanup != nil {
+		err = errors.Join(err, s.cleanup())
+	}
+	return err
 }
 
 func (s *Store) Migrate() error {

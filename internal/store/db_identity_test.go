@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -156,6 +157,264 @@ func TestV2FutureMigrationDoesNotOpen(t *testing.T) {
 		t.Fatal("future migration database opened")
 	}
 	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+}
+
+func TestV2ValidationWALVisibility(t *testing.T) {
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := reader.Exec(`PRAGMA wal_autocheckpoint = 0`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := reader.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var initial int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&initial); err != nil {
+		t.Fatal(err)
+	}
+	if initial != DatabaseFormatUserVersion {
+		t.Fatalf("initial user_version = %d, want %d", initial, DatabaseFormatUserVersion)
+	}
+
+	writer, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`PRAGMA wal_autocheckpoint = 0`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(999, '')`); err != nil {
+		t.Fatal(err)
+	}
+
+	observe := func(name, validationDSN string) [2]int {
+		t.Helper()
+		db, err := sql.Open(sqliteDriverName, validationDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		var userVersion, futureMigrations int
+		if err := db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+			t.Fatalf("%s user_version: %v", name, err)
+		}
+		if err := db.QueryRow(`SELECT COUNT(1) FROM schema_migrations WHERE version = 999`).Scan(&futureMigrations); err != nil {
+			t.Fatalf("%s migration: %v", name, err)
+		}
+		return [2]int{userVersion, futureMigrations}
+	}
+
+	immutableDSN, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	immutableURL, err := url.Parse(immutableDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := immutableURL.Query()
+	query.Set("immutable", "1")
+	immutableURL.RawQuery = query.Encode()
+	immutableDSN = immutableURL.String()
+	if got := observe("immutable", immutableDSN); got != [2]int{2, 0} {
+		t.Fatalf("immutable observes user_version=%d future_migrations=%d, want stale 2/0", got[0], got[1])
+	}
+	readOnlyDSN, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := observe("read-only", readOnlyDSN); got != [2]int{3, 1} {
+		t.Fatalf("read-only observes user_version=%d future_migrations=%d, want WAL 3/1", got[0], got[1])
+	}
+	if got := observe("writable", dsn); got != [2]int{3, 1} {
+		t.Fatalf("writable observes user_version=%d future_migrations=%d, want WAL 3/1", got[0], got[1])
+	}
+}
+
+func TestV2WALFutureMetadataRejectedWithoutMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write string
+	}{
+		{name: "user_version", write: `PRAGMA user_version = 3`},
+		{name: "migration", write: `INSERT INTO schema_migrations(version, applied_at) VALUES(999, '')`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, reader, writer, tx := v2PinnedWALFixture(t)
+			defer tx.Rollback()
+			defer reader.Close()
+			defer writer.Close()
+			if _, err := writer.Exec(tc.write); err != nil {
+				t.Fatal(err)
+			}
+			want := snapshotSQLiteArtifacts(t, path)
+			if _, err := Open(path); err == nil {
+				t.Fatal("future WAL metadata accepted")
+			}
+			assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+		})
+	}
+}
+
+func TestV2WALCurrentMetadataAccepted(t *testing.T) {
+	path, reader, writer, tx := v2PinnedWALFixture(t)
+	defer tx.Rollback()
+	defer reader.Close()
+	defer writer.Close()
+	if _, err := writer.Exec(`UPDATE schema_migrations SET applied_at = 'wal' WHERE version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	want := snapshotSQLiteArtifacts(t, path)
+	if err := validateExistingDatabase(path); err != nil {
+		t.Fatalf("current WAL metadata rejected: %v", err)
+	}
+	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+}
+
+func TestOpenReadOnlyUsesAcceptedSnapshot(t *testing.T) {
+	path, reader, writer, tx := v2PinnedWALFixture(t)
+	defer tx.Rollback()
+	defer reader.Close()
+	defer writer.Close()
+	ro, err := OpenReadOnly(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	var userVersion int
+	if err := ro.db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+		t.Fatal(err)
+	}
+	if userVersion != DatabaseFormatUserVersion {
+		t.Fatalf("read-only snapshot user_version = %d, want %d", userVersion, DatabaseFormatUserVersion)
+	}
+}
+
+func TestV2NoSidecarValidationDoesNotCreateSidecars(t *testing.T) {
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := snapshotSQLiteArtifacts(t, path)
+	if _, ok := want[path+"-wal"]; ok {
+		t.Fatal("fixture WAL still exists")
+	}
+	if _, ok := want[path+"-shm"]; ok {
+		t.Fatal("fixture SHM still exists")
+	}
+	ro, err := OpenReadOnly(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+}
+
+func TestV2RollbackJournalValidationDoesNotMutateSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(sqliteDriverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`PRAGMA journal_mode=DELETE`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE schema_migrations SET applied_at = 'uncommitted' WHERE version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	want := snapshotSQLiteArtifacts(t, path)
+	if _, ok := want[path+"-journal"]; !ok {
+		t.Fatal("fixture rollback journal missing")
+	}
+	if err := validateExistingDatabase(path); err != nil {
+		t.Fatalf("rollback-journal validation: %v", err)
+	}
+	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+}
+
+func v2PinnedWALFixture(t *testing.T) (string, *sql.DB, *sql.DB, *sql.Tx) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := reader.Begin()
+	if err != nil {
+		reader.Close()
+		t.Fatal(err)
+	}
+	var version int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		tx.Rollback()
+		reader.Close()
+		t.Fatal(err)
+	}
+	writer, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		tx.Rollback()
+		reader.Close()
+		t.Fatal(err)
+	}
+	return path, reader, writer, tx
 }
 
 func TestV2MalformedMigrationMetadataRejected(t *testing.T) {

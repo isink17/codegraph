@@ -56,12 +56,19 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 	if st.Size() == 0 {
 		return nil, fmt.Errorf("%w: graph database at %s is empty", ErrRepoNotIndexed, dbPath)
 	}
-	if err := validateExistingDatabase(dbPath); err != nil {
+	snapshotPath, cleanup, err := createSQLiteValidationSnapshot(dbPath)
+	if err != nil {
 		return nil, err
 	}
+	keepSnapshot := false
+	defer func() {
+		if !keepSnapshot {
+			_ = cleanup()
+		}
+	}()
 	// isNewDB=false keeps the one-time creation pragmas out of the DSN;
 	// readOnly=true adds mode=ro.
-	dsn, err := BuildSQLiteDSN(dbPath, opts, false, true)
+	dsn, err := BuildSQLiteDSN(snapshotPath, opts, false, true)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +86,12 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("open %s read-only: %w", dbPath, err)
 	}
-	return &Store{db: db}, nil
+	if err := validateDatabaseFormat(context.Background(), db, dbPath); err != nil {
+		db.Close()
+		return nil, err
+	}
+	keepSnapshot = true
+	return &Store{db: db, cleanup: cleanup}, nil
 }
 
 // FindRepo looks up a repository by root path without creating it.
