@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -287,8 +290,12 @@ func TestV2WALCurrentMetadataAccepted(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := snapshotSQLiteArtifacts(t, path)
+	beforeSnapshots := validationSnapshotCalls.Load()
 	if err := validateExistingDatabase(path); err != nil {
 		t.Fatalf("current WAL metadata rejected: %v", err)
+	}
+	if got := validationSnapshotCalls.Load() - beforeSnapshots; got != 1 {
+		t.Fatalf("snapshot calls = %d, want 1", got)
 	}
 	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
 }
@@ -298,6 +305,8 @@ func TestOpenReadOnlyUsesAcceptedSnapshot(t *testing.T) {
 	defer tx.Rollback()
 	defer reader.Close()
 	defer writer.Close()
+	beforeSnapshots := validationSnapshotCalls.Load()
+	beforeTemp := validationTempDirCount(t)
 	ro, err := OpenReadOnly(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -305,13 +314,38 @@ func TestOpenReadOnlyUsesAcceptedSnapshot(t *testing.T) {
 	if _, err := writer.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
-	defer ro.Close()
 	var userVersion int
 	if err := ro.db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatal(err)
 	}
 	if userVersion != DatabaseFormatUserVersion {
 		t.Fatalf("read-only snapshot user_version = %d, want %d", userVersion, DatabaseFormatUserVersion)
+	}
+	if got := validationSnapshotCalls.Load() - beforeSnapshots; got != 1 {
+		t.Fatalf("snapshot calls = %d, want 1", got)
+	}
+	if err := ro.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := validationTempDirCount(t); got != beforeTemp {
+		t.Fatalf("validation temp directories before=%d after=%d", beforeTemp, got)
+	}
+}
+
+func TestOpenReadOnlyFailedSnapshotCleansTempDirectory(t *testing.T) {
+	path, reader, writer, tx := v2PinnedWALFixture(t)
+	defer tx.Rollback()
+	defer reader.Close()
+	defer writer.Close()
+	if _, err := writer.Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	before := validationTempDirCount(t)
+	if _, err := OpenReadOnly(path, OpenOptions{}); err == nil {
+		t.Fatal("future WAL database opened read-only")
+	}
+	if got := validationTempDirCount(t); got != before {
+		t.Fatalf("validation temp directories before=%d after=%d", before, got)
 	}
 }
 
@@ -328,11 +362,15 @@ func TestV2NoSidecarValidationDoesNotCreateSidecars(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := snapshotSQLiteArtifacts(t, path)
+	beforeSnapshots := validationSnapshotCalls.Load()
 	if _, ok := want[path+"-wal"]; ok {
 		t.Fatal("fixture WAL still exists")
 	}
 	if _, ok := want[path+"-shm"]; ok {
 		t.Fatal("fixture SHM still exists")
+	}
+	if err := validateExistingDatabase(path); err != nil {
+		t.Fatal(err)
 	}
 	ro, err := OpenReadOnly(path, OpenOptions{})
 	if err != nil {
@@ -341,7 +379,38 @@ func TestV2NoSidecarValidationDoesNotCreateSidecars(t *testing.T) {
 	if err := ro.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if got := validationSnapshotCalls.Load() - beforeSnapshots; got != 0 {
+		t.Fatalf("snapshot calls = %d, want 0", got)
+	}
 	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+}
+
+func TestStoreCleanupRunsOnceAfterDatabaseClose(t *testing.T) {
+	db, err := sql.Open(sqliteDriverName, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupErr := errors.New("cleanup failed")
+	var calls atomic.Int32
+	s := &Store{
+		db: db,
+		cleanup: func() error {
+			calls.Add(1)
+			if err := db.Ping(); err == nil {
+				t.Error("cleanup ran before database close")
+			}
+			return cleanupErr
+		},
+	}
+	if err := s.Close(); !errors.Is(err, cleanupErr) {
+		t.Fatalf("Close() error = %v, want cleanup error", err)
+	}
+	if err := s.Close(); !errors.Is(err, cleanupErr) {
+		t.Fatalf("second Close() error = %v, want cleanup error", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", got)
+	}
 }
 
 func TestV2RollbackJournalValidationDoesNotMutateSource(t *testing.T) {
@@ -377,6 +446,21 @@ func TestV2RollbackJournalValidationDoesNotMutateSource(t *testing.T) {
 		t.Fatalf("rollback-journal validation: %v", err)
 	}
 	assertSQLiteArtifactsEqual(t, want, snapshotSQLiteArtifacts(t, path))
+}
+
+func validationTempDirCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "codegraph-validation-") {
+			count++
+		}
+	}
+	return count
 }
 
 func v2PinnedWALFixture(t *testing.T) (string, *sql.DB, *sql.DB, *sql.Tx) {

@@ -79,8 +79,10 @@ const (
 )
 
 type Store struct {
-	db      *sql.DB
-	cleanup func() error
+	db          *sql.DB
+	cleanup     func() error
+	cleanupOnce sync.Once
+	cleanupErr  error
 	// neighborStmts counts the statements the batched context-neighbour
 	// pipeline issues. The number is the load-bearing property of P19 -- it must
 	// not grow with the seed count -- and wall-clock cannot prove that, so the
@@ -93,6 +95,8 @@ type Store struct {
 	// reset it and then call only what it means to measure.
 	neighborStmts atomic.Int64
 }
+
+var validationSnapshotCalls atomic.Uint64
 
 func boolInt(v bool) int {
 	if v {
@@ -451,6 +455,39 @@ func MigrationCeiling() (int, error) {
 }
 
 func validateExistingDatabase(path string) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		artifacts, err := readSQLiteInspectionArtifacts(path)
+		if err != nil {
+			return err
+		}
+		if len(artifacts) == 1 {
+			db, err := openImmutableValidated(path, OpenOptions{})
+			if err != nil {
+				return err
+			}
+			validationErr := db.Close()
+			current, err := readSQLiteInspectionArtifacts(path)
+			if err != nil {
+				return err
+			}
+			if validationErr != nil {
+				return validationErr
+			}
+			if sqliteInspectionArtifactsEqual(artifacts, current) {
+				return nil
+			}
+			continue
+		}
+		return validateSQLiteValidationSnapshot(path)
+	}
+	return fmt.Errorf("database %s changed while validating", path)
+}
+
+func buildSQLiteValidationDSN(path string) (string, error) {
+	return BuildSQLiteDSN(path, OpenOptions{}, false, true)
+}
+
+func validateSQLiteValidationSnapshot(path string) error {
 	snapshotPath, cleanup, err := createSQLiteValidationSnapshot(path)
 	if err != nil {
 		return err
@@ -468,11 +505,24 @@ func validateExistingDatabase(path string) error {
 	return validateDatabaseFormat(context.Background(), db, path)
 }
 
-func buildSQLiteValidationDSN(path string) (string, error) {
-	return BuildSQLiteDSN(path, OpenOptions{}, false, true)
+func openImmutableValidated(path string, opts OpenOptions) (*sql.DB, error) {
+	dsn, err := buildSQLiteImmutableDSN(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDatabaseFormat(context.Background(), db, path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
+	validationSnapshotCalls.Add(1)
 	// ponytail: three retries bound unstable sidecar copying; a continuously busy database fails closed.
 	for attempt := 0; attempt < 3; attempt++ {
 		artifacts, err := readSQLiteInspectionArtifacts(path)
@@ -556,7 +606,7 @@ func vacuumSQLiteSnapshot(path string, artifacts map[string]sqliteInspectionArti
 		sourcePath = inputPath
 		dsn, err = BuildSQLiteDSN(sourcePath, OpenOptions{}, false, true)
 	} else {
-		dsn, err = buildSQLiteImmutableDSN(sourcePath)
+		dsn, err = buildSQLiteImmutableDSN(sourcePath, OpenOptions{})
 	}
 	if err != nil {
 		_ = cleanup()
@@ -575,8 +625,8 @@ func vacuumSQLiteSnapshot(path string, artifacts map[string]sqliteInspectionArti
 	return snapshotPath, cleanup, nil
 }
 
-func buildSQLiteImmutableDSN(path string) (string, error) {
-	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
+func buildSQLiteImmutableDSN(path string, opts OpenOptions) (string, error) {
+	dsn, err := BuildSQLiteDSN(path, opts, false, true)
 	if err != nil {
 		return "", err
 	}
@@ -783,7 +833,8 @@ func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
 func (s *Store) Close() error {
 	err := s.db.Close()
 	if s.cleanup != nil {
-		err = errors.Join(err, s.cleanup())
+		s.cleanupOnce.Do(func() { s.cleanupErr = s.cleanup() })
+		err = errors.Join(err, s.cleanupErr)
 	}
 	return err
 }
