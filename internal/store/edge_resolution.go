@@ -125,7 +125,21 @@ const (
 	// repository: a name that is ambiguous repo-wide can still be unambiguous
 	// here, and a name that is unique repo-wide reaches nothing from outside its
 	// package.
-	ResolutionStrategyGoPackageScope         = "go_package_scope"
+	ResolutionStrategyGoPackageScope = "go_package_scope"
+
+	// ResolutionStrategyGoReceiverScope: the edge is a Go selector call
+	// `x.Method()` whose qualifier `x` the calling file's own lexical scope
+	// binds, whose type that binding's syntax states outright, whose Go package
+	// is proven (the caller's own, or an import path that maps to one directory
+	// of this repository), and which leaves exactly one method of that name on
+	// that type. See go_receiver_scope.go.
+	//
+	// A local qualifier whose type the syntax does not state resolves to
+	// nothing at all: the same evidence that proves `x` is local also proves it
+	// is not the imported package it is spelled like, so the edge is withheld
+	// from every generic strategy rather than handed down to one.
+	ResolutionStrategyGoReceiverScope = "go_receiver_scope"
+
 	ResolutionStrategyRustModuleScope        = "rust_module_scope"
 	ResolutionStrategyRustUseScope           = "rust_use_scope"
 	ResolutionStrategyRustAssociatedFunction = "rust_associated_function"
@@ -202,7 +216,14 @@ var resolutionConfidenceByStrategy = map[string]string{
 	// The name is matched in full against `symbols.name`, and the destination's
 	// package is proven rather than assumed, so nothing about either identity is
 	// discarded to reach the match.
-	ResolutionStrategyGoPackageScope:         ResolutionConfidenceHigh,
+	ResolutionStrategyGoPackageScope: ResolutionConfidenceHigh,
+
+	// The method name is matched in full against `symbols.name`, its owner in
+	// full against `symbols.container_name`, and the package is proven rather
+	// than assumed. Nothing about the destination's identity is discarded, and
+	// the receiver's type is read off the syntax rather than inferred.
+	ResolutionStrategyGoReceiverScope: ResolutionConfidenceHigh,
+
 	ResolutionStrategyRustModuleScope:        ResolutionConfidenceHigh,
 	ResolutionStrategyRustUseScope:           ResolutionConfidenceHigh,
 	ResolutionStrategyRustAssociatedFunction: ResolutionConfidenceHigh,
@@ -275,6 +296,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyKotlinImportScope,
 	ResolutionStrategyPythonImportScope,
 	ResolutionStrategyPythonModuleScope,
+	ResolutionStrategyGoReceiverScope,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.

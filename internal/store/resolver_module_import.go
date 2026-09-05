@@ -252,6 +252,13 @@ func repoGoModules(ctx context.Context, tx *sql.Tx, repoID int64) ([]goModule, e
 	if err := tx.QueryRowContext(ctx, `SELECT root_path FROM repos WHERE id = ?`, repoID).Scan(&root); err != nil {
 		return nil, err
 	}
+	return goModulesUnderRoot(root)
+}
+
+// goModulesUnderRoot walks a repository root for go.mod files. It is split from
+// repoGoModules so callers holding only the read/write surface (execQuerier)
+// can reach it after looking the root up themselves.
+func goModulesUnderRoot(root string) ([]goModule, error) {
 	if _, err := os.Stat(root); os.IsNotExist(err) {
 		return nil, nil
 	} else if err != nil {

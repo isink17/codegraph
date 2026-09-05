@@ -98,6 +98,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyCrossLanguageImportPath,
 		ResolutionStrategyModuleImport,
 		ResolutionStrategyGoPackageScope,
+		ResolutionStrategyGoReceiverScope,
 		ResolutionStrategyRustModuleScope,
 		ResolutionStrategyRustUseScope,
 		ResolutionStrategyRustAssociatedFunction,

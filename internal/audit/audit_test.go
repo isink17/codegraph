@@ -64,10 +64,17 @@ func TestFixtureIntegrity(t *testing.T) {
 				}
 			}
 			for _, competing := range c.CompetingTargets {
-				if !strings.HasSuffix(competing, "."+c.DstName) && competing != c.DstName {
-					t.Errorf("case %s competing target %q does not define the called name %q",
-						c.ID, competing, c.DstName)
+				if strings.HasSuffix(competing, "."+c.DstName) || competing == c.DstName {
+					continue
 				}
+				// A Go receiver spelling names a local variable on its left,
+				// not part of the destination's identity, so the target defines
+				// the method half alone.
+				if _, method, ok := goSelectorSpelling(c.DstName); ok && strings.HasSuffix(competing, "."+method) {
+					continue
+				}
+				t.Errorf("case %s competing target %q does not define the called name %q",
+					c.ID, competing, c.DstName)
 			}
 		default:
 			t.Errorf("case %s has unknown expectation %q", c.ID, c.Expect)

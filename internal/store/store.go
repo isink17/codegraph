@@ -1994,6 +1994,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM scope_import_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM go_local_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2134,6 +2137,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM scope_import_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM go_local_binding_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2350,6 +2356,24 @@ func insertParsedFileGraph(
 		}
 		if err := execBatchInsert(ctx, tx, "rust_module_evidence", "repo_id, file_id, owner_module, module_name, external_path, is_inline, visibility", 7, args, stats); err != nil {
 			return nil, err
+		}
+	}
+	if len(parsed.Scope.GoLocals) > 0 {
+		const goLocalCols = "repo_id, file_id, name, scope_start_line, scope_end_line, type_name, type_package, type_import_path, is_pointer"
+		args := make([]any, 0, min(len(parsed.Scope.GoLocals), sqliteImportValuesBatchRows)*9)
+		for _, local := range parsed.Scope.GoLocals {
+			args = append(args, repoID, fileID, local.Name, local.ScopeStartLine, local.ScopeEndLine, local.TypeName, local.TypePackage, local.TypeImportPath, boolInt(local.Pointer))
+			if len(args) >= sqliteImportValuesBatchRows*9 {
+				if err := execBatchInsert(ctx, tx, "go_local_binding_evidence", goLocalCols, 9, args, stats); err != nil {
+					return nil, err
+				}
+				args = args[:0]
+			}
+		}
+		if len(args) > 0 {
+			if err := execBatchInsert(ctx, tx, "go_local_binding_evidence", goLocalCols, 9, args, stats); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if len(parsed.Scope.Imports) > 0 {
@@ -3563,6 +3587,17 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		return 0, err
 	}
 	if n, _, err := s.resolveOwnModuleImports(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
+	// Go selector calls on a locally bound qualifier are answered by the
+	// receiver's proven type before any repo-wide strategy runs, and
+	// resolverGoLocalQualifierSQL keeps those strategies off them afterwards --
+	// including the ones that would otherwise rebuild the very miswire this
+	// slice removed, since `x.Method` matches a package function's dot_tail2 by
+	// construction. See go_receiver_scope.go.
+	if n, err := s.resolveGoReceiverScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
@@ -5433,6 +5468,62 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	}
 	if len(targets) == 0 {
 		return outcome, nil
+	}
+	// P22.28: a Go selector call whose qualifier the calling file binds locally
+	// is answered by the receiver's proven type or by nothing, and never by a
+	// repo-wide coincidence. resolveGoReceiverScope binds what it can prove and
+	// claims the rest; the claim joins moduleVeto because both mean the same
+	// thing to everything below -- this edge is not the generic strategies' to
+	// answer. This is the Go-side twin of resolverGoLocalQualifierSQL.
+	if hasGoTargets(targets) {
+		// The claim is taken before the pass runs, and never from what the pass
+		// happened to bind. It has to cover both halves of the outcome: the
+		// edges go_receiver_scope resolves (which the binder must not then
+		// overwrite with a repo-wide guess) and the ones it leaves unresolved
+		// on purpose (which the binder must not answer at all). Reading it
+		// afterwards would miss the first half, because a bound edge is no
+		// longer unresolved and drops out of the claim.
+		//
+		// goLocalQualifierClaims is the Go-side twin of
+		// resolverGoLocalQualifierSQL, pinned by
+		// TestGoLocalQualifierVetoSQLMatchesGoTwin.
+		claimed, err := goLocalQualifierClaims(ctx, s.db, repoID)
+		if err != nil {
+			return outcome, err
+		}
+		n, boundHere, err := s.resolveGoReceiverScopeStandalone(ctx, repoID, nil)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		if len(claimed) > 0 {
+			widened := make(map[int64]struct{}, len(moduleVeto)+len(claimed))
+			for id := range moduleVeto {
+				widened[id] = struct{}{}
+			}
+			for id := range claimed {
+				widened[id] = struct{}{}
+			}
+			moduleVeto = widened
+		}
+		remaining := targets[:0]
+		for _, target := range targets {
+			if _, bound := claimed[target.edgeID]; bound {
+				// Withheld from every strategy below, but still an edge this
+				// batch decided: the ones the pass could not prove a type for
+				// stay unresolved on purpose, and dropping them from the count
+				// would make the batch look smaller than it was.
+				if _, resolved := boundHere[target.edgeID]; !resolved {
+					outcome.unresolved++
+				}
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		targets = remaining
+		if len(targets) == 0 {
+			return outcome, nil
+		}
 	}
 	// P22.6: a bare spelling in a Go file is answered by the calling symbol's own
 	// package and by nothing else, so those targets take a separate lookup and
