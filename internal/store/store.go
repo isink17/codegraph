@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -11,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math"
 	"net/url"
@@ -456,8 +456,14 @@ func MigrationCeiling() (int, error) {
 
 func validateExistingDatabase(path string) error {
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+		}
 		artifacts, err := readSQLiteInspectionArtifacts(path)
 		if err != nil {
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
 			return err
 		}
 		if len(artifacts) == 1 {
@@ -468,6 +474,9 @@ func validateExistingDatabase(path string) error {
 			validationErr := db.Close()
 			current, err := readSQLiteInspectionArtifacts(path)
 			if err != nil {
+				if errors.Is(err, errSQLiteInspectionChanged) {
+					continue
+				}
 				return err
 			}
 			if validationErr != nil {
@@ -525,17 +534,30 @@ func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
 	validationSnapshotCalls.Add(1)
 	// ponytail: three retries bound unstable sidecar copying; a continuously busy database fails closed.
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			// Let short writer bursts finish rather than exhausting retries immediately.
+			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+		}
 		artifacts, err := readSQLiteInspectionArtifacts(path)
 		if err != nil {
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
 			return "", nil, err
 		}
 		snapshotPath, cleanup, err := vacuumSQLiteSnapshot(path, artifacts)
 		if err != nil {
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
 			return "", nil, err
 		}
 		current, err := readSQLiteInspectionArtifacts(path)
 		if err != nil {
 			_ = cleanup()
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
 			return "", nil, err
 		}
 		if sqliteInspectionArtifactsEqual(artifacts, current) {
@@ -546,20 +568,76 @@ func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
 	return "", nil, fmt.Errorf("database %s changed while creating validation snapshot", path)
 }
 
+var errSQLiteInspectionChanged = errors.New("database artifacts changed during inspection")
+
 type sqliteInspectionArtifact struct {
-	exists bool
-	data   []byte
+	info   os.FileInfo
+	digest [sha256.Size]byte
+}
+
+// streamSQLiteInspectionArtifact retains no file contents. SHA-256 detects
+// same-size writes even when filesystem timestamps are coarse or restored.
+// Metadata/identity checks additionally reject replacement and size changes
+// during the read. dst, when non-nil, receives exactly the bytes being hashed.
+func streamSQLiteInspectionArtifact(path string, dst io.Writer) (sqliteInspectionArtifact, error) {
+	var artifact sqliteInspectionArtifact
+	f, err := os.Open(path)
+	if err != nil {
+		return artifact, err
+	}
+	defer f.Close()
+	before, err := f.Stat()
+	if err != nil {
+		return artifact, err
+	}
+	if !before.Mode().IsRegular() {
+		return artifact, fmt.Errorf("database artifact %s is not a regular file", path)
+	}
+	hash := sha256.New()
+	var writer io.Writer = hash
+	if dst != nil {
+		writer = io.MultiWriter(dst, hash)
+	}
+	// Bound both memory and the read extent: do not chase a growing WAL.
+	n, err := io.CopyBuffer(writer, io.LimitReader(f, before.Size()), make([]byte, 32<<10))
+	if err != nil {
+		return artifact, err
+	}
+	var extra [1]byte
+	extraN, readErr := f.Read(extra[:])
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return artifact, readErr
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return artifact, err
+	}
+	current, err := os.Stat(path)
+	if err != nil {
+		// Do not report a file that vanished mid-read as an absent sidecar.
+		return artifact, fmt.Errorf("%w: %s: %v", errSQLiteInspectionChanged, path, err)
+	}
+	if n != before.Size() || extraN != 0 || !sqliteInspectionFileInfoEqual(before, after) || !sqliteInspectionFileInfoEqual(after, current) {
+		return artifact, fmt.Errorf("%w: %s changed while reading", errSQLiteInspectionChanged, path)
+	}
+	artifact.info = after
+	hash.Sum(artifact.digest[:0])
+	return artifact, nil
+}
+
+func sqliteInspectionFileInfoEqual(left, right os.FileInfo) bool {
+	return os.SameFile(left, right) && left.Size() == right.Size() && left.ModTime().Equal(right.ModTime())
 }
 
 func readSQLiteInspectionArtifacts(path string) (map[string]sqliteInspectionArtifact, error) {
 	artifacts := make(map[string]sqliteInspectionArtifact, 4)
 	for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
-		data, err := os.ReadFile(candidate)
+		artifact, err := streamSQLiteInspectionArtifact(candidate, nil)
 		if err == nil {
-			artifacts[candidate] = sqliteInspectionArtifact{exists: true, data: data}
+			artifacts[candidate] = artifact
 			continue
 		}
-		if !errors.Is(err, fs.ErrNotExist) {
+		if candidate == path || !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("read database artifact %s: %w", candidate, err)
 		}
 	}
@@ -572,11 +650,32 @@ func sqliteInspectionArtifactsEqual(left, right map[string]sqliteInspectionArtif
 	}
 	for path, want := range left {
 		got, ok := right[path]
-		if !ok || want.exists != got.exists || !bytes.Equal(want.data, got.data) {
+		if !ok || want.digest != got.digest || !sqliteInspectionFileInfoEqual(want.info, got.info) {
 			return false
 		}
 	}
 	return true
+}
+
+func copySQLiteInspectionArtifact(sourcePath, targetPath string, want sqliteInspectionArtifact) error {
+	target, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	got, copyErr := streamSQLiteInspectionArtifact(sourcePath, target)
+	closeErr := target.Close()
+	if errors.Is(copyErr, fs.ErrNotExist) {
+		copyErr = errors.Join(errSQLiteInspectionChanged, copyErr)
+	}
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return err
+	}
+	// Validate the copied stream before SQLite can recover or read it, not just
+	// the source before/after the copy (which could miss a transient torn copy).
+	if got.digest != want.digest || !sqliteInspectionFileInfoEqual(want.info, got.info) {
+		return fmt.Errorf("%w: %s changed while copying", errSQLiteInspectionChanged, sourcePath)
+	}
+	return nil
 }
 
 func vacuumSQLiteSnapshot(path string, artifacts map[string]sqliteInspectionArtifact) (string, func() error, error) {
@@ -585,43 +684,64 @@ func vacuumSQLiteSnapshot(path string, artifacts map[string]sqliteInspectionArti
 		return "", nil, err
 	}
 	cleanup := func() error { return os.RemoveAll(dir) }
+	keepSnapshot := false
+	defer func() {
+		if !keepSnapshot {
+			_ = cleanup()
+		}
+	}()
 	inputPath := filepath.Join(dir, "input.sqlite")
 	snapshotPath := filepath.Join(dir, "snapshot.sqlite")
-	if len(artifacts) > 1 {
-		for _, sourcePath := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
-			artifact, ok := artifacts[sourcePath]
-			if !ok {
-				continue
-			}
-			targetPath := inputPath + strings.TrimPrefix(sourcePath, path)
-			if err := os.WriteFile(targetPath, artifact.data, 0o600); err != nil {
-				_ = cleanup()
-				return "", nil, fmt.Errorf("copy database artifact %s: %w", sourcePath, err)
-			}
+	// Without sidecars, a verified file copy already is a complete snapshot.
+	// It needs neither recovery nor VACUUM's page cache and temporary workspace.
+	if len(artifacts) == 1 {
+		if err := copySQLiteInspectionArtifact(path, snapshotPath, artifacts[path]); err != nil {
+			return "", nil, fmt.Errorf("copy database artifact %s: %w", path, err)
+		}
+		keepSnapshot = true
+		return snapshotPath, cleanup, nil
+	}
+	for _, sourcePath := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+		artifact, ok := artifacts[sourcePath]
+		if !ok {
+			continue
+		}
+		targetPath := inputPath + strings.TrimPrefix(sourcePath, path)
+		if err := copySQLiteInspectionArtifact(sourcePath, targetPath, artifact); err != nil {
+			return "", nil, fmt.Errorf("copy database artifact %s: %w", sourcePath, err)
 		}
 	}
-	sourcePath := path
-	var dsn string
-	if len(artifacts) > 1 {
-		sourcePath = inputPath
-		dsn, err = BuildSQLiteDSN(sourcePath, OpenOptions{}, false, true)
-	} else {
-		dsn, err = buildSQLiteImmutableDSN(sourcePath, OpenOptions{})
-	}
+	dsn, err := BuildSQLiteDSN(inputPath, OpenOptions{}, false, true)
 	if err != nil {
-		_ = cleanup()
 		return "", nil, err
 	}
+	// Recovery of a hot rollback journal writes to the private input copy.
+	// Keep the read-only DSN's omission of journal_mode; change only its mode.
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", nil, err
+	}
+	query := u.Query()
+	query.Set("mode", "rw")
+	u.RawQuery = query.Encode()
+	dsn = u.String()
 	db, err := sql.Open(sqliteDriverName, dsn)
 	if err != nil {
-		_ = cleanup()
 		return "", nil, err
 	}
-	defer db.Close()
+	// These limits apply only to disposable recovery, not returned Store handles.
+	db.SetMaxOpenConns(1)
+	defer db.Close() // Runs before the directory cleanup, including on Windows.
+	if _, err := db.Exec(`PRAGMA cache_size=-1024; PRAGMA temp_store=FILE`); err != nil {
+		return "", nil, err
+	}
 	if _, err := db.Exec(`VACUUM INTO ` + sqliteStringLiteral(snapshotPath)); err != nil {
-		_ = cleanup()
 		return "", nil, fmt.Errorf("snapshot database %s: %w", path, err)
 	}
+	if err := db.Close(); err != nil {
+		return "", nil, err
+	}
+	keepSnapshot = true
 	return snapshotPath, cleanup, nil
 }
 

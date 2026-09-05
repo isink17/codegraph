@@ -6,13 +6,281 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestSQLiteArtifactMemoryBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.sqlite")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(16 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	first, err := readSQLiteInspectionArtifacts(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := readSQLiteInspectionArtifacts(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sqliteInspectionArtifactsEqual(first, second) {
+		t.Fatal("unchanged artifacts differ")
+	}
+	snapshot, cleanup, err := vacuumSQLiteSnapshot(path, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	copyState, err := streamSQLiteInspectionArtifact(snapshot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copyState.digest != first[path].digest || copyState.info.Size() != first[path].info.Size() {
+		t.Fatal("streamed snapshot differs from source")
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 2<<20 {
+		t.Fatalf("artifact fingerprints and copy allocated %d bytes for a 16 MiB file; limit 2 MiB", allocated)
+	}
+}
+
+func TestSQLiteArtifactFingerprintDetectsChanges(t *testing.T) {
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		t.Run("artifact="+suffix, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "source.sqlite")
+			for _, name := range []string{path, path + suffix} {
+				if err := os.WriteFile(name, []byte("before"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Coarse/restored timestamps cannot hide a same-size content change.
+			stamp := time.Unix(1700000000, 0)
+			if err := os.Chtimes(path+suffix, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+			before, err := readSQLiteInspectionArtifacts(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+suffix, []byte("after!"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(path+suffix, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+			after, err := readSQLiteInspectionArtifacts(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sqliteInspectionFileInfoEqual(before[path+suffix].info, after[path+suffix].info) {
+				t.Fatal("fixture must preserve size, identity and timestamp to isolate digest comparison")
+			}
+			if sqliteInspectionArtifactsEqual(before, after) {
+				t.Fatal("same-size rewrite with restored timestamp was missed")
+			}
+			if err := os.Rename(path+suffix, path+suffix+".old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+suffix, []byte("after!"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(path+suffix, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+			replaced, err := readSQLiteInspectionArtifacts(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sqliteInspectionArtifactsEqual(after, replaced) {
+				t.Fatal("same-content file replacement was missed")
+			}
+			if err := os.Remove(path + suffix); err != nil {
+				t.Fatal(err)
+			}
+			missing, err := readSQLiteInspectionArtifacts(path)
+			if suffix == "" {
+				if err == nil {
+					t.Fatal("missing main database accepted")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sqliteInspectionArtifactsEqual(after, missing) {
+					t.Fatal("disappearing sidecar was missed")
+				}
+				if sqliteInspectionArtifactsEqual(missing, after) {
+					t.Fatal("appearing sidecar was missed")
+				}
+			}
+		})
+	}
+}
+
+type sqliteArtifactWriterFunc func([]byte) (int, error)
+
+func (f sqliteArtifactWriterFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestSQLiteArtifactStreamRejectsChangesAndIOFailure(t *testing.T) {
+	for _, change := range []string{"shrink", "grow", "replace", "remove", "write-error", "short-write"} {
+		t.Run(change, func(t *testing.T) {
+			if runtime.GOOS == "windows" && (change == "replace" || change == "remove") {
+				t.Skip("Windows denies deletion/rename while os.Open holds a read handle; replacement between reads is tested separately")
+			}
+			path := filepath.Join(t.TempDir(), "source.sqlite")
+			data := make([]byte, 64<<10)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("injected write failure")
+			changed := false
+			_, err := streamSQLiteInspectionArtifact(path, sqliteArtifactWriterFunc(func(p []byte) (int, error) {
+				if changed {
+					return len(p), nil
+				}
+				changed = true
+				switch change {
+				case "shrink":
+					if err := os.Truncate(path, 1); err != nil {
+						t.Fatal(err)
+					}
+				case "grow":
+					if err := os.Truncate(path, int64(len(data)+1)); err != nil {
+						t.Fatal(err)
+					}
+				case "replace":
+					if err := os.Rename(path, path+".old"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, data, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				case "remove":
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+				case "write-error":
+					return 0, injected
+				case "short-write":
+					return 0, nil
+				}
+				return len(p), nil
+			}))
+			if err == nil {
+				t.Fatal("unstable or incomplete stream accepted")
+			}
+			if change == "write-error" && !errors.Is(err, injected) {
+				t.Fatalf("lost write error: %v", err)
+			}
+			if change == "short-write" && !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("lost short write: %v", err)
+			}
+		})
+	}
+}
+
+func TestSQLiteSnapshotCopyFailureCleansTempDirectory(t *testing.T) {
+	privateTemp := t.TempDir()
+	for _, variable := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(variable, privateTemp)
+	}
+	for _, failure := range []string{"changed-content", "missing-sidecar", "invalid-database"} {
+		t.Run(failure, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "source.sqlite")
+			for _, name := range []string{path, path + "-wal"} {
+				if err := os.WriteFile(name, []byte("before"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			artifacts, err := readSQLiteInspectionArtifacts(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch failure {
+			case "changed-content":
+				if err := os.WriteFile(path+"-wal", []byte("after!"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				stamp := artifacts[path+"-wal"].info.ModTime()
+				if err := os.Chtimes(path+"-wal", stamp, stamp); err != nil {
+					t.Fatal(err)
+				}
+			case "missing-sidecar":
+				if err := os.Remove(path + "-wal"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := validationTempDirCount(t)
+			_, cleanup, err := vacuumSQLiteSnapshot(path, artifacts)
+			if err == nil {
+				cleanup()
+				t.Fatal("invalid snapshot accepted")
+			}
+			if failure == "changed-content" && !strings.Contains(err.Error(), "changed while copying") {
+				t.Fatalf("changed copied bytes must be rejected before SQLite recovery: %v", err)
+			}
+			if got := validationTempDirCount(t); got != before {
+				t.Fatalf("failed copy/recovery leaked temp directory: before=%d after=%d", before, got)
+			}
+		})
+	}
+}
+
+func TestSQLiteSnapshotRecoversHotJournalWithoutSourceWrites(t *testing.T) {
+	path := createReadOnlyProbeDatabase(t)
+	db, err := sql.Open(sqliteDriverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=DELETE; PRAGMA cache_size=1;
+		CREATE TABLE journal_probe(value INTEGER, padding BLOB);
+		WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<64)
+		INSERT INTO journal_probe SELECT 1, zeroblob(4096) FROM n`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	// More dirty pages than the cache forces a spill with a recoverable journal.
+	if _, err := tx.Exec(`UPDATE journal_probe SET value=2`); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotSQLiteArtifacts(t, path)
+	reader, err := OpenReadOnly(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var value int
+	if err := reader.db.QueryRow(`SELECT max(value) FROM journal_probe`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != 1 {
+		t.Fatalf("snapshot value=%d, want committed value=1", value)
+	}
+	assertSQLiteArtifactsEqual(t, before, snapshotSQLiteArtifacts(t, path))
+}
 
 func TestV2DatabaseIdentityAndCeiling(t *testing.T) {
 	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
