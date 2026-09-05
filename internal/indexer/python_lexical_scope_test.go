@@ -80,15 +80,15 @@ func runPythonLexicalCases(t *testing.T, reg *parser.Registry) {
 			t.Errorf("%s: %s -> %q = %s; want %s", tc.name, tc.file, tc.dst, got, tc.want)
 		}
 	}
-	// Two functions binding the same alias to different modules: each call takes
-	// the import written in its own scope, and neither takes the other's. The
-	// pairing is asserted by calling symbol, not by row order.
+	// Two functions binding the same alias to different modules: neither call
+	// may take the other's import, and a function-local import binds nothing on
+	// its own, so both stay unresolved. The pairing is asserted by calling
+	// symbol, not by row order.
 	byCaller := r.callEdgeTargets(t, "two_locals.py")
-	if got := byCaller["two_locals.f"]; !strings.Contains(got, "pkg/helpers.py") {
-		t.Errorf("f() must take its own import: %s", got)
-	}
-	if got := byCaller["two_locals.g"]; !strings.Contains(got, "other/helpers.py") {
-		t.Errorf("g() must take its own import: %s", got)
+	for _, caller := range []string{"two_locals.f", "two_locals.g"} {
+		if got := byCaller[caller]; !strings.Contains(got, "<unresolved>") {
+			t.Errorf("%s must not bind from a function-local import: %s", caller, got)
+		}
 	}
 }
 
@@ -119,9 +119,11 @@ func TestPythonLexicalScopeLifecycleParity(t *testing.T) {
 			want:   inPkg,
 		},
 		{
-			name:   "moving the import into the function keeps it visible",
+			// A function-local import binds the name for the whole function,
+			// but nothing here proves the import ran before the call.
+			name:   "moving the import into the function stops it binding",
 			source: "def run():\n    import pkg.helpers as h\n    return h.load()\n",
-			want:   inPkg,
+			want:   "<unresolved>",
 		},
 		{
 			name:   "moving it into a sibling function takes it out of scope",
@@ -225,39 +227,201 @@ func TestPythonDottedNamespaceImportBindsBothSpellings(t *testing.T) {
 	}
 }
 
-// Whether a directory is a package decides which roots an absolute import in
-// it resolves against, so adding or removing an `__init__.py` has to reach the
-// files below it on an incremental update.
-func TestPythonPackageMarkerLifecycleParity(t *testing.T) {
+// An absolute import is anchored at the repository root and nowhere else, so a
+// sibling module never answers one -- with or without an `__init__.py`. Adding
+// or removing that marker still has to reach the files below it on an
+// incremental update, because it decides whether the directory is an importable
+// package at all.
+func TestPythonAbsoluteRootLifecycleParity(t *testing.T) {
 	reg := parser.NewRegistry(pyparser.New())
-	files := map[string]string{
+	r := newPyRepo(t, reg, map[string]string{
 		"pkg/helpers.py": "def load():\n    return 1\n",
 		"pkg/main.py":    "import helpers\n\n\ndef run():\n    return helpers.load()\n",
+	})
+	// Case A: `import helpers` inside `pkg/` is top-level `helpers`, which does
+	// not exist. Whether `pkg/` happens to be `sys.path[0]` at runtime is not a
+	// repository fact, so nothing binds.
+	if got := r.edgeState(t, "pkg/main.py", "helpers.load"); !strings.Contains(got, "<unresolved>") {
+		t.Fatalf("sibling module answered an absolute import: %s", got)
 	}
-	r := newPyRepo(t, reg, files)
-	// With no `__init__.py`, `pkg/` is a plain directory: it is the importing
-	// file's own root, and `import helpers` reaches its sibling.
-	if got := r.edgeState(t, "pkg/main.py", "helpers.load"); !strings.Contains(got, "pkg/helpers.py:helpers.load [python_import_scope]") {
-		t.Fatalf("script directory root: %s", got)
-	}
-	assertPythonFreshParity(t, reg, r, "no package marker")
+	assertPythonFreshParity(t, reg, r, "no top-level module")
 
-	// Adding one makes `pkg/` a package, and an implicit-relative import stops
-	// meaning anything.
+	// Case B: a top-level `helpers.py` is what the import names, and the
+	// sibling still never is.
+	r.write(t, "helpers.py", "def load():\n    return 2\n")
+	r.update(t)
+	got := r.edgeState(t, "pkg/main.py", "helpers.load")
+	if !strings.Contains(got, "helpers.py:helpers.load [python_import_scope]") || strings.Contains(got, "pkg/helpers.py") {
+		t.Fatalf("absolute import must bind the repository-root module: %s", got)
+	}
+	assertPythonFreshParity(t, reg, r, "top-level module added")
+
+	// The package marker changes nothing about which module that is.
 	r.write(t, "pkg/__init__.py", "")
 	r.update(t)
-	if got := r.edgeState(t, "pkg/main.py", "helpers.load"); !strings.Contains(got, "<unresolved>") {
-		t.Fatalf("after __init__.py: %s; want unresolved", got)
+	if got := r.edgeState(t, "pkg/main.py", "helpers.load"); !strings.Contains(got, "helpers.py:helpers.load") || strings.Contains(got, "pkg/helpers.py") {
+		t.Fatalf("after __init__.py: %s", got)
 	}
 	assertPythonFreshParity(t, reg, r, "package marker added")
 
-	// Removing it puts the root back.
-	r.remove(t, "pkg/__init__.py")
+	r.remove(t, "helpers.py")
 	r.update(t)
-	if got := r.edgeState(t, "pkg/main.py", "helpers.load"); !strings.Contains(got, "pkg/helpers.py") {
-		t.Fatalf("after removing __init__.py: %s", got)
+	if got := r.edgeState(t, "pkg/main.py", "helpers.load"); !strings.Contains(got, "<unresolved>") {
+		t.Fatalf("after removing the top-level module: %s; want unresolved", got)
 	}
-	assertPythonFreshParity(t, reg, r, "package marker removed")
+	assertPythonFreshParity(t, reg, r, "top-level module removed")
+}
+
+// A `src/` layout is a packaging convention, not a repository-provable import
+// root, so an import that only such a root could satisfy stays unresolved.
+func TestPythonSrcLayoutRootIsNotAssumed(t *testing.T) {
+	r := newPyRepo(t, parser.NewRegistry(pyparser.New()), map[string]string{
+		"src/pkg/__init__.py": "",
+		"src/pkg/helpers.py":  "def load():\n    return 1\n",
+		"src/app.py":          "import pkg.helpers\n\n\ndef run():\n    return pkg.helpers.load()\n",
+	})
+	if got := r.edgeState(t, "src/app.py", "pkg.helpers.load"); !strings.Contains(got, "<unresolved>") {
+		t.Fatalf("src layout was treated as an import root: %s", got)
+	}
+}
+
+// `from pkg import name` binds whatever `pkg` exposes as `name`. A package that
+// binds the name itself wins over its own same-named submodule, and no
+// syntax proves what that object is.
+func TestPythonPackageAttributeShadowsSubmodule(t *testing.T) {
+	r := newPyRepo(t, parser.NewRegistry(pyparser.New()), map[string]string{
+		"attr/__init__.py":     "class Obj:\n    def load(self):\n        return 0\n\n\nhelpers = Obj()\n",
+		"attr/helpers.py":      "def load():\n    return 1\n",
+		"decl/__init__.py":     "def helpers():\n    return 0\n",
+		"decl/helpers.py":      "def load():\n    return 1\n",
+		"alias/__init__.py":    "from other.mod import helpers\n",
+		"alias/helpers.py":     "def load():\n    return 1\n",
+		"other/__init__.py":    "",
+		"other/mod.py":         "def helpers():\n    return 0\n",
+		"reexport/__init__.py": "from . import helpers\n",
+		"reexport/helpers.py":  "def load():\n    return 1\n",
+		"plain/__init__.py":    "",
+		"plain/helpers.py":     "def load():\n    return 1\n",
+		"star/__init__.py":     "from .base import *\n",
+		"star/base.py":         "helpers = 1\n",
+		"star/helpers.py":      "def load():\n    return 1\n",
+		"app.py": "from attr import helpers as a\n" +
+			"from decl import helpers as d\n" +
+			"from alias import helpers as x\n" +
+			"from reexport import helpers as r\n" +
+			"from plain import helpers as p\n" +
+			"from star import helpers as st\n\n\n" +
+			"def run():\n    a.load()\n    d.load()\n    x.load()\n    r.load()\n    st.load()\n    return p.load()\n",
+	})
+	for _, tc := range []struct{ dst, want string }{
+		{"a.load", "<unresolved>"},
+		{"d.load", "<unresolved>"},
+		{"x.load", "<unresolved>"},
+		// An `__init__.py` that imports the submodule itself is exactly the
+		// re-export that proves the submodule reading.
+		{"r.load", "reexport/helpers.py:helpers.load [python_import_scope]"},
+		{"p.load", "plain/helpers.py:helpers.load [python_import_scope]"},
+		// A star import in the package can bind the name to anything.
+		{"st.load", "<unresolved>"},
+	} {
+		if got := r.edgeState(t, "app.py", tc.dst); !strings.Contains(got, tc.want) {
+			t.Errorf("%s = %s; want %s", tc.dst, got, tc.want)
+		}
+	}
+}
+
+// A nested `def` or `class` binds its name in the enclosing function for the
+// whole function, so it shadows an outer import wherever it is written.
+func TestPythonNestedDeclarationShadowsImport(t *testing.T) {
+	tree := map[string]string{
+		"pkg/__init__.py": "",
+		"pkg/helpers.py":  "def load():\n    return 1\n\n\ndef Client():\n    return 2\n",
+	}
+	cases := []struct{ file, source, dst, want string }{
+		{
+			"nested_def_before.py",
+			"from pkg.helpers import load\n\n\ndef run():\n    def load():\n        return 1\n    return load()\n",
+			"load", "<unresolved>",
+		},
+		{
+			// Python classifies the name local to the whole function, so the
+			// call before the nested `def` is not the outer import either.
+			"nested_def_after.py",
+			"from pkg.helpers import load\n\n\ndef run():\n    value = load()\n\n    def load():\n        return 1\n    return value\n",
+			"load", "<unresolved>",
+		},
+		{
+			"nested_class.py",
+			"from pkg.helpers import Client\n\n\ndef run():\n    class Client:\n        pass\n    return Client()\n",
+			"Client", "<unresolved>",
+		},
+		{
+			// A nested declaration in a sibling function binds nothing here.
+			"nested_sibling.py",
+			"from pkg.helpers import load\n\n\ndef other():\n    def load():\n        return 1\n    return 0\n\n\ndef run():\n    return load()\n",
+			"load", "pkg/helpers.py:helpers.load [python_import_scope]",
+		},
+	}
+	for _, tc := range cases {
+		tree[tc.file] = tc.source
+	}
+	r := newPyRepo(t, parser.NewRegistry(pyparser.New()), tree)
+	for _, tc := range cases {
+		if got := r.edgeState(t, tc.file, tc.dst); !strings.Contains(got, tc.want) {
+			t.Errorf("%s: %q = %s; want %s", tc.file, tc.dst, got, tc.want)
+		}
+	}
+}
+
+// A nested declaration shadows an import, but with no import to shadow it is
+// the call's own target -- refusing it would trade a false edge for a lost one.
+func TestPythonNestedDeclarationStillAnswersItsOwnCall(t *testing.T) {
+	r := newPyRepo(t, parser.NewRegistry(pyparser.New()), map[string]string{
+		"app.py": "def run():\n    def inner():\n        return 1\n    return inner()\n",
+	})
+	if got := r.edgeState(t, "app.py", "inner"); strings.Contains(got, "<unresolved>") {
+		t.Fatalf("a nested declaration must answer its own call: %s", got)
+	}
+}
+
+// `pkg.py` and `pkg/__init__.py` both existing makes `pkg` undecidable, so what
+// it exposes as a name is undecidable too.
+func TestPythonAmbiguousPackageLayoutRefusesSubmodule(t *testing.T) {
+	r := newPyRepo(t, parser.NewRegistry(pyparser.New()), map[string]string{
+		"pkg.py":          "helpers = 1\n",
+		"pkg/__init__.py": "",
+		"pkg/helpers.py":  "def load():\n    return 1\n",
+		"app.py":          "from pkg import helpers\n\n\ndef run():\n    return helpers.load()\n",
+	})
+	if got := r.edgeState(t, "app.py", "helpers.load"); !strings.Contains(got, "<unresolved>") {
+		t.Fatalf("ambiguous package layout bound anyway: %s", got)
+	}
+}
+
+// `from pkg import helpers` resolves against `pkg.helpers`, so that submodule
+// appearing later has to reach the caller on an incremental update.
+func TestPythonSubmoduleAppearingInvalidatesCaller(t *testing.T) {
+	reg := parser.NewRegistry(pyparser.New())
+	r := newPyRepo(t, reg, map[string]string{
+		"pkg/__init__.py": "",
+		"app.py":          "from pkg import helpers\n\n\ndef run():\n    return helpers.load()\n",
+	})
+	if got := r.edgeState(t, "app.py", "helpers.load"); !strings.Contains(got, "<unresolved>") {
+		t.Fatalf("no submodule yet: %s", got)
+	}
+	r.write(t, "pkg/helpers.py", "def load():\n    return 1\n")
+	r.update(t)
+	if got := r.edgeState(t, "app.py", "helpers.load"); !strings.Contains(got, "pkg/helpers.py:helpers.load [python_import_scope]") {
+		t.Fatalf("submodule added: %s; want the caller rebound", got)
+	}
+	assertPythonFreshParity(t, reg, r, "submodule added")
+
+	r.remove(t, "pkg/helpers.py")
+	r.update(t)
+	if got := r.edgeState(t, "app.py", "helpers.load"); !strings.Contains(got, "<unresolved>") {
+		t.Fatalf("submodule removed: %s; want unresolved", got)
+	}
+	assertPythonFreshParity(t, reg, r, "submodule removed")
 }
 
 func assertPythonFreshParity(t *testing.T, reg *parser.Registry, r *pyRepo, step string) {
@@ -265,6 +429,44 @@ func assertPythonFreshParity(t *testing.T, reg *parser.Registry, r *pyRepo, step
 	fresh := newPyRepo(t, reg, readTree(t, r.root)).projection(t)
 	if diff := pythonProjectionDiff(fresh, r.projection(t)); diff != "" {
 		t.Fatalf("%s: update diverges from a fresh index of the same tree:\n%s", step, diff)
+	}
+}
+
+// A function-local import binds the name for the whole function, but nothing in
+// the evidence says whether the import statement ran before the call. It is
+// claim and veto evidence only: it never binds, and it keeps every weaker
+// strategy off the name.
+func TestPythonFunctionLocalImportNeverBinds(t *testing.T) {
+	tree := map[string]string{
+		"pkg/__init__.py":   "",
+		"pkg/helpers.py":    "def load():\n    return 1\n",
+		"other/__init__.py": "",
+		"other/helpers.py":  "def load():\n    return 2\n",
+	}
+	cases := []struct{ file, source, dst string }{
+		{"before.py", "def run():\n    value = load()\n    from pkg.helpers import load\n    return value\n", "load"},
+		{"after.py", "def run():\n    from pkg.helpers import load\n    return load()\n", "load"},
+		{
+			// The function-local import makes the name local for the whole
+			// function, so the module-level one may not answer either.
+			"over_module.py",
+			"from pkg.helpers import load\n\n\ndef run():\n    value = load()\n    from other.helpers import load\n    return value\n",
+			"load",
+		},
+		{
+			"twice.py",
+			"def run():\n    from pkg.helpers import load\n    from other.helpers import load\n    return load()\n",
+			"load",
+		},
+	}
+	for _, tc := range cases {
+		tree[tc.file] = tc.source
+	}
+	r := newPyRepo(t, parser.NewRegistry(pyparser.New()), tree)
+	for _, tc := range cases {
+		if got := r.edgeState(t, tc.file, tc.dst); !strings.Contains(got, "<unresolved>") {
+			t.Errorf("%s: %q = %s; want unresolved", tc.file, tc.dst, got)
+		}
 	}
 }
 

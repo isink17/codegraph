@@ -12,82 +12,53 @@ import (
 func TestPythonModuleCandidatePaths(t *testing.T) {
 	tests := []struct {
 		name, source, specifier string
-		roots                   []string
 		want                    []string
 	}{
 		{
-			// Absolute imports see only the roots they are given -- never the
-			// caller's own package directory.
+			// Absolute imports are anchored at the repository root and nowhere
+			// else -- never the caller's own directory.
 			name:   "absolute against the repository root",
-			source: "src/app/main.py", specifier: "pkg.helpers", roots: []string{""},
+			source: "src/app/main.py", specifier: "pkg.helpers",
 			want: []string{"pkg/helpers.py", "pkg/helpers/__init__.py"},
 		},
 		{
-			name:   "absolute against a src layout root",
-			source: "src/app/main.py", specifier: "pkg.helpers", roots: []string{"", "src"},
-			want: []string{
-				"pkg/helpers.py", "pkg/helpers/__init__.py",
-				"src/pkg/helpers.py", "src/pkg/helpers/__init__.py",
-			},
+			// A src layout is not a proven import root, so the only candidates
+			// are the repository-root ones -- which do not exist in such a tree.
+			name:   "src layout gets no extra root",
+			source: "src/app/main.py", specifier: "app.helpers",
+			want: []string{"app/helpers.py", "app/helpers/__init__.py"},
 		},
 		{
 			name:   "relative one level is anchored at the importing package",
-			source: "pkg/app.py", specifier: ".helpers", roots: []string{""},
+			source: "pkg/app.py", specifier: ".helpers",
 			want: []string{"pkg/helpers.py", "pkg/helpers/__init__.py"},
 		},
 		{
 			name:   "relative two levels climbs once",
-			source: "pkg/deep/app.py", specifier: "..common.helpers", roots: []string{""},
+			source: "pkg/deep/app.py", specifier: "..common.helpers",
 			want: []string{"pkg/common/helpers.py", "pkg/common/helpers/__init__.py"},
 		},
 		{
 			name:   "bare relative names a package, never a module file",
-			source: "pkg/app.py", specifier: ".", roots: []string{""},
+			source: "pkg/app.py", specifier: ".",
 			want: []string{"pkg/__init__.py"},
 		},
 		{
 			name:   "relative above the repository root has no candidate",
-			source: "app.py", specifier: "..helpers", roots: []string{""},
+			source: "app.py", specifier: "..helpers",
 			want: nil,
 		},
 		{
 			name:   "malformed specifier has no candidate",
-			source: "app.py", specifier: "pkg..helpers", roots: []string{""},
+			source: "app.py", specifier: "pkg..helpers",
 			want: nil,
 		},
-		{name: "empty specifier", source: "app.py", specifier: "", roots: []string{""}, want: nil},
+		{name: "empty specifier", source: "app.py", specifier: "", want: nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pythonModuleCandidatePaths(tc.source, tc.specifier, tc.roots); !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("pythonModuleCandidatePaths(%q, %q, %v) = %v, want %v", tc.source, tc.specifier, tc.roots, got, tc.want)
-			}
-		})
-	}
-}
-
-// A caller's own package directory is not an import root: `import helpers`
-// inside `pkg/` has not meant `pkg.helpers` since Python 3.
-func TestPythonImportRoots(t *testing.T) {
-	tests := []struct {
-		name, source string
-		packages     []string
-		want         []string
-	}{
-		{"repository root for a file in no package", "app.py", nil, []string{""}},
-		{"a script's own directory is its root", "scripts/run.py", nil, []string{"", "scripts"}},
-		{"a package directory is never a root", "pkg/main.py", []string{"pkg"}, []string{""}},
-		{"climbs out of nested packages", "pkg/deep/main.py", []string{"pkg", "pkg/deep"}, []string{""}},
-		{"a src layout puts src on the path", "src/pkg/main.py", []string{"src/pkg"}, []string{"", "src"}},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			packages := map[string]struct{}{}
-			for _, dir := range tc.packages {
-				packages[dir] = struct{}{}
-			}
-			if got := pythonImportRoots(tc.source, packages); !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("pythonImportRoots(%q, %v) = %v, want %v", tc.source, tc.packages, got, tc.want)
+			if got := pythonModuleCandidatePaths(tc.source, tc.specifier); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("pythonModuleCandidatePaths(%q, %q) = %v, want %v", tc.source, tc.specifier, got, tc.want)
 			}
 		})
 	}
@@ -96,9 +67,8 @@ func TestPythonImportRoots(t *testing.T) {
 // Module identity is a path. Two modules sharing a basename must never share a
 // candidate, whichever direction the import is written in.
 func TestPythonModuleCandidatePathsSeparateSameBasename(t *testing.T) {
-	roots := []string{""}
-	foo := pythonModuleCandidatePaths("app.py", "foo.utils", roots)
-	bar := pythonModuleCandidatePaths("app.py", "bar.utils", roots)
+	foo := pythonModuleCandidatePaths("app.py", "foo.utils")
+	bar := pythonModuleCandidatePaths("app.py", "bar.utils")
 	for _, a := range foo {
 		for _, b := range bar {
 			if a == b {
@@ -167,7 +137,10 @@ func TestPythonBindingFor(t *testing.T) {
 		{"module member", "", "other.run", "other", "run", true},
 		{"unclaimed name", "", "sorted", "", "", false},
 		{"prefix that is not a binding", "", "pkg_helpers.load", "", "", false},
-		{"a nearer import wins", "run", "read_config", "local.mod", "", true},
+		// A function-local import claims the name -- so no weaker strategy may
+		// answer it -- but binds nothing itself, since nothing proves the
+		// import statement ran before the call.
+		{"a nearer import claims without binding", "run", "read_config", "", "", true},
 		{"a function-local import is invisible elsewhere", "other_fn", "read_config", "pkg.helpers", "", true},
 	}
 	for _, tc := range tests {
@@ -264,6 +237,11 @@ func TestPythonScopeQueryShapeIsBatched(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The package itself exists, so the submodule-arm callers below make the
+		// pass read its module-level bindings -- that read is counted too.
+		if _, err := insertTestFileLang(ctx, s, repo.ID, "pkg/__init__.py", "python"); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := insertTestSymbolLang(ctx, s, repo.ID, target, "load", "helpers.load", "python"); err != nil {
 			t.Fatal(err)
 		}
@@ -285,14 +263,24 @@ func TestPythonScopeQueryShapeIsBatched(t *testing.T) {
 			if _, err := insertTestEdge(ctx, s, repo.ID, file, src, "load"); err != nil {
 				t.Fatal(err)
 			}
+			// A submodule-arm caller as well, so the package-namespace check
+			// this pass makes is counted too.
+			if _, err := s.db.ExecContext(ctx,
+				`INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind,wildcard) VALUES(?,?,?,?,?,?,?,0)`,
+				repo.ID, file, "python", "pkg", "helpers", "helpers", "named"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := insertTestEdge(ctx, s, repo.ID, file, src, "helpers.load"); err != nil {
+				t.Fatal(err)
+			}
 		}
 		counter := &countingQuerier{inner: s.db}
 		bound, _, err := resolvePythonScope(ctx, counter, repo.ID, nil, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if bound != callers {
-			t.Fatalf("bound %d edges, want %d", bound, callers)
+		if bound != 2*callers {
+			t.Fatalf("bound %d edges, want %d", bound, 2*callers)
 		}
 		return counter.queries.Load(), counter.execs.Load()
 	}

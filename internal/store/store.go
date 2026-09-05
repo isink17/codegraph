@@ -2372,25 +2372,29 @@ func insertParsedFileGraph(
 	if parsed.Language == "typescript" || parsed.Language == "python" {
 		modulePaths := typescriptModuleCandidatePaths
 		if parsed.Language == "python" {
-			// At index time the repository's package structure is not known, so
-			// the persisted candidates are the superset every plausible root
-			// could name. Resolution narrows it; invalidation only needs the
-			// superset. See pythonAncestorRoots.
-			roots := pythonAncestorRoots(filePath)
-			modulePaths = func(source, specifier string) []string {
-				return pythonModuleCandidatePaths(source, specifier, roots)
-			}
+			modulePaths = pythonModuleCandidatePaths
 		}
 		args := make([]any, 0, len(parsed.Scope.Imports)*4)
 		seen := make(map[string]struct{}, len(parsed.Scope.Imports))
-		for _, evidence := range parsed.Scope.Imports {
-			for _, candidate := range modulePaths(filePath, evidence.SourceSpecifier) {
-				key := evidence.SourceSpecifier + "\x00" + candidate
+		add := func(specifier string) {
+			for _, candidate := range modulePaths(filePath, specifier) {
+				key := specifier + "\x00" + candidate
 				if _, ok := seen[key]; ok {
 					continue
 				}
 				seen[key] = struct{}{}
-				args = append(args, repoID, fileID, evidence.SourceSpecifier, candidate)
+				args = append(args, repoID, fileID, specifier, candidate)
+			}
+		}
+		for _, evidence := range parsed.Scope.Imports {
+			add(evidence.SourceSpecifier)
+			// `from pkg import helpers` resolves against `pkg.helpers` when the
+			// imported name turns out to be a submodule, so that spelling needs
+			// a reverse-lookup row too: `pkg/helpers.py` appearing later must
+			// reach this file on an incremental update.
+			if parsed.Language == "python" && evidence.Kind == graph.ScopeImportNamed &&
+				!evidence.Wildcard && evidence.ImportedName != "" && evidence.SourceSpecifier != "" {
+				add(pythonSubmoduleSpecifier(evidence.SourceSpecifier, evidence.ImportedName))
 			}
 		}
 		if len(args) > 0 {

@@ -168,6 +168,10 @@ func importStatements(masked []string) (stmts map[int]string, consumed []bool) {
 // that scope's source: its `def` header's parameters and every assignment,
 // loop target, `with`/`except` alias and nested declaration in its body.
 //
+// A nested declaration's name counts only inside a function scope, where it is
+// a local of the enclosing function. Module-level declarations are symbols this
+// graph holds and are not negative evidence.
+//
 // It is negative evidence, and it is deliberately a superset. Nested scopes are
 // skipped by indentation so a function's own locals stay its own, but anything
 // the scan is unsure of is reported as bound: over-reporting only costs an
@@ -180,20 +184,11 @@ func importStatements(masked []string) (stmts map[int]string, consumed []bool) {
 //
 // Both Python adapters call this with the same text, so neither can decide a
 // shadow the other does not see.
-func LocalBindings(src string, isFunctionScope bool) []string {
+func LocalBindings(src string, isFunctionScope bool) []LocalBinding {
 	lines := maskPythonLines(strings.Split(src, "\n"))
-	var out []string
+	var out []LocalBinding
 	seen := map[string]struct{}{}
-	add := func(name string) {
-		if !validIdentifier(name) || isPythonKeyword(name) {
-			return
-		}
-		if _, ok := seen[name]; ok {
-			return
-		}
-		seen[name] = struct{}{}
-		out = append(out, name)
-	}
+	add := func(name string) { addBinding(&out, seen, LocalBinding{Name: name}) }
 
 	logical, starts := pythonLogicalLines(lines)
 	base := -1
@@ -231,16 +226,53 @@ func LocalBindings(src string, isFunctionScope bool) []string {
 			}
 		}
 		if isDecl {
-			// A nested declaration owns everything indented below it. Its own
-			// name is not reported: declarations are already symbols, with
-			// their own scope, and reporting them here would make a module-level
-			// `def` shadow every call to itself.
+			// A nested declaration owns everything indented below it, and its
+			// body is not part of this scope.
 			skipUntil = indent
+			if isFunctionScope {
+				// Inside a function, a nested `def`/`class` binds its name in
+				// the enclosing function's namespace for the whole function --
+				// it shadows an outer import whether it is written before or
+				// after the call. At module scope the same name is a symbol
+				// this graph already holds, and reporting it here would make a
+				// module-level `def` shadow every call to itself.
+				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: true})
+			}
 			continue
 		}
 		addPythonAssignedNames(trimmed, add)
 	}
 	return out
+}
+
+// LocalBinding is one name a lexical scope binds itself. Declaration marks the
+// names a nested `def` or `class` binds, which shadow an import like any other
+// local but also name a symbol this graph holds.
+type LocalBinding struct {
+	Name        string
+	Declaration bool
+}
+
+func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
+	if !validIdentifier(b.Name) || isPythonKeyword(b.Name) {
+		return
+	}
+	if _, ok := seen[b.Name]; ok {
+		return
+	}
+	seen[b.Name] = struct{}{}
+	*out = append(*out, b)
+}
+
+// declaredName reads the name a `def`/`class` header declares, with any
+// `async ` prefix already stripped.
+func declaredName(header string) string {
+	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(header, "def"), "class"))
+	end := 0
+	for end < len(rest) && isIdentifierByte(rest[end]) {
+		end++
+	}
+	return rest[:end]
 }
 
 // pythonLogicalLines folds bracket and backslash continuations, reporting the

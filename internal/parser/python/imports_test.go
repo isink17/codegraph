@@ -216,10 +216,10 @@ func TestLocalBindings(t *testing.T) {
 			want:     nil,
 		},
 		{
-			name:     "a nested scope keeps its own bindings",
+			name:     "a nested scope keeps its own bindings, but its name is the parent's",
 			src:      "def outer():\n    kept = 1\n    def inner(hidden):\n        also_hidden = 2\n        return hidden\n    return inner\n",
 			function: true,
-			want:     []string{"kept"},
+			want:     []string{"kept", "inner"},
 		},
 		{
 			name: "module scope skips declarations and their bodies",
@@ -232,6 +232,17 @@ func TestLocalBindings(t *testing.T) {
 			want: nil,
 		},
 		{
+			name:     "a nested declaration binds its own name in a function",
+			src:      "def run():\n    def inner():\n        hidden = 1\n\n    class Client:\n        attr = 2\n    return inner()\n",
+			function: true,
+			want:     []string{"inner", "Client"},
+		},
+		{
+			name: "a module-level declaration is not a local binding",
+			src:  "def run():\n    return 1\n\n\nvalue = 2\n",
+			want: []string{"value"},
+		},
+		{
 			name:     "strings and comments bind nothing",
 			src:      "def run():\n    text = \"fake = 1\"\n    # comment = 2\n    return text\n",
 			function: true,
@@ -240,7 +251,7 @@ func TestLocalBindings(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := LocalBindings(tc.src, tc.function)
+			got := localBindingNames(LocalBindings(tc.src, tc.function))
 			sort.Strings(got)
 			want := append([]string(nil), tc.want...)
 			sort.Strings(want)
@@ -303,7 +314,7 @@ func TestLocalBindingsCompoundAndGlobal(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := LocalBindings(tc.src, true)
+			got := localBindingNames(LocalBindings(tc.src, true))
 			sort.Strings(got)
 			want := append([]string(nil), tc.want...)
 			sort.Strings(want)
@@ -311,5 +322,23 @@ func TestLocalBindingsCompoundAndGlobal(t *testing.T) {
 				t.Fatalf("LocalBindings() = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func localBindingNames(bindings []LocalBinding) []string {
+	var out []string
+	for _, b := range bindings {
+		out = append(out, b.Name)
+	}
+	return out
+}
+
+// A nested declaration is a local binding, but a distinguishable one: it
+// shadows an import, and it also names a symbol the graph holds.
+func TestLocalBindingsMarksNestedDeclarations(t *testing.T) {
+	got := LocalBindings("def run():\n    value = 1\n    def inner():\n        return 1\n    return inner()\n", true)
+	want := []LocalBinding{{Name: "value"}, {Name: "inner", Declaration: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LocalBindings() = %+v, want %+v", got, want)
 	}
 }

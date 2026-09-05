@@ -165,8 +165,8 @@ func pythonScopeTree() map[string]string {
 		"local.py":     "def local_helper():\n    return 1\n\n\ndef run():\n    return local_helper()\n",
 		"ambiguous.py": "def twice():\n    return 1\n\n\ndef twice():\n    return 2\n\n\ndef run():\n    return twice()\n",
 
-		// Two plausible absolute roots for `layout.mod`, so the layout itself is
-		// undecidable and nothing may be bound.
+		// An absolute import is anchored at the repository root only, so
+		// `layout.mod` is `layout/mod.py` and never the src-layout twin.
 		"layout/__init__.py":      "",
 		"layout/mod.py":           "def ambiguous_root():\n    return 1\n",
 		"src/layout/__init__.py":  "",
@@ -208,7 +208,7 @@ func pythonScopeCases() []pythonScopeCase {
 		{"dynamic_import", "dynamic.py", "mod.load", "<unresolved> []"},
 		{"builtin", "builtin.py", "sorted", "<unresolved> []"},
 		{"same_module_ambiguous", "ambiguous.py", "twice", "<unresolved> []"},
-		{"ambiguous_layout_root", "src/ambiguous_layout.py", "ambiguous_root", "<unresolved> []"},
+		{"absolute_root_only", "src/ambiguous_layout.py", "ambiguous_root", "layout/mod.py:mod.ambiguous_root [python_import_scope]"},
 		{"import_line_is_not_a_call", "noise.py", "import", "<no edge>"},
 		{"string_is_not_a_call", "noise.py", "fake_call", "<no edge>"},
 		{"comment_is_not_a_call", "noise.py", "comment_call", "<no edge>"},

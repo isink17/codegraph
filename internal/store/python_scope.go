@@ -27,11 +27,18 @@ const (
 //	pkg/__init__.py     <- pkg
 //
 // A relative import is anchored at the importing file's package and nowhere
-// else, so it yields one candidate pair or none, and `roots` does not apply to
-// it. An absolute import is resolved only against the roots it is given -- a
-// caller's own package directory is not one, because `import helpers` inside
-// `pkg/` has not meant `pkg.helpers` since Python 3. See pythonImportRoots.
-func pythonModuleCandidatePaths(sourceFile, specifier string, roots []string) []string {
+// else, so it yields one candidate pair or none. An absolute import is
+// anchored at the repository root and nowhere else.
+//
+// The repository root is the only import root CodeGraph can prove. `sys.path`
+// is a runtime fact: the same tree resolves `import helpers` inside `pkg/`
+// differently when run as `python pkg/main.py` (where `pkg/` is `sys.path[0]`)
+// than when imported as `pkg.main` from the root, and no repository structure
+// distinguishes the two. Roots a repository states rather than implies -- a
+// `pyproject.toml` `packages` table, a `setup.cfg` `package_dir`, a `src/`
+// layout -- are not read, so an import only such a root could satisfy stays
+// unresolved. A wrong high-confidence edge is worse than a missing one.
+func pythonModuleCandidatePaths(sourceFile, specifier string) []string {
 	if specifier == "" {
 		return nil
 	}
@@ -63,18 +70,7 @@ func pythonModuleCandidatePaths(sourceFile, specifier string, roots []string) []
 	if len(segments) == 0 {
 		return nil
 	}
-	var out []string
-	seen := make(map[string]struct{}, len(roots)*2)
-	for _, root := range roots {
-		for _, candidate := range pythonModuleFiles(root, segments) {
-			if _, ok := seen[candidate]; ok {
-				continue
-			}
-			seen[candidate] = struct{}{}
-			out = append(out, candidate)
-		}
-	}
-	return out
+	return pythonModuleFiles("", segments)
 }
 
 func pythonParentDir(p string) string {
@@ -83,61 +79,6 @@ func pythonParentDir(p string) string {
 		return ""
 	}
 	return dir
-}
-
-// pythonImportRoots names the directories an absolute import written in
-// `sourceFile` may be resolved against.
-//
-// There are at most two, and neither is guessed. The repository root is always
-// one. The other is the importing file's own package root: climb out of the
-// packages the file sits in -- a directory is a package when it holds an
-// `__init__.py` -- and stop at the first directory that is not one. That is
-// `sys.path[0]` for a script and the directory a `src/` layout puts on the path
-// for a package, and it is exactly what makes `import helpers` from inside
-// `pkg/` reach a top-level `helpers.py` rather than `pkg/helpers.py`.
-//
-// Roots that a repository states rather than implies -- a `pyproject.toml`
-// `packages` table, a `setup.cfg` `package_dir` -- are not read here. Adding
-// one would need those files parsed and persisted at index time; until then an
-// import that only such a root could satisfy stays unresolved.
-//
-// A PEP 420 namespace package leaves no `__init__.py`, so its directory reads
-// as a root here and an absolute import written inside it keeps the
-// implicit-relative meaning this rule removes for ordinary packages. There is
-// no repository evidence that separates a namespace package from a plain
-// source directory, and inventing one would trade a missing edge for a wrong
-// one.
-func pythonImportRoots(sourceFile string, packageDirs map[string]struct{}) []string {
-	dir := pythonParentDir(canonicalStoredPath(sourceFile))
-	for dir != "" {
-		if _, isPackage := packageDirs[dir]; !isPackage {
-			break
-		}
-		dir = pythonParentDir(dir)
-	}
-	if dir == "" {
-		return []string{""}
-	}
-	return []string{"", dir}
-}
-
-// pythonAncestorRoots is the superset used when candidate paths are persisted
-// at index time, where the package structure of the repository is not known.
-// Invalidation only needs candidates to be a superset of what resolution will
-// consider: extra rows cost an extra reconsideration, never a stale binding.
-//
-// ponytail: this is 2*(depth+1) rows per absolute import whether or not the
-// module is repository-local, so third-party imports pay for nothing. If a deep
-// tree's candidate table measures large, the lever is to persist the package
-// structure alongside it and narrow this to pythonImportRoots.
-func pythonAncestorRoots(sourceFile string) []string {
-	roots := []string{}
-	for dir := pythonParentDir(canonicalStoredPath(sourceFile)); ; dir = pythonParentDir(dir) {
-		roots = append(roots, dir)
-		if dir == "" {
-			return roots
-		}
-	}
 }
 
 func pythonModuleFiles(dir string, segments []string) []string {
@@ -183,6 +124,10 @@ type pyBinding struct {
 // an import of the same name written no nearer does not reach a call below it.
 type pyScopeLocal struct {
 	owner, name string
+	// declaration marks a nested `def`/`class` name. It shadows an import like
+	// any other local, but the name it binds is a symbol this graph holds, so
+	// it is not a reason to keep every other strategy off the call.
+	declaration bool
 }
 
 type pyScopeEdge struct {
@@ -266,6 +211,11 @@ type pythonScopeDecision struct {
 	// it is vetoed and bound to nothing.
 	spec, want string
 	paths      []string
+	// pkgPaths, when set, names the package `from pkg import name` imported
+	// from. If that package binds `name` at module level itself, `name` is that
+	// binding rather than the `pkg.name` submodule, and the edge is dropped.
+	pkgPaths []string
+	pkgName  string
 }
 
 // pythonScopeAnswers is what one pass over the Python evidence decides.
@@ -412,18 +362,9 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 	if err != nil {
 		return answers, err
 	}
-	packageDirs, err := pythonScopePackageDirs(ctx, q, repoID)
-	if err != nil {
-		return answers, err
-	}
-
 	bindings := make(map[int64][]pyBinding, len(imports))
-	roots := make(map[int64][]string, len(callerPaths))
 	for file, list := range imports {
 		bindings[file] = pythonBindingsOf(list)
-	}
-	for file, p := range callerPaths {
-		roots[file] = pythonImportRoots(p, packageDirs)
 	}
 
 	// Pass 1: decide, per edge, what its own lexical scope says its leading
@@ -468,12 +409,22 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			// `from pkg import helpers` + `helpers.load()`: the imported name is
 			// a submodule of the imported package as often as it is an object
 			// with attributes, and only the submodule reading names something
-			// this graph holds. Look for `pkg.helpers` and take `load` from it.
-			d = pythonScopeDecision{spec: pythonSubmoduleSpecifier(binding.source, binding.imported), want: member}
+			// this graph holds. Look for `pkg.helpers` and take `load` from it,
+			// unless `pkg` itself binds `helpers` at module level -- then the
+			// name is that binding, not the submodule, and nothing is decidable.
+			d = pythonScopeDecision{
+				spec:     pythonSubmoduleSpecifier(binding.source, binding.imported),
+				want:     member,
+				pkgPaths: pythonModuleCandidatePaths(callerPaths[e.file], binding.source),
+				pkgName:  binding.imported,
+			}
 		}
 		if d.spec != "" {
-			d.paths = pythonModuleCandidatePaths(callerPaths[e.file], d.spec, roots[e.file])
+			d.paths = pythonModuleCandidatePaths(callerPaths[e.file], d.spec)
 			for _, candidate := range d.paths {
+				candidates[candidate] = struct{}{}
+			}
+			for _, candidate := range d.pkgPaths {
 				candidates[candidate] = struct{}{}
 			}
 		}
@@ -493,6 +444,8 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 	// Pass 2: turn each decision into at most one target file, then load the
 	// symbols of every file that can still answer something.
 	targetFile := make(map[int64]int64, len(decisions))
+	packageFile := make(map[int64]int64, len(decisions))
+	packageFiles := map[int64]struct{}{}
 	symbolFiles := make(map[int64]struct{}, len(decisions)+len(callerIDs))
 	for _, e := range edges {
 		d, ok := decisions[e.id]
@@ -517,10 +470,36 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 		}
 		targetFile[e.id] = found
 		symbolFiles[found] = struct{}{}
+		switch id, hits := pythonUniqueCandidateFile(d.pkgPaths, moduleFiles); {
+		case hits == 1:
+			packageFile[e.id] = id
+			packageFiles[id] = struct{}{}
+			symbolFiles[id] = struct{}{}
+		case hits > 1:
+			// `pkg.py` and `pkg/__init__.py` both exist: which one `pkg` names
+			// is undecidable, so what it exposes as `helpers` is too.
+			delete(targetFile, e.id)
+		}
 	}
 	topLevel, err := pythonScopeTopLevelSymbols(ctx, q, repoID, sortedIDs(symbolFiles))
 	if err != nil {
 		return answers, err
+	}
+	// A package's own module-level bindings decide whether `from pkg import x`
+	// named the `pkg.x` submodule or something `pkg/__init__.py` bound itself.
+	pkgImports, pkgLocals, err := pythonScopeImports(ctx, q, repoID, sortedIDs(packageFiles))
+	if err != nil {
+		return answers, err
+	}
+	pkgPaths := make(map[int64]string, len(packageFiles))
+	for candidate, id := range moduleFiles {
+		if _, ok := packageFiles[id]; ok {
+			pkgPaths[id] = candidate
+		}
+	}
+	pkgBindings := make(map[int64][]pyBinding, len(packageFiles))
+	for id := range packageFiles {
+		pkgBindings[id] = pythonBindingsOf(pkgImports[id])
 	}
 
 	// Pass 3: bind.
@@ -545,6 +524,10 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 		if !ok || d.want == "" {
 			continue
 		}
+		if pkg, checked := packageFile[e.id]; checked &&
+			pythonPackageRebindsName(pkgPaths[pkg], pkgImports[pkg], pkgBindings[pkg], pkgLocals[pkg], topLevel[pkg], d.pkgName, d.paths) {
+			continue
+		}
 		if g := topLevel[file][d.want]; g != nil && g.declarations == 1 && len(g.topLevel) == 1 {
 			answers.imported[e.id] = g.topLevel[0]
 		}
@@ -560,12 +543,23 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 // runs last is control flow this resolver does not model. When no import
 // claimed the name at all, any visible local binding of it still shadows the
 // module's own declarations.
+//
+// A nested declaration is the exception to that last rule: with no import to
+// shadow, `def inner()` inside `run()` is the target of `inner()`, not a reason
+// to refuse one. It shadows an import as any local does, and answers for
+// itself otherwise.
 func pythonNameIsShadowed(locals []pyScopeLocal, at, name, importOwner string, claimed bool) bool {
 	for _, local := range locals {
 		if local.name != name || !pythonScopeVisible(local.owner, at) {
 			continue
 		}
-		if !claimed || len(local.owner) >= len(importOwner) {
+		if !claimed {
+			if !local.declaration {
+				return true
+			}
+			continue
+		}
+		if len(local.owner) >= len(importOwner) {
 			return true
 		}
 	}
@@ -626,7 +620,94 @@ func pythonBindingFor(bindings []pyBinding, at, name string) (pyBinding, string,
 		// caller vetoes the edge and binds nothing.
 		return pyBinding{owner: best.owner, kind: "ambiguous"}, "", true
 	}
+	if best.owner != "" {
+		// A function-local import binds the name for the whole function, but
+		// nothing in this evidence says whether the import statement runs
+		// before the call: `load(); from pkg.helpers import load` is an
+		// UnboundLocalError, not an edge, and the two spellings are
+		// indistinguishable without a persisted source position.
+		//
+		// So a function-local import is claim and veto evidence only. It stops
+		// a module-level import and every weaker repository-wide strategy from
+		// binding a name the function rebound, and it never binds one itself.
+		// Module-level imports, whose statements always run before any call in
+		// the module's functions, still resolve.
+		return pyBinding{owner: best.owner, kind: "local-import"}, "", true
+	}
 	return best, strings.TrimPrefix(name[bestPrefix:], "."), true
+}
+
+// pythonUniqueCandidateFile reports the file a candidate list names and how
+// many of the candidates exist. More than one is an ambiguous layout, which
+// every caller must refuse rather than pick from.
+func pythonUniqueCandidateFile(paths []string, files map[string]int64) (int64, int) {
+	var found int64
+	hits := 0
+	for _, candidate := range paths {
+		if id, exists := files[candidate]; exists && id != found {
+			found = id
+			hits++
+		}
+	}
+	return found, hits
+}
+
+// pythonPackageRebindsName reports whether `pkg/__init__.py` binds `name` at
+// module level as something other than the submodule at `subPaths`.
+//
+// `from pkg import name` binds whatever `pkg` exposes as `name`. Python looks
+// at the package's own namespace first, so a `name = Obj()`, a `def name`, a
+// `class name` or an import that binds `name` to anything else all win over the
+// `pkg/name.py` submodule -- and none of them is a target this resolver can
+// name. The one module-level binding that proves the submodule is an import of
+// the submodule itself (`from . import name`), which is exactly the re-export
+// that makes the submodule reading right.
+//
+// No object or attribute inference happens here: every check is syntax already
+// recorded as evidence.
+func pythonPackageRebindsName(pkgPath string, imports []pyScopeImport, bindings []pyBinding, locals []pyScopeLocal, symbols map[string]*pySymbolGroup, name string, subPaths []string) bool {
+	if name == "" {
+		return false
+	}
+	if g := symbols[name]; g != nil && len(g.topLevel) > 0 {
+		return true
+	}
+	for _, imp := range imports {
+		// `from .base import *` at module level can bind any name, including
+		// this one, and nothing in the syntax says whether it did.
+		if imp.wildcard && imp.owner == "" {
+			return true
+		}
+	}
+	for _, local := range locals {
+		if local.owner == "" && local.name == name {
+			return true
+		}
+	}
+	wanted := make(map[string]struct{}, len(subPaths))
+	for _, p := range subPaths {
+		wanted[p] = struct{}{}
+	}
+	for _, b := range bindings {
+		if b.owner != "" || b.prefix != name {
+			continue
+		}
+		spec := b.source
+		if b.kind != "namespace" {
+			spec = pythonSubmoduleSpecifier(b.source, b.imported)
+		}
+		proven := false
+		for _, candidate := range pythonModuleCandidatePaths(pkgPath, spec) {
+			if _, ok := wanted[candidate]; ok {
+				proven = true
+				break
+			}
+		}
+		if !proven {
+			return true
+		}
+	}
+	return false
 }
 
 func pythonScopeEdges(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}) ([]pyScopeEdge, error) {
@@ -686,9 +767,13 @@ func pythonScopeImports(ctx context.Context, q execQuerier, repoID int64, ids []
 		if err := scan(&file, &imp.source, &imp.imported, &imp.local, &imp.kind, &wildcard, &imp.owner); err != nil {
 			return err
 		}
-		if imp.kind == graph.ScopeImportLocalBinding {
+		if imp.kind == graph.ScopeImportLocalBinding || imp.kind == graph.ScopeImportNestedDeclaration {
 			if imp.local != "" {
-				locals[file] = append(locals[file], pyScopeLocal{owner: imp.owner, name: imp.local})
+				locals[file] = append(locals[file], pyScopeLocal{
+					owner:       imp.owner,
+					name:        imp.local,
+					declaration: imp.kind == graph.ScopeImportNestedDeclaration,
+				})
 			}
 			return nil
 		}
@@ -713,30 +798,6 @@ func pythonScopeCallScopes(ctx context.Context, q execQuerier, repoID int64, ids
 		return nil
 	})
 	return out, err
-}
-
-// pythonScopePackageDirs is the set of directories the repository makes Python
-// packages by putting an `__init__.py` in them. One query per repository: it is
-// the evidence pythonImportRoots needs, and it is small.
-func pythonScopePackageDirs(ctx context.Context, q execQuerier, repoID int64) (map[string]struct{}, error) {
-	rows, err := q.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND is_deleted=0 AND language='python' AND (path LIKE '%\_\_init\_\_.py' ESCAPE '\')`, repoID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]struct{}{}
-	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
-			return nil, err
-		}
-		canonical := canonicalStoredPath(p)
-		if path.Base(canonical) != "__init__.py" {
-			continue
-		}
-		out[pythonParentDir(canonical)] = struct{}{}
-	}
-	return out, rows.Err()
 }
 
 // pySymbolGroup is what one file declares under one name.
@@ -958,10 +1019,11 @@ func (s *Store) invalidatePythonScopeBindings(ctx context.Context, repoID int64,
 			return nil, qerr
 		}
 	}
-	// An `__init__.py` appearing or disappearing changes which directories are
-	// packages, and therefore which roots an absolute import in the subtree
-	// below it resolves against. That dependency is not a module candidate, so
-	// it has no reverse-lookup row -- the subtree is swept directly.
+	// An `__init__.py` appearing, disappearing or changing decides whether its
+	// directory is an importable package at all and what that package binds at
+	// module level. The candidate reverse-lookup above already covers callers
+	// that named it; the subtree is swept as well because a package's own files
+	// are the ones whose relative imports it answers.
 	for _, p := range canonical {
 		if path.Base(p) != "__init__.py" {
 			continue

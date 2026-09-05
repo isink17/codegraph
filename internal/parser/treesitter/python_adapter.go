@@ -118,10 +118,14 @@ func pyLexicalOwner(node *sitter.Node, content []byte) string {
 // through, so only the module and each function body are scanned.
 func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
 	emit := func(owner, source string) {
-		for _, name := range python.LocalBindings(source, owner != "") {
+		for _, binding := range python.LocalBindings(source, owner != "") {
+			kind := graph.ScopeImportLocalBinding
+			if binding.Declaration {
+				kind = graph.ScopeImportNestedDeclaration
+			}
 			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
-				LocalName:   name,
-				Kind:        graph.ScopeImportLocalBinding,
+				LocalName:   binding.Name,
+				Kind:        kind,
 				OwnerModule: owner,
 			})
 		}

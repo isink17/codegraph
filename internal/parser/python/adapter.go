@@ -228,10 +228,14 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 // method scans only its own body.
 func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile) {
 	emit := func(owner, source string) {
-		for _, name := range LocalBindings(source, owner != "") {
+		for _, binding := range LocalBindings(source, owner != "") {
+			kind := graph.ScopeImportLocalBinding
+			if binding.Declaration {
+				kind = graph.ScopeImportNestedDeclaration
+			}
 			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
-				LocalName:   name,
-				Kind:        graph.ScopeImportLocalBinding,
+				LocalName:   binding.Name,
+				Kind:        kind,
 				OwnerModule: owner,
 			})
 		}
