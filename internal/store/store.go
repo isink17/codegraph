@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math"
 	"net/url"
@@ -78,7 +79,10 @@ const (
 )
 
 type Store struct {
-	db *sql.DB
+	db          *sql.DB
+	cleanup     func() error
+	cleanupOnce sync.Once
+	cleanupErr  error
 	// neighborStmts counts the statements the batched context-neighbour
 	// pipeline issues. The number is the load-bearing property of P19 -- it must
 	// not grow with the seed count -- and wall-clock cannot prove that, so the
@@ -91,6 +95,8 @@ type Store struct {
 	// reset it and then call only what it means to measure.
 	neighborStmts atomic.Int64
 }
+
+var validationSnapshotCalls atomic.Uint64
 
 func boolInt(v bool) int {
 	if v {
@@ -396,18 +402,20 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	} else if st.Size() == 0 {
 		isNewDB = true
 	}
-	if !isNewDB {
-		if err := validateExistingDatabase(path); err != nil {
+	var db *sql.DB
+	if isNewDB {
+		dsn, err := BuildSQLiteDSN(path, opts, true, false)
+		if err != nil {
 			return nil, err
 		}
-	}
-	dsn, err := BuildSQLiteDSN(path, opts, isNewDB, false)
-	if err != nil {
-		return nil, err
-	}
-	db, err := sql.Open(sqliteDriverName, dsn)
-	if err != nil {
-		return nil, err
+		if db, err = sql.Open(sqliteDriverName, dsn); err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		if db, err = openExistingValidated(path, opts); err != nil {
+			return nil, err
+		}
 	}
 	if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
 		return applyPragmas(db, isNewDB, opts.PerformanceProfile)
@@ -421,6 +429,66 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// openExistingValidated opens an existing database in two phases so that an
+// unsupported format can never be mutated before it is rejected.
+//
+// Phase 1 is this function: a zero-write preflight, then a connection that
+// applies only connection-local pragmas (see buildSQLiteSafeExistingDSN), then
+// the authoritative compatibility check under BEGIN IMMEDIATE. Phase 2 -- the
+// persistent pragmas and Migrate -- runs in the caller, only once this
+// returned.
+//
+// The preflight fails fast for a quiescent database, but a source that keeps
+// changing during inspection is not evidence of corruption: another process
+// bootstrapping the same database looks exactly like that. Such a preflight is
+// skipped rather than fatal, because the locked check below reaches the same
+// verdict with SQLite's own write serialization instead of filesystem
+// quiescence.
+func openExistingValidated(path string, opts OpenOptions) (*sql.DB, error) {
+	if err := validateExistingDatabase(path); err != nil && !errors.Is(err, errSQLiteValidationUnstable) {
+		return nil, err
+	}
+	dsn, err := buildSQLiteSafeExistingDSN(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateExistingDatabaseLocked(context.Background(), db, path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// validateExistingDatabaseLocked is the authoritative compatibility gate. It
+// holds the same BEGIN IMMEDIATE write lock Migrate uses, so a concurrent
+// opener cannot change the format underneath it, and losing the race only
+// means waiting for the winner. It writes nothing: BEGIN IMMEDIATE takes a
+// RESERVED lock without dirtying a page, and the transaction is always rolled
+// back.
+func validateExistingDatabaseLocked(ctx context.Context, db *sql.DB, path string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
+		_, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`)
+		return err
+	}); err != nil {
+		return err
+	}
+	validationErr := validateDatabaseFormat(ctx, conn, path)
+	_, rollbackErr := conn.ExecContext(ctx, `ROLLBACK`)
+	if validationErr != nil {
+		return validationErr
+	}
+	return rollbackErr
 }
 
 func migrationVersions() (map[int]struct{}, int, error) {
@@ -449,7 +517,54 @@ func MigrationCeiling() (int, error) {
 }
 
 func validateExistingDatabase(path string) error {
-	dsn, err := buildSQLiteValidationDSN(path)
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+		}
+		artifacts, err := readSQLiteInspectionArtifacts(path)
+		if err != nil {
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
+			return err
+		}
+		if len(artifacts) == 1 {
+			db, err := openImmutableValidated(path, OpenOptions{})
+			if err != nil {
+				return err
+			}
+			validationErr := db.Close()
+			current, err := readSQLiteInspectionArtifacts(path)
+			if err != nil {
+				if errors.Is(err, errSQLiteInspectionChanged) {
+					continue
+				}
+				return err
+			}
+			if validationErr != nil {
+				return validationErr
+			}
+			if sqliteInspectionArtifactsEqual(artifacts, current) {
+				return nil
+			}
+			continue
+		}
+		return validateSQLiteValidationSnapshot(path)
+	}
+	return fmt.Errorf("%w: database %s changed while validating", errSQLiteValidationUnstable, path)
+}
+
+func buildSQLiteValidationDSN(path string) (string, error) {
+	return BuildSQLiteDSN(path, OpenOptions{}, false, true)
+}
+
+func validateSQLiteValidationSnapshot(path string) error {
+	snapshotPath, cleanup, err := createSQLiteValidationSnapshot(path)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	dsn, err := buildSQLiteValidationDSN(snapshotPath)
 	if err != nil {
 		return err
 	}
@@ -461,19 +576,316 @@ func validateExistingDatabase(path string) error {
 	return validateDatabaseFormat(context.Background(), db, path)
 }
 
-func buildSQLiteValidationDSN(path string) (string, error) {
-	dsn, err := BuildSQLiteDSN(path, OpenOptions{}, false, true)
+func openImmutableValidated(path string, opts OpenOptions) (*sql.DB, error) {
+	dsn, err := buildSQLiteImmutableDSN(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDatabaseFormat(context.Background(), db, path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
+	validationSnapshotCalls.Add(1)
+	// ponytail: three retries bound unstable sidecar copying; a continuously busy database fails closed.
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			// Let short writer bursts finish rather than exhausting retries immediately.
+			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+		}
+		artifacts, err := readSQLiteInspectionArtifacts(path)
+		if err != nil {
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
+			return "", nil, err
+		}
+		snapshotPath, cleanup, err := vacuumSQLiteSnapshot(path, artifacts)
+		if err != nil {
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
+			return "", nil, err
+		}
+		current, err := readSQLiteInspectionArtifacts(path)
+		if err != nil {
+			_ = cleanup()
+			if errors.Is(err, errSQLiteInspectionChanged) {
+				continue
+			}
+			return "", nil, err
+		}
+		if sqliteInspectionArtifactsEqual(artifacts, current) {
+			return snapshotPath, cleanup, nil
+		}
+		_ = cleanup()
+	}
+	return "", nil, fmt.Errorf("%w: database %s changed while creating validation snapshot", errSQLiteValidationUnstable, path)
+}
+
+var errSQLiteInspectionChanged = errors.New("database artifacts changed during inspection")
+
+// errSQLiteValidationUnstable marks a preflight that could not reach a verdict
+// because the source kept changing underneath it -- typically another process
+// bootstrapping or migrating the same database. It says nothing about
+// compatibility: an unstable source is not a rejected source. Callers that can
+// fall back to the authoritative BEGIN IMMEDIATE gate must proceed instead of
+// failing, so the check stays a fail-fast optimisation for quiescent databases.
+var errSQLiteValidationUnstable = errors.New("database changed while validating")
+
+type sqliteInspectionArtifact struct {
+	info   os.FileInfo
+	digest [sha256.Size]byte
+}
+
+// streamSQLiteInspectionArtifact retains no file contents. SHA-256 detects
+// same-size writes even when filesystem timestamps are coarse or restored.
+// Metadata/identity checks additionally reject replacement and size changes
+// during the read. dst, when non-nil, receives exactly the bytes being hashed.
+func streamSQLiteInspectionArtifact(path string, dst io.Writer) (sqliteInspectionArtifact, error) {
+	var artifact sqliteInspectionArtifact
+	f, err := os.Open(path)
+	if err != nil {
+		return artifact, err
+	}
+	defer f.Close()
+	before, err := f.Stat()
+	if err != nil {
+		return artifact, err
+	}
+	if !before.Mode().IsRegular() {
+		return artifact, fmt.Errorf("database artifact %s is not a regular file", path)
+	}
+	hash := sha256.New()
+	var writer io.Writer = hash
+	if dst != nil {
+		writer = io.MultiWriter(dst, hash)
+	}
+	// Bound both memory and the read extent: do not chase a growing WAL.
+	n, err := io.CopyBuffer(writer, io.LimitReader(f, before.Size()), make([]byte, 32<<10))
+	if err != nil {
+		return artifact, err
+	}
+	var extra [1]byte
+	extraN, readErr := f.Read(extra[:])
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return artifact, readErr
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return artifact, err
+	}
+	current, err := os.Stat(path)
+	if err != nil {
+		// Do not report a file that vanished mid-read as an absent sidecar.
+		return artifact, fmt.Errorf("%w: %s: %v", errSQLiteInspectionChanged, path, err)
+	}
+	if n != before.Size() || extraN != 0 || !sqliteInspectionFileInfoEqual(before, after) || !sqliteInspectionFileInfoEqual(after, current) {
+		return artifact, fmt.Errorf("%w: %s changed while reading", errSQLiteInspectionChanged, path)
+	}
+	artifact.info = after
+	hash.Sum(artifact.digest[:0])
+	return artifact, nil
+}
+
+func sqliteInspectionFileInfoEqual(left, right os.FileInfo) bool {
+	return os.SameFile(left, right) && left.Size() == right.Size() && left.ModTime().Equal(right.ModTime())
+}
+
+// sqlitePersistentArtifactSuffixes name the files that carry committed database
+// content: the database itself, the write-ahead log, and the rollback journal.
+// Together they define the logical state a snapshot has to reproduce, so these
+// are the files that get fingerprinted for stability and copied into a snapshot.
+//
+// The WAL-index (`-shm`) is deliberately absent. SQLite documents it as a
+// transient shared-memory coordination file that holds no database content: it
+// is an index into the WAL plus reader marks and locks, and SQLite rebuilds it
+// from the WAL whenever the first connection finds no valid index. A snapshot
+// that carries the database and the WAL therefore carries the whole committed
+// state, and the private copy simply builds its own index.
+//
+// Reading the source `-shm` is not merely unnecessary, it is actively wrong: on
+// Windows the live WAL-index is memory-mapped and carries byte-range locks, so
+// opening and reading it fails with a sharing violation while any connection is
+// active. Excluding it removes the need for the read rather than tolerating its
+// failure.
+var sqlitePersistentArtifactSuffixes = []string{"", "-wal", "-journal"}
+
+// sqliteTransientArtifactSuffix is the WAL-index. It is never fingerprinted,
+// copied, or opened by validation -- see sqlitePersistentArtifactSuffixes.
+const sqliteTransientArtifactSuffix = "-shm"
+
+func sqlitePersistentArtifactPaths(path string) []string {
+	paths := make([]string, 0, len(sqlitePersistentArtifactSuffixes))
+	for _, suffix := range sqlitePersistentArtifactSuffixes {
+		paths = append(paths, path+suffix)
+	}
+	return paths
+}
+
+func readSQLiteInspectionArtifacts(path string) (map[string]sqliteInspectionArtifact, error) {
+	artifacts := make(map[string]sqliteInspectionArtifact, len(sqlitePersistentArtifactSuffixes))
+	for _, candidate := range sqlitePersistentArtifactPaths(path) {
+		artifact, err := streamSQLiteInspectionArtifact(candidate, nil)
+		if err == nil {
+			artifacts[candidate] = artifact
+			continue
+		}
+		if candidate == path || !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("read database artifact %s: %w", candidate, err)
+		}
+	}
+	return artifacts, nil
+}
+
+func sqliteInspectionArtifactsEqual(left, right map[string]sqliteInspectionArtifact) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for path, want := range left {
+		got, ok := right[path]
+		if !ok || want.digest != got.digest || !sqliteInspectionFileInfoEqual(want.info, got.info) {
+			return false
+		}
+	}
+	return true
+}
+
+func copySQLiteInspectionArtifact(sourcePath, targetPath string, want sqliteInspectionArtifact) error {
+	target, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	got, copyErr := streamSQLiteInspectionArtifact(sourcePath, target)
+	closeErr := target.Close()
+	if errors.Is(copyErr, fs.ErrNotExist) {
+		copyErr = errors.Join(errSQLiteInspectionChanged, copyErr)
+	}
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return err
+	}
+	// Validate the copied stream before SQLite can recover or read it, not just
+	// the source before/after the copy (which could miss a transient torn copy).
+	if got.digest != want.digest || !sqliteInspectionFileInfoEqual(want.info, got.info) {
+		return fmt.Errorf("%w: %s changed while copying", errSQLiteInspectionChanged, sourcePath)
+	}
+	return nil
+}
+
+func vacuumSQLiteSnapshot(path string, artifacts map[string]sqliteInspectionArtifact) (string, func() error, error) {
+	dir, err := os.MkdirTemp("", "codegraph-validation-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() error { return os.RemoveAll(dir) }
+	keepSnapshot := false
+	defer func() {
+		if !keepSnapshot {
+			_ = cleanup()
+		}
+	}()
+	inputPath := filepath.Join(dir, "input.sqlite")
+	snapshotPath := filepath.Join(dir, "snapshot.sqlite")
+	// Without sidecars, a verified file copy already is a complete snapshot.
+	// It needs neither recovery nor VACUUM's page cache and temporary workspace.
+	if len(artifacts) == 1 {
+		if err := copySQLiteInspectionArtifact(path, snapshotPath, artifacts[path]); err != nil {
+			return "", nil, fmt.Errorf("copy database artifact %s: %w", path, err)
+		}
+		keepSnapshot = true
+		return snapshotPath, cleanup, nil
+	}
+	// Only persistent artifacts are copied. SQLite rebuilds the private
+	// WAL-index inside the temporary directory from the copied WAL.
+	for _, sourcePath := range sqlitePersistentArtifactPaths(path) {
+		artifact, ok := artifacts[sourcePath]
+		if !ok {
+			continue
+		}
+		targetPath := inputPath + strings.TrimPrefix(sourcePath, path)
+		if err := copySQLiteInspectionArtifact(sourcePath, targetPath, artifact); err != nil {
+			return "", nil, fmt.Errorf("copy database artifact %s: %w", sourcePath, err)
+		}
+	}
+	dsn, err := BuildSQLiteDSN(inputPath, OpenOptions{}, false, true)
+	if err != nil {
+		return "", nil, err
+	}
+	// Recovery of a hot rollback journal writes to the private input copy.
+	// Keep the read-only DSN's omission of journal_mode; change only its mode.
+	dsn, err = sqliteDSNWithParam(dsn, "mode", "rw")
+	if err != nil {
+		return "", nil, err
+	}
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return "", nil, err
+	}
+	// These limits apply only to disposable recovery, not returned Store handles.
+	db.SetMaxOpenConns(1)
+	defer db.Close() // Runs before the directory cleanup, including on Windows.
+	if _, err := db.Exec(`PRAGMA cache_size=-1024; PRAGMA temp_store=FILE`); err != nil {
+		return "", nil, err
+	}
+	if _, err := db.Exec(`VACUUM INTO ` + sqliteStringLiteral(snapshotPath)); err != nil {
+		return "", nil, fmt.Errorf("snapshot database %s: %w", path, err)
+	}
+	if err := db.Close(); err != nil {
+		return "", nil, err
+	}
+	keepSnapshot = true
+	return snapshotPath, cleanup, nil
+}
+
+func buildSQLiteImmutableDSN(path string, opts OpenOptions) (string, error) {
+	dsn, err := BuildSQLiteDSN(path, opts, false, true)
 	if err != nil {
 		return "", err
 	}
+	return sqliteDSNWithParam(dsn, "immutable", "1")
+}
+
+// buildSQLiteSafeExistingDSN returns a writable DSN for an existing database
+// that applies no persistent, source-mutating setting at connection time.
+//
+// Pragma audit of the writable set built by buildPragmas:
+//   - journal_mode(WAL): PERSISTENT. Rewrites the source header and creates
+//     sidecars. Excluded here; applied only after locked validation.
+//   - auto_vacuum, page_size: PERSISTENT, but buildPragmas emits them for a new
+//     database only, so they never reach this DSN.
+//   - busy_timeout, foreign_keys, cache_size, synchronous, temp_store:
+//     connection-local. They configure this handle and never touch the file.
+//
+// The read-only builder already omits exactly the persistent journal_mode
+// pragma, so this reuses it and only widens the access mode.
+func buildSQLiteSafeExistingDSN(path string, opts OpenOptions) (string, error) {
+	dsn, err := BuildSQLiteDSN(path, opts, false, true)
+	if err != nil {
+		return "", err
+	}
+	return sqliteDSNWithParam(dsn, "mode", "rw")
+}
+
+func sqliteDSNWithParam(dsn, key, value string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return "", err
 	}
 	query := u.Query()
-	query.Set("immutable", "1")
+	query.Set(key, value)
 	u.RawQuery = query.Encode()
 	return u.String(), nil
+}
+
+func sqliteStringLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 type migrationMetadataQuerier interface {
@@ -663,7 +1075,12 @@ func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	if s.cleanup != nil {
+		s.cleanupOnce.Do(func() { s.cleanupErr = s.cleanup() })
+		err = errors.Join(err, s.cleanupErr)
+	}
+	return err
 }
 
 func (s *Store) Migrate() error {
