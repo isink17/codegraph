@@ -94,6 +94,15 @@ type Store struct {
 	// a FindCallees call adds to it too. A test that reads the counter must
 	// reset it and then call only what it means to measure.
 	neighborStmts atomic.Int64
+	// neighborStatementWrap must be assigned before the first neighbour query
+	// and never afterwards: it is read without synchronisation on every one of
+	// them. When set, it wraps every statement target the
+	// neighbour page pipeline issues statements on -- the pool for the
+	// single-statement path, the pinned connection for the staged one. It
+	// exists for the same reason neighborStmts does: the portable
+	// variable-budget contract is a property of the statements that pipeline
+	// emits, and only a wrapper placed where they are emitted can observe it.
+	neighborStatementWrap func(execQuerier) execQuerier
 }
 
 var validationSnapshotCalls atomic.Uint64
