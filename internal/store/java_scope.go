@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
-	"strconv"
+	"sort"
 	"strings"
 )
 
@@ -37,49 +37,33 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_java_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return 0, err
 	}
-	where, args := "", []any{repoID}
-	onlyIDs := []string{}
-	if len(only) > 0 {
-		ids := make([]string, 0, len(only))
-		for id := range only {
-			ids = append(ids, strconv.FormatInt(id, 10))
-		}
-		onlyIDs = ids
-		where = " AND e.id IN (" + strings.Join(ids, ",") + ")"
-	}
-	rows, err := q.QueryContext(ctx, `SELECT e.id,e.dst_name,e.edge_kind,e.evidence,e.file_id,s.container_name,COALESCE(fs.package_name,''),fs.file_id IS NOT NULL
+	onlyIDs := sortedIDs(only)
+	var edges []javaScopeEdge
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.dst_name,e.edge_kind,e.evidence,e.file_id,s.container_name,COALESCE(fs.package_name,''),fs.file_id IS NOT NULL
 		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols s ON s.id=e.src_symbol_id
 		LEFT JOIN file_scope_evidence fs ON fs.file_id=e.file_id AND fs.repo_id=e.repo_id
-		WHERE e.repo_id=? AND f.language='java' AND e.dst_symbol_id IS NULL`+where, args...)
-	if err != nil {
+		WHERE e.repo_id=? AND f.language='java' AND e.dst_symbol_id IS NULL`, " AND e.id IN (%s)",
+		[]any{repoID}, int64SliceToAny(onlyIDs), len(only) > 0,
+		func(rows *sql.Rows) error {
+			var x javaScopeEdge
+			var scoped int
+			if err := rows.Scan(&x.id, &x.name, &x.kind, &x.evidence, &x.file, &x.container, &x.pkg, &scoped); err != nil {
+				return err
+			}
+			x.scoped = scoped != 0
+			edges = append(edges, x)
+			return nil
+		}); err != nil {
 		return 0, err
 	}
-	var edges []javaScopeEdge
-	for rows.Next() {
-		var x javaScopeEdge
-		var scoped int
-		if err := rows.Scan(&x.id, &x.name, &x.kind, &x.evidence, &x.file, &x.container, &x.pkg, &scoped); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		x.scoped = scoped != 0
-		edges = append(edges, x)
-	}
-	if err := rows.Close(); err != nil {
-		return 0, err
-	}
-	vetoValues := make([]string, 0, len(edges))
-	vetoArgs := make([]any, 0, len(edges))
+	vetoRows := make([][]any, 0, len(edges))
 	for _, e := range edges {
 		if e.scoped {
-			vetoValues = append(vetoValues, "(?)")
-			vetoArgs = append(vetoArgs, e.id)
+			vetoRows = append(vetoRows, []any{e.id})
 		}
 	}
-	if len(vetoValues) > 0 {
-		if _, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO tmp_java_scope_veto(edge_id) VALUES `+strings.Join(vetoValues, ","), vetoArgs...); err != nil {
-			return 0, err
-		}
+	if err := sqliteBatchedValuesExec(ctx, q, `INSERT OR IGNORE INTO tmp_java_scope_veto(edge_id) VALUES `, "(?)", nil, vetoRows); err != nil {
+		return 0, err
 	}
 	if len(edges) == 0 {
 		return 0, nil
@@ -95,63 +79,54 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 			}
 		}
 	}
-	nameList := make([]string, 0, len(scopeNames))
-	nameArgs := make([]any, 0, len(scopeNames)+1)
-	nameArgs = append(nameArgs, repoID)
-	for name := range scopeNames {
-		nameList = append(nameList, name)
-		nameArgs = append(nameArgs, name)
-	}
+	nameList := sortedKeys(scopeNames)
 	if len(nameList) == 0 {
 		return 0, nil
 	}
-	namePlaceholders := strings.TrimRight(strings.Repeat("?,", len(nameList)), ",")
-	symbolFilter := " AND s.name IN (" + namePlaceholders + ")"
 
 	symbols := map[int64]javaScopeSymbol{}
 	byQName := map[string][]javaScopeSymbol{}
 	byName := map[string][]javaScopeSymbol{}
-	rows, err = q.QueryContext(ctx, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,'')
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,'')
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
-		WHERE s.repo_id=? AND f.language='java' AND f.is_deleted=0`+symbolFilter, nameArgs...)
-	if err != nil {
-		return 0, err
-	}
-	for rows.Next() {
-		var s javaScopeSymbol
-		if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		symbols[s.id] = s
-		byQName[s.qname] = append(byQName[s.qname], s)
-		byName[s.name] = append(byName[s.name], s)
-	}
-	if err := rows.Close(); err != nil {
+		WHERE s.repo_id=? AND f.language='java' AND f.is_deleted=0`, " AND s.name IN (%s)",
+		[]any{repoID}, stringSliceToAny(nameList), true,
+		func(rows *sql.Rows) error {
+			var s javaScopeSymbol
+			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg); err != nil {
+				return err
+			}
+			symbols[s.id] = s
+			byQName[s.qname] = append(byQName[s.qname], s)
+			byName[s.name] = append(byName[s.name], s)
+			return nil
+		}); err != nil {
 		return 0, err
 	}
 	imports := map[int64][]javaScopeImport{}
-	importFilter := ""
-	if len(onlyIDs) > 0 {
-		importFilter = " AND file_id IN (SELECT file_id FROM edges WHERE repo_id=" + strconv.FormatInt(repoID, 10) + " AND id IN (" + strings.Join(onlyIDs, ",") + "))"
+	// Load the evidence by file rather than through the selected edges: the
+	// edges are already in hand and carry their file, and `imports` is only ever
+	// read as imports[e.file]. Batching an edge-id subquery would select the
+	// same file from several batches and duplicate its import rows, which the
+	// unique-candidate rules below read as ambiguity.
+	importFiles := map[int64]struct{}{}
+	for _, e := range edges {
+		importFiles[e.file] = struct{}{}
 	}
-	rows, err = q.QueryContext(ctx, `SELECT file_id,source_specifier,local_name,wildcard,is_static FROM scope_import_evidence WHERE repo_id=? AND language='java'`+importFilter, repoID)
-	if err != nil {
-		return 0, err
-	}
-	for rows.Next() {
-		var file int64
-		var i javaScopeImport
-		var w, st int
-		if err := rows.Scan(&file, &i.source, &i.local, &w, &st); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		i.wildcard = w != 0
-		i.static = st != 0
-		imports[file] = append(imports[file], i)
-	}
-	if err := rows.Close(); err != nil {
+	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(importFiles),
+		`SELECT file_id,source_specifier,local_name,wildcard,is_static FROM scope_import_evidence WHERE repo_id=? AND language='java' AND file_id IN (`,
+		[]any{repoID}, func(scan func(...any) error) error {
+			var file int64
+			var i javaScopeImport
+			var w, st int
+			if err := scan(&file, &i.source, &i.local, &w, &st); err != nil {
+				return err
+			}
+			i.wildcard = w != 0
+			i.static = st != 0
+			imports[file] = append(imports[file], i)
+			return nil
+		}); err != nil {
 		return 0, err
 	}
 
@@ -189,16 +164,19 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	if _, err := q.ExecContext(ctx, `DELETE FROM tmp_java_scope_resolution`); err != nil {
 		return 0, err
 	}
-	vals := make([]string, 0, len(res))
-	args2 := []any{}
-	for id, dst := range res {
-		vals = append(vals, "(?,?,?)")
-		args2 = append(args2, id, dst.dst, dst.strategy)
+	resRows := make([][]any, 0, len(res))
+	resIDs := make([]int64, 0, len(res))
+	for id := range res {
+		resIDs = append(resIDs, id)
 	}
-	if _, err := q.ExecContext(ctx, `INSERT INTO tmp_java_scope_resolution(edge_id,dst_symbol_id,strategy) VALUES `+strings.Join(vals, ","), args2...); err != nil {
+	sort.Slice(resIDs, func(i, j int) bool { return resIDs[i] < resIDs[j] })
+	for _, id := range resIDs {
+		resRows = append(resRows, []any{id, res[id].dst, res[id].strategy})
+	}
+	if err := sqliteBatchedValuesExec(ctx, q, `INSERT INTO tmp_java_scope_resolution(edge_id,dst_symbol_id,strategy) VALUES `, "(?,?,?)", nil, resRows); err != nil {
 		return 0, err
 	}
-	_, err = q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM tmp_java_scope_resolution r WHERE r.edge_id=edges.id),resolution_strategy=(SELECT strategy FROM tmp_java_scope_resolution r WHERE r.edge_id=edges.id),resolution_confidence='high' WHERE id IN (SELECT edge_id FROM tmp_java_scope_resolution)`)
+	_, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM tmp_java_scope_resolution r WHERE r.edge_id=edges.id),resolution_strategy=(SELECT strategy FROM tmp_java_scope_resolution r WHERE r.edge_id=edges.id),resolution_confidence='high' WHERE id IN (SELECT edge_id FROM tmp_java_scope_resolution)`)
 	return len(res), err
 }
 

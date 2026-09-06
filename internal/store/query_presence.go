@@ -227,25 +227,17 @@ func (s *Store) RelatedTestFilesPresent(ctx context.Context, repoID int64, files
 	if len(variants) == 0 {
 		return present, nil
 	}
-	args := make([]any, 0, len(variants)+1)
-	args = append(args, repoID)
-	for _, variant := range variants {
-		args = append(args, variant)
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id = ? AND path IN (`+sqlPlaceholders(len(variants))+`)`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	found := map[string]struct{}{}
-	for rows.Next() {
-		var path string
-		if err := rows.Scan(&path); err != nil {
-			return nil, err
-		}
-		found[path] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
+	if err := sqliteBatchedQuery(ctx, s.db, `SELECT path FROM files WHERE repo_id = ?`, ` AND path IN (%s)`,
+		[]any{repoID}, stringSliceToAny(variants), true,
+		func(rows *sql.Rows) error {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				return err
+			}
+			found[path] = struct{}{}
+			return nil
+		}); err != nil {
 		return nil, err
 	}
 	for i, file := range files {
