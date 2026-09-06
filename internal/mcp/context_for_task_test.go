@@ -64,7 +64,7 @@ func TestProcessPayment(t *testing.T) {
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-	return NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
+	return NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 }
 
 // callToolViaServe drives one tools/call through the production stdio path and

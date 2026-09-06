@@ -44,7 +44,7 @@ func newBulkUsageTestServer(t *testing.T) *Server {
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-	return NewServer(repoRoot, repoRoot, repo.ID, st, idx, query.New(st, nil), io.Discard)
+	return NewServer(repoRoot, repo.ID, st, idx, query.New(st, nil), io.Discard)
 }
 
 // usageReport drives a real `tools/call usage_stats` through Serve and decodes

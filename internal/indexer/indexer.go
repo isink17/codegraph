@@ -122,6 +122,15 @@ func (i *Indexer) Update(ctx context.Context, opts Options) (store.ScanSummary, 
 }
 
 func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, error) {
+	// Deliberately the first statement in the run: Options.Paths is
+	// caller-controlled, and a candidate that escapes RepoRoot must be refused
+	// before this repository's config is read, before its repo row is touched,
+	// before BeginScan, and before any candidate is stat'ed or read. A refused
+	// run leaves the database byte-identical.
+	candidatePaths, err := containCandidates(opts.RepoRoot, opts.Paths)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
 	repoCfg, err := config.LoadRepo(opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -152,23 +161,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if scanKind == "" {
 		scanKind = "index"
 	}
-	candidateSet := make(map[string]struct{}, len(opts.Paths))
-	if len(opts.Paths) > 0 {
-		for _, path := range opts.Paths {
-			rel := path
-			if filepath.IsAbs(path) {
-				if v, err := filepath.Rel(opts.RepoRoot, path); err == nil {
-					rel = v
-				}
-			}
-			candidateSet[filepath.Clean(rel)] = struct{}{}
-		}
-	}
-	candidatePaths := make([]string, 0, len(candidateSet))
-	for rel := range candidateSet {
-		candidatePaths = append(candidatePaths, rel)
-	}
-	pathScoped := len(candidateSet) > 0
+	pathScoped := len(candidatePaths) > 0
 	// Which languages a path-scoped run could mutate. Profile convergence is
 	// language-scoped, so a Go-only flush must not be refused because Java is
 	// still on an older parser.
@@ -334,9 +327,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 	go func() {
 		defer close(tasks)
-		if len(candidateSet) > 0 {
+		if pathScoped {
 			for _, rel := range candidatePaths {
-				rel = filepath.Clean(rel)
 				if shouldIgnorePath(rel, opts.Exclude) {
 					continue
 				}
@@ -782,7 +774,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, runErr
 	}
 
-	if len(candidateSet) == 0 {
+	if !pathScoped {
 		missingStarted := time.Now()
 		deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
 		if err != nil {

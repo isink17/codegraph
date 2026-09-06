@@ -14,13 +14,18 @@ var (
 )
 
 // ResolveRepoRoot resolves the repository root directory using a stable fallback chain:
-//  1. Per-call MCP tool parameter (toolParam) (most specific override)
+//  1. Explicit caller override (toolParam) (most specific)
 //  2. Explicit CLI flag value (flagValue) (process-level default)
 //  3. `git rev-parse --show-toplevel` from the current working directory
 //  4. os.Getwd()
 //  5. Return error
 //
 // Empty inputs are treated as "not provided".
+//
+// This chain selects which repository a *process* opens, which is a startup
+// decision. An already-running MCP server does not use it: that server is scoped
+// to the one repository it was opened for and never calls this, so a tool
+// argument cannot retarget it. See mcp.Server.assertActiveRepo.
 func ResolveRepoRoot(flagValue, toolParam string) (string, error) {
 	if v := strings.TrimSpace(toolParam); v != "" {
 		return v, nil

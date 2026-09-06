@@ -87,7 +87,7 @@ func AlsoUseHelper() int {
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-	return NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard), ctx
+	return NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard), ctx
 }
 
 // callTooolJSON invokes a tool through Serve -- the same framing, dispatch, and

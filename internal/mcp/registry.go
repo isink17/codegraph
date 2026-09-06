@@ -103,13 +103,13 @@ type toolDescriptor struct {
 // first, discovery second.
 var toolRegistry = []toolDescriptor{
 	{
-		name: "index_repo", description: "Index a repository into the local code graph",
+		name: "index_repo", description: "Index this server's active repository into the local code graph",
 		properties: []string{"repo_root", "repo_path", "force", "paths"},
 		category:   "index", mutates: true,
 		handler: (*Server).handleIndexRepo,
 	},
 	{
-		name: "update_graph", description: "Update only changed repository files in the local graph",
+		name: "update_graph", description: "Update only changed files of this server's active repository in the local graph",
 		properties: []string{"repo_root", "repo_path", "force", "paths"},
 		category:   "index", mutates: true,
 		handler: (*Server).handleUpdateGraph,

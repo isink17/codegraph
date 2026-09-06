@@ -1679,7 +1679,7 @@ func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, 
 		return err
 	}
 	defer app.Close()
-	server := mcp.NewServer(repoRootCandidate, repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
+	server := mcp.NewServer(repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
 	if err := server.SetToolMode(toolMode); err != nil {
 		return err
 	}

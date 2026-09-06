@@ -37,7 +37,7 @@ func main() {}
 		t.Fatalf("Index() error = %v", err)
 	}
 
-	server := NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 	input := bytes.NewBuffer(nil)
 	writeFrameToBuffer(t, input, map[string]any{
 		"jsonrpc": "2.0",
@@ -100,7 +100,7 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	input := bytes.NewBuffer(nil)
 	writeFrameToBuffer(t, input, map[string]any{
@@ -167,7 +167,7 @@ func TestServeMalformedJSONReturnsParseErrorAndContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	var input bytes.Buffer
 	input.WriteString("not-json\n")
@@ -204,7 +204,7 @@ func TestToolValidationRejectsMissingQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
-	server := NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	var input bytes.Buffer
 	writeFrameToBuffer(t, &input, map[string]any{

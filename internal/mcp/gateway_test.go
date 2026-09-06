@@ -73,7 +73,7 @@ func TestHelper(t *testing.T) { _ = Helper() }
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-	server := NewServer(repoRoot, repoRoot, repo.ID, st, idx, query.New(st, nil), io.Discard)
+	server := NewServer(repoRoot, repo.ID, st, idx, query.New(st, nil), io.Discard)
 	if mode != "" {
 		if err := server.SetToolMode(mode); err != nil {
 			t.Fatalf("SetToolMode(%q) error = %v", mode, err)
@@ -294,14 +294,19 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // every advertised `limit`, `offset`, and `depth` carries the minimum and
 // maximum the validator actually enforces, and get_impact_radius and
 // trace_dependencies gained the limit/offset pair that bounds their traversal.
-// The current contract edit grew full tools/list 11870 -> 12000 bytes (+130)
-// and gateway 3968 -> 4062 (+94). These are deliberate per-session costs for
-// more precise relationship and trace descriptions; schemas and arguments are
-// unchanged. A client that can read a bound does not have to discover it by
-// being rejected.
+// P18 moved these: full tools/list 11870 -> 12000 bytes (+130) and gateway
+// 3968 -> 4062 (+94), buying machine-readable bounds.
+//
+// P22.31 moves them again: 12000 -> 12535 bytes (+535, +134 estimated tokens).
+// index_repo and update_graph now say they act on *this server's active
+// repository*, and repo_root/repo_path carry a one-line description saying they
+// may only assert that repository, never retarget the server. The rule is
+// enforced either way; without it on the wire, the only way for a model to
+// discover the rule is to trip over it, and the README is not visible to an MCP
+// client. The text is deliberately one line per property for this reason.
 const (
-	fullToolsListBytes  = 12000
-	fullToolsListTokens = 3000
+	fullToolsListBytes  = 12535
+	fullToolsListTokens = 3134
 	// The gateway payload is pinned for the same reason, and became load-bearing
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name

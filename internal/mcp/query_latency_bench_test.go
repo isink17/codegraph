@@ -94,7 +94,7 @@ func setupMCPHubServer(b *testing.B) (*Server, *store.Store, int64) {
 		b.Fatalf("Analyze() error = %v", err)
 	}
 
-	server := NewServer(repoRoot, repoRoot, repo.ID, s, nil, query.New(s, nil), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, nil, query.New(s, nil), io.Discard)
 	return server, s, repo.ID
 }
 
