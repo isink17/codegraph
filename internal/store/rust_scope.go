@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -30,14 +31,14 @@ type rustScopeModule struct {
 // RustResolutionStats is bounded-work evidence for one Rust resolver batch.
 // It is intentionally not a runtime counter or a public product setting.
 type RustResolutionStats struct {
-	AffectedCrates       int
-	AffectedModules      int
-	AffectedEdges        int
-	CandidateRows        int
-	ReExportNodesVisited int
+	AffectedCrates        int
+	AffectedModules       int
+	AffectedEdges         int
+	CandidateRows         int
+	ReExportNodesVisited  int
 	ReExportEvidenceLoads int
-	BatchInvalidationOps int
-	BatchApplyOps        int
+	BatchInvalidationOps  int
+	BatchApplyOps         int
 }
 
 func filepathSlash(path string) string { return strings.ReplaceAll(path, "\\", "/") }
@@ -49,6 +50,168 @@ func conventionalRustRoot(path string) string {
 		return path
 	}
 	return ""
+}
+
+// rustCrateRootPredicateParams is how many parameters one crate root binds in
+// rustCrateRootPredicate: the persisted root, the root path in both stored
+// spellings, and the directory prefix in both. Every batched Rust statement
+// budgets from this.
+const rustCrateRootPredicateParams = 5
+
+// rustCrateRootPredicate renders the crate-membership predicate for one batch
+// of crate roots: membership already persisted on the evidence row, or a file
+// at or under the root's directory whose membership has not been persisted
+// yet. It is a *discovery* predicate -- it decides which rows a statement
+// loads, never which memberships are true.
+//
+// crate_root is always written slashed (conventionalRustRoot normalises it),
+// but files.path still holds whichever separator the indexing host used, so the
+// path half of the predicate has to spell both. Dropping the native spelling
+// would silently lose the blank-root branch on a Windows-written database --
+// which is exactly the branch that rediscovers a file whose `mod` declaration
+// has just been restored.
+func rustCrateRootPredicate(fileAlias, evidenceAlias string, roots []string) (string, []any) {
+	args := make([]any, 0, len(roots)*rustCrateRootPredicateParams)
+	for _, root := range roots {
+		args = append(args, root)
+	}
+	paths := make([]any, 0, len(roots)*2)
+	likes := make([]string, 0, len(roots)*2)
+	likeArgs := make([]any, 0, len(roots)*2)
+	for _, root := range roots {
+		dir := root[:strings.LastIndex(root, "/")+1]
+		paths = append(paths, root, strings.ReplaceAll(root, "/", `\`))
+		likes = append(likes, fileAlias+".path LIKE ?", fileAlias+".path LIKE ?")
+		likeArgs = append(likeArgs, dir+"%", strings.ReplaceAll(dir, "/", `\`)+"%")
+	}
+	args = append(args, paths...)
+	args = append(args, likeArgs...)
+	// The directory tests are a chain rather than a list because they are
+	// prefix matches. Everything that can be an IN list is one, which keeps the
+	// expression-tree depth linear in the batch instead of multiplying it --
+	// SQLite caps that depth independently of the parameter count.
+	return "(" + evidenceAlias + ".crate_root IN (" + sqlitePlaceholders(len(roots)) + ") OR (" +
+		evidenceAlias + ".crate_root='' AND (" + fileAlias + ".path IN (" + sqlitePlaceholders(len(paths)) + ") OR " +
+		strings.Join(likes, " OR ") + ")))", args
+}
+
+// sortedRustRoots is the deterministic root order every batched Rust statement
+// uses. Batching must be transport only, so the order cannot depend on map
+// iteration.
+func sortedRustRoots(roots map[string]struct{}) []string {
+	out := make([]string, 0, len(roots))
+	for root := range roots {
+		out = append(out, root)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// rustRootPredicateMaxRoots bounds a batch by SQLite's expression-tree depth,
+// which is capped independently of the parameter count (SQLITE_MAX_EXPR_DEPTH,
+// 1000 by default). One root contributes two terms to the left-deep OR chain of
+// directory prefix tests, so the parameter budget alone would stop protecting
+// the statement if sqliteInClauseBatchSize were ever raised.
+const rustRootPredicateMaxRoots = 150
+
+// rustRootBatches slices crate roots into groups whose predicate fits the
+// shared SQLite parameter budget alongside fixedArgs fixed parameters. An
+// arbitrary number of affected crates is supported; the caller is responsible
+// for aggregating every batch before deciding anything, because a batch
+// boundary is not a crate boundary.
+// rustRootBatchSize is how many crate roots one statement may carry alongside
+// fixedArgs fixed parameters, under both the parameter budget and the
+// expression-depth ceiling.
+func rustRootBatchSize(fixedArgs int) int {
+	return min(sqliteBatchSize(fixedArgs, rustCrateRootPredicateParams), rustRootPredicateMaxRoots)
+}
+
+func rustRootBatches(fixedArgs int, roots []string) ([][]string, error) {
+	size := rustRootBatchSize(fixedArgs)
+	if size == 0 {
+		return nil, errSQLiteBatchImpossible
+	}
+	batches := make([][]string, 0, (len(roots)+size-1)/size)
+	for start := 0; start < len(roots); start += size {
+		batches = append(batches, roots[start:min(start+size, len(roots))])
+	}
+	return batches, nil
+}
+
+// rustScopedFileIDs answers which Rust files a set of crate roots covers. It
+// resolves the root fan-out once, so every consumer can then bound its own
+// statements by file id instead of re-binding three parameters per root. A nil
+// root set means "no Rust scoping"; an empty result means no Rust file
+// qualifies.
+func (s *Store) rustScopedFileIDs(ctx context.Context, repoID int64, roots map[string]struct{}) (map[int64]struct{}, error) {
+	if roots == nil {
+		return nil, nil
+	}
+	return rustScopedFileIDs(ctx, s.db, repoID, sortedRustRoots(roots))
+}
+
+func rustScopedFileIDs(ctx context.Context, q queryContexter, repoID int64, roots []string) (map[int64]struct{}, error) {
+	scoped := map[int64]struct{}{}
+	if len(roots) == 0 {
+		return scoped, nil
+	}
+	batches, err := rustRootBatches(1, roots)
+	if err != nil {
+		return nil, err
+	}
+	for _, batch := range batches {
+		predicate, predicateArgs := rustCrateRootPredicate("f", "e", batch)
+		query := `SELECT f.id FROM files f JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE f.repo_id=? AND f.language='rust' AND ` + predicate
+		if err := sqliteScanRows(ctx, q, query, append([]any{repoID}, predicateArgs...), func(rows *sql.Rows) error {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			scoped[id] = struct{}{}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return scoped, nil
+}
+
+// updateRustCrateRoots persists recomputed crate membership.
+//
+// crate_root is derived evidence of *currently proven* membership, not an
+// append-only historical claim, so a file whose membership can no longer be
+// proven is written back empty. Writing only non-empty roots would let a
+// removed `mod` declaration keep its old crate and make an incremental update
+// resolve edges a fresh index leaves unresolved.
+//
+// One row binds three parameters -- the CASE pair plus its IN entry -- on top
+// of the single fixed repo id, so the batch size comes from that arithmetic
+// rather than a hardcoded constant.
+func updateRustCrateRoots(ctx context.Context, q execContexter, repoID int64, ids []int64, roots map[int64]string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	size := sqliteBatchSize(1, 3)
+	if size == 0 {
+		return errSQLiteBatchImpossible
+	}
+	for start := 0; start < len(ids); start += size {
+		batch := ids[start:min(start+size, len(ids))]
+		cases := make([]string, 0, len(batch))
+		args := make([]any, 0, 1+len(batch)*3)
+		for _, id := range batch {
+			cases = append(cases, "WHEN ? THEN ?")
+			args = append(args, id, roots[id])
+		}
+		args = append(args, repoID)
+		args = append(args, int64SliceToAny(batch)...)
+		query := `UPDATE file_scope_evidence SET crate_root=CASE file_id ` + strings.Join(cases, " ") +
+			` ELSE crate_root END WHERE repo_id=? AND file_id IN (` + sqlitePlaceholders(len(batch)) + `)`
+		if _, err := q.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []string) (map[string]struct{}, error) {
@@ -118,7 +281,7 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 			return nil, err
 		}
 		if len(candidates) == 0 {
-			rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND language='rust' AND is_deleted=0 AND (path LIKE '%/lib.rs' OR path LIKE '%/main.rs' OR path IN ('lib.rs','main.rs'))`, repoID)
+			rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND language='rust' AND is_deleted=0 AND (path LIKE '%/lib.rs' OR path LIKE '%/main.rs' OR path LIKE '%\lib.rs' OR path LIKE '%\main.rs' OR path IN ('lib.rs','main.rs'))`, repoID)
 			if err != nil {
 				return nil, err
 			}
@@ -128,7 +291,10 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 					_ = rows.Close()
 					return nil, err
 				}
-				candidates = append(candidates, path)
+				// A crate root is a slashed identity everywhere else (it is what
+				// crate_root persists), so normalise the stored spelling here
+				// rather than leaking a backslashed root into the predicates.
+				candidates = append(candidates, filepathSlash(path))
 			}
 			if err := rows.Close(); err != nil {
 				return nil, err
@@ -166,57 +332,70 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 }
 
 func (s *Store) rustNamesForChangedPaths(ctx context.Context, repoID int64, roots map[string]struct{}) ([]string, error) {
+	return rustNamesForChangedPaths(ctx, s.db, repoID, roots)
+}
+
+func rustNamesForChangedPaths(ctx context.Context, q execQuerier, repoID int64, roots map[string]struct{}) ([]string, error) {
 	if len(roots) == 0 {
 		return nil, nil
 	}
-	values := make([]string, 0, len(roots))
-	for root := range roots {
-		values = append(values, root)
-	}
-	sort.Strings(values)
-	parts := make([]string, 0, len(values))
-	args := make([]any, 0, len(values)+1)
-	args = append(args, repoID)
-	for _, root := range values {
-		dir := root[:strings.LastIndex(root, "/")+1]
-		parts = append(parts, "(e.crate_root=? OR (e.crate_root='' AND (f.path=? OR f.path LIKE ?)))")
-		args = append(args, root, root, dir+"%")
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT x.dst_name FROM edges x JOIN files f ON f.id=x.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE x.repo_id=? AND f.language='rust' AND x.dst_name!='' AND (`+strings.Join(parts, " OR ")+") ORDER BY x.dst_name", args...)
+	batches, err := rustRootBatches(1, sortedRustRoots(roots))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+	// Every batch is read before anything is returned, and the names are
+	// collapsed into a set and sorted afterwards, so the result is exactly what
+	// one hypothetical unlimited DISTINCT ... ORDER BY statement would produce.
+	unique := map[string]struct{}{}
+	for _, batch := range batches {
+		predicate, predicateArgs := rustCrateRootPredicate("f", "e", batch)
+		query := `SELECT DISTINCT x.dst_name FROM edges x JOIN files f ON f.id=x.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE x.repo_id=? AND f.language='rust' AND x.dst_name!='' AND ` + predicate
+		if err := sqliteScanRows(ctx, q, query, append([]any{repoID}, predicateArgs...), func(rows *sql.Rows) error {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			unique[name] = struct{}{}
+			return nil
+		}); err != nil {
 			return nil, err
 		}
+	}
+	if len(unique) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(unique))
+	for name := range unique {
 		names = append(names, name)
 	}
-	return names, rows.Err()
+	sort.Strings(names)
+	return names, nil
 }
 
 func (s *Store) invalidateRustBindingsForRoots(ctx context.Context, repoID int64, roots map[string]struct{}) error {
+	return invalidateRustBindingsForRoots(ctx, s.db, repoID, roots)
+}
+
+func invalidateRustBindingsForRoots(ctx context.Context, q execQuerier, repoID int64, roots map[string]struct{}) error {
 	if len(roots) == 0 {
 		return nil
 	}
-	values := make([]string, 0, len(roots))
-	args := make([]any, 0, len(roots)+2)
-	args = append(args, repoID, repoID)
-	for root := range roots {
-		values = append(values, root)
+	batches, err := rustRootBatches(2, sortedRustRoots(roots))
+	if err != nil {
+		return err
 	}
-	sort.Strings(values)
-	parts := make([]string, 0, len(values))
-	for _, root := range values {
-		dir := root[:strings.LastIndex(root, "/")+1]
-		parts = append(parts, "(se.crate_root=? OR (se.crate_root='' AND (f.path=? OR f.path LIKE ?)))")
-		args = append(args, root, root, dir+"%")
+	// Clearing is idempotent, so a row matched by two batches is simply cleared
+	// twice; what matters is that every batch runs, or a crate past the first
+	// batch would keep stale bindings.
+	for _, batch := range batches {
+		predicate, predicateArgs := rustCrateRootPredicate("f", "se", batch)
+		query := `UPDATE edges SET ` + resolverClearResolutionSQL + ` WHERE repo_id=? AND resolution_strategy IN ('rust_module_scope','rust_use_scope','rust_associated_function') AND file_id IN (SELECT f.id FROM files f JOIN file_scope_evidence se ON se.file_id=f.id AND se.repo_id=f.repo_id WHERE f.repo_id=? AND f.language='rust' AND ` + predicate + `)`
+		args := append([]any{repoID, repoID}, predicateArgs...)
+		if _, err := q.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+` WHERE repo_id=? AND resolution_strategy IN ('rust_module_scope','rust_use_scope','rust_associated_function') AND file_id IN (SELECT f.id FROM files f JOIN file_scope_evidence se ON se.file_id=f.id AND se.repo_id=f.repo_id WHERE f.repo_id=? AND f.language='rust' AND (`+strings.Join(parts, " OR ")+`))`, args...)
-	return err
+	return nil
 }
 
 // resolveRustModuleScope is deliberately conservative: Rust edges are decided
@@ -263,87 +442,81 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			}
 		}
 	}
-	rootList := make([]string, 0, len(roots))
-	for root := range roots {
-		rootList = append(rootList, root)
-	}
-	sort.Strings(rootList)
+	rootList := sortedRustRoots(roots)
 	if stats != nil {
 		stats.AffectedCrates = len(rootList)
 	}
-	scope := func(fileAlias, evidenceAlias string) (string, []any) {
-		if only == nil {
-			return "", nil
-		}
-		if len(rootList) == 0 {
-			return " AND 0", nil
-		}
-		parts := make([]string, 0, len(rootList)*2)
-		args := make([]any, 0, len(rootList)*3)
-		for _, root := range rootList {
-			dir := root[:strings.LastIndex(root, "/")+1]
-			parts = append(parts, evidenceAlias+`.crate_root=? OR (`+evidenceAlias+`.crate_root='' AND (`+fileAlias+`.path=? OR `+fileAlias+`.path LIKE ?))`)
-			args = append(args, root, root, dir+"%")
-		}
-		return " AND (" + strings.Join(parts, " OR ") + ")", args
-	}
-
-	files := map[int64]rustScopeFile{}
-	fileScope, fileArgs := scope("f", "e")
-	rows, err := tx.QueryContext(ctx, `SELECT f.id,f.path,e.module_path,e.crate_root FROM files f JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE f.repo_id=? AND f.language='rust' AND f.is_deleted=0`+fileScope, append([]any{repoID}, fileArgs...)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var f rustScopeFile
-		if err := rows.Scan(&f.id, &f.path, &f.module, &f.root); err != nil {
+	// The crate-root fan-out is resolved once, into a file-id set, instead of
+	// being re-bound (three parameters per root) into every statement below.
+	// That keeps an arbitrary number of affected crates inside the shared
+	// parameter budget and, more importantly, keeps the SQL batch boundary out
+	// of the semantics: the complete file set is known before anything is
+	// loaded, so no decision is ever taken on a partial view.
+	filtered := only != nil
+	var scopedFiles []any
+	if filtered && len(rootList) > 0 {
+		scoped, err := rustScopedFileIDs(ctx, tx, repoID, rootList)
+		if err != nil {
 			return nil, err
 		}
-		files[f.id] = f
+		ids := make([]int64, 0, len(scoped))
+		for id := range scoped {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		scopedFiles = int64SliceToAny(ids)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
+	const scopeClause = " AND f.id IN (%s)"
+
+	files := map[int64]rustScopeFile{}
+	if err := sqliteBatchedQuery(ctx, tx,
+		`SELECT f.id,f.path,e.module_path,e.crate_root FROM files f JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE f.repo_id=? AND f.language='rust' AND f.is_deleted=0`,
+		scopeClause, []any{repoID}, scopedFiles, filtered,
+		func(rows *sql.Rows) error {
+			var f rustScopeFile
+			if err := rows.Scan(&f.id, &f.path, &f.module, &f.root); err != nil {
+				return err
+			}
+			files[f.id] = f
+			return nil
+		}); err != nil {
 		return nil, err
 	}
 	if stats != nil {
 		stats.AffectedModules = len(files)
 	}
 	symbols := map[int64]rustScopeSymbol{}
-	byQ := map[string][]rustScopeSymbol{}
-	symbolScope, symbolArgs := scope("f", "e")
-	rows, err = tx.QueryContext(ctx, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.visibility,s.kind FROM symbols s JOIN files f ON f.id=s.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE s.repo_id=? AND s.language='rust'`+symbolScope, append([]any{repoID}, symbolArgs...)...)
-	if err != nil {
+	var byQ map[string][]rustScopeSymbol
+	if err := sqliteBatchedQuery(ctx, tx,
+		`SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.visibility,s.kind FROM symbols s JOIN files f ON f.id=s.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE s.repo_id=? AND s.language='rust'`,
+		scopeClause, []any{repoID}, scopedFiles, filtered,
+		func(rows *sql.Rows) error {
+			var s rustScopeSymbol
+			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qualified, &s.container, &s.visibility, &s.kind); err != nil {
+				return err
+			}
+			symbols[s.id] = s
+			return nil
+		}); err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var s rustScopeSymbol
-		if err := rows.Scan(&s.id, &s.file, &s.name, &s.qualified, &s.container, &s.visibility, &s.kind); err != nil {
-			return nil, err
-		}
-		symbols[s.id] = s
-		byQ[s.qualified] = append(byQ[s.qualified], s)
-	}
-	rows.Close()
 	imports := []rustScopeImport{}
-	importScope, importArgs := scope("f", "e")
-	rows, err = tx.QueryContext(ctx, `SELECT i.file_id,i.owner_module,i.source_specifier,i.local_name,i.wildcard,i.is_reexport FROM scope_import_evidence i JOIN files f ON f.id=i.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE i.repo_id=? AND i.language='rust'`+importScope, append([]any{repoID}, importArgs...)...)
-	if err != nil {
+	if err := sqliteBatchedQuery(ctx, tx,
+		`SELECT i.file_id,i.owner_module,i.source_specifier,i.local_name,i.wildcard,i.is_reexport FROM scope_import_evidence i JOIN files f ON f.id=i.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE i.repo_id=? AND i.language='rust'`,
+		scopeClause, []any{repoID}, scopedFiles, filtered,
+		func(rows *sql.Rows) error {
+			var i rustScopeImport
+			var glob, re int
+			if err := rows.Scan(&i.file, &i.owner, &i.source, &i.local, &glob, &re); err != nil {
+				return err
+			}
+			i.glob = glob != 0
+			i.reexport = re != 0
+			imports = append(imports, i)
+			return nil
+		}); err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var i rustScopeImport
-		var glob, re int
-		if err := rows.Scan(&i.file, &i.owner, &i.source, &i.local, &glob, &re); err != nil {
-			return nil, err
-		}
-		i.glob = glob != 0
-		i.reexport = re != 0
-		imports = append(imports, i)
-	}
-	rows.Close()
 	if stats != nil {
 		stats.ReExportEvidenceLoads = 1
 	}
@@ -353,38 +526,36 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	}
 	// A module path is only meaningful inside its crate.  Keep the root in the
 	// key; `crate::util` in two targets of one repository is not one scope.
+	//
+	// Membership is derived from primary evidence only: a conventional crate
+	// root proves itself, and the declaration graph below propagates from
+	// there. The persisted crate_root deliberately seeds nothing -- it is a
+	// cache of a previous recomputation, and letting it seed membership would
+	// let it prove itself after the `mod` declaration behind it disappeared.
 	moduleFiles := map[string][]int64{}
 	rootOfFile := map[int64]string{}
 	for _, f := range files {
-		if f.root != "" {
-			rootOfFile[f.id] = f.root
-			module := f.module
-			if module == "" {
-				module = "crate"
-			}
-			moduleFiles[f.root+"\x00"+module] = append(moduleFiles[f.root+"\x00"+module], f.id)
-		}
 		if root := rootPath(f.path); root != "" {
 			rootOfFile[f.id] = root
 			moduleFiles[root+"\x00crate"] = append(moduleFiles[root+"\x00crate"], f.id)
 		}
 	}
-	moduleScope, moduleArgs := scope("f", "e")
-	rows, err = tx.QueryContext(ctx, `SELECT m.file_id,m.owner_module,m.module_name,m.external_path,m.is_inline,m.visibility FROM rust_module_evidence m JOIN files f ON f.id=m.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE m.repo_id=?`+moduleScope, append([]any{repoID}, moduleArgs...)...)
-	if err != nil {
+	decls := []rustScopeModule{}
+	if err := sqliteBatchedQuery(ctx, tx,
+		`SELECT m.file_id,m.owner_module,m.module_name,m.external_path,m.is_inline,m.visibility FROM rust_module_evidence m JOIN files f ON f.id=m.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE m.repo_id=?`,
+		scopeClause, []any{repoID}, scopedFiles, filtered,
+		func(rows *sql.Rows) error {
+			var m rustScopeModule
+			var inline int
+			if err := rows.Scan(&m.file, &m.owner, &m.name, &m.external, &inline, &m.visibility); err != nil {
+				return err
+			}
+			m.inline = inline != 0
+			decls = append(decls, m)
+			return nil
+		}); err != nil {
 		return nil, err
 	}
-	decls := []rustScopeModule{}
-	for rows.Next() {
-		var m rustScopeModule
-		var inline int
-		if err := rows.Scan(&m.file, &m.owner, &m.name, &m.external, &inline, &m.visibility); err != nil {
-			return nil, err
-		}
-		m.inline = inline != 0
-		decls = append(decls, m)
-	}
-	rows.Close()
 	for changed := true; changed; {
 		changed = false
 		for _, m := range decls {
@@ -435,37 +606,19 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}
 		return len(moduleFiles[root+"\x00"+module]) == 1
 	}
-	if len(rootOfFile) > 0 {
-		ids := make([]int64, 0, len(rootOfFile))
-		for id := range rootOfFile {
-			ids = append(ids, id)
-		}
-		for _, chunk := range chunkInt64s(ids, 300) {
-			args := make([]any, 0, len(chunk)*2)
-			cases := make([]string, 0, len(chunk))
-			for _, id := range chunk {
-				cases = append(cases, "WHEN ? THEN ?")
-				args = append(args, id, rootOfFile[id])
-			}
-			where := make([]string, 0, len(chunk))
-			for _, id := range chunk {
-				where = append(where, "?")
-				args = append(args, id)
-			}
-			query := `UPDATE file_scope_evidence SET crate_root=CASE file_id ` + strings.Join(cases, " ") + ` ELSE crate_root END WHERE repo_id=? AND file_id IN (` + strings.Join(where, ",") + `)`
-			// The repo id is last because the CASE parameters precede the WHERE.
-			queryArgs := make([]any, 0, len(args))
-			queryArgs = append(queryArgs, args[1:]...)
-			queryArgs = append(queryArgs, repoID)
-			queryArgs = append(queryArgs, int64SliceToAny(chunk)...)
-			if _, err := tx.ExecContext(ctx, query, queryArgs...); err != nil {
-				return nil, err
-			}
-		}
+	// Persist over every loaded file, not only the ones with a proven root: a
+	// file that lost its membership must have its cached crate_root cleared, or
+	// the next incremental run would still see it in the crate.
+	persistIDs := make([]int64, 0, len(files))
+	for id := range files {
+		persistIDs = append(persistIDs, id)
 	}
-	for id, root := range rootOfFile {
-		f := files[id]
-		f.root = root
+	slices.Sort(persistIDs)
+	if err := updateRustCrateRoots(ctx, tx, repoID, persistIDs, rootOfFile); err != nil {
+		return nil, err
+	}
+	for id, f := range files {
+		f.root = rootOfFile[id]
 		files[id] = f
 	}
 	// Parser paths are provisional for files that can also be bin roots (for
@@ -591,9 +744,13 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		strategy     string
 	}
 	resolutions := make([]rustResolution, 0)
-	edgeScope := ""
-	edgeArgs := []any{repoID}
-	if only != nil {
+	// The selected-edge set is unbounded, so the id fan is batched by the same
+	// budget. Every batch is scanned before any resolution is applied, and each
+	// edge id appears in exactly one batch, so batching changes nothing about
+	// which edges are decided.
+	edgeBatches := [][]any{nil}
+	filteredEdges := only != nil
+	if filteredEdges {
 		if len(only) == 0 {
 			return map[int64]struct{}{}, nil
 		}
@@ -601,123 +758,134 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		for id := range only {
 			ids = append(ids, id)
 		}
-		edgeScope = ` AND e.id IN (` + sqlitePlaceholders(len(ids)) + `)`
-		edgeArgs = append(edgeArgs, int64SliceToAny(ids)...)
-	}
-	rows, err = tx.QueryContext(ctx, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='rust' AND e.dst_symbol_id IS NULL`+edgeScope, edgeArgs...)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var id, file, src int64
-		var dst string
-		if err := rows.Scan(&id, &file, &src, &dst); err != nil {
+		slices.Sort(ids)
+		var err error
+		if edgeBatches, err = sqliteBatchArgs(1, int64SliceToAny(ids)); err != nil {
 			return nil, err
 		}
-		if only != nil {
-			if _, ok := only[id]; !ok {
-				continue
+	}
+	const edgeQuery = `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='rust' AND e.dst_symbol_id IS NULL`
+	for _, edgeBatch := range edgeBatches {
+		query := edgeQuery
+		if filteredEdges {
+			query += ` AND e.id IN (` + sqlitePlaceholders(len(edgeBatch)) + `)`
+		}
+		rows, err := tx.QueryContext(ctx, query, append([]any{repoID}, edgeBatch...)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id, file, src int64
+			var dst string
+			if err := rows.Scan(&id, &file, &src, &dst); err != nil {
+				return nil, err
 			}
-		}
-		if stats != nil {
-			stats.AffectedEdges++
-		}
-		caller, ok := files[file]
-		if !ok {
-			continue
-		}
-		ss := symbols[src]
-		if strings.Contains(dst, ".") {
-			continue
-		}
-		owner := ss.container
-		if owner == "" {
-			owner = caller.module
-		}
-		path := dst
-		strategy := ResolutionStrategyRustModuleScope
-		var globCandidates []rustScopeSymbol
-		for _, im := range importsBy[file] {
-			if im.owner != owner {
-				continue
-			}
-			if im.glob {
-				module := resolvePath(im.source, owner)
-				for _, c := range byQ[module+"::"+dst] {
-					if stats != nil {
-						stats.CandidateRows++
-					}
-					if eligible(c, caller) {
-						globCandidates = append(globCandidates, c)
-					}
+			if only != nil {
+				if _, ok := only[id]; !ok {
+					continue
 				}
-				continue
 			}
-			if im.local == dst {
-				path = resolvePath(im.source, owner)
-				strategy = ResolutionStrategyRustUseScope
-				break
-			}
-		}
-		if path == dst && strings.Contains(dst, "::") {
-			path = resolvePath(dst, owner)
-		} else if path == dst {
-			path = owner + "::" + dst
-		}
-		if path == owner+"::"+dst && len(globCandidates) > 0 {
-			path = ""
-			strategy = ResolutionStrategyRustUseScope
-		}
-		var chosen int64
-		count := 0
-		for _, c := range globCandidates {
-			if c.file == caller.id || (moduleProven(rootOfFile[caller.id], candidateModule(c)) && moduleMember(candidateModule(c), c.file, caller.id)) {
-				count++
-				chosen = c.id
-			}
-		}
-		for _, c := range byQ[path] {
 			if stats != nil {
-				stats.CandidateRows++
+				stats.AffectedEdges++
 			}
-			module := candidateModule(c)
-			if eligible(c, caller) && (c.file == caller.id || (moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id))) {
-				count++
-				chosen = c.id
+			caller, ok := files[file]
+			if !ok {
+				continue
 			}
-		}
-		if count == 0 {
-			parts := strings.Split(path, "::")
-			if len(parts) > 1 {
-				for _, c := range exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], map[string]struct{}{}) {
-					if stats != nil {
-						stats.CandidateRows++
+			ss := symbols[src]
+			if strings.Contains(dst, ".") {
+				continue
+			}
+			owner := ss.container
+			if owner == "" {
+				owner = caller.module
+			}
+			path := dst
+			strategy := ResolutionStrategyRustModuleScope
+			var globCandidates []rustScopeSymbol
+			for _, im := range importsBy[file] {
+				if im.owner != owner {
+					continue
+				}
+				if im.glob {
+					module := resolvePath(im.source, owner)
+					for _, c := range byQ[module+"::"+dst] {
+						if stats != nil {
+							stats.CandidateRows++
+						}
+						if eligible(c, caller) {
+							globCandidates = append(globCandidates, c)
+						}
 					}
-					module := candidateModule(c)
-					if eligible(c, caller) && moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id) {
-						count++
-						chosen = c.id
-					}
+					continue
+				}
+				if im.local == dst {
+					path = resolvePath(im.source, owner)
+					strategy = ResolutionStrategyRustUseScope
+					break
 				}
 			}
-		}
-		if count != 1 {
-			continue
-		}
-		if strings.Contains(dst, "::") {
+			if path == dst && strings.Contains(dst, "::") {
+				path = resolvePath(dst, owner)
+			} else if path == dst {
+				path = owner + "::" + dst
+			}
+			if path == owner+"::"+dst && len(globCandidates) > 0 {
+				path = ""
+				strategy = ResolutionStrategyRustUseScope
+			}
+			var chosen int64
+			count := 0
+			for _, c := range globCandidates {
+				if c.file == caller.id || (moduleProven(rootOfFile[caller.id], candidateModule(c)) && moduleMember(candidateModule(c), c.file, caller.id)) {
+					count++
+					chosen = c.id
+				}
+			}
 			for _, c := range byQ[path] {
-				if c.id == chosen && c.kind == "function" && c.container != candidateModule(c) {
-					strategy = ResolutionStrategyRustAssociatedFunction
+				if stats != nil {
+					stats.CandidateRows++
+				}
+				module := candidateModule(c)
+				if eligible(c, caller) && (c.file == caller.id || (moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id))) {
+					count++
+					chosen = c.id
 				}
 			}
+			if count == 0 {
+				parts := strings.Split(path, "::")
+				if len(parts) > 1 {
+					for _, c := range exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], map[string]struct{}{}) {
+						if stats != nil {
+							stats.CandidateRows++
+						}
+						module := candidateModule(c)
+						if eligible(c, caller) && moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id) {
+							count++
+							chosen = c.id
+						}
+					}
+				}
+			}
+			if count != 1 {
+				continue
+			}
+			if strings.Contains(dst, "::") {
+				for _, c := range byQ[path] {
+					if c.id == chosen && c.kind == "function" && c.container != candidateModule(c) {
+						strategy = ResolutionStrategyRustAssociatedFunction
+					}
+				}
+			}
+			resolutions = append(resolutions, rustResolution{edge: id, symbol: chosen, strategy: strategy})
 		}
-		resolutions = append(resolutions, rustResolution{edge: id, symbol: chosen, strategy: strategy})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
 	if len(resolutions) == 0 {
 		return map[int64]struct{}{}, nil
@@ -769,4 +937,38 @@ func (s *Store) resolveRustModuleScopeStandaloneWithStats(ctx context.Context, r
 		return nil, err
 	}
 	return bound, nil
+}
+
+// dropRustEdgesOutsideScope removes from stale every Rust edge that the
+// crate-scoped pass owns but will not look at again, because its file is not
+// covered by the affected crate roots. It is the guard that keeps the
+// repo-wide, name-based invalidation from unbinding crates nothing will rebind.
+//
+// Only the three strategies invalidateRustBindingsForRoots itself clears are
+// protected. A Rust edge bound by any other redecidable strategy is not owned
+// by that pass, so exempting it would leave it permanently stale instead of
+// converging on the unresolved state a fresh index produces.
+//
+// The query is driven by the stale ids rather than by the Rust edge population,
+// so the work is proportional to the invalidation batch and not to the size of
+// the repository.
+func (s *Store) dropRustEdgesOutsideScope(ctx context.Context, repoID int64, scope map[int64]struct{}, stale map[int64]struct{}) error {
+	ids := make([]int64, 0, len(stale))
+	for id := range stale {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return sqliteBatchedQuery(ctx, s.db,
+		`SELECT e.id,e.file_id FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='rust' AND e.resolution_strategy IN ('rust_module_scope','rust_use_scope','rust_associated_function')`,
+		` AND e.id IN (%s)`, []any{repoID}, int64SliceToAny(ids), true,
+		func(rows *sql.Rows) error {
+			var id, file int64
+			if err := rows.Scan(&id, &file); err != nil {
+				return err
+			}
+			if _, ok := scope[file]; !ok {
+				delete(stale, id)
+			}
+			return nil
+		})
 }

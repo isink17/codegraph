@@ -1173,6 +1173,9 @@ type importScopeCache struct {
 	repoID    int64
 	scope     map[int64]map[int64]struct{}
 	rustRoots map[string]struct{}
+	// rustFiles is the Rust file set those roots cover, resolved once so no
+	// statement has to re-bind the crate-root fan-out.
+	rustFiles map[int64]struct{}
 	loaded    bool
 }
 

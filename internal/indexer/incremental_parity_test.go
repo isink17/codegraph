@@ -707,6 +707,59 @@ func TestRustModuleScopeAcceptanceMatrix(t *testing.T) {
 		}, func(r *lifecycleRepo, t *testing.T) {
 			assertRustUnresolved(t, r, "caller.rs", "helper")
 		}},
+		{"M mod declaration added", tree{
+			"lib.rs":    "mod caller;",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::a::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+			r.write(t, "lib.rs", "mod a; mod caller;")
+			r.update(t, "lib.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "helper", "a.rs")
+		}},
+		{"N module renamed", tree{
+			"lib.rs":    "mod helper; mod caller;",
+			"helper.rs": "pub fn run() {}",
+			"caller.rs": "use crate::helper::run; fn go() { run(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "run", "helper.rs")
+			r.remove(t, "helper.rs")
+			r.write(t, "util.rs", "pub fn run() {}")
+			r.write(t, "lib.rs", "mod util; mod caller;")
+			r.write(t, "caller.rs", "use crate::util::run; fn go() { run(); }")
+			r.update(t)
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "run", "util.rs")
+		}},
+		// An inline module is not a file module: nothing on disk carries its
+		// contents, so a cross-file `use` of it stays fail-closed. The
+		// crate-root lifecycle must not start treating it like an external
+		// file module, and the sibling file module beside it must keep
+		// resolving.
+		{"O inline module stays fail-closed", tree{
+			"lib.rs":    "mod caller; mod a; mod inner { pub fn helper() {} }",
+			"a.rs":      "pub fn helper() {}",
+			"caller.rs": "use crate::inner::helper; fn run() { helper(); }",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "caller.rs", "helper")
+			r.write(t, "caller.rs", "use crate::a::helper; fn run() { helper(); }")
+			r.update(t, "caller.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustResolved(t, r, "caller.rs", "helper", "a.rs")
+		}},
+		{"P sibling crate untouched", tree{
+			"src/lib.rs":  "mod util; fn run() { crate::util::helper(); }",
+			"src/util.rs": "pub fn helper() {}",
+			"alt/main.rs": "mod util; fn run() { crate::util::helper(); }",
+			"alt/util.rs": "pub fn helper() {}",
+		}, func(r *lifecycleRepo, t *testing.T) {
+			r.write(t, "src/lib.rs", "fn run() { crate::util::helper(); }")
+			r.update(t, "src/lib.rs")
+		}, func(r *lifecycleRepo, t *testing.T) {
+			assertRustUnresolved(t, r, "src/lib.rs", "crate::util::helper")
+			assertRustResolved(t, r, "alt/main.rs", "crate::util::helper", "alt/util.rs")
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1360,4 +1413,57 @@ func TestJavaPackageConstructorIncrementalMatrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRustCrateLifecycleParityAcrossCrates walks a two-crate repository through
+// the transitions that move crate membership -- declaration added, declaration
+// removed, target edited, module moved -- and demands a fresh index of the same
+// tree after every one of them. Crate membership is derived state, so a
+// transition that leaves it stale shows up here as a binding the fresh index
+// does not make.
+func TestRustCrateLifecycleParityAcrossCrates(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"src/lib.rs":    "mod util; mod caller; fn run() { crate::util::helper(); }",
+		"src/util.rs":   "pub fn helper() {}",
+		"src/caller.rs": "use crate::util::helper; fn go() { helper(); }",
+		"alt/main.rs":   "mod util; fn run() { crate::util::helper(); }",
+		"alt/util.rs":   "pub fn helper() {}",
+	})
+	r.assertFreshParity(t, "initial")
+	assertRustResolved(t, r, "src/caller.rs", "helper", "src/util.rs")
+	assertRustResolved(t, r, "alt/main.rs", "crate::util::helper", "alt/util.rs")
+
+	// A declaration added in one crate.
+	r.write(t, "src/extra.rs", "pub fn extra() {}")
+	r.write(t, "src/lib.rs", "mod util; mod caller; mod extra; fn run() { crate::util::helper(); crate::extra::extra(); }")
+	r.update(t, "src/extra.rs", "src/lib.rs")
+	r.assertFreshParity(t, "declaration added")
+	assertRustResolved(t, r, "src/lib.rs", "crate::extra::extra", "src/extra.rs")
+
+	// A declaration removed: the file stays on disk but leaves the crate.
+	r.write(t, "src/lib.rs", "mod caller; mod extra; fn run() { crate::util::helper(); crate::extra::extra(); }")
+	r.update(t, "src/lib.rs")
+	r.assertFreshParity(t, "declaration removed")
+	assertRustUnresolved(t, r, "src/lib.rs", "crate::util::helper")
+	assertRustResolved(t, r, "alt/main.rs", "crate::util::helper", "alt/util.rs")
+
+	// The same declaration restored: membership must come back.
+	r.write(t, "src/lib.rs", "mod util; mod caller; mod extra; fn run() { crate::util::helper(); crate::extra::extra(); }")
+	r.update(t, "src/lib.rs")
+	r.assertFreshParity(t, "declaration restored")
+	assertRustResolved(t, r, "src/lib.rs", "crate::util::helper", "src/util.rs")
+
+	// A target edited inside one crate.
+	r.write(t, "alt/util.rs", "pub fn helper() {} pub fn second() {}")
+	r.update(t, "alt/util.rs")
+	r.assertFreshParity(t, "target edited")
+
+	// A module moved between directories, which is also a move between crates.
+	r.remove(t, "src/extra.rs")
+	r.write(t, "alt/extra.rs", "pub fn extra() {}")
+	r.write(t, "src/lib.rs", "mod util; mod caller; fn run() { crate::util::helper(); }")
+	r.write(t, "alt/main.rs", "mod util; mod extra; fn run() { crate::util::helper(); crate::extra::extra(); }")
+	r.update(t)
+	r.assertFreshParity(t, "module moved between crates")
+	assertRustResolved(t, r, "alt/main.rs", "crate::extra::extra", "alt/extra.rs")
 }

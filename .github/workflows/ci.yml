@@ -25,4 +25,8 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        run: go test ./...
+        # Explicit headroom over Go's 10-minute default: the store package runs
+        # close to it on hosted Windows runners, where every test database pays
+        # a WAL checkpoint flush on close. This is a failure ceiling, not a
+        # budget -- a passing run takes exactly as long as it did before.
+        run: go test -timeout 20m ./...
