@@ -278,7 +278,10 @@ func TestUpdateGraphPathEscapeRejectedZeroMutation(t *testing.T) {
 func TestIndexToolsSameRepoRegression(t *testing.T) {
 	ctx := context.Background()
 	server, s, repoID, repoA, _ := containmentEnv(t)
+	// Options.Paths inputs are platform-native; the persisted graph path is
+	// slash-canonical. Conflating the two passes everywhere but Windows.
 	relative := filepath.Join("src", "a.go")
+	const stored = "src/a.go"
 
 	calls := []struct {
 		name string
@@ -302,8 +305,8 @@ func TestIndexToolsSameRepoRegression(t *testing.T) {
 				t.Fatalf("%s response = %v, want ok", tc.tool, res)
 			}
 			_, files, _ := mcpGraphState(t, s, repoID)
-			if len(files) != 1 || files[0] != relative {
-				t.Fatalf("after %s files = %v, want [%q]", tc.tool, files, relative)
+			if len(files) != 1 || files[0] != stored {
+				t.Fatalf("after %s files = %v, want [%q]", tc.tool, files, stored)
 			}
 		})
 	}

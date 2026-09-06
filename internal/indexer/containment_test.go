@@ -17,7 +17,16 @@ import (
 // can hand Options.Paths, and the canonical repo-relative form it must collapse
 // to -- or the refusal it must produce.
 func TestContainRelPathMatrix(t *testing.T) {
-	root := filepath.Join(string(filepath.Separator), "repo")
+	// A genuinely absolute, platform-native root. filepath.Join(Separator,
+	// "repo") is NOT one on Windows: "\\repo" has no volume name, so
+	// filepath.IsAbs reports false and containRelPath would read it as a
+	// relative candidate rather than a root.
+	parent := t.TempDir()
+	root := filepath.Join(parent, "repo")
+	outsideRoot := filepath.Join(parent, "repo-b")
+	prefixSibling := filepath.Join(parent, "repo2")
+	requireAbs(t, root, outsideRoot, prefixSibling)
+
 	abs := func(parts ...string) string { return filepath.Join(append([]string{root}, parts...)...) }
 
 	accepted := []struct {
@@ -32,8 +41,9 @@ func TestContainRelPathMatrix(t *testing.T) {
 		{"absolute root itself", root, "."},
 		{"missing file kept for deletion", filepath.Join("src", "deleted.go"), filepath.Join("src", "deleted.go")},
 		{"dotfile is not traversal", ".golangci.yml", ".golangci.yml"},
-		// Prefix confusion: /repo2 is a different repository, but /repo/foobar
-		// is genuinely inside /repo. A naive HasPrefix check conflates them.
+		// Prefix confusion: "<parent>/repo2" is a different repository, but
+		// "<parent>/repo/foobar" is genuinely inside the root. A naive
+		// HasPrefix check conflates them.
 		{"sibling-looking name inside root", abs("foobar", "a.go"), filepath.Join("foobar", "a.go")},
 	}
 	for _, tc := range accepted {
@@ -56,10 +66,10 @@ func TestContainRelPathMatrix(t *testing.T) {
 		{"parent traversal", filepath.Join("..", "x.go")},
 		{"traversal through interior", filepath.Join("src", "..", "..", "x.go")},
 		{"outside sibling repo", filepath.Join("..", "repo-b", "secret.go")},
-		{"absolute outside", filepath.Join(string(filepath.Separator), "repo-b", "secret.go")},
-		// Prefix confusion in the other direction: /repo2 must never be
-		// accepted just because "/repo2" starts with "/repo".
-		{"absolute prefix-confusable sibling", filepath.Join(string(filepath.Separator), "repo2", "a.go")},
+		{"absolute outside", filepath.Join(outsideRoot, "secret.go")},
+		// Prefix confusion in the other direction: "<parent>/repo2" must never
+		// be accepted just because its path starts with the root's.
+		{"absolute prefix-confusable sibling", filepath.Join(prefixSibling, "a.go")},
 		{"missing file outside root", filepath.Join("..", "repo-b", "deleted.go")},
 		{"empty", ""},
 		{"blank", "   "},
@@ -112,7 +122,8 @@ func TestContainRelPathWindowsShapes(t *testing.T) {
 // TestContainCandidatesDedupes pins P22.31 item 15: the shapes that name one
 // repository path collapse to one candidate, in first-seen order.
 func TestContainCandidatesDedupes(t *testing.T) {
-	root := filepath.Join(string(filepath.Separator), "repo")
+	root := filepath.Join(t.TempDir(), "repo")
+	requireAbs(t, root)
 	got, err := containCandidates(root, []string{
 		filepath.Join("src", "a.go"),
 		"." + string(filepath.Separator) + filepath.Join("src", "a.go"),
@@ -130,7 +141,8 @@ func TestContainCandidatesDedupes(t *testing.T) {
 }
 
 func TestContainCandidatesRefusesWholeRun(t *testing.T) {
-	root := filepath.Join(string(filepath.Separator), "repo")
+	root := filepath.Join(t.TempDir(), "repo")
+	requireAbs(t, root)
 	if _, err := containCandidates(root, []string{
 		filepath.Join("src", "a.go"),
 		filepath.Join("..", "repo-b", "secret.go"),
@@ -169,6 +181,18 @@ func escapeEnv(t *testing.T) (*store.Store, *Indexer, int64, string, string) {
 		t.Fatalf("Index(A) error = %v", err)
 	}
 	return s, idx, repo.ID, repoA, repoB
+}
+
+// requireAbs guards the fixture bug that made these tests pass everywhere but
+// Windows: filepath.Join(Separator, "repo") yields "\\repo", which has no
+// volume name and so is not an absolute path on Windows at all.
+func requireAbs(t *testing.T, paths ...string) {
+	t.Helper()
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			t.Fatalf("fixture root %q is not absolute on %s", path, runtime.GOOS)
+		}
+	}
 }
 
 func graphState(t *testing.T, s *store.Store, repoID int64) ([]string, int) {
@@ -263,8 +287,10 @@ func TestPathScopedContainedFormsStillWork(t *testing.T) {
 		if _, err := idx.Update(ctx, Options{RepoRoot: repoA, Paths: []string{path}}); err != nil {
 			t.Fatalf("Update(paths=%q) error = %v, want success", path, err)
 		}
+		// Options.Paths inputs are platform-native; persisted graph paths are
+		// slash-canonical. Conflating the two passes everywhere but Windows.
 		paths, _ := graphState(t, s, repoID)
-		if len(paths) != 1 || paths[0] != filepath.Join("src", "a.go") {
+		if len(paths) != 1 || paths[0] != "src/a.go" {
 			t.Fatalf("after Update(paths=%q) files = %v, want [src/a.go]", path, paths)
 		}
 	}
@@ -353,7 +379,7 @@ func TestDirectorySymlinkEscapeRejected(t *testing.T) {
 		t.Fatalf("Index() error = %v", err)
 	}
 	full, _ := graphState(t, s, repo.ID)
-	if len(full) != 1 || full[0] != filepath.Join("src", "a.go") {
+	if len(full) != 1 || full[0] != "src/a.go" {
 		t.Fatalf("full scan files = %v, want only src/a.go", full)
 	}
 
@@ -367,7 +393,7 @@ func TestDirectorySymlinkEscapeRejected(t *testing.T) {
 		}
 	}
 	after, _ := graphState(t, s, repo.ID)
-	if len(after) != 1 || after[0] != filepath.Join("src", "a.go") {
+	if len(after) != 1 || after[0] != "src/a.go" {
 		t.Fatalf("after rejected scoped runs files = %v, want only src/a.go", after)
 	}
 }
