@@ -275,3 +275,143 @@ func TestRustCrateRootConvergesWithFullRecompute(t *testing.T) {
 		t.Fatalf("fixture never proved src/b.rs in the first place: %v", afterFull)
 	}
 }
+
+// TestRustCrateRootDiscoversWindowsStoredPaths pins the separator half of the
+// discovery predicate. crate_root is always written slashed, but files.path
+// still holds whatever separator the indexing host used, so a slash-only
+// predicate loses every blank-root file on a Windows-written database -- which
+// is the branch that rediscovers a file whose `mod` declaration has just been
+// restored.
+func TestRustCrateRootDiscoversWindowsStoredPaths(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]int64{}
+	for _, spec := range []struct{ path, module string }{
+		{`src\lib.rs`, "crate"},
+		{`src\util.rs`, "crate::util"},
+		{`other\lib.rs`, "crate"},
+	} {
+		id, err := insertTestFileLang(ctx, s, repo.ID, spec.path, "rust")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,module_path,crate_root) VALUES(?,?,?,?,'')`, repo.ID, id, "rust", spec.module); err != nil {
+			t.Fatal(err)
+		}
+		ids[spec.path] = id
+	}
+	scoped, err := s.rustScopedFileIDs(ctx, repo.ID, map[string]struct{}{"src/lib.rs": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{`src\lib.rs`, `src\util.rs`} {
+		if _, ok := scoped[ids[path]]; !ok {
+			t.Fatalf("%s was not discovered: %v", path, scoped)
+		}
+	}
+	if _, ok := scoped[ids[`other\lib.rs`]]; ok {
+		t.Fatalf(`other\lib.rs leaked into the src crate's scope: %v`, scoped)
+	}
+}
+
+// TestRustCrateRootRestoresMembershipOnWindowsPaths walks the full lifecycle a
+// Windows-written database goes through: membership proven, lost when the `mod`
+// declaration goes away, and regained when it comes back. Step three is the one
+// that depends on the blank-root discovery branch, because by then the file's
+// cached crate_root is empty and only its path can bring it back into scope.
+func TestRustCrateRootRestoresMembershipOnWindowsPaths(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	addFile := func(path, module string) int64 {
+		id, err := insertTestFileLang(ctx, s, repo.ID, path, "rust")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,module_path,crate_root) VALUES(?,?,?,?,'')`, repo.ID, id, "rust", module); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	declare := func(owner int64) {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO rust_module_evidence(repo_id,file_id,owner_module,module_name,external_path,visibility) VALUES(?,?,?,?,?,?)`, repo.ID, owner, "crate", "util", "src/util", "private"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	crateRoot := func(fileID int64) string {
+		var root string
+		if err := s.db.QueryRowContext(ctx, `SELECT crate_root FROM file_scope_evidence WHERE repo_id=? AND file_id=?`, repo.ID, fileID).Scan(&root); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+
+	lib := addFile(`src\lib.rs`, "crate")
+	util := addFile(`src\util.rs`, "crate::util")
+	declare(lib)
+	target, err := insertTestSymbolLang(ctx, s, repo.ID, util, "helper", "crate::util::helper", "rust")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE symbols SET visibility='public' WHERE id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	src, err := insertTestSymbolLang(ctx, s, repo.ID, lib, "run", "crate::run", "rust")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge, err := insertTestEdge(ctx, s, repo.ID, lib, src, "crate::util::helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := func() {
+		t.Helper()
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+` WHERE id=?`, edge); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.resolveRustModuleScopeStandalone(ctx, repo.ID, map[int64]struct{}{edge: {}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bound := func() int64 {
+		var got int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(dst_symbol_id,0) FROM edges WHERE id=?`, edge).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	scoped()
+	if crateRoot(util) != "src/lib.rs" || bound() != target {
+		t.Fatalf("declared: crate_root=%q bound=%d, want %q and %d", crateRoot(util), bound(), "src/lib.rs", target)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM rust_module_evidence WHERE repo_id=?`, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	scoped()
+	if crateRoot(util) != "" || bound() != 0 {
+		t.Fatalf("removed: crate_root=%q bound=%d, want cleared and unresolved", crateRoot(util), bound())
+	}
+
+	declare(lib)
+	scoped()
+	if crateRoot(util) != "src/lib.rs" || bound() != target {
+		t.Fatalf("restored: crate_root=%q bound=%d, want %q and %d", crateRoot(util), bound(), "src/lib.rs", target)
+	}
+}

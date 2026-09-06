@@ -122,7 +122,7 @@ func TestRustScopeRootFanOutStaysInVariableBudget(t *testing.T) {
 	if want := rustBudgetCrateCount*2 + 2; len(scoped) != want {
 		t.Fatalf("scoped %d files, want %d", len(scoped), want)
 	}
-	batchSize := sqliteBatchSize(1, rustCrateRootPredicateParams)
+	batchSize := rustRootBatchSize(1)
 	wantBatches := (len(f.roots) + batchSize - 1) / batchSize
 	if wantBatches < 2 {
 		t.Fatalf("fixture fits one batch (%d roots, batch %d); the test proves nothing", len(f.roots), batchSize)
@@ -252,7 +252,7 @@ func TestInvalidateRustBindingsForRootsClearsEveryBatch(t *testing.T) {
 	if guard.maxArgs > sqliteDefaultMaxVariables {
 		t.Fatalf("max bound args = %d, want <= %d", guard.maxArgs, sqliteDefaultMaxVariables)
 	}
-	batchSize := sqliteBatchSize(2, rustCrateRootPredicateParams)
+	batchSize := rustRootBatchSize(2)
 	if want := (len(affected) + batchSize - 1) / batchSize; len(guard.matching("UPDATE edges SET")) != want {
 		t.Fatalf("invalidation ran %d statements, want %d", len(guard.matching("UPDATE edges SET")), want)
 	}

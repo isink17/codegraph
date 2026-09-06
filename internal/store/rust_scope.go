@@ -53,35 +53,45 @@ func conventionalRustRoot(path string) string {
 }
 
 // rustCrateRootPredicateParams is how many parameters one crate root binds in
-// rustCrateRootPredicate. Every batched Rust statement budgets from this.
-const rustCrateRootPredicateParams = 3
+// rustCrateRootPredicate: the persisted root, the root path in both stored
+// spellings, and the directory prefix in both. Every batched Rust statement
+// budgets from this.
+const rustCrateRootPredicateParams = 5
 
 // rustCrateRootPredicate renders the crate-membership predicate for one batch
 // of crate roots: membership already persisted on the evidence row, or a file
 // at or under the root's directory whose membership has not been persisted
 // yet. It is a *discovery* predicate -- it decides which rows a statement
 // loads, never which memberships are true.
+//
+// crate_root is always written slashed (conventionalRustRoot normalises it),
+// but files.path still holds whichever separator the indexing host used, so the
+// path half of the predicate has to spell both. Dropping the native spelling
+// would silently lose the blank-root branch on a Windows-written database --
+// which is exactly the branch that rediscovers a file whose `mod` declaration
+// has just been restored.
 func rustCrateRootPredicate(fileAlias, evidenceAlias string, roots []string) (string, []any) {
 	args := make([]any, 0, len(roots)*rustCrateRootPredicateParams)
 	for _, root := range roots {
 		args = append(args, root)
 	}
-	for _, root := range roots {
-		args = append(args, root)
-	}
-	// The directory tests are a chain rather than a list because they are
-	// prefix matches. Everything that can be an IN list is one, which keeps the
-	// expression-tree depth linear in the batch instead of tripling it -- SQLite
-	// caps that depth independently of the parameter count.
-	likes := make([]string, 0, len(roots))
+	paths := make([]any, 0, len(roots)*2)
+	likes := make([]string, 0, len(roots)*2)
+	likeArgs := make([]any, 0, len(roots)*2)
 	for _, root := range roots {
 		dir := root[:strings.LastIndex(root, "/")+1]
-		likes = append(likes, fileAlias+".path LIKE ?")
-		args = append(args, dir+"%")
+		paths = append(paths, root, strings.ReplaceAll(root, "/", `\`))
+		likes = append(likes, fileAlias+".path LIKE ?", fileAlias+".path LIKE ?")
+		likeArgs = append(likeArgs, dir+"%", strings.ReplaceAll(dir, "/", `\`)+"%")
 	}
-	list := sqlitePlaceholders(len(roots))
-	return "(" + evidenceAlias + ".crate_root IN (" + list + ") OR (" +
-		evidenceAlias + ".crate_root='' AND (" + fileAlias + ".path IN (" + list + ") OR " +
+	args = append(args, paths...)
+	args = append(args, likeArgs...)
+	// The directory tests are a chain rather than a list because they are
+	// prefix matches. Everything that can be an IN list is one, which keeps the
+	// expression-tree depth linear in the batch instead of multiplying it --
+	// SQLite caps that depth independently of the parameter count.
+	return "(" + evidenceAlias + ".crate_root IN (" + sqlitePlaceholders(len(roots)) + ") OR (" +
+		evidenceAlias + ".crate_root='' AND (" + fileAlias + ".path IN (" + sqlitePlaceholders(len(paths)) + ") OR " +
 		strings.Join(likes, " OR ") + ")))", args
 }
 
@@ -97,20 +107,27 @@ func sortedRustRoots(roots map[string]struct{}) []string {
 	return out
 }
 
-// rustRootPredicateMaxTerms bounds a batch by SQLite's expression-tree depth,
+// rustRootPredicateMaxRoots bounds a batch by SQLite's expression-tree depth,
 // which is capped independently of the parameter count (SQLITE_MAX_EXPR_DEPTH,
-// 1000 by default). One root contributes one term to the left-deep OR chain of
+// 1000 by default). One root contributes two terms to the left-deep OR chain of
 // directory prefix tests, so the parameter budget alone would stop protecting
 // the statement if sqliteInClauseBatchSize were ever raised.
-const rustRootPredicateMaxTerms = 250
+const rustRootPredicateMaxRoots = 150
 
 // rustRootBatches slices crate roots into groups whose predicate fits the
 // shared SQLite parameter budget alongside fixedArgs fixed parameters. An
 // arbitrary number of affected crates is supported; the caller is responsible
 // for aggregating every batch before deciding anything, because a batch
 // boundary is not a crate boundary.
+// rustRootBatchSize is how many crate roots one statement may carry alongside
+// fixedArgs fixed parameters, under both the parameter budget and the
+// expression-depth ceiling.
+func rustRootBatchSize(fixedArgs int) int {
+	return min(sqliteBatchSize(fixedArgs, rustCrateRootPredicateParams), rustRootPredicateMaxRoots)
+}
+
 func rustRootBatches(fixedArgs int, roots []string) ([][]string, error) {
-	size := min(sqliteBatchSize(fixedArgs, rustCrateRootPredicateParams), rustRootPredicateMaxTerms)
+	size := rustRootBatchSize(fixedArgs)
 	if size == 0 {
 		return nil, errSQLiteBatchImpossible
 	}
@@ -264,7 +281,7 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 			return nil, err
 		}
 		if len(candidates) == 0 {
-			rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND language='rust' AND is_deleted=0 AND (path LIKE '%/lib.rs' OR path LIKE '%/main.rs' OR path IN ('lib.rs','main.rs'))`, repoID)
+			rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND language='rust' AND is_deleted=0 AND (path LIKE '%/lib.rs' OR path LIKE '%/main.rs' OR path LIKE '%\lib.rs' OR path LIKE '%\main.rs' OR path IN ('lib.rs','main.rs'))`, repoID)
 			if err != nil {
 				return nil, err
 			}
@@ -274,7 +291,10 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 					_ = rows.Close()
 					return nil, err
 				}
-				candidates = append(candidates, path)
+				// A crate root is a slashed identity everywhere else (it is what
+				// crate_root persists), so normalise the stored spelling here
+				// rather than leaking a backslashed root into the predicates.
+				candidates = append(candidates, filepathSlash(path))
 			}
 			if err := rows.Close(); err != nil {
 				return nil, err
