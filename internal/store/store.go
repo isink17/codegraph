@@ -4357,6 +4357,9 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
+	if scopes.rustFiles, err = s.rustScopedFileIDs(ctx, repoID, scopes.rustRoots); err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
 	if err := s.invalidateRustBindingsForRoots(ctx, repoID, scopes.rustRoots); err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
@@ -4382,7 +4385,7 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	names = mergeResolverNames(names, scopeNames)
 
 	invalidateStarted := time.Now()
-	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names)
+	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
@@ -4498,7 +4501,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 //     can therefore still go stale in the way described above; that is the
 //     pre-existing behaviour, and narrowing it is a separate decision from
 //     this one.
-func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string) (int, error) {
+func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string, rustScope map[int64]struct{}) (int, error) {
 	wanted := make(map[string]struct{}, len(names))
 	unique := make([]string, 0, len(names))
 	for _, name := range names {
@@ -4648,6 +4651,18 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	}
 	if err := rows.Close(); err != nil {
 		return 0, err
+	}
+	// Rust bindings belong to the crate-scoped pass. When a Rust scope is in
+	// effect, invalidateRustBindingsForRoots has already cleared every binding
+	// inside the affected crates; a Rust edge outside them is not reconsidered
+	// by anything afterwards, so clearing it here would drop a destination that
+	// a fresh index still finds. Crates are isolated -- a symbol in one crate is
+	// never a candidate for a caller in another -- so an unaffected crate's
+	// answer cannot have changed.
+	if rustScope != nil && len(stale) > 0 {
+		if err := s.dropRustEdgesOutsideScope(ctx, repoID, rustScope, stale); err != nil {
+			return 0, err
+		}
 	}
 	if len(stale) == 0 {
 		return 0, nil
@@ -4897,32 +4912,35 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		return stats, nil
 	}
 	stats.NamesUnique = len(unique)
-	rustFilter := ""
-	var rustFilterArgs []any
+	// The changed-path pass bounds Rust candidates to the affected crate roots.
+	// That fan-out is resolved once into a file-id set rather than bound three
+	// parameters per root into every statement below, which would put a hard
+	// ceiling on how many crates one update may touch. A nil set means no Rust
+	// scoping at all; an empty set means no Rust file qualifies.
+	var rustScope map[int64]struct{}
 	if scopes != nil {
-		if len(scopes.rustRoots) == 0 {
-			rustFilter = " AND f.language <> 'rust'"
-		} else {
-			roots := make([]string, 0, len(scopes.rustRoots))
-			for root := range scopes.rustRoots {
-				roots = append(roots, root)
-			}
-			slices.Sort(roots)
-			parts := make([]string, 0, len(roots)*2)
-			for _, root := range roots {
-				dir := root[:strings.LastIndex(root, "/")+1]
-				parts = append(parts, "se.crate_root=? OR (se.crate_root='' AND (f.path=? OR f.path LIKE ?))")
-				rustFilterArgs = append(rustFilterArgs, root, root, dir+"%")
-			}
-			rustFilter = " AND (f.language <> 'rust' OR (" + strings.Join(parts, " OR ") + "))"
+		rustScope = scopes.rustFiles
+	}
+	outOfRustScope := func(language string, fileID int64) bool {
+		if rustScope == nil || language != "rust" {
+			return false
 		}
+		_, ok := rustScope[fileID]
+		return !ok
+	}
+	// The common case -- a change that touches no Rust crate -- is still worth
+	// excluding in SQL, because it binds no parameters and keeps the repo-wide
+	// qualified scan from shipping every Rust row to Go only to discard it.
+	rustExclusion := ""
+	if rustScope != nil && len(rustScope) == 0 {
+		rustExclusion = " AND f.language <> 'rust'"
 	}
 	if moduleVeto == nil {
 		// Standalone entry point: no caller ran the invalidation pass, so this
 		// one owns it. It must precede the module pass below for the ordering
 		// reason ResolveEdgesForPathsAndNames documents.
 		invalidateStarted := time.Now()
-		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique)
+		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique, nil)
 		if err != nil {
 			return stats, err
 		}
@@ -4960,9 +4978,9 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	targetByID := make(map[int64]edgeTarget, 64)
 
 	exactStarted := time.Now()
-	// The Rust crate-root filter binds three parameters per root on top of the
-	// repo id, so the name batch takes what those leave.
-	exactNameBatch := sqliteBatchSize(1+len(rustFilterArgs), 1)
+	// Only the repo id is fixed now that the crate-root filter no longer binds
+	// parameters, so the name set takes the whole budget.
+	exactNameBatch := sqliteBatchSize(1, 1)
 	if exactNameBatch <= 0 {
 		return stats, errSQLiteBatchImpossible
 	}
@@ -4979,14 +4997,12 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
 			FROM edges e
 			JOIN files f ON f.id = e.file_id
-			LEFT JOIN file_scope_evidence se ON se.file_id=f.id AND se.repo_id=f.repo_id
-			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)` + rustFilter
+			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)` + rustExclusion
 		args := make([]any, 1+len(chunk))
 		args[0] = repoID
 		for i, name := range chunk {
 			args[i+1] = name
 		}
-		args = append(args, rustFilterArgs...)
 
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -5001,6 +5017,9 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence); err != nil {
 				_ = rows.Close()
 				return stats, err
+			}
+			if outOfRustScope(srcLanguage, srcFileID) {
+				continue
 			}
 			targetByID[id] = edgeTarget{
 				edgeID:      id,
@@ -5032,8 +5051,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
 		FROM edges e
 		JOIN files f ON f.id = e.file_id
-		LEFT JOIN file_scope_evidence se ON se.file_id=f.id AND se.repo_id=f.repo_id
-		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND (instr(e.dst_name, '.') > 0 OR instr(e.dst_name, '::') > 0)`+rustFilter, append([]any{repoID}, rustFilterArgs...)...)
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND (instr(e.dst_name, '.') > 0 OR instr(e.dst_name, '::') > 0)`+rustExclusion, repoID)
 	if err != nil {
 		return stats, err
 	}
@@ -5046,6 +5064,9 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence); err != nil {
 			_ = rows.Close()
 			return stats, err
+		}
+		if outOfRustScope(srcLanguage, srcFileID) {
+			continue
 		}
 		stats.QualifiedScanned++
 		if _, ok := targetByID[id]; ok {
@@ -5285,6 +5306,13 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 				}
 				if _, err := s.db.ExecContext(ctx, `UPDATE file_scope_evidence SET crate_root=? WHERE repo_id=? AND file_id=? AND crate_root=''`, root, repoID, target.srcFileID); err != nil {
 					return outcome, err
+				}
+				// The cached Rust file set was resolved from crate_root before
+				// this stamp, so it has to learn about the file the stamp just
+				// brought into the crate; otherwise the later name pass would
+				// treat it as out of scope.
+				if scopes.rustFiles != nil {
+					scopes.rustFiles[target.srcFileID] = struct{}{}
 				}
 			}
 		}
