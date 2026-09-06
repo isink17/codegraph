@@ -1,0 +1,37 @@
+-- P22.29: record WHICH parser produced each file's graph.
+--
+-- Before this migration a file was considered unchanged from filesystem and
+-- content metadata alone. That is not sufficient, because the production
+-- adapter registry differs by build mode: the cgo build parses eleven
+-- languages with tree-sitter, the non-cgo build parses Go with go/ast and
+-- Python with a dedicated adapter but falls back to symbols-only heuristics
+-- for the other nine. Swapping binaries therefore left a graph whose call
+-- evidence came from a parser that is no longer running -- silently preserved
+-- on a full update (every file "unchanged"), and silently replaced one file at
+-- a time on an incremental one, producing a same-language mixed graph.
+--
+-- Provenance is per file, not per repository, because path-scoped scans exist:
+-- a language converges one batch at a time and the half-converged state has to
+-- be describable. `parser_profile` is the adapter's semantic identity (see
+-- internal/parser.Profile), `parser_call_edges` its call-graph capability at
+-- the time it wrote the row -- persisted rather than derived, because a binary
+-- reading a profile string it does not implement still has to know whether the
+-- graph it is looking at was call-capable.
+--
+-- Rows written before this migration keep the empty profile, which means
+-- UNKNOWN -- explicitly NOT "produced by a parser that emits no calls". The
+-- two states are different and the indexer treats them differently: unknown
+-- provenance converges silently under a call-capable parser and fails closed
+-- under a call-less one.
+--
+-- This migration deliberately does NOT clear content hashes. Doing so would
+-- make the first non-cgo run after an upgrade reparse a possibly
+-- tree-sitter-produced graph with a lower-capability adapter -- exactly the
+-- destructive downgrade this slice exists to prevent. Establishing UNKNOWN and
+-- letting the indexer decide is the safe half of the job.
+--
+-- No index accompanies the columns. Provenance is read once per scan as a
+-- single aggregate; an extra index on `files` would be maintained by every
+-- file upsert in the write path to save nothing measurable on one query.
+ALTER TABLE files ADD COLUMN parser_profile TEXT NOT NULL DEFAULT '';
+ALTER TABLE files ADD COLUMN parser_call_edges INTEGER NOT NULL DEFAULT 0;

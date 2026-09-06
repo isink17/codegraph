@@ -138,6 +138,23 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	if len(languages) == 0 {
 		t.Fatalf("languages = %v, want non-empty", languages)
 	}
+	// Pinned public contract (P22.29): the pre-existing fields stay, and every
+	// entry additionally discloses which parser serves the language and whether
+	// it produces call edges, so a client can tell a degraded index apart from a
+	// complete one without guessing from the build.
+	entry := languages[0].(map[string]any)
+	if _, ok := entry["language"]; !ok {
+		t.Fatalf("entry = %v, missing language", entry)
+	}
+	if _, ok := entry["extensions"]; !ok {
+		t.Fatalf("entry = %v, missing extensions", entry)
+	}
+	if got, ok := entry["parser_profile"].(string); !ok || got != "go-ast:go:v1" {
+		t.Fatalf("parser_profile = %v, want go-ast:go:v1", entry["parser_profile"])
+	}
+	if got, ok := entry["call_edges"].(bool); !ok || !got {
+		t.Fatalf("call_edges = %v, want true", entry["call_edges"])
+	}
 }
 
 func TestServeMalformedJSONReturnsParseErrorAndContinues(t *testing.T) {

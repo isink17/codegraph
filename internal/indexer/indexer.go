@@ -152,6 +152,77 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if scanKind == "" {
 		scanKind = "index"
 	}
+	candidateSet := make(map[string]struct{}, len(opts.Paths))
+	if len(opts.Paths) > 0 {
+		for _, path := range opts.Paths {
+			rel := path
+			if filepath.IsAbs(path) {
+				if v, err := filepath.Rel(opts.RepoRoot, path); err == nil {
+					rel = v
+				}
+			}
+			candidateSet[filepath.Clean(rel)] = struct{}{}
+		}
+	}
+	candidatePaths := make([]string, 0, len(candidateSet))
+	for rel := range candidateSet {
+		candidatePaths = append(candidatePaths, rel)
+	}
+	pathScoped := len(candidateSet) > 0
+	// Which languages a path-scoped run could mutate. Profile convergence is
+	// language-scoped, so a Go-only flush must not be refused because Java is
+	// still on an older parser.
+	//
+	// The same admission rules the producer applies below decide membership: a
+	// candidate the scan would skip, or one that no longer exists on disk (a
+	// watcher flush of deletions), cannot create a mixed graph, and refusing
+	// such a flush would stall the watcher over files it was only going to
+	// retire.
+	candidateLanguages := make(map[string]struct{}, len(candidatePaths))
+	for _, rel := range candidatePaths {
+		if shouldIgnorePath(rel, opts.Exclude) || shouldSkipFile(rel, opts.Include, opts.Exclude) {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(opts.RepoRoot, rel)); err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if adapter := i.registry.AdapterFor(rel); adapter != nil {
+			candidateLanguages[adapter.Language()] = struct{}{}
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// Parser-profile safety (P22.29).
+	//
+	// Deliberately before BeginScan: a refused downgrade must leave the
+	// database byte-identical, and the cheapest way to guarantee that is to
+	// decide before any row -- scan bookkeeping included -- is written.
+	//
+	// It is also before the C++ repair below and before change detection, for
+	// the same reason that repair marks files here: the decision is an input to
+	// which files this run parses, so a run that discovers it one phase later
+	// would not act on it until the next one.
+	// ------------------------------------------------------------------
+	currentProfiles := i.registry.LanguageProfiles()
+	profileGroups, err := i.store.FileParserProfileGroups(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	affectedLanguage := func(language string) bool {
+		if !languageAllowed(opts.Languages, language) {
+			return false
+		}
+		if !pathScoped {
+			return true
+		}
+		_, ok := candidateLanguages[language]
+		return ok
+	}
+	profilePlan, err := planParserProfiles(profileGroups, currentProfiles, affectedLanguage, pathScoped)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+
 	// P22.11: a repository indexed by an older release holds C/C++ call edges
 	// whose destination lost its receiver (`v.size()` persisted as `size`), and
 	// the wrong binding that produced. Unlike every earlier resolver upgrade
@@ -198,25 +269,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return store.ScanSummary{}, err
 	}
 	summary := store.ScanSummary{RepoID: repo.ID, ScanID: scanID, ParseSamples: make([]string, 0, 20)}
+	summary.ParserProfileLanguages = profilePlan.languages()
 	summary.LanguageCoverage = map[string]store.LanguageCounts{}
-	candidateSet := make(map[string]struct{}, len(opts.Paths))
-	if len(opts.Paths) > 0 {
-		for _, path := range opts.Paths {
-			rel := path
-			if filepath.IsAbs(path) {
-				if v, err := filepath.Rel(opts.RepoRoot, path); err == nil {
-					rel = v
-				}
-			}
-			candidateSet[filepath.Clean(rel)] = struct{}{}
-		}
-	}
-	candidatePaths := make([]string, 0, len(candidateSet))
-	for rel := range candidateSet {
-		candidatePaths = append(candidatePaths, rel)
-	}
-	pathScoped := len(candidateSet) > 0
-
 	// Run the existing-files load concurrently with the filesystem walk so
 	// the floor cost of a no-op repo-wide update is roughly max(loadMS, walkMS)
 	// instead of loadMS+walkMS. Workers block on `existingReady` before
@@ -396,7 +450,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			for task := range tasks {
 				prev, hasPrev := existing[task.rel]
-				res := processFileTask(ctxRun, task, prev, hasPrev, opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy, hashLookup)
+				res := processFileTask(ctxRun, task, prev, hasPrev, opts.Force, repoCfg.MaxFileSizeBytes, opts.Languages, repoCfg.ParseErrorPolicy, hashLookup, profilePlan.reparseLanguages)
 				select {
 				case results <- res:
 				case <-ctxRun.Done():
@@ -603,13 +657,21 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.FilesSkipped++
 		case "replace":
 			writeStart := time.Now()
+			// Stamped here and nowhere else: this is the only path that writes
+			// the file's graph, so it is the only moment at which the file
+			// actually reflects the current parser. A parse failure takes the
+			// `parse_failed` branch below and keeps its old provenance rather
+			// than claiming a conversion that did not happen.
+			replaceProfile := currentProfiles[res.task.language]
 			replaceBatch = append(replaceBatch, store.ReplaceFileGraphInput{
-				Path:        res.task.rel,
-				Language:    res.parsed.Language,
-				SizeBytes:   res.task.info.Size(),
-				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
-				ContentHash: res.hash,
-				Parsed:      res.parsed,
+				Path:            res.task.rel,
+				Language:        res.parsed.Language,
+				SizeBytes:       res.task.info.Size(),
+				MtimeUnixNS:     res.task.info.ModTime().UnixNano(),
+				ContentHash:     res.hash,
+				Parsed:          res.parsed,
+				ParserProfile:   replaceProfile.ID,
+				ParserCallEdges: replaceProfile.EmitsCallEdges,
 			})
 			changedPathSet[res.task.rel] = struct{}{}
 			for _, sym := range res.parsed.Symbols {
@@ -939,7 +1001,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	return summary, nil
 }
 
-func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFileMeta, hasPrev bool, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string, hashLookup func(rel string) (string, bool, error)) fileResult {
+func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFileMeta, hasPrev bool, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string, hashLookup func(rel string) (string, bool, error), reparseLanguages map[string]struct{}) fileResult {
 	result := fileResult{task: task}
 	started := time.Now()
 	defer func() {
@@ -958,6 +1020,16 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 			result.action = "skip_only"
 		}
 		return result
+	}
+	// A parser-profile change is a semantic input change: the bytes on disk mean
+	// something different to this binary than they did to the one that indexed
+	// them, so size/mtime/hash equality no longer proves the persisted graph is
+	// current. Scoped to the languages the plan actually flagged, so an
+	// unrelated language keeps its incremental fast paths.
+	if task.language != "" && len(reparseLanguages) > 0 {
+		if _, stale := reparseLanguages[task.language]; stale {
+			force = true
+		}
 	}
 	if hasPrev && !force && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano() {
 		result.action = "mark_seen"

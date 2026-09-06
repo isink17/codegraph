@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
@@ -491,4 +492,12 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 		b.WriteByte(ch)
 	}
 	return b.String(), state
+}
+
+// Profile identifies the heuristic fallback for this adapter's language. These
+// adapters extract symbols and imports from regular expressions and emit NO
+// call edges at all -- which is exactly why the indexer must refuse to replace
+// a call-capable graph with one of them. See parser.Profile.
+func (a *Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: "heuristic:" + a.language + ":v1", EmitsCallEdges: false}
 }

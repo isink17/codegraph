@@ -128,16 +128,20 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
-	RepoID                  int64                      `json:"repo_id"`
-	ScanID                  int64                      `json:"scan_id"`
-	Rebuild                 bool                       `json:"rebuild,omitempty"`
-	RemovedDBFiles          []string                   `json:"removed_db_files,omitempty"`
-	FilesSeen               int                        `json:"files_seen"`
-	FilesIndexed            int                        `json:"files_indexed"`
-	FilesSkipped            int                        `json:"files_skipped"`
-	FilesChanged            int                        `json:"files_changed"`
-	FilesDeleted            int                        `json:"files_deleted"`
-	FilesTotal              int                        `json:"files_total,omitempty"`
+	RepoID         int64    `json:"repo_id"`
+	ScanID         int64    `json:"scan_id"`
+	Rebuild        bool     `json:"rebuild,omitempty"`
+	RemovedDBFiles []string `json:"removed_db_files,omitempty"`
+	FilesSeen      int      `json:"files_seen"`
+	FilesIndexed   int      `json:"files_indexed"`
+	FilesSkipped   int      `json:"files_skipped"`
+	FilesChanged   int      `json:"files_changed"`
+	FilesDeleted   int      `json:"files_deleted"`
+	FilesTotal     int      `json:"files_total,omitempty"`
+	// ParserProfileLanguages are the languages this scan reconverged because
+	// their persisted parser profile differed from the running binary's. Empty
+	// on every scan of an already-current repository.
+	ParserProfileLanguages  []string                   `json:"parser_profile_languages,omitempty"`
 	FilesDeletedPct         float64                    `json:"files_deleted_pct,omitempty"`
 	ParseErrors             int                        `json:"parse_errors,omitempty"`
 	ParseSamples            []string                   `json:"parse_samples,omitempty"`
@@ -382,6 +386,13 @@ type ReplaceFileGraphInput struct {
 	MtimeUnixNS int64
 	ContentHash string
 	Parsed      graph.ParsedFile
+	// ParserProfile / ParserCallEdges stamp the file with the semantic identity
+	// of the adapter whose output is being written in this very statement. They
+	// are only ever written together with the graph they describe: no other
+	// metadata path (mark-seen, touch, parse-failed) touches these columns, so a
+	// file can never claim a provenance its rows do not have.
+	ParserProfile   string
+	ParserCallEdges bool
 }
 
 func Open(path string) (*Store, error) {
@@ -1860,8 +1871,8 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	}
 
 	upsertFileStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted)
-		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0)
+		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges)
+		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0, ?, ?)
 		ON CONFLICT(repo_id, path)
 		DO UPDATE SET
 			language = excluded.language,
@@ -1871,7 +1882,9 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			parse_state = 'indexed',
 			last_scan_id = excluded.last_scan_id,
 			indexed_at = excluded.indexed_at,
-			is_deleted = 0
+			is_deleted = 0,
+			parser_profile = excluded.parser_profile,
+			parser_call_edges = excluded.parser_call_edges
 		RETURNING id
 	`)
 	if err != nil {
@@ -1884,7 +1897,11 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	fileIDs := make([]int64, 0, len(inputs))
 	for _, input := range inputs {
 		var fileID int64
-		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now).Scan(&fileID); err != nil {
+		callEdges := 0
+		if input.ParserCallEdges {
+			callEdges = 1
+		}
+		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now, input.ParserProfile, callEdges).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
 			return result, err
 		}

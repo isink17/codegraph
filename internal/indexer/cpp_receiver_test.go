@@ -627,6 +627,15 @@ func TestCppThisReceiverStaysUnresolved(t *testing.T) {
 // P22.11 reparse there would delete a C++ call graph a cgo build had produced
 // rather than rebuild it. The mark must not fire, and the graph must survive an
 // ordinary update run.
+//
+// Since P22.29 the run does not merely decline the mark: parser-profile safety
+// refuses the scan outright, before BeginScan, because replacing tree-sitter
+// C++ evidence with symbols-only heuristic output is the destructive downgrade
+// that contract exists to stop. The property under test is unchanged -- the
+// C++ call graph must survive -- and it is now enforced one step earlier. The
+// P22.11 capability probe stays in place: it still gates the mark for the
+// cases parser profiles do not cover (a repository whose C++ files already
+// carry the current profile but predate the receiver fix).
 func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A { int size() { return 1; } };\nvoid caller(A* a) {\n    a->size();\n}\n")
@@ -640,7 +649,9 @@ func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
 	// still pending, then swap in the registry a non-cgo build would use.
 	clearCppUpgradeMarker(t, r.dbPath)
 	r.useRegistry(parser.NewRegistry(heuristicparser.NewCAndCpp()))
-	r.run("update")
+	if _, err := r.idx.Update(context.Background(), Options{RepoRoot: r.root}); !errors.Is(err, ErrParserDowngradeRefused) {
+		t.Fatalf("Update() error = %v, want ErrParserDowngradeRefused", err)
+	}
 	after := r.projection()
 	if strings.Join(after, "\n") != strings.Join(before, "\n") {
 		t.Fatalf("heuristic-adapter update changed the C++ call graph:\ngot:\n%s\nwant:\n%s",
