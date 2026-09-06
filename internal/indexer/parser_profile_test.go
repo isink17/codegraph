@@ -25,6 +25,9 @@ type profileAdapter struct {
 	// noProfile drops the ProfileProvider implementation's answer, standing in
 	// for an adapter that declares nothing.
 	noProfile bool
+	// emptyFn parses every file to an empty ParsedFile, standing in for a
+	// source file that is blank or holds nothing but comments.
+	emptyFn bool
 }
 
 func (a *profileAdapter) Language() string { return a.language }
@@ -45,6 +48,36 @@ func (a *profileAdapter) Profile() parser.Profile {
 func (a *profileAdapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	if strings.Contains(string(content), "PARSE_FAIL") {
 		return graph.ParsedFile{}, errors.New("synthetic parse failure")
+	}
+	// The zero-symbol shapes real adapters produce. `import "./bootstrap"`
+	// yields a raw import and a side-effect scope import; `export * from
+	// "./api"` yields only a namespace re-export -- not even a raw import --
+	// and neither declares a symbol. Verified against the production
+	// TypeScript and Python adapters, which parse exactly this way.
+	if strings.Contains(string(content), "IMPORT_ONLY") {
+		return graph.ParsedFile{
+			Language: a.language,
+			Imports:  []string{"./bootstrap"},
+			Scope: graph.ScopeEvidence{Imports: []graph.ScopeImport{{
+				SourceSpecifier: "./bootstrap",
+				Kind:            graph.ScopeImportSideEffect,
+			}}},
+		}, nil
+	}
+	if strings.Contains(string(content), "REEXPORT_ONLY") {
+		return graph.ParsedFile{
+			Language: a.language,
+			Scope: graph.ScopeEvidence{Imports: []graph.ScopeImport{{
+				SourceSpecifier: "./api",
+				Kind:            graph.ScopeImportNamespace,
+				Wildcard:        true,
+				ReExport:        true,
+				NamespaceExport: true,
+			}}},
+		}, nil
+	}
+	if a.emptyFn {
+		return graph.ParsedFile{Language: a.language}, nil
 	}
 	base := strings.TrimSuffix(filepath.Base(path), a.ext)
 	parsed := graph.ParsedFile{
@@ -656,7 +689,11 @@ func TestParserProfileFreshDegradedIndexIsAllowedAndHonest(t *testing.T) {
 // graphSnapshot is the byte-level evidence a refused scan must not change.
 type snapshot struct {
 	Files, Symbols, Edges, Refs, Imports, ScopeEvidence, TestLinks, Scans int
-	Provenance                                                            string
+	// ScopeImports and ModuleCandidates are the only evidence a zero-symbol
+	// re-export-only file has, so a snapshot that omitted them could not prove
+	// a refused transition left such a file untouched.
+	ScopeImports, ModuleCandidates int
+	Provenance                     string
 }
 
 func graphSnapshot(t *testing.T, s *profileStore) snapshot {
@@ -671,11 +708,14 @@ func graphSnapshot(t *testing.T, s *profileStore) snapshot {
 		       (SELECT COUNT(*) FROM file_scope_evidence),
 		       (SELECT COUNT(*) FROM test_links),
 		       (SELECT COUNT(*) FROM scans),
+		       (SELECT COUNT(*) FROM scope_import_evidence),
+		       (SELECT COUNT(*) FROM scope_module_candidate_evidence),
 		       (SELECT COALESCE(GROUP_CONCAT(path || '=' || parser_profile || ':' || parser_call_edges), '')
 		          FROM (SELECT path, parser_profile, parser_call_edges FROM files ORDER BY path))
 	`)
 	if err := row.Scan(&out.Files, &out.Symbols, &out.Edges, &out.Refs, &out.Imports,
-		&out.ScopeEvidence, &out.TestLinks, &out.Scans, &out.Provenance); err != nil {
+		&out.ScopeEvidence, &out.TestLinks, &out.Scans,
+		&out.ScopeImports, &out.ModuleCandidates, &out.Provenance); err != nil {
 		t.Fatalf("snapshot error = %v", err)
 	}
 	return out
@@ -712,5 +752,220 @@ func TestParserProfilePathScopedIgnoresUnparsedCandidates(t *testing.T) {
 	// A path the run WOULD parse still refuses.
 	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
 		t.Fatalf("err = %v, want ErrParserProfileTransitionRequired", err)
+	}
+}
+
+// evidenceCounts is the parser-owned footprint of one file, read straight from
+// the tables insertParsedFileGraph writes.
+type evidenceCounts struct {
+	Symbols      int
+	Imports      int
+	ScopeImports int
+}
+
+func evidenceFor(t *testing.T, s *profileStore, root, path string) evidenceCounts {
+	t.Helper()
+	id := repoID(t, s, root)
+	var got evidenceCounts
+	if err := s.raw(t).QueryRowContext(context.Background(), `
+		SELECT
+			(SELECT COUNT(*) FROM symbols WHERE file_id = f.id),
+			(SELECT COUNT(*) FROM file_imports WHERE file_id = f.id),
+			(SELECT COUNT(*) FROM scope_import_evidence WHERE repo_id = f.repo_id AND file_id = f.id)
+		FROM files f WHERE f.repo_id = ? AND f.path = ?
+	`, id, path).Scan(&got.Symbols, &got.Imports, &got.ScopeImports); err != nil {
+		t.Fatalf("evidence for %s error = %v", path, err)
+	}
+	return got
+}
+
+// A file can declare zero symbols and still own parser evidence a reparse would
+// rewrite: `import "./bootstrap"` persists a raw import and a side-effect scope
+// import, and `export * from "./api"` persists a namespace re-export and no raw
+// import at all. Before P22.29-F1 the provenance population was a bare EXISTS
+// over `symbols`, so a repository made only of such files reported NO
+// provenance -- and every transition rule downstream of that answer, refusal
+// included, silently did not apply to them.
+func TestParserProfileEvidenceOnlyFilesPinProvenance(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "bootstrap.ts"), "IMPORT_ONLY\n")
+	writeProfileFile(t, filepath.Join(root, "reexport.ts"), "REEXPORT_ONLY\n")
+	s := newProfileStore(t)
+
+	degraded := New(s.Store, parser.NewRegistry(symbolsOnly("typescript", ".ts", "heuristic:typescript:v1")), nil)
+	if _, err := degraded.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Both files are genuinely symbol-free and genuinely evidence-bearing.
+	if got := evidenceFor(t, s, root, "bootstrap.ts"); got != (evidenceCounts{Imports: 1, ScopeImports: 1}) {
+		t.Fatalf("import-only evidence = %#v, want zero symbols with import evidence", got)
+	}
+	if got := evidenceFor(t, s, root, "reexport.ts"); got != (evidenceCounts{ScopeImports: 1}) {
+		t.Fatalf("re-export-only evidence = %#v, want zero symbols and zero raw imports", got)
+	}
+
+	groups := profilesInDB(t, s, repoID(t, s, root))
+	if len(groups) != 1 || groups[0].Profile != "heuristic:typescript:v1" || groups[0].Files != 2 || groups[0].CallEdges {
+		t.Fatalf("groups = %#v, want both evidence-only files under the call-less profile", groups)
+	}
+
+	upgraded := New(s.Store, parser.NewRegistry(callCapable("typescript", ".ts", "treesitter:typescript:v1")), nil)
+
+	// A path-scoped scan cannot converge a language, so it must refuse rather
+	// than rewrite one evidence-only file under the new parser.
+	before := graphSnapshot(t, s)
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"bootstrap.ts"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
+		t.Fatalf("path-scoped err = %v, want ErrParserProfileTransitionRequired", err)
+	}
+	if after := graphSnapshot(t, s); before != after {
+		t.Fatalf("path-scoped refusal mutated the graph:\nbefore %#v\nafter  %#v", before, after)
+	}
+
+	// A full run converges them and stamps the current profile.
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("full Update() error = %v", err)
+	}
+	if summary.FilesChanged != 2 {
+		t.Fatalf("FilesChanged = %d, want 2 (both evidence-only files reparsed)", summary.FilesChanged)
+	}
+	groups = profilesInDB(t, s, repoID(t, s, root))
+	if len(groups) != 1 || groups[0].Profile != "treesitter:typescript:v1" || groups[0].Files != 2 || !groups[0].CallEdges {
+		t.Fatalf("groups = %#v, want both files stamped call-capable", groups)
+	}
+
+	// And the converged provenance now protects them from the reverse move.
+	if _, err := degraded.Update(ctx, Options{RepoRoot: root}); !errors.Is(err, ErrParserDowngradeRefused) {
+		t.Fatalf("downgrade err = %v, want ErrParserDowngradeRefused", err)
+	}
+}
+
+// Legacy rows carry no profile at all, and an evidence-only file is no more
+// exempt from that than a symbol-bearing one: UNKNOWN provenance converges
+// under a call-capable parser and fails closed under a call-less one.
+func TestParserProfileEvidenceOnlyUnknownProvenance(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "reexport.ts"), "REEXPORT_ONLY\n")
+	s := newProfileStore(t)
+
+	capable := New(s.Store, parser.NewRegistry(callCapable("typescript", ".ts", "treesitter:typescript:v1")), nil)
+	if _, err := capable.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	// Rewind to what migration 036 leaves behind for a pre-036 database.
+	if _, err := s.raw(t).ExecContext(ctx,
+		`UPDATE files SET parser_profile = '', parser_call_edges = 0`); err != nil {
+		t.Fatalf("clear provenance: %v", err)
+	}
+
+	groups := profilesInDB(t, s, repoID(t, s, root))
+	if len(groups) != 1 || groups[0].Profile != "" || groups[0].Files != 1 || groups[0].CallEdges {
+		t.Fatalf("groups = %#v, want the evidence-only file reported as UNKNOWN, not ignored", groups)
+	}
+
+	degraded := New(s.Store, parser.NewRegistry(symbolsOnly("typescript", ".ts", "heuristic:typescript:v1")), nil)
+	if _, err := degraded.Update(ctx, Options{RepoRoot: root}); !errors.Is(err, ErrParserDowngradeRefused) {
+		t.Fatalf("call-less err = %v, want ErrParserDowngradeRefused on unknown provenance", err)
+	}
+	if _, err := capable.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("call-capable convergence err = %v, want nil", err)
+	}
+	groups = profilesInDB(t, s, repoID(t, s, root))
+	if len(groups) != 1 || groups[0].Profile != "treesitter:typescript:v1" || !groups[0].CallEdges {
+		t.Fatalf("groups = %#v, want the evidence-only file stamped call-capable", groups)
+	}
+}
+
+// A comments-only or empty source file owns no parser evidence at all, so it
+// must NOT pin its language forever. This is the boundary the wider predicate
+// must not cross: nothing a reparse could change was ever persisted.
+func TestParserProfileEvidencelessFilesDoNotPinProvenance(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "empty.ts"), "")
+	writeProfileFile(t, filepath.Join(root, "comments.ts"), "EMPTY_PARSE\n")
+	s := newProfileStore(t)
+
+	empty := &profileAdapter{
+		language: "typescript", ext: ".ts",
+		profile: parser.Profile{ID: "treesitter:typescript:v1", EmitsCallEdges: true},
+		emptyFn: true,
+	}
+	capable := New(s.Store, parser.NewRegistry(empty), nil)
+	if _, err := capable.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	if got := evidenceFor(t, s, root, "comments.ts"); got != (evidenceCounts{}) {
+		t.Fatalf("comments-only evidence = %#v, want none", got)
+	}
+	if groups := profilesInDB(t, s, repoID(t, s, root)); len(groups) != 0 {
+		t.Fatalf("groups = %#v, want no provenance from files that declare nothing", groups)
+	}
+
+	// With nothing pinned, a call-less parser is free to take over.
+	degraded := New(s.Store, parser.NewRegistry(symbolsOnly("typescript", ".ts", "heuristic:typescript:v1")), nil)
+	if _, err := degraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("Update() error = %v, want nil for an evidence-free repository", err)
+	}
+}
+
+// Same rule, on a file whose last-good graph is evidence only. A failed reparse
+// leaves the previous parser's imports and re-exports in place, so the file
+// still belongs to the profile that wrote them and the language is still mixed
+// -- provenance follows the surviving evidence, never `parse_state`.
+func TestParserProfileParseFailureKeepsEvidenceOnlyProvenance(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "bootstrap.ts"), "IMPORT_ONLY\n")
+	writeProfileFile(t, filepath.Join(root, "reexport.ts"), "REEXPORT_ONLY\n")
+	if err := os.MkdirAll(filepath.Join(root, ".codegraph"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	writeProfileFile(t, filepath.Join(root, ".codegraph", "config.json"), `{"parse_error_policy":"best_effort"}`)
+	s := newProfileStore(t)
+
+	old := New(s.Store, parser.NewRegistry(symbolsOnly("typescript", ".ts", "heuristic:typescript:v1")), nil)
+	if _, err := old.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	writeProfileFile(t, filepath.Join(root, "reexport.ts"), "PARSE_FAIL\n")
+	upgraded := New(s.Store, parser.NewRegistry(callCapable("typescript", ".ts", "treesitter:typescript:v1")), nil)
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	// The last-good re-export row survived, and still belongs to the parser
+	// that wrote it.
+	if got := evidenceFor(t, s, root, "reexport.ts"); got != (evidenceCounts{ScopeImports: 1}) {
+		t.Fatalf("last-good evidence = %#v, want the previous parser's re-export intact", got)
+	}
+	var stamped string
+	if err := s.raw(t).QueryRowContext(ctx,
+		`SELECT parser_profile FROM files WHERE path = 'reexport.ts'`).Scan(&stamped); err != nil {
+		t.Fatalf("scan error = %v", err)
+	}
+	if stamped != "heuristic:typescript:v1" {
+		t.Fatalf("failed file parser_profile = %q, want the profile that actually wrote its graph", stamped)
+	}
+
+	groups := profilesInDB(t, s, repoID(t, s, root))
+	if len(groups) != 2 {
+		t.Fatalf("groups = %#v, want both profiles while convergence is incomplete", groups)
+	}
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"bootstrap.ts"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
+		t.Fatalf("path-scoped err = %v, want ErrParserProfileTransitionRequired", err)
+	}
+
+	writeProfileFile(t, filepath.Join(root, "reexport.ts"), "REEXPORT_ONLY\n")
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("converging Update() error = %v", err)
+	}
+	groups = profilesInDB(t, s, repoID(t, s, root))
+	if len(groups) != 1 || groups[0].Profile != "treesitter:typescript:v1" {
+		t.Fatalf("groups = %#v, want a single converged profile", groups)
 	}
 }

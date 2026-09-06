@@ -19,7 +19,14 @@ package parser
 //
 //   - call extraction changes (new, removed, or differently spelled call edges)
 //   - symbol identity or extraction changes (names, qualified names, kinds)
-//   - import or scope evidence changes
+//   - import, re-export or scope evidence changes
+//   - any other parser-owned primary semantic evidence
+//
+// That last clause is not filler. The set of persisted facts a profile covers
+// is exactly store.FileParserOwnedEvidencePredicate, which is wider than
+// "symbols and calls": a file whose whole content is `export * from "./api"`
+// declares no symbol and no import, only a re-export row, and it is still a
+// persisted fact a different adapter would write differently.
 //
 // Do NOT bump for changes that cannot alter persisted output:
 //

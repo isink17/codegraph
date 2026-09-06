@@ -200,10 +200,12 @@ type repoParserProfileGroup struct {
 	store.FileParserProfileGroup
 }
 
-// queryParserProfileGroups mirrors store.FileParserProfileGroups, including its
-// "has persisted graph evidence" population, over a read-only handle. Doctor
-// never opens the store proper, because it must be able to inspect a database
-// it will not migrate.
+// queryParserProfileGroups mirrors store.FileParserProfileGroups over a
+// read-only handle, sharing its population predicate verbatim rather than
+// restating it -- a doctor that disagreed with the indexer about which files
+// are pinned would report a repository as converged while the indexer refuses
+// to touch it. Doctor never opens the store proper, because it must be able to
+// inspect a database it will not migrate.
 func queryParserProfileGroups(ctx context.Context, dbPath string) ([]repoParserProfileGroup, error) {
 	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, true)
 	if err != nil {
@@ -218,7 +220,7 @@ func queryParserProfileGroups(ctx context.Context, dbPath string) ([]repoParserP
 		SELECT f.repo_id, f.language, f.parser_profile, f.parser_call_edges, COUNT(*)
 		FROM files f
 		WHERE f.is_deleted = 0
-		  AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_id = f.id)
+		  AND `+store.FileParserOwnedEvidencePredicate+`
 		GROUP BY f.repo_id, f.language, f.parser_profile, f.parser_call_edges
 	`)
 	if err != nil {
