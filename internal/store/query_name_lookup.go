@@ -741,8 +741,20 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 		langColumn = ""
 	}
 	out := map[string][]symbolIDLang{}
-	for start := 0; start < len(names); start += nameLookupChunk {
-		end := min(start+nameLookupChunk, len(names))
+	// On the qualified-name column a global-scope C++ spelling makes the
+	// statement name each chunk three times -- once in the SELECT CASE and
+	// twice in the WHERE clause -- on top of the repo id and one parameter per
+	// language. Every other column binds each name once.
+	perName := 1
+	if column == "qualified_name" {
+		perName = 3
+	}
+	chunkSize := min(nameLookupChunk, sqliteBatchSize(1+len(languages), perName))
+	if chunkSize <= 0 {
+		return nil, errSQLiteBatchImpossible
+	}
+	for start := 0; start < len(names); start += chunkSize {
+		end := min(start+chunkSize, len(names))
 		chunk := names[start:end]
 		hasGlobal := false
 		for _, name := range chunk {
@@ -751,15 +763,20 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 				break
 			}
 		}
-		args := make([]any, 0, len(chunk)*2+len(languages)+1)
+		globalCase := column == "qualified_name" && hasGlobal
+		args := make([]any, 0, len(chunk)*3+len(languages)+1)
+		// The CASE list lives in the SELECT clause, so it binds before the repo
+		// id in the WHERE clause.
+		if globalCase {
+			for _, name := range chunk {
+				args = append(args, name)
+			}
+		}
 		args = append(args, repoID)
 		for _, name := range chunk {
 			args = append(args, name)
 		}
-		if column == "qualified_name" && hasGlobal {
-			for _, name := range chunk {
-				args = append(args, name)
-			}
+		if globalCase {
 			for _, name := range chunk {
 				args = append(args, name)
 			}
@@ -773,7 +790,7 @@ func (s *Store) symbolIDsByColumn(ctx context.Context, repoID int64, column stri
 		}
 		keyExpr := `s.` + column
 		match := `s.` + column + ` IN (` + strings.TrimRight(strings.Repeat("?,", len(chunk)), ",") + `)`
-		if column == "qualified_name" && hasGlobal {
+		if globalCase {
 			keyExpr = `CASE WHEN '::' || s.qualified_name IN (` + strings.TrimRight(strings.Repeat("?,", len(chunk)), ",") + `) THEN '::' || s.qualified_name ELSE s.qualified_name END`
 			match = `(` + match + ` OR ('::' || s.qualified_name IN (` + strings.TrimRight(strings.Repeat("?,", len(chunk)), ",") + `) AND s.language = 'cpp' AND instr(s.qualified_name, '::') = 0))`
 		}

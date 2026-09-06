@@ -1959,8 +1959,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	}
 
 	execInChunks := func(sqlPrefix, sqlSuffix string, ids []int64, leadingArgs ...any) error {
-		for start := 0; start < len(ids); start += sqliteInClauseBatchSize {
-			end := start + sqliteInClauseBatchSize
+		idBatch := sqliteBatchSize(len(leadingArgs), 1)
+		for start := 0; start < len(ids); start += idBatch {
+			end := start + idBatch
 			if end > len(ids) {
 				end = len(ids)
 			}
@@ -2706,6 +2707,21 @@ func execBatchInsert(ctx context.Context, tx *sql.Tx, table, columns string, row
 	if len(args)%rowsPerBatch != 0 {
 		return fmt.Errorf("invalid %s insert args len=%d (expected multiple of %d)", table, len(args), rowsPerBatch)
 	}
+	// A caller may hand over more rows than one statement can bind: the batch
+	// row constants above are per-table, and several evidence writers reuse one
+	// constant for a wider row. Split here so no statement ever exceeds the
+	// portable parameter limit, whatever the caller accumulated.
+	if maxRows := sqliteDefaultMaxVariables / rowsPerBatch; maxRows == 0 {
+		return fmt.Errorf("invalid %s insert: a single row binds %d parameters, over the %d limit", table, rowsPerBatch, sqliteDefaultMaxVariables)
+	} else if len(args)/rowsPerBatch > maxRows {
+		for start := 0; start < len(args); start += maxRows * rowsPerBatch {
+			end := min(start+maxRows*rowsPerBatch, len(args))
+			if err := execBatchInsert(ctx, tx, table, columns, rowsPerBatch, args[start:end], stats); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	rowCount := len(args) / rowsPerBatch
 	key := insertSQLKey{table: table, columns: columns, width: rowsPerBatch, rows: rowCount}
 	queryAny, ok := insertSQLCache.Load(key)
@@ -3002,10 +3018,13 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 		return nil, nil
 	}
 	names := map[string]struct{}{}
-	for start := 0; start < len(paths); start += sqliteInClauseBatchSize {
-		end := min(start+sqliteInClauseBatchSize, len(paths))
+	// The statement names the chunk twice and binds the repo id twice, so each
+	// path costs two parameters on top of two fixed ones.
+	pathBatch := sqliteBatchSize(2, 2)
+	for start := 0; start < len(paths); start += pathBatch {
+		end := min(start+pathBatch, len(paths))
 		chunk := paths[start:end]
-		args := make([]any, 0, len(chunk)+1)
+		args := make([]any, 0, 2*len(chunk)+2)
 		args = append(args, repoID)
 		for _, path := range chunk {
 			args = append(args, path)
@@ -4519,50 +4538,36 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	// name is unique: a bound caller can lose its only header proof after a
 	// declaration is removed or renamed. Reconsider such edges on every OLD ∪
 	// NEW name, while retaining the contested-name fast path for other languages.
-	cppArgs := make([]any, 1, len(unique)+1)
-	cppArgs[0] = repoID
-	for _, name := range unique {
-		cppArgs = append(cppArgs, name)
-	}
-	cppRows, err := s.db.QueryContext(ctx, `
+	cppNames := map[string]struct{}{}
+	if err := sqliteBatchedQuery(ctx, s.db, `
 		SELECT DISTINCT e.dst_name
 		FROM edges e JOIN files f ON f.id = e.file_id
-		WHERE e.repo_id = ? AND f.language = 'cpp' AND e.dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(unique)), ",")+`)`, cppArgs...)
-	if err != nil {
-		return 0, err
-	}
-	cppNames := map[string]struct{}{}
-	for cppRows.Next() {
-		var name string
-		if err := cppRows.Scan(&name); err != nil {
-			cppRows.Close()
-			return 0, err
-		}
-		cppNames[name] = struct{}{}
-	}
-	if err := cppRows.Err(); err != nil {
-		cppRows.Close()
-		return 0, err
-	}
-	if err := cppRows.Close(); err != nil {
+		WHERE e.repo_id = ? AND f.language = 'cpp'`, ` AND e.dst_name IN (%s)`,
+		[]any{repoID}, stringSliceToAny(unique), true,
+		func(rows *sql.Rows) error {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			cppNames[name] = struct{}{}
+			return nil
+		}); err != nil {
 		return 0, err
 	}
 	legacyStale := map[int64]struct{}{}
-	legacyArgs := make([]any, 0, len(unique)+1)
-	legacyArgs = append(legacyArgs, repoID)
-	for _, name := range unique {
-		legacyArgs = append(legacyArgs, name)
-	}
-	legacyRows, err := s.db.QueryContext(ctx, `
+	if err := sqliteBatchedQuery(ctx, s.db, `
 		SELECT id FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
-		AND resolution_strategy IN ('receiver_method', 'slash_suffix')
-		  AND dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(unique)), ",")+
-		`)`, legacyArgs...)
-	if err != nil {
-		return 0, err
-	}
-	if err := scanEdgeIDsInto(legacyRows, legacyStale); err != nil {
+		AND resolution_strategy IN ('receiver_method', 'slash_suffix')`, ` AND dst_name IN (%s)`,
+		[]any{repoID}, stringSliceToAny(unique), true,
+		func(rows *sql.Rows) error {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			legacyStale[id] = struct{}{}
+			return nil
+		}); err != nil {
 		return 0, err
 	}
 	allNames := append([]string(nil), unique...)
@@ -4590,8 +4595,9 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	for id := range legacyStale {
 		stale[id] = struct{}{}
 	}
-	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
-		end := min(start+sqliteInClauseBatchSize, len(unique))
+	nameBatch := sqliteBatchSize(1, 1)
+	for start := 0; start < len(unique); start += nameBatch {
+		end := min(start+nameBatch, len(unique))
 		chunk := unique[start:end]
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -4684,8 +4690,9 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 // later statement text is a function of its own argument and not of row order.
 func (s *Store) namesWithSeveralDeclarations(ctx context.Context, repoID int64, names []string) ([]string, error) {
 	contested := make(map[string]struct{}, len(names))
-	for start := 0; start < len(names); start += sqliteInClauseBatchSize {
-		end := min(start+sqliteInClauseBatchSize, len(names))
+	nameBatch := sqliteBatchSize(1, 1)
+	for start := 0; start < len(names); start += nameBatch {
+		end := min(start+nameBatch, len(names))
 		chunk := names[start:end]
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
@@ -4782,8 +4789,9 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	// Source language per file is read once here (no per-edge lookup) and carried
 	// into resolveEdgeTargets, which applies the shared language gate.
 	languageByFileID := make(map[int64]string, len(uniquePaths))
-	for start := 0; start < len(storedPaths); start += sqliteInClauseBatchSize {
-		end := min(start+sqliteInClauseBatchSize, len(storedPaths))
+	pathBatch := sqliteBatchSize(1, 1)
+	for start := 0; start < len(storedPaths); start += pathBatch {
+		end := min(start+pathBatch, len(storedPaths))
 		chunk := storedPaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `SELECT id, path, language FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
@@ -4952,9 +4960,14 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	targetByID := make(map[int64]edgeTarget, 64)
 
 	exactStarted := time.Now()
-	// Keep under sqliteDefaultMaxVariables (repoID + N names).
-	for start := 0; start < len(unique); start += sqliteInClauseBatchSize {
-		end := min(start+sqliteInClauseBatchSize, len(unique))
+	// The Rust crate-root filter binds three parameters per root on top of the
+	// repo id, so the name batch takes what those leave.
+	exactNameBatch := sqliteBatchSize(1+len(rustFilterArgs), 1)
+	if exactNameBatch <= 0 {
+		return stats, errSQLiteBatchImpossible
+	}
+	for start := 0; start < len(unique); start += exactNameBatch {
+		end := min(start+exactNameBatch, len(unique))
 		chunk := unique[start:end]
 
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
@@ -5343,24 +5356,17 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		javaFiles[target.srcFileID] = struct{}{}
 	}
 	if len(javaFiles) > 0 {
-		ids := make([]string, 0, len(javaFiles))
-		for id := range javaFiles {
-			ids = append(ids, strconv.FormatInt(id, 10))
-		}
-		rows, err := s.db.QueryContext(ctx, `SELECT file_id FROM file_scope_evidence WHERE repo_id=? AND file_id IN (`+strings.Join(ids, ",")+`)`, repoID)
-		if err != nil {
-			return outcome, err
-		}
 		seenFiles := map[int64]struct{}{}
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return outcome, err
-			}
-			seenFiles[id] = struct{}{}
-		}
-		if err := rows.Close(); err != nil {
+		if err := sqliteBatchedIDQuery(ctx, s.db, sortedIDs(javaFiles),
+			`SELECT file_id FROM file_scope_evidence WHERE repo_id=? AND file_id IN (`,
+			[]any{repoID}, func(scan func(...any) error) error {
+				var id int64
+				if err := scan(&id); err != nil {
+					return err
+				}
+				seenFiles[id] = struct{}{}
+				return nil
+			}); err != nil {
 			return outcome, err
 		}
 		for _, target := range targets {
@@ -5395,24 +5401,17 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 	}
 	if len(kotlinFiles) > 0 {
-		ids := make([]string, 0, len(kotlinFiles))
-		for id := range kotlinFiles {
-			ids = append(ids, strconv.FormatInt(id, 10))
-		}
-		rows, err := s.db.QueryContext(ctx, `SELECT file_id FROM file_scope_evidence WHERE repo_id=? AND language='kotlin' AND file_id IN (`+strings.Join(ids, ",")+`)`, repoID)
-		if err != nil {
-			return outcome, err
-		}
 		seenKotlinFiles := map[int64]struct{}{}
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return outcome, err
-			}
-			seenKotlinFiles[id] = struct{}{}
-		}
-		if err := rows.Close(); err != nil {
+		if err := sqliteBatchedIDQuery(ctx, s.db, sortedIDs(kotlinFiles),
+			`SELECT file_id FROM file_scope_evidence WHERE repo_id=? AND language='kotlin' AND file_id IN (`,
+			[]any{repoID}, func(scan func(...any) error) error {
+				var id int64
+				if err := scan(&id); err != nil {
+					return err
+				}
+				seenKotlinFiles[id] = struct{}{}
+				return nil
+			}); err != nil {
 			return outcome, err
 		}
 		for _, target := range targets {
@@ -6287,31 +6286,21 @@ func resolveSymbolsByStableKeysQuery(ctx context.Context, q queryContexter, repo
 	if len(stableKeys) == 0 {
 		return out, nil
 	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(stableKeys)), ",")
-	query := `
+	err := sqliteBatchedQuery(ctx, q, `
 		SELECT stable_key, id
 		FROM symbols
-		WHERE repo_id = ? AND stable_key IN (` + placeholders + `)
-	`
-	args := make([]any, 0, len(stableKeys)+1)
-	args = append(args, repoID)
-	for _, key := range stableKeys {
-		args = append(args, key)
-	}
-	rows, err := q.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var key string
-		var id int64
-		if err := rows.Scan(&key, &id); err != nil {
-			return nil, err
-		}
-		out[key] = id
-	}
-	return out, rows.Err()
+		WHERE repo_id = ?`, ` AND stable_key IN (%s)`,
+		[]any{repoID}, stringSliceToAny(stableKeys), true,
+		func(rows *sql.Rows) error {
+			var key string
+			var id int64
+			if err := rows.Scan(&key, &id); err != nil {
+				return err
+			}
+			out[key] = id
+			return nil
+		})
+	return out, err
 }
 
 func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {

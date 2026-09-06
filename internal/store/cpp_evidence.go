@@ -112,45 +112,49 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(names)), ",")
-	args := make([]any, 1+2*len(names))
-	args[0] = repoID
-	for i, name := range names {
-		args[i+1] = name
-		args[i+1+len(names)] = name
-	}
-	rows, err := q.QueryContext(ctx, `
-		SELECT id, file_id, kind, name, qualified_name, signature, visibility
-		FROM symbols
-		WHERE repo_id = ? AND language = 'cpp'
-		  AND (name IN (`+placeholders+`) OR qualified_name IN (`+placeholders+`))`, args...)
-	if err != nil {
-		return 0, err
-	}
 	var candidates []cppEvidenceCandidate
 	declarations := map[string][]int64{}
 	declarationSignatures := map[string]map[string]struct{}{}
-	for rows.Next() {
-		var c cppEvidenceCandidate
-		if err := rows.Scan(&c.id, &c.fileID, &c.kind, &c.name, &c.qualified, &c.signature, &c.visibility); err != nil {
+	// A symbol may match on `name` in one chunk and on `qualified_name` in
+	// another, so the row can come back from more than one batch.
+	scanned := map[int64]struct{}{}
+	// Each name is named twice by the statement, so it costs two parameters.
+	for _, chunk := range chunkStrings(names, sqliteBatchSize(1, 2)) {
+		args := make([]any, 1+2*len(chunk))
+		args[0] = repoID
+		for i, name := range chunk {
+			args[i+1] = name
+			args[i+1+len(chunk)] = name
+		}
+		placeholders := sqlitePlaceholders(len(chunk))
+		if err := sqliteScanRows(ctx, q, `
+		SELECT id, file_id, kind, name, qualified_name, signature, visibility
+		FROM symbols
+		WHERE repo_id = ? AND language = 'cpp'
+		  AND (name IN (`+placeholders+`) OR qualified_name IN (`+placeholders+`))`, args,
+			func(rows *sql.Rows) error {
+				var c cppEvidenceCandidate
+				if err := rows.Scan(&c.id, &c.fileID, &c.kind, &c.name, &c.qualified, &c.signature, &c.visibility); err != nil {
+					return err
+				}
+				if _, dup := scanned[c.id]; dup {
+					return nil
+				}
+				scanned[c.id] = struct{}{}
+				if c.kind == "declaration" {
+					key := cppEvidenceKey(c.qualified, c.signature)
+					declarations[key] = append(declarations[key], c.fileID)
+					if declarationSignatures[c.qualified] == nil {
+						declarationSignatures[c.qualified] = map[string]struct{}{}
+					}
+					declarationSignatures[c.qualified][c.signature] = struct{}{}
+					return nil
+				}
+				candidates = append(candidates, c)
+				return nil
+			}); err != nil {
 			return 0, err
 		}
-		if c.kind == "declaration" {
-			key := cppEvidenceKey(c.qualified, c.signature)
-			declarations[key] = append(declarations[key], c.fileID)
-			if declarationSignatures[c.qualified] == nil {
-				declarationSignatures[c.qualified] = map[string]struct{}{}
-			}
-			declarationSignatures[c.qualified][c.signature] = struct{}{}
-			continue
-		}
-		candidates = append(candidates, c)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	if err := rows.Close(); err != nil {
-		return 0, err
 	}
 	// Out-of-line definitions keep their qualified declarator in `name`
 	// (`A::foo`), while the header declaration has the callable tail (`foo`).
@@ -166,41 +170,28 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 			qualifiedNames = append(qualifiedNames, qualified)
 		}
 		sort.Strings(qualifiedNames)
-		qualifiedPlaceholders := strings.TrimRight(strings.Repeat("?,", len(qualifiedNames)), ",")
-		qualifiedArgs := make([]any, 1, len(qualifiedNames)+1)
-		qualifiedArgs[0] = repoID
-		for _, qualified := range qualifiedNames {
-			qualifiedArgs = append(qualifiedArgs, qualified)
-		}
-		rows, err := q.QueryContext(ctx, `
-			SELECT id, file_id, kind, name, qualified_name, signature, visibility
-			FROM symbols
-			WHERE repo_id = ? AND language = 'cpp' AND qualified_name IN (`+qualifiedPlaceholders+`)`, qualifiedArgs...)
-		if err != nil {
-			return 0, err
-		}
 		seen := make(map[int64]struct{}, len(candidates))
 		for _, candidate := range candidates {
 			seen[candidate.id] = struct{}{}
 		}
-		for rows.Next() {
-			var candidate cppEvidenceCandidate
-			if err := rows.Scan(&candidate.id, &candidate.fileID, &candidate.kind, &candidate.name, &candidate.qualified, &candidate.signature, &candidate.visibility); err != nil {
-				rows.Close()
-				return 0, err
-			}
-			if candidate.kind == "declaration" {
-				continue
-			}
-			if _, ok := seen[candidate.id]; !ok {
-				candidates = append(candidates, candidate)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		if err := rows.Close(); err != nil {
+		if err := sqliteBatchedQuery(ctx, q, `
+			SELECT id, file_id, kind, name, qualified_name, signature, visibility
+			FROM symbols
+			WHERE repo_id = ? AND language = 'cpp'`, ` AND qualified_name IN (%s)`,
+			[]any{repoID}, stringSliceToAny(qualifiedNames), true,
+			func(rows *sql.Rows) error {
+				var candidate cppEvidenceCandidate
+				if err := rows.Scan(&candidate.id, &candidate.fileID, &candidate.kind, &candidate.name, &candidate.qualified, &candidate.signature, &candidate.visibility); err != nil {
+					return err
+				}
+				if candidate.kind == "declaration" {
+					return nil
+				}
+				if _, ok := seen[candidate.id]; !ok {
+					candidates = append(candidates, candidate)
+				}
+				return nil
+			}); err != nil {
 			return 0, err
 		}
 	}
@@ -383,22 +374,12 @@ func augmentCppOutOfLineScopes(ctx context.Context, q queryContexter, repoID int
 	for _, edge := range edges {
 		edgeIDs = append(edgeIDs, edge.edgeID)
 	}
-	if len(edgeIDs) > 0 {
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(edgeIDs)), ",")
-		args := make([]any, 1, len(edgeIDs)+1)
-		args[0] = repoID
-		for _, id := range edgeIDs {
-			args = append(args, id)
-		}
-		rows, err := q.QueryContext(ctx, `SELECT e.id, s.file_id, s.qualified_name FROM edges e JOIN symbols s ON s.id = e.src_symbol_id WHERE e.repo_id = ? AND e.id IN (`+placeholders+`)`, args...)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
+	if err := sqliteBatchedIDQuery(ctx, q, edgeIDs,
+		`SELECT e.id, s.file_id, s.qualified_name FROM edges e JOIN symbols s ON s.id = e.src_symbol_id WHERE e.repo_id = ? AND e.id IN (`,
+		[]any{repoID}, func(scan func(...any) error) error {
 			var id, fileID int64
 			var name string
-			if err := rows.Scan(&id, &fileID, &name); err != nil {
-				rows.Close()
+			if err := scan(&id, &fileID, &name); err != nil {
 				return err
 			}
 			edgeSources[id] = struct {
@@ -408,14 +389,9 @@ func augmentCppOutOfLineScopes(ctx context.Context, q queryContexter, repoID int
 			if prefix := cppOwnerPrefix(name); prefix != "" {
 				prefixes[prefix] = struct{}{}
 			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
+			return nil
+		}); err != nil {
+		return err
 	}
 	if len(prefixes) == 0 {
 		return nil
@@ -425,41 +401,41 @@ func augmentCppOutOfLineScopes(ctx context.Context, q queryContexter, repoID int
 		keys = append(keys, prefix)
 	}
 	sort.Strings(keys)
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(keys)), ",")
-	args := make([]any, 1, len(keys)+1)
-	args[0] = repoID
-	for _, key := range keys {
-		args = append(args, key)
-	}
-	rows, err := q.QueryContext(ctx, `SELECT id, file_id, name, qualified_name FROM symbols WHERE repo_id = ? AND kind IN ('class','struct','union') AND (name IN (`+placeholders+`) OR qualified_name IN (`+placeholders+`))`, append(args, func() []any {
-		out := make([]any, len(keys))
-		for i, key := range keys {
-			out[i] = key
-		}
-		return out
-	}()...)...)
-	if err != nil {
-		return err
-	}
 	type classRow struct {
 		id, fileID      int64
 		name, qualified string
 	}
 	var classes []classRow
-	for rows.Next() {
-		var c classRow
-		if err := rows.Scan(&c.id, &c.fileID, &c.name, &c.qualified); err != nil {
-			rows.Close()
+	// As above, one class can match on `name` in one batch and on
+	// `qualified_name` in another; `choose` reads a second copy as ambiguity.
+	scannedClasses := map[int64]struct{}{}
+	// Each key is named twice by the statement, so it costs two parameters.
+	for _, chunk := range chunkStrings(keys, sqliteBatchSize(1, 2)) {
+		args := make([]any, 1, 1+2*len(chunk))
+		args[0] = repoID
+		for _, key := range chunk {
+			args = append(args, key)
+		}
+		for _, key := range chunk {
+			args = append(args, key)
+		}
+		placeholders := sqlitePlaceholders(len(chunk))
+		if err := sqliteScanRows(ctx, q,
+			`SELECT id, file_id, name, qualified_name FROM symbols WHERE repo_id = ? AND kind IN ('class','struct','union') AND (name IN (`+placeholders+`) OR qualified_name IN (`+placeholders+`))`,
+			args, func(rows *sql.Rows) error {
+				var c classRow
+				if err := rows.Scan(&c.id, &c.fileID, &c.name, &c.qualified); err != nil {
+					return err
+				}
+				if _, dup := scannedClasses[c.id]; dup {
+					return nil
+				}
+				scannedClasses[c.id] = struct{}{}
+				classes = append(classes, c)
+				return nil
+			}); err != nil {
 			return err
 		}
-		classes = append(classes, c)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
 	}
 	choose := func(fileID int64, prefix string) (classRow, bool) {
 		var found classRow

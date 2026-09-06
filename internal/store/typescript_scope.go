@@ -13,75 +13,7 @@ const (
 	tsScopeVeto       = "tmp_typescript_scope_veto"
 	tsScopeResolution = "tmp_typescript_scope_resolution"
 	tsScopeStrategy   = "typescript_module_scope"
-
-	// tsScopeResolutionBatchSize caps the multi-row resolution INSERT. Each row
-	// binds two parameters, so rows*2 stays under sqliteDefaultMaxVariables.
-	tsScopeResolutionBatchSize = sqliteInClauseBatchSize / 2
-
-	// tsScopeVetoBatchSize caps the multi-row veto INSERT, which binds one
-	// parameter per row and carries no fixed parameters.
-	tsScopeVetoBatchSize = sqliteInClauseBatchSize
 )
-
-// tsScopeBatchSize is the number of dynamic parameters a single TypeScript
-// scope statement may bind once its fixed parameters are accounted for.
-func tsScopeBatchSize(fixedArgs int) int { return sqliteInClauseBatchSize - fixedArgs }
-
-// tsScopeBatchedQuery runs one statement per batch of dynamic parameters so no
-// statement ever binds more than sqliteDefaultMaxVariables arguments, and feeds
-// every row of every batch to scan. base is the statement without its IN
-// clause; clause is appended for a filtered pass and must contain a single %s
-// for the placeholder list. An unfiltered pass (filtered=false) runs base once
-// with the fixed arguments alone, and a filtered pass over an empty set runs
-// nothing at all -- neither ever emits "IN ()".
-//
-// The accumulated rows are exactly those one hypothetical unlimited statement
-// would return: batches are deterministic slices of a caller-sorted set, and
-// every batch is read before the caller acts on the result.
-func tsScopeBatchedQuery(
-	ctx context.Context,
-	q queryContexter,
-	base, clause string,
-	fixed, items []any,
-	filtered bool,
-	scan func(*sql.Rows) error,
-) error {
-	batches := [][]any{nil}
-	if filtered {
-		batches = nil
-		size := tsScopeBatchSize(len(fixed))
-		for start := 0; start < len(items); start += size {
-			batches = append(batches, items[start:min(start+size, len(items))])
-		}
-	}
-	for _, batch := range batches {
-		query := base
-		if filtered {
-			query += strings.Replace(clause, "%s", tsPlaceholders(len(batch)), 1)
-		}
-		args := make([]any, 0, len(fixed)+len(batch))
-		args = append(args, fixed...)
-		args = append(args, batch...)
-		if err := tsScopeScanRows(ctx, q, query, args, scan); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func tsScopeScanRows(ctx context.Context, q queryContexter, query string, args []any, scan func(*sql.Rows) error) error {
-	rows, err := q.QueryContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		if err := scan(rows); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
-}
 
 // tsScopeIDArgs renders a sorted id set as bind arguments.
 func tsScopeIDArgs(ids map[int64]struct{}) []any {
@@ -142,7 +74,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		name     string
 	}
 	var edges []edge
-	if err := tsScopeBatchedQuery(ctx, q,
+	if err := sqliteBatchedQuery(ctx, q,
 		`SELECT e.id,e.file_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='typescript' AND e.dst_symbol_id IS NULL`,
 		` AND e.id IN (%s)`, []any{repoID}, tsScopeIDArgs(only), len(only) > 0,
 		func(rows *sql.Rows) error {
@@ -158,15 +90,12 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 	if len(edges) == 0 {
 		return 0, nil
 	}
-	for start := 0; start < len(edges); start += tsScopeVetoBatchSize {
-		end := min(start+tsScopeVetoBatchSize, len(edges))
-		v := make([]any, 0, end-start)
-		for _, e := range edges[start:end] {
-			v = append(v, e.id)
-		}
-		if _, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO `+tsScopeVeto+`(edge_id) VALUES `+valuePlaceholders(end-start), v...); err != nil {
-			return 0, err
-		}
+	vetoRows := make([][]any, 0, len(edges))
+	for _, e := range edges {
+		vetoRows = append(vetoRows, []any{e.id})
+	}
+	if err := sqliteBatchedValuesExec(ctx, q, `INSERT OR IGNORE INTO `+tsScopeVeto+`(edge_id) VALUES `, "(?)", nil, vetoRows); err != nil {
+		return 0, err
 	}
 
 	files := map[int64]tsScopeFile{}
@@ -177,7 +106,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			fileIDs[e.file] = struct{}{}
 		}
 	}
-	if err := tsScopeBatchedQuery(ctx, q,
+	if err := sqliteBatchedQuery(ctx, q,
 		`SELECT id,path FROM files WHERE repo_id=? AND is_deleted=0`, ` AND id IN (%s)`,
 		[]any{repoID}, tsScopeIDArgs(fileIDs), len(fileIDs) > 0,
 		func(rows *sql.Rows) error {
@@ -206,7 +135,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			// resolved, so a SQL batch boundary never becomes a graph
 			// traversal boundary.
 			candidatePaths := map[string]struct{}{}
-			if err := tsScopeBatchedQuery(ctx, q,
+			if err := sqliteBatchedQuery(ctx, q,
 				`SELECT file_id,source_specifier FROM scope_import_evidence WHERE repo_id=? AND language='typescript'`,
 				` AND file_id IN (%s)`, []any{repoID}, frontier, true,
 				func(rows *sql.Rows) error {
@@ -247,7 +176,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			for _, p := range variants {
 				pathArgs = append(pathArgs, p)
 			}
-			if err := tsScopeBatchedQuery(ctx, q,
+			if err := sqliteBatchedQuery(ctx, q,
 				`SELECT id,path FROM files WHERE repo_id=? AND is_deleted=0`, ` AND path IN (%s)`,
 				[]any{repoID}, pathArgs, true,
 				func(rows *sql.Rows) error {
@@ -280,7 +209,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		sort.Slice(componentIDs, func(i, j int) bool { return componentIDs[i] < componentIDs[j] })
 	}
 	componentArgs := int64SliceToAny(componentIDs)
-	if err := tsScopeBatchedQuery(ctx, q,
+	if err := sqliteBatchedQuery(ctx, q,
 		`SELECT s.id,s.file_id,s.name,s.qualified_name,s.visibility,s.kind FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='typescript' AND f.is_deleted=0`,
 		` AND s.file_id IN (%s)`, []any{repoID}, componentArgs, len(only) > 0,
 		func(rows *sql.Rows) error {
@@ -304,7 +233,7 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 
 	imports := map[int64][]tsScopeImport{}
 	defaultNames := map[int64]map[string]struct{}{}
-	if err := tsScopeBatchedQuery(ctx, q,
+	if err := sqliteBatchedQuery(ctx, q,
 		`SELECT file_id,source_specifier,imported_name,local_name,import_kind,wildcard,is_reexport,is_namespace_export,is_type_only FROM scope_import_evidence WHERE repo_id=? AND language='typescript'`,
 		` AND file_id IN (%s)`, []any{repoID}, componentArgs, len(only) > 0,
 		func(rows *sql.Rows) error {
@@ -513,14 +442,12 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			ids = append(ids, id)
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		for _, chunk := range chunkInt64s(ids, tsScopeResolutionBatchSize) {
-			vals := make([]any, 0, len(chunk)*2)
-			for _, id := range chunk {
-				vals = append(vals, id, results[id])
-			}
-			if _, err := q.ExecContext(ctx, `INSERT INTO `+tsScopeResolution+`(edge_id,dst_symbol_id) VALUES `+pairPlaceholders(len(chunk)), vals...); err != nil {
-				return 0, err
-			}
+		rows := make([][]any, 0, len(ids))
+		for _, id := range ids {
+			rows = append(rows, []any{id, results[id]})
+		}
+		if err := sqliteBatchedValuesExec(ctx, q, `INSERT INTO `+tsScopeResolution+`(edge_id,dst_symbol_id) VALUES `, "(?,?)", nil, rows); err != nil {
+			return 0, err
 		}
 		if _, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM `+tsScopeResolution+` r WHERE r.edge_id=edges.id),resolution_strategy='`+tsScopeStrategy+`',resolution_confidence='high' WHERE id IN (SELECT edge_id FROM `+tsScopeResolution+`)`); err != nil {
 			return 0, err
@@ -556,21 +483,6 @@ func sortedIDs(m map[int64]struct{}) []int64 {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
-}
-func tsPlaceholders(n int) string { return strings.TrimRight(strings.Repeat("?,", n), ",") }
-func valuePlaceholders(n int) string {
-	p := make([]string, n)
-	for i := range p {
-		p[i] = "(?)"
-	}
-	return strings.Join(p, ",")
-}
-func pairPlaceholders(n int) string {
-	p := make([]string, n)
-	for i := range p {
-		p[i] = "(?,?)"
-	}
-	return strings.Join(p, ",")
 }
 
 // invalidateTypeScriptScopeBindings clears the dependent module component for
@@ -610,7 +522,7 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 			pathArgs = append(pathArgs, p)
 		}
 		next := make([]string, 0)
-		if err := tsScopeBatchedQuery(ctx, q, `
+		if err := sqliteBatchedQuery(ctx, q, `
 			SELECT c.source_file_id, f.path
 			FROM scope_module_candidate_evidence c
 			JOIN files f ON f.id=c.source_file_id AND f.repo_id=c.repo_id AND f.language='typescript'
@@ -645,7 +557,7 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 	}
 	var edgeIDs []int64
 	names := map[string]struct{}{}
-	if err := tsScopeBatchedQuery(ctx, q,
+	if err := sqliteBatchedQuery(ctx, q,
 		`SELECT e.id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='typescript' AND e.edge_kind <> 'cross_language_ref'`,
 		` AND e.file_id IN (%s)`, []any{repoID}, tsScopeIDArgs(affected), true,
 		func(rows *sql.Rows) error {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path"
 	"sort"
 	"strings"
@@ -314,17 +315,11 @@ func pythonScopeRecordClaims(ctx context.Context, q execQuerier, claims map[int6
 		claimed = append(claimed, id)
 	}
 	sort.Slice(claimed, func(i, j int) bool { return claimed[i] < claimed[j] })
-	for start := 0; start < len(claimed); start += 400 {
-		end := min(start+400, len(claimed))
-		args := make([]any, 0, end-start)
-		for _, id := range claimed[start:end] {
-			args = append(args, id)
-		}
-		if _, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO `+pyScopeVeto+`(edge_id) VALUES `+valuePlaceholders(end-start), args...); err != nil {
-			return err
-		}
+	rows := make([][]any, 0, len(claimed))
+	for _, id := range claimed {
+		rows = append(rows, []any{id})
 	}
-	return nil
+	return sqliteBatchedValuesExec(ctx, q, `INSERT OR IGNORE INTO `+pyScopeVeto+`(edge_id) VALUES `, "(?)", nil, rows)
 }
 
 // pythonScopeDecide walks the Python evidence once. With claimsOnly it stops
@@ -711,28 +706,20 @@ func pythonPackageRebindsName(pkgPath string, imports []pyScopeImport, bindings 
 }
 
 func pythonScopeEdges(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}) ([]pyScopeEdge, error) {
-	where, args := "", []any{repoID}
-	if len(only) > 0 {
-		ids := sortedIDs(only)
-		where = ` AND e.id IN (` + tsPlaceholders(len(ids)) + `)`
-		for _, id := range ids {
-			args = append(args, id)
-		}
-	}
-	rows, err := q.QueryContext(ctx, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='python' AND f.is_deleted=0 AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND e.edge_kind <> 'cross_language_ref'`+where, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var edges []pyScopeEdge
-	for rows.Next() {
-		var e pyScopeEdge
-		if err := rows.Scan(&e.id, &e.file, &e.src, &e.name); err != nil {
-			return nil, err
-		}
-		edges = append(edges, e)
-	}
-	return edges, rows.Err()
+	err := sqliteBatchedQuery(ctx, q,
+		`SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='python' AND f.is_deleted=0 AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND e.edge_kind <> 'cross_language_ref'`,
+		` AND e.id IN (%s)`,
+		[]any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
+		func(rows *sql.Rows) error {
+			var e pyScopeEdge
+			if err := rows.Scan(&e.id, &e.file, &e.src, &e.name); err != nil {
+				return err
+			}
+			edges = append(edges, e)
+			return nil
+		})
+	return edges, err
 }
 
 func pythonScopeFilePaths(ctx context.Context, q execQuerier, repoID int64, ids []int64) (map[int64]string, error) {
@@ -864,62 +851,30 @@ func pythonScopeFileIDsByPath(ctx context.Context, q execQuerier, repoID int64, 
 	}
 	sort.Strings(lookup)
 	out := make(map[string]int64, len(canonical))
-	for start := 0; start < len(lookup); start += 400 {
-		end := min(start+400, len(lookup))
-		args := make([]any, 0, end-start+1)
-		args = append(args, repoID)
-		for _, variant := range lookup[start:end] {
-			args = append(args, variant)
-		}
-		rows, err := q.QueryContext(ctx, `SELECT path,id FROM files WHERE repo_id=? AND is_deleted=0 AND language='python' AND path IN (`+tsPlaceholders(end-start)+`)`, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
+	items := make([]any, 0, len(lookup))
+	for _, variant := range lookup {
+		items = append(items, variant)
+	}
+	err := sqliteBatchedQuery(ctx, q,
+		`SELECT path,id FROM files WHERE repo_id=? AND is_deleted=0 AND language='python'`, ` AND path IN (%s)`,
+		[]any{repoID}, items, true,
+		func(rows *sql.Rows) error {
 			var p string
 			var id int64
 			if err := rows.Scan(&p, &id); err != nil {
-				rows.Close()
-				return nil, err
+				return err
 			}
 			out[variants[p]] = id
-		}
-		if err := rows.Close(); err != nil {
-			return nil, err
-		}
-	}
-	return out, nil
+			return nil
+		})
+	return out, err
 }
 
 // chunkedInt64Query runs one query per bounded slice of ids, so evidence is
-// loaded per repository or per scoped batch rather than per edge.
+// loaded per repository or per scoped batch rather than per edge. prefix must
+// end with an open IN clause, which this closes.
 func chunkedInt64Query(ctx context.Context, q execQuerier, ids []int64, prefix string, repoID int64, scanRow func(func(...any) error) error) error {
-	for start := 0; start < len(ids); start += 400 {
-		end := min(start+400, len(ids))
-		args := make([]any, 0, end-start+1)
-		args = append(args, repoID)
-		for _, id := range ids[start:end] {
-			args = append(args, id)
-		}
-		rows, err := q.QueryContext(ctx, prefix+tsPlaceholders(end-start)+`)`, args...)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			if err := scanRow(rows.Scan); err != nil {
-				rows.Close()
-				return err
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return sqliteBatchedIDQuery(ctx, q, ids, prefix, []any{repoID}, scanRow)
 }
 
 func pythonScopeApply(ctx context.Context, q execQuerier, results map[int64]int64, strategy string) (int, error) {
@@ -937,15 +892,12 @@ func pythonScopeApply(ctx context.Context, q execQuerier, results map[int64]int6
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	for start := 0; start < len(ids); start += 400 {
-		end := min(start+400, len(ids))
-		vals := make([]any, 0, (end-start)*2)
-		for _, id := range ids[start:end] {
-			vals = append(vals, id, results[id])
-		}
-		if _, err := q.ExecContext(ctx, `INSERT INTO `+pyScopeResolution+`(edge_id,dst_symbol_id) VALUES `+pairPlaceholders(end-start), vals...); err != nil {
-			return 0, err
-		}
+	rows := make([][]any, 0, len(ids))
+	for _, id := range ids {
+		rows = append(rows, []any{id, results[id]})
+	}
+	if err := sqliteBatchedValuesExec(ctx, q, `INSERT INTO `+pyScopeResolution+`(edge_id,dst_symbol_id) VALUES `, "(?,?)", nil, rows); err != nil {
+		return 0, err
 	}
 	if _, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM `+pyScopeResolution+` r WHERE r.edge_id=edges.id),resolution_strategy='`+strategy+`',resolution_confidence='`+resolutionConfidenceFor(strategy)+`' WHERE id IN (SELECT edge_id FROM `+pyScopeResolution+`)`); err != nil {
 		return 0, err
@@ -991,33 +943,25 @@ func (s *Store) invalidatePythonScopeBindings(ctx context.Context, repoID int64,
 		canonical = append(canonical, p)
 	}
 	sort.Strings(canonical)
-	for start := 0; start < len(canonical); start += 400 {
-		end := min(start+400, len(canonical))
-		args := make([]any, 0, end-start+1)
-		args = append(args, repoID)
-		for _, p := range canonical[start:end] {
-			args = append(args, p)
-		}
-		rows, qerr := s.db.QueryContext(ctx, `
-			SELECT c.source_file_id
-			FROM scope_module_candidate_evidence c
-			JOIN files f ON f.id = c.source_file_id AND f.repo_id = c.repo_id
-			WHERE c.repo_id = ? AND f.language = 'python' AND c.candidate_path IN (`+tsPlaceholders(end-start)+`)
-		`, args...)
-		if qerr != nil {
-			return nil, qerr
-		}
-		for rows.Next() {
+	candidates := make([]any, 0, len(canonical))
+	for _, p := range canonical {
+		candidates = append(candidates, p)
+	}
+	if qerr := sqliteBatchedQuery(ctx, s.db, `
+		SELECT c.source_file_id
+		FROM scope_module_candidate_evidence c
+		JOIN files f ON f.id = c.source_file_id AND f.repo_id = c.repo_id
+		WHERE c.repo_id = ? AND f.language = 'python'`, ` AND c.candidate_path IN (%s)`,
+		[]any{repoID}, candidates, true,
+		func(rows *sql.Rows) error {
 			var id int64
-			if qerr = rows.Scan(&id); qerr != nil {
-				rows.Close()
-				return nil, qerr
+			if err := rows.Scan(&id); err != nil {
+				return err
 			}
 			affected[id] = struct{}{}
-		}
-		if qerr = rows.Close(); qerr != nil {
-			return nil, qerr
-		}
+			return nil
+		}); qerr != nil {
+		return nil, qerr
 	}
 	// An `__init__.py` appearing, disappearing or changing decides whether its
 	// directory is an importable package at all and what that package binds at

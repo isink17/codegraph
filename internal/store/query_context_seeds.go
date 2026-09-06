@@ -147,9 +147,12 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 	paths := sortedKeys(pathSet)
 	names := sortedKeys(nameSet)
 
-	// Both IN lists are bound into one statement, so each loop takes half the
-	// single-list chunk budget rather than all of it.
-	const refChunk = sqliteInClauseBatchSize / 2
+	// Both IN lists are bound into one statement: a path costs one parameter,
+	// and a name costs two when a global-scope C++ spelling is present. Give
+	// the path axis half the budget and buy the name axis its second copy out
+	// of the rest, so 1 + pathChunk + 2*nameChunk stays inside the budget.
+	pathChunk := sqliteBatchSize(1, 1) / 2
+	nameChunk := sqliteBatchSize(1+pathChunk, 2)
 
 	// The cross product of the two IN lists over-selects (a path may hold a
 	// qualified name wanted for a different path), which the wanted-set filter
@@ -157,34 +160,34 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 	// row-value IN support is not portable across the drivers this project
 	// builds with.
 	best := map[SymbolRef]graph.Symbol{}
-	for pathStart := 0; pathStart < len(paths); pathStart += refChunk {
-		pathChunk := paths[pathStart:min(pathStart+refChunk, len(paths))]
-		for nameStart := 0; nameStart < len(names); nameStart += refChunk {
-			nameChunk := names[nameStart:min(nameStart+refChunk, len(names))]
+	for pathStart := 0; pathStart < len(paths); pathStart += pathChunk {
+		pathBatch := paths[pathStart:min(pathStart+pathChunk, len(paths))]
+		for nameStart := 0; nameStart < len(names); nameStart += nameChunk {
+			nameBatch := names[nameStart:min(nameStart+nameChunk, len(names))]
 			hasGlobal := false
-			for _, name := range nameChunk {
+			for _, name := range nameBatch {
 				if strings.HasPrefix(name, "::") {
 					hasGlobal = true
 					break
 				}
 			}
 
-			args := make([]any, 0, len(pathChunk)+len(nameChunk)*2+1)
+			args := make([]any, 0, len(pathBatch)+len(nameBatch)*2+1)
 			args = append(args, repoID)
-			for _, p := range pathChunk {
+			for _, p := range pathBatch {
 				args = append(args, p)
 			}
-			for _, n := range nameChunk {
+			for _, n := range nameBatch {
 				args = append(args, n)
 			}
 			if hasGlobal {
-				for _, n := range nameChunk {
+				for _, n := range nameBatch {
 					args = append(args, n)
 				}
 			}
-			nameMatch := `s.qualified_name IN (` + placeholders(len(nameChunk)) + `)`
+			nameMatch := `s.qualified_name IN (` + placeholders(len(nameBatch)) + `)`
 			if hasGlobal {
-				nameMatch = `(` + nameMatch + ` OR (s.language = 'cpp' AND s.container_name = '' AND '::' || s.qualified_name IN (` + placeholders(len(nameChunk)) + `)))`
+				nameMatch = `(` + nameMatch + ` OR (s.language = 'cpp' AND s.container_name = '' AND '::' || s.qualified_name IN (` + placeholders(len(nameBatch)) + `)))`
 			}
 			query := `
 				SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
@@ -192,7 +195,7 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 				FROM symbols s
 				JOIN files f ON f.id = s.file_id
 				WHERE s.repo_id = ?
-				  AND f.path IN (` + placeholders(len(pathChunk)) + `)
+				  AND f.path IN (` + placeholders(len(pathBatch)) + `)
 				  AND ` + nameMatch + `
 			`
 			rows, err := s.db.QueryContext(ctx, query, args...)
