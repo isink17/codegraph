@@ -848,7 +848,7 @@ func Emit(code int) int {
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		tb.Fatalf("Index() error = %v", err)
 	}
-	return NewServer(repoRoot, repoRoot, repo.ID, st, idx, query.New(st, nil), io.Discard), ctx
+	return NewServer(repoRoot, repo.ID, st, idx, query.New(st, nil), io.Discard), ctx
 }
 
 func writeRepoFileTB(tb testing.TB, repoRoot, relativePath, content string) {

@@ -858,13 +858,21 @@ Created with `codegraph config init --repo .` at `.codegraph/config.json`:
 
 ### Repo Root Resolution
 
-When `--repo-root` (CLI) or `repo_root` (MCP tool parameter) is omitted, codegraph resolves the repo root using:
+At CLI startup, codegraph resolves the repo root using:
 
-1. Per-call `repo_root` MCP tool parameter
-2. `--repo-root` CLI flag (process-level default)
-3. `git rev-parse --show-toplevel` from the current working directory
-4. `os.Getwd()` (current working directory)
-5. Return error
+1. `--repo-root` CLI flag (or the positional repo argument)
+2. `git rev-parse --show-toplevel` from the current working directory
+3. `os.Getwd()` (current working directory)
+4. Return error
+
+An MCP server is opened for one active repository, resolved once by that startup
+chain. The `repo_root` and `repo_path` tool parameters on `index_repo` and
+`update_graph` remain accepted, but they may only **assert** the server's active
+repository -- naming any other path (another repository, a parent directory, or a
+subdirectory of the active root) is rejected with a repository scope violation
+rather than retargeting the running server. Likewise, `paths` entries must name
+locations inside the active repository; `../` traversal and absolute paths outside
+the root are rejected. To index a different repository, start a server for it.
 
 ### Ignore file
 

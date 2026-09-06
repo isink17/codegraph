@@ -12,7 +12,6 @@ import (
 
 	"github.com/isink17/codegraph/internal/agent"
 	"github.com/isink17/codegraph/internal/compactfmt"
-	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/detail"
 	"github.com/isink17/codegraph/internal/framework"
 	"github.com/isink17/codegraph/internal/graph"
@@ -26,29 +25,28 @@ import (
 )
 
 type Server struct {
-	cliRepoRoot string
-	repoRoot    string
-	repoID      int64
-	store       *store.Store
-	indexer     *indexer.Indexer
-	query       *query.Service
-	errOut      io.Writer
-	agentCfg    agent.OllamaLLMConfig
-	toolMode    ToolMode
+	repoRoot string
+	repoID   int64
+	store    *store.Store
+	indexer  *indexer.Indexer
+	query    *query.Service
+	errOut   io.Writer
+	agentCfg agent.OllamaLLMConfig
+	toolMode ToolMode
 	// usage is this server's local context meter. One server lifetime is one
 	// metering session; nothing about it is persisted, exported, or reported.
 	usage *usage.Meter
 }
 
-// NewServer builds an MCP server. cliRepoRoot is the raw `--repo-root` flag value
-// provided to `codegraph serve` (empty when omitted). repoRoot is the resolved
-// active repository root for tools that operate on the initially opened repo.
+// NewServer builds an MCP server. repoRoot is the active repository root,
+// resolved once by the CLI at startup; every tool on this server, indexing
+// included, operates on that repository for the server's lifetime.
 //
 // The tool surface defaults to ToolModeFull, so a server built without an
 // explicit mode advertises exactly what it advertised before gateway mode existed.
-func NewServer(cliRepoRoot, repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
+func NewServer(repoRoot string, repoID int64, s *store.Store, idx *indexer.Indexer, q *query.Service, errOut io.Writer) *Server {
 	return &Server{
-		cliRepoRoot: cliRepoRoot, repoRoot: repoRoot, repoID: repoID,
+		repoRoot: repoRoot, repoID: repoID,
 		store: s, indexer: idx, query: q, errOut: errOut,
 		toolMode: ToolModeFull,
 		usage:    usage.New(string(ToolModeFull), nil),
@@ -626,20 +624,21 @@ func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bo
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	toolParam := strings.TrimSpace(req.RepoRoot)
-	if toolParam == "" {
-		toolParam = strings.TrimSpace(req.RepoPath)
-	}
-	resolved, err := config.ResolveRepoRoot(s.cliRepoRoot, toolParam)
-	if err != nil {
+	// This server is scoped to one repository, resolved once at startup. A tool
+	// argument may assert that repository but may never select another, so no
+	// cwd/git fallback resolution runs here: the answer is already s.repoRoot.
+	// Refused before config.LoadRepo, UpsertRepo, or BeginScan can touch the
+	// requested root.
+	if err := s.assertActiveRepoArgs(req.RepoRoot, req.RepoPath); err != nil {
 		return nil, err
 	}
 	opts := indexer.Options{
-		RepoRoot: resolved,
+		RepoRoot: s.repoRoot,
 		Force:    req.Force,
 		Paths:    req.Paths,
 	}
 	var summary store.ScanSummary
+	var err error
 	if update {
 		opts.ScanKind = "update"
 		summary, err = s.indexer.Update(ctx, opts)
@@ -1098,6 +1097,16 @@ func contextCursorProperty() map[string]any {
 	}
 }
 
+// repoAssertionProperty describes repo_root and repo_path. They may only assert
+// this server's active repository; they cannot retarget it. Kept to one line
+// because every word here is paid for on every session's tools/list.
+func repoAssertionProperty() map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": "Optional assertion of the active repository root; any other path is rejected. Cannot retarget this server.",
+	}
+}
+
 // toolDef renders one tool's advertised definition. The four documented
 // properties get their shared schema; everything else is typed by argType, the
 // same function the validator consults, so a schema cannot advertise one type and
@@ -1130,6 +1139,12 @@ func toolDef(name, description string, properties, required []string) map[string
 			props[prop] = map[string]any{"type": "integer", "minimum": 0, "maximum": limits.MaxAuditExamples}
 		case "max_steps":
 			props[prop] = map[string]any{"type": "integer", "minimum": 0, "maximum": limits.MaxAgentSteps}
+		// A server is opened for one repository. These two stay accepted so a
+		// client can assert which repository it believes it is addressing, but
+		// the schema has to say so: otherwise the only way to discover the rule
+		// is to trip over it, and the README is not visible to an MCP client.
+		case "repo_root", "repo_path":
+			props[prop] = repoAssertionProperty()
 		default:
 			if argType(prop) == "array" {
 				props[prop] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}

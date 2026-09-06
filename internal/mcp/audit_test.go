@@ -38,7 +38,7 @@ func main() { helper() }
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-	return NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard), s, repo.ID
+	return NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard), s, repo.ID
 }
 
 // callAudit invokes the tool over the wire and returns the decoded payload.

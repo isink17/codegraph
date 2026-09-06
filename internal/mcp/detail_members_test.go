@@ -51,7 +51,7 @@ def free_function():
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
 	}
-	server := NewServer(repoRoot, repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
+	server := NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard)
 
 	data, _ := callToolJSON(t, server, ctx, "find_symbol", map[string]any{"query": "Shape", "detail": "skeleton"})
 	shape := findRecord(t, recordsOf(t, data, "matches"), "Shape")
