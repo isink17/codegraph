@@ -316,21 +316,21 @@ func sqlGoPackageLevelDeclaration(alias string) string {
 //
 // It requires the surrounding statement to expose the edge's source symbol as
 // `src` and that symbol's file as `srcf`.
-func sqlGoBareSourceScope(n int) string {
+func sqlGoBareSourceScope(setSQL string) string {
 	gated := `src.language <> 'go' AND src.language NOT IN ` + bareNameScopeAllKindsSQL
-	if n == 0 {
+	if setSQL == "" {
 		// No scoped destination to match: Go and C/C++ sources contribute
 		// nothing, but the leg still serves every other language.
 		//
 		// This is a refusal, so callers may only render it once a target
 		// identity exists. A query that matched no symbol has no scope to
-		// derive and must omit the predicate entirely rather than ask for
-		// zero keys (P22.14); FindCallers is where that branch lives.
+		// derive and must omit the predicate entirely rather than pass an
+		// empty set (P22.14); FindCallers is where that branch lives.
 		return `(` + gated + `)`
 	}
 	return `((` + gated + `) OR ` +
 		sqlBareScopeKeyForSymbol("src", "srcf.path") +
-		` IN (` + strings.TrimRight(strings.Repeat("?,", n), ",") + `))`
+		` IN ` + setSQL + `)`
 }
 
 // resolverGoBareScopeSQL is the repo-wide resolver's half of the rule: a Go
@@ -534,7 +534,7 @@ func symbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, ids 
 	if len(ids) == 0 {
 		return out, nil
 	}
-	for _, chunk := range chunkInt64s(ids, sqliteInClauseBatchSize) {
+	for _, chunk := range chunkInt64s(ids, sqliteBatchSize(1, 1)) {
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		args = append(args, int64SliceToAny(chunk)...)
@@ -643,7 +643,7 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 // scope that decides such a call, the caller's class is, and a name-evidence leg
 // carries no class fact -- so the target is dropped rather than answered from
 // file evidence it does not have. When every matched target is one, the caller
-// renders sqlGoBareSourceScope(0), which refuses the leg for C/C++ writers; that
+// renders sqlGoBareSourceScope(""), which refuses the leg for C/C++ writers; that
 // is the same population the resolver refused, and a relationship the class rule
 // DOES admit was bound and is answered through the id leg instead.
 //

@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -28,25 +31,132 @@ import (
 // to the target, plus unresolved edges whose `dst_name` names it), duplicates
 // are still removed, and the order is the same total order `sortSymbols`
 // produced: qualified_name, start_line, start_col, id.
+//
+// P22.34 closed the half of the second point P12 left open. P12 removed the
+// *neighbour* set -- the one that grows with fan-in -- from the bound
+// parameters, but the *input* sets (the ids a name lookup matched, the
+// unresolved spellings a suffix scan found) were still bound in full, merely
+// split across UNION branches. Splitting one 5000-id `IN` list into six bounds
+// each expression list and does nothing at all to the statement's total, which
+// is the number SQLITE_MAX_VARIABLE_NUMBER is measured against.
+//
+// The invariant now is per statement, not per expression list: every statement
+// this pipeline issues binds at most sqliteInClauseBatchSize arguments, and
+// never more than sqliteDefaultMaxVariables. It holds through one transport
+// switch rather than two implementations. The candidate CTE is rendered by a
+// builder that asks a neighborSets for each dynamic value set. Rendered inline,
+// a set is a placeholder list and its values are bound -- exactly the statement
+// the pre-P22.34 code issued, for the small queries that are almost all of
+// them. When that statement's own argument count does not fit the budget, the
+// same builder is called again against a connection-pinned staging table: each
+// set is inserted in bounded batches and rendered as a scalar subquery, so the
+// page statement's arguments no longer track the input size at all.
+//
+// What deliberately did not change: the candidate set is still computed,
+// deduped, ordered and paged by one statement inside SQLite. Staging moves the
+// *inputs* out of the parameter list, never the candidates into Go. Paging per
+// input batch would be a different answer -- a global ORDER BY over the union
+// is not the concatenation of per-batch orderings -- and materialising the
+// candidates in Go would restore the cost P12 removed.
 
-// neighborIDChunk bounds how many symbol ids go into one `IN` or `VALUES`
-// branch.
+// symbolPageFixedArgs is what symbolPageSQL binds beyond its candidate CTE:
+// the repository id, the LIMIT and the OFFSET.
+const symbolPageFixedArgs = 3
+
+// neighborKeysTable stages the value sets a neighbour candidate query matches
+// against, when binding them would exceed the statement's variable budget.
 //
-// Be precise about what this does and does not buy. All branches end up in one
-// statement, so the statement's total bound-variable count still tracks the
-// total id count -- splitting one 5000-id `IN` list into six does not change
-// that, and the driver's ceiling (32766 on the current build) still applies to
-// the sum. What chunking bounds is the size of a single expression list, and
-// the chunk size trades against SQLITE_MAX_COMPOUND_SELECT (default 500): at
-// 900 ids per branch that ceiling sits around 450k ids, comfortably past the
-// variable ceiling, so the variable limit is the binding one.
+// It is a TEMP table, so it is private to one SQLite connection and to the
+// lifetime of that connection: concurrent FindCallers/FindCallees calls land on
+// different pooled connections and cannot see each other's rows, and nothing
+// here touches the persistent graph. The fixed name is safe for that same
+// reason, provided every statement of one call runs on the connection that
+// staged it -- see neighborPage, which pins one *sql.Conn for the whole
+// operation.
 //
-// The variable-count win of the P12 rewrite is elsewhere: the *neighbour* set
-// -- the one that grows with fan-in, and reached 18k for the hub in the
-// benchmark fixture -- is no longer bound into a statement at all. The id sets
-// still bound here are the ones a name lookup produced, which the pre-P12 code
-// bound too.
-const neighborIDChunk = 900
+// `val` is deliberately typeless: ids are stored as integers and spellings as
+// text, and SQLite compares each against the column it is matched to. The
+// primary key makes each set a set, which is what the UNION used to provide.
+const neighborKeysTable = "temp.neighbor_query_keys"
+
+const createNeighborKeysSQL = `CREATE TABLE IF NOT EXISTS ` + neighborKeysTable + `(
+	kind INTEGER NOT NULL,
+	val NOT NULL,
+	PRIMARY KEY(kind, val)
+) WITHOUT ROWID`
+
+const clearNeighborKeysSQL = `DELETE FROM ` + neighborKeysTable
+
+const insertNeighborKeysSQL = `INSERT OR IGNORE INTO ` + neighborKeysTable + `(kind, val) VALUES `
+
+// neighborTarget applies the test-only statement wrapper, if one is installed.
+func (s *Store) neighborTarget(t execQuerier) execQuerier {
+	if s.neighborStatementWrap != nil {
+		return s.neighborStatementWrap(t)
+	}
+	return t
+}
+
+// errNeighborEmptySet reports a value set rendered with no members. Every leg
+// here tests for evidence before rendering it, so this is a programming error.
+var errNeighborEmptySet = errors.New("store: neighbour value set is empty")
+
+// neighborSets renders the dynamic value sets a candidate query matches
+// against, in whichever of the two transports the page statement can afford.
+//
+// Inline is the default and the fast path: the set becomes a placeholder list
+// and its values join the page statement's arguments. Staged is the fallback:
+// the set is inserted into neighborKeysTable in bounded batches and becomes a
+// subquery that binds nothing.
+type neighborSets struct {
+	target execQuerier
+	staged bool
+	kinds  int
+}
+
+// ref renders `values` as SQL usable directly after `IN`, together with the
+// arguments the rendering binds -- none, when staged. Callers must not pass an
+// empty set: `IN ()` is not valid SQL, and every leg here already tests for
+// evidence before rendering it.
+func (n *neighborSets) ref(ctx context.Context, values []any) (string, []any, error) {
+	if len(values) == 0 {
+		// Enforced rather than documented, because the two transports would
+		// disagree about it: inline would render invalid SQL and staged a
+		// valid always-false subquery.
+		return "", nil, errNeighborEmptySet
+	}
+	if !n.staged {
+		return "(" + placeholders(len(values)) + ")", values, nil
+	}
+	kind := n.kinds
+	n.kinds++
+	rows := make([][]any, 0, len(values))
+	for _, value := range values {
+		rows = append(rows, []any{kind, value})
+	}
+	if err := sqliteBatchedValuesExec(ctx, n.target, insertNeighborKeysSQL, "(?,?)", nil, rows); err != nil {
+		return "", nil, err
+	}
+	// The kind is generated here and rendered as a literal rather than bound,
+	// so a staged set costs the page statement exactly zero parameters.
+	return "(SELECT val FROM " + neighborKeysTable + " WHERE kind = " + strconv.Itoa(kind) + ")", nil, nil
+}
+
+func (n *neighborSets) refInt64s(ctx context.Context, ids []int64) (string, []any, error) {
+	return n.ref(ctx, int64SliceToAny(ids))
+}
+
+func (n *neighborSets) refStrings(ctx context.Context, values []string) (string, []any, error) {
+	return n.ref(ctx, stringSliceToAny(values))
+}
+
+// neighborCandidateBuilder renders one query's candidate CTE and the arguments
+// it binds. It is called once per transport attempt, so it must derive
+// everything it needs from evidence its caller already gathered: the only
+// database work it may do is the staging neighborSets performs.
+//
+// An empty CTE means "no evidence at all", which is an empty page.
+type neighborCandidateBuilder func(ctx context.Context, sets *neighborSets) (string, []any, error)
 
 // symbolPageSQL renders the page query over a candidate-id CTE. The CTE is
 // supplied by the caller because callers and callees differ only in how the
@@ -74,67 +184,86 @@ func symbolPageSQL(candidateCTE string) string {
 	`
 }
 
-// edgeIDBranches renders one `SELECT ... WHERE <col> IN (...)` branch per id
-// chunk, UNIONed together. UNION (not UNION ALL) so the CTE is already a set.
+// edgeIDBranch renders the `SELECT ... WHERE <matchCol> IN <set>` leg that
+// turns an input id set into candidate ids.
 //
-// DISTINCT inside each branch matters even though UNION dedupes across
-// branches: when this is the only branch the caller has (every other evidence
-// leg came up empty), no UNION runs, and two edges to the same destination
-// would otherwise surface the destination twice.
-func edgeIDBranches(repoID int64, ids []int64, selectCol, matchCol, extra string) (string, []any) {
-	var sb strings.Builder
-	args := make([]any, 0, len(ids)+len(ids)/neighborIDChunk+1)
-	for i, chunk := range chunkInt64s(ids, neighborIDChunk) {
-		if i > 0 {
-			sb.WriteString(" UNION ")
-		}
-		sb.WriteString("SELECT DISTINCT e.")
-		sb.WriteString(selectCol)
-		sb.WriteString(" FROM edges e WHERE e.repo_id = ? AND e.")
-		sb.WriteString(matchCol)
-		sb.WriteString(" IN (")
-		sb.WriteString(strings.TrimRight(strings.Repeat("?,", len(chunk)), ","))
-		sb.WriteString(")")
-		if extra != "" {
-			sb.WriteString(" AND ")
-			sb.WriteString(extra)
-		}
-		args = append(args, repoID)
-		args = append(args, int64SliceToAny(chunk)...)
+// DISTINCT matters even though the surrounding UNION dedupes across legs: when
+// this is the only leg the caller has (every other evidence leg came up empty),
+// no UNION runs, and two edges to the same destination would otherwise surface
+// the destination twice.
+func edgeIDBranch(selectCol, matchCol, setSQL, extra string) string {
+	sql := "SELECT DISTINCT e." + selectCol +
+		" FROM edges e WHERE e.repo_id = ? AND e." + matchCol + " IN " + setSQL
+	if extra != "" {
+		sql += " AND " + extra
 	}
-	return sb.String(), args
+	return sql
 }
 
-// valueBranches renders a literal id set as a single UNIONable branch.
+// neighborPage renders a candidate CTE and returns one page of the symbols it
+// names, choosing the transport that keeps the page statement inside the shared
+// variable budget.
 //
-// A `VALUES` list rather than N chained `SELECT ?` terms: the chained form
-// makes the number of compound SELECTs grow with the number of ids, and SQLite
-// pays to plan every one of them. On a real repository a symbol with a few
-// hundred unresolved destinations turned that into a several-hundred-way UNION
-// and ~290ms of query planning for a twenty-row page.
-func valueBranches(ids []int64) (string, []any) {
-	if len(ids) == 0 {
-		return "", nil
+// The inline attempt comes first and is measured, not guessed: the builder
+// reports exactly what it would bind, and only a total -- inputs plus
+// symbolPageSQL's own three arguments -- that does not fit falls back. The
+// fallback re-renders the same CTE against a staging table on one pinned
+// connection, so the two transports cannot disagree about semantics: they
+// differ only in how a value set is spelled.
+func (s *Store) neighborPage(ctx context.Context, repoID int64, limit, offset int, build neighborCandidateBuilder) ([]graph.Symbol, error) {
+	inline := &neighborSets{target: s.neighborTarget(s.db)}
+	cte, args, err := build(ctx, inline)
+	if err != nil {
+		return nil, err
 	}
-	var sb strings.Builder
-	sb.WriteString("SELECT column1 FROM (VALUES ")
-	args := make([]any, 0, len(ids))
-	for i, id := range ids {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		sb.WriteString("(?)")
-		args = append(args, id)
+	if cte == "" {
+		return []graph.Symbol{}, nil
 	}
-	sb.WriteString(")")
-	return sb.String(), args
+	if len(args)+symbolPageFixedArgs <= sqliteInClauseBatchSize {
+		return s.symbolPage(ctx, inline.target, repoID, cte, args, limit, offset)
+	}
+
+	// Everything below -- the staging inserts and the page SELECT that reads
+	// them -- must run on one physical connection, because a TEMP table belongs
+	// to the connection that created it. Taking it from the pool per statement
+	// would silently query an empty table on a different connection.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	target := s.neighborTarget(conn)
+	if _, err := target.ExecContext(ctx, createNeighborKeysSQL); err != nil {
+		return nil, err
+	}
+	// Clearing before use is the load-bearing half, not the cleanup below: a
+	// pooled connection may carry rows an earlier call left behind when it
+	// failed or its context was cancelled between staging and paging.
+	if _, err := target.ExecContext(ctx, clearNeighborKeysSQL); err != nil {
+		return nil, err
+	}
+	defer func() {
+		// Best effort, and detached from ctx so a cancelled query still hands
+		// back a clean connection. Correctness does not depend on it.
+		_, _ = target.ExecContext(context.WithoutCancel(ctx), clearNeighborKeysSQL)
+	}()
+
+	staged := &neighborSets{target: target, staged: true}
+	cte, args, err = build(ctx, staged)
+	if err != nil {
+		return nil, err
+	}
+	if cte == "" {
+		return []graph.Symbol{}, nil
+	}
+	return s.symbolPage(ctx, target, repoID, cte, args, limit, offset)
 }
 
-func (s *Store) symbolPage(ctx context.Context, repoID int64, candidateCTE string, cteArgs []any, limit, offset int) ([]graph.Symbol, error) {
-	args := make([]any, 0, len(cteArgs)+3)
+func (s *Store) symbolPage(ctx context.Context, target execQuerier, repoID int64, candidateCTE string, cteArgs []any, limit, offset int) ([]graph.Symbol, error) {
+	args := make([]any, 0, len(cteArgs)+symbolPageFixedArgs)
 	args = append(args, cteArgs...)
 	args = append(args, repoID, safeLimit(limit), safeOffset(offset))
-	rows, err := s.db.QueryContext(ctx, symbolPageSQL(candidateCTE), args...)
+	rows, err := target.QueryContext(ctx, symbolPageSQL(candidateCTE), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -199,260 +328,338 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 	return s.findCallersResolved(ctx, repoID, symbol, targetIDs, limit, offset)
 }
 
+// callerNameEvidence is the unresolved-spelling evidence FindCallers gathers
+// when no indexed target matched: the value sets its legs match against, and
+// nothing about how they are spelled into SQL.
+//
+// Gathering is separated from rendering because the renderer runs twice when
+// the inline transport does not fit, and every database read must happen
+// exactly once regardless of which transport answers.
+type callerNameEvidence struct {
+	qualifiedExact []string
+	bareExact      []string
+	scopeKeys      []string
+	scopeKeyed     bool
+	bareLangs      []string
+	spellings      []string
+	targetLangs    []string
+}
+
+func (e callerNameEvidence) empty() bool {
+	return len(e.qualifiedExact) == 0 && len(e.bareExact) == 0 && len(e.spellings) == 0
+}
+
 func (s *Store) findCallersResolved(ctx context.Context, repoID int64, symbol string, targetIDs []int64, limit, offset int) ([]graph.Symbol, error) {
 	short := lookupSymbolShortName(strings.TrimSpace(strings.TrimPrefix(symbol, "::")))
 
-	var branches []string
-	var args []any
-	if len(targetIDs) > 0 {
-		sql, a := edgeIDBranches(repoID, targetIDs, "src_symbol_id", "dst_symbol_id", "")
-		branches = append(branches, sql)
-		args = append(args, a...)
-	}
+	var evidence callerNameEvidence
 	// An unresolved spelling is a hint only when no indexed target exists.
 	// Once a target is known, only its persisted edge identity is authoritative.
 	if len(targetIDs) == 0 && short != "" {
-		// One read of the targets answers both name-evidence rules: their
-		// persisted languages (P22.7) and, for the Go ones, the package scopes a
-		// bare spelling could name them from (P22.6).
-		//
-		// No target row means no language evidence at all -- the name is not in
-		// the index, and the honest answer to "who spells this" is still every
-		// writer. Inventing a language there would be the guess this phase
-		// removes, in the other direction.
-		targetScopes, err := symbolScopesByIDs(ctx, neighborQuerier{s}, repoID, targetIDs)
-		if err != nil {
+		var err error
+		if evidence, err = s.callerNameEvidence(ctx, repoID, symbol, short, targetIDs); err != nil {
 			return nil, err
 		}
-		targetLangs := symbolLanguagesOf(targetScopes)
-		// The name legs are collected separately from the bound-destination leg
-		// so the language gate can be applied once to their union, rather than
-		// once per branch. The writer lookup is an integer-primary-key seek, and
-		// the union already has to be materialised, so paying for it once keeps
-		// the gate off the per-chunk path entirely.
-		var nameBranches []string
-		var nameArgs []any
-		// Split rather than one many-way OR. A single OR-of-predicates is not
-		// seekable, so SQLite fell back to walking every edge in the repo
-		// through idx_edges_repo_src and fetching each row. Separated, the
-		// equality half seeks idx_edges_repo_unresolved_name_src directly and
-		// the LIKE half is confined to the unresolved population by the
-		// `dst_symbol_id IS NULL` equality. UNION makes the halves one set,
-		// so the candidate set is identical to the combined predicate's.
-		//
-		// The exact spellings are split once more, by whether they are bare
-		// (P22.6). A qualified spelling names this target wherever it is
-		// written; a bare one only does so from inside the target's own Go
-		// package, so its leg carries the package-scope predicate. Without the
-		// split, a bare `countTags` unresolved in package `profile` claimed
-		// `graph.countTags` -- the same fabrication the resolver now refuses.
-		//
-		// P22.9 narrows the bare half by what the input matched: in a language
-		// whose visibility this rule decides, a bare spelling may not claim a
-		// type. Every relationship of that shape the evidence supports is
-		// already a bound `dst_symbol_id` and arrives through the id leg above,
-		// so what this leg would still add is exactly the population the
-		// resolver refused -- `pathlib.Path` claiming a project `class Path`
-		// among it.
-		//
-		// The narrowing is per LANGUAGE, not over the whole match set: an input
-		// matching a Python class and a Kotlin class must lose the Python
-		// writers and keep the Kotlin ones, because Kotlin resolves a bare class
-		// name across files with no import at all. When every matched language
-		// is type-only the leg has nobody left to serve and is dropped.
-		// See resolver_type_scope.go.
-		bareLangs := languagesExcept(targetLangs, typeOnlyGatedLanguages(targetScopes))
-		var bareExact, qualifiedExact []string
-		seenExact := map[string]bool{}
-		for _, spelling := range []string{symbol, short} {
-			if spelling == "" || seenExact[spelling] {
-				continue
-			}
-			seenExact[spelling] = true
-			if goBareCallName(spelling) {
-				if len(targetLangs) > 0 && len(bareLangs) == 0 {
-					continue
-				}
-				bareExact = append(bareExact, spelling)
-			} else {
-				qualifiedExact = append(qualifiedExact, spelling)
-			}
-		}
-		if len(qualifiedExact) > 0 {
-			nameBranches = append(nameBranches, `SELECT e.src_symbol_id AS src FROM edges e
-				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
-				  AND e.dst_name IN (`+placeholders(len(qualifiedExact))+`)`)
-			nameArgs = append(nameArgs, repoID)
-			for _, spelling := range qualifiedExact {
-				nameArgs = append(nameArgs, spelling)
-			}
-		}
-		if len(bareExact) > 0 {
-			scopeKeys := goBareTargetScopes(targetScopes)
-			// P22.14: the scope predicate is target-derived evidence, so it
-			// only exists when a target does. Zero scope keys has two causes
-			// and they are opposite answers: a matched target whose own rules
-			// say no bare spelling reaches it (a Go method, a C/C++ symbol with
-			// no file) is a refusal and keeps the predicate, which then admits
-			// only writers in ungated languages; no matched target at all is an
-			// absence of evidence, and gating on it deleted precisely the
-			// unresolved Go and C/C++ writers this leg exists to surface. The
-			// same reasoning already governs `bareLangFilter` above.
-			//
-			// `scopeKeys` is empty in the second case by construction, so the
-			// bound arguments stay in step with the rendered statement.
-			//
-			// The test is `targetIDs`, not the rows they loaded: an explicit
-			// `symbol_id` is an assertion of identity, and a stale one whose
-			// row is gone must stay refused rather than fail open into the
-			// unknown-name contract. Only a lookup that matched nothing at all
-			// is an absence of evidence.
-			bareScopeFilter := ""
-			if len(targetIDs) > 0 {
-				bareScopeFilter = ` AND ` + sqlGoBareSourceScope(len(scopeKeys))
-			}
-			// `bareLangs` rather than the union's `targetLangs`: this leg alone
-			// drops the languages whose matched targets are all types (P22.9).
-			// The outer language gate below still applies and is a superset.
-			bareLangFilter := ""
-			if len(bareLangs) > 0 {
-				bareLangFilter = ` AND src.language IN (` + placeholders(len(bareLangs)) + `)`
-			}
-			nameBranches = append(nameBranches, `SELECT e.src_symbol_id AS src FROM edges e
-				JOIN symbols src ON src.id = e.src_symbol_id
-				JOIN files srcf ON srcf.id = src.file_id
-				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
-				  AND e.dst_name IN (`+placeholders(len(bareExact))+`)
-				  `+bareScopeFilter+bareLangFilter)
-			nameArgs = append(nameArgs, repoID)
-			for _, spelling := range bareExact {
-				nameArgs = append(nameArgs, spelling)
-			}
-			for _, key := range scopeKeys {
-				nameArgs = append(nameArgs, key)
-			}
-			for _, language := range bareLangs {
-				nameArgs = append(nameArgs, language)
-			}
-		}
+	}
+	if len(targetIDs) == 0 && evidence.empty() {
+		return []graph.Symbol{}, nil
+	}
 
-		// Suffix evidence (P22.1): an unresolved spelling claims this target
-		// only when one of the two extends the other at a separator boundary,
-		// so the qualifier stays part of the match. The pre-P22.1 legs matched
-		// `%.` + bare short, which let `rows.Close` claim every project Close.
-		//
-		// Direction one: the spelling is a qualified suffix of the target's
-		// identity (`App.Close` for cli.App.Close) -- a finite, indexed IN set
-		// built from the input and the resolved targets' qualified names.
-		// Direction two: the spelling extends an identity at a '.', '::' or
-		// '/' boundary (`x.cli.App.Close`, `path/to/pkg.Func`). One scan of
-		// the distinct unresolved destination names decides direction two for
-		// every identity at once -- the same shape context expansion uses --
-		// so neither the statement's compound-SELECT terms nor its bound
-		// variables grow with how many symbols share the input's bare name.
-		qnames := []string{symbol}
-		if targetQNames, err := s.qualifiedNamesByIDs(ctx, repoID, targetIDs); err != nil {
-			return nil, err
-		} else {
-			qnames = append(qnames, targetQNames...)
-		}
-		spellings, seen := []string{}, map[string]bool{symbol: true, short: true}
-		for _, qname := range qnames {
-			for _, spelling := range boundaryProperSuffixes(qname) {
-				if !seen[spelling] {
-					seen[spelling] = true
-					spellings = append(spellings, spelling)
-				}
+	return s.neighborPage(ctx, repoID, limit, offset, func(ctx context.Context, sets *neighborSets) (string, []any, error) {
+		var branches []string
+		var args []any
+		if len(targetIDs) > 0 {
+			set, setArgs, err := sets.refInt64s(ctx, targetIDs)
+			if err != nil {
+				return "", nil, err
 			}
+			branches = append(branches, edgeIDBranch("src_symbol_id", "dst_symbol_id", set, ""))
+			args = append(args, repoID)
+			args = append(args, setArgs...)
 		}
-		// Direction two seeds only on qualifier-bearing identities. A bare seed
-		// is extended by every receiver spelling that ends in it, which is the
-		// bare-tail match P22.1 retired -- `pcsApmMap.LoadWorldMap` extends
-		// `LoadWorldMap` and would name `AgcmMinimap::F` a caller of
-		// `ApmMap::LoadWorldMap`, on nothing but the tail. Direction one already
-		// applies the same rule (boundaryProperSuffixes drops the bare tail);
-		// this is the other half of it. `qnames` still carries the bare input
-		// for direction one and for the exact legs above, where an equal
-		// spelling is evidence rather than a suffix of one.
-		extendSeeds := make([]string, 0, len(qnames))
-		for _, qname := range qnames {
-			if memberSeparated(qname) {
-				extendSeeds = append(extendSeeds, qname)
-			}
-		}
-		extending, err := s.unresolvedDstNamesExtending(ctx, repoID, extendSeeds)
-		if err != nil {
-			return nil, err
-		}
-		for _, name := range extending {
-			if !seen[name] {
-				seen[name] = true
-				spellings = append(spellings, name)
-			}
-		}
-		for start := 0; start < len(spellings); start += neighborIDChunk {
-			end := min(start+neighborIDChunk, len(spellings))
-			chunk := spellings[start:end]
-			nameBranches = append(nameBranches, `SELECT e.src_symbol_id AS src FROM edges e
-				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
-				  AND e.dst_name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`)
-			nameArgs = append(nameArgs, repoID)
-			for _, spelling := range chunk {
-				nameArgs = append(nameArgs, spelling)
-			}
-		}
-
-		if len(nameBranches) > 0 {
-			nameSQL := strings.Join(nameBranches, " UNION ")
-			if len(targetLangs) > 0 {
-				// P22.7: only a writer in one of the target's own languages may
-				// claim it by name. With no target row there is no language to
-				// require, and the union stands as it did.
-				nameSQL = `SELECT nl.src FROM (` + nameSQL + `) nl
-					JOIN symbols srclang ON srclang.id = nl.src
-					WHERE srclang.language IN (` + placeholders(len(targetLangs)) + `)`
-				for _, language := range targetLangs {
-					nameArgs = append(nameArgs, language)
-				}
+		if !evidence.empty() {
+			nameSQL, nameArgs, err := evidence.render(ctx, repoID, sets)
+			if err != nil {
+				return "", nil, err
 			}
 			branches = append(branches, nameSQL)
 			args = append(args, nameArgs...)
 		}
+		if len(branches) == 0 {
+			return "", nil, nil
+		}
+		return strings.Join(branches, " UNION "), args, nil
+	})
+}
+
+// callerNameEvidence gathers the unknown-target evidence legs. Every rule it
+// applies is a semantic one; the transport question is settled later, by
+// render.
+func (s *Store) callerNameEvidence(ctx context.Context, repoID int64, symbol, short string, targetIDs []int64) (callerNameEvidence, error) {
+	var out callerNameEvidence
+
+	// One read of the targets answers both name-evidence rules: their
+	// persisted languages (P22.7) and, for the Go ones, the package scopes a
+	// bare spelling could name them from (P22.6).
+	//
+	// No target row means no language evidence at all -- the name is not in
+	// the index, and the honest answer to "who spells this" is still every
+	// writer. Inventing a language there would be the guess this phase
+	// removes, in the other direction.
+	targetScopes, err := symbolScopesByIDs(ctx, neighborQuerier{s}, repoID, targetIDs)
+	if err != nil {
+		return out, err
 	}
+	out.targetLangs = symbolLanguagesOf(targetScopes)
+	// The name legs are collected separately from the bound-destination leg
+	// so the language gate can be applied once to their union, rather than
+	// once per branch. The writer lookup is an integer-primary-key seek, and
+	// the union already has to be materialised, so paying for it once keeps
+	// the gate off the per-leg path entirely.
+	//
+	// Split rather than one many-way OR. A single OR-of-predicates is not
+	// seekable, so SQLite fell back to walking every edge in the repo
+	// through idx_edges_repo_src and fetching each row. Separated, the
+	// equality half seeks idx_edges_repo_unresolved_name_src directly and
+	// the LIKE half is confined to the unresolved population by the
+	// `dst_symbol_id IS NULL` equality. UNION makes the halves one set,
+	// so the candidate set is identical to the combined predicate's.
+	//
+	// The exact spellings are split once more, by whether they are bare
+	// (P22.6). A qualified spelling names this target wherever it is
+	// written; a bare one only does so from inside the target's own Go
+	// package, so its leg carries the package-scope predicate. Without the
+	// split, a bare `countTags` unresolved in package `profile` claimed
+	// `graph.countTags` -- the same fabrication the resolver now refuses.
+	//
+	// P22.9 narrows the bare half by what the input matched: in a language
+	// whose visibility this rule decides, a bare spelling may not claim a
+	// type. Every relationship of that shape the evidence supports is
+	// already a bound `dst_symbol_id` and arrives through the id leg above,
+	// so what this leg would still add is exactly the population the
+	// resolver refused -- `pathlib.Path` claiming a project `class Path`
+	// among it.
+	//
+	// The narrowing is per LANGUAGE, not over the whole match set: an input
+	// matching a Python class and a Kotlin class must lose the Python
+	// writers and keep the Kotlin ones, because Kotlin resolves a bare class
+	// name across files with no import at all. When every matched language
+	// is type-only the leg has nobody left to serve and is dropped.
+	// See resolver_type_scope.go.
+	out.bareLangs = languagesExcept(out.targetLangs, typeOnlyGatedLanguages(targetScopes))
+	seenExact := map[string]bool{}
+	for _, spelling := range []string{symbol, short} {
+		if spelling == "" || seenExact[spelling] {
+			continue
+		}
+		seenExact[spelling] = true
+		if goBareCallName(spelling) {
+			if len(out.targetLangs) > 0 && len(out.bareLangs) == 0 {
+				continue
+			}
+			out.bareExact = append(out.bareExact, spelling)
+		} else {
+			out.qualifiedExact = append(out.qualifiedExact, spelling)
+		}
+	}
+	// P22.14: the scope predicate is target-derived evidence, so it only
+	// exists when a target does. Zero scope keys has two causes and they are
+	// opposite answers: a matched target whose own rules say no bare spelling
+	// reaches it (a Go method, a C/C++ symbol with no file) is a refusal and
+	// keeps the predicate, which then admits only writers in ungated
+	// languages; no matched target at all is an absence of evidence, and
+	// gating on it deleted precisely the unresolved Go and C/C++ writers this
+	// leg exists to surface. The same reasoning already governs `bareLangs`
+	// above.
+	//
+	// The test is `targetIDs`, not the rows they loaded: an explicit
+	// `symbol_id` is an assertion of identity, and a stale one whose row is
+	// gone must stay refused rather than fail open into the unknown-name
+	// contract. Only a lookup that matched nothing at all is an absence of
+	// evidence.
+	out.scopeKeyed = len(targetIDs) > 0
+	if out.scopeKeyed {
+		out.scopeKeys = goBareTargetScopes(targetScopes)
+	}
+
+	// Suffix evidence (P22.1): an unresolved spelling claims this target
+	// only when one of the two extends the other at a separator boundary,
+	// so the qualifier stays part of the match. The pre-P22.1 legs matched
+	// `%.` + bare short, which let `rows.Close` claim every project Close.
+	//
+	// Direction one: the spelling is a qualified suffix of the target's
+	// identity (`App.Close` for cli.App.Close) -- a finite, indexed IN set
+	// built from the input and the resolved targets' qualified names.
+	// Direction two: the spelling extends an identity at a '.', '::' or
+	// '/' boundary (`x.cli.App.Close`, `path/to/pkg.Func`). One scan of
+	// the distinct unresolved destination names decides direction two for
+	// every identity at once -- the same shape context expansion uses --
+	// so neither the statement's compound-SELECT terms nor its bound
+	// variables grow with how many symbols share the input's bare name.
+	qnames := []string{symbol}
+	targetQNames, err := s.qualifiedNamesByIDs(ctx, repoID, targetIDs)
+	if err != nil {
+		return out, err
+	}
+	qnames = append(qnames, targetQNames...)
+	seen := map[string]bool{symbol: true, short: true}
+	for _, qname := range qnames {
+		for _, spelling := range boundaryProperSuffixes(qname) {
+			if !seen[spelling] {
+				seen[spelling] = true
+				out.spellings = append(out.spellings, spelling)
+			}
+		}
+	}
+	// Direction two seeds only on qualifier-bearing identities. A bare seed
+	// is extended by every receiver spelling that ends in it, which is the
+	// bare-tail match P22.1 retired -- `pcsApmMap.LoadWorldMap` extends
+	// `LoadWorldMap` and would name `AgcmMinimap::F` a caller of
+	// `ApmMap::LoadWorldMap`, on nothing but the tail. Direction one already
+	// applies the same rule (boundaryProperSuffixes drops the bare tail);
+	// this is the other half of it. `qnames` still carries the bare input
+	// for direction one and for the exact legs above, where an equal
+	// spelling is evidence rather than a suffix of one.
+	extendSeeds := make([]string, 0, len(qnames))
+	for _, qname := range qnames {
+		if memberSeparated(qname) {
+			extendSeeds = append(extendSeeds, qname)
+		}
+	}
+	extending, err := s.unresolvedDstNamesExtending(ctx, repoID, extendSeeds)
+	if err != nil {
+		return out, err
+	}
+	for _, name := range extending {
+		if !seen[name] {
+			seen[name] = true
+			out.spellings = append(out.spellings, name)
+		}
+	}
+	return out, nil
+}
+
+// render spells the gathered evidence into one UNIONed candidate leg.
+//
+// The legs, their predicates and their union are exactly what they were before
+// P22.34; only the value sets change shape, and only when the inline transport
+// cannot afford them.
+func (e callerNameEvidence) render(ctx context.Context, repoID int64, sets *neighborSets) (string, []any, error) {
+	var branches []string
+	var args []any
+
+	if len(e.qualifiedExact) > 0 {
+		set, setArgs, err := sets.refStrings(ctx, e.qualifiedExact)
+		if err != nil {
+			return "", nil, err
+		}
+		branches = append(branches, `SELECT e.src_symbol_id AS src FROM edges e
+				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
+				  AND e.dst_name IN `+set)
+		args = append(args, repoID)
+		args = append(args, setArgs...)
+	}
+
+	if len(e.bareExact) > 0 {
+		set, setArgs, err := sets.refStrings(ctx, e.bareExact)
+		if err != nil {
+			return "", nil, err
+		}
+		// `scopeKeys` is empty whenever the predicate is omitted, so the bound
+		// arguments stay in step with the rendered statement.
+		bareScopeFilter := ""
+		var scopeArgs []any
+		if e.scopeKeyed {
+			scopeSet := ""
+			if len(e.scopeKeys) > 0 {
+				var err error
+				if scopeSet, scopeArgs, err = sets.refStrings(ctx, e.scopeKeys); err != nil {
+					return "", nil, err
+				}
+			}
+			bareScopeFilter = ` AND ` + sqlGoBareSourceScope(scopeSet)
+		}
+		// `bareLangs` rather than the union's `targetLangs`: this leg alone
+		// drops the languages whose matched targets are all types (P22.9).
+		// The outer language gate below still applies and is a superset.
+		bareLangFilter := ""
+		var langArgs []any
+		if len(e.bareLangs) > 0 {
+			langSet, a, err := sets.refStrings(ctx, e.bareLangs)
+			if err != nil {
+				return "", nil, err
+			}
+			bareLangFilter = ` AND src.language IN ` + langSet
+			langArgs = a
+		}
+		branches = append(branches, `SELECT e.src_symbol_id AS src FROM edges e
+				JOIN symbols src ON src.id = e.src_symbol_id
+				JOIN files srcf ON srcf.id = src.file_id
+				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
+				  AND e.dst_name IN `+set+`
+				  `+bareScopeFilter+bareLangFilter)
+		args = append(args, repoID)
+		args = append(args, setArgs...)
+		args = append(args, scopeArgs...)
+		args = append(args, langArgs...)
+	}
+
+	if len(e.spellings) > 0 {
+		set, setArgs, err := sets.refStrings(ctx, e.spellings)
+		if err != nil {
+			return "", nil, err
+		}
+		branches = append(branches, `SELECT e.src_symbol_id AS src FROM edges e
+				WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
+				  AND e.dst_name IN `+set)
+		args = append(args, repoID)
+		args = append(args, setArgs...)
+	}
+
 	if len(branches) == 0 {
-		return []graph.Symbol{}, nil
+		return "", nil, nil
 	}
-	return s.symbolPage(ctx, repoID, strings.Join(branches, " UNION "), args, limit, offset)
+	nameSQL := strings.Join(branches, " UNION ")
+	if len(e.targetLangs) > 0 {
+		// P22.7: only a writer in one of the target's own languages may
+		// claim it by name. With no target row there is no language to
+		// require, and the union stands as it did.
+		langSet, langArgs, err := sets.refStrings(ctx, e.targetLangs)
+		if err != nil {
+			return "", nil, err
+		}
+		nameSQL = `SELECT nl.src FROM (` + nameSQL + `) nl
+					JOIN symbols srclang ON srclang.id = nl.src
+					WHERE srclang.language IN ` + langSet
+		args = append(args, langArgs...)
+	}
+	return nameSQL, args, nil
 }
 
 // qualifiedNamesByIDs returns the distinct qualified names of the given
-// symbols, ordered by name so downstream statement text is deterministic.
+// symbols, sorted, so downstream statement text is a function of the graph
+// rather than of how the ids were batched.
+//
+// The ids are read one bounded batch per statement, so SQLite can only order
+// within a batch; the sort is applied once to the union, which is the
+// guarantee the single pre-P22.34 statement's ORDER BY gave.
 func (s *Store) qualifiedNamesByIDs(ctx context.Context, repoID int64, ids []int64) ([]string, error) {
 	var out []string
-	for _, chunk := range chunkInt64s(ids, neighborIDChunk) {
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoID)
-		args = append(args, int64SliceToAny(chunk)...)
-		rows, err := s.db.QueryContext(ctx, `
-			SELECT DISTINCT qualified_name FROM symbols
-			WHERE repo_id = ? AND id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
-			ORDER BY qualified_name`, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
+	err := sqliteBatchedIDQuery(ctx, s.db, ids, `
+		SELECT DISTINCT qualified_name FROM symbols
+		WHERE repo_id = ? AND id IN (`, []any{repoID},
+		func(scan func(...any) error) error {
 			var qname string
-			if err := rows.Scan(&qname); err != nil {
-				rows.Close()
-				return nil, err
+			if err := scan(&qname); err != nil {
+				return err
 			}
 			out = append(out, qname)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -513,7 +720,12 @@ func (s *Store) findCalleesResolved(ctx context.Context, repoID int64, srcIDs []
 	if len(srcIDs) == 0 {
 		return []graph.Symbol{}, nil
 	}
-
-	resolvedSQL, args := edgeIDBranches(repoID, srcIDs, "dst_symbol_id", "src_symbol_id", "e.dst_symbol_id IS NOT NULL")
-	return s.symbolPage(ctx, repoID, resolvedSQL, args, limit, offset)
+	return s.neighborPage(ctx, repoID, limit, offset, func(ctx context.Context, sets *neighborSets) (string, []any, error) {
+		set, setArgs, err := sets.refInt64s(ctx, srcIDs)
+		if err != nil {
+			return "", nil, err
+		}
+		args := append([]any{repoID}, setArgs...)
+		return edgeIDBranch("dst_symbol_id", "src_symbol_id", set, "e.dst_symbol_id IS NOT NULL"), args, nil
+	})
 }
