@@ -31,10 +31,10 @@ type FileParserProfileGroup struct {
 //
 // The population is "files that currently hold parser-owned graph evidence",
 // and NOT `parse_state`. That distinction is the contract, and it is not
-// cosmetic: `TouchFilesMetadataBatch` writes `parse_state = 'skipped'` for a
-// file whose content hash is unchanged but whose mtime moved -- the ordinary
-// result of a checkout, rebase or rebuild -- while leaving every row it
-// declared in place. Filtering on `parse_state = 'indexed'` therefore made a
+// cosmetic: `TouchFilesMetadataBatch` writes `parse_state = ParseStateSkipped`
+// for a file whose content hash is unchanged but whose mtime moved -- the
+// ordinary result of a checkout, rebase or rebuild -- while leaving every row
+// it declared in place. Filtering on `parse_state = 'indexed'` therefore made a
 // whole repository look provenance-free after one `git checkout`, and a
 // downgrade the indexer must refuse would have run unopposed.
 //
@@ -84,13 +84,18 @@ type FileParserProfileGroup struct {
 // guard and no refusal.
 //
 // What the predicate still excludes is exactly right. A file over the size cap
-// or behind a languages allowlist never reached a parser and declares nothing,
-// so it can never pin its language to a stale profile -- and neither can a
-// genuinely empty or comments-only source file, which owns no row in any table
-// below. A file that failed to parse but still holds the previous parser's
-// evidence DOES count: that evidence is real and was produced by that parser,
-// so a half-converged language keeps reporting itself as mixed until the
-// failure is fixed.
+// never reached a parser and, since P22.35, owns nothing: its old graph is
+// retired rather than left standing, so it can never pin its language to a
+// stale profile. The same now holds for a file whose parse failed under
+// `best_effort` -- RetireFileGraphsBatch drops the previous parser's rows with
+// the rest, because a successful scan must not keep serving them as a
+// description of bytes no parser accepted. Neither can a genuinely empty or
+// comments-only source file, which owns no row in any table below.
+//
+// A file behind a `languages` allowlist is the one case that still keeps its
+// rows, and deliberately so: a `--languages go` run makes no claim about Java,
+// so the Java evidence a previous run wrote is still the best answer anyone
+// has, and it keeps pinning its profile.
 const FileParserOwnedEvidencePredicate = `(
 		   EXISTS (SELECT 1 FROM symbols t WHERE t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM references_tbl t WHERE t.file_id = f.id)

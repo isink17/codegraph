@@ -1483,15 +1483,27 @@ func QueryDBPragmas(ctx context.Context, db *sql.DB) (DBPragmas, error) {
 }
 
 // ExistingFileMeta is the slim per-row value the change-detection path
-// actually consumes upfront. It carries only the (size, mtime) pair —
-// the fields the indexer's fast path checks first. `content_sha256` is
-// deliberately NOT in this struct: it's only consulted in the slow
+// actually consumes upfront. It carries the (size, mtime) pair the indexer's
+// fast path checks first, plus the persisted `parse_state`. `content_sha256`
+// is deliberately NOT in this struct: it's only consulted in the slow
 // branch (size/mtime mismatch) and is fetched lazily via
 // `LookupFileContentHash` so a repo-wide no-op load doesn't allocate
 // one hex string per file.
+//
+// ParseState is here because (size, mtime) alone cannot answer the question
+// the fast path is really asking. "Nothing about this file changed" only
+// implies "the persisted graph is still right" when the last scan actually
+// produced a graph from these bytes: a file that was skipped as oversize, or
+// whose parse failed under `best_effort`, must be re-evaluated against the
+// CURRENT configuration and the CURRENT parser even though the bytes are
+// byte-identical -- otherwise raising `max_file_size_bytes`, or fixing a
+// parser, never reaches the file. It is one short interned-ish string per
+// row, which is why it is affordable here and the hash is not.
+// See ParseStateDescribesCurrentBytes.
 type ExistingFileMeta struct {
 	SizeBytes   int64
 	MtimeUnixNS int64
+	ParseState  string
 }
 
 // ExistingFiles returns active (non-deleted) file records for the repo,
@@ -1502,7 +1514,7 @@ type ExistingFileMeta struct {
 // when (size, mtime) differs from disk.
 func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]ExistingFileMeta, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT path, size_bytes, mtime_unix_ns
+		SELECT path, size_bytes, mtime_unix_ns, parse_state
 		FROM files
 		WHERE repo_id = ? AND is_deleted = 0
 	`, repoID)
@@ -1529,7 +1541,7 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		chunk := paths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT path, size_bytes, mtime_unix_ns
+			SELECT path, size_bytes, mtime_unix_ns, parse_state
 			FROM files
 			WHERE repo_id = ? AND is_deleted = 0 AND path IN (` + placeholders + `)
 		`
@@ -1578,7 +1590,7 @@ func scanExistingFileMetasInto(rows *sql.Rows, dst map[string]ExistingFileMeta) 
 	for rows.Next() {
 		var path string
 		var meta ExistingFileMeta
-		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS); err != nil {
+		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS, &meta.ParseState); err != nil {
 			return err
 		}
 		dst[path] = meta
@@ -1787,36 +1799,88 @@ func (s *Store) TouchFilesMetadataBatch(ctx context.Context, repoID, scanID int6
 	return tx.Commit()
 }
 
-func (s *Store) MarkFilesParseFailedBatch(ctx context.Context, repoID, scanID int64, updates []FileMetadataUpdate) error {
+// RetireFileGraphsBatch records a file as present but NOT indexable under the
+// configuration and parser this run actually used, and drops the parser-owned
+// graph its previous bytes produced -- both in one transaction.
+//
+// It exists because a successful scan must never present an old graph as a
+// description of the file's current bytes. Two transitions reach it:
+//
+//   - the file grew past `max_file_size_bytes`, so no parser saw these bytes
+//     (ParseStateOversize)
+//   - the parse failed under `parse_error_policy = best_effort`, so the scan
+//     completes but the file converged on nothing (ParseStateFailed)
+//
+// The `files` row STAYS ACTIVE. The file still exists in the repository and its
+// path, language, size, mtime and hash are truthful facts about it; only the
+// facts a parser owned are retired. That is deliberately not a deletion:
+// `is_deleted` stays 0, no tombstone is written, and the scan's FilesDeleted
+// counter is not involved.
+//
+// `parser_profile` and `parser_call_edges` are cleared for the same reason.
+// P22.29 provenance answers "which parser produced this file's persisted
+// evidence"; a file that now holds none must not keep pinning its language to
+// the profile of a parse whose output no longer exists.
+//
+// Retirement reuses `deleteFileGraphsBatch` rather than maintaining a second
+// list of parser-owned tables. That primitive is the authority on what a file
+// owns, and -- just as important here -- it is what unbinds the INBOUND
+// relationships other files hold: edges resolved to a symbol that is about to
+// disappear have their P4 resolution cleared, and `test_links.target_symbol_id`
+// is nulled, so no row is left pointing at a retired symbol. The caller is
+// responsible for feeding the retired paths into the same removed-name /
+// changed-path invalidation an ordinary replacement uses, so Pass 2 can re-bind
+// what became decidable.
+// It returns how many of the given files actually HELD parser-owned evidence,
+// which is the caller's signal that something left the graph. Re-retiring a
+// file that already owns nothing -- a broken file failing again on every
+// update, an oversize log file whose mtime keeps moving -- returns 0, removes
+// nothing, and must not make the run pay for the repo-wide invalidation a real
+// retirement needs.
+func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64, updates []FileMetadataUpdate, parseState string, stats *WriteStats) (int, error) {
 	if len(updates) == 0 {
-		return nil
+		return 0, nil
+	}
+	switch parseState {
+	case ParseStateOversize, ParseStateFailed:
+	default:
+		return 0, fmt.Errorf("store: RetireFileGraphsBatch: refusing parse_state %q", parseState)
+	}
+	if stats != nil {
+		stats.TxCount++
+		stats.FileUpsertStatements += len(updates)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted)
-		VALUES(?, ?, ?, ?, ?, ?, 'failed', ?, ?, 0)
+		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0)
 		ON CONFLICT(repo_id, path)
 		DO UPDATE SET
 			language = excluded.language,
 			size_bytes = excluded.size_bytes,
 			mtime_unix_ns = excluded.mtime_unix_ns,
 			content_sha256 = excluded.content_sha256,
-			parse_state = 'failed',
+			parse_state = excluded.parse_state,
 			last_scan_id = excluded.last_scan_id,
 			indexed_at = excluded.indexed_at,
-			is_deleted = 0
+			is_deleted = 0,
+			parser_profile = '',
+			parser_call_edges = 0
+		RETURNING id
 	`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return 0, err
 	}
 	defer stmt.Close()
 	indexedAt := time.Now().UTC().Format(time.RFC3339)
+	fileIDs := make([]int64, 0, len(updates))
 	for _, update := range updates {
-		if _, err := stmt.ExecContext(
+		var fileID int64
+		if err := stmt.QueryRowContext(
 			ctx,
 			repoID,
 			update.Path,
@@ -1824,14 +1888,63 @@ func (s *Store) MarkFilesParseFailedBatch(ctx context.Context, repoID, scanID in
 			update.SizeBytes,
 			update.MtimeUnixNS,
 			update.ContentHash,
+			parseState,
 			scanID,
 			indexedAt,
-		); err != nil {
+		).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
-			return err
+			return 0, err
+		}
+		fileIDs = append(fileIDs, fileID)
+	}
+	// Asked before the delete and inside the same transaction, using the
+	// authority on what "holds parser-owned evidence" means. Zero is the common
+	// case on a repeat retirement, and it lets the whole delete be skipped:
+	// sixteen statements that would remove nothing.
+	retired, err := countFilesWithParserOwnedEvidence(ctx, tx, repoID, fileIDs)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	// Same transaction as the metadata write above: a retirement that dropped
+	// the graph but failed to record why would leave the file claiming a state
+	// it no longer holds evidence for, and one that recorded the state but kept
+	// the rows is the very defect this exists to fix.
+	if retired > 0 {
+		if err := deleteFileGraphsBatch(ctx, tx, repoID, fileIDs, stats); err != nil {
+			_ = tx.Rollback()
+			return 0, err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return retired, nil
+}
+
+// countFilesWithParserOwnedEvidence counts how many of `fileIDs` still hold
+// parser-owned graph evidence, by the same predicate provenance uses.
+func countFilesWithParserOwnedEvidence(ctx context.Context, tx *sql.Tx, repoID int64, fileIDs []int64) (int, error) {
+	total := 0
+	idBatch := sqliteBatchSize(1, 1)
+	for start := 0; start < len(fileIDs); start += idBatch {
+		end := min(start+idBatch, len(fileIDs))
+		chunk := fileIDs[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		var n int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM files f
+			WHERE f.repo_id = ? AND f.id IN (`+sqlitePlaceholders(len(chunk))+`)
+			  AND `+FileParserOwnedEvidencePredicate, args...).Scan(&n); err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 func (s *Store) ReplaceFileGraph(ctx context.Context, repoID, scanID int64, path, language string, sizeBytes, mtimeUnixNS int64, contentHash string, parsed graph.ParsedFile) error {

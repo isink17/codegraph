@@ -502,10 +502,15 @@ func TestParserProfileLanguageScopedInvalidation(t *testing.T) {
 	}
 }
 
-// A parse failure mid-convergence must leave provenance TRUTHFUL: the file that
-// could not be reparsed still holds the old parser's symbols, so the language is
-// genuinely mixed, and the next path-scoped update has to say so rather than
-// convert one more file. See parser.Profile and store.FileParserProfileGroups.
+// A parse failure mid-convergence must leave provenance TRUTHFUL. Since P22.35
+// a best-effort failure RETIRES the file's parser-owned graph -- a successful
+// scan must not present the old parser's symbols as a description of the
+// current bytes -- so the file ends up owning no evidence at all. Provenance
+// follows surviving evidence, so it must claim neither profile: not the new one
+// (which never parsed these bytes) and not the old one (whose output is gone).
+// The language is therefore genuinely converged, not mixed.
+// See parser.Profile, store.FileParserOwnedEvidencePredicate and
+// store.RetireFileGraphsBatch.
 func TestParserProfileParseFailureKeepsProvenanceTruthful(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -533,23 +538,27 @@ func TestParserProfileParseFailureKeepsProvenanceTruthful(t *testing.T) {
 	}
 
 	// The failed file was NOT stamped with the parser that never produced its
-	// rows.
+	// rows, and no longer claims the one whose rows were retired with it.
 	var stamped string
 	if err := s.raw(t).QueryRowContext(ctx,
 		`SELECT parser_profile FROM files WHERE path = 'B.java'`).Scan(&stamped); err != nil {
 		t.Fatalf("scan error = %v", err)
 	}
-	if stamped != "heuristic:java:v1" {
-		t.Fatalf("failed file parser_profile = %q, want the profile that actually wrote its graph", stamped)
+	if stamped != "" {
+		t.Fatalf("failed file parser_profile = %q, want empty after retirement", stamped)
+	}
+	if got := evidenceFor(t, s, root, "B.java"); got != (evidenceCounts{}) {
+		t.Fatalf("failed file evidence = %#v, want none after retirement", got)
 	}
 
-	// So the language reads as mixed, and an incremental update refuses.
+	// It pins nothing, so the language reads as converged and an incremental
+	// update is free to proceed.
 	groups := profilesInDB(t, s, repoID(t, s, root))
-	if len(groups) != 2 {
-		t.Fatalf("groups = %#v, want both profiles while convergence is incomplete", groups)
+	if len(groups) != 1 || groups[0].Profile != "treesitter:java:v1" {
+		t.Fatalf("groups = %#v, want only the converged profile", groups)
 	}
-	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("path-scoped err = %v, want ErrParserProfileTransitionRequired", err)
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); err != nil {
+		t.Fatalf("path-scoped err = %v, want nil", err)
 	}
 
 	// Fixing the file lets a full update finish convergence.
@@ -912,10 +921,11 @@ func TestParserProfileEvidencelessFilesDoNotPinProvenance(t *testing.T) {
 	}
 }
 
-// Same rule, on a file whose last-good graph is evidence only. A failed reparse
-// leaves the previous parser's imports and re-exports in place, so the file
-// still belongs to the profile that wrote them and the language is still mixed
-// -- provenance follows the surviving evidence, never `parse_state`.
+// Same rule, on a file whose last-good graph is evidence only. Since P22.35 a
+// failed reparse retires the previous parser's imports and re-exports along
+// with everything else it owned, so the file belongs to no profile at all --
+// provenance follows the surviving evidence, never `parse_state`, and here
+// none survives.
 func TestParserProfileParseFailureKeepsEvidenceOnlyProvenance(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -938,26 +948,27 @@ func TestParserProfileParseFailureKeepsEvidenceOnlyProvenance(t *testing.T) {
 		t.Fatalf("Update() error = %v", err)
 	}
 
-	// The last-good re-export row survived, and still belongs to the parser
-	// that wrote it.
-	if got := evidenceFor(t, s, root, "reexport.ts"); got != (evidenceCounts{ScopeImports: 1}) {
-		t.Fatalf("last-good evidence = %#v, want the previous parser's re-export intact", got)
+	// The last-good re-export row went with the retirement: a scan that
+	// completed successfully must not keep serving a row describing bytes no
+	// parser accepted.
+	if got := evidenceFor(t, s, root, "reexport.ts"); got != (evidenceCounts{}) {
+		t.Fatalf("retired evidence = %#v, want none", got)
 	}
 	var stamped string
 	if err := s.raw(t).QueryRowContext(ctx,
 		`SELECT parser_profile FROM files WHERE path = 'reexport.ts'`).Scan(&stamped); err != nil {
 		t.Fatalf("scan error = %v", err)
 	}
-	if stamped != "heuristic:typescript:v1" {
-		t.Fatalf("failed file parser_profile = %q, want the profile that actually wrote its graph", stamped)
+	if stamped != "" {
+		t.Fatalf("failed file parser_profile = %q, want empty after retirement", stamped)
 	}
 
 	groups := profilesInDB(t, s, repoID(t, s, root))
-	if len(groups) != 2 {
-		t.Fatalf("groups = %#v, want both profiles while convergence is incomplete", groups)
+	if len(groups) != 1 || groups[0].Profile != "treesitter:typescript:v1" {
+		t.Fatalf("groups = %#v, want only the converged profile", groups)
 	}
-	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"bootstrap.ts"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("path-scoped err = %v, want ErrParserProfileTransitionRequired", err)
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"bootstrap.ts"}}); err != nil {
+		t.Fatalf("path-scoped err = %v, want nil", err)
 	}
 
 	writeProfileFile(t, filepath.Join(root, "reexport.ts"), "REEXPORT_ONLY\n")
