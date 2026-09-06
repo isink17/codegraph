@@ -111,7 +111,10 @@ func (f *rustCrateRootFixture) resolveAll(t *testing.T, ctx context.Context) {
 // allows.
 func TestRustCrateRootPersistenceWritesEveryBatch(t *testing.T) {
 	ctx := context.Background()
-	for _, moduleCount := range []int{0, 1, 2, 700} {
+	// One module past the CASE writer's batch boundary is what proves batching;
+	// the root file makes it batch+1 rows in total. Larger fixtures prove the
+	// same thing and only cost runtime.
+	for _, moduleCount := range []int{0, 1, 2, sqliteBatchSize(1, 3)} {
 		t.Run(fmt.Sprintf("modules=%d", moduleCount), func(t *testing.T) {
 			modules := make([]string, 0, moduleCount)
 			for i := 0; i < moduleCount; i++ {
@@ -196,12 +199,18 @@ func TestRustCrateRootDoesNotProveItself(t *testing.T) {
 }
 
 // TestRustCrateRootKeepsCratesIsolated proves the write does not leak
-// membership across independent crate roots, including past one SQL batch.
+// membership across independent crate roots when both spell the same module
+// names.
 func TestRustCrateRootKeepsCratesIsolated(t *testing.T) {
 	ctx := context.Background()
 	f := newRustCrateRootFixture(t, ctx, "src/lib.rs")
 	alt := f.addFile(t, ctx, "alt/main.rs", "crate")
-	const perCrate = 400
+	// This test's contract is cross-crate isolation of identical module names,
+	// not batching -- the CASE writer's batch behaviour is proven by
+	// TestRustCrateRootPersistenceWritesEveryBatch and
+	// TestUpdateRustCrateRootsBindsCorrectGroups, and isolation at batch scale
+	// by TestRustScopeResolvesEveryCrateAcrossRootBatches.
+	const perCrate = 3
 	want := map[string]string{"src/lib.rs": "src/lib.rs", "alt/main.rs": "alt/main.rs"}
 	for i := 0; i < perCrate; i++ {
 		name := fmt.Sprintf("m%04d", i)

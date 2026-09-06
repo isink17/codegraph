@@ -21,7 +21,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        run: go test ./...
+        run: go test -timeout 20m ./...
 
   build:
     needs: test
@@ -74,7 +74,10 @@ jobs:
           go env GOOS GOARCH CGO_ENABLED GOPATH GOMODCACHE GOCACHE
 
       - name: Run native tests
-        run: go test ./...
+        # Same 20-minute ceiling as CI: this step runs on hosted Windows
+        # runners, where Go's 10-minute default is within reach of the store
+        # package's WAL-checkpoint-heavy test set.
+        run: go test -timeout 20m ./...
 
       - name: Build archive
         shell: bash

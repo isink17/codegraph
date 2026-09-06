@@ -22,7 +22,20 @@ type rustBudgetFixture struct {
 	ambiguous int64
 }
 
-const rustBudgetCrateCount = 400
+// rustBudgetCrateCount is the smallest crate count that is still load-bearing:
+// one root past the point where a single unbatched predicate would exceed the
+// portable variable contract. At rustCrateRootPredicateParams parameters per
+// root that is 200 crates, which also spans more than one rustRootBatchSize
+// batch (150), so the cross-batch guarantees stay under test. The tests below
+// assert both properties, so shrinking this constant fails loudly rather than
+// quietly proving nothing.
+const rustBudgetCrateCount = sqliteDefaultMaxVariables/rustCrateRootPredicateParams + 1
+
+// rustBudgetCrateDir and rustBudgetCrateRoot name the fixture's crates, so the
+// tests address them by index and stay correct when the count changes.
+func rustBudgetCrateDir(i int) string { return fmt.Sprintf("c%04d", i) }
+
+func rustBudgetCrateRoot(i int) string { return rustBudgetCrateDir(i) + "/lib.rs" }
 
 func buildRustBudgetFixture(t *testing.T, s *Store, repoID int64) *rustBudgetFixture {
 	t.Helper()
@@ -60,7 +73,7 @@ func buildRustBudgetFixture(t *testing.T, s *Store, repoID int64) *rustBudgetFix
 		return id
 	}
 	for i := range rustBudgetCrateCount {
-		crate := fmt.Sprintf("c%04d", i)
+		crate := rustBudgetCrateDir(i)
 		root := crate + "/lib.rs"
 		f.roots[root] = struct{}{}
 		lib := addFile(root, "crate")
@@ -75,8 +88,9 @@ func buildRustBudgetFixture(t *testing.T, s *Store, repoID int64) *rustBudgetFix
 		f.edgeByCrate[root] = edge
 		f.wantTarget[edge] = target
 		// The ambiguity: `shared/util` suffix-matches a file in the first crate
-		// and a file in the last one, so no single membership is proven. The two
-		// candidates deliberately land in different root batches.
+		// and a file in the last one, so no single membership is proven. Roots
+		// are batched in sorted order, so the first and last crate land in
+		// different root batches -- asserted in the test that depends on it.
 		if i == 0 || i == rustBudgetCrateCount-1 {
 			util := addFile(crate+"/shared/util.rs", "crate::util")
 			publicFn(util, "shared", "crate::util::shared")
@@ -127,6 +141,7 @@ func TestRustScopeRootFanOutStaysInVariableBudget(t *testing.T) {
 	if wantBatches < 2 {
 		t.Fatalf("fixture fits one batch (%d roots, batch %d); the test proves nothing", len(f.roots), batchSize)
 	}
+	assertRustAmbiguityCandidatesSplitBatches(t, batchSize)
 	if got := len(guard.matching("SELECT f.id FROM files f")); got != wantBatches {
 		t.Fatalf("root discovery ran %d statements, want %d", got, wantBatches)
 	}
@@ -145,6 +160,7 @@ func TestRustScopeResolvesEveryCrateAcrossRootBatches(t *testing.T) {
 		only[edge] = struct{}{}
 	}
 	only[f.ambiguous] = struct{}{}
+	assertRustAmbiguityCandidatesSplitBatches(t, rustRootBatchSize(1))
 	if _, err := s.resolveRustModuleScopeStandalone(ctx, repo.ID, only); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +190,7 @@ func TestRustNamesForChangedPathsCoversEveryRootBatch(t *testing.T) {
 	s, repo := openBudgetStore(t)
 	f := buildRustBudgetFixture(t, s, repo.ID)
 
+	assertRustAmbiguityCandidatesSplitBatches(t, rustRootBatchSize(1))
 	guard := newBudgetQuerier(s.db)
 	names, err := rustNamesForChangedPaths(ctx, guard, repo.ID, f.roots)
 	if err != nil {
@@ -195,12 +212,13 @@ func TestRustNamesForChangedPathsCoversEveryRootBatch(t *testing.T) {
 	}
 
 	// One crate's roots must not surface another crate's names.
-	single := map[string]struct{}{"c0001/lib.rs": {}}
-	if _, err := s.db.ExecContext(ctx, `UPDATE file_scope_evidence SET crate_root='c0001/lib.rs' WHERE repo_id=? AND file_id IN (SELECT id FROM files WHERE repo_id=? AND path LIKE 'c0001/%')`, repo.ID, repo.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE file_scope_evidence SET crate_root='c0002/lib.rs' WHERE repo_id=? AND file_id IN (SELECT id FROM files WHERE repo_id=? AND path LIKE 'c0002/%')`, repo.ID, repo.ID); err != nil {
-		t.Fatal(err)
+	single := map[string]struct{}{rustBudgetCrateRoot(1): {}}
+	for _, i := range []int{1, 2} {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE file_scope_evidence SET crate_root=? WHERE repo_id=? AND file_id IN (SELECT id FROM files WHERE repo_id=? AND path LIKE ?)`,
+			rustBudgetCrateRoot(i), repo.ID, repo.ID, rustBudgetCrateDir(i)+"/%"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	scopedNames, err := rustNamesForChangedPaths(ctx, s.db, repo.ID, single)
 	if err != nil {
@@ -238,7 +256,7 @@ func TestInvalidateRustBindingsForRootsClearsEveryBatch(t *testing.T) {
 
 	// Hold one crate back so completeness is not the same thing as "cleared
 	// everything".
-	keep := "c0399/lib.rs"
+	keep := rustBudgetCrateRoot(rustBudgetCrateCount - 1)
 	affected := map[string]struct{}{}
 	for root := range f.roots {
 		if root != keep {
@@ -253,6 +271,7 @@ func TestInvalidateRustBindingsForRootsClearsEveryBatch(t *testing.T) {
 		t.Fatalf("max bound args = %d, want <= %d", guard.maxArgs, sqliteDefaultMaxVariables)
 	}
 	batchSize := rustRootBatchSize(2)
+	assertRustAmbiguityCandidatesSplitBatches(t, batchSize)
 	if want := (len(affected) + batchSize - 1) / batchSize; len(guard.matching("UPDATE edges SET")) != want {
 		t.Fatalf("invalidation ran %d statements, want %d", len(guard.matching("UPDATE edges SET")), want)
 	}
@@ -273,7 +292,11 @@ func TestInvalidateRustBindingsForRootsClearsEveryBatch(t *testing.T) {
 // several batches all land, and no statement exceeds the budget.
 func TestUpdateRustCrateRootsBindsCorrectGroups(t *testing.T) {
 	ctx := context.Background()
-	for _, rowCount := range []int{0, 1, 2, 3, sqliteBatchSize(1, 3) + 1, 1000} {
+	// One row past the first batch boundary proves batching; one row past the
+	// second proves the loop, not just the split. Anything larger only buys
+	// runtime.
+	batch := sqliteBatchSize(1, 3)
+	for _, rowCount := range []int{0, 1, 2, 3, batch + 1, 2*batch + 1} {
 		t.Run(fmt.Sprintf("rows=%d", rowCount), func(t *testing.T) {
 			s, repo := openBudgetStore(t)
 			ids := make([]int64, 0, rowCount)
@@ -307,17 +330,35 @@ func TestUpdateRustCrateRootsBindsCorrectGroups(t *testing.T) {
 				t.Fatalf("max bound args = %d, want <= the working ceiling %d", guard.maxArgs, sqliteInClauseBatchSize)
 			}
 			statements := len(guard.matching("UPDATE file_scope_evidence SET crate_root=CASE file_id"))
-			batch := sqliteBatchSize(1, 3)
 			if want := (rowCount + batch - 1) / batch; statements != want {
 				t.Fatalf("ran %d statements for %d rows, want %d", statements, rowCount, want)
 			}
-			for i, id := range ids {
-				var got string
-				if err := s.db.QueryRowContext(ctx, `SELECT crate_root FROM file_scope_evidence WHERE repo_id=? AND file_id=?`, repo.ID, id).Scan(&got); err != nil {
+			written := map[int64]string{}
+			rows, err := s.db.QueryContext(ctx, `SELECT file_id,crate_root FROM file_scope_evidence WHERE repo_id=?`, repo.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id int64
+				var root string
+				if err := rows.Scan(&id, &root); err != nil {
 					t.Fatal(err)
 				}
-				if got != roots[id] {
-					t.Fatalf("row %d: crate_root=%q, want %q", i, got, roots[id])
+				written[id] = root
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			// A missing row reads back as the zero value, which is also the
+			// wanted value for every row that lost its membership -- so the
+			// count is what keeps the empty-root half of the proof honest.
+			if len(written) != rowCount {
+				t.Fatalf("read back %d rows, want %d", len(written), rowCount)
+			}
+			for i, id := range ids {
+				if written[id] != roots[id] {
+					t.Fatalf("row %d: crate_root=%q, want %q", i, written[id], roots[id])
 				}
 			}
 		})
@@ -360,18 +401,19 @@ func TestNameInvalidationKeepsUnaffectedRustCrates(t *testing.T) {
 	}
 	// A legacy binding on a Rust file, written by a strategy the Rust pass does
 	// not own. It must still be cleared, or it can never converge.
-	legacy := f.edgeByCrate["c0100/lib.rs"]
+	mid := rustBudgetCrateRoot(rustBudgetCrateCount / 2)
+	legacy := f.edgeByCrate[mid]
 	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET resolution_strategy=? WHERE id=?`, ResolutionStrategyDotSuffix, legacy); err != nil {
 		t.Fatal(err)
 	}
 
-	affected := map[string]struct{}{"c0000/lib.rs": {}, "c0100/lib.rs": {}}
+	affected := map[string]struct{}{rustBudgetCrateRoot(0): {}, mid: {}}
 	scope, err := s.rustScopedFileIDs(ctx, repo.ID, affected)
 	if err != nil {
 		t.Fatal(err)
 	}
-	inScope := f.edgeByCrate["c0000/lib.rs"]
-	outOfScope := f.edgeByCrate["c0399/lib.rs"]
+	inScope := f.edgeByCrate[rustBudgetCrateRoot(0)]
+	outOfScope := f.edgeByCrate[rustBudgetCrateRoot(rustBudgetCrateCount-1)]
 	if _, err := s.invalidateNameEvidenceBindings(ctx, repo.ID, []string{"crate::m::helper"}, scope); err != nil {
 		t.Fatal(err)
 	}
@@ -390,5 +432,19 @@ func TestNameInvalidationKeepsUnaffectedRustCrates(t *testing.T) {
 	}
 	if got := strategy(legacy); got != "" {
 		t.Fatalf("legacy %q binding on a Rust file survived, want it cleared", got)
+	}
+}
+
+// assertRustAmbiguityCandidatesSplitBatches proves the fixture still spans more
+// than one root batch, and specifically that its two competing candidates land
+// in different ones. Roots are batched in sorted order, so the first and last
+// crate must not share a batch -- otherwise every test that says "EveryBatch"
+// silently degrades into a single-batch test.
+func assertRustAmbiguityCandidatesSplitBatches(t *testing.T, batchSize int) {
+	t.Helper()
+	first, last := 0, rustBudgetCrateCount-1
+	if first/batchSize == last/batchSize {
+		t.Fatalf("crates %d and %d share root batch %d of size %d; the ambiguity is no longer cross-batch",
+			first, last, first/batchSize, batchSize)
 	}
 }
