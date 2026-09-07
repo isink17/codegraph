@@ -321,6 +321,177 @@ public class Outer { private class Hidden { public class Inner { public static v
 	}
 }
 
+func TestCSharpScopeF3RelativeNamespaceLookup(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"Global.cs":     `public class Service { public static void Run() {} }`,
+		"A.cs":          `namespace A; public class Service { public static void Run() {} }`,
+		"AB.cs":         `namespace A.B; public class Service { public static void Run() {} }`,
+		"XService.cs":   `namespace X; public class Service { public static void Run() {} }`,
+		"XABService.cs": `namespace X.A.B; public class Service { public static void Run() {} }`,
+		"Caller.cs": `namespace X;
+class Caller { void F() { Service.Run(); A.B.Service.Run(); global::A.B.Service.Run(); } }`,
+		"UsingCaller.cs": `using A;
+namespace Y;
+class Caller { void F() { Service.Run(); } }`,
+		"GlobalCaller.cs": `namespace Z;
+class Caller { void F() { Service.Run(); } }`,
+	}
+	for path, content := range files {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := s.ExportEdgesPage(context.Background(), repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"Caller.cs:Service.Run":             "X.Service.Run",
+		"Caller.cs:A.B.Service.Run":         "X.A.B.Service.Run",
+		"Caller.cs:global::A.B.Service.Run": "A.B.Service.Run",
+		"UsingCaller.cs:Service.Run":        "A.Service.Run",
+		"GlobalCaller.cs:Service.Run":       "Service.Run",
+	}
+	seen := map[string]bool{}
+	for _, edge := range edges {
+		key, ok := edge.FilePath+":"+edge.DstName, false
+		for candidate := range want {
+			if candidate == key {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		seen[key] = true
+		if edge.DstSymbolID == nil || edge.DstQualifiedName != want[key] {
+			t.Errorf("%s target=%q resolved=%v, want %q", key, edge.DstQualifiedName, edge.DstSymbolID != nil, want[key])
+		}
+	}
+	for key := range want {
+		if !seen[key] {
+			t.Errorf("missing F3 edge %s", key)
+		}
+	}
+}
+
+func TestCSharpScopeF3IncrementalRetargetParity(t *testing.T) {
+	root := t.TempDir()
+	write := func(path, content string) {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Global.cs", `public class Service { public static void Run() {} }`)
+	write("A.cs", `namespace A; public class Service { public static void Run() {} }`)
+	write("Caller.cs", `namespace X; class Caller { void F() { Service.Run(); } }`)
+	write("UsingCaller.cs", `namespace Y; class Caller { void F() { Service.Run(); } }`)
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	idx := New(s, parser.NewRegistry(ts.NewCSharp()), nil)
+	if _, err := idx.Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	assertTarget := func(file, name, target string) {
+		if got := csharpTarget(t, s, root, file, name); got != target {
+			t.Fatalf("%s:%s target=%q, want %q", file, name, got, target)
+		}
+	}
+	assertTarget("Caller.cs", "Service.Run", "Service.Run")
+
+	write("XService.cs", `namespace X; public class Service { public static void Run() {} }`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"XService.cs", "Caller.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assertTarget("Caller.cs", "Service.Run", "X.Service.Run")
+	assertCSharpFreshParity(t, s, root)
+
+	if err := os.Remove(filepath.Join(root, "XService.cs")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"XService.cs", "Caller.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assertTarget("Caller.cs", "Service.Run", "Service.Run")
+	write("UsingCaller.cs", `using A;
+namespace Y; class Caller { void F() { Service.Run(); } }`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"UsingCaller.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assertTarget("UsingCaller.cs", "Service.Run", "A.Service.Run")
+	write("UsingCaller.cs", `namespace Y; class Caller { void F() { Service.Run(); } }`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"UsingCaller.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assertTarget("UsingCaller.cs", "Service.Run", "Service.Run")
+	assertCSharpFreshParity(t, s, root)
+}
+
+func csharpTarget(t *testing.T, s *store.Store, root, file, name string) string {
+	t.Helper()
+	repo, err := s.UpsertRepo(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := s.ExportEdgesPage(context.Background(), repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range edges {
+		if edge.FilePath == file && edge.DstName == name {
+			return edge.DstQualifiedName
+		}
+	}
+	t.Fatalf("missing %s:%s edge", file, name)
+	return ""
+}
+
+func assertCSharpFreshParity(t *testing.T, current *store.Store, root string) {
+	t.Helper()
+	freshRoot := t.TempDir()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(root, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(freshRoot, entry.Name()), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if _, err := New(fresh, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: freshRoot, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(csharpProjection(t, current, root), "\n"), strings.Join(csharpProjection(t, fresh, freshRoot), "\n"); got != want {
+		t.Fatalf("fresh/incremental mismatch\nfresh=%s\nincremental=%s", want, got)
+	}
+}
+
 func csharpResolved(t *testing.T, s *store.Store, root, file, name string) bool {
 	t.Helper()
 	repo, err := s.UpsertRepo(context.Background(), root)

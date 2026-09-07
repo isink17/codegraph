@@ -346,9 +346,6 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 	if len(aliases) > 0 {
 		return decide(aliases, true)
 	}
-	if types := semanticTypes([]string{qualifier}); len(types) > 0 {
-		return decide([]string{qualifier}, false)
-	}
 	for current := namespace; current != ""; {
 		candidate := current + "." + qualifier
 		if len(semanticTypes([]string{candidate})) > 0 {
@@ -366,7 +363,10 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 			usingTypes = append(usingTypes, i.source+"."+qualifier)
 		}
 	}
-	return decide(usingTypes, false)
+	if len(semanticTypes(usingTypes)) > 0 {
+		return decide(usingTypes, false)
+	}
+	return decide([]string{qualifier}, false)
 }
 
 func csharpTypeAccessibleByQName(qname, sourceContainer string, byQName map[string][]csharpScopeSymbol) bool {
