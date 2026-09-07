@@ -1373,12 +1373,20 @@ func (s *Store) repairResolverBindingsOnce(ctx context.Context, repoID int64, de
 // unset would make the next ordinary update pay for a repo-wide resolve that
 // can only reproduce what the index just decided. See RepoHasExistingGraph.
 func (s *Store) MarkResolverBindingsRepaired(ctx context.Context, repoID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, repair := range resolverRepairs {
-		if err := s.markRepairDone(ctx, repair.key, repoID); err != nil {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings(key, value) VALUES(?, '1')
+			 ON CONFLICT(key) DO UPDATE SET value = '1'`,
+			repair.key+"."+strconv.FormatInt(repoID, 10)); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // markRepairDone writes one repair's per-repository marker.

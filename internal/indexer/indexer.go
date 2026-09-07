@@ -957,12 +957,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	repairResolvedRepoWide := false
 	markFreshResolverRepairs := false
 	deferReferenceRepair := len(changedPathSet) > 0 || len(removedSymbolNameSet) > 0
+	referenceRepairAfterEdgePass := false
 	if hadExistingGraph {
 		if deferReferenceRepair {
 			repairResolvedRepoWide, err = i.store.RepairResolverBindingsBeforeEdges(ctx, repo.ID)
 		} else {
 			repairResolvedRepoWide, err = i.store.RepairResolverBindingsOnce(ctx, repo.ID)
 		}
+		referenceRepairAfterEdgePass = deferReferenceRepair && repairResolvedRepoWide && !incrementalResolve
 	} else {
 		// Mark only after this scan's edge and reference Pass 2 succeeds. A
 		// failed fresh scan must not claim current derived-state semantics.
@@ -1033,6 +1035,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		summary.ResolveMode = "repo"
 	}
 	if markFreshResolverRepairs || deferReferenceRepair {
+		if referenceRepairAfterEdgePass {
+			if _, err := i.store.RepairResolverBindingsOnce(ctx, repo.ID); err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+		}
 		if err := i.store.MarkResolverBindingsRepaired(ctx, repo.ID); err != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
