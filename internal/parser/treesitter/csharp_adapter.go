@@ -40,7 +40,7 @@ func (a *CSharpAdapter) Parse(ctx context.Context, path string, content []byte) 
 
 	csExtractImports(root, "", content, &pf)
 	csExtractSymbols(root, "", "", content, &pf)
-	if namespaces := csNamespaces(root, content); len(namespaces) == 1 {
+	if namespaces := csNamespaces(root, content); len(namespaces) == 1 && csTruthfulFileNamespace(pf.Symbols, namespaces[0]) {
 		pf.Scope.Package = namespaces[0]
 	}
 	csExtractCalls(root, content, &pf)
@@ -147,7 +147,7 @@ func csAddType(node *sitter.Node, module, parent string, content []byte, pf *gra
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: container,
-		Visibility:    heuristicVisibility(name),
+		Visibility:    csTypeVisibility(node, content),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "type:csharp:" + qualified,
@@ -298,7 +298,10 @@ func csCollectBindings(node *sitter.Node, owner string, content []byte, pf *grap
 		csAddBinding(pf, nodeText(v, content), owner)
 	}
 	for _, v := range findDescendants(node, "catch_declaration") {
-		csAddBinding(pf, nodeText(v, content), owner)
+		csAddBinding(pf, nodeText(childByFieldName(v, "name"), content), owner)
+	}
+	for _, v := range findDescendants(node, "local_function_statement") {
+		csAddBinding(pf, nodeText(childByFieldName(v, "name"), content), owner)
 	}
 }
 
@@ -334,6 +337,44 @@ func csMethodVisibility(node *sitter.Node, content []byte) string {
 		}
 	}
 	return "private"
+}
+
+func csTypeVisibility(node *sitter.Node, content []byte) string {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		c := node.Child(i)
+		if c.Type() != "modifier" && c.Type() != "access_modifier" {
+			continue
+		}
+		switch nodeText(c, content) {
+		case "public":
+			return "public"
+		case "private":
+			return "private"
+		case "protected":
+			return "protected"
+		case "internal":
+			return "module"
+		}
+	}
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.Type() {
+		case "class_declaration", "interface_declaration", "struct_declaration", "enum_declaration", "record_declaration":
+			return "private"
+		}
+	}
+	return "module"
+}
+
+func csTruthfulFileNamespace(symbols []graph.Symbol, namespace string) bool {
+	if namespace == "" || len(symbols) == 0 {
+		return false
+	}
+	for _, symbol := range symbols {
+		if symbol.QualifiedName != namespace && !strings.HasPrefix(symbol.QualifiedName, namespace+".") {
+			return false
+		}
+	}
+	return true
 }
 
 func csExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {

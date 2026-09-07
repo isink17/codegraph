@@ -56,7 +56,6 @@ WHERE e.repo_id=? AND f.language='csharp' AND e.dst_symbol_id IS NULL`, " AND e.
 		return 0, nil
 	}
 
-	symbols := map[int64]csharpScopeSymbol{}
 	byName := map[string][]csharpScopeSymbol{}
 	byQName := map[string][]csharpScopeSymbol{}
 	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.stable_key,s.signature,s.visibility,s.is_static
@@ -66,12 +65,14 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.stable, &s.signature, &s.visibility, &s.static); err != nil {
 				return err
 			}
-			symbols[s.id] = s
 			byName[s.name] = append(byName[s.name], s)
 			byQName[s.qname] = append(byQName[s.qname], s)
 			return nil
 		}); err != nil {
 		return 0, err
+	}
+	for i := range edges {
+		edges[i].srcNamespace = csharpNamespaceForType(edges[i].srcContainer, byQName)
 	}
 
 	files := map[int64]struct{}{}
@@ -150,7 +151,7 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 }
 
 func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol, byQName map[string][]csharpScopeSymbol, imports []csharpScopeImport, bindings map[string]map[string]struct{}) (csharpScopeSymbol, string, bool) {
-	name := strings.TrimPrefix(e.name, "global::")
+	name := e.name
 	if name == "" || strings.HasPrefix(name, "base.") {
 		return csharpScopeSymbol{}, "", false
 	}
@@ -205,53 +206,67 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 		if out, ok := choose(c, false); ok {
 			return out, "csharp_same_type", true
 		}
+		var c2 []csharpScopeSymbol
+		seen := map[string]struct{}{}
 		for _, i := range imports {
-			if applicable(i) && i.static && !strings.HasPrefix(i.kind, "global_") {
-				if out, ok := choose(byQName[i.source+"."+method], true); ok {
-					return out, "csharp_static_using", true
+			if !applicable(i) || !i.static || strings.HasPrefix(i.kind, "global_") {
+				continue
+			}
+			typeAccessible := false
+			for _, typeSymbol := range byQName[i.source] {
+				if typeSymbol.kind == "type" && csharpTypeAccessible(typeSymbol, e.srcContainer) {
+					typeAccessible = true
+					break
 				}
 			}
+			if !typeAccessible {
+				continue
+			}
+			for _, s := range byQName[i.source+"."+method] {
+				if _, ok := seen[s.stable]; !ok {
+					seen[s.stable] = struct{}{}
+					c2 = append(c2, s)
+				}
+			}
+		}
+		if out, ok := choose(c2, true); ok {
+			return out, "csharp_static_using", true
 		}
 		return csharpScopeSymbol{}, "", false
 	}
 	if qualifier == "this" {
+		var c []csharpScopeSymbol
 		for _, s := range byName[method] {
 			if s.container == e.srcContainer {
-				if out, ok := choose([]csharpScopeSymbol{s}, false); ok {
-					return out, "csharp_this_scope", true
-				}
+				c = append(c, s)
 			}
+		}
+		if out, ok := choose(c, false); ok {
+			return out, "csharp_this_scope", true
 		}
 		return csharpScopeSymbol{}, "", false
 	}
 	if shadowed(strings.TrimPrefix(qualifier, "global::")) {
 		return csharpScopeSymbol{}, "", false
 	}
-	typeQ := qualifier
+	typeQ := strings.TrimPrefix(qualifier, "global::")
 	alias := false
-	namespaceQ := map[string]struct{}{}
+	qnames := csharpCandidateTypeQNames(typeQ, e.srcNamespace, imports)
 	for _, i := range imports {
 		if applicable(i) && i.local == qualifier && !strings.HasPrefix(i.kind, "global_") {
-			typeQ = i.source
+			qnames = append(qnames, i.source)
 			alias = i.kind == "alias"
 		}
-		if applicable(i) && i.kind == "namespace" && !strings.HasPrefix(i.kind, "global_") {
-			namespaceQ[i.source+"."+qualifier] = struct{}{}
-		}
 	}
-	var c []csharpScopeSymbol
 	types := map[string]struct{}{}
-	for q, ss := range byQName {
-		_, importedType := namespaceQ[q]
-		currentType := e.srcNamespace != "" && q == e.srcNamespace+"."+typeQ
-		if q == typeQ || importedType || currentType || (strings.Contains(typeQ, ".") && strings.HasSuffix(q, "."+typeQ)) {
-			for _, s := range ss {
-				if s.kind == "type" {
-					types[s.qname] = struct{}{}
-				}
+	for _, q := range qnames {
+		for _, s := range byQName[q] {
+			if s.kind == "type" && csharpTypeAccessible(s, e.srcContainer) {
+				types[s.qname] = struct{}{}
 			}
 		}
 	}
+	var c []csharpScopeSymbol
 	for _, s := range byName[method] {
 		if _, ok := types[s.container]; ok {
 			c = append(c, s)
@@ -264,4 +279,79 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 		return out, "csharp_type_scope", true
 	}
 	return csharpScopeSymbol{}, "", false
+}
+
+func csharpNamespaceForType(qname string, byQName map[string][]csharpScopeSymbol) string {
+	if qname == "" {
+		return ""
+	}
+	var containers []string
+	for _, s := range byQName[qname] {
+		if s.kind == "type" {
+			containers = append(containers, s.container)
+		}
+	}
+	if len(containers) == 0 {
+		return ""
+	}
+	first := containers[0]
+	for _, c := range containers[1:] {
+		if c != first {
+			return ""
+		}
+	}
+	if first == "" {
+		return ""
+	}
+	if parent := byQName[first]; len(parent) > 0 {
+		for _, s := range parent {
+			if s.kind == "type" {
+				return csharpNamespaceForType(first, byQName)
+			}
+		}
+	}
+	return first
+}
+
+func csharpCandidateTypeQNames(qualifier, namespace string, imports []csharpScopeImport) []string {
+	seen := map[string]struct{}{}
+	add := func(q string) {
+		q = strings.TrimPrefix(strings.TrimSpace(q), "global::")
+		if q != "" {
+			seen[q] = struct{}{}
+		}
+	}
+	add(qualifier)
+	for _, i := range imports {
+		if strings.HasPrefix(i.kind, "global_") || i.owner != namespace && i.owner != "" {
+			continue
+		}
+		if i.kind == "namespace" {
+			add(i.source + "." + qualifier)
+		}
+		if i.kind == "alias" && i.local == qualifier {
+			add(i.source)
+		}
+	}
+	for current := namespace; current != ""; {
+		add(current + "." + qualifier)
+		if dot := strings.LastIndexByte(current, '.'); dot >= 0 {
+			current = current[:dot]
+		} else {
+			current = ""
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for q := range seen {
+		out = append(out, q)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func csharpTypeAccessible(s csharpScopeSymbol, sourceContainer string) bool {
+	if s.qname == sourceContainer || s.container == sourceContainer {
+		return true
+	}
+	return s.visibility == "public"
 }
