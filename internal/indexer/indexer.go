@@ -464,6 +464,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	markSeenBatch := make([]string, 0, metadataBatchSize)
 	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
+	// Files present on disk but not indexable under THIS run's configuration or
+	// parser. Their old graph is retired rather than left standing; see
+	// store.RetireFileGraphsBatch.
+	oversizeBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
+	// How many files this run retired a REAL graph from, as reported by the
+	// store. Not a summary field: it exists only to dispatch the import-index
+	// revalidation below, which retirement needs for the same reason deletion
+	// does.
+	retiredFiles := 0
 	replaceBatch := make([]store.ReplaceFileGraphInput, 0, replaceBatchSize)
 	changedPathSet := make(map[string]struct{}, 64)
 	changedSymbolNameSet := make(map[string]struct{}, 256)
@@ -528,18 +537,65 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		touchBatch = touchBatch[:0]
 		return nil
 	}
+	// flushRetire writes one retirement batch: the file rows keep truthful
+	// metadata while the parser-owned graph their previous bytes produced goes
+	// away, in a single transaction.
+	//
+	// collectRemovedNames runs FIRST, exactly as in flushReplace and for the
+	// same reason: retiring a declaration changes what the rest of the
+	// repository can decide. An edge in an untouched file bound to a retired
+	// symbol must be unbound (the store primitive does that), and a name that
+	// was ambiguous because two files declared it can become decidable once one
+	// of them stops -- which is only discoverable from the names the rows held
+	// before they were dropped.
+	flushRetire := func(batch *[]store.FileMetadataUpdate, parseState string) error {
+		if len(*batch) == 0 {
+			return nil
+		}
+		paths := make([]string, 0, len(*batch))
+		for _, update := range *batch {
+			paths = append(paths, update.Path)
+		}
+		if err := collectRemovedNames(paths); err != nil {
+			return err
+		}
+		started := time.Now()
+		retired, err := i.store.RetireFileGraphsBatch(ctx, repo.ID, scanID, *batch, parseState, &writeStats)
+		if err != nil {
+			return err
+		}
+		writeMetadataDur += time.Since(started)
+		// Only a batch that actually removed something changed the graph.
+		// Re-retiring a file that already owned nothing -- a file that fails to
+		// parse on every update, an oversize log whose mtime keeps moving --
+		// gives Pass 2 nothing to re-decide, and dispatching it anyway would
+		// turn every watcher event in such a repository into a repo-wide
+		// resolve and test-link pass.
+		if retired > 0 {
+			for _, path := range paths {
+				changedPathSet[path] = struct{}{}
+			}
+			retiredFiles += retired
+		}
+		*batch = (*batch)[:0]
+		return nil
+	}
 	flushParseFailed := func() error {
 		if len(parseFailedBatch) == 0 {
 			return nil
 		}
-		started := time.Now()
-		if err := i.store.MarkFilesParseFailedBatch(ctx, repo.ID, scanID, parseFailedBatch); err != nil {
+		if err := flushRetire(&parseFailedBatch, store.ParseStateFailed); err != nil {
 			return err
 		}
 		summary.WriteParseFailedFlushes++
-		writeMetadataDur += time.Since(started)
-		parseFailedBatch = parseFailedBatch[:0]
 		return nil
+	}
+	// No flush counter of its own: `WriteParseFailedFlushes` is named for parse
+	// failures and means exactly that, and the retirement work itself -- the
+	// upsert and the graph delete -- is already attributed through `writeStats`
+	// by flushRetire.
+	flushOversize := func() error {
+		return flushRetire(&oversizeBatch, store.ParseStateOversize)
 	}
 	flushReplace := func() error {
 		if len(replaceBatch) == 0 {
@@ -623,6 +679,28 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			if err := flushMarkSeen(); err != nil {
 				runErr = err
 				cancel()
+			}
+			writeDur += time.Since(writeStart)
+			summary.FilesSkipped++
+		case "retire_oversize":
+			writeStart := time.Now()
+			oversizeBatch = append(oversizeBatch, store.FileMetadataUpdate{
+				Path:      res.task.rel,
+				Language:  res.task.language,
+				SizeBytes: res.task.info.Size(),
+				// The file was never read, so there is no hash of these bytes
+				// to record. Empty is the truthful answer and, unlike the
+				// previous content's hash, it cannot later be mistaken for
+				// proof that the persisted graph matches what is on disk.
+				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
+				ContentHash: "",
+			})
+			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
+			if len(oversizeBatch) >= metadataBatchSize {
+				if err := flushOversize(); err != nil {
+					runErr = err
+					cancel()
+				}
 			}
 			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
@@ -742,6 +820,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 		writeDur += time.Since(writeStart)
 	}
+	if runErr == nil {
+		writeStart := time.Now()
+		if err := flushOversize(); err != nil {
+			runErr = err
+			cancel()
+		}
+		writeDur += time.Since(writeStart)
+	}
 
 	walkErr := <-producerErr
 	// Safe to read existingLoadMS here: the workers' `<-existingReady` happens-
@@ -825,10 +911,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
-		// A deleted file leaves the import index, so the changed-path passes
-		// below cannot find the files that used to see through it -- deleting a
-		// package barrel would otherwise strand every binding it re-exported.
-		// See store/resolver_type_scope.go.
+	}
+
+	// A file that leaves the import index strands every binding that saw
+	// through it, and the changed-path passes below cannot find those files --
+	// no specifier resolves to it any more, so "the files that can see the
+	// changed file" finds nobody. Deletion is the obvious case; retirement is
+	// the same event, because a retired file's `file_imports` and
+	// scope evidence went with the rest of its graph. Both are rare next to
+	// saves. See store/resolver_type_scope.go.
+	if summary.FilesDeleted > 0 || retiredFiles > 0 {
 		if err := i.store.RevalidateTypeScopeAfterDeletion(ctx, repo.ID); err != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
@@ -1023,14 +1115,45 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 			force = true
 		}
 	}
-	if hasPrev && !force && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano() {
+	// Eligibility under THIS run's configuration, decided before change
+	// detection rather than after it. The size cap is a property of the run,
+	// not of the file, so "nothing about the file changed" is not an answer to
+	// "is this file indexable now".
+	oversizeNow := maxFileSizeBytes > 0 && task.info.Size() > maxFileSizeBytes
+	// Does the persisted graph describe the bytes on disk? Only a prior state
+	// that actually produced a graph from them says yes. A file previously
+	// skipped as oversize, failed under best_effort, or marked pending by a
+	// repair migration says no, and must be re-evaluated even when its size and
+	// mtime are byte-identical -- otherwise raising the cap, fixing a parser, or
+	// shipping a repair migration never reaches it.
+	priorDescribesBytes := hasPrev && store.ParseStateDescribesCurrentBytes(prev.ParseState)
+	unchangedOnDisk := hasPrev && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano()
+
+	// The size cap is answered before change detection, because it is the one
+	// question whose answer can flip while the file does not move at all.
+	if oversizeNow {
+		if unchangedOnDisk && !force && prev.ParseState == store.ParseStateOversize {
+			// Still over the cap, still holding no parser-owned graph, and
+			// nothing on disk moved. This is why the state is tracked at all:
+			// a repository full of huge files must not be read or hashed on
+			// every no-op update to rediscover that they are still huge.
+			result.action = "mark_seen"
+			return result
+		}
+		// Either the file just became oversize, or it moved while staying
+		// oversize. No parser saw these bytes, so whatever it used to declare
+		// is not a description of them: retire the graph and record truthful
+		// metadata. Deliberately before the read below -- an oversize file is
+		// never read, on this scan or any other.
+		result.action = "retire_oversize"
+		return result
+	}
+	if unchangedOnDisk && !force && priorDescribesBytes {
 		result.action = "mark_seen"
 		return result
 	}
-	if maxFileSizeBytes > 0 && task.info.Size() > maxFileSizeBytes {
-		result.action = "touch"
-		return result
-	}
+	// Otherwise fall through and parse. When the file did not move, what
+	// changed is the configuration, the parser, or a repair marker.
 
 	hash := ""
 	var content []byte
@@ -1045,7 +1168,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 		result.hashDur = time.Since(hashStarted)
 	} else {
 		readStarted := time.Now()
-		content, err = os.ReadFile(task.path)
+		content, err = readFile(task.path)
 		if err != nil {
 			result.err = err
 			return result
@@ -1056,7 +1179,11 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 		result.hashDur = time.Since(hashStarted)
 	}
 	result.hash = hash
-	if hasPrev && !force && hashLookup != nil {
+	// The hash short-circuit is only valid when the persisted graph came from a
+	// successful parse: a best-effort failure stores the FAILING content's hash,
+	// so trusting it here would make an equal hash mean "already converged" and
+	// deny the file its retry forever.
+	if hasPrev && !force && priorDescribesBytes && hashLookup != nil {
 		prevHash, ok, err := hashLookup(task.rel)
 		if err != nil {
 			result.err = err
@@ -1103,6 +1230,13 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 // Production never assigns to it. Tests that do must not run in parallel with
 // any other test in this package that indexes.
 var walkDir = filepath.WalkDir
+
+// readFile is os.ReadFile, indirected for the same reason as walkDir: tests
+// assert that a still-oversize no-op scan does not read the file at all, and
+// the only honest way to prove that is to count the reads.
+//
+// Production never assigns to it.
+var readFile = os.ReadFile
 
 // entryFileInfo returns the FileInfo the file pipeline should use for entry
 // `d`, or (nil, nil) when the entry is one the scan deliberately skips.
