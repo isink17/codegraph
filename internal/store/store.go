@@ -1897,11 +1897,15 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 		}
 		fileIDs = append(fileIDs, fileID)
 	}
-	// Asked before the delete and inside the same transaction, using the
-	// authority on what "holds parser-owned evidence" means. Zero is the common
-	// case on a repeat retirement, and it lets the whole delete be skipped:
-	// sixteen statements that would remove nothing.
+	// Keep resolver invalidation semantic: derived rows such as file_tokens do
+	// not make a file own parser-profile evidence. Physical cleanup has a
+	// separate presence check because deleteFileGraphsBatch owns those rows too.
 	retired, err := countFilesWithParserOwnedEvidence(ctx, tx, repoID, fileIDs)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	deletable, err := countFilesWithDeletableGraphRows(ctx, tx, repoID, fileIDs)
 	if err != nil {
 		_ = tx.Rollback()
 		return 0, err
@@ -1910,7 +1914,7 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 	// the graph but failed to record why would leave the file claiming a state
 	// it no longer holds evidence for, and one that recorded the state but kept
 	// the rows is the very defect this exists to fix.
-	if retired > 0 {
+	if deletable > 0 {
 		if err := deleteFileGraphsBatch(ctx, tx, repoID, fileIDs, stats); err != nil {
 			_ = tx.Rollback()
 			return 0, err
@@ -1920,6 +1924,44 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 		return 0, err
 	}
 	return retired, nil
+}
+
+const fileGraphRowsPredicate = `(
+	   EXISTS (SELECT 1 FROM symbols t WHERE t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM edges t WHERE t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM references_tbl t WHERE t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM file_imports t WHERE t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM scope_import_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM scope_module_candidate_evidence t WHERE t.repo_id = f.repo_id AND t.source_file_id = f.id)
+	OR EXISTS (SELECT 1 FROM rust_module_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM go_local_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM file_scope_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM file_tokens t WHERE t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM test_links t WHERE t.test_file_id = f.id)
+	OR EXISTS (SELECT 1 FROM symbol_embeddings t WHERE t.file_id = f.id)
+)`
+
+func countFilesWithDeletableGraphRows(ctx context.Context, tx *sql.Tx, repoID int64, fileIDs []int64) (int, error) {
+	total := 0
+	idBatch := sqliteBatchSize(1, 1)
+	for start := 0; start < len(fileIDs); start += idBatch {
+		end := min(start+idBatch, len(fileIDs))
+		chunk := fileIDs[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		var n int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM files f
+			WHERE f.repo_id = ? AND f.id IN (`+sqlitePlaceholders(len(chunk))+`)
+			  AND `+fileGraphRowsPredicate, args...).Scan(&n); err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // countFilesWithParserOwnedEvidence counts how many of `fileIDs` still hold

@@ -91,6 +91,11 @@ func (a *lifecycleAdapter) Parse(_ context.Context, path string, content []byte)
 			continue
 		}
 		switch verb {
+		case "tokens":
+			parsed.FileTokens = map[string]float64{}
+			for _, token := range strings.Fields(arg) {
+				parsed.FileTokens[token] = 1
+			}
 		case "sym":
 			parsed.Symbols = append(parsed.Symbols, graph.Symbol{
 				Language:      a.language,
@@ -284,15 +289,20 @@ func (f *lifecycleFixture) parserOwnedRows(rel string) map[string]int {
 	f.t.Helper()
 	out := map[string]int{}
 	for name, query := range map[string]string{
-		"symbols":               `SELECT COUNT(*) FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"symbol_fts":            `SELECT COUNT(*) FROM symbol_fts t JOIN symbols s ON s.id = t.symbol_id JOIN files f ON f.id = s.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"symbol_tokens":         `SELECT COUNT(*) FROM symbol_tokens t JOIN symbols s ON s.id = t.symbol_id JOIN files f ON f.id = s.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"symbol_embeddings":     `SELECT COUNT(*) FROM symbol_embeddings t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"references_tbl":        `SELECT COUNT(*) FROM references_tbl t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"edges":                 `SELECT COUNT(*) FROM edges t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"file_imports":          `SELECT COUNT(*) FROM file_imports t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"scope_import_evidence": `SELECT COUNT(*) FROM scope_import_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
-		"test_links":            `SELECT COUNT(*) FROM test_links t JOIN files f ON f.id = t.test_file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"symbols":                         `SELECT COUNT(*) FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"symbol_fts":                      `SELECT COUNT(*) FROM symbol_fts t JOIN symbols s ON s.id = t.symbol_id JOIN files f ON f.id = s.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"symbol_tokens":                   `SELECT COUNT(*) FROM symbol_tokens t JOIN symbols s ON s.id = t.symbol_id JOIN files f ON f.id = s.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"symbol_embeddings":               `SELECT COUNT(*) FROM symbol_embeddings t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"file_tokens":                     `SELECT COUNT(*) FROM file_tokens t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"references_tbl":                  `SELECT COUNT(*) FROM references_tbl t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"edges":                           `SELECT COUNT(*) FROM edges t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"file_imports":                    `SELECT COUNT(*) FROM file_imports t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"file_scope_evidence":             `SELECT COUNT(*) FROM file_scope_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"scope_import_evidence":           `SELECT COUNT(*) FROM scope_import_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"scope_module_candidate_evidence": `SELECT COUNT(*) FROM scope_module_candidate_evidence t JOIN files f ON f.id = t.source_file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"go_local_binding_evidence":       `SELECT COUNT(*) FROM go_local_binding_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"rust_module_evidence":            `SELECT COUNT(*) FROM rust_module_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"test_links":                      `SELECT COUNT(*) FROM test_links t JOIN files f ON f.id = t.test_file_id WHERE f.repo_id = ? AND f.path = ?`,
 	} {
 		out[name] = f.count(query, f.repoID, rel)
 	}
@@ -415,6 +425,38 @@ func TestOversizeFileRetiresStaleGraph(t *testing.T) {
 	}
 }
 
+func TestOversizeTokenOnlyFileRetiresTokensWithoutPassTwo(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.repoConfig(4096, "fail_fast")
+	f.write("tokens.lc", "tokens alpha beta\n")
+	f.index(Options{})
+	if got := f.parserOwnedRows("tokens.lc")["file_tokens"]; got != 2 {
+		t.Fatalf("initial file_tokens = %d, want 2", got)
+	}
+
+	f.rewrite("tokens.lc", bigContent("tokens alpha beta\n", 8192))
+	summary := f.update(Options{})
+	if got := f.fileRow("tokens.lc").ParseState; got != store.ParseStateOversize {
+		t.Fatalf("parse_state = %q, want %q", got, store.ParseStateOversize)
+	}
+	if summary.ResolveMode != "none" {
+		t.Fatalf("ResolveMode = %q, want none for token-only retirement", summary.ResolveMode)
+	}
+	if got := f.parserOwnedRows("tokens.lc")["file_tokens"]; got != 0 {
+		t.Fatalf("retired file_tokens = %d, want 0", got)
+	}
+
+	summary = f.update(Options{})
+	if summary.ResolveMode != "none" {
+		t.Fatalf("repeat ResolveMode = %q, want none", summary.ResolveMode)
+	}
+	f.repoConfig(1<<20, "fail_fast")
+	f.update(Options{})
+	if got := f.parserOwnedRows("tokens.lc")["file_tokens"]; got != 2 {
+		t.Fatalf("recovered file_tokens = %d, want 2", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 4. best_effort parse failure retirement
 // ---------------------------------------------------------------------------
@@ -453,6 +495,32 @@ func TestBestEffortParseFailureRetiresStaleGraph(t *testing.T) {
 	f.assertNoParserOwnedRows("a.lc")
 	if got := f.parserOwnedRows("dep.lc")["symbols"]; got != 1 {
 		t.Errorf("dep.lc symbols = %d, want 1", got)
+	}
+}
+
+func TestBestEffortTokenOnlyFailureRetiresAndRecovers(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.repoConfig(1<<20, "best_effort")
+	f.write("tokens.lc", "tokens alpha beta\n")
+	f.index(Options{})
+	f.adapter.setFailing("tokens.lc", true)
+	f.rewrite("tokens.lc", "tokens alpha beta changed\n")
+	summary := f.update(Options{})
+	if summary.ParseErrors != 1 || summary.ResolveMode != "none" {
+		t.Fatalf("failure summary = errors %d, resolve %q; want 1, none", summary.ParseErrors, summary.ResolveMode)
+	}
+	if got := f.parserOwnedRows("tokens.lc")["file_tokens"]; got != 0 {
+		t.Fatalf("failed file_tokens = %d, want 0", got)
+	}
+
+	summary = f.update(Options{})
+	if summary.WriteStats == nil || summary.WriteStats.FileGraphDeleteStatements != 0 {
+		t.Fatalf("repeat write stats = %#v, want no graph deletes", summary.WriteStats)
+	}
+	f.adapter.setFailing("tokens.lc", false)
+	f.update(Options{})
+	if got := f.parserOwnedRows("tokens.lc")["file_tokens"]; got != 3 {
+		t.Fatalf("recovered file_tokens = %d, want 3", got)
 	}
 }
 

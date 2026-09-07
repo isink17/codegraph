@@ -7,6 +7,108 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 )
 
+func TestRetireFileGraphsBatchDropsTokenOnlyGraph(t *testing.T) {
+	f := newGateFixture(t)
+	if _, err := f.store.ReplaceFileGraphsBatch(f.ctx, f.repoID, 1, []ReplaceFileGraphInput{{
+		Path: "tokens.go", Language: "go", SizeBytes: 10, MtimeUnixNS: 7, ContentHash: "h",
+		ParserProfile: "treesitter:go:v1", ParserCallEdges: true,
+		Parsed: graph.ParsedFile{Language: "go", FileTokens: map[string]float64{"alpha": 1, "beta": 1}},
+	}}); err != nil {
+		t.Fatalf("ReplaceFileGraphsBatch() error = %v", err)
+	}
+	var fileID int64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT id FROM files WHERE repo_id = ? AND path = 'tokens.go'`, f.repoID).Scan(&fileID); err != nil {
+		t.Fatalf("file lookup error = %v", err)
+	}
+	var tokens int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM file_tokens WHERE file_id = ?`, fileID).Scan(&tokens); err != nil {
+		t.Fatalf("token count error = %v", err)
+	}
+	if tokens == 0 {
+		t.Fatal("token-only graph did not persist file_tokens")
+	}
+	var ownsProfile bool
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT `+FileParserOwnedEvidencePredicate+` FROM files f WHERE f.id = ?`, fileID).Scan(&ownsProfile); err != nil {
+		t.Fatalf("provenance predicate error = %v", err)
+	}
+	if ownsProfile {
+		t.Fatal("file_tokens-only graph classified as parser-profile evidence")
+	}
+	if groups, err := f.store.FileParserProfileGroups(f.ctx, f.repoID); err != nil {
+		t.Fatalf("FileParserProfileGroups() error = %v", err)
+	} else if len(groups) != 0 {
+		t.Fatalf("profile groups = %#v, want none for token-only graph", groups)
+	}
+
+	firstStats := &WriteStats{}
+	retired, err := f.store.RetireFileGraphsBatch(f.ctx, f.repoID, 2, []FileMetadataUpdate{{
+		Path: "tokens.go", Language: "go", SizeBytes: 20, MtimeUnixNS: 8, ContentHash: "oversize",
+	}}, ParseStateOversize, firstStats)
+	if err != nil {
+		t.Fatalf("RetireFileGraphsBatch() error = %v", err)
+	}
+	if retired != 0 {
+		t.Fatalf("retired = %d, want 0: token-only rows are not provenance evidence", retired)
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM file_tokens WHERE file_id = ?`, fileID).Scan(&tokens); err != nil {
+		t.Fatalf("post-retirement token count error = %v", err)
+	}
+	if tokens != 0 {
+		t.Fatalf("post-retirement file_tokens = %d, want 0", tokens)
+	}
+	if firstStats.FileGraphDeleteStatements == 0 {
+		t.Fatal("first retirement did not execute graph deletion")
+	}
+	secondStats := &WriteStats{}
+	retired, err = f.store.RetireFileGraphsBatch(f.ctx, f.repoID, 3, []FileMetadataUpdate{{
+		Path: "tokens.go", Language: "go", SizeBytes: 20, MtimeUnixNS: 8, ContentHash: "oversize",
+	}}, ParseStateOversize, secondStats)
+	if err != nil {
+		t.Fatalf("second RetireFileGraphsBatch() error = %v", err)
+	}
+	if retired != 0 || secondStats.FileGraphDeleteStatements != 0 {
+		t.Fatalf("repeat retirement = retired %d, delete statements %d; want 0, 0", retired, secondStats.FileGraphDeleteStatements)
+	}
+}
+
+func TestRetireFileGraphsBatchMixedOwnership(t *testing.T) {
+	f := newGateFixture(t)
+	empty := f.file(t, "empty.go", "go")
+	if _, err := f.store.ReplaceFileGraphsBatch(f.ctx, f.repoID, 1, []ReplaceFileGraphInput{
+		{Path: "symbol.go", Language: "go", SizeBytes: 1, Parsed: graph.ParsedFile{Language: "go", Symbols: []graph.Symbol{{Language: "go", Kind: "function", Name: "A", QualifiedName: "A", StableKey: "go:A"}}}},
+		{Path: "tokens.go", Language: "go", SizeBytes: 1, Parsed: graph.ParsedFile{Language: "go", FileTokens: map[string]float64{"alpha": 1}}},
+	}); err != nil {
+		t.Fatalf("ReplaceFileGraphsBatch() error = %v", err)
+	}
+	retired, err := f.store.RetireFileGraphsBatch(f.ctx, f.repoID, 2, []FileMetadataUpdate{
+		{Path: "symbol.go", Language: "go"},
+		{Path: "tokens.go", Language: "go"},
+		{Path: "empty.go", Language: "go"},
+	}, ParseStateFailed, nil)
+	if err != nil {
+		t.Fatalf("RetireFileGraphsBatch() error = %v", err)
+	}
+	if retired != 1 {
+		t.Fatalf("retired = %d, want 1 resolver-evidence file", retired)
+	}
+	for _, path := range []string{"symbol.go", "tokens.go", "empty.go"} {
+		var n int
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = ?`, path).Scan(&n); err != nil {
+			t.Fatalf("symbol count for %s: %v", path, err)
+		}
+		if n != 0 {
+			t.Errorf("symbols for %s = %d, want 0", path, n)
+		}
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM file_tokens t JOIN files f ON f.id = t.file_id WHERE f.path = ?`, path).Scan(&n); err != nil {
+			t.Fatalf("token count for %s: %v", path, err)
+		}
+		if n != 0 {
+			t.Errorf("file_tokens for %s = %d, want 0", path, n)
+		}
+	}
+	_ = empty
+}
+
 func TestParseStateDescribesCurrentBytes(t *testing.T) {
 	for state, want := range map[string]bool{
 		ParseStateIndexed:  true,
