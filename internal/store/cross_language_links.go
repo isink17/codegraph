@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -54,14 +56,11 @@ import (
 // `LIMIT 50` was a cap on a symbol cross product that no longer exists, and a
 // cap on a write path silently drops real links.
 //
-// Lifecycle, unchanged by this fix and worth knowing: nothing in the indexer
-// calls this pass. Only the `cross_language_links` MCP tool does, and
-// re-indexing a bridged file drops the links it owns (the source side always
-// did, through the ordinary per-file edge delete; the destination side now does
-// too, because an unbound cross-language row is worse than none). So these
-// links live until the next index of either endpoint and are recreated by the
-// next invocation. Putting the pass into the index lifecycle is a product
-// decision, not a correctness one.
+// Index and update call this pass after current file/import/symbol graph writes
+// commit. The versioned settings marker records that the stored set is current
+// for the presently persisted graph; graph replacement, retirement, and deletion
+// clear it in their own write transactions. The MCP tool remains an explicit
+// idempotent recompute surface.
 const (
 	// crossLangEligibleKinds are the symbol kinds a cross-language link may
 	// connect, unchanged from the original pass.
@@ -72,6 +71,31 @@ const (
 	// under sqliteDefaultMaxVariables.
 	crossLangEdgeValuesBatchRows = 98
 )
+
+const crossLanguageLinksCurrentSettingKey = "derived.cross_language_links_current.v1"
+
+func crossLanguageLinksCurrentKey(repoID int64) string {
+	return crossLanguageLinksCurrentSettingKey + "." + strconv.FormatInt(repoID, 10)
+}
+
+// CrossLanguageLinksCurrent reports whether stored cross_language_ref edges
+// equal the current persisted file/import/symbol evidence under this resolver.
+func (s *Store) CrossLanguageLinksCurrent(ctx context.Context, repoID int64) (bool, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, crossLanguageLinksCurrentKey(repoID)).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return value == "1", nil
+}
+
+func clearCrossLanguageLinksCurrentTx(ctx context.Context, tx *sql.Tx, repoID int64) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, crossLanguageLinksCurrentKey(repoID))
+	return err
+}
 
 // xlangFile is an active file, identified by its slash-form path rather than by
 // its row id: two indexes of the same tree agree on the path and not on the id.
@@ -132,6 +156,11 @@ func (s *Store) ResolveCrossLanguageLinks(ctx context.Context, repoID int64) (in
 		var created int
 		created, err = applyCrossLanguageLinksTx(ctx, tx, repoID, links)
 		if err == nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key, value) VALUES(?, '1')
+                ON CONFLICT(key) DO UPDATE SET value = '1'`, crossLanguageLinksCurrentKey(repoID)); err != nil {
+				_ = tx.Rollback()
+				return 0, err
+			}
 			if err = tx.Commit(); err == nil {
 				return created, nil
 			}

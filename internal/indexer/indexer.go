@@ -1046,6 +1046,21 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, err
 		}
 	}
+	xlangCurrent, err := i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
+	if err != nil {
+		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+		return summary, err
+	}
+	// Cross-language edges are a complete derived set. Any parser graph
+	// replacement, retirement, or deletion clears the durable currentness marker
+	// in the same store transaction; an absent marker also covers pre-P22.37
+	// databases and failed prior repairs.
+	if !xlangCurrent || len(changedPathSet) > 0 {
+		if _, err := i.store.ResolveCrossLanguageLinks(ctx, repo.ID); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+	}
 	// Test links: one canonical repo-wide pass (P22.2). Unlike edge resolution
 	// it is not scoped to the changed batch, because the canonical pass is what
 	// guarantees full-index/update parity (a candidate added or deleted outside

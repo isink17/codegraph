@@ -1878,7 +1878,22 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 	defer stmt.Close()
 	indexedAt := time.Now().UTC().Format(time.RFC3339)
 	fileIDs := make([]int64, 0, len(updates))
+	xlangFileEvidenceChanged := false
 	for _, update := range updates {
+		var oldLanguage string
+		var oldDeleted int
+		err := tx.QueryRowContext(ctx, `
+			SELECT language, is_deleted FROM files WHERE repo_id = ? AND path = ?
+		`, repoID, update.Path).Scan(&oldLanguage, &oldDeleted)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			xlangFileEvidenceChanged = true
+		case err != nil:
+			_ = tx.Rollback()
+			return 0, err
+		case oldDeleted != 0 || oldLanguage != update.Language:
+			xlangFileEvidenceChanged = true
+		}
 		var fileID int64
 		if err := stmt.QueryRowContext(
 			ctx,
@@ -1916,6 +1931,11 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 	// the rows is the very defect this exists to fix.
 	if deletable > 0 {
 		if err := deleteFileGraphsBatch(ctx, tx, repoID, fileIDs, stats); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+	} else if xlangFileEvidenceChanged {
+		if err := clearCrossLanguageLinksCurrentTx(ctx, tx, repoID); err != nil {
 			_ = tx.Rollback()
 			return 0, err
 		}
@@ -2112,6 +2132,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if len(fileIDs) == 0 {
 		return nil
 	}
+	if err := clearCrossLanguageLinksCurrentTx(ctx, tx, repoID); err != nil {
+		return err
+	}
 
 	// For large batches, use a temp table to avoid repeating large IN clauses across each dependent-table delete.
 	// This reduces statement pressure from ~O(numTables * chunks) down to O(chunks + numTables).
@@ -2290,6 +2313,9 @@ func prepareTmpDeleteFileIDs(ctx context.Context, tx *sql.Tx, fileIDs []int64, s
 }
 
 func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64, stats *WriteStats) error {
+	if err := clearCrossLanguageLinksCurrentTx(ctx, tx, repoID); err != nil {
+		return err
+	}
 	exec := func(query string, args ...any) error {
 		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return err
@@ -3125,7 +3151,12 @@ func (c srcSymbolChooser) attribute(line int) sourceAttribution {
 }
 
 func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (int, error) {
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `
 		UPDATE files
 		SET is_deleted = 1, parse_state = 'deleted', last_scan_id = ?
 		WHERE repo_id = ? AND is_deleted = 0 AND last_scan_id <> ?
@@ -3135,6 +3166,14 @@ func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (i
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		if err := clearCrossLanguageLinksCurrentTx(ctx, tx, repoID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return int(n), nil
@@ -3325,12 +3364,27 @@ func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64,
 		for _, path := range chunk {
 			args = append(args, path)
 		}
-		res, err := s.db.ExecContext(ctx, query, args...)
+		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
+			return int(total), err
+		}
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			_ = tx.Rollback()
 			return int(total), err
 		}
 		affected, err := res.RowsAffected()
 		if err != nil {
+			_ = tx.Rollback()
+			return int(total), err
+		}
+		if affected > 0 {
+			if err := clearCrossLanguageLinksCurrentTx(ctx, tx, repoID); err != nil {
+				_ = tx.Rollback()
+				return int(total), err
+			}
+		}
+		if err := tx.Commit(); err != nil {
 			return int(total), err
 		}
 		total += affected
