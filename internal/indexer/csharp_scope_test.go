@@ -92,7 +92,7 @@ class Unknown { void F() { Service.Run(); } }`,
 	}
 	assert("Caller.cs", "Service.Run", "csharp_type_scope", true)
 	assert("Caller.cs", "this.InstanceRun", "csharp_this_scope", true)
-	assert("Caller.cs", "service.InstanceRun", "", false)
+	assert("Caller.cs", "service.InstanceRun", "csharp_typed_receiver", true)
 	assert("Alias.cs", "A.Run", "csharp_alias_scope", true)
 	assert("Static.cs", "Run", "csharp_static_using", true)
 	assert("Ambiguous.cs", "Service.Run", "", false)
@@ -101,6 +101,121 @@ class Unknown { void F() { Service.Run(); } }`,
 	if got["Caller.cs:Service.Run"].DstQualifiedName != "App.Core.Service.Run" {
 		t.Fatalf("Service.Run target = %#v", got["Caller.cs:Service.Run"])
 	}
+}
+
+func TestCSharpTypedReceiverAcceptance(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"Core.cs": `namespace App.Core; public class Service { public void Run() {} public static void StaticRun() {} public void Overload(int x) {} public void Overload(string x) {} } public class Other { public void Run() {} }`,
+		"Caller.cs": `using S = App.Core.Service;
+namespace App.Core;
+class Caller {
+ Service field;
+ Service Property { get; }
+ void Param(Service service) { service.Run(); service.StaticRun(); }
+ void Local() { Service service = Get(); service.Run(); }
+ void NewLocal() { var service = new Service(); service.Run(); }
+ void Unknown() { var service = Get(); service.Run(); }
+ void Field() { field.Run(); }
+ void PropertyCall() { Property.Run(); }
+ void ThisField() { this.field.Run(); }
+ void Shadow(Other field) { field.Run(); }
+ void Alias(S service) { service.Run(); }
+ void Global(global::App.Core.Service service) { service.Run(); }
+ void Generic<T>(T value) { value.Run(); }
+ void Bad(Service[] value) { value.Run(); }
+}`,
+	}
+	for path, content := range files {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := s.ExportEdgesPage(context.Background(), repo.ID, 200, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"App.Core.Caller.Param:service.Run": "App.Core.Service.Run", "App.Core.Caller.Param:service.StaticRun": "", "App.Core.Caller.Local:service.Run": "App.Core.Service.Run", "App.Core.Caller.NewLocal:service.Run": "App.Core.Service.Run", "App.Core.Caller.Unknown:service.Run": "", "App.Core.Caller.Field:field.Run": "App.Core.Service.Run", "App.Core.Caller.PropertyCall:Property.Run": "App.Core.Service.Run", "App.Core.Caller.ThisField:this.field.Run": "App.Core.Service.Run", "App.Core.Caller.Shadow:field.Run": "App.Core.Other.Run", "App.Core.Caller.Alias:service.Run": "App.Core.Service.Run", "App.Core.Caller.Global:service.Run": "App.Core.Service.Run", "App.Core.Caller.Generic:value.Run": "", "App.Core.Caller.Bad:value.Run": "",
+	}
+	seen := map[string]bool{}
+	for _, edge := range edges {
+		if edge.FilePath != "Caller.cs" {
+			continue
+		}
+		key := edge.SrcQualifiedName + ":" + edge.DstName
+		if target, ok := want[key]; ok {
+			seen[key] = true
+			got := edge.DstQualifiedName
+			if target == "" {
+				got = ""
+			}
+			if got != target {
+				t.Errorf("%s target=%q want %q", key, got, target)
+			}
+		}
+	}
+	for name, target := range want {
+		if !seen[name] {
+			t.Errorf("missing edge %s want %q", name, target)
+		}
+	}
+	if got := csharpTarget(t, s, root, "Caller.cs", "service.Run"); got != "App.Core.Service.Run" {
+		t.Fatalf("service target=%q", got)
+	}
+}
+
+func TestCSharpTypedReceiverIncrementalTransitions(t *testing.T) {
+	root := t.TempDir()
+	write := func(path, content string) {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Core.cs", `namespace App; public class Service { public void Run() {} } public class Other { public void Run() {} }`)
+	write("Caller.cs", `using App; class Caller { void F(Service service) { service.Run(); } }`)
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	idx := New(s, parser.NewRegistry(ts.NewCSharp()), nil)
+	if _, err := idx.Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	assert := func(want string) {
+		if got := csharpTarget(t, s, root, "Caller.cs", "service.Run"); got != want {
+			t.Fatalf("target=%q want %q", got, want)
+		}
+	}
+	assert("App.Service.Run")
+	write("Caller.cs", `using App; class Caller { void F(Other service) { service.Run(); } }`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"Caller.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assert("App.Other.Run")
+	write("Caller.cs", `using App; class Caller { void F(Service service) { service.Run(); } }`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"Caller.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assert("App.Service.Run")
+	write("Core.cs", `namespace App; public class Service { public void Run() {} public void Run(int n) {} } public class Other { public void Run() {} }`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"Core.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assert("")
 }
 
 func TestCSharpScopeFreshIncrementalParity(t *testing.T) {

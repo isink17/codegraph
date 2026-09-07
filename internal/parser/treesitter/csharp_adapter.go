@@ -287,18 +287,132 @@ func csAddBinding(pf *graph.ParsedFile, name, owner string) {
 	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{LocalName: name, Kind: graph.ScopeImportLocalBinding, OwnerModule: owner})
 }
 
+func csAddTypedBinding(pf *graph.ParsedFile, name, typeName, owner string) {
+	if name == "" {
+		return
+	}
+	if typeName == "" {
+		csAddBinding(pf, name, owner)
+		return
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{LocalName: name, SourceSpecifier: typeName, ImportedName: typeName, Kind: graph.ScopeImportTypedBinding, OwnerModule: owner})
+}
+
+func csSupportedType(node *sitter.Node, content []byte) string {
+	if node == nil {
+		return ""
+	}
+	text := strings.TrimSpace(nodeText(node, content))
+	if text == "" || text == "var" || text == "dynamic" {
+		return ""
+	}
+	if strings.ContainsAny(text, "[]?*<>(){},") || strings.Contains(text, "=>") {
+		return ""
+	}
+	if strings.HasPrefix(text, "global::") {
+		text = strings.TrimPrefix(text, "global::")
+	}
+	if text == "" {
+		return ""
+	}
+	for _, part := range strings.Split(text, ".") {
+		if part == "" {
+			return ""
+		}
+		for i, r := range part {
+			if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9') {
+				return ""
+			}
+		}
+	}
+	return strings.TrimSpace(nodeText(node, content))
+}
+
+func csTypeParameterNames(node *sitter.Node, content []byte) map[string]struct{} {
+	set := map[string]struct{}{}
+	for n := node; n != nil; n = n.Parent() {
+		for _, p := range findDescendants(n, "type_parameter") {
+			if parent := p.Parent(); parent != nil && (parent == n || parent.Type() == "type_parameter_list") {
+				set[nodeText(p, content)] = struct{}{}
+			}
+		}
+		if n.Type() == "class_declaration" || n.Type() == "struct_declaration" || n.Type() == "interface_declaration" || n.Type() == "record_declaration" {
+			break
+		}
+	}
+	return set
+}
+
+func csBindingType(node, valueNode *sitter.Node, content []byte, typeParams map[string]struct{}) string {
+	typeNode := childByFieldName(node, "type")
+	if typeNode == nil {
+		return ""
+	}
+	typeName := csSupportedType(typeNode, content)
+	if _, blocked := typeParams[typeName]; blocked {
+		return ""
+	}
+	if typeName != "" {
+		return typeName
+	}
+	if typeNode.Type() != "implicit_type" {
+		return ""
+	}
+	value := childByFieldName(valueNode, "value")
+	if value == nil {
+		for i := range int(valueNode.ChildCount()) {
+			candidate := valueNode.Child(i)
+			if candidate.Type() == "object_creation_expression" {
+				value = candidate
+				break
+			}
+		}
+	}
+	if value == nil || value.Type() != "object_creation_expression" {
+		return ""
+	}
+	return csSupportedType(childByFieldName(value, "type"), content)
+}
+
+func csOwnedByMethod(root, node *sitter.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		if parent == root {
+			return true
+		}
+		if parent.Type() == "method_declaration" || parent.Type() == "constructor_declaration" {
+			return false
+		}
+	}
+	return false
+}
+
 func csCollectBindings(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	typeParams := csTypeParameterNames(node, content)
 	for _, p := range findDescendants(node, "parameter") {
-		csAddBinding(pf, nodeText(childByFieldName(p, "name"), content), owner)
+		if !csOwnedByMethod(node, p) {
+			continue
+		}
+		csAddTypedBinding(pf, nodeText(childByFieldName(p, "name"), content), csBindingType(p, p, content, typeParams), owner)
 	}
-	for _, v := range findDescendants(node, "variable_declarator") {
-		csAddBinding(pf, nodeText(childByFieldName(v, "name"), content), owner)
+	for _, declaration := range findDescendants(node, "variable_declaration") {
+		if !csOwnedByMethod(node, declaration) {
+			continue
+		}
+		for _, v := range findDescendants(declaration, "variable_declarator") {
+			csAddTypedBinding(pf, nodeText(childByFieldName(v, "name"), content), csBindingType(declaration, v, content, typeParams), owner)
+		}
 	}
-	for _, v := range findDescendants(node, "foreach_variable") {
-		csAddBinding(pf, nodeText(v, content), owner)
+	for _, v := range findDescendants(node, "foreach_statement") {
+		if !csOwnedByMethod(node, v) {
+			continue
+		}
+		csAddTypedBinding(pf, nodeText(childByFieldName(v, "left"), content), csSupportedType(childByFieldName(v, "type"), content), owner)
 	}
 	for _, v := range findDescendants(node, "catch_declaration") {
-		csAddBinding(pf, nodeText(childByFieldName(v, "name"), content), owner)
+		if !csOwnedByMethod(node, v) {
+			continue
+		}
+		csAddTypedBinding(pf, nodeText(childByFieldName(v, "name"), content), csSupportedType(childByFieldName(v, "type"), content), owner)
 	}
 	for _, v := range findDescendants(node, "local_function_statement") {
 		csAddBinding(pf, nodeText(childByFieldName(v, "name"), content), owner)
@@ -310,11 +424,21 @@ func csCollectMemberBindings(body *sitter.Node, owner string, content []byte, pf
 		child := body.Child(i)
 		switch child.Type() {
 		case "field_declaration", "event_field_declaration":
+			declaration := childByFieldName(child, "declaration")
+			if declaration == nil {
+				for i := range int(child.ChildCount()) {
+					if child.Child(i).Type() == "variable_declaration" {
+						declaration = child.Child(i)
+						break
+					}
+				}
+			}
+			typeName := csSupportedType(childByFieldName(declaration, "type"), content)
 			for _, v := range findDescendants(child, "variable_declarator") {
-				csAddBinding(pf, nodeText(childByFieldName(v, "name"), content), owner)
+				csAddTypedBinding(pf, nodeText(childByFieldName(v, "name"), content), typeName, owner)
 			}
 		case "property_declaration":
-			csAddBinding(pf, nodeText(childByFieldName(child, "name"), content), owner)
+			csAddTypedBinding(pf, nodeText(childByFieldName(child, "name"), content), csSupportedType(childByFieldName(child, "type"), content), owner)
 		}
 	}
 }

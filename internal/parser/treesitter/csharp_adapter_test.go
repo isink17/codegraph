@@ -65,15 +65,17 @@ class Caller { void F(Service service, int value) { Run(); this.Run(); service.R
 		}
 	}
 	local := map[string]bool{}
+	typed := map[string]string{}
 	for _, i := range p.Scope.Imports {
 		if i.Kind == "local_binding" {
 			local[i.LocalName] = true
 		}
-	}
-	for _, want := range []string{"service", "value"} {
-		if !local[want] {
-			t.Errorf("missing local binding %q", want)
+		if i.Kind == "typed_binding" {
+			typed[i.LocalName] = i.SourceSpecifier
 		}
+	}
+	if typed["service"] != "Service" || local["value"] {
+		t.Fatalf("bindings local=%v typed=%v", local, typed)
 	}
 }
 
@@ -115,10 +117,55 @@ func TestCSharpV2LocalFunctionAndCatchBindings(t *testing.T) {
 			got[i.LocalName] = true
 		}
 	}
-	for _, name := range []string{"Run", "error"} {
-		if !got[name] {
-			t.Fatalf("missing local binding %q: %#v", name, p.Scope.Imports)
+	if !got["Run"] {
+		t.Fatalf("missing local function binding: %#v", p.Scope.Imports)
+	}
+	if got["error"] {
+		t.Fatalf("typed catch binding became unknown: %#v", p.Scope.Imports)
+	}
+}
+
+func TestCSharpV3TypedBindingEvidence(t *testing.T) {
+	// AST shape pin lives in assertions below; parser nodes are intentionally
+	// inspected through the adapter's field accessors.
+	p, err := NewCSharp().Parse(context.Background(), "Bindings.cs", []byte(`using S = App.Core.Service;
+namespace App.Core;
+class Caller {
+ Service field;
+ Service Property { get; }
+ void F(Service parameter, S alias, global::App.Core.Service globalName) {
+  Service local;
+  var created = new Service();
+  var qualified = new App.Core.Service();
+  var unknown = GetService();
+  foreach (Service item in values) { item.Run(); }
+  parameter.Run(); alias.Run(); globalName.Run(); local.Run(); created.Run(); qualified.Run(); unknown.Run();
+  try {} catch (System.Exception ex) { ex.Handle(); }
+ }
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	unknown := map[string]bool{}
+	for _, i := range p.Scope.Imports {
+		if i.Kind == "typed_binding" {
+			got[i.LocalName] = i.SourceSpecifier
 		}
+		if i.Kind == "local_binding" {
+			unknown[i.LocalName] = true
+		}
+	}
+	for name, want := range map[string]string{"parameter": "Service", "alias": "S", "globalName": "global::App.Core.Service", "local": "Service", "created": "Service", "qualified": "App.Core.Service", "item": "Service", "ex": "System.Exception"} {
+		if got[name] != want {
+			t.Errorf("typed %s=%q, want %q; imports=%#v", name, got[name], want, p.Scope.Imports)
+		}
+	}
+	if !unknown["unknown"] {
+		t.Errorf("unknown var lost negative evidence: %#v", p.Scope.Imports)
+	}
+	if _, ok := got["unknown"]; ok {
+		t.Errorf("method-call var inferred: %#v", p.Scope.Imports)
 	}
 }
 
