@@ -2,8 +2,10 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ func helper() {}
 func main() {
 	helper()
 }
+
 `)
 
 	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
@@ -119,6 +122,87 @@ func main() {
 	}
 	if stats.Edges != 0 {
 		t.Fatalf("stats.Edges after delete = %d, want 0", stats.Edges)
+	}
+}
+
+func TestUnchangedUpdateBackfillsReferenceIdentities(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "main.go"), `package main
+
+func Target() {}
+
+func Caller() { Target() }
+`)
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	key := "resolver.reference_identity_repaired.v1." + strconv.FormatInt(repo.ID, 10)
+	if _, err := raw.ExecContext(ctx, `UPDATE references_tbl SET symbol_id = NULL, context_symbol_id = NULL WHERE repo_id = ?`, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, key); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ResolveMode != "none" {
+		t.Fatalf("first unchanged upgrade ResolveMode = %q, want none", first.ResolveMode)
+	}
+	var target, contextID, edgeTarget, edgeSource sql.NullInt64
+	if err := raw.QueryRowContext(ctx, `
+		SELECT r.symbol_id, r.context_symbol_id, e.dst_symbol_id, e.src_symbol_id
+		FROM references_tbl r JOIN edges e
+		  ON e.repo_id = r.repo_id AND e.file_id = r.file_id
+		 AND e.edge_kind = 'calls' AND e.line = r.start_line AND e.dst_name = r.name
+		WHERE r.repo_id = ? AND r.ref_kind = 'call'`, repo.ID).
+		Scan(&target, &contextID, &edgeTarget, &edgeSource); err != nil {
+		t.Fatal(err)
+	}
+	if !target.Valid || target.Int64 != edgeTarget.Int64 || !contextID.Valid || contextID.Int64 != edgeSource.Int64 {
+		var refName, refQualified, edgeName, edgeKind string
+		var refLine, edgeLine int
+		if err := raw.QueryRowContext(ctx, `SELECT r.name, r.qualified_name, r.start_line, e.dst_name, e.line, e.edge_kind FROM references_tbl r JOIN edges e ON e.repo_id = r.repo_id AND e.file_id = r.file_id WHERE r.repo_id = ? AND r.ref_kind = 'call'`, repo.ID).Scan(&refName, &refQualified, &refLine, &edgeName, &edgeLine, &edgeKind); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("backfilled identities = (%v,%v), edge = (%v,%v), ref=(%q,%q,%d), edge=(%q,%d,%q)", target, contextID, edgeTarget, edgeSource, refName, refQualified, refLine, edgeName, edgeLine, edgeKind)
+	}
+
+	if _, err := raw.ExecContext(ctx, `UPDATE references_tbl SET symbol_id = NULL, context_symbol_id = NULL WHERE repo_id = ?`, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ResolveMode != "none" {
+		t.Fatalf("second unchanged update ResolveMode = %q, want none", second.ResolveMode)
+	}
+	var bound int
+	if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM references_tbl WHERE repo_id = ? AND (symbol_id IS NOT NULL OR context_symbol_id IS NOT NULL)`, repo.ID).Scan(&bound); err != nil {
+		t.Fatal(err)
+	}
+	if bound != 0 {
+		t.Fatalf("second unchanged update reconciled %d references", bound)
 	}
 }
 

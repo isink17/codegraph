@@ -1222,6 +1222,8 @@ func (c *importScopeCache) get(ctx context.Context, s *Store, repoID int64) (map
 // two identical repo-wide scans, the second one provably finding nothing.
 const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v2"
 
+const referenceIdentityRepairSettingKey = "resolver.reference_identity_repaired.v1"
+
 // repairTypeScopeBindingsOnce clears this repository's pre-P22.9 bindings the
 // first time any resolve runs against it, and does nothing afterwards.
 //
@@ -1293,9 +1295,13 @@ var (
 		run:              (*Store).repairBareNameLevelBindings,
 		resolvesRepoWide: true,
 	}
-	// Ordered: the bare-name re-resolve should see the bindings the type-scope
-	// repair already cleared.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair}
+	referenceIdentityRepair = resolverRepair{
+		key:              referenceIdentityRepairSettingKey,
+		run:              (*Store).ReconcileReferenceIdentities,
+		resolvesRepoWide: false,
+	}
+	// Ordered: edge repairs finish before derived reference identities bind.
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,
@@ -1327,14 +1333,32 @@ func (s *Store) runResolverRepairOnce(ctx context.Context, repoID int64, repair 
 // It reports whether a repair left the repository fully re-resolved, so the
 // caller can skip a repo-wide pass that would only repeat the work.
 func (s *Store) RepairResolverBindingsOnce(ctx context.Context, repoID int64) (bool, error) {
+	return s.repairResolverBindingsOnce(ctx, repoID, false)
+}
+
+// RepairResolverBindingsBeforeEdges runs the edge repairs while deferring the
+// derived reference repair until the update's edge pass has completed.
+func (s *Store) RepairResolverBindingsBeforeEdges(ctx context.Context, repoID int64) (bool, error) {
+	return s.repairResolverBindingsOnce(ctx, repoID, true)
+}
+
+func (s *Store) repairResolverBindingsOnce(ctx context.Context, repoID int64, deferReference bool) (bool, error) {
 	resolvedRepoWide := false
 	for _, repair := range resolverRepairs {
+		if deferReference && repair.key == referenceIdentityRepair.key {
+			continue
+		}
 		ran, err := s.runResolverRepairOnce(ctx, repoID, repair)
 		if err != nil {
 			return false, err
 		}
 		if ran && repair.resolvesRepoWide {
 			resolvedRepoWide = true
+			// Edge repairs can change the facts from which reference identities
+			// are derived. Do not trust a marker written for the old edge state.
+			if _, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, referenceIdentityRepair.key+"."+strconv.FormatInt(repoID, 10)); err != nil {
+				return false, err
+			}
 		}
 	}
 	return resolvedRepoWide, nil
@@ -1349,12 +1373,20 @@ func (s *Store) RepairResolverBindingsOnce(ctx context.Context, repoID int64) (b
 // unset would make the next ordinary update pay for a repo-wide resolve that
 // can only reproduce what the index just decided. See RepoHasExistingGraph.
 func (s *Store) MarkResolverBindingsRepaired(ctx context.Context, repoID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, repair := range resolverRepairs {
-		if err := s.markRepairDone(ctx, repair.key, repoID); err != nil {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings(key, value) VALUES(?, '1')
+			 ON CONFLICT(key) DO UPDATE SET value = '1'`,
+			repair.key+"."+strconv.FormatInt(repoID, 10)); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // markRepairDone writes one repair's per-repository marker.

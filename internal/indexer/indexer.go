@@ -955,13 +955,20 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// re-resolves inside its own transaction, and the repo-wide dispatch below
 	// would then repeat exactly that work.
 	repairResolvedRepoWide := false
+	markFreshResolverRepairs := false
+	deferReferenceRepair := len(changedPathSet) > 0 || len(removedSymbolNameSet) > 0
+	referenceRepairAfterEdgePass := false
 	if hadExistingGraph {
-		repairResolvedRepoWide, err = i.store.RepairResolverBindingsOnce(ctx, repo.ID)
+		if deferReferenceRepair {
+			repairResolvedRepoWide, err = i.store.RepairResolverBindingsBeforeEdges(ctx, repo.ID)
+		} else {
+			repairResolvedRepoWide, err = i.store.RepairResolverBindingsOnce(ctx, repo.ID)
+		}
+		referenceRepairAfterEdgePass = deferReferenceRepair && repairResolvedRepoWide && !incrementalResolve
 	} else {
-		// Nothing an older release could have written. Record the repairs as
-		// done so no later update pays for a repo-wide resolve that can only
-		// reproduce what this run already decided.
-		err = i.store.MarkResolverBindingsRepaired(ctx, repo.ID)
+		// Mark only after this scan's edge and reference Pass 2 succeeds. A
+		// failed fresh scan must not claim current derived-state semantics.
+		markFreshResolverRepairs = true
 	}
 	if err != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
@@ -1026,6 +1033,18 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, resolveErr
 		}
 		summary.ResolveMode = "repo"
+	}
+	if markFreshResolverRepairs || deferReferenceRepair {
+		if referenceRepairAfterEdgePass {
+			if _, err := i.store.RepairResolverBindingsOnce(ctx, repo.ID); err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+		}
+		if err := i.store.MarkResolverBindingsRepaired(ctx, repo.ID); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
 	}
 	// Test links: one canonical repo-wide pass (P22.2). Unlike edge resolution
 	// it is not scoped to the changed batch, because the canonical pass is what
