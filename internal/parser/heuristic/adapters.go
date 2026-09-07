@@ -24,6 +24,7 @@ type symbolPattern struct {
 }
 
 var heredocStartRE = regexp.MustCompile(`<<[-~]?['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+var heuristicCSharpNamespaceRE = regexp.MustCompile(`(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_.]*)\s*(?:;|\{)`)
 
 type Adapter struct {
 	language    string
@@ -226,6 +227,12 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 		module = pf.Scope.Package
 	}
+	if a.language == "csharp" {
+		if m := heuristicCSharpNamespaceRE.FindStringSubmatch(string(content)); len(m) == 2 {
+			module = m[1]
+			pf.Scope.Package = module
+		}
+	}
 
 	depth := 0
 	classScopes := []classScope{}
@@ -250,6 +257,9 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				val := strings.TrimSpace(m[imp.nameGroup])
 				if val != "" {
 					pf.Imports = append(pf.Imports, val)
+					if a.language == "csharp" {
+						pf.Scope.Imports = append(pf.Scope.Imports, heuristicCSharpImport(val))
+					}
 				}
 			}
 		}
@@ -499,5 +509,25 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 // call edges at all -- which is exactly why the indexer must refuse to replace
 // a call-capable graph with one of them. See parser.Profile.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "heuristic:" + a.language + ":v1", EmitsCallEdges: false}
+	version := "v1"
+	if a.language == "csharp" {
+		version = "v2"
+	}
+	return parser.Profile{ID: "heuristic:" + a.language + ":" + version, EmitsCallEdges: false}
+}
+
+func heuristicCSharpImport(value string) graph.ScopeImport {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "static ") {
+		return graph.ScopeImport{SourceSpecifier: strings.TrimSpace(strings.TrimPrefix(value, "static ")), Kind: "static", Static: true}
+	}
+	if i := strings.Index(value, "="); i >= 0 {
+		source := strings.TrimSpace(value[i+1:])
+		return graph.ScopeImport{SourceSpecifier: source, ImportedName: source, LocalName: strings.TrimSpace(value[:i]), Kind: "alias"}
+	}
+	local := value
+	if i := strings.LastIndexByte(value, '.'); i >= 0 {
+		local = value[i+1:]
+	}
+	return graph.ScopeImport{SourceSpecifier: value, ImportedName: value, LocalName: local, Kind: "namespace"}
 }

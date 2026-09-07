@@ -222,6 +222,7 @@ var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
 		AND ` + resolverCppBareMemberScopeSQL + `
 		AND NOT EXISTS (SELECT 1 FROM tmp_java_scope_veto jsv WHERE jsv.edge_id = edges.id)` + `
 		AND NOT EXISTS (SELECT 1 FROM tmp_kotlin_scope_veto ksv WHERE ksv.edge_id = edges.id)` + `
+		AND NOT EXISTS (SELECT 1 FROM ` + csharpScopeVeto + ` csv WHERE csv.edge_id = edges.id)` + `
 		AND NOT EXISTS (SELECT 1 FROM ` + tsScopeVeto + ` tsv WHERE tsv.edge_id = edges.id)` + `
 		AND NOT EXISTS (SELECT 1 FROM ` + pyScopeVeto + ` psv WHERE psv.edge_id = edges.id)`
 

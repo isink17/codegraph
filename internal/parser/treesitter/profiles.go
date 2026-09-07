@@ -12,11 +12,13 @@ func tsProfile(language string) parser.Profile {
 	return parser.Profile{ID: "treesitter:" + language + ":v1", EmitsCallEdges: true}
 }
 
-func (a *GoAdapter) Profile() parser.Profile         { return tsProfile("go") }
-func (a *PythonAdapter) Profile() parser.Profile     { return tsProfile("python") }
-func (a *JavaAdapter) Profile() parser.Profile       { return tsProfile("java") }
-func (a *KotlinAdapter) Profile() parser.Profile     { return tsProfile("kotlin") }
-func (a *CSharpAdapter) Profile() parser.Profile     { return tsProfile("csharp") }
+func (a *GoAdapter) Profile() parser.Profile     { return tsProfile("go") }
+func (a *PythonAdapter) Profile() parser.Profile { return tsProfile("python") }
+func (a *JavaAdapter) Profile() parser.Profile   { return tsProfile("java") }
+func (a *KotlinAdapter) Profile() parser.Profile { return tsProfile("kotlin") }
+func (a *CSharpAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:csharp:v2", EmitsCallEdges: true}
+}
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
 func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") }
 func (a *RubyAdapter) Profile() parser.Profile       { return tsProfile("ruby") }

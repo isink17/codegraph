@@ -97,6 +97,19 @@ func TestJVMHeuristicKeepsNestedContainersAndHeaders(t *testing.T) {
 	}
 }
 
+func TestCSharpHeuristicV2KeepsNamespaceIdentity(t *testing.T) {
+	p, err := NewCSharp().Parse(context.Background(), "Service.cs", []byte("namespace App.Core;\nclass Outer {\n class Inner {\n  void Run(int x) {}\n }\n}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Scope.Package != "App.Core" || p.Symbols[len(p.Symbols)-1].QualifiedName != "App.Core.Outer.Inner.Run" {
+		t.Fatalf("C# heuristic facts = package %q symbols %+v", p.Scope.Package, p.Symbols)
+	}
+	if NewCSharp().Profile().ID != "heuristic:csharp:v2" || NewCSharp().Profile().EmitsCallEdges {
+		t.Fatalf("C# heuristic profile = %+v", NewCSharp().Profile())
+	}
+}
+
 func hasSymbolName(parsed graph.ParsedFile, name string) bool {
 	for _, sym := range parsed.Symbols {
 		if sym.Name == name {
