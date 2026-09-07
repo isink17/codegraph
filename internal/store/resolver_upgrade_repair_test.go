@@ -65,6 +65,29 @@ func TestUpgradeRepairClearsBindingTheBareNameLevelRefuses(t *testing.T) {
 	}
 }
 
+func TestUpgradeRepairClearsStaleDotTailAmbiguityBinding(t *testing.T) {
+	f := newParityFixture(t, "")
+	defs := f.file(t, "app/defs.py", "python")
+	target := f.symbol(t, defs, "run", "pkg.obj.run", "function", "python")
+	f.symbolIn(t, defs, "obj.run", "other.different", "value", "Obj", "python")
+	f.symbolIn(t, defs, "obj.run", "third.different", "value", "Obj", "python")
+	callerFile := f.file(t, "app/main.py", "python")
+	caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+	edge := f.edge(t, callerFile, caller, "obj.run")
+	f.setBinding(t, edge, target, ResolutionStrategyDotTail2, ResolutionConfidenceMedium)
+	for _, repair := range []resolverRepair{typeScopeRepair, bareNameLevelRepair} {
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("stale dot-tail binding survived repair: %q", got)
+	}
+}
+
 // The mirror case: a database left under-resolved because a competing
 // declaration was removed by an older binary, on a tree that has not changed
 // since. The repair must resolve it, and must give it the same strategy and
@@ -225,6 +248,9 @@ func TestReferenceIdentityRepairBackfillsOldCurrentDB(t *testing.T) {
 	if err := f.store.markRepairDone(f.ctx, bareNameLevelRepair.key, f.repoID); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.store.markRepairDone(f.ctx, dotTailAmbiguityRepair.key, f.repoID); err != nil {
+		t.Fatal(err)
+	}
 	resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil {
 		t.Fatal(err)
@@ -284,7 +310,7 @@ func TestResolverRepairsShareOneList(t *testing.T) {
 		}
 		seen[repair.key] = struct{}{}
 	}
-	for _, key := range []string{typeScopeRepairSettingKey, bareNameLevelRepairSettingKey} {
+	for _, key := range []string{typeScopeRepairSettingKey, bareNameLevelRepairSettingKey, dotTailAmbiguityRepairSettingKey} {
 		if _, ok := seen[key]; !ok {
 			t.Fatalf("repair key %q is not in resolverRepairs", key)
 		}
@@ -320,6 +346,9 @@ func TestUpgradeRepairClearsOutOfScopeCppCallableBinding(t *testing.T) {
 	// re-resolve from masking the one under test.
 	if err := f.store.markRepairDone(f.ctx, bareNameLevelRepair.key, f.repoID); err != nil {
 		t.Fatalf("markRepairDone(%s): %v", bareNameLevelRepair.key, err)
+	}
+	if err := f.store.markRepairDone(f.ctx, dotTailAmbiguityRepair.key, f.repoID); err != nil {
+		t.Fatalf("markRepairDone(%s): %v", dotTailAmbiguityRepair.key, err)
 	}
 
 	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
@@ -373,6 +402,9 @@ func TestUpgradeRepairBindsEdgeTheWidenedIncludeScopeNowProves(t *testing.T) {
 	// edge is unresolved and the P22.12 repair is already marked done.
 	if err := f.store.markRepairDone(f.ctx, bareNameLevelRepair.key, f.repoID); err != nil {
 		t.Fatalf("markRepairDone(%s): %v", bareNameLevelRepair.key, err)
+	}
+	if err := f.store.markRepairDone(f.ctx, dotTailAmbiguityRepair.key, f.repoID); err != nil {
+		t.Fatalf("markRepairDone(%s): %v", dotTailAmbiguityRepair.key, err)
 	}
 	if got := f.binding(t, edge); got != "<unresolved>" {
 		t.Fatalf("precondition: want the edge unresolved, got %s", got)
