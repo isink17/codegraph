@@ -13,213 +13,260 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 )
 
-// PHPAdapter parses PHP source files using tree-sitter.
 type PHPAdapter struct{}
 
-func NewPHP() *PHPAdapter { return &PHPAdapter{} }
-
-func (a *PHPAdapter) Language() string     { return "php" }
-func (a *PHPAdapter) Extensions() []string { return []string{".php"} }
-
-func (a *PHPAdapter) Supports(path string) bool {
-	return strings.EqualFold(filepath.Ext(path), ".php")
-}
+func NewPHP() *PHPAdapter                       { return &PHPAdapter{} }
+func (a *PHPAdapter) Language() string          { return "php" }
+func (a *PHPAdapter) Extensions() []string      { return []string{".php"} }
+func (a *PHPAdapter) Supports(path string) bool { return strings.EqualFold(filepath.Ext(path), ".php") }
 
 func (a *PHPAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	root, err := parse(ctx, php.GetLanguage(), content)
 	if err != nil {
 		return graph.ParsedFile{}, err
 	}
-
-	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	pf := graph.ParsedFile{
-		Language:   "php",
-		FileTokens: computeFileTokens(content),
+	p := graph.ParsedFile{Language: "php", FileTokens: computeFileTokens(content)}
+	phpExtractImports(root, content, &p)
+	namespaces, globalDecl := 0, false
+	var onlyNamespace string
+	phpExtractSymbols(root, "", "", content, &p, &namespaces, &globalDecl, &onlyNamespace)
+	if namespaces == 1 && !globalDecl {
+		p.Scope.Package = onlyNamespace
 	}
-
-	phpExtractImports(root, content, &pf)
-	phpExtractSymbols(root, module, "", content, &pf)
-	phpExtractCalls(root, content, &pf)
-	linkTestsGeneric(module, &pf, func(target string) string {
+	phpExtractCalls(root, content, &p)
+	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	linkTestsGeneric(module, &p, func(target string) string {
 		return "func:php:" + testTargetModule(module, "Test", "Tests") + ":" + target
 	})
-	return pf, nil
+	return p, nil
 }
 
+// namespace_definition has name/body fields for braced namespaces, but no
+// body for semicolon namespaces; following program siblings keep that scope.
+// namespace_use_declaration contains namespace_use_clause or namespace_use_group.
+// scoped_call_expression uses scope/name; member calls use object/name.
 func phpExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
-	// use statements
-	for _, use := range findDescendants(root, "namespace_use_declaration") {
-		for _, clause := range findDescendants(use, "namespace_use_clause") {
-			nameNode := childByFieldName(clause, "name")
-			if nameNode == nil {
-				nameNode = firstChild(clause, "qualified_name")
-			}
-			if nameNode != nil {
-				pf.Imports = append(pf.Imports, nodeText(nameNode, content))
+	var walk func(*sitter.Node, string)
+	walk = func(node *sitter.Node, current string) {
+		for i := range int(node.ChildCount()) {
+			child := node.Child(i)
+			switch child.Type() {
+			case "namespace_definition":
+				ns := phpSemanticQName(nodeText(childByFieldName(child, "name"), content))
+				if body := childByFieldName(child, "body"); body != nil {
+					walk(body, ns)
+				} else {
+					current = ns
+				}
+			case "namespace_use_declaration":
+				phpAddNamespaceUses(child, current, content, pf)
+			case "program", "compound_statement":
+				walk(child, current)
 			}
 		}
 	}
-	// require/require_once/include/include_once
+	walk(root, "")
 	for _, call := range findDescendants(root, "include_expression") {
 		arg := call.Child(int(call.ChildCount()) - 1)
 		if arg != nil {
-			val := strings.Trim(nodeText(arg, content), `"'`)
-			if val != "" {
+			if val := strings.Trim(nodeText(arg, content), `"'`); val != "" {
 				pf.Imports = append(pf.Imports, val)
 			}
 		}
 	}
 }
 
-func phpExtractSymbols(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+func phpAddNamespaceUses(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	text := strings.TrimSpace(nodeText(node, content))
+	kind := "php_type"
+	if strings.HasPrefix(text, "use function") {
+		kind = "php_function"
+	}
+	if strings.HasPrefix(text, "use const") {
+		kind = "php_const"
+	}
+	prefix := ""
+	if n := firstChild(node, "namespace_name"); n != nil {
+		prefix = nodeText(n, content)
+	}
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
-		case "class_declaration", "interface_declaration", "trait_declaration", "enum_declaration":
-			phpAddType(child, module, content, pf)
-		case "function_definition":
-			phpAddFunction(child, module, container, content, pf)
-		case "method_declaration":
-			phpAddFunction(child, module, container, content, pf)
-		case "program":
-			phpExtractSymbols(child, module, container, content, pf)
-		case "namespace_definition":
-			body := childByFieldName(child, "body")
-			if body != nil {
-				phpExtractSymbols(body, module, container, content, pf)
+		case "namespace_use_clause":
+			phpAddUseClause(child, "", kind, owner, content, pf)
+		case "namespace_use_group":
+			for j := range int(child.ChildCount()) {
+				if clause := child.Child(j); clause.Type() == "namespace_use_group_clause" {
+					phpAddUseClause(clause, prefix, kind, owner, content, pf)
+				}
 			}
-		case "declaration_list":
-			phpExtractSymbols(child, module, container, content, pf)
 		}
 	}
 }
 
-func phpAddType(node *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
-	nameNode := childByFieldName(node, "name")
+func phpAddUseClause(node *sitter.Node, prefix, kind, owner string, content []byte, pf *graph.ParsedFile) {
+	nameNode := firstChild(node, "qualified_name")
+	if nameNode == nil {
+		nameNode = firstChild(node, "namespace_name")
+	}
 	if nameNode == nil {
 		return
 	}
-	name := nodeText(nameNode, content)
-
-	pf.Symbols = append(pf.Symbols, graph.Symbol{
-		Language:      "php",
-		Kind:          "type",
-		Name:          name,
-		QualifiedName: module + "." + name,
-		ContainerName: module,
-		Visibility:    heuristicVisibility(name),
-		Range:         nodeRange(node),
-		DocSummary:    prevCommentText(node, content),
-		StableKey:     "type:php:" + module + ":" + name,
+	imported := nodeText(nameNode, content)
+	if prefix != "" {
+		imported = strings.TrimSuffix(prefix, `\`) + `\` + imported
+	}
+	semantic := phpSemanticQName(imported)
+	parts := strings.Split(semantic, ".")
+	if len(parts) == 0 || parts[len(parts)-1] == "" {
+		return
+	}
+	local := parts[len(parts)-1]
+	if alias := firstChild(node, "namespace_aliasing_clause"); alias != nil {
+		if n := firstChild(alias, "name"); n != nil {
+			local = nodeText(n, content)
+		}
+	}
+	pf.Imports = append(pf.Imports, imported)
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+		SourceSpecifier: semantic, ImportedName: parts[len(parts)-1], LocalName: local,
+		Kind: kind, OwnerModule: owner,
 	})
+}
 
-	body := childByFieldName(node, "body")
-	if body != nil {
-		phpExtractSymbols(body, module, name, content, pf)
+func phpExtractSymbols(node *sitter.Node, namespace, container string, content []byte, pf *graph.ParsedFile, namespaces *int, globalDecl *bool, onlyNamespace *string) {
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		switch child.Type() {
+		case "namespace_definition":
+			ns := phpSemanticQName(nodeText(childByFieldName(child, "name"), content))
+			(*namespaces)++
+			*onlyNamespace = ns
+			if body := childByFieldName(child, "body"); body != nil {
+				phpExtractSymbols(body, ns, "", content, pf, namespaces, globalDecl, onlyNamespace)
+			} else {
+				namespace = ns
+			}
+		case "class_declaration", "interface_declaration", "trait_declaration", "enum_declaration":
+			if namespace == "" {
+				*globalDecl = true
+			}
+			phpAddType(child, namespace, content, pf, namespaces, globalDecl, onlyNamespace)
+		case "method_declaration":
+			phpAddFunction(child, namespace, container, true, content, pf)
+		case "function_definition":
+			if namespace == "" && container == "" {
+				*globalDecl = true
+			}
+			phpAddFunction(child, namespace, container, container != "", content, pf)
+		case "program", "compound_statement", "declaration_list":
+			phpExtractSymbols(child, namespace, container, content, pf, namespaces, globalDecl, onlyNamespace)
+		}
 	}
 }
 
-func phpAddFunction(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+func phpAddType(node *sitter.Node, namespace string, content []byte, pf *graph.ParsedFile, namespaces *int, globalDecl *bool, onlyNamespace *string) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
 	}
 	name := nodeText(nameNode, content)
-	effectiveContainer := module
-	if container != "" && container != module {
-		effectiveContainer = container
+	qualified := phpJoinQName(namespace, name)
+	pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "php", Kind: "type", Name: name, QualifiedName: qualified,
+		ContainerName: namespace, Visibility: "public", Range: nodeRange(node), DocSummary: prevCommentText(node, content), StableKey: "type:php:" + qualified})
+	if body := childByFieldName(node, "body"); body != nil {
+		phpExtractSymbols(body, namespace, qualified, content, pf, namespaces, globalDecl, onlyNamespace)
 	}
-	qualified := module + "." + name
-	if container != "" && container != module {
-		qualified = module + "." + container + "." + name
+}
+
+func phpAddFunction(node *sitter.Node, namespace, container string, method bool, content []byte, pf *graph.ParsedFile) {
+	nameNode := childByFieldName(node, "name")
+	if nameNode == nil {
+		return
 	}
+	name := nodeText(nameNode, content)
+	qualified := phpJoinQName(namespace, name)
+	if container != "" {
+		qualified = phpJoinQName(container, name)
+	}
+	p := graph.Symbol{Language: "php", Kind: "function", Name: name, QualifiedName: qualified,
+		ContainerName: containerOrNamespace(container, namespace), Visibility: "public", Range: nodeRange(node),
+		DocSummary: prevCommentText(node, content), StableKey: "func:php:" + qualified}
+	if method {
+		p.Visibility, p.Static = phpMethodVisibility(node, content), phpStatic(node, content)
+	}
+	pf.Symbols = append(pf.Symbols, p)
+}
 
-	vis := phpMethodVisibility(node, content)
-
-	pf.Symbols = append(pf.Symbols, graph.Symbol{
-		Language:      "php",
-		Kind:          "function",
-		Name:          name,
-		QualifiedName: qualified,
-		ContainerName: effectiveContainer,
-		Visibility:    vis,
-		Range:         nodeRange(node),
-		DocSummary:    prevCommentText(node, content),
-		StableKey:     "func:php:" + module + ":" + name,
-	})
+func containerOrNamespace(container, namespace string) string {
+	if container != "" {
+		return container
+	}
+	return namespace
 }
 
 func phpMethodVisibility(node *sitter.Node, content []byte) string {
-	for i := 0; i < int(node.ChildCount()); i++ {
-		c := node.Child(i)
-		if c.Type() == "visibility_modifier" {
-			text := nodeText(c, content)
-			switch text {
-			case "public":
-				return "public"
-			case "private":
-				return "private"
-			case "protected":
-				return "protected"
-			}
+	for i := range int(node.ChildCount()) {
+		if c := node.Child(i); c.Type() == "visibility_modifier" {
+			return nodeText(c, content)
 		}
 	}
-	return "public" // PHP defaults to public
+	return "public"
+}
+
+func phpStatic(node *sitter.Node, content []byte) *bool {
+	static := false
+	for i := range int(node.ChildCount()) {
+		if node.Child(i).Type() == "static_modifier" || nodeText(node.Child(i), content) == "static" {
+			static = true
+			break
+		}
+	}
+	return &static
 }
 
 func phpExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
-	for _, call := range findDescendants(root, "function_call_expression") {
-		fnNode := childByFieldName(call, "function")
-		if fnNode == nil && call.ChildCount() > 0 {
-			fnNode = call.Child(0)
-		}
-		if fnNode == nil {
-			continue
-		}
-		name := nodeText(fnNode, content)
+	add := func(call *sitter.Node, name string) {
 		if name == "" {
-			continue
+			return
 		}
-		line := int(call.StartPoint().Row) + 1
-		pf.Edges = append(pf.Edges, graph.Edge{
-			SrcSymbolID: 0,
-			DstName:     name,
-			Kind:        "calls",
-			Evidence:    name,
-			Line:        line,
-		})
-		pf.References = append(pf.References, graph.Reference{
-			Kind:          "call",
-			Name:          name,
-			QualifiedName: name,
-			Range:         nodeRange(call),
-		})
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: name, Line: int(call.StartPoint().Row) + 1})
+		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
 	}
-	// Member call expressions
-	for _, call := range findDescendants(root, "member_call_expression") {
-		nameNode := childByFieldName(call, "name")
-		if nameNode == nil {
-			continue
+	for _, call := range findDescendants(root, "function_call_expression") {
+		fn := childByFieldName(call, "function")
+		if fn == nil && call.ChildCount() > 0 {
+			fn = call.Child(0)
 		}
-		name := nodeText(nameNode, content)
-		obj := childByFieldName(call, "object")
-		fullName := name
-		if obj != nil {
-			fullName = nodeText(obj, content) + "->" + name
+		if fn != nil {
+			add(call, nodeText(fn, content))
 		}
-		line := int(call.StartPoint().Row) + 1
-		pf.Edges = append(pf.Edges, graph.Edge{
-			SrcSymbolID: 0,
-			DstName:     fullName,
-			Kind:        "calls",
-			Evidence:    fullName,
-			Line:        line,
-		})
-		pf.References = append(pf.References, graph.Reference{
-			Kind:          "call",
-			Name:          fullName,
-			QualifiedName: fullName,
-			Range:         nodeRange(call),
-		})
 	}
+	for _, call := range findDescendants(root, "scoped_call_expression") {
+		scope, name := childByFieldName(call, "scope"), childByFieldName(call, "name")
+		if scope != nil && name != nil {
+			add(call, nodeText(scope, content)+"::"+nodeText(name, content))
+		}
+	}
+	for _, typ := range []string{"member_call_expression", "nullsafe_member_call_expression"} {
+		for _, call := range findDescendants(root, typ) {
+			name, object := childByFieldName(call, "name"), childByFieldName(call, "object")
+			if name == nil || object == nil {
+				continue
+			}
+			op := "->"
+			if typ == "nullsafe_member_call_expression" {
+				op = "?->"
+			}
+			add(call, nodeText(object, content)+op+nodeText(name, content))
+		}
+	}
+}
+
+// Normalize only syntax-proven PHP names; arbitrary runtime strings stay raw.
+func phpSemanticQName(source string) string {
+	return strings.Trim(strings.ReplaceAll(strings.TrimSpace(source), `\`, "."), ".")
+}
+func phpJoinQName(container, name string) string {
+	return phpSemanticQName(strings.Trim(container, ".") + "." + strings.Trim(name, "."))
 }
