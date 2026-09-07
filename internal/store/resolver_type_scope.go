@@ -1337,6 +1337,11 @@ func (s *Store) RepairResolverBindingsOnce(ctx context.Context, repoID int64) (b
 			resolvedRepoWide = true
 		}
 	}
+	if resolvedRepoWide {
+		if err := s.ReconcileReferenceIdentities(ctx, repoID); err != nil {
+			return false, err
+		}
+	}
 	return resolvedRepoWide, nil
 }
 

@@ -2450,15 +2450,13 @@ func insertParsedFileGraph(
 	if len(parsed.References) > 0 {
 		referenceArgs := make([]any, 0, min(len(parsed.References), sqliteReferenceValuesBatchRows)*11)
 		for _, ref := range parsed.References {
-			var symbolID any
-			if ref.SymbolID != nil {
-				symbolID = *ref.SymbolID
-			}
 			referenceArgs = append(
 				referenceArgs,
 				repoID,
 				fileID,
-				symbolID,
+				// Parser references carry syntax identity only. Database row ids
+				// are current-store derived state and are reconciled from edges.
+				nil,
 				ref.Kind,
 				ref.Name,
 				ref.QualifiedName,
@@ -3719,7 +3717,14 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	if err := s.repairTypeScopeBindingsOnce(ctx, repoID); err != nil {
 		return 0, err
 	}
-	return s.resolveEdgesWithPreStep(ctx, repoID, nil)
+	n, err := s.resolveEdgesWithPreStep(ctx, repoID, nil)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.ReconcileReferenceIdentities(ctx, repoID); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // resolveEdgesWithPreStep is ResolveEdges with an optional statement run inside
@@ -4497,13 +4502,22 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 }
 
 func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []string) error {
-	return s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil)
+	if len(paths) == 0 {
+		return nil
+	}
+	if err := s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil); err != nil {
+		return err
+	}
+	return s.ReconcileReferenceIdentities(ctx, repoID)
 }
 
 // ResolveEdgesForPathsAndNames shares one module discovery pass across the two
 // incremental resolver scopes. Own-module edges are resolved repo-wide first;
 // path/name scopes then handle remaining evidence without another WalkDir.
 func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, paths, names []string) (ResolveEdgesForNamesStats, error) {
+	if len(paths) == 0 && len(names) == 0 {
+		return ResolveEdgesForNamesStats{}, nil
+	}
 	// Invalidate before anything re-binds: a binding this batch may have made
 	// ambiguous has to be reconsidered, not merely left alone. It runs first so
 	// the module pass below can immediately re-bind the own-module edges it
@@ -4569,6 +4583,9 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	}
 	stats.InvalidateMS += invalidateMS
 	stats.InvalidatedBindings += invalidated
+	if err == nil {
+		err = s.ReconcileReferenceIdentities(ctx, repoID)
+	}
 	return stats, err
 }
 
