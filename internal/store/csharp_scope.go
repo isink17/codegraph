@@ -22,6 +22,7 @@ type csharpScopeEdge struct {
 	id, file                                              int64
 	name, srcStable, srcContainer, srcQName, srcNamespace string
 	callArity                                             sql.NullInt64
+	srcStatic                                             sql.NullInt64
 }
 
 type csharpScopeImport struct {
@@ -40,13 +41,13 @@ func resolveCSharpScope(ctx context.Context, q javaQuery, repoID int64, only map
 	}
 	ids := sortedIDs(only)
 	edges := []csharpScopeEdge{}
-	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.dst_name,src.stable_key,src.container_name,src.qualified_name,COALESCE(fs.package_name,''),e.call_arity
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.dst_name,src.stable_key,src.container_name,src.qualified_name,COALESCE(fs.package_name,''),e.call_arity,src.is_static
 FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id
 LEFT JOIN file_scope_evidence fs ON fs.repo_id=e.repo_id AND fs.file_id=e.file_id
 WHERE e.repo_id=? AND f.language='csharp' AND e.dst_symbol_id IS NULL`, " AND e.id IN (%s)", []any{repoID}, int64SliceToAny(ids), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e csharpScopeEdge
-			if err := rows.Scan(&e.id, &e.file, &e.name, &e.srcStable, &e.srcContainer, &e.srcQName, &e.srcNamespace, &e.callArity); err != nil {
+			if err := rows.Scan(&e.id, &e.file, &e.name, &e.srcStable, &e.srcContainer, &e.srcQName, &e.srcNamespace, &e.callArity, &e.srcStatic); err != nil {
 				return err
 			}
 			edges = append(edges, e)
@@ -271,6 +272,7 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 			}
 		}
 		if len(c) > 0 {
+			c = csharpBareCallableCandidates(c, e.srcStatic)
 			if out, ok := choose(c, false); ok {
 				return out, "csharp_same_type", true
 			}
@@ -384,6 +386,19 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 		return out, "csharp_type_scope", true
 	}
 	return csharpScopeSymbol{}, "", false
+}
+
+func csharpBareCallableCandidates(c []csharpScopeSymbol, sourceStatic sql.NullInt64) []csharpScopeSymbol {
+	if sourceStatic.Valid && sourceStatic.Int64 == 0 {
+		return c
+	}
+	out := make([]csharpScopeSymbol, 0, len(c))
+	for _, candidate := range c {
+		if candidate.static.Valid && candidate.static.Int64 != 0 {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 // csharpArityApplicable returns (applicable, known). Unknown call or

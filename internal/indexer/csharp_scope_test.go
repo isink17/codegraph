@@ -103,6 +103,92 @@ class Unknown { void F() { Service.Run(); } }`,
 	}
 }
 
+func TestCSharpBareArityRespectsStaticCaller(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "C.cs"), []byte(`class C {
+ static void F() { Run(); }
+ void Run() {}
+ static void Run(int x) {}
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := csharpTarget(t, s, root, "C.cs", "Run"); got != "" {
+		t.Fatalf("static bare Run resolved to %q, want unresolved", got)
+	}
+}
+
+func TestCSharpBareArityStaticContextControlsOverloads(t *testing.T) {
+	root := t.TempDir()
+	source := `class C {
+ static void StaticCaller() { Run(); }
+ void InstanceCaller() { Run(); }
+ void Run() {}
+ static void Run(int x) {}
+}
+class D {
+ void Run(int x) {}
+ static void Run() {}
+ static void F() { Run(); }
+}
+class E {
+ static void Run() {}
+ static void Run(int x = 0) {}
+ static void F() { Run(); }
+}
+class I {
+ void Run(int x) {}
+ static void Run(string x) {}
+ void F(int x) { Run(x); }
+ static void G(int x) { Run(x); }
+}`
+	if err := os.WriteFile(filepath.Join(root, "Calls.cs"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := s.ExportEdgesPage(context.Background(), repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, edge := range edges {
+		if edge.FilePath == "Calls.cs" && edge.DstName == "Run" {
+			got[edge.SrcQualifiedName] = edge.DstQualifiedName
+		}
+	}
+	want := map[string]string{
+		"C.StaticCaller":   "",
+		"C.InstanceCaller": "C.Run",
+		"D.F":              "D.Run",
+		"E.F":              "",
+		"I.F":              "",
+		"I.G":              "I.Run",
+	}
+	for source, target := range want {
+		if got[source] != target {
+			t.Errorf("%s target=%q want %q", source, got[source], target)
+		}
+	}
+}
+
 func TestCSharpTypedReceiverAcceptance(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
