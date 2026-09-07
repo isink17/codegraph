@@ -25,6 +25,8 @@ type Symbol struct {
 	Visibility    string `json:"visibility,omitempty"`
 	// Static is nil when the parser cannot prove declaration staticness.
 	Static     *bool    `json:"static,omitempty"`
+	ArityMin   *int     `json:"arity_min,omitempty"`
+	ArityMax   *int     `json:"arity_max,omitempty"`
 	Range      Position `json:"range"`
 	DocSummary string   `json:"doc_summary,omitempty"`
 	StableKey  string   `json:"stable_key"`
@@ -51,6 +53,7 @@ type Edge struct {
 	Evidence    string `json:"evidence,omitempty"`
 	FileID      int64  `json:"file_id"`
 	Line        int    `json:"line"`
+	CallArity   *int   `json:"call_arity,omitempty"`
 }
 
 type ParsedFile struct {

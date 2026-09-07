@@ -49,6 +49,56 @@ public class Outer { public class Inner { public static void Run(int x) {} publi
 	}
 }
 
+func TestCSharpV4ArityFacts(t *testing.T) {
+	p, err := NewCSharp().Parse(context.Background(), "Arity.cs", []byte(`class C {
+ void Run() {}
+ void Run(int x = 1) {}
+ void Pack(int x, params int[] values) {}
+ void Ref(ref int x) {}
+	 void F(int x) { Run(); Run(x, Foo(1, 2)); Pack(x, x); Ref(ref x); Run<int>(x); }
+ int Foo(int x, int y) { return x + y; }
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][][2]int{}
+	for _, symbol := range p.Symbols {
+		if symbol.Name != "Run" && symbol.Name != "Pack" {
+			continue
+		}
+		if symbol.ArityMin == nil || symbol.ArityMax == nil {
+			t.Fatalf("%s arity unknown", symbol.Signature)
+		}
+		got[symbol.Name] = append(got[symbol.Name], [2]int{*symbol.ArityMin, *symbol.ArityMax})
+	}
+	if len(got["Run"]) != 2 || !containsArity(got["Run"], [2]int{0, 0}) || !containsArity(got["Run"], [2]int{0, 1}) {
+		t.Fatalf("Run arity = %v, want [0 0] and [0 1]", got["Run"])
+	}
+	if len(got["Pack"]) != 1 || got["Pack"][0] != [2]int{1, -1} {
+		t.Fatalf("Pack arity = %v, want [1 -1]", got["Pack"])
+	}
+	for _, edge := range p.Edges {
+		if edge.DstName == "Run" && edge.Line == 5 && edge.CallArity == nil {
+			t.Fatal("simple Run() call missing arity")
+		}
+		if edge.DstName == "Ref" && edge.CallArity != nil {
+			t.Fatal("ref call must not carry narrowing arity")
+		}
+		if edge.DstName == "Run<int>" && edge.CallArity != nil {
+			t.Fatal("explicit generic call must not carry narrowing arity")
+		}
+	}
+}
+
+func containsArity(values [][2]int, want [2]int) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCSharpV2CallSpellingAndNegativeBindings(t *testing.T) {
 	p, err := NewCSharp().Parse(context.Background(), "Caller.cs", []byte(`namespace App.Core;
 class Caller { void F(Service service, int value) { Run(); this.Run(); service.Run(); Service.Run(); App.Core.Service.Run(); } void Run() {} }`))

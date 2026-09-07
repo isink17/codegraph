@@ -215,7 +215,7 @@ func TestCSharpTypedReceiverIncrementalTransitions(t *testing.T) {
 	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"Core.cs"}}); err != nil {
 		t.Fatal(err)
 	}
-	assert("")
+	assert("App.Service.Run")
 }
 
 func TestCSharpScopeFreshIncrementalParity(t *testing.T) {
@@ -416,7 +416,7 @@ public class Outer { private class Hidden { public class Inner { public static v
 		"Alias.cs:S.Run":                             "A.Service.Run",
 		"RootCaller.cs:App.Core.Service.Run":         "",
 		"RootCaller.cs:global::App.Core.Service.Run": "App.Core.Service.Run",
-		"BareOverload.cs:Run":                        "",
+		"BareOverload.cs:Run":                        "T.Caller.Run",
 		"HiddenCaller.cs:Lib.Outer.Hidden.Inner.Run": "",
 	}
 	seen := map[string]bool{}

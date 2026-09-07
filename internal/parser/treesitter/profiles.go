@@ -17,7 +17,7 @@ func (a *PythonAdapter) Profile() parser.Profile { return tsProfile("python") }
 func (a *JavaAdapter) Profile() parser.Profile   { return tsProfile("java") }
 func (a *KotlinAdapter) Profile() parser.Profile { return tsProfile("kotlin") }
 func (a *CSharpAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:csharp:v3", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}
 }
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
 func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") }

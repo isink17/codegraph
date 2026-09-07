@@ -190,8 +190,81 @@ func csAddMethod(node *sitter.Node, module, container string, content []byte, pf
 		Signature:     signature,
 		Static:        csStatic(node, content),
 	}
+	p.ArityMin, p.ArityMax = csDeclarationArity(node, content)
 	pf.Symbols = append(pf.Symbols, p)
 	csCollectBindings(node, stableKey, content, pf)
+}
+
+func csDeclarationArity(node *sitter.Node, content []byte) (*int, *int) {
+	params := childByFieldName(node, "parameters")
+	if params == nil {
+		return nil, nil
+	}
+	var items []*sitter.Node
+	paramsIndex := -1
+	for i := range int(params.ChildCount()) {
+		child := params.Child(i)
+		if child.Type() == "params" {
+			paramsIndex = i
+		}
+		if child.Type() == "parameter" {
+			items = append(items, child)
+		}
+	}
+	if paramsIndex >= 0 {
+		for i := paramsIndex + 1; i < int(params.ChildCount()); i++ {
+			if params.Child(i).Type() == "," || params.Child(i).Type() == "parameter" {
+				return nil, nil
+			}
+		}
+		if paramsIndex+2 >= int(params.ChildCount()) || params.Child(paramsIndex+1).Type() != "array_type" {
+			return nil, nil
+		}
+		minPtr, maxPtr := len(items), -1
+		return &minPtr, &maxPtr
+	}
+	min, max := 0, 0
+	optionalSeen := false
+	for i, parameter := range items {
+		isParams := false
+		for j := range int(parameter.ChildCount()) {
+			child := parameter.Child(j)
+			text := nodeText(child, content)
+			if text == "params" {
+				isParams = true
+			}
+			if (child.Type() == "modifier" || child.Type() == "ref" || child.Type() == "out" || child.Type() == "in") && (text == "ref" || text == "out" || text == "in") {
+				return nil, nil
+			}
+		}
+		if isParams {
+			if i != len(items)-1 {
+				return nil, nil
+			}
+			minPtr, maxPtr := min, -1
+			return &minPtr, &maxPtr
+		}
+		optional := childByFieldName(parameter, "default_value") != nil
+		if !optional {
+			for j := range int(parameter.ChildCount()) {
+				if parameter.Child(j).Type() == "=" {
+					optional = true
+					break
+				}
+			}
+		}
+		if optional {
+			optionalSeen = true
+		} else if optionalSeen {
+			return nil, nil
+		}
+		max++
+		if !optional {
+			min++
+		}
+	}
+	minPtr, maxPtr := min, max
+	return &minPtr, &maxPtr
 }
 
 func csJoinQName(parts ...string) string {
@@ -515,12 +588,14 @@ func csExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		arity, safe := csCallArity(call, fnNode)
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
 			DstName:     name,
 			Kind:        "calls",
 			Evidence:    name,
 			Line:        line,
+			CallArity:   callArityIfSafe(arity, safe),
 		})
 		pf.References = append(pf.References, graph.Reference{
 			Kind:          "call",
@@ -529,4 +604,39 @@ func csExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+func callArityIfSafe(arity int, safe bool) *int {
+	if !safe {
+		return nil
+	}
+	return &arity
+}
+
+func csCallArity(call, function *sitter.Node) (int, bool) {
+	arguments := childByFieldName(call, "arguments")
+	if arguments == nil {
+		return 0, false
+	}
+	if len(findDescendants(function, "type_argument_list")) > 0 || len(findDescendants(function, "type_arguments")) > 0 {
+		return 0, false
+	}
+	count := 0
+	safe := true
+	for _, kind := range []string{"named_argument", "ref_argument", "out_argument", "in_argument", "ref", "out", "in", "name_colon", "name_equals", "argument_name"} {
+		if len(findDescendants(arguments, kind)) > 0 {
+			safe = false
+		}
+	}
+	for i := range int(arguments.ChildCount()) {
+		child := arguments.Child(i)
+		switch child.Type() {
+		case ",", "(", ")":
+			continue
+		case "named_argument", "ref_argument", "out_argument", "in_argument", "name_colon", "name_equals", "argument_name":
+			safe = false
+		}
+		count++
+	}
+	return count, safe
 }
