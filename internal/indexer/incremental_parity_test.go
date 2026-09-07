@@ -4,10 +4,13 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -41,6 +44,7 @@ type tree map[string]string
 type lifecycleRepo struct {
 	ctx    context.Context
 	root   string
+	dbPath string
 	store  *store.Store
 	idx    *Indexer
 	repoID int64
@@ -51,6 +55,180 @@ type lifecycleRepo struct {
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
 	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust())
+}
+
+func TestCrossLanguageLinksFollowIncrementalLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"src.ts":    "import { RenderReport } from \"./target.py\";\nexport function RenderReport() {}\n",
+		"target.py": "def RenderReport():\n    pass\n",
+	})
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("fresh index cross-language edges = %d, want 1", got)
+	}
+
+	r.write(t, "src.ts", "import { RenderReport } from \"./target.py\";\nexport function RenderReport() { return 1; }\n")
+	r.update(t, "src.ts")
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("source replacement cross-language edges = %d, want 1", got)
+	}
+
+	r.write(t, "target.py", "def RenderReport():\n    return 1\n")
+	r.update(t, "target.py")
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("destination replacement cross-language edges = %d, want 1", got)
+	}
+
+	r.write(t, "src.ts", "export function RenderReport() {}\n")
+	r.update(t, "src.ts")
+	if got := crossLanguageEdgeCount(t, r); got != 0 {
+		t.Fatalf("import removal cross-language edges = %d, want 0", got)
+	}
+
+	r.write(t, "src.ts", "import { RenderReport } from \"./target.py\";\nexport function RenderReport() {}\n")
+	r.update(t, "src.ts")
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("import addition cross-language edges = %d, want 1", got)
+	}
+}
+
+func TestCrossLanguageLinksRetireActiveFileCandidate(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"src.ts":    "import { RenderReport } from \"./target\";\nexport function RenderReport() {}\n",
+		"target.py": "def RenderReport():\n    pass\n",
+	})
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("initial cross-language edges = %d, want 1", got)
+	}
+	writeRepoConfig(t, r.root, 1, "")
+	r.write(t, "target.ts", "export function Other() {}\n")
+	current, err := r.store.CrossLanguageLinksCurrent(r.ctx, r.repoID)
+	if err != nil || !current {
+		t.Fatalf("marker before retirement = %v, %v; want current", current, err)
+	}
+	r.update(t, "target.ts")
+	if got := crossLanguageEdgeCount(t, r); got != 0 {
+		t.Fatalf("oversize active candidate left %d cross-language edges, want 0", got)
+	}
+	current, err = r.store.CrossLanguageLinksCurrent(r.ctx, r.repoID)
+	if err != nil || !current {
+		t.Fatalf("marker after retirement = %v, %v; want current", current, err)
+	}
+	r.write(t, "target.ts", "export function Other() {}\nmore metadata\n")
+	r.update(t, "target.ts")
+	current, err = r.store.CrossLanguageLinksCurrent(r.ctx, r.repoID)
+	if err != nil || !current {
+		t.Fatalf("marker after repeated retirement = %v, %v; want current", current, err)
+	}
+	r.remove(t, "target.ts")
+	r.update(t, "target.ts")
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("removing retired candidate restored %d cross-language edges, want 1", got)
+	}
+}
+
+func TestCrossLanguageLinksFailureRetriesOnUnchangedUpdate(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"src.ts":    "import { RenderReport } from \"./target.py\";\nexport function RenderReport() {}\n",
+		"target.py": "def RenderReport():\n    pass\n",
+	})
+	installCrossLanguageInsertFailure(t, r)
+	r.write(t, "src.ts", "import { RenderReport } from \"./target.py\";\nexport function RenderReport() { return 1; }\n")
+	if _, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update"}); err == nil {
+		t.Fatal("update succeeded with injected cross-language failure")
+	}
+	if current, err := r.store.CrossLanguageLinksCurrent(r.ctx, r.repoID); err != nil || current {
+		t.Fatalf("marker after failed reconciliation = %v, %v; want absent", current, err)
+	}
+	dropCrossLanguageInsertFailure(t, r)
+	r.update(t)
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("retry cross-language edges = %d, want 1", got)
+	}
+	installCrossLanguageInsertFailure(t, r)
+	if summary := r.update(t); summary.ResolveMode != "none" {
+		t.Fatalf("third unchanged update ResolveMode = %q, want none", summary.ResolveMode)
+	}
+	dropCrossLanguageInsertFailure(t, r)
+}
+
+func TestCrossLanguageLinksUnchangedUpgradeRebuildsOnce(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"src.ts":    "import { RenderReport } from \"./target.py\";\nexport function RenderReport() {}\n",
+		"target.py": "def RenderReport():\n    pass\n",
+	})
+	raw, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(r.ctx, `DELETE FROM settings WHERE key = ?`, "derived.cross_language_links_current.v1."+strconv.FormatInt(r.repoID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(r.ctx, `DELETE FROM edges WHERE repo_id = ? AND edge_kind = 'cross_language_ref'`, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+	r.update(t)
+	if got := crossLanguageEdgeCount(t, r); got != 1 {
+		t.Fatalf("upgrade rebuild cross-language edges = %d, want 1", got)
+	}
+	installCrossLanguageInsertFailure(t, r)
+	if summary := r.update(t); summary.ResolveMode != "none" {
+		t.Fatalf("second unchanged upgrade update ResolveMode = %q, want none", summary.ResolveMode)
+	}
+	dropCrossLanguageInsertFailure(t, r)
+}
+
+func installCrossLanguageInsertFailure(t *testing.T, r *lifecycleRepo) {
+	t.Helper()
+	raw, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(r.ctx, `CREATE TRIGGER fail_cross_language_insert BEFORE INSERT ON edges
+		WHEN NEW.edge_kind = 'cross_language_ref'
+		BEGIN SELECT RAISE(ABORT, 'injected cross-language failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func dropCrossLanguageInsertFailure(t *testing.T, r *lifecycleRepo) {
+	t.Helper()
+	raw, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(r.ctx, `DROP TRIGGER fail_cross_language_insert`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRepoConfig(t *testing.T, root string, maxFileSize int64, parseErrorPolicy string) {
+	t.Helper()
+	dir := filepath.Join(root, ".codegraph")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"max_file_size_bytes": %d, "parse_error_policy": %q}`, maxFileSize, parseErrorPolicy)
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func crossLanguageEdgeCount(t *testing.T, r *lifecycleRepo) int {
+	t.Helper()
+	edges, err := r.store.ExportEdgesPage(r.ctx, r.repoID, 10000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, edge := range edges {
+		if edge.Kind == store.EdgeKindCrossLanguageRef {
+			count++
+		}
+	}
+	return count
 }
 
 func TestTypeScriptModuleAcceptanceLifecycle(t *testing.T) {
@@ -789,12 +967,13 @@ func newLifecycleRepo(t *testing.T, files tree) *lifecycleRepo {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	s, err := store.Open(filepath.Join(t.TempDir(), "codegraph.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "codegraph.sqlite")
+	s, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	r := &lifecycleRepo{ctx: ctx, root: root, store: s, idx: New(s, lifecycleRegistry(), nil)}
+	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: dbPath, store: s, idx: New(s, lifecycleRegistry(), nil)}
 	for rel, content := range files {
 		r.write(t, rel, content)
 	}
