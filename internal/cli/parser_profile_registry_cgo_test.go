@@ -9,6 +9,7 @@ import "testing"
 func TestCgoRegistryProfiles(t *testing.T) {
 	for _, lang := range newDefaultRegistry().SupportedLanguages() {
 		want := "treesitter:" + lang.Language + ":v1"
+		if lang.Language == "csharp" { want = "treesitter:csharp:v2" }
 		if lang.ParserProfile != want {
 			t.Fatalf("%s: parser profile = %q, want %q", lang.Language, lang.ParserProfile, want)
 		}

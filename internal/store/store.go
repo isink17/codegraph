@@ -3812,6 +3812,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	if n, err := resolveCSharpScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if n, err := resolveJavaScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
@@ -4657,6 +4662,10 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	csharpResolved, err := resolveCSharpScope(ctx, tx, repoID, nil)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
@@ -4671,6 +4680,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err != nil {
 		return 0, err
 	}
+	n += csharpResolved
 	for _, table := range []string{
 		resolverAmbiguousNamesTable, resolverTestFilesTable,
 		resolverImportScopeTable, resolverCppNamespaceScopesTable,
@@ -5514,6 +5524,9 @@ func setToSlice(set map[string]struct{}) []string {
 // same rule the repo-wide SQL strategies apply.
 func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []edgeTarget, moduleVeto map[int64]struct{}, scopes *importScopeCache) (resolveEdgeTargetsOutcome, error) {
 	var outcome resolveEdgeTargetsOutcome
+	if _, err := s.db.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+csharpScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return outcome, err
+	}
 	if len(targets) == 0 {
 		return outcome, nil
 	}
@@ -5737,6 +5750,29 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		remaining = targets[:0]
 		for _, target := range targets {
 			if _, done := handled[target.edgeID]; !done {
+				remaining = append(remaining, target)
+			}
+		}
+		targets = remaining
+	}
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	csharpIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage == "csharp" {
+			csharpIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(csharpIDs) > 0 {
+		n, err := resolveCSharpScope(ctx, s.db, repoID, csharpIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if target.srcLanguage != "csharp" {
 				remaining = append(remaining, target)
 			}
 		}
