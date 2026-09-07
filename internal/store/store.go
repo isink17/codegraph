@@ -5464,12 +5464,9 @@ type resolveEdgeTargetsOutcome struct {
 //     ::-scoped spellings have no schema-backed tail and abstain (repo-wide
 //     keeps its low-confidence LIKE fallback for the multi-dot forms).
 //
-// One known, deliberate gap against the repo-wide strategies: the dot-tail
-// fallbacks do not consult the bare-level ambiguity veto (reachable only when
-// a symbol's bare `name` itself contains a dot -- the pre-existing strategy-set
-// gap class documented in resolver_ambiguity.go). The slash-qualified identity
-// case is closed: no adapter emits slash-qualified `qualified_name`s, and the
-// slash-qualified *spelling* is owned by module_import (P22.5).
+// Dot-tail fallbacks also consult the broad bare-name ambiguity level. The
+// broad group is veto evidence only; dotted spellings still resolve through
+// dot_tail2/dot_tail3, never through the bare name itself.
 func binderFallback(dstName string) (lookup, column string) {
 	name := strings.TrimSpace(dstName)
 	if name == "" {
@@ -5870,6 +5867,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	}
 
 	shortSet := make(map[string]struct{}, len(targets))
+	bareLevelSet := make(map[string]struct{})
 	tail2Set := map[string]struct{}{}
 	tail3Set := map[string]struct{}{}
 	for _, target := range targets {
@@ -5896,12 +5894,18 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		case "name":
 			shortSet[fallbackName] = struct{}{}
 		case "dot_tail2":
+			bareLevelSet[target.dstName] = struct{}{}
 			tail2Set[fallbackName] = struct{}{}
 		case "dot_tail3":
+			bareLevelSet[target.dstName] = struct{}{}
 			tail3Set[fallbackName] = struct{}{}
 		}
 	}
 	byShort, err := s.resolveUniqueSymbolsByNames(ctx, repoID, setToSlice(shortSet), testFileIDs)
+	if err != nil {
+		return outcome, err
+	}
+	bareLevel, err := s.resolveSymbolCandidates(ctx, repoID, "name", setToSlice(bareLevelSet), testFileIDs)
 	if err != nil {
 		return outcome, err
 	}
@@ -6048,6 +6052,17 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		strategy := ResolutionStrategyExactQualified
 		matchedGroup, matched := byQualified.groups[qualifiedKey]
 		if !matched {
+			if fallbackColumn == "dot_tail2" || fallbackColumn == "dot_tail3" {
+				if broad, found := bareLevel.groups[qualifiedKey]; found && broad.levelUndecidedFor(callerIsTest) {
+					outcome.unresolved++
+					if broad.ambiguousFor(callerIsTest) {
+						outcome.ambiguityBlocked++
+					} else if !broad.levelReachableFor(callerIsTest) {
+						outcome.testShadowBlocked++
+					}
+					continue
+				}
+			}
 			// Only when the qualified name matched nothing in this language may
 			// the fallback evidence level be consulted -- and which level that
 			// is depends on the dst_name's own syntax (binderFallback): bare
@@ -6438,7 +6453,7 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 	if len(names) == 0 {
 		return out, nil
 	}
-	const chunkSize = 400
+	chunkSize := sqliteBatchSize(1, 1)
 	for start := 0; start < len(names); start += chunkSize {
 		end := min(start+chunkSize, len(names))
 		chunk := names[start:end]

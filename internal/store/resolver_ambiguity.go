@@ -67,14 +67,10 @@ const resolverQualifiedLookupFilter = `
 //     binds nothing. No entrypoint can therefore pick a winner out of a
 //     candidate set another entrypoint would have refused.
 //     What the entrypoints still do *not* share is the strategy set, and that
-//     gap predates P3. Measured on this repository (7758 call edges), a full
-//     resolve and an incremental resolve of the same tree disagree on 697
-//     edges, all in the same direction: the Go-side binder's bare-tail lookup
-//     binds names (`f.file`, `s.UpsertRepo`) for which the repo-wide resolver
-//     has no strategy at all. P3 narrowed that disagreement from 811 edges to
-//     697 by removing the ones the repo-wide resolver had been binding
-//     arbitrarily; closing the rest means giving one path the other's
-//     strategies, which is a resolver redesign, not an ambiguity rule.
+//     gap predates P3. The 697-edge figure is a historical P3 measurement, not
+//     a current claim; current parity measurements belong in the phase report.
+//     P22.38 closes the documented dot-tail/bare-level population gap without
+//     giving the binder a new destination strategy.
 //   - Ranking evidence that would break a tie on purpose is out of scope here,
 //     with one exception added in P7: a production caller facing one production
 //     candidate and any number of test-only candidates binds the production one
@@ -181,17 +177,9 @@ func resolverBareNameLevelKindsSQL(alias string) string {
 // is what stops a narrower strategy from quietly retargeting an explicit
 // reference to a test symbol at some unrelated production symbol.
 //
-// One narrow gap comes with that relaxation, inherited from a kind-set mismatch
-// that predates P7: the bare-name veto counts symbols whose kind is callable
-// *or* which merely have a container, while the bare-name strategy binds only
-// the callable kinds. So a level holding one production candidate of a
-// non-callable, contained kind plus a test candidate now writes no production
-// veto row, and a suffix strategy (which runs before the receiver strategy) may
-// bind a *different* production symbol that the pre-P7 veto would have blocked.
-// Reaching it needs a dotted `symbols.name`, so it is not observed on this
-// repository; closing it means either giving the veto a second, suffix-only
-// scope or reordering the strategies, both of which are resolver changes rather
-// than ambiguity rules.
+// The Go-side binder loads this broad population for dotted fallback spellings
+// too (P22.38). It uses the same caller-kind counts as this SQL veto while
+// retaining dot_tail2/dot_tail3 as the only destination lookup.
 const (
 	// resolverAmbiguousNamesTable holds (dst_name, dst_language, caller_is_test)
 	// triples: the name was matched at a broad evidence level, and a caller of
@@ -279,6 +267,8 @@ var resolverBindGateSQL = resolverBindableCandidateSQL + `
 // converged that is not.
 const bareNameLevelRepairSettingKey = "resolver.bare_name_level_repaired.v1"
 
+const dotTailAmbiguityRepairSettingKey = "resolver.dot_tail_ambiguity_repaired.v1"
+
 // repairBareNameLevelBindings re-decides a repository's bare-name bindings. The
 // once-per-repository guard lives in runResolverRepairOnce.
 func (s *Store) repairBareNameLevelBindings(ctx context.Context, repoID int64) error {
@@ -292,6 +282,22 @@ func (s *Store) repairBareNameLevelBindings(ctx context.Context, repoID int64) e
 			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
 			  AND resolution_strategy = ?
 		`, repoID, ResolutionStrategyExactName)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
+}
+
+// repairDotTailAmbiguityBindings re-decides dot-tail bindings written before
+// the incremental binder consulted the broad bare-name veto.
+func (s *Store) repairDotTailAmbiguityBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE edges
+			SET `+resolverClearResolutionSQL+`
+			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
+			  AND resolution_strategy IN (?, ?)
+		`, repoID, ResolutionStrategyDotTail2, ResolutionStrategyDotTail3)
 		return err
 	}
 	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)

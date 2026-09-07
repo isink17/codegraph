@@ -317,6 +317,137 @@ func TestBareNameEvidenceIsIdenticalOnEveryEntryPoint(t *testing.T) {
 	}
 }
 
+// A dotted persisted symbol name can make the broad bare-name level ambiguous
+// while its dot_tail2 remains unique. The full resolver vetoes the narrower
+// tail; incremental resolution must make the same decision.
+func TestIncrementalDotTail2HonorsBroadBareNameAmbiguity(t *testing.T) {
+	f := newParityFixture(t, "")
+	defs := f.file(t, "app/defs.py", "python")
+	tail := f.symbol(t, defs, "run", "pkg.obj.run", "function", "python")
+	f.symbolIn(t, defs, "obj.run", "other.different", "value", "Obj", "python")
+	f.symbolIn(t, defs, "obj.run", "third.different", "value", "Obj", "python")
+	callerFile := f.file(t, "app/main.py", "python")
+	caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+	edge := f.edge(t, callerFile, caller, "obj.run")
+
+	f.resolveVia(t, "full", nil, nil)
+	full := f.binding(t, edge)
+	if full != "<unresolved>" {
+		t.Fatalf("full resolver bound %q; want broad ambiguity veto", full)
+	}
+	f.clearAll(t)
+	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "paths+names", []string{"app/defs.py"}, []string{"obj.run"})
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("incremental resolver bound %q; want parity with full resolver (tail target %d)", got, tail)
+	}
+}
+
+func TestIncrementalDotTail3HonorsBroadBareNameAmbiguity(t *testing.T) {
+	f := newParityFixture(t, "")
+	defs := f.file(t, "app/defs.py", "python")
+	f.symbol(t, defs, "run", "pkg.a.obj.run", "function", "python")
+	f.symbolIn(t, defs, "a.obj.run", "other.different", "value", "Obj", "python")
+	f.symbolIn(t, defs, "a.obj.run", "third.different", "value", "Obj", "python")
+	callerFile := f.file(t, "app/main.py", "python")
+	caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+	edge := f.edge(t, callerFile, caller, "a.obj.run")
+
+	f.resolveVia(t, "full", nil, nil)
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("full resolver bound %q; want broad ambiguity veto", got)
+	}
+	f.clearAll(t)
+	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "paths+names", []string{"app/defs.py"}, []string{"a.obj.run"})
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("incremental resolver bound %q; want parity with full resolver", got)
+	}
+}
+
+func TestExactQualifiedEvidenceBeatsBroadBareAmbiguity(t *testing.T) {
+	for _, entry := range []string{"full", "paths", "names", "paths+names"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newParityFixture(t, "")
+			defs := f.file(t, "app/defs.py", "python")
+			target := f.symbol(t, defs, "obj.run", "obj.run", "function", "python")
+			f.symbol(t, defs, "obj.run", "other.different", "function", "python")
+			callerFile := f.file(t, "app/main.py", "python")
+			caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+			edge := f.edge(t, callerFile, caller, "obj.run")
+			if entry != "full" {
+				if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.resolveVia(t, entry, []string{"app/main.py"}, []string{"obj.run"})
+			if got, want := f.binding(t, edge), "obj.run|exact_qualified|high"; got != want {
+				t.Fatalf("got %q, want %q (target %d)", got, want, target)
+			}
+		})
+	}
+}
+
+func TestDotTailBroadVetoKeepsCallerTestSemantics(t *testing.T) {
+	for _, callerPath := range []string{"app/main.py", "app/main_test.py"} {
+		t.Run(callerPath, func(t *testing.T) {
+			f := newParityFixture(t, "")
+			defs := f.file(t, "app/defs.py", "python")
+			f.symbol(t, defs, "run", "pkg.obj.run", "function", "python")
+			prodDefs := f.file(t, "app/other.py", "python")
+			f.symbolIn(t, prodDefs, "obj.run", "other.different", "value", "Obj", "python")
+			testDefs := f.file(t, "app/other_test.py", "python")
+			f.symbolIn(t, testDefs, "obj.run", "third.different", "value", "Obj", "python")
+			callerFile := f.file(t, callerPath, "python")
+			caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+			edge := f.edge(t, callerFile, caller, "obj.run")
+			if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+				t.Fatal(err)
+			}
+			f.resolveVia(t, "paths+names", []string{callerPath}, []string{"obj.run"})
+			got := f.binding(t, edge)
+			if strings.HasSuffix(callerPath, "_test.py") {
+				if got != "<unresolved>" {
+					t.Fatalf("test caller got %q, want unresolved", got)
+				}
+			} else if got != "pkg.obj.run|dot_tail2|medium" {
+				t.Fatalf("production caller got %q, want dot-tail binding", got)
+			}
+		})
+	}
+}
+
+func TestDotTailAmbiguityAddRemoveRebinds(t *testing.T) {
+	f := newParityFixture(t, "")
+	defs := f.file(t, "app/defs.py", "python")
+	f.symbol(t, defs, "run", "pkg.obj.run", "function", "python")
+	f.symbolIn(t, defs, "obj.run", "other.different", "value", "Obj", "python")
+	callerFile := f.file(t, "app/main.py", "python")
+	caller := f.symbol(t, callerFile, "main", "main", "function", "python")
+	edge := f.edge(t, callerFile, caller, "obj.run")
+	f.resolveVia(t, "full", nil, nil)
+	if got, want := f.binding(t, edge), "pkg.obj.run|dot_tail2|medium"; got != want {
+		t.Fatalf("initial binding = %q, want %q", got, want)
+	}
+	competitorFile := f.file(t, "app/other.py", "python")
+	competitor := f.symbolIn(t, competitorFile, "obj.run", "other.different", "value", "Obj", "python")
+	f.resolveVia(t, "paths+names", []string{"app/other.py"}, []string{"obj.run"})
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("after ambiguity add = %q, want unresolved", got)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM symbols WHERE id = ?`, competitor); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "paths+names", []string{"app/other.py"}, []string{"obj.run"})
+	if got, want := f.binding(t, edge), "pkg.obj.run|dot_tail2|medium"; got != want {
+		t.Fatalf("after ambiguity removal = %q, want %q", got, want)
+	}
+}
+
 // A call edge may only denote a callable kind. The repo-wide pass has always
 // restricted bare-name candidates that way; the binder must agree, or the two
 // pipelines disagree about whether a name is ambiguous at all.
