@@ -1,6 +1,10 @@
 package store
 
-import "testing"
+import (
+	"database/sql"
+	"strconv"
+	"testing"
+)
 
 // Upgrade coverage for P22.12 (resolver_ambiguity.go).
 //
@@ -199,6 +203,73 @@ func TestRepoWithGraphRepairsOnceAndReportsRepoWideResolve(t *testing.T) {
 	}
 }
 
+func TestReferenceIdentityRepairBackfillsOldCurrentDB(t *testing.T) {
+	f := newParityFixture(t, "")
+	targetFile := f.file(t, "app/target.py", "python")
+	target := f.symbol(t, targetFile, "target", "target.target", "function", "python")
+	callerFile := f.file(t, "app/caller.py", "python")
+	caller := f.symbol(t, callerFile, "caller", "caller.caller", "function", "python")
+	edge := f.edge(t, callerFile, caller, "target.target")
+	if _, err := f.store.db.ExecContext(f.ctx, `
+		UPDATE edges SET edge_kind = 'calls', dst_symbol_id = ?, resolution_strategy = 'exact_qualified', resolution_confidence = 'high' WHERE id = ?`, target, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `
+		INSERT INTO references_tbl(repo_id, file_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col)
+		VALUES (?, ?, 'call', 'target', 'target.target', 1, 1, 1, 1)`, f.repoID, callerFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.markRepairDone(f.ctx, typeScopeRepair.key, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.markRepairDone(f.ctx, bareNameLevelRepair.key, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedRepoWide {
+		t.Fatal("reference-only repair reported repo-wide edge resolution")
+	}
+	var gotTarget, gotContext sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id, context_symbol_id FROM references_tbl WHERE repo_id = ?`, f.repoID).Scan(&gotTarget, &gotContext); err != nil {
+		t.Fatal(err)
+	}
+	if !gotTarget.Valid || gotTarget.Int64 != target || !gotContext.Valid || gotContext.Int64 != caller {
+		t.Fatalf("reference identities = (%v,%v), want (%d,%d)", gotTarget, gotContext, target, caller)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key = ?`, typeScopeRepair.key+"."+strconv.FormatInt(f.repoID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id = NULL, context_symbol_id = NULL WHERE repo_id = ?`, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	} else if !resolvedRepoWide {
+		t.Fatal("pending edge repair did not report repo-wide resolution")
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id, context_symbol_id FROM references_tbl WHERE repo_id = ?`, f.repoID).Scan(&gotTarget, &gotContext); err != nil {
+		t.Fatal(err)
+	}
+	if !gotTarget.Valid || gotTarget.Int64 != target || !gotContext.Valid || gotContext.Int64 != caller {
+		t.Fatalf("reference identities after edge repair = (%v,%v), want (%d,%d)", gotTarget, gotContext, target, caller)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id = NULL, context_symbol_id = NULL WHERE repo_id = ?`, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM references_tbl WHERE repo_id = ? AND (symbol_id IS NOT NULL OR context_symbol_id IS NOT NULL)`, f.repoID).Scan(&gotTarget); err != nil {
+		t.Fatal(err)
+	}
+	if gotTarget.Int64 != 0 {
+		t.Fatalf("second repair ran after marker: bound=%d", gotTarget.Int64)
+	}
+}
+
 // Every repair must appear in the one list both the runner and the marker
 // writer walk. A repair enumerated in only one of them would silently make
 // every freshly indexed repository pay a repo-wide resolve on its second scan.
@@ -217,6 +288,12 @@ func TestResolverRepairsShareOneList(t *testing.T) {
 		if _, ok := seen[key]; !ok {
 			t.Fatalf("repair key %q is not in resolverRepairs", key)
 		}
+	}
+	if _, ok := seen[referenceIdentityRepairSettingKey]; !ok {
+		t.Fatalf("repair key %q is not in resolverRepairs", referenceIdentityRepairSettingKey)
+	}
+	if referenceIdentityRepair.resolvesRepoWide {
+		t.Fatal("reference identity repair must not report repo-wide edge resolution")
 	}
 }
 
