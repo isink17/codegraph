@@ -212,6 +212,113 @@ class Local {
 	if !csharpResolved(t, s, root, "Local.cs", "Run") {
 		t.Fatal("local-function removal did not rebind")
 	}
+	freshRoot := t.TempDir()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(root, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(freshRoot, entry.Name()), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if _, err := New(fresh, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: freshRoot, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(csharpProjection(t, s, root), "\n"), strings.Join(csharpProjection(t, fresh, freshRoot), "\n"); got != want {
+		t.Fatalf("transition fresh/incremental mismatch\nfresh=%s\nincremental=%s", want, got)
+	}
+}
+
+func TestCSharpScopeF2TypeIdentity(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"A.cs": `namespace A; public class Service { public static void Run() {} }`,
+		"B.cs": `namespace B; public class Service { }`,
+		"Lexical.cs": `using A;
+namespace X;
+public class Service {}
+class Caller { void F() { Service.Run(); } }`,
+		"ImportedAmbiguous.cs": `using A;
+using B;
+namespace Y;
+class Caller { void F() { Service.Run(); } }`,
+		"Alias.cs": `using S = A.Service;
+namespace Y;
+class AliasCaller { void F() { S.Run(); } }`,
+		"Root.cs": `namespace App.Core;
+public static class Service { public static void Run() {} }`,
+		"RootCaller.cs": `namespace Test;
+class Root { public Mid Core { get; } }
+class Mid { public Leaf Service { get; } }
+class Leaf { public void Run() {} }
+class Caller { void F(Root App) { App.Core.Service.Run(); global::App.Core.Service.Run(); } }`,
+		"Helpers.cs": `namespace H; public static class Helpers { public static void Run() {} }`,
+		"BareOverload.cs": `using static H.Helpers;
+namespace T;
+class Caller {
+ void Run() {}
+ void Run(int x) {}
+ void F() { Run(); }
+}`,
+		"Hidden.cs": `namespace Lib;
+public class Outer { private class Hidden { public class Inner { public static void Run() {} } } }`,
+		"HiddenCaller.cs": `namespace Other; class Caller { void F() { Lib.Outer.Hidden.Inner.Run(); } }`,
+	}
+	for path, content := range files {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := s.ExportEdgesPage(context.Background(), repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"Lexical.cs:Service.Run":                     "",
+		"ImportedAmbiguous.cs:Service.Run":           "",
+		"Alias.cs:S.Run":                             "A.Service.Run",
+		"RootCaller.cs:App.Core.Service.Run":         "",
+		"RootCaller.cs:global::App.Core.Service.Run": "App.Core.Service.Run",
+		"BareOverload.cs:Run":                        "",
+		"HiddenCaller.cs:Lib.Outer.Hidden.Inner.Run": "",
+	}
+	seen := map[string]bool{}
+	for _, edge := range edges {
+		key := edge.FilePath + ":" + edge.DstName
+		if expected, ok := want[key]; ok {
+			seen[key] = true
+			if (edge.DstSymbolID != nil) != (expected != "") || expected != "" && edge.DstQualifiedName != expected {
+				t.Errorf("%s resolved=%v target=%q, want %q", key, edge.DstSymbolID != nil, edge.DstQualifiedName, expected)
+			}
+		}
+	}
+	for key := range want {
+		if !seen[key] {
+			t.Errorf("missing F2 edge %s", key)
+		}
+	}
 }
 
 func csharpResolved(t *testing.T, s *store.Store, root, file, name string) bool {

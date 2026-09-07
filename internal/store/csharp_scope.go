@@ -203,8 +203,11 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 				c = append(c, s)
 			}
 		}
-		if out, ok := choose(c, false); ok {
-			return out, "csharp_same_type", true
+		if len(c) > 0 {
+			if out, ok := choose(c, false); ok {
+				return out, "csharp_same_type", true
+			}
+			return csharpScopeSymbol{}, "", false
 		}
 		var c2 []csharpScopeSymbol
 		seen := map[string]struct{}{}
@@ -214,7 +217,7 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 			}
 			typeAccessible := false
 			for _, typeSymbol := range byQName[i.source] {
-				if typeSymbol.kind == "type" && csharpTypeAccessible(typeSymbol, e.srcContainer) {
+				if typeSymbol.kind == "type" && csharpTypeAccessibleByQName(typeSymbol.qname, e.srcContainer, byQName) {
 					typeAccessible = true
 					break
 				}
@@ -246,29 +249,18 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 		}
 		return csharpScopeSymbol{}, "", false
 	}
-	if shadowed(strings.TrimPrefix(qualifier, "global::")) {
+	global := strings.HasPrefix(qualifier, "global::")
+	if !global && shadowed(strings.Split(qualifier, ".")[0]) {
 		return csharpScopeSymbol{}, "", false
 	}
 	typeQ := strings.TrimPrefix(qualifier, "global::")
-	alias := false
-	qnames := csharpCandidateTypeQNames(typeQ, e.srcNamespace, imports)
-	for _, i := range imports {
-		if applicable(i) && i.local == qualifier && !strings.HasPrefix(i.kind, "global_") {
-			qnames = append(qnames, i.source)
-			alias = i.kind == "alias"
-		}
-	}
-	types := map[string]struct{}{}
-	for _, q := range qnames {
-		for _, s := range byQName[q] {
-			if s.kind == "type" && csharpTypeAccessible(s, e.srcContainer) {
-				types[s.qname] = struct{}{}
-			}
-		}
+	qname, alias, ok := csharpResolveTypeIdentity(typeQ, e.srcNamespace, imports, byQName, e.srcContainer, global)
+	if !ok {
+		return csharpScopeSymbol{}, "", false
 	}
 	var c []csharpScopeSymbol
 	for _, s := range byName[method] {
-		if _, ok := types[s.container]; ok {
+		if s.container == qname {
 			c = append(c, s)
 		}
 	}
@@ -313,45 +305,93 @@ func csharpNamespaceForType(qname string, byQName map[string][]csharpScopeSymbol
 	return first
 }
 
-func csharpCandidateTypeQNames(qualifier, namespace string, imports []csharpScopeImport) []string {
-	seen := map[string]struct{}{}
-	add := func(q string) {
-		q = strings.TrimPrefix(strings.TrimSpace(q), "global::")
-		if q != "" {
-			seen[q] = struct{}{}
+func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScopeImport, byQName map[string][]csharpScopeSymbol, sourceContainer string, global bool) (string, bool, bool) {
+	semanticTypes := func(qnames []string) []string {
+		seen := map[string]struct{}{}
+		for _, q := range qnames {
+			for _, s := range byQName[q] {
+				if s.kind == "type" {
+					seen[s.qname] = struct{}{}
+				}
+			}
+		}
+		out := make([]string, 0, len(seen))
+		for q := range seen {
+			out = append(out, q)
+		}
+		sort.Strings(out)
+		return out
+	}
+	decide := func(qnames []string, alias bool) (string, bool, bool) {
+		types := semanticTypes(qnames)
+		if len(types) == 1 {
+			if !csharpTypeAccessibleByQName(types[0], sourceContainer, byQName) {
+				return "", alias, false
+			}
+			return types[0], alias, true
+		}
+		return "", alias, false
+	}
+	if global {
+		return decide([]string{qualifier}, false)
+	}
+	var aliases []string
+	for _, i := range imports {
+		if i.owner == namespace || i.owner == "" {
+			if i.kind == "alias" && i.local == qualifier && !strings.HasPrefix(i.kind, "global_") {
+				aliases = append(aliases, i.source)
+			}
 		}
 	}
-	add(qualifier)
-	for _, i := range imports {
-		if strings.HasPrefix(i.kind, "global_") || i.owner != namespace && i.owner != "" {
-			continue
-		}
-		if i.kind == "namespace" {
-			add(i.source + "." + qualifier)
-		}
-		if i.kind == "alias" && i.local == qualifier {
-			add(i.source)
-		}
+	if len(aliases) > 0 {
+		return decide(aliases, true)
+	}
+	if types := semanticTypes([]string{qualifier}); len(types) > 0 {
+		return decide([]string{qualifier}, false)
 	}
 	for current := namespace; current != ""; {
-		add(current + "." + qualifier)
+		candidate := current + "." + qualifier
+		if len(semanticTypes([]string{candidate})) > 0 {
+			return decide([]string{candidate}, false)
+		}
 		if dot := strings.LastIndexByte(current, '.'); dot >= 0 {
 			current = current[:dot]
 		} else {
 			current = ""
 		}
 	}
-	out := make([]string, 0, len(seen))
-	for q := range seen {
-		out = append(out, q)
+	var usingTypes []string
+	for _, i := range imports {
+		if (i.owner == namespace || i.owner == "") && i.kind == "namespace" && !strings.HasPrefix(i.kind, "global_") {
+			usingTypes = append(usingTypes, i.source+"."+qualifier)
+		}
 	}
-	sort.Strings(out)
-	return out
+	return decide(usingTypes, false)
 }
 
-func csharpTypeAccessible(s csharpScopeSymbol, sourceContainer string) bool {
-	if s.qname == sourceContainer || s.container == sourceContainer {
+func csharpTypeAccessibleByQName(qname, sourceContainer string, byQName map[string][]csharpScopeSymbol) bool {
+	if qname == sourceContainer {
 		return true
 	}
-	return s.visibility == "public"
+	for current := qname; current != ""; {
+		var typeSymbol *csharpScopeSymbol
+		for i := range byQName[current] {
+			if byQName[current][i].kind == "type" {
+				candidate := byQName[current][i]
+				typeSymbol = &candidate
+				break
+			}
+		}
+		if typeSymbol == nil {
+			return true
+		}
+		if current == sourceContainer || typeSymbol.container == sourceContainer {
+			return true
+		}
+		if typeSymbol.visibility != "public" {
+			return false
+		}
+		current = typeSymbol.container
+	}
+	return true
 }

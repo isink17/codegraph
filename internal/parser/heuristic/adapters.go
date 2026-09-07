@@ -228,10 +228,8 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		module = pf.Scope.Package
 	}
 	if a.language == "csharp" {
-		if m := heuristicCSharpNamespaceRE.FindStringSubmatch(string(content)); len(m) == 2 {
-			module = m[1]
-			pf.Scope.Package = module
-		}
+		module = heuristicCSharpModule(content)
+		pf.Scope.Package = module
 	}
 
 	depth := 0
@@ -289,7 +287,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				}
 				container = strings.Join(names, ".")
 			}
-			qualified := module + "." + name
+			qualified := heuristicQualified(module, name)
 			if a.language == "kotlin" {
 				qualified = heuristicQualified(module, name)
 			}
@@ -297,7 +295,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				if a.language == "kotlin" {
 					qualified = heuristicQualified(module, container+"."+name)
 				} else {
-					qualified = module + "." + container + "." + name
+					qualified = heuristicQualified(module, container+"."+name)
 				}
 			}
 			stablePrefix := "func"
@@ -530,4 +528,47 @@ func heuristicCSharpImport(value string) graph.ScopeImport {
 		local = value[i+1:]
 	}
 	return graph.ScopeImport{SourceSpecifier: value, ImportedName: value, LocalName: local, Kind: "namespace"}
+}
+
+func heuristicCSharpModule(content []byte) string {
+	text := string(content)
+	matches := heuristicCSharpNamespaceRE.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) != 1 {
+		return ""
+	}
+	m := matches[0]
+	name := text[m[2]:m[3]]
+	declaration := text[m[0]:m[1]]
+	if strings.Contains(declaration, ";") {
+		return name
+	}
+	prefix := strings.TrimSpace(text[:m[0]])
+	if prefix != "" {
+		return ""
+	}
+	open := strings.IndexByte(text[m[0]:m[1]], '{')
+	if open < 0 {
+		return ""
+	}
+	open += m[0]
+	depth := 0
+	close := -1
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				close = i
+			}
+		}
+		if close >= 0 {
+			break
+		}
+	}
+	if close < 0 || strings.TrimSpace(text[close+1:]) != "" {
+		return ""
+	}
+	return name
 }

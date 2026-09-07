@@ -2,6 +2,7 @@ package heuristic
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -107,6 +108,28 @@ func TestCSharpHeuristicV2KeepsNamespaceIdentity(t *testing.T) {
 	}
 	if NewCSharp().Profile().ID != "heuristic:csharp:v2" || NewCSharp().Profile().EmitsCallEdges {
 		t.Fatalf("C# heuristic profile = %+v", NewCSharp().Profile())
+	}
+}
+
+func TestCSharpHeuristicV2FailsClosedOnBlockNamespaceMix(t *testing.T) {
+	for name, source := range map[string]string{
+		"mixed.cs": `class Global {}
+namespace App.Core { class Namespaced {} }`,
+		"multiple.cs": `namespace A { class One {} }
+namespace B { class Two {} }`,
+	} {
+		p, err := NewCSharp().Parse(context.Background(), name, []byte(source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Scope.Package != "" {
+			t.Fatalf("%s package = %q, want empty", name, p.Scope.Package)
+		}
+		for _, symbol := range p.Symbols {
+			if strings.Contains(symbol.QualifiedName, ".") {
+				t.Fatalf("%s leaked namespace into %q", name, symbol.QualifiedName)
+			}
+		}
 	}
 }
 
