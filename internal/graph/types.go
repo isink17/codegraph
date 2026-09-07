@@ -150,6 +150,11 @@ const (
 	// scope, LocalName the bound name, and SourceSpecifier is empty.
 	ScopeImportLocalBinding = "local_binding"
 
+	// ScopeImportTypedBinding records a value binding whose declared type is
+	// syntax-proven. SourceSpecifier carries the type spelling; OwnerModule
+	// carries the exact lexical owner.
+	ScopeImportTypedBinding = "typed_binding"
+
 	// ScopeImportNestedDeclaration is a local binding a nested `def` or `class`
 	// makes in the function that encloses it. It shadows an import of the same
 	// name the way any other local does, but the name it binds is a symbol this

@@ -160,12 +160,13 @@ const (
 	// ResolutionStrategyPythonModuleScope: the call is a bare name that the
 	// calling Python file itself declares exactly once at module level, and no
 	// import in that file binds the name.
-	ResolutionStrategyPythonModuleScope = "python_module_scope"
-	ResolutionStrategyCSharpSameType    = "csharp_same_type"
-	ResolutionStrategyCSharpThisScope   = "csharp_this_scope"
-	ResolutionStrategyCSharpTypeScope   = "csharp_type_scope"
-	ResolutionStrategyCSharpAliasScope  = "csharp_alias_scope"
-	ResolutionStrategyCSharpStaticUsing = "csharp_static_using"
+	ResolutionStrategyPythonModuleScope   = "python_module_scope"
+	ResolutionStrategyCSharpSameType      = "csharp_same_type"
+	ResolutionStrategyCSharpThisScope     = "csharp_this_scope"
+	ResolutionStrategyCSharpTypeScope     = "csharp_type_scope"
+	ResolutionStrategyCSharpAliasScope    = "csharp_alias_scope"
+	ResolutionStrategyCSharpStaticUsing   = "csharp_static_using"
+	ResolutionStrategyCSharpTypedReceiver = "csharp_typed_receiver"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -243,13 +244,14 @@ var resolutionConfidenceByStrategy = map[string]string{
 	// Both Python strategies match the name in full against `symbols.name` in a
 	// file the import syntax (or the module itself) proves, so nothing about
 	// either identity is discarded to reach the match.
-	ResolutionStrategyPythonImportScope: ResolutionConfidenceHigh,
-	ResolutionStrategyPythonModuleScope: ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpSameType:    ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpThisScope:   ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpTypeScope:   ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpAliasScope:  ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpStaticUsing: ResolutionConfidenceHigh,
+	ResolutionStrategyPythonImportScope:   ResolutionConfidenceHigh,
+	ResolutionStrategyPythonModuleScope:   ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpSameType:      ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpThisScope:     ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpTypeScope:     ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpAliasScope:    ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpStaticUsing:   ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpTypedReceiver: ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -312,6 +314,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyCSharpTypeScope,
 	ResolutionStrategyCSharpAliasScope,
 	ResolutionStrategyCSharpStaticUsing,
+	ResolutionStrategyCSharpTypedReceiver,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.

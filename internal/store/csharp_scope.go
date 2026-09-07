@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"sort"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 const csharpScopeVeto = "tmp_csharp_scope_veto"
@@ -23,6 +25,11 @@ type csharpScopeEdge struct {
 type csharpScopeImport struct {
 	source, imported, local, kind, owner string
 	static                               bool
+}
+
+type csharpScopeBindings struct {
+	unknown map[string]map[string]struct{}
+	typed   map[string]map[string]map[string]struct{}
 }
 
 func resolveCSharpScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
@@ -93,23 +100,27 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 	}); err != nil {
 		return 0, err
 	}
-	bindings := map[int64]map[string]map[string]struct{}{}
-	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(files), `SELECT file_id,local_name,owner_module FROM scope_import_evidence WHERE repo_id=? AND language='csharp' AND import_kind='local_binding' AND file_id IN (`, []any{repoID}, func(scan func(...any) error) error {
-		var f int64
-		var name, owner string
-		if err := scan(&f, &name, &owner); err != nil {
-			return err
+	bindings := map[int64]csharpScopeBindings{}
+	for file, rows := range imports {
+		b := csharpScopeBindings{unknown: map[string]map[string]struct{}{}, typed: map[string]map[string]map[string]struct{}{}}
+		for _, i := range rows {
+			switch i.kind {
+			case graph.ScopeImportLocalBinding:
+				if b.unknown[i.owner] == nil {
+					b.unknown[i.owner] = map[string]struct{}{}
+				}
+				b.unknown[i.owner][i.local] = struct{}{}
+			case graph.ScopeImportTypedBinding:
+				if b.typed[i.owner] == nil {
+					b.typed[i.owner] = map[string]map[string]struct{}{}
+				}
+				if b.typed[i.owner][i.local] == nil {
+					b.typed[i.owner][i.local] = map[string]struct{}{}
+				}
+				b.typed[i.owner][i.local][i.source] = struct{}{}
+			}
 		}
-		if bindings[f] == nil {
-			bindings[f] = map[string]map[string]struct{}{}
-		}
-		if bindings[f][owner] == nil {
-			bindings[f][owner] = map[string]struct{}{}
-		}
-		bindings[f][owner][name] = struct{}{}
-		return nil
-	}); err != nil {
-		return 0, err
+		bindings[file] = b
 	}
 
 	res := map[int64]struct {
@@ -150,7 +161,7 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 	return len(res), err
 }
 
-func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol, byQName map[string][]csharpScopeSymbol, imports []csharpScopeImport, bindings map[string]map[string]struct{}) (csharpScopeSymbol, string, bool) {
+func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol, byQName map[string][]csharpScopeSymbol, imports []csharpScopeImport, bindings csharpScopeBindings) (csharpScopeSymbol, string, bool) {
 	name := e.name
 	if name == "" || strings.HasPrefix(name, "base.") {
 		return csharpScopeSymbol{}, "", false
@@ -159,14 +170,39 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 	method := parts[len(parts)-1]
 	qualifier := strings.Join(parts[:len(parts)-1], ".")
 	shadowed := func(n string) bool {
-		for owner, names := range bindings {
-			if owner == e.srcStable || owner == e.srcContainer {
-				if _, ok := names[n]; ok {
-					return true
-				}
-			}
+		_, local := bindings.unknown[e.srcStable][n]
+		_, typed := bindings.typed[e.srcStable][n]
+		_, memberUnknown := bindings.unknown[e.srcContainer][n]
+		_, memberTyped := bindings.typed[e.srcContainer][n]
+		return local || typed || memberUnknown || memberTyped
+	}
+	valueType := func(owner, n string) (string, bool) {
+		if _, ok := bindings.unknown[owner][n]; ok {
+			return "", false
 		}
-		return false
+		facts := bindings.typed[owner][n]
+		if len(facts) != 1 {
+			return "", false
+		}
+		for fact := range facts {
+			return fact, true
+		}
+		return "", false
+	}
+	valueOwner := func(n string) (string, bool) {
+		if _, ok := bindings.unknown[e.srcStable][n]; ok {
+			return e.srcStable, true
+		}
+		if _, ok := bindings.typed[e.srcStable][n]; ok {
+			return e.srcStable, true
+		}
+		if _, ok := bindings.unknown[e.srcContainer][n]; ok {
+			return e.srcContainer, true
+		}
+		if _, ok := bindings.typed[e.srcContainer][n]; ok {
+			return e.srcContainer, true
+		}
+		return "", false
 	}
 	applicable := func(i csharpScopeImport) bool { return i.owner == "" || i.owner == e.srcNamespace }
 	visible := func(s csharpScopeSymbol) bool {
@@ -190,6 +226,17 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 			}
 			out = s
 			n++
+		}
+		return out, n == 1
+	}
+	chooseInstance := func(c []csharpScopeSymbol) (csharpScopeSymbol, bool) {
+		var out csharpScopeSymbol
+		n := 0
+		for _, s := range c {
+			if s.kind != "function" || !visible(s) || !s.static.Valid || s.static.Int64 != 0 {
+				continue
+			}
+			out, n = s, n+1
 		}
 		return out, n == 1
 	}
@@ -246,6 +293,52 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 		}
 		if out, ok := choose(c, false); ok {
 			return out, "csharp_this_scope", true
+		}
+		return csharpScopeSymbol{}, "", false
+	}
+	if len(parts) == 2 {
+		if owner, exists := valueOwner(qualifier); exists {
+			typeSpelling, ok := valueType(owner, qualifier)
+			if !ok {
+				return csharpScopeSymbol{}, "", false
+			}
+			global := strings.HasPrefix(typeSpelling, "global::")
+			typeQ := strings.TrimPrefix(typeSpelling, "global::")
+			qname, _, ok := csharpResolveTypeIdentity(typeQ, e.srcNamespace, imports, byQName, e.srcContainer, global)
+			if !ok {
+				return csharpScopeSymbol{}, "", false
+			}
+			var c []csharpScopeSymbol
+			for _, s := range byName[method] {
+				if s.container == qname {
+					c = append(c, s)
+				}
+			}
+			if out, ok := chooseInstance(c); ok {
+				return out, "csharp_typed_receiver", true
+			}
+			return csharpScopeSymbol{}, "", false
+		}
+	}
+	if len(parts) == 3 && parts[0] == "this" {
+		typeSpelling, ok := valueType(e.srcContainer, parts[1])
+		if !ok {
+			return csharpScopeSymbol{}, "", false
+		}
+		global := strings.HasPrefix(typeSpelling, "global::")
+		typeQ := strings.TrimPrefix(typeSpelling, "global::")
+		qname, _, ok := csharpResolveTypeIdentity(typeQ, e.srcNamespace, imports, byQName, e.srcContainer, global)
+		if !ok {
+			return csharpScopeSymbol{}, "", false
+		}
+		var c []csharpScopeSymbol
+		for _, s := range byName[method] {
+			if s.container == qname {
+				c = append(c, s)
+			}
+		}
+		if out, ok := chooseInstance(c); ok {
+			return out, "csharp_typed_receiver", true
 		}
 		return csharpScopeSymbol{}, "", false
 	}
