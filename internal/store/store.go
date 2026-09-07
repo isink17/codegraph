@@ -58,9 +58,9 @@ const (
 	// 90*11=990 variables, staying under sqliteDefaultMaxVariables.
 	sqliteReferenceValuesBatchRows = 90
 
-	// sqliteEdgeValuesBatchRows controls multi-row inserts into edges where each row uses 7 parameters.
-	// 140*7=980 variables, staying under sqliteDefaultMaxVariables.
-	sqliteEdgeValuesBatchRows = 140
+	// sqliteEdgeValuesBatchRows controls multi-row inserts into edges where each row uses 8 parameters.
+	// 124*8=992 variables, staying under sqliteDefaultMaxVariables.
+	sqliteEdgeValuesBatchRows = 124
 
 	// sqliteImportValuesBatchRows controls multi-row inserts into file_imports where each row uses 3 parameters.
 	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
@@ -70,9 +70,9 @@ const (
 	// 124*8=992 variables, staying under sqliteDefaultMaxVariables.
 	sqliteTestLinkValuesBatchRows = 124
 
-	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 19 parameters.
-	// 52*19=988 variables, staying under sqliteDefaultMaxVariables.
-	sqliteSymbolValuesBatchRows = 52
+	// sqliteSymbolValuesBatchRows controls multi-row inserts into symbols where each row uses 21 parameters.
+	// 47*21=987 variables, staying under sqliteDefaultMaxVariables.
+	sqliteSymbolValuesBatchRows = 47
 	// sqliteSymbolFTSValuesBatchRows controls multi-row inserts into symbol_fts where each row uses 6 parameters.
 	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteSymbolFTSValuesBatchRows = 150
@@ -2508,7 +2508,7 @@ func insertParsedFileGraph(
 
 	if len(parsed.Edges) > 0 {
 		srcChooser := newSrcSymbolChooser(symbolIDs, parsed.Symbols)
-		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*7)
+		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*8)
 		for _, edge := range parsed.Edges {
 			attribution := srcChooser.attribute(edge.Line)
 			srcID := attribution.id
@@ -2518,8 +2518,8 @@ func insertParsedFileGraph(
 				}
 				continue
 			}
-			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line)
-			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*7 {
+			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line, edge.CallArity)
+			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*8 {
 				if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
 					return nil, err
 				}
@@ -2720,7 +2720,7 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		return map[symbolRowKey]int64{}, nil
 	}
 
-	args := make([]any, len(symbols)*19)
+	args := make([]any, len(symbols)*21)
 	argIdx := 0
 	for _, sym := range symbols {
 		args[argIdx+0] = repoID
@@ -2744,7 +2744,13 @@ func insertSymbolsBatchReturning(ctx context.Context, tx *sql.Tx, repoID, fileID
 		args[argIdx+16] = qualifiedSuffix(sym.QualifiedName)
 		args[argIdx+17] = dotTail2(sym.QualifiedName)
 		args[argIdx+18] = dotTail3(sym.QualifiedName)
-		argIdx += 19
+		if sym.ArityMin != nil {
+			args[argIdx+19] = *sym.ArityMin
+		}
+		if sym.ArityMax != nil {
+			args[argIdx+20] = *sym.ArityMax
+		}
+		argIdx += 21
 	}
 
 	rows, err := tx.QueryContext(ctx, symbolInsertSQL(len(symbols)), args...)
@@ -2788,8 +2794,8 @@ func symbolInsertSQL(n int) string {
 	if v, ok := symbolInsertSQLCache.Load(n); ok {
 		return v.(string)
 	}
-	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, is_static, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2, dot_tail3) VALUES "
-	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const prefix = "INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, container_name, signature, visibility, is_static, start_line, start_col, end_line, end_col, doc_summary, stable_key, qualified_suffix, dot_tail2, dot_tail3, arity_min, arity_max) VALUES "
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 	const suffix = " RETURNING id, stable_key, start_line, start_col"
 
 	var b strings.Builder
@@ -2971,7 +2977,7 @@ func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *Wr
 }
 
 func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
-	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line", 7, args, stats)
+	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line, call_arity", 8, args, stats)
 }
 
 // testLinkInsertCols is the arity of the test_links insert tuple. It includes
