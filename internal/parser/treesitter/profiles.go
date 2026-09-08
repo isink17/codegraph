@@ -23,5 +23,7 @@ func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescr
 func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") }
 func (a *RubyAdapter) Profile() parser.Profile       { return tsProfile("ruby") }
 func (a *SwiftAdapter) Profile() parser.Profile      { return tsProfile("swift") }
-func (a *PHPAdapter) Profile() parser.Profile        { return tsProfile("php") }
-func (a *CppAdapter) Profile() parser.Profile        { return tsProfile("cpp") }
+func (a *PHPAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:php:v2", EmitsCallEdges: true}
+}
+func (a *CppAdapter) Profile() parser.Profile { return tsProfile("cpp") }
