@@ -139,6 +139,79 @@ func TestPHPProfileV2(t *testing.T) {
 	}
 }
 
+func TestPHPF1MixedUseAndStaticReturnFacts(t *testing.T) {
+	src := []byte(`<?php
+use Vendor\Package\{Client, Service as S, function run, function stop as halt, const VALUE};
+use /* comment */ function Foo\bar;
+class Factory {
+    public function instanceFactory(): static { return $this; }
+    public static function staticFactory(): static { return new static(); }
+    public function normal() {}
+    static public function reordered() {}
+}
+`)
+	p, err := NewPHP().Parse(context.Background(), "Factory.php", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantImports := map[string]struct{ local, kind string }{
+		"Vendor.Package.Client":  {"Client", "php_type"},
+		"Vendor.Package.Service": {"S", "php_type"},
+		"Vendor.Package.run":     {"run", "php_function"},
+		"Vendor.Package.stop":    {"halt", "php_function"},
+		"Vendor.Package.VALUE":   {"VALUE", "php_const"},
+		"Foo.bar":                {"bar", "php_function"},
+	}
+	for _, i := range p.Scope.Imports {
+		if want, ok := wantImports[i.SourceSpecifier]; ok {
+			if i.LocalName != want.local || i.Kind != want.kind {
+				t.Fatalf("import = %+v", i)
+			}
+			delete(wantImports, i.SourceSpecifier)
+		}
+	}
+	if len(wantImports) != 0 {
+		t.Fatalf("missing imports = %v", wantImports)
+	}
+	for _, s := range p.Symbols {
+		switch s.QualifiedName {
+		case "Factory.instanceFactory":
+			if s.Static == nil || *s.Static {
+				t.Fatalf("instance static = %v", s.Static)
+			}
+		case "Factory.staticFactory":
+			if s.Static == nil || !*s.Static {
+				t.Fatalf("static static = %v", s.Static)
+			}
+		case "Factory.normal":
+			if s.Static == nil || *s.Static {
+				t.Fatalf("normal static = %v", s.Static)
+			}
+		case "Factory.reordered":
+			if s.Static == nil || !*s.Static {
+				t.Fatalf("reordered static = %v", s.Static)
+			}
+		}
+	}
+}
+
+func TestPHPTestLinkKeysFailClosedOnUnknownNamespace(t *testing.T) {
+	global, err := NewPHP().Parse(context.Background(), "ServiceTest.php", []byte("<?php function TestService() {}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(global.TestLinks) != 1 || global.TestLinks[0].TargetStableKey != "func:php:Service" {
+		t.Fatalf("global links = %+v", global.TestLinks)
+	}
+	namespaced, err := NewPHP().Parse(context.Background(), "ServiceTest.php", []byte("<?php namespace App\\Tests; function TestService() {}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(namespaced.TestLinks) != 0 {
+		t.Fatalf("namespaced links = %+v", namespaced.TestLinks)
+	}
+}
+
 func TestPHPGlobalAndSemicolonNamespaceIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name, source, qname, container string

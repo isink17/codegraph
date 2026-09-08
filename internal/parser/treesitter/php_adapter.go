@@ -34,10 +34,7 @@ func (a *PHPAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 		p.Scope.Package = onlyNamespace
 	}
 	phpExtractCalls(root, content, &p)
-	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	linkTestsGeneric(module, &p, func(target string) string {
-		return "func:php:" + testTargetModule(module, "Test", "Tests") + ":" + target
-	})
+	phpLinkTests(&p)
 	return p, nil
 }
 
@@ -77,14 +74,7 @@ func phpExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) 
 }
 
 func phpAddNamespaceUses(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
-	text := strings.TrimSpace(nodeText(node, content))
-	kind := "php_type"
-	if strings.HasPrefix(text, "use function") {
-		kind = "php_function"
-	}
-	if strings.HasPrefix(text, "use const") {
-		kind = "php_const"
-	}
+	kind := phpUseKind(node, content, "php_type")
 	prefix := ""
 	if n := firstChild(node, "namespace_name"); n != nil {
 		prefix = nodeText(n, content)
@@ -93,14 +83,59 @@ func phpAddNamespaceUses(node *sitter.Node, owner string, content []byte, pf *gr
 		child := node.Child(i)
 		switch child.Type() {
 		case "namespace_use_clause":
-			phpAddUseClause(child, "", kind, owner, content, pf)
+			phpAddUseClause(child, "", phpUseKind(child, content, kind), owner, content, pf)
 		case "namespace_use_group":
 			for j := range int(child.ChildCount()) {
 				if clause := child.Child(j); clause.Type() == "namespace_use_group_clause" {
-					phpAddUseClause(clause, prefix, kind, owner, content, pf)
+					phpAddUseClause(clause, prefix, phpUseKind(clause, content, kind), owner, content, pf)
 				}
 			}
 		}
+	}
+}
+
+// The PHP grammar keeps `function`/`const` as anonymous tokens. Their AST
+// evidence is the token span before each namespace_name: declaration-level
+// `use function` supplies inheritance, while mixed group clauses carry their
+// own keyword in that span. Comments are ignored only inside this syntax span.
+func phpUseKind(node *sitter.Node, content []byte, inherited string) string {
+	first := firstChild(node, "namespace_name")
+	if first == nil {
+		first = firstChild(node, "qualified_name")
+	}
+	if first == nil {
+		first = firstChild(node, "namespace_use_clause")
+	}
+	if first == nil {
+		return inherited
+	}
+	start, end := node.StartByte(), first.StartByte()
+	if start >= end || int(end) > len(content) {
+		return inherited
+	}
+	words := strings.Fields(stripPHPComments(string(content[start:end])))
+	for _, word := range words {
+		switch word {
+		case "function":
+			return "php_function"
+		case "const":
+			return "php_const"
+		}
+	}
+	return inherited
+}
+
+func stripPHPComments(source string) string {
+	for {
+		start := strings.Index(source, "/*")
+		if start < 0 {
+			return source
+		}
+		end := strings.Index(source[start+2:], "*/")
+		if end < 0 {
+			return source[:start]
+		}
+		source = source[:start] + " " + source[start+2+end+2:]
 	}
 }
 
@@ -193,7 +228,7 @@ func phpAddFunction(node *sitter.Node, namespace, container string, method bool,
 		ContainerName: containerOrNamespace(container, namespace), Visibility: "public", Range: nodeRange(node),
 		DocSummary: prevCommentText(node, content), StableKey: "func:php:" + qualified}
 	if method {
-		p.Visibility, p.Static = phpMethodVisibility(node, content), phpStatic(node, content)
+		p.Visibility, p.Static = phpMethodVisibility(node, content), phpStatic(node)
 	}
 	pf.Symbols = append(pf.Symbols, p)
 }
@@ -214,15 +249,39 @@ func phpMethodVisibility(node *sitter.Node, content []byte) string {
 	return "public"
 }
 
-func phpStatic(node *sitter.Node, content []byte) *bool {
+func phpStatic(node *sitter.Node) *bool {
 	static := false
 	for i := range int(node.ChildCount()) {
-		if node.Child(i).Type() == "static_modifier" || nodeText(node.Child(i), content) == "static" {
+		if node.Child(i).Type() == "static_modifier" {
 			static = true
 			break
 		}
 	}
 	return &static
+}
+
+func phpLinkTests(pf *graph.ParsedFile) {
+	for i, sym := range pf.Symbols {
+		if sym.Kind != "function" || sym.ContainerName != "" {
+			continue
+		}
+		target := ""
+		switch {
+		case strings.HasPrefix(sym.Name, "test_"):
+			target = strings.TrimPrefix(sym.Name, "test_")
+		case strings.HasPrefix(sym.Name, "Test") && testNameUpperBoundary(sym.Name[4:]):
+			target = sym.Name[4:]
+		case strings.HasPrefix(sym.Name, "test") && testNameLowerBoundary(sym.Name[4:]):
+			target = sym.Name[4:]
+		}
+		if target == "" {
+			continue
+		}
+		pf.TestLinks = append(pf.TestLinks, graph.TestLink{
+			TestName: sym.QualifiedName, TargetName: target, Reason: "test_name_match", Score: 0.7,
+			TestSymbolKey: sym.StableKey, TargetStableKey: "func:php:" + target, TestSymbolIndex: intRef(i),
+		})
+	}
 }
 
 func phpExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
