@@ -179,7 +179,11 @@ func phpAddType(node *sitter.Node, namespace string, content []byte, pf *graph.P
 	qualified := phpJoinQName(namespace, name)
 	pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "php", Kind: "type", Name: name, QualifiedName: qualified,
 		ContainerName: namespace, Visibility: "public", Range: nodeRange(node), DocSummary: prevCommentText(node, content), StableKey: "type:php:" + qualified})
+	if node.Type() == "trait_declaration" {
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{Kind: graph.ScopeImportPHPTraitScope, OwnerModule: qualified})
+	}
 	if body := childByFieldName(node, "body"); body != nil {
+		phpExtractPropertyFacts(body, qualified, content, pf)
 		phpExtractSymbols(body, namespace, qualified, content, pf, namespaces, globalDecl, onlyNamespace)
 	}
 }
@@ -201,6 +205,77 @@ func phpAddFunction(node *sitter.Node, namespace, container string, method bool,
 		p.Visibility, p.Static = phpMethodVisibility(node, content), phpStatic(node)
 	}
 	pf.Symbols = append(pf.Symbols, p)
+	if method {
+		phpExtractPromotedPropertyFacts(childByFieldName(node, "parameters"), container, content, pf)
+	}
+}
+
+func phpExtractPropertyFacts(body *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	for i := range int(body.ChildCount()) {
+		child := body.Child(i)
+		if child.Type() == "property_declaration" {
+			phpAddPropertyFacts(child, owner, content, pf)
+		}
+	}
+}
+
+func phpExtractPromotedPropertyFacts(parameters *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	if parameters == nil {
+		return
+	}
+	for i := range int(parameters.ChildCount()) {
+		child := parameters.Child(i)
+		if child.Type() == "property_promotion_parameter" {
+			phpAddPropertyFact(child, owner, content, pf)
+		}
+	}
+}
+
+func phpAddPropertyFacts(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	static := false
+	for i := range int(node.ChildCount()) {
+		if node.Child(i).Type() == "static_modifier" {
+			static = true
+		}
+	}
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		if child.Type() != "property_element" {
+			continue
+		}
+		phpAddPropertyFactWithType(child, node, owner, static, content, pf)
+	}
+}
+
+func phpAddPropertyFact(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	phpAddPropertyFactWithType(node, node, owner, false, content, pf)
+}
+
+func phpAddPropertyFactWithType(element, declaration *sitter.Node, owner string, static bool, content []byte, pf *graph.ParsedFile) {
+	variable := childByFieldName(element, "name")
+	if variable == nil {
+		variable = childByFieldName(element, "variable_name")
+	}
+	if variable == nil {
+		variable = firstChild(element, "variable_name")
+	}
+	if variable == nil {
+		return
+	}
+	name := strings.TrimPrefix(nodeText(variable, content), "$")
+	if name == "" {
+		return
+	}
+	typeNode := childByFieldName(declaration, "type")
+	typeName := ""
+	if typeNode != nil && typeNode.Type() == "named_type" && !static {
+		typeName = strings.TrimSpace(nodeText(typeNode, content))
+	}
+	kind := graph.ScopeImportLocalBinding
+	if typeName != "" {
+		kind = graph.ScopeImportTypedBinding
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{LocalName: name, SourceSpecifier: typeName, Kind: kind, OwnerModule: owner})
 }
 
 func containerOrNamespace(container, namespace string) string {
@@ -255,41 +330,53 @@ func phpLinkTests(pf *graph.ParsedFile) {
 }
 
 func phpExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
-	add := func(call *sitter.Node, name string) {
+	add := func(call *sitter.Node, name string, nested bool) {
 		if name == "" {
 			return
 		}
-		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: name, Line: int(call.StartPoint().Row) + 1})
+		evidence := name
+		if nested && strings.HasPrefix(name, "$this->") {
+			evidence = graph.PHPMemberCallNestedScopeEvidence
+		}
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1})
 		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
 	}
-	for _, call := range findDescendants(root, "function_call_expression") {
-		fn := childByFieldName(call, "function")
-		if fn == nil && call.ChildCount() > 0 {
-			fn = call.Child(0)
+	var walk func(*sitter.Node, bool)
+	walk = func(node *sitter.Node, nested bool) {
+		if node == nil {
+			return
 		}
-		if fn != nil {
-			add(call, nodeText(fn, content))
-		}
-	}
-	for _, call := range findDescendants(root, "scoped_call_expression") {
-		scope, name := childByFieldName(call, "scope"), childByFieldName(call, "name")
-		if scope != nil && name != nil {
-			add(call, nodeText(scope, content)+"::"+nodeText(name, content))
-		}
-	}
-	for _, typ := range []string{"member_call_expression", "nullsafe_member_call_expression"} {
-		for _, call := range findDescendants(root, typ) {
-			name, object := childByFieldName(call, "name"), childByFieldName(call, "object")
-			if name == nil || object == nil {
-				continue
+		switch node.Type() {
+		case "anonymous_function_creation_expression", "arrow_function", "function_definition":
+			nested = true
+		case "function_call_expression":
+			fn := childByFieldName(node, "function")
+			if fn == nil && node.ChildCount() > 0 {
+				fn = node.Child(0)
 			}
-			op := "->"
-			if typ == "nullsafe_member_call_expression" {
-				op = "?->"
+			if fn != nil {
+				add(node, nodeText(fn, content), nested)
 			}
-			add(call, nodeText(object, content)+op+nodeText(name, content))
+		case "scoped_call_expression":
+			scope, name := childByFieldName(node, "scope"), childByFieldName(node, "name")
+			if scope != nil && name != nil {
+				add(node, nodeText(scope, content)+"::"+nodeText(name, content), nested)
+			}
+		case "member_call_expression", "nullsafe_member_call_expression":
+			name, object := childByFieldName(node, "name"), childByFieldName(node, "object")
+			if name != nil && object != nil {
+				op := "->"
+				if node.Type() == "nullsafe_member_call_expression" {
+					op = "?->"
+				}
+				add(node, nodeText(object, content)+op+nodeText(name, content), nested)
+			}
+		}
+		for i := range int(node.ChildCount()) {
+			walk(node.Child(i), nested)
 		}
 	}
+	walk(root, false)
 }
 
 // Normalize only syntax-proven PHP names; arbitrary runtime strings stay raw.

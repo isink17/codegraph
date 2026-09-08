@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"sort"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 // PHP scoped static-call resolution (P22.44).
@@ -61,6 +63,8 @@ var phpScopeStrategies = []string{
 	ResolutionStrategyPHPTypeScope,
 	ResolutionStrategyPHPAliasStatic,
 	ResolutionStrategyPHPSelfStatic,
+	ResolutionStrategyPHPThisInstance,
+	ResolutionStrategyPHPTypedProperty,
 }
 
 // phpScopeOwnedSQL is the SQL twin of phpScopeOwned: the edge spellings this
@@ -98,10 +102,13 @@ type phpScopeEdge struct {
 	srcQName     string
 	srcContainer string
 	srcStatic    sql.NullInt64
+	evidence     string
 	// derived
 	namespace   string // lexical PHP namespace of the caller ("" = global)
 	currentType string // containing type qname, "" when the caller is not inside a type
 	sourceOK    bool   // namespace derivation succeeded
+	trait       bool
+	nested      bool
 }
 
 type phpScopeImport struct {
@@ -124,13 +131,13 @@ func resolvePHPScope(ctx context.Context, q phpScopeQuery, repoID int64, only ma
 	var edges []phpScopeEdge
 	// LEFT JOIN on the source: an edge without a trustworthy source symbol is
 	// still owned (and vetoed); it just cannot prove a namespace and abstains.
-	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.dst_name,src.id IS NOT NULL,COALESCE(src.kind,''),COALESCE(src.qualified_name,''),COALESCE(src.container_name,''),src.is_static
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.dst_name,e.evidence,src.id IS NOT NULL,COALESCE(src.kind,''),COALESCE(src.qualified_name,''),COALESCE(src.container_name,''),src.is_static
 FROM edges e JOIN files f ON f.id=e.file_id LEFT JOIN symbols src ON src.id=e.src_symbol_id
-WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND `+phpScopeStaticSQL, " AND e.id IN (%s)", []any{repoID}, int64SliceToAny(ids), len(only) > 0,
+WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND (`+phpScopeStaticSQL+` OR e.dst_name LIKE '$this->%')`, " AND e.id IN (%s)", []any{repoID}, int64SliceToAny(ids), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e phpScopeEdge
 			var hasSrc int
-			if err := rows.Scan(&e.id, &e.file, &e.name, &hasSrc, &e.srcKind, &e.srcQName, &e.srcContainer, &e.srcStatic); err != nil {
+			if err := rows.Scan(&e.id, &e.file, &e.name, &e.evidence, &hasSrc, &e.srcKind, &e.srcQName, &e.srcContainer, &e.srcStatic); err != nil {
 				return err
 			}
 			e.hasSrc = hasSrc != 0
@@ -166,7 +173,7 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND `+phpScop
 		files[e.file] = struct{}{}
 	}
 	imports := map[int64][]phpScopeImport{}
-	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(files), `SELECT file_id,source_specifier,local_name,import_kind,owner_module FROM scope_import_evidence WHERE repo_id=? AND language='php' AND import_kind='php_type' AND file_id IN (`, []any{repoID}, func(scan func(...any) error) error {
+	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(files), `SELECT file_id,source_specifier,local_name,import_kind,owner_module FROM scope_import_evidence WHERE repo_id=? AND language='php' AND file_id IN (`, []any{repoID}, func(scan func(...any) error) error {
 		var f int64
 		var i phpScopeImport
 		if err := scan(&f, &i.source, &i.local, &i.kind, &i.owner); err != nil {
@@ -187,7 +194,23 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND `+phpScop
 	decisions := make([]decision, len(edges))
 	wanted := map[string]struct{}{}
 	for i, e := range edges {
+		edges[i].nested = e.evidence == graph.PHPMemberCallNestedScopeEvidence
+		for _, fact := range imports[e.file] {
+			if fact.kind == graph.ScopeImportPHPTraitScope && fact.owner == e.currentType {
+				edges[i].trait = true
+			}
+		}
 		typeQ, method, strategy, ok := phpDecideType(e, imports[e.file])
+		if property, member, propertyStrategy, propertyOK := phpThisCall(e.name); propertyOK {
+			if e.srcKind != "function" || !e.srcStatic.Valid || e.srcStatic.Int64 != 0 || edges[i].trait || edges[i].nested || e.currentType == "" {
+				continue
+			}
+			if property == "" {
+				typeQ, method, strategy, ok = e.currentType, member, propertyStrategy, true
+			} else {
+				typeQ, method, strategy, ok = phpPropertyType(e, property, member, imports[e.file])
+			}
+		}
 		if !ok {
 			continue
 		}
@@ -209,6 +232,22 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND `+phpScop
 			continue
 		}
 		if !phpUniqueType(byQName[d.typeQ]) {
+			continue
+		}
+		if property, _, propertyStrategy, propertyOK := phpThisCall(e.name); propertyOK {
+			if property == "" {
+				if dst, found := phpChooseInstanceMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType); found {
+					res[e.id] = struct {
+						dst      int64
+						strategy string
+					}{dst.id, propertyStrategy}
+				}
+			} else if dst, found := phpChooseInstanceMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType); found {
+				res[e.id] = struct {
+					dst      int64
+					strategy string
+				}{dst.id, propertyStrategy}
+			}
 			continue
 		}
 		if dst, ok := phpChooseStaticMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType); ok {
@@ -323,65 +362,70 @@ func phpDeriveSource(e *phpScopeEdge, byQName map[string][]phpScopeSymbol) {
 // name plus the requested method, or abstains. It never consults symbols: type
 // identity is a function of syntax, the caller's namespace and its imports.
 func phpDecideType(e phpScopeEdge, imports []phpScopeImport) (typeQ, method, strategy string, ok bool) {
-	name := e.name
-	if strings.Contains(name, "->") {
-		return "", "", "", false // object/member call: no receiver typing here
+	if strings.Contains(e.name, "->") {
+		return "", "", "", false
 	}
-	sep := strings.Index(name, "::")
+	sep := strings.Index(e.name, "::")
 	if sep <= 0 {
 		return "", "", "", false
 	}
-	scope, member := name[:sep], name[sep+2:]
+	scope, member := e.name[:sep], e.name[sep+2:]
 	if !phpIdentifier(member) {
-		return "", "", "", false // `Foo::$method`, `Foo::{expr}`, `Foo::BAR::baz`
+		return "", "", "", false
 	}
 	if !e.sourceOK {
-		return "", "", "", false // no proven lexical namespace
+		return "", "", "", false
+	}
+	q, strategy, ok := phpResolveTypeIdentity(scope, e.namespace, e.currentType, imports)
+	return q, member, strategy, ok
+}
+
+var phpBuiltinTypes = map[string]struct{}{"array": {}, "iterable": {}, "object": {}, "callable": {}, "mixed": {}, "string": {}, "int": {}, "float": {}, "bool": {}, "null": {}, "false": {}, "true": {}, "void": {}, "never": {}, "resource": {}, "scalar": {}}
+
+func phpResolveTypeIdentity(scope, namespace, currentType string, imports []phpScopeImport) (string, string, bool) {
+	if scope == "" || strings.HasPrefix(scope, "$") || strings.HasPrefix(scope, "(") {
+		return "", "", false
 	}
 	switch strings.ToLower(scope) {
 	case "self":
-		if e.currentType == "" {
-			return "", "", "", false
+		if currentType == "" {
+			return "", "", false
 		}
-		return e.currentType, member, ResolutionStrategyPHPSelfStatic, true
+		return currentType, ResolutionStrategyPHPSelfStatic, true
 	case "static", "parent":
-		return "", "", "", false // late static binding / inheritance: not modelled
+		return "", "", false
 	}
-	if strings.HasPrefix(scope, "$") || strings.HasPrefix(scope, "(") {
-		return "", "", "", false // value receiver, not a type spelling
-	}
-	// A. absolute
 	if strings.HasPrefix(scope, `\`) {
 		q := phpSemanticName(scope[1:])
 		if q == "" {
-			return "", "", "", false
+			return "", "", false
 		}
-		return q, member, ResolutionStrategyPHPTypeScope, true
+		for _, segment := range strings.Split(q, ".") {
+			if _, builtin := phpBuiltinTypes[strings.ToLower(segment)]; builtin {
+				return "", "", false
+			}
+		}
+		return q, ResolutionStrategyPHPTypeScope, true
 	}
 	segments := strings.Split(scope, `\`)
 	for _, seg := range segments {
 		if !phpIdentifier(seg) {
-			return "", "", "", false
+			return "", "", false
+		}
+		if _, builtin := phpBuiltinTypes[strings.ToLower(seg)]; builtin {
+			return "", "", false
 		}
 	}
-	// B. namespace-relative
 	if strings.EqualFold(segments[0], "namespace") {
-		if len(segments) < 2 {
-			return "", "", "", false
+		if len(segments) < 2 || namespace == "" {
+			return "", "", false
 		}
-		if e.namespace == "" {
-			// PHP resolves `namespace\Foo` in global code to `\Foo`; this
-			// phase does not assert runtime semantics it cannot pin from the
-			// parser, so the global form fails closed.
-			return "", "", "", false
-		}
-		return e.namespace + "." + strings.Join(segments[1:], "."), member, ResolutionStrategyPHPTypeScope, true
+		return namespace + "." + strings.Join(segments[1:], "."), ResolutionStrategyPHPTypeScope, true
 	}
-	// C. import alias on the first segment, exact local spelling, exact owner.
 	sources := map[string]struct{}{}
 	caseCollision := false
 	for _, i := range imports {
-		if i.kind != "php_type" || i.owner != e.namespace {
+		if i.kind != "php_type" || i.owner != namespace {
 			continue
 		}
 		if i.local == segments[0] {
@@ -392,7 +436,7 @@ func phpDecideType(e phpScopeEdge, imports []phpScopeImport) (typeQ, method, str
 	}
 	if len(sources) > 0 {
 		if len(sources) != 1 {
-			return "", "", "", false // several imports own the local name
+			return "", "", false
 		}
 		var source string
 		for source = range sources {
@@ -401,18 +445,68 @@ func phpDecideType(e phpScopeEdge, imports []phpScopeImport) (typeQ, method, str
 		if len(segments) > 1 {
 			q += "." + strings.Join(segments[1:], ".")
 		}
-		return q, member, ResolutionStrategyPHPAliasStatic, true
+		return q, ResolutionStrategyPHPAliasStatic, true
 	}
 	if caseCollision {
+		return "", "", false
+	}
+	q := strings.Join(segments, ".")
+	if namespace != "" {
+		q = namespace + "." + q
+	}
+	return q, ResolutionStrategyPHPTypeScope, true
+}
+
+func phpPropertyType(e phpScopeEdge, property, method string, imports []phpScopeImport) (string, string, string, bool) {
+	var typed map[string]map[string]struct{}
+	unknown := false
+	for _, i := range imports {
+		if i.owner != e.currentType || i.local != property {
+			continue
+		}
+		switch i.kind {
+		case graph.ScopeImportLocalBinding:
+			unknown = true
+		case graph.ScopeImportTypedBinding:
+			if typed == nil {
+				typed = map[string]map[string]struct{}{}
+			}
+			if typed[i.local] == nil {
+				typed[i.local] = map[string]struct{}{}
+			}
+			typed[i.local][i.source] = struct{}{}
+		}
+	}
+	if unknown || len(typed) == 0 || len(typed[property]) != 1 {
 		return "", "", "", false
 	}
-	// D. current namespace + relative spelling. No parent walk, no global
-	// fallback: a global namespace is simply the empty prefix.
-	q := strings.Join(segments, ".")
-	if e.namespace != "" {
-		q = e.namespace + "." + q
+	var spelling string
+	for s := range typed[property] {
+		spelling = s
 	}
-	return q, member, ResolutionStrategyPHPTypeScope, true
+	q, _, ok := phpResolveTypeIdentity(spelling, phpNamespaceForType(e), e.currentType, imports)
+	return q, method, ResolutionStrategyPHPTypedProperty, ok
+}
+
+func phpNamespaceForType(e phpScopeEdge) string {
+	if i := strings.LastIndexByte(e.currentType, '.'); i >= 0 {
+		return e.currentType[:i]
+	}
+	return ""
+}
+
+func phpThisCall(name string) (property, method, strategy string, ok bool) {
+	if strings.Contains(name, "?->") {
+		return "", "", "", false
+	}
+	parts := strings.Split(name, "->")
+	if len(parts) == 2 && parts[0] == "$this" && phpIdentifier(parts[1]) {
+		return "", parts[1], ResolutionStrategyPHPThisInstance, true
+	}
+	if len(parts) == 3 && parts[0] == "$this" && phpIdentifier(parts[1]) && phpIdentifier(parts[2]) {
+		return parts[1], parts[2], ResolutionStrategyPHPTypedProperty, true
+	}
+	return "", "", "", false
 }
 
 // phpUniqueType reports whether exactly one active type row claims the qname.
@@ -439,6 +533,25 @@ func phpChooseStaticMethod(rows []phpScopeSymbol, typeQ, currentType string) (ph
 			continue
 		}
 		if !s.static.Valid || s.static.Int64 != 1 {
+			continue
+		}
+		if typeQ == currentType {
+			if s.vis == "" {
+				continue
+			}
+		} else if s.vis != "public" {
+			continue
+		}
+		out, n = s, n+1
+	}
+	return out, n == 1
+}
+
+func phpChooseInstanceMethod(rows []phpScopeSymbol, typeQ, currentType string) (phpScopeSymbol, bool) {
+	var out phpScopeSymbol
+	n := 0
+	for _, s := range rows {
+		if s.kind != "function" || s.container != typeQ || !s.static.Valid || s.static.Int64 != 0 {
 			continue
 		}
 		if typeQ == currentType {

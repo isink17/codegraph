@@ -56,6 +56,10 @@ type Edge struct {
 	CallArity   *int   `json:"call_arity,omitempty"`
 }
 
+// PHPMemberCallNestedScopeEvidence marks a PHP $this member call lexically
+// inside an executable scope P22.45 does not model as a source symbol.
+const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
+
 type ParsedFile struct {
 	Language   string
 	Symbols    []Symbol
@@ -156,7 +160,8 @@ const (
 	// ScopeImportTypedBinding records a value binding whose declared type is
 	// syntax-proven. SourceSpecifier carries the type spelling; OwnerModule
 	// carries the exact lexical owner.
-	ScopeImportTypedBinding = "typed_binding"
+	ScopeImportTypedBinding  = "typed_binding"
+	ScopeImportPHPTraitScope = "php_trait_scope"
 
 	// ScopeImportNestedDeclaration is a local binding a nested `def` or `class`
 	// makes in the function that encloses it. It shadows an import of the same

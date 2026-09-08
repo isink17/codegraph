@@ -178,9 +178,11 @@ const (
 	//	                  own namespace + relative spelling
 	//	php_alias_static  a `use` (php_type) import owns the first segment
 	//	php_self_static   `self::m` inside a type
-	ResolutionStrategyPHPTypeScope   = "php_type_scope"
-	ResolutionStrategyPHPAliasStatic = "php_alias_static"
-	ResolutionStrategyPHPSelfStatic  = "php_self_static"
+	ResolutionStrategyPHPTypeScope     = "php_type_scope"
+	ResolutionStrategyPHPAliasStatic   = "php_alias_static"
+	ResolutionStrategyPHPSelfStatic    = "php_self_static"
+	ResolutionStrategyPHPThisInstance  = "php_this_instance"
+	ResolutionStrategyPHPTypedProperty = "php_typed_property"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -269,6 +271,8 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyPHPTypeScope:        ResolutionConfidenceHigh,
 	ResolutionStrategyPHPAliasStatic:      ResolutionConfidenceHigh,
 	ResolutionStrategyPHPSelfStatic:       ResolutionConfidenceHigh,
+	ResolutionStrategyPHPThisInstance:     ResolutionConfidenceHigh,
+	ResolutionStrategyPHPTypedProperty:    ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -335,6 +339,8 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyPHPTypeScope,
 	ResolutionStrategyPHPAliasStatic,
 	ResolutionStrategyPHPSelfStatic,
+	ResolutionStrategyPHPThisInstance,
+	ResolutionStrategyPHPTypedProperty,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.
