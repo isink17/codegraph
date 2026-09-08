@@ -379,9 +379,15 @@ func phpDecideType(e phpScopeEdge, imports []phpScopeImport) (typeQ, method, str
 	}
 	// C. import alias on the first segment, exact local spelling, exact owner.
 	sources := map[string]struct{}{}
+	caseCollision := false
 	for _, i := range imports {
-		if i.kind == "php_type" && i.owner == e.namespace && i.local == segments[0] {
+		if i.kind != "php_type" || i.owner != e.namespace {
+			continue
+		}
+		if i.local == segments[0] {
 			sources[i.source] = struct{}{}
+		} else if strings.EqualFold(i.local, segments[0]) {
+			caseCollision = true
 		}
 	}
 	if len(sources) > 0 {
@@ -396,6 +402,9 @@ func phpDecideType(e phpScopeEdge, imports []phpScopeImport) (typeQ, method, str
 			q += "." + strings.Join(segments[1:], ".")
 		}
 		return q, member, ResolutionStrategyPHPAliasStatic, true
+	}
+	if caseCollision {
+		return "", "", "", false
 	}
 	// D. current namespace + relative spelling. No parent walk, no global
 	// fallback: a global namespace is simply the empty prefix.

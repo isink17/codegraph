@@ -556,6 +556,69 @@ class Caller {
 	r.assertFreshParity()
 }
 
+func TestPHPStaticScopeAliasCaseCollisionFailsClosed(t *testing.T) {
+	r := newPHPRepo(t, map[string]string{
+		"Types.php": `<?php
+namespace App;
+
+class s {
+    public static function run() {}
+}
+
+namespace App\p;
+
+class Service {
+    public static function run() {}
+}
+
+namespace Vendor;
+
+class Service {
+    public static function run() {}
+}
+`,
+		"Caller.php": `<?php
+namespace App;
+
+use Vendor\Service as S;
+use Vendor\Package as P;
+
+class Caller {
+    public function f() {
+        s::run();
+        S::run();
+        p\Service::run();
+    }
+}
+`,
+	})
+	r.assertUnresolved("Caller.php", "s::run")
+	r.assertTarget("Caller.php", "S::run", "Vendor.Service.run", "php_alias_static")
+	r.assertUnresolved("Caller.php", `p\Service::run`)
+	r.assertFreshParity()
+}
+
+func TestPHPStaticScopeAliasCaseCollisionControls(t *testing.T) {
+	caller := func(className, use string, call string) string {
+		return "<?php\nnamespace App;\n\n" + use + "\nclass " + className + " {\n    function f() {\n        " + call + "\n    }\n}\n"
+	}
+	r := newPHPRepo(t, map[string]string{
+		"Types.php": `<?php
+namespace App;
+class s { public static function run() {} }
+namespace Vendor;
+class Service { public static function run() {} }
+`,
+		"NoImport.php": caller("NoImport", "", "s::run();"),
+		"Function.php": caller("FunctionAlias", "use function Vendor\\Service as S;", "s::run();"),
+		"Const.php":    caller("ConstAlias", "use const Vendor\\Service as S;", "s::run();"),
+	})
+	r.assertTarget("NoImport.php", "s::run", "App.s.run", "php_type_scope")
+	r.assertTarget("Function.php", "s::run", "App.s.run", "php_type_scope")
+	r.assertTarget("Const.php", "s::run", "App.s.run", "php_type_scope")
+	r.assertFreshParity()
+}
+
 func TestPHPStaticScopeImportOwnerIsExactNamespace(t *testing.T) {
 	r := newPHPRepo(t, map[string]string{
 		"Vendor.php": `<?php
