@@ -168,6 +168,7 @@ const (
 	// name the way any other local does, but the name it binds is a symbol this
 	// graph holds, so it is not a reason to refuse every other strategy.
 	ScopeImportNestedDeclaration = "nested_decl"
+	ScopeImportRubyLexicalParent = "ruby_lexical_parent"
 )
 
 type ReExport struct {

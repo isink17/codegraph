@@ -70,6 +70,26 @@ class Service:
 	assertCallers(t, s, repoID, "svc.target", "svc.Service.run")
 }
 
+func TestRubyMethodAttributionAndReceiverVeto(t *testing.T) {
+	const src = `module App
+  class Service
+    def run
+      helper()
+    end
+    def self.build
+      self.prepare()
+    end
+    def self.prepare; end
+  end
+end
+def helper; end
+`
+	s, repoID := indexSource(t, tsparser.NewRuby(), "service.rb", src)
+	assertCallers(t, s, repoID, "helper", "App.Service.run")
+	assertCallees(t, s, repoID, "App.Service.run", "helper")
+	assertCallees(t, s, repoID, "App.Service.build")
+}
+
 func TestNestedPythonFunctionOwnsItsBodyEdges(t *testing.T) {
 	const src = `def leaf():
     pass

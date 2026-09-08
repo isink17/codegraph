@@ -5843,6 +5843,20 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if len(targets) == 0 {
 		return outcome, nil
 	}
+	// Ruby receiver syntax needs lexical proof that this phase does not have.
+	// Keep it unresolved instead of letting generic suffix matching invent an
+	// owner; bare Ruby calls continue below.
+	remaining = targets[:0]
+	for _, target := range targets {
+		if target.srcLanguage == "ruby" && rubyReceiverCall(target.dstName) {
+			continue
+		}
+		remaining = append(remaining, target)
+	}
+	targets = remaining
+	if len(targets) == 0 {
+		return outcome, nil
+	}
 	// P22.28: a Go selector call whose qualifier the calling file binds locally
 	// is answered by the receiver's proven type or by nothing, and never by a
 	// repo-wide coincidence. resolveGoReceiverScope binds what it can prove and
