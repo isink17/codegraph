@@ -179,7 +179,11 @@ func phpAddType(node *sitter.Node, namespace string, content []byte, pf *graph.P
 	qualified := phpJoinQName(namespace, name)
 	pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "php", Kind: "type", Name: name, QualifiedName: qualified,
 		ContainerName: namespace, Visibility: "public", Range: nodeRange(node), DocSummary: prevCommentText(node, content), StableKey: "type:php:" + qualified})
+	if node.Type() == "trait_declaration" {
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{Kind: graph.ScopeImportPHPTraitScope, OwnerModule: qualified})
+	}
 	if body := childByFieldName(node, "body"); body != nil {
+		phpExtractPropertyFacts(body, qualified, content, pf)
 		phpExtractSymbols(body, namespace, qualified, content, pf, namespaces, globalDecl, onlyNamespace)
 	}
 }
@@ -201,6 +205,77 @@ func phpAddFunction(node *sitter.Node, namespace, container string, method bool,
 		p.Visibility, p.Static = phpMethodVisibility(node, content), phpStatic(node)
 	}
 	pf.Symbols = append(pf.Symbols, p)
+	if method {
+		phpExtractPromotedPropertyFacts(childByFieldName(node, "parameters"), container, content, pf)
+	}
+}
+
+func phpExtractPropertyFacts(body *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	for i := range int(body.ChildCount()) {
+		child := body.Child(i)
+		if child.Type() == "property_declaration" {
+			phpAddPropertyFacts(child, owner, content, pf)
+		}
+	}
+}
+
+func phpExtractPromotedPropertyFacts(parameters *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	if parameters == nil {
+		return
+	}
+	for i := range int(parameters.ChildCount()) {
+		child := parameters.Child(i)
+		if child.Type() == "property_promotion_parameter" {
+			phpAddPropertyFact(child, owner, content, pf)
+		}
+	}
+}
+
+func phpAddPropertyFacts(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	static := false
+	for i := range int(node.ChildCount()) {
+		if node.Child(i).Type() == "static_modifier" {
+			static = true
+		}
+	}
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		if child.Type() != "property_element" {
+			continue
+		}
+		phpAddPropertyFactWithType(child, node, owner, static, content, pf)
+	}
+}
+
+func phpAddPropertyFact(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+	phpAddPropertyFactWithType(node, node, owner, false, content, pf)
+}
+
+func phpAddPropertyFactWithType(element, declaration *sitter.Node, owner string, static bool, content []byte, pf *graph.ParsedFile) {
+	variable := childByFieldName(element, "name")
+	if variable == nil {
+		variable = childByFieldName(element, "variable_name")
+	}
+	if variable == nil {
+		variable = firstChild(element, "variable_name")
+	}
+	if variable == nil {
+		return
+	}
+	name := strings.TrimPrefix(nodeText(variable, content), "$")
+	if name == "" {
+		return
+	}
+	typeNode := childByFieldName(declaration, "type")
+	typeName := ""
+	if typeNode != nil && typeNode.Type() == "named_type" && !static {
+		typeName = strings.TrimSpace(nodeText(typeNode, content))
+	}
+	kind := graph.ScopeImportLocalBinding
+	if typeName != "" {
+		kind = graph.ScopeImportTypedBinding
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{LocalName: name, SourceSpecifier: typeName, Kind: kind, OwnerModule: owner})
 }
 
 func containerOrNamespace(container, namespace string) string {

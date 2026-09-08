@@ -133,8 +133,8 @@ namespace B { use Vendor\Two as X; class Caller {} function run() {} }
 	}
 }
 
-func TestPHPProfileV2(t *testing.T) {
-	if got := NewPHP().Profile(); got.ID != "treesitter:php:v2" || !got.EmitsCallEdges {
+func TestPHPProfileV3(t *testing.T) {
+	if got := NewPHP().Profile(); got.ID != "treesitter:php:v3" || !got.EmitsCallEdges {
 		t.Fatalf("profile = %+v", got)
 	}
 }
@@ -149,6 +149,7 @@ class Factory {
     public function normal() {}
     static public function reordered() {}
 }
+
 `)
 	p, err := NewPHP().Parse(context.Background(), "Factory.php", src)
 	if err != nil {
@@ -192,6 +193,48 @@ class Factory {
 				t.Fatalf("reordered static = %v", s.Static)
 			}
 		}
+	}
+}
+
+func TestPHPPropertyScopeFacts(t *testing.T) {
+	p, err := NewPHP().Parse(context.Background(), "Caller.php", []byte(`<?php
+namespace App;
+use Vendor\Service as S;
+trait T { function f() {} }
+class Caller {
+ private S $one, $two;
+ private readonly Other $other;
+ private static S $static;
+ private $unknown;
+ private ?S $nullable;
+ private A|B $union;
+ function __construct(private S $promoted) {}
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"one": "S", "two": "S", "other": "Other", "static": "", "unknown": "", "nullable": "", "union": "", "promoted": "S"}
+	got := map[string]string{}
+	for _, i := range p.Scope.Imports {
+		if i.OwnerModule == "App.Caller" {
+			got[i.LocalName] = i.Kind + ":" + i.SourceSpecifier
+		}
+	}
+	for name, typ := range want {
+		wantFact := "local_binding:"
+		if typ != "" {
+			wantFact = "typed_binding:" + typ
+		}
+		if got[name] != wantFact {
+			t.Fatalf("%s = %q, facts=%#v", name, got[name], p.Scope.Imports)
+		}
+	}
+	trait := false
+	for _, i := range p.Scope.Imports {
+		trait = trait || i.Kind == graph.ScopeImportPHPTraitScope && i.OwnerModule == "App.T"
+	}
+	if !trait {
+		t.Fatalf("missing trait fact: %#v", p.Scope.Imports)
 	}
 }
 

@@ -289,6 +289,84 @@ func TestPHPStaticScopeAcceptance(t *testing.T) {
 	r.assertFreshParity()
 }
 
+func TestPHPInstancePropertyScopeAcceptance(t *testing.T) {
+	r := newPHPRepo(t, map[string]string{
+		"Service.php": `<?php
+namespace Vendor;
+class Service { public function run() {} public static function staticRun() {} private function hidden() {} }
+`,
+		"Caller.php": `<?php
+namespace App;
+use Vendor\Service as S;
+class Caller {
+ private S $service;
+ private self $peer;
+ private $unknown;
+	 private function helper() {}
+	 public function f() {
+  $this->helper();
+  $this->service->run();
+  $this->service->staticRun();
+  $this->service->hidden();
+  $this->peer->helper();
+  $this->unknown->run();
+  $this?->helper();
+	  $this->service?->run();
+	  $service->run();
+	  $service = new S();
+	  $service->run();
+ }
+ public static function sf() { $this->helper(); }
+}
+
+`,
+	})
+	r.assertTarget("Caller.php", "$this->service->run", "Vendor.Service.run", "php_typed_property")
+	r.assertTarget("Caller.php", "$this->peer->helper", "App.Caller.helper", "php_typed_property")
+	for _, dst := range []string{"$this->service->staticRun", "$this->service->hidden", "$this->unknown->run", "$this?->helper", "$this->service?->run", "$service->run"} {
+		r.assertUnresolved("Caller.php", dst)
+	}
+	// Static source method must not be rescued by its containing type.
+	all, err := r.s.ExportEdgesPage(context.Background(), r.repoID, 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range all {
+		if e.SrcQualifiedName == "App.Caller.f" && e.DstName == "$this->helper" && (e.DstQualifiedName != "App.Caller.helper" || e.ResolutionStrategy != "php_this_instance") {
+			t.Fatalf("direct this = %+v", e)
+		}
+	}
+	for _, e := range all {
+		if e.SrcQualifiedName == "App.Caller.sf" && e.DstName == "$this->helper" && e.DstSymbolID != nil {
+			t.Fatalf("static source bound: %+v", e)
+		}
+	}
+	r.assertFreshParity()
+}
+
+func TestPHPTraitInstanceScopeVeto(t *testing.T) {
+	r := newPHPRepo(t, map[string]string{
+		"Service.php": `<?php
+namespace App;
+class Service { public function run() {} }
+`,
+		"Trait.php": `<?php
+namespace App;
+trait T { function f() { $this->run(); } }
+`,
+		"Class.php": `<?php
+namespace App;
+class C {
+ function f() { $this->run(); }
+ function run() {}
+}
+`,
+	})
+	r.assertUnresolved("Trait.php", "$this->run")
+	r.assertTarget("Class.php", "$this->run", "App.C.run", "php_this_instance")
+	r.assertFreshParity()
+}
+
 func TestPHPStaticScopeBaseShapes(t *testing.T) {
 	r := newPHPRepo(t, map[string]string{
 		"Service.php": `<?php
@@ -919,7 +997,7 @@ class Caller {
 		"App.Caller.f:Service::$expr":        "",
 		"App.Caller.f:Service::CONST::pub":   "",
 		"App.Caller.f:Service::pub()->chain": "",
-		"App.Caller.f:$this->instHelper":     "",
+		"App.Caller.f:$this->instHelper":     "App.Caller.instHelper",
 	}
 	for key, target := range want {
 		e, ok := got[key]
