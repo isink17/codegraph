@@ -74,7 +74,7 @@ func phpExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) 
 }
 
 func phpAddNamespaceUses(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
-	kind := phpUseKind(node, content, "php_type")
+	kind := phpUseKind(node, "php_type")
 	prefix := ""
 	if n := firstChild(node, "namespace_name"); n != nil {
 		prefix = nodeText(n, content)
@@ -83,39 +83,23 @@ func phpAddNamespaceUses(node *sitter.Node, owner string, content []byte, pf *gr
 		child := node.Child(i)
 		switch child.Type() {
 		case "namespace_use_clause":
-			phpAddUseClause(child, "", phpUseKind(child, content, kind), owner, content, pf)
+			phpAddUseClause(child, "", phpUseKind(child, kind), owner, content, pf)
 		case "namespace_use_group":
 			for j := range int(child.ChildCount()) {
 				if clause := child.Child(j); clause.Type() == "namespace_use_group_clause" {
-					phpAddUseClause(clause, prefix, phpUseKind(clause, content, kind), owner, content, pf)
+					phpAddUseClause(clause, prefix, phpUseKind(clause, kind), owner, content, pf)
 				}
 			}
 		}
 	}
 }
 
-// The PHP grammar keeps `function`/`const` as anonymous tokens. Their AST
-// evidence is the token span before each namespace_name: declaration-level
-// `use function` supplies inheritance, while mixed group clauses carry their
-// own keyword in that span. Comments are ignored only inside this syntax span.
-func phpUseKind(node *sitter.Node, content []byte, inherited string) string {
-	first := firstChild(node, "namespace_name")
-	if first == nil {
-		first = firstChild(node, "qualified_name")
-	}
-	if first == nil {
-		first = firstChild(node, "namespace_use_clause")
-	}
-	if first == nil {
-		return inherited
-	}
-	start, end := node.StartByte(), first.StartByte()
-	if start >= end || int(end) > len(content) {
-		return inherited
-	}
-	words := strings.Fields(stripPHPComments(string(content[start:end])))
-	for _, word := range words {
-		switch word {
+// The pinned PHP grammar exposes anonymous `function` and `const` tokens as
+// direct children. Declaration-level tokens provide inheritance; mixed group
+// clauses carry their own child token. Comments and whitespace have no effect.
+func phpUseKind(node *sitter.Node, inherited string) string {
+	for i := range int(node.ChildCount()) {
+		switch node.Child(i).Type() {
 		case "function":
 			return "php_function"
 		case "const":
@@ -123,20 +107,6 @@ func phpUseKind(node *sitter.Node, content []byte, inherited string) string {
 		}
 	}
 	return inherited
-}
-
-func stripPHPComments(source string) string {
-	for {
-		start := strings.Index(source, "/*")
-		if start < 0 {
-			return source
-		}
-		end := strings.Index(source[start+2:], "*/")
-		if end < 0 {
-			return source[:start]
-		}
-		source = source[:start] + " " + source[start+2+end+2:]
-	}
 }
 
 func phpAddUseClause(node *sitter.Node, prefix, kind, owner string, content []byte, pf *graph.ParsedFile) {
