@@ -404,6 +404,38 @@ class C {
 	}
 }
 
+func TestPHPThisNestedScopeIncrementalParity(t *testing.T) {
+	r := newPHPRepo(t, map[string]string{"C.php": `<?php
+namespace App;
+class C {
+ private function run() {}
+ public function f() { $this->run(); }
+}
+`})
+	r.assertTarget("C.php", "$this->run", "App.C.run", "php_this_instance")
+	r.assertFreshParity()
+	r.write("C.php", `<?php
+namespace App;
+class C {
+ private function run() {}
+ public function f() { $cb = static function () { $this->run(); }; }
+}
+`)
+	r.update("C.php")
+	r.assertUnresolved("C.php", "$this->run")
+	r.assertFreshParity()
+	r.write("C.php", `<?php
+namespace App;
+class C {
+ private function run() {}
+ public function f() { $this->run(); }
+}
+`)
+	r.update("C.php")
+	r.assertTarget("C.php", "$this->run", "App.C.run", "php_this_instance")
+	r.assertFreshParity()
+}
+
 func TestPHPStaticScopeBaseShapes(t *testing.T) {
 	r := newPHPRepo(t, map[string]string{
 		"Service.php": `<?php
