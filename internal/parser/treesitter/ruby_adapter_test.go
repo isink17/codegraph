@@ -159,3 +159,59 @@ func TestRubyProfileV2(t *testing.T) {
 		t.Fatalf("profile=%+v", got)
 	}
 }
+
+func TestRubyNestedSingletonScopesFailClosed(t *testing.T) {
+	const src = `class Service
+  class << self
+    def normal; end
+    def self.meta; end
+    class << self
+      def deeper; end
+    end
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "service.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, s := range p.Symbols {
+		got[s.QualifiedName] = true
+	}
+	if !got["Service.normal"] {
+		t.Fatal("ordinary method inside class << self omitted")
+	}
+	if got["Service.meta"] || got["Service.deeper"] {
+		t.Fatalf("nested singleton methods leaked: %#v", got)
+	}
+}
+
+func TestRubyNestedSingletonPreservesSiblings(t *testing.T) {
+	const src = `class Service
+  class << self
+    def before; end
+    class << self
+      def deeper; end
+    end
+    def after; end
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "service.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, s := range p.Symbols {
+		got[s.QualifiedName] = true
+	}
+	for _, name := range []string{"Service.before", "Service.after"} {
+		if !got[name] {
+			t.Fatalf("sibling %s omitted: %#v", name, got)
+		}
+	}
+	if got["Service.deeper"] {
+		t.Fatalf("nested singleton method leaked: %#v", got)
+	}
+}

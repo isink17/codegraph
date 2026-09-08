@@ -86,11 +86,11 @@ func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, c
 		case "method":
 			rubyAddMethod(child, container, singleton, content, pf)
 		case "singleton_method":
-			if nodeText(childByFieldName(child, "object"), content) == "self" {
+			if !singleton && nodeText(childByFieldName(child, "object"), content) == "self" {
 				rubyAddMethod(child, container, true, content, pf)
 			}
 		case "singleton_class":
-			if nodeText(childByFieldName(child, "value"), content) == "self" {
+			if !singleton && nodeText(childByFieldName(child, "value"), content) == "self" {
 				if body := childByFieldName(child, "body"); body != nil {
 					rubyExtractSymbolsIn(body, container, true, content, pf)
 				}

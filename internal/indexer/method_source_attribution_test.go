@@ -90,6 +90,20 @@ def helper; end
 	assertCallees(t, s, repoID, "App.Service.build")
 }
 
+func TestRubyNestedSingletonMethodCallHasNoFalseAttribution(t *testing.T) {
+	const src = `class Service
+  def self.helper; end
+  class << self
+    def self.meta
+      helper()
+    end
+  end
+end
+`
+	s, repoID := indexSource(t, tsparser.NewRuby(), "service.rb", src)
+	assertCallers(t, s, repoID, "Service.helper")
+}
+
 func TestNestedPythonFunctionOwnsItsBodyEdges(t *testing.T) {
 	const src = `def leaf():
     pass
