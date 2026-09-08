@@ -39,6 +39,10 @@ import (
 // actually written.
 const EdgeKindCrossLanguageRef = "cross_language_ref"
 
+// EdgeKindCalls is an ordinary call edge, the kind every language resolver
+// decides. It is not a cross-language reference.
+const EdgeKindCalls = "calls"
+
 // EdgeAuditExample identifies one violating edge. It carries identity only --
 // the endpoints, the recorded target name, and the resolution provenance --
 // because examples exist to be looked up by a human or an agent, not to

@@ -3594,6 +3594,7 @@ type edgeTarget struct {
 	srcFileID int64
 	dstName   string
 	evidence  string
+	edgeKind  string
 }
 
 // ensureResolverAmbiguousNamesTable makes the veto table exist for the current
@@ -3827,6 +3828,14 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	// unresolved; phpScopeVetoSQL keeps every strategy below off them and off
 	// PHP member calls. See php_scope.go.
 	if n, err := resolvePHPScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
+	// Ruby implicit/self calls: bound from the caller's own semantic container
+	// and staticness, or left unresolved; rubyScopeVetoSQL keeps every strategy
+	// below off every other ordinary Ruby call. See ruby_scope.go.
+	if n, err := resolveRubyScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
@@ -4928,6 +4937,37 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	if err := rows.Close(); err != nil {
 		return 0, err
 	}
+	// `self::run` is the one bound spelling with a tail but no dot, so the
+	// partial index migration 028 built for the scan above (which requires
+	// instr(dst_name, '.') > 0) does not cover it. Widening that predicate with
+	// an OR would disable the index for every language on every incremental
+	// update; this second selection stays bounded to Ruby files instead.
+	rows, err = s.db.QueryContext(ctx, `
+		SELECT e.id, e.dst_name FROM edges e JOIN files f ON f.id = e.file_id
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f.language = 'ruby'
+		  AND e.resolution_strategy = ? AND e.dst_name LIKE 'self::%'
+	`, repoID, ResolutionStrategyRubyExplicitSelf)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var id int64
+		var dstName string
+		if err := rows.Scan(&id, &dstName); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if _, ok := wanted[strings.TrimPrefix(dstName, "self::")]; ok {
+			stale[id] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
 	// Rust bindings belong to the crate-scoped pass. When a Rust scope is in
 	// effect, invalidateRustBindingsForRoots has already cleared every binding
 	// inside the affected crates; a Rust edge outside them is not reconsidered
@@ -5127,7 +5167,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		end := min(start+chunkSize, len(fileIDs))
 		chunk := fileIDs[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		query := `SELECT id, dst_name, file_id, evidence FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
+		query := `SELECT id, dst_name, file_id, evidence, edge_kind FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND file_id IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, id := range chunk {
@@ -5270,7 +5310,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		// caller's own file id travels with it so resolveEdgeTargets can classify
 		// it against the repo's test-file set.
 		query := `
-			SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
+			SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence, e.edge_kind
 			FROM edges e
 			JOIN files f ON f.id = e.file_id
 			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name IN (` + placeholders + `)` + rustExclusion
@@ -5289,8 +5329,8 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			var dstName string
 			var srcLanguage string
 			var srcFileID int64
-			var evidence string
-			if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence); err != nil {
+			var evidence, edgeKind string
+			if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence, &edgeKind); err != nil {
 				_ = rows.Close()
 				return stats, err
 			}
@@ -5303,6 +5343,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 				srcLanguage: srcLanguage,
 				srcFileID:   srcFileID,
 				evidence:    evidence,
+				edgeKind:    edgeKind,
 			}
 			stats.ExactHits++
 		}
@@ -5324,7 +5365,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	// batch when a declaration arrives after its caller.
 	suffixStarted := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence
+		SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence, e.edge_kind
 		FROM edges e
 		JOIN files f ON f.id = e.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND (instr(e.dst_name, '.') > 0 OR instr(e.dst_name, '::') > 0)`+rustExclusion, repoID)
@@ -5336,8 +5377,8 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		var dstName string
 		var srcLanguage string
 		var srcFileID int64
-		var evidence string
-		if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence); err != nil {
+		var evidence, edgeKind string
+		if err := rows.Scan(&id, &dstName, &srcLanguage, &srcFileID, &evidence, &edgeKind); err != nil {
 			_ = rows.Close()
 			return stats, err
 		}
@@ -5363,6 +5404,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 					srcLanguage: srcLanguage,
 					srcFileID:   srcFileID,
 					evidence:    evidence,
+					edgeKind:    edgeKind,
 				}
 				stats.SuffixHits++
 			}
@@ -5409,7 +5451,7 @@ func scanEdgeTargets(rows *sql.Rows, languageByFileID map[int64]string) ([]edgeT
 	var targets []edgeTarget
 	for rows.Next() {
 		var target edgeTarget
-		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID, &target.evidence); err != nil {
+		if err := rows.Scan(&target.edgeID, &target.dstName, &target.srcFileID, &target.evidence, &target.edgeKind); err != nil {
 			return nil, err
 		}
 		target.srcLanguage = languageByFileID[target.srcFileID]
@@ -5843,17 +5885,34 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if len(targets) == 0 {
 		return outcome, nil
 	}
-	// Ruby receiver syntax needs lexical proof that this phase does not have.
-	// Keep it unresolved instead of letting generic suffix matching invent an
-	// owner; bare Ruby calls continue below.
-	remaining = targets[:0]
+	// Ruby owns every ordinary call outright: the pass binds the implicit and
+	// literal-self receivers the parser proved, and every other receiver form
+	// stays unresolved on purpose, so none of them reach the generic lookups
+	// below. This is the Go-side twin of rubyScopeVetoSQL.
+	rubyIDs := make(map[int64]struct{})
 	for _, target := range targets {
-		if target.srcLanguage == "ruby" && rubyReceiverCall(target.dstName) {
-			continue
+		if rubyScopeOwned(target) {
+			rubyIDs[target.edgeID] = struct{}{}
 		}
-		remaining = append(remaining, target)
 	}
-	targets = remaining
+	if len(rubyIDs) > 0 {
+		n, err := s.resolveRubyScopeStandalone(ctx, repoID, rubyIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		// Owned but unbound edges are still edges this batch decided; dropping
+		// them from the count would make the batch look smaller than it was.
+		outcome.unresolved += len(rubyIDs) - n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, owned := rubyIDs[target.edgeID]; owned {
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		targets = remaining
+	}
 	if len(targets) == 0 {
 		return outcome, nil
 	}

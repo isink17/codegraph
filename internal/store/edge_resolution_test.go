@@ -122,6 +122,8 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyPHPSelfStatic,
 		ResolutionStrategyPHPThisInstance,
 		ResolutionStrategyPHPTypedProperty,
+		ResolutionStrategyRubyImplicitSelf,
+		ResolutionStrategyRubyExplicitSelf,
 	}
 	if len(all) != len(resolutionConfidenceByStrategy) {
 		t.Fatalf("strategy constants = %d, registered confidences = %d; every strategy needs exactly one tier", len(all), len(resolutionConfidenceByStrategy))

@@ -1,7 +1,5 @@
 package store
 
-import "strings"
-
 // Resolver language compatibility (P2).
 //
 // Implicit resolver strategies bind `edges.dst_symbol_id` by matching names
@@ -48,12 +46,6 @@ func resolverLanguageCompatible(srcLanguage, dstLanguage string) bool {
 	return srcLanguage == dstLanguage
 }
 
-// rubyReceiverCall is parser-owned syntax that generic name matching cannot
-// interpret. Bare Ruby calls remain eligible for existing generic behavior.
-func rubyReceiverCall(dstName string) bool {
-	return strings.ContainsAny(dstName, ".:&")
-}
-
 // resolverLanguageGateSQL is the one SQL predicate that enforces the rule above
 // for every implicit strategy. It is spliced into each resolver UPDATE and
 // requires exactly three things of the surrounding statement:
@@ -66,8 +58,6 @@ func rubyReceiverCall(dstName string) bool {
 // `files` drops edges whose file row is missing, so an unknown language on
 // either side yields no match rather than a guess.
 const resolverLanguageGateSQL = `f.id = edges.file_id AND r.dst_language = f.language AND f.language <> 'rust'`
-
-const rubyReceiverVetoSQL = `NOT (f.language = 'ruby' AND (instr(edges.dst_name, '.') > 0 OR instr(edges.dst_name, '::') > 0 OR instr(edges.dst_name, '&.') > 0))`
 
 // symbolLangKey keys candidate lookups by (name, language) so that Go-side
 // resolution can only ever pick a same-language destination.

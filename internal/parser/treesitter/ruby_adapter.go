@@ -168,6 +168,104 @@ func rubyCallEvidence(receiver *sitter.Node, operator string) string {
 	return "ruby:value_receiver"
 }
 
+// rubyAssignmentTarget reports whether a `call` node is the left-hand side of
+// an assignment: `self.name = v` parses as an assignment whose left IS a call
+// node spelled `self.name`, but the method it invokes is the writer `name=`,
+// not the reader `name`. The writer's spelling is not what the node carries, so
+// the edge is dropped rather than pointed at the wrong method.
+func rubyAssignmentTarget(call *sitter.Node) bool {
+	node := call
+	// A multiple assignment nests its targets one or two levels deeper:
+	// `self.a, self.b = 1, 2` puts each call under a left_assignment_list.
+	for _, wrapper := range []string{"left_assignment_list", "rest_assignment", "destructured_left_assignment"} {
+		parent := node.Parent()
+		if parent == nil {
+			return false
+		}
+		if parent.Type() == wrapper {
+			node = parent
+		}
+	}
+	parent := node.Parent()
+	if parent == nil {
+		return false
+	}
+	switch parent.Type() {
+	case "assignment", "operator_assignment":
+		return childByFieldName(parent, "left") == node
+	}
+	return false
+}
+
+// rubyBlockLocalDefinition reports whether a call sits inside a `def` that is
+// itself inside a block (`Class.new do def run; end end`). rubyExtractSymbols
+// walks direct children only, so such a `def` is never a symbol and its body
+// would otherwise be attributed to the enclosing method -- binding its calls to
+// the enclosing container's members. Ruby's runtime owner there is the object
+// the block builds, which is not syntax-proven, so fail closed.
+func rubyBlockLocalDefinition(call *sitter.Node) bool {
+	def := call.Parent()
+	for def != nil && def.Type() != "method" && def.Type() != "singleton_method" {
+		def = def.Parent()
+	}
+	for node := def; node != nil; node = node.Parent() {
+		if node.Type() == "block" || node.Type() == "do_block" {
+			return true
+		}
+	}
+	return false
+}
+
+// rubySelfRebindingMethods take a block whose `self` is some other object, so a
+// receiver-less call inside one is not the lexical self the parser can see.
+var rubySelfRebindingMethods = map[string]struct{}{
+	"instance_eval": {}, "instance_exec": {},
+	"class_eval": {}, "class_exec": {},
+	"module_eval": {}, "module_exec": {},
+	"define_method": {}, "define_singleton_method": {},
+}
+
+// rubySelfRebindingConstants build an anonymous class or module and evaluate
+// the block against it, so `self` inside is that new object.
+var rubySelfRebindingConstants = map[string]struct{}{
+	"Class": {}, "Module": {}, "Struct": {}, "Data": {},
+}
+
+// rubyRebindsSelf reports whether a call sits inside a block that rebinds
+// `self`. `other.instance_eval { run() }` calls `run` on `other`, not on the
+// enclosing method's receiver, and which object that is cannot be proven from
+// syntax -- so no receiver evidence is emitted for it at all. Ordinary blocks
+// (`each`, `map`, a lambda) keep the enclosing lexical self and are unaffected.
+func rubyRebindsSelf(call *sitter.Node, content []byte) bool {
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		if node.Type() != "block" && node.Type() != "do_block" {
+			continue
+		}
+		parent := node.Parent()
+		if parent == nil || parent.Type() != "call" {
+			continue
+		}
+		method := nodeText(childByFieldName(parent, "method"), content)
+		if _, ok := rubySelfRebindingMethods[method]; ok {
+			return true
+		}
+		// `Class.new do ... end` class_evals its block, so `self` there is the
+		// anonymous class. `new` alone is far too broad a name to key on, so
+		// this is restricted to the constants that actually do it.
+		if method != "new" && method != "define" {
+			continue
+		}
+		receiver := childByFieldName(parent, "receiver")
+		if receiver == nil || receiver.Type() != "constant" {
+			continue
+		}
+		if _, ok := rubySelfRebindingConstants[nodeText(receiver, content)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call") {
 		methodNode := childByFieldName(call, "method")
@@ -180,9 +278,14 @@ func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if receiver != nil {
 			name = nodeText(receiver, content) + rubyCallOperator(receiver, methodNode, content) + method
 		}
+		// The reference is a real occurrence either way; only the call edge
+		// needs a receiver the parser can vouch for.
+		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
+		if rubyAssignmentTarget(call) || rubyBlockLocalDefinition(call) || rubyRebindsSelf(call, content) {
+			continue
+		}
 		evidence := rubyCallEvidence(receiver, rubyCallOperator(receiver, methodNode, content))
 		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1})
-		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
 	}
 }
 
