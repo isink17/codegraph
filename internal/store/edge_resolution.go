@@ -167,6 +167,20 @@ const (
 	ResolutionStrategyCSharpAliasScope    = "csharp_alias_scope"
 	ResolutionStrategyCSharpStaticUsing   = "csharp_static_using"
 	ResolutionStrategyCSharpTypedReceiver = "csharp_typed_receiver"
+
+	// PHP scoped static calls (P22.44, php_scope.go). The type is proven by one
+	// syntactic evidence level, the method is the unique syntax-proven static
+	// member of that exact type the caller may see, and the source namespace
+	// comes from the calling symbol -- so nothing about either identity is
+	// guessed.
+	//
+	//	php_type_scope    absolute `\A\B::m`, `namespace\B::m`, or the caller's
+	//	                  own namespace + relative spelling
+	//	php_alias_static  a `use` (php_type) import owns the first segment
+	//	php_self_static   `self::m` inside a type
+	ResolutionStrategyPHPTypeScope   = "php_type_scope"
+	ResolutionStrategyPHPAliasStatic = "php_alias_static"
+	ResolutionStrategyPHPSelfStatic  = "php_self_static"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -252,6 +266,9 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyCSharpAliasScope:    ResolutionConfidenceHigh,
 	ResolutionStrategyCSharpStaticUsing:   ResolutionConfidenceHigh,
 	ResolutionStrategyCSharpTypedReceiver: ResolutionConfidenceHigh,
+	ResolutionStrategyPHPTypeScope:        ResolutionConfidenceHigh,
+	ResolutionStrategyPHPAliasStatic:      ResolutionConfidenceHigh,
+	ResolutionStrategyPHPSelfStatic:       ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -315,6 +332,9 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyCSharpAliasScope,
 	ResolutionStrategyCSharpStaticUsing,
 	ResolutionStrategyCSharpTypedReceiver,
+	ResolutionStrategyPHPTypeScope,
+	ResolutionStrategyPHPAliasStatic,
+	ResolutionStrategyPHPSelfStatic,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.
