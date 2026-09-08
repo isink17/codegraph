@@ -15,6 +15,9 @@ func TestCgoRegistryProfiles(t *testing.T) {
 		if lang.Language == "php" {
 			want = "treesitter:php:v3"
 		}
+		if lang.Language == "ruby" {
+			want = "treesitter:ruby:v2"
+		}
 		if lang.ParserProfile != want {
 			t.Fatalf("%s: parser profile = %q, want %q", lang.Language, lang.ParserProfile, want)
 		}
