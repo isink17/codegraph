@@ -154,8 +154,8 @@ def run; end
 	}
 }
 
-func TestRubyProfileV2(t *testing.T) {
-	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v2" || !got.EmitsCallEdges {
+func TestRubyProfileV3(t *testing.T) {
+	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v3" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
 	}
 }
@@ -213,5 +213,169 @@ end
 	}
 	if got["Service.deeper"] {
 		t.Fatalf("nested singleton method leaked: %#v", got)
+	}
+}
+
+// `self.name = v` parses as an assignment whose left is a `call` node spelled
+// `self.name`, but the method it invokes is the writer `name=`. Emitting the
+// reader's spelling would let the resolver bind a syntax-proven self receiver
+// to the wrong method, so no call edge is emitted for it at all. A read of the
+// same attribute in the same file still is.
+func TestRubyAssignmentTargetIsNotACall(t *testing.T) {
+	const src = `class Service
+  def name; @name; end
+  def name=(v); @name = v; end
+
+  def rename(v)
+    self.name = v
+    self.count += 1
+    other = self.name
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "service.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	for _, e := range p.Edges {
+		if e.DstName != "self.name" && e.DstName != "self.count" {
+			t.Errorf("unexpected edge %#v", e)
+		}
+		reads++
+	}
+	// `self.name = v` and `self.count += 1` are writes; only the read remains.
+	if reads != 1 {
+		t.Errorf("emitted %d self edges, want 1 (the read)", reads)
+	}
+	// The write site is still a real occurrence: only the call edge is dropped.
+	refs := 0
+	for _, r := range p.References {
+		if r.Name == "self.name" || r.Name == "self.count" {
+			refs++
+		}
+	}
+	if refs != 3 {
+		t.Errorf("self references = %d, want 3 (two writes and one read)", refs)
+	}
+}
+
+// A `def` inside a block belongs to whatever object the block builds, which is
+// not syntax-proven. It is not a symbol, so its body would otherwise be
+// attributed to the enclosing method and its calls bound to that method's
+// container. Fail closed: emit no call edges from inside it. A block that only
+// calls, with no nested `def`, keeps its enclosing method's lexical self.
+func TestRubyBlockLocalDefinitionEmitsNoCalls(t *testing.T) {
+	const src = `class Service
+  def run; end
+
+  def build
+    Class.new do
+      def run; end
+      def go; run(); end
+    end
+  end
+
+  def lexical
+    lambda { run() }
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "service.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []int
+	for _, e := range p.Edges {
+		if e.DstName == "run" {
+			lines = append(lines, e.Line)
+		}
+	}
+	if len(lines) != 1 || lines[0] != 12 {
+		t.Fatalf("bare run() edges at lines %v, want only the lambda at line 12", lines)
+	}
+}
+
+// A block passed to instance_eval and friends runs with another object as
+// `self`, so a receiver-less call inside it is not the enclosing method's
+// receiver and no receiver evidence may be claimed for it. An ordinary block
+// keeps the lexical self and still emits its call.
+func TestRubySelfRebindingBlocksEmitNoImplicitCalls(t *testing.T) {
+	const src = `class Service
+  def run; end
+
+  def rebound(other)
+    other.instance_eval { run() }
+    other.class_eval do
+      run()
+    end
+  end
+
+  def lexical(items)
+    items.each { run() }
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "service.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []int
+	for _, e := range p.Edges {
+		if e.DstName == "run" {
+			lines = append(lines, e.Line)
+		}
+	}
+	if len(lines) != 1 || lines[0] != 12 {
+		t.Fatalf("bare run() edges at lines %v, want only the each block at line 12", lines)
+	}
+}
+
+// `Class.new do ... end` evaluates its block against the anonymous class it
+// builds, so `self` inside is that class, not the enclosing receiver. A bare
+// call there has no receiver the parser can vouch for.
+func TestRubyAnonymousClassBlockEmitsNoImplicitCalls(t *testing.T) {
+	const src = `class Service
+  def run; end
+
+  def build
+    Class.new do
+      run()
+    end
+    Struct.new(:a) do
+      run()
+    end
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "service.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range p.Edges {
+		if e.DstName == "run" {
+			t.Fatalf("anonymous-class block emitted a call edge: %#v", e)
+		}
+	}
+}
+
+// A multiple assignment nests its targets under a left_assignment_list, which
+// must not smuggle the reader spelling past the assignment-target guard.
+func TestRubyMultipleAssignmentTargetsAreNotCalls(t *testing.T) {
+	const src = `class Service
+  def a; @a; end
+  def b; @b; end
+
+  def rename
+    self.a, self.b = 1, 2
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "service.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range p.Edges {
+		t.Fatalf("multiple-assignment target emitted a call edge: %#v", e)
 	}
 }

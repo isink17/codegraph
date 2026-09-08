@@ -70,7 +70,7 @@ class Service:
 	assertCallers(t, s, repoID, "svc.target", "svc.Service.run")
 }
 
-func TestRubyMethodAttributionAndReceiverVeto(t *testing.T) {
+func TestRubyMethodAttributionAndSelfScope(t *testing.T) {
 	const src = `module App
   class Service
     def run
@@ -85,9 +85,9 @@ end
 def helper; end
 `
 	s, repoID := indexSource(t, tsparser.NewRuby(), "service.rb", src)
-	assertCallers(t, s, repoID, "helper", "App.Service.run")
-	assertCallees(t, s, repoID, "App.Service.run", "helper")
-	assertCallees(t, s, repoID, "App.Service.build")
+	assertCallers(t, s, repoID, "helper")
+	assertCallees(t, s, repoID, "App.Service.run")
+	assertCallees(t, s, repoID, "App.Service.build", "App.Service.prepare")
 }
 
 func TestRubyNestedSingletonMethodCallHasNoFalseAttribution(t *testing.T) {
@@ -102,6 +102,87 @@ end
 `
 	s, repoID := indexSource(t, tsparser.NewRuby(), "service.rb", src)
 	assertCallers(t, s, repoID, "Service.helper")
+}
+
+func TestRubyImplicitAndExplicitSelfScope(t *testing.T) {
+	const src = `module App
+  class Service
+    def run; end
+    def self.run; end
+    def instance_caller
+      run()
+      self.run()
+      self::run()
+    end
+    def self.singleton_caller
+      run()
+      self.run()
+    end
+  end
+end
+`
+	s, repoID := indexSource(t, tsparser.NewRuby(), "service.rb", src)
+	assertCallees(t, s, repoID, "App.Service.instance_caller", "App.Service.run")
+	assertCallees(t, s, repoID, "App.Service.singleton_caller", "App.Service.run")
+	for _, tc := range []struct {
+		caller string
+		key    string
+	}{
+		{caller: "App.Service.instance_caller", key: "func:ruby:App.Service:instance:run"},
+		{caller: "App.Service.singleton_caller", key: "func:ruby:App.Service:singleton:run"},
+	} {
+		got, err := s.FindCallees(context.Background(), repoID, tc.caller, 0, 10, 0)
+		if err != nil || len(got) != 1 || got[0].StableKey != tc.key {
+			t.Fatalf("FindCallees(%s) = %#v, err=%v; want %s", tc.caller, got, err, tc.key)
+		}
+	}
+}
+
+// `class << self` bodies and `def self.` in a module are both singleton
+// scopes: an implicit or literal self call inside them reaches the container's
+// singleton method, never an instance method of the same name.
+func TestRubySingletonScopeVariants(t *testing.T) {
+	for _, tc := range []struct{ name, src, caller, key string }{
+		{
+			name: "eigenclass",
+			src: `class Service
+  def run; end
+  class << self
+    def run; end
+
+    def f
+      run()
+      self.run()
+    end
+  end
+end
+`,
+			caller: "Service.f",
+			key:    "func:ruby:Service:singleton:run",
+		},
+		{
+			name: "module singleton",
+			src: `module Helpers
+  def self.run; end
+
+  def self.f
+    run()
+    self.run()
+  end
+end
+`,
+			caller: "Helpers.f",
+			key:    "func:ruby:Helpers:singleton:run",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repoID := indexSource(t, tsparser.NewRuby(), "service.rb", tc.src)
+			got, err := s.FindCallees(context.Background(), repoID, tc.caller, 0, 10, 0)
+			if err != nil || len(got) != 1 || got[0].StableKey != tc.key {
+				t.Fatalf("FindCallees(%s) = %#v, err=%v; want %s", tc.caller, got, err, tc.key)
+			}
+		})
+	}
 }
 
 func TestNestedPythonFunctionOwnsItsBodyEdges(t *testing.T) {
