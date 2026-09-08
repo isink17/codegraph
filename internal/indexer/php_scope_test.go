@@ -619,6 +619,32 @@ class Service { public static function run() {} }
 	r.assertFreshParity()
 }
 
+func TestPHPStaticScopeAliasCaseCollisionImportTransitions(t *testing.T) {
+	caller := func(use string) string {
+		return "<?php\nnamespace App;\n\n" + use + "\nclass Caller {\n    function f() {\n        s::run();\n    }\n}\n"
+	}
+	r := newPHPRepo(t, map[string]string{
+		"Types.php": `<?php
+namespace App;
+class s { public static function run() {} }
+namespace Vendor;
+class Service { public static function run() {} }
+`,
+		"Caller.php": caller(""),
+	})
+	r.assertTarget("Caller.php", "s::run", "App.s.run", "php_type_scope")
+
+	r.write("Caller.php", caller("use Vendor\\Service as S;"))
+	r.update("Caller.php")
+	r.assertUnresolved("Caller.php", "s::run")
+	r.assertFreshParity()
+
+	r.write("Caller.php", caller(""))
+	r.update("Caller.php")
+	r.assertTarget("Caller.php", "s::run", "App.s.run", "php_type_scope")
+	r.assertFreshParity()
+}
+
 func TestPHPStaticScopeImportOwnerIsExactNamespace(t *testing.T) {
 	r := newPHPRepo(t, map[string]string{
 		"Vendor.php": `<?php
