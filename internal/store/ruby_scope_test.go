@@ -1,11 +1,8 @@
 package store
 
 import (
-	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -82,39 +79,6 @@ func (f *rubyFixture) call(t *testing.T, fileID int64, src sql.NullInt64, dst, e
 	}
 	id, _ := res.LastInsertId()
 	return id
-}
-
-func (f *rubyFixture) reference(t *testing.T, fileID int64, name string, line int) {
-	t.Helper()
-	if _, err := f.store.db.ExecContext(f.ctx, `
-		INSERT INTO references_tbl(repo_id, file_id, ref_kind, name, qualified_name, start_line, start_col, end_line, end_col)
-		VALUES (?, ?, 'call', ?, ?, ?, 1, ?, 1)`, f.repoID, fileID, name, name, line, line); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (f *rubyFixture) markerSet(t *testing.T, key string) bool {
-	t.Helper()
-	var value string
-	err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key = ?`, key+"."+strconv.FormatInt(f.repoID, 10)).Scan(&value)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	return value == "1"
-}
-
-func (f *rubyFixture) assertReference(t *testing.T, line int, wantSymbol, wantContext sql.NullInt64) {
-	t.Helper()
-	var symbol, ctxID sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id, context_symbol_id FROM references_tbl WHERE repo_id = ? AND start_line = ?`, f.repoID, line).Scan(&symbol, &ctxID); err != nil {
-		t.Fatal(err)
-	}
-	if symbol != wantSymbol || ctxID != wantContext {
-		t.Fatalf("reference line %d = (%v,%v), want (%v,%v)", line, symbol, ctxID, wantSymbol, wantContext)
-	}
 }
 
 var rubyEntryPoints = []string{"full", "paths", "names", "paths+names"}
@@ -345,105 +309,6 @@ func TestRubyScopeReopenedContainerAndDuplicateMethods(t *testing.T) {
 		if dst != restored {
 			t.Fatalf("%s: stale destination %d, want %d", entry, dst, restored)
 		}
-	}
-}
-
-// A database written before this pass holds Ruby call targets the generic
-// strategies decided. Ordinary Ruby calls are now owned here, so the repair
-// clears them -- including the non-NULL ones -- and re-decides in the same
-// transaction, with the marker written only after success.
-func TestRubyScopeUpgradeRepairOldDatabase(t *testing.T) {
-	f := newRubyFixture(t)
-	file := f.rb(t, "app/service.rb")
-	f.typ(t, file, "Service")
-	run := f.method(t, file, "Service.run", false)
-	caller := f.method(t, file, "Service.f", false)
-	provable := f.call(t, file, srcOf(caller), "self.run", rubySelfReceiver, 1)
-	f.reference(t, file, "self.run", 1)
-	// The old generic answer for a receiver form this phase does not support.
-	topFile := f.rb(t, "app/top.rb")
-	topCaller := f.insert(t, topFile, "function", "main", sql.NullInt64{Int64: 0, Valid: true})
-	stale := f.call(t, topFile, srcOf(topCaller), "run", rubyImplicitReceiver, 2)
-	f.reference(t, topFile, "run", 2)
-	f.setBinding(t, stale, run, ResolutionStrategyExactName, ResolutionConfidenceHigh)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id = ?, context_symbol_id = ? WHERE start_line = 2`, run, topCaller); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key != rubyScopeRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	// A failed pass must not mark the repository repaired or commit a
-	// half-cleared graph.
-	canceled, cancel := context.WithCancel(f.ctx)
-	cancel()
-	if _, err := f.store.RepairResolverBindingsOnce(canceled, f.repoID); err == nil {
-		t.Fatal("repair under a canceled context succeeded")
-	}
-	if f.markerSet(t, rubyScopeRepairSettingKey) {
-		t.Fatal("marker written after a failed repair")
-	}
-	if got := f.binding(t, stale); got != "Service.run|"+ResolutionStrategyExactName+"|high" {
-		t.Fatalf("failed repair left half-cleared state: %s", got)
-	}
-
-	resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !resolvedRepoWide {
-		t.Fatal("Ruby scope repair did not report a repo-wide resolve")
-	}
-	if got, want := f.binding(t, provable), "Service.run|"+ResolutionStrategyRubyExplicitSelf+"|high"; got != want {
-		t.Fatalf("provable edge after repair = %s, want %s", got, want)
-	}
-	if got := f.binding(t, stale); got != "<unresolved>" {
-		t.Fatalf("top-level edge kept its old generic target: %s", got)
-	}
-	f.assertReference(t, 1, srcOf(run), srcOf(caller))
-	f.assertReference(t, 2, sql.NullInt64{}, srcOf(topCaller))
-	if !f.markerSet(t, rubyScopeRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) {
-		t.Fatal("repair markers not set after success")
-	}
-
-	// Second run: nothing runs.
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET resolution_confidence = 'probe' WHERE id = ?`, provable); err != nil {
-		t.Fatal(err)
-	}
-	if resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || resolvedRepoWide {
-		t.Fatalf("second repair: resolvedRepoWide=%v err=%v", resolvedRepoWide, err)
-	}
-	if got := f.binding(t, provable); got != "Service.run|"+ResolutionStrategyRubyExplicitSelf+"|probe" {
-		t.Fatalf("second repair rewrote edges: %s", got)
-	}
-}
-
-// A repository without Ruby has nothing to re-decide: the marker is written, no
-// repo-wide resolve is claimed.
-func TestRubyScopeRepairSkipsRepositoriesWithoutRuby(t *testing.T) {
-	f := newRubyFixture(t)
-	goFile := f.file(t, "main.go", "go")
-	f.symbol(t, goFile, "main", "main.main", "function", "go")
-	for _, repair := range resolverRepairs {
-		if repair.key != rubyScopeRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolvedRepoWide {
-		t.Fatal("Ruby repair claimed a repo-wide resolve on a repository without Ruby")
-	}
-	if !f.markerSet(t, rubyScopeRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) {
-		t.Fatal("markers after a skipped Ruby repair are not all set")
 	}
 }
 

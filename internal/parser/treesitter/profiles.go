@@ -21,8 +21,18 @@ func (a *CSharpAdapter) Profile() parser.Profile {
 }
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
 func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") }
+
+// Ruby v3 adds P22.47 call-edge safety on top of the v2 semantic identities
+// (module/class/method qnames, lexical-parent facts, receiver evidence and
+// operator spelling, nested-eigenclass fail-closed): an assignment target is no
+// longer emitted as a call to the reader it is spelled after, a `def` nested in
+// a block no longer contributes calls to the enclosing method, and a block that
+// rebinds `self` no longer contributes lexical-self calls. Those are fewer,
+// different call edges for the same bytes, so the profile has to say so --
+// otherwise a repository indexed under v2 would keep edges this parser refuses
+// to emit and never reparse.
 func (a *RubyAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:ruby:v2", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:ruby:v3", EmitsCallEdges: true}
 }
 func (a *SwiftAdapter) Profile() parser.Profile { return tsProfile("swift") }
 func (a *PHPAdapter) Profile() parser.Profile {

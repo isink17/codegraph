@@ -41,13 +41,18 @@ import (
 // Method visibility is deliberately not consulted: the receiver is exactly
 // self, which may call private and protected methods. Constant receivers
 // (P22.48) will need a visibility audit before they can bind.
-
-const rubyScopeRepairSettingKey = "resolver.ruby_self_scope_repaired.v1"
+//
+// There is no one-time resolver repair for this pass. The parser facts it
+// consumes changed with it, so treesitter:ruby:v3 is the compatibility
+// boundary: a repository indexed under v2 reparses every Ruby file on its next
+// full scan, which replaces the edge rows themselves. A resolver repair can
+// only re-decide bindings, and a v2 edge row for `self.name = v` or for a
+// self-rebinding block is stale evidence no re-decision could make truthful.
 
 const rubyScopeResolution = "tmp_ruby_scope_resolution"
 
-// rubyScopeStrategies is every strategy this pass writes; the one-time repair
-// and the incremental invalidation both key on it.
+// rubyScopeStrategies is every strategy this pass writes; the incremental
+// invalidation keys on it.
 var rubyScopeStrategies = []string{
 	ResolutionStrategyRubyImplicitSelf,
 	ResolutionStrategyRubyExplicitSelf,
@@ -297,37 +302,4 @@ func (s *Store) resolveRubyScopeStandalone(ctx context.Context, repoID int64, on
 		return 0, err
 	}
 	return n, tx.Commit()
-}
-
-func (s *Store) rubyScopeRepairApplies(ctx context.Context, repoID int64) (bool, error) {
-	var has int
-	err := sqliteScanRows(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id = ? AND language = 'ruby')`,
-		[]any{repoID}, func(rows *sql.Rows) error { return rows.Scan(&has) })
-	return has != 0, err
-}
-
-// repairRubyScopeBindings converges a database written before this pass
-// existed. The parser profile is unchanged, so unchanged Ruby files never
-// reparse and their edges keep whatever the generic strategies decided:
-// a bare `run()` may hold an exact_name target the language never justified,
-// and a receiver-shaped call may hold a stale one. Ordinary Ruby call
-// resolution is now owned here, so every such target is cleared and re-decided
-// in the same transaction as the repo-wide resolve; cross-language reference
-// edges and other languages are untouched.
-//
-// Ceiling: the repair re-decides bindings, never the edge rows themselves. A
-// Ruby file already indexed under treesitter:ruby:v2 keeps the call edges that
-// profile emitted, including the three shapes the parser now refuses to emit
-// (assignment targets, `def` inside a block, and blocks that rebind `self`).
-// Those stale rows carry implicit/self evidence, so this pass will bind them.
-// Reindexing the file -- which any edit to it triggers -- drops them for good.
-func (s *Store) repairRubyScopeBindings(ctx context.Context, repoID int64) error {
-	clear := func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
-			WHERE repo_id = ? AND edge_kind = '`+EdgeKindCalls+`' AND dst_symbol_id IS NOT NULL
-			  AND file_id IN (SELECT id FROM files WHERE repo_id = ? AND language = 'ruby')`, repoID, repoID)
-		return err
-	}
-	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
-	return err
 }
