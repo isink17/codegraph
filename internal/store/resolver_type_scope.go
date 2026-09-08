@@ -1279,6 +1279,10 @@ func (s *Store) repairTypeScopeBindings(ctx context.Context, repoID int64) error
 type resolverRepair struct {
 	key string
 	run func(*Store, context.Context, int64) error
+	// applies, when set, says whether the repository has anything this repair
+	// could touch. A repository it does not apply to is marked repaired without
+	// running -- and without claiming a repo-wide resolve it never did.
+	applies func(*Store, context.Context, int64) (bool, error)
 	// resolvesRepoWide says the repair leaves the repository fully re-resolved,
 	// so a caller that was about to run its own repo-wide pass can skip it.
 	resolvesRepoWide bool
@@ -1300,13 +1304,19 @@ var (
 		run:              (*Store).repairDotTailAmbiguityBindings,
 		resolvesRepoWide: true,
 	}
+	phpScopeRepair = resolverRepair{
+		key:              phpScopeRepairSettingKey,
+		run:              (*Store).repairPHPScopeBindings,
+		applies:          (*Store).phpScopeRepairApplies,
+		resolvesRepoWide: true,
+	}
 	referenceIdentityRepair = resolverRepair{
 		key:              referenceIdentityRepairSettingKey,
 		run:              (*Store).ReconcileReferenceIdentities,
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,
@@ -1323,6 +1333,15 @@ func (s *Store) runResolverRepairOnce(ctx context.Context, repoID int64, repair 
 		return false, nil
 	case err != nil && !errors.Is(err, sql.ErrNoRows):
 		return false, err
+	}
+	if repair.applies != nil {
+		applies, err := repair.applies(s, ctx, repoID)
+		if err != nil {
+			return false, err
+		}
+		if !applies {
+			return false, s.markRepairDone(ctx, repair.key, repoID)
+		}
 	}
 	if err := repair.run(s, ctx, repoID); err != nil {
 		return false, err

@@ -242,14 +242,15 @@ func TestReferenceIdentityRepairBackfillsOldCurrentDB(t *testing.T) {
 		VALUES (?, ?, 'call', 'target', 'target.target', 1, 1, 1, 1)`, f.repoID, callerFile); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.store.markRepairDone(f.ctx, typeScopeRepair.key, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.markRepairDone(f.ctx, bareNameLevelRepair.key, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.markRepairDone(f.ctx, dotTailAmbiguityRepair.key, f.repoID); err != nil {
-		t.Fatal(err)
+	// Every edge repair is already marked: only the derived reference repair
+	// is pending.
+	for _, repair := range resolverRepairs {
+		if repair.key == referenceIdentityRepair.key {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil {

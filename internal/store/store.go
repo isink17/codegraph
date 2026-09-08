@@ -3823,6 +3823,14 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	// PHP scoped calls: bound by namespace/import/type evidence or left
+	// unresolved; phpScopeVetoSQL keeps every strategy below off them and off
+	// PHP member calls. See php_scope.go.
+	if n, err := resolvePHPScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if n, err := resolveJavaScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
@@ -4672,6 +4680,14 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err != nil {
 		return 0, err
 	}
+	// Every unresolved scoped PHP edge is re-decided here, not only the ones a
+	// changed path or name selected: a type identity can become unique again
+	// through a removal that names nothing the `::` spelling carries (see
+	// phpStaleScopeBindings).
+	phpResolved, err := resolvePHPScope(ctx, tx, repoID, nil)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
@@ -4686,7 +4702,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err != nil {
 		return 0, err
 	}
-	n += csharpResolved
+	n += csharpResolved + phpResolved
 	for _, table := range []string{
 		resolverAmbiguousNamesTable, resolverTestFilesTable,
 		resolverImportScopeTable, resolverCppNamespaceScopesTable,
@@ -4809,6 +4825,15 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		return 0, err
 	}
 	legacyStale := map[int64]struct{}{}
+	// PHP scoped bindings have no '.' tail for the dotted selection below to
+	// find, so they are keyed on the bound destination instead.
+	phpStale, err := s.phpStaleScopeBindings(ctx, repoID, wanted)
+	if err != nil {
+		return 0, err
+	}
+	for _, id := range phpStale {
+		legacyStale[id] = struct{}{}
+	}
 	if err := sqliteBatchedQuery(ctx, s.db, `
 		SELECT id FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
@@ -5323,12 +5348,15 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		if _, ok := targetByID[id]; ok {
 			continue
 		}
+		// The final component starts after the separator: one byte past a
+		// '.', two past a '::'.
 		last := strings.LastIndexByte(dstName, '.')
+		width := 1
 		if scope := strings.LastIndex(dstName, "::"); scope > last {
-			last = scope
+			last, width = scope, 2
 		}
-		if last >= 0 && last+1 < len(dstName) {
-			if _, ok := seen[dstName[last+1:]]; ok {
+		if last >= 0 && last+width < len(dstName) {
+			if _, ok := seen[dstName[last+width:]]; ok {
 				targetByID[id] = edgeTarget{
 					edgeID:      id,
 					dstName:     dstName,
@@ -5781,6 +5809,34 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			if target.srcLanguage != "csharp" {
 				remaining = append(remaining, target)
 			}
+		}
+		targets = remaining
+	}
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	// PHP owns its `::` and `->` spellings outright: the pass binds what the
+	// language rules prove and the rest stays unresolved on purpose, so none of
+	// them reach the generic lookups below. Bare PHP calls are not owned and
+	// continue. This is the Go-side twin of phpScopeVetoSQL.
+	phpIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if target.srcLanguage == "php" && phpScopeOwned(target.dstName) {
+			phpIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(phpIDs) > 0 {
+		n, err := s.resolvePHPScopeStandalone(ctx, repoID, phpIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, owned := phpIDs[target.edgeID]; owned {
+				continue
+			}
+			remaining = append(remaining, target)
 		}
 		targets = remaining
 	}
