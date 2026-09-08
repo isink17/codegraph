@@ -102,11 +102,13 @@ type phpScopeEdge struct {
 	srcQName     string
 	srcContainer string
 	srcStatic    sql.NullInt64
+	evidence     string
 	// derived
 	namespace   string // lexical PHP namespace of the caller ("" = global)
 	currentType string // containing type qname, "" when the caller is not inside a type
 	sourceOK    bool   // namespace derivation succeeded
 	trait       bool
+	nested      bool
 }
 
 type phpScopeImport struct {
@@ -129,13 +131,13 @@ func resolvePHPScope(ctx context.Context, q phpScopeQuery, repoID int64, only ma
 	var edges []phpScopeEdge
 	// LEFT JOIN on the source: an edge without a trustworthy source symbol is
 	// still owned (and vetoed); it just cannot prove a namespace and abstains.
-	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.dst_name,src.id IS NOT NULL,COALESCE(src.kind,''),COALESCE(src.qualified_name,''),COALESCE(src.container_name,''),src.is_static
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.dst_name,e.evidence,src.id IS NOT NULL,COALESCE(src.kind,''),COALESCE(src.qualified_name,''),COALESCE(src.container_name,''),src.is_static
 FROM edges e JOIN files f ON f.id=e.file_id LEFT JOIN symbols src ON src.id=e.src_symbol_id
 WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND (`+phpScopeStaticSQL+` OR e.dst_name LIKE '$this->%')`, " AND e.id IN (%s)", []any{repoID}, int64SliceToAny(ids), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e phpScopeEdge
 			var hasSrc int
-			if err := rows.Scan(&e.id, &e.file, &e.name, &hasSrc, &e.srcKind, &e.srcQName, &e.srcContainer, &e.srcStatic); err != nil {
+			if err := rows.Scan(&e.id, &e.file, &e.name, &e.evidence, &hasSrc, &e.srcKind, &e.srcQName, &e.srcContainer, &e.srcStatic); err != nil {
 				return err
 			}
 			e.hasSrc = hasSrc != 0
@@ -192,6 +194,7 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND (`+phpSco
 	decisions := make([]decision, len(edges))
 	wanted := map[string]struct{}{}
 	for i, e := range edges {
+		edges[i].nested = e.evidence == graph.PHPMemberCallNestedScopeEvidence
 		for _, fact := range imports[e.file] {
 			if fact.kind == graph.ScopeImportPHPTraitScope && fact.owner == e.currentType {
 				edges[i].trait = true
@@ -199,7 +202,7 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND (`+phpSco
 		}
 		typeQ, method, strategy, ok := phpDecideType(e, imports[e.file])
 		if property, member, propertyStrategy, propertyOK := phpThisCall(e.name); propertyOK {
-			if e.srcStatic.Valid && e.srcStatic.Int64 != 0 || edges[i].trait || e.currentType == "" {
+			if e.srcKind != "function" || !e.srcStatic.Valid || e.srcStatic.Int64 != 0 || edges[i].trait || edges[i].nested || e.currentType == "" {
 				continue
 			}
 			if property == "" {

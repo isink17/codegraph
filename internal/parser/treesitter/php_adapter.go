@@ -330,41 +330,53 @@ func phpLinkTests(pf *graph.ParsedFile) {
 }
 
 func phpExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
-	add := func(call *sitter.Node, name string) {
+	add := func(call *sitter.Node, name string, nested bool) {
 		if name == "" {
 			return
 		}
-		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: name, Line: int(call.StartPoint().Row) + 1})
+		evidence := name
+		if nested && strings.HasPrefix(name, "$this->") {
+			evidence = graph.PHPMemberCallNestedScopeEvidence
+		}
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1})
 		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
 	}
-	for _, call := range findDescendants(root, "function_call_expression") {
-		fn := childByFieldName(call, "function")
-		if fn == nil && call.ChildCount() > 0 {
-			fn = call.Child(0)
+	var walk func(*sitter.Node, bool)
+	walk = func(node *sitter.Node, nested bool) {
+		if node == nil {
+			return
 		}
-		if fn != nil {
-			add(call, nodeText(fn, content))
-		}
-	}
-	for _, call := range findDescendants(root, "scoped_call_expression") {
-		scope, name := childByFieldName(call, "scope"), childByFieldName(call, "name")
-		if scope != nil && name != nil {
-			add(call, nodeText(scope, content)+"::"+nodeText(name, content))
-		}
-	}
-	for _, typ := range []string{"member_call_expression", "nullsafe_member_call_expression"} {
-		for _, call := range findDescendants(root, typ) {
-			name, object := childByFieldName(call, "name"), childByFieldName(call, "object")
-			if name == nil || object == nil {
-				continue
+		switch node.Type() {
+		case "anonymous_function_creation_expression", "arrow_function", "function_definition":
+			nested = true
+		case "function_call_expression":
+			fn := childByFieldName(node, "function")
+			if fn == nil && node.ChildCount() > 0 {
+				fn = node.Child(0)
 			}
-			op := "->"
-			if typ == "nullsafe_member_call_expression" {
-				op = "?->"
+			if fn != nil {
+				add(node, nodeText(fn, content), nested)
 			}
-			add(call, nodeText(object, content)+op+nodeText(name, content))
+		case "scoped_call_expression":
+			scope, name := childByFieldName(node, "scope"), childByFieldName(node, "name")
+			if scope != nil && name != nil {
+				add(node, nodeText(scope, content)+"::"+nodeText(name, content), nested)
+			}
+		case "member_call_expression", "nullsafe_member_call_expression":
+			name, object := childByFieldName(node, "name"), childByFieldName(node, "object")
+			if name != nil && object != nil {
+				op := "->"
+				if node.Type() == "nullsafe_member_call_expression" {
+					op = "?->"
+				}
+				add(node, nodeText(object, content)+op+nodeText(name, content), nested)
+			}
+		}
+		for i := range int(node.ChildCount()) {
+			walk(node.Child(i), nested)
 		}
 	}
+	walk(root, false)
 }
 
 // Normalize only syntax-proven PHP names; arbitrary runtime strings stay raw.

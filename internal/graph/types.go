@@ -56,6 +56,10 @@ type Edge struct {
 	CallArity   *int   `json:"call_arity,omitempty"`
 }
 
+// PHPMemberCallNestedScopeEvidence marks a PHP $this member call lexically
+// inside an executable scope P22.45 does not model as a source symbol.
+const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
+
 type ParsedFile struct {
 	Language   string
 	Symbols    []Symbol

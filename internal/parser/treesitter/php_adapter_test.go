@@ -238,6 +238,22 @@ class Caller {
 	}
 }
 
+func TestPHPNestedThisEvidenceIsCallsiteLocal(t *testing.T) {
+	p, err := NewPHP().Parse(context.Background(), "C.php", []byte(`<?php class C { function f() { $this->direct(); $cb = static function () { $this->nested(); }; } }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, e := range p.Edges {
+		if strings.HasPrefix(e.DstName, "$this->") {
+			got[e.DstName] = e.Evidence
+		}
+	}
+	if got["$this->direct"] != "$this->direct" || got["$this->nested"] != graph.PHPMemberCallNestedScopeEvidence {
+		t.Fatalf("evidence = %#v", got)
+	}
+}
+
 func TestPHPTestLinkKeysFailClosedOnUnknownNamespace(t *testing.T) {
 	global, err := NewPHP().Parse(context.Background(), "ServiceTest.php", []byte("<?php function TestService() {}"))
 	if err != nil {
