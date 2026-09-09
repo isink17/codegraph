@@ -704,13 +704,27 @@ end
 	}
 }
 
-// rubyIdentityHazards renders the constant-identity evidence of one parse.
-func rubyIdentityHazards(p graph.ParsedFile) map[string]bool {
-	got := map[string]bool{}
+// rubyIdentityHazardRows counts the constant-identity evidence of one parse per
+// name, so a fact emitted twice fails rather than collapsing into a set.
+func rubyIdentityHazardRows(p graph.ParsedFile) map[string]int {
+	got := map[string]int{}
 	for _, fact := range p.Scope.Imports {
 		if fact.Kind == graph.ScopeImportRubyConstantIdentityUnknown {
-			got[fact.OwnerModule+"|"+fact.LocalName] = true
+			got[fact.OwnerModule+"|"+fact.LocalName]++
 		}
+	}
+	return got
+}
+
+// rubyIdentityHazards is the same evidence as a set, for the cases that only
+// care which constants were withdrawn.
+func rubyIdentityHazards(p graph.ParsedFile) map[string]bool {
+	got := map[string]bool{}
+	for name, n := range rubyIdentityHazardRows(p) {
+		if n != 1 {
+			panic("duplicate constant-identity rows for " + name)
+		}
+		got[name] = true
 	}
 	return got
 }
@@ -786,10 +800,13 @@ func TestRubyConstantIdentityHazardBoundaries(t *testing.T) {
 		"root level": {"Service = Other\n", nil},
 		// A qualified assignment at root names its constant absolutely.
 		"root qualified": {"App::Service = Other\n", []string{"App.Service|Service"}},
-		// Dynamic names are not modelled, and neither is a receiver this parser
-		// has not proven.
-		"dynamic const_set":   {"module App\n  const_set(name, Other)\n  const_set(\"#{p}X\", Other)\nend\n", nil},
-		"foreign const_set":   {"module App\n  Other.const_set(:Service, X)\nend\n", nil},
+		// Dynamic names are not modelled, and neither is a value receiver.
+		"dynamic const_set": {"module App\n  const_set(name, Other)\n  const_set(\"#{p}X\", Other)\nend\n", nil},
+		"value const_set":   {"module App\n  target.const_set(:Service, X)\nend\n", nil},
+		// A constant receiver does name its target: this moves some
+		// `Other::Service`, whichever lexical level `Other` resolves to.
+		"constant receiver const_set": {"module App\n  Other.const_set(:Service, X)\nend\n",
+			[]string{"App.Other.Service|Service", "Other.Service|Service"}},
 		"unrelated api":       {"module App\n  configure(:Service)\nend\n", nil},
 		"qualified open body": {"class App::Caller\n  Service = Other\nend\n", []string{"App.Caller.Service|Service"}},
 		// A relative qualified opening inside another scope names an owner this
@@ -803,6 +820,203 @@ func TestRubyConstantIdentityHazardBoundaries(t *testing.T) {
 		// inside any wrapper must still withdraw the root `App::Service`.
 		"qualified target inside a wrapper": {"class Boot\n  App::Service = Other\nend\n",
 			[]string{"Boot.App.Service|Service", "App.Service|Service"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := rubyIdentityHazards(parseRuby(t, tc.source))
+			if len(got) != len(tc.want) {
+				t.Fatalf("hazards = %#v, want %v", got, tc.want)
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Fatalf("missing %s in %#v", w, got)
+				}
+			}
+		})
+	}
+}
+
+// A constant-mutation API called through a literal constant receiver names its
+// target as exactly as a bare assignment does. Ignoring it because the receiver
+// is "not self" left the same confidently wrong edge in place.
+func TestRubyConstantIdentityLiteralReceiver(t *testing.T) {
+	for name, tc := range map[string]struct {
+		source string
+		want   []string
+	}{
+		"root const_set":    {"App.const_set(:Service, Other)\n", []string{"App.Service|Service"}},
+		"root remove_const": {"App.remove_const(:Service)\n", []string{"App.Service|Service"}},
+		"root autoload":     {"App.autoload(:Service, \"service\")\n", []string{"App.Service|Service"}},
+		"root string name":  {"App.const_set(\"Service\", Other)\n", []string{"App.Service|Service"}},
+		// A qualified receiver names a constant under that path, not under its
+		// first segment.
+		"qualified receiver": {"App::Nested.const_set(:Service, Other)\n", []string{"App.Nested.Service|Service"}},
+		"deep receiver":      {"App::Nested::Deep.const_set(:Service, Other)\n", []string{"App.Nested.Deep.Service|Service"}},
+		// A leading `::` is exact: no owner-relative alternative belongs here.
+		"absolute receiver":           {"module Boot\n  ::App.const_set(:Service, Other)\nend\n", []string{"App.Service|Service"}},
+		"absolute qualified receiver": {"module Boot\n  ::App::Nested.const_set(:Service, Other)\nend\n", []string{"App.Nested.Service|Service"}},
+		// A relative receiver inside a lexical owner could be that owner's
+		// constant or the root one; both are recorded because a hazard only
+		// ever withholds an edge.
+		"relative receiver in one level": {"module Boot\n  App.const_set(:Service, Other)\nend\n",
+			[]string{"Boot.App.Service|Service", "App.Service|Service"}},
+		"relative receiver in three levels": {"module A\n  module B\n    class C\n      App.const_set(:Service, Other)\n    end\n  end\nend\n",
+			[]string{"A.B.C.App.Service|Service", "A.B.App.Service|Service", "A.App.Service|Service", "App.Service|Service"}},
+		// A qualified opening reaches the root boundary, so its body has one
+		// lexical level, not two.
+		"relative receiver in a qualified open": {"class App::Caller\n  Boot.const_set(:Service, Other)\nend\n",
+			[]string{"App.Caller.Boot.Service|Service", "Boot.Service|Service"}},
+		// The cref forms keep naming the current owner, exactly once.
+		"bare in an owner": {"module App\n  const_set(:Service, Other)\nend\n", []string{"App.Service|Service"}},
+		"self in an owner": {"module App\n  self.const_set(:Service, Other)\nend\n", []string{"App.Service|Service"}},
+		// Deferred: nothing here names a constant from syntax.
+		"value receiver":      {"target.const_set(:Service, Other)\n", nil},
+		"chained receiver":    {"factory.module.const_set(:Service, Other)\n", nil},
+		"send indirection":    {"App.send(:const_set, :Service, Other)\n", nil},
+		"dynamic name":        {"App.const_set(name, Other)\n", nil},
+		"interpolated name":   {"App.const_set(\"#{p}Service\", Other)\n", nil},
+		"no arguments":        {"App.const_set\n", nil},
+		"unrelated method":    {"App.configure(:Service)\n", nil},
+		"root cref const_set": {"const_set(:Service, Other)\n", nil},
+		"root self const_set": {"self.const_set(:Service, Other)\n", nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := rubyIdentityHazards(parseRuby(t, tc.source))
+			if len(got) != len(tc.want) {
+				t.Fatalf("hazards = %#v, want %v", got, tc.want)
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Fatalf("missing %s in %#v", w, got)
+				}
+			}
+		})
+	}
+}
+
+// The lexical chain a relative path is measured against is the nesting the walk
+// actually descended, so an assignment target gets the same candidate set.
+func TestRubyRelativeQualifiedAssignmentUsesTheLexicalChain(t *testing.T) {
+	p := parseRuby(t, "module A\n  module B\n    Foo::Bar = Other\n  end\nend\n")
+	want := []string{"A.B.Foo.Bar|Bar", "A.Foo.Bar|Bar", "Foo.Bar|Bar"}
+	got := rubyIdentityHazards(p)
+	if len(got) != len(want) {
+		t.Fatalf("hazards = %#v, want %v", got, want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("missing %s in %#v", w, got)
+		}
+	}
+}
+
+// A mutation whose receiver is a proven constant path does not depend on the
+// cref, so a `def` or an eigenclass body -- the shape an installer actually
+// takes -- must not swallow it. The cref forms, by contrast, are only evidence
+// where `self` really is a nameable class or module.
+func TestRubyConstantIdentityInsideMethodBodies(t *testing.T) {
+	for name, tc := range map[string]struct {
+		source string
+		want   []string
+	}{
+		"receiver mutation in a singleton method": {
+			"module Boot\n  def self.install\n    App.const_set(:Service, Other)\n  end\nend\n",
+			[]string{"Boot.App.Service|Service", "App.Service|Service"}},
+		"receiver mutation in an instance method": {
+			"module Boot\n  def install\n    App.const_set(:Service, Other)\n  end\nend\n",
+			[]string{"Boot.App.Service|Service", "App.Service|Service"}},
+		"receiver mutation in an eigenclass body": {
+			"module App\n  class << self\n    Boot.const_set(:Service, Other)\n  end\nend\n",
+			[]string{"App.Boot.Service|Service", "Boot.Service|Service"}},
+		"absolute receiver mutation in a method": {
+			"module Boot\n  def self.install\n    ::App.const_set(:Service, Other)\n  end\nend\n",
+			[]string{"App.Service|Service"}},
+		// `self` inside `def self.install` IS the module, so a bare const_set
+		// there names the module's own constant.
+		"cref mutation in a singleton method": {
+			"module App\n  def self.install\n    const_set(:Service, Other)\n  end\nend\n",
+			[]string{"App.Service|Service"}},
+		"self cref mutation in a singleton method": {
+			"module App\n  def self.install\n    self.const_set(:Service, Other)\n  end\nend\n",
+			[]string{"App.Service|Service"}},
+		// A `def` inside `class << self` is also a singleton method.
+		"cref mutation in an eigenclass method": {
+			"module App\n  class << self\n    def install\n      const_set(:Service, Other)\n    end\n  end\nend\n",
+			[]string{"App.Service|Service"}},
+		// `self` in an instance method is an instance: it has no const_set.
+		"cref mutation in an instance method": {
+			"module App\n  def install\n    const_set(:Service, Other)\n  end\nend\n", nil},
+		// Directly inside `class << self` the cref is the singleton class, so
+		// the container's own constants are untouched.
+		"cref mutation directly in an eigenclass": {
+			"module App\n  class << self\n    const_set(:Service, Other)\n  end\nend\n", nil},
+		// Every constant assignment inside a `def` is a Ruby SyntaxError, bare
+		// and qualified alike, so none of them is evidence.
+		"bare assignment in a method": {
+			"module App\n  def install\n    Service = Other\n  end\nend\n", nil},
+		"qualified assignment in a method": {
+			"module App\n  def install\n    Foo::Bar = Other\n  end\nend\n", nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := rubyIdentityHazards(parseRuby(t, tc.source))
+			if len(got) != len(tc.want) {
+				t.Fatalf("hazards = %#v, want %v", got, tc.want)
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Fatalf("missing %s in %#v", w, got)
+				}
+			}
+		})
+	}
+}
+
+// A relative qualified opening cannot name its own cref, but Ruby's nesting
+// there is that unnameable frame plus the enclosing levels -- which are still
+// candidates a relative receiver could resolve through.
+func TestRubyConstantIdentityInRelativeQualifiedOpening(t *testing.T) {
+	p := parseRuby(t, "module Boot\n  class Outer::Wrap\n    App.const_set(:Service, Other)\n    Service = Other\n  end\nend\n")
+	want := []string{"Boot.App.Service|Service", "App.Service|Service"}
+	got := rubyIdentityHazards(p)
+	if len(got) != len(want) {
+		t.Fatalf("hazards = %#v, want %v (the bare assignment has no nameable cref)", got, want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("missing %s in %#v", w, got)
+		}
+	}
+}
+
+// One row per constant per file: repeating the mutation says nothing more, and
+// a relative path whose candidate levels collide must not double up either.
+func TestRubyConstantIdentityHazardsAreDeduped(t *testing.T) {
+	rows := rubyIdentityHazardRows(parseRuby(t, `module App
+  Service = Other
+  const_set(:Service, Other)
+  self.const_set(:Service, Other)
+  Service = Third
+end
+`))
+	if len(rows) != 1 || rows["App.Service|Service"] != 1 {
+		t.Fatalf("rows = %#v, want exactly one App.Service row", rows)
+	}
+}
+
+// Spellings that must keep behaving, as regression fences.
+func TestRubyConstantIdentityReceiverSpellingFences(t *testing.T) {
+	for name, tc := range map[string]struct {
+		source string
+		want   []string
+	}{
+		"paren-less arguments": {"App.const_set :Service, Other\n", []string{"App.Service|Service"}},
+		"safe navigation":      {"App&.const_set(:Service, Other)\n", []string{"App.Service|Service"}},
+		"scope operator call":  {"App::Nested::const_set(:Service, Other)\n", []string{"App.Nested.Service|Service"}},
+		"superclass body":      {"class Foo < Bar\n  App.const_set(:Service, Other)\nend\n", []string{"Foo.App.Service|Service", "App.Service|Service"}},
+		"public_send indirect": {"App.public_send(:const_set, :Service, Other)\n", nil},
+		"send indirect":        {"App.send(:const_set, :Service, Other)\n", nil},
+		// The root constant table is not a constant this phase can withhold.
+		"Object receiver": {"Object.const_set(:Service, Other)\n", nil},
+		"Kernel receiver": {"Kernel.const_set(:Service, Other)\n", nil},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := rubyIdentityHazards(parseRuby(t, tc.source))

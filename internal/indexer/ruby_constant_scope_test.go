@@ -868,10 +868,23 @@ end
 // repair pre-marked -- must reparse, produce it, keep the call unresolved, and
 // land on exactly the from-scratch v4 graph.
 func TestRubyProfileV3ToV4RecordsConstantIdentityHazards(t *testing.T) {
+	for name, tc := range map[string]struct {
+		source string
+		line   string
+	}{
+		"reassignment":              {rubyConstantReassignedSource, "Service.run@18"},
+		"literal receiver mutation": {rubyConstantMutatedSource, "Service.run@16"},
+	} {
+		t.Run(name, func(t *testing.T) { rubyProfileV3ToV4Hazard(t, tc.source, tc.line) })
+	}
+}
+
+func rubyProfileV3ToV4Hazard(t *testing.T, source, line string) {
+	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
 	path := filepath.Join(root, "app.rb")
-	writeProfileFile(t, path, rubyConstantReassignedSource)
+	writeProfileFile(t, path, source)
 	before, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -911,8 +924,8 @@ func TestRubyProfileV3ToV4RecordsConstantIdentityHazards(t *testing.T) {
 		t.Fatalf("facts after upgrade = %q, want one containing %q", got, want)
 	}
 	bindings := rubyBindings(t, s, repo)
-	if !strings.Contains(bindings, "Service.run@18=-|-") {
-		t.Fatalf("the reassigned constant bound after the upgrade:\n%s", bindings)
+	if !strings.Contains(bindings, line+"=-|-") {
+		t.Fatalf("the mutated constant bound after the upgrade:\n%s", bindings)
 	}
 	if fresh := freshRubyGraph(t, root); bindings != fresh {
 		t.Fatalf("upgraded graph:\n%s\nfrom-scratch v4 graph:\n%s", bindings, fresh)
@@ -1050,4 +1063,255 @@ end
 			}
 		})
 	}
+}
+
+// -- P22.48-F2: literal constant receiver mutations ---------------------------
+
+// The F2 wrong edge, end to end. `App.const_set(:Service, Other)` makes
+// `App::Service == Other`, so `App::Caller.new.f` returns `Other.run` -- and a
+// mutation whose receiver is a literal constant path is exactly as
+// syntax-proven as a bare assignment inside the module body.
+const rubyConstantMutatedSource = `class Other
+  def self.run
+    :other
+  end
+end
+
+module App
+  class Service
+    def self.run
+      :service
+    end
+  end
+
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+
+App.const_set(:Service, Other)
+`
+
+func TestRubyLiteralConstantMutationFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "app.rb"), rubyConstantMutatedSource)
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@16=-|-") {
+		t.Fatalf("a const_set through a literal constant receiver still bound:\n%s", bindings)
+	}
+	want := graph.ScopeImportRubyConstantIdentityUnknown + "|App.Service|Service|"
+	if got := rubyVisibilityFactRows(t, s, repo); !strings.Contains(got, want) {
+		t.Fatalf("facts = %q, want one containing %q", got, want)
+	}
+}
+
+// Every receiver shape, decided end to end against the same caller.
+func TestRubyLiteralConstantMutationReceiverShapes(t *testing.T) {
+	caller := `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`
+	for name, tc := range map[string]struct {
+		patch string
+		want  string
+	}{
+		"root const_set":            {"App.const_set(:Service, Other)\n", "-"},
+		"root remove_const":         {"App.remove_const(:Service)\n", "-"},
+		"root autoload":             {"App.autoload(:Service, \"service\")\n", "-"},
+		"root string name":          {"App.const_set(\"Service\", Other)\n", "-"},
+		"absolute receiver":         {"::App.const_set(:Service, Other)\n", "-"},
+		"absolute inside a wrapper": {"module Boot\n  ::App.const_set(:Service, Other)\nend\n", "-"},
+		"relative inside a wrapper": {"module Boot\n  App.const_set(:Service, Other)\nend\n", "-"},
+		"self inside the module":    {"module App\n  self.const_set(:Service, Other)\nend\n", "-"},
+		"bare inside the module":    {"module App\n  const_set(:Service, Other)\nend\n", "-"},
+		// A qualified receiver moves a constant under that path, so
+		// `App::Service` is untouched and the call still binds.
+		"qualified receiver elsewhere": {"App::Nested.const_set(:Service, Other)\n", "App.Service.run"},
+		// Deferred shapes prove nothing and must not veto.
+		"value receiver":   {"target.const_set(:Service, Other)\n", "App.Service.run"},
+		"chained receiver": {"factory.module.const_set(:Service, Other)\n", "App.Service.run"},
+		"send indirection": {"App.send(:const_set, :Service, Other)\n", "App.Service.run"},
+		"dynamic name":     {"App.const_set(name, Other)\n", "App.Service.run"},
+		"unrelated method": {"App.configure(:Service)\n", "App.Service.run"},
+		// The shape an installer actually takes: the receiver proves the target
+		// whether or not the surrounding cref is nameable.
+		"receiver mutation in a singleton method": {"module Boot\n  def self.install\n    App.const_set(:Service, Other)\n  end\nend\n", "-"},
+		"receiver mutation in an instance method": {"module Boot\n  def install\n    App.const_set(:Service, Other)\n  end\nend\n", "-"},
+		"receiver mutation in an eigenclass":      {"module Boot\n  class << self\n    App.const_set(:Service, Other)\n  end\nend\n", "-"},
+		"receiver mutation in a relative open":    {"module Boot\n  class Outer::Wrap\n    App.const_set(:Service, Other)\n  end\nend\n", "-"},
+		"cref mutation in a singleton method":     {"module App\n  def self.install\n    const_set(:Service, Other)\n  end\nend\n", "-"},
+		// `self` in an instance method has no const_set at all.
+		"cref mutation in an instance method": {"module App\n  def install\n    const_set(:Service, Other)\n  end\nend\n", "App.Service.run"},
+		// The root constant table names a root constant, not App::Service.
+		"Object receiver": {"Object.const_set(:Service, Other)\n", "App.Service.run"},
+		// Paren-less and safe-navigation spellings still count.
+		"paren-less":      {"App.const_set :Service, Other\n", "-"},
+		"safe navigation": {"App&.const_set(:Service, Other)\n", "-"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+			writeProfileFile(t, filepath.Join(root, "caller.rb"), caller)
+			writeProfileFile(t, filepath.Join(root, "patch.rb"), tc.patch)
+			s := newProfileStore(t)
+			if _, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+				t.Fatalf("index: %v", err)
+			}
+			if bindings := rubyBindings(t, s, repoID(t, s, root)); !strings.Contains(bindings, "Service.run@4="+tc.want) {
+				t.Fatalf("%s:\n%s\nwant Service.run@4=%s", name, bindings, tc.want)
+			}
+		})
+	}
+}
+
+// A qualified receiver names a constant under its own path, and a caller nested
+// there loses exactly that one.
+func TestRubyLiteralConstantMutationQualifiedReceiverTargetsItsOwnPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "service.rb"),
+		"module App\n  module Nested\n    class Service\n      def self.run; end\n    end\n  end\nend\n")
+	writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  module Nested
+    class Caller
+      def f
+        Service.run()
+      end
+    end
+  end
+end
+`)
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@5=App.Nested.Service.run|ruby_lexical_constant") {
+		t.Fatalf("initial bind missing:\n%s", bindings)
+	}
+	writeProfileFile(t, filepath.Join(root, "patch.rb"), "App::Nested.const_set(:Service, Other)\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@5=-|-") {
+		t.Fatalf("a qualified-receiver mutation did not withdraw its own path:\n%s", bindings)
+	}
+	if got, want := rubyBindings(t, s, repo), freshRubyGraph(t, root); got != want {
+		t.Fatalf("incremental:\n%s\nfresh:\n%s", got, want)
+	}
+}
+
+// P7: a root-level literal mutation in a spec file must not veto a production
+// caller, and the same mutation in production code must.
+func TestRubyLiteralConstantMutationRespectsTestFiles(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "spec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+	writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`)
+	writeProfileFile(t, filepath.Join(root, "spec", "patch_spec.rb"), "App.const_set(:Service, Fake)\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@4=App.Service.run|ruby_lexical_constant") {
+		t.Fatalf("a spec-only const_set erased the production identity:\n%s", bindings)
+	}
+	writeProfileFile(t, filepath.Join(root, "patch.rb"), "App.const_set(:Service, Fake)\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@4=-|-") {
+		t.Fatalf("a production const_set did not withdraw the identity:\n%s", bindings)
+	}
+	if got, want := rubyBindings(t, s, repo), freshRubyGraph(t, root); got != want {
+		t.Fatalf("incremental:\n%s\nfresh:\n%s", got, want)
+	}
+}
+
+// A patch file holding nothing but `App.const_set(:Service, Other)` declares no
+// symbol at all, so the invalidation has to come from the hazard itself. The
+// reference follows the call in both directions.
+func TestRubyLiteralConstantMutationIncrementalLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+	writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`)
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	patch := filepath.Join(root, "patch.rb")
+	referenceBound := func() bool {
+		t.Helper()
+		var n int
+		if err := s.raw(t).QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM references_tbl
+			WHERE repo_id = ? AND name = 'Service.run' AND symbol_id IS NOT NULL`, repo).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	step := func(name, want string) {
+		t.Helper()
+		if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+			t.Fatalf("%s: update: %v", name, err)
+		}
+		bindings := rubyBindings(t, s, repo)
+		if !strings.Contains(bindings, "Service.run@4="+want) {
+			t.Fatalf("%s:\n%s\nwant Service.run@4=%s", name, bindings, want)
+		}
+		if fresh := freshRubyGraph(t, root); bindings != fresh {
+			t.Fatalf("%s: incremental:\n%s\nfresh:\n%s", name, bindings, fresh)
+		}
+		if got := referenceBound(); got != (want != "-") {
+			t.Fatalf("%s: reference bound = %v, want %v", name, got, want != "-")
+		}
+	}
+	if !referenceBound() {
+		t.Fatal("reference has no destination while the call is bound")
+	}
+	writeProfileFile(t, patch, "App.const_set(:Service, Other)\n")
+	step("mutation added", "-")
+	if err := os.Remove(patch); err != nil {
+		t.Fatal(err)
+	}
+	step("mutation file deleted", "App.Service.run")
+	writeProfileFile(t, patch, "App.const_set(:Service, Other)\n")
+	step("mutation restored", "-")
+	writeProfileFile(t, patch, "App.const_set(name, Other)\n")
+	step("mutation became dynamic", "App.Service.run")
 }
