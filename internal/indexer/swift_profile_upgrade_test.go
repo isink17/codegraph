@@ -5,7 +5,9 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,6 +21,39 @@ import (
 // module and emits the pre-v2 raw call fact. It exists only to prove profile
 // replacement, not to provide a second production parser.
 type swiftV1FixtureAdapter struct{}
+
+// swiftV2FixtureAdapter replays measured BASE v2 facts for the controlled
+// source. It removes only v3 call-shape and member-value facts from current
+// parser output, keeping fixture tied to real Swift syntax.
+type swiftV2FixtureAdapter struct{}
+
+func (swiftV2FixtureAdapter) Language() string     { return "swift" }
+func (swiftV2FixtureAdapter) Extensions() []string { return []string{".swift"} }
+func (swiftV2FixtureAdapter) Supports(path string) bool {
+	return filepath.Ext(path) == ".swift"
+}
+func (swiftV2FixtureAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:swift:v2", EmitsCallEdges: true}
+}
+func (swiftV2FixtureAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	p, err := tsparser.NewSwift().Parse(ctx, path, content)
+	if err != nil {
+		return graph.ParsedFile{}, err
+	}
+	for i := range p.Edges {
+		if marker := strings.Index(p.Edges[i].Evidence, ";trailing_labels="); marker >= 0 {
+			labels := p.Edges[i].Evidence[marker+len(";trailing_labels="):]
+			p.Edges[i].Evidence = p.Edges[i].Evidence[:marker]
+			if p.Edges[i].CallArity != nil {
+				*p.Edges[i].CallArity -= 1 + strings.Count(labels, ",")
+			}
+		}
+	}
+	p.Scope.Imports = slices.DeleteFunc(p.Scope.Imports, func(f graph.ScopeImport) bool {
+		return f.Kind == graph.ScopeImportSwiftMemberValue || f.Kind == graph.ScopeImportSwiftEnumCase
+	})
+	return p, nil
+}
 
 func (swiftV1FixtureAdapter) Language() string     { return "swift" }
 func (swiftV1FixtureAdapter) Extensions() []string { return []string{".swift"} }
@@ -69,7 +104,7 @@ func (swiftV1FixtureAdapter) Parse(_ context.Context, path string, content []byt
 	return p, nil
 }
 
-func TestSwiftV1ToV2UnchangedSourceConverges(t *testing.T) {
+func TestSwiftV1ToV3UnchangedSourceConverges(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	path := filepath.Join(root, "Foo.swift")
@@ -78,6 +113,7 @@ func TestSwiftV1ToV2UnchangedSourceConverges(t *testing.T) {
         static func run() { helper() }
     }
 }
+
 struct Service { init() {} }
 extension Service { func extensionRun() {} }
 func helper() {}
@@ -114,7 +150,7 @@ public struct Visible {}
 	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 || len(summary.ParserProfileLanguages) != 1 || summary.ParserProfileLanguages[0] != "swift" {
 		t.Fatalf("upgrade summary=%+v", summary)
 	}
-	assertSwiftV2Facts(t, legacy, repo, true)
+	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v3")
 
 	fresh := newProfileStore(t)
 	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
@@ -124,6 +160,78 @@ public struct Visible {}
 		t.Fatalf("upgraded facts=%q fresh facts=%q", got, want)
 	}
 	again, err := v2.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update=%+v", again)
+	}
+}
+
+func TestSwiftV2ToV3UnchangedSourceConverges(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	source := `struct Service {
+    let handler: () -> Void, first: () -> Void = {}, second: () -> Void = {}
+    func run() {}
+    func run(_ body: () -> Void) {}
+    func run(id: Int) {}
+    func caller() {
+        self.run()
+        self.run() { work() }
+        self.run(id: 1)
+        self.run(id: 1) { work() }
+    }
+    func work() {}
+}
+enum Events { case build(Int), second(String) }
+	`
+	path := filepath.Join(root, "Service.swift")
+	writeProfileFile(t, path, source)
+	writeProfileFile(t, filepath.Join(root, "Extension.swift"), "extension External { var handler: () -> Void { {} } }\n")
+	legacy := newProfileStore(t)
+	if _, err := New(legacy.Store, parser.NewRegistry(swiftV2FixtureAdapter{}), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, legacy, root)
+	var collision int
+	if err := legacy.raw(t).QueryRowContext(ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND dst_name='self.run' AND evidence='swift:self' AND call_arity=0`, repo).Scan(&collision); err != nil {
+		t.Fatal(err)
+	}
+	if collision != 2 {
+		t.Fatalf("v2 trailing collision=%d, want 2", collision)
+	}
+	var memberFacts int
+	if err := legacy.raw(t).QueryRowContext(ctx, `SELECT COUNT(*) FROM scope_import_evidence WHERE repo_id=? AND import_kind=?`, repo, graph.ScopeImportSwiftMemberValue).Scan(&memberFacts); err != nil {
+		t.Fatal(err)
+	}
+	if memberFacts != 0 {
+		t.Fatalf("v2 member facts=%d, want 0", memberFacts)
+	}
+	var enumFacts int
+	if err := legacy.raw(t).QueryRowContext(ctx, `SELECT COUNT(*) FROM scope_import_evidence WHERE repo_id=? AND import_kind=?`, repo, graph.ScopeImportSwiftEnumCase).Scan(&enumFacts); err != nil {
+		t.Fatal(err)
+	}
+	if enumFacts != 0 {
+		t.Fatalf("v2 enum facts=%d, want 0", enumFacts)
+	}
+	current := New(legacy.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	upgraded, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.FilesChanged != 2 || upgraded.FilesIndexed != 2 || len(upgraded.ParserProfileLanguages) != 1 || upgraded.ParserProfileLanguages[0] != "swift" {
+		t.Fatalf("upgrade summary=%+v", upgraded)
+	}
+	assertSwiftV3Facts(t, legacy, repo)
+	fresh := newProfileStore(t)
+	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := swiftFactDigest(t, legacy, repo), swiftFactDigest(t, fresh, repoID(t, fresh, root)); got != want {
+		t.Fatalf("upgraded facts=%q fresh facts=%q", got, want)
+	}
+	again, err := current.Update(ctx, Options{RepoRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,25 +289,71 @@ struct A {
 	}
 }
 
+func TestSwiftMemberValueLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "Service.swift")
+	writeProfileFile(t, path, "struct Service { var a: () -> Void, b: () -> Void }\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	countFact := func(name string) int {
+		var count int
+		if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM scope_import_evidence WHERE repo_id=? AND import_kind=? AND local_name=?`, repo, graph.ScopeImportSwiftMemberValue, name).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	if countFact("a") != 1 || countFact("b") != 1 {
+		t.Fatalf("initial facts a=%d b=%d", countFact("a"), countFact("b"))
+	}
+	writeProfileFile(t, path, "struct Service { var a: () -> Void, c: () -> Void }\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if countFact("a") != 1 || countFact("b") != 0 || countFact("c") != 1 {
+		t.Fatalf("multi-binding facts a=%d b=%d c=%d", countFact("a"), countFact("b"), countFact("c"))
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if countFact("a") != 0 || countFact("c") != 0 {
+		t.Fatalf("deleted fact remains")
+	}
+	writeProfileFile(t, path, "struct Service { var restored: () -> Void }\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if countFact("restored") != 1 {
+		t.Fatalf("restored fact missing")
+	}
+}
+
 func TestSwiftV2ProfileSafety(t *testing.T) {
 	all := func(string) bool { return true }
-	v2 := parser.Profile{ID: "treesitter:swift:v2", EmitsCallEdges: true}
+	v3 := parser.Profile{ID: "treesitter:swift:v3", EmitsCallEdges: true}
 	fallback := parser.Profile{ID: "heuristic:swift:v1", EmitsCallEdges: false}
-	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: v2.ID, CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": fallback}, all, false); !errors.Is(err, ErrParserDowngradeRefused) {
+	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: v3.ID, CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": fallback}, all, false); !errors.Is(err, ErrParserDowngradeRefused) {
 		t.Fatalf("downgrade error=%v, want refusal", err)
 	}
-	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: "treesitter:swift:v1", CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": v2}, all, true); !errors.Is(err, ErrParserProfileTransitionRequired) {
+	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: "treesitter:swift:v2", CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": v3}, all, true); !errors.Is(err, ErrParserProfileTransitionRequired) {
 		t.Fatalf("path transition error=%v, want refusal", err)
 	}
 }
 
-func assertSwiftV2Facts(t *testing.T, s *profileStore, repo int64, wantV2 bool) {
+func assertSwiftProfileFacts(t *testing.T, s *profileStore, repo int64, wantProfile string) {
 	t.Helper()
 	var profile string
 	if err := s.raw(t).QueryRow(`SELECT parser_profile FROM files WHERE repo_id=? AND is_deleted=0 LIMIT 1`, repo).Scan(&profile); err != nil {
 		t.Fatal(err)
 	}
-	if profile != "treesitter:swift:v2" {
+	if profile != wantProfile {
 		t.Fatalf("profile=%q", profile)
 	}
 	var service, legacy, rawCall int
@@ -213,15 +367,56 @@ func assertSwiftV2Facts(t *testing.T, s *profileStore, repo int64, wantV2 bool) 
 	if err := db.QueryRow(`SELECT COUNT(*) FROM edges WHERE repo_id=? AND dst_name='helper()'`, repo).Scan(&rawCall); err != nil {
 		t.Fatal(err)
 	}
-	if wantV2 && (service != 1 || legacy != 0 || rawCall != 0) {
-		t.Fatalf("v2 facts service=%d legacy=%d raw_call=%d", service, legacy, rawCall)
+	if service != 1 || legacy != 0 || rawCall != 0 {
+		t.Fatalf("profile facts service=%d legacy=%d raw_call=%d", service, legacy, rawCall)
+	}
+}
+
+func assertSwiftV3Facts(t *testing.T, s *profileStore, repo int64) {
+	t.Helper()
+	db := s.raw(t)
+	var profile string
+	if err := db.QueryRow(`SELECT parser_profile FROM files WHERE repo_id=? AND is_deleted=0 LIMIT 1`, repo).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile != "treesitter:swift:v3" {
+		t.Fatalf("profile=%q", profile)
+	}
+	var trailing, members, enumCases int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence LIKE '%trailing_labels=%'`, repo).Scan(&trailing); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scope_import_evidence WHERE repo_id=? AND import_kind=?`, repo, graph.ScopeImportSwiftMemberValue).Scan(&members); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scope_import_evidence WHERE repo_id=? AND import_kind=?`, repo, graph.ScopeImportSwiftEnumCase).Scan(&enumCases); err != nil {
+		t.Fatal(err)
+	}
+	if trailing != 2 || members != 4 || enumCases != 2 {
+		t.Fatalf("v3 trailing=%d member_facts=%d enum_cases=%d", trailing, members, enumCases)
+	}
+	for _, want := range []struct{ kind, owner, name string }{
+		{graph.ScopeImportSwiftMemberValue, "Service", "handler"},
+		{graph.ScopeImportSwiftMemberValue, "Service", "first"},
+		{graph.ScopeImportSwiftMemberValue, "Service", "second"},
+		{graph.ScopeImportSwiftMemberValue, "External", "handler"},
+		{graph.ScopeImportSwiftEnumCase, "Events", "build"},
+		{graph.ScopeImportSwiftEnumCase, "Events", "second"},
+	} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM scope_import_evidence WHERE repo_id=? AND import_kind=? AND owner_module=? AND local_name=?`, repo, want.kind, want.owner, want.name).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("scope fact %+v count=%d", want, count)
+		}
 	}
 }
 
 func swiftFactDigest(t *testing.T, s *profileStore, repo int64) string {
 	t.Helper()
 	db := s.raw(t)
-	rows, err := db.Query(`SELECT 's|'||kind||'|'||name||'|'||qualified_name||'|'||stable_key FROM symbols WHERE repo_id=? UNION ALL SELECT 'e|'||dst_name||'|'||evidence FROM edges WHERE repo_id=? UNION ALL SELECT 'r|'||name||'|'||qualified_name FROM references_tbl WHERE repo_id=? ORDER BY 1`, repo, repo, repo)
+	rows, err := db.Query(`SELECT 's|'||kind||'|'||name||'|'||qualified_name||'|'||stable_key FROM symbols WHERE repo_id=? UNION ALL SELECT 'e|'||dst_name||'|'||evidence||'|'||COALESCE(CAST(call_arity AS TEXT),'') FROM edges WHERE repo_id=? UNION ALL SELECT 'r|'||name||'|'||qualified_name FROM references_tbl WHERE repo_id=? UNION ALL SELECT 'q|'||import_kind||'|'||owner_module||'|'||local_name||'|'||is_static FROM scope_import_evidence WHERE repo_id=? ORDER BY 1`, repo, repo, repo, repo)
 	if err != nil {
 		t.Fatal(err)
 	}

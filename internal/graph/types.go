@@ -205,6 +205,11 @@ const (
 	// exact semantic constant qname whose identity moved, LocalName its last
 	// segment. No destination identity is asserted.
 	ScopeImportRubyConstantIdentityUnknown = "ruby_constant_identity_unknown"
+
+	// ScopeImportSwiftMemberValue records a type-owned Swift property value.
+	// It is negative evidence for a future method resolver, not a destination.
+	ScopeImportSwiftMemberValue = "swift_member_value"
+	ScopeImportSwiftEnumCase    = "swift_enum_case"
 )
 
 type ReExport struct {
