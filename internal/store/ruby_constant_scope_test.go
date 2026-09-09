@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -884,5 +885,228 @@ func TestRubyLexicalConstantBatchBudget(t *testing.T) {
 				t.Fatalf("%s: edge %d = %s, want %s", entry, i, got, want)
 			}
 		}
+	}
+}
+
+// -- P22.48-F1: constant identity reassignment ---------------------------------
+
+func (f *rubyFixture) reassigned(t *testing.T, fileID int64, qname string) {
+	leaf := qname[strings.LastIndexByte(qname, '.')+1:]
+	f.scopeFact(t, fileID, graph.ScopeImportRubyConstantIdentityUnknown, qname, leaf, "", false)
+}
+
+// A `class` declaration proves what a constant denoted, not what it denotes. A
+// syntax-proven reassignment withdraws the identity, and the reassigned
+// constant still OWNS the lexical name -- so the lookup stops there rather than
+// finding an outer constant Ruby would never reach.
+func TestRubyLexicalConstantIdentityReassignment(t *testing.T) {
+	runRubyConstantCases(t, []rubyConstantCase{
+		{
+			// The P22.48-F1 wrong edge: App::Service == Other at runtime.
+			name: "reassigned after declaration",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.reassigned(t, a, "App.Service")
+				f.nested(t, a, "class", "App.Caller", "App")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+		{
+			// A reassigned inner constant still owns the name: no fallback to
+			// the outer App.Service, which Ruby's lookup never reaches.
+			name: "reassigned inner constant does not fall through",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.nested(t, a, "class", "App.Caller", "App")
+				f.nested(t, a, "class", "App.Caller.Service", "App.Caller")
+				f.singleton(t, a, "App.Caller.Service.run", "public")
+				f.reassigned(t, a, "App.Caller.Service")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+		{
+			// A hazard with no declaration at all still owns the name: the
+			// assignment is what put the constant there.
+			name: "reassigned with no declaration owns the name",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.nested(t, a, "class", "App.Caller", "App")
+				f.reassigned(t, a, "App.Caller.Service")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+		{
+			// Ruby reopens modules, so the assignment may sit anywhere.
+			name: "cross-file reassignment",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				b := f.rb(t, "app/b.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.reassigned(t, b, "App.Service")
+				f.nested(t, a, "class", "App.Caller", "App")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+		{
+			// The identity veto runs before method lookup and visibility, so a
+			// perfectly public target does not override it.
+			name: "public target does not override the hazard",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.visibility(t, a, "App.Service", "run", "public")
+				f.reassigned(t, a, "App.Service")
+				f.nested(t, a, "class", "App.Caller", "App")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+		{
+			// The hazard is about one exact qname; a sibling constant of the
+			// same leaf name elsewhere is untouched.
+			name:      "hazard on another owner does not veto",
+			wantQName: "App.Service.run",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.nested(t, a, "type", "Other", "")
+				f.reassigned(t, a, "Other.Service")
+				f.nested(t, a, "class", "App.Caller", "App")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+		{
+			// Ordinary reopening is not a mutation.
+			name:      "same-kind reopenings stay one identity",
+			wantQName: "App.Service.run",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				b := f.rb(t, "app/b.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.nested(t, b, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.nested(t, a, "class", "App.Caller", "App")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+		{
+			// P7: spec code that monkey-patches a production constant must not
+			// erase the production answer.
+			name:      "test-only reassignment does not veto a production caller",
+			wantQName: "App.Service.run",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				spec := f.rb(t, "spec/a_spec.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.reassigned(t, spec, "App.Service")
+				f.nested(t, a, "class", "App.Caller", "App")
+				caller := f.method(t, a, "App.Caller.f", false)
+				return f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1), "Service.run"
+			},
+		},
+	})
+}
+
+// A test caller sees the monkey patch its own suite installed.
+func TestRubyLexicalConstantTestCallerSeesTestReassignment(t *testing.T) {
+	f := newRubyFixture(t)
+	app := f.rb(t, "app/a.rb")
+	spec := f.rb(t, "spec/a_spec.rb")
+	f.nested(t, app, "type", "App", "")
+	f.nested(t, app, "class", "App.Service", "App")
+	f.singleton(t, app, "App.Service.run", "public")
+	f.reassigned(t, spec, "App.Service")
+	f.nested(t, app, "class", "App.Caller", "App")
+	f.lexical(t, spec, "App.Caller", "App")
+	specCaller := f.method(t, spec, "App.Caller.g", false)
+	edge := f.call(t, spec, srcOf(specCaller), "Service.run", rubyConstantReceiver, 1)
+	for _, entry := range rubyEntryPoints {
+		f.clearAll(t)
+		f.resolveVia(t, entry, []string{"app/a.rb", "spec/a_spec.rb"}, []string{"Service.run", "run"})
+		if got := f.binding(t, edge); got != "<unresolved>" {
+			t.Fatalf("%s: test caller = %s, want unresolved", entry, got)
+		}
+	}
+}
+
+// A deleted file states nothing, so its reassignment stops vetoing.
+func TestRubyLexicalConstantSoftDeletedReassignment(t *testing.T) {
+	runRubyConstantCases(t, []rubyConstantCase{
+		{
+			name:      "deleted reassignment stops vetoing",
+			wantQName: "App.Service.run",
+			build: func(t *testing.T, f *rubyFixture) (int64, string) {
+				a := f.rb(t, "app/a.rb")
+				stale := f.rb(t, "app/stale.rb")
+				f.nested(t, a, "type", "App", "")
+				f.nested(t, a, "class", "App.Service", "App")
+				f.singleton(t, a, "App.Service.run", "public")
+				f.reassigned(t, stale, "App.Service")
+				f.nested(t, a, "class", "App.Caller", "App")
+				caller := f.method(t, a, "App.Caller.f", false)
+				edge := f.call(t, a, srcOf(caller), "Service.run", rubyConstantReceiver, 1)
+				if _, err := f.store.db.ExecContext(f.ctx,
+					`UPDATE files SET is_deleted = 1 WHERE repo_id = ? AND path = 'app/stale.rb'`, f.repoID); err != nil {
+					t.Fatal(err)
+				}
+				return edge, "Service.run"
+			},
+		},
+	})
+}
+
+// Stage 1's four states, decided from declarations and hazards alone.
+func TestRubyOwnsConstantStates(t *testing.T) {
+	kinds := func(values ...string) map[string]struct{} {
+		s := map[string]struct{}{}
+		for _, v := range values {
+			s[v] = struct{}{}
+		}
+		return s
+	}
+	for name, tc := range map[string]struct {
+		rows rubyConstantRows
+		want rubyConstantState
+	}{
+		"absent":     {rubyConstantRows{anyKinds: kinds(), productionKinds: kinds()}, rubyConstantAbsent},
+		"coherent":   {rubyConstantRows{anyKinds: kinds("class"), productionKinds: kinds("class")}, rubyConstantCoherent},
+		"reopened":   {rubyConstantRows{anyKinds: kinds("class"), productionKinds: kinds("class")}, rubyConstantCoherent},
+		"conflict":   {rubyConstantRows{anyKinds: kinds("class", "type"), productionKinds: kinds("class", "type")}, rubyConstantConflicting},
+		"reassigned": {rubyConstantRows{anyKinds: kinds("class"), productionKinds: kinds("class"), reassignedProduction: true, reassignedAny: true}, rubyConstantIdentityUnknown},
+		// The hazard wins over a conflict: both stop the lookup, and the
+		// reassignment is the more specific truth.
+		"reassigned and conflicting": {rubyConstantRows{anyKinds: kinds("class", "type"), productionKinds: kinds("class", "type"), reassignedProduction: true, reassignedAny: true}, rubyConstantIdentityUnknown},
+		// A hazard with no declaration still owns the name.
+		"reassigned only": {rubyConstantRows{anyKinds: kinds(), productionKinds: kinds(), reassignedProduction: true, reassignedAny: true}, rubyConstantIdentityUnknown},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := rubyOwnsConstant(map[string]rubyConstantRows{"App.Service": tc.rows}, "App.Service", false); got != tc.want {
+				t.Fatalf("state = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

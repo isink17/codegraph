@@ -248,8 +248,16 @@ WHERE p.repo_id=? AND p.language='ruby' AND f.is_deleted=0
 // set rather than a count: two `class App.Service` rows are not an ambiguity,
 // while a `class` row and a `module` row for one name is a contradiction Ruby
 // would raise on and this pass refuses to break.
+//
+// `reassigned` is the P22.48-F1 hazard: syntax proved the constant's identity
+// moved (`Service = Other`, `const_set`, `remove_const`, `autoload`), so the
+// declarations are no longer evidence of what the name denotes. It is tracked
+// per production/test origin like the declarations themselves -- spec code that
+// monkey-patches a constant must not erase the production answer.
 type rubyConstantRows struct {
 	anyKinds, productionKinds map[string]struct{}
+	reassignedAny             bool
+	reassignedProduction      bool
 }
 
 func (r rubyConstantRows) kinds(callerIsTest bool) map[string]struct{} {
@@ -259,11 +267,44 @@ func (r rubyConstantRows) kinds(callerIsTest bool) map[string]struct{} {
 	return r.productionKinds
 }
 
+func (r rubyConstantRows) reassigned(callerIsTest bool) bool {
+	if callerIsTest {
+		return r.reassignedAny
+	}
+	return r.reassignedProduction
+}
+
+// rubyConstantState is stage 1's answer for one lexical level.
+type rubyConstantState int
+
+const (
+	// rubyConstantAbsent: the level does not own the name -- continue outward.
+	rubyConstantAbsent rubyConstantState = iota
+	// rubyConstantCoherent: the level owns the name and it denotes exactly one
+	// semantic class/module -- choose it and stop.
+	rubyConstantCoherent
+	// rubyConstantConflicting: the level owns the name but its declarations
+	// disagree materially (class and module) -- stop, unresolved.
+	rubyConstantConflicting
+	// rubyConstantIdentityUnknown: the level owns the name but syntax proved
+	// the identity was reassigned -- stop, unresolved. A reassigned constant
+	// still OWNS the lexical name, so this must not continue outward: Ruby
+	// would find this level's constant, whatever it now points at.
+	rubyConstantIdentityUnknown
+)
+
 // rubyLoadConstants loads the class/module declarations of exactly the
 // candidate names the lexical chains produced. Deleted files establish nothing.
 func rubyLoadConstants(ctx context.Context, q rubyScopeQuery, repoID int64, qnames []string, testFiles map[int64]struct{}) (map[string]rubyConstantRows, error) {
 	constants := make(map[string]rubyConstantRows, len(qnames))
-	err := sqliteBatchedQuery(ctx, q, `SELECT s.qualified_name,s.kind,s.file_id
+	row := func(qname string) rubyConstantRows {
+		c, found := constants[qname]
+		if !found {
+			c = rubyConstantRows{anyKinds: map[string]struct{}{}, productionKinds: map[string]struct{}{}}
+		}
+		return c
+	}
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.qualified_name,s.kind,s.file_id
 FROM symbols s JOIN files f ON f.id=s.file_id
 WHERE s.repo_id=? AND s.language='ruby' AND s.kind IN ('class','type') AND f.is_deleted=0
   AND s.qualified_name IN (`, "%s)", []any{repoID}, stringSliceToAny(qnames), true,
@@ -273,13 +314,48 @@ WHERE s.repo_id=? AND s.language='ruby' AND s.kind IN ('class','type') AND f.is_
 			if err := rows.Scan(&qname, &kind, &fileID); err != nil {
 				return err
 			}
-			c, found := constants[qname]
-			if !found {
-				c = rubyConstantRows{anyKinds: map[string]struct{}{}, productionKinds: map[string]struct{}{}}
-			}
+			c := row(qname)
 			c.anyKinds[kind] = struct{}{}
 			if _, isTest := testFiles[fileID]; !isTest {
 				c.productionKinds[kind] = struct{}{}
+			}
+			constants[qname] = c
+			return nil
+		}); err != nil {
+		return nil, err
+	}
+	// The identity hazards for the same names, read repository-wide: Ruby
+	// reopens modules, so the reassignment may sit in a file that declares
+	// nothing else about the constant.
+	//
+	// The selection is by last segment, not by owner: `local_name` is indexed
+	// and `owner_module` is not, and the candidate set holds one qname per
+	// lexical level, so an `owner_module IN (...)` predicate would turn into
+	// one table scan per batch. The exact owner is matched in Go instead.
+	wanted := make(map[string]struct{}, len(qnames))
+	leafSet := make(map[string]struct{}, len(qnames))
+	for _, qname := range qnames {
+		wanted[qname] = struct{}{}
+		leafSet[qname[strings.LastIndexByte(qname, '.')+1:]] = struct{}{}
+	}
+	err := sqliteBatchedQuery(ctx, q, `SELECT h.owner_module,h.file_id
+FROM scope_import_evidence h JOIN files f ON f.id=h.file_id
+WHERE h.repo_id=? AND h.language='ruby' AND f.is_deleted=0
+  AND h.import_kind='`+graph.ScopeImportRubyConstantIdentityUnknown+`'
+  AND h.local_name IN (`, "%s)", []any{repoID}, stringSliceToAny(sortedKeys(leafSet)), true,
+		func(rows *sql.Rows) error {
+			var qname string
+			var fileID int64
+			if err := rows.Scan(&qname, &fileID); err != nil {
+				return err
+			}
+			if _, ok := wanted[qname]; !ok {
+				return nil
+			}
+			c := row(qname)
+			c.reassignedAny = true
+			if _, isTest := testFiles[fileID]; !isTest {
+				c.reassignedProduction = true
 			}
 			constants[qname] = c
 			return nil
@@ -287,20 +363,22 @@ WHERE s.repo_id=? AND s.language='ruby' AND s.kind IN ('class','type') AND f.is_
 	return constants, err
 }
 
-// rubyOwnsConstant answers stage 1 for one lexical level: does this level own
-// the name, and is that ownership coherent. The three outcomes are distinct on
-// purpose -- "absent" continues outward, "conflicting" stops the whole lookup,
-// because an outer level cannot be the answer to a name an inner level already
-// claims incoherently.
-func rubyOwnsConstant(constants map[string]rubyConstantRows, qname string, callerIsTest bool) (owns, coherent bool) {
-	kinds := constants[qname].kinds(callerIsTest)
-	switch len(kinds) {
-	case 0:
-		return false, true
-	case 1:
-		return true, true
+// rubyOwnsConstant answers stage 1 for one lexical level. The four outcomes are
+// distinct on purpose: only "absent" continues outward, because an outer level
+// cannot be the answer to a name an inner level already claims -- incoherently,
+// or as something other than its own declaration.
+func rubyOwnsConstant(constants map[string]rubyConstantRows, qname string, callerIsTest bool) rubyConstantState {
+	rows := constants[qname]
+	if rows.reassigned(callerIsTest) {
+		return rubyConstantIdentityUnknown
 	}
-	return true, false
+	switch len(rows.kinds(callerIsTest)) {
+	case 0:
+		return rubyConstantAbsent
+	case 1:
+		return rubyConstantCoherent
+	}
+	return rubyConstantConflicting
 }
 
 // rubySingletonVisibility is every visibility fact recorded for the owners a
@@ -510,11 +588,11 @@ WHERE e.repo_id=? AND f.language='ruby' AND e.edge_kind='`+EdgeKindCalls+`' AND 
 		for id, l := range lookups {
 			_, callerIsTest := testFiles[l.fileID]
 			for _, candidate := range l.candidates {
-				owns, coherent := rubyOwnsConstant(declared, candidate, callerIsTest)
-				if !owns {
+				state := rubyOwnsConstant(declared, candidate, callerIsTest)
+				if state == rubyConstantAbsent {
 					continue
 				}
-				if coherent {
+				if state == rubyConstantCoherent {
 					qname := candidate + "." + l.method
 					wants[id] = want{method: l.method, strategy: ResolutionStrategyRubyLexicalConstant,
 						qname: qname, static: 1, public: true}
@@ -646,11 +724,13 @@ func rubyScopeApply(ctx context.Context, q rubyScopeQuery, res map[int64]rubySco
 // rubyStaleConstantBindings reports the ruby_lexical_constant bindings an
 // incremental save may have invalidated. Those bindings depend on facts that
 // are not the destination's own name: which constant the caller's nesting owns,
-// and whether the owner made the method private somewhere else entirely. Ruby
-// reopens classes, so `private_class_method :run` sits in a body that declares
-// the owner constant -- which puts the owner's own name in the changed-name set
-// even though nothing named `run` moved. Keying on the destination's container
-// and on the caller's container is what turns that into a re-decision.
+// whether that constant's identity was reassigned, and whether the owner made
+// the method private somewhere else entirely. Ruby reopens classes and
+// modules, so `private_class_method :run` or `Service = Other` sits in a body
+// that declares some ANCESTOR of the owner -- a file holding only
+// `module App; Service = Other; end` declares nothing but `App`. Every dotted
+// segment of the destination's and the caller's container therefore counts, not
+// just the last one.
 //
 // Over-approximating costs one re-decision that reaches the same answer;
 // under-approximating leaves a binding asserting a call that now raises.
@@ -666,11 +746,13 @@ func (s *Store) rubyStaleConstantBindings(ctx context.Context, repoID int64, wan
 		repoID).Scan(&hasRuby); err != nil || !hasRuby {
 		return nil, err
 	}
-	lastSegment := func(qname string) string {
-		if dot := strings.LastIndexByte(qname, '.'); dot >= 0 {
-			return qname[dot+1:]
+	namesAnySegment := func(qname string) bool {
+		for _, segment := range strings.Split(qname, ".") {
+			if _, ok := wanted[segment]; ok {
+				return true
+			}
 		}
-		return qname
+		return false
 	}
 	var stale []int64
 	err := sqliteScanRows(ctx, s.db, `
@@ -686,9 +768,7 @@ func (s *Store) rubyStaleConstantBindings(ctx context.Context, repoID int64, wan
 				return err
 			}
 			_, byMethod := wanted[name]
-			_, byOwner := wanted[lastSegment(container)]
-			_, bySource := wanted[lastSegment(srcContainer)]
-			if byMethod || byOwner || bySource {
+			if byMethod || namesAnySegment(container) || namesAnySegment(srcContainer) {
 				stale = append(stale, id)
 			}
 			return nil

@@ -28,6 +28,11 @@ func (a *RubyAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	p := graph.ParsedFile{Language: "ruby", FileTokens: computeFileTokens(content)}
 	rubyExtractImports(root, content, &p)
 	rubyExtractSymbols(root, "", content, &p)
+	// Root-level statements are their own lexical owner. A bare `Service = X`
+	// there names a root constant, which is never a single-segment candidate
+	// and records nothing; a qualified `App::Service = X` is absolute and names
+	// its constant exactly.
+	rubyScanConstantAssignments(root, "", content, &p)
 	rubyExtractCalls(root, content, &p)
 	rubyLinkTests(&p)
 	return p, nil
@@ -220,22 +225,35 @@ func rubySymbolArguments(args *sitter.Node, content []byte) []string {
 	}
 	names := make([]string, 0, args.NamedChildCount())
 	for i := range int(args.NamedChildCount()) {
-		arg := args.NamedChild(i)
-		text := nodeText(arg, content)
-		switch arg.Type() {
-		case "simple_symbol":
-			text = strings.TrimPrefix(text, ":")
-		case "string":
-			text = strings.Trim(text, `"'`)
-		default:
+		name, ok := rubyLiteralName(args.NamedChild(i), content)
+		if !ok {
 			return nil
 		}
-		if text == "" || strings.ContainsAny(text, " \t\n#{}:.'\"") {
-			return nil
-		}
-		names = append(names, text)
+		names = append(names, name)
 	}
 	return names
+}
+
+// rubyLiteralName decodes one argument node as a literal method or constant
+// name, or reports ok=false when it is a splat, a variable, an inline `def`, an
+// interpolated string, or anything else whose value is not in the source.
+func rubyLiteralName(arg *sitter.Node, content []byte) (string, bool) {
+	if arg == nil {
+		return "", false
+	}
+	text := nodeText(arg, content)
+	switch arg.Type() {
+	case "simple_symbol":
+		text = strings.TrimPrefix(text, ":")
+	case "string":
+		text = strings.Trim(text, `"'`)
+	default:
+		return "", false
+	}
+	if text == "" || strings.ContainsAny(text, " \t\n#{}:.'\"") {
+		return "", false
+	}
+	return text, true
 }
 
 func rubyAddType(node *sitter.Node, kind, parent string, content []byte, pf *graph.ParsedFile) {
@@ -453,4 +471,160 @@ func rubyLinkTests(pf *graph.ParsedFile) {
 			Reason: "test_name_match", Score: 0.7, TestSymbolKey: sym.StableKey,
 			TargetStableKey: "func:ruby:top:instance:" + target, TestSymbolIndex: intRef(i)})
 	}
+}
+
+// rubyScanConstantAssignments records every syntax-proven constant identity
+// mutation inside one lexical owner's body, walking the whole file from the
+// root so that a class or module nested under control flow is reached too --
+// the symbol walk only inspects direct children, so it would miss one.
+//
+// A `class`/`module` declaration proves what a constant denoted at that point,
+// not what it denotes: `Service = Other` rebinds `App::Service` to another
+// object, so `Service.run` calls `Other.run` and the declaration's own
+// singleton method is not the target. There is no load order here to say which
+// assignment or declaration wins, so the constant's identity is simply
+// unprovable and every constant-receiver call through it fails closed.
+//
+// Everything that is not an owner boundary is descended into, so an assignment
+// under any control-flow shape the grammar spells -- `if`, `unless`, a
+// modifier, `begin`/`rescue`, a block, a lambda -- still counts against the
+// owner whose body it sits in. That is the safe default: an unrecognised
+// wrapper produces a hazard rather than silence.
+func rubyScanConstantAssignments(node *sitter.Node, container string, content []byte, pf *graph.ParsedFile) {
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		switch child.Type() {
+		case "class", "module":
+			if nested, ok := rubyNestedOwner(child, container, content); ok {
+				if body := childByFieldName(child, "body"); body != nil {
+					rubyScanConstantAssignments(body, nested, content, pf)
+				}
+			}
+			continue
+		case "singleton_class":
+			// A different cref: a constant assigned here lands on the
+			// singleton class, and the container's own constants are untouched.
+			continue
+		case "method", "singleton_method":
+			// Ruby raises SyntaxError for a constant assignment inside a
+			// method, but tree-sitter parses it cleanly, so the walk has to
+			// refuse it rather than rely on a parse error.
+			continue
+		case "assignment", "operator_assignment":
+			rubyConstantAssignmentTargets(childByFieldName(child, "left"), container, content, pf)
+		case "call":
+			rubyConstantIdentityCall(child, container, content, pf)
+		}
+		rubyScanConstantAssignments(child, container, content, pf)
+	}
+}
+
+// rubyNestedOwner is the semantic qname a nested `class`/`module` body owns. A
+// relative qualified opening (`class A::B` inside another scope) names a target
+// this parser cannot resolve, exactly as rubyAddType refuses to declare one, so
+// its body is not attributed to anything.
+func rubyNestedOwner(node *sitter.Node, container string, content []byte) (string, bool) {
+	nameNode := childByFieldName(node, "name")
+	name, ok := rubySemanticConstantQName(nameNode, content)
+	if !ok {
+		return "", false
+	}
+	if nameNode.Type() == "constant" {
+		return rubyJoinQName(container, name), true
+	}
+	return name, container == ""
+}
+
+// rubyConstantAssignmentTargets turns one assignment's left-hand side into the
+// exact semantic constant qnames whose identity it moves. A non-constant target
+// (`local`, `@ivar`, `$global`, an element reference) moves no constant.
+func rubyConstantAssignmentTargets(left *sitter.Node, container string, content []byte, pf *graph.ParsedFile) {
+	if left == nil {
+		return
+	}
+	switch left.Type() {
+	case "left_assignment_list", "rest_assignment", "destructured_left_assignment":
+		for i := range int(left.NamedChildCount()) {
+			rubyConstantAssignmentTargets(left.NamedChild(i), container, content, pf)
+		}
+	case "constant":
+		rubyAddConstantIdentityHazard(rubyJoinQName(container, nodeText(left, content)), pf)
+	case "scope_resolution":
+		path, ok := rubySemanticConstantQName(left, content)
+		if !ok {
+			return
+		}
+		// An absolute path names its constant outright. A relative one names it
+		// through whatever its FIRST segment resolves to, and that lookup is
+		// exactly the multi-segment constant resolution this phase does not
+		// model. Neither reading is proven, so both are recorded: an
+		// `App::Service = Other` written inside some wrapper class means
+		// `::App::Service` far more often than `Wrapper::App::Service`, and
+		// missing that is the very wrong edge this slice exists to remove.
+		// Two hazard rows cost nothing and can only withhold edges.
+		if container == "" || strings.HasPrefix(strings.TrimSpace(nodeText(left, content)), "::") {
+			rubyAddConstantIdentityHazard(path, pf)
+			return
+		}
+		rubyAddConstantIdentityHazard(rubyJoinQName(container, path), pf)
+		rubyAddConstantIdentityHazard(path, pf)
+	}
+}
+
+// rubyConstantIdentityAPIs move a constant's identity without an assignment
+// operator. `autoload` is one of them: it makes a constant appear from a file
+// this graph cannot connect to the name, so a declaration of the same qname is
+// no longer proof of what the name denotes.
+var rubyConstantIdentityAPIs = map[string]bool{
+	"const_set": true, "remove_const": true, "autoload": true,
+}
+
+// rubyConstantIdentityCall records the hazard for the literal-name forms of
+// those APIs. A dynamic name (`const_set(name, x)`) or a receiver other than a
+// literal `self` names a constant this parser cannot identify; guessing one
+// would be worse than the gap, so those are deliberately not modelled --
+// alongside `eval`, `class_eval`, arbitrary `send` and runtime load order.
+func rubyConstantIdentityCall(call *sitter.Node, container string, content []byte, pf *graph.ParsedFile) {
+	if container == "" {
+		return
+	}
+	if receiver := childByFieldName(call, "receiver"); receiver != nil && nodeText(receiver, content) != "self" {
+		return
+	}
+	if !rubyConstantIdentityAPIs[nodeText(childByFieldName(call, "method"), content)] {
+		return
+	}
+	if name, ok := rubyFirstSymbolArgument(childByFieldName(call, "arguments"), content); ok {
+		rubyAddConstantIdentityHazard(rubyJoinQName(container, name), pf)
+	}
+}
+
+// rubyFirstSymbolArgument returns the literal name an argument list names
+// first, or ok=false when that argument is anything else.
+func rubyFirstSymbolArgument(args *sitter.Node, content []byte) (string, bool) {
+	if args == nil || args.NamedChildCount() == 0 {
+		return "", false
+	}
+	names := rubySymbolArguments(args, content)
+	if len(names) > 0 {
+		return names[0], true
+	}
+	// A mixed list (`const_set(:Service, Other)`) is still exact in its first
+	// argument, which is the only one that names the constant.
+	first := args.NamedChild(0)
+	name, ok := rubyLiteralName(first, content)
+	return name, ok
+}
+
+// rubyAddConstantIdentityHazard records one exact semantic constant qname whose
+// identity moved. A root-level constant carries no owner prefix and so can
+// never be a single-segment lexical candidate; recording it would state a fact
+// nothing reads.
+func rubyAddConstantIdentityHazard(qname string, pf *graph.ParsedFile) {
+	dot := strings.LastIndexByte(qname, '.')
+	if dot <= 0 || dot+1 >= len(qname) {
+		return
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+		Kind: graph.ScopeImportRubyConstantIdentityUnknown, OwnerModule: qname, LocalName: qname[dot+1:]})
 }

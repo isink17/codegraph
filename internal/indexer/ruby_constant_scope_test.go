@@ -21,7 +21,8 @@ import (
 // parser minus everything P22.48 added. The profile id is not faked on its own
 // -- the singleton visibility facts are removed and every symbol's visibility
 // is cleared back to v3's silence -- so a repository indexed with it really
-// cannot resolve a constant receiver and really cannot know a private one.
+// cannot resolve a constant receiver, really cannot know a private one, and
+// really carries no constant-identity hazard.
 type rubyV3Adapter struct {
 	*tsparser.RubyAdapter
 }
@@ -38,7 +39,9 @@ func (a rubyV3Adapter) Parse(ctx context.Context, path string, content []byte) (
 	kept := pf.Scope.Imports[:0]
 	for _, fact := range pf.Scope.Imports {
 		switch fact.Kind {
-		case graph.ScopeImportRubySingletonVisibility, graph.ScopeImportRubySingletonVisibilityUnknown:
+		case graph.ScopeImportRubySingletonVisibility,
+			graph.ScopeImportRubySingletonVisibilityUnknown,
+			graph.ScopeImportRubyConstantIdentityUnknown:
 			continue
 		}
 		kept = append(kept, fact)
@@ -89,8 +92,9 @@ func rubyVisibilityFactRows(t *testing.T, s *profileStore, repo int64) string {
 	rows, err := s.raw(t).QueryContext(context.Background(), `
 		SELECT import_kind, owner_module, local_name, source_specifier
 		FROM scope_import_evidence WHERE repo_id = ? AND language = 'ruby'
-		  AND import_kind IN (?, ?)`,
-		repo, graph.ScopeImportRubySingletonVisibility, graph.ScopeImportRubySingletonVisibilityUnknown)
+		  AND import_kind IN (?, ?, ?)`,
+		repo, graph.ScopeImportRubySingletonVisibility, graph.ScopeImportRubySingletonVisibilityUnknown,
+		graph.ScopeImportRubyConstantIdentityUnknown)
 	if err != nil {
 		t.Fatalf("read visibility facts: %v", err)
 	}
@@ -605,6 +609,444 @@ end
 			want := "Service.run@4=" + tc.want
 			if !strings.Contains(bindings, want) {
 				t.Fatalf("%s:\n%s\nwant %s", name, bindings, want)
+			}
+		})
+	}
+}
+
+// -- P22.48-F1: constant identity reassignment ---------------------------------
+
+// The P22.48-F1 wrong edge, end to end. Ruby binds `App::Service` to `Other`,
+// so `App::Caller.new.f` returns `Other.run` -- the declaration's own singleton
+// method is not the target, and no target this graph can prove is.
+const rubyConstantReassignedSource = `class Other
+  def self.run
+    :other
+  end
+end
+
+module App
+  class Service
+    def self.run
+      :service
+    end
+  end
+
+  Service = Other
+
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`
+
+func TestRubyConstantReassignmentFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "app.rb"), rubyConstantReassignedSource)
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	bindings := rubyBindings(t, s, repo)
+	if !strings.Contains(bindings, "Service.run@18=-|-") {
+		t.Fatalf("a reassigned constant still bound its declaration:\n%s", bindings)
+	}
+	want := graph.ScopeImportRubyConstantIdentityUnknown + "|App.Service|Service|"
+	if got := rubyVisibilityFactRows(t, s, repo); !strings.Contains(got, want) {
+		t.Fatalf("facts = %q, want one containing %q", got, want)
+	}
+}
+
+// The shapes that matter end to end: a reassignment withdraws the identity
+// wherever it sits, and nothing that leaves the identity alone does.
+func TestRubyConstantIdentityEndToEnd(t *testing.T) {
+	caller := `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`
+	for name, tc := range map[string]struct {
+		target string
+		want   string
+	}{
+		"declaration only": {
+			"module App\n  class Service\n    def self.run; end\n  end\nend\n", "App.Service.run"},
+		"reassigned after declaration": {
+			"module App\n  class Service\n    def self.run; end\n  end\n  Service = Other\nend\n", "-"},
+		"reassigned before declaration": {
+			"module App\n  Service = Other\n  class Service\n    def self.run; end\n  end\nend\n", "-"},
+		"reassigned under a conditional": {
+			"module App\n  class Service\n    def self.run; end\n  end\n  if cond\n    Service = Other\n  end\nend\n", "-"},
+		"const_set": {
+			"module App\n  class Service\n    def self.run; end\n  end\n  const_set(:Service, Other)\nend\n", "-"},
+		"remove_const": {
+			"module App\n  class Service\n    def self.run; end\n  end\n  remove_const(:Service)\nend\n", "-"},
+		// A reassignment inside the class's own body targets a constant nested
+		// under it, not the class constant itself.
+		"assignment inside the class body": {
+			"module App\n  class Service\n    Inner = Other\n    def self.run; end\n  end\nend\n", "App.Service.run"},
+		// Ruby raises SyntaxError for a constant assignment in a method, so it
+		// is not evidence even though tree-sitter parses it.
+		"assignment inside a method": {
+			"module App\n  class Service\n    def self.run; end\n  end\n  class Boot\n    def go\n      Service = Other\n    end\n  end\nend\n", "App.Service.run"},
+		// The eigenclass is a different cref.
+		"assignment inside class << self": {
+			"module App\n  class Service\n    def self.run; end\n  end\n  class << self\n    Service = Other\n  end\nend\n", "App.Service.run"},
+		"local variable of the same name": {
+			"module App\n  class Service\n    def self.run; end\n  end\n  service = Other\nend\n", "App.Service.run"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			writeProfileFile(t, filepath.Join(root, "caller.rb"), caller)
+			writeProfileFile(t, filepath.Join(root, "target.rb"), tc.target)
+			s := newProfileStore(t)
+			if _, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+				t.Fatalf("index: %v", err)
+			}
+			bindings := rubyBindings(t, s, repoID(t, s, root))
+			if !strings.Contains(bindings, "Service.run@4="+tc.want) {
+				t.Fatalf("%s:\n%s\nwant Service.run@4=%s", name, bindings, tc.want)
+			}
+		})
+	}
+}
+
+// A production caller keeps its production constant identity when only spec
+// code reassigns it, and loses it when production code does.
+func TestRubyConstantIdentityRespectsTestFiles(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "spec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+	writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`)
+	writeProfileFile(t, filepath.Join(root, "spec", "patch_spec.rb"), "module App\n  Service = Fake\nend\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@4=App.Service.run|ruby_lexical_constant") {
+		t.Fatalf("spec-only reassignment erased the production identity:\n%s", bindings)
+	}
+	// The same reassignment in production code does withdraw it.
+	writeProfileFile(t, filepath.Join(root, "patch.rb"), "module App\n  Service = Fake\nend\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@4=-|-") {
+		t.Fatalf("production reassignment did not withdraw the identity:\n%s", bindings)
+	}
+	if got, want := rubyBindings(t, s, repo), freshRubyGraph(t, root); got != want {
+		t.Fatalf("incremental:\n%s\nfresh:\n%s", got, want)
+	}
+}
+
+// Scope evidence can change with no destination method and no caller edit at
+// all: a new file holding only `module App; Service = Other; end` declares
+// nothing named `Service` or `run`. The bind must still be re-decided, and come
+// back when the reassignment is removed and when its file is deleted outright.
+func TestRubyConstantIdentityIncrementalHazardLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+	writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`)
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	patch := filepath.Join(root, "patch.rb")
+	step := func(name, want string) {
+		t.Helper()
+		if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+			t.Fatalf("%s: update: %v", name, err)
+		}
+		bindings := rubyBindings(t, s, repo)
+		if !strings.Contains(bindings, "Service.run@4="+want) {
+			t.Fatalf("%s:\n%s\nwant Service.run@4=%s", name, bindings, want)
+		}
+		if fresh := freshRubyGraph(t, root); bindings != fresh {
+			t.Fatalf("%s: incremental:\n%s\nfresh:\n%s", name, bindings, fresh)
+		}
+	}
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@4=App.Service.run|ruby_lexical_constant") {
+		t.Fatalf("initial bind missing:\n%s", bindings)
+	}
+	// Add the hazard in a file that names neither the constant nor the method.
+	writeProfileFile(t, patch, "module App\n  Service = Other\nend\n")
+	step("hazard added", "-")
+	// Remove the assignment but keep the file: still no symbol named Service.
+	writeProfileFile(t, patch, "module App\n  Unrelated = Other\nend\n")
+	step("hazard removed", "App.Service.run")
+	writeProfileFile(t, patch, "module App\n  Service = Other\nend\n")
+	step("hazard added again", "-")
+	// A pure delete has to reconsider the unresolved call.
+	if err := os.Remove(patch); err != nil {
+		t.Fatal(err)
+	}
+	step("hazard file deleted", "App.Service.run")
+}
+
+// References follow the identity veto exactly as they follow every other one.
+func TestRubyConstantIdentityReferencesFollow(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+	writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`)
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	bound := func() bool {
+		t.Helper()
+		var n int
+		if err := s.raw(t).QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM references_tbl
+			WHERE repo_id = ? AND name = 'Service.run' AND symbol_id IS NOT NULL`, repo).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	if !bound() {
+		t.Fatal("reference has no destination while the call is bound")
+	}
+	writeProfileFile(t, filepath.Join(root, "patch.rb"), "module App\n  Service = Other\nend\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if bound() {
+		t.Fatal("reference kept a destination after the constant identity was withdrawn")
+	}
+	if err := os.Remove(filepath.Join(root, "patch.rb")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !bound() {
+		t.Fatal("reference did not follow the call back")
+	}
+}
+
+// The identity hazard is a v4 parser fact, so a genuine v3 graph carries none
+// and the profile bump alone -- unchanged bytes, no Force, no Paths, every
+// repair pre-marked -- must reparse, produce it, keep the call unresolved, and
+// land on exactly the from-scratch v4 graph.
+func TestRubyProfileV3ToV4RecordsConstantIdentityHazards(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "app.rb")
+	writeProfileFile(t, path, rubyConstantReassignedSource)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(rubyV3Adapter{tsparser.NewRuby()}), nil).
+		Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("v3 index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	if got := rubyVisibilityFactRows(t, s, repo); got != "" {
+		t.Fatalf("v3 fixture already carries P22.48 facts:\n%s", got)
+	}
+	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("v4 update: %v", err)
+	}
+	if summary.FilesChanged != 1 || strings.Join(summary.ParserProfileLanguages, ",") != "ruby" {
+		t.Fatalf("changed=%d languages=%v; the profile bump alone must reparse", summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
+		t.Fatal("the test modified the source file")
+	}
+	if groups := profilesInDB(t, s, repo); len(groups) != 1 || groups[0].Profile != "treesitter:ruby:v4" || !groups[0].CallEdges {
+		t.Fatalf("provenance after upgrade = %#v", groups)
+	}
+	want := graph.ScopeImportRubyConstantIdentityUnknown + "|App.Service|Service|"
+	if got := rubyVisibilityFactRows(t, s, repo); !strings.Contains(got, want) {
+		t.Fatalf("facts after upgrade = %q, want one containing %q", got, want)
+	}
+	bindings := rubyBindings(t, s, repo)
+	if !strings.Contains(bindings, "Service.run@18=-|-") {
+		t.Fatalf("the reassigned constant bound after the upgrade:\n%s", bindings)
+	}
+	if fresh := freshRubyGraph(t, root); bindings != fresh {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch v4 graph:\n%s", bindings, fresh)
+	}
+}
+
+// A reassignment written inside a wrapper class or module, and one inside a
+// class nested under control flow, are the shapes a direct-child walk or a
+// single-reading qname would miss -- and both are the F1 wrong edge.
+func TestRubyConstantIdentityReachesEveryOwnerShape(t *testing.T) {
+	caller := `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`
+	for name, patch := range map[string]string{
+		"qualified target inside a class":  "class Boot\n  App::Service = Other\nend\n",
+		"qualified target inside a module": "module Boot\n  App::Service = Other\nend\n",
+		"absolute target inside a class":   "class Boot\n  ::App::Service = Other\nend\n",
+		"qualified target at root":         "App::Service = Other\n",
+		"reassignment under a conditional": "module App\n  if cond\n    Service = Other\n  end\nend\n",
+		"reassignment inside a block":      "module App\n  [1].each do\n    Service = Other\n  end\nend\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+			writeProfileFile(t, filepath.Join(root, "caller.rb"), caller)
+			writeProfileFile(t, filepath.Join(root, "patch.rb"), patch)
+			s := newProfileStore(t)
+			if _, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+				t.Fatalf("index: %v", err)
+			}
+			if bindings := rubyBindings(t, s, repoID(t, s, root)); !strings.Contains(bindings, "Service.run@4=-|-") {
+				t.Fatalf("%s did not withdraw the identity:\n%s", name, bindings)
+			}
+		})
+	}
+}
+
+// A class nested under control flow is a lexical owner the symbol walk never
+// sees, so an inner reassignment there has to be found by the assignment scan.
+func TestRubyConstantIdentityInsideControlFlowNestedClass(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "service.rb"),
+		"module App\n  module Inner\n    class Service\n      def self.run; end\n    end\n  end\nend\n")
+	writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  module Inner
+    class Caller
+      def f
+        Service.run()
+      end
+    end
+  end
+end
+`)
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@5=App.Inner.Service.run|ruby_lexical_constant") {
+		t.Fatalf("initial bind missing:\n%s", bindings)
+	}
+	writeProfileFile(t, filepath.Join(root, "patch.rb"),
+		"module App\n  if cond\n    module Inner\n      Service = Other\n    end\n  end\nend\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@5=-|-") {
+		t.Fatalf("a reassignment in a control-flow-nested module did not withdraw the identity:\n%s", bindings)
+	}
+	if got, want := rubyBindings(t, s, repo), freshRubyGraph(t, root); got != want {
+		t.Fatalf("incremental:\n%s\nfresh:\n%s", got, want)
+	}
+}
+
+// The invalidation cannot key on declared symbol names alone: a hazard file may
+// declare none at all, or none that shares a segment with the hazard qname.
+func TestRubyConstantIdentityIncrementalWithoutMatchingSymbolNames(t *testing.T) {
+	for name, patch := range map[string]string{
+		"file declares no symbol":      "App::Service = Other\n",
+		"file declares unrelated name": "class Boot\n  App::Service = Other\nend\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			writeProfileFile(t, filepath.Join(root, "service.rb"), "module App\n  class Service\n    def self.run; end\n  end\nend\n")
+			writeProfileFile(t, filepath.Join(root, "caller.rb"), `module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`)
+			s := newProfileStore(t)
+			idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+			if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+				t.Fatalf("index: %v", err)
+			}
+			repo := repoID(t, s, root)
+			if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@4=App.Service.run|ruby_lexical_constant") {
+				t.Fatalf("initial bind missing:\n%s", bindings)
+			}
+			patchPath := filepath.Join(root, "patch.rb")
+			writeProfileFile(t, patchPath, patch)
+			if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+				t.Fatalf("update: %v", err)
+			}
+			bindings := rubyBindings(t, s, repo)
+			if !strings.Contains(bindings, "Service.run@4=-|-") {
+				t.Fatalf("adding the hazard did not invalidate the bind:\n%s", bindings)
+			}
+			if fresh := freshRubyGraph(t, root); bindings != fresh {
+				t.Fatalf("incremental:\n%s\nfresh:\n%s", bindings, fresh)
+			}
+			if err := os.Remove(patchPath); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+				t.Fatalf("update after removal: %v", err)
+			}
+			bindings = rubyBindings(t, s, repo)
+			if !strings.Contains(bindings, "Service.run@4=App.Service.run|ruby_lexical_constant") {
+				t.Fatalf("removing the hazard did not restore the bind:\n%s", bindings)
+			}
+			if fresh := freshRubyGraph(t, root); bindings != fresh {
+				t.Fatalf("after removal incremental:\n%s\nfresh:\n%s", bindings, fresh)
 			}
 		})
 	}

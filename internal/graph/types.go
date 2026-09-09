@@ -185,6 +185,16 @@ const (
 	// OwnerModule is the semantic owner; nothing else is asserted. It means the
 	// owner's singleton visibility is unknown, not that any method is private.
 	ScopeImportRubySingletonVisibilityUnknown = "ruby_singleton_visibility_unknown"
+
+	// ScopeImportRubyConstantIdentityUnknown says a constant's identity was
+	// reassigned in a lexical owner this parser proved: `Service = Other`,
+	// `const_set(:Service, X)`, `remove_const(:Service)`, `autoload :Lazy, ...`.
+	// A `class`/`module` declaration is then no longer evidence that the
+	// constant still denotes that declaration -- `App::Service.run` calls
+	// `Other.run` -- so the constant identity is unprovable. OwnerModule is the
+	// exact semantic constant qname whose identity moved, LocalName its last
+	// segment. No destination identity is asserted.
+	ScopeImportRubyConstantIdentityUnknown = "ruby_constant_identity_unknown"
 )
 
 type ReExport struct {

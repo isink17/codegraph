@@ -703,3 +703,117 @@ end
 		t.Fatalf("lexical parents = %#v, want App.Caller at the root boundary", parents)
 	}
 }
+
+// rubyIdentityHazards renders the constant-identity evidence of one parse.
+func rubyIdentityHazards(p graph.ParsedFile) map[string]bool {
+	got := map[string]bool{}
+	for _, fact := range p.Scope.Imports {
+		if fact.Kind == graph.ScopeImportRubyConstantIdentityUnknown {
+			got[fact.OwnerModule+"|"+fact.LocalName] = true
+		}
+	}
+	return got
+}
+
+// Every syntax shape that moves a constant's identity inside a proven lexical
+// owner records that exact qname. The walk descends through control flow --
+// Ruby's constant scope is the enclosing class/module body, whatever `if`,
+// `begin` or block sits in between.
+func TestRubyConstantIdentityHazardShapes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want []string
+	}{
+		"plain assignment":     {"    Service = Other\n", []string{"App.Service|Service"}},
+		"or assignment":        {"    Service ||= Other\n", []string{"App.Service|Service"}},
+		"and assignment":       {"    Service &&= Other\n", []string{"App.Service|Service"}},
+		"multiple assignment":  {"    Service, Helper = a, b\n", []string{"App.Service|Service", "App.Helper|Helper"}},
+		"conditional":          {"    if cond\n      Service = Other\n    end\n", []string{"App.Service|Service"}},
+		"modifier conditional": {"    Service = Other if cond\n", []string{"App.Service|Service"}},
+		"begin rescue":         {"    begin\n      Service = Other\n    rescue\n    end\n", []string{"App.Service|Service"}},
+		"inside a block":       {"    [1].each do\n      Service = Other\n    end\n", []string{"App.Service|Service"}},
+		"case when":            {"    case x\n    when 1\n      Service = Other\n    end\n", []string{"App.Service|Service"}},
+		"const_set":            {"    const_set(:Service, Other)\n", []string{"App.Service|Service"}},
+		"self const_set":       {"    self.const_set(:Service, Other)\n", []string{"App.Service|Service"}},
+		"remove_const":         {"    remove_const(:Service)\n", []string{"App.Service|Service"}},
+		"autoload":             {"    autoload :Lazy, \"lazy\"\n", []string{"App.Lazy|Lazy"}},
+		"absolute qualified":   {"    ::Root::Service = Other\n", []string{"Root.Service|Service"}},
+		// A relative qualified target names its constant through whatever its
+		// first segment resolves to, which this phase does not model. Neither
+		// reading is proven, so both are recorded: `App::Service = Other`
+		// inside a wrapper almost always means the root `App::Service`, and
+		// only stating the owner-relative reading would miss the wrong edge.
+		"relative qualified": {"    Inner::Service = Other\n",
+			[]string{"App.Inner.Service|Service", "Inner.Service|Service"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := parseRuby(t, "module App\n"+tc.body+"end\n")
+			got := rubyIdentityHazards(p)
+			if len(got) != len(tc.want) {
+				t.Fatalf("hazards = %#v, want %v", got, tc.want)
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Fatalf("missing %s in %#v", w, got)
+				}
+			}
+		})
+	}
+}
+
+// Nothing that does not move a constant's identity records a hazard, and an
+// assignment is attributed to the body it sits in, never to an outer owner.
+func TestRubyConstantIdentityHazardBoundaries(t *testing.T) {
+	for name, tc := range map[string]struct {
+		source string
+		want   []string
+	}{
+		"declaration only":    {"module App\n  class Service\n    def self.run; end\n  end\nend\n", nil},
+		"local, ivar, global": {"module App\n  lower = 1\n  @ivar = 2\n  $glob = 3\n  SOME[:k] = 4\nend\n", nil},
+		// The nested class owns it: App::Inner::Service moved, App::Service did not.
+		"nested class body": {"module App\n  class Inner\n    Service = Other\n  end\nend\n",
+			[]string{"App.Inner.Service|Service"}},
+		"nested module body": {"module App\n  module Inner\n    Service = Other\n  end\nend\n",
+			[]string{"App.Inner.Service|Service"}},
+		// Ruby raises SyntaxError for this, but tree-sitter parses it cleanly,
+		// so the walker has to refuse it rather than trust the parse.
+		"inside a method":    {"module App\n  def f\n    Service = Other\n  end\nend\n", nil},
+		"inside self method": {"module App\n  def self.f\n    Service = Other\n  end\nend\n", nil},
+		// The eigenclass is a different cref: this puts the constant on the
+		// singleton class, and App::Service is untouched.
+		"inside class << self": {"module App\n  class << self\n    Service = Other\n  end\nend\n", nil},
+		// A root-level constant is never a single-segment lexical candidate.
+		"root level": {"Service = Other\n", nil},
+		// A qualified assignment at root names its constant absolutely.
+		"root qualified": {"App::Service = Other\n", []string{"App.Service|Service"}},
+		// Dynamic names are not modelled, and neither is a receiver this parser
+		// has not proven.
+		"dynamic const_set":   {"module App\n  const_set(name, Other)\n  const_set(\"#{p}X\", Other)\nend\n", nil},
+		"foreign const_set":   {"module App\n  Other.const_set(:Service, X)\nend\n", nil},
+		"unrelated api":       {"module App\n  configure(:Service)\nend\n", nil},
+		"qualified open body": {"class App::Caller\n  Service = Other\nend\n", []string{"App.Caller.Service|Service"}},
+		// A relative qualified opening inside another scope names an owner this
+		// parser cannot resolve, so its body is attributed to nothing.
+		"nested qualified open body": {"module App\n  class Deep::Caller\n    Service = Other\n  end\nend\n", nil},
+		// A class nested under control flow is still a lexical owner: the
+		// symbol walk only sees direct children, the assignment scan does not.
+		"class under a conditional": {"module App\n  if cond\n    class Inner\n      Service = Other\n    end\n  end\nend\n",
+			[]string{"App.Inner.Service|Service"}},
+		// The wrong edge the reviewer proved: `App::Service = Other` written
+		// inside any wrapper must still withdraw the root `App::Service`.
+		"qualified target inside a wrapper": {"class Boot\n  App::Service = Other\nend\n",
+			[]string{"Boot.App.Service|Service", "App.Service|Service"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := rubyIdentityHazards(parseRuby(t, tc.source))
+			if len(got) != len(tc.want) {
+				t.Fatalf("hazards = %#v, want %v", got, tc.want)
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Fatalf("missing %s in %#v", w, got)
+				}
+			}
+		})
+	}
+}
