@@ -154,9 +154,70 @@ def run; end
 	}
 }
 
-func TestRubyProfileV4(t *testing.T) {
-	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v4" || !got.EmitsCallEdges {
+func TestRubyProfileV5(t *testing.T) {
+	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v5" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
+	}
+}
+
+func TestRubyConstantFacts(t *testing.T) {
+	const src = `Service = Other
+Object.const_set(:Root, Other)
+Object.private_constant :Root
+Object.public_constant :Root
+Kernel.const_set(:K, Other)
+BasicObject.const_set(:B, Other)
+module App
+  class Service; end
+  private_constant :Service, "Other"
+  public_constant :Service
+  private_constant dynamic_name
+  target.private_constant :Foreign
+  def self.install
+    private_constant :Installed
+  end
+  def install
+    private_constant :Instance
+  end
+  class << self
+    private_constant :Eigen
+  end
+end
+`
+	p, err := NewRuby().Parse(context.Background(), "facts.rb", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, fact := range p.Scope.Imports {
+		got[fact.Kind+"|"+fact.OwnerModule+"|"+fact.LocalName+"|"+fact.SourceSpecifier] = true
+	}
+	for _, want := range []string{
+		"ruby_constant_identity_unknown|Service|Service|",
+		"ruby_constant_identity_unknown|Object.Root|Root|",
+		"ruby_constant_identity_unknown|Root|Root|",
+		"ruby_constant_identity_unknown|Kernel.K|K|",
+		"ruby_constant_identity_unknown|BasicObject.B|B|",
+		"ruby_constant_visibility|App|Service|private",
+		"ruby_constant_visibility|App|Other|private",
+		"ruby_constant_visibility|App|Service|public",
+		"ruby_constant_visibility|Object|Root|private",
+		"ruby_constant_visibility|Object|Root|public",
+		"ruby_constant_visibility|App|Installed|private",
+		"ruby_constant_visibility_unknown|App||",
+	} {
+		if !got[want] {
+			t.Errorf("missing fact %q; got %#v", want, got)
+		}
+	}
+	for _, forbidden := range []string{
+		"ruby_constant_visibility|App|Foreign|private",
+		"ruby_constant_visibility|App|Instance|private",
+		"ruby_constant_visibility|App|Eigen|private",
+	} {
+		if got[forbidden] {
+			t.Errorf("unexpected fact %q", forbidden)
+		}
 	}
 }
 
@@ -796,8 +857,7 @@ func TestRubyConstantIdentityHazardBoundaries(t *testing.T) {
 		// The eigenclass is a different cref: this puts the constant on the
 		// singleton class, and App::Service is untouched.
 		"inside class << self": {"module App\n  class << self\n    Service = Other\n  end\nend\n", nil},
-		// A root-level constant is never a single-segment lexical candidate.
-		"root level": {"Service = Other\n", nil},
+		"root level":           {"Service = Other\n", []string{"Service|Service"}},
 		// A qualified assignment at root names its constant absolutely.
 		"root qualified": {"App::Service = Other\n", []string{"App.Service|Service"}},
 		// Dynamic names are not modelled, and neither is a value receiver.
@@ -1014,18 +1074,22 @@ func TestRubyConstantIdentityReceiverSpellingFences(t *testing.T) {
 		"superclass body":      {"class Foo < Bar\n  App.const_set(:Service, Other)\nend\n", []string{"Foo.App.Service|Service", "App.Service|Service"}},
 		"public_send indirect": {"App.public_send(:const_set, :Service, Other)\n", nil},
 		"send indirect":        {"App.send(:const_set, :Service, Other)\n", nil},
-		// `Object`, `Kernel` and `BasicObject` are ordinary constant receivers:
-		// each names its own constant, and this parser already makes those
-		// qnames lexical candidates for a caller inside them.
-		"Object receiver":      {"Object.const_set(:Service, Other)\n", []string{"Object.Service|Service"}},
-		"Kernel receiver":      {"Kernel.const_set(:Service, Other)\n", []string{"Kernel.Service|Service"}},
-		"BasicObject receiver": {"BasicObject.const_set(:Service, Other)\n", []string{"BasicObject.Service|Service"}},
-		"absolute Kernel":      {"::Kernel.const_set(:Service, Other)\n", []string{"Kernel.Service|Service"}},
-		// The ROOT constant table stays deferred, and that follows from a
-		// single-segment qname being unreachable here rather than from the
-		// receiver: a bare `Service` at the root is not a candidate.
-		"root bare assignment": {"Service = Other\n", nil},
-		"root cref const_set":  {"const_set(:Service, Other)\n", nil},
+		// Object aliases root constants; Kernel and BasicObject do not.
+		"Object receiver":        {"Object.const_set(:Service, Other)\n", []string{"Object.Service|Service", "Service|Service"}},
+		"Object remove_const":    {"Object.remove_const(:Service)\n", []string{"Object.Service|Service", "Service|Service"}},
+		"Object autoload":        {"Object.autoload(:Service, \"service\")\n", []string{"Object.Service|Service", "Service|Service"}},
+		"nested Object":          {"module Boot\n  Object.const_set(:Service, X)\nend\n", []string{"Boot.Object.Service|Service", "Object.Service|Service", "Service|Service"}},
+		"deep Object":            {"module A\n  module B\n    Object.const_set(:Service, X)\n  end\nend\n", []string{"A.B.Object.Service|Service", "A.Object.Service|Service", "Object.Service|Service", "Service|Service"}},
+		"absolute Object":        {"module Boot\n  ::Object.const_set(:Service, X)\nend\n", []string{"Object.Service|Service", "Service|Service"}},
+		"nested Object remove":   {"module Boot\n  Object.remove_const(:Service)\nend\n", []string{"Boot.Object.Service|Service", "Object.Service|Service", "Service|Service"}},
+		"nested Object autoload": {"module Boot\n  Object.autoload(:Service, \"service\")\nend\n", []string{"Boot.Object.Service|Service", "Object.Service|Service", "Service|Service"}},
+		"Kernel receiver":        {"Kernel.const_set(:Service, Other)\n", []string{"Kernel.Service|Service"}},
+		"BasicObject receiver":   {"BasicObject.const_set(:Service, Other)\n", []string{"BasicObject.Service|Service"}},
+		"nested Kernel":          {"module Boot\n  Kernel.const_set(:Service, X)\nend\n", []string{"Boot.Kernel.Service|Service", "Kernel.Service|Service"}},
+		"nested BasicObject":     {"module Boot\n  BasicObject.const_set(:Service, X)\nend\n", []string{"Boot.BasicObject.Service|Service", "BasicObject.Service|Service"}},
+		"absolute Kernel":        {"::Kernel.const_set(:Service, Other)\n", []string{"Kernel.Service|Service"}},
+		"root bare assignment":   {"Service = Other\n", []string{"Service|Service"}},
+		"root cref const_set":    {"const_set(:Service, Other)\n", nil},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := rubyIdentityHazards(parseRuby(t, tc.source))

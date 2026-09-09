@@ -27,6 +27,39 @@ type rubyV3Adapter struct {
 	*tsparser.RubyAdapter
 }
 
+// rubyV4Adapter reproduces genuine treesitter:ruby:v4 output: it keeps
+// P22.48 singleton facts and non-root P22.48 identity hazards, while stripping
+// only P22.50 root identity/alias and constant-visibility facts.
+type rubyV4Adapter struct {
+	*tsparser.RubyAdapter
+}
+
+func (rubyV4Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:ruby:v4", EmitsCallEdges: true}
+}
+
+func (a rubyV4Adapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	p, err := a.RubyAdapter.Parse(ctx, path, content)
+	if err != nil {
+		return p, err
+	}
+	kept := p.Scope.Imports[:0]
+	for _, fact := range p.Scope.Imports {
+		switch fact.Kind {
+		case graph.ScopeImportRubyConstantVisibility,
+			graph.ScopeImportRubyConstantVisibilityUnknown:
+			continue
+		case graph.ScopeImportRubyConstantIdentityUnknown:
+			if !strings.Contains(fact.OwnerModule, ".") {
+				continue
+			}
+		}
+		kept = append(kept, fact)
+	}
+	p.Scope.Imports = kept
+	return p, nil
+}
+
 func (rubyV3Adapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:ruby:v3", EmitsCallEdges: true}
 }
@@ -92,9 +125,10 @@ func rubyVisibilityFactRows(t *testing.T, s *profileStore, repo int64) string {
 	rows, err := s.raw(t).QueryContext(context.Background(), `
 		SELECT import_kind, owner_module, local_name, source_specifier
 		FROM scope_import_evidence WHERE repo_id = ? AND language = 'ruby'
-		  AND import_kind IN (?, ?, ?)`,
+		  AND import_kind IN (?, ?, ?, ?, ?)`,
 		repo, graph.ScopeImportRubySingletonVisibility, graph.ScopeImportRubySingletonVisibilityUnknown,
-		graph.ScopeImportRubyConstantIdentityUnknown)
+		graph.ScopeImportRubyConstantIdentityUnknown, graph.ScopeImportRubyConstantVisibility,
+		graph.ScopeImportRubyConstantVisibilityUnknown)
 	if err != nil {
 		t.Fatalf("read visibility facts: %v", err)
 	}
@@ -219,7 +253,7 @@ func TestRubyProfileV3ToV4ResolvesConstantReceivers(t *testing.T) {
 				t.Fatalf("the test modified the source file")
 			}
 			groups := profilesInDB(t, s, repo)
-			if len(groups) != 1 || groups[0].Profile != "treesitter:ruby:v4" || !groups[0].CallEdges {
+			if len(groups) != 1 || groups[0].Profile != "treesitter:ruby:v5" || !groups[0].CallEdges {
 				t.Fatalf("provenance after upgrade = %#v", groups)
 			}
 
@@ -916,7 +950,7 @@ func rubyProfileV3ToV4Hazard(t *testing.T, source, line string) {
 	if !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
 		t.Fatal("the test modified the source file")
 	}
-	if groups := profilesInDB(t, s, repo); len(groups) != 1 || groups[0].Profile != "treesitter:ruby:v4" || !groups[0].CallEdges {
+	if groups := profilesInDB(t, s, repo); len(groups) != 1 || groups[0].Profile != "treesitter:ruby:v5" || !groups[0].CallEdges {
 		t.Fatalf("provenance after upgrade = %#v", groups)
 	}
 	want := graph.ScopeImportRubyConstantIdentityUnknown + "|App.Service|Service|"
@@ -930,6 +964,106 @@ func rubyProfileV3ToV4Hazard(t *testing.T, source, line string) {
 	if fresh := freshRubyGraph(t, root); bindings != fresh {
 		t.Fatalf("upgraded graph:\n%s\nfrom-scratch v4 graph:\n%s", bindings, fresh)
 	}
+}
+
+func TestRubyProfileV4ToV5ConvergesConstantFacts(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	source := `class Service
+  def self.run; end
+end
+Service = Other
+module App
+  Service = Other
+  class Visible; end
+  private_constant :Visible
+end
+Object.const_set(:Root, Other)
+`
+	writeProfileFile(t, filepath.Join(root, "app.rb"), source)
+	s := newProfileStore(t)
+	old := New(s.Store, parser.NewRegistry(rubyV4Adapter{tsparser.NewRuby()}), nil)
+	if _, err := old.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	v4Facts := rubyVisibilityFactRows(t, s, repo)
+	if !strings.Contains(v4Facts, "ruby_constant_identity_unknown|App.Service|Service|") ||
+		!strings.Contains(v4Facts, "ruby_constant_identity_unknown|Object.Root|Root|") ||
+		strings.Contains(v4Facts, "ruby_constant_identity_unknown|Service|Service|") ||
+		strings.Contains(v4Facts, "ruby_constant_identity_unknown|Root|Root|") ||
+		strings.Contains(v4Facts, "ruby_constant_visibility") {
+		t.Fatalf("genuine v4 facts = %q", v4Facts)
+	}
+	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 || strings.Join(summary.ParserProfileLanguages, ",") != "ruby" {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if got := rubyVisibilityFactRows(t, s, repo); !strings.Contains(got, "ruby_constant_identity_unknown|App.Service|Service|") || !strings.Contains(got, "ruby_constant_identity_unknown|Object.Root|Root|") || !strings.Contains(got, "ruby_constant_identity_unknown|Service|Service|") || !strings.Contains(got, "ruby_constant_identity_unknown|Root|Root|") || !strings.Contains(got, "ruby_constant_visibility|App|Visible|private") {
+		t.Fatalf("v5 facts = %q", got)
+	}
+	fresh := newProfileStore(t)
+	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rubyVisibilityFactRows(t, s, repo), rubyVisibilityFactRows(t, fresh, repoID(t, fresh, root)); got != want {
+		t.Fatalf("upgraded facts:\n%s\nfresh facts:\n%s", got, want)
+	}
+	again, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update = %+v", again)
+	}
+}
+
+func TestRubyNestedObjectAliasFactLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	patch := filepath.Join(root, "patch.rb")
+	writeProfileFile(t, patch, "module Boot\n  Object.const_set(:Service, Other)\nend\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	hasRootFact := func(want bool) {
+		t.Helper()
+		var n int
+		if err := s.raw(t).QueryRowContext(ctx, `SELECT COUNT(*) FROM scope_import_evidence e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.path='patch.rb' AND f.is_deleted=0 AND e.import_kind=? AND e.owner_module='Service' AND e.local_name='Service'`, repo, graph.ScopeImportRubyConstantIdentityUnknown).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if (n > 0) != want {
+			t.Fatalf("root alias fact count=%d, want present=%v", n, want)
+		}
+	}
+	hasRootFact(true)
+	writeProfileFile(t, patch, "module Boot\n  Object.const_set(name, Other)\nend\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	hasRootFact(false)
+	if err := os.Remove(patch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	hasRootFact(false)
+	writeProfileFile(t, patch, "module Boot\n  Object.const_set(:Service, Other)\nend\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	hasRootFact(true)
 }
 
 // A reassignment written inside a wrapper class or module, and one inside a

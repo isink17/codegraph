@@ -22,7 +22,7 @@ func (a *CSharpAdapter) Profile() parser.Profile {
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
 func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") }
 
-// Ruby v4 adds P22.48 singleton visibility: `def self.run` and a `class <<
+// Ruby v5 adds constant identity and visibility facts. Ruby v4 adds P22.48 singleton visibility: `def self.run` and a `class <<
 // self` body under the default state are stated public, a bare `private` /
 // `protected` inside `class << self` is carried on the method symbol, and
 // `private_class_method` / `public_class_method` / a named `private` inside
@@ -42,7 +42,7 @@ func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") 
 // otherwise a repository indexed under v2 would keep edges this parser refuses
 // to emit and never reparse.
 func (a *RubyAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:ruby:v4", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:ruby:v5", EmitsCallEdges: true}
 }
 func (a *SwiftAdapter) Profile() parser.Profile { return tsProfile("swift") }
 func (a *PHPAdapter) Profile() parser.Profile {

@@ -28,10 +28,8 @@ func (a *RubyAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	p := graph.ParsedFile{Language: "ruby", FileTokens: computeFileTokens(content)}
 	rubyExtractImports(root, content, &p)
 	rubyExtractSymbols(root, "", content, &p)
-	// Root-level statements are their own lexical owner. A bare `Service = X`
-	// there names a root constant, which is never a single-segment candidate
-	// and records nothing; a qualified `App::Service = X` is absolute and names
-	// its constant exactly.
+	// Root-level statements are their own lexical owner. Root identity is
+	// retained because Object's constant table aliases the root namespace.
 	rubyScanConstantAssignments(root, rubyConstantScope{cref: true}, content, &p)
 	rubyExtractCalls(root, content, &p)
 	rubyLinkTests(&p)
@@ -557,6 +555,7 @@ func rubyScanConstantAssignments(node *sitter.Node, scope rubyConstantScope, con
 			}
 		case "call":
 			rubyConstantIdentityCall(child, scope, content, pf)
+			rubyConstantVisibilityCall(child, scope, content, pf)
 		}
 		rubyScanConstantAssignments(child, inner, content, pf)
 	}
@@ -712,14 +711,89 @@ func rubyConstantIdentityCall(call *sitter.Node, scope rubyConstantScope, conten
 		// instance method `self` is an instance and has no const_set at all,
 		// and directly inside `class << self` the target is the singleton
 		// class, not the container.
-		if scope.cref {
+		if scope.cref && scope.owner() != "" {
 			rubyAddConstantIdentityHazard(rubyJoinQName(scope.owner(), name), pf)
 		}
 	case absolute:
 		rubyAddConstantIdentityHazard(rubyJoinQName(path, name), pf)
+		if path == "Object" {
+			rubyAddConstantIdentityHazard(name, pf)
+		}
 	default:
 		rubyRelativeConstantHazards(scope.chain, rubyJoinQName(path, name), pf)
+		if path == "Object" {
+			rubyAddConstantIdentityHazard(name, pf)
+		}
 	}
+}
+
+var rubyConstantVisibilityAPIs = map[string]string{
+	"private_constant": "private",
+	"public_constant":  "public",
+}
+
+func rubyConstantVisibilityCall(call *sitter.Node, scope rubyConstantScope, content []byte, pf *graph.ParsedFile) {
+	specifier, recognized := rubyConstantVisibilityAPIs[nodeText(childByFieldName(call, "method"), content)]
+	if !recognized {
+		return
+	}
+	path, absolute, cref, ok := rubyConstantReceiverPath(call, content)
+	if !ok {
+		return
+	}
+	owners := make([]string, 0, len(scope.chain)+1)
+	if cref {
+		if scope.cref && scope.owner() != "" {
+			owners = append(owners, scope.owner())
+		}
+	} else if path == "Object" && (absolute || len(scope.chain) == 0) {
+		owners = append(owners, "Object")
+	} else if absolute {
+		owners = append(owners, path)
+	} else {
+		for _, level := range scope.chain {
+			owners = append(owners, rubyJoinQName(level, path))
+		}
+		owners = append(owners, path)
+	}
+	if len(owners) == 0 {
+		return
+	}
+	args := childByFieldName(call, "arguments")
+	names := rubySymbolArguments(args, content)
+	if len(names) == 0 {
+		for _, owner := range owners {
+			rubyAddConstantVisibilityUnknown(owner, pf)
+		}
+		return
+	}
+	for _, owner := range owners {
+		for _, name := range names {
+			rubyAddConstantVisibility(owner, name, specifier, pf)
+		}
+	}
+}
+
+func rubyAddConstantVisibility(owner, name, specifier string, pf *graph.ParsedFile) {
+	for _, fact := range pf.Scope.Imports {
+		if fact.Kind == graph.ScopeImportRubyConstantVisibility && fact.OwnerModule == owner &&
+			fact.LocalName == name && fact.SourceSpecifier == specifier {
+			return
+		}
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+		Kind: graph.ScopeImportRubyConstantVisibility, OwnerModule: owner,
+		LocalName: name, SourceSpecifier: specifier, Static: true})
+}
+
+func rubyAddConstantVisibilityUnknown(owner string, pf *graph.ParsedFile) {
+	for _, fact := range pf.Scope.Imports {
+		if fact.Kind == graph.ScopeImportRubyConstantVisibilityUnknown && fact.OwnerModule == owner {
+			return
+		}
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+		Kind: graph.ScopeImportRubyConstantVisibilityUnknown, OwnerModule: owner, Static: true})
 }
 
 // rubyFirstSymbolArgument returns the literal name an argument list names
@@ -740,12 +814,11 @@ func rubyFirstSymbolArgument(args *sitter.Node, content []byte) (string, bool) {
 }
 
 // rubyAddConstantIdentityHazard records one exact semantic constant qname whose
-// identity moved. A root-level constant carries no owner prefix and so can
-// never be a single-segment lexical candidate; recording it would state a fact
-// nothing reads.
+// identity moved. Root constants use their own qname as OwnerModule and
+// LocalName because Object aliases the root constant table.
 func rubyAddConstantIdentityHazard(qname string, pf *graph.ParsedFile) {
 	dot := strings.LastIndexByte(qname, '.')
-	if dot <= 0 || dot+1 >= len(qname) {
+	if qname == "" || dot+1 >= len(qname) {
 		return
 	}
 	// One row per constant per file: the fact is that the identity is
