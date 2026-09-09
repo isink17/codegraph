@@ -169,6 +169,22 @@ const (
 	// graph holds, so it is not a reason to refuse every other strategy.
 	ScopeImportNestedDeclaration = "nested_decl"
 	ScopeImportRubyLexicalParent = "ruby_lexical_parent"
+
+	// ScopeImportRubySingletonVisibility is a syntax-proven visibility override
+	// for one singleton method, spelled by literal name: `private_class_method
+	// :run` in a class/module body, or `private :run` inside `class << self`.
+	// OwnerModule is the semantic owner's qualified name, LocalName the method
+	// name, SourceSpecifier one of public/private/protected, Static always
+	// true. Ruby reopens classes, so an override may live in a file other than
+	// the definition's; a consumer has to read them repo-wide per owner.
+	ScopeImportRubySingletonVisibility = "ruby_singleton_visibility"
+
+	// ScopeImportRubySingletonVisibilityUnknown is an owner-level hazard: a
+	// visibility or module-singleton operation was recognised but its targets
+	// are not literal names (`private_class_method *names`, `module_function`).
+	// OwnerModule is the semantic owner; nothing else is asserted. It means the
+	// owner's singleton visibility is unknown, not that any method is private.
+	ScopeImportRubySingletonVisibilityUnknown = "ruby_singleton_visibility_unknown"
 )
 
 type ReExport struct {

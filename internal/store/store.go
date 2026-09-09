@@ -4697,6 +4697,15 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err != nil {
 		return 0, err
 	}
+	// Same argument for Ruby: a lexical constant becomes bindable again through
+	// a removal that names nothing the receiver spelling carries -- a deleted
+	// reopening that held `private_class_method :run`, a deleted duplicate
+	// declaration, a deleted shadowing constant. Nothing else reconsiders an
+	// unresolved Ruby call after a pure delete.
+	rubyResolved, err := resolveRubyScope(ctx, tx, repoID, nil)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
@@ -4711,12 +4720,12 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err != nil {
 		return 0, err
 	}
-	n += csharpResolved + phpResolved
+	n += csharpResolved + phpResolved + rubyResolved
 	for _, table := range []string{
 		resolverAmbiguousNamesTable, resolverTestFilesTable,
 		resolverImportScopeTable, resolverCppNamespaceScopesTable,
 		"tmp_resolver_own_module_veto", "tmp_resolver_own_module_targets",
-		"tmp_resolver_own_module_resolution",
+		"tmp_resolver_own_module_resolution", rubyScopeResolution,
 	} {
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+table); err != nil {
 			return 0, err
@@ -4843,6 +4852,15 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	for _, id := range phpStale {
 		legacyStale[id] = struct{}{}
 	}
+	// Ruby constant bindings depend on the owner's visibility facts and on the
+	// caller's lexical nesting, neither of which is the destination's own name.
+	rubyStale, err := s.rubyStaleConstantBindings(ctx, repoID, wanted)
+	if err != nil {
+		return 0, err
+	}
+	for _, id := range rubyStale {
+		legacyStale[id] = struct{}{}
+	}
 	if err := sqliteBatchedQuery(ctx, s.db, `
 		SELECT id FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
@@ -4937,16 +4955,18 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	if err := rows.Close(); err != nil {
 		return 0, err
 	}
-	// `self::run` is the one bound spelling with a tail but no dot, so the
-	// partial index migration 028 built for the scan above (which requires
-	// instr(dst_name, '.') > 0) does not cover it. Widening that predicate with
-	// an OR would disable the index for every language on every incremental
-	// update; this second selection stays bounded to Ruby files instead.
+	// `self::run` and `Service::run` are the bound spellings with a tail but no
+	// dot, so the partial index migration 028 built for the scan above (which
+	// requires instr(dst_name, '.') > 0) does not cover them. Widening that
+	// predicate with an OR would disable the index for every language on every
+	// incremental update; this second selection stays bounded to Ruby files
+	// instead, and to the spellings the dot scan cannot already see.
 	rows, err = s.db.QueryContext(ctx, `
 		SELECT e.id, e.dst_name FROM edges e JOIN files f ON f.id = e.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f.language = 'ruby'
-		  AND e.resolution_strategy = ? AND e.dst_name LIKE 'self::%'
-	`, repoID, ResolutionStrategyRubyExplicitSelf)
+		  AND e.resolution_strategy IN `+sqlQuotedList(rubyScopeStrategies)+`
+		  AND instr(e.dst_name, '::') > 0 AND instr(e.dst_name, '.') = 0
+	`, repoID)
 	if err != nil {
 		return 0, err
 	}
@@ -4957,7 +4977,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 			_ = rows.Close()
 			return 0, err
 		}
-		if _, ok := wanted[strings.TrimPrefix(dstName, "self::")]; ok {
+		if _, ok := wanted[dstName[strings.LastIndex(dstName, "::")+2:]]; ok {
 			stale[id] = struct{}{}
 		}
 	}

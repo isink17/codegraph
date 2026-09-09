@@ -75,7 +75,17 @@ func rubyExtractSymbols(node *sitter.Node, container string, content []byte, pf 
 	rubyExtractSymbolsIn(node, container, false, content, pf)
 }
 
+// rubyVisibilitySpecifiers are the three bare toggles a body may carry.
+var rubyVisibilitySpecifiers = map[string]bool{"public": true, "private": true, "protected": true}
+
 func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, content []byte, pf *graph.ParsedFile) {
+	// Default singleton visibility is public, and a bare toggle moves it only
+	// for the definitions that follow it in the same body. The state is tracked
+	// for a `class << self` body only: a bare `private` in an ordinary class
+	// body sets the default for that class's INSTANCE methods and leaves
+	// `def self.run` public, so applying it to singleton definitions would
+	// invent a private method Ruby never made.
+	state := "public"
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
@@ -84,10 +94,10 @@ func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, c
 		case "module":
 			rubyAddType(child, "type", container, content, pf)
 		case "method":
-			rubyAddMethod(child, container, singleton, content, pf)
+			rubyAddMethod(child, container, singleton, state, content, pf)
 		case "singleton_method":
 			if !singleton && nodeText(childByFieldName(child, "object"), content) == "self" {
-				rubyAddMethod(child, container, true, content, pf)
+				rubyAddMethod(child, container, true, "public", content, pf)
 			}
 		case "singleton_class":
 			if !singleton && nodeText(childByFieldName(child, "value"), content) == "self" {
@@ -95,8 +105,137 @@ func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, c
 					rubyExtractSymbolsIn(body, container, true, content, pf)
 				}
 			}
+		case "identifier":
+			// A bare toggle parses as a plain identifier, not a call.
+			name := nodeText(child, content)
+			if singleton && rubyVisibilitySpecifiers[name] {
+				state = name
+			}
+			// Argument-less `module_function` turns every following `def` into
+			// a module-singleton method as well. Synthesising those would be a
+			// guess, so the owner's singleton surface is unknown. An
+			// argument-less `private_class_method` names nothing this parser
+			// can see either, and it is not the shape a no-op takes.
+			if name == "module_function" || name == "private_class_method" || name == "public_class_method" {
+				rubyAddVisibilityHazard(container, pf)
+			}
+		case "call":
+			rubyVisibilityCall(child, container, singleton, content, pf)
 		}
 	}
+}
+
+// rubyAddVisibilityHazard records that an owner's singleton visibility cannot
+// be concluded from syntax. It carries no method name on purpose: the point is
+// that the affected names are exactly what could not be proven.
+func rubyAddVisibilityHazard(container string, pf *graph.ParsedFile) {
+	if container == "" {
+		return
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+		Kind: graph.ScopeImportRubySingletonVisibilityUnknown, OwnerModule: container, Static: true})
+}
+
+// rubyVisibilityAPIs are the receiver-taking method names that change singleton
+// visibility or the module singleton surface. A call to one of them through a
+// receiver this parser cannot resolve to the current cref proves that SOMETHING
+// changed, which is exactly enough to withdraw the owner.
+var rubyVisibilityAPIs = map[string]bool{
+	"private_class_method": true, "public_class_method": true, "module_function": true,
+	"private": true, "public": true, "protected": true,
+}
+
+// rubyVisibilityCall records a syntax-proven singleton-visibility override, or
+// an owner-level hazard when a recognised visibility API is spelled in a form
+// whose targets are not literal method names.
+//
+// `private_class_method` is an ordinary public method of Module, so a body may
+// spell it bare or with a literal `self` receiver; both are the current cref
+// and are treated identically. Any other receiver -- `Other.private_class_method
+// :x`, `Service.private_class_method :x` inside `Service` itself, or a
+// `singleton_class` expression -- names an owner this parser has not proven, so
+// the current owner is withdrawn rather than either trusted or ignored.
+func rubyVisibilityCall(call *sitter.Node, container string, singleton bool, content []byte, pf *graph.ParsedFile) {
+	if container == "" {
+		return
+	}
+	method := nodeText(childByFieldName(call, "method"), content)
+	if receiver := childByFieldName(call, "receiver"); receiver != nil && nodeText(receiver, content) != "self" {
+		// An eigenclass expression reaches the singleton class through methods
+		// with no visibility name of their own (`singleton_class.send(:private,
+		// name)`, `singleton_class.class_eval { ... }`).
+		if rubyVisibilityAPIs[method] || strings.HasPrefix(nodeText(receiver, content), "singleton_class") {
+			rubyAddVisibilityHazard(container, pf)
+		}
+		return
+	}
+	specifier := ""
+	switch method {
+	case "private_class_method", "public_class_method":
+		// The cref inside `class << self` is the singleton class, so these
+		// would name a method of the singleton's singleton. Nothing this phase
+		// resolves lives there, and guessing the outer owner would invent one.
+		if singleton {
+			rubyAddVisibilityHazard(container, pf)
+			return
+		}
+		specifier = "private"
+		if method == "public_class_method" {
+			specifier = "public"
+		}
+	case "module_function":
+		rubyAddVisibilityHazard(container, pf)
+		return
+	case "public", "private", "protected":
+		// With arguments these name methods of the current cref. In an ordinary
+		// class body that cref holds the instance methods; only inside
+		// `class << self` does one of them name a singleton method.
+		if !singleton {
+			return
+		}
+		specifier = method
+	default:
+		return
+	}
+	names := rubySymbolArguments(childByFieldName(call, "arguments"), content)
+	if len(names) == 0 {
+		rubyAddVisibilityHazard(container, pf)
+		return
+	}
+	for _, name := range names {
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+			Kind: graph.ScopeImportRubySingletonVisibility, OwnerModule: container,
+			LocalName: name, SourceSpecifier: specifier, Static: true})
+	}
+}
+
+// rubySymbolArguments returns the literal method names an argument list spells,
+// or nil when the list is empty or any argument is anything else -- a splat, a
+// variable, an inline `def`, an interpolated string. Nil is not "no targets":
+// it is "recognised operation, unprovable targets", which the caller turns into
+// an owner hazard.
+func rubySymbolArguments(args *sitter.Node, content []byte) []string {
+	if args == nil || args.NamedChildCount() == 0 {
+		return nil
+	}
+	names := make([]string, 0, args.NamedChildCount())
+	for i := range int(args.NamedChildCount()) {
+		arg := args.NamedChild(i)
+		text := nodeText(arg, content)
+		switch arg.Type() {
+		case "simple_symbol":
+			text = strings.TrimPrefix(text, ":")
+		case "string":
+			text = strings.Trim(text, `"'`)
+		default:
+			return nil
+		}
+		if text == "" || strings.ContainsAny(text, " \t\n#{}:.'\"") {
+			return nil
+		}
+		names = append(names, text)
+	}
+	return names
 }
 
 func rubyAddType(node *sitter.Node, kind, parent string, content []byte, pf *graph.ParsedFile) {
@@ -123,10 +262,17 @@ func rubyAddType(node *sitter.Node, kind, parent string, content []byte, pf *gra
 	}
 }
 
-func rubyAddMethod(node *sitter.Node, container string, static bool, content []byte, pf *graph.ParsedFile) {
+func rubyAddMethod(node *sitter.Node, container string, static bool, visibility string, content []byte, pf *graph.ParsedFile) {
 	name := nodeText(childByFieldName(node, "name"), content)
 	if name == "" {
 		return
+	}
+	// Only singleton visibility is modelled (P22.48): an explicit constant
+	// receiver may not reach a private or protected singleton method, so that
+	// nature needs a proven answer. Instance visibility stays unstated rather
+	// than guessed -- `self` receivers reach private methods anyway.
+	if !static {
+		visibility = ""
 	}
 	owner := container
 	if owner == "" {
@@ -138,7 +284,7 @@ func rubyAddMethod(node *sitter.Node, container string, static bool, content []b
 	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "ruby", Kind: "function", Name: name,
 		QualifiedName: rubyJoinQName(container, name), ContainerName: container, Static: rubyBool(static),
-		Range: nodeRange(node), DocSummary: prevCommentText(node, content),
+		Visibility: visibility, Range: nodeRange(node), DocSummary: prevCommentText(node, content),
 		StableKey: "func:ruby:" + owner + ":" + nature + ":" + name})
 }
 
