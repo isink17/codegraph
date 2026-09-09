@@ -753,6 +753,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					changedSymbolNameSet[sym.QualifiedName] = struct{}{}
 				}
 			}
+			// Some scope evidence re-decides bindings without declaring any
+			// symbol: a file holding only `App::Service = Other` says a
+			// constant's identity moved and declares nothing at all. The names
+			// such evidence carries have to join the changed set or nothing
+			// downstream reconsiders the bindings it invalidates.
+			for _, fact := range res.parsed.Scope.Imports {
+				if name := scopeEvidenceInvalidationName(fact); name != "" {
+					changedSymbolNameSet[name] = struct{}{}
+				}
+			}
 			summary.FilesChanged++
 			summary.FilesIndexed++
 			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Indexed: 1})
@@ -1621,4 +1631,20 @@ func (i *Indexer) embedReplaceBatch(ctx context.Context, repoID int64, result st
 		return
 	}
 	_ = i.store.UpsertSymbolEmbeddingsBatch(ctx, repoID, "", upserts)
+}
+
+// scopeEvidenceInvalidationName returns the name one scope-evidence fact must
+// contribute to the changed-name set, or "" when the fact declares nothing a
+// resolver keys on beyond the symbols its file already declares.
+//
+// Only the facts that can flip an existing binding on their own belong here.
+// A Ruby constant-identity hazard is one: `module App; Service = Other; end`
+// declares `App` and nothing else, and a root-level `App::Service = Other`
+// declares no symbol whatsoever, yet both withdraw the identity of
+// `App::Service` for every constant-receiver call in the repository.
+func scopeEvidenceInvalidationName(fact graph.ScopeImport) string {
+	if fact.Kind == graph.ScopeImportRubyConstantIdentityUnknown {
+		return fact.LocalName
+	}
+	return ""
 }

@@ -185,6 +185,13 @@ const (
 	ResolutionStrategyPHPTypedProperty = "php_typed_property"
 	ResolutionStrategyRubyImplicitSelf = "ruby_implicit_self"
 	ResolutionStrategyRubyExplicitSelf = "ruby_explicit_self"
+
+	// ruby_lexical_constant: `Service.run` / `Service::run` where `Service` is
+	// exactly one constant token, the caller's own file proves the lexical
+	// nesting its definition sits in, the first nesting level that owns that
+	// constant name is the target's semantic owner, and the owner has exactly
+	// one public singleton method of that name.
+	ResolutionStrategyRubyLexicalConstant = "ruby_lexical_constant"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -277,6 +284,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyPHPTypedProperty:    ResolutionConfidenceHigh,
 	ResolutionStrategyRubyImplicitSelf:    ResolutionConfidenceHigh,
 	ResolutionStrategyRubyExplicitSelf:    ResolutionConfidenceHigh,
+	ResolutionStrategyRubyLexicalConstant: ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -347,6 +355,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyPHPTypedProperty,
 	ResolutionStrategyRubyImplicitSelf,
 	ResolutionStrategyRubyExplicitSelf,
+	ResolutionStrategyRubyLexicalConstant,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.

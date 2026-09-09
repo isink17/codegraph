@@ -28,6 +28,11 @@ func (a *RubyAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	p := graph.ParsedFile{Language: "ruby", FileTokens: computeFileTokens(content)}
 	rubyExtractImports(root, content, &p)
 	rubyExtractSymbols(root, "", content, &p)
+	// Root-level statements are their own lexical owner. A bare `Service = X`
+	// there names a root constant, which is never a single-segment candidate
+	// and records nothing; a qualified `App::Service = X` is absolute and names
+	// its constant exactly.
+	rubyScanConstantAssignments(root, rubyConstantScope{cref: true}, content, &p)
 	rubyExtractCalls(root, content, &p)
 	rubyLinkTests(&p)
 	return p, nil
@@ -75,7 +80,17 @@ func rubyExtractSymbols(node *sitter.Node, container string, content []byte, pf 
 	rubyExtractSymbolsIn(node, container, false, content, pf)
 }
 
+// rubyVisibilitySpecifiers are the three bare toggles a body may carry.
+var rubyVisibilitySpecifiers = map[string]bool{"public": true, "private": true, "protected": true}
+
 func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, content []byte, pf *graph.ParsedFile) {
+	// Default singleton visibility is public, and a bare toggle moves it only
+	// for the definitions that follow it in the same body. The state is tracked
+	// for a `class << self` body only: a bare `private` in an ordinary class
+	// body sets the default for that class's INSTANCE methods and leaves
+	// `def self.run` public, so applying it to singleton definitions would
+	// invent a private method Ruby never made.
+	state := "public"
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
@@ -84,10 +99,10 @@ func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, c
 		case "module":
 			rubyAddType(child, "type", container, content, pf)
 		case "method":
-			rubyAddMethod(child, container, singleton, content, pf)
+			rubyAddMethod(child, container, singleton, state, content, pf)
 		case "singleton_method":
 			if !singleton && nodeText(childByFieldName(child, "object"), content) == "self" {
-				rubyAddMethod(child, container, true, content, pf)
+				rubyAddMethod(child, container, true, "public", content, pf)
 			}
 		case "singleton_class":
 			if !singleton && nodeText(childByFieldName(child, "value"), content) == "self" {
@@ -95,8 +110,150 @@ func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, c
 					rubyExtractSymbolsIn(body, container, true, content, pf)
 				}
 			}
+		case "identifier":
+			// A bare toggle parses as a plain identifier, not a call.
+			name := nodeText(child, content)
+			if singleton && rubyVisibilitySpecifiers[name] {
+				state = name
+			}
+			// Argument-less `module_function` turns every following `def` into
+			// a module-singleton method as well. Synthesising those would be a
+			// guess, so the owner's singleton surface is unknown. An
+			// argument-less `private_class_method` names nothing this parser
+			// can see either, and it is not the shape a no-op takes.
+			if name == "module_function" || name == "private_class_method" || name == "public_class_method" {
+				rubyAddVisibilityHazard(container, pf)
+			}
+		case "call":
+			rubyVisibilityCall(child, container, singleton, content, pf)
 		}
 	}
+}
+
+// rubyAddVisibilityHazard records that an owner's singleton visibility cannot
+// be concluded from syntax. It carries no method name on purpose: the point is
+// that the affected names are exactly what could not be proven.
+func rubyAddVisibilityHazard(container string, pf *graph.ParsedFile) {
+	if container == "" {
+		return
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+		Kind: graph.ScopeImportRubySingletonVisibilityUnknown, OwnerModule: container, Static: true})
+}
+
+// rubyVisibilityAPIs are the receiver-taking method names that change singleton
+// visibility or the module singleton surface. A call to one of them through a
+// receiver this parser cannot resolve to the current cref proves that SOMETHING
+// changed, which is exactly enough to withdraw the owner.
+var rubyVisibilityAPIs = map[string]bool{
+	"private_class_method": true, "public_class_method": true, "module_function": true,
+	"private": true, "public": true, "protected": true,
+}
+
+// rubyVisibilityCall records a syntax-proven singleton-visibility override, or
+// an owner-level hazard when a recognised visibility API is spelled in a form
+// whose targets are not literal method names.
+//
+// `private_class_method` is an ordinary public method of Module, so a body may
+// spell it bare or with a literal `self` receiver; both are the current cref
+// and are treated identically. Any other receiver -- `Other.private_class_method
+// :x`, `Service.private_class_method :x` inside `Service` itself, or a
+// `singleton_class` expression -- names an owner this parser has not proven, so
+// the current owner is withdrawn rather than either trusted or ignored.
+func rubyVisibilityCall(call *sitter.Node, container string, singleton bool, content []byte, pf *graph.ParsedFile) {
+	if container == "" {
+		return
+	}
+	method := nodeText(childByFieldName(call, "method"), content)
+	if receiver := childByFieldName(call, "receiver"); receiver != nil && nodeText(receiver, content) != "self" {
+		// An eigenclass expression reaches the singleton class through methods
+		// with no visibility name of their own (`singleton_class.send(:private,
+		// name)`, `singleton_class.class_eval { ... }`).
+		if rubyVisibilityAPIs[method] || strings.HasPrefix(nodeText(receiver, content), "singleton_class") {
+			rubyAddVisibilityHazard(container, pf)
+		}
+		return
+	}
+	specifier := ""
+	switch method {
+	case "private_class_method", "public_class_method":
+		// The cref inside `class << self` is the singleton class, so these
+		// would name a method of the singleton's singleton. Nothing this phase
+		// resolves lives there, and guessing the outer owner would invent one.
+		if singleton {
+			rubyAddVisibilityHazard(container, pf)
+			return
+		}
+		specifier = "private"
+		if method == "public_class_method" {
+			specifier = "public"
+		}
+	case "module_function":
+		rubyAddVisibilityHazard(container, pf)
+		return
+	case "public", "private", "protected":
+		// With arguments these name methods of the current cref. In an ordinary
+		// class body that cref holds the instance methods; only inside
+		// `class << self` does one of them name a singleton method.
+		if !singleton {
+			return
+		}
+		specifier = method
+	default:
+		return
+	}
+	names := rubySymbolArguments(childByFieldName(call, "arguments"), content)
+	if len(names) == 0 {
+		rubyAddVisibilityHazard(container, pf)
+		return
+	}
+	for _, name := range names {
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+			Kind: graph.ScopeImportRubySingletonVisibility, OwnerModule: container,
+			LocalName: name, SourceSpecifier: specifier, Static: true})
+	}
+}
+
+// rubySymbolArguments returns the literal method names an argument list spells,
+// or nil when the list is empty or any argument is anything else -- a splat, a
+// variable, an inline `def`, an interpolated string. Nil is not "no targets":
+// it is "recognised operation, unprovable targets", which the caller turns into
+// an owner hazard.
+func rubySymbolArguments(args *sitter.Node, content []byte) []string {
+	if args == nil || args.NamedChildCount() == 0 {
+		return nil
+	}
+	names := make([]string, 0, args.NamedChildCount())
+	for i := range int(args.NamedChildCount()) {
+		name, ok := rubyLiteralName(args.NamedChild(i), content)
+		if !ok {
+			return nil
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+// rubyLiteralName decodes one argument node as a literal method or constant
+// name, or reports ok=false when it is a splat, a variable, an inline `def`, an
+// interpolated string, or anything else whose value is not in the source.
+func rubyLiteralName(arg *sitter.Node, content []byte) (string, bool) {
+	if arg == nil {
+		return "", false
+	}
+	text := nodeText(arg, content)
+	switch arg.Type() {
+	case "simple_symbol":
+		text = strings.TrimPrefix(text, ":")
+	case "string":
+		text = strings.Trim(text, `"'`)
+	default:
+		return "", false
+	}
+	if text == "" || strings.ContainsAny(text, " \t\n#{}:.'\"") {
+		return "", false
+	}
+	return text, true
 }
 
 func rubyAddType(node *sitter.Node, kind, parent string, content []byte, pf *graph.ParsedFile) {
@@ -123,10 +280,17 @@ func rubyAddType(node *sitter.Node, kind, parent string, content []byte, pf *gra
 	}
 }
 
-func rubyAddMethod(node *sitter.Node, container string, static bool, content []byte, pf *graph.ParsedFile) {
+func rubyAddMethod(node *sitter.Node, container string, static bool, visibility string, content []byte, pf *graph.ParsedFile) {
 	name := nodeText(childByFieldName(node, "name"), content)
 	if name == "" {
 		return
+	}
+	// Only singleton visibility is modelled (P22.48): an explicit constant
+	// receiver may not reach a private or protected singleton method, so that
+	// nature needs a proven answer. Instance visibility stays unstated rather
+	// than guessed -- `self` receivers reach private methods anyway.
+	if !static {
+		visibility = ""
 	}
 	owner := container
 	if owner == "" {
@@ -138,7 +302,7 @@ func rubyAddMethod(node *sitter.Node, container string, static bool, content []b
 	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "ruby", Kind: "function", Name: name,
 		QualifiedName: rubyJoinQName(container, name), ContainerName: container, Static: rubyBool(static),
-		Range: nodeRange(node), DocSummary: prevCommentText(node, content),
+		Visibility: visibility, Range: nodeRange(node), DocSummary: prevCommentText(node, content),
 		StableKey: "func:ruby:" + owner + ":" + nature + ":" + name})
 }
 
@@ -307,4 +471,292 @@ func rubyLinkTests(pf *graph.ParsedFile) {
 			Reason: "test_name_match", Score: 0.7, TestSymbolKey: sym.StableKey,
 			TargetStableKey: "func:ruby:top:instance:" + target, TestSymbolIndex: intRef(i)})
 	}
+}
+
+// rubyScanConstantAssignments records every syntax-proven constant identity
+// mutation inside one lexical owner's body, walking the whole file from the
+// root so that a class or module nested under control flow is reached too --
+// the symbol walk only inspects direct children, so it would miss one.
+//
+// A `class`/`module` declaration proves what a constant denoted at that point,
+// not what it denotes: `Service = Other` rebinds `App::Service` to another
+// object, so `Service.run` calls `Other.run` and the declaration's own
+// singleton method is not the target. There is no load order here to say which
+// assignment or declaration wins, so the constant's identity is simply
+// unprovable and every constant-receiver call through it fails closed.
+//
+// Everything that is not an owner boundary is descended into, so an assignment
+// under any control-flow shape the grammar spells -- `if`, `unless`, a
+// modifier, `begin`/`rescue`, a block, a lambda -- still counts against the
+// owner whose body it sits in. That is the safe default: an unrecognised
+// wrapper produces a hazard rather than silence.
+// rubyConstantScope is where in the file the assignment scan currently stands.
+// A mutation's target depends on two different things, and only the first one
+// moves with the lexical body: which constants a relative path can resolve
+// through, and which object a receiver-less mutation is called on.
+type rubyConstantScope struct {
+	// chain is the nameable lexical nesting, innermost first. A body whose own
+	// cref cannot be named (`class A::B` inside another scope) keeps its
+	// enclosing chain: Ruby's nesting there really is that unnameable frame
+	// plus the outer levels, so the outer levels are still candidates.
+	chain []string
+	// cref reports that a receiver-less or literal-`self` mutation names a
+	// constant directly under chain's innermost level -- true in a class or
+	// module body, and inside a singleton method, where `self` is that
+	// class/module object.
+	cref bool
+	// eigenclass reports that the walk is directly inside `class << self`,
+	// where a `def` is a singleton method of the enclosing container but a
+	// bare constant lands on the singleton class instead.
+	eigenclass bool
+	// inMethod reports that the walk is inside a `def`. Every constant
+	// assignment there -- bare `X = 1` and qualified `Foo::Bar = 1` alike --
+	// is a Ruby SyntaxError, so none of them is evidence.
+	inMethod bool
+}
+
+// owner is the semantic qname of the innermost nameable lexical level, or ""
+// at the root.
+func (s rubyConstantScope) owner() string {
+	if len(s.chain) == 0 {
+		return ""
+	}
+	return s.chain[0]
+}
+
+func rubyScanConstantAssignments(node *sitter.Node, scope rubyConstantScope, content []byte, pf *graph.ParsedFile) {
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		inner := scope
+		switch child.Type() {
+		case "class", "module":
+			nested, ok := rubyNestedScope(child, scope, content)
+			if !ok {
+				continue
+			}
+			if body := childByFieldName(child, "body"); body != nil {
+				rubyScanConstantAssignments(body, nested, content, pf)
+			}
+			continue
+		case "singleton_class":
+			// A bare constant here lands on the singleton class, so the
+			// container's own constants are untouched -- but a `def` inside is
+			// a singleton method of the container, and a receiver-proven
+			// mutation is not about the cref at all, so the body is still
+			// walked.
+			inner.cref, inner.eigenclass = false, true
+		case "method":
+			// `def x` in an eigenclass body IS a singleton method of the
+			// container, so `self` there is that class/module object.
+			inner.cref, inner.eigenclass, inner.inMethod = scope.eigenclass, false, true
+		case "singleton_method":
+			inner.cref, inner.eigenclass, inner.inMethod = !scope.eigenclass, false, true
+		case "assignment", "operator_assignment":
+			if !scope.inMethod {
+				rubyConstantAssignmentTargets(childByFieldName(child, "left"), scope, content, pf)
+			}
+		case "call":
+			rubyConstantIdentityCall(child, scope, content, pf)
+		}
+		rubyScanConstantAssignments(child, inner, content, pf)
+	}
+}
+
+// rubyNestedScope is the scope a nested `class`/`module` body opens.
+//
+// A bare-constant opening pushes one frame onto the enclosing chain. A
+// qualified opening (`class A::B`) pushes exactly one frame, which at the root
+// is nameable; inside another scope that frame is whatever `A` resolves to,
+// which this parser cannot name -- so the body keeps only the enclosing chain
+// (Ruby's nesting there is the unnameable frame plus those outer levels) and
+// loses its cref, exactly as rubyAddType refuses to declare such a type.
+func rubyNestedScope(node *sitter.Node, scope rubyConstantScope, content []byte) (rubyConstantScope, bool) {
+	nameNode := childByFieldName(node, "name")
+	name, ok := rubySemanticConstantQName(nameNode, content)
+	if !ok {
+		return scope, false
+	}
+	nested := rubyConstantScope{cref: true}
+	if nameNode.Type() != "constant" {
+		if len(scope.chain) != 0 {
+			return rubyConstantScope{chain: scope.chain}, true
+		}
+		nested.chain = []string{name}
+		return nested, true
+	}
+	chain := make([]string, 0, len(scope.chain)+1)
+	chain = append(chain, rubyJoinQName(scope.owner(), name))
+	nested.chain = append(chain, scope.chain...)
+	return nested, true
+}
+
+// rubyRelativeConstantHazards records one relative constant path against every
+// lexical level it could resolve through, innermost first, plus the root. Which
+// level Ruby picks is the multi-segment constant lookup this phase does not
+// model, and a hazard can only WITHHOLD an edge -- it never creates a target --
+// so recording every syntax-derived candidate is the fail-closed choice, and
+// picking one would be a guess.
+func rubyRelativeConstantHazards(chain []string, path string, pf *graph.ParsedFile) {
+	for _, level := range chain {
+		rubyAddConstantIdentityHazard(rubyJoinQName(level, path), pf)
+	}
+	rubyAddConstantIdentityHazard(path, pf)
+}
+
+// rubyConstantReceiverPath returns the semantic qname path a call's receiver
+// spells, whether that path is absolute, and whether the receiver is the
+// current cref (absent, or a literal `self`). A value receiver -- an
+// identifier, a chain, an instance variable -- names an object this parser has
+// not proven and is reported as unusable.
+func rubyConstantReceiverPath(call *sitter.Node, content []byte) (path string, absolute, cref, ok bool) {
+	receiver := childByFieldName(call, "receiver")
+	if receiver == nil || nodeText(receiver, content) == "self" {
+		return "", false, true, true
+	}
+	if receiver.Type() != "constant" && receiver.Type() != "scope_resolution" {
+		return "", false, false, false
+	}
+	path, ok = rubySemanticConstantQName(receiver, content)
+	if !ok {
+		return "", false, false, false
+	}
+	// `Object`, `Kernel` and `BasicObject` get no special treatment. They are
+	// ordinary constant receivers, and `Kernel.const_set(:Service, X)` moves
+	// `Kernel::Service` exactly as any other receiver moves its own -- while
+	// this parser's semantic qnames already make `Kernel.Service` a lexical
+	// candidate for a caller inside `module Kernel`, so dropping the hazard
+	// left a confidently wrong edge.
+	//
+	// What stays deferred is the ROOT constant table, and that is the
+	// resolver's doing rather than this classification's: its candidates are
+	// always owner-qualified, so a bare root `Service` is never looked up.
+	// The single-segment refusal in rubyAddConstantIdentityHazard only keeps a
+	// row nothing reads out of the evidence table.
+	return path, strings.HasPrefix(nodeText(receiver, content), "::"), false, true
+}
+
+// rubyConstantAssignmentTargets turns one assignment's left-hand side into the
+// exact semantic constant qnames whose identity it moves. A non-constant target
+// (`local`, `@ivar`, `$global`, an element reference) moves no constant.
+func rubyConstantAssignmentTargets(left *sitter.Node, scope rubyConstantScope, content []byte, pf *graph.ParsedFile) {
+	if left == nil {
+		return
+	}
+	switch left.Type() {
+	case "left_assignment_list", "rest_assignment", "destructured_left_assignment":
+		for i := range int(left.NamedChildCount()) {
+			rubyConstantAssignmentTargets(left.NamedChild(i), scope, content, pf)
+		}
+	case "constant":
+		// A bare constant assignment always defines the constant in the current
+		// cref, never in an outer one, so this qname is exact -- and it is only
+		// evidence when that cref is nameable.
+		if scope.cref {
+			rubyAddConstantIdentityHazard(rubyJoinQName(scope.owner(), nodeText(left, content)), pf)
+		}
+	case "scope_resolution":
+		path, ok := rubySemanticConstantQName(left, content)
+		if !ok {
+			return
+		}
+		// An absolute path names its constant outright; a relative one names it
+		// through whatever its first segment resolves to.
+		if strings.HasPrefix(nodeText(left, content), "::") {
+			rubyAddConstantIdentityHazard(path, pf)
+			return
+		}
+		rubyRelativeConstantHazards(scope.chain, path, pf)
+	}
+}
+
+// rubyConstantIdentityAPIs move a constant's identity without an assignment
+// operator. `autoload` is one of them: it makes a constant appear from a file
+// this graph cannot connect to the name, so a declaration of the same qname is
+// no longer proof of what the name denotes.
+var rubyConstantIdentityAPIs = map[string]bool{
+	"const_set": true, "remove_const": true, "autoload": true,
+}
+
+// rubyConstantIdentityCall records the hazard for the literal-name forms of
+// those APIs.
+//
+// The receiver matters, and a constant one is not a dynamic one:
+// `App.const_set(:Service, Other)` at the top of a file names its target as
+// exactly as a bare `Service = Other` inside `module App` does, and ignoring it
+// leaves the same confidently wrong edge in place. So the cref forms (no
+// receiver, or a literal `self`) keep naming the current owner, a constant or
+// constant-path receiver names its own path -- exactly when absolute, against
+// every lexical level it could resolve through when relative -- and everything
+// else is a value this parser has not proven.
+//
+// A dynamic name (`const_set(name, x)`), a value receiver
+// (`target.const_set(...)`), and the indirect spellings -- `send(:const_set,
+// ...)`, `eval`, `class_eval`, `const_missing`, runtime load order -- are
+// deliberately not modelled: none of them names a constant from syntax, and
+// inventing an owner would be worse than the gap.
+func rubyConstantIdentityCall(call *sitter.Node, scope rubyConstantScope, content []byte, pf *graph.ParsedFile) {
+	if !rubyConstantIdentityAPIs[nodeText(childByFieldName(call, "method"), content)] {
+		return
+	}
+	path, absolute, cref, ok := rubyConstantReceiverPath(call, content)
+	if !ok {
+		return
+	}
+	name, ok := rubyFirstSymbolArgument(childByFieldName(call, "arguments"), content)
+	if !ok {
+		return
+	}
+	switch {
+	case cref:
+		// Only when the current cref is a nameable class or module: inside an
+		// instance method `self` is an instance and has no const_set at all,
+		// and directly inside `class << self` the target is the singleton
+		// class, not the container.
+		if scope.cref {
+			rubyAddConstantIdentityHazard(rubyJoinQName(scope.owner(), name), pf)
+		}
+	case absolute:
+		rubyAddConstantIdentityHazard(rubyJoinQName(path, name), pf)
+	default:
+		rubyRelativeConstantHazards(scope.chain, rubyJoinQName(path, name), pf)
+	}
+}
+
+// rubyFirstSymbolArgument returns the literal name an argument list names
+// first, or ok=false when that argument is anything else.
+func rubyFirstSymbolArgument(args *sitter.Node, content []byte) (string, bool) {
+	if args == nil || args.NamedChildCount() == 0 {
+		return "", false
+	}
+	names := rubySymbolArguments(args, content)
+	if len(names) > 0 {
+		return names[0], true
+	}
+	// A mixed list (`const_set(:Service, Other)`) is still exact in its first
+	// argument, which is the only one that names the constant.
+	first := args.NamedChild(0)
+	name, ok := rubyLiteralName(first, content)
+	return name, ok
+}
+
+// rubyAddConstantIdentityHazard records one exact semantic constant qname whose
+// identity moved. A root-level constant carries no owner prefix and so can
+// never be a single-segment lexical candidate; recording it would state a fact
+// nothing reads.
+func rubyAddConstantIdentityHazard(qname string, pf *graph.ParsedFile) {
+	dot := strings.LastIndexByte(qname, '.')
+	if dot <= 0 || dot+1 >= len(qname) {
+		return
+	}
+	// One row per constant per file: the fact is that the identity is
+	// unprovable, and repeating it says nothing more. Two mutations of one
+	// constant, or one relative path whose candidate levels collide, would
+	// otherwise persist duplicate evidence rows.
+	for _, fact := range pf.Scope.Imports {
+		if fact.Kind == graph.ScopeImportRubyConstantIdentityUnknown && fact.OwnerModule == qname {
+			return
+		}
+	}
+	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+		Kind: graph.ScopeImportRubyConstantIdentityUnknown, OwnerModule: qname, LocalName: qname[dot+1:]})
 }
