@@ -106,10 +106,90 @@ func swiftExtractSymbols(node *sitter.Node, container, visibility string, conten
 			swiftAddCallable(child, "function", container, visibility, content, pf)
 		case "protocol_function_declaration":
 			swiftAddCallable(child, "protocol_requirement", container, visibility, content, pf)
+		case "property_declaration":
+			swiftAddMemberValue(child, container, content, pf)
+		case "protocol_property_declaration":
+			swiftAddMemberValue(child, container, content, pf)
+		case "enum_entry":
+			swiftAddEnumCase(child, container, content, pf)
 		case "ERROR":
 			swiftExtractSymbols(child, container, visibility, content, pf)
 		}
 	}
+}
+
+func swiftAddMemberValue(node *sitter.Node, container string, content []byte, pf *graph.ParsedFile) {
+	if container == "" {
+		return
+	}
+	for _, name := range swiftBindingNames(node, content) {
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+			Kind: graph.ScopeImportSwiftMemberValue, OwnerModule: container,
+			LocalName: name, Static: swiftMemberStatic(node, content),
+		})
+	}
+}
+
+func swiftAddEnumCase(node *sitter.Node, container string, content []byte, pf *graph.ParsedFile) {
+	if container == "" {
+		return
+	}
+	for _, name := range swiftBindingNames(node, content) {
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+			Kind: graph.ScopeImportSwiftEnumCase, OwnerModule: container,
+			LocalName: name, Static: true,
+		})
+	}
+}
+
+func swiftBindingNames(node *sitter.Node, content []byte) []string {
+	var names []string
+	for i := 0; i < int(node.ChildCount()); i++ {
+		if node.FieldNameForChild(i) != "name" {
+			continue
+		}
+		names = append(names, swiftPatternBindingNames(node.Child(i), content)...)
+	}
+	return names
+}
+
+func swiftPatternBindingNames(node *sitter.Node, content []byte) []string {
+	if node == nil {
+		return nil
+	}
+	if bound := node.ChildByFieldName("bound_identifier"); bound != nil {
+		return []string{nodeText(bound, content)}
+	}
+	if node.Type() == "simple_identifier" {
+		return []string{nodeText(node, content)}
+	}
+	var names []string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "pattern" || child.Type() == "simple_identifier" {
+			names = append(names, swiftPatternBindingNames(child, content)...)
+		}
+	}
+	return names
+}
+
+func swiftMemberStatic(node *sitter.Node, content []byte) bool {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "modifiers" {
+			for j := 0; j < int(child.ChildCount()); j++ {
+				modifier := child.Child(j)
+				if modifier.Type() != "property_modifier" {
+					continue
+				}
+				text := strings.TrimSpace(nodeText(modifier, content))
+				if text == "static" || text == "class" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func swiftAddType(node *sitter.Node, container, kind, inheritedVisibility string, content []byte, pf *graph.ParsedFile) {
@@ -199,7 +279,7 @@ func swiftAddCall(call *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		return
 	}
 	name := nodeText(fn, content)
-	swiftAppendCall(call, name, swiftCallEvidence(fn, name)+swiftLabelsSuffix(call, content), content, pf)
+	swiftAppendCall(call, name, swiftCallEvidence(fn, name)+swiftCallShapeSuffix(call, content), content, pf)
 }
 
 func swiftAddConstructorCall(call *sitter.Node, content []byte, pf *graph.ParsedFile) {
@@ -212,7 +292,7 @@ func swiftAddConstructorCall(call *sitter.Node, content []byte, pf *graph.Parsed
 	}
 	name := swiftStripGeneric(nodeText(typeNode, content))
 	if name != "" {
-		swiftAppendCall(call, name, "swift:initializer"+swiftLabelsSuffix(call, content), content, pf)
+		swiftAppendCall(call, name, "swift:initializer"+swiftCallShapeSuffix(call, content), content, pf)
 	}
 }
 
@@ -248,25 +328,7 @@ func swiftCallEvidence(fn *sitter.Node, name string) string {
 }
 
 func swiftLabelsSuffix(call *sitter.Node, content []byte) string {
-	if call == nil {
-		return ""
-	}
-	args := firstChild(call, "value_arguments")
-	if args == nil {
-		found := findDescendants(call, "value_arguments")
-		if len(found) > 0 {
-			args = found[0]
-		}
-	}
-	if args == nil {
-		args = firstChild(call, "constructor_suffix")
-	}
-	if args == nil {
-		found := findDescendants(call, "constructor_suffix")
-		if len(found) > 0 {
-			args = found[0]
-		}
-	}
+	args := swiftCallArguments(call)
 	if args == nil {
 		return ""
 	}
@@ -287,6 +349,61 @@ func swiftLabelsSuffix(call *sitter.Node, content []byte) string {
 		return ""
 	}
 	return ";labels=" + strings.Join(labels, ",")
+}
+
+func swiftCallShapeSuffix(call *sitter.Node, content []byte) string {
+	regular := swiftLabelsSuffix(call, content)
+	suffix := swiftCallSuffix(call)
+	if suffix == nil {
+		return regular
+	}
+	labels := swiftTrailingLabels(suffix, content)
+	if len(labels) == 0 {
+		return regular
+	}
+	return regular + ";trailing_labels=" + strings.Join(labels, ",")
+}
+
+func swiftCallSuffix(call *sitter.Node) *sitter.Node {
+	if call == nil {
+		return nil
+	}
+	for i := 0; i < int(call.ChildCount()); i++ {
+		child := call.Child(i)
+		if child.Type() == "call_suffix" || child.Type() == "constructor_suffix" {
+			return child
+		}
+	}
+	return nil
+}
+
+func swiftCallArguments(call *sitter.Node) *sitter.Node {
+	suffix := swiftCallSuffix(call)
+	if suffix == nil {
+		return nil
+	}
+	for i := 0; i < int(suffix.ChildCount()); i++ {
+		if child := suffix.Child(i); child.Type() == "value_arguments" {
+			return child
+		}
+	}
+	return nil
+}
+
+func swiftTrailingLabels(suffix *sitter.Node, content []byte) []string {
+	labels := make([]string, 0, 1)
+	next := "_"
+	for i := 0; i < int(suffix.ChildCount()); i++ {
+		child := suffix.Child(i)
+		switch child.Type() {
+		case "lambda_literal":
+			labels = append(labels, next)
+			next = "_"
+		case "simple_identifier":
+			next = nodeText(child, content) + ":"
+		}
+	}
+	return labels
 }
 
 func swiftSelector(node *sitter.Node, name string, content []byte) string {
@@ -323,13 +440,21 @@ func swiftArity(node *sitter.Node, content []byte) (*int, *int) {
 }
 
 func swiftCallArity(call *sitter.Node) *int {
-	args := findDescendants(call, "value_arguments")
-	if len(args) == 0 {
+	suffix := swiftCallSuffix(call)
+	if suffix == nil {
 		return nil
 	}
 	count := 0
-	for i := 0; i < int(args[0].ChildCount()); i++ {
-		if args[0].Child(i).Type() == "value_argument" {
+	for i := 0; i < int(suffix.ChildCount()); i++ {
+		child := suffix.Child(i)
+		switch child.Type() {
+		case "value_arguments":
+			for j := 0; j < int(child.ChildCount()); j++ {
+				if child.Child(j).Type() == "value_argument" {
+					count++
+				}
+			}
+		case "lambda_literal":
 			count++
 		}
 	}

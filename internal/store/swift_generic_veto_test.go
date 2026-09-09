@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestSwiftV2GenericVetoFullAndIncremental(t *testing.T) {
+func TestSwiftV3GenericVetoFullAndIncremental(t *testing.T) {
 	build := func(t *testing.T, f *gateFixture) []int64 {
 		t.Helper()
 		defs := f.file(t, "A.swift", "swift")
@@ -22,7 +22,7 @@ func TestSwiftV2GenericVetoFullAndIncremental(t *testing.T) {
 			{"foo.bar.run", "swift:chained"},
 			{"value?.run", "swift:optional_member"},
 			{"super.run", "swift:super"},
-			{"Self.run", "swift:Self"},
+			{"Self.run", "swift:Self;trailing_labels=_"},
 		}
 		ids := make([]int64, 0, len(calls))
 		for _, call := range calls {
