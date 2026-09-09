@@ -193,6 +193,8 @@ const (
 	// one public singleton method of that name.
 	ResolutionStrategyRubyLexicalConstant = "ruby_lexical_constant"
 	ResolutionStrategyRubyConstantPath    = "ruby_constant_path"
+	ResolutionStrategySwiftSelfScope      = "swift_self_scope"
+	ResolutionStrategySwiftSelfTypeScope  = "swift_self_type_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -287,6 +289,8 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyRubyExplicitSelf:    ResolutionConfidenceHigh,
 	ResolutionStrategyRubyLexicalConstant: ResolutionConfidenceHigh,
 	ResolutionStrategyRubyConstantPath:    ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSelfScope:      ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSelfTypeScope:  ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -359,6 +363,8 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyRubyExplicitSelf,
 	ResolutionStrategyRubyLexicalConstant,
 	ResolutionStrategyRubyConstantPath,
+	ResolutionStrategySwiftSelfScope,
+	ResolutionStrategySwiftSelfTypeScope,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.

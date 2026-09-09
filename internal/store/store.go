@@ -3819,6 +3819,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	if n, err := s.resolveSwiftScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if n, err := resolveCSharpScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
@@ -4587,6 +4592,13 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if len(paths) == 0 {
 		return nil
 	}
+	if changed, err := s.swiftPathsChanged(ctx, repoID, paths); err != nil {
+		return err
+	} else if changed {
+		if err := s.redecideSwiftSelfBindings(ctx, repoID); err != nil {
+			return err
+		}
+	}
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil); err != nil {
 		return err
 	}
@@ -4666,6 +4678,15 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	names = mergeResolverNames(names, scopeNames)
+	swiftChanged, err := s.swiftPathsChanged(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	if swiftChanged {
+		if err := s.redecideSwiftSelfBindings(ctx, repoID); err != nil {
+			return ResolveEdgesForNamesStats{}, err
+		}
+	}
 
 	invalidateStarted := time.Now()
 	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles, rubyChanged)
@@ -5649,8 +5670,42 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if len(targets) == 0 {
 		return outcome, nil
 	}
+	swiftIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if swiftScopeOwned(target) {
+			swiftIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(swiftIDs) > 0 {
+		if _, err := s.resolveSwiftScopeStandalone(ctx, repoID, swiftIDs); err != nil {
+			return outcome, err
+		}
+		boundSwiftIDs := make(map[int64]struct{})
+		if err := sqliteBatchedIDQuery(ctx, s.db, sortedIDs(swiftIDs),
+			`SELECT id FROM edges WHERE repo_id=? AND dst_symbol_id IS NOT NULL AND id IN (`,
+			[]any{repoID}, func(scan func(...any) error) error {
+				var id int64
+				if err := scan(&id); err != nil {
+					return err
+				}
+				boundSwiftIDs[id] = struct{}{}
+				return nil
+			}); err != nil {
+			return outcome, err
+		}
+		for edgeID := range swiftIDs {
+			if _, bound := boundSwiftIDs[edgeID]; bound {
+				outcome.resolved++
+			} else {
+				outcome.unresolved++
+			}
+		}
+	}
 	filtered := targets[:0]
 	for _, target := range targets {
+		if _, owned := swiftIDs[target.edgeID]; owned {
+			continue
+		}
 		if swiftGenericCallVeto(target.srcLanguage, target.evidence) {
 			outcome.unresolved++
 			continue
