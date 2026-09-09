@@ -46,6 +46,13 @@ func resolverLanguageCompatible(srcLanguage, dstLanguage string) bool {
 	return srcLanguage == dstLanguage
 }
 
+// swiftGenericCallVeto owns no Swift resolution. It withholds parser-v2 Swift
+// call facts from generic name/suffix matching until P22.54 adds syntax-safe
+// Swift ownership.
+func swiftGenericCallVeto(srcLanguage, evidence string) bool {
+	return srcLanguage == "swift" && len(evidence) >= len("swift:") && evidence[:len("swift:")] == "swift:"
+}
+
 // resolverLanguageGateSQL is the one SQL predicate that enforces the rule above
 // for every implicit strategy. It is spliced into each resolver UPDATE and
 // requires exactly three things of the surrounding statement:
@@ -57,7 +64,7 @@ func resolverLanguageCompatible(srcLanguage, dstLanguage string) bool {
 // Candidate relations are always built with `language != ”`, and the join to
 // `files` drops edges whose file row is missing, so an unknown language on
 // either side yields no match rather than a guess.
-const resolverLanguageGateSQL = `f.id = edges.file_id AND r.dst_language = f.language AND f.language <> 'rust'`
+const resolverLanguageGateSQL = `f.id = edges.file_id AND r.dst_language = f.language AND f.language <> 'rust' AND NOT (f.language = 'swift' AND substr(edges.evidence, 1, 6) = 'swift:')`
 
 // symbolLangKey keys candidate lookups by (name, language) so that Go-side
 // resolution can only ever pick a same-language destination.
