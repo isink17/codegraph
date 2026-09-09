@@ -5649,6 +5649,18 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if len(targets) == 0 {
 		return outcome, nil
 	}
+	filtered := targets[:0]
+	for _, target := range targets {
+		if swiftGenericCallVeto(target.srcLanguage, target.evidence) {
+			outcome.unresolved++
+			continue
+		}
+		filtered = append(filtered, target)
+	}
+	targets = filtered
+	if len(targets) == 0 {
+		return outcome, nil
+	}
 	rustIDs := map[int64]struct{}{}
 	for _, target := range targets {
 		if target.srcLanguage == "rust" {

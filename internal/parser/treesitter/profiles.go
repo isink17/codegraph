@@ -44,7 +44,9 @@ func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") 
 func (a *RubyAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:ruby:v5", EmitsCallEdges: true}
 }
-func (a *SwiftAdapter) Profile() parser.Profile { return tsProfile("swift") }
+func (a *SwiftAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:swift:v2", EmitsCallEdges: true}
+}
 func (a *PHPAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:php:v3", EmitsCallEdges: true}
 }
