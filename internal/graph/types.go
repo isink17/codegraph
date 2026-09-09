@@ -186,6 +186,16 @@ const (
 	// owner's singleton visibility is unknown, not that any method is private.
 	ScopeImportRubySingletonVisibilityUnknown = "ruby_singleton_visibility_unknown"
 
+	// ScopeImportRubyConstantVisibility is an explicit constant visibility
+	// override. OwnerModule is the semantic owner, LocalName the constant name,
+	// SourceSpecifier public or private, and Static is always true. Ruby
+	// constants are public by default, so no row means public.
+	ScopeImportRubyConstantVisibility = "ruby_constant_visibility"
+
+	// ScopeImportRubyConstantVisibilityUnknown withdraws visibility for every
+	// constant under OwnerModule when a recognised mutator has dynamic targets.
+	ScopeImportRubyConstantVisibilityUnknown = "ruby_constant_visibility_unknown"
+
 	// ScopeImportRubyConstantIdentityUnknown says a constant's identity was
 	// reassigned in a lexical owner this parser proved: `Service = Other`,
 	// `const_set(:Service, X)`, `remove_const(:Service)`, `autoload :Lazy, ...`.
