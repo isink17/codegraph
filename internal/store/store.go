@@ -4603,7 +4603,12 @@ func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []stri
 	}
 	var changed bool
 	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(stored), true, func(rows *sql.Rows) error {
-		return rows.Scan(&changed)
+		var batchChanged bool
+		if err := rows.Scan(&batchChanged); err != nil {
+			return err
+		}
+		changed = changed || batchChanged
+		return nil
 	})
 	return changed, err
 }
