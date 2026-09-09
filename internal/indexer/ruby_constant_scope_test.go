@@ -28,7 +28,8 @@ type rubyV3Adapter struct {
 }
 
 // rubyV4Adapter reproduces genuine treesitter:ruby:v4 output: it keeps
-// P22.48 singleton facts and strips only P22.50 constant facts.
+// P22.48 singleton facts and non-root P22.48 identity hazards, while stripping
+// only P22.50 root identity/alias and constant-visibility facts.
 type rubyV4Adapter struct {
 	*tsparser.RubyAdapter
 }
@@ -45,10 +46,13 @@ func (a rubyV4Adapter) Parse(ctx context.Context, path string, content []byte) (
 	kept := p.Scope.Imports[:0]
 	for _, fact := range p.Scope.Imports {
 		switch fact.Kind {
-		case graph.ScopeImportRubyConstantIdentityUnknown,
-			graph.ScopeImportRubyConstantVisibility,
+		case graph.ScopeImportRubyConstantVisibility,
 			graph.ScopeImportRubyConstantVisibilityUnknown:
 			continue
+		case graph.ScopeImportRubyConstantIdentityUnknown:
+			if !strings.Contains(fact.OwnerModule, ".") {
+				continue
+			}
 		}
 		kept = append(kept, fact)
 	}
@@ -970,8 +974,9 @@ func TestRubyProfileV4ToV5ConvergesConstantFacts(t *testing.T) {
 end
 Service = Other
 module App
-  class Service; end
-  private_constant :Service
+  Service = Other
+  class Visible; end
+  private_constant :Visible
 end
 Object.const_set(:Root, Other)
 `
@@ -982,8 +987,13 @@ Object.const_set(:Root, Other)
 		t.Fatal(err)
 	}
 	repo := repoID(t, s, root)
-	if got := rubyVisibilityFactRows(t, s, repo); got != "" {
-		t.Fatalf("v4 fixture carries v5 facts: %s", got)
+	v4Facts := rubyVisibilityFactRows(t, s, repo)
+	if !strings.Contains(v4Facts, "ruby_constant_identity_unknown|App.Service|Service|") ||
+		!strings.Contains(v4Facts, "ruby_constant_identity_unknown|Object.Root|Root|") ||
+		strings.Contains(v4Facts, "ruby_constant_identity_unknown|Service|Service|") ||
+		strings.Contains(v4Facts, "ruby_constant_identity_unknown|Root|Root|") ||
+		strings.Contains(v4Facts, "ruby_constant_visibility") {
+		t.Fatalf("genuine v4 facts = %q", v4Facts)
 	}
 	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
 		t.Fatal(err)
@@ -996,7 +1006,7 @@ Object.const_set(:Root, Other)
 	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 || strings.Join(summary.ParserProfileLanguages, ",") != "ruby" {
 		t.Fatalf("summary = %+v", summary)
 	}
-	if got := rubyVisibilityFactRows(t, s, repo); !strings.Contains(got, "ruby_constant_identity_unknown|Service|Service|") || !strings.Contains(got, "ruby_constant_visibility|App|Service|private") {
+	if got := rubyVisibilityFactRows(t, s, repo); !strings.Contains(got, "ruby_constant_identity_unknown|App.Service|Service|") || !strings.Contains(got, "ruby_constant_identity_unknown|Object.Root|Root|") || !strings.Contains(got, "ruby_constant_identity_unknown|Service|Service|") || !strings.Contains(got, "ruby_constant_identity_unknown|Root|Root|") || !strings.Contains(got, "ruby_constant_visibility|App|Visible|private") {
 		t.Fatalf("v5 facts = %q", got)
 	}
 	fresh := newProfileStore(t)
@@ -1013,6 +1023,47 @@ Object.const_set(:Root, Other)
 	if again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
 		t.Fatalf("second update = %+v", again)
 	}
+}
+
+func TestRubyNestedObjectAliasFactLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	patch := filepath.Join(root, "patch.rb")
+	writeProfileFile(t, patch, "module Boot\n  Object.const_set(:Service, Other)\nend\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	hasRootFact := func(want bool) {
+		t.Helper()
+		var n int
+		if err := s.raw(t).QueryRowContext(ctx, `SELECT COUNT(*) FROM scope_import_evidence e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.path='patch.rb' AND f.is_deleted=0 AND e.import_kind=? AND e.owner_module='Service' AND e.local_name='Service'`, repo, graph.ScopeImportRubyConstantIdentityUnknown).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if (n > 0) != want {
+			t.Fatalf("root alias fact count=%d, want present=%v", n, want)
+		}
+	}
+	hasRootFact(true)
+	writeProfileFile(t, patch, "module Boot\n  Object.const_set(name, Other)\nend\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	hasRootFact(false)
+	if err := os.Remove(patch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	hasRootFact(false)
+	writeProfileFile(t, patch, "module Boot\n  Object.const_set(:Service, Other)\nend\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	hasRootFact(true)
 }
 
 // A reassignment written inside a wrapper class or module, and one inside a

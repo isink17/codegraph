@@ -721,7 +721,7 @@ func rubyConstantIdentityCall(call *sitter.Node, scope rubyConstantScope, conten
 		}
 	default:
 		rubyRelativeConstantHazards(scope.chain, rubyJoinQName(path, name), pf)
-		if path == "Object" && (absolute || len(scope.chain) == 0) {
+		if path == "Object" {
 			rubyAddConstantIdentityHazard(name, pf)
 		}
 	}
