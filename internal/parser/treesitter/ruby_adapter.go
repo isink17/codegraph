@@ -620,19 +620,20 @@ func rubyConstantReceiverPath(call *sitter.Node, content []byte) (path string, a
 	if !ok {
 		return "", false, false, false
 	}
-	// `Object.const_set(:Service, X)` moves the ROOT `Service`, not
-	// `Object::Service`. Root constants are never single-segment lexical
-	// candidates in this phase, so there is nothing to withhold and naming
-	// `Object.Service` would state a fact about a different constant.
-	// ponytail: root-constant mutations unmodelled; needs root candidates first.
-	if rubyRootObjectReceivers[path] {
-		return "", false, false, false
-	}
+	// `Object`, `Kernel` and `BasicObject` get no special treatment. They are
+	// ordinary constant receivers, and `Kernel.const_set(:Service, X)` moves
+	// `Kernel::Service` exactly as any other receiver moves its own -- while
+	// this parser's semantic qnames already make `Kernel.Service` a lexical
+	// candidate for a caller inside `module Kernel`, so dropping the hazard
+	// left a confidently wrong edge.
+	//
+	// What stays deferred is the ROOT constant table, and that is the
+	// resolver's doing rather than this classification's: its candidates are
+	// always owner-qualified, so a bare root `Service` is never looked up.
+	// The single-segment refusal in rubyAddConstantIdentityHazard only keeps a
+	// row nothing reads out of the evidence table.
 	return path, strings.HasPrefix(nodeText(receiver, content), "::"), false, true
 }
-
-// rubyRootObjectReceivers hold the root constant table itself.
-var rubyRootObjectReceivers = map[string]bool{"Object": true, "Kernel": true, "BasicObject": true}
 
 // rubyConstantAssignmentTargets turns one assignment's left-hand side into the
 // exact semantic constant qnames whose identity it moves. A non-constant target

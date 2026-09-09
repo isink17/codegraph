@@ -1153,8 +1153,11 @@ end
 		"cref mutation in a singleton method":     {"module App\n  def self.install\n    const_set(:Service, Other)\n  end\nend\n", "-"},
 		// `self` in an instance method has no const_set at all.
 		"cref mutation in an instance method": {"module App\n  def install\n    const_set(:Service, Other)\n  end\nend\n", "App.Service.run"},
-		// The root constant table names a root constant, not App::Service.
+		// A root-object receiver names its own constant, so `App::Service` is
+		// untouched and the call still binds. The hazard it does record
+		// (`Object.Service`) is proven by TestRubyRootObjectMutationFailsClosed.
 		"Object receiver": {"Object.const_set(:Service, Other)\n", "App.Service.run"},
+		"Kernel receiver": {"Kernel.const_set(:Service, Other)\n", "App.Service.run"},
 		// Paren-less and safe-navigation spellings still count.
 		"paren-less":      {"App.const_set :Service, Other\n", "-"},
 		"safe navigation": {"App&.const_set(:Service, Other)\n", "-"},
@@ -1314,4 +1317,170 @@ end
 	step("mutation restored", "-")
 	writeProfileFile(t, patch, "App.const_set(name, Other)\n")
 	step("mutation became dynamic", "App.Service.run")
+}
+
+// -- P22.48-F3: root-object receivers -----------------------------------------
+
+// `Object`, `Kernel` and `BasicObject` are ordinary constant receivers. Each
+// names its OWN constant, and this parser's semantic qnames already make
+// `Kernel.Service` a lexical candidate for a caller inside `module Kernel`, so
+// skipping those receivers left a confidently wrong edge:
+//
+//	Kernel::Service == Other  and  Kernel::Caller.new.f == :other
+//
+// verified against the real interpreter for all three.
+func TestRubyRootObjectMutationFailsClosed(t *testing.T) {
+	for _, owner := range []struct{ keyword, name string }{
+		{"module", "Kernel"},
+		{"class", "BasicObject"},
+		{"class", "Object"},
+	} {
+		t.Run(owner.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			writeProfileFile(t, filepath.Join(root, "app.rb"), rubyRootObjectSource(owner.keyword, owner.name, owner.name+".const_set(:Service, Other)\n"))
+			s := newProfileStore(t)
+			if _, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+				t.Fatalf("index: %v", err)
+			}
+			repo := repoID(t, s, root)
+			if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@16=-|-") {
+				t.Fatalf("%s.const_set did not withdraw %s::Service:\n%s", owner.name, owner.name, bindings)
+			}
+			want := graph.ScopeImportRubyConstantIdentityUnknown + "|" + owner.name + ".Service|Service|"
+			if got := rubyVisibilityFactRows(t, s, repo); !strings.Contains(got, want) {
+				t.Fatalf("facts = %q, want one containing %q", got, want)
+			}
+		})
+	}
+}
+
+// rubyRootObjectSource is the F3 fixture: a caller nested in a root-object
+// owner reaching that owner's own `Service`, plus one trailing patch line.
+func rubyRootObjectSource(keyword, name, patch string) string {
+	return `class Other
+  def self.run
+    :other
+  end
+end
+
+` + keyword + ` ` + name + `
+  class Service
+    def self.run
+      :service
+    end
+  end
+
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+
+` + patch
+}
+
+// The hazard is exact: mutating one root object's constant says nothing about
+// another's, and it must not turn into a root fallback that lets an unrelated
+// caller start resolving a global constant.
+func TestRubyRootObjectMutationIsExact(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	// A caller inside `module Kernel`, and an unrelated caller inside `module
+	// App` whose only tempting target is a ROOT `Service`.
+	writeProfileFile(t, filepath.Join(root, "kernel.rb"), rubyRootObjectSource("module", "Kernel", ""))
+	writeProfileFile(t, filepath.Join(root, "global.rb"), `class Service
+  def self.run; end
+end
+
+module App
+  class Caller
+    def f
+      Service.run()
+    end
+  end
+end
+`)
+	writeProfileFile(t, filepath.Join(root, "patch.rb"), "Object.const_set(:Service, Other)\n")
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	// The whole answer, asserted exactly: rubyBindings renders no file path, so
+	// two Contains probes would be satisfiable by the wrong file's edge.
+	// Object's mutation is not Kernel's, so Kernel::Service still binds; and no
+	// root fallback appeared, so `App::Caller` still reaches nothing.
+	const want = "Service.run@16=Kernel.Service.run|ruby_lexical_constant\nService.run@8=-|-"
+	if got := rubyBindings(t, s, repoID(t, s, root)); got != want {
+		t.Fatalf("bindings:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// The root-object hazards follow the same lifecycle as every other one:
+// production/test origin, soft delete, add/delete/restore, references.
+func TestRubyRootObjectMutationLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "spec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, filepath.Join(root, "kernel.rb"), rubyRootObjectSource("module", "Kernel", ""))
+	// A spec-only mutation must not veto the production caller.
+	writeProfileFile(t, filepath.Join(root, "spec", "patch_spec.rb"), "Kernel.const_set(:Service, Other)\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo := repoID(t, s, root)
+	patch := filepath.Join(root, "patch.rb")
+	referenceBound := func() bool {
+		t.Helper()
+		var n int
+		if err := s.raw(t).QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM references_tbl
+			WHERE repo_id = ? AND name = 'Service.run' AND symbol_id IS NOT NULL`, repo).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	step := func(name, want string) {
+		t.Helper()
+		if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+			t.Fatalf("%s: update: %v", name, err)
+		}
+		bindings := rubyBindings(t, s, repo)
+		if !strings.Contains(bindings, "Service.run@16="+want) {
+			t.Fatalf("%s:\n%s\nwant Service.run@16=%s", name, bindings, want)
+		}
+		if fresh := freshRubyGraph(t, root); bindings != fresh {
+			t.Fatalf("%s: incremental:\n%s\nfresh:\n%s", name, bindings, fresh)
+		}
+		if got := referenceBound(); got != (want != "-") {
+			t.Fatalf("%s: reference bound = %v, want %v", name, got, want != "-")
+		}
+	}
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@16=Kernel.Service.run|ruby_lexical_constant") {
+		t.Fatalf("a spec-only Kernel.const_set erased the production identity:\n%s", bindings)
+	}
+	writeProfileFile(t, patch, "Kernel.const_set(:Service, Other)\n")
+	step("production mutation added", "-")
+	if err := os.Remove(patch); err != nil {
+		t.Fatal(err)
+	}
+	step("mutation file deleted", "Kernel.Service.run")
+	writeProfileFile(t, patch, "Kernel.const_set(:Service, Other)\n")
+	step("mutation restored", "-")
+	// A soft-deleted patch states nothing: same end state as the hard delete.
+	if _, err := s.raw(t).ExecContext(ctx,
+		`UPDATE files SET is_deleted = 1 WHERE repo_id = ? AND path = 'patch.rb'`, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.ResolveEdges(ctx, repo); err != nil {
+		t.Fatalf("re-resolve: %v", err)
+	}
+	if bindings := rubyBindings(t, s, repo); !strings.Contains(bindings, "Service.run@16=Kernel.Service.run|ruby_lexical_constant") {
+		t.Fatalf("a soft-deleted patch kept vetoing:\n%s", bindings)
+	}
 }

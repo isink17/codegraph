@@ -1014,9 +1014,18 @@ func TestRubyConstantIdentityReceiverSpellingFences(t *testing.T) {
 		"superclass body":      {"class Foo < Bar\n  App.const_set(:Service, Other)\nend\n", []string{"Foo.App.Service|Service", "App.Service|Service"}},
 		"public_send indirect": {"App.public_send(:const_set, :Service, Other)\n", nil},
 		"send indirect":        {"App.send(:const_set, :Service, Other)\n", nil},
-		// The root constant table is not a constant this phase can withhold.
-		"Object receiver": {"Object.const_set(:Service, Other)\n", nil},
-		"Kernel receiver": {"Kernel.const_set(:Service, Other)\n", nil},
+		// `Object`, `Kernel` and `BasicObject` are ordinary constant receivers:
+		// each names its own constant, and this parser already makes those
+		// qnames lexical candidates for a caller inside them.
+		"Object receiver":      {"Object.const_set(:Service, Other)\n", []string{"Object.Service|Service"}},
+		"Kernel receiver":      {"Kernel.const_set(:Service, Other)\n", []string{"Kernel.Service|Service"}},
+		"BasicObject receiver": {"BasicObject.const_set(:Service, Other)\n", []string{"BasicObject.Service|Service"}},
+		"absolute Kernel":      {"::Kernel.const_set(:Service, Other)\n", []string{"Kernel.Service|Service"}},
+		// The ROOT constant table stays deferred, and that follows from a
+		// single-segment qname being unreachable here rather than from the
+		// receiver: a bare `Service` at the root is not a candidate.
+		"root bare assignment": {"Service = Other\n", nil},
+		"root cref const_set":  {"const_set(:Service, Other)\n", nil},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := rubyIdentityHazards(parseRuby(t, tc.source))
