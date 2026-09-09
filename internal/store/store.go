@@ -4593,12 +4593,36 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	return s.ReconcileReferenceIdentities(ctx, repoID)
 }
 
+func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []string) (bool, error) {
+	if len(paths) == 0 {
+		return false, nil
+	}
+	stored := make([]string, 0, len(paths)*3)
+	for _, path := range paths {
+		stored = append(stored, storedPathVariants(CanonicalRelPath(path))...)
+	}
+	var changed bool
+	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(stored), true, func(rows *sql.Rows) error {
+		var batchChanged bool
+		if err := rows.Scan(&batchChanged); err != nil {
+			return err
+		}
+		changed = changed || batchChanged
+		return nil
+	})
+	return changed, err
+}
+
 // ResolveEdgesForPathsAndNames shares one module discovery pass across the two
 // incremental resolver scopes. Own-module edges are resolved repo-wide first;
 // path/name scopes then handle remaining evidence without another WalkDir.
 func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, paths, names []string) (ResolveEdgesForNamesStats, error) {
 	if len(paths) == 0 && len(names) == 0 {
 		return ResolveEdgesForNamesStats{}, nil
+	}
+	rubyChanged, err := s.rubyPathsChanged(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
 	}
 	// Invalidate before anything re-binds: a binding this batch may have made
 	// ambiguous has to be reconsidered, not merely left alone. It runs first so
@@ -4612,7 +4636,6 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	scopes := newImportScopeCache(s, repoID)
-	var err error
 	scopes.rustRoots, err = s.rustRootsForPaths(ctx, repoID, paths)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -4645,7 +4668,7 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	names = mergeResolverNames(names, scopeNames)
 
 	invalidateStarted := time.Now()
-	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles)
+	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles, rubyChanged)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
@@ -4786,7 +4809,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 //     can therefore still go stale in the way described above; that is the
 //     pre-existing behaviour, and narrowing it is a separate decision from
 //     this one.
-func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string, rustScope map[int64]struct{}) (int, error) {
+func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string, rustScope map[int64]struct{}, rubyChanged bool) (int, error) {
 	wanted := make(map[string]struct{}, len(names))
 	unique := make([]string, 0, len(names))
 	for _, name := range names {
@@ -4800,7 +4823,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		wanted[name] = struct{}{}
 		unique = append(unique, name)
 	}
-	if len(unique) == 0 {
+	if len(unique) == 0 && !rubyChanged {
 		return 0, nil
 	}
 
@@ -4854,7 +4877,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	}
 	// Ruby constant bindings depend on the owner's visibility facts and on the
 	// caller's lexical nesting, neither of which is the destination's own name.
-	rubyStale, err := s.rubyStaleConstantBindings(ctx, repoID, wanted)
+	rubyStale, err := s.rubyStaleConstantBindings(ctx, repoID, wanted, rubyChanged)
 	if err != nil {
 		return 0, err
 	}
@@ -5276,7 +5299,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		// one owns it. It must precede the module pass below for the ordering
 		// reason ResolveEdgesForPathsAndNames documents.
 		invalidateStarted := time.Now()
-		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique, nil)
+		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique, nil, false)
 		if err != nil {
 			return stats, err
 		}

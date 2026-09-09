@@ -192,6 +192,7 @@ const (
 	// constant name is the target's semantic owner, and the owner has exactly
 	// one public singleton method of that name.
 	ResolutionStrategyRubyLexicalConstant = "ruby_lexical_constant"
+	ResolutionStrategyRubyConstantPath    = "ruby_constant_path"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -285,6 +286,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyRubyImplicitSelf:    ResolutionConfidenceHigh,
 	ResolutionStrategyRubyExplicitSelf:    ResolutionConfidenceHigh,
 	ResolutionStrategyRubyLexicalConstant: ResolutionConfidenceHigh,
+	ResolutionStrategyRubyConstantPath:    ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -356,6 +358,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyRubyImplicitSelf,
 	ResolutionStrategyRubyExplicitSelf,
 	ResolutionStrategyRubyLexicalConstant,
+	ResolutionStrategyRubyConstantPath,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.

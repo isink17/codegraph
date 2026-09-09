@@ -414,7 +414,7 @@ func TestNameInvalidationKeepsUnaffectedRustCrates(t *testing.T) {
 	}
 	inScope := f.edgeByCrate[rustBudgetCrateRoot(0)]
 	outOfScope := f.edgeByCrate[rustBudgetCrateRoot(rustBudgetCrateCount-1)]
-	if _, err := s.invalidateNameEvidenceBindings(ctx, repo.ID, []string{"crate::m::helper"}, scope); err != nil {
+	if _, err := s.invalidateNameEvidenceBindings(ctx, repo.ID, []string{"crate::m::helper"}, scope, false); err != nil {
 		t.Fatal(err)
 	}
 	strategy := func(edge int64) string {

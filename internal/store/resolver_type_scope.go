@@ -1310,13 +1310,19 @@ var (
 		applies:          (*Store).phpScopeRepairApplies,
 		resolvesRepoWide: true,
 	}
+	rubyConstantPathRepair = resolverRepair{
+		key:              rubyConstantPathRepairSettingKey,
+		run:              (*Store).repairRubyConstantPathBindings,
+		applies:          (*Store).rubyConstantPathRepairApplies,
+		resolvesRepoWide: true,
+	}
 	referenceIdentityRepair = resolverRepair{
 		key:              referenceIdentityRepairSettingKey,
 		run:              (*Store).ReconcileReferenceIdentities,
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, rubyConstantPathRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,
