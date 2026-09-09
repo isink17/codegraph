@@ -427,7 +427,7 @@ end
 				{name: "multi segment", source: shape("App::Service.run()"),
 					want: map[string]string{"App::Service.run": "-"}},
 				{name: "absolute", source: shape("::App::Service.run()"),
-					want: map[string]string{"::App::Service.run": "-"}},
+					want: map[string]string{"::App::Service.run": "App.Service.run"}},
 				{name: "value receiver", source: shape("obj.run()"),
 					want: map[string]string{"obj.run": "-"}},
 				{name: "safe navigation", source: shape("Service&.run()"),

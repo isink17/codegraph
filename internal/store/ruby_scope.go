@@ -74,14 +74,12 @@ import (
 // whose singleton surface a dynamic form or `module_function` made unprovable.
 // Facts that disagree without a load order to break the tie fail closed.
 //
-// There is no one-time resolver repair for this pass. The parser facts it
-// consumes changed with it, so treesitter:ruby:v3 is the compatibility
-// boundary: a repository indexed under v2 reparses every Ruby file on its next
-// full scan, which replaces the edge rows themselves. A resolver repair can
-// only re-decide bindings, and a v2 edge row for `self.name = v` or for a
-// self-rebinding block is stale evidence no re-decision could make truthful.
+// Constant-path semantics use a resolver repair because v5 parser facts already
+// contain the receiver spelling. The repair clears Ruby call bindings and
+// re-decides them without reparsing; parser profile remains treesitter:ruby:v5.
 
 const rubyScopeResolution = "tmp_ruby_scope_resolution"
+const rubyConstantPathRepairSettingKey = "resolver.ruby_constant_path_repaired.v1"
 
 // rubyScopeStrategies is every strategy this pass writes; the incremental
 // invalidation keys on it.
@@ -89,6 +87,7 @@ var rubyScopeStrategies = []string{
 	ResolutionStrategyRubyImplicitSelf,
 	ResolutionStrategyRubyExplicitSelf,
 	ResolutionStrategyRubyLexicalConstant,
+	ResolutionStrategyRubyConstantPath,
 }
 
 // rubyScopeVetoSQL keeps every repo-wide strategy off ordinary Ruby calls. It
@@ -140,32 +139,34 @@ func rubyScopeMethod(evidence, dstName string) (method, strategy string, ok bool
 	return method, strategy, true
 }
 
-// rubyConstantCall splits `Service.run` / `Service::run` into the receiver
-// constant and the method name. Both operators are ordinary explicit-receiver
-// method calls on the same object, so both are accepted and the spelling is
-// preserved on the edge; nothing else is. A multi-segment path
-// (`A::Service.run`), an absolute one (`::Service.run`), a lowercase receiver
-// and any further operator in the tail all fail closed: this phase models the
-// nesting scan for one unqualified constant, and every one of those spellings
-// asks a different question.
-func rubyConstantCall(dstName string) (constant, method string, ok bool) {
-	cut := strings.IndexAny(dstName, ".:&")
-	if cut <= 0 {
-		return "", "", false
+// rubyConstantCall parses only explicit constant receivers with one final
+// method operator. Punctuation is accepted only after parser evidence owns it.
+func rubyConstantCall(dstName string) (absolute bool, segments []string, method, operator string, ok bool) {
+	receiver, tail, operator := "", "", ""
+	if i := strings.IndexByte(dstName, '.'); i >= 0 {
+		receiver, tail, operator = dstName[:i], dstName[i+1:], "."
+	} else if i := strings.LastIndex(dstName, "::"); i >= 0 {
+		receiver, tail, operator = dstName[:i], dstName[i+2:], "::"
+	} else {
+		return false, nil, "", "", false
 	}
-	constant = dstName[:cut]
-	switch rest := dstName[cut:]; {
-	case strings.HasPrefix(rest, "::"):
-		method = rest[2:]
-	case strings.HasPrefix(rest, "."):
-		method = rest[1:]
-	default:
-		return "", "", false
+	if tail == "" || strings.ContainsAny(tail, ".:&()") {
+		return false, nil, "", "", false
 	}
-	if !rubySimpleConstant(constant) || method == "" || strings.ContainsAny(method, ".:&(") {
-		return "", "", false
+	absolute = strings.HasPrefix(receiver, "::")
+	if absolute {
+		receiver = receiver[2:]
 	}
-	return constant, method, true
+	if receiver == "" {
+		return false, nil, "", "", false
+	}
+	for _, segment := range strings.Split(receiver, "::") {
+		if !rubySimpleConstant(segment) {
+			return false, nil, "", "", false
+		}
+		segments = append(segments, segment)
+	}
+	return absolute, segments, tail, operator, true
 }
 
 // rubySimpleConstant reports whether text is exactly one Ruby constant token.
@@ -258,6 +259,87 @@ type rubyConstantRows struct {
 	anyKinds, productionKinds map[string]struct{}
 	reassignedAny             bool
 	reassignedProduction      bool
+}
+
+type rubyConstantVisibility struct {
+	overrides, productionOverrides map[string]map[string]struct{}
+	hazards, productionHazards     map[string]struct{}
+}
+
+func rubyConstantVisible(v rubyConstantVisibility, owner, name string, callerIsTest, explicit bool) bool {
+	if !explicit {
+		return true
+	}
+	if owner == "" {
+		owner = "Object"
+	}
+	hazards, overrides := v.hazards, v.overrides
+	if !callerIsTest {
+		hazards, overrides = v.productionHazards, v.productionOverrides
+	}
+	if _, ok := hazards[owner]; ok {
+		return false
+	}
+	values := overrides[owner+"."+name]
+	_, public := values[rubyVisibilityPublic]
+	return len(values) == 0 || (len(values) == 1 && public)
+}
+
+func rubyLoadConstantVisibility(ctx context.Context, q rubyScopeQuery, repoID int64, qnames []string, testFiles map[int64]struct{}) (rubyConstantVisibility, error) {
+	v := rubyConstantVisibility{
+		overrides: map[string]map[string]struct{}{}, productionOverrides: map[string]map[string]struct{}{},
+		hazards: map[string]struct{}{}, productionHazards: map[string]struct{}{},
+	}
+	owners := make(map[string]struct{}, len(qnames)*2)
+	names := make(map[string]struct{}, len(qnames))
+	for _, qname := range qnames {
+		if dot := strings.LastIndexByte(qname, '.'); dot >= 0 {
+			owners[qname[:dot]] = struct{}{}
+			names[qname[dot+1:]] = struct{}{}
+		} else {
+			owners["Object"] = struct{}{}
+			names[qname] = struct{}{}
+		}
+	}
+	if len(owners) == 0 || len(names) == 0 {
+		return v, nil
+	}
+	err := sqliteBatchedQuery(ctx, q, `SELECT h.import_kind,h.owner_module,h.local_name,h.source_specifier,h.file_id
+FROM scope_import_evidence h JOIN files f ON f.id=h.file_id
+WHERE h.repo_id=? AND h.language='ruby' AND f.is_deleted=0 AND h.is_static=1
+  AND h.import_kind IN ('`+graph.ScopeImportRubyConstantVisibility+`','`+graph.ScopeImportRubyConstantVisibilityUnknown+`')
+  AND h.owner_module IN (`, "%s)", []any{repoID}, stringSliceToAny(sortedKeys(owners)), true,
+		func(rows *sql.Rows) error {
+			var kind, owner, name, specifier string
+			var fileID int64
+			if err := rows.Scan(&kind, &owner, &name, &specifier, &fileID); err != nil {
+				return err
+			}
+			if kind != graph.ScopeImportRubyConstantVisibilityUnknown {
+				if _, ok := names[name]; !ok {
+					return nil
+				}
+			}
+			if kind == graph.ScopeImportRubyConstantVisibilityUnknown {
+				v.hazards[owner] = struct{}{}
+				if _, test := testFiles[fileID]; !test {
+					v.productionHazards[owner] = struct{}{}
+				}
+				return nil
+			}
+			if _, ok := v.overrides[owner+"."+name]; !ok {
+				v.overrides[owner+"."+name] = map[string]struct{}{}
+			}
+			v.overrides[owner+"."+name][specifier] = struct{}{}
+			if _, test := testFiles[fileID]; !test {
+				if v.productionOverrides[owner+"."+name] == nil {
+					v.productionOverrides[owner+"."+name] = map[string]struct{}{}
+				}
+				v.productionOverrides[owner+"."+name][specifier] = struct{}{}
+			}
+			return nil
+		})
+	return v, err
 }
 
 func (r rubyConstantRows) kinds(callerIsTest bool) map[string]struct{} {
@@ -491,7 +573,7 @@ FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_sym
 WHERE e.repo_id=? AND f.language='ruby' AND e.edge_kind='`+EdgeKindCalls+`' AND e.dst_symbol_id IS NULL
   AND e.evidence IN ('`+rubyImplicitReceiver+`','`+rubySelfReceiver+`','`+rubyConstantReceiver+`')
   AND src.repo_id=e.repo_id AND src.language='ruby' AND src.kind='function'
-  AND src.container_name<>'' AND src.is_static IS NOT NULL`,
+  AND src.is_static IS NOT NULL`,
 		" AND e.id IN (%s)", []any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e rubyScopeEdge
@@ -529,13 +611,16 @@ WHERE e.repo_id=? AND f.language='ruby' AND e.edge_kind='`+EdgeKindCalls+`' AND 
 	constantFiles := make(map[int64]struct{}, 4)
 	for _, e := range edges {
 		if e.evidence == rubyConstantReceiver {
-			if _, _, ok := rubyConstantCall(e.dstName); ok {
+			if _, _, _, _, ok := rubyConstantCall(e.dstName); ok {
 				constantFiles[e.fileID] = struct{}{}
 			}
 			continue
 		}
 		method, strategy, ok := rubyScopeMethod(e.evidence, e.dstName)
 		if !ok {
+			continue
+		}
+		if e.container == "" {
 			continue
 		}
 		qname := e.container + "." + method
@@ -557,6 +642,8 @@ WHERE e.repo_id=? AND f.language='ruby' AND e.edge_kind='`+EdgeKindCalls+`' AND 
 		type lookup struct {
 			method     string
 			fileID     int64
+			absolute   bool
+			segments   []string
 			candidates []string
 		}
 		lookups := make(map[int64]lookup, len(constantFiles))
@@ -565,23 +652,36 @@ WHERE e.repo_id=? AND f.language='ruby' AND e.edge_kind='`+EdgeKindCalls+`' AND 
 			if e.evidence != rubyConstantReceiver {
 				continue
 			}
-			constant, method, ok := rubyConstantCall(e.dstName)
+			absolute, segments, method, _, ok := rubyConstantCall(e.dstName)
 			if !ok {
 				continue
 			}
-			chain, ok := rubyLexicalChain(parents[e.fileID], e.container)
-			if !ok {
-				continue
+			var candidates []string
+			if absolute {
+				candidates = []string{segments[0]}
+			} else {
+				chain, chainOK := rubyLexicalChain(parents[e.fileID], e.container)
+				if !chainOK {
+					continue
+				}
+				for _, level := range chain {
+					candidates = append(candidates, level+"."+segments[0])
+				}
 			}
-			candidates := make([]string, 0, len(chain))
-			for _, level := range chain {
-				candidate := level + "." + constant
-				candidates = append(candidates, candidate)
+			for _, candidate := range candidates {
 				candidateSet[candidate] = struct{}{}
+				for _, segment := range segments[1:] {
+					candidate += "." + segment
+					candidateSet[candidate] = struct{}{}
+				}
 			}
-			lookups[e.id] = lookup{method: method, fileID: e.fileID, candidates: candidates}
+			lookups[e.id] = lookup{method: method, fileID: e.fileID, absolute: absolute, segments: segments, candidates: candidates}
 		}
 		declared, err := rubyLoadConstants(ctx, q, repoID, sortedKeys(candidateSet), testFiles)
+		if err != nil {
+			return 0, err
+		}
+		visibility, err := rubyLoadConstantVisibility(ctx, q, repoID, sortedKeys(candidateSet), testFiles)
 		if err != nil {
 			return 0, err
 		}
@@ -592,12 +692,32 @@ WHERE e.repo_id=? AND f.language='ruby' AND e.edge_kind='`+EdgeKindCalls+`' AND 
 				if state == rubyConstantAbsent {
 					continue
 				}
-				if state == rubyConstantCoherent {
-					qname := candidate + "." + l.method
-					wants[id] = want{method: l.method, strategy: ResolutionStrategyRubyLexicalConstant,
-						qname: qname, static: 1, public: true}
+				visibilityOwner := candidate
+				if l.absolute {
+					visibilityOwner = "Object"
+				}
+				if state != rubyConstantCoherent || !rubyConstantVisible(visibility, visibilityOwner, l.segments[0], callerIsTest, l.absolute) {
+					break
+				}
+				owner := candidate
+				valid := true
+				for _, segment := range l.segments[1:] {
+					parent := owner
+					owner += "." + segment
+					if rubyOwnsConstant(declared, owner, callerIsTest) != rubyConstantCoherent || !rubyConstantVisible(visibility, parent, segment, callerIsTest, true) {
+						valid = false
+						break
+					}
+				}
+				if valid {
+					qname := owner + "." + l.method
+					strategy := ResolutionStrategyRubyLexicalConstant
+					if l.absolute || len(l.segments) > 1 {
+						strategy = ResolutionStrategyRubyConstantPath
+					}
+					wants[id] = want{method: l.method, strategy: strategy, qname: qname, static: 1, public: true}
 					qnameSet[qname] = struct{}{}
-					owners[candidate] = struct{}{}
+					owners[owner] = struct{}{}
 				}
 				break
 			}
@@ -734,8 +854,8 @@ func rubyScopeApply(ctx context.Context, q rubyScopeQuery, res map[int64]rubySco
 //
 // Over-approximating costs one re-decision that reaches the same answer;
 // under-approximating leaves a binding asserting a call that now raises.
-func (s *Store) rubyStaleConstantBindings(ctx context.Context, repoID int64, wanted map[string]struct{}) ([]int64, error) {
-	if len(wanted) == 0 {
+func (s *Store) rubyStaleConstantBindings(ctx context.Context, repoID int64, wanted map[string]struct{}, rubyChanged bool) ([]int64, error) {
+	if len(wanted) == 0 && !rubyChanged {
 		return nil, nil
 	}
 	// edges.resolution_strategy is not indexed, so the scan below is repo-wide.
@@ -760,7 +880,7 @@ func (s *Store) rubyStaleConstantBindings(ctx context.Context, repoID int64, wan
 		FROM edges e JOIN symbols d ON d.id = e.dst_symbol_id
 		LEFT JOIN symbols src ON src.id = e.src_symbol_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL
-		  AND e.resolution_strategy = '`+ResolutionStrategyRubyLexicalConstant+`'`, []any{repoID},
+		  AND e.resolution_strategy IN `+sqlQuotedList(rubyScopeStrategies), []any{repoID},
 		func(rows *sql.Rows) error {
 			var id int64
 			var name, container, srcContainer string
@@ -768,7 +888,7 @@ func (s *Store) rubyStaleConstantBindings(ctx context.Context, repoID int64, wan
 				return err
 			}
 			_, byMethod := wanted[name]
-			if byMethod || namesAnySegment(container) || namesAnySegment(srcContainer) {
+			if rubyChanged || byMethod || namesAnySegment(container) || namesAnySegment(srcContainer) {
 				stale = append(stale, id)
 			}
 			return nil
@@ -790,4 +910,21 @@ func (s *Store) resolveRubyScopeStandalone(ctx context.Context, repoID int64, on
 		return 0, err
 	}
 	return n, tx.Commit()
+}
+
+func (s *Store) rubyConstantPathRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND is_deleted=0)`, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairRubyConstantPathBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+WHERE repo_id=? AND edge_kind='`+EdgeKindCalls+`'
+  AND file_id IN (SELECT id FROM files WHERE repo_id=? AND language='ruby')`, repoID, repoID)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
 }

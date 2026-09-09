@@ -78,17 +78,17 @@ func TestRubyConstantCallSpellings(t *testing.T) {
 		{spelling: "Service::run", constant: "Service", method: "run", ok: true},
 		{spelling: "Service2.run_now?", constant: "Service2", method: "run_now?", ok: true},
 		{spelling: "Service.run!", constant: "Service", method: "run!", ok: true},
-		{spelling: "A::Service.run"},
-		{spelling: "A::B.run"},
-		{spelling: "A::B::run"},
-		{spelling: "::Service.run"},
-		{spelling: "::A::B.run"},
+		{spelling: "A::Service.run", constant: "A::Service", method: "run", ok: true},
+		{spelling: "A::B.run", constant: "A::B", method: "run", ok: true},
+		{spelling: "A::B::run", constant: "A::B", method: "run", ok: true},
+		{spelling: "::Service.run", constant: "::Service", method: "run", ok: true},
+		{spelling: "::A::B.run", constant: "::A::B", method: "run", ok: true},
 		{spelling: "Service&.run"},
 		{spelling: "service.run"},
 		{spelling: "obj.run"},
 		{spelling: "factory.service.run"},
 		{spelling: "Service.build.run"},
-		{spelling: "SERVICE::Nested.run"},
+		{spelling: "SERVICE::Nested.run", constant: "SERVICE::Nested", method: "run", ok: true},
 		{spelling: "Service"},
 		{spelling: "Service."},
 		{spelling: "Service::"},
@@ -96,7 +96,11 @@ func TestRubyConstantCallSpellings(t *testing.T) {
 		{spelling: "self.run"},
 		{spelling: "@ivar.run"},
 	} {
-		constant, method, ok := rubyConstantCall(tc.spelling)
+		absolute, segments, method, _, ok := rubyConstantCall(tc.spelling)
+		constant := strings.Join(segments, "::")
+		if absolute {
+			constant = "::" + constant
+		}
 		if ok != tc.ok || constant != tc.constant || method != tc.method {
 			t.Errorf("rubyConstantCall(%q) = (%q, %q, %v), want (%q, %q, %v)",
 				tc.spelling, constant, method, ok, tc.constant, tc.method, tc.ok)
@@ -159,36 +163,52 @@ func TestRubyLexicalConstantAcceptance(t *testing.T) {
 	f.nested(t, file, "class", "App.PrivateService", "App")
 	f.singleton(t, file, "App.PrivateService.run", "public")
 	f.visibility(t, file, "App.PrivateService", "run", "private")
+	f.nested(t, file, "type", "App.API", "App")
+	f.nested(t, file, "type", "App.API.V2", "App.API")
+	f.nested(t, file, "class", "App.API.V2.Service", "App.API.V2")
+	apiPublic := f.singleton(t, file, "App.API.V2.Service.run", "public")
 	f.nested(t, file, "class", "App.Caller", "App")
 	caller := f.method(t, file, "App.Caller.f", false)
 
 	bound := map[string]int64{
-		"PublicService.run":  f.call(t, file, srcOf(caller), "PublicService.run", rubyConstantReceiver, 1),
-		"PublicService::run": f.call(t, file, srcOf(caller), "PublicService::run", rubyConstantReceiver, 2),
+		"PublicService.run":        f.call(t, file, srcOf(caller), "PublicService.run", rubyConstantReceiver, 1),
+		"PublicService::run":       f.call(t, file, srcOf(caller), "PublicService::run", rubyConstantReceiver, 2),
+		"API::V2::Service.run":     f.call(t, file, srcOf(caller), "API::V2::Service.run", rubyConstantReceiver, 8),
+		"::App::PublicService.run": f.call(t, file, srcOf(caller), "::App::PublicService.run", rubyConstantReceiver, 6),
 	}
 	nullEdges := map[string]int64{
-		"private target":     f.call(t, file, srcOf(caller), "PrivateService.run", rubyConstantReceiver, 3),
-		"missing constant":   f.call(t, file, srcOf(caller), "Missing.run", rubyConstantReceiver, 4),
-		"multi segment":      f.call(t, file, srcOf(caller), "App::PublicService.run", rubyConstantReceiver, 5),
-		"absolute":           f.call(t, file, srcOf(caller), "::App::PublicService.run", rubyConstantReceiver, 6),
-		"multi segment cons": f.call(t, file, srcOf(caller), "App::PublicService::run", rubyConstantReceiver, 7),
+		"private target":          f.call(t, file, srcOf(caller), "PrivateService.run", rubyConstantReceiver, 3),
+		"missing constant":        f.call(t, file, srcOf(caller), "Missing.run", rubyConstantReceiver, 4),
+		"relative root-like path": f.call(t, file, srcOf(caller), "App::PublicService::run", rubyConstantReceiver, 7),
 	}
 	names := []string{"run", "PublicService.run", "PublicService::run", "PrivateService.run",
-		"Missing.run", "App::PublicService.run", "::App::PublicService.run", "App::PublicService::run"}
+		"Missing.run", "App::PublicService.run", "::App::PublicService.run", "App::PublicService::run", "API::V2::Service.run"}
+	nullEdges["relative root-like dot path"] = f.call(t, file, srcOf(caller), "App::PublicService.run", rubyConstantReceiver, 5)
 	want := "App.PublicService.run|" + ResolutionStrategyRubyLexicalConstant + "|" + ResolutionConfidenceHigh
 	for _, entry := range rubyEntryPoints {
 		f.clearAll(t)
 		f.resolveVia(t, entry, []string{"app/services.rb"}, names)
 		for name, edge := range bound {
-			if got := f.binding(t, edge); got != want {
-				t.Fatalf("%s: %s = %s, want %s", entry, name, got, want)
+			wantEdge := want
+			if strings.HasPrefix(name, "API::") {
+				wantEdge = "App.API.V2.Service.run|" + ResolutionStrategyRubyConstantPath + "|" + ResolutionConfidenceHigh
+			}
+			if strings.Contains(name, "::") && (strings.HasPrefix(name, "App::") || strings.HasPrefix(name, "::")) {
+				wantEdge = "App.PublicService.run|" + ResolutionStrategyRubyConstantPath + "|" + ResolutionConfidenceHigh
+			}
+			if got := f.binding(t, edge); got != wantEdge {
+				t.Fatalf("%s: %s = %s, want %s", entry, name, got, wantEdge)
 			}
 			var dst int64
 			if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id FROM edges WHERE id = ?`, edge).Scan(&dst); err != nil {
 				t.Fatal(err)
 			}
-			if dst != public {
-				t.Fatalf("%s: %s bound symbol %d, want %d", entry, name, dst, public)
+			wantDst := public
+			if strings.HasPrefix(name, "API::") {
+				wantDst = apiPublic
+			}
+			if dst != wantDst {
+				t.Fatalf("%s: %s bound symbol %d, want %d", entry, name, dst, wantDst)
 			}
 		}
 		for name, edge := range nullEdges {
@@ -750,6 +770,8 @@ func TestRubyLexicalConstantWrongEdgeFixtures(t *testing.T) {
 	names = append(names, "Service.run")
 
 	paths := []string{"app/a.rb", "app/bait.rb", "app/top.rb"}
+	positive := edges["absolute multi segment"]
+	delete(edges, "absolute multi segment")
 	for _, entry := range rubyEntryPoints {
 		f.clearAll(t)
 		f.resolveVia(t, entry, paths, names)
@@ -757,6 +779,9 @@ func TestRubyLexicalConstantWrongEdgeFixtures(t *testing.T) {
 			if got := f.binding(t, edge); got != "<unresolved>" {
 				t.Fatalf("%s: %s = %s, want unresolved", entry, name, got)
 			}
+		}
+		if got := f.binding(t, positive); got != "App.Service.run|"+ResolutionStrategyRubyConstantPath+"|"+ResolutionConfidenceHigh {
+			t.Fatalf("%s: absolute multi segment = %s", entry, got)
 		}
 	}
 }
