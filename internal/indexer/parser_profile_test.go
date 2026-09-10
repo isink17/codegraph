@@ -702,6 +702,7 @@ type snapshot struct {
 	// re-export-only file has, so a snapshot that omitted them could not prove
 	// a refused transition left such a file untouched.
 	ScopeImports, ModuleCandidates int
+	SwiftLexicalBindings           int
 	Provenance                     string
 }
 
@@ -719,12 +720,13 @@ func graphSnapshot(t *testing.T, s *profileStore) snapshot {
 		       (SELECT COUNT(*) FROM scans),
 		       (SELECT COUNT(*) FROM scope_import_evidence),
 		       (SELECT COUNT(*) FROM scope_module_candidate_evidence),
+		       (SELECT COUNT(*) FROM swift_lexical_binding_evidence),
 		       (SELECT COALESCE(GROUP_CONCAT(path || '=' || parser_profile || ':' || parser_call_edges), '')
 		          FROM (SELECT path, parser_profile, parser_call_edges FROM files ORDER BY path))
 	`)
 	if err := row.Scan(&out.Files, &out.Symbols, &out.Edges, &out.Refs, &out.Imports,
 		&out.ScopeEvidence, &out.TestLinks, &out.Scans,
-		&out.ScopeImports, &out.ModuleCandidates, &out.Provenance); err != nil {
+		&out.ScopeImports, &out.ModuleCandidates, &out.SwiftLexicalBindings, &out.Provenance); err != nil {
 		t.Fatalf("snapshot error = %v", err)
 	}
 	return out

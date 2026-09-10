@@ -96,8 +96,9 @@ type FileParserProfileGroup struct {
 // rows, and deliberately so: a `--languages go` run makes no claim about Java,
 // so the Java evidence a previous run wrote is still the best answer anyone
 // has, and it keeps pinning its profile.
-// Swift v2 is also included while upgrading to v3: v3 adds member-value facts
-// to files that v2 could index with no persisted graph rows.
+// Swift v2 and v3 are also included while upgrading to the next tree-sitter
+// profile: each can index a factless Swift file whose new parser semantics must
+// still replace the old persisted interpretation.
 const FileParserOwnedEvidencePredicate = `(
 		   EXISTS (SELECT 1 FROM symbols t WHERE t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM references_tbl t WHERE t.file_id = f.id)
@@ -108,8 +109,9 @@ const FileParserOwnedEvidencePredicate = `(
 		OR EXISTS (SELECT 1 FROM scope_module_candidate_evidence t WHERE t.repo_id = f.repo_id AND t.source_file_id = f.id)
 		OR EXISTS (SELECT 1 FROM rust_module_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM go_local_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+		OR EXISTS (SELECT 1 FROM swift_lexical_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM test_links t WHERE t.test_file_id = f.id)
-		OR (f.language = 'swift' AND f.parser_profile = 'treesitter:swift:v2' AND f.parse_state = 'indexed')
+		OR (f.language = 'swift' AND f.parser_profile IN ('treesitter:swift:v2', 'treesitter:swift:v3') AND f.parse_state = 'indexed')
 	)`
 
 // FileParserProfileGroups returns the repository's persisted parser provenance,

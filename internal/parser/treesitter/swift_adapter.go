@@ -34,6 +34,7 @@ func (a *SwiftAdapter) Parse(ctx context.Context, path string, content []byte) (
 	p := graph.ParsedFile{Language: "swift", FileTokens: computeFileTokens(content)}
 	swiftExtractImports(root, content, &p)
 	swiftExtractSymbols(root, "", "internal", content, &p)
+	swiftExtractLexicalBindings(root, content, &p)
 	swiftExtractCalls(root, content, &p)
 	return p, nil
 }
@@ -279,7 +280,11 @@ func swiftAddCall(call *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		return
 	}
 	name := nodeText(fn, content)
-	swiftAppendCall(call, name, swiftCallEvidence(fn, name)+swiftCallShapeSuffix(call, content), content, pf)
+	evidence := swiftCallEvidence(fn, name) + swiftCallShapeSuffix(call, content)
+	if swiftNominalCallProven(name, call, pf) {
+		evidence = "swift:initializer" + swiftCallShapeSuffix(call, content)
+	}
+	swiftAppendCall(call, name, evidence, content, pf)
 }
 
 func swiftAddConstructorCall(call *sitter.Node, content []byte, pf *graph.ParsedFile) {
@@ -290,10 +295,38 @@ func swiftAddConstructorCall(call *sitter.Node, content []byte, pf *graph.Parsed
 	if typeNode == nil {
 		return
 	}
-	name := swiftStripGeneric(nodeText(typeNode, content))
+	raw := nodeText(typeNode, content)
+	name := swiftStripGeneric(raw)
 	if name != "" {
-		swiftAppendCall(call, name, "swift:initializer"+swiftCallShapeSuffix(call, content), content, pf)
+		evidence := "swift:initializer_unproven"
+		if swiftNominalCallProven(name, call, pf) {
+			evidence = "swift:initializer"
+		}
+		if strings.Contains(raw, "<") {
+			evidence += ";generic_specialization=true"
+		}
+		swiftAppendCall(call, name, evidence+swiftCallShapeSuffix(call, content), content, pf)
 	}
+}
+
+func swiftNominalCallProven(name string, call *sitter.Node, pf *graph.ParsedFile) bool {
+	root := name
+	if dot := strings.IndexByte(root, '.'); dot >= 0 {
+		root = root[:dot]
+	}
+	if !swiftTypePath.MatchString(name) || swiftLexicalBindingBlocks(pf.Scope.SwiftLexicalBindings, root, int(call.StartPoint().Row)+1) {
+		return false
+	}
+	count := 0
+	for _, symbol := range pf.Symbols {
+		if symbol.Language == "swift" && symbol.QualifiedName == name {
+			switch symbol.Kind {
+			case "struct", "enum", "actor", "class":
+				count++
+			}
+		}
+	}
+	return count == 1
 }
 
 func swiftAppendCall(call *sitter.Node, name, evidence string, content []byte, pf *graph.ParsedFile) {
