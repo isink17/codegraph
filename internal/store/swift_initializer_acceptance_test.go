@@ -77,6 +77,340 @@ func TestSwiftInitializerAcceptancePositiveMatrix(t *testing.T) {
 	}
 }
 
+func TestSwiftTrailingInitializerAcceptance(t *testing.T) {
+	tests := []struct {
+		name, owner, kind, evidence, signature string
+		arity                                  int64
+	}{
+		{"underscore", "Builder", "struct", "swift:initializer;trailing_labels=_", "init(_:)", 1},
+		{"named", "Builder", "struct", "swift:initializer;trailing_labels=_", "init(completion:)", 1},
+		{"regular-prefix", "Builder", "struct", "swift:initializer;labels=id:;trailing_labels=_", "init(id:,completion:)", 2},
+		{"multiple", "Builder", "struct", "swift:initializer;trailing_labels=_,completion:", "init(first:,completion:)", 2},
+		{"generic", "GenericBuilder", "struct", "swift:initializer;generic_specialization=true;trailing_labels=_", "init(_:)", 1},
+		{"nested", "Outer.Builder", "struct", "swift:initializer;trailing_labels=_", "init(completion:)", 1},
+		{"enum", "Event", "enum", "swift:initializer;trailing_labels=_", "init(completion:)", 1},
+		{"actor", "Worker", "actor", "swift:initializer;trailing_labels=_", "init(completion:)", 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			if tc.owner == "Outer.Builder" {
+				f.symbol(f.mainFile, "Outer", "", "struct", "", false)
+				f.symbol(f.mainFile, "Builder", "Outer", tc.kind, "", false)
+			} else {
+				f.symbol(f.mainFile, tc.owner, "", tc.kind, "", false)
+			}
+			target := swiftInitCandidate(f, f.mainFile, tc.owner, tc.signature, tc.arity, tc.arity)
+			caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+			edge := f.call(f.mainFile, caller, tc.owner, tc.evidence, int(tc.arity), 1)
+			f.resolve()
+			assertSwiftInitBinding(t, f, edge, target)
+		})
+	}
+}
+
+func TestSwiftTrailingInitializerRefusesAmbiguityAndUnsupportedEvidence(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	slash := swiftInitCandidate(f, f.mainFile, "Builder", "init(_:)", 1, 1)
+	completion := swiftInitCandidate(f, f.mainFile, "Builder", "init(completion:)", 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	ambiguous := f.call(f.mainFile, caller, "Builder", "swift:initializer;trailing_labels=_", 1, 1)
+	unproven := f.call(f.mainFile, caller, "Builder", "swift:initializer_unproven;trailing_labels=_", 1, 2)
+	classOwner := f.symbol(f.mainFile, "ClassBuilder", "", "class", "", false)
+	classInit := swiftInitCandidate(f, f.mainFile, "ClassBuilder", "init(completion:)", 1, 1)
+	classEdge := f.call(f.mainFile, caller, "ClassBuilder", "swift:initializer;trailing_labels=_", 1, 3)
+	defaultInit := swiftInitCandidate(f, f.mainFile, "Defaults", "init(completion:)", 0, 1)
+	f.symbol(f.mainFile, "Defaults", "", "struct", "", false)
+	defaultEdge := f.call(f.mainFile, caller, "Defaults", "swift:initializer;trailing_labels=_", 1, 4)
+	f.resolve()
+	for _, edge := range []int64{ambiguous, unproven, classEdge, defaultEdge} {
+		if got := f.dst(edge); got.Valid {
+			t.Fatalf("edge %d resolved to %d", edge, got.Int64)
+		}
+	}
+	_, _, _, _ = slash, completion, classOwner, classInit
+	_ = defaultInit
+}
+
+func TestSwiftTrailingInitializerCrossFileUsesShapeCompatibility(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	local := swiftInitCandidate(f, f.mainFile, "Builder", "init(first:,completion:)", 2, 2)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	edge := f.call(f.mainFile, caller, "Builder", "swift:initializer;trailing_labels=_,completion:", 2, 1)
+	other := f.file("Other.swift")
+	competitor := swiftInitCandidate(f, other, "Builder", "init(first:,failure:)", 2, 2)
+	assertSwiftInitializerArity(t, f, local, 2, 2)
+	assertSwiftInitializerArity(t, f, competitor, 2, 2)
+	f.resolve()
+	assertSwiftInitBinding(t, f, edge, local)
+}
+
+func assertSwiftInitializerArity(t *testing.T, f *swiftScopeFixture, symbol, min, max int64) {
+	t.Helper()
+	var gotMin, gotMax sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT arity_min,arity_max FROM symbols WHERE id=?`, symbol).Scan(&gotMin, &gotMax); err != nil {
+		t.Fatal(err)
+	}
+	if !gotMin.Valid || gotMin.Int64 != min || !gotMax.Valid || gotMax.Int64 != max {
+		t.Fatalf("symbol %d arity=(%v,%v), want (%d,%d)", symbol, gotMin, gotMax, min, max)
+	}
+}
+
+func TestSwiftTrailingInitializerCrossFileHiddenFirstLabelVeto(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	swiftInitCandidate(f, f.mainFile, "Builder", "init(_:)", 1, 1)
+	other := f.file("Other.swift")
+	swiftInitCandidate(f, other, "Builder", "init(completion:)", 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	edge := f.call(f.mainFile, caller, "Builder", "swift:initializer;trailing_labels=_", 1, 1)
+	f.resolve()
+	if got := f.dst(edge); got.Valid {
+		t.Fatalf("hidden-first-label competitor resolved edge to %d", got.Int64)
+	}
+}
+
+func TestSwiftTrailingInitializerCrossFileRegularPrefixIsExact(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	local := swiftInitCandidate(f, f.mainFile, "Builder", "init(id:,completion:)", 2, 2)
+	other := f.file("Other.swift")
+	competitor := swiftInitCandidate(f, other, "Builder", "init(name:,completion:)", 2, 2)
+	assertSwiftInitializerArity(t, f, local, 2, 2)
+	assertSwiftInitializerArity(t, f, competitor, 2, 2)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	edge := f.call(f.mainFile, caller, "Builder", "swift:initializer;labels=id:;trailing_labels=_", 2, 1)
+	f.resolve()
+	assertSwiftInitBinding(t, f, edge, local)
+}
+
+func TestSwiftTrailingInitializerRefusesVariadicCandidate(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	target := swiftInitCandidate(f, f.mainFile, "Builder", "init(completion:)", 1, 1)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET arity_max=NULL WHERE id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	edge := f.call(f.mainFile, caller, "Builder", "swift:initializer;trailing_labels=_", 1, 1)
+	f.resolve()
+	if got := f.dst(edge); got.Valid {
+		t.Fatalf("variadic trailing initializer resolved to %d", got.Int64)
+	}
+}
+
+func TestSwiftTrailingInitializerRepairApplicabilityMatrix(t *testing.T) {
+	tests := []struct {
+		name, language, evidence, dst string
+		arity                         int
+		bound                         bool
+		want                          bool
+	}{
+		{"no-swift", "go", "swift:initializer;trailing_labels=_", "Builder", 1, false, false},
+		{"ordinary", "swift", "swift:initializer", "Builder", 0, false, false},
+		{"unproven", "swift", "swift:initializer_unproven;trailing_labels=_", "Builder", 1, false, false},
+		{"self", "swift", "swift:self;trailing_labels=_", "self.run", 1, false, false},
+		{"Self", "swift", "swift:Self;trailing_labels=_", "Self.run", 1, false, false},
+		{"trailing-unbound", "swift", "swift:initializer;trailing_labels=_", "Builder", 1, false, true},
+		{"trailing-bound", "swift", "swift:initializer;trailing_labels=_", "Builder", 1, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			if tc.language != "swift" {
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET language=? WHERE id=?`, tc.language, f.mainFile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+			edge := f.call(f.mainFile, caller, tc.dst, tc.evidence, tc.arity, 1)
+			if tc.bound {
+				target := swiftInitCandidate(f, f.mainFile, "Builder", "init(completion:)", 1, 1)
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=? WHERE id=?`, target, edge); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := f.store.swiftTrailingInitializerRepairApplies(f.ctx, f.repoID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("applies=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSwiftTrailingInitializerRepairBindsMarksAndSkips(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	target := swiftInitCandidate(f, f.mainFile, "Builder", "init(completion:)", 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	edge := f.call(f.mainFile, caller, "Builder", "swift:initializer;trailing_labels=_", 1, 1)
+	didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingInitializerRepair)
+	if err != nil || !didRun {
+		t.Fatalf("first repair=(%v,%v)", didRun, err)
+	}
+	assertSwiftInitBinding(t, f, edge, target)
+	assertSwiftRepairMarker(t, f, swiftTrailingInitializerRepairSettingKey)
+	didRun, err = f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingInitializerRepair)
+	if err != nil || didRun {
+		t.Fatalf("second repair=(%v,%v)", didRun, err)
+	}
+}
+
+func TestSwiftTrailingInitializerRepairFailureRetries(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	target := swiftInitCandidate(f, f.mainFile, "Builder", "init(completion:)", 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	edge := f.call(f.mainFile, caller, "Builder", "swift:initializer;trailing_labels=_", 1, 1)
+	canceled, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if _, err := f.store.runResolverRepairOnce(canceled, f.repoID, swiftTrailingInitializerRepair); err == nil {
+		t.Fatal("canceled trailing repair unexpectedly succeeded")
+	}
+	assertSwiftRepairMarkerAbsent(t, f, swiftTrailingInitializerRepairSettingKey)
+	didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingInitializerRepair)
+	if err != nil || !didRun {
+		t.Fatalf("retry=(%v,%v)", didRun, err)
+	}
+	assertSwiftInitBinding(t, f, edge, target)
+	assertSwiftRepairMarker(t, f, swiftTrailingInitializerRepairSettingKey)
+}
+
+func TestSwiftInitializerRepairsCoalesceOnlyWhenOldRepairRuns(t *testing.T) {
+	var oldRuns, trailingRuns int
+	repairs := resolverRepairs
+	defer func() { resolverRepairs = repairs }()
+	for i := range resolverRepairs {
+		switch resolverRepairs[i].key {
+		case swiftInitializerRepairSettingKey:
+			run := resolverRepairs[i].run
+			resolverRepairs[i].run = func(s *Store, ctx context.Context, repoID int64) error {
+				oldRuns++
+				return run(s, ctx, repoID)
+			}
+		case swiftTrailingInitializerRepairSettingKey:
+			run := resolverRepairs[i].run
+			resolverRepairs[i].run = func(s *Store, ctx context.Context, repoID int64) error {
+				trailingRuns++
+				return run(s, ctx, repoID)
+			}
+		}
+	}
+
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	ordinaryTarget := swiftInitCandidate(f, f.mainFile, "Builder", "init()", 0, 0)
+	trailingTarget := swiftInitCandidate(f, f.mainFile, "Builder", "init(completion:)", 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	ordinaryEdge := f.call(f.mainFile, caller, "Builder", "swift:initializer", 0, 1)
+	trailingEdge := f.call(f.mainFile, caller, "Builder", "swift:initializer;trailing_labels=_", 1, 2)
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if oldRuns != 1 || trailingRuns != 0 {
+		t.Fatalf("repair runs old=%d trailing=%d, want 1,0", oldRuns, trailingRuns)
+	}
+	assertSwiftInitBinding(t, f, ordinaryEdge, ordinaryTarget)
+	assertSwiftInitBinding(t, f, trailingEdge, trailingTarget)
+	assertSwiftRepairMarker(t, f, swiftTrailingInitializerRepairSettingKey)
+
+	g := newSwiftScopeFixture(t)
+	g.symbol(g.mainFile, "Builder", "", "struct", "", false)
+	swiftInitCandidate(g, g.mainFile, "Builder", "init(completion:)", 1, 1)
+	gCaller := g.symbol(g.mainFile, "make", "", "function", "make()", false)
+	g.call(g.mainFile, gCaller, "Builder", "swift:initializer;trailing_labels=_", 1, 1)
+	if err := g.store.markRepairDone(g.ctx, swiftInitializerRepair.key, g.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.store.RepairResolverBindingsOnce(g.ctx, g.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if oldRuns != 1 || trailingRuns != 1 {
+		t.Fatalf("marked-old repair runs old=%d trailing=%d, want 1,1", oldRuns, trailingRuns)
+	}
+}
+
+func TestSwiftInitializerRepairCoalescingFailureLeavesTrailingMarkerAbsent(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Builder", "", "struct", "", false)
+	f.call(f.mainFile, f.symbol(f.mainFile, "make", "", "function", "make()", false), "Builder", "swift:initializer", 0, 1)
+	f.call(f.mainFile, f.symbol(f.mainFile, "make2", "", "function", "make2()", false), "Builder", "swift:initializer;trailing_labels=_", 1, 2)
+	for _, repair := range resolverRepairs {
+		if repair.key == swiftInitializerRepairSettingKey || repair.key == swiftTrailingInitializerRepairSettingKey || repair.key == referenceIdentityRepairSettingKey {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canceled, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if _, err := f.store.RepairResolverBindingsOnce(canceled, f.repoID); err == nil {
+		t.Fatal("canceled initializer repair unexpectedly succeeded")
+	}
+	assertSwiftRepairMarkerAbsent(t, f, swiftInitializerRepairSettingKey)
+	assertSwiftRepairMarkerAbsent(t, f, swiftTrailingInitializerRepairSettingKey)
+}
+
+func assertSwiftRepairMarker(t *testing.T, f *swiftScopeFixture, key string) {
+	t.Helper()
+	var value string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, key+fmt.Sprintf(".%d", f.repoID)).Scan(&value); err != nil || value != "1" {
+		t.Fatalf("marker %s=%q err=%v", key, value, err)
+	}
+}
+
+func assertSwiftRepairMarkerAbsent(t *testing.T, f *swiftScopeFixture, key string) {
+	t.Helper()
+	var value string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, key+fmt.Sprintf(".%d", f.repoID)).Scan(&value); err == nil {
+		t.Fatalf("marker %s unexpectedly set to %q", key, value)
+	}
+}
+
+func TestSwiftTrailingInitializerAcceptanceBatch(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	const total = 1200
+	for i := 0; i < total; i++ {
+		owner := fmt.Sprintf("Batch%d", i)
+		f.symbol(f.mainFile, owner, "", "struct", "", false)
+		switch i % 6 {
+		case 0:
+			swiftInitCandidate(f, f.mainFile, owner, "init(id:)", 1, 1)
+			f.call(f.mainFile, caller, owner, "swift:initializer;labels=id:", 1, i+1)
+		case 1:
+			swiftInitCandidate(f, f.mainFile, owner, "init(completion:)", 1, 1)
+			f.call(f.mainFile, caller, owner, "swift:initializer;trailing_labels=_", 1, i+1)
+		case 2:
+			swiftInitCandidate(f, f.mainFile, owner, "init(id:,completion:)", 2, 2)
+			f.call(f.mainFile, caller, owner, "swift:initializer;labels=id:;trailing_labels=_", 2, i+1)
+		case 3:
+			swiftInitCandidate(f, f.mainFile, owner, "init(first:,completion:)", 2, 2)
+			f.call(f.mainFile, caller, owner, "swift:initializer;trailing_labels=_,completion:", 2, i+1)
+		case 4:
+			swiftInitCandidate(f, f.mainFile, owner, "init(_:)", 1, 1)
+			swiftInitCandidate(f, f.mainFile, owner, "init(completion:)", 1, 1)
+			f.call(f.mainFile, caller, owner, "swift:initializer;trailing_labels=_", 1, i+1)
+		case 5:
+			f.call(f.mainFile, caller, owner, "swift:initializer;trailing_labels=_", 1, i+1)
+		}
+	}
+	f.resolve()
+	var count int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND dst_symbol_id IS NOT NULL AND resolution_strategy=?`, f.repoID, ResolutionStrategySwiftInitializerScope).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != total/6*4 {
+		t.Fatalf("resolved initializer count=%d want %d", count, total/6*4)
+	}
+}
+
 func TestSwiftInitializerAcceptanceOwnerRefusals(t *testing.T) {
 	tests := []struct {
 		name, kind string
