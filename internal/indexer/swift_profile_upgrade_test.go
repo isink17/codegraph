@@ -194,7 +194,7 @@ public struct Visible {}
 	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 || len(summary.ParserProfileLanguages) != 1 || summary.ParserProfileLanguages[0] != "swift" {
 		t.Fatalf("upgrade summary=%+v", summary)
 	}
-	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v4")
+	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v5")
 
 	fresh := newProfileStore(t)
 	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
@@ -433,6 +433,36 @@ func TestSwiftMemberValueLifecycle(t *testing.T) {
 	}
 }
 
+func TestSwiftInheritanceFactsPersistWithoutNestedOrMemberContamination(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "Facts.swift")
+	writeProfileFile(t, path, `protocol P {}
+class Base {}
+class Child: Base {
+    func helper<T>(_ value: T) {}
+    struct Box<T> {}
+}
+class Outer {
+    struct Inner: P {}
+}`)
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	var child, outer int
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Child' AND target_qualified_name='Base' AND relation_kind='superclass' AND is_generic=0 AND is_constrained=0`, repo).Scan(&child); err != nil { t.Fatal(err) }
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Outer'`, repo).Scan(&outer); err != nil { t.Fatal(err) }
+	if child != 1 || outer != 0 { t.Fatalf("persisted facts child=%d outer=%d", child, outer) }
+	writeProfileFile(t, path, `class Base {}
+class Child: Base {}`)
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil { t.Fatal(err) }
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&child); err != nil { t.Fatal(err) }
+	if child != 1 { t.Fatalf("stale inheritance facts=%d", child) }
+}
+
 func TestSwiftLexicalBindingLifecycle(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -485,7 +515,7 @@ func TestSwiftLexicalBindingLifecycle(t *testing.T) {
 
 func TestSwiftV2ProfileSafety(t *testing.T) {
 	all := func(string) bool { return true }
-	v3 := parser.Profile{ID: "treesitter:swift:v4", EmitsCallEdges: true}
+	v3 := parser.Profile{ID: "treesitter:swift:v5", EmitsCallEdges: true}
 	fallback := parser.Profile{ID: "heuristic:swift:v1", EmitsCallEdges: false}
 	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: v3.ID, CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": fallback}, all, false); !errors.Is(err, ErrParserDowngradeRefused) {
 		t.Fatalf("downgrade error=%v, want refusal", err)
@@ -527,7 +557,7 @@ func assertSwiftV3Facts(t *testing.T, s *profileStore, repo int64) {
 	if err := db.QueryRow(`SELECT parser_profile FROM files WHERE repo_id=? AND is_deleted=0 LIMIT 1`, repo).Scan(&profile); err != nil {
 		t.Fatal(err)
 	}
-	if profile != "treesitter:swift:v4" {
+	if profile != "treesitter:swift:v5" {
 		t.Fatalf("profile=%q", profile)
 	}
 	var trailing, members, enumCases int
@@ -564,7 +594,7 @@ func assertSwiftV3Facts(t *testing.T, s *profileStore, repo int64) {
 func swiftFactDigest(t *testing.T, s *profileStore, repo int64) string {
 	t.Helper()
 	db := s.raw(t)
-	rows, err := db.Query(`SELECT 's|'||kind||'|'||name||'|'||qualified_name||'|'||stable_key FROM symbols WHERE repo_id=? UNION ALL SELECT 'e|'||dst_name||'|'||evidence||'|'||COALESCE(CAST(call_arity AS TEXT),'') FROM edges WHERE repo_id=? UNION ALL SELECT 'r|'||name||'|'||qualified_name FROM references_tbl WHERE repo_id=? UNION ALL SELECT 'q|'||import_kind||'|'||owner_module||'|'||local_name||'|'||is_static FROM scope_import_evidence WHERE repo_id=? UNION ALL SELECT 'l|'||name||'|'||binding_kind||'|'||owner_module||'|'||scope_start_line||'|'||scope_end_line FROM swift_lexical_binding_evidence WHERE repo_id=? ORDER BY 1`, repo, repo, repo, repo, repo)
+	rows, err := db.Query(`SELECT 's|'||kind||'|'||name||'|'||qualified_name||'|'||stable_key FROM symbols WHERE repo_id=? UNION ALL SELECT 'e|'||dst_name||'|'||evidence||'|'||COALESCE(CAST(call_arity AS TEXT),'') FROM edges WHERE repo_id=? UNION ALL SELECT 'r|'||name||'|'||qualified_name FROM references_tbl WHERE repo_id=? UNION ALL SELECT 'q|'||import_kind||'|'||owner_module||'|'||local_name||'|'||is_static FROM scope_import_evidence WHERE repo_id=? UNION ALL SELECT 'l|'||name||'|'||binding_kind||'|'||owner_module||'|'||scope_start_line||'|'||scope_end_line FROM swift_lexical_binding_evidence WHERE repo_id=? UNION ALL SELECT 'i|'||child_qualified_name||'|'||target_qualified_name||'|'||relation_kind||'|'||is_generic||'|'||is_constrained FROM swift_inheritance_relations WHERE repo_id=? UNION ALL SELECT 'd|'||s.stable_key||'|'||is_final||'|'||is_override||'|'||dispatch_kind FROM swift_declaration_facts d JOIN symbols s ON s.id=d.symbol_id WHERE d.repo_id=? ORDER BY 1`, repo, repo, repo, repo, repo, repo, repo, repo)
 	if err != nil {
 		t.Fatal(err)
 	}

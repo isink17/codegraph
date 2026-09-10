@@ -135,8 +135,97 @@ func TestSwiftCallsNormalizeAndSuppressLocalFunctions(t *testing.T) {
 }
 
 func TestSwiftProfileV3(t *testing.T) {
-	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v4" || !got.EmitsCallEdges {
+	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v5" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
+	}
+}
+
+func TestSwiftClassInheritanceFactsV5(t *testing.T) {
+	p := mustSwiftParse(t, "Facts.swift", `class Base {}
+protocol P {}
+class Child: Base, P {}
+class ExternalChild: ExternalBase {}
+final class Service {
+    final override class func make() {}
+    static func build() {}
+    func run() {}
+}`)
+	got := map[string]string{}
+	for _, f := range p.SwiftInheritanceRelations {
+		got[f.Child+"->"+f.Target] = f.Relation
+	}
+	if got["Child->Base"] != "superclass" || got["Child->P"] != "conformance" || got["ExternalChild->ExternalBase"] != "unproven" {
+		t.Fatalf("inheritance facts=%v", got)
+	}
+	byName := map[string]graph.SwiftDeclarationFact{}
+	for _, f := range p.SwiftDeclarationFacts {
+		byName[p.Symbols[f.SymbolIndex].QualifiedName] = f
+	}
+	if !byName["Service"].Final || !byName["Service.make"].Final || !byName["Service.make"].Override || byName["Service.make"].Dispatch != "class" || byName["Service.build"].Dispatch != "static" || byName["Service.run"].Dispatch != "instance" {
+		t.Fatalf("declaration facts=%v", byName)
+	}
+}
+
+func TestSwiftInheritanceFactsRespectNestedNominalOwnership(t *testing.T) {
+	p := mustSwiftParse(t, "Nested.swift", `protocol P {}
+class Base {}
+class Outer {
+    struct Inner: P {}
+    enum NestedEnum: P { case value }
+    actor NestedActor: P {}
+    class NestedClass: Base {}
+}`)
+	for _, fact := range p.SwiftInheritanceRelations {
+		if fact.Child == "Outer" {
+			t.Fatalf("nested inheritance leaked to Outer: %#v", fact)
+		}
+		if fact.Child == "Outer.NestedClass" && (fact.Target != "Base" || fact.Relation != "superclass") {
+			t.Fatalf("nested class fact=%#v", fact)
+		}
+	}
+	if !slices.ContainsFunc(p.SwiftInheritanceRelations, func(f graph.SwiftInheritanceRelation) bool {
+		return f.Child == "Outer.NestedClass" && f.Target == "Base"
+	}) {
+		t.Fatal("nested class inheritance fact missing")
+	}
+}
+
+func TestSwiftInheritanceConstraintsIgnoreNestedBodies(t *testing.T) {
+	p := mustSwiftParse(t, "Constraints.swift", `class Base {}
+class Child: Base {
+    func helper<T>(_ value: T) {}
+    struct Box<T> {}
+}`)
+	for _, fact := range p.SwiftInheritanceRelations {
+		if fact.Child != "Child" || fact.Target != "Base" || fact.Relation != "superclass" {
+			continue
+		}
+		if fact.Constrained || fact.Generic {
+			t.Fatalf("nested generic syntax contaminated Child: %#v", fact)
+		}
+		return
+	}
+	t.Fatal("Child inheritance fact missing")
+}
+
+func TestSwiftInheritanceConstraintBoundaries(t *testing.T) {
+	p := mustSwiftParse(t, "Generic.swift", `protocol P {}
+class Base<T> {}
+class Simple: Base<Int> {}
+class GenericChild<T>: Base<Int> {}
+class WhereChild<T>: Base<Int> where T: P {}`)
+	byChild := map[string]graph.SwiftInheritanceRelation{}
+	for _, fact := range p.SwiftInheritanceRelations {
+		byChild[fact.Child] = fact
+	}
+	if fact := byChild["Simple"]; fact.Target != "Base" || fact.Relation != "superclass" || !fact.Generic || fact.Constrained {
+		t.Fatalf("generic superclass fact=%#v", fact)
+	}
+	if fact := byChild["GenericChild"]; fact.Target != "Base" || !fact.Generic || !fact.Constrained {
+		t.Fatalf("child constraint fact=%#v", fact)
+	}
+	if fact := byChild["WhereChild"]; fact.Target != "Base" || !fact.Generic || !fact.Constrained {
+		t.Fatalf("where constraint fact=%#v", fact)
 	}
 }
 

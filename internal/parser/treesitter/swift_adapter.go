@@ -6,6 +6,7 @@ import (
 	"context"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -34,6 +35,7 @@ func (a *SwiftAdapter) Parse(ctx context.Context, path string, content []byte) (
 	p := graph.ParsedFile{Language: "swift", FileTokens: computeFileTokens(content)}
 	swiftExtractImports(root, content, &p)
 	swiftExtractSymbols(root, "", "internal", content, &p)
+	swiftExtractInheritanceRelations(root, content, &p)
 	swiftExtractLexicalBindings(root, content, &p)
 	swiftExtractCalls(root, content, &p)
 	return p, nil
@@ -211,6 +213,7 @@ func swiftAddType(node *sitter.Node, container, kind, inheritedVisibility string
 		DocSummary: prevCommentText(node, content),
 		StableKey:  "type:swift:" + qualified,
 	})
+	pf.SwiftDeclarationFacts = append(pf.SwiftDeclarationFacts, graph.SwiftDeclarationFact{SymbolIndex: len(pf.Symbols) - 1, Final: swiftHasModifier(node, "final", content)})
 	if body := childByFieldName(node, "body"); body != nil {
 		memberVisibility := "internal"
 		if kind == "protocol" {
@@ -243,6 +246,10 @@ func swiftAddCallable(node *sitter.Node, kind, container, inheritedVisibility st
 		Static: &static, Range: nodeRange(node),
 		DocSummary: prevCommentText(node, content),
 		StableKey:  "func:swift:" + owner + ":" + selector,
+	})
+	pf.SwiftDeclarationFacts = append(pf.SwiftDeclarationFacts, graph.SwiftDeclarationFact{
+		SymbolIndex: len(pf.Symbols) - 1, Final: swiftHasModifier(node, "final", content),
+		Override: swiftHasModifier(node, "override", content), Dispatch: swiftCallableDispatch(node, content),
 	})
 	minArity, maxArity := swiftArity(node, content)
 	pf.Symbols[len(pf.Symbols)-1].ArityMin = minArity
@@ -504,6 +511,145 @@ func swiftCallableStatic(node *sitter.Node, content []byte) bool {
 	return false
 }
 
+func swiftHasModifier(node *sitter.Node, want string, content []byte) bool {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() != want && child.Type() != "modifiers" {
+			continue
+		}
+		for _, token := range strings.Fields(nodeText(child, content)) {
+			if strings.TrimSpace(token) == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func swiftCallableDispatch(node *sitter.Node, content []byte) string {
+	hasClass, hasStatic := swiftHasModifier(node, "class", content), swiftHasModifier(node, "static", content)
+	if hasClass && hasStatic {
+		return ""
+	}
+	if hasClass {
+		return "class"
+	}
+	if hasStatic {
+		return "static"
+	}
+	return "instance"
+}
+
+func swiftExtractInheritanceRelations(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+	kinds := make(map[string][]string)
+	for _, symbol := range pf.Symbols {
+		switch symbol.Kind {
+		case "class", "protocol", "struct", "enum", "actor":
+			kinds[symbol.QualifiedName] = append(kinds[symbol.QualifiedName], symbol.Kind)
+		}
+	}
+	var walk func(*sitter.Node, string)
+	walk = func(node *sitter.Node, container string) {
+		if node == nil {
+			return
+		}
+		nextContainer := container
+		if (node.Type() == "class_declaration" || node.Type() == "protocol_declaration") && !swiftIsExtension(node, content) {
+			nameNode := childByFieldName(node, "name")
+			if nameNode == nil {
+				nameNode = firstChild(node, "type_identifier")
+			}
+			if nameNode != nil {
+				child := swiftJoinQName(container, nodeText(nameNode, content))
+				nextContainer = child
+				specifiers, constrained := swiftInheritanceHeaderFacts(node)
+				for _, spec := range specifiers {
+					targetNode := childByFieldName(spec, "inherits_from")
+					if targetNode == nil {
+						targetNode = firstChild(spec, "user_type")
+					}
+					if targetNode == nil {
+						continue
+					}
+					raw := strings.TrimSpace(nodeText(targetNode, content))
+					target := swiftStripGeneric(raw)
+					relation := "unproven"
+					matches, childKinds := kinds[target], kinds[child]
+					if target != child && len(matches) == 1 && len(childKinds) == 1 {
+						switch {
+						case matches[0] == "class" && childKinds[0] == "class":
+							relation = "superclass"
+						case matches[0] == "protocol" && childKinds[0] != "protocol":
+							relation = "conformance"
+						}
+					}
+					pf.SwiftInheritanceRelations = append(pf.SwiftInheritanceRelations, graph.SwiftInheritanceRelation{
+						Child: child, Target: target, Relation: relation, Range: nodeRange(targetNode), Generic: raw != target,
+						Constrained: constrained,
+					})
+				}
+			}
+		}
+		for i := 0; i < int(node.ChildCount()); i++ {
+			walk(node.Child(i), nextContainer)
+		}
+	}
+	walk(root, "")
+	sort.Slice(pf.SwiftInheritanceRelations, func(i, j int) bool {
+		a, b := pf.SwiftInheritanceRelations[i], pf.SwiftInheritanceRelations[j]
+		if a.Child != b.Child {
+			return a.Child < b.Child
+		}
+		if a.Target != b.Target {
+			return a.Target < b.Target
+		}
+		return a.Range.StartLine < b.Range.StartLine || a.Range.StartLine == b.Range.StartLine && a.Range.StartCol < b.Range.StartCol
+	})
+}
+
+func swiftInheritanceSpecifiers(root *sitter.Node) []*sitter.Node {
+	specifiers, _ := swiftInheritanceHeaderFacts(root)
+	return specifiers
+}
+
+func swiftInheritanceHeaderFacts(root *sitter.Node) ([]*sitter.Node, bool) {
+	var out []*sitter.Node
+	constrained := false
+	body := childByFieldName(root, "body")
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			if child == body {
+				continue
+			}
+			if child.Type() == "inheritance_specifier" {
+				out = append(out, child)
+				continue
+			}
+			if child.Type() == "type_constraints" || child.Type() == "type_parameters" {
+				constrained = true
+				continue
+			}
+			if child != root && swiftNominalDeclarationNode(child.Type()) {
+				continue
+			}
+			walk(child)
+		}
+	}
+	walk(root)
+	return out, constrained
+}
+
+func swiftNominalDeclarationNode(kind string) bool {
+	switch kind {
+	case "class_declaration", "protocol_declaration", "struct_declaration", "enum_declaration", "actor_declaration":
+		return true
+	default:
+		return false
+	}
+}
+
 func swiftVisibility(node *sitter.Node, inherited string, content []byte) string {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
@@ -572,7 +718,7 @@ func swiftJoinQName(container, name string) string {
 
 func swiftStripGeneric(name string) string {
 	if i := strings.IndexByte(name, '<'); i >= 0 {
-		return name[:i]
+		return strings.TrimSpace(name[:i])
 	}
 	return name
 }

@@ -129,8 +129,8 @@ func TestMigrationCeilingAndDatabaseIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MigrationCeiling() error = %v", err)
 	}
-	if ceiling != 38 {
-		t.Fatalf("MigrationCeiling() = %d, want 38", ceiling)
+	if ceiling != 39 {
+		t.Fatalf("MigrationCeiling() = %d, want 39", ceiling)
 	}
 	if DatabaseFormatUserVersion != 2 {
 		t.Fatalf("DatabaseFormatUserVersion = %d, want 2", DatabaseFormatUserVersion)

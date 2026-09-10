@@ -301,8 +301,8 @@ func TestV2DatabaseIdentityAndCeiling(t *testing.T) {
 	}
 	// The v2 generation boundary exists so migration 033 and up can be v2-only.
 	// user_version stays 2 while the ceiling moves.
-	if ceiling != 38 {
-		t.Fatalf("migration ceiling = %d, want 38", ceiling)
+	if ceiling != 39 {
+		t.Fatalf("migration ceiling = %d, want 39", ceiling)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
