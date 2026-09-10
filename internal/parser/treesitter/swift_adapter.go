@@ -555,9 +555,7 @@ func swiftExtractInheritanceRelations(root *sitter.Node, content []byte, pf *gra
 		}
 		nextContainer := container
 		if node.Type() == "class_declaration" && swiftIsExtension(node, content) {
-			if target := swiftExtensionTarget(node, content); target != "" {
-				nextContainer = target
-			}
+			nextContainer = swiftExtensionTarget(node, content)
 			if target := swiftExtensionFactTarget(node, content); target != "" {
 				specifiers, constrained := swiftInheritanceHeaderFacts(node)
 				for _, spec := range specifiers {
@@ -574,6 +572,9 @@ func swiftExtractInheritanceRelations(root *sitter.Node, content []byte, pf *gra
 						continue
 					}
 					relation := "conformance"
+					if raw != targetName {
+						relation = "unproven"
+					}
 					if matches := kinds[targetName]; len(matches) > 0 && (len(matches) != 1 || matches[0] != "protocol") {
 						relation = "unproven"
 					}
@@ -581,6 +582,9 @@ func swiftExtractInheritanceRelations(root *sitter.Node, content []byte, pf *gra
 						Child: target, Target: targetName, Relation: relation, Range: nodeRange(targetNode), Generic: raw != targetName, Constrained: constrained,
 					})
 				}
+			}
+			if nextContainer == "" {
+				return
 			}
 		} else if (node.Type() == "class_declaration" || node.Type() == "protocol_declaration") && !swiftIsExtension(node, content) {
 			nameNode := childByFieldName(node, "name")

@@ -452,7 +452,14 @@ func TestSwiftV5ToV6ExtensionConformanceLifecycle(t *testing.T) {
 func TestSwiftExtensionConformanceFactsBatch(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	writeProfileFile(t, filepath.Join(root, "Conformances.swift"), strings.Repeat("extension Service: P {}\n", 1200))
+	var source strings.Builder
+	for i := 0; i < 240; i++ {
+		source.WriteString("extension Service: P, Q {}\n")
+		source.WriteString("extension Qualified.Service: R {}\n")
+		source.WriteString("extension Box: S where T: U {}\n")
+		source.WriteString("extension External.Service: V {}\n")
+	}
+	writeProfileFile(t, filepath.Join(root, "Conformances.swift"), source.String())
 
 	s := newProfileStore(t)
 	idx := New(s.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
@@ -480,6 +487,40 @@ func TestSwiftExtensionConformanceFactsBatch(t *testing.T) {
 	if count != 1200 {
 		t.Fatalf("unchanged extension facts=%d, want 1200", count)
 	}
+}
+
+func TestSwiftConstrainedExtensionFactLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "Box.swift")
+	writeProfileFile(t, path, "protocol P {}\nprotocol Q {}\nstruct Box<T> {}\nextension Box: P {}\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	assertConstrained := func(want int) {
+		t.Helper()
+		var got int
+		if err := s.raw(t).QueryRow(`SELECT COALESCE(MAX(is_constrained), 0) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Box' AND target_qualified_name='P'`, repo).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("is_constrained=%d, want %d", got, want)
+		}
+	}
+	assertConstrained(0)
+	writeProfileFile(t, path, "protocol P {}\nprotocol Q {}\nstruct Box<T> {}\nextension Box: P where T: Q {}\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	assertConstrained(1)
+	writeProfileFile(t, path, "protocol P {}\nprotocol Q {}\nstruct Box<T> {}\nextension Box: P {}\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	assertConstrained(0)
 }
 
 func TestSwiftSourceAttributionAndLocalFunctionSafety(t *testing.T) {

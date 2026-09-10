@@ -200,6 +200,60 @@ extension Box: P where T: Q {
 	}
 }
 
+func TestSwiftExtensionRecoveryAndNestedOwnershipFailClosed(t *testing.T) {
+	p := mustSwiftParse(t, "ExtensionRecovery.swift", `protocol P {}
+class Base {}
+struct Box<T> {}
+protocol Q {}
+class Service {}
+extension Service: P<Int> {}
+extension Box where T: Q {
+    class Nested: Base {}
+}
+extension Service {
+    class Nested: Base {}
+}
+extension Service: P {
+    class NestedWithConformance: Base {}
+}`)
+	for _, fact := range p.SwiftInheritanceRelations {
+		if fact.Child == "Service" && fact.Target == "P" && fact.Generic && fact.Relation == "conformance" {
+			t.Fatalf("generic recovery became positive conformance: %+v", fact)
+		}
+		if fact.Child == "Nested" {
+			t.Fatalf("constrained extension leaked nested inheritance: %+v", fact)
+		}
+	}
+	var ordinary, nestedWithConformance bool
+	for _, fact := range p.SwiftInheritanceRelations {
+		ordinary = ordinary || fact.Child == "Service.Nested" && fact.Target == "Base" && fact.Relation == "superclass"
+		nestedWithConformance = nestedWithConformance || fact.Child == "Service.NestedWithConformance" && fact.Target == "Base" && fact.Relation == "superclass"
+	}
+	if !ordinary || !nestedWithConformance {
+		t.Fatalf("supported extension nested facts missing: ordinary=%v conformance=%v facts=%+v", ordinary, nestedWithConformance, p.SwiftInheritanceRelations)
+	}
+	var ordinaryConformance bool
+	for _, fact := range p.SwiftInheritanceRelations {
+		ordinaryConformance = ordinaryConformance || fact.Child == "Service" && fact.Target == "P" && !fact.Generic && fact.Relation == "conformance"
+	}
+	if !ordinaryConformance {
+		t.Fatal("ordinary extension conformance missing")
+	}
+}
+
+func TestSwiftExtensionConformanceRange(t *testing.T) {
+	p := mustSwiftParse(t, "ExtensionRange.swift", "protocol P {}\nclass Service {}\nextension Service: P {}\n")
+	for _, fact := range p.SwiftInheritanceRelations {
+		if fact.Child == "Service" && fact.Target == "P" {
+			if fact.Range.StartLine != 3 || fact.Range.StartCol != 20 || fact.Range.EndLine != 3 || fact.Range.EndCol != 21 {
+				t.Fatalf("range=%+v, want P token range", fact.Range)
+			}
+			return
+		}
+	}
+	t.Fatal("ordinary extension conformance missing")
+}
+
 func TestSwiftClassInheritanceFactsV5(t *testing.T) {
 	p := mustSwiftParse(t, "Facts.swift", `class Base {}
 protocol P {}
