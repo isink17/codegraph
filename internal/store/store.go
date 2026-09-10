@@ -3843,6 +3843,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
+	if n, err := s.resolveSwiftInitializerScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if n, err := s.resolveSwiftScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
@@ -4619,7 +4624,7 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if changed, err := s.swiftPathsChanged(ctx, repoID, paths); err != nil {
 		return err
 	} else if changed {
-		if err := s.redecideSwiftSelfBindings(ctx, repoID); err != nil {
+		if err := s.redecideSwiftBindings(ctx, repoID); err != nil {
 			return err
 		}
 	}
@@ -4707,7 +4712,7 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	if swiftChanged {
-		if err := s.redecideSwiftSelfBindings(ctx, repoID); err != nil {
+		if err := s.redecideSwiftBindings(ctx, repoID); err != nil {
 			return ResolveEdgesForNamesStats{}, err
 		}
 	}
