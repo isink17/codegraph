@@ -27,6 +27,50 @@ type swiftV1FixtureAdapter struct{}
 // parser output, keeping fixture tied to real Swift syntax.
 type swiftV2FixtureAdapter struct{}
 
+// swiftV3FixtureAdapter replays v3 call facts from the v4 parser, removing
+// only v4's new ordinary-constructor classification and lexical evidence.
+type swiftV3FixtureAdapter struct{}
+
+func (swiftV3FixtureAdapter) Language() string     { return "swift" }
+func (swiftV3FixtureAdapter) Extensions() []string { return []string{".swift"} }
+func (swiftV3FixtureAdapter) Supports(path string) bool {
+	return filepath.Ext(path) == ".swift"
+}
+func (swiftV3FixtureAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:swift:v3", EmitsCallEdges: true}
+}
+func (swiftV3FixtureAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	p, err := tsparser.NewSwift().Parse(ctx, path, content)
+	if err != nil {
+		return graph.ParsedFile{}, err
+	}
+	for i := range p.Edges {
+		if !strings.HasPrefix(p.Edges[i].Evidence, "swift:initializer") {
+			continue
+		}
+		parts := strings.Split(p.Edges[i].Evidence, ";")
+		generic := false
+		shape := make([]string, 0, len(parts))
+		for _, part := range parts[1:] {
+			if part == "generic_specialization=true" {
+				generic = true
+				continue
+			}
+			shape = append(shape, part)
+		}
+		base := "swift:bare"
+		if generic {
+			base = "swift:initializer"
+		}
+		if len(shape) > 0 {
+			base += ";" + strings.Join(shape, ";")
+		}
+		p.Edges[i].Evidence = base
+	}
+	p.Scope.SwiftLexicalBindings = nil
+	return p, nil
+}
+
 func (swiftV2FixtureAdapter) Language() string     { return "swift" }
 func (swiftV2FixtureAdapter) Extensions() []string { return []string{".swift"} }
 func (swiftV2FixtureAdapter) Supports(path string) bool {
@@ -150,7 +194,7 @@ public struct Visible {}
 	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 || len(summary.ParserProfileLanguages) != 1 || summary.ParserProfileLanguages[0] != "swift" {
 		t.Fatalf("upgrade summary=%+v", summary)
 	}
-	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v3")
+	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v4")
 
 	fresh := newProfileStore(t)
 	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
@@ -184,6 +228,7 @@ func TestSwiftV2ToV3UnchangedSourceConverges(t *testing.T) {
     }
     func work() {}
 }
+
 enum Events { case build(Int), second(String) }
 	`
 	path := filepath.Join(root, "Service.swift")
@@ -236,6 +281,59 @@ enum Events { case build(Int), second(String) }
 		t.Fatal(err)
 	}
 	if again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update=%+v", again)
+	}
+}
+
+func TestSwiftV3ToV4UnchangedSourceConverges(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "Facts.swift"), `
+struct Service { init() {} }
+struct Box<T> {}
+typealias BoxAlias<T> = Box<T>
+func make() { Service(); Box<Int>(); BoxAlias<Int>() }
+func shadow(_ Service: () -> Int) { Service() }
+`)
+	legacy := newProfileStore(t)
+	if _, err := New(legacy.Store, parser.NewRegistry(swiftV3FixtureAdapter{}), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, legacy, root)
+	var oldLexical int
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_lexical_binding_evidence WHERE repo_id=?`, repo).Scan(&oldLexical); err != nil {
+		t.Fatal(err)
+	}
+	if oldLexical != 0 {
+		t.Fatalf("v3 lexical facts=%d, want 0", oldLexical)
+	}
+	current := New(legacy.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	upgraded, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.FilesChanged != 1 || upgraded.FilesIndexed != 1 {
+		t.Fatalf("upgrade summary=%+v", upgraded)
+	}
+	fresh := newProfileStore(t)
+	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := swiftFactDigest(t, legacy, repo), swiftFactDigest(t, fresh, repoID(t, fresh, root)); got != want {
+		t.Fatalf("upgraded facts=%q fresh facts=%q", got, want)
+	}
+	var newLexical int
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_lexical_binding_evidence WHERE repo_id=?`, repo).Scan(&newLexical); err != nil {
+		t.Fatal(err)
+	}
+	if newLexical == 0 {
+		t.Fatal("v4 lexical facts missing after upgrade")
+	}
+	again, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || again.FilesIndexed != 0 {
 		t.Fatalf("second update=%+v", again)
 	}
 }
@@ -335,9 +433,59 @@ func TestSwiftMemberValueLifecycle(t *testing.T) {
 	}
 }
 
+func TestSwiftLexicalBindingLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "Facts.swift")
+	writeProfileFile(t, path, "struct Service {}\nfunc f(_ Service: () -> Int) { Service() }\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	count := func(name, kind string) int {
+		var n int
+		if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_lexical_binding_evidence WHERE repo_id=? AND name=? AND binding_kind=?`, repo, name, kind).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if count("Service", graph.SwiftLexicalParameter) != 1 {
+		t.Fatalf("initial parameter facts=%d", count("Service", graph.SwiftLexicalParameter))
+	}
+	writeProfileFile(t, path, "struct Service {}\nfunc f(_ Other: () -> Int) { Other() }\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if count("Service", graph.SwiftLexicalParameter) != 0 || count("Other", graph.SwiftLexicalParameter) != 1 {
+		t.Fatalf("renamed facts Service=%d Other=%d", count("Service", graph.SwiftLexicalParameter), count("Other", graph.SwiftLexicalParameter))
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_lexical_binding_evidence WHERE repo_id=?`, repo).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("deleted lexical facts=%d", remaining)
+	}
+	writeProfileFile(t, path, "struct Service {}\nfunc f(_ Restored: () -> Int) { Restored() }\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if count("Restored", graph.SwiftLexicalParameter) != 1 {
+		t.Fatalf("restored facts=%d", count("Restored", graph.SwiftLexicalParameter))
+	}
+}
+
 func TestSwiftV2ProfileSafety(t *testing.T) {
 	all := func(string) bool { return true }
-	v3 := parser.Profile{ID: "treesitter:swift:v3", EmitsCallEdges: true}
+	v3 := parser.Profile{ID: "treesitter:swift:v4", EmitsCallEdges: true}
 	fallback := parser.Profile{ID: "heuristic:swift:v1", EmitsCallEdges: false}
 	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: v3.ID, CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": fallback}, all, false); !errors.Is(err, ErrParserDowngradeRefused) {
 		t.Fatalf("downgrade error=%v, want refusal", err)
@@ -379,7 +527,7 @@ func assertSwiftV3Facts(t *testing.T, s *profileStore, repo int64) {
 	if err := db.QueryRow(`SELECT parser_profile FROM files WHERE repo_id=? AND is_deleted=0 LIMIT 1`, repo).Scan(&profile); err != nil {
 		t.Fatal(err)
 	}
-	if profile != "treesitter:swift:v3" {
+	if profile != "treesitter:swift:v4" {
 		t.Fatalf("profile=%q", profile)
 	}
 	var trailing, members, enumCases int
@@ -416,7 +564,7 @@ func assertSwiftV3Facts(t *testing.T, s *profileStore, repo int64) {
 func swiftFactDigest(t *testing.T, s *profileStore, repo int64) string {
 	t.Helper()
 	db := s.raw(t)
-	rows, err := db.Query(`SELECT 's|'||kind||'|'||name||'|'||qualified_name||'|'||stable_key FROM symbols WHERE repo_id=? UNION ALL SELECT 'e|'||dst_name||'|'||evidence||'|'||COALESCE(CAST(call_arity AS TEXT),'') FROM edges WHERE repo_id=? UNION ALL SELECT 'r|'||name||'|'||qualified_name FROM references_tbl WHERE repo_id=? UNION ALL SELECT 'q|'||import_kind||'|'||owner_module||'|'||local_name||'|'||is_static FROM scope_import_evidence WHERE repo_id=? ORDER BY 1`, repo, repo, repo, repo)
+	rows, err := db.Query(`SELECT 's|'||kind||'|'||name||'|'||qualified_name||'|'||stable_key FROM symbols WHERE repo_id=? UNION ALL SELECT 'e|'||dst_name||'|'||evidence||'|'||COALESCE(CAST(call_arity AS TEXT),'') FROM edges WHERE repo_id=? UNION ALL SELECT 'r|'||name||'|'||qualified_name FROM references_tbl WHERE repo_id=? UNION ALL SELECT 'q|'||import_kind||'|'||owner_module||'|'||local_name||'|'||is_static FROM scope_import_evidence WHERE repo_id=? UNION ALL SELECT 'l|'||name||'|'||binding_kind||'|'||owner_module||'|'||scope_start_line||'|'||scope_end_line FROM swift_lexical_binding_evidence WHERE repo_id=? ORDER BY 1`, repo, repo, repo, repo, repo)
 	if err != nil {
 		t.Fatal(err)
 	}

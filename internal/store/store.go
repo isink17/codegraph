@@ -2199,6 +2199,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM scope_import_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM swift_lexical_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM go_local_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2345,6 +2348,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM scope_import_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM swift_lexical_binding_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM go_local_binding_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2578,6 +2584,24 @@ func insertParsedFileGraph(
 		}
 		if len(args) > 0 {
 			if err := execBatchInsert(ctx, tx, "go_local_binding_evidence", goLocalCols, 9, args, stats); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(parsed.Scope.SwiftLexicalBindings) > 0 {
+		const swiftCols = "repo_id, file_id, name, binding_kind, owner_module, scope_start_line, scope_end_line"
+		args := make([]any, 0, min(len(parsed.Scope.SwiftLexicalBindings), sqliteImportValuesBatchRows)*7)
+		for _, binding := range parsed.Scope.SwiftLexicalBindings {
+			args = append(args, repoID, fileID, binding.Name, binding.Kind, binding.OwnerModule, binding.ScopeStartLine, binding.ScopeEndLine)
+			if len(args) >= sqliteImportValuesBatchRows*7 {
+				if err := execBatchInsert(ctx, tx, "swift_lexical_binding_evidence", swiftCols, 7, args, stats); err != nil {
+					return nil, err
+				}
+				args = args[:0]
+			}
+		}
+		if len(args) > 0 {
+			if err := execBatchInsert(ctx, tx, "swift_lexical_binding_evidence", swiftCols, 7, args, stats); err != nil {
 				return nil, err
 			}
 		}

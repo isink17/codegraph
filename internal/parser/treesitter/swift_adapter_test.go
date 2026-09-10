@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -134,7 +135,7 @@ func TestSwiftCallsNormalizeAndSuppressLocalFunctions(t *testing.T) {
 }
 
 func TestSwiftProfileV3(t *testing.T) {
-	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v3" || !got.EmitsCallEdges {
+	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v4" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
 	}
 }
@@ -330,8 +331,8 @@ func caller() {
 
 `)
 	want := map[string]string{
-		"Service":     "swift:bare",
-		"Box":         "swift:initializer",
+		"Service":     "swift:initializer",
+		"Box":         "swift:initializer;generic_specialization=true",
 		"Service.run": "swift:member;type_path_unproven",
 		"service.run": "swift:member;type_path_unproven",
 	}
@@ -341,6 +342,192 @@ func caller() {
 	for _, edge := range p.Edges {
 		if got := want[edge.DstName]; got != edge.Evidence {
 			t.Errorf("edge=%#v want evidence=%q", edge, got)
+		}
+	}
+}
+
+func TestSwiftV4InitializerFactsFailClosedOnLexicalBindings(t *testing.T) {
+	p := mustSwiftParse(t, "Facts.swift", `
+struct Service { init() {} }
+struct Outer { struct Inner { init() {}; func make() { Inner(); Outer.Inner() } } }
+struct Box<T> {}
+typealias BoxAlias<T> = Box<T>
+protocol Proto {}
+class ClassService {}
+enum Event { case value(Int) }
+func clear() { Service() }
+func shadow(_ Service: () -> Int) {
+    let Local = { 1 }
+    func Service() -> Int { return 1 }
+    struct Local { init() {} }
+    typealias Alias = Service
+    Service()
+    Local()
+    Alias()
+    { Service in Service() }(1)
+}
+
+func generic<T>() { T() }
+func other() { BoxAlias<Int>(); Proto(); ClassService(); Event.value(1); Swift.Array<Int>() }
+`)
+	var byName = map[string][]graph.Edge{}
+	for _, edge := range p.Edges {
+		byName[edge.DstName] = append(byName[edge.DstName], edge)
+	}
+	if got := byName["Service"]; len(got) != 3 || got[0].Evidence != "swift:initializer" || got[1].Evidence != "swift:bare" || got[2].Evidence != "swift:bare" {
+		t.Fatalf("Service facts=%#v", got)
+	}
+	for _, want := range []struct{ name, evidence string }{
+		{"Outer.Inner", "swift:initializer"},
+		{"BoxAlias", "swift:initializer_unproven;generic_specialization=true"},
+		{"Proto", "swift:bare"},
+		{"ClassService", "swift:initializer"},
+		{"Swift.Array", "swift:initializer_unproven;generic_specialization=true"},
+	} {
+		edges := byName[want.name]
+		if len(edges) != 1 || edges[0].Evidence != want.evidence {
+			t.Fatalf("%s facts=%#v want %q", want.name, edges, want.evidence)
+		}
+	}
+	if got := byName["Inner"]; len(got) != 1 || got[0].Evidence == "swift:initializer" {
+		t.Fatalf("short nested path=%#v", got)
+	}
+	for _, name := range []string{"Local", "Alias"} {
+		for _, edge := range byName[name] {
+			if edge.Evidence == "swift:initializer" {
+				t.Fatalf("shadowed %s became initializer: %#v", name, edge)
+			}
+		}
+	}
+	wantFacts := map[string][]string{
+		"Service|parameter":      {"10|19", "18|18"},
+		"Local|value":            {"10|19"},
+		"Service|local_function": {"10|19"},
+		"Local|local_nominal":    {"10|19"},
+		"Alias|typealias":        {"10|19"},
+		"T|generic_parameter":    {"4|4", "5|5", "21|21"},
+	}
+	seen := map[string]map[string]bool{}
+	for _, fact := range p.Scope.SwiftLexicalBindings {
+		key := fact.Name + "|" + fact.Kind
+		if wants, ok := wantFacts[key]; ok {
+			got := fmt.Sprintf("%d|%d", fact.ScopeStartLine, fact.ScopeEndLine)
+			if seen[key] == nil {
+				seen[key] = map[string]bool{}
+			}
+			if !slices.Contains(wants, got) {
+				t.Errorf("fact %s range=%s want one of %v", key, got, wants)
+			} else {
+				seen[key][got] = true
+			}
+		}
+	}
+	for key, wants := range wantFacts {
+		for _, want := range wants {
+			if !seen[key][want] {
+				t.Errorf("missing lexical fact %s range=%s", key, want)
+			}
+		}
+	}
+}
+
+func TestSwiftV4QualifiedRootAndPatternShadowing(t *testing.T) {
+	p := mustSwiftParse(t, "Shadow.swift", `
+struct Outer { struct Inner { init() {} } }
+struct OtherOuter { struct Inner { init() {} } }
+struct Service { init() {} }
+let maybe: (() -> Int)? = { 1 }
+let factories: [() -> Int] = [{ 1 }]
+func clear() { Outer.Inner() }
+func outside() { Service() }
+func shadowed() {
+    typealias Outer = OtherOuter
+    Outer.Inner()
+}
+func unrelated() {
+    let Inner = { 1 }
+    Outer.Inner()
+}
+func patterns() {
+    if let Service = maybe { Service() }
+    guard let Service = maybe else { return }
+    Service()
+    for Service in factories { Service() }
+    while let Service = maybe { Service() }
+    if case let Service? = maybe { Service() }
+    switch maybe {
+    case let Service?: Service()
+    default: break
+    }
+    do { throw ServiceError() } catch let Service { _ = Service }
+}
+struct ServiceError: Error {}
+`)
+	byName := map[string][]graph.Edge{}
+	for _, edge := range p.Edges {
+		byName[edge.DstName] = append(byName[edge.DstName], edge)
+	}
+	outer := byName["Outer.Inner"]
+	positive, blocked := 0, 0
+	for _, edge := range outer {
+		if edge.Evidence == "swift:initializer" {
+			positive++
+		} else {
+			blocked++
+		}
+	}
+	if len(outer) != 3 || positive != 2 || blocked != 1 {
+		t.Fatalf("qualified facts=%#v", outer)
+	}
+	serviceInitializers := 0
+	for _, edge := range byName["Service"] {
+		if edge.Evidence == "swift:initializer" {
+			serviceInitializers++
+		}
+	}
+	if serviceInitializers != 1 {
+		t.Fatalf("pattern-bound Service facts=%#v", byName["Service"])
+	}
+	facts := map[string]bool{}
+	for _, fact := range p.Scope.SwiftLexicalBindings {
+		if fact.Kind == graph.SwiftLexicalValue {
+			facts[fmt.Sprintf("%s|%d|%d", fact.Name, fact.ScopeStartLine, fact.ScopeEndLine)] = true
+		}
+	}
+	if !slices.ContainsFunc([]string{"Service|16|16", "Service|17|17", "Service|20|20", "Service|21|21", "Service|23|23", "Service|26|26"}, func(want string) bool { return facts[want] }) {
+		t.Fatalf("missing pattern binding facts: %#v", facts)
+	}
+}
+
+func TestSwiftV4NestedLambdaAndTypealiasGenericRanges(t *testing.T) {
+	p := mustSwiftParse(t, "Ranges.swift", `
+struct Service { init() {} }
+struct T { init() {} }
+typealias Alias<T> = Service
+func f() {
+    let outer = {
+        let inner = { Service in Service() }
+        Service()
+    }
+    T()
+}
+`)
+	serviceEdges := 0
+	serviceInitializers := 0
+	for _, edge := range p.Edges {
+		if edge.DstName == "Service" {
+			serviceEdges++
+			if edge.Evidence == "swift:initializer" {
+				serviceInitializers++
+			}
+		}
+	}
+	if serviceEdges != 2 || serviceInitializers != 1 {
+		t.Fatalf("nested lambda facts edges=%#v bindings=%#v", p.Edges, p.Scope.SwiftLexicalBindings)
+	}
+	for _, fact := range p.Scope.SwiftLexicalBindings {
+		if fact.Name == "T" && fact.Kind == graph.SwiftLexicalGenericParameter && (fact.ScopeStartLine != 4 || fact.ScopeEndLine != 4) {
+			t.Fatalf("typealias generic range=%#v", fact)
 		}
 	}
 }

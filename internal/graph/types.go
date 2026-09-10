@@ -75,12 +75,33 @@ type ParsedFile struct {
 // ScopeEvidence contains syntax-proven facts used by later language-specific
 // resolvers. It deliberately contains no destination identity.
 type ScopeEvidence struct {
-	Package    string
-	ModulePath string
-	Imports    []ScopeImport
-	Modules    []RustModule
-	GoLocals   []GoLocalBinding
+	Package              string
+	ModulePath           string
+	Imports              []ScopeImport
+	Modules              []RustModule
+	GoLocals             []GoLocalBinding
+	SwiftLexicalBindings []SwiftLexicalBinding
 }
+
+// SwiftLexicalBinding is conservative, range-bearing negative evidence for a
+// Swift spelling. It identifies a lexical binding but deliberately carries no
+// destination identity; consumers use it to refuse an inferred nominal claim.
+type SwiftLexicalBinding struct {
+	Name           string
+	Kind           string
+	OwnerModule    string
+	ScopeStartLine int
+	ScopeEndLine   int
+}
+
+const (
+	SwiftLexicalValue            = "value"
+	SwiftLexicalParameter        = "parameter"
+	SwiftLexicalLocalFunction    = "local_function"
+	SwiftLexicalTypealias        = "typealias"
+	SwiftLexicalLocalNominal     = "local_nominal"
+	SwiftLexicalGenericParameter = "generic_parameter"
+)
 
 // GoLocalBinding is one syntax-proven Go lexical binding: a name that some
 // block in the file binds itself, over the line range that block spans.

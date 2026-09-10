@@ -129,8 +129,8 @@ func TestMigrationCeilingAndDatabaseIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MigrationCeiling() error = %v", err)
 	}
-	if ceiling != 37 {
-		t.Fatalf("MigrationCeiling() = %d, want 37", ceiling)
+	if ceiling != 38 {
+		t.Fatalf("MigrationCeiling() = %d, want 38", ceiling)
 	}
 	if DatabaseFormatUserVersion != 2 {
 		t.Fatalf("DatabaseFormatUserVersion = %d, want 2", DatabaseFormatUserVersion)
@@ -171,6 +171,8 @@ func TestFileParserProfileGroupsCountEvidenceWithoutSymbols(t *testing.T) {
 			VALUES(?1, ?2, 'crate', 'sub')`},
 		{"go_local_binding_evidence", `INSERT INTO go_local_binding_evidence(repo_id, file_id, name, scope_start_line, scope_end_line)
 			VALUES(?1, ?2, 'x', 1, 2)`},
+		{"swift_lexical_binding_evidence", `INSERT INTO swift_lexical_binding_evidence(repo_id, file_id, name, binding_kind, scope_start_line, scope_end_line)
+			VALUES(?1, ?2, 'x', 'value', 1, 2)`},
 		{"test_links", `INSERT INTO test_links(repo_id, test_file_id, reason, score) VALUES(?1, ?2, 'name', 1.0)`},
 	}
 	for _, tc := range cases {
