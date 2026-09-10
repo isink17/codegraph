@@ -418,7 +418,12 @@ func (s *Store) resolveSwiftScopeStandalone(ctx context.Context, repoID int64, o
 		return 0, err
 	}
 	defer tx.Rollback()
-	n, err := s.resolveSwiftScope(ctx, tx, repoID, only)
+	n, err := s.resolveSwiftInitializerScope(ctx, tx, repoID, only)
+	if err == nil {
+		var self int
+		self, err = s.resolveSwiftScope(ctx, tx, repoID, only)
+		n += self
+	}
 	if err != nil {
 		return 0, err
 	}

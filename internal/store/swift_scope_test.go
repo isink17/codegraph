@@ -488,6 +488,98 @@ func TestSwiftSelfCallAcceptsExactRegularLabelsOnly(t *testing.T) {
 	}
 }
 
+func TestSwiftInitializerScopeBindsExactSameFileInit(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	target := f.symbol(f.mainFile, "init", "Service", "function", "init(id:)", false)
+	f.arity(target, 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	edge := f.call(f.mainFile, caller, "Service", "swift:initializer;labels=id:", 1, 1)
+	f.resolve()
+	if got := f.dst(edge); !got.Valid || got.Int64 != target {
+		t.Fatalf("dst=%v want %d", got, target)
+	}
+	var strategy, confidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&strategy, &confidence); err != nil {
+		t.Fatal(err)
+	}
+	if strategy != ResolutionStrategySwiftInitializerScope || confidence != ResolutionConfidenceHigh {
+		t.Fatalf("resolution=(%q,%q)", strategy, confidence)
+	}
+}
+
+func TestSwiftInitializerScopeRefusesWrongEvidenceAndCrossFileCompetitor(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	target := f.symbol(f.mainFile, "init", "Service", "function", "init(id:)", false)
+	f.arity(target, 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	wrong := f.call(f.mainFile, caller, "Service", "swift:initializer_unproven;generic_specialization=true", 1, 1)
+	valid := f.call(f.mainFile, caller, "Service", "swift:initializer;labels=id:", 1, 2)
+	other := f.file("Other.swift")
+	competing := f.symbol(other, "init", "Service", "function", "init(id:)", false)
+	f.arity(competing, 1, 1)
+	f.resolve()
+	for _, edge := range []int64{wrong, valid} {
+		if got := f.dst(edge); got.Valid {
+			t.Fatalf("edge %d resolved to %d", edge, got.Int64)
+		}
+	}
+}
+
+func TestSwiftInitializerResolverStatsTrackActualBindings(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	target := f.symbol(f.mainFile, "init", "Service", "function", "init(id:)", false)
+	f.arity(target, 1, 1)
+	caller := f.symbol(f.mainFile, "make", "", "function", "make()", false)
+	bound := f.call(f.mainFile, caller, "Service", "swift:initializer;labels=id:", 1, 1)
+	unbound := f.call(f.mainFile, caller, "Service", "swift:initializer;labels=name:", 1, 2)
+	stats := f.resolveNames("Service")
+	assertSwiftStats(t, stats, 2, 1, 1, 0)
+	if got := f.dst(bound); !got.Valid || got.Int64 != target {
+		t.Fatalf("bound dst=%v want %d", got, target)
+	}
+	if got := f.dst(unbound); got.Valid {
+		t.Fatalf("unbound dst=%d", got.Int64)
+	}
+}
+
+func TestParseSwiftInitializerCallRejectsUnprovenAndMalformedFacts(t *testing.T) {
+	valid := []struct {
+		evidence, dst string
+		arity         int64
+	}{
+		{"swift:initializer", "Service", 0},
+		{"swift:initializer;labels=_", "Service", 1},
+		{"swift:initializer;generic_specialization=true;labels=value:", "Box", 1},
+	}
+	for _, tc := range valid {
+		if _, ok := parseSwiftInitializerCall(tc.evidence, tc.dst, sql.NullInt64{Int64: tc.arity, Valid: true}); !ok {
+			t.Fatalf("rejected valid fact %+v", tc)
+		}
+	}
+	invalid := []struct {
+		evidence, dst string
+		arity         sql.NullInt64
+	}{
+		{"swift:initializer_unproven;generic_specialization=true", "Service", sql.NullInt64{Int64: 0, Valid: true}},
+		{"swift:initializer;labels=", "Service", sql.NullInt64{Int64: 0, Valid: true}},
+		{"swift:initializer;generic_specialization=false", "Service", sql.NullInt64{Int64: 0, Valid: true}},
+		{"swift:initializer;trailing_labels=_", "Service", sql.NullInt64{Int64: 1, Valid: true}},
+		{"swift:initializer", "Service.init", sql.NullInt64{Int64: 0, Valid: true}},
+		{"swift:initializer;labels=id:", "Service", sql.NullInt64{Int64: 0, Valid: true}},
+		{"swift:initializer;labels=id:,id:", "Service", sql.NullInt64{Int64: 2, Valid: true}},
+		{"swift:initializer", "Sérvice", sql.NullInt64{Int64: 0, Valid: true}},
+		{"swift:initializer", "Service", sql.NullInt64{}},
+	}
+	for _, tc := range invalid {
+		if _, ok := parseSwiftInitializerCall(tc.evidence, tc.dst, tc.arity); ok {
+			t.Fatalf("accepted invalid fact %+v", tc)
+		}
+	}
+}
+
 func TestSwiftTrailingClosureResolution(t *testing.T) {
 	tests := []struct {
 		name, evidence, signature string
