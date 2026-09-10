@@ -13,6 +13,7 @@ import (
 )
 
 const swiftSelfRepairSettingKey = "resolver.swift_explicit_self_repaired.v1"
+const swiftTrailingRepairSettingKey = "resolver.swift_trailing_closure_repaired.v1"
 
 var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope}
 
@@ -27,10 +28,17 @@ type swiftScopeEdge struct {
 	arity                sql.NullInt64
 }
 
+type swiftSelfCallShape struct {
+	method, strategy              string
+	regularLabels, trailingLabels []string
+	arity                         int
+}
+
 type swiftScopeSymbol struct {
 	id, file               int64
 	name, owner, sig, kind string
 	static                 sql.NullInt64
+	arityMin, arityMax     sql.NullInt64
 }
 
 type swiftScopeFact struct {
@@ -57,57 +65,69 @@ func swiftIdentifier(s string) bool {
 	return true
 }
 
-func swiftSelfCall(evidence, dst string, arity sql.NullInt64) (method, strategy string, labels []string, ok bool) {
+func parseSwiftSelfCallShape(evidence, dst string, arity sql.NullInt64) (swiftSelfCallShape, bool) {
+	shape := swiftSelfCallShape{}
 	prefix, strategy := "swift:self", ResolutionStrategySwiftSelfScope
-	if strings.HasPrefix(evidence, "swift:Self") {
+	if evidence == "swift:Self" || strings.HasPrefix(evidence, "swift:Self;") {
 		prefix, strategy = "swift:Self", ResolutionStrategySwiftSelfTypeScope
 	}
-	if !strings.HasPrefix(evidence, prefix) {
-		return "", "", nil, false
+	if evidence != prefix && !strings.HasPrefix(evidence, prefix+";") {
+		return shape, false
 	}
-	rest := strings.TrimPrefix(evidence, prefix)
-	if rest != "" {
-		if !strings.HasPrefix(rest, ";") {
-			return "", "", nil, false
+	parts := strings.Split(evidence, ";")
+	seenLabels, seenTrailing := false, false
+	for _, part := range parts[1:] {
+		var dstLabels *[]string
+		switch {
+		case strings.HasPrefix(part, "labels=") && !seenLabels && !seenTrailing:
+			seenLabels, dstLabels = true, &shape.regularLabels
+		case strings.HasPrefix(part, "trailing_labels=") && !seenTrailing:
+			seenTrailing, dstLabels = true, &shape.trailingLabels
+		default:
+			return swiftSelfCallShape{}, false
 		}
-		parts := strings.Split(rest, ";")
-		seen := false
-		for _, part := range parts[1:] {
-			if !strings.HasPrefix(part, "labels=") || seen {
-				return "", "", nil, false
-			}
-			seen = true
-			value := strings.TrimPrefix(part, "labels=")
-			if value == "" {
-				return "", "", nil, false
-			}
-			for _, label := range strings.Split(value, ",") {
-				if label == "_" {
-					labels = append(labels, label)
-					continue
-				}
-				if !strings.HasSuffix(label, ":") || !swiftIdentifier(strings.TrimSuffix(label, ":")) {
-					return "", "", nil, false
-				}
-				labels = append(labels, label)
-			}
+		value := strings.TrimPrefix(part, "labels=")
+		if dstLabels == &shape.trailingLabels {
+			value = strings.TrimPrefix(part, "trailing_labels=")
 		}
-		if !seen {
-			return "", "", nil, false
+		if value == "" {
+			return swiftSelfCallShape{}, false
+		}
+		for _, label := range strings.Split(value, ",") {
+			if label != "_" && (!strings.HasSuffix(label, ":") || !swiftIdentifier(strings.TrimSuffix(label, ":"))) {
+				return swiftSelfCallShape{}, false
+			}
+			*dstLabels = append(*dstLabels, label)
+		}
+	}
+	if len(shape.trailingLabels) > 0 {
+		if shape.trailingLabels[0] != "_" {
+			return swiftSelfCallShape{}, false
+		}
+		for _, label := range shape.trailingLabels[1:] {
+			if label == "_" {
+				return swiftSelfCallShape{}, false
+			}
 		}
 	}
 	want := strings.TrimPrefix(prefix, "swift:") + "."
 	if !strings.HasPrefix(dst, want) {
-		return "", "", nil, false
+		return swiftSelfCallShape{}, false
 	}
-	method = strings.TrimPrefix(dst, want)
-	if !swiftIdentifier(method) || method == "init" || method == "deinit" || method == "subscript" || strings.Contains(method, ".") {
-		return "", "", nil, false
+	shape.method, shape.strategy = strings.TrimPrefix(dst, want), strategy
+	if !swiftIdentifier(shape.method) || shape.method == "init" || shape.method == "deinit" || shape.method == "subscript" || strings.Contains(shape.method, ".") || !arity.Valid {
+		return swiftSelfCallShape{}, false
 	}
-	if !arity.Valid || int(arity.Int64) != len(labels) {
-		return "", "", nil, false
+	shape.arity = int(arity.Int64)
+	if shape.arity != len(shape.regularLabels)+len(shape.trailingLabels) {
+		return swiftSelfCallShape{}, false
 	}
-	return method, strategy, labels, true
+	return shape, true
+}
+
+func swiftSelfCall(evidence, dst string, arity sql.NullInt64) (method, strategy string, labels []string, ok bool) {
+	shape, parsed := parseSwiftSelfCallShape(evidence, dst, arity)
+	return shape.method, shape.strategy, append(shape.regularLabels, shape.trailingLabels...), parsed && len(shape.trailingLabels) == 0
 }
 
 func (s *Store) resolveSwiftScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
@@ -131,7 +151,7 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 	valid := make([]swiftScopeEdge, 0, len(edges))
 	candidateKeys := map[string][]any{}
 	for _, e := range edges {
-		method, strategy, labels, ok := swiftSelfCall(e.evidence, e.dst, e.arity)
+		shape, ok := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
 		if !ok {
 			continue
 		}
@@ -139,10 +159,14 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 			continue
 		}
 		static := e.static.Int64
-		if strategy == ResolutionStrategySwiftSelfTypeScope {
+		if shape.strategy == ResolutionStrategySwiftSelfTypeScope {
 			static = 1
 		}
-		candidateKeys[swiftCandidateKey(e.owner, method, swiftSelector(method, labels), static)] = []any{e.owner, method, swiftSelector(method, labels), static}
+		signature := swiftSelector(shape.method, shape.regularLabels)
+		if len(shape.trailingLabels) > 0 {
+			signature = ""
+		}
+		candidateKeys[swiftCandidateKey(e.owner, shape.method, signature, static)] = []any{e.owner, shape.method, signature, static}
 		valid = append(valid, e)
 	}
 	if len(valid) == 0 {
@@ -190,9 +214,9 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 		return 0, err
 	}
 	var symbols []swiftScopeSymbol
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static FROM symbols s JOIN tmp_swift_scope_candidates c ON c.owner=s.container_name AND c.name=s.name AND c.signature=s.signature AND c.is_static=s.is_static JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function'`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max FROM symbols s JOIN tmp_swift_scope_candidates c ON c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature) AND c.is_static=s.is_static JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function'`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
 		var x swiftScopeSymbol
-		if err := rows.Scan(&x.id, &x.file, &x.name, &x.owner, &x.sig, &x.kind, &x.static); err != nil {
+		if err := rows.Scan(&x.id, &x.file, &x.name, &x.owner, &x.sig, &x.kind, &x.static, &x.arityMin, &x.arityMax); err != nil {
 			return err
 		}
 		symbols = append(symbols, x)
@@ -229,8 +253,9 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 	}
 	res := map[int64]swiftScopeBinding{}
 	for _, e := range valid {
-		method, strategy, labels, _ := swiftSelfCall(e.evidence, e.dst, e.arity)
-		selector := swiftSelector(method, labels)
+		shape, _ := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
+		method, strategy := shape.method, shape.strategy
+		selector := swiftSelector(method, shape.regularLabels)
 		ownerKey := e.owner + "\x00" + strconv.FormatInt(e.file, 10)
 		if ownerCount[ownerKey] != 1 || allowedOwners[ownerKey] != 1 {
 			continue
@@ -242,7 +267,14 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 		var found swiftScopeSymbol
 		count := 0
 		for _, c := range symbols {
-			if c.owner != e.owner || c.name != method || c.sig != selector || !c.static.Valid || c.static.Int64 != wantStatic {
+			if c.owner != e.owner || c.name != method || !c.static.Valid || c.static.Int64 != wantStatic {
+				continue
+			}
+			if len(shape.trailingLabels) == 0 {
+				if c.sig != selector {
+					continue
+				}
+			} else if !swiftTrailingCandidate(shape, c) {
 				continue
 			}
 			if _, test := tests[c.file]; test {
@@ -266,6 +298,53 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 	return swiftScopeApply(ctx, q, res)
 }
 
+func swiftTrailingCandidate(call swiftSelfCallShape, candidate swiftScopeSymbol) bool {
+	if !candidate.arityMin.Valid || !candidate.arityMax.Valid || candidate.arityMin.Int64 != int64(call.arity) || candidate.arityMax.Int64 != int64(call.arity) {
+		return false
+	}
+	labels, ok := swiftDeclarationLabels(candidate.sig, candidate.name)
+	if !ok || len(labels) != call.arity {
+		return false
+	}
+	r := len(call.regularLabels)
+	for i := 0; i < r; i++ {
+		if labels[i] != swiftLabel(call.regularLabels[i]) {
+			return false
+		}
+	}
+	for i, label := range call.trailingLabels {
+		if i > 0 && labels[r+i] != label {
+			return false
+		}
+	}
+	return true
+}
+
+func swiftLabel(label string) string {
+	if label == "_" {
+		return "_:"
+	}
+	return label
+}
+
+func swiftDeclarationLabels(signature, method string) ([]string, bool) {
+	prefix := method + "("
+	if !strings.HasPrefix(signature, prefix) || !strings.HasSuffix(signature, ")") {
+		return nil, false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(signature, prefix), ")")
+	if body == "" {
+		return nil, true
+	}
+	labels := strings.Split(body, ",")
+	for _, label := range labels {
+		if label != "_:" && (!strings.HasSuffix(label, ":") || !swiftIdentifier(strings.TrimSuffix(label, ":"))) {
+			return nil, false
+		}
+	}
+	return labels, true
+}
+
 func swiftOwnerKeys(edges []swiftScopeEdge) []string {
 	set := map[string]struct{}{}
 	for _, e := range edges {
@@ -286,6 +365,7 @@ func swiftSelector(method string, labels []string) string {
 	if len(labels) == 0 {
 		return method + "()"
 	}
+	labels = append([]string(nil), labels...)
 	for i, label := range labels {
 		if label == "_" {
 			labels[i] = "_:"
@@ -345,6 +425,10 @@ func (s *Store) resolveSwiftScopeStandalone(ctx context.Context, repoID int64, o
 	return n, tx.Commit()
 }
 func (s *Store) repairSwiftSelfBindings(ctx context.Context, repoID int64) error {
+	return s.redecideSwiftSelfBindings(ctx, repoID)
+}
+
+func (s *Store) repairSwiftTrailingBindings(ctx context.Context, repoID int64) error {
 	return s.redecideSwiftSelfBindings(ctx, repoID)
 }
 

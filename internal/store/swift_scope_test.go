@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -60,6 +61,13 @@ func (f *swiftScopeFixture) symbol(file int64, name, owner, kind, signature stri
 		f.t.Fatal(err)
 	}
 	return id
+}
+
+func (f *swiftScopeFixture) arity(symbol int64, min, max int64) {
+	f.t.Helper()
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET arity_min=?,arity_max=? WHERE id=?`, min, max, symbol); err != nil {
+		f.t.Fatal(err)
+	}
 }
 
 func (f *swiftScopeFixture) call(file, source int64, dst, evidence string, arity, line int) int64 {
@@ -476,5 +484,140 @@ func TestSwiftSelfCallAcceptsExactRegularLabelsOnly(t *testing.T) {
 		if _, _, _, ok := swiftSelfCall(tc.evidence, tc.dst, sql.NullInt64{Int64: tc.arity, Valid: true}); ok {
 			t.Fatalf("accepted invalid fact %+v", tc)
 		}
+	}
+}
+
+func TestSwiftTrailingClosureResolution(t *testing.T) {
+	tests := []struct {
+		name, evidence, signature string
+		static                    bool
+		labels                    []string
+	}{
+		{"underscore", "swift:self;trailing_labels=_", "run(_:) ", false, nil},
+		{"named", "swift:self;trailing_labels=_", "run(completion:)", false, nil},
+		{"regular-prefix", "swift:self;labels=id:;trailing_labels=_", "run(id:,completion:)", false, nil},
+		{"multiple", "swift:self;trailing_labels=_,completion:", "run(first:,completion:)", false, nil},
+		{"static-self", "swift:self;trailing_labels=_", "make(completion:)", true, nil},
+		{"static-type", "swift:Self;trailing_labels=_", "make(completion:)", true, nil},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			f.symbol(f.mainFile, "Service", "", "struct", "", false)
+			caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", tc.name == "static-self")
+			name := "run"
+			dst := "self.run"
+			arity := int64(1)
+			if tc.name == "regular-prefix" {
+				arity, tc.signature = 2, "run(id:,completion:)"
+			}
+			if tc.name == "multiple" {
+				arity, tc.signature = 2, "run(first:,completion:)"
+			}
+			if tc.name == "static-self" || strings.HasPrefix(tc.evidence, "swift:Self") {
+				name = "make"
+			}
+			if strings.HasPrefix(tc.evidence, "swift:Self") {
+				dst = "Self.make"
+			}
+			if tc.name == "static-self" {
+				dst = "self.make"
+			}
+			target := f.symbol(f.mainFile, name, "Service", "function", strings.TrimSpace(tc.signature), tc.static)
+			f.arity(target, arity, arity)
+			edge := f.call(f.mainFile, caller, dst, tc.evidence, int(arity), i+1)
+			f.resolve()
+			if got := f.dst(edge); !got.Valid || got.Int64 != target {
+				t.Fatalf("%s: dst=%v want %d", tc.name, got, target)
+			}
+		})
+	}
+}
+
+func TestSwiftTrailingClosureRefusesAmbiguityAndUnsupportedFacts(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
+	add := func(sig string, min, max int64) int64 {
+		id := f.symbol(f.mainFile, "run", "Service", "function", sig, false)
+		f.arity(id, min, max)
+		return id
+	}
+	add("run(_:)", 1, 1)
+	add("run(completion:)", 1, 1)
+	ambiguous := f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=_", 1, 1)
+	defaulted := add("run(value:,completion:)", 1, 2)
+	_ = defaulted
+	defaultCall := f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=_", 1, 2)
+	variadic := add("run(items:,completion:)", 2, -1)
+	_ = variadic
+	variadicCall := f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=_", 2, 3)
+	malformed := f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=completion:", 1, 4)
+	f.resolve()
+	for _, edge := range []int64{ambiguous, defaultCall, variadicCall, malformed} {
+		if got := f.dst(edge); got.Valid {
+			t.Fatalf("unsupported edge %d resolved to %d", edge, got.Int64)
+		}
+	}
+}
+
+func TestSwiftTrailingClosureStatsMixed(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	one := f.symbol(f.mainFile, "run", "Service", "function", "run(completion:)", false)
+	f.arity(one, 1, 1)
+	two := f.symbol(f.mainFile, "finish", "Service", "function", "finish(_:)", false)
+	f.arity(two, 1, 1)
+	three := f.symbol(f.mainFile, "finish", "Service", "function", "finish(done:)", false)
+	f.arity(three, 1, 1)
+	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
+	f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=_", 1, 1)
+	f.call(f.mainFile, caller, "self.finish", "swift:self;trailing_labels=_", 1, 2)
+	assertSwiftStats(t, f.resolveNames("run", "finish"), 2, 1, 1, 0)
+}
+
+func TestSwiftTrailingClosureSecondLabelAndBlocker(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run(first:,completion:)", false)
+	f.arity(target, 2, 2)
+	wrong := f.symbol(f.mainFile, "run", "Service", "function", "run(first:,failure:)", false)
+	f.arity(wrong, 2, 2)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=_,completion:", 2, 1)
+	f.resolve()
+	if got := f.dst(edge); !got.Valid || got.Int64 != target {
+		t.Fatalf("second label dst=%v want %d", got, target)
+	}
+	f.blocker(f.mainFile, "Service", "run", graph.ScopeImportSwiftMemberValue, false)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.dst(edge); got.Valid {
+		t.Fatalf("member blocker left dst=%d", got.Int64)
+	}
+}
+
+func TestSwiftTrailingClosureRepairBindsAndMarksOnce(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run(completion:)", false)
+	f.arity(target, 1, 1)
+	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=_", 1, 1)
+	didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
+	if err != nil || !didRun {
+		t.Fatalf("repair=(%v,%v)", didRun, err)
+	}
+	if got := f.dst(edge); !got.Valid || got.Int64 != target {
+		t.Fatalf("repaired dst=%v want %d", got, target)
+	}
+	var marker string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftTrailingRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
+		t.Fatalf("marker=%q err=%v", marker, err)
+	}
+	didRun, err = f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
+	if err != nil || didRun {
+		t.Fatalf("second repair=(%v,%v)", didRun, err)
 	}
 }
