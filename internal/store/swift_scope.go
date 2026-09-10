@@ -423,6 +423,11 @@ func (s *Store) resolveSwiftScopeStandalone(ctx context.Context, repoID int64, o
 		var self int
 		self, err = s.resolveSwiftScope(ctx, tx, repoID, only)
 		n += self
+		if err == nil {
+			var super int
+			super, err = s.resolveSwiftSuperScope(ctx, tx, repoID, only)
+			n += super
+		}
 	}
 	if err != nil {
 		return 0, err

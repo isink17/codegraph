@@ -3886,6 +3886,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	if n, err := s.resolveSwiftSuperScope(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if n, err := resolveCSharpScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {
@@ -4660,6 +4665,15 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		if err := s.redecideSwiftBindings(ctx, repoID); err != nil {
 			return err
 		}
+		applies, err := s.swiftSuperEvidenceApplies(ctx, repoID)
+		if err != nil {
+			return err
+		}
+		if applies {
+			if err := s.redecideSwiftSuperBindings(ctx, repoID); err != nil {
+				return err
+			}
+		}
 	}
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil); err != nil {
 		return err
@@ -4747,6 +4761,15 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	if swiftChanged {
 		if err := s.redecideSwiftBindings(ctx, repoID); err != nil {
 			return ResolveEdgesForNamesStats{}, err
+		}
+		applies, err := s.swiftSuperEvidenceApplies(ctx, repoID)
+		if err != nil {
+			return ResolveEdgesForNamesStats{}, err
+		}
+		if applies {
+			if err := s.redecideSwiftSuperBindings(ctx, repoID); err != nil {
+				return ResolveEdgesForNamesStats{}, err
+			}
 		}
 	}
 
