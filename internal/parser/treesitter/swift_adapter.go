@@ -554,7 +554,35 @@ func swiftExtractInheritanceRelations(root *sitter.Node, content []byte, pf *gra
 			return
 		}
 		nextContainer := container
-		if (node.Type() == "class_declaration" || node.Type() == "protocol_declaration") && !swiftIsExtension(node, content) {
+		if node.Type() == "class_declaration" && swiftIsExtension(node, content) {
+			if target := swiftExtensionTarget(node, content); target != "" {
+				nextContainer = target
+			}
+			if target := swiftExtensionFactTarget(node, content); target != "" {
+				specifiers, constrained := swiftInheritanceHeaderFacts(node)
+				for _, spec := range specifiers {
+					targetNode := childByFieldName(spec, "inherits_from")
+					if targetNode == nil {
+						targetNode = firstChild(spec, "user_type")
+					}
+					if targetNode == nil {
+						continue
+					}
+					raw := strings.TrimSpace(nodeText(targetNode, content))
+					targetName := swiftStripGeneric(raw)
+					if targetName == "" {
+						continue
+					}
+					relation := "conformance"
+					if matches := kinds[targetName]; len(matches) > 0 && (len(matches) != 1 || matches[0] != "protocol") {
+						relation = "unproven"
+					}
+					pf.SwiftInheritanceRelations = append(pf.SwiftInheritanceRelations, graph.SwiftInheritanceRelation{
+						Child: target, Target: targetName, Relation: relation, Range: nodeRange(targetNode), Generic: raw != targetName, Constrained: constrained,
+					})
+				}
+			}
+		} else if (node.Type() == "class_declaration" || node.Type() == "protocol_declaration") && !swiftIsExtension(node, content) {
 			nameNode := childByFieldName(node, "name")
 			if nameNode == nil {
 				nameNode = firstChild(node, "type_identifier")
@@ -605,6 +633,27 @@ func swiftExtractInheritanceRelations(root *sitter.Node, content []byte, pf *gra
 		}
 		return a.Range.StartLine < b.Range.StartLine || a.Range.StartLine == b.Range.StartLine && a.Range.StartCol < b.Range.StartCol
 	})
+}
+
+// swiftExtensionFactTarget reads only the extension header. It intentionally
+// differs from swiftExtensionTarget: constrained extensions may not own
+// member symbols, but their conformance is still parser-owned hazard evidence.
+func swiftExtensionFactTarget(node *sitter.Node, content []byte) string {
+	if node == nil || !swiftIsExtension(node, content) {
+		return ""
+	}
+	target := childByFieldName(node, "name")
+	if target == nil {
+		target = firstChild(node, "user_type")
+	}
+	if target == nil {
+		return ""
+	}
+	text := strings.TrimSpace(nodeText(target, content))
+	if !swiftTypePath.MatchString(text) {
+		return ""
+	}
+	return text
 }
 
 func swiftInheritanceSpecifiers(root *sitter.Node) []*sitter.Node {
