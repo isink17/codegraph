@@ -1321,13 +1321,18 @@ var (
 		run:              (*Store).repairSwiftSelfBindings,
 		resolvesRepoWide: true,
 	}
+	swiftTrailingRepair = resolverRepair{
+		key:              swiftTrailingRepairSettingKey,
+		run:              (*Store).repairSwiftTrailingBindings,
+		resolvesRepoWide: true,
+	}
 	referenceIdentityRepair = resolverRepair{
 		key:              referenceIdentityRepairSettingKey,
 		run:              (*Store).ReconcileReferenceIdentities,
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftTrailingRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,
