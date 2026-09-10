@@ -2199,6 +2199,12 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM scope_import_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM swift_inheritance_relations WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
+	if err := execInChunks(`DELETE FROM swift_declaration_facts WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM swift_lexical_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2348,6 +2354,12 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM scope_import_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM swift_inheritance_relations WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM swift_declaration_facts WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM swift_lexical_binding_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2604,6 +2616,27 @@ func insertParsedFileGraph(
 			if err := execBatchInsert(ctx, tx, "swift_lexical_binding_evidence", swiftCols, 7, args, stats); err != nil {
 				return nil, err
 			}
+		}
+	}
+	if len(parsed.SwiftInheritanceRelations) > 0 {
+		args := make([]any, 0, len(parsed.SwiftInheritanceRelations)*11)
+		for _, fact := range parsed.SwiftInheritanceRelations {
+			args = append(args, repoID, fileID, fact.Child, fact.Target, fact.Relation, fact.Range.StartLine, fact.Range.StartCol, fact.Range.EndLine, fact.Range.EndCol, boolInt(fact.Generic), boolInt(fact.Constrained))
+		}
+		if err := execBatchInsert(ctx, tx, "swift_inheritance_relations", "repo_id, file_id, child_qualified_name, target_qualified_name, relation_kind, start_line, start_col, end_line, end_col, is_generic, is_constrained", 11, args, stats); err != nil {
+			return nil, err
+		}
+	}
+	if len(parsed.SwiftDeclarationFacts) > 0 {
+		args := make([]any, 0, len(parsed.SwiftDeclarationFacts)*6)
+		for _, fact := range parsed.SwiftDeclarationFacts {
+			if fact.SymbolIndex < 0 || fact.SymbolIndex >= len(symbolIDs) {
+				return nil, fmt.Errorf("invalid Swift declaration fact symbol index %d", fact.SymbolIndex)
+			}
+			args = append(args, repoID, fileID, symbolIDs[fact.SymbolIndex], boolInt(fact.Final), boolInt(fact.Override), fact.Dispatch)
+		}
+		if err := execBatchInsert(ctx, tx, "swift_declaration_facts", "repo_id, file_id, symbol_id, is_final, is_override, dispatch_kind", 6, args, stats); err != nil {
+			return nil, err
 		}
 	}
 	if len(parsed.Scope.Imports) > 0 {

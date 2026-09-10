@@ -61,15 +61,33 @@ type Edge struct {
 const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
 
 type ParsedFile struct {
-	Language   string
-	Symbols    []Symbol
-	References []Reference
-	Edges      []Edge
-	Imports    []string
-	Scope      ScopeEvidence
-	ReExports  []ReExport
-	FileTokens map[string]float64
-	TestLinks  []TestLink
+	Language                  string
+	Symbols                   []Symbol
+	References                []Reference
+	Edges                     []Edge
+	Imports                   []string
+	Scope                     ScopeEvidence
+	ReExports                 []ReExport
+	FileTokens                map[string]float64
+	TestLinks                 []TestLink
+	SwiftInheritanceRelations []SwiftInheritanceRelation
+	SwiftDeclarationFacts     []SwiftDeclarationFact
+}
+
+type SwiftInheritanceRelation struct {
+	Child       string
+	Target      string
+	Relation    string
+	Range       Position
+	Generic     bool
+	Constrained bool
+}
+
+type SwiftDeclarationFact struct {
+	SymbolIndex int
+	Final       bool
+	Override    bool
+	Dispatch    string
 }
 
 // ScopeEvidence contains syntax-proven facts used by later language-specific
