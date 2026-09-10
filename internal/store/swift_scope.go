@@ -432,6 +432,18 @@ func (s *Store) repairSwiftTrailingBindings(ctx context.Context, repoID int64) e
 	return s.redecideSwiftSelfBindings(ctx, repoID)
 }
 
+func (s *Store) swiftTrailingRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM edges e JOIN files f ON f.id=e.file_id
+		WHERE e.repo_id=? AND f.repo_id=e.repo_id AND f.language='swift' AND f.is_deleted=0
+		  AND e.edge_kind='calls'
+		  AND (e.evidence LIKE 'swift:self;trailing_labels=%' OR e.evidence LIKE 'swift:self;labels=%;trailing_labels=%'
+		       OR e.evidence LIKE 'swift:Self;trailing_labels=%' OR e.evidence LIKE 'swift:Self;labels=%;trailing_labels=%')
+	)`, repoID).Scan(&found)
+	return found, err
+}
+
 func (s *Store) swiftPathsChanged(ctx context.Context, repoID int64, paths []string) (bool, error) {
 	if len(paths) == 0 {
 		return false, nil

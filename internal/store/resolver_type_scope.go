@@ -1324,6 +1324,7 @@ var (
 	swiftTrailingRepair = resolverRepair{
 		key:              swiftTrailingRepairSettingKey,
 		run:              (*Store).repairSwiftTrailingBindings,
+		applies:          (*Store).swiftTrailingRepairApplies,
 		resolvesRepoWide: true,
 	}
 	referenceIdentityRepair = resolverRepair{

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -619,5 +620,91 @@ func TestSwiftTrailingClosureRepairBindsAndMarksOnce(t *testing.T) {
 	didRun, err = f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
 	if err != nil || didRun {
 		t.Fatalf("second repair=(%v,%v)", didRun, err)
+	}
+}
+
+func TestSwiftTrailingRepairAppliesOnlyToTrailingCalls(t *testing.T) {
+	noSwift, repoID := newQueryTestStore(t)
+	if applies, err := noSwift.swiftTrailingRepairApplies(context.Background(), repoID); err != nil || applies {
+		t.Fatalf("no-Swift applies=(%v,%v), want false", applies, err)
+	}
+
+	f := newSwiftScopeFixture(t)
+	f.symbol(f.mainFile, "Service", "", "struct", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
+	ordinary := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy='sentinel' WHERE id=?`, target, ordinary); err != nil {
+		t.Fatal(err)
+	}
+	if applies, err := f.store.swiftTrailingRepairApplies(f.ctx, f.repoID); err != nil || applies {
+		t.Fatalf("ordinary-self applies=(%v,%v), want false", applies, err)
+	}
+	run, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
+	if err != nil || run {
+		t.Fatalf("ordinary-self repair=(%v,%v), want (false,nil)", run, err)
+	}
+	var strategy string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT resolution_strategy FROM edges WHERE id=?`, ordinary).Scan(&strategy); err != nil {
+		t.Fatal(err)
+	}
+	if strategy != "sentinel" {
+		t.Fatalf("ordinary-self strategy=%q, repair executed", strategy)
+	}
+}
+
+func TestSwiftTrailingRepairAppliesToUnresolvedAndBoundCalls(t *testing.T) {
+	for _, tc := range []struct {
+		name, evidence string
+	}{
+		{"unresolved", "swift:self;trailing_labels=_"},
+		{"bound", "swift:Self;trailing_labels=_"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			f.symbol(f.mainFile, "Service", "", "struct", "", false)
+			target := f.symbol(f.mainFile, "run", "Service", "function", "run(completion:)", tc.name == "bound")
+			f.arity(target, 1, 1)
+			caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", tc.name == "bound")
+			dst := "self.run"
+			if tc.name == "bound" {
+				dst = "Self.run"
+			}
+			edge := f.call(f.mainFile, caller, dst, tc.evidence, 1, 1)
+			if tc.name == "bound" {
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=? WHERE id=?`, target, edge); err != nil {
+					t.Fatal(err)
+				}
+			}
+			applies, err := f.store.swiftTrailingRepairApplies(f.ctx, f.repoID)
+			if err != nil || !applies {
+				t.Fatalf("applies=(%v,%v), want true", applies, err)
+			}
+			didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
+			if err != nil || !didRun {
+				t.Fatalf("repair=(%v,%v), want (true,nil)", didRun, err)
+			}
+			if got := f.dst(edge); tc.name == "unresolved" && (!got.Valid || got.Int64 != target) {
+				t.Fatalf("repaired dst=%v, want %d", got, target)
+			}
+			if tc.name == "bound" && (!f.dst(edge).Valid || f.dst(edge).Int64 != target) {
+				t.Fatalf("bound dst changed: %v", f.dst(edge))
+			}
+		})
+	}
+}
+
+func TestSwiftTrailingRepairFreshRepositoriesAvoidTax(t *testing.T) {
+	s, _ := newQueryTestStore(t)
+	root := t.TempDir()
+	for i := 0; i < 16; i++ {
+		repo, err := s.UpsertRepo(context.Background(), filepath.Join(root, fmt.Sprintf("repo-%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := s.runResolverRepairOnce(context.Background(), repo.ID, swiftTrailingRepair)
+		if err != nil || run {
+			t.Fatalf("repo %d repair=(%v,%v), want (false,nil)", i, run, err)
+		}
 	}
 }
