@@ -1333,13 +1333,19 @@ var (
 		applies:          (*Store).swiftInitializerRepairApplies,
 		resolvesRepoWide: true,
 	}
+	swiftTrailingInitializerRepair = resolverRepair{
+		key:              swiftTrailingInitializerRepairSettingKey,
+		run:              (*Store).redecideSwiftBindings,
+		applies:          (*Store).swiftTrailingInitializerRepairApplies,
+		resolvesRepoWide: true,
+	}
 	referenceIdentityRepair = resolverRepair{
 		key:              referenceIdentityRepairSettingKey,
 		run:              (*Store).ReconcileReferenceIdentities,
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftTrailingRepair, swiftInitializerRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,
@@ -1401,6 +1407,11 @@ func (s *Store) repairResolverBindingsOnce(ctx context.Context, repoID int64, de
 		}
 		if ran && repair.resolvesRepoWide {
 			resolvedRepoWide = true
+			if repair.key == swiftInitializerRepairSettingKey {
+				if err := s.markRepairDone(ctx, swiftTrailingInitializerRepairSettingKey, repoID); err != nil {
+					return false, err
+				}
+			}
 			// Edge repairs can change the facts from which reference identities
 			// are derived. Do not trust a marker written for the old edge state.
 			if _, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, referenceIdentityRepair.key+"."+strconv.FormatInt(repoID, 10)); err != nil {

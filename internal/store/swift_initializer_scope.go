@@ -8,13 +8,14 @@ import (
 )
 
 const swiftInitializerRepairSettingKey = "resolver.swift_initializer_repaired.v1"
+const swiftTrailingInitializerRepairSettingKey = "resolver.swift_trailing_initializer_repaired.v1"
 
 type swiftInitializerCallShape struct {
-	owner    string
-	labels   []string
-	generic  bool
-	selector string
-	arity    int64
+	owner                         string
+	regularLabels, trailingLabels []string
+	generic                       bool
+	selector                      string
+	arity                         int64
 }
 
 func parseSwiftInitializerCall(evidence, dst string, arity sql.NullInt64) (swiftInitializerCallShape, bool) {
@@ -23,14 +24,14 @@ func parseSwiftInitializerCall(evidence, dst string, arity sql.NullInt64) (swift
 		return shape, false
 	}
 	parts := strings.Split(evidence, ";")
-	seenGeneric, seenLabels := false, false
+	seenGeneric, seenLabels, seenTrailing := false, false, false
 	seenNamedLabels := map[string]struct{}{}
 	for _, part := range parts[1:] {
 		switch {
-		case part == "generic_specialization=true" && !seenGeneric && !seenLabels:
+		case part == "generic_specialization=true" && !seenGeneric && !seenLabels && !seenTrailing:
 			seenGeneric = true
 			shape.generic = true
-		case strings.HasPrefix(part, "labels=") && !seenLabels:
+		case strings.HasPrefix(part, "labels=") && !seenLabels && !seenTrailing:
 			seenLabels = true
 			value := strings.TrimPrefix(part, "labels=")
 			if value == "" {
@@ -47,17 +48,29 @@ func parseSwiftInitializerCall(evidence, dst string, arity sql.NullInt64) (swift
 					}
 					seenNamedLabels[name] = struct{}{}
 				}
-				shape.labels = append(shape.labels, label)
+				shape.regularLabels = append(shape.regularLabels, label)
+			}
+		case strings.HasPrefix(part, "trailing_labels=") && !seenTrailing:
+			seenTrailing = true
+			value := strings.TrimPrefix(part, "trailing_labels=")
+			if value == "" {
+				return swiftInitializerCallShape{}, false
+			}
+			for i, label := range strings.Split(value, ",") {
+				if (i == 0 && label != "_") || (i > 0 && (label == "_" || !strings.HasSuffix(label, ":") || !swiftIdentifier(strings.TrimSuffix(label, ":")))) {
+					return swiftInitializerCallShape{}, false
+				}
+				shape.trailingLabels = append(shape.trailingLabels, label)
 			}
 		default:
 			return swiftInitializerCallShape{}, false
 		}
 	}
-	if len(shape.labels) != int(arity.Int64) || (arity.Int64 == 0 && len(shape.labels) != 0) {
+	if len(shape.regularLabels)+len(shape.trailingLabels) != int(arity.Int64) {
 		return swiftInitializerCallShape{}, false
 	}
 	shape.owner, shape.arity = dst, arity.Int64
-	shape.selector = swiftSelector("init", shape.labels)
+	shape.selector = swiftSelector("init", shape.regularLabels)
 	return shape, true
 }
 
@@ -167,8 +180,7 @@ func (s *Store) resolveSwiftInitializerScope(ctx context.Context, q javaQuery, r
 			return err
 		}
 		c.min, c.max, c.minValid, c.maxValid = min.Int64, max.Int64, min.Valid, max.Valid
-		key := c.owner + "\x00" + c.signature
-		candidates[key] = append(candidates[key], c)
+		candidates[c.owner] = append(candidates[c.owner], c)
 		return nil
 	})
 	if err != nil {
@@ -187,8 +199,8 @@ func (s *Store) resolveSwiftInitializerScope(ctx context.Context, q javaQuery, r
 		}
 		matches := 0
 		var found swiftInitializerCandidate
-		for _, c := range candidates[shape.owner+"\x00"+shape.selector] {
-			if c.owner != shape.owner || c.signature != shape.selector || c.minValid == false || c.maxValid == false || c.min != c.max || c.min != shape.arity || c.visibility == "private" {
+		for _, c := range candidates[shape.owner] {
+			if !swiftInitializerCandidateMatches(shape, c) || c.visibility == "private" {
 				continue
 			}
 			if _, test := tests[c.file]; test {
@@ -205,6 +217,31 @@ func (s *Store) resolveSwiftInitializerScope(ctx context.Context, q javaQuery, r
 		res[e.id] = swiftScopeBinding{dst: found.id, strategy: ResolutionStrategySwiftInitializerScope}
 	}
 	return swiftScopeApply(ctx, q, res)
+}
+
+func swiftInitializerCandidateMatches(call swiftInitializerCallShape, candidate swiftInitializerCandidate) bool {
+	if !candidate.minValid || !candidate.maxValid || candidate.min != candidate.max || candidate.min != call.arity {
+		return false
+	}
+	if len(call.trailingLabels) == 0 {
+		return candidate.signature == call.selector
+	}
+	labels, ok := swiftDeclarationLabels(candidate.signature, "init")
+	if !ok || int64(len(labels)) != call.arity {
+		return false
+	}
+	for i, label := range call.regularLabels {
+		if labels[i] != swiftLabel(label) {
+			return false
+		}
+	}
+	regular := len(call.regularLabels)
+	for i, label := range call.trailingLabels {
+		if i > 0 && labels[regular+i] != label {
+			return false
+		}
+	}
+	return true
 }
 
 func strconvI(v int64) string { return strconv.FormatInt(v, 10) }
@@ -228,7 +265,24 @@ func (s *Store) redecideSwiftBindings(ctx context.Context, repoID int64) error {
 }
 
 func (s *Store) swiftInitializerRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	return s.swiftInitializerRepairEvidenceApplies(ctx, repoID, false)
+}
+
+func (s *Store) swiftTrailingInitializerRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	return s.swiftInitializerRepairEvidenceApplies(ctx, repoID, true)
+}
+
+func (s *Store) swiftInitializerRepairEvidenceApplies(ctx context.Context, repoID int64, trailing bool) (bool, error) {
+	condition := `e.evidence NOT LIKE '%;trailing_labels=%'`
+	if trailing {
+		condition = `e.evidence LIKE '%;trailing_labels=%'`
+	}
 	var found bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls' AND (e.evidence='swift:initializer' OR e.evidence LIKE 'swift:initializer;%'))`, repoID).Scan(&found)
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM edges e JOIN files f ON f.id=e.file_id
+		WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls'
+		  AND (e.evidence='swift:initializer' OR e.evidence LIKE 'swift:initializer;%')
+		  AND `+condition+`
+	)`, repoID).Scan(&found)
 	return found, err
 }

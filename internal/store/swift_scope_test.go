@@ -553,6 +553,8 @@ func TestParseSwiftInitializerCallRejectsUnprovenAndMalformedFacts(t *testing.T)
 		{"swift:initializer", "Service", 0},
 		{"swift:initializer;labels=_", "Service", 1},
 		{"swift:initializer;generic_specialization=true;labels=value:", "Box", 1},
+		{"swift:initializer;trailing_labels=_", "Service", 1},
+		{"swift:initializer;labels=id:;trailing_labels=_,completion:", "Service", 3},
 	}
 	for _, tc := range valid {
 		if _, ok := parseSwiftInitializerCall(tc.evidence, tc.dst, sql.NullInt64{Int64: tc.arity, Valid: true}); !ok {
@@ -566,7 +568,10 @@ func TestParseSwiftInitializerCallRejectsUnprovenAndMalformedFacts(t *testing.T)
 		{"swift:initializer_unproven;generic_specialization=true", "Service", sql.NullInt64{Int64: 0, Valid: true}},
 		{"swift:initializer;labels=", "Service", sql.NullInt64{Int64: 0, Valid: true}},
 		{"swift:initializer;generic_specialization=false", "Service", sql.NullInt64{Int64: 0, Valid: true}},
-		{"swift:initializer;trailing_labels=_", "Service", sql.NullInt64{Int64: 1, Valid: true}},
+		{"swift:initializer;trailing_labels=completion:", "Service", sql.NullInt64{Int64: 1, Valid: true}},
+		{"swift:initializer;trailing_labels=_,_", "Service", sql.NullInt64{Int64: 2, Valid: true}},
+		{"swift:initializer;trailing_labels=", "Service", sql.NullInt64{Int64: 1, Valid: true}},
+		{"swift:initializer;trailing_labels=_;generic_specialization=true", "Service", sql.NullInt64{Int64: 1, Valid: true}},
 		{"swift:initializer", "Service.init", sql.NullInt64{Int64: 0, Valid: true}},
 		{"swift:initializer;labels=id:", "Service", sql.NullInt64{Int64: 0, Valid: true}},
 		{"swift:initializer;labels=id:,id:", "Service", sql.NullInt64{Int64: 2, Valid: true}},
