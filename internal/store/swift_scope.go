@@ -13,9 +13,10 @@ import (
 )
 
 const swiftSelfRepairSettingKey = "resolver.swift_explicit_self_repaired.v1"
+const swiftClassSelfRepairSettingKey = "resolver.swift_class_self_final_repaired.v1"
 const swiftTrailingRepairSettingKey = "resolver.swift_trailing_closure_repaired.v1"
 
-var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope}
+var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope, ResolutionStrategySwiftClassSelfFinalScope}
 
 // Swift v3 call facts are owned here. Unsupported Swift calls must never fall
 // through to a name-based resolver.
@@ -424,6 +425,11 @@ func (s *Store) resolveSwiftScopeStandalone(ctx context.Context, repoID int64, o
 		self, err = s.resolveSwiftScope(ctx, tx, repoID, only)
 		n += self
 		if err == nil {
+			var classSelf int
+			classSelf, err = s.resolveSwiftClassSelf(ctx, tx, repoID, only)
+			n += classSelf
+		}
+		if err == nil {
 			var super int
 			super, err = s.resolveSwiftSuperScope(ctx, tx, repoID, only)
 			n += super
@@ -484,6 +490,9 @@ func (s *Store) redecideSwiftSelfBindings(ctx context.Context, repoID int64) err
 		return err
 	}
 	if _, err := s.resolveSwiftScope(ctx, tx, repoID, nil); err != nil {
+		return err
+	}
+	if _, err := s.resolveSwiftClassSelf(ctx, tx, repoID, nil); err != nil {
 		return err
 	}
 	return tx.Commit()

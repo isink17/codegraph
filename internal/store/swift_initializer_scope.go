@@ -261,6 +261,9 @@ func (s *Store) redecideSwiftBindings(ctx context.Context, repoID int64) error {
 	if _, err := s.resolveSwiftScope(ctx, tx, repoID, nil); err != nil {
 		return err
 	}
+	if _, err := s.resolveSwiftClassSelf(ctx, tx, repoID, nil); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
