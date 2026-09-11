@@ -24,6 +24,21 @@ func swiftIsTestFile(tests map[int64]struct{}, file int64) bool {
 	return ok
 }
 
+func swiftInheritedLoadRelations(ctx context.Context, q javaQuery, repoID int64, names []string) ([]swiftSuperRelation, error) {
+	var out []swiftSuperRelation
+	err := sqliteBatchedQuery(ctx, q, `SELECT r.file_id,r.child_qualified_name,r.target_qualified_name,r.relation_kind,r.is_generic,r.is_constrained
+		FROM swift_inheritance_relations r JOIN files f ON f.id=r.file_id AND f.is_deleted=0
+		WHERE r.repo_id=? AND r.child_qualified_name IN (`, `%s)`, []any{repoID}, stringSliceToAny(names), true, func(rows *sql.Rows) error {
+		var r swiftSuperRelation
+		if err := rows.Scan(&r.file, &r.child, &r.target, &r.kind, &r.generic, &r.constrained); err != nil {
+			return err
+		}
+		out = append(out, r)
+		return nil
+	})
+	return out, err
+}
+
 // resolveSwiftClassSelf is deliberately separate from value-type self scope:
 // finality and a complete absence of active ancestry/conformance evidence are
 // proofs this resolver alone owns.
@@ -326,7 +341,7 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 	for _, e := range edges {
 		childNames[e.owner] = struct{}{}
 	}
-	relations, err := swiftSuperLoadRelations(ctx, q, repoID, sortedSwiftSet(childNames))
+	relations, err := swiftInheritedLoadRelations(ctx, q, repoID, sortedSwiftSet(childNames))
 	if err != nil {
 		return 0, err
 	}
@@ -357,7 +372,7 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 		var direct []swiftSuperRelation
 		hazard := false
 		for _, r := range relations {
-			if r.file != e.file || r.child != e.owner || (!callerTest && swiftIsTestFile(tests, r.file)) {
+			if r.child != e.owner || (!callerTest && swiftIsTestFile(tests, r.file)) {
 				continue
 			}
 			if r.generic != 0 || r.constrained != 0 || r.kind == "conformance" || r.kind == "unproven" || r.kind != "superclass" {
@@ -367,7 +382,7 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 				direct = append(direct, r)
 			}
 		}
-		if hazard || len(direct) != 1 {
+		if hazard || len(direct) != 1 || direct[0].file != e.file {
 			continue
 		}
 		baseNames[direct[0].target] = struct{}{}
@@ -444,7 +459,7 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
 		FROM symbols s JOIN tmp_swift_inherited_self_candidates c ON c.file_id=s.file_id AND c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature)
 		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
-		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' AND s.is_static=0
+		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' AND s.is_static=0 AND COALESCE(s.visibility,'') <> 'private'
 		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftScopeSymbol
 		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.kind, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
