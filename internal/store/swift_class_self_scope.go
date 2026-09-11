@@ -199,6 +199,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			}
 			finalClassMethod := c.dispatchFacts == 1 && c.dispatchMin == "class" && c.dispatchMax == "class" && c.finalFacts == 1
 			staticMethod := c.dispatchFacts == 1 && c.dispatchMin == "static" && c.dispatchMax == "static"
+			if shape.strategy == ResolutionStrategySwiftSelfTypeScope && owner.finals == 0 && !staticMethod {
+				continue
+			}
 			if typeContext && owner.finals == 0 && !staticMethod && !finalClassMethod {
 				continue
 			}
@@ -214,8 +217,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		if matches != 1 {
 			continue
 		}
+		staticTypeMethod := shape.strategy == ResolutionStrategySwiftSelfTypeScope && owner.finals == 0 && found.dispatchFacts == 1 && found.dispatchMin == "static" && found.dispatchMax == "static"
 		finalMethod := shape.strategy == ResolutionStrategySwiftSelfScope && e.static.Int64 == 0 && owner.finals == 0 && found.dispatchFacts == 1 && found.finalFacts == 1 && found.dispatchMin == "instance" && found.dispatchMax == "instance"
-		if owner.finals == 0 && !finalMethod && !typeContext {
+		if owner.finals == 0 && !finalMethod && !typeContext && !staticTypeMethod {
 			continue
 		}
 		blocked := false
@@ -234,7 +238,11 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		if !blocked {
 			strategy := ResolutionStrategySwiftClassSelfFinalScope
 			if shape.strategy == ResolutionStrategySwiftSelfTypeScope {
-				strategy = ResolutionStrategySwiftClassSelfTypeFinalScope
+				if staticTypeMethod {
+					strategy = ResolutionStrategySwiftClassSelfTypeStaticMethodScope
+				} else {
+					strategy = ResolutionStrategySwiftClassSelfTypeFinalScope
+				}
 			} else if finalMethod {
 				strategy = ResolutionStrategySwiftClassSelfFinalMethodScope
 			} else if typeContext && owner.finals == 0 {
