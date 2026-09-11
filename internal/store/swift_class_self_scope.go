@@ -199,7 +199,7 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			}
 			finalClassMethod := c.dispatchFacts == 1 && c.dispatchMin == "class" && c.dispatchMax == "class" && c.finalFacts == 1
 			staticMethod := c.dispatchFacts == 1 && c.dispatchMin == "static" && c.dispatchMax == "static"
-			if shape.strategy == ResolutionStrategySwiftSelfTypeScope && owner.finals == 0 && !staticMethod {
+			if shape.strategy == ResolutionStrategySwiftSelfTypeScope && owner.finals == 0 && !staticMethod && !finalClassMethod {
 				continue
 			}
 			if typeContext && owner.finals == 0 && !staticMethod && !finalClassMethod {
@@ -218,8 +218,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			continue
 		}
 		staticTypeMethod := shape.strategy == ResolutionStrategySwiftSelfTypeScope && owner.finals == 0 && found.dispatchFacts == 1 && found.dispatchMin == "static" && found.dispatchMax == "static"
+		staticTypeFinalClassMethod := shape.strategy == ResolutionStrategySwiftSelfTypeScope && owner.finals == 0 && found.dispatchFacts == 1 && found.finalFacts == 1 && found.dispatchMin == "class" && found.dispatchMax == "class"
 		finalMethod := shape.strategy == ResolutionStrategySwiftSelfScope && e.static.Int64 == 0 && owner.finals == 0 && found.dispatchFacts == 1 && found.finalFacts == 1 && found.dispatchMin == "instance" && found.dispatchMax == "instance"
-		if owner.finals == 0 && !finalMethod && !typeContext && !staticTypeMethod {
+		if owner.finals == 0 && !finalMethod && !typeContext && !staticTypeMethod && !staticTypeFinalClassMethod {
 			continue
 		}
 		blocked := false
@@ -240,6 +241,8 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			if shape.strategy == ResolutionStrategySwiftSelfTypeScope {
 				if staticTypeMethod {
 					strategy = ResolutionStrategySwiftClassSelfTypeStaticMethodScope
+				} else if staticTypeFinalClassMethod {
+					strategy = ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope
 				} else {
 					strategy = ResolutionStrategySwiftClassSelfTypeFinalScope
 				}

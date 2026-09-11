@@ -1552,7 +1552,7 @@ func TestSwiftClassSelfTypeStaticMethodScopeBoundaries(t *testing.T) {
 		wantBound, finalOwner                  bool
 	}{
 		{"ordinary class", "class", false, false, false, false, false},
-		{"final class method", "class", false, true, false, false, false},
+		{"final class method", "class", false, true, false, true, false},
 		{"static", "static", false, false, false, true, false},
 		{"final static", "static", false, true, false, true, false},
 		{"missing fact", "", false, false, false, false, false},
@@ -1579,11 +1579,92 @@ func TestSwiftClassSelfTypeStaticMethodScopeBoundaries(t *testing.T) {
 				return
 			}
 			want := ResolutionStrategySwiftClassSelfTypeStaticMethodScope
+			if tc.name == "final class method" {
+				want = ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope
+			}
 			if tc.finalOwner {
 				want = ResolutionStrategySwiftClassSelfTypeFinalScope
 			}
 			assertSwiftBinding(t, f, edge, target, want)
 		})
+	}
+}
+
+func TestSwiftClassSelfTypeFinalClassMethodScope(t *testing.T) {
+	for _, dispatch := range []string{"instance", "class", "static"} {
+		t.Run(dispatch+" caller", func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+			target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+			caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", dispatch == "static")
+			edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
+			f.reference(f.mainFile, caller, "Self.make", 1)
+			f.declarationFact(f.mainFile, owner, false)
+			f.dispatchFact(f.mainFile, target, true, "class")
+			f.dispatchFact(f.mainFile, caller, false, dispatch)
+			f.resolve()
+			assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
+		})
+	}
+}
+
+func TestSwiftClassSelfTypeFinalClassMethodScopeLifecycleAndRepair(t *testing.T) {
+	f, _, target, _, edge := newSwiftNonFinalStaticSelfFixture(t, "Service", "", "class", true)
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
+	for _, repair := range resolverRepairs {
+		if repair.key == swiftClassSelfTypeFinalClassMethodRepairSettingKey {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(new(string)); err == nil {
+		t.Fatal("new repair marker unexpectedly present")
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope, ResolutionConfidenceHigh, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !run {
+		t.Fatalf("repair=(%v,%v)", run, err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key=?`, swiftClassSelfTypeFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)); err != nil {
+		t.Fatal(err)
+	}
+	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !run {
+		t.Fatalf("rebind repair=(%v,%v)", run, err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
+	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || run {
+		t.Fatalf("second repair=(%v,%v)", run, err)
 	}
 }
 
@@ -1745,6 +1826,7 @@ func TestSwiftClassSelfTypeStaticMethodScopeHardenedStress(t *testing.T) {
 		{"final_static", "instance", "static", false, true, "", "", false},
 		{"ordinary_class", "instance", "class", false, false, "", "", false},
 		{"final_class", "instance", "class", false, true, "", "", false},
+		{"final_class_class", "class", "class", false, true, "", "", false},
 		{"missing_fact", "instance", "", false, false, "", "", false},
 		{"duplicate_fact", "instance", "static", false, false, "duplicate", "", false},
 		{"malformed_dispatch", "instance", "instance", false, false, "", "", false},
@@ -1836,7 +1918,7 @@ func TestSwiftClassSelfTypeStaticMethodScopeHardenedStress(t *testing.T) {
 	}
 	f.resolve()
 	resolved1, unresolved1, strategies1 := state()
-	if resolved1 != 700 || unresolved1 != 1000 || strategies1[ResolutionStrategySwiftClassSelfTypeFinalScope] != 100 || strategies1[ResolutionStrategySwiftClassSelfTypeStaticMethodScope] != 600 {
+	if resolved1 != 900 || unresolved1 != 900 || strategies1[ResolutionStrategySwiftClassSelfTypeFinalScope] != 100 || strategies1[ResolutionStrategySwiftClassSelfTypeStaticMethodScope] != 600 || strategies1[ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope] != 200 {
 		t.Fatalf("state=(%d,%d,%v)", resolved1, unresolved1, strategies1)
 	}
 	f.resolve()
