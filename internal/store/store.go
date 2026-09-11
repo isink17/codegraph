@@ -3886,6 +3886,11 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	} else {
 		totalResolved += n
 	}
+	if n, err := s.resolveSwiftClassSelf(ctx, tx, repoID, nil); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if n, err := s.resolveSwiftSuperScope(ctx, tx, repoID, nil); err != nil {
 		return 0, err
 	} else {

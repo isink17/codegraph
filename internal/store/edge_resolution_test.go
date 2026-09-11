@@ -128,6 +128,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyRubyConstantPath,
 		ResolutionStrategySwiftSelfScope,
 		ResolutionStrategySwiftSelfTypeScope,
+		ResolutionStrategySwiftClassSelfFinalScope,
 		ResolutionStrategySwiftInitializerScope,
 		ResolutionStrategySwiftSuperScope,
 	}

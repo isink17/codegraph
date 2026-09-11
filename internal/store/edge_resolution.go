@@ -191,12 +191,13 @@ const (
 	// nesting its definition sits in, the first nesting level that owns that
 	// constant name is the target's semantic owner, and the owner has exactly
 	// one public singleton method of that name.
-	ResolutionStrategyRubyLexicalConstant   = "ruby_lexical_constant"
-	ResolutionStrategyRubyConstantPath      = "ruby_constant_path"
-	ResolutionStrategySwiftSelfScope        = "swift_self_scope"
-	ResolutionStrategySwiftSelfTypeScope    = "swift_self_type_scope"
-	ResolutionStrategySwiftInitializerScope = "swift_initializer_scope"
-	ResolutionStrategySwiftSuperScope       = "swift_super_scope"
+	ResolutionStrategyRubyLexicalConstant      = "ruby_lexical_constant"
+	ResolutionStrategyRubyConstantPath         = "ruby_constant_path"
+	ResolutionStrategySwiftSelfScope           = "swift_self_scope"
+	ResolutionStrategySwiftSelfTypeScope       = "swift_self_type_scope"
+	ResolutionStrategySwiftClassSelfFinalScope = "swift_class_self_final_scope"
+	ResolutionStrategySwiftInitializerScope    = "swift_initializer_scope"
+	ResolutionStrategySwiftSuperScope          = "swift_super_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -274,27 +275,28 @@ var resolutionConfidenceByStrategy = map[string]string{
 	// Both Python strategies match the name in full against `symbols.name` in a
 	// file the import syntax (or the module itself) proves, so nothing about
 	// either identity is discarded to reach the match.
-	ResolutionStrategyPythonImportScope:     ResolutionConfidenceHigh,
-	ResolutionStrategyPythonModuleScope:     ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpSameType:        ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpThisScope:       ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpTypeScope:       ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpAliasScope:      ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpStaticUsing:     ResolutionConfidenceHigh,
-	ResolutionStrategyCSharpTypedReceiver:   ResolutionConfidenceHigh,
-	ResolutionStrategyPHPTypeScope:          ResolutionConfidenceHigh,
-	ResolutionStrategyPHPAliasStatic:        ResolutionConfidenceHigh,
-	ResolutionStrategyPHPSelfStatic:         ResolutionConfidenceHigh,
-	ResolutionStrategyPHPThisInstance:       ResolutionConfidenceHigh,
-	ResolutionStrategyPHPTypedProperty:      ResolutionConfidenceHigh,
-	ResolutionStrategyRubyImplicitSelf:      ResolutionConfidenceHigh,
-	ResolutionStrategyRubyExplicitSelf:      ResolutionConfidenceHigh,
-	ResolutionStrategyRubyLexicalConstant:   ResolutionConfidenceHigh,
-	ResolutionStrategyRubyConstantPath:      ResolutionConfidenceHigh,
-	ResolutionStrategySwiftSelfScope:        ResolutionConfidenceHigh,
-	ResolutionStrategySwiftSelfTypeScope:    ResolutionConfidenceHigh,
-	ResolutionStrategySwiftInitializerScope: ResolutionConfidenceHigh,
-	ResolutionStrategySwiftSuperScope:       ResolutionConfidenceHigh,
+	ResolutionStrategyPythonImportScope:        ResolutionConfidenceHigh,
+	ResolutionStrategyPythonModuleScope:        ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpSameType:           ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpThisScope:          ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpTypeScope:          ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpAliasScope:         ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpStaticUsing:        ResolutionConfidenceHigh,
+	ResolutionStrategyCSharpTypedReceiver:      ResolutionConfidenceHigh,
+	ResolutionStrategyPHPTypeScope:             ResolutionConfidenceHigh,
+	ResolutionStrategyPHPAliasStatic:           ResolutionConfidenceHigh,
+	ResolutionStrategyPHPSelfStatic:            ResolutionConfidenceHigh,
+	ResolutionStrategyPHPThisInstance:          ResolutionConfidenceHigh,
+	ResolutionStrategyPHPTypedProperty:         ResolutionConfidenceHigh,
+	ResolutionStrategyRubyImplicitSelf:         ResolutionConfidenceHigh,
+	ResolutionStrategyRubyExplicitSelf:         ResolutionConfidenceHigh,
+	ResolutionStrategyRubyLexicalConstant:      ResolutionConfidenceHigh,
+	ResolutionStrategyRubyConstantPath:         ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSelfScope:           ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSelfTypeScope:       ResolutionConfidenceHigh,
+	ResolutionStrategySwiftClassSelfFinalScope: ResolutionConfidenceHigh,
+	ResolutionStrategySwiftInitializerScope:    ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSuperScope:          ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -369,6 +371,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyRubyConstantPath,
 	ResolutionStrategySwiftSelfScope,
 	ResolutionStrategySwiftSelfTypeScope,
+	ResolutionStrategySwiftClassSelfFinalScope,
 	ResolutionStrategySwiftInitializerScope,
 	ResolutionStrategySwiftSuperScope,
 )
