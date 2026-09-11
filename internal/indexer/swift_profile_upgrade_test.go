@@ -447,12 +447,41 @@ func TestSwiftV5ToV6ExtensionConformanceLifecycle(t *testing.T) {
 	if oldRelations != 1 {
 		t.Fatalf("deleting nominal owner removed extension fact=%d", oldRelations)
 	}
+	if err := os.Remove(extensionPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 0 {
+		t.Fatalf("deleted extension left relations=%d", oldRelations)
+	}
+	writeProfileFile(t, extensionPath, "extension Service: ExternalProtocol {}\n")
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 1 {
+		t.Fatalf("restored extension relations=%d", oldRelations)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT f.path FROM swift_inheritance_relations r JOIN files f ON f.id=r.file_id WHERE r.repo_id=?`, repo).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	if path != "Conformance.swift" {
+		t.Fatalf("restored relation owner=%q", path)
+	}
 }
 
 func TestSwiftExtensionConformanceFactsBatch(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	var source strings.Builder
+	source.WriteString("protocol P {}\nprotocol Q {}\nprotocol R {}\nprotocol S {}\nprotocol U {}\nclass Service {}\nstruct Box<T> {}\n")
 	for i := 0; i < 240; i++ {
 		source.WriteString("extension Service: P, Q {}\n")
 		source.WriteString("extension Qualified.Service: R {}\n")
@@ -473,6 +502,25 @@ func TestSwiftExtensionConformanceFactsBatch(t *testing.T) {
 	}
 	if count != 1200 {
 		t.Fatalf("persisted extension facts=%d, want 1200", count)
+	}
+	var constrained, qualified, pCount, qCount, conformances int
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND relation_kind='conformance'`, repo).Scan(&conformances); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND is_constrained=1`, repo).Scan(&constrained); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Qualified.Service'`, repo).Scan(&qualified); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND target_qualified_name='P'`, repo).Scan(&pCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND target_qualified_name='Q'`, repo).Scan(&qCount); err != nil {
+		t.Fatal(err)
+	}
+	if conformances != 1200 || constrained != 240 || qualified != 240 || pCount != 240 || qCount != 240 {
+		t.Fatalf("representative facts conformances=%d constrained=%d qualified=%d P=%d Q=%d", conformances, constrained, qualified, pCount, qCount)
 	}
 	updated, err := idx.Update(ctx, Options{RepoRoot: root})
 	if err != nil {
@@ -502,12 +550,12 @@ func TestSwiftConstrainedExtensionFactLifecycle(t *testing.T) {
 	repo := repoID(t, s, root)
 	assertConstrained := func(want int) {
 		t.Helper()
-		var got int
-		if err := s.raw(t).QueryRow(`SELECT COALESCE(MAX(is_constrained), 0) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Box' AND target_qualified_name='P'`, repo).Scan(&got); err != nil {
+		var count, got int
+		if err := s.raw(t).QueryRow(`SELECT COUNT(*), COALESCE(MAX(is_constrained), 0) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Box' AND target_qualified_name='P'`, repo).Scan(&count, &got); err != nil {
 			t.Fatal(err)
 		}
-		if got != want {
-			t.Fatalf("is_constrained=%d, want %d", got, want)
+		if count != 1 || got != want {
+			t.Fatalf("count=%d is_constrained=%d, want count=1 constrained=%d", count, got, want)
 		}
 	}
 	assertConstrained(0)
