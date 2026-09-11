@@ -305,6 +305,21 @@ final class Service {
 	}
 }
 
+func TestSwiftMalformedCallableDispatchFailsClosed(t *testing.T) {
+	p := mustSwiftParse(t, "Malformed.swift", `final class Service {
+    class static func broken() {}
+}`)
+	for _, fact := range p.SwiftDeclarationFacts {
+		if p.Symbols[fact.SymbolIndex].QualifiedName == "Service.broken" {
+			if fact.Dispatch != "" {
+				t.Fatalf("malformed dispatch=%q, want empty", fact.Dispatch)
+			}
+			return
+		}
+	}
+	t.Fatal("malformed callable fact missing")
+}
+
 func TestSwiftInheritanceFactsRespectNestedNominalOwnership(t *testing.T) {
 	p := mustSwiftParse(t, "Nested.swift", `protocol P {}
 class Base {}
