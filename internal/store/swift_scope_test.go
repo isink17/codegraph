@@ -405,6 +405,391 @@ func TestSwiftClassSelfFinalMethodScope(t *testing.T) {
 	}
 }
 
+func newSwiftInheritedFinalSelfFixture(t *testing.T, child, base string) (*swiftScopeFixture, int64, int64, int64, int64) {
+	t.Helper()
+	f := newSwiftScopeFixture(t)
+	baseID := f.symbol(f.mainFile, base, "", "class", "", false)
+	childID := f.symbol(f.mainFile, child, "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", base, "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", child, "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.declarationFact(f.mainFile, childID, false)
+	f.dispatchFact(f.mainFile, target, true, "instance")
+	f.relation(f.mainFile, child, base, "superclass", false, false)
+	return f, baseID, target, caller, edge
+}
+
+func TestSwiftClassSelfInheritedFinalMethodScope(t *testing.T) {
+	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+}
+
+func TestSwiftClassSelfInheritedFinalMethodScopeNamesStats(t *testing.T) {
+	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+	assertSwiftStats(t, f.resolveNames("run"), 1, 1, 0, 0)
+	assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+
+	f, _, _, _, edge = newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=(SELECT id FROM symbols WHERE name='run')`); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftStats(t, f.resolveNames("run"), 1, 0, 1, 0)
+	assertSwiftEdgeUnresolved(t, f, edge)
+}
+
+func TestSwiftClassSelfInheritedFinalMethodScopeRejectsUnsafeProofs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*swiftScopeFixture)
+	}{
+		{"ordinary method", func(f *swiftScopeFixture) {
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=(SELECT id FROM symbols WHERE name='run')`); err != nil {
+				f.t.Fatal(err)
+			}
+		}},
+		{"grandparent only", func(f *swiftScopeFixture) {
+			middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+			f.declarationFact(f.mainFile, middle, false)
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Middle' WHERE child_qualified_name='Child'`); err != nil {
+				f.t.Fatal(err)
+			}
+			f.relation(f.mainFile, "Middle", "Base", "superclass", false, false)
+		}},
+		{"conformance hazard", func(f *swiftScopeFixture) {
+			f.relation(f.mainFile, "Child", "P", "conformance", false, false)
+		}},
+		{"same instance blocker", func(f *swiftScopeFixture) {
+			f.blocker(f.mainFile, "Child", "run", graph.ScopeImportSwiftMemberValue, false)
+		}},
+		{"child redeclaration", func(f *swiftScopeFixture) {
+			shadow := f.symbol(f.mainFile, "run", "Child", "function", "run()", false)
+			f.dispatchFact(f.mainFile, shadow, false, "instance")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+			tc.setup(f)
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f, edge)
+			_ = target
+		})
+	}
+}
+
+func TestSwiftClassSelfInheritedFinalMethodScopeSelectorsAndControls(t *testing.T) {
+	for _, tc := range []struct {
+		name, signature, evidence string
+		arity                     int
+	}{
+		{"zero", "run()", "swift:self", 0},
+		{"underscore", "run(_:)", "swift:self;labels=_", 1},
+		{"named", "run(id:)", "swift:self;labels=id:", 1},
+		{"two labels", "run(id:,cache:)", "swift:self;labels=id:,cache:", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _, target, caller, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET signature=?,arity_min=?,arity_max=? WHERE id=?`, tc.signature, tc.arity, tc.arity, target); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET evidence=?,call_arity=? WHERE id=?`, tc.evidence, tc.arity, edge); err != nil {
+				t.Fatal(err)
+			}
+			_ = caller
+			f.resolve()
+			assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+		})
+	}
+	t.Run("trailing closure", func(t *testing.T) {
+		f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET name='perform',signature='perform(_:)',arity_min=1,arity_max=1 WHERE id=?`, target); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_name='self.perform',evidence='swift:self;trailing_labels=_',call_arity=1 WHERE id=?`, edge); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET name='self.perform',qualified_name='self.perform' WHERE repo_id=?`, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+		f.resolve()
+		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+	})
+}
+
+func TestSwiftClassSelfInheritedFinalMethodScopeLifecycleAndRepair(t *testing.T) {
+	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE child_qualified_name='Child'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	f.relation(f.mainFile, "Child", "Base", "superclass", false, false)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+	for _, repair := range resolverRepairs {
+		if repair.key == swiftClassSelfInheritedFinalMethodRepairSettingKey {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, ResolutionConfidenceHigh, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !run {
+		t.Fatalf("repair=(%v,%v)", run, err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	var ref sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&ref); err != nil {
+		t.Fatal(err)
+	}
+	if ref.Valid {
+		t.Fatalf("stale reference=%v", ref)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key=?`, swiftClassSelfInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)); err != nil {
+		t.Fatal(err)
+	}
+	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !run {
+		t.Fatalf("rebind repair=(%v,%v)", run, err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || run {
+		t.Fatalf("second repair=(%v,%v)", run, err)
+	}
+}
+
+func TestSwiftClassSelfInheritedFinalMethodScopeMixedStress(t *testing.T) {
+	type group struct {
+		name, mode, strategy string
+		count                int
+	}
+	groups := []group{
+		{"direct", "direct", ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, 100},
+		{"same_final", "same_final", ResolutionStrategySwiftClassSelfFinalMethodScope, 100},
+		{"same_static", "same_static", ResolutionStrategySwiftClassSelfStaticMethodScope, 100},
+		{"ordinary", "ordinary", "", 100},
+		{"grandparent", "grandparent", "", 100},
+		{"missing_relation", "missing_relation", "", 100},
+		{"duplicate_relation", "duplicate_relation", "", 100},
+		{"unproven", "unproven", "", 100},
+		{"conformance", "conformance", "", 100},
+		{"constrained", "constrained", "", 100},
+		{"generic", "generic", "", 100},
+		{"missing_base", "missing_base", "", 100},
+		{"duplicate_base", "duplicate_base", "", 100},
+		{"missing_fact", "missing_fact", "", 100},
+		{"duplicate_fact", "duplicate_fact", "", 100},
+		{"malformed", "malformed", "", 100},
+		{"cross_file", "cross_file", "", 100},
+		{"qualified", "qualified", ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, 100},
+		{"reverse_subclass", "reverse_subclass", ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, 100},
+		{"same_blocker", "same_blocker", "", 100},
+		{"opposite_static", "opposite_static", ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, 100},
+	}
+	f := newSwiftScopeFixture(t)
+	for _, g := range groups {
+		child, base := "Child_"+g.name, "Base_"+g.name
+		childOwner, baseOwner := child, base
+		if g.mode == "qualified" {
+			childOwner, baseOwner = "Outer."+child, "Outer."+base
+		}
+		childID := f.symbol(f.mainFile, child, "", "class", "", false)
+		if g.mode == "qualified" {
+			childID = f.symbol(f.mainFile, child, "Outer", "class", "", false)
+		}
+		f.declarationFact(f.mainFile, childID, false)
+		if g.mode != "missing_relation" && g.mode != "cross_file" {
+			baseFile := f.mainFile
+			if g.mode == "cross_file" {
+				baseFile = f.file("Base_" + g.name + ".swift")
+			}
+			f.symbol(baseFile, base, "", "class", "", false)
+			if g.mode == "qualified" {
+				f.symbol(baseFile, base, "Outer", "class", "", false)
+			}
+		}
+		if g.mode == "duplicate_base" {
+			f.symbol(f.mainFile, base, "", "class", "", false)
+		}
+		if g.mode == "grandparent" {
+			middle := "Middle_" + g.name
+			middleID := f.symbol(f.mainFile, middle, "", "class", "", false)
+			f.declarationFact(f.mainFile, middleID, false)
+			f.relation(f.mainFile, child, middle, "superclass", false, false)
+			f.relation(f.mainFile, middle, base, "superclass", false, false)
+		} else if g.mode == "direct" || g.mode == "ordinary" || g.mode == "duplicate_relation" || g.mode == "unproven" || g.mode == "conformance" || g.mode == "constrained" || g.mode == "generic" || g.mode == "missing_base" || g.mode == "duplicate_base" || g.mode == "cross_file" || g.mode == "qualified" || g.mode == "reverse_subclass" || g.mode == "same_blocker" || g.mode == "opposite_static" {
+			relationTarget := baseOwner
+			if g.mode == "missing_base" {
+				relationTarget = "Missing_" + g.name
+			}
+			f.relation(f.mainFile, childOwner, relationTarget, "superclass", false, false)
+			if g.mode == "duplicate_relation" {
+				f.relation(f.mainFile, childOwner, relationTarget, "superclass", false, false)
+			}
+			if g.mode == "unproven" {
+				f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='unproven' WHERE child_qualified_name=?`, childOwner)
+			}
+			if g.mode == "conformance" {
+				f.relation(f.mainFile, childOwner, "P_"+g.name, "conformance", false, false)
+			}
+			if g.mode == "constrained" {
+				f.relation(f.mainFile, childOwner, "P_"+g.name, "conformance", false, true)
+			}
+			if g.mode == "generic" {
+				f.relation(f.mainFile, childOwner, "P_"+g.name, "conformance", true, false)
+			}
+			if g.mode == "reverse_subclass" {
+				f.relation(f.mainFile, "GrandChild_"+g.name, childOwner, "superclass", false, false)
+			}
+		}
+		for i := 0; i < g.count; i++ {
+			method := fmt.Sprintf("run_%s_%d", g.name, i)
+			owner := baseOwner
+			staticCaller := false
+			targetStatic := false
+			if g.mode == "same_final" || g.mode == "same_static" {
+				owner = childOwner
+			}
+			if g.mode == "same_static" {
+				staticCaller, targetStatic = true, true
+			}
+			targetFile := f.mainFile
+			if g.mode == "cross_file" {
+				targetFile = f.file(fmt.Sprintf("Base_%s_%d.swift", g.name, i))
+			}
+			target := f.symbol(targetFile, method, owner, "function", method+"()", targetStatic)
+			caller := f.symbol(f.mainFile, fmt.Sprintf("f_%s_%d", g.name, i), childOwner, "function", "f()", staticCaller)
+			if g.mode == "same_final" {
+				f.dispatchFact(targetFile, target, true, "instance")
+			} else if g.mode == "same_static" {
+				f.dispatchFact(targetFile, target, false, "static")
+				f.dispatchFact(f.mainFile, caller, false, "static")
+			} else if g.mode != "missing_fact" {
+				dispatch := "instance"
+				if g.mode == "malformed" {
+					dispatch = ""
+				}
+				f.dispatchFact(targetFile, target, true, dispatch)
+				if g.mode == "duplicate_fact" {
+					f.dispatchFact(targetFile, target, true, dispatch)
+				}
+				if g.mode == "ordinary" {
+					f.dispatchFact(targetFile, target, false, dispatch)
+				}
+			}
+			f.call(f.mainFile, caller, "self."+method, "swift:self", 0, i+1)
+			if g.mode == "same_blocker" {
+				f.blocker(f.mainFile, childOwner, method, graph.ScopeImportSwiftMemberValue, false)
+			}
+			if g.mode == "opposite_static" {
+				f.blocker(f.mainFile, childOwner, method, graph.ScopeImportSwiftMemberValue, true)
+			}
+		}
+	}
+	f.resolve()
+	var resolved, unresolved int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND dst_symbol_id IS NOT NULL`, f.repoID).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND dst_symbol_id IS NULL`, f.repoID).Scan(&unresolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved != 600 || unresolved != 1500 {
+		t.Fatalf("state=(resolved %d,unresolved %d), want (600,1500)", resolved, unresolved)
+	}
+	rows, err := f.store.db.QueryContext(f.ctx, `SELECT resolution_strategy,COUNT(*) FROM edges WHERE repo_id=? GROUP BY resolution_strategy`, f.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	strategies := map[string]int{}
+	for rows.Next() {
+		var strategy string
+		var count int
+		if err := rows.Scan(&strategy, &count); err != nil {
+			t.Fatal(err)
+		}
+		strategies[strategy] = count
+	}
+	for _, g := range groups {
+		if g.strategy != "" && strategies[g.strategy] < g.count {
+			t.Fatalf("strategy %q count=%d, want at least %d", g.strategy, strategies[g.strategy], g.count)
+		}
+	}
+	want := map[string]int{
+		"": 1500,
+		ResolutionStrategySwiftClassSelfInheritedFinalMethodScope: 400,
+		ResolutionStrategySwiftClassSelfFinalMethodScope:          100,
+		ResolutionStrategySwiftClassSelfStaticMethodScope:         100,
+	}
+	if len(strategies) != len(want) {
+		t.Fatalf("strategies=%v, want %v", strategies, want)
+	}
+	for strategy, count := range want {
+		if strategies[strategy] != count {
+			t.Fatalf("strategy %q count=%d, want %d", strategy, strategies[strategy], count)
+		}
+	}
+	f.resolve()
+	rows, err = f.store.db.QueryContext(f.ctx, `SELECT resolution_strategy,COUNT(*) FROM edges WHERE repo_id=? GROUP BY resolution_strategy`, f.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := map[string]int{}
+	for rows.Next() {
+		var strategy string
+		var count int
+		if err := rows.Scan(&strategy, &count); err != nil {
+			t.Fatal(err)
+		}
+		second[strategy] = count
+	}
+	rows.Close()
+	if len(second) != len(strategies) {
+		t.Fatalf("second strategies=%v, want %v", second, strategies)
+	}
+	for strategy, count := range strategies {
+		if second[strategy] != count {
+			t.Fatalf("second strategy %q count=%d, want %d", strategy, second[strategy], count)
+		}
+	}
+}
+
 func TestSwiftClassSelfFinalMethodOwnerFactProof(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
