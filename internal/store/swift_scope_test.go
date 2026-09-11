@@ -405,6 +405,399 @@ func TestSwiftClassSelfFinalMethodScope(t *testing.T) {
 	}
 }
 
+func TestSwiftClassSelfFinalMethodOwnerFactProof(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ownerFacts   int
+		ownerFinal   bool
+		wantStrategy string
+		wantBound    bool
+	}{
+		{"one non-final owner", 1, false, ResolutionStrategySwiftClassSelfFinalMethodScope, true},
+		{"missing owner", 0, false, "", false},
+		{"duplicate owner", 2, false, "", false},
+		{"final owner uses existing strategy", 1, true, ResolutionStrategySwiftClassSelfFinalScope, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+			target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+			caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+			edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+			for i := 0; i < tc.ownerFacts; i++ {
+				f.declarationFact(f.mainFile, owner, tc.ownerFinal)
+			}
+			f.declarationFact(f.mainFile, target, true)
+			f.reference(f.mainFile, caller, "self.run", 1)
+			f.resolve()
+			if tc.wantBound {
+				assertSwiftBinding(t, f, edge, target, tc.wantStrategy)
+			} else {
+				assertSwiftBindingCleared(t, f, edge)
+			}
+		})
+	}
+}
+
+func TestSwiftClassSelfFinalMethodTargetFactProof(t *testing.T) {
+	for _, tc := range []struct {
+		name, dispatch   string
+		final, duplicate bool
+		wantBound        bool
+	}{
+		{"final instance", "instance", true, false, true},
+		{"non-final instance", "instance", false, false, false},
+		{"missing fact", "", false, false, false},
+		{"duplicate final instance", "instance", true, true, false},
+		{"final static", "static", true, false, false},
+		{"final class", "class", true, false, false},
+		{"final empty dispatch", "", true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+			target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+			caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+			edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+			f.reference(f.mainFile, caller, "self.run", 1)
+			f.declarationFact(f.mainFile, owner, false)
+			if tc.dispatch != "" {
+				f.dispatchFact(f.mainFile, target, tc.final, tc.dispatch)
+				if tc.duplicate {
+					f.dispatchFact(f.mainFile, target, tc.final, tc.dispatch)
+				}
+			}
+			f.resolve()
+			if tc.wantBound {
+				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+			} else {
+				assertSwiftBindingCleared(t, f, edge)
+			}
+		})
+	}
+}
+
+func TestSwiftClassSelfFinalMethodLifecycle(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.declarationFact(f.mainFile, target, true)
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBindingCleared(t, f, edge)
+
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1,dispatch_kind='instance' WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+}
+
+func TestSwiftClassSelfFinalMethodCrossFileHazardLifecycle(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.declarationFact(f.mainFile, target, true)
+	hazard := f.file("Conformance.swift")
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+	f.relation(hazard, "Service", "P", "conformance", false, false)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBindingCleared(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE file_id=?`, hazard); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+}
+
+func TestSwiftClassSelfFinalMethodSubclassPresenceDoesNotVeto(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+	childRun := f.symbol(f.mainFile, "run", "Child", "function", "run(id:)", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.declarationFact(f.mainFile, target, true)
+	f.relation(f.mainFile, "Child", "Service", "superclass", false, false)
+	f.declarationFact(f.mainFile, childRun, false)
+	var relations int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM swift_inheritance_relations WHERE child_qualified_name=? AND target_qualified_name=?`, "Child", "Service").Scan(&relations); err != nil {
+		t.Fatal(err)
+	}
+	if relations != 1 {
+		t.Fatalf("subclass relation count=%d, want 1", relations)
+	}
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+	_ = child
+}
+
+func TestSwiftClassSelfFinalMethodCrossFileDestinationStaysUnresolved(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.declarationFact(f.mainFile, owner, false)
+	destination := f.file("Extension.swift")
+	target := f.symbol(destination, "run", "Service", "function", "run()", false)
+	f.declarationFact(destination, target, true)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.resolve()
+	assertSwiftBindingCleared(t, f, edge)
+}
+
+func TestSwiftClassSelfFinalMethodStats(t *testing.T) {
+	for _, final := range []bool{true, false} {
+		f := newSwiftScopeFixture(t)
+		owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+		target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+		caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+		edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+		f.reference(f.mainFile, caller, "self.run", 1)
+		f.declarationFact(f.mainFile, owner, false)
+		f.declarationFact(f.mainFile, target, final)
+		stats := f.resolveNames("run")
+		assertSwiftStats(t, stats, 1, btoi(final), btoi(!final), 0)
+		if final {
+			assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+		} else {
+			assertSwiftEdgeUnresolved(t, f, edge)
+		}
+	}
+}
+
+func btoi(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func TestSwiftClassSelfFinalMethodHazardAndBlockerParity(t *testing.T) {
+	for _, tc := range []struct {
+		name, callerPath, hazardPath, relation       string
+		generic, constrained, blockTest, blockStatic bool
+		wantBound                                    bool
+	}{
+		{"production test conformance", "Service.swift", "Tests/Hazard.swift", "conformance", false, false, false, false, true},
+		{"production production conformance", "Service.swift", "Hazard.swift", "conformance", false, false, false, false, false},
+		{"test test conformance", "Tests/Service.swift", "Tests/Hazard.swift", "conformance", false, false, false, false, false},
+		{"test production conformance", "Tests/Service.swift", "Hazard.swift", "conformance", false, false, false, false, false},
+		{"production superclass", "Service.swift", "Hazard.swift", "superclass", false, false, false, false, false},
+		{"production unproven", "Service.swift", "Hazard.swift", "unproven", false, false, false, false, false},
+		{"production constrained", "Service.swift", "Hazard.swift", "conformance", false, true, false, false, false},
+		{"production generic", "Service.swift", "Hazard.swift", "conformance", true, false, false, false, false},
+		{"production test blocker", "Service.swift", "", "", false, false, true, false, true},
+		{"production blocker", "Service.swift", "", "", false, false, false, false, false},
+		{"test test blocker", "Tests/Service.swift", "", "", false, false, true, false, false},
+		{"opposite static blocker", "Service.swift", "", "", false, false, false, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			callerFile := f.mainFile
+			if strings.HasPrefix(tc.callerPath, "Tests/") {
+				callerFile = f.file(tc.callerPath)
+			}
+			owner := f.symbol(callerFile, "Service", "", "class", "", false)
+			target := f.symbol(callerFile, "run", "Service", "function", "run()", false)
+			caller := f.symbol(callerFile, "f", "Service", "function", "f()", false)
+			edge := f.call(callerFile, caller, "self.run", "swift:self", 0, 1)
+			f.reference(callerFile, caller, "self.run", 1)
+			f.declarationFact(callerFile, owner, false)
+			f.declarationFact(callerFile, target, true)
+			if tc.relation != "" {
+				f.relation(f.file(tc.hazardPath), "Service", "P", tc.relation, tc.generic, tc.constrained)
+			}
+			if tc.name == "production test blocker" || tc.name == "production blocker" || tc.name == "test test blocker" || tc.name == "opposite static blocker" {
+				blockFile := callerFile
+				if tc.blockTest {
+					blockFile = f.file("Tests/Blocker.swift")
+				}
+				f.blocker(blockFile, "Service", "run", graph.ScopeImportSwiftMemberValue, tc.blockStatic)
+			}
+			f.resolve()
+			if tc.wantBound {
+				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+			} else {
+				assertSwiftBindingCleared(t, f, edge)
+			}
+		})
+	}
+}
+
+func TestSwiftClassSelfFinalMethodRepairMarkerOnly(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.declarationFact(f.mainFile, target, true)
+	for _, repair := range resolverRepairs {
+		if repair.key == swiftClassSelfFinalMethodRepairSettingKey {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !ran {
+		t.Fatalf("repair=(%v,%v)", ran, err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+	var marker string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
+		t.Fatalf("marker=%q err=%v", marker, err)
+	}
+	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || ran {
+		t.Fatalf("second repair=(%v,%v)", ran, err)
+	}
+}
+
+func TestSwiftClassSelfFinalMethodRepairClearsUnsafeBinding(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.declarationFact(f.mainFile, target, false)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfFinalMethodScope, ResolutionConfidenceHigh, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	for _, repair := range resolverRepairs {
+		if repair.key == swiftClassSelfFinalMethodRepairSettingKey {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBindingCleared(t, f, edge)
+}
+
+func TestSwiftClassSelfFinalMethodMixedStress(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	type kind struct {
+		name                                                  string
+		count                                                 int
+		owner, relation                                       string
+		ownerFinal, methodFinal, blocker, opposite, duplicate bool
+	}
+	categories := []kind{
+		{"final_nonfinal", 100, "", "", true, false, false, false, false},
+		{"final_final", 100, "", "", true, true, false, false, false},
+		{"new", 100, "", "", false, true, false, false, false},
+		{"nonfinal", 100, "", "", false, false, false, false, false},
+		{"superclass", 100, "", "superclass", false, true, false, false, false},
+		{"conformance", 100, "", "conformance", false, true, false, false, false},
+		{"unproven", 100, "", "unproven", false, true, false, false, false},
+		{"constrained", 100, "", "conformance", false, true, false, false, false},
+		{"generic", 100, "", "conformance", false, true, false, false, false},
+		{"qualified", 100, "Outer", "", false, true, false, false, false},
+		{"same_blocker", 100, "", "", false, true, true, false, false},
+		{"opposite_blocker", 100, "", "", false, true, false, true, false},
+		{"duplicate_target", 100, "", "", false, true, false, false, true},
+	}
+	const total = 1300
+	for _, tc := range categories {
+		ownerName := "Service_" + tc.name
+		container := ownerName
+		if tc.owner != "" {
+			container = tc.owner + "." + ownerName
+		}
+		ownerID := f.symbol(f.mainFile, ownerName, tc.owner, "class", "", false)
+		f.declarationFact(f.mainFile, ownerID, tc.ownerFinal)
+		for i := 0; i < tc.count; i++ {
+			method := fmt.Sprintf("run_%s_%d", tc.name, i)
+			target := f.symbol(f.mainFile, method, container, "function", method+"()", false)
+			f.declarationFact(f.mainFile, target, tc.methodFinal)
+			if tc.duplicate {
+				f.declarationFact(f.mainFile, target, tc.methodFinal)
+			}
+			caller := f.symbol(f.mainFile, fmt.Sprintf("f_%s_%d", tc.name, i), container, "function", "f()", false)
+			edge := f.call(f.mainFile, caller, "self."+method, "swift:self", 0, i+1)
+			if tc.relation != "" {
+				f.relation(f.mainFile, ownerName, "P", tc.relation, tc.name == "generic", tc.name == "constrained")
+			}
+			if tc.blocker {
+				f.blocker(f.mainFile, ownerName, method, graph.ScopeImportSwiftMemberValue, false)
+			}
+			if tc.opposite {
+				f.blocker(f.mainFile, ownerName, method, graph.ScopeImportSwiftMemberValue, true)
+			}
+			_ = edge
+		}
+	}
+	var edgeCount int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence='swift:self'`, f.repoID).Scan(&edgeCount); err != nil {
+		t.Fatal(err)
+	}
+	if edgeCount != total {
+		t.Fatalf("edges=%d want=%d", edgeCount, total)
+	}
+	f.resolve()
+	check := func() (resolved, unresolved, old, method int) {
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence='swift:self' AND dst_symbol_id IS NOT NULL`, f.repoID).Scan(&resolved); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence='swift:self' AND dst_symbol_id IS NULL`, f.repoID).Scan(&unresolved); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND resolution_strategy=?`, f.repoID, ResolutionStrategySwiftClassSelfFinalScope).Scan(&old); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND resolution_strategy=?`, f.repoID, ResolutionStrategySwiftClassSelfFinalMethodScope).Scan(&method); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	r1, u1, old1, method1 := check()
+	if r1 != 500 || u1 != 800 || r1+u1 != total || old1 != 200 || method1 != 300 {
+		t.Fatalf("counts=(%d,%d), strategies=(%d,%d)", r1, u1, old1, method1)
+	}
+	f.resolve()
+	r2, u2, old2, method2 := check()
+	if r2 != r1 || u2 != u1 || old2 != old1 || method2 != method1 {
+		t.Fatalf("second counts=(%d,%d,%d,%d), first=(%d,%d,%d,%d)", r2, u2, old2, method2, r1, u1, old1, method1)
+	}
+}
+
 func TestSwiftClassSelfControls(t *testing.T) {
 	t.Run("uppercase Self accepts proven static and class dispatch", func(t *testing.T) {
 		for _, dispatch := range []string{"static", "class"} {
@@ -769,6 +1162,21 @@ func TestSwiftClassSelfQualifiedOwnerDoesNotUseSuffix(t *testing.T) {
 		t.Fatalf("qualified owner binding=%v, want %d", got, target)
 	}
 	_ = outer
+}
+
+func TestSwiftClassSelfFinalMethodQualifiedOwnerUsesExactHazardKey(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "Outer", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Outer.Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", "Outer.Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.declarationFact(f.mainFile, target, true)
+	// A relation for Service must not be treated as a relation for Outer.Service.
+	f.relation(f.mainFile, "Service", "P", "conformance", false, false)
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
 }
 
 func TestSwiftClassSelfRepairBindsAndMarksOnce(t *testing.T) {
