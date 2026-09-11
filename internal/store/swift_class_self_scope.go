@@ -19,6 +19,16 @@ type swiftClassSelfRelation struct {
 	child      string
 }
 
+type swiftInheritedSelfCandidate struct {
+	id, file                  int64
+	name, owner, sig          string
+	visibility                string
+	static                    sql.NullInt64
+	arityMin, arityMax        sql.NullInt64
+	dispatchFacts, finalFacts int64
+	dispatchMin, dispatchMax  string
+}
+
 func swiftIsTestFile(tests map[int64]struct{}, file int64) bool {
 	_, ok := tests[file]
 	return ok
@@ -37,6 +47,28 @@ func swiftInheritedLoadRelations(ctx context.Context, q javaQuery, repoID int64,
 		return nil
 	})
 	return out, err
+}
+
+func swiftInheritedTrailingCandidate(call swiftSelfCallShape, candidate swiftInheritedSelfCandidate) bool {
+	if !candidate.arityMin.Valid || !candidate.arityMax.Valid || candidate.arityMin.Int64 != int64(call.arity) || candidate.arityMax.Int64 != int64(call.arity) {
+		return false
+	}
+	labels, ok := swiftDeclarationLabels(candidate.sig, candidate.name)
+	if !ok || len(labels) != call.arity {
+		return false
+	}
+	regular := len(call.regularLabels)
+	for i := 0; i < regular; i++ {
+		if labels[i] != swiftLabel(call.regularLabels[i]) {
+			return false
+		}
+	}
+	for i, label := range call.trailingLabels {
+		if i > 0 && labels[regular+i] != label {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveSwiftClassSelf is deliberately separate from value-type self scope:
@@ -455,14 +487,14 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 	if err := sqliteBatchedValuesExec(ctx, q, `INSERT INTO tmp_swift_inherited_self_candidates(file_id,owner,name,signature) VALUES `, "(?,?,?,?)", nil, rows); err != nil {
 		return 0, err
 	}
-	var candidates []swiftScopeSymbol
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
+	var candidates []swiftInheritedSelfCandidate
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
 		FROM symbols s JOIN tmp_swift_inherited_self_candidates c ON c.file_id=s.file_id AND c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature)
 		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
-		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' AND s.is_static=0 AND COALESCE(s.visibility,'') <> 'private'
-		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
-		var c swiftScopeSymbol
-		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.kind, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
+		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' AND s.is_static=0
+		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+		var c swiftInheritedSelfCandidate
+		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.visibility, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
 			return err
 		}
 		candidates = append(candidates, c)
@@ -488,7 +520,8 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 	for _, p := range valid2 {
 		shape, _ := parseSwiftSelfCallShape(p.edge.evidence, p.edge.dst, p.edge.arity)
 		matches := 0
-		var found swiftScopeSymbol
+		veto := false
+		var found swiftInheritedSelfCandidate
 		for _, c := range candidates {
 			if c.file != p.edge.file || c.name != shape.method || !c.static.Valid || c.static.Int64 != 0 {
 				continue
@@ -497,23 +530,24 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 			if len(shape.trailingLabels) == 0 && c.sig != selector {
 				continue
 			}
-			if len(shape.trailingLabels) > 0 && !swiftTrailingCandidate(shape, c) {
+			if len(shape.trailingLabels) > 0 && !swiftInheritedTrailingCandidate(shape, c) {
 				continue
 			}
 			if c.owner == p.edge.owner {
-				matches = -1
-				break
+				veto = true
+				continue
 			}
 			if c.owner != p.relation.target {
 				continue
 			}
-			if c.dispatchFacts != 1 || c.finalFacts != 1 || c.dispatchMin != "instance" || c.dispatchMax != "instance" {
+			if c.visibility == "private" || c.dispatchFacts != 1 || c.finalFacts != 1 || c.dispatchMin != "instance" || c.dispatchMax != "instance" {
+				veto = true
 				continue
 			}
 			matches++
 			found = c
 		}
-		if matches != 1 {
+		if veto || matches != 1 {
 			continue
 		}
 		blocked := false
