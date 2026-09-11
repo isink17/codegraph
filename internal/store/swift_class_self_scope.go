@@ -26,7 +26,7 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
 		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id JOIN files sf ON sf.id=src.file_id
 		WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls' AND e.dst_symbol_id IS NULL
-		  AND sf.id=e.file_id AND sf.is_deleted=0 AND src.language='swift' AND src.kind='function' AND src.container_name<>''`,
+		  AND sf.id=e.file_id AND sf.is_deleted=0 AND src.repo_id=e.repo_id AND src.language='swift' AND src.kind='function' AND src.container_name<>''`,
 		" AND e.id IN (%s)", []any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e swiftScopeEdge
@@ -195,7 +195,7 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		blocked := false
 		for _, b := range blockers {
 			_, blockerTest := tests[b.file]
-			if b.owner != e.owner || b.name != shape.method || (b.kind == graph.ScopeImportSwiftEnumCase && b.static != 1) || (!callerTest && blockerTest) {
+			if b.owner != e.owner || b.name != shape.method || b.static != e.static.Int64 || (b.kind == graph.ScopeImportSwiftEnumCase && b.static != 1) || (!callerTest && blockerTest) {
 				continue
 			}
 			blocked = true
