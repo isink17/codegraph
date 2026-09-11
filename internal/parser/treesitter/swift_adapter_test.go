@@ -308,26 +308,33 @@ final class Service {
 func TestSwiftFinalClassMethodFacts(t *testing.T) {
 	p := mustSwiftParse(t, "FinalClassMethod.swift", `class Service {
     final class func make() {}
+    class func ordinary() {}
 }`)
-	var symbol graph.Symbol
+	var finalMethod, ordinary graph.Symbol
 	for _, candidate := range p.Symbols {
-		if candidate.QualifiedName == "Service.make" {
-			symbol = candidate
-			break
+		switch candidate.QualifiedName {
+		case "Service.make":
+			finalMethod = candidate
+		case "Service.ordinary":
+			ordinary = candidate
 		}
 	}
-	if symbol.QualifiedName == "" || symbol.Static == nil || !*symbol.Static {
-		t.Fatalf("symbol=%+v, want static callable", symbol)
+	if finalMethod.QualifiedName == "" || finalMethod.Static == nil || !*finalMethod.Static {
+		t.Fatalf("final method=%+v, want static callable", finalMethod)
 	}
+	if ordinary.QualifiedName == "" || ordinary.Static == nil || !*ordinary.Static {
+		t.Fatalf("ordinary method=%+v, want static callable", ordinary)
+	}
+	facts := map[string]graph.SwiftDeclarationFact{}
 	for _, fact := range p.SwiftDeclarationFacts {
-		if p.Symbols[fact.SymbolIndex].QualifiedName == "Service.make" {
-			if !fact.Final || fact.Dispatch != "class" {
-				t.Fatalf("fact=%+v, want final class dispatch", fact)
-			}
-			return
-		}
+		facts[p.Symbols[fact.SymbolIndex].QualifiedName] = fact
 	}
-	t.Fatal("Service.make declaration fact missing")
+	if fact := facts["Service.make"]; !fact.Final || fact.Dispatch != "class" {
+		t.Fatalf("final fact=%+v, want final class dispatch", fact)
+	}
+	if fact := facts["Service.ordinary"]; fact.Final || fact.Dispatch != "class" {
+		t.Fatalf("ordinary fact=%+v, want non-final class dispatch", fact)
+	}
 }
 
 func TestSwiftMalformedCallableDispatchFailsClosed(t *testing.T) {
