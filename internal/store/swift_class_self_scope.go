@@ -23,14 +23,17 @@ type swiftClassSelfRelation struct {
 // proofs this resolver alone owns.
 func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
 	var edges []swiftScopeEdge
-	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity,
+		COALESCE(sd.facts,0),COALESCE(sd.dispatch_min,''),COALESCE(sd.dispatch_max,'')
 		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id JOIN files sf ON sf.id=src.file_id
+		LEFT JOIN (SELECT symbol_id,COUNT(*) AS facts,MIN(dispatch_kind) AS dispatch_min,MAX(dispatch_kind) AS dispatch_max
+			FROM swift_declaration_facts WHERE repo_id=? GROUP BY symbol_id) sd ON sd.symbol_id=src.id
 		WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls' AND e.dst_symbol_id IS NULL
 		  AND sf.id=e.file_id AND sf.is_deleted=0 AND src.repo_id=e.repo_id AND src.language='swift' AND src.kind='function' AND src.container_name<>''`,
-		" AND e.id IN (%s)", []any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
+		" AND e.id IN (%s)", []any{repoID, repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e swiftScopeEdge
-			if err := rows.Scan(&e.id, &e.file, &e.src, &e.dst, &e.evidence, &e.owner, &e.static, &e.arity); err != nil {
+			if err := rows.Scan(&e.id, &e.file, &e.src, &e.dst, &e.evidence, &e.owner, &e.static, &e.arity, &e.sourceDispatchFacts, &e.sourceDispatchMin, &e.sourceDispatchMax); err != nil {
 				return err
 			}
 			shape, ok := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
@@ -177,6 +180,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			continue
 		}
 		shape, _ := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
+		typeContext := shape.strategy == ResolutionStrategySwiftSelfScope && e.static.Int64 == 1 &&
+			e.sourceDispatchFacts == 1 && e.sourceDispatchMin == e.sourceDispatchMax &&
+			(e.sourceDispatchMin == "static" || e.sourceDispatchMin == "class")
 		selector := swiftSelector(shape.method, shape.regularLabels)
 		matches := 0
 		var found swiftScopeSymbol
@@ -189,6 +195,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 				continue
 			}
 			if shape.strategy == ResolutionStrategySwiftSelfTypeScope && (c.dispatchFacts != 1 || c.dispatchMin != c.dispatchMax || (c.dispatchMin != "static" && c.dispatchMin != "class")) {
+				continue
+			}
+			if typeContext && owner.finals == 0 && (c.dispatchFacts != 1 || c.dispatchMin != "static" || c.dispatchMax != "static") {
 				continue
 			}
 			if len(shape.trailingLabels) == 0 && c.sig != selector {
@@ -204,7 +213,7 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			continue
 		}
 		finalMethod := shape.strategy == ResolutionStrategySwiftSelfScope && e.static.Int64 == 0 && owner.finals == 0 && found.dispatchFacts == 1 && found.finalFacts == 1 && found.dispatchMin == "instance" && found.dispatchMax == "instance"
-		if owner.finals == 0 && !finalMethod {
+		if owner.finals == 0 && !finalMethod && !typeContext {
 			continue
 		}
 		blocked := false
@@ -226,6 +235,8 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 				strategy = ResolutionStrategySwiftClassSelfTypeFinalScope
 			} else if finalMethod {
 				strategy = ResolutionStrategySwiftClassSelfFinalMethodScope
+			} else if typeContext && owner.finals == 0 {
+				strategy = ResolutionStrategySwiftClassSelfStaticMethodScope
 			}
 			res[e.id] = swiftScopeBinding{dst: found.id, strategy: strategy}
 		}
