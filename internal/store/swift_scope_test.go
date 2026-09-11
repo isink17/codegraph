@@ -528,6 +528,73 @@ func TestSwiftClassSelfTestHazardsUseFileClassification(t *testing.T) {
 	})
 }
 
+func TestSwiftClassSelfTypeCrossFileHazardLifecycle(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
+	edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
+	f.reference(f.mainFile, caller, "Self.make", 1)
+	f.declarationFact(f.mainFile, owner, true)
+	f.dispatchFact(f.mainFile, target, false, "static")
+	hazard := f.file("Conformance.swift")
+	f.resolve()
+	assertSwiftClassSelfTypeBinding(t, f, edge, target)
+	f.relation(hazard, "Service", "P", "conformance", false, false)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBindingCleared(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE file_id=?`, hazard); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftClassSelfTypeBinding(t, f, edge, target)
+	f.relation(hazard, "Service", "P", "conformance", false, false)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBindingCleared(t, f, edge)
+}
+
+func TestSwiftClassSelfTypeHazardFiltering(t *testing.T) {
+	for _, tc := range []struct {
+		name, callerPath, hazardPath, relation string
+		wantBound                              bool
+	}{
+		{"production-test-conformance", "Service.swift", "Tests/Conformance.swift", "conformance", true},
+		{"production-production-conformance", "Service.swift", "Conformance.swift", "conformance", false},
+		{"test-test-conformance", "Tests/Service.swift", "Tests/Conformance.swift", "conformance", false},
+		{"production-test-unproven", "Service.swift", "Tests/Conformance.swift", "unproven", true},
+		{"test-production-conformance", "Tests/Service.swift", "Conformance.swift", "conformance", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			callerFile := f.mainFile
+			if strings.HasPrefix(tc.callerPath, "Tests/") {
+				callerFile = f.file(tc.callerPath)
+			}
+			owner := f.symbol(callerFile, "Service", "", "class", "", false)
+			target := f.symbol(callerFile, "make", "Service", "function", "make()", true)
+			caller := f.symbol(callerFile, "f", "Service", "function", "f()", true)
+			edge := f.call(callerFile, caller, "Self.make", "swift:Self", 0, 1)
+			f.reference(callerFile, caller, "Self.make", 1)
+			f.declarationFact(callerFile, owner, true)
+			f.dispatchFact(callerFile, target, false, "static")
+			hazard := f.file(tc.hazardPath)
+			f.relation(hazard, "Service", "P", tc.relation, false, false)
+			f.resolve()
+			if tc.wantBound {
+				assertSwiftClassSelfTypeBinding(t, f, edge, target)
+			} else {
+				assertSwiftBindingCleared(t, f, edge)
+			}
+		})
+	}
+}
+
 func TestSwiftClassSelfBlockersMatchStaticnessAndTestShadow(t *testing.T) {
 	for _, tc := range []struct {
 		name                      string
@@ -563,6 +630,81 @@ func TestSwiftClassSelfBlockersMatchStaticnessAndTestShadow(t *testing.T) {
 			got := f.dst(edge)
 			if tc.wantBound != got.Valid || (tc.wantBound && got.Int64 != target) {
 				t.Fatalf("dst=%v, want bound=%v target=%d", got, tc.wantBound, target)
+			}
+		})
+	}
+}
+
+func TestSwiftClassSelfTypeBlockersMatchStaticnessAndTestShadow(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		callerTest, blockerTest bool
+		blockStatic             bool
+		blockKind               string
+		wantBound               bool
+	}{
+		{"production-static-member", false, false, true, graph.ScopeImportSwiftMemberValue, false},
+		{"production-test-only-static-member", false, true, true, graph.ScopeImportSwiftMemberValue, true},
+		{"test-test-static-member", true, true, true, graph.ScopeImportSwiftMemberValue, false},
+		{"opposite-static-instance-member", false, false, false, graph.ScopeImportSwiftMemberValue, true},
+		{"static-enum-case", false, false, true, graph.ScopeImportSwiftEnumCase, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			callerFile := f.mainFile
+			if tc.callerTest {
+				callerFile = f.file("Tests/Service.swift")
+			}
+			owner := f.symbol(callerFile, "Service", "", "class", "", false)
+			target := f.symbol(callerFile, "make", "Service", "function", "make()", true)
+			caller := f.symbol(callerFile, "f", "Service", "function", "f()", false)
+			edge := f.call(callerFile, caller, "Self.make", "swift:Self", 0, 1)
+			f.reference(callerFile, caller, "Self.make", 1)
+			f.declarationFact(callerFile, owner, true)
+			f.dispatchFact(callerFile, target, false, "static")
+			blockFile := callerFile
+			if tc.blockerTest {
+				blockFile = f.file("Tests/Blocker.swift")
+			}
+			f.blocker(blockFile, "Service", "make", tc.blockKind, tc.blockStatic)
+			f.resolve()
+			if tc.wantBound {
+				assertSwiftClassSelfTypeBinding(t, f, edge, target)
+			} else {
+				assertSwiftBindingCleared(t, f, edge)
+			}
+		})
+	}
+}
+
+func TestSwiftClassSelfTypeResolveEdgesForNames(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		hazard     bool
+		resolved   int
+		unresolved int
+	}{
+		{"positive", false, 1, 0},
+		{"conformance-veto", true, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+			target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+			caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+			edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
+			f.reference(f.mainFile, caller, "Self.make", 1)
+			f.declarationFact(f.mainFile, owner, true)
+			f.dispatchFact(f.mainFile, target, false, "static")
+			if tc.hazard {
+				f.relation(f.mainFile, "Service", "P", "conformance", false, false)
+			}
+			stats := f.resolveNames("make")
+			assertSwiftStats(t, stats, 1, tc.resolved, tc.unresolved, 0)
+			if tc.resolved == 1 {
+				assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalScope)
+			} else {
+				assertSwiftBindingCleared(t, f, edge)
 			}
 		})
 	}
@@ -675,6 +817,27 @@ func TestSwiftClassSelfTypeRepairRunsAfterEarlierMarkers(t *testing.T) {
 func TestSwiftClassSelfRepairClearsUnsafeBinding(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.declarationFact(f.mainFile, owner, true)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfFinalScope, ResolutionConfidenceHigh, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	f.relation(f.mainFile, "Service", "P", "conformance", false, false)
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBindingCleared(t, f, edge)
+}
+
+func TestSwiftClassSelfTypeRepairClearsUnsafeBinding(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
 	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
 	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
 	edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
@@ -707,29 +870,134 @@ func TestSwiftClassSelfRepairClearsUnsafeBinding(t *testing.T) {
 	}
 }
 
-func TestSwiftClassSelfTypeConsumesLargeBatchedEdgeSet(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	f.declarationFact(f.mainFile, owner, true)
-	const count = 1200
-	edges := make([]int64, 0, count)
-	for i := 0; i < count; i++ {
-		name := fmt.Sprintf("make%d", i)
-		target := f.symbol(f.mainFile, name, "Service", "function", name+"()", true)
-		f.dispatchFact(f.mainFile, target, false, "static")
-		caller := f.symbol(f.mainFile, fmt.Sprintf("f%d", i), "Service", "function", fmt.Sprintf("f%d()", i), i%2 == 0)
-		edges = append(edges, f.call(f.mainFile, caller, "Self."+name, "swift:Self", 0, i+1))
+func assertSwiftBindingCleared(t *testing.T, f *swiftScopeFixture, edge int64) {
+	t.Helper()
+	var dst, strategy, confidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COALESCE(CAST(dst_symbol_id AS TEXT),''),COALESCE(resolution_strategy,''),COALESCE(resolution_confidence,'') FROM edges WHERE id=?`, edge).Scan(&dst, &strategy, &confidence); err != nil {
+		t.Fatal(err)
 	}
-	f.resolve()
-	for _, edge := range edges {
-		if got := f.dst(edge); !got.Valid {
-			t.Fatalf("edge %d unresolved", edge)
+	if dst != "" || strategy != "" || confidence != "" {
+		t.Fatalf("unsafe binding survived=(%q,%q,%q)", dst, strategy, confidence)
+	}
+	var reference sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil {
+		t.Fatal(err)
+	}
+	if reference.Valid {
+		t.Fatalf("unsafe reference survived=%d", reference.Int64)
+	}
+}
+
+func TestSwiftClassSelfTypeBatchedMixedEdges(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	type category struct {
+		name  string
+		count int
+		bound bool
+	}
+	categories := []category{
+		{"static", 300, true}, {"class", 200, true}, {"nonfinal", 100, false},
+		{"conformance", 100, false}, {"unproven", 100, false}, {"constrained", 100, false},
+		{"qualified", 100, true}, {"same_blocker", 50, false}, {"opposite_blocker", 50, true},
+		{"missing_dispatch", 50, false}, {"duplicate_dispatch", 50, false},
+	}
+	const total = 1200
+	edges := make([]int64, 0, total)
+	samples := make(map[string]int64, len(categories))
+	sampleTargets := make(map[string]int64, len(categories))
+	line := 1
+	for _, tc := range categories {
+		ownerName, owner := "Service_"+tc.name, ""
+		if tc.name == "qualified" {
+			ownerName, owner = "ServiceQualified", "Outer"
+		}
+		container := ownerName
+		if owner != "" {
+			container = owner + "." + ownerName
+		}
+		ownerID := f.symbol(f.mainFile, ownerName, owner, "class", "", false)
+		final := tc.name != "nonfinal"
+		f.declarationFact(f.mainFile, ownerID, final)
+		for i := 0; i < tc.count; i++ {
+			method := fmt.Sprintf("make_%s_%d", tc.name, i)
+			target := f.symbol(f.mainFile, method, container, "function", method+"()", true)
+			if tc.name != "missing_dispatch" {
+				dispatch := "static"
+				if tc.name == "class" {
+					dispatch = "class"
+				}
+				f.dispatchFact(f.mainFile, target, false, dispatch)
+				if tc.name == "duplicate_dispatch" {
+					f.dispatchFact(f.mainFile, target, false, "class")
+				}
+			}
+			caller := f.symbol(f.mainFile, fmt.Sprintf("f_%s_%d", tc.name, i), container, "function", "f()", false)
+			dst := "Self." + method
+			edge := f.call(f.mainFile, caller, dst, "swift:Self", 0, line)
+			if i == 0 {
+				samples[tc.name] = edge
+				sampleTargets[tc.name] = target
+			}
+			edges = append(edges, edge)
+			if tc.name == "conformance" || tc.name == "unproven" || tc.name == "constrained" {
+				kind := tc.name
+				if kind == "constrained" {
+					kind = "conformance"
+				}
+				f.relation(f.mainFile, ownerName, "P", kind, false, tc.name == "constrained")
+			}
+			if tc.name == "same_blocker" {
+				f.blocker(f.mainFile, ownerName, method, graph.ScopeImportSwiftMemberValue, true)
+			}
+			if tc.name == "opposite_blocker" {
+				f.blocker(f.mainFile, ownerName, method, graph.ScopeImportSwiftMemberValue, false)
+			}
+			line++
 		}
 	}
-	before := len(edges)
+	if len(edges) != total {
+		t.Fatalf("total edges=%d, want %d", len(edges), total)
+	}
+	count := func() (resolved, unresolved int) {
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence='swift:Self' AND dst_symbol_id IS NOT NULL`, f.repoID).Scan(&resolved); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence='swift:Self' AND dst_symbol_id IS NULL`, f.repoID).Scan(&unresolved); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	f.resolve()
-	if before != count {
-		t.Fatalf("edge count=%d, want %d", before, count)
+	resolved1, unresolved1 := count()
+	if resolved1 != 650 || unresolved1 != 550 || resolved1+unresolved1 != total {
+		t.Fatalf("counts=(%d,%d), want (650,550)", resolved1, unresolved1)
+	}
+	for _, tc := range categories {
+		if tc.bound {
+			assertSwiftEdgeMetadata(t, f, samples[tc.name], sampleTargets[tc.name], ResolutionStrategySwiftClassSelfTypeFinalScope)
+		} else {
+			assertSwiftEdgeUnresolved(t, f, samples[tc.name])
+		}
+	}
+	if got := f.dst(samples["static"]); !got.Valid {
+		t.Fatal("static sample unresolved")
+	}
+	if got := f.dst(samples["class"]); !got.Valid {
+		t.Fatal("class sample unresolved")
+	}
+	if got := f.dst(samples["nonfinal"]); got.Valid {
+		t.Fatalf("non-final sample resolved=%d", got.Int64)
+	}
+	if got := f.dst(samples["same_blocker"]); got.Valid {
+		t.Fatalf("same-static blocker sample resolved=%d", got.Int64)
+	}
+	if got := f.dst(samples["opposite_blocker"]); !got.Valid {
+		t.Fatal("opposite-static blocker sample unresolved")
+	}
+	f.resolve()
+	resolved2, unresolved2 := count()
+	if resolved2 != resolved1 || unresolved2 != unresolved1 {
+		t.Fatalf("second counts=(%d,%d), want (%d,%d)", resolved2, unresolved2, resolved1, unresolved1)
 	}
 }
 
@@ -757,6 +1025,30 @@ func assertSwiftBinding(t *testing.T, f *swiftScopeFixture, edge, target int64, 
 	}
 	if !reference.Valid || reference.Int64 != target {
 		t.Fatalf("reference=%v, want %d", reference, target)
+	}
+}
+
+func assertSwiftEdgeMetadata(t *testing.T, f *swiftScopeFixture, edge, target int64, wantStrategy string) {
+	t.Helper()
+	var got int64
+	var strategy, confidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&got, &strategy, &confidence); err != nil {
+		t.Fatal(err)
+	}
+	if got != target || strategy != wantStrategy || confidence != ResolutionConfidenceHigh {
+		t.Fatalf("edge=(%d,%q,%q), want=(%d,%q,%q)", got, strategy, confidence, target, wantStrategy, ResolutionConfidenceHigh)
+	}
+}
+
+func assertSwiftEdgeUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
+	t.Helper()
+	var dst sql.NullInt64
+	var strategy, confidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&dst, &strategy, &confidence); err != nil {
+		t.Fatal(err)
+	}
+	if dst.Valid || strategy != "" || confidence != "" {
+		t.Fatalf("edge=(%v,%q,%q), want unresolved with empty metadata", dst, strategy, confidence)
 	}
 }
 
