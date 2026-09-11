@@ -200,6 +200,7 @@ const (
 	ResolutionStrategySwiftClassSelfFinalMethodScope      = "swift_class_self_final_method_scope"
 	ResolutionStrategySwiftClassSelfStaticMethodScope     = "swift_class_self_static_method_scope"
 	ResolutionStrategySwiftClassSelfFinalClassMethodScope = "swift_class_self_final_class_method_scope"
+	ResolutionStrategySwiftClassSelfTypeStaticMethodScope = "swift_class_self_type_static_method_scope"
 	ResolutionStrategySwiftInitializerScope               = "swift_initializer_scope"
 	ResolutionStrategySwiftSuperScope                     = "swift_super_scope"
 )
@@ -303,6 +304,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategySwiftClassSelfFinalMethodScope:      ResolutionConfidenceHigh,
 	ResolutionStrategySwiftClassSelfStaticMethodScope:     ResolutionConfidenceHigh,
 	ResolutionStrategySwiftClassSelfFinalClassMethodScope: ResolutionConfidenceHigh,
+	ResolutionStrategySwiftClassSelfTypeStaticMethodScope: ResolutionConfidenceHigh,
 	ResolutionStrategySwiftInitializerScope:               ResolutionConfidenceHigh,
 	ResolutionStrategySwiftSuperScope:                     ResolutionConfidenceHigh,
 }
@@ -384,6 +386,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategySwiftClassSelfFinalMethodScope,
 	ResolutionStrategySwiftClassSelfStaticMethodScope,
 	ResolutionStrategySwiftClassSelfFinalClassMethodScope,
+	ResolutionStrategySwiftClassSelfTypeStaticMethodScope,
 	ResolutionStrategySwiftInitializerScope,
 	ResolutionStrategySwiftSuperScope,
 )
