@@ -197,7 +197,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			if shape.strategy == ResolutionStrategySwiftSelfTypeScope && (c.dispatchFacts != 1 || c.dispatchMin != c.dispatchMax || (c.dispatchMin != "static" && c.dispatchMin != "class")) {
 				continue
 			}
-			if typeContext && owner.finals == 0 && (c.dispatchFacts != 1 || c.dispatchMin != "static" || c.dispatchMax != "static") {
+			finalClassMethod := c.dispatchFacts == 1 && c.dispatchMin == "class" && c.dispatchMax == "class" && c.finalFacts == 1
+			staticMethod := c.dispatchFacts == 1 && c.dispatchMin == "static" && c.dispatchMax == "static"
+			if typeContext && owner.finals == 0 && !staticMethod && !finalClassMethod {
 				continue
 			}
 			if len(shape.trailingLabels) == 0 && c.sig != selector {
@@ -236,7 +238,11 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 			} else if finalMethod {
 				strategy = ResolutionStrategySwiftClassSelfFinalMethodScope
 			} else if typeContext && owner.finals == 0 {
-				strategy = ResolutionStrategySwiftClassSelfStaticMethodScope
+				if found.dispatchMin == "class" {
+					strategy = ResolutionStrategySwiftClassSelfFinalClassMethodScope
+				} else {
+					strategy = ResolutionStrategySwiftClassSelfStaticMethodScope
+				}
 			}
 			res[e.id] = swiftScopeBinding{dst: found.id, strategy: strategy}
 		}

@@ -305,6 +305,38 @@ final class Service {
 	}
 }
 
+func TestSwiftFinalClassMethodFacts(t *testing.T) {
+	p := mustSwiftParse(t, "FinalClassMethod.swift", `class Service {
+    final class func make() {}
+    class func ordinary() {}
+}`)
+	var finalMethod, ordinary graph.Symbol
+	for _, candidate := range p.Symbols {
+		switch candidate.QualifiedName {
+		case "Service.make":
+			finalMethod = candidate
+		case "Service.ordinary":
+			ordinary = candidate
+		}
+	}
+	if finalMethod.QualifiedName == "" || finalMethod.Static == nil || !*finalMethod.Static {
+		t.Fatalf("final method=%+v, want static callable", finalMethod)
+	}
+	if ordinary.QualifiedName == "" || ordinary.Static == nil || !*ordinary.Static {
+		t.Fatalf("ordinary method=%+v, want static callable", ordinary)
+	}
+	facts := map[string]graph.SwiftDeclarationFact{}
+	for _, fact := range p.SwiftDeclarationFacts {
+		facts[p.Symbols[fact.SymbolIndex].QualifiedName] = fact
+	}
+	if fact := facts["Service.make"]; !fact.Final || fact.Dispatch != "class" {
+		t.Fatalf("final fact=%+v, want final class dispatch", fact)
+	}
+	if fact := facts["Service.ordinary"]; fact.Final || fact.Dispatch != "class" {
+		t.Fatalf("ordinary fact=%+v, want non-final class dispatch", fact)
+	}
+}
+
 func TestSwiftMalformedCallableDispatchFailsClosed(t *testing.T) {
 	p := mustSwiftParse(t, "Malformed.swift", `final class Service {
     class static func broken() {}

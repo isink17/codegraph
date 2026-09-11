@@ -17,9 +17,10 @@ const swiftClassSelfRepairSettingKey = "resolver.swift_class_self_final_repaired
 const swiftClassSelfTypeRepairSettingKey = "resolver.swift_class_self_type_final_repaired.v1"
 const swiftClassSelfFinalMethodRepairSettingKey = "resolver.swift_class_self_final_method_repaired.v1"
 const swiftClassSelfStaticMethodRepairSettingKey = "resolver.swift_class_self_static_method_repaired.v1"
+const swiftClassSelfFinalClassMethodRepairSettingKey = "resolver.swift_class_self_final_class_method_repaired.v1"
 const swiftTrailingRepairSettingKey = "resolver.swift_trailing_closure_repaired.v1"
 
-var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope, ResolutionStrategySwiftClassSelfFinalScope, ResolutionStrategySwiftClassSelfTypeFinalScope, ResolutionStrategySwiftClassSelfFinalMethodScope, ResolutionStrategySwiftClassSelfStaticMethodScope}
+var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope, ResolutionStrategySwiftClassSelfFinalScope, ResolutionStrategySwiftClassSelfTypeFinalScope, ResolutionStrategySwiftClassSelfFinalMethodScope, ResolutionStrategySwiftClassSelfStaticMethodScope, ResolutionStrategySwiftClassSelfFinalClassMethodScope}
 
 // Swift v3 call facts are owned here. Unsupported Swift calls must never fall
 // through to a name-based resolver.
