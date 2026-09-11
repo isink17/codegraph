@@ -1505,6 +1505,127 @@ func assertSwiftEdgeUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
 	}
 }
 
+func TestSwiftClassSelfStaticMethodScope(t *testing.T) {
+	for _, dispatch := range []string{"static", "class"} {
+		t.Run(dispatch+" caller", func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+			target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+			caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
+			edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
+			f.declarationFact(f.mainFile, owner, false)
+			f.dispatchFact(f.mainFile, caller, false, dispatch)
+			f.dispatchFact(f.mainFile, target, false, "static")
+			f.reference(f.mainFile, caller, "self.make", 1)
+			f.resolve()
+			assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfStaticMethodScope)
+		})
+	}
+}
+
+func TestSwiftClassSelfStaticMethodScopeFailsClosed(t *testing.T) {
+	cases := []struct {
+		name, sourceDispatch, targetDispatch string
+		duplicateSource, duplicateTarget     bool
+		wantBound                            bool
+	}{
+		{"missing source", "", "static", false, false, false},
+		{"duplicate source", "static", "static", true, false, false},
+		{"malformed source", "", "static", false, false, false},
+		{"instance source", "instance", "static", false, false, false},
+		{"missing target", "static", "", false, false, false},
+		{"duplicate target", "static", "static", false, true, false},
+		{"malformed target", "static", "", false, false, false},
+		{"class target", "static", "class", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+			target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+			caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
+			edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
+			f.declarationFact(f.mainFile, owner, false)
+			if tc.sourceDispatch != "" {
+				f.dispatchFact(f.mainFile, caller, false, tc.sourceDispatch)
+				if tc.duplicateSource {
+					f.dispatchFact(f.mainFile, caller, false, tc.sourceDispatch)
+				}
+			}
+			if tc.targetDispatch != "" {
+				f.dispatchFact(f.mainFile, target, false, tc.targetDispatch)
+				if tc.duplicateTarget {
+					f.dispatchFact(f.mainFile, target, false, tc.targetDispatch)
+				}
+			}
+			f.resolve()
+			if tc.wantBound {
+				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfStaticMethodScope)
+			} else {
+				assertSwiftEdgeUnresolved(t, f, edge)
+			}
+		})
+	}
+}
+
+func TestSwiftClassSelfStaticMethodFinalPrecedenceAndLifecycle(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
+	edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.make", 1)
+	f.declarationFact(f.mainFile, owner, true)
+	f.dispatchFact(f.mainFile, caller, false, "static")
+	f.dispatchFact(f.mainFile, target, false, "static")
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalScope)
+
+}
+
+func TestSwiftClassSelfStaticMethodUpgradeRepair(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
+	edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.make", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.dispatchFact(f.mainFile, caller, false, "class")
+	f.dispatchFact(f.mainFile, target, false, "static")
+	for _, repair := range resolverRepairs {
+		if repair.key == swiftClassSelfStaticMethodRepairSettingKey {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !ran {
+		t.Fatalf("repair=(%v,%v)", ran, err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfStaticMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBindingCleared(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfStaticMethodScope)
+	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || ran {
+		t.Fatalf("second repair=(%v,%v)", ran, err)
+	}
+}
+
 func TestSwiftClassSelfBatchedMixedEdges(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	const perClass = 300
