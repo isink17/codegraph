@@ -34,7 +34,7 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 				return err
 			}
 			shape, ok := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
-			if ok && shape.strategy == ResolutionStrategySwiftSelfScope && e.static.Valid {
+			if ok && (shape.strategy == ResolutionStrategySwiftSelfScope || shape.strategy == ResolutionStrategySwiftSelfTypeScope) && e.static.Valid {
 				edges = append(edges, e)
 			}
 			return nil
@@ -88,8 +88,12 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		if len(shape.trailingLabels) > 0 {
 			signature = ""
 		}
-		key := swiftCandidateKey(e.owner, shape.method, signature, e.static.Int64)
-		keys[key] = []any{e.owner, shape.method, signature, e.static.Int64}
+		wantStatic := e.static.Int64
+		if shape.strategy == ResolutionStrategySwiftSelfTypeScope {
+			wantStatic = 1
+		}
+		key := swiftCandidateKey(e.owner, shape.method, signature, wantStatic)
+		keys[key] = []any{e.owner, shape.method, signature, wantStatic}
 	}
 	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_swift_class_self_candidates(owner TEXT NOT NULL,name TEXT NOT NULL,signature TEXT NOT NULL,is_static INTEGER NOT NULL,PRIMARY KEY(owner,name,signature,is_static)) WITHOUT ROWID`); err != nil {
 		return 0, err
@@ -111,11 +115,11 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		return 0, err
 	}
 	var candidates []swiftScopeSymbol
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
 		FROM symbols s JOIN tmp_swift_class_self_candidates c ON c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature) AND c.is_static=s.is_static
-		JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function'`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftScopeSymbol
-		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.kind, &c.static, &c.arityMin, &c.arityMax); err != nil {
+		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.kind, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
 			return err
 		}
 		candidates = append(candidates, c)
@@ -177,7 +181,14 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		matches := 0
 		var found swiftScopeSymbol
 		for _, c := range candidates {
-			if c.owner != e.owner || c.name != shape.method || c.file != e.file || !c.static.Valid || c.static.Int64 != e.static.Int64 {
+			wantStatic := e.static.Int64
+			if shape.strategy == ResolutionStrategySwiftSelfTypeScope {
+				wantStatic = 1
+			}
+			if c.owner != e.owner || c.name != shape.method || c.file != e.file || !c.static.Valid || c.static.Int64 != wantStatic {
+				continue
+			}
+			if shape.strategy == ResolutionStrategySwiftSelfTypeScope && (c.dispatchFacts != 1 || c.dispatchMin != c.dispatchMax || (c.dispatchMin != "static" && c.dispatchMin != "class")) {
 				continue
 			}
 			if len(shape.trailingLabels) == 0 && c.sig != selector {
@@ -195,14 +206,22 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		blocked := false
 		for _, b := range blockers {
 			_, blockerTest := tests[b.file]
-			if b.owner != e.owner || b.name != shape.method || b.static != e.static.Int64 || (b.kind == graph.ScopeImportSwiftEnumCase && b.static != 1) || (!callerTest && blockerTest) {
+			wantStatic := e.static.Int64
+			if shape.strategy == ResolutionStrategySwiftSelfTypeScope {
+				wantStatic = 1
+			}
+			if b.owner != e.owner || b.name != shape.method || b.static != wantStatic || (b.kind == graph.ScopeImportSwiftEnumCase && b.static != 1) || (!callerTest && blockerTest) {
 				continue
 			}
 			blocked = true
 			break
 		}
 		if !blocked {
-			res[e.id] = swiftScopeBinding{dst: found.id, strategy: ResolutionStrategySwiftClassSelfFinalScope}
+			strategy := ResolutionStrategySwiftClassSelfFinalScope
+			if shape.strategy == ResolutionStrategySwiftSelfTypeScope {
+				strategy = ResolutionStrategySwiftClassSelfTypeFinalScope
+			}
+			res[e.id] = swiftScopeBinding{dst: found.id, strategy: strategy}
 		}
 	}
 	return swiftScopeApply(ctx, q, res)
