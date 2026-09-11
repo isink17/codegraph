@@ -360,6 +360,51 @@ func TestSwiftClassSelfRequiresFinalFactAndNoHazard(t *testing.T) {
 	}
 }
 
+func TestSwiftClassSelfFinalMethodScope(t *testing.T) {
+	t.Run("non-final owner and final instance method", func(t *testing.T) {
+		f := newSwiftScopeFixture(t)
+		owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+		target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+		caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+		edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+		f.reference(f.mainFile, caller, "self.run", 1)
+		f.declarationFact(f.mainFile, owner, false)
+		f.declarationFact(f.mainFile, target, true)
+		f.resolve()
+		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
+	})
+
+	for _, tc := range []struct {
+		name, dispatch                    string
+		finalMethod, staticCaller, hazard bool
+	}{
+		{"non-final method", "instance", false, false, false},
+		{"missing method fact", "", true, false, false},
+		{"static dispatch", "static", true, false, false},
+		{"static caller", "instance", true, true, false},
+		{"owner hazard", "instance", true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+			target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
+			caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", tc.staticCaller)
+			edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+			f.declarationFact(f.mainFile, owner, false)
+			if tc.dispatch != "" {
+				f.dispatchFact(f.mainFile, target, tc.finalMethod, tc.dispatch)
+			}
+			if tc.hazard {
+				f.relation(f.mainFile, "Service", "Base", "superclass", false, false)
+			}
+			f.resolve()
+			if got := f.dst(edge); got.Valid {
+				t.Fatalf("unsafe binding=%d", got.Int64)
+			}
+		})
+	}
+}
+
 func TestSwiftClassSelfControls(t *testing.T) {
 	t.Run("uppercase Self accepts proven static and class dispatch", func(t *testing.T) {
 		for _, dispatch := range []string{"static", "class"} {
