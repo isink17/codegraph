@@ -305,6 +305,31 @@ final class Service {
 	}
 }
 
+func TestSwiftFinalClassMethodFacts(t *testing.T) {
+	p := mustSwiftParse(t, "FinalClassMethod.swift", `class Service {
+    final class func make() {}
+}`)
+	var symbol graph.Symbol
+	for _, candidate := range p.Symbols {
+		if candidate.QualifiedName == "Service.make" {
+			symbol = candidate
+			break
+		}
+	}
+	if symbol.QualifiedName == "" || symbol.Static == nil || !*symbol.Static {
+		t.Fatalf("symbol=%+v, want static callable", symbol)
+	}
+	for _, fact := range p.SwiftDeclarationFacts {
+		if p.Symbols[fact.SymbolIndex].QualifiedName == "Service.make" {
+			if !fact.Final || fact.Dispatch != "class" {
+				t.Fatalf("fact=%+v, want final class dispatch", fact)
+			}
+			return
+		}
+	}
+	t.Fatal("Service.make declaration fact missing")
+}
+
 func TestSwiftMalformedCallableDispatchFailsClosed(t *testing.T) {
 	p := mustSwiftParse(t, "Malformed.swift", `final class Service {
     class static func broken() {}

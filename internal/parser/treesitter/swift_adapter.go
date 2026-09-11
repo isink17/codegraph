@@ -502,13 +502,7 @@ func swiftCallArity(call *sitter.Node) *int {
 }
 
 func swiftCallableStatic(node *sitter.Node, content []byte) bool {
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		if child.Type() == "static" || child.Type() == "class" || (child.Type() == "modifiers" && strings.Contains(nodeText(child, content), "static")) {
-			return true
-		}
-	}
-	return false
+	return swiftHasModifier(node, "static", content) || swiftHasModifier(node, "class", content)
 }
 
 func swiftHasModifier(node *sitter.Node, want string, content []byte) bool {
