@@ -31,6 +31,28 @@ type swiftV2FixtureAdapter struct{}
 // only v4's new ordinary-constructor classification and lexical evidence.
 type swiftV3FixtureAdapter struct{}
 
+// swiftV5ExtensionFixtureAdapter replays the pre-v6 Swift parser contract for
+// extension-only files: it deliberately drops inheritance facts while keeping
+// the rest of the current parser output.
+type swiftV5ExtensionFixtureAdapter struct{}
+
+func (swiftV5ExtensionFixtureAdapter) Language() string     { return "swift" }
+func (swiftV5ExtensionFixtureAdapter) Extensions() []string { return []string{".swift"} }
+func (swiftV5ExtensionFixtureAdapter) Supports(path string) bool {
+	return filepath.Ext(path) == ".swift"
+}
+func (swiftV5ExtensionFixtureAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:swift:v5", EmitsCallEdges: true}
+}
+func (swiftV5ExtensionFixtureAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	p, err := tsparser.NewSwift().Parse(ctx, path, content)
+	if err != nil {
+		return graph.ParsedFile{}, err
+	}
+	p.SwiftInheritanceRelations = nil
+	return p, nil
+}
+
 func (swiftV3FixtureAdapter) Language() string     { return "swift" }
 func (swiftV3FixtureAdapter) Extensions() []string { return []string{".swift"} }
 func (swiftV3FixtureAdapter) Supports(path string) bool {
@@ -194,7 +216,7 @@ public struct Visible {}
 	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 || len(summary.ParserProfileLanguages) != 1 || summary.ParserProfileLanguages[0] != "swift" {
 		t.Fatalf("upgrade summary=%+v", summary)
 	}
-	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v5")
+	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v6")
 
 	fresh := newProfileStore(t)
 	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
@@ -338,6 +360,217 @@ func shadow(_ Service: () -> Int) { Service() }
 	}
 }
 
+func TestSwiftV5ToV6ExtensionConformanceLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	servicePath := filepath.Join(root, "Service.swift")
+	extensionPath := filepath.Join(root, "Conformance.swift")
+	writeProfileFile(t, servicePath, "class Service {}\n")
+	writeProfileFile(t, extensionPath, "extension Service: ExternalProtocol {}\n")
+
+	legacy := newProfileStore(t)
+	legacyIndexer := New(legacy.Store, parser.NewRegistry(swiftV5ExtensionFixtureAdapter{}), nil)
+	if _, err := legacyIndexer.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, legacy, root)
+	var oldRelations int
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 0 {
+		t.Fatalf("v5 relations=%d, want 0", oldRelations)
+	}
+
+	current := New(legacy.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	upgraded, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.FilesChanged != 2 || upgraded.FilesIndexed != 2 || len(upgraded.ParserProfileLanguages) != 1 || upgraded.ParserProfileLanguages[0] != "swift" {
+		t.Fatalf("upgrade summary=%+v", upgraded)
+	}
+	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v6")
+
+	var child, target, relation, path string
+	if err := legacy.raw(t).QueryRow(`SELECT r.child_qualified_name,r.target_qualified_name,r.relation_kind,f.path FROM swift_inheritance_relations r JOIN files f ON f.id=r.file_id WHERE r.repo_id=?`, repo).Scan(&child, &target, &relation, &path); err != nil {
+		t.Fatal(err)
+	}
+	if child != "Service" || target != "ExternalProtocol" || relation != "conformance" || path != "Conformance.swift" {
+		t.Fatalf("extension fact=(%q,%q,%q,%q)", child, target, relation, path)
+	}
+
+	fresh := newProfileStore(t)
+	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := swiftFactDigest(t, legacy, repo), swiftFactDigest(t, fresh, repoID(t, fresh, root)); got != want {
+		t.Fatalf("upgraded facts=%q fresh facts=%q", got, want)
+	}
+	second, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.FilesChanged != 0 || second.FilesIndexed != 0 {
+		t.Fatalf("second update=%+v", second)
+	}
+
+	writeProfileFile(t, extensionPath, "extension Service {}\n")
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 0 {
+		t.Fatalf("plain extension left relations=%d", oldRelations)
+	}
+	writeProfileFile(t, extensionPath, "extension Service: ExternalProtocol {}\n")
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 1 {
+		t.Fatalf("restored relations=%d", oldRelations)
+	}
+	if err := os.Remove(servicePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 1 {
+		t.Fatalf("deleting nominal owner removed extension fact=%d", oldRelations)
+	}
+	if err := os.Remove(extensionPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 0 {
+		t.Fatalf("deleted extension left relations=%d", oldRelations)
+	}
+	writeProfileFile(t, extensionPath, "extension Service: ExternalProtocol {}\n")
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&oldRelations); err != nil {
+		t.Fatal(err)
+	}
+	if oldRelations != 1 {
+		t.Fatalf("restored extension relations=%d", oldRelations)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT f.path FROM swift_inheritance_relations r JOIN files f ON f.id=r.file_id WHERE r.repo_id=?`, repo).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	if path != "Conformance.swift" {
+		t.Fatalf("restored relation owner=%q", path)
+	}
+}
+
+func TestSwiftExtensionConformanceFactsBatch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	var source strings.Builder
+	source.WriteString("protocol P {}\nprotocol Q {}\nprotocol R {}\nprotocol S {}\nprotocol U {}\nclass Service {}\nstruct Box<T> {}\n")
+	for i := 0; i < 240; i++ {
+		source.WriteString("extension Service: P, Q {}\n")
+		source.WriteString("extension Qualified.Service: R {}\n")
+		source.WriteString("extension Box: S where T: U {}\n")
+		source.WriteString("extension External.Service: V {}\n")
+	}
+	writeProfileFile(t, filepath.Join(root, "Conformances.swift"), source.String())
+
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	var count int
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1200 {
+		t.Fatalf("persisted extension facts=%d, want 1200", count)
+	}
+	var constrained, qualified, pCount, qCount, conformances int
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND relation_kind='conformance'`, repo).Scan(&conformances); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND is_constrained=1`, repo).Scan(&constrained); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Qualified.Service'`, repo).Scan(&qualified); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND target_qualified_name='P'`, repo).Scan(&pCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND target_qualified_name='Q'`, repo).Scan(&qCount); err != nil {
+		t.Fatal(err)
+	}
+	if conformances != 1200 || constrained != 240 || qualified != 240 || pCount != 240 || qCount != 240 {
+		t.Fatalf("representative facts conformances=%d constrained=%d qualified=%d P=%d Q=%d", conformances, constrained, qualified, pCount, qCount)
+	}
+	updated, err := idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.FilesChanged != 0 || updated.FilesIndexed != 0 {
+		t.Fatalf("unchanged update=%+v", updated)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1200 {
+		t.Fatalf("unchanged extension facts=%d, want 1200", count)
+	}
+}
+
+func TestSwiftConstrainedExtensionFactLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "Box.swift")
+	writeProfileFile(t, path, "protocol P {}\nprotocol Q {}\nstruct Box<T> {}\nextension Box: P {}\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	assertConstrained := func(want int) {
+		t.Helper()
+		var count, got int
+		if err := s.raw(t).QueryRow(`SELECT COUNT(*), COALESCE(MAX(is_constrained), 0) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Box' AND target_qualified_name='P'`, repo).Scan(&count, &got); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 || got != want {
+			t.Fatalf("count=%d is_constrained=%d, want count=1 constrained=%d", count, got, want)
+		}
+	}
+	assertConstrained(0)
+	writeProfileFile(t, path, "protocol P {}\nprotocol Q {}\nstruct Box<T> {}\nextension Box: P where T: Q {}\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	assertConstrained(1)
+	writeProfileFile(t, path, "protocol P {}\nprotocol Q {}\nstruct Box<T> {}\nextension Box: P {}\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	assertConstrained(0)
+}
+
 func TestSwiftSourceAttributionAndLocalFunctionSafety(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -453,14 +686,26 @@ class Outer {
 	}
 	repo := repoID(t, s, root)
 	var child, outer int
-	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Child' AND target_qualified_name='Base' AND relation_kind='superclass' AND is_generic=0 AND is_constrained=0`, repo).Scan(&child); err != nil { t.Fatal(err) }
-	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Outer'`, repo).Scan(&outer); err != nil { t.Fatal(err) }
-	if child != 1 || outer != 0 { t.Fatalf("persisted facts child=%d outer=%d", child, outer) }
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Child' AND target_qualified_name='Base' AND relation_kind='superclass' AND is_generic=0 AND is_constrained=0`, repo).Scan(&child); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=? AND child_qualified_name='Outer'`, repo).Scan(&outer); err != nil {
+		t.Fatal(err)
+	}
+	if child != 1 || outer != 0 {
+		t.Fatalf("persisted facts child=%d outer=%d", child, outer)
+	}
 	writeProfileFile(t, path, `class Base {}
 class Child: Base {}`)
-	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil { t.Fatal(err) }
-	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&child); err != nil { t.Fatal(err) }
-	if child != 1 { t.Fatalf("stale inheritance facts=%d", child) }
+	if _, err := idx.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_inheritance_relations WHERE repo_id=?`, repo).Scan(&child); err != nil {
+		t.Fatal(err)
+	}
+	if child != 1 {
+		t.Fatalf("stale inheritance facts=%d", child)
+	}
 }
 
 func TestSwiftLexicalBindingLifecycle(t *testing.T) {
@@ -557,7 +802,7 @@ func assertSwiftV3Facts(t *testing.T, s *profileStore, repo int64) {
 	if err := db.QueryRow(`SELECT parser_profile FROM files WHERE repo_id=? AND is_deleted=0 LIMIT 1`, repo).Scan(&profile); err != nil {
 		t.Fatal(err)
 	}
-	if profile != "treesitter:swift:v5" {
+	if profile != "treesitter:swift:v6" {
 		t.Fatalf("profile=%q", profile)
 	}
 	var trailing, members, enumCases int

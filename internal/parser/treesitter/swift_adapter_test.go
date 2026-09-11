@@ -134,10 +134,149 @@ func TestSwiftCallsNormalizeAndSuppressLocalFunctions(t *testing.T) {
 	}
 }
 
-func TestSwiftProfileV3(t *testing.T) {
-	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v5" || !got.EmitsCallEdges {
+func TestSwiftProfileV6(t *testing.T) {
+	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v6" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
 	}
+}
+
+func TestSwiftExtensionConformanceFacts(t *testing.T) {
+	p := mustSwiftParse(t, "Extension.swift", `protocol P {}
+protocol Q {}
+class NotAProtocol {}
+class Base {}
+class Service {}
+extension Service: P, Q {}
+extension External.Service: ExternalProtocol {}
+extension Service: NotAProtocol {}
+extension Service { func helper<T>(_ value: T) {} }
+class Outer { class Nested: P {} }
+extension Outer {
+    class NestedExtension: Base {}
+}`)
+	got := map[string]graph.SwiftInheritanceRelation{}
+	for _, fact := range p.SwiftInheritanceRelations {
+		got[fact.Child+"->"+fact.Target] = fact
+	}
+	for _, want := range []struct {
+		key, relation        string
+		constrained, generic bool
+	}{
+		{"Service->P", "conformance", false, false},
+		{"Service->Q", "conformance", false, false},
+		{"External.Service->ExternalProtocol", "conformance", false, false},
+		{"Service->NotAProtocol", "unproven", false, false},
+		{"Outer.NestedExtension->Base", "superclass", false, false},
+	} {
+		fact, ok := got[want.key]
+		if !ok || fact.Relation != want.relation || fact.Constrained != want.constrained || fact.Generic != want.generic {
+			t.Errorf("fact[%q]=%+v, want relation=%q generic=%v constrained=%v", want.key, fact, want.relation, want.generic, want.constrained)
+		}
+	}
+	if _, ok := got["Service->Service"]; ok {
+		t.Fatal("plain extension emitted a synthetic self relation")
+	}
+	if fact, ok := got["Outer.NestedExtension->Base"]; !ok || fact.Child == "Service" {
+		t.Fatalf("nested extension relation=%+v", fact)
+	}
+}
+
+func TestSwiftConstrainedExtensionConformanceFactExcludesBodyGenerics(t *testing.T) {
+	p := mustSwiftParse(t, "GenericExtension.swift", `protocol P {}
+protocol Q {}
+struct Box<T> {}
+extension Box: P where T: Q {
+    func helper<U>(_ value: U) {}
+    struct Nested<V> {}
+}`)
+	var found []graph.SwiftInheritanceRelation
+	for _, fact := range p.SwiftInheritanceRelations {
+		if fact.Child == "Box" && fact.Target == "P" {
+			found = append(found, fact)
+		}
+	}
+	if len(found) != 1 || !found[0].Constrained || found[0].Generic {
+		t.Fatalf("Box conformance facts=%+v", found)
+	}
+}
+
+func TestSwiftExtensionRecoveryAndNestedOwnershipFailClosed(t *testing.T) {
+	generic := mustSwiftParse(t, "GenericExtensionRecovery.swift", `protocol P {}
+class Service {}
+extension Service: P<Int> {}`)
+	var genericFacts []graph.SwiftInheritanceRelation
+	for _, fact := range generic.SwiftInheritanceRelations {
+		if fact.Child == "Service" && fact.Target == "P" {
+			genericFacts = append(genericFacts, fact)
+		}
+	}
+	if len(genericFacts) != 1 || genericFacts[0].Relation != "unproven" || !genericFacts[0].Generic || genericFacts[0].Constrained {
+		t.Fatalf("generic recovery facts=%+v, want one unproven generic hazard", genericFacts)
+	}
+
+	p := mustSwiftParse(t, "ExtensionRecovery.swift", `protocol P {}
+class Base {}
+struct Box<T> {}
+protocol Q {}
+class Service {}
+extension Box where T: Q {
+    class Nested: Base {}
+}
+extension Service {
+    class Nested: Base {}
+}
+extension Service: P {
+    class NestedWithConformance: Base {}
+}`)
+	var ordinary, nestedWithConformance bool
+	for _, fact := range p.SwiftInheritanceRelations {
+		if fact.Child == "Nested" || fact.Child == "Box.Nested" || fact.Child == "Box" && fact.Target == "Base" {
+			t.Fatalf("constrained extension leaked nested inheritance: %+v", fact)
+		}
+		ordinary = ordinary || fact.Child == "Service.Nested" && fact.Target == "Base" && fact.Relation == "superclass"
+		nestedWithConformance = nestedWithConformance || fact.Child == "Service.NestedWithConformance" && fact.Target == "Base" && fact.Relation == "superclass"
+	}
+	if !ordinary || !nestedWithConformance {
+		t.Fatalf("supported extension nested facts missing: ordinary=%v conformance=%v facts=%+v", ordinary, nestedWithConformance, p.SwiftInheritanceRelations)
+	}
+	var ordinaryConformance bool
+	for _, fact := range p.SwiftInheritanceRelations {
+		ordinaryConformance = ordinaryConformance || fact.Child == "Service" && fact.Target == "P" && !fact.Generic && fact.Relation == "conformance"
+	}
+	if !ordinaryConformance {
+		t.Fatal("ordinary extension conformance missing")
+	}
+}
+
+func TestSwiftExtensionDuplicateTargetProofFailsClosed(t *testing.T) {
+	for _, source := range []string{
+		"protocol P {}\nclass P {}\nclass Service {}\nextension Service: P {}\n",
+		"class P {}\nprotocol P {}\nclass Service {}\nextension Service: P {}\n",
+	} {
+		p := mustSwiftParse(t, "Duplicate.swift", source)
+		var facts []graph.SwiftInheritanceRelation
+		for _, fact := range p.SwiftInheritanceRelations {
+			if fact.Child == "Service" && fact.Target == "P" {
+				facts = append(facts, fact)
+			}
+		}
+		if len(facts) != 1 || facts[0].Relation != "unproven" || facts[0].Generic || facts[0].Constrained {
+			t.Fatalf("duplicate target facts=%+v, want one unproven fact", facts)
+		}
+	}
+}
+
+func TestSwiftExtensionConformanceRange(t *testing.T) {
+	p := mustSwiftParse(t, "ExtensionRange.swift", "protocol P {}\nclass Service {}\nextension Service: P {}\n")
+	for _, fact := range p.SwiftInheritanceRelations {
+		if fact.Child == "Service" && fact.Target == "P" {
+			if fact.Range.StartLine != 3 || fact.Range.StartCol != 20 || fact.Range.EndLine != 3 || fact.Range.EndCol != 21 {
+				t.Fatalf("range=%+v, want P token range", fact.Range)
+			}
+			return
+		}
+	}
+	t.Fatal("ordinary extension conformance missing")
 }
 
 func TestSwiftClassInheritanceFactsV5(t *testing.T) {

@@ -96,7 +96,7 @@ type FileParserProfileGroup struct {
 // rows, and deliberately so: a `--languages go` run makes no claim about Java,
 // so the Java evidence a previous run wrote is still the best answer anyone
 // has, and it keeps pinning its profile.
-// Swift v2 and v3 are also included while upgrading to the next tree-sitter
+// Swift v2, v3, and v5 are included while upgrading to the next tree-sitter
 // profile: each can index a factless Swift file whose new parser semantics must
 // still replace the old persisted interpretation.
 const FileParserOwnedEvidencePredicate = `(
@@ -113,7 +113,7 @@ const FileParserOwnedEvidencePredicate = `(
 		OR EXISTS (SELECT 1 FROM swift_inheritance_relations t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM swift_declaration_facts t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM test_links t WHERE t.test_file_id = f.id)
-		OR (f.language = 'swift' AND f.parser_profile IN ('treesitter:swift:v2', 'treesitter:swift:v3') AND f.parse_state = 'indexed')
+		OR (f.language = 'swift' AND f.parser_profile IN ('treesitter:swift:v2', 'treesitter:swift:v3', 'treesitter:swift:v5') AND f.parse_state = 'indexed')
 	)`
 
 // FileParserProfileGroups returns the repository's persisted parser provenance,
