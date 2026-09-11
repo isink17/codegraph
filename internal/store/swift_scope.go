@@ -15,9 +15,10 @@ import (
 const swiftSelfRepairSettingKey = "resolver.swift_explicit_self_repaired.v1"
 const swiftClassSelfRepairSettingKey = "resolver.swift_class_self_final_repaired.v1"
 const swiftClassSelfTypeRepairSettingKey = "resolver.swift_class_self_type_final_repaired.v1"
+const swiftClassSelfFinalMethodRepairSettingKey = "resolver.swift_class_self_final_method_repaired.v1"
 const swiftTrailingRepairSettingKey = "resolver.swift_trailing_closure_repaired.v1"
 
-var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope, ResolutionStrategySwiftClassSelfFinalScope, ResolutionStrategySwiftClassSelfTypeFinalScope}
+var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope, ResolutionStrategySwiftClassSelfFinalScope, ResolutionStrategySwiftClassSelfTypeFinalScope, ResolutionStrategySwiftClassSelfFinalMethodScope}
 
 // Swift v3 call facts are owned here. Unsupported Swift calls must never fall
 // through to a name-based resolver.
@@ -42,6 +43,7 @@ type swiftScopeSymbol struct {
 	static                   sql.NullInt64
 	arityMin, arityMax       sql.NullInt64
 	dispatchFacts            int64
+	finalFacts               int64
 	dispatchMin, dispatchMax string
 }
 
@@ -218,9 +220,9 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 		return 0, err
 	}
 	var symbols []swiftScopeSymbol
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'') FROM symbols s JOIN tmp_swift_scope_candidates c ON c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature) AND c.is_static=s.is_static JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'') FROM symbols s JOIN tmp_swift_scope_candidates c ON c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature) AND c.is_static=s.is_static JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
 		var x swiftScopeSymbol
-		if err := rows.Scan(&x.id, &x.file, &x.name, &x.owner, &x.sig, &x.kind, &x.static, &x.arityMin, &x.arityMax, &x.dispatchFacts, &x.dispatchMin, &x.dispatchMax); err != nil {
+		if err := rows.Scan(&x.id, &x.file, &x.name, &x.owner, &x.sig, &x.kind, &x.static, &x.arityMin, &x.arityMax, &x.dispatchFacts, &x.finalFacts, &x.dispatchMin, &x.dispatchMax); err != nil {
 			return err
 		}
 		symbols = append(symbols, x)
