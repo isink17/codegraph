@@ -490,6 +490,9 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 	for _, tc := range cases {
 		prefix := "Stress_" + tc.name
 		childName, middleName, baseName := prefix+"Child", prefix+"Middle", prefix+"Base"
+		if tc.name == "qualified" {
+			childName, middleName, baseName = "Outer."+childName, "Outer."+middleName, "Outer."+baseName
+		}
 		child := f.symbol(f.mainFile, childName, "", "class", "", false)
 		middle := f.symbol(f.mainFile, middleName, "", "class", "", false)
 		base := f.symbol(f.mainFile, baseName, "", "class", "", false)
@@ -515,6 +518,9 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 		method := "run_" + tc.name
 		target := f.symbol(f.mainFile, method, baseName, "function", method+"()", false)
 		f.declarationFact(f.mainFile, target, true)
+		if tc.name == "final_child" {
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, child)
+		}
 		if tc.name == "same_owner_final_instance" || tc.name == "same_owner_final_class" {
 			if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE child_qualified_name=?`, childName); err != nil {
 				t.Fatal(err)
@@ -537,6 +543,11 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 		}
 		if tc.name == "target_bounded_parent" {
 			f.relation(f.mainFile, baseName, prefix+"ExternalRoot", "superclass", false, false)
+		}
+		if tc.name == "reverse" {
+			grandChild := f.symbol(f.mainFile, prefix+"GrandChild", "", "class", "", false)
+			f.declarationFact(f.mainFile, grandChild, false)
+			f.relation(f.mainFile, prefix+"GrandChild", childName, "superclass", false, false)
 		}
 		switch tc.name {
 		case "non_final":
@@ -584,7 +595,7 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 		case "competing_intermediate":
 			f.relation(f.mainFile, middleName, prefix+"Other", "superclass", false, false)
 		case "missing_child", "missing_middle", "missing_base":
-			f.store.db.ExecContext(f.ctx, `DELETE FROM symbols WHERE id=?`, map[string]int64{"missing_child": child, "missing_middle": middle, "missing_base": base}[tc.name])
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET kind='struct' WHERE id=?`, map[string]int64{"missing_child": child, "missing_middle": middle, "missing_base": base}[tc.name])
 		case "duplicate_child", "duplicate_middle", "duplicate_base":
 			f.symbol(f.mainFile, map[string]string{"duplicate_child": childName, "duplicate_middle": middleName, "duplicate_base": baseName}[tc.name], "", "class", "", false)
 		case "missing_child_fact", "missing_middle_fact", "missing_base_fact":
@@ -655,17 +666,17 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 				f.dispatchFact(f.mainFile, candidate, false, "instance")
 			}
 		}
-		if tc.strategy == "" {
-			// Keep each negative category isolated even when its specialized
-			// mutation is not relevant to the lowercase-self resolver.
-			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target)
-		}
 		for i := 0; i < perCase; i++ {
 			caller := f.symbol(f.mainFile, fmt.Sprintf("%sCaller%d", prefix, i), childName, "function", "f()", tc.name == "same_owner_final_class")
 			if tc.name == "same_owner_final_class" {
 				f.dispatchFact(f.mainFile, caller, false, "class")
 			}
 			name, evidence, arity := "self."+method, "swift:self", 0
+			if tc.name == "labels" {
+				name, evidence, arity = "self."+method, "swift:self;labels=id:", 1
+				f.arity(target, 1, 1)
+				f.store.db.ExecContext(f.ctx, `UPDATE symbols SET signature=? WHERE id=?`, method+"(id:)", target)
+			}
 			if tc.name == "trailing" || strings.HasPrefix(tc.name, "trailing_") {
 				name, evidence, arity = "self.perform_"+tc.name, "swift:self;trailing_labels=_", 1
 				f.arity(target, 1, 1)
@@ -685,33 +696,54 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 	if total != len(cases)*perCase || badMetadata != 0 {
 		t.Fatalf("state=(total %d,resolved %d,unresolved %d,badMetadata %d)", total, resolved, unresolved, badMetadata)
 	}
-	state := func() map[string]int {
+	type stressState struct {
+		total, resolved, unresolved, badMetadata int
+		strategies                               map[string]int
+	}
+	readState := func() stressState {
+		var out stressState
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*),COALESCE(SUM(dst_symbol_id IS NOT NULL),0),COALESCE(SUM(dst_symbol_id IS NULL),0),COALESCE(SUM(dst_symbol_id IS NULL AND (resolution_strategy<>'' OR resolution_confidence<>'')),0) FROM edges WHERE repo_id=?`, f.repoID).Scan(&out.total, &out.resolved, &out.unresolved, &out.badMetadata); err != nil {
+			t.Fatal(err)
+		}
 		rows, err := f.store.db.QueryContext(f.ctx, `SELECT resolution_strategy,COUNT(*) FROM edges WHERE repo_id=? GROUP BY resolution_strategy ORDER BY resolution_strategy`, f.repoID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer rows.Close()
-		out := map[string]int{}
+		out.strategies = map[string]int{}
 		for rows.Next() {
 			var strategy string
 			var count int
 			if err := rows.Scan(&strategy, &count); err != nil {
 				t.Fatal(err)
 			}
-			out[strategy] = count
+			out.strategies[strategy] = count
 		}
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
 		return out
 	}
-	first := state()
-	want := map[string]int{}
+	first := readState()
+	want := stressState{total: len(cases) * perCase, resolved: 1300, unresolved: 5500, badMetadata: 0, strategies: map[string]int{}}
 	for _, tc := range cases {
-		want[tc.strategy] += perCase
+		want.strategies[tc.strategy] += perCase
+	}
+	for _, tc := range cases {
+		gotDst, gotStrategy, gotConfidence := edgeState(t, f, samples[tc.name])
+		if gotStrategy != tc.strategy {
+			t.Fatalf("category %s strategy=%q want=%q", tc.name, gotStrategy, tc.strategy)
+		}
+		if tc.strategy == "" {
+			if gotDst.Valid || gotConfidence != "" {
+				t.Fatalf("category %s unresolved state=(%v,%q,%q)", tc.name, gotDst, gotStrategy, gotConfidence)
+			}
+		} else if !gotDst.Valid || gotDst.Int64 != targets[tc.name] || gotConfidence != ResolutionConfidenceHigh {
+			t.Fatalf("category %s resolved state=(%v,%q,%q), want target=%d", tc.name, gotDst, gotStrategy, gotConfidence, targets[tc.name])
+		}
 	}
 	if !reflect.DeepEqual(first, want) {
-		t.Fatalf("strategy counts=%d,%d,%d,%d,%d,%d want=%#v", first[ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope], first[ResolutionStrategySwiftClassSelfInheritedFinalMethodScope], first[ResolutionStrategySwiftClassSelfFinalMethodScope], first[ResolutionStrategySwiftClassSelfFinalClassMethodScope], first[ResolutionStrategySwiftClassSelfStaticMethodScope], first[""], want)
+		t.Fatalf("stress state=%#v want=%#v", first, want)
 	}
 	if got := f.dst(samples["two_hop"]); !got.Valid || got.Int64 != targets["two_hop"] {
 		t.Fatalf("2-hop=%v", got)
@@ -726,7 +758,7 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 		t.Fatalf("hazard=%v", got)
 	}
 	f.resolve()
-	if second := state(); !reflect.DeepEqual(second, first) {
+	if second := readState(); !reflect.DeepEqual(second, first) {
 		t.Fatalf("second strategy state=%v first=%v", second, first)
 	}
 }
