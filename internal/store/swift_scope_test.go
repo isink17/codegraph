@@ -6820,7 +6820,7 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeHardenedStress(t *testi
 				if tc.name == "base_private" {
 					dispatch = "class"
 				}
-				f.dispatchFact(f.mainFile, candidate, false, dispatch)
+				f.dispatchFact(f.mainFile, candidate, tc.name == "base_private", dispatch)
 				if tc.name == "base_private" {
 					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, candidate); err != nil {
 						t.Fatal(err)
