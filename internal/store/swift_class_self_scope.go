@@ -336,29 +336,86 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 	if err != nil {
 		return n + inherited, err
 	}
-	multilevel, err := s.resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx, q, repoID, only)
-	if err != nil {
-		return n + inherited + multilevel, err
-	}
 	static, err := s.resolveSwiftClassSelfInheritedStaticMethod(ctx, q, repoID, only)
 	if err != nil {
-		return n + inherited + multilevel + static, err
+		return n + inherited + static, err
 	}
 	finalClass, err := s.resolveSwiftClassSelfInheritedFinalClassMethod(ctx, q, repoID, only)
-	return n + inherited + multilevel + static + finalClass, err
+	if err != nil {
+		return n + inherited + static + finalClass, err
+	}
+	multilevel, err := s.resolveSwiftClassSelfMultilevelInherited(ctx, q, repoID, only)
+	return n + inherited + static + finalClass + multilevel, err
 }
 
-// resolveSwiftClassSelfMultilevelInheritedFinalMethod resolves only final
-// instance methods reached through two or more same-file superclass hops.
-// Relations and candidates are loaded in bulk; compatible members on the
-// required path veto the edge before an exact target is selected.
-func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
-	var edges []swiftScopeEdge
+// swiftMultilevelInheritedSpec parameterises the shared multi-level `self`
+// and `Self` traversal: the same proof walk binds a different member kind per
+// caller shape, so only the edge, target and blocker predicates differ.
+type swiftMultilevelInheritedSpec struct {
+	accept   func(shape swiftSelfCallShape, e swiftScopeEdge) bool
+	targetOK func(c swiftInheritedSelfCandidate) bool
+	blocks   func(b swiftSuperBlocker) bool
+	strategy string
+}
+
+// swiftMultilevelInheritedSpecs holds one spec per member kind reachable by the
+// shared walk. The two accept predicates are disjoint by call shape, so a
+// single pass decides both without loading the hierarchy evidence twice.
+//
+//   - lowercase `self`, instance caller -> inherited final instance method
+//   - uppercase `Self`                  -> inherited static method
+var swiftMultilevelInheritedSpecs = []swiftMultilevelInheritedSpec{
+	{
+		accept: func(shape swiftSelfCallShape, e swiftScopeEdge) bool {
+			return shape.strategy == ResolutionStrategySwiftSelfScope && e.static.Valid && e.static.Int64 == 0
+		},
+		targetOK: func(c swiftInheritedSelfCandidate) bool {
+			return c.visibility != "private" && c.static.Valid && c.static.Int64 == 0 &&
+				c.dispatchFacts == 1 && c.finalFacts == 1 && c.dispatchMin == "instance" && c.dispatchMax == "instance"
+		},
+		blocks: func(b swiftSuperBlocker) bool {
+			return b.static == 0 && b.kind != graph.ScopeImportSwiftEnumCase
+		},
+		strategy: ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope,
+	},
+	{
+		// A compiler-valid descendant cannot redeclare the inherited
+		// `static func`, so no descendant method overrides it. Non-function
+		// members (for example `static let make: () -> Void`) can still shadow
+		// the inherited callable name; those are handled conservatively by the
+		// `scope_import_evidence` blockers collected across the proven chain,
+		// which veto the edge instead of selecting a target.
+		accept: func(shape swiftSelfCallShape, e swiftScopeEdge) bool {
+			return shape.strategy == ResolutionStrategySwiftSelfTypeScope && e.static.Valid
+		},
+		targetOK: func(c swiftInheritedSelfCandidate) bool {
+			return c.visibility != "private" && c.static.Valid && c.static.Int64 == 1 &&
+				c.dispatchFacts == 1 && c.dispatchMin == "static" && c.dispatchMax == "static"
+		},
+		blocks:   func(b swiftSuperBlocker) bool { return b.static == 1 },
+		strategy: ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope,
+	},
+}
+
+// resolveSwiftClassSelfMultilevelInherited walks upward from the caller owner
+// through positively proven same-file superclass hops. Relations, classes and
+// candidates are loaded in bulk; compatible members on the required path veto
+// the edge before an exact target is selected, and the walk stops at the first
+// owner at depth >= 2 that carries any compatible member.
+//
+// The proof is same-file throughout: a cross-file extension of a chain member
+// is neither a candidate nor a veto, matching the direct inherited passes.
+func (s *Store) resolveSwiftClassSelfMultilevelInherited(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
+	type multilevelEdge struct {
+		swiftScopeEdge
+		spec swiftMultilevelInheritedSpec
+	}
+	var edges []multilevelEdge
 	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
 		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id JOIN files sf ON sf.id=src.file_id
 		WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls' AND e.dst_symbol_id IS NULL
 		  AND sf.id=e.file_id AND sf.is_deleted=0 AND src.repo_id=e.repo_id AND src.language='swift' AND src.kind='function'
-		  AND src.container_name<>'' AND src.is_static=0`,
+		  AND src.container_name<>''`,
 		" AND e.id IN (%s)", []any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e swiftScopeEdge
@@ -366,8 +423,14 @@ func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.
 				return err
 			}
 			shape, ok := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
-			if ok && shape.strategy == ResolutionStrategySwiftSelfScope && e.static.Valid && e.static.Int64 == 0 {
-				edges = append(edges, e)
+			if !ok {
+				return nil
+			}
+			for _, spec := range swiftMultilevelInheritedSpecs {
+				if spec.accept(shape, e) {
+					edges = append(edges, multilevelEdge{e, spec})
+					break
+				}
 			}
 			return nil
 		}); err != nil {
@@ -448,7 +511,18 @@ func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.
 	for _, c := range candidates {
 		candidatesByOwner[c.owner] = append(candidatesByOwner[c.owner], c)
 	}
-	blockers, err := swiftInheritedStaticLoadBlockers(ctx, q, repoID, swiftOwnerKeys(edges))
+	// Every class the walk may traverse can shadow the target with a same-named
+	// static or instance property, which lands in scope_import_evidence rather
+	// than symbols. Loading only the caller owners would miss those.
+	blockerOwners := map[string]struct{}{}
+	for _, e := range edges {
+		blockerOwners[e.owner] = struct{}{}
+	}
+	for _, r := range relations {
+		blockerOwners[r.child] = struct{}{}
+		blockerOwners[r.target] = struct{}{}
+	}
+	blockers, err := swiftInheritedStaticLoadBlockers(ctx, q, repoID, sortedSwiftSet(blockerOwners))
 	if err != nil {
 		return 0, err
 	}
@@ -553,7 +627,7 @@ func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.
 		matches := 0
 		var found swiftInheritedSelfCandidate
 		for _, c := range targetCandidates {
-			if c.visibility == "private" || !c.static.Valid || c.static.Int64 != 0 || c.dispatchFacts != 1 || c.finalFacts != 1 || c.dispatchMin != "instance" || c.dispatchMax != "instance" {
+			if !e.spec.targetOK(c) {
 				veto = true
 				continue
 			}
@@ -564,15 +638,20 @@ func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.
 			continue
 		}
 		blocked := false
-		for _, b := range blockers[e.owner+"\x00"+shape.method] {
-			if b.static != 0 || b.kind == graph.ScopeImportSwiftEnumCase || (!callerTest && swiftIsTestFile(tests, b.file)) {
-				continue
+		for _, owner := range chain {
+			for _, b := range blockers[owner+"\x00"+shape.method] {
+				if !e.spec.blocks(b) || (!callerTest && swiftIsTestFile(tests, b.file)) {
+					continue
+				}
+				blocked = true
+				break
 			}
-			blocked = true
-			break
+			if blocked {
+				break
+			}
 		}
 		if !blocked {
-			res[e.id] = swiftScopeBinding{dst: found.id, strategy: ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope}
+			res[e.id] = swiftScopeBinding{dst: found.id, strategy: e.spec.strategy}
 		}
 	}
 	return swiftScopeApply(ctx, q, res)
