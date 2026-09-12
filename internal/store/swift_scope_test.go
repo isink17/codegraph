@@ -265,7 +265,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeControls(t *testing.T) {
 			f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
 			tc.setup(f, target)
 			f.resolve()
-			assertSwiftEdgeUnresolved(t, f, edge)
+			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 		})
 	}
 }
@@ -281,7 +281,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeNamesAndLifecycle(t *testin
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, target); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeNamesAndLifecycle(t *testin
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Base' WHERE child_qualified_name='Child'`); err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeRejectsUnsafeCandidates(t *
 			f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
 			tc.setup(f, target)
 			f.resolve()
-			assertSwiftEdgeUnresolved(t, f, edge)
+			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 		})
 	}
 }
@@ -342,7 +342,9 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeUpgradeRepair(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+	refID := swiftReferenceID(t, f, edge)
+	assertSwiftReferenceCleared(t, f, refID)
 	var marker string
 	markerErr := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker)
 	if markerErr != sql.ErrNoRows {
@@ -353,6 +355,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeUpgradeRepair(t *testing.T)
 		t.Fatalf("repair=(%v,%v)", run, err)
 	}
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope)
+	assertSwiftReferenceTarget(t, f, refID, target)
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
 		t.Fatalf("post-repair marker=%q err=%v", marker, err)
 	}
@@ -361,10 +364,11 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeUpgradeRepair(t *testing.T)
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&firstDst, &firstStrategy, &firstConfidence); err != nil {
 		t.Fatal(err)
 	}
-	var firstReference sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&firstReference); err != nil {
-		t.Fatal(err)
+	firstReference := swiftReferenceSymbol(t, f, refID)
+	if !firstReference.Valid || firstReference.Int64 != target {
+		t.Fatalf("first reference=%v, want %d", firstReference, target)
 	}
+	firstMarker := marker
 	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || run {
 		t.Fatalf("second repair=(%v,%v)", run, err)
@@ -374,12 +378,13 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeUpgradeRepair(t *testing.T)
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&secondDst, &secondStrategy, &secondConfidence); err != nil {
 		t.Fatal(err)
 	}
-	var secondReference sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&secondReference); err != nil {
+	secondReference := swiftReferenceSymbol(t, f, refID)
+	var secondMarker string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&secondMarker); err != nil {
 		t.Fatal(err)
 	}
-	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference {
-		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v), second=(%v,%q,%q,%v)", firstDst, firstStrategy, firstConfidence, firstReference, secondDst, secondStrategy, secondConfidence, secondReference)
+	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference || firstMarker != secondMarker {
+		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v,%q), second=(%v,%q,%q,%v,%q)", firstDst, firstStrategy, firstConfidence, firstReference, firstMarker, secondDst, secondStrategy, secondConfidence, secondReference, secondMarker)
 	}
 }
 
@@ -405,7 +410,9 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeUnsafeRepair(t *testing.T) 
 	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
 		t.Fatalf("repair=(%v,%v)", ran, err)
 	}
-	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+	refID := swiftReferenceID(t, f, edge)
+	assertSwiftReferenceCleared(t, f, refID)
 	var marker string
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
 		t.Fatalf("marker=%q err=%v", marker, err)
@@ -421,7 +428,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeDeletedBlockerLifecycle(t *
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Blocker.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, blocker); err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +442,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeDeletedBlockerLifecycle(t *
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Blocker.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 }
 
 func TestSwiftClassSelfTypeInheritedStaticMethodScopeCallerAndOwnerFacts(t *testing.T) {
@@ -579,7 +586,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeIdentityAndVisibility(t *te
 			f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
 			tc.setup(f)
 			f.resolve()
-			assertSwiftEdgeUnresolved(t, f, edge)
+			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 			_ = target
 		})
 	}
@@ -627,7 +634,7 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeChildCandidatesAndCompetito
 			}
 			tc.add(f, method)
 			f.resolve()
-			assertSwiftEdgeUnresolved(t, f, edge)
+			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 		})
 	}
 }
@@ -2982,13 +2989,7 @@ func assertSwiftBinding(t *testing.T, f *swiftScopeFixture, edge, target int64, 
 	if got != target || strategy != wantStrategy || confidence != ResolutionConfidenceHigh {
 		t.Fatalf("binding=(%d,%q,%q), want (%d,%q,%q)", got, strategy, confidence, target, wantStrategy, ResolutionConfidenceHigh)
 	}
-	var reference sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil {
-		t.Fatal(err)
-	}
-	if !reference.Valid || reference.Int64 != target {
-		t.Fatalf("reference=%v, want %d", reference, target)
-	}
+	assertSwiftReferenceTarget(t, f, swiftReferenceID(t, f, edge), target)
 }
 
 func assertSwiftEdgeMetadata(t *testing.T, f *swiftScopeFixture, edge, target int64, wantStrategy string) {
@@ -3013,26 +3014,56 @@ func assertSwiftEdgeUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
 	if dst.Valid || strategy != "" || confidence != "" {
 		t.Fatalf("edge=(%v,%q,%q), want unresolved with empty metadata", dst, strategy, confidence)
 	}
-	var reference sql.NullInt64
-	err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=? LIMIT 1`, f.repoID).Scan(&reference)
-	if err != nil && err != sql.ErrNoRows {
+}
+
+func assertSwiftInheritedStaticEdgeUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
+	t.Helper()
+	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
+}
+
+func swiftReferenceID(t *testing.T, f *swiftScopeFixture, edge int64) int64 {
+	t.Helper()
+	var fileID, sourceID int64
+	var name string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT file_id,src_symbol_id,dst_name FROM edges WHERE id=?`, edge).Scan(&fileID, &sourceID, &name); err != nil {
 		t.Fatal(err)
 	}
-	if err == nil && reference.Valid {
-		t.Fatalf("reference=%d, want NULL", reference.Int64)
+	var refID int64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT id FROM references_tbl WHERE repo_id=? AND file_id=? AND context_symbol_id=? AND name=?`, f.repoID, fileID, sourceID, name).Scan(&refID); err != nil {
+		t.Fatal(err)
+	}
+	return refID
+}
+
+func swiftReferenceSymbol(t *testing.T, f *swiftScopeFixture, refID int64) sql.NullInt64 {
+	t.Helper()
+	var symbol sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE id=?`, refID).Scan(&symbol); err != nil {
+		t.Fatal(err)
+	}
+	return symbol
+}
+
+func assertSwiftReferenceTarget(t *testing.T, f *swiftScopeFixture, refID, target int64) {
+	t.Helper()
+	got := swiftReferenceSymbol(t, f, refID)
+	if !got.Valid || got.Int64 != target {
+		t.Fatalf("reference %v, want %d", got, target)
+	}
+}
+
+func assertSwiftReferenceCleared(t *testing.T, f *swiftScopeFixture, refID int64) {
+	t.Helper()
+	if got := swiftReferenceSymbol(t, f, refID); got.Valid {
+		t.Fatalf("reference=%d, want NULL", got.Int64)
 	}
 }
 
 func assertSwiftP22FinalClassEdgeUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
 	t.Helper()
 	assertSwiftEdgeUnresolved(t, f, edge)
-	var reference sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil {
-		t.Fatal(err)
-	}
-	if reference.Valid {
-		t.Fatalf("reference=%d, want NULL", reference.Int64)
-	}
+	assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
 }
 
 func TestSwiftClassSelfStaticMethodScope(t *testing.T) {
