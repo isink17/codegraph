@@ -338,7 +338,7 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 	}
 	static, err := s.resolveSwiftClassSelfInheritedStaticMethod(ctx, q, repoID, only)
 	if err != nil {
-		return n + inherited, err
+		return n + inherited + static, err
 	}
 	finalClass, err := s.resolveSwiftClassSelfInheritedFinalClassMethod(ctx, q, repoID, only)
 	return n + inherited + static + finalClass, err
