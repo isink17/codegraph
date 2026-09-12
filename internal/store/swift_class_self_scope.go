@@ -337,7 +337,11 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		return n + inherited, err
 	}
 	static, err := s.resolveSwiftClassSelfInheritedStaticMethod(ctx, q, repoID, only)
-	return n + inherited + static, err
+	if err != nil {
+		return n + inherited, err
+	}
+	finalClass, err := s.resolveSwiftClassSelfInheritedFinalClassMethod(ctx, q, repoID, only)
+	return n + inherited + static + finalClass, err
 }
 
 // resolveSwiftClassSelfInheritedFinalMethod is intentionally narrower than the
@@ -805,6 +809,226 @@ func (s *Store) resolveSwiftClassSelfInheritedStaticMethod(ctx context.Context, 
 		}
 		if !blocked {
 			res[p.edge.id] = swiftScopeBinding{dst: found.id, strategy: ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope}
+		}
+	}
+	return swiftScopeApply(ctx, q, res)
+}
+
+// resolveSwiftClassSelfInheritedFinalClassMethod proves only the final class
+// member case. Static members are intentionally left to P22.76.
+func (s *Store) resolveSwiftClassSelfInheritedFinalClassMethod(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
+	var edges []swiftScopeEdge
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
+		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id JOIN files sf ON sf.id=src.file_id
+		WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls' AND e.dst_symbol_id IS NULL
+		  AND (e.evidence='swift:Self' OR e.evidence LIKE 'swift:Self;%') AND sf.id=e.file_id AND sf.is_deleted=0
+		  AND src.repo_id=e.repo_id AND src.language='swift' AND src.kind='function' AND src.container_name<>''`,
+		" AND e.id IN (%s)", []any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
+		func(rows *sql.Rows) error {
+			var e swiftScopeEdge
+			if err := rows.Scan(&e.id, &e.file, &e.src, &e.dst, &e.evidence, &e.owner, &e.static, &e.arity); err != nil {
+				return err
+			}
+			shape, ok := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
+			if ok && shape.strategy == ResolutionStrategySwiftSelfTypeScope && e.static.Valid {
+				edges = append(edges, e)
+			}
+			return nil
+		}); err != nil {
+		return 0, err
+	}
+	if len(edges) == 0 {
+		return 0, nil
+	}
+	tests, err := testFileIDsForRepo(ctx, q, repoID)
+	if err != nil {
+		return 0, err
+	}
+	owners := swiftOwnerKeys(edges)
+	var classes []swiftClassSelfOwner
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.qualified_name,s.kind,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0)
+		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
+		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='class' AND s.qualified_name IN (`, `%s) GROUP BY s.id`,
+		[]any{repoID}, stringSliceToAny(owners), true, func(rows *sql.Rows) error {
+			var c swiftClassSelfOwner
+			if err := rows.Scan(&c.id, &c.file, &c.qname, &c.kind, &c.facts, &c.finals); err != nil {
+				return err
+			}
+			classes = append(classes, c)
+			return nil
+		}); err != nil {
+		return 0, err
+	}
+	relations, err := swiftInheritedLoadRelations(ctx, q, repoID, owners)
+	if err != nil {
+		return 0, err
+	}
+	type pending struct {
+		edge     swiftScopeEdge
+		relation swiftSuperRelation
+	}
+	var valid []pending
+	baseNames := map[string]struct{}{}
+	for _, e := range edges {
+		callerTest := swiftIsTestFile(tests, e.file)
+		count := 0
+		var child swiftClassSelfOwner
+		for _, c := range classes {
+			if c.qname != e.owner || (!callerTest && swiftIsTestFile(tests, c.file)) {
+				continue
+			}
+			count++
+			if c.file == e.file {
+				child = c
+			}
+		}
+		if count != 1 || child.facts != 1 {
+			continue
+		}
+		var direct []swiftSuperRelation
+		hazard := false
+		for _, r := range relations {
+			if r.child != e.owner || (!callerTest && swiftIsTestFile(tests, r.file)) {
+				continue
+			}
+			if r.generic != 0 || r.constrained != 0 || r.kind != "superclass" {
+				hazard = true
+			}
+			if r.kind == "superclass" {
+				direct = append(direct, r)
+			}
+		}
+		if hazard || len(direct) != 1 || direct[0].file != e.file {
+			continue
+		}
+		baseNames[direct[0].target] = struct{}{}
+		valid = append(valid, pending{e, direct[0]})
+	}
+	if len(valid) == 0 {
+		return 0, nil
+	}
+	bases, err := swiftSuperLoadClasses(ctx, q, repoID, sortedSwiftSet(baseNames))
+	if err != nil {
+		return 0, err
+	}
+	baseByName := map[string][]swiftSuperClass{}
+	for _, b := range bases {
+		baseByName[b.qname] = append(baseByName[b.qname], b)
+	}
+	filtered := valid[:0]
+	for _, p := range valid {
+		callerTest := swiftIsTestFile(tests, p.edge.file)
+		count := 0
+		var base swiftSuperClass
+		for _, b := range baseByName[p.relation.target] {
+			if !callerTest && swiftIsTestFile(tests, b.file) {
+				continue
+			}
+			count++
+			if b.file == p.edge.file {
+				base = b
+			}
+		}
+		if count == 1 && base.kind == "class" && base.file == p.edge.file {
+			filtered = append(filtered, p)
+		}
+	}
+	if len(filtered) == 0 {
+		return 0, nil
+	}
+	keys := map[string][]any{}
+	for _, p := range filtered {
+		shape, _ := parseSwiftSelfCallShape(p.edge.evidence, p.edge.dst, p.edge.arity)
+		sig := swiftSelector(shape.method, shape.regularLabels)
+		if len(shape.trailingLabels) > 0 {
+			sig = ""
+		}
+		for _, owner := range []string{p.relation.target, p.edge.owner} {
+			key := swiftCandidateKey(owner, shape.method, sig, 1) + "\x00" + strconv.FormatInt(p.edge.file, 10)
+			keys[key] = []any{p.edge.file, owner, shape.method, sig}
+		}
+	}
+	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_swift_inherited_final_class_candidates(file_id INTEGER NOT NULL,owner TEXT NOT NULL,name TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(file_id,owner,name,signature)) WITHOUT ROWID`); err != nil {
+		return 0, err
+	}
+	defer q.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_swift_inherited_final_class_candidates`)
+	if _, err := q.ExecContext(ctx, `DELETE FROM tmp_swift_inherited_final_class_candidates`); err != nil {
+		return 0, err
+	}
+	ordered := make([]string, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	rows := make([][]any, 0, len(ordered))
+	for _, key := range ordered {
+		rows = append(rows, keys[key])
+	}
+	if err := sqliteBatchedValuesExec(ctx, q, `INSERT INTO tmp_swift_inherited_final_class_candidates(file_id,owner,name,signature) VALUES `, "(?,?,?,?)", nil, rows); err != nil {
+		return 0, err
+	}
+	var candidates []swiftInheritedSelfCandidate
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
+		FROM symbols s JOIN tmp_swift_inherited_final_class_candidates c ON c.file_id=s.file_id AND c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature)
+		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
+		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function'
+		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+		var c swiftInheritedSelfCandidate
+		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.visibility, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
+			return err
+		}
+		candidates = append(candidates, c)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	blockers, err := swiftInheritedStaticLoadBlockers(ctx, q, repoID, owners)
+	if err != nil {
+		return 0, err
+	}
+	res := map[int64]swiftScopeBinding{}
+	for _, p := range filtered {
+		shape, _ := parseSwiftSelfCallShape(p.edge.evidence, p.edge.dst, p.edge.arity)
+		sig := swiftSelector(shape.method, shape.regularLabels)
+		matches, veto := 0, false
+		var found swiftInheritedSelfCandidate
+		for _, c := range candidates {
+			if c.file != p.edge.file || c.name != shape.method {
+				continue
+			}
+			if len(shape.trailingLabels) == 0 && c.sig != sig {
+				continue
+			}
+			if len(shape.trailingLabels) > 0 && !swiftInheritedTrailingCandidate(shape, c) {
+				continue
+			}
+			if c.owner == p.edge.owner {
+				veto = true
+				continue
+			}
+			if c.owner != p.relation.target {
+				continue
+			}
+			if c.visibility == "private" || !c.static.Valid || c.static.Int64 != 1 || c.dispatchFacts != 1 || c.dispatchMin != "class" || c.dispatchMax != "class" || c.finalFacts != 1 {
+				veto = true
+				continue
+			}
+			matches++
+			found = c
+		}
+		if veto || matches != 1 {
+			continue
+		}
+		blocked := false
+		for _, b := range blockers[p.edge.owner+"\x00"+shape.method] {
+			if b.static != 1 || (!swiftIsTestFile(tests, p.edge.file) && swiftIsTestFile(tests, b.file)) {
+				continue
+			}
+			blocked = true
+			break
+		}
+		if !blocked {
+			res[p.edge.id] = swiftScopeBinding{dst: found.id, strategy: ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope}
 		}
 	}
 	return swiftScopeApply(ctx, q, res)

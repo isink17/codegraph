@@ -265,7 +265,11 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeControls(t *testing.T) {
 			f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
 			tc.setup(f, target)
 			f.resolve()
-			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+			if tc.name == "final class" {
+				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+			} else {
+				assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+			}
 		})
 	}
 }
@@ -865,12 +869,13 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeHardenedStress(t *testing.T
 	}
 	f.resolve()
 	first := readState()
-	want := stressState{total: 4000, resolved: 1000, unresolved: 3000, badMetadata: 0, strategies: map[string]int{
-		ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope: 700,
-		ResolutionStrategySwiftClassSelfTypeStaticMethodScope:          100,
-		ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope:      100,
-		ResolutionStrategySwiftClassSelfInheritedFinalMethodScope:      100,
-		"": 3000,
+	want := stressState{total: 4000, resolved: 1100, unresolved: 2900, badMetadata: 0, strategies: map[string]int{
+		ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope:     700,
+		ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope: 100,
+		ResolutionStrategySwiftClassSelfTypeStaticMethodScope:              100,
+		ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope:          100,
+		ResolutionStrategySwiftClassSelfInheritedFinalMethodScope:          100,
+		"": 2900,
 	}}
 	if !reflect.DeepEqual(first, want) {
 		t.Fatalf("first state=%+v, want %+v", first, want)
@@ -5767,5 +5772,110 @@ func TestSwiftTrailingRepairFreshRepositoriesAvoidTax(t *testing.T) {
 		if err != nil || run {
 			t.Fatalf("repo %d repair=(%v,%v), want (false,nil)", i, run, err)
 		}
+	}
+}
+
+func newSwiftInheritedFinalClassSelfFixture(t *testing.T, staticCaller bool) (*swiftScopeFixture, int64, int64) {
+	t.Helper()
+	f := newSwiftScopeFixture(t)
+	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+	target := f.symbol(f.mainFile, "make", "Base", "function", "make()", true)
+	caller := f.symbol(f.mainFile, "f", "Child", "function", "f()", staticCaller)
+	edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
+	f.reference(f.mainFile, caller, "Self.make", 1)
+	f.declarationFact(f.mainFile, base, false)
+	f.declarationFact(f.mainFile, child, false)
+	f.dispatchFact(f.mainFile, target, true, "class")
+	f.relation(f.mainFile, "Child", "Base", "superclass", false, false)
+	return f, target, edge
+}
+
+func TestSwiftClassSelfTypeInheritedFinalClassMethodScope(t *testing.T) {
+	for _, staticCaller := range []bool{false, true} {
+		f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, staticCaller)
+		f.resolve()
+		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+	}
+	t.Run("final child", func(t *testing.T) {
+		f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=(SELECT id FROM symbols WHERE qualified_name='Child')`); err != nil {
+			t.Fatal(err)
+		}
+		f.resolve()
+		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+	})
+}
+
+func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeControls(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*swiftScopeFixture, int64)
+	}{
+		{"ordinary class", func(f *swiftScopeFixture, target int64) {
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0,dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
+				f.t.Fatal(err)
+			}
+		}},
+		{"private", func(f *swiftScopeFixture, target int64) {
+			_, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, target)
+			if err != nil {
+				f.t.Fatal(err)
+			}
+		}},
+		{"child candidate", func(f *swiftScopeFixture, _ int64) { f.symbol(f.mainFile, "make", "Child", "function", "make()", true) }},
+		{"unsafe base competitor", func(f *swiftScopeFixture, _ int64) {
+			competitor := f.symbol(f.mainFile, "make", "Base", "function", "make()", false)
+			f.dispatchFact(f.mainFile, competitor, false, "instance")
+		}},
+		{"static blocker", func(f *swiftScopeFixture, _ int64) {
+			f.blocker(f.mainFile, "Child", "make", graph.ScopeImportSwiftMemberValue, true)
+		}},
+		{"grandparent", func(f *swiftScopeFixture, _ int64) {
+			middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+			f.declarationFact(f.mainFile, middle, false)
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Middle' WHERE child_qualified_name='Child'`); err != nil {
+				f.t.Fatal(err)
+			}
+			f.relation(f.mainFile, "Middle", "Base", "superclass", false, false)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
+			tc.setup(f, target)
+			f.resolve()
+			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+		})
+	}
+}
+
+func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeUpgradeRepair(t *testing.T) {
+	f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
+	for _, repair := range resolverRepairs {
+		if repair.key == swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey {
+			continue
+		}
+		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refID := swiftReferenceID(t, f, edge)
+	if got := f.dst(edge); got.Valid {
+		t.Fatalf("pre-repair dst=%v, want unresolved", got)
+	}
+	assertSwiftReferenceCleared(t, f, refID)
+	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !run {
+		t.Fatalf("repair=(%v,%v)", run, err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+	assertSwiftReferenceTarget(t, f, refID, target)
+	var marker string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
+		t.Fatalf("marker=%q err=%v", marker, err)
+	}
+	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || run {
+		t.Fatalf("second repair=(%v,%v)", run, err)
 	}
 }
