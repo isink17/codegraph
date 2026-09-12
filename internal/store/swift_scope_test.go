@@ -172,6 +172,206 @@ func (f *swiftScopeFixture) resolveNames(names ...string) ResolveEdgesForNamesSt
 	return stats
 }
 
+func newSwiftMultilevelSelfFixture(t *testing.T, depth int) (*swiftScopeFixture, int64, int64) {
+	t.Helper()
+	f := newSwiftScopeFixture(t)
+	owners := make([]string, depth)
+	for i := range owners {
+		owners[i] = []string{"Child", "Middle", "Middle2", "Middle3"}[i]
+	}
+	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+	f.declarationFact(f.mainFile, base, false)
+	target := f.symbol(f.mainFile, "run", "Base", "function", "run()", false)
+	f.declarationFact(f.mainFile, target, true)
+	for i, owner := range owners {
+		id := f.symbol(f.mainFile, owner, "", "class", "", false)
+		f.declarationFact(f.mainFile, id, false)
+		if i > 0 {
+			f.relation(f.mainFile, owners[i-1], owner, "superclass", false, false)
+		}
+	}
+	f.relation(f.mainFile, owners[depth-1], "Base", "superclass", false, false)
+	caller := f.symbol(f.mainFile, "f", "Child", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
+	f.reference(f.mainFile, caller, "self.run", 1)
+	return f, target, edge
+}
+
+func TestSwiftClassSelfMultilevelInheritedFinalMethodScope(t *testing.T) {
+	for _, depth := range []int{2, 3, 4} {
+		t.Run(fmt.Sprintf("%d-hop", depth), func(t *testing.T) {
+			f, target, edge := newSwiftMultilevelSelfFixture(t, depth)
+			f.resolve()
+			assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope)
+		})
+	}
+}
+
+func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeControls(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*swiftScopeFixture, int64, int64)
+	}{
+		{"non-final target", func(f *swiftScopeFixture, _, target int64) {
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target)
+		}},
+		{"static target", func(f *swiftScopeFixture, _, target int64) {
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, target)
+		}},
+		{"missing target fact", func(f *swiftScopeFixture, _, target int64) {
+			f.store.db.ExecContext(f.ctx, `DELETE FROM swift_declaration_facts WHERE symbol_id=?`, target)
+		}},
+		{"unproven intermediate", func(f *swiftScopeFixture, _, _ int64) {
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='unproven' WHERE child_qualified_name='Middle'`)
+		}},
+		{"generic intermediate", func(f *swiftScopeFixture, _, _ int64) {
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET is_generic=1 WHERE child_qualified_name='Middle'`)
+		}},
+		{"conformance intermediate", func(f *swiftScopeFixture, _, _ int64) {
+			f.relation(f.mainFile, "Middle", "P", "conformance", false, false)
+		}},
+		{"cycle", func(f *swiftScopeFixture, _, _ int64) {
+			f.relation(f.mainFile, "Base", "Child", "superclass", false, false)
+		}},
+		{"intermediate candidate", func(f *swiftScopeFixture, _, _ int64) {
+			candidate := f.symbol(f.mainFile, "run", "Middle", "function", "run()", false)
+			f.declarationFact(f.mainFile, candidate, false)
+		}},
+		{"child candidate", func(f *swiftScopeFixture, _, _ int64) {
+			candidate := f.symbol(f.mainFile, "run", "Child", "function", "run()", false)
+			f.declarationFact(f.mainFile, candidate, false)
+		}},
+		{"private target", func(f *swiftScopeFixture, _, target int64) {
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, target)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _, edge := newSwiftMultilevelSelfFixture(t, 2)
+			var target int64
+			if err := f.store.db.QueryRowContext(f.ctx, `SELECT id FROM symbols WHERE qualified_name='Base.run'`).Scan(&target); err != nil {
+				t.Fatal(err)
+			}
+			tc.edit(f, edge, target)
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f, edge)
+		})
+	}
+}
+
+func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeLifecycle(t *testing.T) {
+	f, target, edge := newSwiftMultilevelSelfFixture(t, 2)
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope)
+	redecide := func() {
+		t.Helper()
+		if err := f.store.redecideSwiftSelfBindings(f.ctx, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='OtherBase' WHERE child_qualified_name='Middle'`); err != nil {
+		t.Fatal(err)
+	}
+	redecide()
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Base' WHERE child_qualified_name='Middle'`); err != nil {
+		t.Fatal(err)
+	}
+	redecide()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope)
+
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	redecide()
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	redecide()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope)
+}
+
+func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeRepair(t *testing.T) {
+	f, target, edge := newSwiftMultilevelSelfFixture(t, 2)
+	if got := f.dst(edge); got.Valid {
+		t.Fatalf("pre-repair dst=%v", got)
+	}
+	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || !run {
+		t.Fatalf("RepairResolverBindingsOnce=(%v,%v)", run, err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope)
+	var ref sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=? AND name='self.run'`, f.repoID).Scan(&ref); err != nil {
+		t.Fatal(err)
+	}
+	if !ref.Valid || ref.Int64 != target {
+		t.Fatalf("reference=%v want %d", ref, target)
+	}
+	var marker string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfMultilevelInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
+		t.Fatalf("marker=%q err=%v", marker, err)
+	}
+	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+	if err != nil || run {
+		t.Fatalf("second RepairResolverBindingsOnce=(%v,%v)", run, err)
+	}
+}
+
+func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *testing.T) {
+	f, target, edge := newSwiftMultilevelSelfFixture(t, 3)
+	for i := 0; i < 99; i++ {
+		f.call(f.mainFile, f.symbol(f.mainFile, fmt.Sprintf("caller%d", i), "Child", "function", fmt.Sprintf("caller%d()", i), false), "self.run", "swift:self", 0, 10+i)
+	}
+	for i := 0; i < 4700; i++ {
+		f.call(f.mainFile, f.symbol(f.mainFile, fmt.Sprintf("malformed%d", i), "Child", "function", fmt.Sprintf("malformed%d()", i), false), "self.bad", "swift:self;malformed=true", 0, 1000+i)
+	}
+	f.resolve()
+	var total, resolved, unresolved int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*),SUM(dst_symbol_id IS NOT NULL),SUM(dst_symbol_id IS NULL) FROM edges WHERE repo_id=?`, f.repoID).Scan(&total, &resolved, &unresolved); err != nil {
+		t.Fatal(err)
+	}
+	if total != 4800 || resolved != 100 || unresolved != 4700 {
+		t.Fatalf("state=(total %d,resolved %d,unresolved %d)", total, resolved, unresolved)
+	}
+	var got int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND resolution_strategy=?`, f.repoID, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 100 {
+		t.Fatalf("P22.78 count=%d want 100", got)
+	}
+	if got := f.dst(edge); !got.Valid || got.Int64 != target {
+		t.Fatalf("stress edge=%v want %d", got, target)
+	}
+	state := func() map[string]int {
+		rows, err := f.store.db.QueryContext(f.ctx, `SELECT resolution_strategy,COUNT(*) FROM edges WHERE repo_id=? GROUP BY resolution_strategy ORDER BY resolution_strategy`, f.repoID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]int{}
+		for rows.Next() {
+			var strategy string
+			var count int
+			if err := rows.Scan(&strategy, &count); err != nil {
+				t.Fatal(err)
+			}
+			out[strategy] = count
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	first := state()
+	f.resolve()
+	if second := state(); !reflect.DeepEqual(second, first) {
+		t.Fatalf("second strategy state=%v first=%v", second, first)
+	}
+}
+
 func newSwiftInheritedStaticSelfFixture(t *testing.T, staticCaller bool) (*swiftScopeFixture, int64, int64) {
 	t.Helper()
 	f := newSwiftScopeFixture(t)
