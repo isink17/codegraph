@@ -6305,6 +6305,20 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeLifecycle(t *testing.T)
 		t.Fatal(err)
 	}
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=0 WHERE id=?`, hazard); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, hazard); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
 
 	blocker := f.file("Blocker.swift")
 	f.blocker(blocker, "Child", "make", graph.ScopeImportSwiftMemberValue, true)
@@ -6393,7 +6407,14 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeLifecycle(t *testing.T)
 		t.Fatal(err)
 	}
 	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Base',relation_kind='unproven' WHERE child_qualified_name='Child'`); err != nil {
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Base' WHERE child_qualified_name='Child'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='unproven' WHERE child_qualified_name='Child'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
@@ -6439,6 +6460,44 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScope(t *testing.T) {
 		}
 		f.resolve()
 		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+	})
+}
+
+func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeNamesAndStats(t *testing.T) {
+	t.Run("positive", func(t *testing.T) {
+		f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
+		stats := f.resolveNames("make")
+		assertSwiftStats(t, stats, 1, 1, 0, 0)
+		assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
+		assertSwiftReferenceTarget(t, f, swiftReferenceID(t, f, edge), target)
+	})
+	t.Run("ordinary class", func(t *testing.T) {
+		f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0,dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
+			t.Fatal(err)
+		}
+		stats := f.resolveNames("make")
+		assertSwiftStats(t, stats, 1, 0, 1, 0)
+		assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+	})
+	t.Run("grandparent", func(t *testing.T) {
+		f, _, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
+		middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+		f.declarationFact(f.mainFile, middle, false)
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Middle' WHERE child_qualified_name='Child'`); err != nil {
+			t.Fatal(err)
+		}
+		f.relation(f.mainFile, "Middle", "Base", "superclass", false, false)
+		stats := f.resolveNames("make")
+		assertSwiftStats(t, stats, 1, 0, 1, 0)
+		assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+	})
+	t.Run("inherited static", func(t *testing.T) {
+		f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
+		stats := f.resolveNames("make")
+		assertSwiftStats(t, stats, 1, 1, 0, 0)
+		assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope)
+		assertSwiftReferenceTarget(t, f, swiftReferenceID(t, f, edge), target)
 	})
 }
 
@@ -6518,9 +6577,29 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeUpgradeRepair(t *testin
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
 		t.Fatalf("marker=%q err=%v", marker, err)
 	}
+	var firstDst sql.NullInt64
+	var firstStrategy, firstConfidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&firstDst, &firstStrategy, &firstConfidence); err != nil {
+		t.Fatal(err)
+	}
+	firstReference := swiftReferenceSymbol(t, f, refID)
+	firstMarker := marker
 	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || run {
 		t.Fatalf("second repair=(%v,%v)", run, err)
+	}
+	var secondDst sql.NullInt64
+	var secondStrategy, secondConfidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&secondDst, &secondStrategy, &secondConfidence); err != nil {
+		t.Fatal(err)
+	}
+	secondReference := swiftReferenceSymbol(t, f, refID)
+	var secondMarker string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&secondMarker); err != nil {
+		t.Fatal(err)
+	}
+	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference || firstMarker != secondMarker {
+		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v,%q), second=(%v,%q,%q,%v,%q)", firstDst, firstStrategy, firstConfidence, firstReference, firstMarker, secondDst, secondStrategy, secondConfidence, secondReference, secondMarker)
 	}
 }
 
@@ -6602,9 +6681,7 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeHardenedStress(t *testi
 			}
 			return ""
 		}(), "class", "", false)
-		if tc.name != "missing_fact" {
-			f.declarationFact(childFile, child, tc.name == "final_child")
-		}
+		f.declarationFact(childFile, child, tc.name == "final_child")
 		if tc.name != "missing_base" {
 			base := f.symbol(baseFile, baseName, func() string {
 				if tc.name == "qualified" {
@@ -6714,7 +6791,7 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeHardenedStress(t *testi
 			default:
 				f.dispatchFact(targetFile, target, true, "class")
 			}
-			if tc.name == "private" || tc.name == "base_private" {
+			if tc.name == "private" {
 				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, target); err != nil {
 					t.Fatal(err)
 				}
@@ -6728,7 +6805,7 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeHardenedStress(t *testi
 					f.dispatchFact(f.mainFile, candidate, tc.name == "child_final", "class")
 				}
 			}
-			if tc.name == "base_static" || tc.name == "base_class" || tc.name == "base_instance" || tc.name == "base_malformed" {
+			if tc.name == "base_static" || tc.name == "base_class" || tc.name == "base_instance" || tc.name == "base_malformed" || tc.name == "base_private" {
 				candidate := f.symbol(f.mainFile, method, baseOwner, "function", method+"()", tc.name != "base_instance")
 				dispatch := ""
 				if tc.name == "base_static" {
@@ -6740,7 +6817,15 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeHardenedStress(t *testi
 				if tc.name == "base_instance" {
 					dispatch = "instance"
 				}
-				f.dispatchFact(f.mainFile, candidate, tc.name == "base_class", dispatch)
+				if tc.name == "base_private" {
+					dispatch = "class"
+				}
+				f.dispatchFact(f.mainFile, candidate, false, dispatch)
+				if tc.name == "base_private" {
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, candidate); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 			if tc.name == "trailing_ambiguity" || tc.name == "trailing_unsafe" {
 				candidate := f.symbol(f.mainFile, "perform", baseOwner, "function", "perform(_:)", true)
