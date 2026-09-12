@@ -350,8 +350,8 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 
 // resolveSwiftClassSelfMultilevelInheritedFinalMethod resolves only final
 // instance methods reached through two or more same-file superclass hops.
-// Relations and candidates are loaded in bulk; a malformed compatible member
-// anywhere outside the selected owner vetoes the edge.
+// Relations and candidates are loaded in bulk; compatible members on the
+// required path veto the edge before an exact target is selected.
 func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
 	var edges []swiftScopeEdge
 	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
@@ -472,50 +472,6 @@ func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.
 	res := map[int64]swiftScopeBinding{}
 	for _, e := range edges {
 		callerTest := swiftIsTestFile(tests, e.file)
-		chain := []string{e.owner}
-		visited := map[string]struct{}{e.owner: {}}
-		valid := true
-		for {
-			if _, ok := classFor(chain[len(chain)-1], e.file, callerTest); !ok {
-				valid = false
-				break
-			}
-			var supers []swiftSuperRelation
-			hazard := false
-			for _, r := range relationsByChild[chain[len(chain)-1]] {
-				if !callerTest && swiftIsTestFile(tests, r.file) {
-					continue
-				}
-				if r.kind != "superclass" || r.generic != 0 || r.constrained != 0 {
-					hazard = true
-				}
-				if r.kind == "superclass" {
-					supers = append(supers, r)
-				}
-			}
-			if hazard || len(supers) > 1 {
-				valid = false
-				break
-			}
-			if len(supers) == 0 {
-				break
-			}
-			if supers[0].file != e.file {
-				valid = false
-				break
-			}
-			parent := supers[0].target
-			if _, ok := visited[parent]; ok {
-				valid = false
-				break
-			}
-			visited[parent] = struct{}{}
-			chain = append(chain, parent)
-		}
-		if !valid || len(chain) < 3 {
-			continue
-		}
-
 		shape, _ := parseSwiftSelfCallShape(e.evidence, e.dst, e.arity)
 		compatible := func(c swiftInheritedSelfCandidate) bool {
 			if c.file != e.file || c.name != shape.method {
@@ -526,45 +482,83 @@ func (s *Store) resolveSwiftClassSelfMultilevelInheritedFinalMethod(ctx context.
 			}
 			return swiftInheritedTrailingCandidate(shape, c)
 		}
-		targetIndex := -1
-		for i := 2; i < len(chain); i++ {
-			for _, c := range candidatesByOwner[chain[i]] {
-				if compatible(c) {
-					targetIndex = i
-					break
-				}
-			}
-			if targetIndex >= 0 {
+		if _, ok := classFor(e.owner, e.file, callerTest); !ok {
+			continue
+		}
+		childCandidate := false
+		for _, c := range candidatesByOwner[e.owner] {
+			if compatible(c) {
+				childCandidate = true
 				break
 			}
 		}
-		if targetIndex < 0 {
+		if childCandidate {
 			continue
 		}
-		veto, matches := false, 0
-		var found swiftInheritedSelfCandidate
-		for _, c := range candidatesByOwner[e.owner] {
-			if compatible(c) {
+		chain := []string{e.owner}
+		visited := map[string]struct{}{e.owner: {}}
+		var targetCandidates []swiftInheritedSelfCandidate
+		veto := false
+		for {
+			current := chain[len(chain)-1]
+			var supers []swiftSuperRelation
+			hazard := false
+			for _, r := range relationsByChild[current] {
+				if !callerTest && swiftIsTestFile(tests, r.file) {
+					continue
+				}
+				if r.kind != "superclass" || r.generic != 0 || r.constrained != 0 {
+					hazard = true
+				}
+				if r.kind == "superclass" {
+					supers = append(supers, r)
+				}
+			}
+			if hazard || len(supers) > 1 || len(supers) == 0 || supers[0].file != e.file {
+				break
+			}
+			parent := supers[0].target
+			if _, ok := visited[parent]; ok {
 				veto = true
+				break
+			}
+			if _, ok := classFor(parent, e.file, callerTest); !ok {
+				veto = true
+				break
+			}
+			visited[parent] = struct{}{}
+			chain = append(chain, parent)
+			depth := len(chain) - 1
+			var matchesAtParent []swiftInheritedSelfCandidate
+			for _, c := range candidatesByOwner[parent] {
+				if compatible(c) {
+					matchesAtParent = append(matchesAtParent, c)
+				}
+			}
+			if depth == 1 {
+				if len(matchesAtParent) > 0 {
+					veto = true
+					break
+				}
+				continue
+			}
+			if len(matchesAtParent) > 0 {
+				targetCandidates = matchesAtParent
+				break
 			}
 		}
-		for i, owner := range chain[1:] {
-			depth := i + 1
-			for _, c := range candidatesByOwner[owner] {
-				if !compatible(c) {
-					continue
-				}
-				if depth != targetIndex {
-					veto = true
-					continue
-				}
-				if c.visibility == "private" || !c.static.Valid || c.static.Int64 != 0 || c.dispatchFacts != 1 || c.finalFacts != 1 || c.dispatchMin != "instance" || c.dispatchMax != "instance" {
-					veto = true
-					continue
-				}
-				matches++
-				found = c
+		if veto || len(chain) < 3 || len(targetCandidates) == 0 {
+			continue
+		}
+		matches := 0
+		var found swiftInheritedSelfCandidate
+		for _, c := range targetCandidates {
+			if c.visibility == "private" || !c.static.Valid || c.static.Int64 != 0 || c.dispatchFacts != 1 || c.finalFacts != 1 || c.dispatchMin != "instance" || c.dispatchMax != "instance" {
+				veto = true
+				continue
 			}
+			matches++
+			found = c
 		}
 		if veto || matches != 1 {
 			continue
