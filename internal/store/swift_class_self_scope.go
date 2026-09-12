@@ -49,6 +49,24 @@ func swiftInheritedLoadRelations(ctx context.Context, q javaQuery, repoID int64,
 	return out, err
 }
 
+func swiftInheritedStaticLoadBlockers(ctx context.Context, q javaQuery, repoID int64, owners []string) (map[string][]swiftSuperBlocker, error) {
+	out := map[string][]swiftSuperBlocker{}
+	err := sqliteBatchedQuery(ctx, q, `SELECT p.owner_module,p.local_name,p.file_id,p.is_static,p.import_kind FROM scope_import_evidence p
+		JOIN files f ON f.id=p.file_id AND f.is_deleted=0
+		WHERE p.repo_id=? AND p.language='swift' AND p.import_kind IN (?,?) AND p.owner_module IN (`, `%s)`,
+		[]any{repoID, graph.ScopeImportSwiftMemberValue, graph.ScopeImportSwiftEnumCase}, stringSliceToAny(owners), true,
+		func(rows *sql.Rows) error {
+			var owner, name string
+			var blocker swiftSuperBlocker
+			if err := rows.Scan(&owner, &name, &blocker.file, &blocker.static, &blocker.kind); err != nil {
+				return err
+			}
+			out[owner+"\x00"+name] = append(out[owner+"\x00"+name], blocker)
+			return nil
+		})
+	return out, err
+}
+
 func swiftInheritedTrailingCandidate(call swiftSelfCallShape, candidate swiftInheritedSelfCandidate) bool {
 	if !candidate.arityMin.Valid || !candidate.arityMax.Valid || candidate.arityMin.Int64 != int64(call.arity) || candidate.arityMax.Int64 != int64(call.arity) {
 		return false
@@ -740,7 +758,7 @@ func (s *Store) resolveSwiftClassSelfInheritedStaticMethod(ctx context.Context, 
 	}); err != nil {
 		return 0, err
 	}
-	blockers, err := swiftSuperLoadBlockers(ctx, q, repoID, owners)
+	blockers, err := swiftInheritedStaticLoadBlockers(ctx, q, repoID, owners)
 	if err != nil {
 		return 0, err
 	}
