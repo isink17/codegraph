@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -342,14 +343,43 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeUpgradeRepair(t *testing.T)
 		}
 	}
 	assertSwiftEdgeUnresolved(t, f, edge)
+	var marker string
+	markerErr := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker)
+	if markerErr != sql.ErrNoRows {
+		t.Fatalf("pre-repair marker=%q err=%v, want absent", marker, markerErr)
+	}
 	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || !run {
 		t.Fatalf("repair=(%v,%v)", run, err)
 	}
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope)
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
+		t.Fatalf("post-repair marker=%q err=%v", marker, err)
+	}
+	var firstDst sql.NullInt64
+	var firstStrategy, firstConfidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&firstDst, &firstStrategy, &firstConfidence); err != nil {
+		t.Fatal(err)
+	}
+	var firstReference sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&firstReference); err != nil {
+		t.Fatal(err)
+	}
 	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || run {
 		t.Fatalf("second repair=(%v,%v)", run, err)
+	}
+	var secondDst sql.NullInt64
+	var secondStrategy, secondConfidence string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&secondDst, &secondStrategy, &secondConfidence); err != nil {
+		t.Fatal(err)
+	}
+	var secondReference sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&secondReference); err != nil {
+		t.Fatal(err)
+	}
+	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference {
+		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v), second=(%v,%q,%q,%v)", firstDst, firstStrategy, firstConfidence, firstReference, secondDst, secondStrategy, secondConfidence, secondReference)
 	}
 }
 
@@ -798,61 +828,50 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeHardenedStress(t *testing.T
 			}
 		}
 	}
-	f.resolve()
-	var total, resolved, unresolved, badMetadata int
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*),COALESCE(SUM(dst_symbol_id IS NOT NULL),0),COALESCE(SUM(dst_symbol_id IS NULL),0),COALESCE(SUM(dst_symbol_id IS NULL AND (resolution_strategy<>'' OR resolution_confidence<>'')),0) FROM edges WHERE repo_id=?`, f.repoID).Scan(&total, &resolved, &unresolved, &badMetadata); err != nil {
-		t.Fatal(err)
+	type stressState struct {
+		total, resolved, unresolved, badMetadata int
+		strategies                               map[string]int
 	}
-	if total != len(cases)*perCase || resolved != 1000 || unresolved != 3000 || badMetadata != 0 {
+	readState := func() stressState {
+		var state stressState
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*),COALESCE(SUM(dst_symbol_id IS NOT NULL),0),COALESCE(SUM(dst_symbol_id IS NULL),0),COALESCE(SUM(dst_symbol_id IS NULL AND (resolution_strategy<>'' OR resolution_confidence<>'')),0) FROM edges WHERE repo_id=?`, f.repoID).Scan(&state.total, &state.resolved, &state.unresolved, &state.badMetadata); err != nil {
+			t.Fatal(err)
+		}
+		state.strategies = map[string]int{}
 		rows, err := f.store.db.QueryContext(f.ctx, `SELECT resolution_strategy,COUNT(*) FROM edges WHERE repo_id=? GROUP BY resolution_strategy`, f.repoID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		counts := map[string]int{}
+		defer rows.Close()
 		for rows.Next() {
 			var strategy string
 			var count int
 			if err := rows.Scan(&strategy, &count); err != nil {
 				t.Fatal(err)
 			}
-			counts[strategy] = count
+			state.strategies[strategy] = count
 		}
-		rows.Close()
-		t.Fatalf("total=%d resolved=%d unresolved=%d bad_metadata=%d strategies=%v", total, resolved, unresolved, badMetadata, counts)
-	}
-	want := map[string]int{ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope: 700, ResolutionStrategySwiftClassSelfTypeStaticMethodScope: 100, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope: 100, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope: 100}
-	rows, err := f.store.db.QueryContext(f.ctx, `SELECT resolution_strategy,COUNT(*) FROM edges WHERE repo_id=? GROUP BY resolution_strategy`, f.repoID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := map[string]int{}
-	for rows.Next() {
-		var strategy string
-		var count int
-		if err := rows.Scan(&strategy, &count); err != nil {
+		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		got[strategy] = count
-	}
-	rows.Close()
-	if len(got) != len(want)+1 {
-		t.Fatalf("strategies=%v", got)
-	}
-	for strategy, count := range want {
-		if got[strategy] != count {
-			t.Fatalf("strategy %q=%d want %d", strategy, got[strategy], count)
-		}
-	}
-	if got[""] != 3000 {
-		t.Fatalf("unresolved strategy count=%d", got[""])
+		return state
 	}
 	f.resolve()
-	var resolved2, unresolved2 int
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COALESCE(SUM(dst_symbol_id IS NOT NULL),0),COALESCE(SUM(dst_symbol_id IS NULL),0) FROM edges WHERE repo_id=?`, f.repoID).Scan(&resolved2, &unresolved2); err != nil {
-		t.Fatal(err)
+	first := readState()
+	want := stressState{total: 4000, resolved: 1000, unresolved: 3000, badMetadata: 0, strategies: map[string]int{
+		ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope: 700,
+		ResolutionStrategySwiftClassSelfTypeStaticMethodScope:          100,
+		ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope:      100,
+		ResolutionStrategySwiftClassSelfInheritedFinalMethodScope:      100,
+		"": 3000,
+	}}
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("first state=%+v, want %+v", first, want)
 	}
-	if resolved2 != resolved || unresolved2 != unresolved {
-		t.Fatalf("second=(%d,%d), first=(%d,%d)", resolved2, unresolved2, resolved, unresolved)
+	f.resolve()
+	second := readState()
+	if !reflect.DeepEqual(second, first) {
+		t.Fatalf("second state=%+v, first=%+v", second, first)
 	}
 }
 
@@ -2993,6 +3012,14 @@ func assertSwiftEdgeUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
 	}
 	if dst.Valid || strategy != "" || confidence != "" {
 		t.Fatalf("edge=(%v,%q,%q), want unresolved with empty metadata", dst, strategy, confidence)
+	}
+	var reference sql.NullInt64
+	err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=? LIMIT 1`, f.repoID).Scan(&reference)
+	if err != nil && err != sql.ErrNoRows {
+		t.Fatal(err)
+	}
+	if err == nil && reference.Valid {
+		t.Fatalf("reference=%d, want NULL", reference.Int64)
 	}
 }
 
