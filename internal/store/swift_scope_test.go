@@ -8161,15 +8161,31 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeRepair(t *testing
 
 	firstDst, firstStrategy, firstConfidence := edgeState(t, f, edge)
 	firstReference := swiftReferenceSymbol(t, f, swiftReferenceID(t, f, edge))
+	firstMarker := swiftRepairMarkerValue(t, f, swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey)
+	if firstMarker != "1" {
+		t.Fatalf("first marker=%q want %q", firstMarker, "1")
+	}
 	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || ran {
 		t.Fatalf("second RepairResolverBindingsOnce=(%v,%v)", ran, err)
 	}
 	secondDst, secondStrategy, secondConfidence := edgeState(t, f, edge)
 	secondReference := swiftReferenceSymbol(t, f, swiftReferenceID(t, f, edge))
-	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference {
-		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v), second=(%v,%q,%q,%v)", firstDst, firstStrategy, firstConfidence, firstReference, secondDst, secondStrategy, secondConfidence, secondReference)
+	secondMarker := swiftRepairMarkerValue(t, f, swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey)
+	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference || firstMarker != secondMarker {
+		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v,%q), second=(%v,%q,%q,%v,%q)", firstDst, firstStrategy, firstConfidence, firstReference, firstMarker, secondDst, secondStrategy, secondConfidence, secondReference, secondMarker)
 	}
+}
+
+// swiftRepairMarkerValue reads the raw repair marker so a second pass can prove
+// the marker is byte-identical rather than merely still present.
+func swiftRepairMarkerValue(t *testing.T, f *swiftScopeFixture, key string) string {
+	t.Helper()
+	var value string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, fmt.Sprintf("%s.%d", key, f.repoID)).Scan(&value); err != nil {
+		t.Fatalf("marker %s: %v", key, err)
+	}
+	return value
 }
 
 func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeUnsafeRepair(t *testing.T) {

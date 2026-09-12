@@ -379,9 +379,12 @@ var swiftMultilevelInheritedSpecs = []swiftMultilevelInheritedSpec{
 		strategy: ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope,
 	},
 	{
-		// `static` members cannot be overridden or shadowed by any descendant
-		// declaration, so the destination is exact once the chain, the owner
-		// and the single candidate are proven.
+		// A compiler-valid descendant cannot redeclare the inherited
+		// `static func`, so no descendant method overrides it. Non-function
+		// members (for example `static let make: () -> Void`) can still shadow
+		// the inherited callable name; those are handled conservatively by the
+		// `scope_import_evidence` blockers collected across the proven chain,
+		// which veto the edge instead of selecting a target.
 		accept: func(shape swiftSelfCallShape, e swiftScopeEdge) bool {
 			return shape.strategy == ResolutionStrategySwiftSelfTypeScope && e.static.Valid
 		},
