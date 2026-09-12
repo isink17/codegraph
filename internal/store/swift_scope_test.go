@@ -609,7 +609,15 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 			}
 			candidate := f.symbol(f.mainFile, method, owner, "function", method+"()", strings.Contains(tc.name, "static") || strings.Contains(tc.name, "class"))
 			if tc.name != "intermediate_missing_fact_candidate" {
-				f.dispatchFact(f.mainFile, candidate, false, "instance")
+				dispatch := "instance"
+				if tc.name == "intermediate_static_candidate" {
+					dispatch = "static"
+				} else if tc.name == "intermediate_class_candidate" {
+					dispatch = "class"
+				} else if tc.name == "intermediate_malformed_candidate" {
+					dispatch = ""
+				}
+				f.dispatchFact(f.mainFile, candidate, false, dispatch)
 			}
 			if tc.name == "intermediate_private_candidate" {
 				f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, candidate)
