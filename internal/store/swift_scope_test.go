@@ -2845,13 +2845,7 @@ func assertSwiftBindingCleared(t *testing.T, f *swiftScopeFixture, edge int64) {
 	if dst != "" || strategy != "" || confidence != "" {
 		t.Fatalf("unsafe binding survived=(%q,%q,%q)", dst, strategy, confidence)
 	}
-	var reference sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil {
-		t.Fatal(err)
-	}
-	if reference.Valid {
-		t.Fatalf("unsafe reference survived=%d", reference.Int64)
-	}
+	assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
 }
 
 func TestSwiftClassSelfTypeBatchedMixedEdges(t *testing.T) {
