@@ -197,6 +197,42 @@ func newSwiftMultilevelSelfFixture(t *testing.T, depth int) (*swiftScopeFixture,
 	return f, target, edge
 }
 
+func newSwiftMultilevelInheritedFinalClassFixture(t *testing.T, depth int) (*swiftScopeFixture, int64, int64) {
+	t.Helper()
+	f, target, edge := newSwiftMultilevelSelfFixture(t, depth)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_name='Self.run',evidence='swift:Self' WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET name='Self.run',qualified_name='Self.run' WHERE context_symbol_id=?`, f.symbolID("Child.f")); err != nil {
+		t.Fatal(err)
+	}
+	return f, target, edge
+}
+
+func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope(t *testing.T) {
+	for _, depth := range []int{2, 3, 4} {
+		t.Run(fmt.Sprintf("%d-hop", depth), func(t *testing.T) {
+			f, target, edge := newSwiftMultilevelInheritedFinalClassFixture(t, depth)
+			f.resolve()
+			assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope)
+		})
+	}
+	t.Run("ordinary class is unresolved", func(t *testing.T) {
+		f, _, edge := newSwiftMultilevelInheritedFinalClassFixture(t, 2)
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, f.symbolID("Base.run")); err != nil {
+			t.Fatal(err)
+		}
+		f.resolve()
+		assertSwiftEdgeUnresolved(t, f, edge)
+	})
+}
+
 func TestSwiftClassSelfMultilevelInheritedFinalMethodScope(t *testing.T) {
 	for _, depth := range []int{2, 3, 4} {
 		t.Run(fmt.Sprintf("%d-hop", depth), func(t *testing.T) {
@@ -7108,8 +7144,8 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeNamesAndStats(t *testin
 		}
 		f.relation(f.mainFile, "Middle", "Base", "superclass", false, false)
 		stats := f.resolveNames("make")
-		assertSwiftStats(t, stats, 1, 0, 1, 0)
-		assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+		assertSwiftStats(t, stats, 1, 1, 0, 0)
+		assertSwiftEdgeMetadata(t, f, edge, f.symbolID("Base.make"), ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope)
 	})
 	t.Run("inherited static", func(t *testing.T) {
 		f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
@@ -7156,7 +7192,11 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeControls(t *testing.T) 
 			f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
 			tc.setup(f, target)
 			f.resolve()
-			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+			if tc.name == "grandparent" {
+				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope)
+			} else {
+				assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+			}
 		})
 	}
 }
@@ -7266,7 +7306,7 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeHardenedStress(t *testi
 		{"same_final_class", ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope},
 		{"inherited_final_instance", ResolutionStrategySwiftClassSelfInheritedFinalMethodScope},
 		{"inherited_static", ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope},
-		{"ordinary_class", ""}, {"grandparent", ""}, {"missing_relation", ""}, {"duplicate_relation", ""},
+		{"ordinary_class", ""}, {"grandparent", ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope}, {"missing_relation", ""}, {"duplicate_relation", ""},
 		{"cross_competing", ""}, {"unproven", ""}, {"conformance", ""}, {"cross_conformance", ""},
 		{"generic", ""}, {"constrained", ""}, {"missing_base", ""}, {"duplicate_base", ""},
 		{"cross_base", ""}, {"cross_relation", ""}, {"cross_method", ""}, {"private", ""},
@@ -7500,13 +7540,14 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeHardenedStress(t *testi
 	}
 	f.resolve()
 	first := readState()
-	want := stressState{total: 4400, resolved: 1100, unresolved: 3300, badMetadata: 0, strategies: map[string]int{
-		ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope: 700,
-		ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope:     100,
-		ResolutionStrategySwiftClassSelfTypeStaticMethodScope:              100,
-		ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope:          100,
-		ResolutionStrategySwiftClassSelfInheritedFinalMethodScope:          100,
-		"": 3300,
+	want := stressState{total: 4400, resolved: 1200, unresolved: 3200, badMetadata: 0, strategies: map[string]int{
+		ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope:           700,
+		ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope:               100,
+		ResolutionStrategySwiftClassSelfTypeStaticMethodScope:                        100,
+		ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope:                    100,
+		ResolutionStrategySwiftClassSelfInheritedFinalMethodScope:                    100,
+		ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope: 100,
+		"": 3200,
 	}}
 	if !reflect.DeepEqual(first, want) {
 		t.Fatalf("first state=%+v, want %+v", first, want)
@@ -7793,7 +7834,11 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeControls(t *testi
 			f, target, edge := newSwiftMultilevelStaticSelfFixture(t, 2, "instance")
 			tc.edit(f, target)
 			f.resolve()
-			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+			if tc.name == "final class target" {
+				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope)
+			} else {
+				assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+			}
 		})
 	}
 	t.Run("irrelevant instance blocker resolves", func(t *testing.T) {
@@ -7997,8 +8042,12 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeTransitions(t *te
 				t.Fatal(err)
 			}
 			redecide(f)
-			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
-			assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
+			if final == 0 {
+				assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
+				assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
+			} else {
+				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope)
+			}
 		}
 		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static',is_final=0 WHERE symbol_id=?`, target); err != nil {
 			t.Fatal(err)
@@ -8239,7 +8288,7 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeHardenedStress(t 
 		{"direct_static", ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope},
 		{"direct_final_class", ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope},
 		{"multilevel_final_instance", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope},
-		{"not_static_symbol", ""}, {"instance_target", ""}, {"class_target", ""}, {"final_class_target", ""},
+		{"not_static_symbol", ""}, {"instance_target", ""}, {"class_target", ""}, {"final_class_target", ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope},
 		{"malformed_target", ""}, {"missing_target_fact", ""}, {"duplicate_target_fact", ""}, {"private_target", ""},
 		{"missing_first_relation", ""}, {"missing_intermediate_relation", ""}, {"duplicate_first_relation", ""},
 		{"duplicate_intermediate_relation", ""}, {"unproven_first", ""}, {"unproven_intermediate", ""},
