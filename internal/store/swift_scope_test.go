@@ -675,6 +675,7 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 				name, evidence, arity = "Self."+method+"Perform", "swift:Self;trailing_labels=_", 1
 			}
 			edge := f.call(f.mainFile, caller, name, evidence, arity, j+1)
+			f.reference(f.mainFile, caller, name, j+1)
 			if j == 0 {
 				samples[tc.name] = sample{edge, target}
 			}
@@ -720,6 +721,12 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 		dst, strategy, confidence := edgeState(t, f, s.edge)
 		if strategy != tc.strategy || confidence != map[bool]string{true: ResolutionConfidenceHigh, false: ""}[tc.strategy != ""] || (tc.strategy != "" && (!dst.Valid || dst.Int64 != s.target)) || (tc.strategy == "" && dst.Valid) {
 			t.Fatalf("%s edge=(%v,%q,%q)", tc.name, dst, strategy, confidence)
+		}
+		refID := swiftReferenceID(t, f, s.edge)
+		if tc.strategy == "" {
+			assertSwiftReferenceCleared(t, f, refID)
+		} else {
+			assertSwiftReferenceTarget(t, f, refID, s.target)
 		}
 	}
 	first := state
