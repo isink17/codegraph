@@ -299,14 +299,78 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeRepair(t *tes
 	}
 	firstDst, firstStrategy, firstConfidence := edgeState(t, f, edge)
 	firstReference := swiftReferenceSymbol(t, f, refID)
+	firstMarker := marker
 	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || run {
 		t.Fatalf("second repair=(%v,%v)", run, err)
 	}
 	secondDst, secondStrategy, secondConfidence := edgeState(t, f, edge)
-	if secondDst != firstDst || secondStrategy != firstStrategy || secondConfidence != firstConfidence || swiftReferenceSymbol(t, f, refID) != firstReference {
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	secondReference := swiftReferenceSymbol(t, f, refID)
+	secondMarker := marker
+	if secondDst != firstDst || secondStrategy != firstStrategy || secondConfidence != firstConfidence || secondReference != firstReference || secondMarker != firstMarker {
 		t.Fatalf("second repair changed binding/reference")
 	}
+}
+
+func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeUnsafeRepair(t *testing.T) {
+	setup := func(t *testing.T) (*swiftScopeFixture, int64, int64, int64) {
+		t.Helper()
+		f, target, edge := newSwiftMultilevelInheritedFinalClassFixture(t, 2)
+		f.resolve()
+		refID := swiftReferenceID(t, f, edge)
+		for _, repair := range resolverRepairs {
+			if repair.key != swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey {
+				if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return f, target, edge, refID
+	}
+	marker := func(t *testing.T, f *swiftScopeFixture) {
+		t.Helper()
+		var value string
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&value); err != nil || value != "1" {
+			t.Fatalf("marker=%q err=%v", value, err)
+		}
+	}
+	t.Run("finality lost clears", func(t *testing.T) {
+		f, target, edge, refID := setup(t)
+		f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target)
+		run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+		if err != nil || !run {
+			t.Fatalf("repair=(%v,%v)", run, err)
+		}
+		assertSwiftEdgeUnresolved(t, f, edge)
+		assertSwiftReferenceCleared(t, f, refID)
+		marker(t, f)
+	})
+	t.Run("static rebinds", func(t *testing.T) {
+		f, target, edge, refID := setup(t)
+		f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static',is_final=0 WHERE symbol_id=?`, target)
+		run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+		if err != nil || !run {
+			t.Fatalf("repair=(%v,%v)", run, err)
+		}
+		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope)
+		assertSwiftReferenceTarget(t, f, refID, target)
+		marker(t, f)
+	})
+	t.Run("unsafe relation clears", func(t *testing.T) {
+		f, target, edge, refID := setup(t)
+		f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='unproven' WHERE child_qualified_name='Middle'`)
+		run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
+		if err != nil || !run {
+			t.Fatalf("repair=(%v,%v)", run, err)
+		}
+		_ = target
+		assertSwiftEdgeUnresolved(t, f, edge)
+		assertSwiftReferenceCleared(t, f, refID)
+		marker(t, f)
+	})
 }
 
 func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeLifecycle(t *testing.T) {
@@ -355,7 +419,7 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 	}
 	const p80 = ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope
 	cases := []stressCase{
-		{"two_hop", p80}, {"three_hop", p80}, {"four_hop", p80}, {"instance_caller", p80}, {"static_caller", p80}, {"class_caller", p80}, {"final_child", p80}, {"qualified", p80}, {"reverse", p80}, {"target_bounded", p80}, {"irrelevant_blocker", p80},
+		{"two_hop", p80}, {"three_hop", p80}, {"four_hop", p80}, {"instance_caller", p80}, {"static_caller", p80}, {"class_caller", p80}, {"final_child", p80}, {"qualified", p80}, {"reverse", p80}, {"target_bounded", p80}, {"irrelevant_blocker", p80}, {"labels", p80}, {"trailing", p80}, {"multilevel_static", ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope}, {"child_blocker", ""}, {"intermediate_blocker", ""}, {"target_owner_blocker", ""},
 		{"same_owner_static", ResolutionStrategySwiftClassSelfTypeStaticMethodScope}, {"same_owner_final_class", ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope}, {"direct_static", ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope}, {"direct_final_class", ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope}, {"multilevel_instance", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope},
 		{"ordinary_class", ""}, {"non_static", ""}, {"instance_dispatch", ""}, {"malformed_dispatch", ""}, {"missing_fact", ""}, {"duplicate_fact", ""}, {"private_target", ""},
 		{"missing_first", ""}, {"missing_intermediate", ""}, {"duplicate_first", ""}, {"duplicate_intermediate", ""}, {"unproven_first", ""}, {"unproven_intermediate", ""}, {"conformance_first", ""}, {"conformance_intermediate", ""}, {"generic_first", ""}, {"generic_intermediate", ""}, {"constrained_first", ""}, {"constrained_intermediate", ""}, {"cycle", ""}, {"competing_first", ""}, {"competing_intermediate", ""},
@@ -398,6 +462,34 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 				f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name=? WHERE child_qualified_name=?`, extra3, child)
 				f.relation(f.mainFile, extra3, extra, "superclass", false, false)
 			}
+		case "final_child":
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, childID)
+		case "reverse":
+			grand := prefix + "GrandChild"
+			grandID := f.symbol(f.mainFile, grand, "", "class", "", false)
+			f.declarationFact(f.mainFile, grandID, false)
+			f.relation(f.mainFile, grand, child, "superclass", false, false)
+		case "target_bounded":
+			f.relation(f.mainFile, base, prefix+"ExternalRoot", "superclass", false, false)
+		case "irrelevant_blocker":
+			f.blocker(f.mainFile, child, method, graph.ScopeImportSwiftMemberValue, false)
+		case "child_blocker", "intermediate_blocker", "target_owner_blocker":
+			owner := child
+			if tc.name == "intermediate_blocker" {
+				owner = middle
+			}
+			if tc.name == "target_owner_blocker" {
+				owner = base
+			}
+			f.blocker(f.mainFile, owner, method, graph.ScopeImportSwiftMemberValue, true)
+		case "labels":
+			f.arity(target, 1, 1)
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET signature=? WHERE id=?`, method+"(id:)", target)
+		case "trailing":
+			f.arity(target, 1, 1)
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET name=?,signature=? WHERE id=?`, method+"Perform", method+"Perform(_:)", target)
+		case "multilevel_static":
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static',is_final=0 WHERE symbol_id=?`, target)
 		case "same_owner_static", "same_owner_final_class":
 			f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE child_qualified_name=?`, child)
 			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name=?,qualified_name=? WHERE id=?`, child, child+"."+method, target)
@@ -415,9 +507,10 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='instance',is_final=1 WHERE symbol_id=?`, target)
 		case "ordinary_class":
 			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target)
-		case "non_static", "instance_dispatch":
+		case "non_static":
 			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=0 WHERE id=?`, target)
-			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='instance',is_final=0 WHERE symbol_id=?`, target)
+		case "instance_dispatch":
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='instance',is_final=1 WHERE symbol_id=?`, target)
 		case "malformed_dispatch":
 			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='' WHERE symbol_id=?`, target)
 		case "missing_fact":
@@ -524,7 +617,7 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 			}
 			f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET file_id=? WHERE child_qualified_name=?`, other, owner)
 		case "intermediate_static", "intermediate_final_class", "intermediate_ordinary", "intermediate_instance", "intermediate_malformed", "intermediate_missing_fact", "intermediate_private":
-			candidate := f.symbol(f.mainFile, method, middle, "function", method+"()", tc.name == "intermediate_static" || tc.name == "intermediate_final_class")
+			candidate := f.symbol(f.mainFile, method, middle, "function", method+"()", tc.name != "intermediate_instance")
 			if tc.name == "intermediate_static" || tc.name == "intermediate_final_class" {
 				target = candidate
 			}
@@ -533,16 +626,17 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 				if tc.name == "intermediate_static" {
 					dispatch = "static"
 				}
-				if tc.name == "intermediate_final_class" {
+				if tc.name == "intermediate_final_class" || tc.name == "intermediate_ordinary" || tc.name == "intermediate_private" {
 					dispatch = "class"
 				}
-				f.dispatchFact(f.mainFile, candidate, tc.name == "intermediate_final_class", dispatch)
+				final := tc.name == "intermediate_final_class" || tc.name == "intermediate_private"
+				f.dispatchFact(f.mainFile, candidate, final, dispatch)
 			}
 			if tc.name == "intermediate_private" {
 				f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, candidate)
 			}
 		case "second_final_class", "target_static_competitor", "target_ordinary_competitor", "target_instance_competitor", "target_malformed_competitor", "target_missing_fact_competitor", "target_duplicate_fact_competitor", "target_private_competitor":
-			candidate := f.symbol(f.mainFile, method, base, "function", method+"()", tc.name == "target_static_competitor" || tc.name == "second_final_class" || tc.name == "target_private_competitor")
+			candidate := f.symbol(f.mainFile, method, base, "function", method+"()", tc.name != "target_instance_competitor" && tc.name != "target_ordinary_competitor" && tc.name != "target_malformed_competitor")
 			switch tc.name {
 			case "second_final_class", "target_private_competitor":
 				f.dispatchFact(f.mainFile, candidate, true, "class")
@@ -570,10 +664,17 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeHardenedStres
 			}
 			name := "Self." + method
 			evidence := "swift:Self"
+			arity := 0
 			if tc.name == "multilevel_instance" {
 				name, evidence = "self."+method, "swift:self"
 			}
-			edge := f.call(f.mainFile, caller, name, evidence, 0, j+1)
+			if tc.name == "labels" {
+				name, evidence, arity = "Self."+method, "swift:Self;labels=id:", 1
+			}
+			if tc.name == "trailing" {
+				name, evidence, arity = "Self."+method+"Perform", "swift:Self;trailing_labels=_", 1
+			}
+			edge := f.call(f.mainFile, caller, name, evidence, arity, j+1)
 			if j == 0 {
 				samples[tc.name] = sample{edge, target}
 			}
