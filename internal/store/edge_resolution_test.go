@@ -139,6 +139,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope,
 		ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope,
 		ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope,
+		ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope,
 		ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope,
 		ResolutionStrategySwiftInitializerScope,
 		ResolutionStrategySwiftSuperScope,

@@ -352,10 +352,11 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 // and `Self` traversal: the same proof walk binds a different member kind per
 // caller shape, so only the edge, target and blocker predicates differ.
 type swiftMultilevelInheritedSpec struct {
-	accept   func(shape swiftSelfCallShape, e swiftScopeEdge) bool
-	targetOK func(c swiftInheritedSelfCandidate) bool
-	blocks   func(b swiftSuperBlocker) bool
-	strategy string
+	accept      func(shape swiftSelfCallShape, e swiftScopeEdge) bool
+	targetOK    func(c swiftInheritedSelfCandidate) bool
+	strategyFor func(c swiftInheritedSelfCandidate) string
+	blocks      func(b swiftSuperBlocker) bool
+	strategy    string
 }
 
 // swiftMultilevelInheritedSpecs holds one spec per member kind reachable by the
@@ -363,7 +364,7 @@ type swiftMultilevelInheritedSpec struct {
 // single pass decides both without loading the hierarchy evidence twice.
 //
 //   - lowercase `self`, instance caller -> inherited final instance method
-//   - uppercase `Self`                  -> inherited static method
+//   - uppercase `Self`                  -> inherited static or final class method
 var swiftMultilevelInheritedSpecs = []swiftMultilevelInheritedSpec{
 	{
 		accept: func(shape swiftSelfCallShape, e swiftScopeEdge) bool {
@@ -379,8 +380,8 @@ var swiftMultilevelInheritedSpecs = []swiftMultilevelInheritedSpec{
 		strategy: ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope,
 	},
 	{
-		// A compiler-valid descendant cannot redeclare the inherited
-		// `static func`, so no descendant method overrides it. Non-function
+		// A compiler-valid descendant cannot redeclare an inherited
+		// `static func` or `final class func`, so no descendant method overrides it. Non-function
 		// members (for example `static let make: () -> Void`) can still shadow
 		// the inherited callable name; those are handled conservatively by the
 		// `scope_import_evidence` blockers collected across the proven chain,
@@ -389,8 +390,15 @@ var swiftMultilevelInheritedSpecs = []swiftMultilevelInheritedSpec{
 			return shape.strategy == ResolutionStrategySwiftSelfTypeScope && e.static.Valid
 		},
 		targetOK: func(c swiftInheritedSelfCandidate) bool {
-			return c.visibility != "private" && c.static.Valid && c.static.Int64 == 1 &&
-				c.dispatchFacts == 1 && c.dispatchMin == "static" && c.dispatchMax == "static"
+			return c.visibility != "private" && c.static.Valid && c.static.Int64 == 1 && c.dispatchFacts == 1 &&
+				((c.dispatchMin == "static" && c.dispatchMax == "static") ||
+					(c.dispatchMin == "class" && c.dispatchMax == "class" && c.finalFacts == 1))
+		},
+		strategyFor: func(c swiftInheritedSelfCandidate) string {
+			if c.dispatchMin == "class" {
+				return ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope
+			}
+			return ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope
 		},
 		blocks:   func(b swiftSuperBlocker) bool { return b.static == 1 },
 		strategy: ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope,
@@ -651,7 +659,11 @@ func (s *Store) resolveSwiftClassSelfMultilevelInherited(ctx context.Context, q 
 			}
 		}
 		if !blocked {
-			res[e.id] = swiftScopeBinding{dst: found.id, strategy: e.spec.strategy}
+			strategy := e.spec.strategy
+			if e.spec.strategyFor != nil {
+				strategy = e.spec.strategyFor(found)
+			}
+			res[e.id] = swiftScopeBinding{dst: found.id, strategy: strategy}
 		}
 	}
 	return swiftScopeApply(ctx, q, res)

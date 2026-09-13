@@ -11,10 +11,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            go_test_timeout: 20m
+          - os: macos-latest
+            go_test_timeout: 20m
+          - os: windows-latest
+            go_test_timeout: 30m
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -25,8 +28,10 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        # Explicit headroom over Go's 10-minute default: the store package runs
-        # close to it on hosted Windows runners, where every test database pays
-        # a WAL checkpoint flush on close. This is a failure ceiling, not a
-        # budget -- a passing run takes exactly as long as it did before.
-        run: go test -timeout 20m ./...
+        # Go's timeout is a failure ceiling, not a runtime target. Hosted
+        # Windows is materially slower because the store suite creates many
+        # SQLite databases and pays WAL/file flush costs. Windows has crossed
+        # 20 minutes as the semantic regression suite grew, so it gets 30m of
+        # finite headroom; Linux/macOS retain the tighter 20m ceiling. A
+        # passing run does not wait longer, and hangs still fail at 30m.
+        run: go test -timeout ${{ matrix.go_test_timeout }} ./...
