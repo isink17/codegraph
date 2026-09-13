@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -65,6 +66,127 @@ func TestSwiftSuperScopeBindsDirectNominalInstanceMethod(t *testing.T) {
 	if strategy != ResolutionStrategySwiftSuperScope || confidence != ResolutionConfidenceHigh {
 		t.Fatalf("metadata=(%q,%q)", strategy, confidence)
 	}
+}
+
+func TestSwiftSuperTypeScopeBindsClassAndStaticSources(t *testing.T) {
+	for _, sourceDispatch := range []string{"class", "static"} {
+		for _, targetDispatch := range []string{"class", "static"} {
+			t.Run(sourceDispatch+"_to_"+targetDispatch, func(t *testing.T) {
+				f := newSwiftScopeFixture(t)
+				base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+				child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+				caller := f.symbol(f.mainFile, "f", "Child", "function", "f()", true)
+				target := f.symbol(f.mainFile, "run", "Base", "function", "run()", true)
+				swiftSetRange(t, f, base, 1, 1, 3, 20)
+				swiftSetRange(t, f, target, 2, 1, 2, 20)
+				swiftSetRange(t, f, child, 5, 1, 9, 20)
+				swiftSetRange(t, f, caller, 6, 1, 8, 20)
+				swiftSuperclass(t, f, f.mainFile, "Child", "Base")
+				f.arity(target, 0, 0)
+				swiftFact(t, f, f.mainFile, target, targetDispatch)
+				swiftFact(t, f, f.mainFile, caller, sourceDispatch)
+				edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 7)
+				f.resolve()
+				assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftSuperTypeScope)
+			})
+		}
+	}
+}
+
+func TestSwiftSuperMultilevelTypeScopeBindsStaticSource(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+	middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+	caller := f.symbol(f.mainFile, "f", "Child", "function", "f()", true)
+	target := f.symbol(f.mainFile, "run", "Base", "function", "run()", true)
+	for id, span := range map[int64][2]int64{base: {1, 3}, middle: {5, 7}, child: {9, 13}, caller: {10, 12}, target: {2, 2}} {
+		swiftSetRange(t, f, id, span[0], 1, span[1], 20)
+	}
+	swiftSuperclass(t, f, f.mainFile, "Child", "Middle")
+	swiftSuperclass(t, f, f.mainFile, "Middle", "Base")
+	f.arity(target, 0, 0)
+	swiftFact(t, f, f.mainFile, target, "static")
+	swiftFact(t, f, f.mainFile, caller, "static")
+	edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 11)
+	f.resolve()
+	assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftSuperMultilevelTypeScope)
+}
+
+func TestSwiftSuperTypeScopeTargetBoundedAncestry(t *testing.T) {
+	for _, tc := range []struct {
+		name, strategy string
+		multilevel     bool
+	}{
+		{"direct", ResolutionStrategySwiftSuperTypeScope, false},
+		{"multilevel", ResolutionStrategySwiftSuperMultilevelTypeScope, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSwiftSuperAcceptanceFixture(t)
+			if tc.multilevel {
+				middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+				swiftSetRange(t, f.swiftScopeFixture, middle, 10, 1, 15, 20)
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Middle' WHERE child_qualified_name='Child'`); err != nil {
+					t.Fatal(err)
+				}
+				swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Middle", "Base")
+			}
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id IN (?,?)`, f.baseRun, f.caller); err != nil {
+				t.Fatal(err)
+			}
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "ExternalRoot")
+			f.resolve()
+			assertSwiftEdgeMetadata(t, f.swiftScopeFixture, f.edge, f.baseRun, tc.strategy)
+		})
+	}
+}
+
+func TestSwiftSuperTypeScopeRejectsMixedDispatchAndStaticBlockers(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+	middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+	caller := f.symbol(f.mainFile, "f", "Child", "function", "f()", true)
+	target := f.symbol(f.mainFile, "run", "Base", "function", "run()", true)
+	other := f.symbol(f.mainFile, "run", "Middle", "function", "run()", true)
+	for id, span := range map[int64][2]int64{base: {1, 3}, target: {2, 2}, middle: {5, 7}, other: {6, 6}, child: {9, 13}, caller: {10, 12}} {
+		swiftSetRange(t, f, id, span[0], 1, span[1], 20)
+	}
+	swiftSuperclass(t, f, f.mainFile, "Child", "Middle")
+	swiftSuperclass(t, f, f.mainFile, "Middle", "Base")
+	f.arity(target, 0, 0)
+	f.arity(other, 0, 0)
+	swiftFact(t, f, f.mainFile, target, "class")
+	swiftFact(t, f, f.mainFile, other, "static")
+	swiftFact(t, f, f.mainFile, caller, "class")
+	edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 11)
+	f.resolve()
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_declaration_facts WHERE symbol_id=?`, other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM symbols WHERE id=?`, other); err != nil {
+		t.Fatal(err)
+	}
+	f.resolve()
+	assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftSuperMultilevelTypeScope)
+
+	blockerFile := f.file("Blocker.swift")
+	f.blocker(blockerFile, "Base", "run", graph.ScopeImportSwiftMemberValue, true)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Blocker.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, blockerFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Blocker.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftSuperMultilevelTypeScope)
 }
 
 func TestSwiftSuperScopeDeletedBlockerLifecycle(t *testing.T) {
@@ -850,6 +972,336 @@ func TestSwiftSuperMultilevelInheritedMethodScopeHardenedStress(t *testing.T) {
 	}
 }
 
+func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
+	const perCase = 8
+	names := []string{
+		"direct_class_source_class_target", "direct_class_source_static_target", "direct_static_source_class_target", "direct_static_source_static_target", "direct_class_source_final_class_target", "direct_static_source_final_class_target",
+		"two_hop_class_to_class", "two_hop_class_to_static", "two_hop_static_to_class", "two_hop_static_to_static", "three_hop_class", "three_hop_static_source", "four_hop_class", "four_hop_static_source", "final_class_target",
+		"selector_zero", "selector_unlabeled", "selector_named", "selector_multi", "trailing_class", "trailing_static", "qualified", "reverse_subclass", "target_bounded", "irrelevant_intermediate_instance_blocker", "irrelevant_target_instance_blocker", "deleted_intermediate_static_blocker", "deleted_target_static_blocker",
+		"source_is_static_missing", "source_class_static_bit_zero", "source_static_static_bit_zero", "source_class_dispatch_instance", "source_static_dispatch_instance", "source_missing_fact", "source_duplicate_fact", "source_malformed_dispatch", "source_wrong_owner", "source_outside_class_body", "source_extension_owned",
+		"target_is_static_missing", "target_is_static_zero", "target_dispatch_instance", "target_malformed_dispatch", "target_missing_fact", "target_duplicate_fact", "target_private", "target_extension_owned", "target_wrong_owner", "target_cross_file",
+		"second_valid_class", "second_valid_static", "valid_class_plus_valid_static", "instance_competitor", "malformed_competitor", "missing_fact_competitor", "duplicate_fact_competitor", "private_competitor", "extension_owned_competitor",
+		"intermediate_valid_class", "intermediate_valid_static", "intermediate_instance", "intermediate_malformed", "intermediate_missing_fact", "intermediate_duplicate_fact", "intermediate_private", "intermediate_extension_owned", "intermediate_known_incompatible",
+		"mixed_class_static", "unknown_selector_shape", "trailing_second_valid_target", "trailing_malformed_target", "trailing_instance_competitor", "trailing_intermediate_unsafe", "trailing_static_blocker", "active_static_blocker",
+	}
+	if len(names) < 60 {
+		t.Fatalf("categories=%d, want >=60", len(names))
+	}
+	resolved := map[string]bool{}
+	for _, name := range []string{
+		"direct_class_source_class_target", "direct_class_source_static_target", "direct_static_source_class_target", "direct_static_source_static_target", "direct_class_source_final_class_target", "direct_static_source_final_class_target",
+		"two_hop_class_to_class", "two_hop_class_to_static", "two_hop_static_to_class", "two_hop_static_to_static", "three_hop_class", "three_hop_static_source", "four_hop_class", "four_hop_static_source", "final_class_target", "selector_zero", "selector_unlabeled", "selector_named", "selector_multi", "trailing_class", "trailing_static", "qualified", "reverse_subclass", "target_bounded", "irrelevant_intermediate_instance_blocker", "irrelevant_target_instance_blocker", "deleted_intermediate_static_blocker", "deleted_target_static_blocker", "intermediate_valid_class", "intermediate_valid_static", "intermediate_known_incompatible",
+	} {
+		resolved[name] = true
+	}
+	mutate := func(name string, f *swiftSuperAcceptanceFixture, targetDispatch, sourceDispatch string) {
+		q := f.store.db
+		if name == "direct_class_source_class_target" || name == "direct_class_source_static_target" || name == "direct_static_source_class_target" || name == "direct_static_source_static_target" || strings.HasPrefix(name, "direct_") {
+			q.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Base' WHERE child_qualified_name='Child'`)
+			q.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE child_qualified_name='Middle'`)
+		}
+		if strings.HasPrefix(name, "three_hop") || strings.HasPrefix(name, "four_hop") {
+			levels := 1
+			if strings.HasPrefix(name, "four_") {
+				levels = 2
+			}
+			child, parent := "Child", "Middle"
+			for i := 0; i < levels; i++ {
+				next := "StressMiddle" + strconv.Itoa(i)
+				f.symbol(f.mainFile, next, "", "class", "", false)
+				q.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name=? WHERE child_qualified_name=?`, next, child)
+				swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, next, parent)
+				child = next
+			}
+		}
+		if strings.Contains(name, "final_class") || name == "final_class_target" {
+			q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, f.baseRun)
+		}
+		if strings.HasPrefix(name, "selector_") {
+			sig, ev, arity := "run()", "swift:super", 0
+			switch name {
+			case "selector_unlabeled":
+				sig, ev, arity = "run(_:)", "swift:super;labels=_", 1
+			case "selector_named":
+				sig, ev, arity = "run(id:)", "swift:super;labels=id:", 1
+			case "selector_multi":
+				sig, ev, arity = "run(id:,cache:)", "swift:super;labels=id:,cache:", 2
+			}
+			q.ExecContext(f.ctx, `UPDATE symbols SET signature=?,arity_min=?,arity_max=? WHERE id=?`, sig, arity, arity, f.baseRun)
+			q.ExecContext(f.ctx, `UPDATE edges SET evidence=?,call_arity=? WHERE evidence LIKE 'swift:super%'`, ev, arity)
+		}
+		if strings.HasPrefix(name, "trailing_") {
+			q.ExecContext(f.ctx, `UPDATE symbols SET name='perform',qualified_name='Base.perform',signature='perform(body:)',arity_min=1,arity_max=1 WHERE id=?`, f.baseRun)
+			q.ExecContext(f.ctx, `UPDATE edges SET dst_name='super.perform',evidence='swift:super;trailing_labels=_',call_arity=1 WHERE evidence LIKE 'swift:super%'`)
+		}
+		if name == "qualified" {
+			q.ExecContext(f.ctx, `UPDATE symbols SET qualified_name=CASE qualified_name WHEN 'Base' THEN 'Outer.Base' WHEN 'Middle' THEN 'Outer.Middle' WHEN 'Child' THEN 'Outer.Child' WHEN 'Base.run' THEN 'Outer.Base.run' WHEN 'Child.f' THEN 'Outer.Child.f' ELSE qualified_name END,container_name=CASE container_name WHEN 'Base' THEN 'Outer.Base' WHEN 'Child' THEN 'Outer.Child' ELSE container_name END WHERE qualified_name IN ('Base','Middle','Child','Base.run','Child.f')`)
+			q.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET child_qualified_name='Outer.Child',target_qualified_name='Outer.Middle' WHERE child_qualified_name='Child'`)
+			q.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET child_qualified_name='Outer.Middle',target_qualified_name='Outer.Base' WHERE child_qualified_name='Middle'`)
+			for i, bare := range []string{"Base", "Middle", "Child"} {
+				id := f.symbol(f.mainFile, bare, "", "class", "", false)
+				swiftSetRange(t, f.swiftScopeFixture, id, int64(22+i*4), 1, int64(24+i*4), 20)
+			}
+			q.ExecContext(f.ctx, `UPDATE edges SET dst_name='super.run' WHERE evidence LIKE 'swift:super%'`)
+		}
+		if name == "reverse_subclass" {
+			grand := f.symbol(f.mainFile, "GrandChild", "", "class", "", false)
+			swiftSetRange(t, f.swiftScopeFixture, grand, 17, 1, 20, 20)
+			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "GrandChild", "Child")
+		}
+		if name == "target_bounded" {
+			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "ExternalRoot")
+		}
+		if strings.Contains(name, "irrelevant_") || strings.Contains(name, "deleted_") {
+			file := f.file(name + ".swift")
+			owner := "Middle"
+			if strings.Contains(name, "target") {
+				owner = "Base"
+			}
+			f.blocker(file, owner, "run", graph.ScopeImportSwiftMemberValue, false)
+			if strings.Contains(name, "deleted_") {
+				q.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, file)
+			}
+		}
+		if strings.HasPrefix(name, "source_") {
+			switch name {
+			case "source_is_static_missing":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=NULL WHERE id=?`, f.caller)
+			case "source_class_static_bit_zero", "source_static_static_bit_zero":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=0 WHERE id=?`, f.caller)
+			case "source_class_dispatch_instance", "source_static_dispatch_instance":
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='instance' WHERE symbol_id=?`, f.caller)
+			case "source_missing_fact":
+				q.ExecContext(f.ctx, `DELETE FROM swift_declaration_facts WHERE symbol_id=?`, f.caller)
+			case "source_duplicate_fact":
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, f.caller, sourceDispatch)
+			case "source_malformed_dispatch":
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='' WHERE symbol_id=?`, f.caller)
+			case "source_wrong_owner":
+				q.ExecContext(f.ctx, `UPDATE symbols SET container_name='Other' WHERE id=?`, f.caller)
+			case "source_outside_class_body", "source_extension_owned":
+				swiftSetRange(f.t, f.swiftScopeFixture, f.caller, 300, 1, 301, 2)
+			}
+		}
+		if strings.HasPrefix(name, "target_") {
+			switch name {
+			case "target_is_static_missing":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=NULL WHERE id=?`, f.baseRun)
+			case "target_is_static_zero":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=0 WHERE id=?`, f.baseRun)
+			case "target_dispatch_instance":
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='instance' WHERE symbol_id=?`, f.baseRun)
+			case "target_malformed_dispatch":
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='' WHERE symbol_id=?`, f.baseRun)
+			case "target_missing_fact":
+				q.ExecContext(f.ctx, `DELETE FROM swift_declaration_facts WHERE symbol_id=?`, f.baseRun)
+			case "target_duplicate_fact":
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, f.baseRun, targetDispatch)
+			case "target_private":
+				q.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, f.baseRun)
+			case "target_extension_owned":
+				swiftSetRange(f.t, f.swiftScopeFixture, f.baseRun, 300, 1, 301, 2)
+			case "target_wrong_owner":
+				q.ExecContext(f.ctx, `UPDATE symbols SET container_name='Other',qualified_name='Other.run' WHERE id=?`, f.baseRun)
+			case "target_cross_file":
+				file := f.file("Target.swift")
+				q.ExecContext(f.ctx, `UPDATE symbols SET file_id=? WHERE id=?`, file, f.baseRun)
+			}
+		}
+		if strings.Contains(name, "competitor") || strings.HasPrefix(name, "second_") || name == "valid_class_plus_valid_static" {
+			id := f.symbol(f.mainFile, "run", "Base", "function", "run()", true)
+			f.arity(id, 0, 0)
+			swiftSetRange(f.t, f.swiftScopeFixture, id, 2, 1, 2, 15)
+			if name == "instance_competitor" || name == "trailing_instance_competitor" {
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=0 WHERE id=?`, id)
+			}
+			if name == "private_competitor" {
+				q.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, id)
+			}
+			if name == "extension_competitor" {
+				swiftSetRange(f.t, f.swiftScopeFixture, id, 300, 1, 301, 2)
+			}
+			if name == "missing_fact_competitor" {
+			} else {
+				dispatch := targetDispatch
+				if name == "malformed_competitor" {
+					dispatch = ""
+				}
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, dispatch)
+			}
+			if name == "duplicate_fact_competitor" {
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, targetDispatch)
+			}
+			if name == "second_valid_class" || name == "valid_class_plus_valid_static" {
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, id)
+			}
+			if name == "second_valid_static" {
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, id)
+			}
+		}
+		if strings.HasPrefix(name, "intermediate_") {
+			id := f.symbol(f.mainFile, "run", "Middle", "function", "run()", false)
+			f.arity(id, 0, 0)
+			swiftSetRange(f.t, f.swiftScopeFixture, id, 11, 1, 11, 15)
+			switch name {
+			case "intermediate_valid_class":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, id)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "class")
+			case "intermediate_valid_static":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, id)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "static")
+			case "intermediate_instance":
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "instance")
+			case "intermediate_malformed":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, id)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "")
+			case "intermediate_duplicate_fact":
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "class")
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "class")
+			case "intermediate_private":
+				q.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, id)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "class")
+			case "intermediate_extension_owned":
+				swiftSetRange(f.t, f.swiftScopeFixture, id, 300, 1, 301, 2)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "class")
+			case "intermediate_known_incompatible":
+				q.ExecContext(f.ctx, `UPDATE symbols SET signature='run(id:)',arity_min=1,arity_max=1,is_static=1 WHERE id=?`, id)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, targetDispatch)
+			}
+		}
+		if name == "mixed_class_static" {
+			id := f.symbol(f.mainFile, "run", "Middle", "function", "run()", true)
+			f.arity(id, 0, 0)
+			swiftSetRange(f.t, f.swiftScopeFixture, id, 11, 1, 11, 15)
+			swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "static")
+		}
+		if name == "unknown_selector_shape" {
+			q.ExecContext(f.ctx, `UPDATE edges SET evidence='swift:super;unknown=x' WHERE evidence LIKE 'swift:super%'`)
+		}
+		if strings.HasPrefix(name, "trailing_") && name != "trailing_class" && name != "trailing_static" {
+			if name == "trailing_second_valid_target" || name == "trailing_instance_competitor" {
+				id := f.symbol(f.mainFile, "perform", "Base", "function", "perform(body:)", true)
+				f.arity(id, 1, 1)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, targetDispatch)
+				if name == "trailing_instance_competitor" {
+					q.ExecContext(f.ctx, `UPDATE symbols SET is_static=0 WHERE id=?`, id)
+				}
+			}
+			if name == "trailing_malformed_target" {
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='' WHERE symbol_id=?`, f.baseRun)
+			}
+			if name == "trailing_intermediate_unsafe" {
+				id := f.symbol(f.mainFile, "perform", "Middle", "function", "perform(body:)", true)
+				f.arity(id, 1, 1)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "instance")
+			}
+			if name == "trailing_static_blocker" {
+				file := f.file(name + ".swift")
+				f.blocker(file, "Base", "perform", graph.ScopeImportSwiftMemberValue, true)
+			}
+		}
+		if name == "active_static_blocker" {
+			file := f.file(name + ".swift")
+			f.blocker(file, "Base", "run", graph.ScopeImportSwiftMemberValue, true)
+		}
+		if name == "relevant_enum_case" {
+			file := f.file("Enum.swift")
+			f.blocker(file, "Base", "run", graph.ScopeImportSwiftEnumCase, false)
+		}
+	}
+	state := func(f *swiftScopeFixture) stressState {
+		got := stressState{strategies: map[string]int{ResolutionStrategySwiftSuperTypeScope: 0, ResolutionStrategySwiftSuperMultilevelTypeScope: 0, ResolutionStrategySwiftSuperScope: 0, ResolutionStrategySwiftSuperMultilevelInheritedMethodScope: 0}}
+		f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence LIKE 'swift:super%'`, f.repoID).Scan(&got.total)
+		f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence LIKE 'swift:super%' AND dst_symbol_id IS NOT NULL`, f.repoID).Scan(&got.resolved)
+		got.unresolved = got.total - got.resolved
+		f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id=? AND evidence LIKE 'swift:super%' AND dst_symbol_id IS NULL AND (resolution_strategy<>'' OR resolution_confidence<>'')`, f.repoID).Scan(&got.badMetadata)
+		rows, _ := f.store.db.QueryContext(f.ctx, `SELECT resolution_strategy,COUNT(*) FROM edges WHERE repo_id=? AND evidence LIKE 'swift:super%' AND dst_symbol_id IS NOT NULL GROUP BY resolution_strategy`, f.repoID)
+		if rows != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var k string
+				var n int
+				rows.Scan(&k, &n)
+				got.strategies[k] = n
+			}
+		}
+		return got
+	}
+	want := stressState{total: len(names) * perCase, strategies: map[string]int{ResolutionStrategySwiftSuperTypeScope: 0, ResolutionStrategySwiftSuperMultilevelTypeScope: 0, ResolutionStrategySwiftSuperScope: 0, ResolutionStrategySwiftSuperMultilevelInheritedMethodScope: 0}}
+	var first stressState
+	for _, name := range names {
+		f := newSwiftSuperAcceptanceFixture(t)
+		targetDispatch, sourceDispatch := "class", "class"
+		if strings.Contains(name, "static_target") || strings.Contains(name, "to_static") {
+			targetDispatch = "static"
+		}
+		if name == "intermediate_valid_static" {
+			targetDispatch = "static"
+		}
+		if strings.Contains(name, "static_source") || strings.Contains(name, "static_to_") || strings.HasPrefix(name, "source_static_") {
+			sourceDispatch = "static"
+		}
+		q := f.store.db
+		q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, f.baseRun)
+		q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind=? WHERE symbol_id=?`, targetDispatch, f.baseRun)
+		q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, f.caller)
+		q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind=? WHERE symbol_id=?`, sourceDispatch, f.caller)
+		if !strings.HasPrefix(name, "direct_") {
+			middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+			swiftSetRange(t, f.swiftScopeFixture, middle, 10, 1, 15, 20)
+			q.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Middle' WHERE child_qualified_name='Child'`)
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Middle", "Base")
+		}
+		for i := 1; i < perCase; i++ {
+			f.call(f.mainFile, f.caller, "super.run", "swift:super", 0, 7+i)
+		}
+		mutate(name, f, targetDispatch, sourceDispatch)
+		if resolved[name] {
+			refName := "super.run"
+			if strings.HasPrefix(name, "trailing") {
+				refName = "super.perform"
+			}
+			f.reference(f.mainFile, f.caller, refName, 7)
+		}
+		f.resolve()
+		got := state(f.swiftScopeFixture)
+		wantResolved := resolved[name]
+		strategy := ResolutionStrategySwiftSuperMultilevelTypeScope
+		if strings.HasPrefix(name, "direct_") || strings.HasPrefix(name, "intermediate_valid_") {
+			strategy = ResolutionStrategySwiftSuperTypeScope
+		}
+		if wantResolved {
+			want.resolved += perCase
+			want.strategies[strategy] += perCase
+			wantTarget := f.baseRun
+			if strings.HasPrefix(name, "intermediate_valid_") {
+				wantTarget = f.symbolID("Middle.run")
+			}
+			assertSwiftBinding(t, f.swiftScopeFixture, f.edge, wantTarget, strategy)
+		} else {
+			want.unresolved += perCase
+			assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+		}
+		if !reflect.DeepEqual(got, wantForTypeOne(got.total, wantResolved, strategy)) {
+			t.Fatalf("%s state=%+v", name, got)
+		}
+		f.resolve()
+		if second := state(f.swiftScopeFixture); !reflect.DeepEqual(second, got) {
+			t.Fatalf("%s not idempotent: first=%+v second=%+v", name, got, second)
+		}
+		first.total += got.total
+		first.resolved += got.resolved
+		first.unresolved += got.unresolved
+		first.badMetadata += got.badMetadata
+		for k, n := range got.strategies {
+			first.strategies = appendStrategy(first.strategies, k, n)
+		}
+	}
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("stress first=%+v want=%+v", first, want)
+	}
+}
+
 func appendStrategy(m map[string]int, key string, n int) map[string]int {
 	if m == nil {
 		m = map[string]int{}
@@ -860,6 +1312,22 @@ func appendStrategy(m map[string]int, key string, n int) map[string]int {
 
 func wantForOne(total int, resolved bool, strategy string) stressState {
 	s := stressState{total: total, strategies: map[string]int{}}
+	if resolved {
+		s.resolved = total
+		s.strategies[strategy] = total
+	} else {
+		s.unresolved = total
+	}
+	return s
+}
+
+func wantForTypeOne(total int, resolved bool, strategy string) stressState {
+	s := stressState{total: total, strategies: map[string]int{
+		ResolutionStrategySwiftSuperTypeScope:                      0,
+		ResolutionStrategySwiftSuperMultilevelTypeScope:            0,
+		ResolutionStrategySwiftSuperScope:                          0,
+		ResolutionStrategySwiftSuperMultilevelInheritedMethodScope: 0,
+	}}
 	if resolved {
 		s.resolved = total
 		s.strategies[strategy] = total
