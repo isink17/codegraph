@@ -143,6 +143,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope,
 		ResolutionStrategySwiftInitializerScope,
 		ResolutionStrategySwiftSuperScope,
+		ResolutionStrategySwiftSuperMultilevelInheritedMethodScope,
 	}
 	if len(all) != len(resolutionConfidenceByStrategy) {
 		t.Fatalf("strategy constants = %d, registered confidences = %d; every strategy needs exactly one tier", len(all), len(resolutionConfidenceByStrategy))
