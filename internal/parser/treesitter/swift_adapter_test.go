@@ -91,6 +91,31 @@ func helper() {}
 	if len(p.Imports) != 2 || p.Imports[1] != "Foundation.URL" || len(p.Scope.Imports) != 2 || p.Scope.Imports[1].Kind != "struct" || p.Scope.Imports[1].SourceSpecifier != "Foundation" || p.Scope.Imports[1].ImportedName != "URL" {
 		t.Fatalf("imports=%q scope=%#v", p.Imports, p.Scope.Imports)
 	}
+	if len(p.SwiftExtensionMemberships) != 3 {
+		t.Fatalf("extension memberships=%d, want 3", len(p.SwiftExtensionMemberships))
+	}
+	for _, membership := range p.SwiftExtensionMemberships {
+		if membership.Target == "" || membership.Range.StartLine == 0 || membership.Range.EndLine < membership.Range.StartLine {
+			t.Fatalf("invalid extension membership=%#v", membership)
+		}
+	}
+}
+
+func TestSwiftExtensionMembershipSeparatesDeclarationsAndConstraints(t *testing.T) {
+	p := mustSwiftParse(t, "Extensions.swift", `class Child {}
+extension Child { func a() {}; func b() {} }
+extension Child where Int: P { func conditional() {} }
+`)
+	if len(p.SwiftExtensionMemberships) != 3 {
+		t.Fatalf("memberships=%d, want 3", len(p.SwiftExtensionMemberships))
+	}
+	seen := map[string]graph.SwiftExtensionMembership{}
+	for _, membership := range p.SwiftExtensionMemberships {
+		seen[p.Symbols[membership.SymbolIndex].Name] = membership
+	}
+	if seen["a"].Range != seen["b"].Range || seen["conditional"].Range == seen["a"].Range || seen["conditional"].Target != "Child" || !seen["conditional"].Constrained {
+		t.Fatalf("memberships=%#v", seen)
+	}
 }
 
 func TestSwiftCallsNormalizeAndSuppressLocalFunctions(t *testing.T) {
@@ -134,8 +159,8 @@ func TestSwiftCallsNormalizeAndSuppressLocalFunctions(t *testing.T) {
 	}
 }
 
-func TestSwiftProfileV6(t *testing.T) {
-	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v6" || !got.EmitsCallEdges {
+func TestSwiftProfileV7(t *testing.T) {
+	if got := NewSwift().Profile(); got.ID != "treesitter:swift:v7" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
 	}
 }

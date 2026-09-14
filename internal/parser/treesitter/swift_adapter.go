@@ -34,7 +34,7 @@ func (a *SwiftAdapter) Parse(ctx context.Context, path string, content []byte) (
 	}
 	p := graph.ParsedFile{Language: "swift", FileTokens: computeFileTokens(content)}
 	swiftExtractImports(root, content, &p)
-	swiftExtractSymbols(root, "", "internal", content, &p)
+	swiftExtractSymbols(root, "", "internal", content, &p, nil)
 	swiftExtractInheritanceRelations(root, content, &p)
 	swiftExtractLexicalBindings(root, content, &p)
 	swiftExtractCalls(root, content, &p)
@@ -83,7 +83,7 @@ func swiftImportEvidence(node *sitter.Node, raw string, content []byte) graph.Sc
 	return graph.ScopeImport{SourceSpecifier: module, ImportedName: imported, LocalName: imported, Kind: kind, ReExport: strings.HasPrefix(full, "@_exported")}
 }
 
-func swiftExtractSymbols(node *sitter.Node, container, visibility string, content []byte, pf *graph.ParsedFile) {
+func swiftExtractSymbols(node *sitter.Node, container, visibility string, content []byte, pf *graph.ParsedFile, extension *graph.SwiftExtensionMembership) {
 	if node == nil {
 		return
 	}
@@ -92,8 +92,11 @@ func swiftExtractSymbols(node *sitter.Node, container, visibility string, conten
 		switch child.Type() {
 		case "class_declaration":
 			if swiftIsExtension(child, content) {
-				if target := swiftExtensionTarget(child, content); target != "" {
-					swiftExtractSymbols(childByFieldName(child, "body"), target, swiftVisibility(child, visibility, content), content, pf)
+				if target := swiftExtensionFactTarget(child, content); target != "" {
+					_, constrained := swiftInheritanceHeaderFacts(child)
+					generic := len(findDescendants(child, "type_parameters")) > 0
+					ctx := &graph.SwiftExtensionMembership{Target: target, Range: nodeRange(child), Generic: generic, Constrained: constrained}
+					swiftExtractSymbols(childByFieldName(child, "body"), target, swiftVisibility(child, visibility, content), content, pf, ctx)
 				}
 				continue
 			}
@@ -104,9 +107,15 @@ func swiftExtractSymbols(node *sitter.Node, container, visibility string, conten
 		case "protocol_declaration":
 			swiftAddType(child, container, "protocol", visibility, content, pf)
 		case "function_declaration":
-			swiftAddCallable(child, "function", container, visibility, content, pf)
+			if swiftAddCallable(child, "function", container, visibility, content, pf) && extension != nil {
+				extension.SymbolIndex = len(pf.Symbols) - 1
+				pf.SwiftExtensionMemberships = append(pf.SwiftExtensionMemberships, *extension)
+			}
 		case "init_declaration":
-			swiftAddCallable(child, "function", container, visibility, content, pf)
+			if swiftAddCallable(child, "function", container, visibility, content, pf) && extension != nil {
+				extension.SymbolIndex = len(pf.Symbols) - 1
+				pf.SwiftExtensionMemberships = append(pf.SwiftExtensionMemberships, *extension)
+			}
 		case "protocol_function_declaration":
 			swiftAddCallable(child, "protocol_requirement", container, visibility, content, pf)
 		case "property_declaration":
@@ -116,7 +125,7 @@ func swiftExtractSymbols(node *sitter.Node, container, visibility string, conten
 		case "enum_entry":
 			swiftAddEnumCase(child, container, content, pf)
 		case "ERROR":
-			swiftExtractSymbols(child, container, visibility, content, pf)
+			swiftExtractSymbols(child, container, visibility, content, pf, extension)
 		}
 	}
 }
@@ -219,16 +228,16 @@ func swiftAddType(node *sitter.Node, container, kind, inheritedVisibility string
 		if kind == "protocol" {
 			memberVisibility = visibility
 		}
-		swiftExtractSymbols(body, qualified, memberVisibility, content, pf)
+		swiftExtractSymbols(body, qualified, memberVisibility, content, pf, nil)
 	}
 }
 
-func swiftAddCallable(node *sitter.Node, kind, container, inheritedVisibility string, content []byte, pf *graph.ParsedFile) {
+func swiftAddCallable(node *sitter.Node, kind, container, inheritedVisibility string, content []byte, pf *graph.ParsedFile) bool {
 	name := "init"
 	if node.Type() != "init_declaration" {
 		nameNode := childByFieldName(node, "name")
 		if nameNode == nil {
-			return
+			return false
 		}
 		name = nodeText(nameNode, content)
 	}
@@ -254,6 +263,7 @@ func swiftAddCallable(node *sitter.Node, kind, container, inheritedVisibility st
 	minArity, maxArity := swiftArity(node, content)
 	pf.Symbols[len(pf.Symbols)-1].ArityMin = minArity
 	pf.Symbols[len(pf.Symbols)-1].ArityMax = maxArity
+	return true
 }
 
 func swiftExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {

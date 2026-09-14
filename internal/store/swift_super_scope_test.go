@@ -44,6 +44,42 @@ func swiftRelation(t *testing.T, f *swiftScopeFixture, file int64, child, target
 	}
 }
 
+func swiftExtensionMembership(t *testing.T, f *swiftScopeFixture, file, symbol int64, target string, start, end int64, generic, constrained int) {
+	t.Helper()
+	_, err := f.store.db.ExecContext(f.ctx, `INSERT INTO swift_extension_memberships(repo_id,file_id,symbol_id,target_qualified_name,extension_start_line,extension_start_col,extension_end_line,extension_end_col,is_generic,is_constrained) VALUES(?,?,?,?,?,?,?,?,?,?)`, f.repoID, file, symbol, target, start, 1, end, 20, generic, constrained)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSwiftSuperExtensionScopeBindsInstanceAndTypeSources(t *testing.T) {
+	for _, sourceDispatch := range []string{"instance", "class", "static"} {
+		t.Run(sourceDispatch, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+			target := f.symbol(f.mainFile, "run", "Base", "function", "run()", sourceDispatch != "instance")
+			child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+			caller := f.symbol(f.mainFile, "f", "Child", "function", "f()", sourceDispatch != "instance")
+			swiftSetRange(t, f, base, 1, 1, 3, 20)
+			swiftSetRange(t, f, target, 2, 1, 2, 20)
+			swiftSetRange(t, f, child, 5, 1, 7, 20)
+			swiftSetRange(t, f, caller, 10, 1, 12, 20)
+			swiftSuperclass(t, f, f.mainFile, "Child", "Base")
+			swiftFact(t, f, f.mainFile, target, sourceDispatch)
+			swiftFact(t, f, f.mainFile, caller, sourceDispatch)
+			swiftExtensionMembership(t, f, f.mainFile, caller, "Child", 9, 13, 0, 0)
+			f.arity(target, 0, 0)
+			edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 11)
+			f.resolve()
+			want := ResolutionStrategySwiftSuperExtensionScope
+			if sourceDispatch != "instance" {
+				want = ResolutionStrategySwiftSuperExtensionTypeScope
+			}
+			assertSwiftEdgeMetadata(t, f, edge, target, want)
+		})
+	}
+}
+
 func TestSwiftSuperScopeBindsDirectNominalInstanceMethod(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	base := f.symbol(f.mainFile, "Base", "", "class", "", false)

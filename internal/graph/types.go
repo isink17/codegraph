@@ -72,6 +72,7 @@ type ParsedFile struct {
 	TestLinks                 []TestLink
 	SwiftInheritanceRelations []SwiftInheritanceRelation
 	SwiftDeclarationFacts     []SwiftDeclarationFact
+	SwiftExtensionMemberships []SwiftExtensionMembership
 }
 
 type SwiftInheritanceRelation struct {
@@ -88,6 +89,14 @@ type SwiftDeclarationFact struct {
 	Final       bool
 	Override    bool
 	Dispatch    string
+}
+
+type SwiftExtensionMembership struct {
+	SymbolIndex int
+	Target      string
+	Range       Position
+	Generic     bool
+	Constrained bool
 }
 
 // ScopeEvidence contains syntax-proven facts used by later language-specific

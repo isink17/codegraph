@@ -213,6 +213,10 @@ const (
 	ResolutionStrategySwiftSuperMultilevelInheritedMethodScope                   = "swift_super_multilevel_inherited_method_scope"
 	ResolutionStrategySwiftSuperTypeScope                                        = "swift_super_type_scope"
 	ResolutionStrategySwiftSuperMultilevelTypeScope                              = "swift_super_multilevel_type_scope"
+	ResolutionStrategySwiftSuperExtensionScope                                   = "swift_super_extension_scope"
+	ResolutionStrategySwiftSuperExtensionMultilevelInheritedMethodScope          = "swift_super_extension_multilevel_inherited_method_scope"
+	ResolutionStrategySwiftSuperExtensionTypeScope                               = "swift_super_extension_type_scope"
+	ResolutionStrategySwiftSuperExtensionMultilevelTypeScope                     = "swift_super_extension_multilevel_type_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -327,6 +331,10 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategySwiftSuperMultilevelInheritedMethodScope:                   ResolutionConfidenceHigh,
 	ResolutionStrategySwiftSuperTypeScope:                                        ResolutionConfidenceHigh,
 	ResolutionStrategySwiftSuperMultilevelTypeScope:                              ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSuperExtensionScope:                                   ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSuperExtensionMultilevelInheritedMethodScope:          ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSuperExtensionTypeScope:                               ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSuperExtensionMultilevelTypeScope:                     ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
