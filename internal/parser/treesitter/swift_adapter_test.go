@@ -56,6 +56,7 @@ func helper() {}
 		"P.make":               {"protocol_requirement", "P", "make()", "func:swift:P:make()", "internal", boolRef(true)},
 		"Service.extensionRun": {"function", "Service", "extensionRun()", "func:swift:Service:extensionRun()", "internal", boolRef(false)},
 		"Outer.Inner.make":     {"function", "Outer.Inner", "make()", "func:swift:Outer.Inner:make()", "internal", boolRef(true)},
+		"Array.ignored":        {"function", "Array", "ignored()", "func:swift:Array:ignored()", "internal", boolRef(false)},
 		"helper":               {"function", "", "helper()", "func:swift:__global__:helper()", "internal", boolRef(false)},
 	}
 	seen := map[string]int{}
@@ -85,14 +86,23 @@ func helper() {}
 			t.Errorf("missing overload signature %q", signature)
 		}
 	}
-	if len(p.Symbols) != 17 {
-		t.Fatalf("symbol count=%d, want 17", len(p.Symbols))
+	if len(p.Symbols) != 18 {
+		t.Fatalf("symbol count=%d, want 18", len(p.Symbols))
 	}
 	if len(p.Imports) != 2 || p.Imports[1] != "Foundation.URL" || len(p.Scope.Imports) != 2 || p.Scope.Imports[1].Kind != "struct" || p.Scope.Imports[1].SourceSpecifier != "Foundation" || p.Scope.Imports[1].ImportedName != "URL" {
 		t.Fatalf("imports=%q scope=%#v", p.Imports, p.Scope.Imports)
 	}
 	if len(p.SwiftExtensionMemberships) != 3 {
 		t.Fatalf("extension memberships=%d, want 3", len(p.SwiftExtensionMemberships))
+	}
+	var foundConstrained bool
+	for _, membership := range p.SwiftExtensionMemberships {
+		if p.Symbols[membership.SymbolIndex].QualifiedName == "Array.ignored" {
+			foundConstrained = membership.Target == "Array" && membership.Constrained
+		}
+	}
+	if !foundConstrained {
+		t.Fatal("Array.ignored lacks constrained extension membership")
 	}
 	for _, membership := range p.SwiftExtensionMemberships {
 		if membership.Target == "" || membership.Range.StartLine == 0 || membership.Range.EndLine < membership.Range.StartLine {
