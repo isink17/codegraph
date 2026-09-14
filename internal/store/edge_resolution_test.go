@@ -183,6 +183,27 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 	}
 }
 
+func TestSwiftSuperExtensionStrategiesAreIncrementallyRedecidable(t *testing.T) {
+	want := []string{
+		ResolutionStrategySwiftSuperExtensionScope,
+		ResolutionStrategySwiftSuperExtensionMultilevelInheritedMethodScope,
+		ResolutionStrategySwiftSuperExtensionTypeScope,
+		ResolutionStrategySwiftSuperExtensionMultilevelTypeScope,
+	}
+	for _, strategy := range want {
+		found := false
+		for _, registered := range incrementallyRedecidableStrategies {
+			if registered == strategy {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s is not incrementally redecidable", strategy)
+		}
+	}
+}
+
 // TestBinderDecodesStrategyPerRow guards the Go-side binder's compact
 // `strategy_rank` encoding: one resolve call must be able to bind edges at
 // different evidence levels and give each its own provenance. A regression that

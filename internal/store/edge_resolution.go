@@ -427,6 +427,10 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategySwiftSuperMultilevelInheritedMethodScope,
 	ResolutionStrategySwiftSuperTypeScope,
 	ResolutionStrategySwiftSuperMultilevelTypeScope,
+	ResolutionStrategySwiftSuperExtensionScope,
+	ResolutionStrategySwiftSuperExtensionMultilevelInheritedMethodScope,
+	ResolutionStrategySwiftSuperExtensionTypeScope,
+	ResolutionStrategySwiftSuperExtensionMultilevelTypeScope,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.
