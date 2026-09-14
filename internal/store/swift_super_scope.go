@@ -150,24 +150,33 @@ func swiftSuperCandidateMatches(call swiftSuperCallShape, c swiftSuperCandidate)
 func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuperCandidate, call swiftSuperCallShape, file int64, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass, candidates []swiftSuperCandidate) bool {
 	current := selectedOwner
 	descendant := selected
+	unknownAncestry := false
 	visited := map[string]struct{}{current: {}}
 	for {
 		var supers []swiftSuperRelation
 		for _, relation := range relationsByChild[current] {
 			if relation.file != file {
+				unknownAncestry = true
 				continue
 			}
 			switch relation.kind {
-			case "conformance", "unproven":
+			case "conformance":
+				continue
+			case "unproven":
+				unknownAncestry = true
 				continue
 			case "superclass":
 				if relation.generic != 0 || relation.constrained != 0 {
-					return false
+					unknownAncestry = true
+					continue
 				}
 				supers = append(supers, relation)
 			default:
-				return false
+				unknownAncestry = true
 			}
+		}
+		if len(supers) == 0 {
+			return !unknownAncestry && descendant.isOverride.Valid && descendant.isOverride.Int64 == 1
 		}
 		if len(supers) != 1 || supers[0].target == "" {
 			return false
@@ -193,6 +202,9 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 				return true
 			}
 			if compatible {
+				if candidate.visibility == "private" || !swiftSuperRangeContains(owners[0], candidate.file, candidate.startLine, candidate.startCol, candidate.endLine, candidate.endCol) {
+					return true
+				}
 				matches++
 				ancestor = candidate
 			}

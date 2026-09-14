@@ -241,6 +241,103 @@ func TestSwiftSuperTypeScopeReachesBlankParentForFinalAndStaticConflicts(t *test
 	}
 }
 
+func TestSwiftSuperTypeScopeRejectsOrphanOverrides(t *testing.T) {
+	for _, dispatch := range []string{"class", "static"} {
+		t.Run(dispatch, func(t *testing.T) {
+			f := newSwiftSuperAcceptanceFixture(t)
+			parent := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+			swiftSetRange(t, f.swiftScopeFixture, parent, 10, 1, 14, 20)
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Parent")
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind=?,is_override=1 WHERE symbol_id=?`, dispatch, f.baseRun)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+		})
+	}
+}
+
+func TestSwiftSuperTypeScopeAllowsRootDeclarationWithoutOverride(t *testing.T) {
+	f := newSwiftSuperAcceptanceFixture(t)
+	parent := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+	swiftSetRange(t, f.swiftScopeFixture, parent, 10, 1, 14, 20)
+	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Parent")
+	f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=0 WHERE symbol_id=?`, f.baseRun)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+	f.reference(f.mainFile, f.caller, "super.run", 7)
+	f.resolve()
+	assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperTypeScope)
+}
+
+func TestSwiftSuperTypeScopeRejectsExtensionOwnedOverrideTarget(t *testing.T) {
+	f := newSwiftSuperAcceptanceFixture(t)
+	grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+	grandRun := f.symbol(f.mainFile, "run", "Grand", "function", "run()", true)
+	swiftSetRange(t, f.swiftScopeFixture, grand, 10, 1, 14, 20)
+	swiftSetRange(t, f.swiftScopeFixture, grandRun, 30, 1, 30, 15)
+	f.arity(grandRun, 0, 0)
+	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Grand")
+	f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=1 WHERE symbol_id=?`, f.baseRun)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+	swiftFact(t, f.swiftScopeFixture, f.mainFile, grandRun, "class")
+	f.resolve()
+	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+}
+
+func TestSwiftSuperTypeScopeRejectsAncestorOrphanOverride(t *testing.T) {
+	f := newSwiftSuperAcceptanceFixture(t)
+	grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+	parent := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+	parentRun := f.symbol(f.mainFile, "run", "Parent", "function", "run()", true)
+	swiftSetRange(t, f.swiftScopeFixture, grand, 20, 1, 24, 20)
+	swiftSetRange(t, f.swiftScopeFixture, parent, 15, 1, 19, 20)
+	swiftSetRange(t, f.swiftScopeFixture, parentRun, 16, 1, 16, 15)
+	f.arity(parentRun, 0, 0)
+	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Parent")
+	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Parent", "Grand")
+	f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?,?)`, f.baseRun, f.caller, parentRun)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=1 WHERE symbol_id=?`, f.baseRun)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+	swiftFact(t, f.swiftScopeFixture, f.mainFile, parentRun, "class")
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id=?`, parentRun)
+	f.reference(f.mainFile, f.caller, "super.run", 7)
+	f.resolve()
+	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=0 WHERE symbol_id=?`, parentRun)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperTypeScope)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id=?`, parentRun)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+}
+
+func TestSwiftSuperTypeScopeRejectsPrivateAncestorOverride(t *testing.T) {
+	for _, override := range []int{0, 1} {
+		t.Run(strconv.Itoa(override), func(t *testing.T) {
+			f := newSwiftSuperAcceptanceFixture(t)
+			grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+			grandRun := f.symbol(f.mainFile, "run", "Grand", "function", "run()", true)
+			swiftSetRange(t, f.swiftScopeFixture, grand, 10, 1, 14, 20)
+			swiftSetRange(t, f.swiftScopeFixture, grandRun, 11, 1, 11, 15)
+			f.arity(grandRun, 0, 0)
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Grand")
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller)
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, grandRun)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=? WHERE symbol_id=?`, override, f.baseRun)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+			swiftFact(t, f.swiftScopeFixture, f.mainFile, grandRun, "class")
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+		})
+	}
+}
+
 func TestSwiftSuperTypeScopeTargetBoundedAncestry(t *testing.T) {
 	for _, tc := range []struct {
 		name, strategy string
@@ -1111,6 +1208,7 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 		"second_valid_class", "second_valid_static", "valid_class_plus_valid_static", "instance_competitor", "malformed_competitor", "missing_fact_competitor", "duplicate_fact_competitor", "private_competitor", "extension_owned_competitor",
 		"intermediate_valid_class", "intermediate_valid_static", "intermediate_class_missing_override", "intermediate_static_illegal_inheritance", "inherited_final_class_conflict", "transitive_class_missing_override", "transitive_static_conflict", "transitive_legal_override", "intermediate_instance", "intermediate_malformed", "intermediate_missing_fact", "intermediate_duplicate_fact", "intermediate_private", "intermediate_extension_owned", "intermediate_known_incompatible",
 		"conformance_missing_override", "conformance_legal_override", "transitive_blank_parent_missing_override", "transitive_blank_parent_legal_override", "ancestor_chain_intermediate_missing_override", "ancestor_chain_all_overrides", "transitive_final_through_blank_parent", "transitive_static_through_blank_parent", "multilevel_conformance_legal", "multilevel_conformance_conflict",
+		"orphan_class_override", "orphan_static_override", "legal_root_type_declaration", "ancestor_orphan_override", "legal_complete_override_chain", "extension_ancestor_override_target", "private_ancestor_override_unsafe", "unknown_ancestry_override_not_proven_invalid",
 		"mixed_class_static", "unknown_selector_shape", "trailing_second_valid_target", "trailing_malformed_target", "trailing_instance_competitor", "trailing_intermediate_unsafe", "trailing_static_blocker", "active_static_blocker",
 	}
 	if len(names) < 60 {
@@ -1121,6 +1219,7 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 		"direct_class_source_class_target", "direct_class_source_static_target", "direct_static_source_class_target", "direct_static_source_static_target", "direct_class_source_final_class_target", "direct_static_source_final_class_target",
 		"two_hop_class_to_class", "two_hop_class_to_static", "two_hop_static_to_class", "two_hop_static_to_static", "three_hop_class", "three_hop_static_source", "four_hop_class", "four_hop_static_source", "final_class_target", "selector_zero", "selector_unlabeled", "selector_named", "selector_multi", "trailing_class", "trailing_static", "qualified", "reverse_subclass", "target_bounded", "irrelevant_intermediate_instance_blocker", "irrelevant_target_instance_blocker", "deleted_intermediate_static_blocker", "deleted_target_static_blocker", "intermediate_valid_class", "intermediate_valid_static", "intermediate_known_incompatible", "transitive_legal_override",
 		"conformance_legal_override", "transitive_blank_parent_legal_override", "ancestor_chain_all_overrides", "multilevel_conformance_legal",
+		"legal_root_type_declaration", "legal_complete_override_chain", "unknown_ancestry_override_not_proven_invalid",
 	} {
 		resolved[name] = true
 	}
@@ -1203,6 +1302,56 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 			swiftSetRange(f.t, f.swiftScopeFixture, middleRun, 11, 1, 11, 15)
 			swiftFact(f.t, f.swiftScopeFixture, f.mainFile, middleRun, "class")
 			q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1,is_final=1 WHERE symbol_id=?`, f.baseRun)
+		}
+		if strings.HasPrefix(name, "orphan_") || strings.HasPrefix(name, "ancestor_orphan") || name == "legal_complete_override_chain" || name == "extension_ancestor_override_target" || name == "private_ancestor_override_unsafe" || name == "unknown_ancestry_override_not_proven_invalid" {
+			if name == "orphan_class_override" || name == "orphan_static_override" || name == "unknown_ancestry_override_not_proven_invalid" {
+				parent := f.symbol(f.mainFile, "OrphanParent", "", "class", "", false)
+				swiftSetRange(f.t, f.swiftScopeFixture, parent, 20, 1, 24, 20)
+				swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "OrphanParent")
+				if name != "unknown_ancestry_override_not_proven_invalid" {
+					q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1,dispatch_kind=? WHERE symbol_id=?`, map[bool]string{true: "static", false: "class"}[name == "orphan_static_override"], f.baseRun)
+				} else {
+					q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id=?`, f.baseRun)
+					q.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='ExternalRoot' WHERE child_qualified_name='Base'`)
+				}
+			}
+			if name == "ancestor_orphan_override" || name == "legal_complete_override_chain" {
+				parent := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+				grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+				parentRun := f.symbol(f.mainFile, "run", "Parent", "function", "run()", true)
+				grandRun := f.symbol(f.mainFile, "run", "Grand", "function", "run()", true)
+				for id, span := range map[int64][2]int64{parent: {16, 19}, grand: {20, 24}, parentRun: {17, 17}, grandRun: {21, 21}} {
+					swiftSetRange(f.t, f.swiftScopeFixture, id, span[0], 1, span[1], 20)
+				}
+				f.arity(parentRun, 0, 0)
+				f.arity(grandRun, 0, 0)
+				swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "Parent")
+				swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Parent", "Grand")
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, parentRun, "class")
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, grandRun, "class")
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id IN (?,?)`, f.baseRun, parentRun)
+				if name == "ancestor_orphan_override" {
+					q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id=?`, f.baseRun)
+					q.ExecContext(f.ctx, `DELETE FROM swift_declaration_facts WHERE symbol_id=?`, grandRun)
+				}
+			}
+			if name == "extension_ancestor_override_target" || name == "private_ancestor_override_unsafe" {
+				grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+				grandRun := f.symbol(f.mainFile, "run", "Grand", "function", "run()", true)
+				swiftSetRange(f.t, f.swiftScopeFixture, grand, 20, 1, 24, 20)
+				grandRunLine := int64(30)
+				if name == "private_ancestor_override_unsafe" {
+					grandRunLine = 21
+				}
+				swiftSetRange(f.t, f.swiftScopeFixture, grandRun, grandRunLine, 1, grandRunLine, 15)
+				f.arity(grandRun, 0, 0)
+				swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "Grand")
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, grandRun, "class")
+				if name == "private_ancestor_override_unsafe" {
+					q.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, grandRun)
+				}
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id=?`, f.baseRun)
+			}
 		}
 		if strings.HasPrefix(name, "selector_") {
 			sig, ev, arity := "run()", "swift:super", 0
