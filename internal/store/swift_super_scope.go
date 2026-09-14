@@ -147,18 +147,16 @@ func swiftSuperCandidateMatches(call swiftSuperCallShape, c swiftSuperCandidate)
 
 // swiftSuperTypeDeclarationConflict checks declaration legality above the
 // already-selected target. Unknown ancestry is not conflict evidence.
-func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuperCandidate, call swiftSuperCallShape, file int64, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass, candidates []swiftSuperCandidate) bool {
+func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuperCandidate, call swiftSuperCallShape, file int64, callerTest bool, tests map[int64]struct{}, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass, candidates []swiftSuperCandidate) bool {
 	current := selectedOwner
 	descendant := selected
-	unknownAncestry := false
 	visited := map[string]struct{}{current: {}}
 	for {
+		// Unknown evidence belongs to this owner only. A proven superclass
+		// remains usable even when unrelated inheritance evidence is unknown.
 		var supers []swiftSuperRelation
+		unknownAncestry := false
 		for _, relation := range relationsByChild[current] {
-			if relation.file != file {
-				unknownAncestry = true
-				continue
-			}
 			switch relation.kind {
 			case "conformance":
 				continue
@@ -166,6 +164,10 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 				unknownAncestry = true
 				continue
 			case "superclass":
+				if relation.file != file {
+					unknownAncestry = true
+					continue
+				}
 				if relation.generic != 0 || relation.constrained != 0 {
 					unknownAncestry = true
 					continue
@@ -176,17 +178,24 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 			}
 		}
 		if len(supers) == 0 {
+			// Only an owner with no superclass evidence is a proven root. An
+			// override is invalid there; an unknown stop is target-bounded.
 			return !unknownAncestry && descendant.isOverride.Valid && descendant.isOverride.Int64 == 1
 		}
-		if len(supers) != 1 || supers[0].target == "" {
-			return false
+		if len(supers) > 1 || supers[0].target == "" {
+			// Multiple or malformed proven superclass evidence is concrete
+			// invalidity, not an unknown target.
+			return true
 		}
 		current = supers[0].target
 		if _, ok := visited[current]; ok {
-			return false
+			return true
 		}
 		visited[current] = struct{}{}
 		owners := baseByKey[current+"\x00"+strconv.FormatInt(file, 10)]
+		if len(owners) == 0 {
+			return false
+		}
 		if len(owners) != 1 || owners[0].kind != "class" || owners[0].visibility == "private" {
 			return false
 		}
@@ -194,7 +203,10 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 		matches := 0
 		var ancestor swiftSuperCandidate
 		for _, candidate := range candidates {
-			if candidate.owner != current || candidate.name != call.method || candidate.file != file {
+			if candidate.owner != current || candidate.name != call.method {
+				continue
+			}
+			if _, candidateTest := tests[candidate.file]; candidateTest && !callerTest {
 				continue
 			}
 			compatible, known := swiftSuperCandidateMatches(call, candidate)
@@ -202,6 +214,12 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 				return true
 			}
 			if compatible {
+				if candidate.file != file {
+					if candidate.visibility != "private" && candidate.visibility != "fileprivate" {
+						return true
+					}
+					continue
+				}
 				if candidate.visibility == "private" || !swiftSuperRangeContains(owners[0], candidate.file, candidate.startLine, candidate.startCol, candidate.endLine, candidate.endCol) {
 					return true
 				}
@@ -466,7 +484,7 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				break
 			}
 			if matches == 1 {
-				if p.mode == swiftSuperTypeSource && swiftSuperTypeDeclarationConflict(current, found, p.call, p.edge.file, relationsByChild, baseByKey, candidates) {
+				if p.mode == swiftSuperTypeSource && swiftSuperTypeDeclarationConflict(current, found, p.call, p.edge.file, callerTest, tests, relationsByChild, baseByKey, candidates) {
 					break
 				}
 				strategy := ResolutionStrategySwiftSuperScope
@@ -548,7 +566,7 @@ func sortedSwiftSet(set map[string]struct{}) []string {
 
 func swiftSuperLoadClasses(ctx context.Context, q javaQuery, repoID int64, names []string) ([]swiftSuperClass, error) {
 	var out []swiftSuperClass
-	err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.qualified_name,s.kind,s.visibility,s.start_line,s.start_col,s.end_line,s.end_col FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='class' AND s.qualified_name IN (`, `%s)`, []any{repoID}, stringSliceToAny(names), true, func(rows *sql.Rows) error {
+	err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.qualified_name,s.kind,s.visibility,s.start_line,s.start_col,s.end_line,s.end_col FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.qualified_name IN (`, `%s)`, []any{repoID}, stringSliceToAny(names), true, func(rows *sql.Rows) error {
 		var c swiftSuperClass
 		if err := rows.Scan(&c.id, &c.file, &c.qname, &c.kind, &c.visibility, &c.startLine, &c.startCol, &c.endLine, &c.endCol); err != nil {
 			return err
