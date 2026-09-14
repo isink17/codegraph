@@ -211,6 +211,8 @@ const (
 	ResolutionStrategySwiftInitializerScope                                      = "swift_initializer_scope"
 	ResolutionStrategySwiftSuperScope                                            = "swift_super_scope"
 	ResolutionStrategySwiftSuperMultilevelInheritedMethodScope                   = "swift_super_multilevel_inherited_method_scope"
+	ResolutionStrategySwiftSuperTypeScope                                        = "swift_super_type_scope"
+	ResolutionStrategySwiftSuperMultilevelTypeScope                              = "swift_super_multilevel_type_scope"
 )
 
 // Resolution confidence tiers, persisted in `edges.resolution_confidence`.
@@ -323,6 +325,8 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategySwiftInitializerScope:                                      ResolutionConfidenceHigh,
 	ResolutionStrategySwiftSuperScope:                                            ResolutionConfidenceHigh,
 	ResolutionStrategySwiftSuperMultilevelInheritedMethodScope:                   ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSuperTypeScope:                                        ResolutionConfidenceHigh,
+	ResolutionStrategySwiftSuperMultilevelTypeScope:                              ResolutionConfidenceHigh,
 }
 
 // resolutionConfidenceFor returns the confidence tier for a strategy.
@@ -413,6 +417,8 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategySwiftInitializerScope,
 	ResolutionStrategySwiftSuperScope,
 	ResolutionStrategySwiftSuperMultilevelInheritedMethodScope,
+	ResolutionStrategySwiftSuperTypeScope,
+	ResolutionStrategySwiftSuperMultilevelTypeScope,
 )
 
 // sqlQuotedList renders a fixed set of identifiers as a SQL literal list.
