@@ -401,6 +401,72 @@ func TestSwiftSuperTypeScopeRejectsCrossFileAncestorMethod(t *testing.T) {
 	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
 }
 
+func TestSwiftSuperTypeScopeOwnerIdentityFailsClosed(t *testing.T) {
+	for _, kind := range []string{"duplicate", "protocol", "struct"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newSwiftSuperAcceptanceFixture(t)
+			parent := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+			swiftSetRange(t, f.swiftScopeFixture, parent, 10, 1, 14, 20)
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Parent")
+			if kind == "duplicate" {
+				duplicate := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+				swiftSetRange(t, f.swiftScopeFixture, duplicate, 20, 1, 24, 20)
+			} else {
+				f.store.db.ExecContext(f.ctx, `UPDATE symbols SET kind=? WHERE id=?`, kind, parent)
+			}
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=0 WHERE symbol_id=?`, f.baseRun)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+			f.reference(f.mainFile, f.caller, "super.run", 7)
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+		})
+	}
+}
+
+func TestSwiftSuperTypeScopeOwnerIdentityRedecides(t *testing.T) {
+	f := newSwiftSuperAcceptanceFixture(t)
+	parent := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+	swiftSetRange(t, f.swiftScopeFixture, parent, 10, 1, 14, 20)
+	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Parent")
+	f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=0 WHERE symbol_id=?`, f.baseRun)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+	f.reference(f.mainFile, f.caller, "super.run", 7)
+	f.resolve()
+	assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperTypeScope)
+
+	duplicate := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+	swiftSetRange(t, f.swiftScopeFixture, duplicate, 20, 1, 24, 20)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM symbols WHERE id=?`, duplicate); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperTypeScope)
+
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET kind='protocol' WHERE id=?`, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET kind='class' WHERE id=?`, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperTypeScope)
+}
+
 func TestSwiftSuperTypeScopeTargetBoundedAncestry(t *testing.T) {
 	for _, tc := range []struct {
 		name, strategy string
@@ -1273,6 +1339,7 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 		"conformance_missing_override", "conformance_legal_override", "transitive_blank_parent_missing_override", "transitive_blank_parent_legal_override", "ancestor_chain_intermediate_missing_override", "ancestor_chain_all_overrides", "transitive_final_through_blank_parent", "transitive_static_through_blank_parent", "multilevel_conformance_legal", "multilevel_conformance_conflict",
 		"orphan_class_override", "orphan_static_override", "legal_root_type_declaration", "ancestor_orphan_override", "legal_complete_override_chain", "extension_ancestor_override_target", "private_ancestor_override_unsafe", "unknown_ancestry_override_not_proven_invalid",
 		"cross_file_conformance_root_declaration", "cross_file_conformance_orphan_override", "cross_file_extension_ancestor", "legality_cycle", "legality_multiple_superclasses",
+		"legality_duplicate_owner", "legality_known_nonclass_super_target",
 		"mixed_class_static", "unknown_selector_shape", "trailing_second_valid_target", "trailing_malformed_target", "trailing_instance_competitor", "trailing_intermediate_unsafe", "trailing_static_blocker", "active_static_blocker",
 	}
 	if len(names) < 60 {
@@ -1482,6 +1549,18 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 				swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Parent", "Base")
 			} else {
 				swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "Grand")
+			}
+			q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=0 WHERE symbol_id=?`, f.baseRun)
+		}
+		if name == "legality_duplicate_owner" || name == "legality_known_nonclass_super_target" {
+			parent := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+			swiftSetRange(f.t, f.swiftScopeFixture, parent, 20, 1, 24, 20)
+			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "Parent")
+			if name == "legality_duplicate_owner" {
+				duplicate := f.symbol(f.mainFile, "Parent", "", "class", "", false)
+				swiftSetRange(f.t, f.swiftScopeFixture, duplicate, 25, 1, 29, 20)
+			} else {
+				q.ExecContext(f.ctx, `UPDATE symbols SET kind='protocol' WHERE id=?`, parent)
 			}
 			q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class',is_override=0 WHERE symbol_id=?`, f.baseRun)
 		}

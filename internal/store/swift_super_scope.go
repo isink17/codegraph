@@ -196,7 +196,13 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 		if len(owners) == 0 {
 			return false
 		}
-		if len(owners) != 1 || owners[0].kind != "class" || owners[0].visibility == "private" {
+		if len(owners) != 1 {
+			return true
+		}
+		if owners[0].kind != "class" {
+			return true
+		}
+		if owners[0].visibility == "private" {
 			return false
 		}
 
