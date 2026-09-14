@@ -149,6 +149,7 @@ func swiftSuperCandidateMatches(call swiftSuperCallShape, c swiftSuperCandidate)
 // already-selected target. Unknown ancestry is not conflict evidence.
 func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuperCandidate, call swiftSuperCallShape, file int64, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass, candidates []swiftSuperCandidate) bool {
 	current := selectedOwner
+	descendant := selected
 	visited := map[string]struct{}{current: {}}
 	for {
 		var supers []swiftSuperRelation
@@ -156,10 +157,17 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 			if relation.file != file {
 				continue
 			}
-			if relation.kind != "superclass" || relation.generic != 0 || relation.constrained != 0 {
+			switch relation.kind {
+			case "conformance", "unproven":
+				continue
+			case "superclass":
+				if relation.generic != 0 || relation.constrained != 0 {
+					return false
+				}
+				supers = append(supers, relation)
+			default:
 				return false
 			}
-			supers = append(supers, relation)
 		}
 		if len(supers) != 1 || supers[0].target == "" {
 			return false
@@ -192,13 +200,19 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 		if matches == 0 {
 			continue
 		}
-		if matches != 1 || ancestor.factCount != 1 || !ancestor.static.Valid || ancestor.static.Int64 != 1 || (ancestor.dispatch != "class" && ancestor.dispatch != "static") || !ancestor.isFinal.Valid || !ancestor.isOverride.Valid {
+		if matches != 1 || ancestor.factCount != 1 || !ancestor.static.Valid || (ancestor.static.Int64 != 0 && ancestor.static.Int64 != 1) || (ancestor.static.Int64 == 0 && ancestor.dispatch != "instance") || (ancestor.static.Int64 == 1 && ancestor.dispatch != "class" && ancestor.dispatch != "static") || (ancestor.static.Int64 == 1 && (!ancestor.isFinal.Valid || !ancestor.isOverride.Valid)) {
 			return true
+		}
+		if ancestor.static.Int64 == 0 {
+			continue
 		}
 		if ancestor.dispatch == "static" || ancestor.isFinal.Int64 != 0 {
 			return true
 		}
-		return !selected.isOverride.Valid || selected.isOverride.Int64 != 1
+		if !descendant.static.Valid || descendant.static.Int64 != 1 || (descendant.dispatch != "class" && descendant.dispatch != "static") || !descendant.isOverride.Valid || descendant.isOverride.Int64 != 1 {
+			return true
+		}
+		descendant = ancestor
 	}
 }
 
