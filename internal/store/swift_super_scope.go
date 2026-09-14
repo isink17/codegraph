@@ -42,6 +42,7 @@ type swiftSuperCandidate struct {
 	id, file, startLine, startCol, endLine, endCol int64
 	owner, name, signature, visibility, dispatch   string
 	static, min, max                               sql.NullInt64
+	isOverride, isFinal                            sql.NullInt64
 	factCount                                      int
 }
 
@@ -144,31 +145,61 @@ func swiftSuperCandidateMatches(call swiftSuperCallShape, c swiftSuperCandidate)
 	return true, true
 }
 
-// swiftSuperTypeDispatchConflict rejects persisted class/static hierarchies
-// that Swift itself rejects. The parser stores declaration facts, not a
-// compiler diagnostic, so a same-selector opposite-dispatch declaration on
-// the selected owner's immediate superclass is unsafe evidence.
-func swiftSuperTypeDispatchConflict(pendingOwner string, found swiftSuperCandidate, call swiftSuperCallShape, file int64, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass, candidates []swiftSuperCandidate) bool {
-	for _, relation := range relationsByChild[pendingOwner] {
-		if relation.file != file || relation.kind != "superclass" || relation.generic != 0 || relation.constrained != 0 {
-			continue
+// swiftSuperTypeDeclarationConflict checks declaration legality above the
+// already-selected target. Unknown ancestry is not conflict evidence.
+func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuperCandidate, call swiftSuperCallShape, file int64, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass, candidates []swiftSuperCandidate) bool {
+	current := selectedOwner
+	visited := map[string]struct{}{current: {}}
+	for {
+		var supers []swiftSuperRelation
+		for _, relation := range relationsByChild[current] {
+			if relation.file != file {
+				continue
+			}
+			if relation.kind != "superclass" || relation.generic != 0 || relation.constrained != 0 {
+				return false
+			}
+			supers = append(supers, relation)
 		}
-		if len(baseByKey[relation.target+"\x00"+strconv.FormatInt(file, 10)]) != 1 {
-			// The selected target already bounds resolution. Missing or
-			// unsupported ancestry above it is not concrete conflict evidence.
-			continue
+		if len(supers) != 1 || supers[0].target == "" {
+			return false
 		}
+		current = supers[0].target
+		if _, ok := visited[current]; ok {
+			return false
+		}
+		visited[current] = struct{}{}
+		owners := baseByKey[current+"\x00"+strconv.FormatInt(file, 10)]
+		if len(owners) != 1 || owners[0].kind != "class" || owners[0].visibility == "private" {
+			return false
+		}
+
+		matches := 0
+		var ancestor swiftSuperCandidate
 		for _, candidate := range candidates {
-			if candidate.owner != relation.target || candidate.name != call.method || candidate.file != file {
+			if candidate.owner != current || candidate.name != call.method || candidate.file != file {
 				continue
 			}
 			compatible, known := swiftSuperCandidateMatches(call, candidate)
-			if known && compatible && candidate.factCount == 1 && candidate.static.Valid && candidate.static.Int64 == 1 && (candidate.dispatch == "class" || candidate.dispatch == "static") && candidate.dispatch != found.dispatch {
+			if !known {
 				return true
 			}
+			if compatible {
+				matches++
+				ancestor = candidate
+			}
 		}
+		if matches == 0 {
+			continue
+		}
+		if matches != 1 || ancestor.factCount != 1 || !ancestor.static.Valid || ancestor.static.Int64 != 1 || (ancestor.dispatch != "class" && ancestor.dispatch != "static") || !ancestor.isFinal.Valid || !ancestor.isOverride.Valid {
+			return true
+		}
+		if ancestor.dispatch == "static" || ancestor.isFinal.Int64 != 0 {
+			return true
+		}
+		return !selected.isOverride.Valid || selected.isOverride.Int64 != 1
 	}
-	return false
 }
 
 func (s *Store) resolveSwiftSuperScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
@@ -328,12 +359,12 @@ FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_sym
 	}
 
 	var candidates []swiftSuperCandidate
-	err = sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.container_name,s.name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,s.start_line,s.start_col,s.end_line,s.end_col,COUNT(d.id),COALESCE(MAX(d.dispatch_kind),'')
+	err = sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.container_name,s.name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,s.start_line,s.start_col,s.end_line,s.end_col,COUNT(d.id),COALESCE(MAX(d.dispatch_kind),''),MAX(d.is_override),MAX(d.is_final)
 FROM symbols s JOIN files f ON f.id=s.file_id JOIN tmp_swift_super_candidates k ON k.owner=s.container_name AND k.name=s.name
 LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
 WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=0 GROUP BY s.id`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftSuperCandidate
-		if err := rows.Scan(&c.id, &c.file, &c.owner, &c.name, &c.signature, &c.visibility, &c.static, &c.min, &c.max, &c.startLine, &c.startCol, &c.endLine, &c.endCol, &c.factCount, &c.dispatch); err != nil {
+		if err := rows.Scan(&c.id, &c.file, &c.owner, &c.name, &c.signature, &c.visibility, &c.static, &c.min, &c.max, &c.startLine, &c.startCol, &c.endLine, &c.endCol, &c.factCount, &c.dispatch, &c.isOverride, &c.isFinal); err != nil {
 			return err
 		}
 		candidates = append(candidates, c)
@@ -409,7 +440,7 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				break
 			}
 			if matches == 1 {
-				if p.mode == swiftSuperTypeSource && swiftSuperTypeDispatchConflict(current, found, p.call, p.edge.file, relationsByChild, baseByKey, candidates) {
+				if p.mode == swiftSuperTypeSource && swiftSuperTypeDeclarationConflict(current, found, p.call, p.edge.file, relationsByChild, baseByKey, candidates) {
 					break
 				}
 				strategy := ResolutionStrategySwiftSuperScope

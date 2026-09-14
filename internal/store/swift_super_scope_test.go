@@ -113,6 +113,42 @@ func TestSwiftSuperMultilevelTypeScopeBindsStaticSource(t *testing.T) {
 	assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftSuperMultilevelTypeScope)
 }
 
+func TestSwiftSuperTypeScopeRequiresLegalInheritedDeclarations(t *testing.T) {
+	for _, selectedDispatch := range []string{"class", "static"} {
+		t.Run(selectedDispatch+"_missing_override", func(t *testing.T) {
+			f := newSwiftSuperAcceptanceFixture(t)
+			middle := f.symbol(f.mainFile, "Middle", "", "class", "", false)
+			middleRun := f.symbol(f.mainFile, "run", "Middle", "function", "run()", true)
+			swiftSetRange(t, f.swiftScopeFixture, middle, 10, 1, 15, 20)
+			swiftSetRange(t, f.swiftScopeFixture, middleRun, 11, 1, 11, 15)
+			f.arity(middleRun, 0, 0)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET target_qualified_name='Middle' WHERE child_qualified_name='Child'`)
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Middle", "Base")
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.baseRun)
+			swiftFact(t, f.swiftScopeFixture, f.mainFile, middleRun, selectedDispatch)
+			f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, middleRun)
+			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.caller)
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+		})
+	}
+}
+
+func TestSwiftSuperTypeScopeRejectsTransitiveInheritedConflicts(t *testing.T) {
+	f := newSwiftSuperAcceptanceFixture(t)
+	grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+	grandRun := f.symbol(f.mainFile, "run", "Grand", "function", "run()", true)
+	swiftSetRange(t, f.swiftScopeFixture, grand, 10, 1, 14, 20)
+	swiftSetRange(t, f.swiftScopeFixture, grandRun, 11, 1, 11, 15)
+	f.arity(grandRun, 0, 0)
+	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Grand")
+	f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id IN (?,?)`, f.baseRun, f.caller)
+	f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id IN (?,?)`, f.baseRun, f.caller)
+	swiftFact(t, f.swiftScopeFixture, f.mainFile, grandRun, "class")
+	f.resolve()
+	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+}
+
 func TestSwiftSuperTypeScopeTargetBoundedAncestry(t *testing.T) {
 	for _, tc := range []struct {
 		name, strategy string
@@ -981,7 +1017,7 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 		"source_is_static_missing", "source_class_static_bit_zero", "source_static_static_bit_zero", "source_class_dispatch_instance", "source_static_dispatch_instance", "source_missing_fact", "source_duplicate_fact", "source_malformed_dispatch", "source_wrong_owner", "source_outside_class_body", "source_extension_owned",
 		"target_is_static_missing", "target_is_static_zero", "target_dispatch_instance", "target_malformed_dispatch", "target_missing_fact", "target_duplicate_fact", "target_private", "target_extension_owned", "target_wrong_owner", "target_cross_file",
 		"second_valid_class", "second_valid_static", "valid_class_plus_valid_static", "instance_competitor", "malformed_competitor", "missing_fact_competitor", "duplicate_fact_competitor", "private_competitor", "extension_owned_competitor",
-		"intermediate_valid_class", "intermediate_valid_static", "intermediate_instance", "intermediate_malformed", "intermediate_missing_fact", "intermediate_duplicate_fact", "intermediate_private", "intermediate_extension_owned", "intermediate_known_incompatible",
+		"intermediate_valid_class", "intermediate_valid_static", "intermediate_class_missing_override", "intermediate_static_illegal_inheritance", "inherited_final_class_conflict", "transitive_class_missing_override", "transitive_static_conflict", "transitive_legal_override", "intermediate_instance", "intermediate_malformed", "intermediate_missing_fact", "intermediate_duplicate_fact", "intermediate_private", "intermediate_extension_owned", "intermediate_known_incompatible",
 		"mixed_class_static", "unknown_selector_shape", "trailing_second_valid_target", "trailing_malformed_target", "trailing_instance_competitor", "trailing_intermediate_unsafe", "trailing_static_blocker", "active_static_blocker",
 	}
 	if len(names) < 60 {
@@ -990,7 +1026,7 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 	resolved := map[string]bool{}
 	for _, name := range []string{
 		"direct_class_source_class_target", "direct_class_source_static_target", "direct_static_source_class_target", "direct_static_source_static_target", "direct_class_source_final_class_target", "direct_static_source_final_class_target",
-		"two_hop_class_to_class", "two_hop_class_to_static", "two_hop_static_to_class", "two_hop_static_to_static", "three_hop_class", "three_hop_static_source", "four_hop_class", "four_hop_static_source", "final_class_target", "selector_zero", "selector_unlabeled", "selector_named", "selector_multi", "trailing_class", "trailing_static", "qualified", "reverse_subclass", "target_bounded", "irrelevant_intermediate_instance_blocker", "irrelevant_target_instance_blocker", "deleted_intermediate_static_blocker", "deleted_target_static_blocker", "intermediate_valid_class", "intermediate_valid_static", "intermediate_known_incompatible",
+		"two_hop_class_to_class", "two_hop_class_to_static", "two_hop_static_to_class", "two_hop_static_to_static", "three_hop_class", "three_hop_static_source", "four_hop_class", "four_hop_static_source", "final_class_target", "selector_zero", "selector_unlabeled", "selector_named", "selector_multi", "trailing_class", "trailing_static", "qualified", "reverse_subclass", "target_bounded", "irrelevant_intermediate_instance_blocker", "irrelevant_target_instance_blocker", "deleted_intermediate_static_blocker", "deleted_target_static_blocker", "intermediate_valid_class", "intermediate_valid_static", "intermediate_known_incompatible", "transitive_legal_override",
 	} {
 		resolved[name] = true
 	}
@@ -1016,6 +1052,30 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 		}
 		if strings.Contains(name, "final_class") || name == "final_class_target" {
 			q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, f.baseRun)
+		}
+		if strings.HasPrefix(name, "transitive_") {
+			grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+			grandRun := f.symbol(f.mainFile, "run", "Grand", "function", "run()", true)
+			swiftSetRange(f.t, f.swiftScopeFixture, grand, 20, 1, 24, 20)
+			swiftSetRange(f.t, f.swiftScopeFixture, grandRun, 21, 1, 21, 15)
+			f.arity(grandRun, 0, 0)
+			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "Grand")
+			grandDispatch := "class"
+			if name == "transitive_static_conflict" {
+				grandDispatch = "static"
+			}
+			swiftFact(f.t, f.swiftScopeFixture, f.mainFile, grandRun, grandDispatch)
+			q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=? WHERE symbol_id=?`, boolInt(name == "transitive_legal_override"), f.baseRun)
+			if name == "transitive_static_conflict" {
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1,dispatch_kind='class' WHERE symbol_id=?`, f.baseRun)
+			}
+		}
+		if name == "inherited_final_class_conflict" {
+			middleRun := f.symbol(f.mainFile, "run", "Middle", "function", "run()", true)
+			f.arity(middleRun, 0, 0)
+			swiftSetRange(f.t, f.swiftScopeFixture, middleRun, 11, 1, 11, 15)
+			swiftFact(f.t, f.swiftScopeFixture, f.mainFile, middleRun, "class")
+			q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1,is_final=1 WHERE symbol_id=?`, f.baseRun)
 		}
 		if strings.HasPrefix(name, "selector_") {
 			sig, ev, arity := "run()", "swift:super", 0
@@ -1147,9 +1207,20 @@ func TestSwiftSuperTypeScopeHardenedStress(t *testing.T) {
 			case "intermediate_valid_class":
 				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, id)
 				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "class")
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id=?`, id)
 			case "intermediate_valid_static":
 				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, id)
 				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "static")
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1 WHERE symbol_id=?`, id)
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, f.baseRun)
+			case "intermediate_class_missing_override":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, id)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "class")
+			case "intermediate_static_illegal_inheritance":
+				q.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, id)
+				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "static")
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_override=1,dispatch_kind='static' WHERE symbol_id=?`, id)
+				q.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, f.baseRun)
 			case "intermediate_instance":
 				swiftFact(f.t, f.swiftScopeFixture, f.mainFile, id, "instance")
 			case "intermediate_malformed":
