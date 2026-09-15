@@ -73,12 +73,6 @@ jobs:
           go version
           go env GOOS GOARCH CGO_ENABLED GOPATH GOMODCACHE GOCACHE
 
-      - name: Run native tests
-        # Same 20-minute ceiling as CI: this step runs on hosted Windows
-        # runners, where Go's 10-minute default is within reach of the store
-        # package's WAL-checkpoint-heavy test set.
-        run: go test -timeout 20m ./...
-
       - name: Build archive
         shell: bash
         run: |
@@ -93,6 +87,7 @@ jobs:
           archive_base="${binary}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
           mkdir -p "${dist}/${archive_base}"
           GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=1 go build -v -x -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
+          "${dist}/${archive_base}/${binary_name}" --version
           cp README.md "${dist}/${archive_base}/README.md"
           cp LICENSE "${dist}/${archive_base}/LICENSE"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then

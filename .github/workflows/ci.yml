@@ -4,10 +4,11 @@ on:
   push:
     branches:
       - master
+      - v2.0
   pull_request:
 
 jobs:
-  test:
+  test-native:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -35,3 +36,74 @@ jobs:
         # finite headroom; Linux/macOS retain the tighter 20m ceiling. A
         # passing run does not wait longer, and hangs still fail at 30m.
         run: go test -timeout ${{ matrix.go_test_timeout }} ./...
+
+      - name: Smoke native binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP ("codegraph-smoke-" + [guid]::NewGuid())
+          try {
+            New-Item -ItemType Directory -Path $work | Out-Null
+            $repo = Join-Path $work 'repo'
+            $home = Join-Path $work 'home'
+            New-Item -ItemType Directory -Path $repo, $home | Out-Null
+            @"
+          module smoke
+
+          go 1.26
+          "@ | Set-Content (Join-Path $repo 'go.mod')
+            @"
+          package smoke
+          func Target() {}
+          func Caller() { Target() }
+          "@ | Set-Content (Join-Path $repo 'smoke.go')
+            $binary = Join-Path $work 'codegraph'
+            go build -o $binary ./cmd/codegraph
+            if ($IsWindows) { $binary += '.exe' }
+            & $binary --version
+            $env:CODEGRAPH_HOME = $home
+            & $binary index $repo
+            & $binary stats $repo
+            $callees = & $binary find_callees $repo Caller
+            if ($callees -notmatch 'Target') { throw "Caller -> Target not found: $callees" }
+            & $binary update $repo
+          } finally {
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $work
+          }
+
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./internal/mcp -run '^(TestFullToolsListIsByteIdentical|TestGatewayToolsListIsByteIdentical)$'
+      - run: go test ./internal/indexer -run '^(TestUpdateReconsidersEdgeAfterCompetingDeclarationRemoved|TestAmbiguityOscillatesWithFreshParity)$'
+      - run: go test -run '^$' -bench '^BenchmarkStoreFindCallers_Hub$' -benchtime=1x ./internal/store
+
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated|TestNeighborConcurrentQueriesStayIsolated)$'
+      - run: go test -race ./internal/indexer -run '^(TestUpdateTraversalFailureKeepsUnvisitedFilesAndRecovers|TestUpdateFileSymlinkSeesTargetEdits|TestIndexNonIndexableEntriesAreSkippedNotFatal)$'
+      - run: go test -race ./internal/query
+      - run: go test -race ./internal/mcp -run '^(TestConcurrentToolCallsAreMeteredSafely|TestGatewayToolsListIsByteIdentical|TestFullToolsListIsByteIdentical)$'
+
+  no-cgo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: CGO_ENABLED=0 go test ./internal/cli
+      - run: CGO_ENABLED=0 go build ./cmd/codegraph

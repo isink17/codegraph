@@ -278,6 +278,16 @@ func goModulesUnderRoot(root string) ([]goModule, error) {
 		if entry.Name() != "go.mod" {
 			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return err
