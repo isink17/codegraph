@@ -14,12 +14,21 @@ const swiftSuperRepairSettingKey = "resolver.swift_super_method_repaired.v1"
 const swiftSuperMultilevelInheritedMethodRepairSettingKey = "resolver.swift_super_multilevel_inherited_method_repaired.v1"
 const swiftSuperTypeMethodRepairSettingKey = "resolver.swift_super_type_method_repaired.v1"
 const swiftSuperExtensionMethodRepairSettingKey = "resolver.swift_super_extension_method_repaired.v1"
+const swiftSuperExtensionTargetMethodRepairSettingKey = "resolver.swift_super_extension_target_method_repaired.v1"
 
 type swiftSuperSourceMode uint8
 
 const (
 	swiftSuperInstanceSource swiftSuperSourceMode = iota + 1
 	swiftSuperTypeSource
+)
+
+type swiftSuperCandidateOwnerKind uint8
+
+const (
+	swiftSuperCandidateOwnerNone swiftSuperCandidateOwnerKind = iota
+	swiftSuperCandidateOwnerNominal
+	swiftSuperCandidateOwnerExtension
 )
 
 type swiftSuperCallShape struct {
@@ -120,6 +129,31 @@ func swiftPositionLE(al, ac, bl, bc int64) bool { return al < bl || al == bl && 
 
 func swiftSuperRangeContains(outer swiftSuperClass, file, sl, sc, el, ec int64) bool {
 	return outer.file == file && swiftPositionLE(outer.startLine, outer.startCol, sl, sc) && swiftPositionLE(el, ec, outer.endLine, outer.endCol)
+}
+
+// swiftSuperCandidateOwnerProof proves one and only one target provenance.
+// A membership row on a nominal-contained candidate is contradictory; an
+// extension candidate must have exactly one complete same-file membership.
+func swiftSuperCandidateOwnerProof(owner swiftSuperClass, candidate swiftSuperCandidate, callerFile int64, memberships map[int64][]swiftSuperExtensionMembership) swiftSuperCandidateOwnerKind {
+	rows := memberships[candidate.id]
+	insideOwner := swiftSuperRangeContains(owner, candidate.file, candidate.startLine, candidate.startCol, candidate.endLine, candidate.endCol)
+	if insideOwner {
+		if len(rows) == 0 {
+			return swiftSuperCandidateOwnerNominal
+		}
+		return swiftSuperCandidateOwnerNone
+	}
+	if len(rows) != 1 {
+		return swiftSuperCandidateOwnerNone
+	}
+	m := rows[0]
+	if m.file == candidate.file && m.file == callerFile && m.target == owner.qname &&
+		m.generic == 0 && m.constrained == 0 &&
+		swiftPositionLE(m.startLine, m.startCol, candidate.startLine, candidate.startCol) &&
+		swiftPositionLE(candidate.endLine, candidate.endCol, m.endLine, m.endCol) {
+		return swiftSuperCandidateOwnerExtension
+	}
+	return swiftSuperCandidateOwnerNone
 }
 
 // The same compatibility result is used for positive selection and every
@@ -256,6 +290,119 @@ func swiftSuperTypeDeclarationConflict(selectedOwner string, selected swiftSuper
 			return true
 		}
 		descendant = ancestor
+	}
+}
+
+// swiftSuperExtensionTargetInstanceDeclarationConflict rejects an
+// extension-owned instance target when a concrete ancestor can declare the
+// same stored call shape. Swift can select such overloads by argument type,
+// which the persisted call shape does not prove.
+func swiftSuperExtensionTargetInstanceDeclarationConflict(selectedOwner string, call swiftSuperCallShape, file int64, callerTest bool, tests map[int64]struct{}, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass, candidates []swiftSuperCandidate) bool {
+	current := selectedOwner
+	visited := map[string]struct{}{current: {}}
+	for {
+		var supers []swiftSuperRelation
+		for _, relation := range relationsByChild[current] {
+			switch relation.kind {
+			case "conformance":
+				continue
+			case "unproven":
+				continue
+			case "superclass":
+				if relation.file != file || relation.generic != 0 || relation.constrained != 0 {
+					continue
+				}
+				supers = append(supers, relation)
+			default:
+				continue
+			}
+		}
+		if len(supers) == 0 {
+			return false
+		}
+		if len(supers) != 1 || supers[0].target == "" {
+			return true
+		}
+		current = supers[0].target
+		if _, ok := visited[current]; ok {
+			return true
+		}
+		visited[current] = struct{}{}
+		owners := baseByKey[current+"\x00"+strconv.FormatInt(file, 10)]
+		if len(owners) == 0 {
+			return false
+		}
+		if len(owners) != 1 || owners[0].kind != "class" {
+			return true
+		}
+		if owners[0].visibility == "private" {
+			return false
+		}
+		for _, candidate := range candidates {
+			if candidate.owner != current || candidate.name != call.method {
+				continue
+			}
+			if _, candidateTest := tests[candidate.file]; candidateTest && !callerTest {
+				continue
+			}
+			compatible, known := swiftSuperCandidateMatches(call, candidate)
+			if !known {
+				return true
+			}
+			if !compatible {
+				continue
+			}
+			if candidate.static.Valid && candidate.static.Int64 == 1 && (candidate.dispatch == "class" || candidate.dispatch == "static") {
+				continue
+			}
+			if candidate.factCount != 1 || !candidate.static.Valid || candidate.static.Int64 != 0 || candidate.dispatch != "instance" {
+				return true
+			}
+			if candidate.file != file && (candidate.visibility == "private" || candidate.visibility == "fileprivate") {
+				continue
+			}
+			return true
+		}
+	}
+}
+
+// swiftSuperExtensionTargetAncestryClosed requires every superclass hop above
+// an extension-owned target to be exact in the caller's file. Unlike nominal
+// targets, an unknown tail could hold a type-only overload that changes Swift
+// dispatch without changing CodeGraph's persisted call shape.
+func swiftSuperExtensionTargetAncestryClosed(selectedOwner string, file int64, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass) bool {
+	current := selectedOwner
+	visited := map[string]struct{}{current: {}}
+	for {
+		var supers []swiftSuperRelation
+		for _, relation := range relationsByChild[current] {
+			switch relation.kind {
+			case "conformance":
+				continue
+			case "superclass":
+				if relation.file != file || relation.generic != 0 || relation.constrained != 0 {
+					return false
+				}
+				supers = append(supers, relation)
+			default:
+				return false
+			}
+		}
+		if len(supers) == 0 {
+			return true
+		}
+		if len(supers) != 1 || supers[0].target == "" {
+			return false
+		}
+		current = supers[0].target
+		if _, ok := visited[current]; ok {
+			return false
+		}
+		visited[current] = struct{}{}
+		owners := baseByKey[current+"\x00"+strconv.FormatInt(file, 10)]
+		if len(owners) != 1 || owners[0].kind != "class" {
+			return false
+		}
 	}
 }
 
@@ -455,6 +602,14 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 	if err != nil {
 		return 0, err
 	}
+	candidateIDs := make([]int64, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidateIDs = append(candidateIDs, candidate.id)
+	}
+	targetMemberships, err := swiftSuperLoadExtensionMemberships(ctx, q, repoID, candidateIDs)
+	if err != nil {
+		return 0, err
+	}
 	tests, err := testFileIDsForRepo(ctx, q, repoID)
 	if err != nil {
 		return 0, err
@@ -477,6 +632,7 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 			owner := owners[0]
 			veto, matches := false, 0
 			var found swiftSuperCandidate
+			var foundProvenance swiftSuperCandidateOwnerKind
 			for _, blocker := range blockers[current+"\x00"+p.call.method] {
 				if p.mode == swiftSuperInstanceSource && blocker.kind == graph.ScopeImportSwiftMemberValue && blocker.static != 0 {
 					continue
@@ -507,9 +663,10 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				if !compatible {
 					continue
 				}
-				validTarget := c.factCount == 1 && c.static.Valid && c.static.Int64 == 0 && c.dispatch == "instance" && c.visibility != "private" && swiftSuperRangeContains(owner, c.file, c.startLine, c.startCol, c.endLine, c.endCol)
+				provenance := swiftSuperCandidateOwnerProof(owner, c, p.edge.file, targetMemberships)
+				validTarget := c.factCount == 1 && c.static.Valid && c.static.Int64 == 0 && c.dispatch == "instance" && c.visibility != "private" && provenance != swiftSuperCandidateOwnerNone
 				if p.mode == swiftSuperTypeSource {
-					validTarget = c.factCount == 1 && c.static.Valid && c.static.Int64 == 1 && (c.dispatch == "class" || c.dispatch == "static") && c.visibility != "private" && c.file == p.edge.file && swiftSuperRangeContains(owner, c.file, c.startLine, c.startCol, c.endLine, c.endCol)
+					validTarget = c.factCount == 1 && c.static.Valid && c.static.Int64 == 1 && (c.dispatch == "class" || c.dispatch == "static") && c.visibility != "private" && c.file == p.edge.file && provenance != swiftSuperCandidateOwnerNone
 				}
 				if !validTarget {
 					veto = true
@@ -517,12 +674,19 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				}
 				matches++
 				found = c
+				foundProvenance = provenance
 			}
 			if veto || matches > 1 {
 				break
 			}
 			if matches == 1 {
 				if swiftSuperConcreteAncestryConflict(current, p.edge.file, visited, relationsByChild) {
+					break
+				}
+				if foundProvenance == swiftSuperCandidateOwnerExtension && !swiftSuperExtensionTargetAncestryClosed(current, p.edge.file, relationsByChild, baseByKey) {
+					break
+				}
+				if p.mode == swiftSuperInstanceSource && foundProvenance == swiftSuperCandidateOwnerExtension && swiftSuperExtensionTargetInstanceDeclarationConflict(current, p.call, p.edge.file, callerTest, tests, relationsByChild, baseByKey, candidates) {
 					break
 				}
 				if p.mode == swiftSuperTypeSource && swiftSuperTypeDeclarationConflict(current, found, p.call, p.edge.file, callerTest, tests, relationsByChild, baseByKey, candidates) {
