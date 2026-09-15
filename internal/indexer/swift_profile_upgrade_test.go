@@ -4,6 +4,7 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -35,6 +36,27 @@ type swiftV3FixtureAdapter struct{}
 // extension-only files: it deliberately drops inheritance facts while keeping
 // the rest of the current parser output.
 type swiftV5ExtensionFixtureAdapter struct{}
+
+// swiftV6ExtensionFixtureAdapter replays the pre-v7 Swift parser contract for
+// extension callers: it drops only the new membership facts.
+type swiftV6ExtensionFixtureAdapter struct{}
+
+func (swiftV6ExtensionFixtureAdapter) Language() string     { return "swift" }
+func (swiftV6ExtensionFixtureAdapter) Extensions() []string { return []string{".swift"} }
+func (swiftV6ExtensionFixtureAdapter) Supports(path string) bool {
+	return filepath.Ext(path) == ".swift"
+}
+func (swiftV6ExtensionFixtureAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:swift:v6", EmitsCallEdges: true}
+}
+func (swiftV6ExtensionFixtureAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	p, err := tsparser.NewSwift().Parse(ctx, path, content)
+	if err != nil {
+		return graph.ParsedFile{}, err
+	}
+	p.SwiftExtensionMemberships = nil
+	return p, nil
+}
 
 func (swiftV5ExtensionFixtureAdapter) Language() string     { return "swift" }
 func (swiftV5ExtensionFixtureAdapter) Extensions() []string { return []string{".swift"} }
@@ -170,6 +192,69 @@ func (swiftV1FixtureAdapter) Parse(_ context.Context, path string, content []byt
 	return p, nil
 }
 
+func TestSwiftV6ToV7ExtensionMembershipUpgrade(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "Base.swift"), `class Base { class func run() {} }
+class Child: Base {}
+extension Child { class func f() { super.run() } }
+`)
+	legacy := newProfileStore(t)
+	if _, err := New(legacy.Store, parser.NewRegistry(swiftV6ExtensionFixtureAdapter{}), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, legacy, root)
+	var profile string
+	if err := legacy.raw(t).QueryRow(`SELECT parser_profile FROM files WHERE repo_id=?`, repo).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile != "treesitter:swift:v6" {
+		t.Fatalf("legacy profile=%q", profile)
+	}
+	var memberships, unresolved int
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_extension_memberships WHERE repo_id=?`, repo).Scan(&memberships); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM edges WHERE repo_id=? AND dst_symbol_id IS NULL AND evidence='swift:super'`, repo).Scan(&unresolved); err != nil {
+		t.Fatal(err)
+	}
+	if memberships != 0 || unresolved != 1 {
+		t.Fatalf("legacy memberships=%d unresolved=%d", memberships, unresolved)
+	}
+	current := New(legacy.Store, parser.NewRegistry(tsparser.NewSwift()), nil)
+	summary, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 {
+		t.Fatalf("upgrade summary=%+v", summary)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT parser_profile FROM files WHERE repo_id=?`, repo).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile != "treesitter:swift:v7" {
+		t.Fatalf("upgraded profile=%q", profile)
+	}
+	if err := legacy.raw(t).QueryRow(`SELECT COUNT(*) FROM swift_extension_memberships WHERE repo_id=?`, repo).Scan(&memberships); err != nil {
+		t.Fatal(err)
+	}
+	var strategy string
+	var dst sql.NullInt64
+	if err := legacy.raw(t).QueryRow(`SELECT dst_symbol_id,resolution_strategy FROM edges WHERE repo_id=? AND evidence='swift:super'`, repo).Scan(&dst, &strategy); err != nil {
+		t.Fatal(err)
+	}
+	if memberships != 1 || !dst.Valid || strategy != store.ResolutionStrategySwiftSuperExtensionTypeScope {
+		t.Fatalf("upgraded membership=%d dst=%v strategy=%q", memberships, dst, strategy)
+	}
+	again, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update=%+v", again)
+	}
+}
+
 func TestSwiftV1ToV3UnchangedSourceConverges(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -216,7 +301,7 @@ public struct Visible {}
 	if summary.FilesChanged != 1 || summary.FilesIndexed != 1 || len(summary.ParserProfileLanguages) != 1 || summary.ParserProfileLanguages[0] != "swift" {
 		t.Fatalf("upgrade summary=%+v", summary)
 	}
-	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v6")
+	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v7")
 
 	fresh := newProfileStore(t)
 	if _, err := New(fresh.Store, parser.NewRegistry(tsparser.NewSwift()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
@@ -390,7 +475,7 @@ func TestSwiftV5ToV6ExtensionConformanceLifecycle(t *testing.T) {
 	if upgraded.FilesChanged != 2 || upgraded.FilesIndexed != 2 || len(upgraded.ParserProfileLanguages) != 1 || upgraded.ParserProfileLanguages[0] != "swift" {
 		t.Fatalf("upgrade summary=%+v", upgraded)
 	}
-	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v6")
+	assertSwiftProfileFacts(t, legacy, repo, "treesitter:swift:v7")
 
 	var child, target, relation, path string
 	if err := legacy.raw(t).QueryRow(`SELECT r.child_qualified_name,r.target_qualified_name,r.relation_kind,f.path FROM swift_inheritance_relations r JOIN files f ON f.id=r.file_id WHERE r.repo_id=?`, repo).Scan(&child, &target, &relation, &path); err != nil {
@@ -802,7 +887,7 @@ func assertSwiftV3Facts(t *testing.T, s *profileStore, repo int64) {
 	if err := db.QueryRow(`SELECT parser_profile FROM files WHERE repo_id=? AND is_deleted=0 LIMIT 1`, repo).Scan(&profile); err != nil {
 		t.Fatal(err)
 	}
-	if profile != "treesitter:swift:v6" {
+	if profile != "treesitter:swift:v7" {
 		t.Fatalf("profile=%q", profile)
 	}
 	var trailing, members, enumCases int

@@ -13,6 +13,7 @@ import (
 const swiftSuperRepairSettingKey = "resolver.swift_super_method_repaired.v1"
 const swiftSuperMultilevelInheritedMethodRepairSettingKey = "resolver.swift_super_multilevel_inherited_method_repaired.v1"
 const swiftSuperTypeMethodRepairSettingKey = "resolver.swift_super_type_method_repaired.v1"
+const swiftSuperExtensionMethodRepairSettingKey = "resolver.swift_super_extension_method_repaired.v1"
 
 type swiftSuperSourceMode uint8
 
@@ -31,6 +32,12 @@ type swiftSuperEdge struct {
 	id, file, src, startLine, startCol, endLine, endCol int64
 	dst, evidence, owner, name                          string
 	static, arity                                       sql.NullInt64
+}
+
+type swiftSuperExtensionMembership struct {
+	file, startLine, startCol, endLine, endCol int64
+	target                                     string
+	generic, constrained, count                int64
 }
 
 type swiftSuperClass struct {
@@ -278,6 +285,7 @@ FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_sym
 		mode        swiftSuperSourceMode
 		child, base swiftSuperClass
 		relation    swiftSuperRelation
+		extension   bool
 	}
 	pendingEdges := make([]pending, 0, len(edges))
 	owners := map[string]struct{}{}
@@ -301,6 +309,21 @@ FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_sym
 		return 0, nil
 	}
 
+	sourceIDs := make([]int64, 0, len(pendingEdges))
+	for _, p := range pendingEdges {
+		sourceIDs = append(sourceIDs, p.edge.src)
+	}
+	extensions, err := swiftSuperLoadExtensionMemberships(ctx, q, repoID, sourceIDs)
+	if err != nil {
+		return 0, err
+	}
+	for _, memberships := range extensions {
+		for _, m := range memberships {
+			if m.target != "" {
+				owners[m.target] = struct{}{}
+			}
+		}
+	}
 	classes, err := swiftSuperLoadClasses(ctx, q, repoID, sortedSwiftSet(owners))
 	if err != nil {
 		return 0, err
@@ -310,10 +333,6 @@ FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_sym
 		classByKey[c.qname+"\x00"+strconv.FormatInt(c.file, 10)] = append(classByKey[c.qname+"\x00"+strconv.FormatInt(c.file, 10)], c)
 	}
 	valid := pendingEdges[:0]
-	sourceIDs := make([]int64, 0, len(pendingEdges))
-	for _, p := range pendingEdges {
-		sourceIDs = append(sourceIDs, p.edge.src)
-	}
 	sourceFacts, err := swiftSuperLoadSourceFacts(ctx, q, repoID, sourceIDs)
 	if err != nil {
 		return 0, err
@@ -324,10 +343,23 @@ FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_sym
 			continue
 		}
 		cs := classByKey[p.edge.owner+"\x00"+strconv.FormatInt(p.edge.file, 10)]
-		if len(cs) != 1 || cs[0].kind != "class" || !swiftSuperRangeContains(cs[0], p.edge.file, p.edge.startLine, p.edge.startCol, p.edge.endLine, p.edge.endCol) {
-			continue
+		if len(cs) == 1 && cs[0].kind == "class" && swiftSuperRangeContains(cs[0], p.edge.file, p.edge.startLine, p.edge.startCol, p.edge.endLine, p.edge.endCol) {
+			p.child = cs[0]
+		} else {
+			members := extensions[p.edge.src]
+			if len(members) != 1 {
+				continue
+			}
+			m := members[0]
+			if m.file != p.edge.file || m.target != p.edge.owner || m.target == "" || m.generic < 0 || m.generic > 1 || m.constrained < 0 || m.constrained > 1 || m.generic != 0 || m.constrained != 0 || !swiftPositionLE(m.startLine, m.startCol, p.edge.startLine, p.edge.startCol) || !swiftPositionLE(p.edge.endLine, p.edge.endCol, m.endLine, m.endCol) {
+				continue
+			}
+			cs = classByKey[m.target+"\x00"+strconv.FormatInt(p.edge.file, 10)]
+			if len(cs) != 1 || cs[0].kind != "class" {
+				continue
+			}
+			p.child, p.extension = cs[0], true
 		}
-		p.child = cs[0]
 		valid = append(valid, p)
 	}
 	if len(valid) == 0 {
@@ -490,6 +522,9 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				break
 			}
 			if matches == 1 {
+				if swiftSuperConcreteAncestryConflict(current, p.edge.file, visited, relationsByChild) {
+					break
+				}
 				if p.mode == swiftSuperTypeSource && swiftSuperTypeDeclarationConflict(current, found, p.call, p.edge.file, callerTest, tests, relationsByChild, baseByKey, candidates) {
 					break
 				}
@@ -497,11 +532,25 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				if p.mode == swiftSuperTypeSource {
 					strategy = ResolutionStrategySwiftSuperTypeScope
 				}
+				if p.extension {
+					if p.mode == swiftSuperTypeSource {
+						strategy = ResolutionStrategySwiftSuperExtensionTypeScope
+					} else {
+						strategy = ResolutionStrategySwiftSuperExtensionScope
+					}
+				}
 				if depth >= 2 {
 					if p.mode == swiftSuperTypeSource {
 						strategy = ResolutionStrategySwiftSuperMultilevelTypeScope
 					} else {
 						strategy = ResolutionStrategySwiftSuperMultilevelInheritedMethodScope
+					}
+					if p.extension {
+						if p.mode == swiftSuperTypeSource {
+							strategy = ResolutionStrategySwiftSuperExtensionMultilevelTypeScope
+						} else {
+							strategy = ResolutionStrategySwiftSuperExtensionMultilevelInheritedMethodScope
+						}
 					}
 				}
 				res[p.edge.id] = swiftScopeBinding{dst: found.id, strategy: strategy}
@@ -532,6 +581,48 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 	return swiftScopeApply(ctx, q, res)
 }
 
+// swiftSuperConcreteAncestryConflict rejects a proven cycle that closes through
+// an already-traversed owner. Unknown ancestry above the selected target is
+// deliberately target-bounded and does not conflict.
+func swiftSuperConcreteAncestryConflict(selectedOwner string, file int64, visited map[string]struct{}, relationsByChild map[string][]swiftSuperRelation) bool {
+	current := selectedOwner
+	seen := map[string]struct{}{current: {}}
+	for {
+		var supers []swiftSuperRelation
+		for _, relation := range relationsByChild[current] {
+			switch relation.kind {
+			case "conformance":
+				continue
+			case "superclass":
+				if relation.file != file || relation.generic != 0 || relation.constrained != 0 {
+					continue
+				}
+				supers = append(supers, relation)
+			case "unproven":
+				continue
+			}
+		}
+		if len(supers) == 0 {
+			return false
+		}
+		if len(supers) != 1 {
+			return true
+		}
+		next := supers[0].target
+		if next == "" {
+			return true
+		}
+		if _, ok := visited[next]; ok {
+			return true
+		}
+		if _, ok := seen[next]; ok {
+			return true
+		}
+		seen[next] = struct{}{}
+		current = next
+	}
+}
+
 type swiftSuperFact struct {
 	count    int
 	dispatch string
@@ -559,6 +650,29 @@ func swiftSuperLoadSourceFacts(ctx context.Context, q javaQuery, repoID int64, i
 			return nil
 		})
 	return result, err
+}
+
+func swiftSuperLoadExtensionMemberships(ctx context.Context, q javaQuery, repoID int64, ids []int64) (map[int64][]swiftSuperExtensionMembership, error) {
+	out := map[int64][]swiftSuperExtensionMembership{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	err := sqliteBatchedIDQuery(ctx, q, ids, `SELECT symbol_id,file_id,target_qualified_name,extension_start_line,extension_start_col,extension_end_line,extension_end_col,is_generic,is_constrained FROM swift_extension_memberships WHERE repo_id=? AND symbol_id IN (`, []any{repoID}, func(scan func(...any) error) error {
+		var symbol int64
+		var m swiftSuperExtensionMembership
+		if err := scan(&symbol, &m.file, &m.target, &m.startLine, &m.startCol, &m.endLine, &m.endCol, &m.generic, &m.constrained); err != nil {
+			return err
+		}
+		out[symbol] = append(out[symbol], m)
+		return nil
+	})
+	for id, rows := range out {
+		for i := range rows {
+			rows[i].count = int64(len(rows))
+		}
+		out[id] = rows
+	}
+	return out, err
 }
 
 func sortedSwiftSet(set map[string]struct{}) []string {

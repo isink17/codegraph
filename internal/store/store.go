@@ -2205,6 +2205,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM swift_declaration_facts WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM swift_extension_memberships WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM swift_lexical_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2360,6 +2363,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM swift_declaration_facts WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM swift_extension_memberships WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM swift_lexical_binding_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2636,6 +2642,18 @@ func insertParsedFileGraph(
 			args = append(args, repoID, fileID, symbolIDs[fact.SymbolIndex], boolInt(fact.Final), boolInt(fact.Override), fact.Dispatch)
 		}
 		if err := execBatchInsert(ctx, tx, "swift_declaration_facts", "repo_id, file_id, symbol_id, is_final, is_override, dispatch_kind", 6, args, stats); err != nil {
+			return nil, err
+		}
+	}
+	if len(parsed.SwiftExtensionMemberships) > 0 {
+		args := make([]any, 0, len(parsed.SwiftExtensionMemberships)*11)
+		for _, fact := range parsed.SwiftExtensionMemberships {
+			if fact.SymbolIndex < 0 || fact.SymbolIndex >= len(symbolIDs) || fact.Target == "" {
+				return nil, fmt.Errorf("invalid Swift extension membership symbol index %d", fact.SymbolIndex)
+			}
+			args = append(args, repoID, fileID, symbolIDs[fact.SymbolIndex], fact.Target, fact.Range.StartLine, fact.Range.StartCol, fact.Range.EndLine, fact.Range.EndCol, boolInt(fact.Generic), boolInt(fact.Constrained))
+		}
+		if err := execBatchInsert(ctx, tx, "swift_extension_memberships", "repo_id, file_id, symbol_id, target_qualified_name, extension_start_line, extension_start_col, extension_end_line, extension_end_col, is_generic, is_constrained", 10, args, stats); err != nil {
 			return nil, err
 		}
 	}

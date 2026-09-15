@@ -146,6 +146,10 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategySwiftSuperMultilevelInheritedMethodScope,
 		ResolutionStrategySwiftSuperTypeScope,
 		ResolutionStrategySwiftSuperMultilevelTypeScope,
+		ResolutionStrategySwiftSuperExtensionScope,
+		ResolutionStrategySwiftSuperExtensionMultilevelInheritedMethodScope,
+		ResolutionStrategySwiftSuperExtensionTypeScope,
+		ResolutionStrategySwiftSuperExtensionMultilevelTypeScope,
 	}
 	if len(all) != len(resolutionConfidenceByStrategy) {
 		t.Fatalf("strategy constants = %d, registered confidences = %d; every strategy needs exactly one tier", len(all), len(resolutionConfidenceByStrategy))
@@ -175,6 +179,27 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 	for _, strategy := range binderStrategies {
 		if _, ok := resolutionConfidenceByStrategy[strategy]; !ok {
 			t.Fatalf("binder strategy %q has no registered confidence", strategy)
+		}
+	}
+}
+
+func TestSwiftSuperExtensionStrategiesAreIncrementallyRedecidable(t *testing.T) {
+	want := []string{
+		ResolutionStrategySwiftSuperExtensionScope,
+		ResolutionStrategySwiftSuperExtensionMultilevelInheritedMethodScope,
+		ResolutionStrategySwiftSuperExtensionTypeScope,
+		ResolutionStrategySwiftSuperExtensionMultilevelTypeScope,
+	}
+	for _, strategy := range want {
+		found := false
+		for _, registered := range incrementallyRedecidableStrategies {
+			if registered == strategy {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s is not incrementally redecidable", strategy)
 		}
 	}
 }

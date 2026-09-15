@@ -19,7 +19,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:ruby:v5"
 		}
 		if lang.Language == "swift" {
-			want = "treesitter:swift:v6"
+			want = "treesitter:swift:v7"
 		}
 		if lang.ParserProfile != want {
 			t.Fatalf("%s: parser profile = %q, want %q", lang.Language, lang.ParserProfile, want)

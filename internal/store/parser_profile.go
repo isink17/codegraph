@@ -112,8 +112,9 @@ const FileParserOwnedEvidencePredicate = `(
 		OR EXISTS (SELECT 1 FROM swift_lexical_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM swift_inheritance_relations t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM swift_declaration_facts t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+		OR EXISTS (SELECT 1 FROM swift_extension_memberships t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM test_links t WHERE t.test_file_id = f.id)
-		OR (f.language = 'swift' AND f.parser_profile IN ('treesitter:swift:v2', 'treesitter:swift:v3', 'treesitter:swift:v5') AND f.parse_state = 'indexed')
+		OR (f.language = 'swift' AND f.parser_profile IN ('treesitter:swift:v2', 'treesitter:swift:v3', 'treesitter:swift:v5', 'treesitter:swift:v6') AND f.parse_state = 'indexed')
 	)`
 
 // FileParserProfileGroups returns the repository's persisted parser provenance,
