@@ -366,6 +366,46 @@ func swiftSuperExtensionTargetInstanceDeclarationConflict(selectedOwner string, 
 	}
 }
 
+// swiftSuperExtensionTargetAncestryClosed requires every superclass hop above
+// an extension-owned target to be exact in the caller's file. Unlike nominal
+// targets, an unknown tail could hold a type-only overload that changes Swift
+// dispatch without changing CodeGraph's persisted call shape.
+func swiftSuperExtensionTargetAncestryClosed(selectedOwner string, file int64, relationsByChild map[string][]swiftSuperRelation, baseByKey map[string][]swiftSuperClass) bool {
+	current := selectedOwner
+	visited := map[string]struct{}{current: {}}
+	for {
+		var supers []swiftSuperRelation
+		for _, relation := range relationsByChild[current] {
+			switch relation.kind {
+			case "conformance":
+				continue
+			case "superclass":
+				if relation.file != file || relation.generic != 0 || relation.constrained != 0 {
+					return false
+				}
+				supers = append(supers, relation)
+			default:
+				return false
+			}
+		}
+		if len(supers) == 0 {
+			return true
+		}
+		if len(supers) != 1 || supers[0].target == "" {
+			return false
+		}
+		current = supers[0].target
+		if _, ok := visited[current]; ok {
+			return false
+		}
+		visited[current] = struct{}{}
+		owners := baseByKey[current+"\x00"+strconv.FormatInt(file, 10)]
+		if len(owners) != 1 || owners[0].kind != "class" {
+			return false
+		}
+	}
+}
+
 func (s *Store) resolveSwiftSuperScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
 	var edges []swiftSuperEdge
 	err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.name,src.is_static,e.call_arity,src.start_line,src.start_col,src.end_line,src.end_col
@@ -641,6 +681,9 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 			}
 			if matches == 1 {
 				if swiftSuperConcreteAncestryConflict(current, p.edge.file, visited, relationsByChild) {
+					break
+				}
+				if foundProvenance == swiftSuperCandidateOwnerExtension && !swiftSuperExtensionTargetAncestryClosed(current, p.edge.file, relationsByChild, baseByKey) {
 					break
 				}
 				if p.mode == swiftSuperInstanceSource && foundProvenance == swiftSuperCandidateOwnerExtension && swiftSuperExtensionTargetInstanceDeclarationConflict(current, p.call, p.edge.file, callerTest, tests, relationsByChild, baseByKey, candidates) {

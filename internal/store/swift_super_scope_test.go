@@ -307,6 +307,124 @@ func TestSwiftSuperExtensionTargetInstanceAncestorConflict(t *testing.T) {
 	}
 }
 
+func TestSwiftSuperExtensionTargetCrossFileAncestor(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	ancestorFile := f.file("Grand.swift")
+	grand := f.symbol(ancestorFile, "Grand", "", "class", "", false)
+	grandRun := f.symbol(ancestorFile, "run", "Grand", "function", "run(_:)", false)
+	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+	baseRun := f.symbol(f.mainFile, "run", "Base", "function", "run(_:)", false)
+	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+	caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller(_:)", false)
+	for id, span := range map[int64][2]int64{grand: {1, 3}, grandRun: {2, 2}, base: {5, 7}, baseRun: {9, 9}, child: {12, 14}, caller: {13, 13}} {
+		swiftSetRange(t, f, id, span[0], 1, span[1], 20)
+	}
+	swiftSuperclass(t, f, f.mainFile, "Child", "Base")
+	swiftSuperclass(t, f, f.mainFile, "Base", "Grand")
+	swiftExtensionMembership(t, f, f.mainFile, baseRun, "Base", 8, 10, 0, 0)
+	for _, item := range []struct{ file, symbol int64 }{{ancestorFile, grandRun}, {f.mainFile, baseRun}, {f.mainFile, caller}} {
+		f.arity(item.symbol, 1, 1)
+		swiftFact(t, f, item.file, item.symbol, "instance")
+	}
+	edge := f.call(f.mainFile, caller, "super.run", "swift:super;labels=_", 1, 13)
+	f.resolve()
+	assertSwiftEdgeUnresolved(t, f, edge)
+}
+
+func TestSwiftSuperExtensionTargetRequiresClosedAncestry(t *testing.T) {
+	for _, kind := range []string{"unproven", "generic", "constrained"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
+			base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+			baseRun := f.symbol(f.mainFile, "run", "Base", "function", "run()", false)
+			child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+			caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller()", false)
+			for id, span := range map[int64][2]int64{grand: {1, 3}, base: {5, 7}, baseRun: {9, 9}, child: {12, 14}, caller: {13, 13}} {
+				swiftSetRange(t, f, id, span[0], 1, span[1], 20)
+			}
+			swiftSuperclass(t, f, f.mainFile, "Child", "Base")
+			if kind == "unproven" {
+				swiftRelation(t, f, f.mainFile, "Base", "", "unproven")
+			} else {
+				swiftSuperclass(t, f, f.mainFile, "Base", "Grand")
+				column := "is_generic"
+				if kind == "constrained" {
+					column = "is_constrained"
+				}
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET `+column+`=1 WHERE child_qualified_name='Base'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			swiftExtensionMembership(t, f, f.mainFile, baseRun, "Base", 8, 10, 0, 0)
+			f.arity(baseRun, 0, 0)
+			swiftFact(t, f, f.mainFile, baseRun, "instance")
+			swiftFact(t, f, f.mainFile, caller, "instance")
+			edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 13)
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f, edge)
+		})
+	}
+}
+
+func TestSwiftSuperExtensionTargetUpgradeRepairRequiresClosedAncestry(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	ancestorFile := f.file("Grand.swift")
+	grand := f.symbol(ancestorFile, "Grand", "", "class", "", false)
+	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+	target := f.symbol(f.mainFile, "run", "Base", "function", "run()", false)
+	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+	caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller()", false)
+	for id, span := range map[int64][2]int64{grand: {1, 3}, base: {5, 7}, target: {9, 9}, child: {12, 14}, caller: {13, 13}} {
+		swiftSetRange(t, f, id, span[0], 1, span[1], 20)
+	}
+	swiftSuperclass(t, f, f.mainFile, "Child", "Base")
+	swiftSuperclass(t, f, f.mainFile, "Base", "Grand")
+	swiftExtensionMembership(t, f, f.mainFile, target, "Base", 8, 10, 0, 0)
+	f.arity(target, 0, 0)
+	swiftFact(t, f, f.mainFile, target, "instance")
+	swiftFact(t, f, f.mainFile, caller, "instance")
+	edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 13)
+	f.reference(f.mainFile, caller, "super.run", 13)
+	ref := swiftReferenceID(t, f, edge)
+	for _, repair := range resolverRepairs {
+		if repair.key != swiftSuperExtensionTargetMethodRepairSettingKey {
+			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !run {
+		t.Fatalf("first repair=(%v,%v)", run, err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	assertSwiftReferenceCleared(t, f, ref)
+	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || run {
+		t.Fatalf("second repair=(%v,%v)", run, err)
+	}
+}
+
+func TestSwiftSuperNominalTargetKeepsUnknownAncestryPolicy(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	ancestorFile := f.file("Grand.swift")
+	grand := f.symbol(ancestorFile, "Grand", "", "class", "", false)
+	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+	baseRun := f.symbol(f.mainFile, "run", "Base", "function", "run()", false)
+	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+	caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller()", false)
+	for id, span := range map[int64][2]int64{grand: {1, 3}, base: {5, 7}, baseRun: {6, 6}, child: {12, 14}, caller: {13, 13}} {
+		swiftSetRange(t, f, id, span[0], 1, span[1], 20)
+	}
+	swiftSuperclass(t, f, f.mainFile, "Child", "Base")
+	swiftSuperclass(t, f, f.mainFile, "Base", "Grand")
+	f.arity(baseRun, 0, 0)
+	swiftFact(t, f, f.mainFile, baseRun, "instance")
+	swiftFact(t, f, f.mainFile, caller, "instance")
+	edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 13)
+	f.resolve()
+	assertSwiftEdgeMetadata(t, f, edge, baseRun, ResolutionStrategySwiftSuperScope)
+}
+
 func TestSwiftSuperExtensionTargetInstanceAncestorSelectors(t *testing.T) {
 	for _, tc := range []struct {
 		name, baseSignature, grandSignature, evidence string
@@ -455,6 +573,32 @@ func TestSwiftSuperExtensionTargetTypeSelectorDistinctAncestor(t *testing.T) {
 			edge := f.call(f.mainFile, caller, "super.run", "swift:super;labels=number:", 1, 13)
 			f.resolve()
 			assertSwiftEdgeMetadata(t, f, edge, baseRun, ResolutionStrategySwiftSuperTypeScope)
+		})
+	}
+}
+
+func TestSwiftSuperExtensionTargetTypeRequiresClosedAncestry(t *testing.T) {
+	for _, dispatch := range []string{"class", "static"} {
+		t.Run(dispatch, func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			ancestorFile := f.file("Grand.swift")
+			grand := f.symbol(ancestorFile, "Grand", "", "class", "", false)
+			base := f.symbol(f.mainFile, "Base", "", "class", "", false)
+			baseRun := f.symbol(f.mainFile, "run", "Base", "function", "run()", true)
+			child := f.symbol(f.mainFile, "Child", "", "class", "", false)
+			caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller()", true)
+			for id, span := range map[int64][2]int64{grand: {1, 3}, base: {5, 7}, baseRun: {9, 9}, child: {12, 14}, caller: {13, 13}} {
+				swiftSetRange(t, f, id, span[0], 1, span[1], 20)
+			}
+			swiftSuperclass(t, f, f.mainFile, "Child", "Base")
+			swiftSuperclass(t, f, f.mainFile, "Base", "Grand")
+			swiftExtensionMembership(t, f, f.mainFile, baseRun, "Base", 8, 10, 0, 0)
+			f.arity(baseRun, 0, 0)
+			swiftFact(t, f, f.mainFile, baseRun, dispatch)
+			swiftFact(t, f, f.mainFile, caller, dispatch)
+			edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 13)
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f, edge)
 		})
 	}
 }
