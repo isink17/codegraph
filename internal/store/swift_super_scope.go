@@ -522,6 +522,9 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				break
 			}
 			if matches == 1 {
+				if swiftSuperConcreteAncestryConflict(current, p.edge.file, visited, relationsByChild) {
+					break
+				}
 				if p.mode == swiftSuperTypeSource && swiftSuperTypeDeclarationConflict(current, found, p.call, p.edge.file, callerTest, tests, relationsByChild, baseByKey, candidates) {
 					break
 				}
@@ -576,6 +579,47 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 		}
 	}
 	return swiftScopeApply(ctx, q, res)
+}
+
+// swiftSuperConcreteAncestryConflict rejects a proven cycle that closes through
+// an already-traversed owner. Unknown ancestry above the selected target is
+// deliberately target-bounded and does not conflict.
+func swiftSuperConcreteAncestryConflict(selectedOwner string, file int64, visited map[string]struct{}, relationsByChild map[string][]swiftSuperRelation) bool {
+	current := selectedOwner
+	seen := map[string]struct{}{current: {}}
+	for {
+		var supers []swiftSuperRelation
+		unknown := false
+		for _, relation := range relationsByChild[current] {
+			switch relation.kind {
+			case "conformance":
+				continue
+			case "superclass":
+				if relation.file != file || relation.generic != 0 || relation.constrained != 0 || relation.target == "" {
+					unknown = true
+					continue
+				}
+				supers = append(supers, relation)
+			case "unproven":
+				unknown = true
+			}
+		}
+		if unknown || len(supers) == 0 {
+			return false
+		}
+		if len(supers) != 1 {
+			return false
+		}
+		next := supers[0].target
+		if _, ok := visited[next]; ok {
+			return true
+		}
+		if _, ok := seen[next]; ok {
+			return true
+		}
+		seen[next] = struct{}{}
+		current = next
+	}
 }
 
 type swiftSuperFact struct {
