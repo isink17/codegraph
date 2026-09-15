@@ -14,6 +14,7 @@ const swiftSuperRepairSettingKey = "resolver.swift_super_method_repaired.v1"
 const swiftSuperMultilevelInheritedMethodRepairSettingKey = "resolver.swift_super_multilevel_inherited_method_repaired.v1"
 const swiftSuperTypeMethodRepairSettingKey = "resolver.swift_super_type_method_repaired.v1"
 const swiftSuperExtensionMethodRepairSettingKey = "resolver.swift_super_extension_method_repaired.v1"
+const swiftSuperExtensionTargetMethodRepairSettingKey = "resolver.swift_super_extension_target_method_repaired.v1"
 
 type swiftSuperSourceMode uint8
 
@@ -120,6 +121,25 @@ func swiftPositionLE(al, ac, bl, bc int64) bool { return al < bl || al == bl && 
 
 func swiftSuperRangeContains(outer swiftSuperClass, file, sl, sc, el, ec int64) bool {
 	return outer.file == file && swiftPositionLE(outer.startLine, outer.startCol, sl, sc) && swiftPositionLE(el, ec, outer.endLine, outer.endCol)
+}
+
+// swiftSuperCandidateOwnerProof proves one and only one target provenance.
+// A membership row on a nominal-contained candidate is contradictory; an
+// extension candidate must have exactly one complete same-file membership.
+func swiftSuperCandidateOwnerProof(owner swiftSuperClass, candidate swiftSuperCandidate, callerFile int64, memberships map[int64][]swiftSuperExtensionMembership) bool {
+	rows := memberships[candidate.id]
+	insideOwner := swiftSuperRangeContains(owner, candidate.file, candidate.startLine, candidate.startCol, candidate.endLine, candidate.endCol)
+	if insideOwner {
+		return len(rows) == 0
+	}
+	if len(rows) != 1 {
+		return false
+	}
+	m := rows[0]
+	return m.file == candidate.file && m.file == callerFile && m.target == owner.qname &&
+		m.generic == 0 && m.constrained == 0 &&
+		swiftPositionLE(m.startLine, m.startCol, candidate.startLine, candidate.startCol) &&
+		swiftPositionLE(candidate.endLine, candidate.endCol, m.endLine, m.endCol)
 }
 
 // The same compatibility result is used for positive selection and every
@@ -455,6 +475,14 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 	if err != nil {
 		return 0, err
 	}
+	candidateIDs := make([]int64, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidateIDs = append(candidateIDs, candidate.id)
+	}
+	targetMemberships, err := swiftSuperLoadExtensionMemberships(ctx, q, repoID, candidateIDs)
+	if err != nil {
+		return 0, err
+	}
 	tests, err := testFileIDsForRepo(ctx, q, repoID)
 	if err != nil {
 		return 0, err
@@ -507,9 +535,9 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 				if !compatible {
 					continue
 				}
-				validTarget := c.factCount == 1 && c.static.Valid && c.static.Int64 == 0 && c.dispatch == "instance" && c.visibility != "private" && swiftSuperRangeContains(owner, c.file, c.startLine, c.startCol, c.endLine, c.endCol)
+				validTarget := c.factCount == 1 && c.static.Valid && c.static.Int64 == 0 && c.dispatch == "instance" && c.visibility != "private" && swiftSuperCandidateOwnerProof(owner, c, p.edge.file, targetMemberships)
 				if p.mode == swiftSuperTypeSource {
-					validTarget = c.factCount == 1 && c.static.Valid && c.static.Int64 == 1 && (c.dispatch == "class" || c.dispatch == "static") && c.visibility != "private" && c.file == p.edge.file && swiftSuperRangeContains(owner, c.file, c.startLine, c.startCol, c.endLine, c.endCol)
+					validTarget = c.factCount == 1 && c.static.Valid && c.static.Int64 == 1 && (c.dispatch == "class" || c.dispatch == "static") && c.visibility != "private" && c.file == p.edge.file && swiftSuperCandidateOwnerProof(owner, c, p.edge.file, targetMemberships)
 				}
 				if !validTarget {
 					veto = true
