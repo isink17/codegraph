@@ -589,28 +589,29 @@ func swiftSuperConcreteAncestryConflict(selectedOwner string, file int64, visite
 	seen := map[string]struct{}{current: {}}
 	for {
 		var supers []swiftSuperRelation
-		unknown := false
 		for _, relation := range relationsByChild[current] {
 			switch relation.kind {
 			case "conformance":
 				continue
 			case "superclass":
-				if relation.file != file || relation.generic != 0 || relation.constrained != 0 || relation.target == "" {
-					unknown = true
+				if relation.file != file || relation.generic != 0 || relation.constrained != 0 {
 					continue
 				}
 				supers = append(supers, relation)
 			case "unproven":
-				unknown = true
+				continue
 			}
 		}
-		if unknown || len(supers) == 0 {
+		if len(supers) == 0 {
 			return false
 		}
 		if len(supers) != 1 {
-			return false
+			return true
 		}
 		next := supers[0].target
+		if next == "" {
+			return true
+		}
 		if _, ok := visited[next]; ok {
 			return true
 		}

@@ -65,7 +65,7 @@ func TestSwiftSuperExtensionFreshDuplicateMembershipUnresolved(t *testing.T) {
 	assertSwiftReferenceCleared(t, f.swiftScopeFixture, swiftReferenceID(t, f.swiftScopeFixture, f.edge))
 }
 
-func TestSwiftSuperExtensionMultiEdgeDuplicateDiagnostics(t *testing.T) {
+func TestSwiftSuperExtensionMultiEdgeDuplicateMembership(t *testing.T) {
 	f := newSwiftSuperAcceptanceFixture(t)
 	swiftSetRange(t, f.swiftScopeFixture, f.child, 20, 1, 25, 20)
 	swiftSetRange(t, f.swiftScopeFixture, f.caller, 6, 1, 8, 20)
@@ -211,7 +211,7 @@ func TestSwiftSuperExtensionScopeHardenedStressPrivateVisibilityControls(t *test
 	}
 }
 
-func TestSwiftSuperExtensionDirectCycleNominalProbe(t *testing.T) {
+func TestSwiftSuperExtensionDirectCycleNominal(t *testing.T) {
 	f := newSwiftSuperAcceptanceFixture(t)
 	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Child")
 	f.reference(f.mainFile, f.caller, "super.run", 7)
@@ -219,7 +219,7 @@ func TestSwiftSuperExtensionDirectCycleNominalProbe(t *testing.T) {
 	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
 }
 
-func TestSwiftSuperExtensionDirectCycleExtensionProbe(t *testing.T) {
+func TestSwiftSuperExtensionDirectCycle(t *testing.T) {
 	f := extensionStressFixture(t, "instance", false)
 	swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Child")
 	f.reference(f.mainFile, f.caller, "super.run", 7)
@@ -247,6 +247,41 @@ func TestSwiftSuperExtensionPostTargetCyclesAndControls(t *testing.T) {
 			f.reference(f.mainFile, f.caller, "super.run", 7)
 			f.resolve()
 			if tc.want {
+				assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperExtensionScope)
+			} else {
+				assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
+			}
+		})
+	}
+}
+
+func TestSwiftSuperExtensionSelectedOwnerConcreteAncestry(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*swiftSuperAcceptanceFixture)
+		valid  bool
+	}{
+		{"cycle_with_unproven_noise", func(f *swiftSuperAcceptanceFixture) {
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "Child")
+			swiftRelation(t, f.swiftScopeFixture, f.mainFile, "Base", "P", "unproven")
+		}, false},
+		{"multiple_concrete_superclasses", func(f *swiftSuperAcceptanceFixture) {
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "GrandA")
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "GrandB")
+		}, false},
+		{"empty_concrete_target", func(f *swiftSuperAcceptanceFixture) {
+			swiftSuperclass(t, f.swiftScopeFixture, f.mainFile, "Base", "")
+		}, false},
+		{"unknown_only_tail", func(f *swiftSuperAcceptanceFixture) {
+			swiftRelation(t, f.swiftScopeFixture, f.mainFile, "Base", "P", "unproven")
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := extensionStressFixture(t, "instance", false)
+			tc.mutate(f)
+			f.reference(f.mainFile, f.caller, "super.run", 7)
+			f.resolve()
+			if tc.valid {
 				assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperExtensionScope)
 			} else {
 				assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
@@ -407,6 +442,14 @@ func runSwiftSuperExtensionScopeHardenedStress(t *testing.T, only string, prefix
 		}},
 		{"cycle", "instance", false, false, func(f *swiftSuperAcceptanceFixture) {
 			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "Child")
+		}},
+		{"cycle_with_unproven_noise", "instance", false, false, func(f *swiftSuperAcceptanceFixture) {
+			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "Child")
+			swiftRelation(f.t, f.swiftScopeFixture, f.mainFile, "Base", "P", "unproven")
+		}},
+		{"selected_owner_multiple_superclass", "instance", false, false, func(f *swiftSuperAcceptanceFixture) {
+			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "GrandA")
+			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Base", "GrandB")
 		}},
 		{"multiple_superclass", "instance", false, false, func(f *swiftSuperAcceptanceFixture) {
 			swiftSuperclass(f.t, f.swiftScopeFixture, f.mainFile, "Child", "Other")
