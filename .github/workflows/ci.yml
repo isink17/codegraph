@@ -11,6 +11,7 @@ jobs:
   test-native:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -75,7 +76,10 @@ jobs:
             Assert-NativeSuccess 'codegraph stats'
             $callees = & $binary find_callees $repo Caller
             Assert-NativeSuccess 'codegraph find_callees'
-            if ($callees -notmatch 'Target') { throw "Caller -> Target not found: $callees" }
+            $calleesJson = ($callees -join "`n") | ConvertFrom-Json
+            if (-not $calleesJson.target_found -or $calleesJson.count -ne 1 -or @($calleesJson.callees).Count -ne 1 -or $calleesJson.callees[0].qualified_name -ne 'smoke.Target') {
+              throw "Caller -> smoke.Target not found: $($callees -join "`n")"
+            }
             & $binary update $repo
             Assert-NativeSuccess 'codegraph update'
           } finally {
