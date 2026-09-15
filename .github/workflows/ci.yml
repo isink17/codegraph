@@ -41,12 +41,17 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          function Assert-NativeSuccess([string]$name) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "$name failed with exit code $LASTEXITCODE"
+            }
+          }
           $work = Join-Path $env:RUNNER_TEMP ("codegraph-smoke-" + [guid]::NewGuid())
           try {
             New-Item -ItemType Directory -Path $work | Out-Null
             $repo = Join-Path $work 'repo'
-            $home = Join-Path $work 'home'
-            New-Item -ItemType Directory -Path $repo, $home | Out-Null
+            $cgHome = Join-Path $work 'home'
+            New-Item -ItemType Directory -Path $repo, $cgHome | Out-Null
             @"
           module smoke
 
@@ -57,16 +62,22 @@ jobs:
           func Target() {}
           func Caller() { Target() }
           "@ | Set-Content (Join-Path $repo 'smoke.go')
-            $binary = Join-Path $work 'codegraph'
+            $binaryName = if ($IsWindows) { 'codegraph.exe' } else { 'codegraph' }
+            $binary = Join-Path $work $binaryName
             go build -o $binary ./cmd/codegraph
-            if ($IsWindows) { $binary += '.exe' }
+            Assert-NativeSuccess 'go build'
             & $binary --version
-            $env:CODEGRAPH_HOME = $home
+            Assert-NativeSuccess 'codegraph --version'
+            $env:CODEGRAPH_HOME = $cgHome
             & $binary index $repo
+            Assert-NativeSuccess 'codegraph index'
             & $binary stats $repo
+            Assert-NativeSuccess 'codegraph stats'
             $callees = & $binary find_callees $repo Caller
+            Assert-NativeSuccess 'codegraph find_callees'
             if ($callees -notmatch 'Target') { throw "Caller -> Target not found: $callees" }
             & $binary update $repo
+            Assert-NativeSuccess 'codegraph update'
           } finally {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $work
           }
