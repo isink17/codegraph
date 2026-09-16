@@ -916,25 +916,29 @@ func typeScopeEdgeNames(ctx context.Context, q queryContexter, repoID int64, fil
 	return out, nil
 }
 
-// fileIDsByPaths resolves repository-relative paths to file ids, accepting the
-// stored separator spellings a pre-P23 database may hold.
+// fileIDsByPaths resolves logical repository paths to file ids.
 func fileIDsByPaths(ctx context.Context, q queryContexter, repoID int64, paths []string) ([]int64, error) {
-	stored := make([]string, 0, len(paths)*3)
+	canonicalPaths := make([]string, 0, len(paths))
+	seenPaths := make(map[string]struct{}, len(paths))
 	for _, p := range paths {
 		canonical := CanonicalRelPath(p)
 		if canonical == "" {
 			continue
 		}
-		stored = append(stored, storedPathVariants(canonical)...)
+		if _, ok := seenPaths[canonical]; ok {
+			continue
+		}
+		seenPaths[canonical] = struct{}{}
+		canonicalPaths = append(canonicalPaths, canonical)
 	}
-	if len(stored) == 0 {
+	if len(canonicalPaths) == 0 {
 		return nil, nil
 	}
 	seen := map[int64]struct{}{}
 	var out []int64
-	for start := 0; start < len(stored); start += sqliteInClauseBatchSize {
-		end := min(start+sqliteInClauseBatchSize, len(stored))
-		chunk := stored[start:end]
+	for start := 0; start < len(canonicalPaths); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(canonicalPaths))
+		chunk := canonicalPaths[start:end]
 		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
 		for _, p := range chunk {

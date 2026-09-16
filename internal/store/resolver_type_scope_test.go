@@ -29,6 +29,31 @@ func newTypeScopeFixture(t *testing.T) *typeScopeFixture {
 	return &typeScopeFixture{newGateFixture(t)}
 }
 
+func TestFileIDsByPathsUsesCanonicalPaths(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	b := f.file(t, "pkg/b.py", "python")
+	a := f.file(t, "pkg/a.py", "python")
+	otherRepo, err := f.store.UpsertRepo(f.ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if _, err := insertTestFileLang(f.ctx, f.store, otherRepo.ID, "pkg/a.py", "python"); err != nil {
+		t.Fatalf("insert other-repo file error = %v", err)
+	}
+
+	got, err := fileIDsByPaths(f.ctx, f.store.db, f.repoID, []string{"pkg/b.py", "pkg/a.py", "pkg/b.py", "missing.py"})
+	if err != nil {
+		t.Fatalf("fileIDsByPaths() error = %v", err)
+	}
+	want := []int64{a, b}
+	if a > b {
+		want[0], want[1] = want[1], want[0]
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("fileIDsByPaths() = %v, want %v", got, want)
+	}
+}
+
 // importPath records that a file's source named a specifier, exactly as the
 // parsers persist it: the module path, never the imported symbol.
 func (f *typeScopeFixture) importPath(t *testing.T, fileID int64, specifier string) {
