@@ -10035,17 +10035,12 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 		paths := firstUniqueCanonicalPaths(results, 10)
 		// Cap at 10 files to mirror context_for_task defaults.
 		if len(paths) > 0 {
-			// SemanticSearch reports canonical (slash) paths; `files.path` holds the
-			// indexing host's native form. Bind both, or this predicate matches
-			// nothing on Windows and the benchmark reports a zero-byte context.
-			bound := make([]string, 0, len(paths)*2)
-			for _, p := range paths {
-				bound = append(bound, storedPathVariants(p)...)
-			}
-			placeholders := strings.TrimRight(strings.Repeat("?,", len(bound)), ",")
-			args := make([]any, 0, len(bound)+1)
+			// SemanticSearch returns logical repository paths, the same identities
+			// persisted in files.path.
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(paths)), ",")
+			args := make([]any, 0, len(paths)+1)
 			args = append(args, repoID)
-			for _, p := range bound {
+			for _, p := range paths {
 				args = append(args, p)
 			}
 			// Rows, not aggregates: a database that holds both forms of one path (a
