@@ -26,6 +26,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
+	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
@@ -116,8 +117,10 @@ func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64
 	if n != 0 || !fullIndex {
 		return ErrRepositoryPathFormatRebuild
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, 'logical-slash-v1')`, canonicalRepositoryPathsKey(repoID))
-	return err
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, 'logical-slash-v1') ON CONFLICT(key) DO NOTHING`, canonicalRepositoryPathsKey(repoID)); err != nil {
+		return err
+	}
+	return s.RequireCanonicalRepositoryPaths(ctx, repoID)
 }
 
 type Store struct {
@@ -7447,6 +7450,13 @@ func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file str
 	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
 		return nil, err
 	}
+	if file != "" {
+		var err error
+		file, err = platform.PublicRepositoryPath(file)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return s.relatedTests(ctx, repoID, symbol, file, limit, offset, 0, false)
 }
 
@@ -7454,19 +7464,8 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 	var rows *sql.Rows
 	var err error
 	if file != "" {
-		file = normalizeRepoRelPath(file)
-		canonical := CanonicalRelPath(file)
-		if canonical == "" {
-			return []RelatedTest{}, nil
-		}
-		variants := storedPathVariants(canonical)
 		var targetFileID int64
-		args := make([]any, 0, len(variants)+1)
-		args = append(args, repoID)
-		for _, variant := range variants {
-			args = append(args, variant)
-		}
-		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path IN (`+sqlPlaceholders(len(variants))+`) ORDER BY id`, args...)
+		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? ORDER BY id`, repoID, file)
 		if err != nil {
 			return nil, err
 		}
