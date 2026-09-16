@@ -483,11 +483,23 @@ func (s *Store) swiftPathsChanged(ctx context.Context, repoID int64, paths []str
 		return false, nil
 	}
 	var changed bool
-	stored := make([]string, 0, len(paths)*3)
+	canonical := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		stored = append(stored, storedPathVariants(CanonicalRelPath(path))...)
+		p := CanonicalRelPath(path)
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		canonical = append(canonical, p)
 	}
-	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='swift' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(stored), true, func(rows *sql.Rows) error {
+	if len(canonical) == 0 {
+		return false, nil
+	}
+	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='swift' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(canonical), true, func(rows *sql.Rows) error {
 		var hit bool
 		if err := rows.Scan(&hit); err != nil {
 			return err
