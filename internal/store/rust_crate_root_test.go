@@ -105,6 +105,23 @@ func (f *rustCrateRootFixture) resolveAll(t *testing.T, ctx context.Context) {
 	}
 }
 
+func TestRustRootsForPathsUsesCanonicalChangedPath(t *testing.T) {
+	ctx := context.Background()
+	f := newRustCrateRootFixture(t, ctx, "crate_a/src/lib.rs", "foo")
+	f.setCrateRoot(t, ctx, f.modules["foo"], "crate_a/src/lib.rs")
+
+	got, err := f.store.rustRootsForPaths(ctx, f.repoID, []string{"crate_a/src/foo.rs", "crate_a/src/foo.rs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rustRootsForPaths() = %v, want one crate root", got)
+	}
+	if _, ok := got["crate_a/src/lib.rs"]; !ok {
+		t.Fatalf("rustRootsForPaths() = %v, want crate_a/src/lib.rs", got)
+	}
+}
+
 // TestRustCrateRootPersistenceWritesEveryBatch is the contract test for the
 // crate-root CASE update: every proven membership must land, at one row, at
 // several rows, and across more rows than one statement's parameter budget

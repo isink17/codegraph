@@ -215,14 +215,16 @@ func updateRustCrateRoots(ctx context.Context, q execContexter, repoID int64, id
 }
 
 func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []string) (map[string]struct{}, error) {
-	wanted := make([]string, 0, len(paths)*3)
+	wanted := make([]string, 0, len(paths))
 	seen := map[string]struct{}{}
 	for _, path := range paths {
-		for _, variant := range storedPathVariants(CanonicalRelPath(path)) {
-			if _, ok := seen[variant]; !ok {
-				seen[variant] = struct{}{}
-				wanted = append(wanted, variant)
-			}
+		canonical := CanonicalRelPath(path)
+		if canonical == "" {
+			continue
+		}
+		if _, ok := seen[canonical]; !ok {
+			seen[canonical] = struct{}{}
+			wanted = append(wanted, canonical)
 		}
 	}
 	roots := map[string]struct{}{}
