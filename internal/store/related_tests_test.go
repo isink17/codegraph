@@ -66,7 +66,7 @@ func TestRelatedTests_FileScoped(t *testing.T) {
 	}
 }
 
-func TestRelatedTests_FileScopedMatchesWindowsStoredPath(t *testing.T) {
+func TestRelatedTests_FileScopedDoesNotInterpretLegacyWindowsPath(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -100,8 +100,8 @@ func TestRelatedTests_FileScopedMatchesWindowsStoredPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RelatedTests() error = %v", err)
 	}
-	if len(got) != 1 || got[0].File != "pkg/test_utils.py" {
-		t.Fatalf("RelatedTests() = %+v, want canonical Python test path", got)
+	if len(got) != 0 {
+		t.Fatalf("RelatedTests() = %+v, want no alias for legacy Windows path", got)
 	}
 }
 

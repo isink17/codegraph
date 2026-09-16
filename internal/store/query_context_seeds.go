@@ -76,35 +76,16 @@ func CanonicalRelPath(path string) string {
 	return strings.TrimPrefix(slashed, "./")
 }
 
-// canonicalStoredPath interprets either native separator spelling at the
-// compatibility boundary. CanonicalRelPath itself keeps POSIX identity rules;
-// this helper is only for bytes read from persisted files.path values.
+// canonicalStoredPath is retained for logical module helpers. Persisted paths
+// are already canonical; notably, a POSIX backslash is data, not a separator.
 func canonicalStoredPath(path string) string {
-	return CanonicalRelPath(strings.ReplaceAll(path, `\`, `/`))
+	return CanonicalRelPath(path)
 }
 
-// storedPathVariants returns slash, current-host native, and Windows-native
-// forms a `files.path` column may hold. This keeps readers compatible with
-// existing databases until canonical persistence is handled by P23.
+// storedPathVariants is the single canonical storage spelling. Its name is
+// retained temporarily for narrow query batching call sites.
 func storedPathVariants(canonical string) []string {
-	native := filepath.FromSlash(canonical)
-	windows := strings.ReplaceAll(canonical, "/", `\`)
-	variants := []string{canonical}
-	for _, variant := range []string{native, windows} {
-		if variant != canonical && !containsString(variants, variant) {
-			variants = append(variants, variant)
-		}
-	}
-	return variants
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
+	return []string{canonical}
 }
 
 // SymbolsForRefs resolves search-result refs to full symbol rows in one query

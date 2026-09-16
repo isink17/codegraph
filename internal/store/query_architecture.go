@@ -46,7 +46,7 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 		JOIN symbols s ON s.id = d.sid
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND d.degree >= (SELECT degree FROM cutoff)
-		ORDER BY d.degree DESC, REPLACE(f.path, char(92), '/') ASC,
+		ORDER BY d.degree DESC, f.path ASC,
 		         s.qualified_name ASC, s.kind ASC, s.signature ASC,
 		         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
 		         s.end_line ASC, s.end_col ASC
@@ -90,7 +90,7 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 		  AND NOT EXISTS (
 		      SELECT 1 FROM edges e WHERE e.repo_id = ? AND e.`+degreeCol+` = s.id
 		  )
-		ORDER BY REPLACE(f.path, char(92), '/') ASC, s.qualified_name ASC,
+		ORDER BY f.path ASC, s.qualified_name ASC,
 		         s.kind ASC, s.signature ASC, s.stable_key ASC,
 		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 		LIMIT ?

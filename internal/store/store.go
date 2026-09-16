@@ -78,6 +78,40 @@ const (
 	sqliteSymbolFTSValuesBatchRows = 150
 )
 
+const canonicalRepositoryPathsSettingKey = "format.canonical_repository_paths.v1"
+
+var ErrRepositoryPathFormatRebuild = errors.New("repository index uses an older path format; remove the index database and re-index required")
+
+func canonicalRepositoryPathsKey(repoID int64) string {
+	return canonicalRepositoryPathsSettingKey + "." + strconv.FormatInt(repoID, 10)
+}
+
+// EnsureCanonicalRepositoryPaths refuses populated indexes whose path identity
+// predates P23. A marker is created only for an empty repository during a full
+// index, before any canonical rows are written.
+func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64, fullIndex bool) error {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, canonicalRepositoryPathsKey(repoID)).Scan(&value)
+	if err == nil {
+		if value == "logical-slash-v1" {
+			return nil
+		}
+		return ErrRepositoryPathFormatRebuild
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM files WHERE repo_id=?) + (SELECT COUNT(*) FROM dirty_files WHERE repo_id=?)`, repoID, repoID).Scan(&n); err != nil {
+		return err
+	}
+	if n != 0 || !fullIndex {
+		return ErrRepositoryPathFormatRebuild
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, 'logical-slash-v1')`, canonicalRepositoryPathsKey(repoID))
+	return err
+}
+
 type Store struct {
 	db          *sql.DB
 	cleanup     func() error
@@ -7912,6 +7946,9 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 }
 
 func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason string) error {
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO dirty_files(repo_id, path, reason, queued_at)
 		VALUES(?, ?, ?, ?)
@@ -9253,6 +9290,9 @@ func (s *Store) FileIDByPath(ctx context.Context, repoID int64, path string) (in
 
 // ListFiles returns indexed files for a repository, optionally filtered by path prefix.
 func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, limit, offset int) ([]map[string]any, error) {
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return nil, err
+	}
 	query := `SELECT path, language, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`
 	args := []any{repoID}
 	if pathFilter != "" {
@@ -9262,7 +9302,7 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 			args = append(args, variant+"%")
 		}
 	}
-	query += ` ORDER BY REPLACE(path, char(92), '/') ASC LIMIT ? OFFSET ?`
+	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
 	args = append(args, safeLimit(limit), safeOffset(offset))
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -9279,7 +9319,7 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"path":       filepath.ToSlash(path),
+			"path":       path,
 			"language":   language,
 			"size_bytes": sizeBytes,
 		})

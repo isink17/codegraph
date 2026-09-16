@@ -31,6 +31,9 @@ func newQueryTestStore(t *testing.T) (*Store, int64) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
+	}
 	return s, repo.ID
 }
 
@@ -501,9 +504,12 @@ func TestArchitectureOverviewTopDegreeAndTotals(t *testing.T) {
 	}
 }
 
-func TestListFilesMatchesMixedPersistedSeparators(t *testing.T) {
+func TestListFilesRejectsMixedPersistedSeparatorsWithoutPathFormatMarker(t *testing.T) {
 	ctx := context.Background()
 	s, repoID := newQueryTestStore(t)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, canonicalRepositoryPathsKey(repoID)); err != nil {
+		t.Fatalf("delete marker: %v", err)
+	}
 	fileID, err := insertTestFile(ctx, s, repoID, `pkg\win.go`)
 	if err != nil {
 		t.Fatalf("insertTestFile: %v", err)
@@ -511,12 +517,8 @@ func TestListFilesMatchesMixedPersistedSeparators(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE files SET path = ? WHERE id = ?`, `pkg\win.go`, fileID); err != nil {
 		t.Fatalf("set Windows path: %v", err)
 	}
-	rows, err := s.ListFiles(ctx, repoID, "pkg/", 20, 0)
-	if err != nil {
-		t.Fatalf("ListFiles: %v", err)
-	}
-	if len(rows) != 1 || rows[0]["path"] != filepath.ToSlash(`pkg\win.go`) {
-		t.Fatalf("ListFiles = %v, want canonical mixed-path row", rows)
+	if _, err := s.ListFiles(ctx, repoID, "pkg/", 20, 0); err == nil {
+		t.Fatal("ListFiles accepted unmarked legacy path row")
 	}
 }
 
