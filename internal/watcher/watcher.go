@@ -342,7 +342,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				w.eventsIgnored.Add(1)
 				continue
 			}
-			rel, err = platform.PublicRepositoryPath(rel)
+			rel, err = platform.NativeRelativeToLogical(rel)
 			if err != nil {
 				w.eventsIgnored.Add(1)
 				continue

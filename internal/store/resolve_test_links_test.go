@@ -35,6 +35,9 @@ func newTestLinkFixture(t *testing.T) *testLinkFixture {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
+	}
 	return &testLinkFixture{t: t, ctx: ctx, store: s, repoID: repo.ID}
 }
 

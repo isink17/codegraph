@@ -86,19 +86,27 @@ func canonicalRepositoryPathsKey(repoID int64) string {
 	return canonicalRepositoryPathsSettingKey + "." + strconv.FormatInt(repoID, 10)
 }
 
+// RequireCanonicalRepositoryPaths is the read-only format gate for all public
+// path-sensitive operations. It never blesses or changes an older database.
+func (s *Store) RequireCanonicalRepositoryPaths(ctx context.Context, repoID int64) error {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, canonicalRepositoryPathsKey(repoID)).Scan(&value)
+	if err == nil && value == "logical-slash-v1" {
+		return nil
+	}
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		return ErrRepositoryPathFormatRebuild
+	}
+	return err
+}
+
 // EnsureCanonicalRepositoryPaths refuses populated indexes whose path identity
 // predates P23. A marker is created only for an empty repository during a full
 // index, before any canonical rows are written.
 func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64, fullIndex bool) error {
-	var value string
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, canonicalRepositoryPathsKey(repoID)).Scan(&value)
-	if err == nil {
-		if value == "logical-slash-v1" {
-			return nil
-		}
-		return ErrRepositoryPathFormatRebuild
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err == nil {
+		return nil
+	} else if !errors.Is(err, ErrRepositoryPathFormatRebuild) {
 		return err
 	}
 	var n int
@@ -108,7 +116,7 @@ func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64
 	if n != 0 || !fullIndex {
 		return ErrRepositoryPathFormatRebuild
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, 'logical-slash-v1')`, canonicalRepositoryPathsKey(repoID))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, 'logical-slash-v1')`, canonicalRepositoryPathsKey(repoID))
 	return err
 }
 
@@ -7436,6 +7444,9 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 }
 
 func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]RelatedTest, error) {
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.relatedTests(ctx, repoID, symbol, file, limit, offset, 0, false)
 }
 

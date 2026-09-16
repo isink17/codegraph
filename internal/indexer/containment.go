@@ -98,7 +98,7 @@ func containRelPath(root, path string) (string, error) {
 	if rel == "." {
 		return rel, nil
 	}
-	return platform.LogicalRepositoryPath(filepath.ToSlash(rel))
+	return platform.NativeRelativeToLogical(rel)
 }
 
 // containment answers "is this candidate inside the active repository" for one

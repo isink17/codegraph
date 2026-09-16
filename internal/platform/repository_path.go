@@ -38,8 +38,19 @@ func PublicRepositoryPath(p string) (string, error) {
 	return LogicalRepositoryPath(p)
 }
 
+// NativeRelativeToLogical converts a host-native relative filesystem path at
+// the traversal/watcher boundary. It is deliberately separate from public
+// input compatibility.
+func NativeRelativeToLogical(p string) (string, error) {
+	p = filepath.Clean(p)
+	if p == "." || filepath.IsAbs(p) || filepath.VolumeName(p) != "" {
+		return "", ErrInvalidRepositoryPath
+	}
+	return LogicalRepositoryPath(filepath.ToSlash(p))
+}
+
 func isWindowsAbsoluteSpelling(p string) bool {
-	return len(p) >= 3 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' && (p[2] == '/' || p[2] == '\\') || strings.HasPrefix(p, `\\`)
+	return len(p) >= 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' || strings.HasPrefix(p, `\\`)
 }
 
 // NativePath joins a logical path to root for filesystem use only.
