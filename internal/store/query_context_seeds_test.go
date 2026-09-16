@@ -195,11 +195,9 @@ func TestSymbolsForRefsPrefersTheRowWithAStableKey(t *testing.T) {
 	}
 }
 
-// The stored form of `files.path` is whatever the indexing host wrote:
-// filepath.Rel/filepath.Clean produce native separators, so a Windows-indexed
-// row holds `billing\renew.go`. A canonical ref must still address it, and the
-// result must be keyed canonically.
-func TestSymbolsForRefsMatchesNativeStoredPaths(t *testing.T) {
+// Persisted file paths are canonical. A canonical ref addresses that row, and
+// the result remains keyed canonically when input uses the host separator.
+func TestSymbolsForRefsMatchesCanonicalStoredPaths(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -211,8 +209,7 @@ func TestSymbolsForRefsMatchesNativeStoredPaths(t *testing.T) {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
 
-	// Exactly what the indexer would have stored on this host.
-	storedPath := filepath.Clean(filepath.FromSlash("billing/renew.go"))
+	storedPath := "billing/renew.go"
 	fileID, err := insertTestFile(ctx, s, repo.ID, storedPath)
 	if err != nil {
 		t.Fatalf("insertTestFile(%q) error = %v", storedPath, err)

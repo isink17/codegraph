@@ -104,10 +104,9 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 		return out, nil
 	}
 
-	// Two representations, kept apart deliberately: `wanted` (and the returned
-	// map) is keyed canonically, because that is what a scanned symbol carries and
-	// what every caller compares; the IN list binds the stored forms, because that
-	// is what the column holds.
+	// `wanted` (and the returned map) is keyed canonically, because that is what
+	// a scanned symbol carries and what every caller compares. pathSet contains
+	// distinct logical lookup paths, each bound once in the SQL IN list.
 	wanted := make(map[SymbolRef]struct{}, len(refs))
 	pathSet := make(map[string]struct{}, len(refs))
 	nameSet := make(map[string]struct{}, len(refs))
@@ -117,9 +116,7 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 			continue
 		}
 		wanted[SymbolRef{File: canonical, QualifiedName: ref.QualifiedName}] = struct{}{}
-		for _, variant := range storedPathVariants(canonical) {
-			pathSet[variant] = struct{}{}
-		}
+		pathSet[canonical] = struct{}{}
 		nameSet[ref.QualifiedName] = struct{}{}
 	}
 	if len(wanted) == 0 {

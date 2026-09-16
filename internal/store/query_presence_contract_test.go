@@ -93,6 +93,27 @@ func TestQueryPresenceContractIsPageIndependent(t *testing.T) {
 	}
 }
 
+func TestRelatedTestFilesPresentPreservesRequestedOrder(t *testing.T) {
+	s, repoID := newQueryTestStore(t)
+	ctx := testContext()
+	for _, path := range []string{"a.go", "b.go"} {
+		if _, err := insertTestFile(ctx, s, repoID, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.RelatedTestFilesPresent(ctx, repoID, []string{"b.go", "missing.go", "a.go", "b.go", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []bool{true, false, true, true, false}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("RelatedTestFilesPresent() = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestFindCalleesPresenceSurvivesHighOffset(t *testing.T) {
 	s, repoID := newQueryTestStore(t)
 	ctx := testContext()
