@@ -14,16 +14,9 @@ const architectureTopN = 15
 // topDegreeSymbols returns the N symbols with the highest edge degree in one
 // direction, as `{qualified_name, kind, file, <countKey>}` maps.
 //
-// The pre-P12 query said what it meant -- `symbols LEFT JOIN edges GROUP BY
-// s.id ORDER BY count DESC LIMIT 15` -- and paid for it: SQLite had to visit
-// every symbol in the repository, build one group per symbol, and sort all of
-// them to find fifteen. On a 100k-symbol graph that was the single slowest
-// query in the whole local surface (~400ms, four times the next worst).
-//
-// Aggregating on the *edge* side inverts the cost. Only symbols that actually
-// have an edge in that direction can be in the top N, so the grouping runs over
-// the edge index and produces at most one row per referenced symbol; the symbol
-// and file rows are then fetched for fifteen ids.
+// It aggregates degree on the edge side, finds the Nth degree cutoff, and joins
+// semantic identity only for rows at or above that cutoff. The final public
+// limit uses degree plus semantic identity, never a database row ID.
 //
 // The one case where that is not equivalent is a repository with fewer than N
 // referenced symbols: the old query padded the list with zero-degree symbols,
@@ -36,24 +29,29 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 	}
 	out := []map[string]any{}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.qualified_name, s.kind, f.path, agg.degree
-		FROM (
+		WITH degrees AS (
 			SELECT e.`+degreeCol+` AS sid, COUNT(1) AS degree
 			FROM edges e
 			WHERE e.repo_id = ? AND e.`+degreeCol+` IS NOT NULL
 			GROUP BY e.`+degreeCol+`
-			-- sid is the tie-break so which symbols make the cut is at least
-			-- deterministic for a given database. It cannot be qualified_name:
-			-- that would mean joining before limiting, which is the whole cost
-			-- this shape exists to avoid.
-			ORDER BY degree DESC, sid ASC
-			LIMIT ?
-		) agg
-		JOIN symbols s ON s.id = agg.sid
+		), cutoff AS (
+			SELECT MIN(degree) AS degree FROM (
+				SELECT degree FROM degrees
+			ORDER BY degree DESC
+				LIMIT ?
+			)
+		)
+		SELECT s.qualified_name, s.kind, f.path, d.degree
+		FROM degrees d
+		JOIN symbols s ON s.id = d.sid
 		JOIN files f ON f.id = s.file_id
-		WHERE s.repo_id = ?
-		ORDER BY agg.degree DESC, s.qualified_name ASC
-	`, repoID, limit, repoID)
+		WHERE s.repo_id = ? AND d.degree >= (SELECT degree FROM cutoff)
+		ORDER BY d.degree DESC, REPLACE(f.path, char(92), '/') ASC,
+		         s.qualified_name ASC, s.kind ASC, s.signature ASC,
+		         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
+		         s.end_line ASC, s.end_col ASC
+		LIMIT ?
+	`, repoID, limit, repoID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +90,9 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 		  AND NOT EXISTS (
 		      SELECT 1 FROM edges e WHERE e.repo_id = ? AND e.`+degreeCol+` = s.id
 		  )
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY REPLACE(f.path, char(92), '/') ASC, s.qualified_name ASC,
+		         s.kind ASC, s.signature ASC, s.stable_key ASC,
+		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 		LIMIT ?
 	`, repoID, repoID, need)
 	if err != nil {
