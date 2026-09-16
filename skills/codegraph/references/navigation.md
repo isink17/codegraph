@@ -9,7 +9,9 @@ file, or subsystem discovery in an unfamiliar codebase.
 
 - Results are ranked: direct matches first, then their callers/callees, then
   linked tests. Each symbol carries `symbol_id`, `stable_key`, and
-  `qualified_name` — exactly what the drill-down tools accept.
+  `qualified_name`. Use `qualified_name` with `find_symbol`; use `symbol_id`
+  where relationship tools accept exact identity. `stable_key` is stable
+  metadata and identity evidence, not a universal selector.
 - The token budget (`max_tokens`) sizes the returned page, not the candidate
   set. `has_more` + `next_cursor` continue the same ranking; replay the same
   task and options with the cursor.
@@ -38,9 +40,10 @@ Typical: `card` list → one `excerpt`. Responses mark cut content
 
 ## Relationships
 
-- `find_callers(symbol=...)` — who depends on this. Prefer `symbol_id` or
-  `qualified_name` when the bare name might be ambiguous.
-- `find_callees(symbol=...)` — what this orchestrates.
+- `find_callers(symbol_id=...)` — who depends on this; use exact ID where
+  available.
+- `find_callees(symbol_id=...)` — what this orchestrates; use exact ID where
+  available.
 - Leaf helper: callers usually matter. Orchestrator: callees usually matter.
   Investigating unfamiliar code: often both.
 
