@@ -682,16 +682,12 @@ func TestProductionSiblingPath(t *testing.T) {
 	}
 }
 
-func TestResolveTestLinksSiblingMatchesStoredSeparatorVariants(t *testing.T) {
+func TestResolveTestLinksSiblingMatchesCanonicalStoredPath(t *testing.T) {
 	cases := []struct {
 		name, testPath, targetPath, language string
 	}{
-		{"go slash", "a/shared_test.go", "a/shared.go", "go"},
-		{"go native", `a\shared_test.go`, `a\shared.go`, "go"},
-		{"go mixed", `a\shared_test.go`, "a/shared.go", "go"},
-		{"python slash", "pkg/test_utils.py", "pkg/utils.py", "python"},
-		{"python native", `pkg\test_utils.py`, `pkg\utils.py`, "python"},
-		{"python mixed", `pkg\test_utils.py`, "pkg/utils.py", "python"},
+		{"go", "a/shared_test.go", "a/shared.go", "go"},
+		{"python", "pkg/test_utils.py", "pkg/utils.py", "python"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

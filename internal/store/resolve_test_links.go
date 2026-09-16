@@ -403,18 +403,14 @@ func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []st
 	for start := 0; start < len(unique); start += testLinkResolveChunkSize {
 		end := min(start+testLinkResolveChunkSize, len(unique))
 		canonicalChunk := unique[start:end]
-		stored := make([]string, 0, len(canonicalChunk)*3)
-		for _, p := range canonicalChunk {
-			stored = append(stored, storedPathVariants(p)...)
-		}
-		args := make([]any, 0, len(stored)+1)
+		args := make([]any, 0, len(canonicalChunk)+1)
 		args = append(args, repoID)
-		for _, p := range stored {
+		for _, p := range canonicalChunk {
 			args = append(args, p)
 		}
 		rows, err := tx.QueryContext(ctx, `
 			SELECT id, path FROM files
-			WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+sqlPlaceholders(len(stored))+`)
+			WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+sqlPlaceholders(len(canonicalChunk))+`)
 		`, args...)
 		if err != nil {
 			return nil, err
@@ -426,7 +422,7 @@ func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []st
 				rows.Close()
 				return nil, err
 			}
-			key := canonicalStoredPath(p)
+			key := p
 			if ambiguous[key] {
 				continue
 			}
