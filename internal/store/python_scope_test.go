@@ -78,6 +78,30 @@ func TestPythonModuleCandidatePathsSeparateSameBasename(t *testing.T) {
 	}
 }
 
+func TestPythonScopeFileIDsByPathUsesCanonicalPaths(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	helperID, err := insertTestFileLang(ctx, s, repoID, "pkg/helper.py", "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainID, err := insertTestFileLang(ctx, s, repoID, "pkg/main.py", "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := pythonScopeFileIDsByPath(ctx, s.db, repoID, map[string]struct{}{
+		"pkg/main.py":   {},
+		"pkg/helper.py": {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got["pkg/helper.py"] != helperID || got["pkg/main.py"] != mainID {
+		t.Fatalf("pythonScopeFileIDsByPath() = %v, want canonical file IDs", got)
+	}
+}
+
 // `import a.b` binds `a`, not `a.b`, and the resolver derives both spellings
 // that reach a module from that truthful record rather than from a corrupted
 // LocalName.
