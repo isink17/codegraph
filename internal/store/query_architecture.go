@@ -36,24 +36,18 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 	}
 	out := []map[string]any{}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.qualified_name, s.kind, f.path, agg.degree
-		FROM (
-			SELECT e.`+degreeCol+` AS sid, COUNT(1) AS degree
-			FROM edges e
-			WHERE e.repo_id = ? AND e.`+degreeCol+` IS NOT NULL
-			GROUP BY e.`+degreeCol+`
-			-- sid is the tie-break so which symbols make the cut is at least
-			-- deterministic for a given database. It cannot be qualified_name:
-			-- that would mean joining before limiting, which is the whole cost
-			-- this shape exists to avoid.
-			ORDER BY degree DESC, sid ASC
-			LIMIT ?
-		) agg
-		JOIN symbols s ON s.id = agg.sid
+		SELECT s.qualified_name, s.kind, f.path, COUNT(1) AS degree
+		FROM edges e
+		JOIN symbols s ON s.id = e.`+degreeCol+`
 		JOIN files f ON f.id = s.file_id
-		WHERE s.repo_id = ?
-		ORDER BY agg.degree DESC, s.qualified_name ASC
-	`, repoID, limit, repoID)
+		WHERE e.repo_id = ? AND e.`+degreeCol+` IS NOT NULL AND s.repo_id = ?
+		GROUP BY e.`+degreeCol+`
+		ORDER BY degree DESC, REPLACE(f.path, char(92), '/') ASC,
+		         s.qualified_name ASC, s.kind ASC, s.signature ASC,
+		         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
+		         s.end_line ASC, s.end_col ASC
+		LIMIT ?
+	`, repoID, repoID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +86,9 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 		  AND NOT EXISTS (
 		      SELECT 1 FROM edges e WHERE e.repo_id = ? AND e.`+degreeCol+` = s.id
 		  )
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY REPLACE(f.path, char(92), '/') ASC, s.qualified_name ASC,
+		         s.kind ASC, s.signature ASC, s.stable_key ASC,
+		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 		LIMIT ?
 	`, repoID, repoID, need)
 	if err != nil {

@@ -9291,7 +9291,7 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT s.id, s.qualified_name, s.kind, s.name, f.path, f.language,
-		       s.start_line, s.end_line
+		       s.start_line, s.start_col, s.end_line, s.end_col
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id
 		-- f.repo_id is implied by the join (a symbol's file is in the symbol's
@@ -9312,7 +9312,9 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Test%'
 		  AND s.name NOT LIKE 'Benchmark%'
 		  AND s.name NOT LIKE 'Example%'
-		ORDER BY REPLACE(f.path, char(92), '/'), s.start_line
+		ORDER BY REPLACE(f.path, char(92), '/') ASC, s.start_line ASC,
+		         s.start_col ASC, s.qualified_name ASC, s.kind ASC, s.name ASC,
+		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ? OFFSET ?
 	`, repoID, repoID, safeLimit(limit), safeOffset(offset))
 	if err != nil {
@@ -9324,8 +9326,8 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 	for rows.Next() {
 		var id int64
 		var qualifiedName, kind, name, path, language string
-		var startLine, endLine int
-		if err := rows.Scan(&id, &qualifiedName, &kind, &name, &path, &language, &startLine, &endLine); err != nil {
+		var startLine, startCol, endLine, endCol int
+		if err := rows.Scan(&id, &qualifiedName, &kind, &name, &path, &language, &startLine, &startCol, &endLine, &endCol); err != nil {
 			return nil, err
 		}
 		out = append(out, map[string]any{
@@ -9441,13 +9443,16 @@ func (s *Store) VectorSearch(ctx context.Context, repoID int64, queryVec []float
 	if embCount > maxVectorScanSymbols {
 		rows, err := s.db.QueryContext(ctx, `
 			SELECT se.symbol_id, se.embedding, se.dimensions,
-				   s.qualified_name, s.kind, s.signature, s.doc_summary,
-				   f.path
+				   s.qualified_name, s.kind, s.signature, s.doc_summary, s.stable_key,
+				   s.start_line, s.start_col, s.end_line, s.end_col, f.path
 			FROM symbol_embeddings se
 			JOIN symbols s ON s.id = se.symbol_id
 			JOIN files f ON f.id = s.file_id
 			WHERE se.repo_id = ?
-			ORDER BY se.updated_at DESC
+			ORDER BY se.updated_at DESC, REPLACE(f.path, char(92), '/') ASC,
+			         s.qualified_name ASC, s.kind ASC, s.signature ASC,
+			         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
+			         s.end_line ASC, s.end_col ASC
 			LIMIT ?
 		`, repoID, maxVectorScanSymbols)
 		if err != nil {
@@ -9458,8 +9463,8 @@ func (s *Store) VectorSearch(ctx context.Context, repoID int64, queryVec []float
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT se.symbol_id, se.embedding, se.dimensions,
-			   s.qualified_name, s.kind, s.signature, s.doc_summary,
-			   f.path
+			   s.qualified_name, s.kind, s.signature, s.doc_summary, s.stable_key,
+			   s.start_line, s.start_col, s.end_line, s.end_col, f.path
 		FROM symbol_embeddings se
 		JOIN symbols s ON s.id = se.symbol_id
 		JOIN files f ON f.id = s.file_id
@@ -9475,12 +9480,14 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 	defer rows.Close()
 
 	type scored struct {
-		id        int64
-		file      string
-		symbol    string
-		kind      string
-		signature string
-		score     float64
+		id                                   int64
+		file                                 string
+		symbol                               string
+		kind                                 string
+		signature                            string
+		stableKey                            string
+		startLine, startCol, endLine, endCol int
+		score                                float64
 	}
 
 	var candidates []scored
@@ -9488,8 +9495,9 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 		var symbolID int64
 		var blob []byte
 		var dims int
-		var qualName, kind, sig, doc, filePath string
-		if err := rows.Scan(&symbolID, &blob, &dims, &qualName, &kind, &sig, &doc, &filePath); err != nil {
+		var qualName, kind, sig, doc, stableKey, filePath string
+		var startLine, startCol, endLine, endCol int
+		if err := rows.Scan(&symbolID, &blob, &dims, &qualName, &kind, &sig, &doc, &stableKey, &startLine, &startCol, &endLine, &endCol, &filePath); err != nil {
 			return nil, err
 		}
 		vec := bytesToFloat32(blob)
@@ -9500,7 +9508,7 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 			// reports the slash form. Left native, the two halves of the fusion
 			// would never meet on Windows and every hit would score as if it had
 			// been found by one searcher only.
-			candidates = append(candidates, scored{id: symbolID, file: CanonicalRelPath(filePath), symbol: qualName, kind: kind, signature: sig, score: sim})
+			candidates = append(candidates, scored{id: symbolID, file: CanonicalRelPath(filePath), symbol: qualName, kind: kind, signature: sig, stableKey: stableKey, startLine: startLine, startCol: startCol, endLine: endLine, endCol: endCol, score: sim})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -9522,7 +9530,22 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 		if candidates[i].kind != candidates[j].kind {
 			return candidates[i].kind < candidates[j].kind
 		}
-		return candidates[i].signature < candidates[j].signature
+		if candidates[i].signature != candidates[j].signature {
+			return candidates[i].signature < candidates[j].signature
+		}
+		if candidates[i].stableKey != candidates[j].stableKey {
+			return candidates[i].stableKey < candidates[j].stableKey
+		}
+		if candidates[i].startLine != candidates[j].startLine {
+			return candidates[i].startLine < candidates[j].startLine
+		}
+		if candidates[i].startCol != candidates[j].startCol {
+			return candidates[i].startCol < candidates[j].startCol
+		}
+		if candidates[i].endLine != candidates[j].endLine {
+			return candidates[i].endLine < candidates[j].endLine
+		}
+		return candidates[i].endCol < candidates[j].endCol
 	})
 
 	end := min(offset+limit, len(candidates))
@@ -9730,7 +9753,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	languages := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT language, COUNT(*) as file_count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY language ORDER BY file_count DESC`,
+			`SELECT language, COUNT(*) as file_count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY language ORDER BY file_count DESC, language ASC`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: languages: %w", err)
@@ -9753,7 +9776,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	topDirs := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT SUBSTR(REPLACE(path, char(92), '/') , 1, INSTR(REPLACE(path, char(92), '/') || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC LIMIT 20`,
+			`SELECT SUBSTR(REPLACE(path, char(92), '/') , 1, INSTR(REPLACE(path, char(92), '/') || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC, dir ASC LIMIT 20`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: directories: %w", err)
@@ -9776,7 +9799,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	symbolKinds := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT kind, COUNT(*) as count FROM symbols WHERE repo_id = ? GROUP BY kind ORDER BY count DESC`,
+			`SELECT kind, COUNT(*) as count FROM symbols WHERE repo_id = ? GROUP BY kind ORDER BY count DESC, kind ASC`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: symbol kinds: %w", err)
@@ -9799,7 +9822,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	edgeKinds := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT edge_kind, COUNT(*) as count FROM edges WHERE repo_id = ? GROUP BY edge_kind ORDER BY count DESC`,
+			`SELECT edge_kind, COUNT(*) as count FROM edges WHERE repo_id = ? GROUP BY edge_kind ORDER BY count DESC, edge_kind ASC`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: edge kinds: %w", err)
@@ -9946,20 +9969,8 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 			return nil, fmt.Errorf("benchmark semantic search: %w", err)
 		}
 		// Collect unique file paths from results.
-		filePaths := map[string]bool{}
-		for _, r := range results {
-			if p, ok := r["file"].(string); ok && p != "" {
-				filePaths[p] = true
-			}
-		}
+		paths := firstUniqueCanonicalPaths(results, 10)
 		// Cap at 10 files to mirror context_for_task defaults.
-		paths := make([]string, 0, len(filePaths))
-		for p := range filePaths {
-			if len(paths) >= 10 {
-				break
-			}
-			paths = append(paths, p)
-		}
 		if len(paths) > 0 {
 			// SemanticSearch reports canonical (slash) paths; `files.path` holds the
 			// indexing host's native form. Bind both, or this predicate matches
@@ -10046,6 +10057,27 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 	}, nil
 }
 
+func firstUniqueCanonicalPaths(results []map[string]any, limit int) []string {
+	seen := map[string]struct{}{}
+	paths := make([]string, 0, limit)
+	for _, result := range results {
+		path, ok := result["file"].(string)
+		if !ok || path == "" {
+			continue
+		}
+		path = CanonicalRelPath(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+		if len(paths) == limit {
+			break
+		}
+	}
+	return paths
+}
+
 // --- Session Memory ---
 
 func (s *Store) SessionLogEvent(ctx context.Context, repoID int64, sessionID, eventType, key, value, metadata string) error {
@@ -10078,7 +10110,7 @@ func (s *Store) SessionGetHistory(ctx context.Context, repoID int64, sessionID s
 		query += ` AND event_type = ?`
 		args = append(args, eventType)
 	}
-	query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -10117,7 +10149,7 @@ func (s *Store) SessionGetHotFiles(ctx context.Context, repoID int64, sessionID 
 		WHERE repo_id = ? AND event_type IN ('read', 'edit')
 		AND (? = '' OR session_id = ?)
 		GROUP BY key
-		ORDER BY access_count DESC
+		ORDER BY access_count DESC, REPLACE(key, char(92), '/') ASC, key ASC
 		LIMIT ?
 	`, repoID, sessionID, sessionID, limit)
 	if err != nil {
