@@ -43,7 +43,9 @@ insufficient.
 ## Keep context small
 
 - **Progressive detail:** `card` (default) → `skeleton` → `excerpt` → `full`.
-  A card already carries the identity every follow-up call accepts. Never
+  Use a card's `qualified_name` as a `find_symbol(query=...)`; where
+  relationship tools accept it, prefer exact `symbol_id` with
+  `find_callers(symbol_id=...)` or `find_callees(symbol_id=...)`. Never
   request `full` for dozens of candidates to discover which one matters.
 - **Bulk pages:** pass `format=compact` on tools whose schema offers it
   (card detail only). Keep JSON when you need structured nested fields.

@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/isink17/codegraph/releases/latest"><img src="https://img.shields.io/github/v/release/isink17/codegraph?color=00ff88&style=flat-square&label=release" alt="Latest Release"/></a>
-  <a href="https://pkg.go.dev/github.com/isink17/codegraph"><img src="https://img.shields.io/badge/go-1.23+-00d4ff?style=flat-square&logo=go&logoColor=white" alt="Go version"/></a>
+  <a href="https://pkg.go.dev/github.com/isink17/codegraph"><img src="https://img.shields.io/badge/go-1.26.0+-00d4ff?style=flat-square&logo=go&logoColor=white" alt="Go version"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-ffaa44?style=flat-square" alt="License"/></a>
   <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-8899aa?style=flat-square" alt="Platforms"/>
   <img src="https://img.shields.io/badge/MCP%20tools-29-00ff88?style=flat-square" alt="MCP Tools"/>
@@ -12,7 +12,7 @@
 
 <br/>
 
-`codegraph` is a **local-first code context engine and MCP server** that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — without sending a single byte to the cloud.
+`codegraph` is a **local-first code context engine and MCP server** that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — with a local SQLite graph and no hosted CodeGraph backend.
 
 **Single binary. Zero config. No external databases. No API keys.**
 
@@ -45,7 +45,7 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
                import resolution  session memory      hybrid search
 ```
 
-`codegraph index .` walks your repo, parses every file with tree-sitter, resolves imports using four strategies (exact, name, suffix, method-receiver), and writes a fully-linked symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no cloud, no Docker, no API keys.
+`codegraph index .` walks your repo, parses every file, resolves relationships with evidence-based, language-aware declaration, import/module, lexical-scope, ownership, and receiver/type facts, and writes a symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Ambiguous evidence remains unresolved. Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no hosted CodeGraph backend, no Docker, no API keys.
 
 ---
 
@@ -53,8 +53,8 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
 
 ### 🔍 Parsing & Indexing
 
-- **Tree-sitter parsing** for all 12 supported languages — robust AST extraction, not regex
-- **4-strategy import resolution** — exact, name, suffix, and method-receiver matching
+- **Native tree-sitter parsing** for all 12 supported languages — robust AST extraction
+- **Evidence-based relationship resolution** — language-aware facts resolve only supported, unambiguous links
 - **Cross-language linking** — connects symbols across language boundaries
 - **Incremental updates** — only re-indexes changed files; fast on large repos
 - **Framework detection** — recognizes 20+ frameworks (Express, Django, gin, React, Spring, Laravel, …)
@@ -89,13 +89,16 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
 - **Zero-config SQLite** — no Docker, no external databases
 - **`codegraph install`** — auto-detects and configures Claude Code, Cursor, Windsurf, Gemini CLI
 - **File watching** — automatic re-indexing on changes
-- **100% local** — no data leaves your machine
+- **Local-first** — repository graph and index data stays in local SQLite; no hosted CodeGraph backend
+
+Normal commands may perform a GitHub Releases update check, cached on a 24-hour
+interval. Optional Ollama features use the configured Ollama endpoint.
 
 ---
 
 ## Supported Languages
 
-All languages use tree-sitter for AST parsing:
+Native CGO and release builds use tree-sitter for all 12 supported languages:
 
 | Language | Extensions |
 |---|---|
@@ -113,8 +116,10 @@ All languages use tree-sitter for AST parsing:
 | C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc` |
 
 Release archives use native CGO builds, so shipped binaries include the tree-sitter
-parsers and expose relationship-graph edges. Explicit `CGO_ENABLED=0` builds use
-the reduced Go/Python plus heuristic parser registry and are not release-equivalent.
+parsers and relationship/call-edge support. Explicit `CGO_ENABLED=0` builds retain
+Go (`go/ast`) and Python (pure fallback) call edges; Java, Kotlin, C#, TypeScript,
+JavaScript, Rust, Ruby, Swift, PHP, and C/C++ retain heuristic symbol/import
+navigation without call edges. They are not release-equivalent.
 
 > Node.js repos are supported; full tree-sitter node support is still in progress.
 
@@ -128,7 +133,7 @@ the reduced Go/Python plus heuristic parser registry and are not release-equival
 go install github.com/isink17/codegraph/cmd/codegraph@latest
 ```
 
-Requires Go 1.23+ and a C compiler (for tree-sitter CGo bindings).
+Requires Go 1.26.0 or newer and a C compiler (for tree-sitter CGo bindings).
 
 ### Build from source
 
@@ -139,7 +144,7 @@ go build ./cmd/codegraph
 go test ./...
 ```
 
-Requires Go 1.23+ and a C compiler (for tree-sitter CGo bindings).
+Requires Go 1.26.0 or newer and a C compiler (for tree-sitter CGo bindings).
 
 #### Clean rebuild
 
@@ -330,14 +335,15 @@ same symbols, files, and counts at every level.
 | `card` (default) | name, qualified name, kind, language, file, line, symbol id, stable key | choose between candidates and drill down |
 | `skeleton` | + signature, visibility, container, doc summary, end line, member declarations | inspect an API or a type's shape |
 | `excerpt` | + source around the symbol: a few lines of context, capped tightly, marked `truncated` when the symbol is longer | read the implementation around a target |
-| `full` | + the same window with a far higher cap, so it always contains what `excerpt` returned, plus `range` and `file_id` | take everything, explicitly |
+| `full` | + a large bounded source window that contains what `excerpt` returned, plus `range` and `file_id` | inspect the richest projection |
 
 `detail=full` returns every field these tools returned before progressive
 disclosure existed, under the same name and with the same value, so nothing became
-unreachable. The one difference: a field whose value is empty is omitted rather
-than sent as `""` or `0`, which is what every other level does too. A card carries `qualified_name`,
-`symbol_id`, and `file`+`line`, which are exactly the selectors these tools accept,
-so any card is enough to make the follow-up call.
+unreachable. Its source is a large bounded window; truncation is explicit. The one
+difference: a field whose value is empty is omitted rather than sent as `""` or
+`0`, which is what every other level does too. Use a card's `qualified_name` as a
+`find_symbol` query. Where relationship tools accept `symbol_id`, prefer that exact
+identity; `stable_key` is metadata, not a universal selector.
 
 Source is read from disk only for `excerpt` and `full`, and only for the symbols
 actually being returned; `card` and `skeleton` touch no files. Rendered source is
@@ -374,11 +380,9 @@ and adding `detail` to them could only make a response larger.
 
 `format` is optional and defaults to JSON. The JSON form remains the standard
 response format, but newer releases may add presence, uncertainty, or pagination
-metadata fields; clients should ignore unknown additive fields. `compact` is worth
-asking for on bulk discovery, where repeated
-keys dominate the payload — on this repository's own index it removes 38–51% of a
-card page's estimated tokens (the `ceil(bytes / 4)` estimate, not a provider
-tokenizer) — and it only encodes `detail=card`, which is the default.
+metadata fields; clients should ignore unknown additive fields. `compact` removes
+repeated JSON keys and is intended to reduce payload size on bulk card pages; it
+only encodes `detail=card`, which is the default.
 `detail=skeleton`, `excerpt`, and `full` with `format=compact` are rejected rather
 than silently answered with cards: beyond a card the payload is source text and
 prose, where the keys are a rounding error. Errors are ordinary MCP tool errors in
@@ -500,8 +504,9 @@ it was issued. Start again without a cursor in that case.
 
 Each returned symbol carries `symbol_id`, `stable_key`, and `qualified_name`, and
 its `signature`/`doc_summary` are bounded card-sized values. Source is never
-embedded: pass the identity to `find_symbol` with `detail=excerpt` or
-`detail=full` when you need the code.
+embedded: use `qualified_name` with `find_symbol` and, where relationship tools
+accept it, prefer exact `symbol_id`; `stable_key` remains metadata. Request
+`detail=excerpt` or `detail=full` when you need the code.
 
 The same four levels are available on the CLI as `--detail`. The CLI default is
 different on purpose: `codegraph find_symbol` and friends keep printing every
@@ -518,9 +523,9 @@ built with either registry is unaffected.
 
 ### Gateway MCP mode (`--tool-mode`)
 
-Describing 29 tools costs a session about 2,700 estimated tokens before it asks a
-single question. Gateway mode is an opt-in surface that charges a fraction of that
-without removing anything:
+Describing 29 tools costs a session 12,535 bytes, or 3,134 estimated tokens
+(`ceil(bytes / 4)`), before it asks a single question. Gateway mode is an opt-in
+surface that charges a fraction of that without removing anything:
 
 ```bash
 codegraph serve --tool-mode gateway
@@ -533,8 +538,8 @@ are already configured, it prints the `args` to change (`["serve", "--tool-mode"
 
 | Mode | `tools/list` | Estimated tokens |
 |---|---|---|
-| `full` (default) | all 29 tools | ~2,676 |
-| `gateway` | 4 core tools + `tool_search` + `tool_call` | ~897 (**-66%**) |
+| `full` (default) | all 29 tools | 3,134 (12,535 bytes) |
+| `gateway` | 4 core tools + `tool_search` + `tool_call` | 1,016 (4,062 bytes; about 68% fewer) |
 
 `full` remains the default, and it is unchanged: `codegraph serve` advertises the
 same tools with the same names, descriptions, and schemas it always has. The two
@@ -924,7 +929,7 @@ go build ./cmd/codegraph
 go test ./...
 ```
 
-Requires Go 1.23+ and a C compiler for the tree-sitter CGo bindings.
+Requires Go 1.26.0 or newer and a C compiler for the tree-sitter CGo bindings.
 
 For a clean rebuild after parser/indexer changes:
 

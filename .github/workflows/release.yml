@@ -86,8 +86,13 @@ jobs:
           fi
           archive_base="${binary}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
           mkdir -p "${dist}/${archive_base}"
-          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=1 go build -v -x -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
-          "${dist}/${archive_base}/${binary_name}" --version
+          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=1 go build -v -x -ldflags "-X github.com/isink17/codegraph/internal/version.Version=${version}" -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
+          actual="$("${dist}/${archive_base}/${binary_name}" --version)"
+          expected="codegraph ${version}"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "version mismatch: got ${actual}, want ${expected}"
+            exit 1
+          fi
           cp README.md "${dist}/${archive_base}/README.md"
           cp LICENSE "${dist}/${archive_base}/LICENSE"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then

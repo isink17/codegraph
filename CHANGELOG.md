@@ -28,9 +28,8 @@ columns once instead of repeating a JSON key on every row.
   `trace_dependencies` accept an optional `format`. The default is `json`; newer releases may
   add metadata fields, so clients should ignore unknown additive fields. `format=compact` returns a
   `codegraph.compact/v1` document -- a version line, a tool line, and named sections of fixed
-  tab-separated columns -- which removes 38-51% of a bulk card page's estimated tokens
-  (`ceil(bytes / 4)`, not a provider tokenizer) measured on model-visible tool content against
-  this repository's own index. Compact encodes `detail=card`, the default; `skeleton`,
+  tab-separated columns -- that avoids repeated JSON keys and is guarded by deterministic size
+  and savings tests. Compact encodes `detail=card`, the default; `skeleton`,
   `excerpt`, and `full` with `format=compact` are rejected with a clear error rather than silently
   answered with cards. `get_impact_radius` keeps its graph semantics as three sections
   (`symbols`, `files`, `summary`) rather than flattening them. Escaping is exactly `\\`, `\t`,
@@ -67,8 +66,9 @@ columns once instead of repeating a JSON key on every row.
 - **`detail` argument** on `find_symbol`, `search_symbols`, `find_callers`, `find_callees`, and
   `get_impact_radius`, with one vocabulary shared by every tool: `card` (identity and location),
   `skeleton` (+ signature, visibility, container, doc summary, member declarations), `excerpt`
-  (+ bounded source around the symbol), `full` (+ the symbol's complete indexed source and the
-  `range`/`file_id` fields the pre-P13 payload carried). An unknown level is rejected rather than
+  (+ bounded source around the symbol), `full` (+ the largest bounded source window and the
+  `range`/`file_id` fields the pre-P13 payload carried). All previously reachable fields remain
+  reachable. An unknown level is rejected rather than
   silently downgraded.
 - **`--detail card|skeleton|excerpt|full`** on `find_symbol`, `search_symbols`, `find_callers`,
   `find_callees`, and `get_impact_radius` on the CLI, with the same per-level semantics as MCP.
