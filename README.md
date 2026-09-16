@@ -12,7 +12,7 @@
 
 <br/>
 
-`codegraph` is a **local-first code context engine and MCP server** that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — without sending a single byte to the cloud.
+`codegraph` is a **local-first code context engine and MCP server** that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — with a local SQLite graph and no hosted CodeGraph backend.
 
 **Single binary. Zero config. No external databases. No API keys.**
 
@@ -89,7 +89,10 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
 - **Zero-config SQLite** — no Docker, no external databases
 - **`codegraph install`** — auto-detects and configures Claude Code, Cursor, Windsurf, Gemini CLI
 - **File watching** — automatic re-indexing on changes
-- **100% local** — no data leaves your machine
+- **Local-first** — repository graph and index data stays in local SQLite; no hosted CodeGraph backend
+
+Normal commands may perform a cached GitHub Releases update check at most once per
+24 hours. Optional Ollama features use the configured Ollama endpoint.
 
 ---
 
