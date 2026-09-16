@@ -186,6 +186,70 @@ func TestModulePackageDirUsesSegmentsAndNestedModuleBoundaries(t *testing.T) {
 	}
 }
 
+func TestGoModulesUnderRootAcceptsOnlyRegularGoModFiles(t *testing.T) {
+	root := t.TempDir()
+	writeGoMod := func(path, contents string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeGoMod(filepath.Join(root, "go.mod"), "module example.com/root\n")
+	writeGoMod(filepath.Join(root, "nested", "go.mod"), "module example.com/nested\n")
+	writeGoMod(filepath.Join(root, "malformed", "go.mod"), "module\n")
+	writeGoMod(filepath.Join(root, "valid", "go.mod"), "module example.com/valid\n")
+	if err := os.MkdirAll(filepath.Join(root, "directory", "go.mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dir := range []string{"symlink", "broken", "directory-link"} {
+		if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	symlinks := os.Symlink(filepath.Join(root, "valid", "go.mod"), filepath.Join(root, "symlink", "go.mod")) == nil
+	if symlinks {
+		if err := os.Symlink(filepath.Join(root, "missing-go.mod"), filepath.Join(root, "broken", "go.mod")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(root, "directory", "go.mod"), filepath.Join(root, "directory-link", "go.mod")); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		t.Log("symlink creation unavailable; regular and directory coverage remains portable")
+	}
+
+	modules, err := goModulesUnderRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]goModule{}
+	for _, module := range modules {
+		got[module.root] = module
+	}
+	for root, path := range map[string]string{".": "example.com/root", "nested": "example.com/nested", "valid": "example.com/valid"} {
+		module, ok := got[root]
+		if !ok || module.path != path || module.blocked {
+			t.Fatalf("module at %q = %#v, want regular module %q", root, module, path)
+		}
+	}
+	if module, ok := got["malformed"]; !ok || !module.blocked {
+		t.Fatalf("malformed regular go.mod = %#v, want blocked boundary", module)
+	}
+	badRoots := []string{"directory"}
+	if symlinks {
+		badRoots = append(badRoots, "symlink", "broken", "directory-link")
+	}
+	for _, badRoot := range badRoots {
+		if module, ok := got[badRoot]; ok {
+			t.Fatalf("nonregular go.mod at %q created module %#v", badRoot, module)
+		}
+	}
+}
+
 func TestGoParserAliasKeepsImportPathEvidence(t *testing.T) {
 	parsed, err := goparser.New().Parse(context.Background(), "caller.go", []byte(`package main
 
