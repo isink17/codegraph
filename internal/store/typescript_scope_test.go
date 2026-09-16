@@ -202,7 +202,7 @@ func TestTypeScriptModuleCandidatePaths(t *testing.T) {
 	}
 }
 
-func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
+func TestTypeScriptScopedLookupUsesCanonicalPersistedPath(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -213,7 +213,7 @@ func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetFile, err := insertTestFileLang(ctx, s, repo.ID, `ts\a.ts`, "typescript")
+	targetFile, err := insertTestFileLang(ctx, s, repo.ID, "ts/a.ts", "typescript")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
 	if _, err := s.db.Exec(`UPDATE symbols SET visibility='public' WHERE id=?`, target); err != nil {
 		t.Fatal(err)
 	}
-	callerFile, err := insertTestFileLang(ctx, s, repo.ID, `ts\b.ts`, "typescript")
+	callerFile, err := insertTestFileLang(ctx, s, repo.ID, "ts/b.ts", "typescript")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.Valid || got.Int64 != int64(target) || strategy != ResolutionStrategyTypeScriptModuleScope {
-		t.Fatalf("scoped Windows-path resolution=(%v,%d,%q), want target %d/%q", got.Valid, got.Int64, strategy, target, ResolutionStrategyTypeScriptModuleScope)
+		t.Fatalf("scoped canonical-path resolution=(%v,%d,%q), want target %d/%q", got.Valid, got.Int64, strategy, target, ResolutionStrategyTypeScriptModuleScope)
 	}
 }
 

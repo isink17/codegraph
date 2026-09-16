@@ -158,22 +158,15 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			if len(candidatePaths) == 0 {
 				continue
 			}
-			// Batching happens after variant expansion: one logical candidate
-			// can be persisted under several path spellings, so the parameter
-			// count is bounded by the variants, not by the candidates.
-			storedPaths := map[string]struct{}{}
+			// candidatePaths contains distinct logical file identities. Sort them
+			// before batching so SQL argument order stays deterministic.
+			candidates := make([]string, 0, len(candidatePaths))
 			for p := range candidatePaths {
-				for _, variant := range storedPathVariants(p) {
-					storedPaths[variant] = struct{}{}
-				}
+				candidates = append(candidates, p)
 			}
-			variants := make([]string, 0, len(storedPaths))
-			for p := range storedPaths {
-				variants = append(variants, p)
-			}
-			sort.Strings(variants)
-			pathArgs := make([]any, 0, len(variants))
-			for _, p := range variants {
+			sort.Strings(candidates)
+			pathArgs := make([]any, 0, len(candidates))
+			for _, p := range candidates {
 				pathArgs = append(pathArgs, p)
 			}
 			if err := sqliteBatchedQuery(ctx, q,
