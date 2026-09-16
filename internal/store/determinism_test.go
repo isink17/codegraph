@@ -134,3 +134,107 @@ func TestArchitectureAndDeadCodeUseSemanticPageOrder(t *testing.T) {
 		t.Fatalf("dead-code pages = %v, want %v", pages, want)
 	}
 }
+
+func TestArchitectureHubTiesUseSemanticIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	fileID, err := insertTestFile(ctx, s, repoID, "hub.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := insertTestSymbol(ctx, s, repoID, fileID, "Target", "pkg.Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := architectureTopN; i >= 0; i-- {
+		name := fmt.Sprintf("Hub%02d", i)
+		id, err := insertTestSymbol(ctx, s, repoID, fileID, name, "pkg."+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line) VALUES (?, ?, ?, '', 'call', '', ?, 1)`, repoID, id, target, fileID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	overview, err := s.ArchitectureOverview(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hubs := overview["hub_symbols"].([]map[string]any)
+	if len(hubs) != architectureTopN {
+		t.Fatalf("hub count = %d", len(hubs))
+	}
+	for i := 0; i < architectureTopN; i++ {
+		if want := fmt.Sprintf("pkg.Hub%02d", i); hubs[i]["qualified_name"] != want {
+			t.Fatalf("hub_symbols[%d] = %v, want %s", i, hubs[i], want)
+		}
+	}
+}
+
+func TestArchitectureZeroDegreeFillUsesSemanticIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	fileID, err := insertTestFile(ctx, s, repoID, "zero.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := insertTestSymbol(ctx, s, repoID, fileID, "zzSource", "pkg.zzSource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := insertTestSymbol(ctx, s, repoID, fileID, "Positive", "pkg.Positive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line) VALUES (?, ?, ?, '', 'call', '', ?, 1)`, repoID, source, target, fileID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 20; i >= 0; i-- {
+		name := fmt.Sprintf("Zero%02d", i)
+		if _, err := insertTestSymbol(ctx, s, repoID, fileID, name, "pkg."+name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	overview, err := s.ArchitectureOverview(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := overview["entry_points"].([]map[string]any)
+	if entry[0]["qualified_name"] != "pkg.Positive" {
+		t.Fatalf("entry_points[0] = %v", entry[0])
+	}
+	for i := 0; i < architectureTopN-1; i++ {
+		if want := fmt.Sprintf("pkg.Zero%02d", i); entry[i+1]["qualified_name"] != want {
+			t.Fatalf("entry_points[%d] = %v, want %s", i+1, entry[i+1], want)
+		}
+	}
+}
+
+func TestVectorSearchLargePrefilterUsesSemanticIdentity(t *testing.T) {
+	ctx := context.Background()
+	for _, order := range [][]string{{"c.go", "b.go", "a.go"}, {"a.go", "b.go", "c.go"}} {
+		s, repoID := newQueryTestStore(t)
+		for _, path := range order {
+			fileID, err := insertTestFile(ctx, s, repoID, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			name := "pkg." + path[:1]
+			symbolID, err := insertTestSymbol(ctx, s, repoID, fileID, path[:1], name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			vector := []float32{0, 1}
+			if path == "a.go" {
+				vector = []float32{1, 0}
+			}
+			if _, err := s.db.ExecContext(ctx, `INSERT INTO symbol_embeddings(symbol_id, file_id, repo_id, embedding, dimensions, model_name, updated_at) VALUES (?, ?, ?, ?, 2, 'test', '2026-01-01T00:00:00Z')`, symbolID, fileID, repoID, float32ToBytes(vector)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rows, err := s.vectorSearch(ctx, repoID, []float32{1, 0}, 1, 0, 2)
+		if err != nil || len(rows) != 1 || rows[0]["symbol"] != "pkg.a" {
+			t.Fatalf("vectorSearch = %v, %v", rows, err)
+		}
+	}
+}

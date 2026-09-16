@@ -9434,13 +9434,17 @@ func (s *Store) UpsertSymbolEmbeddingsBatch(ctx context.Context, repoID int64, m
 const maxVectorScanSymbols = 50_000
 
 func (s *Store) VectorSearch(ctx context.Context, repoID int64, queryVec []float32, limit, offset int) ([]map[string]any, error) {
+	return s.vectorSearch(ctx, repoID, queryVec, limit, offset, maxVectorScanSymbols)
+}
+
+func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float32, limit, offset, scanCap int) ([]map[string]any, error) {
 	limitVal := safeLimit(limit)
 	offsetVal := safeOffset(offset)
 
 	// Guard against loading too many embeddings into memory.
 	var embCount int64
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&embCount)
-	if embCount > maxVectorScanSymbols {
+	if embCount > int64(scanCap) {
 		rows, err := s.db.QueryContext(ctx, `
 			SELECT se.symbol_id, se.embedding, se.dimensions,
 				   s.qualified_name, s.kind, s.signature, s.doc_summary, s.stable_key,
@@ -9454,7 +9458,7 @@ func (s *Store) VectorSearch(ctx context.Context, repoID int64, queryVec []float
 			         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
 			         s.end_line ASC, s.end_col ASC
 			LIMIT ?
-		`, repoID, maxVectorScanSymbols)
+		`, repoID, scanCap)
 		if err != nil {
 			return nil, err
 		}
