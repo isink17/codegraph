@@ -45,7 +45,7 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
                import resolution  session memory      hybrid search
 ```
 
-`codegraph index .` walks your repo, parses every file, resolves relationships with evidence-based, language-aware declaration, import/module, lexical-scope, ownership, and receiver/type facts, and writes a symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Ambiguous evidence remains unresolved. Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no cloud, no Docker, no API keys.
+`codegraph index .` walks your repo, parses every file, resolves relationships with evidence-based, language-aware declaration, import/module, lexical-scope, ownership, and receiver/type facts, and writes a symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Ambiguous evidence remains unresolved. Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no hosted CodeGraph backend, no Docker, no API keys.
 
 ---
 
@@ -91,8 +91,8 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
 - **File watching** — automatic re-indexing on changes
 - **Local-first** — repository graph and index data stays in local SQLite; no hosted CodeGraph backend
 
-Normal commands may perform a cached GitHub Releases update check at most once per
-24 hours. Optional Ollama features use the configured Ollama endpoint.
+Normal commands may perform a GitHub Releases update check, cached on a 24-hour
+interval. Optional Ollama features use the configured Ollama endpoint.
 
 ---
 
