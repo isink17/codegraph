@@ -64,7 +64,7 @@ func TestResolveEdgesOwnModuleImportUsesPackageEvidence(t *testing.T) {
 	}
 }
 
-func TestResolveEdgesOwnModuleImportPersistedPathSeparators(t *testing.T) {
+func TestResolveEdgesOwnModuleImportUsesCanonicalStoredPaths(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
 		name   string
@@ -72,9 +72,6 @@ func TestResolveEdgesOwnModuleImportPersistedPathSeparators(t *testing.T) {
 		target string
 	}{
 		{name: "slash slash", source: "cmd/main.go", target: "pkg/target.go"},
-		{name: "backslash backslash", source: `cmd\main.go`, target: `pkg\target.go`},
-		{name: "backslash slash", source: `cmd\main.go`, target: "pkg/target.go"},
-		{name: "slash backslash", source: "cmd/main.go", target: `pkg\target.go`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

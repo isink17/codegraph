@@ -5339,20 +5339,17 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	const chunkSize = 400
 	fileIDs := make([]int64, 0, len(uniquePaths))
 	wantedPaths := make(map[string]struct{}, len(uniquePaths))
-	storedPaths := make([]string, 0, len(uniquePaths)*3)
 	for _, filePath := range uniquePaths {
-		canonical := filePath
-		wantedPaths[canonical] = struct{}{}
-		storedPaths = append(storedPaths, storedPathVariants(canonical)...)
+		wantedPaths[filePath] = struct{}{}
 	}
 	seenFileIDs := make(map[int64]struct{}, len(uniquePaths))
 	// Source language per file is read once here (no per-edge lookup) and carried
 	// into resolveEdgeTargets, which applies the shared language gate.
 	languageByFileID := make(map[int64]string, len(uniquePaths))
 	pathBatch := sqliteBatchSize(1, 1)
-	for start := 0; start < len(storedPaths); start += pathBatch {
-		end := min(start+pathBatch, len(storedPaths))
-		chunk := storedPaths[start:end]
+	for start := 0; start < len(uniquePaths); start += pathBatch {
+		end := min(start+pathBatch, len(uniquePaths))
+		chunk := uniquePaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `SELECT id, path, language FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
