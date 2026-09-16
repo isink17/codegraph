@@ -4753,12 +4753,24 @@ func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []stri
 	if len(paths) == 0 {
 		return false, nil
 	}
-	stored := make([]string, 0, len(paths)*3)
+	canonical := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		stored = append(stored, storedPathVariants(CanonicalRelPath(path))...)
+		path = CanonicalRelPath(path)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		canonical = append(canonical, path)
+	}
+	if len(canonical) == 0 {
+		return false, nil
 	}
 	var changed bool
-	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(stored), true, func(rows *sql.Rows) error {
+	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(canonical), true, func(rows *sql.Rows) error {
 		var batchChanged bool
 		if err := rows.Scan(&batchChanged); err != nil {
 			return err
