@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"sync/atomic"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 func TestPythonModuleCandidatePaths(t *testing.T) {
@@ -31,6 +33,11 @@ func TestPythonModuleCandidatePaths(t *testing.T) {
 		{
 			name:   "relative one level is anchored at the importing package",
 			source: "pkg/app.py", specifier: ".helpers",
+			want: []string{"pkg/helpers.py", "pkg/helpers/__init__.py"},
+		},
+		{
+			name:   "backslash is logical filename data",
+			source: `pkg/weird\main.py`, specifier: ".helpers",
 			want: []string{"pkg/helpers.py", "pkg/helpers/__init__.py"},
 		},
 		{
@@ -75,6 +82,35 @@ func TestPythonModuleCandidatePathsSeparateSameBasename(t *testing.T) {
 				t.Fatalf("foo.utils and bar.utils share candidate %q", a)
 			}
 		}
+	}
+}
+
+func TestPythonModuleCandidateEvidencePreservesLogicalPathBytes(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	parsed := graph.ParsedFile{Language: "python", Scope: graph.ScopeEvidence{Imports: []graph.ScopeImport{{SourceSpecifier: ".helpers"}}}}
+	if err := s.ReplaceFileGraph(ctx, repoID, 1, `pkg/weird\main.py`, "python", 1, 1, "main", parsed); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT candidate_path FROM scope_module_candidate_evidence ORDER BY candidate_path`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var candidate string
+		if err := rows.Scan(&candidate); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pkg/helpers.py", "pkg/helpers/__init__.py"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidate paths = %v, want %v", got, want)
 	}
 }
 

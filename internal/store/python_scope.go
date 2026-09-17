@@ -58,7 +58,7 @@ func pythonModuleCandidatePaths(sourceFile, specifier string) []string {
 		}
 	}
 	if dots > 0 {
-		dir := pythonParentDir(canonicalStoredPath(sourceFile))
+		dir := pythonParentDir(sourceFile)
 		// `.x` is the importing file's own package; each further dot climbs one.
 		for i := 1; i < dots; i++ {
 			if dir == "" {
