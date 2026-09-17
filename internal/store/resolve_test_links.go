@@ -346,7 +346,7 @@ func recordTestLinkSiblings(ctx context.Context, tx *sql.Tx, repoID int64) error
 		if err := rows.Scan(&id, &filePath); err != nil {
 			return err
 		}
-		sibling := canonicalStoredPath(productionSiblingPath(filePath))
+		sibling := productionSiblingPath(filePath)
 		if sibling == "" {
 			continue
 		}
@@ -393,13 +393,7 @@ func recordTestLinkSiblings(ctx context.Context, tx *sql.Tx, repoID int64) error
 func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []string) (map[string]int64, error) {
 	out := make(map[string]int64, len(paths))
 	ambiguous := make(map[string]bool, len(paths))
-	canonical := make([]string, 0, len(paths))
-	for _, p := range paths {
-		if p = canonicalStoredPath(p); p != "" {
-			canonical = append(canonical, p)
-		}
-	}
-	unique := dedupeNonEmpty(canonical)
+	unique := dedupeNonEmpty(paths)
 	for start := 0; start < len(unique); start += testLinkResolveChunkSize {
 		end := min(start+testLinkResolveChunkSize, len(unique))
 		canonicalChunk := unique[start:end]
