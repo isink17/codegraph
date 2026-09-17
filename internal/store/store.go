@@ -7601,7 +7601,6 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 		if err := rows.Scan(&item.File, &item.Symbol, &item.Reason, &item.Score); err != nil {
 			return nil, err
 		}
-		item.File = canonicalStoredPath(item.File)
 		out = append(out, item)
 	}
 	return out, rows.Err()
