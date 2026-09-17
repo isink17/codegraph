@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"testing"
 
@@ -519,6 +521,97 @@ func TestListFilesRejectsMixedPersistedSeparatorsWithoutPathFormatMarker(t *test
 	}
 	if _, err := s.ListFiles(ctx, repoID, "pkg/", 20, 0); err == nil {
 		t.Fatal("ListFiles accepted unmarked legacy path row")
+	}
+}
+
+func TestListFilesUsesCanonicalLogicalPrefixes(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	otherRepo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo(other): %v", err)
+	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, otherRepo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths(other): %v", err)
+	}
+
+	insert := func(repo int64, path string) int64 {
+		t.Helper()
+		id, err := insertTestFile(ctx, s, repo, path)
+		if err != nil {
+			t.Fatalf("insertTestFile(%q): %v", path, err)
+		}
+		return id
+	}
+
+	insert(repoID, "src/a.go")
+	insert(repoID, "src/nested/b.go")
+	insert(repoID, "src2/c.go")
+	insert(repoID, "other/d.go")
+	deleted := insert(repoID, "src/deleted.go")
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, deleted); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+	insert(otherRepo.ID, "src/foreign.go")
+
+	pathsFor := func(filter string, limit, offset int) []string {
+		t.Helper()
+		rows, err := s.ListFiles(ctx, repoID, filter, limit, offset)
+		if err != nil {
+			t.Fatalf("ListFiles(%q): %v", filter, err)
+		}
+		paths := make([]string, 0, len(rows))
+		for _, row := range rows {
+			paths = append(paths, row["path"].(string))
+		}
+		return paths
+	}
+
+	tests := []struct {
+		name   string
+		filter string
+		limit  int
+		offset int
+		want   []string
+	}{
+		{"empty", "", 20, 0, []string{"other/d.go", "src/a.go", "src/nested/b.go", "src2/c.go"}},
+		{"raw prefix", "src", 20, 0, []string{"src/a.go", "src/nested/b.go", "src2/c.go"}},
+		{"directory prefix", "src/", 20, 0, []string{"src/a.go", "src/nested/b.go"}},
+		{"dot relative prefix", "./src/", 20, 0, []string{"src/a.go", "src/nested/b.go"}},
+		{"ordered page", "", 2, 1, []string{"src/a.go", "src/nested/b.go"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pathsFor(tt.filter, tt.limit, tt.offset); !slices.Equal(got, tt.want) {
+				t.Fatalf("paths = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestListFilesKeepsBackslashIdentityOnPOSIX(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows path storage cannot distinguish separator spellings")
+	}
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	for _, path := range []string{`weird\name.go`, "weird/name.go"} {
+		if _, err := insertTestFile(ctx, s, repoID, path); err != nil {
+			t.Fatalf("insertTestFile(%q): %v", path, err)
+		}
+	}
+
+	rows, err := s.ListFiles(ctx, repoID, `weird\`, 20, 0)
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	var got []string
+	for _, row := range rows {
+		got = append(got, row["path"].(string))
+	}
+	want := []string{`weird\name.go`}
+	if !slices.Equal(got, want) {
+		t.Fatalf("paths = %v, want %v", got, want)
 	}
 }
 

@@ -9315,11 +9315,9 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 	query := `SELECT path, language, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`
 	args := []any{repoID}
 	if pathFilter != "" {
-		variants := storedPathVariants(CanonicalRelPath(pathFilter))
-		query += ` AND (` + strings.TrimRight(strings.Repeat("path LIKE ? OR ", len(variants)), " OR ") + `)`
-		for _, variant := range variants {
-			args = append(args, variant+"%")
-		}
+		prefix := CanonicalRelPath(pathFilter)
+		query += ` AND path LIKE ?`
+		args = append(args, prefix+"%")
 	}
 	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
 	args = append(args, safeLimit(limit), safeOffset(offset))
