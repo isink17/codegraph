@@ -5369,7 +5369,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 				_ = rows.Close()
 				return err
 			}
-			if _, ok := wantedPaths[canonicalStoredPath(storedPath)]; !ok {
+			if _, ok := wantedPaths[storedPath]; !ok {
 				continue
 			}
 			if _, ok := seenFileIDs[id]; ok {
