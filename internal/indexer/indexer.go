@@ -21,6 +21,7 @@ import (
 	"github.com/isink17/codegraph/internal/embedding"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/parser"
+	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -406,6 +407,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			if info == nil {
 				return nil
 			}
+			logicalRel, err := platform.NativeRelativeToLogical(rel)
+			if err != nil {
+				return err
+			}
 			adapter := i.registry.AdapterFor(rel)
 			language := ""
 			if adapter != nil {
@@ -413,7 +418,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			task := fileTask{
 				path:     path,
-				rel:      rel,
+				rel:      logicalRel,
 				info:     info,
 				adapter:  adapter,
 				language: language,
