@@ -7630,12 +7630,9 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		-- boundary would fall in an arbitrary place. The grouping keys are
 		-- already computed, so using them as the tie-break is free.
 		--
-		-- The tie-break sorts the canonical form of the path, not the stored one.
-		-- files.path is native, and backslash (0x5C) and slash (0x2F) sort either side of
-		-- the digits and capitals, so ordering the raw column would put a different
-		-- 30 rows through LIMIT on Windows than on Linux for the same repository --
-		-- a different seed set, and so a different ranked context.
-		ORDER BY score DESC, REPLACE(f.path, '\', '/') ASC, s.qualified_name ASC, s.kind ASC,
+		-- files.path is already the logical repository identity, so it is the
+		-- deterministic path tie-break.
+		ORDER BY score DESC, f.path ASC, s.qualified_name ASC, s.kind ASC,
 		         s.container_name ASC, s.signature ASC, s.stable_key ASC, s.start_line ASC, s.start_col ASC,
 		         s.end_line ASC, s.end_col ASC
 		LIMIT ?
@@ -7668,14 +7665,10 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		}
 		out = append(out, map[string]any{
 			"symbol_id": item.id,
-			// Canonical (slash) form, like every other path this store hands out.
-			// `files.path` is native, so on Windows the raw column value would make
-			// this producer's `file` disagree with the `file` of every symbol-shaped
-			// result -- and with the key any consumer joins them on.
-			"file":   CanonicalRelPath(item.file),
-			"symbol": item.symbol,
-			"score":  item.score,
-			"why":    []string{"token_overlap"},
+			"file":      item.file,
+			"symbol":    item.symbol,
+			"score":     item.score,
+			"why":       []string{"token_overlap"},
 		})
 	}
 	return out, rows.Err()

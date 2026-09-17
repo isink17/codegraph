@@ -749,6 +749,52 @@ func TestSemanticSearchPagesArePartitionOfFullResult(t *testing.T) {
 	}
 }
 
+func TestSemanticSearchPreservesLogicalPathOrderAndIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	paths := []string{"a0.go", "a\\foo.go"}
+	for _, path := range paths {
+		fileID, err := insertTestFile(ctx, s, repoID, path)
+		if err != nil {
+			t.Fatalf("insertTestFile(%q) error = %v", path, err)
+		}
+		symID, err := insertTestSymbol(ctx, s, repoID, fileID, "Match", "pkg.Match")
+		if err != nil {
+			t.Fatalf("insertTestSymbol(%q) error = %v", path, err)
+		}
+		if _, err := s.db.ExecContext(ctx, "INSERT INTO symbol_tokens(symbol_id, token, weight) VALUES(?, 'needle', 1.0)", symID); err != nil {
+			t.Fatalf("insert token for %q error = %v", path, err)
+		}
+	}
+
+	files := func(limit, offset int) []string {
+		t.Helper()
+		rows, err := s.SemanticSearch(ctx, repoID, "needle", limit, offset)
+		if err != nil {
+			t.Fatalf("SemanticSearch(%d, %d) error = %v", limit, offset, err)
+		}
+		got := make([]string, 0, len(rows))
+		for _, row := range rows {
+			file, ok := row["file"].(string)
+			if !ok {
+				t.Fatalf("SemanticSearch row file = %#v, want string", row["file"])
+			}
+			got = append(got, file)
+		}
+		return got
+	}
+
+	if got := files(2, 0); !slices.Equal(got, paths) {
+		t.Fatalf("SemanticSearch order = %q, want raw logical order %q", got, paths)
+	}
+	if got := files(1, 0); !slices.Equal(got, paths[:1]) {
+		t.Fatalf("SemanticSearch first page = %q, want %q", got, paths[:1])
+	}
+	if got := files(1, 1); !slices.Equal(got, paths[1:]) {
+		t.Fatalf("SemanticSearch second page = %q, want exact backslash identity %q", got, paths[1:])
+	}
+}
+
 // TestSuffixMatcherAgreesWithSQLiteLike checks the Go stage-3 matcher against
 // the authority it is replacing: SQLite's own LIKE. The matcher exists so the
 // cascade's third stage costs one scan instead of one scan per name, which is
