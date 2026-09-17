@@ -13,10 +13,9 @@ import (
 // an exact symbol ID. It can be ambiguous for overloads in one file; context
 // seed resolution uses SymbolsForIDs instead.
 //
-// File is a repository-relative path in canonical form: forward slashes,
-// whatever the host's separator. Equality of two refs is therefore
-// platform-independent, and callers may build one from either form -- see
-// CanonicalRelPath.
+// File denotes a logical repository path. SymbolsForRefs retains limited
+// legacy input adaptation through CanonicalRelPath; on POSIX, backslash is
+// filename data rather than a separator.
 type SymbolRef struct {
 	File          string
 	QualifiedName string
@@ -49,25 +48,15 @@ func (s *Store) SymbolsForIDs(ctx context.Context, repoID int64, ids []int64) (m
 	return out, nil
 }
 
-// CanonicalRelPath is the logical form of a repository-relative path: forward
-// slashes, no leading "./".
+// CanonicalRelPath adapts limited legacy/internal input to a logical
+// repository path: forward slashes, no leading "./". Under P23, `files.path`
+// is already a logical repository identity, so this is not a persisted-path
+// canonicalizer. On Windows filepath.ToSlash may adapt native separators; on
+// POSIX, backslash remains filename data.
 //
-// The repository has two path forms and both are legitimate. `files.path` is
-// stored in the host's native form, because the indexer derives it with
-// filepath.Rel/filepath.Clean; every value that leaves the store for a client is
-// slash-normalized instead (scanSymbol, RelatedTests, the export paths). On
-// Linux and macOS the two coincide, which is why mixing them was invisible; on
-// Windows `paymentsvc\service.go` and `paymentsvc/service.go` are different map
-// keys for the same file.
-//
-// Use this wherever a relative path is an identity -- a map key, a comparison, a
-// ranking tie-break -- and keep native form only for the SQL predicates that
-// have to match the stored bytes.
-// It deliberately does not trim whitespace and does not Clean: a leading or
-// trailing space is a legal part of a POSIX filename, and trimming one here
-// would silently fail to resolve that file. Argument hygiene belongs at the tool
-// boundary (normalizeRepoRelPath, FileSourceStates), not in the identity
-// function.
+// Use it only where callers already own the surrounding validation contract.
+// It deliberately does not validate containment, absolute paths, traversal, or
+// the full logical-path grammar, and does not trim whitespace or Clean paths.
 func CanonicalRelPath(path string) string {
 	slashed := filepath.ToSlash(path)
 	if slashed == "" || slashed == "." {
@@ -173,9 +162,7 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 				return nil, err
 			}
 			for _, sym := range syms {
-				// scanSymbols already slash-normalizes FilePath; canonicalizing again
-				// costs nothing and keeps this independent of that.
-				ref := SymbolRef{File: CanonicalRelPath(sym.FilePath), QualifiedName: sym.QualifiedName}
+				ref := SymbolRef{File: sym.FilePath, QualifiedName: sym.QualifiedName}
 				if _, ok := wanted[ref]; !ok {
 					continue
 				}

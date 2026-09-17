@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -240,6 +241,42 @@ func TestSymbolsForRefsMatchesCanonicalStoredPaths(t *testing.T) {
 	}
 	if fromNative[canonical].ID != sym.ID {
 		t.Fatalf("native ref resolved %+v, want symbol %d", fromNative, sym.ID)
+	}
+}
+
+func TestSymbolsForRefsPreservesLiteralBackslashResultKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("scanSymbol's Windows path normalization is deferred to A3")
+	}
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	ref := SymbolRef{File: `pkg/weird\name.go`, QualifiedName: "pkg.Weird"}
+	fileID, err := insertTestFile(ctx, s, repo.ID, ref.File)
+	if err != nil {
+		t.Fatalf("insertTestFile(%q) error = %v", ref.File, err)
+	}
+	if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, "Weird", ref.QualifiedName); err != nil {
+		t.Fatalf("insertTestSymbol() error = %v", err)
+	}
+
+	got, err := s.SymbolsForRefs(ctx, repo.ID, []SymbolRef{ref})
+	if err != nil {
+		t.Fatalf("SymbolsForRefs() error = %v", err)
+	}
+	if _, ok := got[ref]; !ok {
+		t.Fatalf("literal-backslash ref missing from result: %+v", got)
+	}
+	if _, ok := got[SymbolRef{File: "pkg/weird/name.go", QualifiedName: ref.QualifiedName}]; ok {
+		t.Fatalf("literal-backslash path acquired a slash alias: %+v", got)
 	}
 }
 
