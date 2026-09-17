@@ -82,12 +82,6 @@ func canonicalStoredPath(path string) string {
 	return CanonicalRelPath(path)
 }
 
-// storedPathVariants is the single canonical storage spelling. Its name is
-// retained temporarily for narrow query batching call sites.
-func storedPathVariants(canonical string) []string {
-	return []string{canonical}
-}
-
 // SymbolsForRefs resolves search-result refs to full symbol rows in one query
 // per chunk. It exists so seed expansion can use a symbol's real identity
 // (symbol_id, stable_key) instead of a second, ambiguous bare-name lookup, and
