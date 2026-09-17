@@ -530,7 +530,7 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 					return nil
 				}
 				seenModules[fileID] = struct{}{}
-				modulePath := canonicalStoredPath(filePath)
+				modulePath := filePath
 				if modulePath != "" {
 					if _, ok := seenPaths[modulePath]; !ok {
 						seenPaths[modulePath] = struct{}{}
