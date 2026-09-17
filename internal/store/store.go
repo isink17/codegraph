@@ -3423,8 +3423,8 @@ func (s *Store) DeletedPathsInScan(ctx context.Context, repoID, scanID int64) ([
 		if err := rows.Scan(&p); err != nil {
 			return nil, err
 		}
-		if canonical := CanonicalRelPath(strings.ReplaceAll(p, `\`, `/`)); canonical != "" {
-			out = append(out, canonical)
+		if p != "" {
+			out = append(out, p)
 		}
 	}
 	return out, rows.Err()
