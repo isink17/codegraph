@@ -45,7 +45,7 @@ func typescriptModuleCandidatePaths(sourceFile, specifier string) []string {
 	if strings.HasSuffix(specifier, "/") {
 		return nil
 	}
-	base := path.Clean(path.Join(path.Dir(canonicalStoredPath(sourceFile)), specifier))
+	base := path.Clean(path.Join(path.Dir(sourceFile), specifier))
 	if base == "." || base == ".." || strings.HasPrefix(base, "../") {
 		return nil
 	}

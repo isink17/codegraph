@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -182,10 +183,19 @@ func TestTypeScriptModuleCandidatePaths(t *testing.T) {
 	}{
 		{"src/b.ts", "./a", []string{"src/a.ts", "src/a.tsx"}},
 		{"src/lib/b.ts", "../a", []string{"src/a.ts", "src/a.tsx"}},
+		{"src/b.ts", "./a.ts", []string{"src/a.ts"}},
 		{"src/b.ts", "./a.js", []string{"src/a.js"}},
 		{"src/b.ts", "./a.jsx", []string{"src/a.jsx"}},
 		{"src/b.ts", "react", nil},
 		{"src/b.ts", "./dir/", nil},
+		{"src/b.ts", "../../escape", nil},
+		{"src/b.ts", "./data.json", nil},
+	}
+	if runtime.GOOS != "windows" {
+		tests = append(tests, struct {
+			file, spec string
+			want       []string
+		}{`pkg/weird\name.ts`, "./dep", []string{"pkg/dep.ts", "pkg/dep.tsx"}})
 	}
 	for _, tt := range tests {
 		got := typescriptModuleCandidatePaths(tt.file, tt.spec)
