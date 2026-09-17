@@ -452,10 +452,10 @@ func Keep() {}
 	if err != nil {
 		t.Fatalf("ExistingFiles() error = %v", err)
 	}
-	if _, ok := existing[filepath.Clean(filepath.Join("vendor", "keep.go"))]; !ok {
+	if _, ok := existing["vendor/keep.go"]; !ok {
 		t.Fatalf("expected vendor/keep.go to be indexed, got keys: %v", mapKeys(existing))
 	}
-	if _, ok := existing[filepath.Clean(filepath.Join("vendor", "skip.go"))]; ok {
+	if _, ok := existing["vendor/skip.go"]; ok {
 		t.Fatalf("expected vendor/skip.go to be ignored")
 	}
 }

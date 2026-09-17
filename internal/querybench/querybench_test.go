@@ -31,6 +31,9 @@ func seededRepo(t *testing.T, withTestLinks bool) (*store.Store, int64, string) 
 	if err != nil {
 		t.Fatalf("UpsertRepo: %v", err)
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths: %v", err)
+	}
 
 	sym := func(name string, line int) graph.Symbol {
 		return graph.Symbol{
@@ -242,6 +245,9 @@ func TestEmptyGraphSkipsSymbolScenariosWithoutError(t *testing.T) {
 	repo, err := s.UpsertRepo(ctx, dir)
 	if err != nil {
 		t.Fatalf("UpsertRepo: %v", err)
+	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths: %v", err)
 	}
 
 	report, err := Run(ctx, s, repo.ID, dir, Options{Runs: 1, Warmup: 0})

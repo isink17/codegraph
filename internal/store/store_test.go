@@ -25,6 +25,9 @@ func TestDirtyFilesQueueAndDrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
+	}
 
 	if ok, err := s.HasDirtyFiles(ctx, repo.ID); err != nil {
 		t.Fatalf("HasDirtyFiles() error = %v", err)

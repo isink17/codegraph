@@ -24,6 +24,9 @@ func TestPurgeDeletes_TestLinksTargetingDeletedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
+	}
 
 	scanID, _, err := s.BeginScan(ctx, repo.ID, "index")
 	if err != nil {
