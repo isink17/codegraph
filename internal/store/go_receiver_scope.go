@@ -359,7 +359,6 @@ func goReceiverScopeEdges(ctx context.Context, q execQuerier, repoID int64) ([]g
 		if !ok || qualifier != b.name {
 			continue
 		}
-		e.filePath = canonicalStoredPath(e.filePath)
 		e.isTest = IsTestFilePath(e.filePath)
 		e.callerPk = goPackageNameOf(e.callerPk)
 		e.method = method
@@ -405,7 +404,6 @@ func goReceiverScopeCandidates(ctx context.Context, q execQuerier, repoID int64,
 		if _, ok := wanted[container+"\x00"+name]; !ok {
 			continue
 		}
-		filePath = canonicalStoredPath(filePath)
 		key := path.Dir(filePath) + "\x00" + container + "\x00" + name
 		out[key] = append(out[key], goReceiverCandidate{
 			id:     id,
