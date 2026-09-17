@@ -662,6 +662,7 @@ func TestProductionSiblingPath(t *testing.T) {
 		{"internal/store/store_test.go", "internal/store/store.go"},
 		{"store_test.go", "store.go"},
 		{`internal\store\store_test.go`, `internal\store\store.go`},
+		{`test_utils\helper.py`, `utils\helper.py`},
 		{"pkg/test_utils.py", "pkg/utils.py"},
 		{"pkg/utils_test.py", "pkg/utils.py"},
 		{"pkg/utils.py", ""},        // not a test file

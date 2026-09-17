@@ -456,7 +456,7 @@ func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []st
 // (Java/Kotlin/C#/Swift FooTest, JS/TS foo.test.ts, ...) are deliberately not
 // inverted here until their producers mint matchable keys.
 func productionSiblingPath(testPath string) string {
-	idx := strings.LastIndexAny(testPath, `/\`)
+	idx := strings.LastIndexByte(testPath, '/')
 	base := testPath[idx+1:]
 	extension := strings.ToLower(path.Ext(base))
 	stem := base[:len(base)-len(path.Ext(base))]
