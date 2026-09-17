@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/store"
 	"github.com/isink17/codegraph/internal/tokenest"
 )
 
@@ -25,6 +26,65 @@ func mustContext(t *testing.T, fx *contextFixture, task string, opts ContextForT
 		t.Fatalf("ContextForTask(%q) error = %v", task, err)
 	}
 	return res
+}
+
+type testCandidatesStore struct {
+	contextStoreOps
+	tests        []store.RelatedTest
+	refs         []store.SymbolRef
+	relatedFiles []string
+	symbols      map[store.SymbolRef]graph.Symbol
+}
+
+func (s *testCandidatesStore) RelatedTests(_ context.Context, _ int64, _, file string, _, _ int) ([]store.RelatedTest, error) {
+	s.relatedFiles = append(s.relatedFiles, file)
+	return s.tests, nil
+}
+
+func (s *testCandidatesStore) SymbolsForRefs(_ context.Context, _ int64, refs []store.SymbolRef) (map[store.SymbolRef]graph.Symbol, error) {
+	s.refs = append([]store.SymbolRef(nil), refs...)
+	out := make(map[store.SymbolRef]graph.Symbol, len(refs))
+	for _, ref := range refs {
+		if sym, ok := s.symbols[ref]; ok {
+			out[ref] = sym
+		}
+	}
+	return out, nil
+}
+
+func TestTestCandidatesPreservesRelatedTestPathIdentity(t *testing.T) {
+	backslash := store.SymbolRef{File: `pkg/weird\name_test.go`, QualifiedName: "pkg.TestWeird"}
+	normal := store.SymbolRef{File: "pkg/normal_test.go", QualifiedName: "pkg.TestNormal"}
+	ctxStore := &testCandidatesStore{
+		tests: []store.RelatedTest{
+			{File: backslash.File, Symbol: backslash.QualifiedName, Score: 0.9},
+			{File: normal.File, Symbol: normal.QualifiedName, Score: 0.8},
+			{File: backslash.File, Symbol: backslash.QualifiedName, Score: 0.7},
+		},
+		symbols: map[store.SymbolRef]graph.Symbol{
+			backslash: {ID: 1, FilePath: backslash.File, QualifiedName: backslash.QualifiedName},
+			normal:    {ID: 2, FilePath: normal.File, QualifiedName: normal.QualifiedName},
+		},
+	}
+	svc := &Service{ctxStore: ctxStore}
+	production := []contextCandidate{{sym: graph.Symbol{FilePath: `pkg/weird\name.go`}}}
+
+	got, err := svc.testCandidates(context.Background(), 1, production)
+	if err != nil {
+		t.Fatalf("testCandidates() error = %v", err)
+	}
+	if len(ctxStore.relatedFiles) != 1 || ctxStore.relatedFiles[0] != production[0].sym.FilePath {
+		t.Fatalf("RelatedTests files = %q, want %q", ctxStore.relatedFiles, production[0].sym.FilePath)
+	}
+	if len(ctxStore.refs) != 2 || ctxStore.refs[0] != backslash || ctxStore.refs[1] != normal {
+		t.Fatalf("SymbolsForRefs refs = %+v, want [%+v %+v]", ctxStore.refs, backslash, normal)
+	}
+	if len(got) != 2 || got[0].sym.FilePath != backslash.File || got[1].sym.FilePath != normal.File {
+		t.Fatalf("test candidates = %+v, want exact related-test identities", got)
+	}
+	if got[0].taskSignal != 1 || got[1].taskSignal <= 0 || got[1].taskSignal >= 1 {
+		t.Fatalf("test candidate signals = %v, %v", got[0].taskSignal, got[1].taskSignal)
+	}
 }
 
 func allSymbols(res *graph.TaskContext) []graph.TaskContextSymbol {
