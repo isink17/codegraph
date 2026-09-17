@@ -466,12 +466,7 @@ func loadImportFileIndex(ctx context.Context, q queryContexter, repoID int64) (i
 		if err := rows.Scan(&id, &stored); err != nil {
 			return importFileIndex{}, nil, err
 		}
-		// canonicalStoredPath, not CanonicalRelPath: these bytes come out of
-		// `files.path`, which a Windows-written database stores with backslashes.
-		// CanonicalRelPath only calls filepath.ToSlash, a no-op off Windows, so the
-		// '/'-anchored suffix walk below would produce no buckets at all and every
-		// cross-file type binding would be refused on a database written elsewhere.
-		filePath := canonicalStoredPath(stored)
+		filePath := stored
 		if filePath == "" {
 			continue
 		}

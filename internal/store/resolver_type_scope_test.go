@@ -54,6 +54,53 @@ func TestFileIDsByPathsUsesCanonicalPaths(t *testing.T) {
 	}
 }
 
+func TestLoadImportFileIndexPreservesStoredLogicalPaths(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	if err := f.store.EnsureCanonicalRepositoryPaths(f.ctx, f.repoID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
+	}
+	goFile := f.file(t, "src/pkg/a.go", "go")
+	header := f.file(t, "include/pkg/a.h", "cpp")
+	weird := f.file(t, `pkg/weird\name.go`, "go")
+
+	index, pathByID, err := loadImportFileIndex(f.ctx, f.store.db, f.repoID)
+	if err != nil {
+		t.Fatalf("loadImportFileIndex() error = %v", err)
+	}
+	for id, want := range map[int64]string{
+		goFile: "src/pkg/a.go",
+		header: "include/pkg/a.h",
+		weird:  `pkg/weird\name.go`,
+	} {
+		if got := pathByID[id]; got != want {
+			t.Errorf("pathByID[%d] = %q, want %q", id, got, want)
+		}
+		if ids := index.byPath[want]; len(ids) != 1 || ids[0] != id {
+			t.Errorf("byPath[%q] = %v, want [%d]", want, ids, id)
+		}
+	}
+	if ids := index.byBase["src/pkg/a"]; len(ids) != 1 || ids[0] != goFile {
+		t.Errorf("byBase[src/pkg/a] = %v, want [%d]", ids, goFile)
+	}
+	hasID := func(ids []int64, want int64) bool {
+		for _, id := range ids {
+			if id == want {
+				return true
+			}
+		}
+		return false
+	}
+	if ids := index.bySuffix["pkg/a"]; len(ids) != 2 || !hasID(ids, goFile) || !hasID(ids, header) {
+		t.Errorf("bySuffix[pkg/a] = %v, want [%d %d]", ids, goFile, header)
+	}
+	if ids := index.bySuffix["weird\\name"]; len(ids) != 1 || ids[0] != weird {
+		t.Errorf("bySuffix[weird\\name] = %v, want [%d]", ids, weird)
+	}
+	if ids := index.byHeaderSuffix["pkg/a"]; len(ids) != 1 || ids[0] != header {
+		t.Errorf("byHeaderSuffix[pkg/a] = %v, want [%d]", ids, header)
+	}
+}
+
 // importPath records that a file's source named a specifier, exactly as the
 // parsers persist it: the module path, never the imported symbol.
 func (f *typeScopeFixture) importPath(t *testing.T, fileID int64, specifier string) {
