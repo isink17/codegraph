@@ -114,7 +114,6 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			if err := rows.Scan(&f.id, &f.path); err != nil {
 				return err
 			}
-			f.path = canonicalStoredPath(f.path)
 			files[f.id] = f
 			byPath[f.path] = f.id
 			return nil
@@ -177,7 +176,6 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 					if err := rows.Scan(&f.id, &f.path); err != nil {
 						return err
 					}
-					f.path = canonicalStoredPath(f.path)
 					byPath[f.path] = f.id
 					if _, exists := files[f.id]; !exists {
 						files[f.id] = f
