@@ -76,12 +76,6 @@ func CanonicalRelPath(path string) string {
 	return strings.TrimPrefix(slashed, "./")
 }
 
-// canonicalStoredPath is retained for logical module helpers. Persisted paths
-// are already canonical; notably, a POSIX backslash is data, not a separator.
-func canonicalStoredPath(path string) string {
-	return CanonicalRelPath(path)
-}
-
 // SymbolsForRefs resolves search-result refs to full symbol rows in one query
 // per chunk. It exists so seed expansion can use a symbol's real identity
 // (symbol_id, stable_key) instead of a second, ambiguous bare-name lookup, and
