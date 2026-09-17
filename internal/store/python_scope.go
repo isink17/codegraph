@@ -730,7 +730,7 @@ func pythonScopeFilePaths(ctx context.Context, q execQuerier, repoID int64, ids 
 		if err := scan(&id, &p); err != nil {
 			return err
 		}
-		out[id] = canonicalStoredPath(p)
+		out[id] = p
 		return nil
 	})
 	return out, err

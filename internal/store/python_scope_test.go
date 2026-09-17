@@ -102,6 +102,26 @@ func TestPythonScopeFileIDsByPathUsesCanonicalPaths(t *testing.T) {
 	}
 }
 
+func TestPythonScopeFilePathsPreserveStoredPaths(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	mainID, err := insertTestFileLang(ctx, s, repoID, "pkg/main.py", "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperID, err := insertTestFileLang(ctx, s, repoID, "pkg/helpers.py", "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pythonScopeFilePaths(ctx, s.db, repoID, []int64{mainID, helperID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[mainID] != "pkg/main.py" || got[helperID] != "pkg/helpers.py" {
+		t.Fatalf("pythonScopeFilePaths() = %v, want stored logical paths", got)
+	}
+}
+
 // `import a.b` binds `a`, not `a.b`, and the resolver derives both spellings
 // that reach a module from that truthful record rather than from a corrupted
 // LocalName.
