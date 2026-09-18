@@ -54,6 +54,54 @@ func TestFileIDsByPathsUsesCanonicalPaths(t *testing.T) {
 	}
 }
 
+// TestTypeScopeNamesForChangedPathsKeepsDistinctLogicalIdentities pins the
+// generic changed-file lookup to raw `files.path` bytes. `pkg/x\y.py` and
+// `pkg/x/y.py` are two stored files, each carrying its own unresolved bare type
+// name. A batch naming the backslash file must re-decide that file's names and
+// not its slash sibling's. The former CanonicalRelPath call in fileIDsByPaths
+// folded the backslash spelling onto the sibling on Windows, so the batch
+// carried the wrong file's names there; on POSIX the old code also passes, and
+// a Windows host is where it reverse-fails.
+func TestTypeScopeNamesForChangedPathsKeepsDistinctLogicalIdentities(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	backslashFile := f.file(t, `pkg/x\y.py`, "python")
+	slashFile := f.file(t, "pkg/x/y.py", "python")
+	backslashRun := f.symbolKind(t, backslashFile, "run", `pkg/x\y.run`, "function", "python")
+	slashRun := f.symbolKind(t, slashFile, "run", "pkg/x/y.run", "function", "python")
+	f.edge(t, backslashFile, backslashRun, "BackslashType")
+	f.edge(t, slashFile, slashRun, "SlashType")
+
+	ids, err := fileIDsByPaths(f.ctx, f.store.db, f.repoID, []string{`pkg/x\y.py`})
+	if err != nil {
+		t.Fatalf("fileIDsByPaths() error = %v", err)
+	}
+	if len(ids) != 1 || ids[0] != backslashFile {
+		t.Fatalf("fileIDsByPaths(pkg/x\\y.py) = %v, want [%d]", ids, backslashFile)
+	}
+	ids, err = fileIDsByPaths(f.ctx, f.store.db, f.repoID, []string{"pkg/x/y.py"})
+	if err != nil {
+		t.Fatalf("fileIDsByPaths() error = %v", err)
+	}
+	if len(ids) != 1 || ids[0] != slashFile {
+		t.Fatalf("fileIDsByPaths(pkg/x/y.py) = %v, want [%d]", ids, slashFile)
+	}
+
+	names, err := f.store.typeScopeNamesForChangedPaths(f.ctx, f.repoID, []string{`pkg/x\y.py`}, newImportScopeCache(f.store, f.repoID))
+	if err != nil {
+		t.Fatalf("typeScopeNamesForChangedPaths() error = %v", err)
+	}
+	if len(names) != 1 || names[0] != "BackslashType" {
+		t.Fatalf("names for changed pkg/x\\y.py = %v, want [BackslashType]", names)
+	}
+	names, err = f.store.typeScopeNamesForChangedPaths(f.ctx, f.repoID, []string{"pkg/x/y.py"}, newImportScopeCache(f.store, f.repoID))
+	if err != nil {
+		t.Fatalf("typeScopeNamesForChangedPaths() error = %v", err)
+	}
+	if len(names) != 1 || names[0] != "SlashType" {
+		t.Fatalf("names for changed pkg/x/y.py = %v, want [SlashType]", names)
+	}
+}
+
 func TestLoadImportFileIndexPreservesStoredLogicalPaths(t *testing.T) {
 	f := newTypeScopeFixture(t)
 	if err := f.store.EnsureCanonicalRepositoryPaths(f.ctx, f.repoID, true); err != nil {

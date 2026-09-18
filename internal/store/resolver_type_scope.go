@@ -911,12 +911,13 @@ func typeScopeEdgeNames(ctx context.Context, q queryContexter, repoID int64, fil
 	return out, nil
 }
 
-// fileIDsByPaths resolves logical repository paths to file ids.
+// fileIDsByPaths resolves logical repository paths to file ids. paths are
+// `files.path` identities and are matched byte for byte, so a backslash stays
+// filename data on every host; the caller is responsible for the spelling.
 func fileIDsByPaths(ctx context.Context, q queryContexter, repoID int64, paths []string) ([]int64, error) {
 	canonicalPaths := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
-	for _, p := range paths {
-		canonical := CanonicalRelPath(p)
+	for _, canonical := range paths {
 		if canonical == "" {
 			continue
 		}
