@@ -436,3 +436,58 @@ func TestPageRankPreservesLiteralBackslashFileIdentity(t *testing.T) {
 		t.Fatalf("root row = %+v, want pkg.Root in pkg/root.go", rows[2])
 	}
 }
+
+// TestDetectCyclesPreservesLiteralBackslashFileIdentity proves the file graph
+// is keyed by exact stored path bytes. `pkg/x/y.go` and `pkg/x\y.go` are two
+// distinct files; the exact-identity graph below is acyclic among them, and
+// only the unrelated real/ pair forms a cycle. Folding the siblings into one
+// vertex would manufacture a self-cycle (backslash -> slash) and a two-vertex
+// cycle (pkg/a.go <-> merged vertex) that the stored graph does not contain.
+func TestDetectCyclesPreservesLiteralBackslashFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	files := map[string]int64{}
+	syms := map[string]int64{}
+	for _, path := range []string{"pkg/a.go", "pkg/x/y.go", `pkg/x\y.go`, "real/a.go", "real/b.go"} {
+		fid, err := insertTestFile(ctx, s, repoID, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sid, err := insertTestSymbol(ctx, s, repoID, fid, "F", "q."+path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[path], syms[path] = fid, sid
+	}
+	link := func(src, dst string) {
+		edge, err := insertTestEdge(ctx, s, repoID, files[src], syms[src], "q."+dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, syms[dst], edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Acyclic among exact identities; cyclic only if the siblings alias.
+	link(`pkg/x\y.go`, "pkg/x/y.go") // would become a self-edge
+	link("pkg/a.go", "pkg/x/y.go")   // with the next edge, would become a 2-cycle
+	link(`pkg/x\y.go`, "pkg/a.go")
+	// Positive control: a genuine cycle on unrelated exact paths.
+	link("real/a.go", "real/b.go")
+	link("real/b.go", "real/a.go")
+
+	rows, err := s.DetectCycles(ctx, repoID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the real/ cycle: asserted by length and member set so the test
+	// pins vertex identity, not the closing-node representation of a cycle.
+	if len(rows) != 1 || rows[0]["length"] != 2 {
+		t.Fatalf("cycles = %v, want exactly one cycle of length 2 (real/a.go <-> real/b.go)", rows)
+	}
+	for _, node := range rows[0]["cycle"].([]string) {
+		if node != "real/a.go" && node != "real/b.go" {
+			t.Fatalf("alias-created cycle member %q reported: %v", node, rows[0])
+		}
+	}
+}

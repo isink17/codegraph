@@ -9153,7 +9153,6 @@ func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]ma
 		if err := dRows.Scan(&src, &dst); err != nil {
 			return nil, err
 		}
-		src, dst = filepath.ToSlash(src), filepath.ToSlash(dst)
 		fileGraph[src] = append(fileGraph[src], dst)
 		allFiles[src] = struct{}{}
 		allFiles[dst] = struct{}{}
