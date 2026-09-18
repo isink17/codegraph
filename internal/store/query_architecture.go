@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 )
 
 // architectureTopN is how many entry points / hub symbols the architecture
@@ -62,8 +61,11 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 		if err := rows.Scan(&qname, &kind, &path, &degree); err != nil {
 			return nil, err
 		}
+		// `file` is the stored `files.path`: a logical repository identity, kept
+		// byte for byte like `top_directories` in the same overview. A backslash
+		// is filename data, so it is not rewritten here.
 		out = append(out, map[string]any{
-			"qualified_name": qname, "kind": kind, "file": filepath.ToSlash(path), countKey: degree,
+			"qualified_name": qname, "kind": kind, "file": path, countKey: degree,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -105,7 +107,7 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"qualified_name": qname, "kind": kind, "file": filepath.ToSlash(path), countKey: 0,
+			"qualified_name": qname, "kind": kind, "file": path, countKey: 0,
 		})
 	}
 	return out, rows.Err()

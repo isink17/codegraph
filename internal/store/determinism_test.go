@@ -679,3 +679,92 @@ func TestResolveEdgesForPathsKeepsDistinctLogicalIdentities(t *testing.T) {
 		t.Fatalf("b/x/y.go edge resolved to %d, want untouched by that scope", other.Int64)
 	}
 }
+
+// TestArchitectureTopDegreePreservesLogicalBackslashIdentity pins the `file`
+// of every entry point and hub symbol to the stored `files.path` bytes.
+// `pkg/x\y.go` and `pkg/x/y.go` are two stored files; one caller in each calls
+// the target in the same file, so both spellings reach the degree-ranked list
+// (`topDegreeSymbols`) and, because the repository has fewer than
+// architectureTopN symbols, both also reach the zero-degree padding
+// (`fillZeroDegree`). The former filepath.ToSlash at both sites folded the
+// backslash spelling onto its sibling on Windows, so two symbols in different
+// files reported the same `file` while `top_directories` in the same overview
+// kept the stored spelling. On POSIX ToSlash is the identity, so the old code
+// passes there; windows-latest CI is the behavioral proof.
+func TestArchitectureTopDegreePreservesLogicalBackslashIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+
+	backslash, slash := `pkg/x\y.go`, "pkg/x/y.go"
+	files := map[string]int64{}
+	for _, path := range []string{backslash, slash} {
+		id, err := insertTestFile(ctx, s, repoID, path)
+		if err != nil {
+			t.Fatalf("insertTestFile(%q) error = %v", path, err)
+		}
+		files[path] = id
+	}
+	// qualified name -> stored file it lives in.
+	wantFile := map[string]string{}
+	for path, prefix := range map[string]string{backslash: "bs", slash: "sl"} {
+		target, err := insertTestSymbol(ctx, s, repoID, files[path], "Target", prefix+".Target")
+		if err != nil {
+			t.Fatalf("insertTestSymbol(%s.Target) error = %v", prefix, err)
+		}
+		caller, err := insertTestSymbol(ctx, s, repoID, files[path], "Caller", prefix+".Caller")
+		if err != nil {
+			t.Fatalf("insertTestSymbol(%s.Caller) error = %v", prefix, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
+			VALUES(?, ?, ?, ?, 'call', '', ?, 1)
+		`, repoID, caller, target, prefix+".Target", files[path]); err != nil {
+			t.Fatalf("edge %s error = %v", prefix, err)
+		}
+		wantFile[prefix+".Target"] = path
+		wantFile[prefix+".Caller"] = path
+	}
+
+	overview, err := s.ArchitectureOverview(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, section := range []struct {
+		key      string
+		countKey string
+	}{{"entry_points", "caller_count"}, {"hub_symbols", "callee_count"}} {
+		rows := overview[section.key].([]map[string]any)
+		if len(rows) != len(wantFile) {
+			t.Fatalf("%s = %v, want %d rows", section.key, rows, len(wantFile))
+		}
+		ranked, padded := 0, 0
+		for _, row := range rows {
+			qname := row["qualified_name"].(string)
+			want, ok := wantFile[qname]
+			if !ok {
+				t.Fatalf("%s: unexpected symbol %v", section.key, row)
+			}
+			if got := row["file"]; got != want {
+				t.Fatalf("%s: %s file = %q, want stored %q (full %v)", section.key, qname, got, want, rows)
+			}
+			if row[section.countKey].(int) > 0 {
+				ranked++
+			} else {
+				padded++
+			}
+			// The returned spelling must re-address the very row it came from.
+			resolved, err := s.SymbolsForRefs(ctx, repoID, []SymbolRef{{File: want, QualifiedName: qname}})
+			if err != nil {
+				t.Fatalf("SymbolsForRefs(%s) error = %v", qname, err)
+			}
+			sym, found := resolved[SymbolRef{File: want, QualifiedName: qname}]
+			if !found || sym.FilePath != want {
+				t.Fatalf("%s: %s not re-addressable by (%q, %q): %+v", section.key, qname, want, qname, resolved)
+			}
+		}
+		// Both code paths ran for both spellings: two ranked rows, two padded.
+		if ranked != 2 || padded != 2 {
+			t.Fatalf("%s: ranked=%d padded=%d, want 2/2 (rows %v)", section.key, ranked, padded, rows)
+		}
+	}
+}
