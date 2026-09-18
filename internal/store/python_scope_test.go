@@ -489,3 +489,82 @@ func TestPythonScopeLeavesUnclaimedEdgesToGenericStrategies(t *testing.T) {
 		t.Fatalf("generic resolution = %v, want %d", got, want)
 	}
 }
+
+// TestInvalidatePythonScopeBindingsKeepsDistinctLogicalIdentities pins the
+// reverse candidate lookup to raw `files.path` bytes. A caller stored as
+// `pkg\sub/main.py` importing `.y` names `pkg\sub/y.py`, and one stored as
+// `pkg/sub/main.py` names `pkg/sub/y.py`; those are two modules. The former
+// CanonicalRelPath call folded a changed `pkg\sub/y.py` onto the slash sibling
+// on Windows, clearing the wrong caller and leaving the right one bound. On
+// POSIX the old code also passes; a Windows host is where it reverse-fails.
+func TestInvalidatePythonScopeBindingsKeepsDistinctLogicalIdentities(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	target, err := insertTestFileLang(ctx, s, repoID, `pkg\sub/y.py`, "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper, err := insertTestSymbolLang(ctx, s, repoID, target, "helper", "y.helper", "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundCaller := func(callerPath string) int64 {
+		t.Helper()
+		parsed := graph.ParsedFile{Language: "python", Scope: graph.ScopeEvidence{Imports: []graph.ScopeImport{{SourceSpecifier: ".y"}}}}
+		if err := s.ReplaceFileGraph(ctx, repoID, 1, callerPath, "python", 1, 1, callerPath, parsed); err != nil {
+			t.Fatal(err)
+		}
+		var caller int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id=? AND path=?`, repoID, callerPath).Scan(&caller); err != nil {
+			t.Fatal(err)
+		}
+		src, err := insertTestSymbolLang(ctx, s, repoID, caller, "run", callerPath+".run", "python")
+		if err != nil {
+			t.Fatal(err)
+		}
+		edge, err := insertTestEdge(ctx, s, repoID, caller, src, "helper")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence='high' WHERE id=?`,
+			helper, ResolutionStrategyPythonModuleScope, edge); err != nil {
+			t.Fatal(err)
+		}
+		return edge
+	}
+	bound := func(edge int64) bool {
+		t.Helper()
+		var dst sql.NullInt64
+		if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges WHERE id=?`, edge).Scan(&dst); err != nil {
+			t.Fatal(err)
+		}
+		return dst.Valid
+	}
+	backslashCaller := boundCaller(`pkg\sub/main.py`)
+	slashCaller := boundCaller("pkg/sub/main.py")
+	// The persisted candidate rows must spell the backslash module the way the
+	// file is stored, or this test would prove nothing about identity.
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM scope_module_candidate_evidence WHERE repo_id=? AND candidate_path=?`, repoID, `pkg\sub/y.py`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("candidate rows naming pkg\\sub/y.py = %d, want 1", n)
+	}
+
+	if _, err := s.invalidatePythonScopeBindings(ctx, repoID, []string{`pkg\sub/y.py`}); err != nil {
+		t.Fatal(err)
+	}
+	if bound(backslashCaller) {
+		t.Fatal("caller of the changed backslash module stayed bound")
+	}
+	if !bound(slashCaller) {
+		t.Fatal("caller of the untouched slash sibling was invalidated")
+	}
+	if _, err := s.invalidatePythonScopeBindings(ctx, repoID, []string{"pkg/sub/y.py"}); err != nil {
+		t.Fatal(err)
+	}
+	if bound(slashCaller) {
+		t.Fatal("caller of the changed slash module stayed bound")
+	}
+}

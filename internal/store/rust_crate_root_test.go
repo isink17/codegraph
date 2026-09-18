@@ -441,3 +441,41 @@ func TestRustCrateRootRestoresMembershipOnWindowsPaths(t *testing.T) {
 		t.Fatalf("restored: crate_root=%q bound=%d, want %q and %d", crateRoot(util), bound(), "src/lib.rs", target)
 	}
 }
+
+// TestRustRootsForPathsKeepsDistinctLogicalIdentities pins the changed-path
+// lookup to raw `files.path` bytes. `crate_a/src/x\y.rs` is one stored file
+// whose proven membership is crate_b; the former CanonicalRelPath call rewrote
+// it to `crate_a/src/x/y.rs` on Windows, matched the slash sibling's row, and
+// returned that sibling's crate_a instead. On POSIX the old code also passes; a
+// Windows host is where it reverse-fails.
+func TestRustRootsForPathsKeepsDistinctLogicalIdentities(t *testing.T) {
+	ctx := context.Background()
+	f := newRustCrateRootFixture(t, ctx, "crate_a/src/lib.rs", "foo")
+	f.setCrateRoot(t, ctx, f.rootID, "crate_a/src/lib.rs")
+	f.setCrateRoot(t, ctx, f.modules["foo"], "crate_a/src/lib.rs")
+	rootB := f.addFile(t, ctx, "crate_b/src/lib.rs", "crate")
+	f.setCrateRoot(t, ctx, rootB, "crate_b/src/lib.rs")
+	slash := f.addFile(t, ctx, "crate_a/src/x/y.rs", "crate::x::y")
+	f.setCrateRoot(t, ctx, slash, "crate_a/src/lib.rs")
+	backslash := f.addFile(t, ctx, `crate_a/src/x\y.rs`, "crate::y")
+	f.setCrateRoot(t, ctx, backslash, "crate_b/src/lib.rs")
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{`crate_a/src/x\y.rs`, "crate_b/src/lib.rs"},
+		{"crate_a/src/x/y.rs", "crate_a/src/lib.rs"},
+	} {
+		got, err := f.store.rustRootsForPaths(ctx, f.repoID, []string{tc.path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("rustRootsForPaths(%q) = %v, want exactly one root", tc.path, got)
+		}
+		if _, ok := got[tc.want]; !ok {
+			t.Fatalf("rustRootsForPaths(%q) = %v, want %s", tc.path, got, tc.want)
+		}
+	}
+}

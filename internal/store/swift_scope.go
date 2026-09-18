@@ -485,8 +485,9 @@ func (s *Store) swiftPathsChanged(ctx context.Context, repoID int64, paths []str
 	var changed bool
 	canonical := make([]string, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
-	for _, path := range paths {
-		p := CanonicalRelPath(path)
+	// paths are logical `files.path` identities; they are matched byte for byte,
+	// so a backslash stays filename data on every host.
+	for _, p := range paths {
 		if p == "" {
 			continue
 		}

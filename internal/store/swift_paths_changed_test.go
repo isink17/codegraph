@@ -35,3 +35,39 @@ func TestSwiftPathsChangedUsesCanonicalPaths(t *testing.T) {
 		})
 	}
 }
+
+// TestSwiftPathsChangedKeepsDistinctLogicalIdentities pins the Swift changed-path
+// probe to raw logical identities. `Sources/App/x/y.swift` and
+// `Sources/App/x\y.swift` are two stored files under P23; the former
+// CanonicalRelPath call folded the backslash spelling onto the slash one on
+// Windows, so a changed Swift file whose name holds a backslash looked like the
+// unrelated Kotlin sibling and reported no Swift change. On POSIX the old code
+// also passes; a Windows host is where it reverse-fails.
+func TestSwiftPathsChangedKeepsDistinctLogicalIdentities(t *testing.T) {
+	s, repoID := newQueryTestStore(t)
+	ctx := testContext()
+	if _, err := insertTestFileLang(ctx, s, repoID, "Sources/App/x/y.swift", "kotlin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertTestFileLang(ctx, s, repoID, `Sources/App/x\y.swift`, "swift"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		want  bool
+	}{
+		{"backslash identity is the swift file", []string{`Sources/App/x\y.swift`}, true},
+		{"slash sibling is not the swift file", []string{"Sources/App/x/y.swift"}, false},
+		{"exact duplicates deduped", []string{`Sources/App/x\y.swift`, `Sources/App/x\y.swift`}, true},
+		{"empty entries ignored", []string{"", "Sources/App/x/y.swift", ""}, false},
+	} {
+		got, err := s.swiftPathsChanged(ctx, repoID, tc.paths)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: swiftPathsChanged(%q) = %v, want %v", tc.name, tc.paths, got, tc.want)
+		}
+	}
+}

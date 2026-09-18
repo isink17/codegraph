@@ -925,8 +925,9 @@ func (s *Store) invalidatePythonScopeBindings(ctx context.Context, repoID int64,
 	}
 	canonical := make([]string, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
+	// paths and candidate_path are both logical `files.path` spellings, so the
+	// reverse lookup compares exact bytes; a backslash is filename data.
 	for _, p := range paths {
-		p = CanonicalRelPath(p)
 		if p == "" {
 			continue
 		}

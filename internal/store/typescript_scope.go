@@ -497,8 +497,9 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 	}
 	frontier := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
+	// paths and candidate_path are both logical `files.path` spellings, so the
+	// reverse lookup compares exact bytes; a backslash is filename data.
 	for _, p := range paths {
-		p = CanonicalRelPath(p)
 		if p != "" {
 			seenPaths[p] = struct{}{}
 			frontier = append(frontier, p)

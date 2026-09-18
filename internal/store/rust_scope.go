@@ -217,8 +217,9 @@ func updateRustCrateRoots(ctx context.Context, q execContexter, repoID int64, id
 func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []string) (map[string]struct{}, error) {
 	wanted := make([]string, 0, len(paths))
 	seen := map[string]struct{}{}
-	for _, path := range paths {
-		canonical := CanonicalRelPath(path)
+	// paths are logical `files.path` identities and are looked up byte for
+	// byte; a backslash is filename data on every host.
+	for _, canonical := range paths {
 		if canonical == "" {
 			continue
 		}

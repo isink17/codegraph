@@ -468,3 +468,85 @@ func TestTypeScriptCandidateEvidenceSurvivesTargetGraphDelete(t *testing.T) {
 		t.Fatalf("target deletion removed caller candidate evidence: %d", n)
 	}
 }
+
+// TestInvalidateTypeScriptScopeBindingsKeepsDistinctLogicalIdentities pins the
+// reverse candidate lookup to raw `files.path` bytes. `src/x\y.ts` and
+// `src/x/y.ts` are two logical modules; the candidate rows the indexer persists
+// carry the same bytes, so a changed backslash module must clear only the
+// caller that named it. The former CanonicalRelPath call folded the changed
+// path onto the slash sibling on Windows, clearing the wrong caller and leaving
+// the right one bound. On POSIX the old code also passes; a Windows host is
+// where it reverse-fails.
+func TestInvalidateTypeScriptScopeBindingsKeepsDistinctLogicalIdentities(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	target, err := insertTestFileLang(ctx, s, repoID, `src/x\y.ts`, "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foo, err := insertTestSymbolLang(ctx, s, repoID, target, "foo", "y.foo", "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundCaller := func(callerPath, specifier string) int64 {
+		t.Helper()
+		caller, err := insertTestFileLang(ctx, s, repoID, callerPath, "typescript")
+		if err != nil {
+			t.Fatal(err)
+		}
+		src, err := insertTestSymbolLang(ctx, s, repoID, caller, "run", callerPath+".run", "typescript")
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidates := typescriptModuleCandidatePaths(callerPath, specifier)
+		if len(candidates) == 0 {
+			t.Fatalf("typescriptModuleCandidatePaths(%q, %q) produced no candidates", callerPath, specifier)
+		}
+		for _, candidate := range candidates {
+			if _, err := s.db.ExecContext(ctx, `INSERT INTO scope_module_candidate_evidence(repo_id,source_file_id,source_specifier,candidate_path) VALUES(?,?,?,?)`,
+				repoID, caller, specifier, candidate); err != nil {
+				t.Fatal(err)
+			}
+		}
+		edge, err := insertTestEdge(ctx, s, repoID, caller, src, "foo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence='high' WHERE id=?`,
+			foo, ResolutionStrategyTypeScriptModuleScope, edge); err != nil {
+			t.Fatal(err)
+		}
+		return edge
+	}
+	bound := func(edge int64) bool {
+		t.Helper()
+		var dst sql.NullInt64
+		if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges WHERE id=?`, edge).Scan(&dst); err != nil {
+			t.Fatal(err)
+		}
+		return dst.Valid
+	}
+	// The real candidate producer must spell the backslash module the way the
+	// file is stored, or this test would prove nothing about identity.
+	if got := typescriptModuleCandidatePaths("src/main.ts", `./x\y`); len(got) == 0 || got[0] != `src/x\y.ts` {
+		t.Fatalf("typescriptModuleCandidatePaths(src/main.ts, ./x\\y) = %q, want src/x\\y.ts first", got)
+	}
+	backslashCaller := boundCaller("src/main.ts", `./x\y`)
+	slashCaller := boundCaller("src/other.ts", "./x/y")
+
+	if _, err := s.invalidateTypeScriptScopeBindings(ctx, repoID, []string{`src/x\y.ts`}); err != nil {
+		t.Fatal(err)
+	}
+	if bound(backslashCaller) {
+		t.Fatal("caller of the changed backslash module stayed bound")
+	}
+	if !bound(slashCaller) {
+		t.Fatal("caller of the untouched slash sibling was invalidated")
+	}
+	if _, err := s.invalidateTypeScriptScopeBindings(ctx, repoID, []string{"src/x/y.ts"}); err != nil {
+		t.Fatal(err)
+	}
+	if bound(slashCaller) {
+		t.Fatal("caller of the changed slash module stayed bound")
+	}
+}
