@@ -13,9 +13,9 @@ import (
 // an exact symbol ID. It can be ambiguous for overloads in one file; context
 // seed resolution uses SymbolsForIDs instead.
 //
-// File denotes a logical repository path. SymbolsForRefs retains limited
-// legacy input adaptation through CanonicalRelPath; on POSIX, backslash is
-// filename data rather than a separator.
+// File is a logical repository path in the exact spelling `files.path` holds.
+// SymbolsForRefs matches it byte for byte, so a backslash is filename data on
+// every host and callers get back the identity they asked about.
 type SymbolRef struct {
 	File          string
 	QualifiedName string
@@ -81,19 +81,21 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 		return out, nil
 	}
 
-	// `wanted` (and the returned map) is keyed canonically, because that is what
-	// a scanned symbol carries and what every caller compares. pathSet contains
-	// distinct logical lookup paths, each bound once in the SQL IN list.
+	// `wanted` (and the returned map) is keyed by the ref's own path bytes,
+	// which is what `files.path` holds and what the caller looks the result up
+	// with. Rewriting them here would address a different logical file than the
+	// one the ref names -- and would fold `a/x\y.go` onto `a/x/y.go` on
+	// Windows, where those are two distinct indexed files. pathSet contains the
+	// distinct lookup paths, each bound once in the SQL IN list.
 	wanted := make(map[SymbolRef]struct{}, len(refs))
 	pathSet := make(map[string]struct{}, len(refs))
 	nameSet := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
-		canonical := CanonicalRelPath(ref.File)
-		if canonical == "" || ref.QualifiedName == "" {
+		if ref.File == "" || ref.QualifiedName == "" {
 			continue
 		}
-		wanted[SymbolRef{File: canonical, QualifiedName: ref.QualifiedName}] = struct{}{}
-		pathSet[canonical] = struct{}{}
+		wanted[ref] = struct{}{}
+		pathSet[ref.File] = struct{}{}
 		nameSet[ref.QualifiedName] = struct{}{}
 	}
 	if len(wanted) == 0 {

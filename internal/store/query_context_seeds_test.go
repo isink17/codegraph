@@ -304,3 +304,84 @@ func TestSymbolsForRefsDoesNotWidenPathMatching(t *testing.T) {
 		}
 	}
 }
+
+// A ref names one stored file. `a/x/y.go` and `a/x\y.go` are two logical
+// identities under P23, and a leading "./" is a third spelling that addresses
+// no row stored without it. The former CanonicalRelPath call collapsed the
+// backslash pair on Windows and stripped "./" on every host, so a ref built
+// from `files.path` -- which is what the only production caller hands over --
+// resolved the wrong row or none at all.
+func TestSymbolsForRefsMatchesStoredPathIdentityExactly(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	rows := []struct {
+		path string
+		name string
+	}{
+		{"a/x/y.go", "a.Slash"},
+		{`a/x\y.go`, "a.Backslash"},
+		{"./b.go", "b.Dotted"},
+		{"b.go", "b.Plain"},
+	}
+	ids := map[string]int64{}
+	for _, r := range rows {
+		fileID, err := insertTestFile(ctx, s, repo.ID, r.path)
+		if err != nil {
+			t.Fatalf("insertTestFile(%q) error = %v", r.path, err)
+		}
+		symID, err := insertTestSymbol(ctx, s, repo.ID, fileID, r.name, r.name)
+		if err != nil {
+			t.Fatalf("insertTestSymbol(%q) error = %v", r.name, err)
+		}
+		ids[r.path] = symID
+	}
+
+	for _, r := range rows {
+		ref := SymbolRef{File: r.path, QualifiedName: r.name}
+		got, err := s.SymbolsForRefs(ctx, repo.ID, []SymbolRef{ref})
+		if err != nil {
+			t.Fatalf("SymbolsForRefs(%q) error = %v", r.path, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("ref %q resolved %d rows, want exactly 1: %+v", r.path, len(got), got)
+		}
+		sym, ok := got[ref]
+		if !ok {
+			t.Fatalf("ref %q is not the result key: %+v", r.path, got)
+		}
+		if sym.ID != ids[r.path] {
+			t.Fatalf("ref %q resolved symbol %d, want %d", r.path, sym.ID, ids[r.path])
+		}
+		if sym.FilePath != r.path {
+			t.Fatalf("ref %q returned path %q; stored bytes must survive", r.path, sym.FilePath)
+		}
+	}
+
+	// Negative control: the symbol names are distinct per row, so a path folded
+	// onto its sibling cannot resolve at all. Asking for the backslash file's
+	// symbol under the slash spelling (and the reverse) must stay empty, and the
+	// same for the "./" pair -- the local POSIX reverse-failure of the old code.
+	for _, bad := range []SymbolRef{
+		{File: "a/x/y.go", QualifiedName: "a.Backslash"},
+		{File: `a/x\y.go`, QualifiedName: "a.Slash"},
+		{File: "b.go", QualifiedName: "b.Dotted"},
+		{File: "./b.go", QualifiedName: "b.Plain"},
+	} {
+		got, err := s.SymbolsForRefs(ctx, repo.ID, []SymbolRef{bad})
+		if err != nil {
+			t.Fatalf("SymbolsForRefs(%+v) error = %v", bad, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ref %+v crossed a path identity boundary: %+v", bad, got)
+		}
+	}
+}

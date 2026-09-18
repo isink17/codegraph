@@ -13,14 +13,13 @@ import (
 // CI failure: the whole seed bridge, over a repository indexed by the production
 // indexer rather than by hand-written rows.
 //
-// The indexer derives `files.path` with filepath.Rel/filepath.Clean, so the
-// stored value is native-form (`paymentsvc\service.go` on Windows). Every value
-// the store hands back to a client is slash-normalized instead. Before the fix
-// SymbolsForRefs keyed its wanted-set on the producer's raw path and compared it
-// against the scanned symbol's normalized path, so on Windows no seed ever
-// matched and context_for_task returned `{"files":null}` again -- the exact bug
-// P14 set out to fix. The store-level tests could not catch it because they
-// insert `billing/renew.go` literally, which is already canonical on every host.
+// The indexer derives `files.path` through platform.NativeRelativeToLogical, so
+// the stored value is the logical repository identity on every host. Before the
+// fix SymbolsForRefs keyed its wanted-set on a rewritten path and compared it
+// against the scanned symbol's path, so on Windows no seed ever matched and
+// context_for_task returned `{"files":null}` again -- the exact bug P14 set out
+// to fix. The store-level tests could not catch it because they insert
+// `billing/renew.go` literally, which is one spelling on every host.
 func TestSeedRefRoundTripThroughProductionIndexer(t *testing.T) {
 	ctx := context.Background()
 	for name, fx := range map[string]*contextFixture{
@@ -69,33 +68,45 @@ func TestSeedRefRoundTripThroughProductionIndexer(t *testing.T) {
 	}
 }
 
-// A ref built from a native-form path -- what a producer reading `files.path`
-// directly would hand over -- must address the same indexed file as the
-// canonical one, and must come back keyed canonically.
-func TestSeedRefAcceptsNativeSeparatorForm(t *testing.T) {
+// A ref built from a stored path -- what the production caller hands over, since
+// RelatedTest.File is `files.path` verbatim -- addresses that row and comes back
+// keyed by the same bytes. The caller looks the result up with the ref it built,
+// so any rewriting here would silently drop the candidate instead of resolving
+// it; on Windows it would also fold two distinct indexed files into one.
+func TestSeedRefUsesStoredPathIdentity(t *testing.T) {
 	ctx := context.Background()
 	fx := newContextFixture(t)
 
-	canonical := store.SymbolRef{File: "paymentsvc/service.go", QualifiedName: "paymentsvc.ProcessPayment"}
-	native := store.SymbolRef{File: filepath.FromSlash(canonical.File), QualifiedName: canonical.QualifiedName}
+	stored := store.SymbolRef{File: "paymentsvc/service.go", QualifiedName: "paymentsvc.ProcessPayment"}
+	resolved, err := fx.store.SymbolsForRefs(ctx, fx.repoID, []store.SymbolRef{stored})
+	if err != nil {
+		t.Fatalf("SymbolsForRefs(stored) error = %v", err)
+	}
+	if len(resolved) != 1 {
+		t.Fatalf("stored ref resolved %d rows, want 1: %+v", len(resolved), resolved)
+	}
+	sym, ok := resolved[stored]
+	if !ok {
+		t.Fatalf("result is not keyed by the ref the caller built: %+v", resolved)
+	}
+	if sym.FilePath != stored.File {
+		t.Fatalf("resolved path = %q, want the stored %q", sym.FilePath, stored.File)
+	}
 
-	fromCanonical, err := fx.store.SymbolsForRefs(ctx, fx.repoID, []store.SymbolRef{canonical})
-	if err != nil {
-		t.Fatalf("SymbolsForRefs(canonical) error = %v", err)
-	}
-	fromNative, err := fx.store.SymbolsForRefs(ctx, fx.repoID, []store.SymbolRef{native})
-	if err != nil {
-		t.Fatalf("SymbolsForRefs(native) error = %v", err)
-	}
-	if len(fromCanonical) != 1 || len(fromNative) != 1 {
-		t.Fatalf("canonical resolved %d, native resolved %d; want 1 each", len(fromCanonical), len(fromNative))
-	}
-	if fromCanonical[canonical].ID != fromNative[canonical].ID {
-		t.Fatalf("the two ref forms resolved to different symbols: %d vs %d",
-			fromCanonical[canonical].ID, fromNative[canonical].ID)
-	}
-	if _, ok := fromNative[native]; ok && native.File != canonical.File {
-		t.Fatal("result is keyed by the native form; callers compare canonical paths")
+	// A separator variant is a different logical file, not another spelling of
+	// this one. On a slash host the host separator is identical, so only the
+	// backslash form carries the assertion locally.
+	for _, other := range []string{`paymentsvc\service.go`, "./paymentsvc/service.go"} {
+		if other == stored.File {
+			continue
+		}
+		got, err := fx.store.SymbolsForRefs(ctx, fx.repoID, []store.SymbolRef{{File: other, QualifiedName: stored.QualifiedName}})
+		if err != nil {
+			t.Fatalf("SymbolsForRefs(%q) error = %v", other, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ref %q resolved %+v; it names no indexed file", other, got)
+		}
 	}
 }
 
