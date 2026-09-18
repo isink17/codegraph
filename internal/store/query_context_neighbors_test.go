@@ -409,3 +409,87 @@ func TestContextNeighborsPreservesSeedSlots(t *testing.T) {
 		t.Fatalf("seed 2 callers = %v", callerNames(got[2]))
 	}
 }
+
+// A neighbour's FilePath is the stored `files.path`, byte for byte, exactly as
+// SymbolsForRefs returns it for a seed. The pre-fix filepath.ToSlash rewrote a
+// stored backslash on Windows, so a seed keyed `pkg/x\y.go` met its own
+// neighbours under `pkg/x/y.go` -- and collided with a real sibling of that
+// spelling. On POSIX ToSlash is the identity, so this only fails on Windows.
+func TestContextNeighborsPreserveStoredPathIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+
+	backslash, slash := `pkg/x\y.go`, "pkg/x/y.go"
+	files := map[string]int64{}
+	for _, path := range []string{backslash, slash} {
+		id, err := insertTestFile(ctx, s, repo.ID, path)
+		if err != nil {
+			t.Fatalf("insertTestFile(%q) error = %v", path, err)
+		}
+		files[path] = id
+	}
+	targetID, err := insertTestSymbol(ctx, s, repo.ID, files[backslash], "Target", "pkg.Target")
+	if err != nil {
+		t.Fatalf("insertTestSymbol() error = %v", err)
+	}
+	callers := map[string]string{backslash: "pkg.FromBackslash", slash: "pkg.FromSlash"}
+	for path, qname := range callers {
+		id, err := insertTestSymbol(ctx, s, repo.ID, files[path], lookupSymbolShortName(qname), qname)
+		if err != nil {
+			t.Fatalf("insertTestSymbol(%q) error = %v", qname, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
+			VALUES(?, ?, ?, 'pkg.Target', 'call', '', ?, 1)
+		`, repo.ID, id, targetID, files[path]); err != nil {
+			t.Fatalf("edge %q error = %v", qname, err)
+		}
+	}
+
+	seed := ContextSeed{SymbolID: targetID, QualifiedName: "pkg.Target", ShortName: "Target"}
+	got, err := s.FindContextNeighbors(ctx, repo.ID, []ContextSeed{seed}, 10)
+	if err != nil {
+		t.Fatalf("FindContextNeighbors() error = %v", err)
+	}
+	if len(got) != 1 || len(got[0].Callers) != 2 {
+		t.Fatalf("got %d slots / %v callers, want 1 slot with 2 callers", len(got), callerNames(got[0]))
+	}
+	byName := map[string]string{}
+	for _, c := range got[0].Callers {
+		byName[c.QualifiedName] = c.FilePath
+	}
+	if byName["pkg.FromBackslash"] != backslash {
+		t.Fatalf("backslash caller path = %q, want stored %q", byName["pkg.FromBackslash"], backslash)
+	}
+	if byName["pkg.FromSlash"] != slash {
+		t.Fatalf("slash caller path = %q, want stored %q", byName["pkg.FromSlash"], slash)
+	}
+
+	// Seed and neighbour spelling must agree: the same rows through
+	// SymbolsForRefs carry the same FilePath the neighbour page returned.
+	refs := []SymbolRef{
+		{File: backslash, QualifiedName: "pkg.FromBackslash"},
+		{File: slash, QualifiedName: "pkg.FromSlash"},
+	}
+	resolved, err := s.SymbolsForRefs(ctx, repo.ID, refs)
+	if err != nil {
+		t.Fatalf("SymbolsForRefs() error = %v", err)
+	}
+	for _, ref := range refs {
+		sym, ok := resolved[ref]
+		if !ok {
+			t.Fatalf("ref %+v missing from SymbolsForRefs: %+v", ref, resolved)
+		}
+		if sym.FilePath != byName[ref.QualifiedName] {
+			t.Fatalf("%s: seed path %q != neighbour path %q", ref.QualifiedName, sym.FilePath, byName[ref.QualifiedName])
+		}
+	}
+}
