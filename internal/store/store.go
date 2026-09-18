@@ -9005,7 +9005,6 @@ func (s *Store) lookupSymbolIdentity(ctx context.Context, repoID, symbolID int64
 	if err != nil {
 		return symbolIdentity{}, false, err
 	}
-	identity.Path = filepath.ToSlash(identity.Path)
 	return identity, true, nil
 }
 
@@ -9060,7 +9059,6 @@ func (s *Store) symbolIdentities(ctx context.Context, ids []int64) (map[int64]sy
 				_ = rows.Close()
 				return nil, err
 			}
-			si.Path = filepath.ToSlash(si.Path)
 			out[id] = si
 		}
 		if err := rows.Err(); err != nil {

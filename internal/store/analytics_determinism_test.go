@@ -365,3 +365,74 @@ func TestCouplingPageIsTotallyOrdered(t *testing.T) {
 		}
 	}
 }
+
+// TestPageRankPreservesLiteralBackslashFileIdentity pins the pagerank `file`
+// column to the stored `files.path` bytes. `pkg/x\y.go` and `pkg/x/y.go` are
+// two stored files under P23 logical identity. One root symbol links to one
+// leaf in each sibling; the leaves tie on rank, so Path, the first identity
+// comparator, decides ('/' 0x2F sorts before '\' 0x5C). They also tie on
+// qualified name, kind and position, so a folded Path has nothing left to fall
+// through to. symbolIdentities' former filepath.ToSlash folded the backslash
+// spelling onto the sibling on Windows, aliasing the two rows' `file` and
+// leaving their order arbitrary. On POSIX ToSlash is the identity, so the old
+// code passes there.
+func TestPageRankPreservesLiteralBackslashFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	rootFile, err := insertTestFile(ctx, s, repoID, "pkg/root.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backslashFile, err := insertTestFile(ctx, s, repoID, `pkg/x\y.go`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slashFile, err := insertTestFile(ctx, s, repoID, "pkg/x/y.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := insertTestSymbol(ctx, s, repoID, rootFile, "Root", "pkg.Root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Backslash sibling inserted first so a lower row id cannot masquerade as
+	// the path order the assertion below pins.
+	for _, file := range []int64{backslashFile, slashFile} {
+		id, err := insertTestSymbol(ctx, s, repoID, file, "Same", "pkg.Same")
+		if err != nil {
+			t.Fatal(err)
+		}
+		edge, err := insertTestEdge(ctx, s, repoID, rootFile, root, "pkg.Same")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, id, edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows, err := s.PageRank(ctx, repoID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("pagerank rows = %d, want 3: %+v", len(rows), rows)
+	}
+	// The two leaves receive the identical share from the one root, so rank
+	// ties and Path decides; the later comparators tie too, so nothing else
+	// could order a folded Path.
+	if rows[0]["rank"] != rows[1]["rank"] || rows[0]["symbol"] != "pkg.Same" || rows[1]["symbol"] != "pkg.Same" || rows[0]["kind"] != rows[1]["kind"] {
+		t.Fatalf("fixture leaves do not tie before Path; the test proves nothing: %+v", rows[:2])
+	}
+	if rows[0]["file"] != "pkg/x/y.go" || rows[1]["file"] != `pkg/x\y.go` {
+		t.Fatalf("pagerank file identity/order = %q, %q; want stored bytes pkg/x/y.go then pkg/x\\y.go", rows[0]["file"], rows[1]["file"])
+	}
+	// Control: distinct stored identities never alias in output, and the
+	// lower-ranked root is unaffected.
+	if rows[0]["file"] == rows[1]["file"] {
+		t.Fatalf("sibling stored identities aliased: %+v", rows[:2])
+	}
+	if rows[2]["symbol"] != "pkg.Root" || rows[2]["file"] != "pkg/root.go" {
+		t.Fatalf("root row = %+v, want pkg.Root in pkg/root.go", rows[2])
+	}
+}

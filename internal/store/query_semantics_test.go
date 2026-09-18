@@ -846,3 +846,42 @@ func TestSuffixMatcherAgreesWithSQLiteLike(t *testing.T) {
 		}
 	}
 }
+
+// TestSymbolIdentityHelpersPreserveStoredPath pins both symbolIdentity loaders
+// to the persisted `files.path` bytes. Production callers of
+// lookupSymbolIdentity read only ID and QualifiedName today, so its former
+// filepath.ToSlash was unobservable there; the helper still promises stored
+// identity, and this test keeps it consistent with symbolIdentities, which
+// PageRank orders and prints by.
+func TestSymbolIdentityHelpersPreserveStoredPath(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	const stored = `pkg/x\y.go`
+	fileID, err := insertTestFile(ctx, s, repoID, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := insertTestSymbol(ctx, s, repoID, fileID, "Same", "pkg.Same")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	single, ok, err := s.lookupSymbolIdentity(ctx, repoID, id)
+	if err != nil || !ok {
+		t.Fatalf("lookupSymbolIdentity = ok %v, err %v", ok, err)
+	}
+	if single.ID != id || single.QualifiedName != "pkg.Same" || single.Path != stored {
+		t.Fatalf("lookupSymbolIdentity = %+v, want id %d pkg.Same path %q", single, id, stored)
+	}
+	batch, err := s.symbolIdentities(ctx, []int64{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := batch[id]; got.QualifiedName != "pkg.Same" || got.Path != stored || got.Path != single.Path {
+		t.Fatalf("symbolIdentities[%d] = %+v, want pkg.Same path %q matching lookup %q", id, got, stored, single.Path)
+	}
+	// Control: an unknown id is absent, not a zero identity.
+	if _, ok, err := s.lookupSymbolIdentity(ctx, repoID, id+1); err != nil || ok {
+		t.Fatalf("lookupSymbolIdentity(unknown) = ok %v, err %v; want absent", ok, err)
+	}
+}
