@@ -249,3 +249,66 @@ func must[T any](value T, err error) T {
 	}
 	return value
 }
+
+// Presence is reported next to the related-test result for the same request
+// path, so it must address the row that lookup addresses. Both helpers go
+// through platform.PublicRepositoryPath, exactly as Store.RelatedTests does.
+// The former CanonicalRelPath(normalizeRepoRelPath(...)) pair trimmed
+// whitespace the lookup keeps, so " a.go" was reported present while the tests
+// for it came back empty.
+func TestFilePresenceUsesThePublicRequestBoundary(t *testing.T) {
+	s, repoID := newQueryTestStore(t)
+	ctx := testContext()
+	stored := []string{"a.go", "d/x/y.go", `d/x\y.go`}
+	for _, path := range stored {
+		if _, err := insertTestFile(ctx, s, repoID, path); err != nil {
+			t.Fatalf("insertTestFile(%q) error = %v", path, err)
+		}
+	}
+
+	// Every stored identity resolves as itself, and the separator siblings stay
+	// two files rather than one bucket.
+	for _, path := range stored {
+		got, err := s.RelatedTestFilesPresent(ctx, repoID, []string{path})
+		if err != nil {
+			t.Fatalf("RelatedTestFilesPresent(%q) error = %v", path, err)
+		}
+		if len(got) != 1 || !got[0] {
+			t.Fatalf("stored path %q reported absent: %v", path, got)
+		}
+		present, err := s.filePresent(ctx, repoID, path)
+		if err != nil {
+			t.Fatalf("filePresent(%q) error = %v", path, err)
+		}
+		if !present {
+			t.Fatalf("filePresent(%q) = false, want true", path)
+		}
+	}
+
+	// Negative control. None of these name an indexed file: the whitespace
+	// variants differ from "a.go" in bytes the lookup preserves, and the rest are
+	// not valid public repository spellings at all. A vacuous version of this
+	// assertion is ruled out by the positive rungs above, which share the same
+	// call path.
+	//
+	// `d/x\y.go` versus `d/x/y.go` is asserted here only as the POSIX case, where
+	// a backslash is filename data. On Windows platform.PublicRepositoryPath
+	// deliberately accepts the host separator, so that pair is one request
+	// spelling there; proving that needs a Windows run, not this test.
+	for _, absent := range []string{" a.go", "a.go ", "/a.go", "../a.go", "d/x/../x/y.go.bak", ""} {
+		got, err := s.RelatedTestFilesPresent(ctx, repoID, []string{absent})
+		if err != nil {
+			t.Fatalf("RelatedTestFilesPresent(%q) error = %v", absent, err)
+		}
+		if len(got) != 1 || got[0] {
+			t.Fatalf("path %q reported present; it names no indexed file: %v", absent, got)
+		}
+		present, err := s.filePresent(ctx, repoID, absent)
+		if err != nil {
+			t.Fatalf("filePresent(%q) error = %v", absent, err)
+		}
+		if present {
+			t.Fatalf("filePresent(%q) = true, want false", absent)
+		}
+	}
+}

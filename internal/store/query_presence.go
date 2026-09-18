@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/platform"
 )
 
 type ImpactSeedPresence struct {
@@ -206,6 +207,23 @@ func (s *Store) RelatedTestsResult(ctx context.Context, repoID int64, symbol, fi
 	return RelatedTestsResult{TargetFound: found, Tests: tests}, err
 }
 
+// presenceLookupPath translates one public request path to the stored logical
+// identity it addresses, through the same boundary the paired data path uses:
+// Store.RelatedTests validates its `file` with platform.PublicRepositoryPath,
+// and presence is reported next to that result. Normalizing differently here
+// makes Found/Missing describe a different file than Tests -- trimming
+// whitespace, for instance, reported " a.go" as present while the test lookup
+// asked about the untrimmed name and came back empty. A path that is not a
+// valid public spelling addresses no row, so it is simply absent; the data path
+// raises the error.
+func presenceLookupPath(file string) string {
+	logical, err := platform.PublicRepositoryPath(file)
+	if err != nil {
+		return ""
+	}
+	return logical
+}
+
 // RelatedTestFilesPresent resolves all requested file identities with one
 // indexed lookup; the test-result aggregation remains owned by query.Service.
 func (s *Store) RelatedTestFilesPresent(ctx context.Context, repoID int64, files []string) ([]bool, error) {
@@ -213,7 +231,7 @@ func (s *Store) RelatedTestFilesPresent(ctx context.Context, repoID int64, files
 	paths := make([]string, 0, len(files))
 	seen := map[string]struct{}{}
 	for _, file := range files {
-		canonical := CanonicalRelPath(normalizeRepoRelPath(file))
+		canonical := presenceLookupPath(file)
 		if canonical == "" {
 			continue
 		}
@@ -239,14 +257,14 @@ func (s *Store) RelatedTestFilesPresent(ctx context.Context, repoID int64, files
 		return nil, err
 	}
 	for i, file := range files {
-		canonical := CanonicalRelPath(normalizeRepoRelPath(file))
+		canonical := presenceLookupPath(file)
 		_, present[i] = found[canonical]
 	}
 	return present, nil
 }
 
 func (s *Store) filePresent(ctx context.Context, repoID int64, file string) (bool, error) {
-	canonical := CanonicalRelPath(normalizeRepoRelPath(file))
+	canonical := presenceLookupPath(file)
 	if canonical == "" {
 		return false, nil
 	}
