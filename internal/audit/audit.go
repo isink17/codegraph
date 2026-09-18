@@ -501,7 +501,7 @@ func loadSymbols(ctx context.Context, st *store.Store, repoID int64) (map[int64]
 				Name:          sym.Name,
 				Language:      sym.Language,
 				Kind:          sym.Kind,
-				File:          filepath.ToSlash(sym.FilePath),
+				File:          sym.FilePath,
 			}
 		}
 		if len(batch) < page {
@@ -524,7 +524,7 @@ func loadCallEdges(ctx context.Context, st *store.Store, repoID int64, symbols m
 			}
 			obs := EdgeObservation{
 				SrcQualifiedName:     edge.SrcQualifiedName,
-				SrcFile:              filepath.ToSlash(edge.FilePath),
+				SrcFile:              edge.FilePath,
 				Line:                 edge.Line,
 				DstName:              edge.DstName,
 				TargetClassification: edge.TargetClassification,
