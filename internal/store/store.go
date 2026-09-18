@@ -9116,10 +9116,11 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 			coupling = "medium"
 		}
 		cOut = append(cOut, map[string]any{
-			// Slash form, like every other path this store hands out -- and like
-			// PageRank's `file`, so the three analyses of one tool agree.
-			"file_a":     filepath.ToSlash(fileA),
-			"file_b":     filepath.ToSlash(fileB),
+			// Exact stored files.path bytes: the SQL grouped and ordered on
+			// them, so rewriting here would let two distinct groups share one
+			// label and detach the visible order from the visible values.
+			"file_a":     fileA,
+			"file_b":     fileB,
 			"edge_count": edgeCount,
 			"coupling":   coupling,
 		})

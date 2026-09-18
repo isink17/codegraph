@@ -491,3 +491,78 @@ func TestDetectCyclesPreservesLiteralBackslashFileIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestCouplingMetricsPreservesLiteralBackslashFileIdentity pins file_a and
+// file_b to the stored `files.path` bytes. `pkg/x/y.go` and `pkg/x\y.go` are
+// two stored files under P23 logical identity, and the SQL groups, counts and
+// orders on exactly those bytes. Each sibling couples to pkg/target.go with a
+// different count (backslash 2, slash 1) and to pkg/other.go with the same
+// count (1), so the fixture pins both count attachment and the stored-byte
+// tie-break ('/' 0x2F sorts before '\' 0x5C). The former filepath.ToSlash ran
+// after GROUP BY and ORDER BY, so on Windows it relabelled the backslash rows
+// as their slash sibling: two groups with different counts shared one label,
+// and the tied rows visibly violated the ASC order the SQL had produced. On
+// POSIX ToSlash is the identity, so the old code passes there.
+func TestCouplingMetricsPreservesLiteralBackslashFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	const backslash, slash, target, other = `pkg/x\y.go`, "pkg/x/y.go", "pkg/target.go", "pkg/other.go"
+	files := map[string]int64{}
+	syms := map[string]int64{}
+	for _, path := range []string{target, other, backslash, slash} {
+		fid, err := insertTestFile(ctx, s, repoID, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sid, err := insertTestSymbol(ctx, s, repoID, fid, "F", "q."+path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[path], syms[path] = fid, sid
+	}
+	link := func(src, dst string) {
+		edge, err := insertTestEdge(ctx, s, repoID, files[src], syms[src], "q."+dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, syms[dst], edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Backslash sibling linked first so a lower row id cannot masquerade as
+	// the path order the assertions below pin.
+	link(backslash, target)
+	link(backslash, target)
+	link(backslash, other)
+	link(slash, target)
+	link(slash, other)
+
+	rows, err := s.CouplingMetrics(ctx, repoID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{
+		{"file_a": backslash, "file_b": target, "edge_count": 2, "coupling": "low"},
+		{"file_a": slash, "file_b": other, "edge_count": 1, "coupling": "low"},
+		{"file_a": slash, "file_b": target, "edge_count": 1, "coupling": "low"},
+		{"file_a": backslash, "file_b": other, "edge_count": 1, "coupling": "low"},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("coupling rows = %d, want %d: %+v", len(rows), len(want), rows)
+	}
+	for i := range want {
+		for _, k := range []string{"file_a", "file_b", "edge_count", "coupling"} {
+			if rows[i][k] != want[i][k] {
+				t.Fatalf("row %d %s = %v, want %v\nrows: %+v", i, k, rows[i][k], want[i][k], rows)
+			}
+		}
+	}
+	// Controls: the two siblings never alias in output, and the rows that tie
+	// on count are in stored-byte order, which a folded label cannot show.
+	if rows[0]["file_a"] == rows[2]["file_a"] || rows[1]["file_a"] == rows[3]["file_a"] {
+		t.Fatalf("sibling stored identities aliased: %+v", rows)
+	}
+	if rows[1]["file_a"].(string) >= rows[3]["file_a"].(string) {
+		t.Fatalf("tied rows not in stored-byte order: %v then %v", rows[1], rows[3])
+	}
+}
