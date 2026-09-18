@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -245,9 +244,6 @@ func TestSymbolsForRefsMatchesCanonicalStoredPaths(t *testing.T) {
 }
 
 func TestSymbolsForRefsPreservesLiteralBackslashResultKey(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("scanSymbol's Windows path normalization is deferred to A3")
-	}
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -267,16 +263,44 @@ func TestSymbolsForRefsPreservesLiteralBackslashResultKey(t *testing.T) {
 	if _, err := insertTestSymbol(ctx, s, repo.ID, fileID, "Weird", ref.QualifiedName); err != nil {
 		t.Fatalf("insertTestSymbol() error = %v", err)
 	}
+	// The slash sibling is a second stored file declaring the same qualified
+	// name. scanSymbol's former filepath.ToSlash rewrote the backslash row's
+	// FilePath onto this spelling on Windows, so the backslash ref was dropped
+	// from the result and the slash ref could be answered with the wrong row.
+	// On POSIX ToSlash is the identity, so the old code passes there too.
+	sibling := SymbolRef{File: "pkg/weird/name.go", QualifiedName: ref.QualifiedName}
+	siblingFileID, err := insertTestFile(ctx, s, repo.ID, sibling.File)
+	if err != nil {
+		t.Fatalf("insertTestFile(%q) error = %v", sibling.File, err)
+	}
+	if _, err := insertTestSymbol(ctx, s, repo.ID, siblingFileID, "Weird", sibling.QualifiedName); err != nil {
+		t.Fatalf("insertTestSymbol() error = %v", err)
+	}
 
 	got, err := s.SymbolsForRefs(ctx, repo.ID, []SymbolRef{ref})
 	if err != nil {
 		t.Fatalf("SymbolsForRefs() error = %v", err)
 	}
-	if _, ok := got[ref]; !ok {
+	sym, ok := got[ref]
+	if !ok {
 		t.Fatalf("literal-backslash ref missing from result: %+v", got)
 	}
-	if _, ok := got[SymbolRef{File: "pkg/weird/name.go", QualifiedName: ref.QualifiedName}]; ok {
+	if sym.FilePath != ref.File || sym.FileID != fileID {
+		t.Fatalf("literal-backslash ref returned FilePath %q file %d, want %q file %d", sym.FilePath, sym.FileID, ref.File, fileID)
+	}
+	if _, ok := got[sibling]; ok {
 		t.Fatalf("literal-backslash path acquired a slash alias: %+v", got)
+	}
+
+	both, err := s.SymbolsForRefs(ctx, repo.ID, []SymbolRef{ref, sibling})
+	if err != nil {
+		t.Fatalf("SymbolsForRefs() error = %v", err)
+	}
+	if got := both[ref]; got.FileID != fileID || got.FilePath != ref.File {
+		t.Fatalf("backslash ref = file %d %q, want file %d %q", got.FileID, got.FilePath, fileID, ref.File)
+	}
+	if got := both[sibling]; got.FileID != siblingFileID || got.FilePath != sibling.File {
+		t.Fatalf("slash sibling ref = file %d %q, want file %d %q", got.FileID, got.FilePath, siblingFileID, sibling.File)
 	}
 }
 

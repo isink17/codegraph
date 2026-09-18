@@ -819,3 +819,34 @@ func applyMigrationsBelow(t *testing.T, ctx context.Context, dbPath string, maxV
 	}
 	return applied
 }
+
+// TestExportEdgesPagePreservesLiteralBackslashFilePath pins ExportEdge.FilePath
+// to the stored `files.path` bytes. `pkg/x\\y.go` and `pkg/x/y.go` are two
+// stored files, each owning one edge; the export row for each edge must name
+// its own file. scanExportEdges' former filepath.ToSlash folded the backslash
+// spelling onto the sibling on Windows, giving both rows the same FilePath.
+// On POSIX ToSlash is the identity, so the old code passes there.
+func TestExportEdgesPagePreservesLiteralBackslashFilePath(t *testing.T) {
+	f := newGateFixture(t)
+	backslashFile := f.file(t, `pkg/x\y.go`, "go")
+	slashFile := f.file(t, "pkg/x/y.go", "go")
+	backslashRun := f.symbol(t, backslashFile, "Run", `pkg/x\y.Run`, "go")
+	slashRun := f.symbol(t, slashFile, "Run", "pkg/x/y.Run", "go")
+	backslashEdge := f.edge(t, backslashFile, backslashRun, "Helper")
+	slashEdge := f.edge(t, slashFile, slashRun, "Helper")
+
+	edges, err := f.store.ExportEdgesPage(f.ctx, f.repoID, 100, 0)
+	if err != nil {
+		t.Fatalf("ExportEdgesPage() error = %v", err)
+	}
+	paths := make(map[int64]string, len(edges))
+	for _, e := range edges {
+		paths[e.ID] = e.FilePath
+	}
+	if got := paths[backslashEdge]; got != `pkg/x\y.go` {
+		t.Fatalf("backslash edge FilePath = %q, want %q", got, `pkg/x\y.go`)
+	}
+	if got := paths[slashEdge]; got != "pkg/x/y.go" {
+		t.Fatalf("slash edge FilePath = %q, want %q", got, "pkg/x/y.go")
+	}
+}

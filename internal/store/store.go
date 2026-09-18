@@ -7944,7 +7944,6 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 			value := dstID.Int64
 			edge.DstSymbolID = &value
 		}
-		edge.FilePath = filepath.ToSlash(edge.FilePath)
 		out = append(out, edge)
 		evidence = append(evidence, item)
 	}
@@ -8546,8 +8545,9 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 	); err != nil {
 		return graph.Symbol{}, err
 	}
-	// Normalize paths in outputs to be deterministic across platforms and call sites.
-	sym.FilePath = filepath.ToSlash(sym.FilePath)
+	// FilePath is `files.path`: a logical repository identity that callers use
+	// to address the row again (SymbolsForRefs keys its result by it), so the
+	// stored bytes are returned unchanged; a backslash is filename data.
 	return sym, nil
 }
 
