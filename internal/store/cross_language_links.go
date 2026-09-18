@@ -97,8 +97,10 @@ func clearCrossLanguageLinksCurrentTx(ctx context.Context, tx *sql.Tx, repoID in
 	return err
 }
 
-// xlangFile is an active file, identified by its slash-form path rather than by
-// its row id: two indexes of the same tree agree on the path and not on the id.
+// xlangFile is an active file, identified by its logical `files.path` rather
+// than by its row id: two indexes of the same tree agree on the path and not on
+// the id. The path is carried in the exact bytes the row holds; a backslash in
+// it is filename data on every host, never a separator to rewrite.
 type xlangFile struct {
 	id       int64
 	path     string
@@ -313,8 +315,12 @@ func crossLanguageTarget(src xlangSymbol, srcEligible int, dstSymbols []xlangSym
 }
 
 // crossLanguageFiles loads the active files and the two path indexes the
-// specifier matcher needs. Paths are compared in slash form so a Windows index
-// resolves the same specifiers as a POSIX one.
+// specifier matcher needs. `files.path` is already the logical repository
+// identity (the indexer writes it through platform.NativeRelativeToLogical and
+// the format gate refuses older databases), so a Windows index and a POSIX
+// index of one tree hold the same bytes and are keyed here without rewriting.
+// Canonicalizing again would fold `a/x\y.py` onto `a/x/y.py` on Windows: two
+// stored files answering one specifier, which the ambiguity rule then drops.
 func crossLanguageFiles(ctx context.Context, q xlangQueryer, repoID int64) ([]xlangFile, map[string][]xlangFile, map[string][]xlangFile, error) {
 	rows, err := q.QueryContext(ctx, `
 		SELECT id, path, language FROM files
@@ -331,11 +337,9 @@ func crossLanguageFiles(ctx context.Context, q xlangQueryer, repoID int64) ([]xl
 	byBase := map[string][]xlangFile{}
 	for rows.Next() {
 		var f xlangFile
-		var stored string
-		if err := rows.Scan(&f.id, &stored, &f.language); err != nil {
+		if err := rows.Scan(&f.id, &f.path, &f.language); err != nil {
 			return nil, nil, nil, fmt.Errorf("cross-language file scan: %w", err)
 		}
-		f.path = CanonicalRelPath(stored)
 		files = append(files, f)
 		byFullPath[f.path] = append(byFullPath[f.path], f)
 		if base := strings.TrimSuffix(f.path, path.Ext(f.path)); base != "" && base != f.path {
@@ -374,11 +378,10 @@ func crossLanguageBridges(
 	var bridges []xlangBridge
 	for rows.Next() {
 		var importer xlangFile
-		var stored, specifier string
-		if err := rows.Scan(&importer.id, &stored, &importer.language, &specifier); err != nil {
+		var specifier string
+		if err := rows.Scan(&importer.id, &importer.path, &importer.language, &specifier); err != nil {
 			return nil, fmt.Errorf("cross-language import scan: %w", err)
 		}
-		importer.path = CanonicalRelPath(stored)
 		target, ok := crossLanguageImportTarget(importer, specifier, byFullPath, byBase)
 		if !ok {
 			continue
