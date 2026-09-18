@@ -45,12 +45,14 @@ func parseSearchHits(results []map[string]any) []searchHit {
 	hits := make([]searchHit, 0, len(results))
 	for i, r := range results {
 		hit := searchHit{Rank: i}
-		// Canonicalize the path here, at the one place both producers funnel
-		// through: a hit's file is an identity (it joins to a symbol row, keys
-		// dedup, and breaks ranking ties), and a native-separator value would make
-		// the same file two different identities on Windows.
-		rawFile, _ := r["file"].(string)
-		hit.File = store.CanonicalRelPath(rawFile)
+		// A hit's file is an identity: it joins to a symbol row, keys dedup, and
+		// breaks ranking ties. Both producers -- Store.SemanticSearch and
+		// Store.HybridSearch (via SearchSymbols and VectorSearch) -- read it
+		// straight out of `files.path`, which under P23 is already the logical
+		// repository identity. Rewriting those bytes here would make the adapter
+		// address a different logical file than the row the hit came from, so the
+		// value is carried through unchanged.
+		hit.File, _ = r["file"].(string)
 		// Precedence: the current `symbol` key wins; `name` is the legacy shape.
 		if v, ok := r["symbol"].(string); ok && v != "" {
 			hit.QualifiedName = v
@@ -70,7 +72,7 @@ func parseSearchHits(results []map[string]any) []searchHit {
 				}
 			}
 		}
-		if hit.File == "" || hit.QualifiedName == "" {
+		if hit.File == "" || hit.File == "." || hit.QualifiedName == "" {
 			// Neither field alone identifies a symbol row, so such a hit cannot
 			// become context. Dropping it here keeps the ranking stream free of
 			// items that could never carry a drill-down identity.

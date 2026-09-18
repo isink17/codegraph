@@ -122,3 +122,35 @@ func TestHybridSearchOrderIsStable(t *testing.T) {
 		}
 	}
 }
+
+// Two rows of `files.path` that differ only by separator byte are two distinct
+// logical files. The adapter used to fold them through store.CanonicalRelPath,
+// which on Windows turned the backslash row into the slash row's identity --
+// every later join, dedup key and tie-break would then address the sibling row.
+// Store.SemanticSearch is proven to emit the stored bytes verbatim
+// (TestSemanticSearchPreservesLogicalPathOrderAndIdentity), so the adapter only
+// has to carry them. The separator pair only distinguishes old from new
+// behaviour on Windows, where filepath.ToSlash rewrites; on POSIX the
+// "./"-prefixed rows are what fail against the old implementation.
+func TestParseSearchHitsPreservesStoredPathIdentity(t *testing.T) {
+	hits := parseSearchHits([]map[string]any{
+		{"file": `a/x.go`, "symbol": "a.X", "symbol_id": int64(1)},
+		{"file": `a\x.go`, "symbol": "a.X", "symbol_id": int64(2)},
+		{"file": "./b.go", "symbol": "b.B", "symbol_id": int64(3)},
+		{"file": "./c/./d.go", "symbol": "c.D", "symbol_id": int64(4)},
+	})
+	want := []string{`a/x.go`, `a\x.go`, "./b.go", "./c/./d.go"}
+	if len(hits) != len(want) {
+		t.Fatalf("parsed %d hits, want %d: %+v", len(hits), len(want), hits)
+	}
+	for i, hit := range hits {
+		if hit.File != want[i] {
+			t.Fatalf("hit %d file = %q, want stored identity %q", i, hit.File, want[i])
+		}
+	}
+	// Control: the separator variants stay two identities, and the one that would
+	// have been rewritten is not the one it would have been rewritten into.
+	if hits[0].File == hits[1].File {
+		t.Fatalf("separator variants folded into one identity: %q", hits[0].File)
+	}
+}
