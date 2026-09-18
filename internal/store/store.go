@@ -4756,7 +4756,6 @@ func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []stri
 	canonical := make([]string, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		path = CanonicalRelPath(path)
 		if path == "" {
 			continue
 		}
@@ -5314,7 +5313,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	uniquePaths := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		scopePath := CanonicalRelPath(path)
+		scopePath := path
 		if scopePath == "" {
 			continue
 		}
@@ -7540,9 +7539,8 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 				)
 				GROUP BY path, symbol
 			)
-			-- Canonical-form tie-break: which tests survive LIMIT must not depend on
-			-- whether the index was written on Windows or on Linux.
-			ORDER BY score DESC, REPLACE(path, '\', '/'), symbol
+			-- files.path is already the logical repository identity.
+			ORDER BY score DESC, path ASC, symbol
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetFileID, repoID, targetFileID, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
@@ -7586,7 +7584,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 				)
 				GROUP BY path, symbol
 			)
-			ORDER BY score DESC, REPLACE(path, '\', '/'), symbol
+			ORDER BY score DESC, path ASC, symbol
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetID, repoID, targetID, safeLimit(limit), safeOffset(offset))
@@ -9361,7 +9359,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Test%'
 		  AND s.name NOT LIKE 'Benchmark%'
 		  AND s.name NOT LIKE 'Example%'
-		ORDER BY REPLACE(f.path, char(92), '/') ASC, s.start_line ASC,
+		ORDER BY f.path ASC, s.start_line ASC,
 		         s.start_col ASC, s.qualified_name ASC, s.kind ASC, s.name ASC,
 		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ? OFFSET ?
@@ -9383,7 +9381,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 			"symbol":     qualifiedName,
 			"kind":       kind,
 			"name":       name,
-			"file":       filepath.ToSlash(path),
+			"file":       path,
 			"language":   language,
 			"start_line": startLine,
 			"end_line":   endLine,
@@ -9502,7 +9500,7 @@ func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float
 			JOIN symbols s ON s.id = se.symbol_id
 			JOIN files f ON f.id = s.file_id
 			WHERE se.repo_id = ?
-			ORDER BY se.updated_at DESC, REPLACE(f.path, char(92), '/') ASC,
+			ORDER BY se.updated_at DESC, f.path ASC,
 			         s.qualified_name ASC, s.kind ASC, s.signature ASC,
 			         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
 			         s.end_line ASC, s.end_col ASC
@@ -9556,12 +9554,8 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 		vec := bytesToFloat32(blob)
 		sim := cosineSimilarity(queryVec, vec)
 		if sim > 0 {
-			// Canonical form: HybridSearch fuses these entries with SearchSymbols
-			// results keyed on `file + "::" + qualified_name`, and SearchSymbols
-			// reports the slash form. Left native, the two halves of the fusion
-			// would never meet on Windows and every hit would score as if it had
-			// been found by one searcher only.
-			candidates = append(candidates, scored{id: symbolID, file: CanonicalRelPath(filePath), symbol: qualName, kind: kind, signature: sig, stableKey: stableKey, startLine: startLine, startCol: startCol, endLine: endLine, endCol: endCol, score: sim})
+			// files.path is already the logical repository identity.
+			candidates = append(candidates, scored{id: symbolID, file: filePath, symbol: qualName, kind: kind, signature: sig, stableKey: stableKey, startLine: startLine, startCol: startCol, endLine: endLine, endCol: endCol, score: sim})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -9829,7 +9823,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	topDirs := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT SUBSTR(REPLACE(path, char(92), '/') , 1, INSTR(REPLACE(path, char(92), '/') || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC, dir ASC LIMIT 20`,
+			`SELECT SUBSTR(path, 1, INSTR(path || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC, dir ASC LIMIT 20`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: directories: %w", err)
@@ -9963,7 +9957,6 @@ func (s *Store) AllImports(ctx context.Context, repoID int64) (map[string][]stri
 		if err := rows.Scan(&path, &importPath); err != nil {
 			return nil, err
 		}
-		path = filepath.ToSlash(path)
 		result[path] = append(result[path], importPath)
 	}
 	if err := rows.Err(); err != nil {
@@ -9977,7 +9970,7 @@ func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT path FROM files
 		WHERE repo_id = ? AND is_deleted = 0
-		ORDER BY REPLACE(path, char(92), '/')`, repoID)
+		ORDER BY path`, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -9989,7 +9982,7 @@ func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error
 		if err := rows.Scan(&path); err != nil {
 			return nil, err
 		}
-		paths = append(paths, filepath.ToSlash(path))
+		paths = append(paths, path)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -10033,10 +10026,6 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 			for _, p := range paths {
 				args = append(args, p)
 			}
-			// Rows, not aggregates: a database that holds both forms of one path (a
-			// graph.sqlite carried between hosts) would otherwise count that file
-			// twice and overstate the context it charges for. Folding on the canonical
-			// path counts each logical file once.
 			rows, err := s.db.QueryContext(ctx,
 				`SELECT path, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+placeholders+`)`,
 				args...,
@@ -10052,7 +10041,7 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 					_ = rows.Close()
 					return nil, fmt.Errorf("benchmark context bytes: %w", err)
 				}
-				sizes[CanonicalRelPath(path)] = size
+				sizes[path] = size
 			}
 			if err := rows.Err(); err != nil {
 				_ = rows.Close()
@@ -10113,7 +10102,6 @@ func firstUniqueCanonicalPaths(results []map[string]any, limit int) []string {
 		if !ok || path == "" {
 			continue
 		}
-		path = CanonicalRelPath(path)
 		if _, ok := seen[path]; ok {
 			continue
 		}
