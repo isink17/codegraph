@@ -8640,7 +8640,7 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 			})
 			results = append(results, bfsEntry{
 				id: seed.id, qualifiedName: seed.qualifiedName,
-				kind: seed.kind, name: seed.name, file: filepath.ToSlash(seed.file), depth: 0, dir: dir,
+				kind: seed.kind, name: seed.name, file: seed.file, depth: 0, dir: dir,
 			})
 		}
 
@@ -8672,7 +8672,6 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 					rows.Close()
 					return err
 				}
-				si.file = filepath.ToSlash(si.file)
 				if visited[si.id] {
 					continue
 				}
