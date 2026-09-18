@@ -7243,8 +7243,13 @@ func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, sym
 		}
 	}
 	for _, file := range files {
-		file = normalizeRepoRelPath(file)
-		if file == "" {
+		// File seeds are public request spelling (MCP `files`, CLI --file),
+		// translated once here exactly as RelatedTests does; the lookup binds
+		// the logical identity byte-exact. An invalid spelling addresses no
+		// row and is missing under the requested name.
+		logical, err := platform.PublicRepositoryPath(file)
+		if err != nil {
+			presence.Missing = append(presence.Missing, file)
 			continue
 		}
 		rows, err := s.db.QueryContext(ctx, `
@@ -7252,7 +7257,7 @@ func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, sym
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
 			WHERE s.repo_id = ? AND f.path = ?
-		`, repoID, file)
+		`, repoID, logical)
 		if err != nil {
 			return nil, nil, ImpactSeedPresence{}, 0, 0, err
 		}
@@ -9263,20 +9268,6 @@ func exportLimit(limit int) int {
 
 func safeOffset(offset int) int {
 	return limits.Offset(offset)
-}
-
-func normalizeRepoRelPath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return ""
-	}
-	// Normalize common caller variations: forward slashes, leading ./, etc.
-	path = filepath.FromSlash(path)
-	path = filepath.Clean(path)
-	if path == "." {
-		return ""
-	}
-	return path
 }
 
 func quoteFTS(query string) string {
