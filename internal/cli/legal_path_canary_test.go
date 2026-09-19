@@ -455,7 +455,7 @@ func TestLegalRepositoryPathCanaryLifecycle(t *testing.T) {
 		}
 	}
 	verify("path-scoped update", expected, updated)
-	{
+	func() {
 		dbPath, _ := dbPathForRepo(cfg, repoRoot, canonical)
 		db := openCanaryDB(t, dbPath, canonical)
 		defer db.close()
@@ -468,7 +468,7 @@ func TestLegalRepositoryPathCanaryLifecycle(t *testing.T) {
 				t.Fatalf("stale symbol %s still owned by %q after update", old, got)
 			}
 		}
-	}
+	}()
 	// The CLI update path (full walk) must reach the same state.
 	run("update_graph", repoRoot)
 	verify("update_graph", expected, updated)
@@ -499,7 +499,7 @@ func TestLegalRepositoryPathCanaryLifecycle(t *testing.T) {
 	}
 	run("update_graph", repoRoot)
 	verify("delete", afterDelete, afterDeleteSymbols)
-	{
+	func() {
 		app, _, repoID, err := openApp(ctx, cfg, repoRoot)
 		if err != nil {
 			t.Fatal(err)
@@ -529,7 +529,7 @@ func TestLegalRepositoryPathCanaryLifecycle(t *testing.T) {
 		if rows := db.rowsForPath(slashPath); len(rows) != 1 || rows[0] != 0 {
 			t.Fatalf("sibling %q rows is_deleted = %v, want exactly [0]", slashPath, rows)
 		}
-	}
+	}()
 
 	// PHASE 10: re-add at the exact same filesystem path.
 	if err := os.WriteFile(filepath.Join(repoRoot, deleted.nativeRel), []byte(canarySource(deleted.pkg, deletedSymbol)), 0o644); err != nil {
@@ -537,14 +537,14 @@ func TestLegalRepositoryPathCanaryLifecycle(t *testing.T) {
 	}
 	run("update_graph", repoRoot)
 	verify("re-add", expected, updated)
-	{
+	func() {
 		dbPath, _ := dbPathForRepo(cfg, repoRoot, canonical)
 		db := openCanaryDB(t, dbPath, canonical)
 		defer db.close()
 		if rows := db.rowsForPath(deletedPath); len(rows) != 1 || rows[0] != 0 {
 			t.Fatalf("re-added %q rows is_deleted = %v, want exactly [0] (no duplicate row, no stale deletion)", deletedPath, rows)
 		}
-	}
+	}()
 
 	// PHASE 11: full rebuild through the documented recovery path.
 	run("index", repoRoot, "--rebuild")
