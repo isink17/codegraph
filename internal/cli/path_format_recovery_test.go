@@ -159,6 +159,9 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 		// audit reads the store through graphaudit.Run, not query.Service;
 		// the gate it inherits is graphaudit's own.
 		{"audit", repoRoot},
+		// bench-queries reads the store through querybench.Run, not
+		// query.Service; the gate it inherits is querybench's own.
+		{"bench-queries", repoRoot, "--runs", "1", "--warmup", "0"},
 	} {
 		out.Reset()
 		err := Run(context.Background(), args, &out, &errOut)
@@ -171,6 +174,18 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 		if after := snapshotRepoDBPathState(t, dbPath); after != before {
 			t.Fatalf("Run(%v) mutated the legacy database:\nbefore:\n%s\nafter:\n%s", args, before, after)
 		}
+	}
+
+	// bench-queries must refuse before it selects a target or measures a
+	// scenario: the bare sentinel, not a per-scenario error. A downstream
+	// Store gate (list_files, related_tests) also yields the sentinel, but
+	// only after the legacy targets were read and wrapped as
+	// "scenario <name>: ...", so errors.Is alone would not prove the
+	// querybench gate is what refused.
+	out.Reset()
+	err = Run(context.Background(), []string{"bench-queries", repoRoot, "--runs", "1", "--warmup", "0"}, &out, &errOut)
+	if err == nil || err.Error() != store.ErrRepositoryPathFormatRebuild.Error() {
+		t.Fatalf("Run(bench-queries) on legacy database: err = %v, want the bare rebuild sentinel", err)
 	}
 
 	// Supported recovery: remove the database and re-index.
@@ -251,5 +266,12 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"schema": "codegraph.graph_audit/v1"`) {
 		t.Fatalf("audit after rebuild did not print a report: %s", out.String())
+	}
+	out.Reset()
+	if err := Run(context.Background(), []string{"bench-queries", repoRoot, "--runs", "1", "--warmup", "0"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(bench-queries) after rebuild: %v", err)
+	}
+	if !strings.Contains(out.String(), `"schema": "codegraph.query_bench/v1"`) {
+		t.Fatalf("bench-queries after rebuild did not print a report: %s", out.String())
 	}
 }

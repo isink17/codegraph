@@ -156,6 +156,15 @@ func Run(ctx context.Context, s *store.Store, repoID int64, repoRoot string, opt
 		return Report{}, err
 	}
 
+	// Run reads indexed repository data directly rather than through
+	// query.Service, so it owns the same precondition the Service applies: an
+	// index whose path identity predates P23 is refused with
+	// store.ErrRepositoryPathFormatRebuild before any target is selected or
+	// any query is measured, for every caller.
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
+		return Report{}, err
+	}
+
 	stats, err := s.Stats(ctx, repoID)
 	if err != nil {
 		return Report{}, fmt.Errorf("repository stats: %w", err)

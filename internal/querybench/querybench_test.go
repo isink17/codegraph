@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -356,5 +357,135 @@ func TestRunAgainstReadOnlyStore(t *testing.T) {
 	}
 	if report.Summary.Measured == 0 {
 		t.Fatal("no scenario was measured against the read-only store")
+	}
+}
+
+// snapshotPathState captures every byte the path-format gate must leave
+// alone: files.path, dirty_files.path, the settings table, and row counts.
+func snapshotPathState(t *testing.T, dbPath string) string {
+	t.Helper()
+	db, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var b strings.Builder
+	for _, q := range []string{
+		`SELECT id, hex(path), is_deleted FROM files ORDER BY id`,
+		`SELECT hex(path), reason, queued_at FROM dirty_files ORDER BY path`,
+		`SELECT key, value FROM settings ORDER BY key`,
+		`SELECT (SELECT COUNT(*) FROM files), (SELECT COUNT(*) FROM dirty_files), (SELECT COUNT(*) FROM symbols), (SELECT COUNT(*) FROM edges), (SELECT COUNT(*) FROM test_links)`,
+	} {
+		rows, err := db.Query(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		cols, _ := rows.Columns()
+		for rows.Next() {
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatal(err)
+			}
+			for _, v := range vals {
+				if bs, ok := v.([]byte); ok {
+					b.Write(bs)
+				} else {
+					fmt.Fprint(&b, v)
+				}
+				b.WriteByte('|')
+			}
+			b.WriteByte('\n')
+		}
+		rows.Close()
+		b.WriteString("--\n")
+	}
+	return b.String()
+}
+
+// relocateRepo moves every seeded file under a `src`/`pkg` directory spelled
+// with sep, adds a dirty row in the same spelling, and removes the current
+// path-format marker when legacy is set. With `\` and legacy=true the result
+// is a populated pre-P23 index whose related_tests target would be a
+// native-spelled path; with `/` and legacy=false it is the same graph in the
+// supported shape.
+func relocateRepo(t *testing.T, root string, repoID int64, sep string, legacy bool) {
+	t.Helper()
+	dsn, err := store.BuildSQLiteDSN(filepath.Join(root, "graph.sqlite"), store.OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatalf("BuildSQLiteDSN: %v", err)
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	prefix := "src" + sep + "pkg" + sep
+	if _, err := db.Exec(`UPDATE files SET path = ? || path WHERE repo_id = ?`, prefix, repoID); err != nil {
+		t.Fatalf("relocate files.path: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO dirty_files(repo_id, path, reason, queued_at) VALUES(?, ?, 'legacy', '2026-01-01T00:00:00Z')`, repoID, prefix+"file.go"); err != nil {
+		t.Fatalf("insert dirty row: %v", err)
+	}
+	if legacy {
+		if _, err := db.Exec(`DELETE FROM settings WHERE value = 'logical-slash-v1'`); err != nil {
+			t.Fatalf("remove marker: %v", err)
+		}
+	}
+}
+
+// TestLegacyPathFormatFailsClosedBeforeAnyRead proves Run owns the P23
+// precondition for every caller: on a populated repository without the
+// current path-format marker it returns store.ErrRepositoryPathFormatRebuild
+// with no report, no legacy-spelled target, and every byte of the database
+// untouched.
+//
+// The sentinel must come back bare. An ungated Run would still end in the
+// sentinel, because Store.ListFiles (and RelatedTests) gate themselves -- but
+// only after graph_stats was measured and the benchmark targets, including the
+// legacy-spelled test file, were read, and wrapped as "scenario list_files:
+// ...". The bare error is what proves Run refused before reading anything.
+//
+// The same graph under the marker benchmarks normally and selects the
+// relocated test file, so the gate keys on the marker alone.
+func TestLegacyPathFormatFailsClosedBeforeAnyRead(t *testing.T) {
+	ctx := context.Background()
+	s, repoID, root := seededRepo(t, true)
+	relocateRepo(t, root, repoID, `\`, true)
+	dbPath := filepath.Join(root, "graph.sqlite")
+	before := snapshotPathState(t, dbPath)
+	if !strings.Contains(before, "7372635C") { // hex(`src\`)
+		t.Fatalf("fixture did not produce a native-spelled files.path:\n%s", before)
+	}
+	if strings.Contains(before, "logical-slash-v1") {
+		t.Fatalf("fixture still carries the current marker:\n%s", before)
+	}
+
+	report, err := Run(ctx, s, repoID, root, Options{Runs: 1, Warmup: 0})
+	if !errors.Is(err, store.ErrRepositoryPathFormatRebuild) {
+		t.Fatalf("Run() on legacy index: err = %v, want ErrRepositoryPathFormatRebuild", err)
+	}
+	if err.Error() != store.ErrRepositoryPathFormatRebuild.Error() {
+		t.Fatalf("Run() refused only after reading the graph (error is wrapped by a scenario): %v", err)
+	}
+	if len(report.Results) != 0 || report.Summary.Measured != 0 || report.Schema != "" {
+		t.Fatalf("Run() on legacy index returned a partial report: %+v", report)
+	}
+	if after := snapshotPathState(t, dbPath); after != before {
+		t.Fatalf("Run() mutated the legacy database:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+
+	// Positive control: same graph, supported spelling, marker present.
+	cur, curRepo, curRoot := seededRepo(t, true)
+	relocateRepo(t, curRoot, curRepo, "/", false)
+	report, err = Run(ctx, cur, curRepo, curRoot, Options{Runs: 1, Warmup: 0})
+	if err != nil {
+		t.Fatalf("Run() on marked repository: %v", err)
+	}
+	if got := resultByName(t, report, "related_tests"); got.Status != StatusMeasured || !strings.HasPrefix(got.Target, "src/pkg/") {
+		t.Fatalf("related_tests on marked repository = %+v, want measured against a relocated src/pkg/ file", got)
 	}
 }
