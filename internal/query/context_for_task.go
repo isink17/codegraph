@@ -87,6 +87,11 @@ func (s *Service) ContextForTask(ctx context.Context, repoID int64, task string,
 	if err != nil {
 		return nil, err
 	}
+	// Before LastScanID: the generation cursor is repository data too, and a
+	// legacy index must fail closed before any of it is read.
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 
 	// The graph generation identity. A cursor issued before a re-index must not
 	// be honoured after it, because the candidate stream it points into no longer
@@ -147,7 +152,7 @@ func (s *Service) ContextForTask(ctx context.Context, repoID int64, task string,
 // stream for a task. The same options and the same graph always produce the same
 // stream, which is what makes an offset cursor safe.
 func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task string, opts ContextForTaskOptions) ([]contextCandidate, error) {
-	rawHits, err := s.SemanticSearch(ctx, repoID, task, opts.MaxSymbols, 0)
+	rawHits, err := s.semanticSearch(ctx, repoID, task, opts.MaxSymbols, 0)
 	if err != nil {
 		return nil, fmt.Errorf("semantic search: %w", err)
 	}

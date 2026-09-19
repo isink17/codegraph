@@ -144,6 +144,32 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 		}
 	}
 
+	// Read surfaces (the F4B1 probe, now permanent): every query command must
+	// fail closed on the legacy database and emit no legacy-spelled path.
+	for _, args := range [][]string{
+		{"find-symbol", repoRoot, "Thing", "--exact"},
+		{"find-symbol", repoRoot, "Thing"},
+		{"search", repoRoot, "Thing"},
+		{"find_callers", repoRoot, "Thing"},
+		{"find_callees", repoRoot, "Thing"},
+		{"get_impact_radius", repoRoot, "--symbols", "Thing"},
+		{"find_related_tests", repoRoot, "--symbol", "Thing"},
+		{"stats", repoRoot},
+		{"graph", "export", repoRoot},
+	} {
+		out.Reset()
+		err := Run(context.Background(), args, &out, &errOut)
+		if !errors.Is(err, store.ErrRepositoryPathFormatRebuild) {
+			t.Fatalf("Run(%v) on legacy database: err = %v, output = %s; want ErrRepositoryPathFormatRebuild", args, err, out.String())
+		}
+		if strings.Contains(out.String(), `src\\pkg`) || strings.Contains(out.String(), `"count"`) {
+			t.Fatalf("Run(%v) emitted repository data from a legacy database: %s", args, out.String())
+		}
+		if after := snapshotRepoDBPathState(t, dbPath); after != before {
+			t.Fatalf("Run(%v) mutated the legacy database:\nbefore:\n%s\nafter:\n%s", args, before, after)
+		}
+	}
+
 	// Supported recovery: remove the database and re-index.
 	out.Reset()
 	if err := Run(context.Background(), []string{"index", repoRoot, "--rebuild"}, &out, &errOut); err != nil {

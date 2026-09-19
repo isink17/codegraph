@@ -27,11 +27,19 @@ func New(s *store.Store, embedder embedding.Embedder) *Service {
 	return &Service{store: s, embedder: embedder, ctxStore: s}
 }
 
+// requirePaths is the Service-owned path-format gate. Every exported method
+// that reads, derives, exports or summarises indexed repository data calls it
+// before touching the store, so a pre-P23 index fails closed with
+// store.ErrRepositoryPathFormatRebuild no matter which surface (CLI, MCP,
+// export, another package) invoked the method.
 func (s *Service) requirePaths(ctx context.Context, repoID int64) error {
 	return s.store.RequireCanonicalRepositoryPaths(ctx, repoID)
 }
 
 func (s *Service) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return graph.Stats{}, err
+	}
 	return s.store.Stats(ctx, repoID)
 }
 
@@ -57,6 +65,9 @@ func (s *Service) FindSymbolExact(ctx context.Context, repoID int64, query strin
 }
 
 func (s *Service) FindSymbolExactResult(ctx context.Context, repoID int64, query string, limit, offset int) (store.SymbolSearchResult, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return store.SymbolSearchResult{}, err
+	}
 	return s.store.FindSymbolExactResult(ctx, repoID, query, limit, offset)
 }
 
@@ -68,6 +79,9 @@ func (s *Service) SearchSymbols(ctx context.Context, repoID int64, query string,
 }
 
 func (s *Service) SearchSymbolsResult(ctx context.Context, repoID int64, query string, limit, offset int) (store.SymbolSearchResult, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return store.SymbolSearchResult{}, err
+	}
 	return s.store.SearchSymbolsResult(ctx, repoID, query, limit, offset)
 }
 
@@ -79,6 +93,9 @@ func (s *Service) FindCallers(ctx context.Context, repoID int64, symbol string, 
 }
 
 func (s *Service) FindCallersResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (store.NeighborResult, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return store.NeighborResult{}, err
+	}
 	return s.store.FindCallersResult(ctx, repoID, symbol, symbolID, limit, offset)
 }
 
@@ -90,6 +107,9 @@ func (s *Service) FindCallees(ctx context.Context, repoID int64, symbol string, 
 }
 
 func (s *Service) FindCalleesResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (store.NeighborResult, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return store.NeighborResult{}, err
+	}
 	return s.store.FindCalleesResult(ctx, repoID, symbol, symbolID, limit, offset)
 }
 
@@ -108,6 +128,9 @@ func (s *Service) RelatedTests(ctx context.Context, repoID int64, symbol, file s
 }
 
 func (s *Service) RelatedTestsResult(ctx context.Context, repoID int64, symbol, file string, limit, offset int) (store.RelatedTestsResult, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return store.RelatedTestsResult{}, err
+	}
 	return s.store.RelatedTestsResult(ctx, repoID, symbol, file, limit, offset)
 }
 
@@ -132,6 +155,9 @@ func (s *Service) RelatedTestsForFilesResult(ctx context.Context, repoID int64, 
 }
 
 func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files []string, limit, offset int) ([]store.RelatedTest, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	if offset < 0 {
 		offset = 0
 	}
@@ -182,6 +208,12 @@ func (s *Service) SemanticSearch(ctx context.Context, repoID int64, query string
 	if err := s.requirePaths(ctx, repoID); err != nil {
 		return nil, err
 	}
+	return s.semanticSearch(ctx, repoID, query, limit, offset)
+}
+
+// semanticSearch is SemanticSearch after the path-format gate, for callers
+// that have already passed it (ContextForTask).
+func (s *Service) semanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
 	if !embedding.IsNoop(s.embedder) {
 		hasEmb, _ := s.store.HasEmbeddings(ctx, repoID)
 		if hasEmb {
@@ -210,53 +242,92 @@ func (s *Service) ListFiles(ctx context.Context, repoID int64, pathFilter string
 }
 
 func (s *Service) GraphSnapshot(ctx context.Context, repoID int64, symbol string, depth int) ([]graph.Symbol, []store.ExportEdge, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, nil, err
+	}
 	return s.store.GraphSnapshot(ctx, repoID, symbol, depth)
 }
 
 func (s *Service) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.ExportSymbolsPage(ctx, repoID, limit, offset)
 }
 
 func (s *Service) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]store.ExportEdge, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.ExportEdgesPage(ctx, repoID, limit, offset)
 }
 
 func (s *Service) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.ExportDOTNodeNamesPage(ctx, repoID, limit, offset)
 }
 
 func (s *Service) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, 0, err
+	}
 	return s.store.TraceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 }
 
 func (s *Service) TraceDependenciesResult(ctx context.Context, repoID int64, symbol, direction string, maxDepth, limit, offset int) (store.TraceResult, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return store.TraceResult{}, err
+	}
 	return s.store.TraceDependenciesResult(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 }
 
 func (s *Service) BenchmarkTokens(ctx context.Context, repoID int64, task string) (map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.BenchmarkTokens(ctx, repoID, task)
 }
 
 func (s *Service) ResolveCrossLanguageLinks(ctx context.Context, repoID int64) (int, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return 0, err
+	}
 	return s.store.ResolveCrossLanguageLinks(ctx, repoID)
 }
 
 func (s *Service) PageRank(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.PageRank(ctx, repoID, limit)
 }
 
 func (s *Service) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.CouplingMetrics(ctx, repoID, limit)
 }
 
 func (s *Service) DetectCycles(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.DetectCycles(ctx, repoID, limit)
 }
 
 func (s *Service) AllImports(ctx context.Context, repoID int64) (map[string][]string, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.AllImports(ctx, repoID)
 }
 
 func (s *Service) AllFilePaths(ctx context.Context, repoID int64) ([]string, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.AllFilePaths(ctx, repoID)
 }
