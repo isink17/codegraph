@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -40,12 +41,6 @@ type RustResolutionStats struct {
 	BatchInvalidationOps  int
 	BatchApplyOps         int
 }
-
-// filepathSlash folds backslashes for rust_module_evidence.external_path, whose
-// spelling the Rust adapter still derives with native filepath calls. It must
-// never be applied to files.path: that column is logical repository identity
-// where '/' is the only directory separator and a backslash is filename data.
-func filepathSlash(path string) string { return strings.ReplaceAll(path, "\\", "/") }
 
 // conventionalRustRoot returns path itself when its file name is lib.rs or
 // main.rs, and "" otherwise. path is a stored files.path, so the file name is
@@ -546,6 +541,10 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			moduleFiles[root+"\x00crate"] = append(moduleFiles[root+"\x00crate"], f.id)
 		}
 	}
+	fileByPath := make(map[string]int64, len(files))
+	for id, f := range files {
+		fileByPath[f.path] = id
+	}
 	decls := []rustScopeModule{}
 	if err := sqliteBatchedQuery(ctx, tx,
 		`SELECT m.file_id,m.owner_module,m.module_name,m.external_path,m.is_inline,m.visibility FROM rust_module_evidence m JOIN files f ON f.id=m.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE m.repo_id=?`,
@@ -577,17 +576,15 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				}
 				continue
 			}
-			base := strings.TrimSuffix(filepathSlash(m.external), "/")
+			// external_path is the candidate stem relative to the declaring
+			// file's directory. Joining it to that file's stored path names the
+			// two spellings Rust accepts, and both are compared to files.path
+			// bytes exactly: a '/' is the only separator and a backslash is
+			// filename data, so no suffix or separator folding may enter here.
+			stem := path.Join(path.Dir(files[m.file].path), m.external)
 			matches := []int64{}
-			for id, f := range files {
-				path := f.path
-				stem := strings.TrimSuffix(path, ".rs")
-				if strings.HasSuffix(stem, "/mod") {
-					stem = strings.TrimSuffix(stem, "/mod")
-				}
-				if path == base+".rs" || path == base+"/mod.rs" ||
-					strings.HasSuffix(path, "/"+base+".rs") || strings.HasSuffix(path, "/"+base+"/mod.rs") ||
-					strings.HasSuffix(base, "/"+stem) {
+			for _, candidate := range [2]string{stem + ".rs", stem + "/mod.rs"} {
+				if id, ok := fileByPath[candidate]; ok {
 					matches = append(matches, id)
 				}
 			}

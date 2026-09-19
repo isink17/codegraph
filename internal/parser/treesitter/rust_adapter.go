@@ -120,7 +120,10 @@ func rustExtractSymbols(node *sitter.Node, module, container, path string, conte
 				name := nodeText(nameNode, content)
 				m := graph.RustModule{Name: name, OwnerModule: module, Inline: body != nil, Visibility: rustVisibility(child, content)}
 				if body == nil {
-					m.ExternalPath = filepath.ToSlash(filepath.Join(rustModuleSourceBase(path), name))
+					m.ExternalPath = name
+					if base := rustModuleSourceBase(path); base != "" {
+						m.ExternalPath = base + "/" + name
+					}
 				}
 				pf.Scope.Modules = append(pf.Scope.Modules, m)
 				if body != nil {
@@ -196,13 +199,21 @@ func rustExtractImpl(node *sitter.Node, module, path string, content []byte, pf 
 	}
 }
 
+// rustModuleSourceBase returns the directory, relative to the declaring file's
+// own directory, that holds the file's out-of-line `mod name;` sources: "" for
+// a directory owner (lib.rs, main.rs, mod.rs), whose modules are siblings, and
+// the file's stem otherwise. It is the whole of what the parser knows about
+// where a module lives; the store joins it with the declaring file's logical
+// repository path, so nothing above that file -- least of all the native
+// checkout root -- reaches rust_module_evidence.external_path. Only the file
+// name is read from the native path, so a backslash in it stays filename data
+// on POSIX.
 func rustModuleSourceBase(path string) string {
-	dir := filepath.ToSlash(filepath.Dir(path))
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	if base != "lib" && base != "main" && base != "mod" {
-		dir = filepath.ToSlash(filepath.Join(dir, base))
+	if base == "lib" || base == "main" || base == "mod" {
+		return ""
 	}
-	return dir
+	return base
 }
 func rustVisibility(node *sitter.Node, content []byte) string {
 	vis := firstChild(node, "visibility_modifier")

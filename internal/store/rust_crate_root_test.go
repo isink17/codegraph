@@ -36,7 +36,7 @@ func newRustCrateRootFixture(t *testing.T, ctx context.Context, root string, mod
 	dir := root[:len(root)-len(filepath.Base(root))]
 	for _, name := range modules {
 		f.modules[name] = f.addFile(t, ctx, dir+name+".rs", "crate::"+name)
-		f.declare(t, ctx, f.rootID, "crate", name, dir+name)
+		f.declare(t, ctx, f.rootID, "crate", name, name)
 	}
 	return f
 }
@@ -232,10 +232,10 @@ func TestRustCrateRootKeepsCratesIsolated(t *testing.T) {
 	for i := 0; i < perCrate; i++ {
 		name := fmt.Sprintf("m%04d", i)
 		f.addFile(t, ctx, "src/"+name+".rs", "crate::"+name)
-		f.declare(t, ctx, f.rootID, "crate", name, "src/"+name)
+		f.declare(t, ctx, f.rootID, "crate", name, name)
 		want["src/"+name+".rs"] = "src/lib.rs"
 		f.addFile(t, ctx, "alt/"+name+".rs", "crate::"+name)
-		f.declare(t, ctx, alt, "crate", name, "alt/"+name)
+		f.declare(t, ctx, alt, "crate", name, name)
 		want["alt/"+name+".rs"] = "alt/main.rs"
 	}
 	f.resolveAll(t, ctx)
@@ -387,7 +387,7 @@ func TestRustCrateRootRestoresMembershipOnBlankRoot(t *testing.T) {
 		return id
 	}
 	declare := func(owner int64) {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO rust_module_evidence(repo_id,file_id,owner_module,module_name,external_path,visibility) VALUES(?,?,?,?,?,?)`, repo.ID, owner, "crate", "util", "src/util", "private"); err != nil {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO rust_module_evidence(repo_id,file_id,owner_module,module_name,external_path,visibility) VALUES(?,?,?,?,?,?)`, repo.ID, owner, "crate", "util", "util", "private"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -656,5 +656,121 @@ func TestRustRootsForPathsKeepsDistinctLogicalIdentities(t *testing.T) {
 		if _, ok := got[tc.want]; !ok {
 			t.Fatalf("rustRootsForPaths(%q) = %v, want %s", tc.path, got, tc.want)
 		}
+	}
+}
+
+// rustPublicFn inserts a public Rust function symbol in file.
+func (f *rustCrateRootFixture) rustPublicFn(t *testing.T, ctx context.Context, file int64, name, qualified string) int64 {
+	t.Helper()
+	id, err := insertTestSymbolLang(ctx, f.store, f.repoID, file, name, qualified, "rust")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(ctx, `UPDATE symbols SET visibility='public' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// rustEdgeFromRoot adds `fn run` to the crate root and an edge from it to target.
+func (f *rustCrateRootFixture) rustEdgeFromRoot(t *testing.T, ctx context.Context, target string) int64 {
+	t.Helper()
+	src, err := insertTestSymbolLang(ctx, f.store, f.repoID, f.rootID, "run", "crate::run", "rust")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge, err := insertTestEdge(ctx, f.store, f.repoID, f.rootID, src, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return edge
+}
+
+func (f *rustCrateRootFixture) boundTarget(t *testing.T, ctx context.Context, edge int64) int64 {
+	t.Helper()
+	var got int64
+	if err := f.store.db.QueryRowContext(ctx, `SELECT COALESCE(dst_symbol_id,0) FROM edges WHERE id=?`, edge).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// TestRustModuleResolutionNestedModRs walks the mod.rs layout with
+// declaring-file-relative evidence: `mod foo;` in lib.rs is the stem `foo`,
+// which the store joins to crate_a/src/foo/mod.rs; `mod bar;` inside that
+// mod.rs is the sibling stem `bar`, joined to crate_a/src/foo/bar.rs. The
+// decoy other/foo/mod.rs shares the `/foo/mod.rs` suffix and must not count.
+func TestRustModuleResolutionNestedModRs(t *testing.T) {
+	ctx := context.Background()
+	f := newRustCrateRootFixture(t, ctx, "crate_a/src/lib.rs")
+	f.addFile(t, ctx, "other/foo/mod.rs", "crate::foo")
+	modRS := f.addFile(t, ctx, "crate_a/src/foo/mod.rs", "crate::foo")
+	f.declare(t, ctx, f.rootID, "crate", "foo", "foo")
+	bar := f.addFile(t, ctx, "crate_a/src/foo/bar.rs", "crate::foo::bar")
+	f.declare(t, ctx, modRS, "crate::foo", "bar", "bar")
+	target := f.rustPublicFn(t, ctx, bar, "helper", "crate::foo::bar::helper")
+	edge := f.rustEdgeFromRoot(t, ctx, "crate::foo::bar::helper")
+	f.resolveAll(t, ctx)
+	if got := f.boundTarget(t, ctx, edge); got != target {
+		t.Fatalf("crate::foo::bar::helper bound to %d, want %d", got, target)
+	}
+	roots := f.crateRoots(t, ctx)
+	for _, p := range []string{"crate_a/src/foo/mod.rs", "crate_a/src/foo/bar.rs"} {
+		if roots[p] != "crate_a/src/lib.rs" {
+			t.Fatalf("%s crate_root=%q, want crate_a/src/lib.rs", p, roots[p])
+		}
+	}
+	if roots["other/foo/mod.rs"] != "" {
+		t.Fatalf("other/foo/mod.rs crate_root=%q, want unproven", roots["other/foo/mod.rs"])
+	}
+}
+
+// TestRustModuleResolutionIsRootedAtDeclaringFile is the negative control for
+// suffix matching. `mod foo;` in crate_a/src/lib.rs names exactly
+// crate_a/src/foo.rs; vendor/src/foo.rs ends in the same `/foo.rs` and must be
+// neither chosen nor allowed to make the declaration ambiguous.
+func TestRustModuleResolutionIsRootedAtDeclaringFile(t *testing.T) {
+	ctx := context.Background()
+	f := newRustCrateRootFixture(t, ctx, "crate_a/src/lib.rs", "foo")
+	decoy := f.addFile(t, ctx, "vendor/src/foo.rs", "crate::foo")
+	target := f.rustPublicFn(t, ctx, f.modules["foo"], "helper", "crate::foo::helper")
+	f.rustPublicFn(t, ctx, decoy, "helper", "crate::foo::helper")
+	edge := f.rustEdgeFromRoot(t, ctx, "crate::foo::helper")
+	f.resolveAll(t, ctx)
+	if got := f.boundTarget(t, ctx, edge); got != target {
+		t.Fatalf("crate::foo::helper bound to %d, want %d (crate_a/src/foo.rs); vendor/src/foo.rs only shares a suffix", got, target)
+	}
+	roots := f.crateRoots(t, ctx)
+	if roots["crate_a/src/foo.rs"] != "crate_a/src/lib.rs" {
+		t.Fatalf("crate_a/src/foo.rs crate_root=%q, want crate_a/src/lib.rs", roots["crate_a/src/foo.rs"])
+	}
+	if roots["vendor/src/foo.rs"] != "" {
+		t.Fatalf("vendor/src/foo.rs crate_root=%q, want unproven", roots["vendor/src/foo.rs"])
+	}
+}
+
+// TestRustModuleResolutionKeepsBackslashDeclaringFileAsData joins evidence to
+// stored bytes only. The declaring file crate_a/src/x\y.rs is one logical file
+// whose stem is `x\y`; its `mod foo;` names crate_a/src/x\y/foo.rs, not the
+// slash-spelled crate_a/src/x/y/foo.rs that separator folding would produce.
+func TestRustModuleResolutionKeepsBackslashDeclaringFileAsData(t *testing.T) {
+	ctx := context.Background()
+	f := newRustCrateRootFixture(t, ctx, "crate_a/src/lib.rs", `x\y`)
+	real := f.addFile(t, ctx, `crate_a/src/x\y/foo.rs`, `crate::x\y::foo`)
+	f.declare(t, ctx, f.modules[`x\y`], `crate::x\y`, "foo", `x\y/foo`)
+	slash := f.addFile(t, ctx, "crate_a/src/x/y/foo.rs", "crate::x::y::foo")
+	target := f.rustPublicFn(t, ctx, real, "helper", `crate::x\y::foo::helper`)
+	f.rustPublicFn(t, ctx, slash, "helper", `crate::x\y::foo::helper`)
+	edge := f.rustEdgeFromRoot(t, ctx, `crate::x\y::foo::helper`)
+	f.resolveAll(t, ctx)
+	if got := f.boundTarget(t, ctx, edge); got != target {
+		t.Fatalf("bound to %d, want %d (crate_a/src/x\\y/foo.rs); the slash sibling is a different file", got, target)
+	}
+	roots := f.crateRoots(t, ctx)
+	if roots[`crate_a/src/x\y/foo.rs`] != "crate_a/src/lib.rs" {
+		t.Fatalf("crate_a/src/x\\y/foo.rs crate_root=%q, want crate_a/src/lib.rs", roots[`crate_a/src/x\y/foo.rs`])
+	}
+	if roots["crate_a/src/x/y/foo.rs"] != "" {
+		t.Fatalf("crate_a/src/x/y/foo.rs crate_root=%q, want unproven", roots["crate_a/src/x/y/foo.rs"])
 	}
 }
