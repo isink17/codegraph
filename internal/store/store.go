@@ -9086,11 +9086,9 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f1.id != f2.id
 		GROUP BY f1.path, f2.path
 		-- The tie-break is the pair of grouping keys, which is unique per row, so
-		-- the order is total. It sorts the *stored* form rather than the
-		-- canonical one: REPLACE() here cost ~6% of this query on a 100k-symbol
-		-- graph, and the two forms differ only on Windows, where files.path is
-		-- native. P23 makes files.path canonical and removes the distinction
-		-- globally; paying for it per row in the meantime is not worth it.
+		-- the order is total. It sorts files.path bytes as stored: under P23
+		-- files.path is already the logical '/'-separated identity on every
+		-- host, so there is no canonical form to REPLACE() into.
 		-- Edge counts tie constantly -- most coupled pairs share one or two
 		-- edges -- so score alone decides neither the order of the page nor its
 		-- membership. The grouping keys are already computed and are a total
