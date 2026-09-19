@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -122,6 +123,45 @@ func main() {
 	}
 	if stats.Edges != 0 {
 		t.Fatalf("stats.Edges after delete = %d, want 0", stats.Edges)
+	}
+}
+
+func TestFullIndexStoresLogicalRepositoryPaths(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, "nested", "file.go"), "package nested\n")
+
+	want := []string{"nested/file.go"}
+	if runtime.GOOS != "windows" {
+		writeFile(t, filepath.Join(repoRoot, `weird\name.go`), "package weird\n")
+		want = append(want, `weird\name.go`)
+	}
+
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(goparser.New()), nil).Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	files, err := s.ListFiles(ctx, repo.ID, "", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(files))
+	for _, file := range files {
+		got = append(got, file["path"].(string))
+	}
+	if !equalPaths(got, want) {
+		t.Fatalf("stored paths = %v, want %v", got, want)
 	}
 }
 
@@ -412,10 +452,10 @@ func Keep() {}
 	if err != nil {
 		t.Fatalf("ExistingFiles() error = %v", err)
 	}
-	if _, ok := existing[filepath.Clean(filepath.Join("vendor", "keep.go"))]; !ok {
+	if _, ok := existing["vendor/keep.go"]; !ok {
 		t.Fatalf("expected vendor/keep.go to be indexed, got keys: %v", mapKeys(existing))
 	}
-	if _, ok := existing[filepath.Clean(filepath.Join("vendor", "skip.go"))]; ok {
+	if _, ok := existing["vendor/skip.go"]; ok {
 		t.Fatalf("expected vendor/skip.go to be ignored")
 	}
 }

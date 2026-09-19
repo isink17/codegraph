@@ -21,6 +21,7 @@ import (
 	"github.com/isink17/codegraph/internal/embedding"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/parser"
+	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -148,6 +149,13 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	scanKind := opts.ScanKind
+	if scanKind == "" {
+		scanKind = "index"
+	}
+	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, len(candidatePaths) == 0 && scanKind != "update"); err != nil {
+		return store.ScanSummary{}, err
+	}
 	// Asked before pass 1 writes anything, because that is the only moment an
 	// empty graph still means "this repository has never been indexed". It gates
 	// the one-time resolver repairs below: a first index produces the current
@@ -156,10 +164,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	hadExistingGraph, err := i.store.RepoHasExistingGraph(ctx, repo.ID)
 	if err != nil {
 		return store.ScanSummary{}, err
-	}
-	scanKind := opts.ScanKind
-	if scanKind == "" {
-		scanKind = "index"
 	}
 	pathScoped := len(candidatePaths) > 0
 	// Which languages a path-scoped run could mutate. Profile convergence is
@@ -403,6 +407,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			if info == nil {
 				return nil
 			}
+			logicalRel, err := platform.NativeRelativeToLogical(rel)
+			if err != nil {
+				return err
+			}
 			adapter := i.registry.AdapterFor(rel)
 			language := ""
 			if adapter != nil {
@@ -410,7 +418,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			}
 			task := fileTask{
 				path:     path,
-				rel:      rel,
+				rel:      logicalRel,
 				info:     info,
 				adapter:  adapter,
 				language: language,

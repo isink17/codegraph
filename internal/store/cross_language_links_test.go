@@ -902,3 +902,58 @@ func TestCrossLanguageLinksTempTableDeletePath(t *testing.T) {
 		t.Fatalf("temp-table delete left %d cross-language rows (%d unbound), want none", total, unbound)
 	}
 }
+
+// TestCrossLanguageLinksKeepStoredPathIdentity pins that the bridge matcher
+// keys and resolves against `files.path` byte for byte. `pkg/a/x/y.py` and
+// `pkg/a/x\y.py` are two stored files under P23; the former CanonicalRelPath
+// call folded them onto one key on Windows, so a specifier naming the slash
+// file found two foreign candidates and abstained, and an importer whose own
+// path holds a backslash resolved its relative specifiers from the wrong
+// directory. On POSIX filepath.ToSlash is the identity, so this test is a
+// control there and the reverse-failure only on a Windows host.
+func TestCrossLanguageLinksKeepStoredPathIdentity(t *testing.T) {
+	spec := crossLangSpec{
+		files: []crossLangFile{
+			{path: "pkg/a/x/y.py", language: "python", symbols: []crossLangSymbol{{name: "Target", qualified: "y.Target"}}},
+			{path: `pkg/a/x\y.py`, language: "python", symbols: []crossLangSymbol{{name: "Decoy", qualified: "y.Decoy"}}},
+			{path: "pkg/a/main.ts", language: "typescript", symbols: []crossLangSymbol{{name: "Target", qualified: "main.Target"}}},
+			{path: "pkg/z.py", language: "python", symbols: []crossLangSymbol{{name: "Other", qualified: "z.Other"}}},
+			{path: `pkg/b\main.ts`, language: "typescript", symbols: []crossLangSymbol{{name: "Other", qualified: "main.Other"}}},
+		},
+		imports: []crossLangImport{
+			// Names pkg/a/x/y exactly; the backslash sibling is not a candidate.
+			{fromPath: "pkg/a/main.ts", path: "./x/y"},
+			// path.Dir(`pkg/b\main.ts`) is `pkg`: the backslash is filename data,
+			// so `./z` is pkg/z, not pkg/b/z.
+			{fromPath: `pkg/b\main.ts`, path: "./z"},
+		},
+	}
+	want := []string{
+		"pkg/a/main.ts:main.Target(typescript) -> pkg/a/x/y.py:y.Target(python) name=Target evidence=shared_name:typescript→python strategy=" +
+			ResolutionStrategyCrossLanguageSharedName + " confidence=" + resolutionConfidenceFor(ResolutionStrategyCrossLanguageSharedName) + " edge_file=pkg/a/main.ts",
+		`pkg/b\main.ts:main.Other(typescript) -> pkg/z.py:z.Other(python) name=Other evidence=shared_name:typescript→python strategy=` +
+			ResolutionStrategyCrossLanguageSharedName + " confidence=" + resolutionConfidenceFor(ResolutionStrategyCrossLanguageSharedName) + ` edge_file=pkg/b\main.ts`,
+	}
+	sort.Strings(want)
+	for _, tc := range []struct {
+		name  string
+		order int
+	}{{"forward", 1}, {"reverse", -1}, {"interleaved", 0}} {
+		f := newGateFixture(t)
+		spec.build(t, f, tc.order)
+		if created := f.resolveCrossLanguage(t); created != len(want) {
+			t.Fatalf("%s: ResolveCrossLanguageLinks() created %d links, want %d", tc.name, created, len(want))
+		}
+		got := crossLangLinks(t, f)
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Fatalf("%s: link set diverged:\n got:\n%s\n want:\n%s", tc.name, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
+		// Negative control, non-vacuous because the sibling defines a symbol of
+		// its own: the backslash file neither receives nor sends a link.
+		for _, l := range got {
+			if strings.Contains(l, `pkg/a/x\y.py`) || strings.Contains(l, "Decoy") {
+				t.Fatalf("%s: separator sibling took part in a link: %s", tc.name, l)
+			}
+		}
+	}
+}

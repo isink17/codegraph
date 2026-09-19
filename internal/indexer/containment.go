@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/platform"
 )
 
 // ErrPathOutsideRepo is the sentinel behind every path-containment refusal.
@@ -91,7 +93,12 @@ func containRelPath(root, path string) (string, error) {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return reject()
 	}
-	return rel, nil
+	// A repository-root candidate is useful to callers that scope a walk; it is
+	// never admitted as a file identity or persisted path.
+	if rel == "." {
+		return rel, nil
+	}
+	return platform.NativeRelativeToLogical(rel)
 }
 
 // containment answers "is this candidate inside the active repository" for one

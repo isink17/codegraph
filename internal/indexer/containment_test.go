@@ -34,17 +34,17 @@ func TestContainRelPathMatrix(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"relative", filepath.Join("src", "a.go"), filepath.Join("src", "a.go")},
-		{"dot prefixed", "." + string(filepath.Separator) + filepath.Join("src", "a.go"), filepath.Join("src", "a.go")},
-		{"interior traversal", filepath.Join("src", "x", "..", "a.go"), filepath.Join("src", "a.go")},
-		{"absolute inside root", abs("src", "a.go"), filepath.Join("src", "a.go")},
+		{"relative", filepath.Join("src", "a.go"), "src/a.go"},
+		{"dot prefixed", "." + string(filepath.Separator) + filepath.Join("src", "a.go"), "src/a.go"},
+		{"interior traversal", filepath.Join("src", "x", "..", "a.go"), "src/a.go"},
+		{"absolute inside root", abs("src", "a.go"), "src/a.go"},
 		{"absolute root itself", root, "."},
-		{"missing file kept for deletion", filepath.Join("src", "deleted.go"), filepath.Join("src", "deleted.go")},
+		{"missing file kept for deletion", filepath.Join("src", "deleted.go"), "src/deleted.go"},
 		{"dotfile is not traversal", ".golangci.yml", ".golangci.yml"},
 		// Prefix confusion: "<parent>/repo2" is a different repository, but
 		// "<parent>/repo/foobar" is genuinely inside the root. A naive
 		// HasPrefix check conflates them.
-		{"sibling-looking name inside root", abs("foobar", "a.go"), filepath.Join("foobar", "a.go")},
+		{"sibling-looking name inside root", abs("foobar", "a.go"), "foobar/a.go"},
 	}
 	for _, tc := range accepted {
 		t.Run("accept/"+tc.name, func(t *testing.T) {
@@ -114,8 +114,8 @@ func TestContainRelPathWindowsShapes(t *testing.T) {
 	}
 	// Case difference must not falsely identify a path as contained; rejecting
 	// is the safe direction.
-	if got, err := containRelPath(root, `C:\repo\src\a.go`); err != nil || got != `src\a.go` {
-		t.Errorf("containRelPath(exact case) = %q, %v; want src\\a.go", got, err)
+	if got, err := containRelPath(root, `C:\repo\src\a.go`); err != nil || got != "src/a.go" {
+		t.Errorf("containRelPath(exact case) = %q, %v; want src/a.go", got, err)
 	}
 }
 
@@ -134,7 +134,7 @@ func TestContainCandidatesDedupes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("containCandidates() error = %v", err)
 	}
-	want := []string{filepath.Join("src", "a.go"), filepath.Join("src", "b.go")}
+	want := []string{"src/a.go", "src/b.go"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("containCandidates() = %v, want %v", got, want)
 	}
@@ -331,7 +331,7 @@ func TestContainCandidatesRelativeRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("containCandidates(relative root, absolute contained path) error = %v", err)
 	}
-	if len(got) != 1 || got[0] != filepath.Join("src", "a.go") {
+	if len(got) != 1 || got[0] != "src/a.go" {
 		t.Fatalf("containCandidates() = %v, want [src/a.go]", got)
 	}
 

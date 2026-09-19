@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"testing"
 
@@ -30,6 +32,9 @@ func newQueryTestStore(t *testing.T) (*Store, int64) {
 	repo, err := s.UpsertRepo(ctx, t.TempDir())
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
 	}
 	return s, repo.ID
 }
@@ -501,9 +506,12 @@ func TestArchitectureOverviewTopDegreeAndTotals(t *testing.T) {
 	}
 }
 
-func TestListFilesMatchesMixedPersistedSeparators(t *testing.T) {
+func TestListFilesRejectsMixedPersistedSeparatorsWithoutPathFormatMarker(t *testing.T) {
 	ctx := context.Background()
 	s, repoID := newQueryTestStore(t)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, canonicalRepositoryPathsKey(repoID)); err != nil {
+		t.Fatalf("delete marker: %v", err)
+	}
 	fileID, err := insertTestFile(ctx, s, repoID, `pkg\win.go`)
 	if err != nil {
 		t.Fatalf("insertTestFile: %v", err)
@@ -511,12 +519,99 @@ func TestListFilesMatchesMixedPersistedSeparators(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE files SET path = ? WHERE id = ?`, `pkg\win.go`, fileID); err != nil {
 		t.Fatalf("set Windows path: %v", err)
 	}
-	rows, err := s.ListFiles(ctx, repoID, "pkg/", 20, 0)
+	if _, err := s.ListFiles(ctx, repoID, "pkg/", 20, 0); err == nil {
+		t.Fatal("ListFiles accepted unmarked legacy path row")
+	}
+}
+
+func TestListFilesUsesCanonicalLogicalPrefixes(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	otherRepo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo(other): %v", err)
+	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, otherRepo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths(other): %v", err)
+	}
+
+	insert := func(repo int64, path string) int64 {
+		t.Helper()
+		id, err := insertTestFile(ctx, s, repo, path)
+		if err != nil {
+			t.Fatalf("insertTestFile(%q): %v", path, err)
+		}
+		return id
+	}
+
+	insert(repoID, "src/a.go")
+	insert(repoID, "src/nested/b.go")
+	insert(repoID, "src2/c.go")
+	insert(repoID, "other/d.go")
+	deleted := insert(repoID, "src/deleted.go")
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, deleted); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+	insert(otherRepo.ID, "src/foreign.go")
+
+	pathsFor := func(filter string, limit, offset int) []string {
+		t.Helper()
+		rows, err := s.ListFiles(ctx, repoID, filter, limit, offset)
+		if err != nil {
+			t.Fatalf("ListFiles(%q): %v", filter, err)
+		}
+		paths := make([]string, 0, len(rows))
+		for _, row := range rows {
+			paths = append(paths, row["path"].(string))
+		}
+		return paths
+	}
+
+	tests := []struct {
+		name   string
+		filter string
+		limit  int
+		offset int
+		want   []string
+	}{
+		{"empty", "", 20, 0, []string{"other/d.go", "src/a.go", "src/nested/b.go", "src2/c.go"}},
+		{"raw prefix", "src", 20, 0, []string{"src/a.go", "src/nested/b.go", "src2/c.go"}},
+		{"directory prefix", "src/", 20, 0, []string{"src/a.go", "src/nested/b.go"}},
+		{"dot relative prefix", "./src/", 20, 0, []string{"src/a.go", "src/nested/b.go"}},
+		{"ordered page", "", 2, 1, []string{"src/a.go", "src/nested/b.go"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pathsFor(tt.filter, tt.limit, tt.offset); !slices.Equal(got, tt.want) {
+				t.Fatalf("paths = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestListFilesKeepsBackslashIdentityOnPOSIX(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows path storage cannot distinguish separator spellings")
+	}
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	for _, path := range []string{`weird\name.go`, "weird/name.go"} {
+		if _, err := insertTestFile(ctx, s, repoID, path); err != nil {
+			t.Fatalf("insertTestFile(%q): %v", path, err)
+		}
+	}
+
+	rows, err := s.ListFiles(ctx, repoID, `weird\`, 20, 0)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
-	if len(rows) != 1 || rows[0]["path"] != filepath.ToSlash(`pkg\win.go`) {
-		t.Fatalf("ListFiles = %v, want canonical mixed-path row", rows)
+	var got []string
+	for _, row := range rows {
+		got = append(got, row["path"].(string))
+	}
+	want := []string{`weird\name.go`}
+	if !slices.Equal(got, want) {
+		t.Fatalf("paths = %v, want %v", got, want)
 	}
 }
 
@@ -654,6 +749,52 @@ func TestSemanticSearchPagesArePartitionOfFullResult(t *testing.T) {
 	}
 }
 
+func TestSemanticSearchPreservesLogicalPathOrderAndIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	paths := []string{"a0.go", "a\\foo.go"}
+	for _, path := range paths {
+		fileID, err := insertTestFile(ctx, s, repoID, path)
+		if err != nil {
+			t.Fatalf("insertTestFile(%q) error = %v", path, err)
+		}
+		symID, err := insertTestSymbol(ctx, s, repoID, fileID, "Match", "pkg.Match")
+		if err != nil {
+			t.Fatalf("insertTestSymbol(%q) error = %v", path, err)
+		}
+		if _, err := s.db.ExecContext(ctx, "INSERT INTO symbol_tokens(symbol_id, token, weight) VALUES(?, 'needle', 1.0)", symID); err != nil {
+			t.Fatalf("insert token for %q error = %v", path, err)
+		}
+	}
+
+	files := func(limit, offset int) []string {
+		t.Helper()
+		rows, err := s.SemanticSearch(ctx, repoID, "needle", limit, offset)
+		if err != nil {
+			t.Fatalf("SemanticSearch(%d, %d) error = %v", limit, offset, err)
+		}
+		got := make([]string, 0, len(rows))
+		for _, row := range rows {
+			file, ok := row["file"].(string)
+			if !ok {
+				t.Fatalf("SemanticSearch row file = %#v, want string", row["file"])
+			}
+			got = append(got, file)
+		}
+		return got
+	}
+
+	if got := files(2, 0); !slices.Equal(got, paths) {
+		t.Fatalf("SemanticSearch order = %q, want raw logical order %q", got, paths)
+	}
+	if got := files(1, 0); !slices.Equal(got, paths[:1]) {
+		t.Fatalf("SemanticSearch first page = %q, want %q", got, paths[:1])
+	}
+	if got := files(1, 1); !slices.Equal(got, paths[1:]) {
+		t.Fatalf("SemanticSearch second page = %q, want exact backslash identity %q", got, paths[1:])
+	}
+}
+
 // TestSuffixMatcherAgreesWithSQLiteLike checks the Go stage-3 matcher against
 // the authority it is replacing: SQLite's own LIKE. The matcher exists so the
 // cascade's third stage costs one scan instead of one scan per name, which is
@@ -703,5 +844,44 @@ func TestSuffixMatcherAgreesWithSQLiteLike(t *testing.T) {
 				t.Errorf("qname=%q short=%q: matcher=%v, SQLite LIKE=%v", qname, short, got[short], want)
 			}
 		}
+	}
+}
+
+// TestSymbolIdentityHelpersPreserveStoredPath pins both symbolIdentity loaders
+// to the persisted `files.path` bytes. Production callers of
+// lookupSymbolIdentity read only ID and QualifiedName today, so its former
+// filepath.ToSlash was unobservable there; the helper still promises stored
+// identity, and this test keeps it consistent with symbolIdentities, which
+// PageRank orders and prints by.
+func TestSymbolIdentityHelpersPreserveStoredPath(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	const stored = `pkg/x\y.go`
+	fileID, err := insertTestFile(ctx, s, repoID, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := insertTestSymbol(ctx, s, repoID, fileID, "Same", "pkg.Same")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	single, ok, err := s.lookupSymbolIdentity(ctx, repoID, id)
+	if err != nil || !ok {
+		t.Fatalf("lookupSymbolIdentity = ok %v, err %v", ok, err)
+	}
+	if single.ID != id || single.QualifiedName != "pkg.Same" || single.Path != stored {
+		t.Fatalf("lookupSymbolIdentity = %+v, want id %d pkg.Same path %q", single, id, stored)
+	}
+	batch, err := s.symbolIdentities(ctx, []int64{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := batch[id]; got.QualifiedName != "pkg.Same" || got.Path != stored || got.Path != single.Path {
+		t.Fatalf("symbolIdentities[%d] = %+v, want pkg.Same path %q matching lookup %q", id, got, stored, single.Path)
+	}
+	// Control: an unknown id is absent, not a zero identity.
+	if _, ok, err := s.lookupSymbolIdentity(ctx, repoID, id+1); err != nil || ok {
+		t.Fatalf("lookupSymbolIdentity(unknown) = ok %v, err %v; want absent", ok, err)
 	}
 }

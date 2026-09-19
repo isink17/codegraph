@@ -24,14 +24,6 @@ func TestRubyPathsChangedOrAcrossBatches(t *testing.T) {
 		}
 		return out
 	}
-	expanded := func(in []string) int {
-		n := 0
-		for _, path := range in {
-			n += len(storedPathVariants(CanonicalRelPath(path)))
-		}
-		return n
-	}
-
 	for _, tc := range []struct {
 		name, hit         string
 		first, last, want bool
@@ -50,8 +42,8 @@ func TestRubyPathsChangedOrAcrossBatches(t *testing.T) {
 				f.rb(t, "app/late.rb")
 			}
 			paths := paths(tc.first, tc.last)
-			if got := expanded(paths); got <= limit {
-				t.Fatalf("expanded path count = %d, want > batch limit %d", got, limit)
+			if got := len(paths); got <= limit {
+				t.Fatalf("path count = %d, want > batch limit %d", got, limit)
 			}
 			got, err := f.store.rubyPathsChanged(ctx, f.repoID, paths)
 			if err != nil {
@@ -93,5 +85,34 @@ func TestRubyPathsChangedBatchInvalidatesBoundPath(t *testing.T) {
 	}
 	if got := f.binding(t, edge); got != "<unresolved>" {
 		t.Fatalf("stale path binding = %s, want unresolved", got)
+	}
+}
+
+func TestRubyPathsChangedUsesCanonicalPaths(t *testing.T) {
+	f := newRubyFixture(t)
+	f.rb(t, "lib/foo.rb")
+	f.file(t, "lib/bar.py", "python")
+
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		want  bool
+	}{
+		{"ruby", []string{"lib/foo.rb"}, true},
+		{"missing", []string{"missing.rb"}, false},
+		{"non-ruby", []string{"lib/bar.py"}, false},
+		{"duplicate", []string{"lib/foo.rb", "lib/foo.rb"}, true},
+		{"mixed", []string{"lib/bar.py", "lib/foo.rb"}, true},
+		{"empty", []string{"", "."}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := f.store.rubyPathsChanged(f.ctx, f.repoID, tc.paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("rubyPathsChanged() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

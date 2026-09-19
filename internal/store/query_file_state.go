@@ -2,9 +2,9 @@ package store
 
 import (
 	"context"
-	gopath "path"
-	"path/filepath"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/platform"
 )
 
 // fileStateChunkSize bounds one IN-list of paths.
@@ -21,7 +21,7 @@ type FileSourceState struct {
 }
 
 // FileSourceStates returns the indexed size and modification time for each of
-// the given repository-relative paths. Paths the repository does not know are
+// the given logical repository paths. Paths the repository does not know are
 // simply absent from the result.
 func (s *Store) FileSourceStates(ctx context.Context, repoID int64, paths []string) (map[string]FileSourceState, error) {
 	if len(paths) == 0 {
@@ -30,19 +30,18 @@ func (s *Store) FileSourceStates(ctx context.Context, repoID int64, paths []stri
 	wanted := make([]string, 0, len(paths))
 	seen := make(map[string]bool, len(paths))
 	for _, raw := range paths {
-		// Two forms are in play. The keys of the returned map are canonical
-		// (slash-separated), because that is the form every caller holds -- a
-		// symbol's FilePath, a related test's file. `files.path` itself is stored
-		// in the indexing host's native form (the indexer derives it with
-		// filepath.Rel/filepath.Clean), so the IN list below binds both forms;
-		// binding only the canonical one returned no rows at all on Windows, which
-		// made source-drift detection silently answer "not drifted".
-		normalized := gopath.Clean(filepath.ToSlash(strings.TrimSpace(raw)))
-		if normalized == "" || normalized == "." || seen[normalized] {
+		if raw == "" {
 			continue
 		}
-		seen[normalized] = true
-		wanted = append(wanted, normalized)
+		logical, err := platform.LogicalRepositoryPath(raw)
+		if err != nil {
+			return nil, err
+		}
+		if seen[logical] {
+			continue
+		}
+		seen[logical] = true
+		wanted = append(wanted, logical)
 	}
 	if len(wanted) == 0 {
 		return nil, nil
@@ -53,14 +52,10 @@ func (s *Store) FileSourceStates(ctx context.Context, repoID int64, paths []stri
 		end := min(start+fileStateChunkSize, len(wanted))
 		chunk := wanted[start:end]
 
-		bound := make([]string, 0, len(chunk)*2)
-		for _, path := range chunk {
-			bound = append(bound, storedPathVariants(path)...)
-		}
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(bound)), ",")
-		args := make([]any, 0, len(bound)+1)
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, 0, len(chunk)+1)
 		args = append(args, repoID)
-		for _, path := range bound {
+		for _, path := range chunk {
 			args = append(args, path)
 		}
 
@@ -79,7 +74,7 @@ func (s *Store) FileSourceStates(ctx context.Context, repoID int64, paths []stri
 				_ = rows.Close()
 				return nil, err
 			}
-			out[filepath.ToSlash(path)] = state
+			out[path] = state
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()

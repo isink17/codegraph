@@ -20,7 +20,14 @@ func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}
 }
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
-func (a *RustAdapter) Profile() parser.Profile       { return tsProfile("rust") }
+
+// Rust v2 changes rust_module_evidence.external_path from a checkout-absolute
+// candidate path to the candidate stem relative to the declaring file's
+// directory. Unchanged bytes persist a different row, and the resolver joins
+// the new spelling exactly, so every Rust file has to reach the parser again.
+func (a *RustAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:rust:v2", EmitsCallEdges: true}
+}
 
 // Ruby v5 adds constant identity and visibility facts. Ruby v4 adds P22.48 singleton visibility: `def self.run` and a `class <<
 // self` body under the default state are stated public, a bare `private` /

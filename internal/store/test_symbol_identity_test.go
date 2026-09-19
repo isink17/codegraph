@@ -165,6 +165,9 @@ func TestRelatedTestsUsesExactPersistedTestSymbolIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatal(err)
+	}
 	targets := graph.ParsedFile{Language: "go", Symbols: []graph.Symbol{
 		{Language: "go", Kind: "function", Name: "TargetA", QualifiedName: "pkg.TargetA", StableKey: "func:pkg::TargetA", Range: graph.Position{StartLine: 1, EndLine: 3}},
 		{Language: "go", Kind: "function", Name: "TargetB", QualifiedName: "pkg.TargetB", StableKey: "func:pkg::TargetB", Range: graph.Position{StartLine: 5, EndLine: 7}},

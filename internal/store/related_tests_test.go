@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -18,6 +19,9 @@ func TestRelatedTests_FileScoped(t *testing.T) {
 	repo, err := s.UpsertRepo(ctx, t.TempDir())
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
 	}
 
 	targetA, err := insertTestFile(ctx, s, repo.ID, "a.go")
@@ -66,7 +70,7 @@ func TestRelatedTests_FileScoped(t *testing.T) {
 	}
 }
 
-func TestRelatedTests_FileScopedMatchesWindowsStoredPath(t *testing.T) {
+func TestRelatedTests_FileScopedDoesNotInterpretLegacyWindowsPath(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -97,11 +101,11 @@ func TestRelatedTests_FileScopedMatchesWindowsStoredPath(t *testing.T) {
 	}
 
 	got, err := s.RelatedTests(ctx, repo.ID, "", "pkg/utils.py", 10, 0)
-	if err != nil {
-		t.Fatalf("RelatedTests() error = %v", err)
+	if !errors.Is(err, ErrRepositoryPathFormatRebuild) {
+		t.Fatalf("RelatedTests() error = %v, want rebuild error", err)
 	}
-	if len(got) != 1 || got[0].File != "pkg/test_utils.py" {
-		t.Fatalf("RelatedTests() = %+v, want canonical Python test path", got)
+	if got != nil {
+		t.Fatalf("RelatedTests() = %+v with rebuild error", got)
 	}
 }
 

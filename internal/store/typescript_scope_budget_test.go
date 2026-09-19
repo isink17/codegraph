@@ -190,13 +190,13 @@ func TestTypeScriptScopeBatchCountIsProportionalToBatches(t *testing.T) {
 	}
 }
 
-// TestTypeScriptScopeVariantExpansionIsBatched covers the subtle case where the
-// logical candidate set fits the budget but its persisted path spellings do not.
-func TestTypeScriptScopeVariantExpansionIsBatched(t *testing.T) {
+// TestTypeScriptScopeLogicalCandidateExpansionIsBatched proves extension
+// candidates are batched after their logical paths exceed SQLite's budget.
+func TestTypeScriptScopeLogicalCandidateExpansionIsBatched(t *testing.T) {
 	ctx := context.Background()
 	s, repo := openBudgetStore(t)
 	b := newTSFixtureBuilder(t, s, repo.ID)
-	const callers = 300
+	const callers = sqliteDefaultMaxVariables/2 + 2
 	only := make(map[int64]struct{}, callers)
 	targets := make(map[int64]int64, callers)
 	for i := range callers {
@@ -204,8 +204,7 @@ func TestTypeScriptScopeVariantExpansionIsBatched(t *testing.T) {
 		target := b.symbol(mod, fmt.Sprintf("shared%04d", i))
 		f := b.file(fmt.Sprintf("src/call%04d.ts", i))
 		src := b.symbol(f, fmt.Sprintf("run%04d", i))
-		// Extensionless specifiers expand to two logical candidates each, and
-		// every candidate expands again into its persisted path spellings.
+		// Extensionless specifiers expand to two logical candidates each.
 		b.importEvidence(f, fmt.Sprintf("./mod%04d", i), fmt.Sprintf("shared%04d", i), fmt.Sprintf("shared%04d", i), "named", false, false)
 		e := b.edge(f, src, fmt.Sprintf("shared%04d", i))
 		only[e] = struct{}{}
@@ -223,7 +222,7 @@ func TestTypeScriptScopeVariantExpansionIsBatched(t *testing.T) {
 		bound += len(st.args) - 1
 	}
 	if bound <= sqliteDefaultMaxVariables {
-		t.Fatalf("path lookup bound %d variants; fixture must exceed %d", bound, sqliteDefaultMaxVariables)
+		t.Fatalf("path lookup bound %d candidates; fixture must exceed %d", bound, sqliteDefaultMaxVariables)
 	}
 	if guard.maxArgs > sqliteDefaultMaxVariables {
 		t.Fatalf("max bound args = %d, want <= %d", guard.maxArgs, sqliteDefaultMaxVariables)

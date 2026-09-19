@@ -10,9 +10,14 @@ import (
 // resolver and the public queries, once in Go by the binder and the query-side
 // helpers. Drift between the two is exactly the full-vs-incremental divergence
 // this phase exists to remove, so the derivations are evaluated side by side on
-// the inputs most likely to separate them: Windows separators, dotted directory
-// names, repository-root files, receivers, and package names that are a prefix
-// of a directory name.
+// the inputs most likely to separate them: literal backslashes in filenames,
+// dotted directory names, repository-root files, receivers, and package names
+// that are a prefix of a directory name.
+//
+// files.path is the logical repository identity (P23): '/' is its only
+// separator and '\' is filename data. `internal\store\store.go` is therefore
+// one repository-root file whose directory prefix is "", and `b/x\y.go` sits in
+// `b/` beside `b/z.go`, not in `b/x/` beside `b/x/y.go`.
 func TestGoPackageScopeSQLMatchesGo(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -26,8 +31,12 @@ func TestGoPackageScopeSQLMatchesGo(t *testing.T) {
 		qualifiedName string
 		name          string
 	}{
+		{"a.go", "main.run", "run"},
 		{"internal/store/store.go", "store.Open", "Open"},
 		{`internal\store\store.go`, "store.Open", "Open"},
+		{`b/x\y.go`, "b.Run", "Run"},
+		{"b/z.go", "b.Run", "Run"},
+		{"b/x/y.go", "x.Run", "Run"},
 		{"main.go", "main.run", "run"},
 		{"a.b/c.d/e.go", "e.Helper", "Helper"},
 		{"internal/store/store.go", "store.Store.Ping", "Ping"},
@@ -39,7 +48,23 @@ func TestGoPackageScopeSQLMatchesGo(t *testing.T) {
 		{"pkg/x.go", ".leading", "leading"},
 	}
 
+	// The logical contract the twins must agree on, pinned on the Go side so a
+	// change that keeps them equal but wrong is still caught.
+	wantDir := map[string]string{
+		"a.go":                    "",
+		"internal/store/store.go": "internal/store/",
+		`internal\store\store.go`: "",
+		`b/x\y.go`:                "b/",
+		"b/z.go":                  "b/",
+		"b/x/y.go":                "b/x/",
+	}
+
 	for _, tc := range cases {
+		if want, pinned := wantDir[tc.path]; pinned {
+			if got := storedPathDir(tc.path); got != want {
+				t.Errorf("storedPathDir(%q) = %q, want %q", tc.path, got, want)
+			}
+		}
 		var sqlKey, sqlDir, sqlPkg string
 		var sqlPackageLevel int
 		// The builders repeat their column expression, so the inputs arrive as
@@ -73,8 +98,8 @@ func TestGoPackageScopeSQLMatchesGo(t *testing.T) {
 
 // The scope key concatenates a directory prefix and a package name with no
 // separator, which is only unambiguous because a non-empty directory prefix
-// always ends in '/' or '\' and a Go package name never contains either. These
-// are the pairs that would collide if that reasoning were wrong.
+// always ends in '/' and a Go package name never contains one. These are the
+// pairs that would collide if that reasoning were wrong.
 func TestGoPackageScopeKeysDoNotCollide(t *testing.T) {
 	cases := []struct{ aPath, aQname, bPath, bQname string }{
 		{"main.go", "main.X", "mai/n.go", "n.X"},

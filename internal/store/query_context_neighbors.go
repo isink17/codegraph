@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -670,9 +669,10 @@ func (s *Store) pageNeighborChunk(
 		); err != nil {
 			return err
 		}
-		// Same normalization scanSymbol applies, for the same reason: every path
-		// this store hands out is slash-form whatever the host wrote.
-		sym.FilePath = filepath.ToSlash(sym.FilePath)
+		// FilePath is `files.path`, returned byte-exact for the reason scanSymbol
+		// gives: the seeds this neighbourhood is merged with came out of
+		// SymbolsForRefs with the stored spelling, and a rewritten neighbour path
+		// would key the same file twice in the ranking and budget maps.
 		emit(int(idx), sym)
 	}
 	return rows.Err()

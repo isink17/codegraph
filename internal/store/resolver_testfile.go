@@ -94,25 +94,24 @@ import (
 // ambiguity in place. The rules above are chosen to fail in the second
 // direction.
 func IsTestFilePath(filePath string) bool {
-	normalized := strings.TrimSpace(filePath)
-	if normalized == "" {
+	if filePath == "" {
 		return false
 	}
 	// Segment walk rather than strings.Split: this runs once per file per
-	// resolve, and there is no reason for it to allocate. Both separators are
-	// accepted because `files.path` is written with the host separator.
+	// resolve, and there is no reason for it to allocate. Input is a
+	// repository-logical path: '/' separates segments and '\\' is filename data.
 	start := 0
-	for i := 0; i < len(normalized); i++ {
-		if normalized[i] != '/' && normalized[i] != '\\' {
+	for i := 0; i < len(filePath); i++ {
+		if filePath[i] != '/' {
 			continue
 		}
-		if isTestDirSegment(normalized[start:i]) {
+		if isTestDirSegment(filePath[start:i]) {
 			return true
 		}
 		start = i + 1
 	}
 	// Everything after the last separator is the file name, never a directory.
-	return isTestFileName(normalized[start:])
+	return isTestFileName(filePath[start:])
 }
 
 // testDirSegments are directory names that *are* a test location rather than

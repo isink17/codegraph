@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -182,10 +183,19 @@ func TestTypeScriptModuleCandidatePaths(t *testing.T) {
 	}{
 		{"src/b.ts", "./a", []string{"src/a.ts", "src/a.tsx"}},
 		{"src/lib/b.ts", "../a", []string{"src/a.ts", "src/a.tsx"}},
+		{"src/b.ts", "./a.ts", []string{"src/a.ts"}},
 		{"src/b.ts", "./a.js", []string{"src/a.js"}},
 		{"src/b.ts", "./a.jsx", []string{"src/a.jsx"}},
 		{"src/b.ts", "react", nil},
 		{"src/b.ts", "./dir/", nil},
+		{"src/b.ts", "../../escape", nil},
+		{"src/b.ts", "./data.json", nil},
+	}
+	if runtime.GOOS != "windows" {
+		tests = append(tests, struct {
+			file, spec string
+			want       []string
+		}{`pkg/weird\name.ts`, "./dep", []string{"pkg/dep.ts", "pkg/dep.tsx"}})
 	}
 	for _, tt := range tests {
 		got := typescriptModuleCandidatePaths(tt.file, tt.spec)
@@ -202,7 +212,7 @@ func TestTypeScriptModuleCandidatePaths(t *testing.T) {
 	}
 }
 
-func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
+func TestTypeScriptScopedLookupUsesCanonicalPersistedPath(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -213,7 +223,7 @@ func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetFile, err := insertTestFileLang(ctx, s, repo.ID, `ts\a.ts`, "typescript")
+	targetFile, err := insertTestFileLang(ctx, s, repo.ID, "ts/a.ts", "typescript")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +234,7 @@ func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
 	if _, err := s.db.Exec(`UPDATE symbols SET visibility='public' WHERE id=?`, target); err != nil {
 		t.Fatal(err)
 	}
-	callerFile, err := insertTestFileLang(ctx, s, repo.ID, `ts\b.ts`, "typescript")
+	callerFile, err := insertTestFileLang(ctx, s, repo.ID, "ts/b.ts", "typescript")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +258,7 @@ func TestTypeScriptScopedLookupAcceptsWindowsPersistedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.Valid || got.Int64 != int64(target) || strategy != ResolutionStrategyTypeScriptModuleScope {
-		t.Fatalf("scoped Windows-path resolution=(%v,%d,%q), want target %d/%q", got.Valid, got.Int64, strategy, target, ResolutionStrategyTypeScriptModuleScope)
+		t.Fatalf("scoped canonical-path resolution=(%v,%d,%q), want target %d/%q", got.Valid, got.Int64, strategy, target, ResolutionStrategyTypeScriptModuleScope)
 	}
 }
 
@@ -456,5 +466,87 @@ func TestTypeScriptCandidateEvidenceSurvivesTargetGraphDelete(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("target deletion removed caller candidate evidence: %d", n)
+	}
+}
+
+// TestInvalidateTypeScriptScopeBindingsKeepsDistinctLogicalIdentities pins the
+// reverse candidate lookup to raw `files.path` bytes. `src/x\y.ts` and
+// `src/x/y.ts` are two logical modules; the candidate rows the indexer persists
+// carry the same bytes, so a changed backslash module must clear only the
+// caller that named it. The former CanonicalRelPath call folded the changed
+// path onto the slash sibling on Windows, clearing the wrong caller and leaving
+// the right one bound. On POSIX the old code also passes; a Windows host is
+// where it reverse-fails.
+func TestInvalidateTypeScriptScopeBindingsKeepsDistinctLogicalIdentities(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	target, err := insertTestFileLang(ctx, s, repoID, `src/x\y.ts`, "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foo, err := insertTestSymbolLang(ctx, s, repoID, target, "foo", "y.foo", "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundCaller := func(callerPath, specifier string) int64 {
+		t.Helper()
+		caller, err := insertTestFileLang(ctx, s, repoID, callerPath, "typescript")
+		if err != nil {
+			t.Fatal(err)
+		}
+		src, err := insertTestSymbolLang(ctx, s, repoID, caller, "run", callerPath+".run", "typescript")
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidates := typescriptModuleCandidatePaths(callerPath, specifier)
+		if len(candidates) == 0 {
+			t.Fatalf("typescriptModuleCandidatePaths(%q, %q) produced no candidates", callerPath, specifier)
+		}
+		for _, candidate := range candidates {
+			if _, err := s.db.ExecContext(ctx, `INSERT INTO scope_module_candidate_evidence(repo_id,source_file_id,source_specifier,candidate_path) VALUES(?,?,?,?)`,
+				repoID, caller, specifier, candidate); err != nil {
+				t.Fatal(err)
+			}
+		}
+		edge, err := insertTestEdge(ctx, s, repoID, caller, src, "foo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence='high' WHERE id=?`,
+			foo, ResolutionStrategyTypeScriptModuleScope, edge); err != nil {
+			t.Fatal(err)
+		}
+		return edge
+	}
+	bound := func(edge int64) bool {
+		t.Helper()
+		var dst sql.NullInt64
+		if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges WHERE id=?`, edge).Scan(&dst); err != nil {
+			t.Fatal(err)
+		}
+		return dst.Valid
+	}
+	// The real candidate producer must spell the backslash module the way the
+	// file is stored, or this test would prove nothing about identity.
+	if got := typescriptModuleCandidatePaths("src/main.ts", `./x\y`); len(got) == 0 || got[0] != `src/x\y.ts` {
+		t.Fatalf("typescriptModuleCandidatePaths(src/main.ts, ./x\\y) = %q, want src/x\\y.ts first", got)
+	}
+	backslashCaller := boundCaller("src/main.ts", `./x\y`)
+	slashCaller := boundCaller("src/other.ts", "./x/y")
+
+	if _, err := s.invalidateTypeScriptScopeBindings(ctx, repoID, []string{`src/x\y.ts`}); err != nil {
+		t.Fatal(err)
+	}
+	if bound(backslashCaller) {
+		t.Fatal("caller of the changed backslash module stayed bound")
+	}
+	if !bound(slashCaller) {
+		t.Fatal("caller of the untouched slash sibling was invalidated")
+	}
+	if _, err := s.invalidateTypeScriptScopeBindings(ctx, repoID, []string{"src/x/y.ts"}); err != nil {
+		t.Fatal(err)
+	}
+	if bound(slashCaller) {
+		t.Fatal("caller of the changed slash module stayed bound")
 	}
 }

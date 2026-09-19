@@ -365,3 +365,204 @@ func TestCouplingPageIsTotallyOrdered(t *testing.T) {
 		}
 	}
 }
+
+// TestPageRankPreservesLiteralBackslashFileIdentity pins the pagerank `file`
+// column to the stored `files.path` bytes. `pkg/x\y.go` and `pkg/x/y.go` are
+// two stored files under P23 logical identity. One root symbol links to one
+// leaf in each sibling; the leaves tie on rank, so Path, the first identity
+// comparator, decides ('/' 0x2F sorts before '\' 0x5C). They also tie on
+// qualified name, kind and position, so a folded Path has nothing left to fall
+// through to. symbolIdentities' former filepath.ToSlash folded the backslash
+// spelling onto the sibling on Windows, aliasing the two rows' `file` and
+// leaving their order arbitrary. On POSIX ToSlash is the identity, so the old
+// code passes there.
+func TestPageRankPreservesLiteralBackslashFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	rootFile, err := insertTestFile(ctx, s, repoID, "pkg/root.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backslashFile, err := insertTestFile(ctx, s, repoID, `pkg/x\y.go`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slashFile, err := insertTestFile(ctx, s, repoID, "pkg/x/y.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := insertTestSymbol(ctx, s, repoID, rootFile, "Root", "pkg.Root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Backslash sibling inserted first so a lower row id cannot masquerade as
+	// the path order the assertion below pins.
+	for _, file := range []int64{backslashFile, slashFile} {
+		id, err := insertTestSymbol(ctx, s, repoID, file, "Same", "pkg.Same")
+		if err != nil {
+			t.Fatal(err)
+		}
+		edge, err := insertTestEdge(ctx, s, repoID, rootFile, root, "pkg.Same")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, id, edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows, err := s.PageRank(ctx, repoID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("pagerank rows = %d, want 3: %+v", len(rows), rows)
+	}
+	// The two leaves receive the identical share from the one root, so rank
+	// ties and Path decides; the later comparators tie too, so nothing else
+	// could order a folded Path.
+	if rows[0]["rank"] != rows[1]["rank"] || rows[0]["symbol"] != "pkg.Same" || rows[1]["symbol"] != "pkg.Same" || rows[0]["kind"] != rows[1]["kind"] {
+		t.Fatalf("fixture leaves do not tie before Path; the test proves nothing: %+v", rows[:2])
+	}
+	if rows[0]["file"] != "pkg/x/y.go" || rows[1]["file"] != `pkg/x\y.go` {
+		t.Fatalf("pagerank file identity/order = %q, %q; want stored bytes pkg/x/y.go then pkg/x\\y.go", rows[0]["file"], rows[1]["file"])
+	}
+	// Control: distinct stored identities never alias in output, and the
+	// lower-ranked root is unaffected.
+	if rows[0]["file"] == rows[1]["file"] {
+		t.Fatalf("sibling stored identities aliased: %+v", rows[:2])
+	}
+	if rows[2]["symbol"] != "pkg.Root" || rows[2]["file"] != "pkg/root.go" {
+		t.Fatalf("root row = %+v, want pkg.Root in pkg/root.go", rows[2])
+	}
+}
+
+// TestDetectCyclesPreservesLiteralBackslashFileIdentity proves the file graph
+// is keyed by exact stored path bytes. `pkg/x/y.go` and `pkg/x\y.go` are two
+// distinct files; the exact-identity graph below is acyclic among them, and
+// only the unrelated real/ pair forms a cycle. Folding the siblings into one
+// vertex would manufacture a self-cycle (backslash -> slash) and a two-vertex
+// cycle (pkg/a.go <-> merged vertex) that the stored graph does not contain.
+func TestDetectCyclesPreservesLiteralBackslashFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	files := map[string]int64{}
+	syms := map[string]int64{}
+	for _, path := range []string{"pkg/a.go", "pkg/x/y.go", `pkg/x\y.go`, "real/a.go", "real/b.go"} {
+		fid, err := insertTestFile(ctx, s, repoID, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sid, err := insertTestSymbol(ctx, s, repoID, fid, "F", "q."+path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[path], syms[path] = fid, sid
+	}
+	link := func(src, dst string) {
+		edge, err := insertTestEdge(ctx, s, repoID, files[src], syms[src], "q."+dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, syms[dst], edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Acyclic among exact identities; cyclic only if the siblings alias.
+	link(`pkg/x\y.go`, "pkg/x/y.go") // would become a self-edge
+	link("pkg/a.go", "pkg/x/y.go")   // with the next edge, would become a 2-cycle
+	link(`pkg/x\y.go`, "pkg/a.go")
+	// Positive control: a genuine cycle on unrelated exact paths.
+	link("real/a.go", "real/b.go")
+	link("real/b.go", "real/a.go")
+
+	rows, err := s.DetectCycles(ctx, repoID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the real/ cycle: asserted by length and member set so the test
+	// pins vertex identity, not the closing-node representation of a cycle.
+	if len(rows) != 1 || rows[0]["length"] != 2 {
+		t.Fatalf("cycles = %v, want exactly one cycle of length 2 (real/a.go <-> real/b.go)", rows)
+	}
+	for _, node := range rows[0]["cycle"].([]string) {
+		if node != "real/a.go" && node != "real/b.go" {
+			t.Fatalf("alias-created cycle member %q reported: %v", node, rows[0])
+		}
+	}
+}
+
+// TestCouplingMetricsPreservesLiteralBackslashFileIdentity pins file_a and
+// file_b to the stored `files.path` bytes. `pkg/x/y.go` and `pkg/x\y.go` are
+// two stored files under P23 logical identity, and the SQL groups, counts and
+// orders on exactly those bytes. Each sibling couples to pkg/target.go with a
+// different count (backslash 2, slash 1) and to pkg/other.go with the same
+// count (1), so the fixture pins both count attachment and the stored-byte
+// tie-break ('/' 0x2F sorts before '\' 0x5C). The former filepath.ToSlash ran
+// after GROUP BY and ORDER BY, so on Windows it relabelled the backslash rows
+// as their slash sibling: two groups with different counts shared one label,
+// and the tied rows visibly violated the ASC order the SQL had produced. On
+// POSIX ToSlash is the identity, so the old code passes there.
+func TestCouplingMetricsPreservesLiteralBackslashFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	const backslash, slash, target, other = `pkg/x\y.go`, "pkg/x/y.go", "pkg/target.go", "pkg/other.go"
+	files := map[string]int64{}
+	syms := map[string]int64{}
+	for _, path := range []string{target, other, backslash, slash} {
+		fid, err := insertTestFile(ctx, s, repoID, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sid, err := insertTestSymbol(ctx, s, repoID, fid, "F", "q."+path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[path], syms[path] = fid, sid
+	}
+	link := func(src, dst string) {
+		edge, err := insertTestEdge(ctx, s, repoID, files[src], syms[src], "q."+dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, syms[dst], edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Backslash sibling linked first so a lower row id cannot masquerade as
+	// the path order the assertions below pin.
+	link(backslash, target)
+	link(backslash, target)
+	link(backslash, other)
+	link(slash, target)
+	link(slash, other)
+
+	rows, err := s.CouplingMetrics(ctx, repoID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{
+		{"file_a": backslash, "file_b": target, "edge_count": 2, "coupling": "low"},
+		{"file_a": slash, "file_b": other, "edge_count": 1, "coupling": "low"},
+		{"file_a": slash, "file_b": target, "edge_count": 1, "coupling": "low"},
+		{"file_a": backslash, "file_b": other, "edge_count": 1, "coupling": "low"},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("coupling rows = %d, want %d: %+v", len(rows), len(want), rows)
+	}
+	for i := range want {
+		for _, k := range []string{"file_a", "file_b", "edge_count", "coupling"} {
+			if rows[i][k] != want[i][k] {
+				t.Fatalf("row %d %s = %v, want %v\nrows: %+v", i, k, rows[i][k], want[i][k], rows)
+			}
+		}
+	}
+	// Controls: the two siblings never alias in output, and the rows that tie
+	// on count are in stored-byte order, which a folded label cannot show.
+	if rows[0]["file_a"] == rows[2]["file_a"] || rows[1]["file_a"] == rows[3]["file_a"] {
+		t.Fatalf("sibling stored identities aliased: %+v", rows)
+	}
+	if rows[1]["file_a"].(string) >= rows[3]["file_a"].(string) {
+		t.Fatalf("tied rows not in stored-byte order: %v then %v", rows[1], rows[3])
+	}
+}

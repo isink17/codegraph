@@ -45,7 +45,7 @@ func typescriptModuleCandidatePaths(sourceFile, specifier string) []string {
 	if strings.HasSuffix(specifier, "/") {
 		return nil
 	}
-	base := path.Clean(path.Join(path.Dir(canonicalStoredPath(sourceFile)), specifier))
+	base := path.Clean(path.Join(path.Dir(sourceFile), specifier))
 	if base == "." || base == ".." || strings.HasPrefix(base, "../") {
 		return nil
 	}
@@ -114,7 +114,6 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			if err := rows.Scan(&f.id, &f.path); err != nil {
 				return err
 			}
-			f.path = canonicalStoredPath(f.path)
 			files[f.id] = f
 			byPath[f.path] = f.id
 			return nil
@@ -158,22 +157,15 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			if len(candidatePaths) == 0 {
 				continue
 			}
-			// Batching happens after variant expansion: one logical candidate
-			// can be persisted under several path spellings, so the parameter
-			// count is bounded by the variants, not by the candidates.
-			storedPaths := map[string]struct{}{}
+			// candidatePaths contains distinct logical file identities. Sort them
+			// before batching so SQL argument order stays deterministic.
+			candidates := make([]string, 0, len(candidatePaths))
 			for p := range candidatePaths {
-				for _, variant := range storedPathVariants(p) {
-					storedPaths[variant] = struct{}{}
-				}
+				candidates = append(candidates, p)
 			}
-			variants := make([]string, 0, len(storedPaths))
-			for p := range storedPaths {
-				variants = append(variants, p)
-			}
-			sort.Strings(variants)
-			pathArgs := make([]any, 0, len(variants))
-			for _, p := range variants {
+			sort.Strings(candidates)
+			pathArgs := make([]any, 0, len(candidates))
+			for _, p := range candidates {
 				pathArgs = append(pathArgs, p)
 			}
 			if err := sqliteBatchedQuery(ctx, q,
@@ -184,7 +176,6 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 					if err := rows.Scan(&f.id, &f.path); err != nil {
 						return err
 					}
-					f.path = canonicalStoredPath(f.path)
 					byPath[f.path] = f.id
 					if _, exists := files[f.id]; !exists {
 						files[f.id] = f
@@ -506,8 +497,9 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 	}
 	frontier := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
+	// paths and candidate_path are both logical `files.path` spellings, so the
+	// reverse lookup compares exact bytes; a backslash is filename data.
 	for _, p := range paths {
-		p = CanonicalRelPath(p)
 		if p != "" {
 			seenPaths[p] = struct{}{}
 			frontier = append(frontier, p)
@@ -539,7 +531,7 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 					return nil
 				}
 				seenModules[fileID] = struct{}{}
-				modulePath := canonicalStoredPath(filePath)
+				modulePath := filePath
 				if modulePath != "" {
 					if _, ok := seenPaths[modulePath]; !ok {
 						seenPaths[modulePath] = struct{}{}

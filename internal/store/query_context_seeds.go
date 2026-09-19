@@ -13,10 +13,9 @@ import (
 // an exact symbol ID. It can be ambiguous for overloads in one file; context
 // seed resolution uses SymbolsForIDs instead.
 //
-// File is a repository-relative path in canonical form: forward slashes,
-// whatever the host's separator. Equality of two refs is therefore
-// platform-independent, and callers may build one from either form -- see
-// CanonicalRelPath.
+// File is a logical repository path in the exact spelling `files.path` holds.
+// SymbolsForRefs matches it byte for byte, so a backslash is filename data on
+// every host and callers get back the identity they asked about.
 type SymbolRef struct {
 	File          string
 	QualifiedName string
@@ -49,62 +48,21 @@ func (s *Store) SymbolsForIDs(ctx context.Context, repoID int64, ids []int64) (m
 	return out, nil
 }
 
-// CanonicalRelPath is the logical form of a repository-relative path: forward
-// slashes, no leading "./".
+// CanonicalRelPath adapts limited legacy/internal input to a logical
+// repository path: forward slashes, no leading "./". Under P23, `files.path`
+// is already a logical repository identity, so this is not a persisted-path
+// canonicalizer. On Windows filepath.ToSlash may adapt native separators; on
+// POSIX, backslash remains filename data.
 //
-// The repository has two path forms and both are legitimate. `files.path` is
-// stored in the host's native form, because the indexer derives it with
-// filepath.Rel/filepath.Clean; every value that leaves the store for a client is
-// slash-normalized instead (scanSymbol, RelatedTests, the export paths). On
-// Linux and macOS the two coincide, which is why mixing them was invisible; on
-// Windows `paymentsvc\service.go` and `paymentsvc/service.go` are different map
-// keys for the same file.
-//
-// Use this wherever a relative path is an identity -- a map key, a comparison, a
-// ranking tie-break -- and keep native form only for the SQL predicates that
-// have to match the stored bytes.
-// It deliberately does not trim whitespace and does not Clean: a leading or
-// trailing space is a legal part of a POSIX filename, and trimming one here
-// would silently fail to resolve that file. Argument hygiene belongs at the tool
-// boundary (normalizeRepoRelPath, FileSourceStates), not in the identity
-// function.
+// Use it only where callers already own the surrounding validation contract.
+// It deliberately does not validate containment, absolute paths, traversal, or
+// the full logical-path grammar, and does not trim whitespace or Clean paths.
 func CanonicalRelPath(path string) string {
 	slashed := filepath.ToSlash(path)
 	if slashed == "" || slashed == "." {
 		return ""
 	}
 	return strings.TrimPrefix(slashed, "./")
-}
-
-// canonicalStoredPath interprets either native separator spelling at the
-// compatibility boundary. CanonicalRelPath itself keeps POSIX identity rules;
-// this helper is only for bytes read from persisted files.path values.
-func canonicalStoredPath(path string) string {
-	return CanonicalRelPath(strings.ReplaceAll(path, `\`, `/`))
-}
-
-// storedPathVariants returns slash, current-host native, and Windows-native
-// forms a `files.path` column may hold. This keeps readers compatible with
-// existing databases until canonical persistence is handled by P23.
-func storedPathVariants(canonical string) []string {
-	native := filepath.FromSlash(canonical)
-	windows := strings.ReplaceAll(canonical, "/", `\`)
-	variants := []string{canonical}
-	for _, variant := range []string{native, windows} {
-		if variant != canonical && !containsString(variants, variant) {
-			variants = append(variants, variant)
-		}
-	}
-	return variants
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 // SymbolsForRefs resolves search-result refs to full symbol rows in one query
@@ -123,22 +81,21 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 		return out, nil
 	}
 
-	// Two representations, kept apart deliberately: `wanted` (and the returned
-	// map) is keyed canonically, because that is what a scanned symbol carries and
-	// what every caller compares; the IN list binds the stored forms, because that
-	// is what the column holds.
+	// `wanted` (and the returned map) is keyed by the ref's own path bytes,
+	// which is what `files.path` holds and what the caller looks the result up
+	// with. Rewriting them here would address a different logical file than the
+	// one the ref names -- and would fold `a/x\y.go` onto `a/x/y.go` on
+	// Windows, where those are two distinct indexed files. pathSet contains the
+	// distinct lookup paths, each bound once in the SQL IN list.
 	wanted := make(map[SymbolRef]struct{}, len(refs))
 	pathSet := make(map[string]struct{}, len(refs))
 	nameSet := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
-		canonical := CanonicalRelPath(ref.File)
-		if canonical == "" || ref.QualifiedName == "" {
+		if ref.File == "" || ref.QualifiedName == "" {
 			continue
 		}
-		wanted[SymbolRef{File: canonical, QualifiedName: ref.QualifiedName}] = struct{}{}
-		for _, variant := range storedPathVariants(canonical) {
-			pathSet[variant] = struct{}{}
-		}
+		wanted[ref] = struct{}{}
+		pathSet[ref.File] = struct{}{}
 		nameSet[ref.QualifiedName] = struct{}{}
 	}
 	if len(wanted) == 0 {
@@ -207,9 +164,7 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 				return nil, err
 			}
 			for _, sym := range syms {
-				// scanSymbols already slash-normalizes FilePath; canonicalizing again
-				// costs nothing and keeps this independent of that.
-				ref := SymbolRef{File: CanonicalRelPath(sym.FilePath), QualifiedName: sym.QualifiedName}
+				ref := SymbolRef{File: sym.FilePath, QualifiedName: sym.QualifiedName}
 				if _, ok := wanted[ref]; !ok {
 					continue
 				}

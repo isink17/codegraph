@@ -140,3 +140,63 @@ func TestTraceBothDirectionIsRepeatable(t *testing.T) {
 		t.Fatalf("both trace is not repeatable: first=%+v second=%+v", first, second)
 	}
 }
+
+// TestTracePreservesLiteralBackslashFileIdentity pins the trace `file` column
+// to the stored `files.path` bytes. `pkg/x\y.go` and `pkg/x/y.go` are two
+// stored files under P23 logical identity. The seed lives in the backslash
+// file and reaches one symbol in each sibling; both share a qualified name so
+// depth and symbol tie and the stored path is the public ordering
+// discriminator ('/' sorts before '\'). traceDependencies' former
+// filepath.ToSlash on the seed row and on each BFS row folded the backslash
+// spelling onto the sibling on Windows, aliasing the two rows and flipping
+// their order. On POSIX ToSlash is the identity, so the old code passes there.
+func TestTracePreservesLiteralBackslashFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	backslashFile, err := insertTestFile(ctx, s, repoID, `pkg/x\y.go`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slashFile, err := insertTestFile(ctx, s, repoID, "pkg/x/y.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := insertTestSymbol(ctx, s, repoID, backslashFile, "Root", "pkg.Root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []struct {
+		file int64
+		name string
+	}{{slashFile, "SameSlash"}, {backslashFile, "SameBackslash"}} {
+		id, err := insertTestSymbol(ctx, s, repoID, target.file, target.name, "pkg.Same")
+		if err != nil {
+			t.Fatal(err)
+		}
+		edge, err := insertTestEdge(ctx, s, repoID, backslashFile, root, "pkg.Same")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, id, edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := s.TraceDependenciesResult(ctx, repoID, "pkg.Root", "downstream", 1, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{
+		{"symbol": "pkg.Root", "kind": "function", "name": "Root", "file": `pkg/x\y.go`, "depth": 0, "direction": "downstream"},
+		{"symbol": "pkg.Same", "kind": "function", "name": "SameSlash", "file": "pkg/x/y.go", "depth": 1, "direction": "downstream"},
+		{"symbol": "pkg.Same", "kind": "function", "name": "SameBackslash", "file": `pkg/x\y.go`, "depth": 1, "direction": "downstream"},
+	}
+	if result.Total != 3 || !result.TargetFound || !reflect.DeepEqual(result.Dependencies, want) {
+		t.Fatalf("trace = %+v\nwant dependencies %v", result, want)
+	}
+	// Control: the two depth-1 rows are distinct stored identities and must not
+	// alias in output; the name column proves which stored row each file came from.
+	if result.Dependencies[1]["file"] == result.Dependencies[2]["file"] {
+		t.Fatalf("sibling stored identities aliased: %+v", result.Dependencies[1:])
+	}
+}

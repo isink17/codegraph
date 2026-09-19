@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 )
 
 // architectureTopN is how many entry points / hub symbols the architecture
@@ -46,7 +45,7 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 		JOIN symbols s ON s.id = d.sid
 		JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND d.degree >= (SELECT degree FROM cutoff)
-		ORDER BY d.degree DESC, REPLACE(f.path, char(92), '/') ASC,
+		ORDER BY d.degree DESC, f.path ASC,
 		         s.qualified_name ASC, s.kind ASC, s.signature ASC,
 		         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
 		         s.end_line ASC, s.end_col ASC
@@ -62,8 +61,11 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 		if err := rows.Scan(&qname, &kind, &path, &degree); err != nil {
 			return nil, err
 		}
+		// `file` is the stored `files.path`: a logical repository identity, kept
+		// byte for byte like `top_directories` in the same overview. A backslash
+		// is filename data, so it is not rewritten here.
 		out = append(out, map[string]any{
-			"qualified_name": qname, "kind": kind, "file": filepath.ToSlash(path), countKey: degree,
+			"qualified_name": qname, "kind": kind, "file": path, countKey: degree,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -90,7 +92,7 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 		  AND NOT EXISTS (
 		      SELECT 1 FROM edges e WHERE e.repo_id = ? AND e.`+degreeCol+` = s.id
 		  )
-		ORDER BY REPLACE(f.path, char(92), '/') ASC, s.qualified_name ASC,
+		ORDER BY f.path ASC, s.qualified_name ASC,
 		         s.kind ASC, s.signature ASC, s.stable_key ASC,
 		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 		LIMIT ?
@@ -105,7 +107,7 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"qualified_name": qname, "kind": kind, "file": filepath.ToSlash(path), countKey: 0,
+			"qualified_name": qname, "kind": kind, "file": path, countKey: 0,
 		})
 	}
 	return out, rows.Err()

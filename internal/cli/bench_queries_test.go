@@ -35,6 +35,9 @@ func benchRepo(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("UpsertRepo: %v", err)
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths: %v", err)
+	}
 
 	sym := func(name string) graph.Symbol {
 		return graph.Symbol{

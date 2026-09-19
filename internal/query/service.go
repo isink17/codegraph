@@ -27,19 +27,32 @@ func New(s *store.Store, embedder embedding.Embedder) *Service {
 	return &Service{store: s, embedder: embedder, ctxStore: s}
 }
 
+func (s *Service) requirePaths(ctx context.Context, repoID int64) error {
+	return s.store.RequireCanonicalRepositoryPaths(ctx, repoID)
+}
+
 func (s *Service) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 	return s.store.Stats(ctx, repoID)
 }
 
 func (s *Service) ArchitectureOverview(ctx context.Context, repoID int64) (map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.ArchitectureOverview(ctx, repoID)
 }
 
 func (s *Service) FindSymbol(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.FindSymbol(ctx, repoID, query, limit, offset)
 }
 
 func (s *Service) FindSymbolExact(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.FindSymbolExact(ctx, repoID, query, limit, offset)
 }
 
@@ -48,6 +61,9 @@ func (s *Service) FindSymbolExactResult(ctx context.Context, repoID int64, query
 }
 
 func (s *Service) SearchSymbols(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.SearchSymbols(ctx, repoID, query, limit, offset)
 }
 
@@ -56,6 +72,9 @@ func (s *Service) SearchSymbolsResult(ctx context.Context, repoID int64, query s
 }
 
 func (s *Service) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.FindCallers(ctx, repoID, symbol, symbolID, limit, offset)
 }
 
@@ -64,6 +83,9 @@ func (s *Service) FindCallersResult(ctx context.Context, repoID int64, symbol st
 }
 
 func (s *Service) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.FindCallees(ctx, repoID, symbol, symbolID, limit, offset)
 }
 
@@ -72,10 +94,16 @@ func (s *Service) FindCalleesResult(ctx context.Context, repoID int64, symbol st
 }
 
 func (s *Service) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth, limit, offset int) (map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.ImpactRadius(ctx, repoID, symbols, files, depth, limit, offset)
 }
 
 func (s *Service) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]store.RelatedTest, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.RelatedTests(ctx, repoID, symbol, file, limit, offset)
 }
 
@@ -151,6 +179,9 @@ func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files 
 // SemanticSearch performs hybrid search (vector + FTS) when embeddings are
 // available, falling back to token-overlap search otherwise.
 func (s *Service) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	if !embedding.IsNoop(s.embedder) {
 		hasEmb, _ := s.store.HasEmbeddings(ctx, repoID)
 		if hasEmb {
@@ -165,10 +196,16 @@ func (s *Service) SemanticSearch(ctx context.Context, repoID int64, query string
 }
 
 func (s *Service) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.FindDeadCode(ctx, repoID, limit, offset)
 }
 
 func (s *Service) ListFiles(ctx context.Context, repoID int64, pathFilter string, limit, offset int) ([]map[string]any, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return nil, err
+	}
 	return s.store.ListFiles(ctx, repoID, pathFilter, limit, offset)
 }
 

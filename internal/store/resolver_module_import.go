@@ -90,7 +90,6 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		if err := rows.Scan(&id, &dst, &imported, &sourcePath); err != nil {
 			return 0, blocked, err
 		}
-		sourcePath = canonicalStoredPath(sourcePath)
 		dot := strings.LastIndexByte(dst, '.')
 		if dot <= 0 || dot == len(dst)-1 || dst[:dot] != imported {
 			continue
@@ -169,7 +168,6 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		if err := rows.Scan(&dir, &name, &id, &filePath); err != nil {
 			return 0, blocked, err
 		}
-		filePath = canonicalStoredPath(filePath)
 		if path.Dir(filePath) != dir || IsTestFilePath(filePath) {
 			continue
 		}

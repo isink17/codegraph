@@ -479,14 +479,21 @@ func TestIsTestFilePath(t *testing.T) {
 	}
 }
 
-// TestIsTestFilePathIgnoresPathSeparatorStyle guards the one platform detail
-// that could make the classifier disagree with itself: `files.path` is written
-// with the host separator, so a Windows-style path must classify the same way.
-func TestIsTestFilePathIgnoresPathSeparatorStyle(t *testing.T) {
-	if !IsTestFilePath(`internal\store\store_test.go`) {
-		t.Error(`IsTestFilePath("internal\\store\\store_test.go") = false, want true`)
-	}
-	if !IsTestFilePath(`tests\py\helper.py`) {
-		t.Error(`IsTestFilePath("tests\\py\\helper.py") = false, want true`)
+func TestIsTestFilePathPreservesLogicalPathBytes(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"tests/helper.go", true},
+		{`tests\helper.go`, false},
+		{`test_utils\helper.py`, true},
+		{`pkg\helper_test.go`, true},
+		{" tests/helper.go", false},
+		{"helper_test.go ", false},
+		{"helper_test.go", true},
+	} {
+		if got := IsTestFilePath(tc.path); got != tc.want {
+			t.Errorf("IsTestFilePath(%q) = %t, want %t", tc.path, got, tc.want)
+		}
 	}
 }

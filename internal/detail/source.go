@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/platform"
 )
 
 // Source-window bounds. All of them are line counts, because the indexer stores
@@ -127,12 +129,11 @@ func (r *sourceReader) resolve(rel string) (string, string) {
 	if rel == "" {
 		return "", "no indexed file path for this symbol"
 	}
-	clean := filepath.Clean(filepath.FromSlash(rel))
-	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+	abs, err := platform.NativePath(r.root, rel)
+	if err != nil {
 		return "", "path outside repository root"
 	}
 	root := r.resolvedRoot()
-	abs := filepath.Join(root, clean)
 	// A file that does not exist cannot be resolved; report that directly rather
 	// than as a containment failure.
 	resolved, err := filepath.EvalSymlinks(abs)
@@ -142,8 +143,8 @@ func (r *sourceReader) resolve(rel string) (string, string) {
 		}
 		return "", "file unreadable"
 	}
-	rootWithSep := strings.TrimSuffix(root, string(filepath.Separator)) + string(filepath.Separator)
-	if !strings.HasPrefix(resolved, rootWithSep) {
+	contained, err := filepath.Rel(root, resolved)
+	if err != nil || contained == ".." || strings.HasPrefix(contained, ".."+string(filepath.Separator)) {
 		return "", "path outside repository root"
 	}
 	return resolved, ""

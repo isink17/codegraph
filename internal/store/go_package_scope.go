@@ -111,11 +111,14 @@ func goPackageNameOf(qualifiedName string) string {
 }
 
 // storedPathDir returns the directory prefix of a stored path, including the
-// trailing separator, or "" for a repository-root file. It is the Go twin of
-// sqlStoredPathDir and must stay byte-identical to it: both accept '/' and '\'
-// so a Windows-written row is treated the same on either side.
+// trailing '/', or "" for a repository-root file. It is the Go twin of
+// sqlStoredPathDir and must stay byte-identical to it.
+//
+// files.path is the logical repository identity (P23): '/' is its only
+// separator and a '\' is filename data, so `b/x\y.go` lives in `b/` next to
+// `b/z.go`, not in a directory of its own.
 func storedPathDir(filePath string) string {
-	if i := strings.LastIndexAny(filePath, `/\`); i >= 0 {
+	if i := strings.LastIndexByte(filePath, '/'); i >= 0 {
 		return filePath[:i+1]
 	}
 	return ""
@@ -125,7 +128,7 @@ func storedPathDir(filePath string) string {
 //
 // The key is `<directory prefix><package name>`. Concatenation is unambiguous
 // without a separator because a non-empty directory prefix always ends in '/'
-// or '\' and a Go package name never contains one.
+// and a Go package name never contains one.
 func goPackageScopeKey(filePath, qualifiedName string) string {
 	pkg := goPackageNameOf(qualifiedName)
 	if pkg == "" {
@@ -274,11 +277,10 @@ func sqlNotBareName(expr string) string {
 }
 
 // sqlStoredPathDir renders storedPathDir. rtrim(X, Y) strips trailing characters
-// that occur in Y, and Y here is exactly X's non-separator characters, so what
-// survives is the prefix through the last '/' or '\' -- or ” when the path has
-// neither.
+// that occur in Y, and Y here is exactly X's non-'/' characters, so what
+// survives is the prefix through the last '/' -- or ” when the path has none.
 func sqlStoredPathDir(expr string) string {
-	return `rtrim(` + expr + `, replace(replace(` + expr + `, '/', ''), '\', ''))`
+	return `rtrim(` + expr + `, replace(` + expr + `, '/', ''))`
 }
 
 // sqlGoHasPackageName renders goPackageNameOf's non-empty test. SQLite's instr

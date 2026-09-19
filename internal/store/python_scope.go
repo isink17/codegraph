@@ -58,7 +58,7 @@ func pythonModuleCandidatePaths(sourceFile, specifier string) []string {
 		}
 	}
 	if dots > 0 {
-		dir := pythonParentDir(canonicalStoredPath(sourceFile))
+		dir := pythonParentDir(sourceFile)
 		// `.x` is the importing file's own package; each further dot climbs one.
 		for i := 1; i < dots; i++ {
 			if dir == "" {
@@ -730,7 +730,7 @@ func pythonScopeFilePaths(ctx context.Context, q execQuerier, repoID int64, ids 
 		if err := scan(&id, &p); err != nil {
 			return err
 		}
-		out[id] = canonicalStoredPath(p)
+		out[id] = p
 		return nil
 	})
 	return out, err
@@ -839,21 +839,15 @@ func pythonScopeFileIDsByPath(ctx context.Context, q execQuerier, repoID int64, 
 	if len(canonical) == 0 {
 		return nil, nil
 	}
-	variants := make(map[string]string, len(canonical)*2)
+	lookup := make([]string, 0, len(canonical))
 	for p := range canonical {
-		for _, variant := range storedPathVariants(p) {
-			variants[variant] = p
-		}
-	}
-	lookup := make([]string, 0, len(variants))
-	for variant := range variants {
-		lookup = append(lookup, variant)
+		lookup = append(lookup, p)
 	}
 	sort.Strings(lookup)
 	out := make(map[string]int64, len(canonical))
 	items := make([]any, 0, len(lookup))
-	for _, variant := range lookup {
-		items = append(items, variant)
+	for _, path := range lookup {
+		items = append(items, path)
 	}
 	err := sqliteBatchedQuery(ctx, q,
 		`SELECT path,id FROM files WHERE repo_id=? AND is_deleted=0 AND language='python'`, ` AND path IN (%s)`,
@@ -864,7 +858,7 @@ func pythonScopeFileIDsByPath(ctx context.Context, q execQuerier, repoID int64, 
 			if err := rows.Scan(&p, &id); err != nil {
 				return err
 			}
-			out[variants[p]] = id
+			out[p] = id
 			return nil
 		})
 	return out, err
@@ -931,8 +925,9 @@ func (s *Store) invalidatePythonScopeBindings(ctx context.Context, repoID int64,
 	}
 	canonical := make([]string, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
+	// paths and candidate_path are both logical `files.path` spellings, so the
+	// reverse lookup compares exact bytes; a backslash is filename data.
 	for _, p := range paths {
-		p = CanonicalRelPath(p)
 		if p == "" {
 			continue
 		}

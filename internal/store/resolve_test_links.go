@@ -346,7 +346,7 @@ func recordTestLinkSiblings(ctx context.Context, tx *sql.Tx, repoID int64) error
 		if err := rows.Scan(&id, &filePath); err != nil {
 			return err
 		}
-		sibling := canonicalStoredPath(productionSiblingPath(filePath))
+		sibling := productionSiblingPath(filePath)
 		if sibling == "" {
 			continue
 		}
@@ -393,28 +393,18 @@ func recordTestLinkSiblings(ctx context.Context, tx *sql.Tx, repoID int64) error
 func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []string) (map[string]int64, error) {
 	out := make(map[string]int64, len(paths))
 	ambiguous := make(map[string]bool, len(paths))
-	canonical := make([]string, 0, len(paths))
-	for _, p := range paths {
-		if p = canonicalStoredPath(p); p != "" {
-			canonical = append(canonical, p)
-		}
-	}
-	unique := dedupeNonEmpty(canonical)
+	unique := dedupeNonEmpty(paths)
 	for start := 0; start < len(unique); start += testLinkResolveChunkSize {
 		end := min(start+testLinkResolveChunkSize, len(unique))
 		canonicalChunk := unique[start:end]
-		stored := make([]string, 0, len(canonicalChunk)*3)
-		for _, p := range canonicalChunk {
-			stored = append(stored, storedPathVariants(p)...)
-		}
-		args := make([]any, 0, len(stored)+1)
+		args := make([]any, 0, len(canonicalChunk)+1)
 		args = append(args, repoID)
-		for _, p := range stored {
+		for _, p := range canonicalChunk {
 			args = append(args, p)
 		}
 		rows, err := tx.QueryContext(ctx, `
 			SELECT id, path FROM files
-			WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+sqlPlaceholders(len(stored))+`)
+			WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+sqlPlaceholders(len(canonicalChunk))+`)
 		`, args...)
 		if err != nil {
 			return nil, err
@@ -426,7 +416,7 @@ func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []st
 				rows.Close()
 				return nil, err
 			}
-			key := canonicalStoredPath(p)
+			key := p
 			if ambiguous[key] {
 				continue
 			}
@@ -460,7 +450,7 @@ func liveFileIDsByPath(ctx context.Context, tx *sql.Tx, repoID int64, paths []st
 // (Java/Kotlin/C#/Swift FooTest, JS/TS foo.test.ts, ...) are deliberately not
 // inverted here until their producers mint matchable keys.
 func productionSiblingPath(testPath string) string {
-	idx := strings.LastIndexAny(testPath, `/\`)
+	idx := strings.LastIndexByte(testPath, '/')
 	base := testPath[idx+1:]
 	extension := strings.ToLower(path.Ext(base))
 	stem := base[:len(base)-len(path.Ext(base))]

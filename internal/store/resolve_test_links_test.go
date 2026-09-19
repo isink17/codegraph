@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 )
@@ -34,6 +35,9 @@ func newTestLinkFixture(t *testing.T) *testLinkFixture {
 	repo, err := s.UpsertRepo(ctx, t.TempDir())
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
 	}
 	return &testLinkFixture{t: t, ctx: ctx, store: s, repoID: repo.ID}
 }
@@ -659,6 +663,7 @@ func TestProductionSiblingPath(t *testing.T) {
 		{"internal/store/store_test.go", "internal/store/store.go"},
 		{"store_test.go", "store.go"},
 		{`internal\store\store_test.go`, `internal\store\store.go`},
+		{`test_utils\helper.py`, `utils\helper.py`},
 		{"pkg/test_utils.py", "pkg/utils.py"},
 		{"pkg/utils_test.py", "pkg/utils.py"},
 		{"pkg/utils.py", ""},        // not a test file
@@ -679,16 +684,38 @@ func TestProductionSiblingPath(t *testing.T) {
 	}
 }
 
-func TestResolveTestLinksSiblingMatchesStoredSeparatorVariants(t *testing.T) {
+func TestLiveFileIDsByPathPreservesLogicalPathIdentity(t *testing.T) {
+	f := newTestLinkFixture(t)
+	slashID := f.file("utils/helper.py", "python")
+	backslashID := f.file(`utils\helper.py`, "python")
+	spaceID := f.file(" utils.py", "python")
+	deletedID := f.file("deleted.py", "python")
+	f.markFileDeleted(deletedID)
+
+	tx, err := f.store.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	got, err := liveFileIDsByPath(f.ctx, tx, f.repoID, []string{
+		"", "utils/helper.py", `utils\helper.py`, `utils\helper.py`, " utils.py", "deleted.py",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int64{"utils/helper.py": slashID, `utils\helper.py`: backslashID, " utils.py": spaceID}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("liveFileIDsByPath() = %#v, want %#v", got, want)
+	}
+}
+
+func TestResolveTestLinksSiblingMatchesCanonicalStoredPath(t *testing.T) {
 	cases := []struct {
 		name, testPath, targetPath, language string
 	}{
-		{"go slash", "a/shared_test.go", "a/shared.go", "go"},
-		{"go native", `a\shared_test.go`, `a\shared.go`, "go"},
-		{"go mixed", `a\shared_test.go`, "a/shared.go", "go"},
-		{"python slash", "pkg/test_utils.py", "pkg/utils.py", "python"},
-		{"python native", `pkg\test_utils.py`, `pkg\utils.py`, "python"},
-		{"python mixed", `pkg\test_utils.py`, "pkg/utils.py", "python"},
+		{"go", "a/shared_test.go", "a/shared.go", "go"},
+		{"python", "pkg/test_utils.py", "pkg/utils.py", "python"},
+		{"python_backslash_data", `test_utils\helper.py`, `utils\helper.py`, "python"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -17,15 +17,15 @@ type rustBudgetFixture struct {
 	edgeByCrate map[string]int64
 	// wantTarget maps that edge to the symbol it must bind.
 	wantTarget map[int64]int64
-	// ambiguous is the edge whose module declaration matches files in two
-	// different crates, and which therefore must stay unresolved.
+	// ambiguous is the edge whose module declaration matches two files,
+	// util.rs and util/mod.rs, and which therefore must stay unresolved.
 	ambiguous int64
 }
 
 // rustBudgetCrateCount is the smallest crate count that is still load-bearing:
 // one root past the point where a single unbatched predicate would exceed the
 // portable variable contract. At rustCrateRootPredicateParams parameters per
-// root that is 200 crates, which also spans more than one rustRootBatchSize
+// root that is 334 crates, which also spans more than one rustRootBatchSize
 // batch (150), so the cross-batch guarantees stay under test. The tests below
 // assert both properties, so shrinking this constant fails loudly rather than
 // quietly proving nothing.
@@ -78,7 +78,7 @@ func buildRustBudgetFixture(t *testing.T, s *Store, repoID int64) *rustBudgetFix
 		f.roots[root] = struct{}{}
 		lib := addFile(root, "crate")
 		member := addFile(crate+"/m.rs", "crate::m")
-		declare(lib, "crate", "m", crate+"/m")
+		declare(lib, "crate", "m", "m")
 		target := publicFn(member, "helper", "crate::m::helper")
 		src := publicFn(lib, "run", "crate::run")
 		edge, err := insertTestEdge(ctx, s, repoID, lib, src, "crate::m::helper")
@@ -87,19 +87,19 @@ func buildRustBudgetFixture(t *testing.T, s *Store, repoID int64) *rustBudgetFix
 		}
 		f.edgeByCrate[root] = edge
 		f.wantTarget[edge] = target
-		// The ambiguity: `shared/util` suffix-matches a file in the first crate
-		// and a file in the last one, so no single membership is proven. Roots
-		// are batched in sorted order, so the first and last crate land in
-		// different root batches -- asserted in the test that depends on it.
-		if i == 0 || i == rustBudgetCrateCount-1 {
-			util := addFile(crate+"/shared/util.rs", "crate::util")
-			publicFn(util, "shared", "crate::util::shared")
-			if i == 0 {
-				declare(lib, "crate", "util", "shared/util")
-				f.ambiguous, err = insertTestEdge(ctx, s, repoID, lib, src, "crate::util::shared")
-				if err != nil {
-					t.Fatal(err)
-				}
+		// The ambiguity: the first crate's `mod util;` has both candidate
+		// spellings on disk, util.rs and util/mod.rs, so no single membership is
+		// proven. Roots are batched in sorted order and the fixture spans more
+		// than one batch -- asserted in the test that depends on it.
+		if i == 0 {
+			for _, p := range []string{crate + "/util.rs", crate + "/util/mod.rs"} {
+				util := addFile(p, "crate::util")
+				publicFn(util, "shared", "crate::util::shared")
+			}
+			declare(lib, "crate", "util", "util")
+			f.ambiguous, err = insertTestEdge(ctx, s, repoID, lib, src, "crate::util::shared")
+			if err != nil {
+				t.Fatal(err)
 			}
 		}
 	}
@@ -132,7 +132,7 @@ func TestRustScopeRootFanOutStaysInVariableBudget(t *testing.T) {
 	if guard.maxArgs > sqliteInClauseBatchSize {
 		t.Fatalf("max bound args = %d, want <= the working ceiling %d", guard.maxArgs, sqliteInClauseBatchSize)
 	}
-	// Two files per crate, plus the two ambiguous `shared/util` files.
+	// Two files per crate, plus the two ambiguous `util` candidates.
 	if want := rustBudgetCrateCount*2 + 2; len(scoped) != want {
 		t.Fatalf("scoped %d files, want %d", len(scoped), want)
 	}
@@ -149,7 +149,7 @@ func TestRustScopeRootFanOutStaysInVariableBudget(t *testing.T) {
 
 // TestRustScopeResolvesEveryCrateAcrossRootBatches proves batching is transport
 // only: every crate resolves its own member, no crate binds another's, and the
-// cross-batch ambiguity stays unresolved.
+// ambiguous declaration stays unresolved.
 func TestRustScopeResolvesEveryCrateAcrossRootBatches(t *testing.T) {
 	ctx := context.Background()
 	s, repo := openBudgetStore(t)
@@ -178,7 +178,7 @@ func TestRustScopeResolvesEveryCrateAcrossRootBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ambiguous != 0 {
-		t.Fatalf("cross-batch ambiguity bound to %d, want unresolved", ambiguous)
+		t.Fatalf("ambiguous declaration bound to %d, want unresolved", ambiguous)
 	}
 }
 
@@ -436,15 +436,14 @@ func TestNameInvalidationKeepsUnaffectedRustCrates(t *testing.T) {
 }
 
 // assertRustAmbiguityCandidatesSplitBatches proves the fixture still spans more
-// than one root batch, and specifically that its two competing candidates land
-// in different ones. Roots are batched in sorted order, so the first and last
+// than one root batch. Roots are batched in sorted order, so the first and last
 // crate must not share a batch -- otherwise every test that says "EveryBatch"
 // silently degrades into a single-batch test.
 func assertRustAmbiguityCandidatesSplitBatches(t *testing.T, batchSize int) {
 	t.Helper()
 	first, last := 0, rustBudgetCrateCount-1
 	if first/batchSize == last/batchSize {
-		t.Fatalf("crates %d and %d share root batch %d of size %d; the ambiguity is no longer cross-batch",
+		t.Fatalf("crates %d and %d share root batch %d of size %d; the fixture is no longer multi-batch",
 			first, last, first/batchSize, batchSize)
 	}
 }

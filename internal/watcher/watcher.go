@@ -16,6 +16,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/indexer"
+	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -341,7 +342,11 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				w.eventsIgnored.Add(1)
 				continue
 			}
-			rel = filepath.Clean(rel)
+			rel, err = platform.NativeRelativeToLogical(rel)
+			if err != nil {
+				w.eventsIgnored.Add(1)
+				continue
+			}
 			if !isRelPathWithinRepo(rel) {
 				w.eventsIgnored.Add(1)
 				continue

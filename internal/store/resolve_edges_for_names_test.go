@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -117,6 +118,96 @@ func TestResolveEdgesForNames_QualifiedSuffix(t *testing.T) {
 	}
 	if !gotDst.Valid || gotDst.Int64 != dstID {
 		t.Fatalf("dst_symbol_id = (%v,%d), want (%v,%d)", gotDst.Valid, gotDst.Int64, true, dstID)
+	}
+}
+
+func TestResolveEdgesForPathsUsesCanonicalLogicalPaths(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "graph.sqlite"), OpenOptions{PerformanceProfile: "fast"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	otherRepo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo(other) error = %v", err)
+	}
+
+	targetFile, err := insertTestFile(ctx, s, repo.ID, "src/a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := insertTestSymbol(ctx, s, repo.ID, targetFile, "Target", "pkg.Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerB, err := insertTestFile(ctx, s, repo.ID, "src/b.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerC, err := insertTestFile(ctx, s, repo.ID, "src/c.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcB, err := insertTestSymbol(ctx, s, repo.ID, callerB, "UseB", "pkg.UseB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcC, err := insertTestSymbol(ctx, s, repo.ID, callerC, "UseC", "pkg.UseC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeB, err := insertTestEdge(ctx, s, repo.ID, callerB, srcB, "Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeC, err := insertTestEdge(ctx, s, repo.ID, callerC, srcC, "Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	otherFile, err := insertTestFile(ctx, s, otherRepo.ID, "src/b.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherSrc, err := insertTestSymbol(ctx, s, otherRepo.ID, otherFile, "UseOther", "pkg.UseOther")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherEdge, err := insertTestEdge(ctx, s, otherRepo.ID, otherFile, otherSrc, "Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	paths := []string{"src/b.go", "missing.go", "src/c.go", "src/b.go"}
+	for i := 0; len(paths) <= sqliteBatchSize(1, 1); i++ {
+		paths = append(paths, fmt.Sprintf("missing/%04d.go", i))
+	}
+	if err := s.ResolveEdgesForPaths(ctx, repo.ID, paths); err != nil {
+		t.Fatalf("ResolveEdgesForPaths() error = %v", err)
+	}
+
+	for _, edgeID := range []int64{edgeB, edgeC} {
+		var got sql.NullInt64
+		var strategy string
+		if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id, resolution_strategy FROM edges WHERE id = ?`, edgeID).Scan(&got, &strategy); err != nil {
+			t.Fatal(err)
+		}
+		if !got.Valid || got.Int64 != target || strategy != ResolutionStrategyGoPackageScope {
+			t.Fatalf("edge %d resolution = (%v, %d, %q), want (%v, %d, %q)", edgeID, got.Valid, got.Int64, strategy, true, target, ResolutionStrategyGoPackageScope)
+		}
+	}
+	var other sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges WHERE id = ?`, otherEdge).Scan(&other); err != nil {
+		t.Fatal(err)
+	}
+	if other.Valid {
+		t.Fatalf("other repo edge resolved to %d, want unresolved", other.Int64)
 	}
 }
 

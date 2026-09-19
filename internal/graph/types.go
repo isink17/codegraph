@@ -184,8 +184,13 @@ type ScopeImport struct {
 }
 
 type RustModule struct {
-	Name         string
-	OwnerModule  string
+	Name        string
+	OwnerModule string
+	// ExternalPath is, for an out-of-line `mod name;`, the candidate source stem
+	// relative to the declaring file's directory with '/' as the separator
+	// ("name" under lib.rs, main.rs or mod.rs; "<file stem>/name" otherwise).
+	// The store joins it with the declaring file's logical repository path and
+	// matches "<stem>.rs" or "<stem>/mod.rs" exactly. Empty for inline modules.
 	ExternalPath string
 	Inline       bool
 	Visibility   string

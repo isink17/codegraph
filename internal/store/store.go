@@ -26,6 +26,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
+	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
@@ -77,6 +78,50 @@ const (
 	// 150*6=900 variables, staying under sqliteDefaultMaxVariables.
 	sqliteSymbolFTSValuesBatchRows = 150
 )
+
+const canonicalRepositoryPathsSettingKey = "format.canonical_repository_paths.v1"
+
+var ErrRepositoryPathFormatRebuild = errors.New("repository index uses an older path format; remove the index database and re-index required")
+
+func canonicalRepositoryPathsKey(repoID int64) string {
+	return canonicalRepositoryPathsSettingKey + "." + strconv.FormatInt(repoID, 10)
+}
+
+// RequireCanonicalRepositoryPaths is the read-only format gate for all public
+// path-sensitive operations. It never blesses or changes an older database.
+func (s *Store) RequireCanonicalRepositoryPaths(ctx context.Context, repoID int64) error {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, canonicalRepositoryPathsKey(repoID)).Scan(&value)
+	if err == nil && value == "logical-slash-v1" {
+		return nil
+	}
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		return ErrRepositoryPathFormatRebuild
+	}
+	return err
+}
+
+// EnsureCanonicalRepositoryPaths refuses populated indexes whose path identity
+// predates P23. A marker is created only for an empty repository during a full
+// index, before any canonical rows are written.
+func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64, fullIndex bool) error {
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err == nil {
+		return nil
+	} else if !errors.Is(err, ErrRepositoryPathFormatRebuild) {
+		return err
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM files WHERE repo_id=?) + (SELECT COUNT(*) FROM dirty_files WHERE repo_id=?)`, repoID, repoID).Scan(&n); err != nil {
+		return err
+	}
+	if n != 0 || !fullIndex {
+		return ErrRepositoryPathFormatRebuild
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, 'logical-slash-v1') ON CONFLICT(key) DO NOTHING`, canonicalRepositoryPathsKey(repoID)); err != nil {
+		return err
+	}
+	return s.RequireCanonicalRepositoryPaths(ctx, repoID)
+}
 
 type Store struct {
 	db          *sql.DB
@@ -3378,8 +3423,8 @@ func (s *Store) DeletedPathsInScan(ctx context.Context, repoID, scanID int64) ([
 		if err := rows.Scan(&p); err != nil {
 			return nil, err
 		}
-		if canonical := CanonicalRelPath(strings.ReplaceAll(p, `\`, `/`)); canonical != "" {
-			out = append(out, canonical)
+		if p != "" {
+			out = append(out, p)
 		}
 	}
 	return out, rows.Err()
@@ -4708,12 +4753,23 @@ func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []stri
 	if len(paths) == 0 {
 		return false, nil
 	}
-	stored := make([]string, 0, len(paths)*3)
+	canonical := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		stored = append(stored, storedPathVariants(CanonicalRelPath(path))...)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		canonical = append(canonical, path)
+	}
+	if len(canonical) == 0 {
+		return false, nil
 	}
 	var changed bool
-	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(stored), true, func(rows *sql.Rows) error {
+	err := sqliteBatchedQuery(ctx, s.db, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND path IN (`, "%s))", []any{repoID}, stringSliceToAny(canonical), true, func(rows *sql.Rows) error {
 		var batchChanged bool
 		if err := rows.Scan(&batchChanged); err != nil {
 			return err
@@ -5257,7 +5313,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	uniquePaths := make([]string, 0, len(paths))
 	seenPaths := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		scopePath := CanonicalRelPath(path)
+		scopePath := path
 		if scopePath == "" {
 			continue
 		}
@@ -5282,20 +5338,17 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	const chunkSize = 400
 	fileIDs := make([]int64, 0, len(uniquePaths))
 	wantedPaths := make(map[string]struct{}, len(uniquePaths))
-	storedPaths := make([]string, 0, len(uniquePaths)*3)
 	for _, filePath := range uniquePaths {
-		canonical := filePath
-		wantedPaths[canonical] = struct{}{}
-		storedPaths = append(storedPaths, storedPathVariants(canonical)...)
+		wantedPaths[filePath] = struct{}{}
 	}
 	seenFileIDs := make(map[int64]struct{}, len(uniquePaths))
 	// Source language per file is read once here (no per-edge lookup) and carried
 	// into resolveEdgeTargets, which applies the shared language gate.
 	languageByFileID := make(map[int64]string, len(uniquePaths))
 	pathBatch := sqliteBatchSize(1, 1)
-	for start := 0; start < len(storedPaths); start += pathBatch {
-		end := min(start+pathBatch, len(storedPaths))
-		chunk := storedPaths[start:end]
+	for start := 0; start < len(uniquePaths); start += pathBatch {
+		end := min(start+pathBatch, len(uniquePaths))
+		chunk := uniquePaths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `SELECT id, path, language FROM files WHERE repo_id = ? AND path IN (` + placeholders + `)`
 		args := make([]any, 0, len(chunk)+1)
@@ -5315,7 +5368,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 				_ = rows.Close()
 				return err
 			}
-			if _, ok := wantedPaths[canonicalStoredPath(storedPath)]; !ok {
+			if _, ok := wantedPaths[storedPath]; !ok {
 				continue
 			}
 			if _, ok := seenFileIDs[id]; ok {
@@ -7190,8 +7243,13 @@ func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, sym
 		}
 	}
 	for _, file := range files {
-		file = normalizeRepoRelPath(file)
-		if file == "" {
+		// File seeds are public request spelling (MCP `files`, CLI --file),
+		// translated once here exactly as RelatedTests does; the lookup binds
+		// the logical identity byte-exact. An invalid spelling addresses no
+		// row and is missing under the requested name.
+		logical, err := platform.PublicRepositoryPath(file)
+		if err != nil {
+			presence.Missing = append(presence.Missing, file)
 			continue
 		}
 		rows, err := s.db.QueryContext(ctx, `
@@ -7199,7 +7257,7 @@ func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, sym
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
 			WHERE s.repo_id = ? AND f.path = ?
-		`, repoID, file)
+		`, repoID, logical)
 		if err != nil {
 			return nil, nil, ImpactSeedPresence{}, 0, 0, err
 		}
@@ -7402,6 +7460,16 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 }
 
 func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]RelatedTest, error) {
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
+		return nil, err
+	}
+	if file != "" {
+		var err error
+		file, err = platform.PublicRepositoryPath(file)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return s.relatedTests(ctx, repoID, symbol, file, limit, offset, 0, false)
 }
 
@@ -7409,19 +7477,8 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 	var rows *sql.Rows
 	var err error
 	if file != "" {
-		file = normalizeRepoRelPath(file)
-		canonical := CanonicalRelPath(file)
-		if canonical == "" {
-			return []RelatedTest{}, nil
-		}
-		variants := storedPathVariants(canonical)
 		var targetFileID int64
-		args := make([]any, 0, len(variants)+1)
-		args = append(args, repoID)
-		for _, variant := range variants {
-			args = append(args, variant)
-		}
-		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path IN (`+sqlPlaceholders(len(variants))+`) ORDER BY id`, args...)
+		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? ORDER BY id`, repoID, file)
 		if err != nil {
 			return nil, err
 		}
@@ -7487,9 +7544,8 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 				)
 				GROUP BY path, symbol
 			)
-			-- Canonical-form tie-break: which tests survive LIMIT must not depend on
-			-- whether the index was written on Windows or on Linux.
-			ORDER BY score DESC, REPLACE(path, '\', '/'), symbol
+			-- files.path is already the logical repository identity.
+			ORDER BY score DESC, path ASC, symbol
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetFileID, repoID, targetFileID, repoID, targetFileID, safeLimit(limit), safeOffset(offset))
@@ -7533,7 +7589,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 				)
 				GROUP BY path, symbol
 			)
-			ORDER BY score DESC, REPLACE(path, '\', '/'), symbol
+			ORDER BY score DESC, path ASC, symbol
 			LIMIT ?
 			OFFSET ?
 		`, repoID, targetID, repoID, targetID, safeLimit(limit), safeOffset(offset))
@@ -7548,7 +7604,6 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 		if err := rows.Scan(&item.File, &item.Symbol, &item.Reason, &item.Score); err != nil {
 			return nil, err
 		}
-		item.File = canonicalStoredPath(item.File)
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -7578,12 +7633,9 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		-- boundary would fall in an arbitrary place. The grouping keys are
 		-- already computed, so using them as the tie-break is free.
 		--
-		-- The tie-break sorts the canonical form of the path, not the stored one.
-		-- files.path is native, and backslash (0x5C) and slash (0x2F) sort either side of
-		-- the digits and capitals, so ordering the raw column would put a different
-		-- 30 rows through LIMIT on Windows than on Linux for the same repository --
-		-- a different seed set, and so a different ranked context.
-		ORDER BY score DESC, REPLACE(f.path, '\', '/') ASC, s.qualified_name ASC, s.kind ASC,
+		-- files.path is already the logical repository identity, so it is the
+		-- deterministic path tie-break.
+		ORDER BY score DESC, f.path ASC, s.qualified_name ASC, s.kind ASC,
 		         s.container_name ASC, s.signature ASC, s.stable_key ASC, s.start_line ASC, s.start_col ASC,
 		         s.end_line ASC, s.end_col ASC
 		LIMIT ?
@@ -7616,14 +7668,10 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		}
 		out = append(out, map[string]any{
 			"symbol_id": item.id,
-			// Canonical (slash) form, like every other path this store hands out.
-			// `files.path` is native, so on Windows the raw column value would make
-			// this producer's `file` disagree with the `file` of every symbol-shaped
-			// result -- and with the key any consumer joins them on.
-			"file":   CanonicalRelPath(item.file),
-			"symbol": item.symbol,
-			"score":  item.score,
-			"why":    []string{"token_overlap"},
+			"file":      item.file,
+			"symbol":    item.symbol,
+			"score":     item.score,
+			"why":       []string{"token_overlap"},
 		})
 	}
 	return out, rows.Err()
@@ -7901,7 +7949,6 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 			value := dstID.Int64
 			edge.DstSymbolID = &value
 		}
-		edge.FilePath = filepath.ToSlash(edge.FilePath)
 		out = append(out, edge)
 		evidence = append(evidence, item)
 	}
@@ -7912,6 +7959,9 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 }
 
 func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason string) error {
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO dirty_files(repo_id, path, reason, queued_at)
 		VALUES(?, ?, ?, ?)
@@ -8500,8 +8550,9 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 	); err != nil {
 		return graph.Symbol{}, err
 	}
-	// Normalize paths in outputs to be deterministic across platforms and call sites.
-	sym.FilePath = filepath.ToSlash(sym.FilePath)
+	// FilePath is `files.path`: a logical repository identity that callers use
+	// to address the row again (SymbolsForRefs keys its result by it), so the
+	// stored bytes are returned unchanged; a backslash is filename data.
 	return sym, nil
 }
 
@@ -8589,7 +8640,7 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 			})
 			results = append(results, bfsEntry{
 				id: seed.id, qualifiedName: seed.qualifiedName,
-				kind: seed.kind, name: seed.name, file: filepath.ToSlash(seed.file), depth: 0, dir: dir,
+				kind: seed.kind, name: seed.name, file: seed.file, depth: 0, dir: dir,
 			})
 		}
 
@@ -8621,7 +8672,6 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 					rows.Close()
 					return err
 				}
-				si.file = filepath.ToSlash(si.file)
 				if visited[si.id] {
 					continue
 				}
@@ -8955,7 +9005,6 @@ func (s *Store) lookupSymbolIdentity(ctx context.Context, repoID, symbolID int64
 	if err != nil {
 		return symbolIdentity{}, false, err
 	}
-	identity.Path = filepath.ToSlash(identity.Path)
 	return identity, true, nil
 }
 
@@ -9010,7 +9059,6 @@ func (s *Store) symbolIdentities(ctx context.Context, ids []int64) (map[int64]sy
 				_ = rows.Close()
 				return nil, err
 			}
-			si.Path = filepath.ToSlash(si.Path)
 			out[id] = si
 		}
 		if err := rows.Err(); err != nil {
@@ -9038,11 +9086,9 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f1.id != f2.id
 		GROUP BY f1.path, f2.path
 		-- The tie-break is the pair of grouping keys, which is unique per row, so
-		-- the order is total. It sorts the *stored* form rather than the
-		-- canonical one: REPLACE() here cost ~6% of this query on a 100k-symbol
-		-- graph, and the two forms differ only on Windows, where files.path is
-		-- native. P23 makes files.path canonical and removes the distinction
-		-- globally; paying for it per row in the meantime is not worth it.
+		-- the order is total. It sorts files.path bytes as stored: under P23
+		-- files.path is already the logical '/'-separated identity on every
+		-- host, so there is no canonical form to REPLACE() into.
 		-- Edge counts tie constantly -- most coupled pairs share one or two
 		-- edges -- so score alone decides neither the order of the page nor its
 		-- membership. The grouping keys are already computed and are a total
@@ -9068,10 +9114,11 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 			coupling = "medium"
 		}
 		cOut = append(cOut, map[string]any{
-			// Slash form, like every other path this store hands out -- and like
-			// PageRank's `file`, so the three analyses of one tool agree.
-			"file_a":     filepath.ToSlash(fileA),
-			"file_b":     filepath.ToSlash(fileB),
+			// Exact stored files.path bytes: the SQL grouped and ordered on
+			// them, so rewriting here would let two distinct groups share one
+			// label and detach the visible order from the visible values.
+			"file_a":     fileA,
+			"file_b":     fileB,
 			"edge_count": edgeCount,
 			"coupling":   coupling,
 		})
@@ -9105,7 +9152,6 @@ func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]ma
 		if err := dRows.Scan(&src, &dst); err != nil {
 			return nil, err
 		}
-		src, dst = filepath.ToSlash(src), filepath.ToSlash(dst)
 		fileGraph[src] = append(fileGraph[src], dst)
 		allFiles[src] = struct{}{}
 		allFiles[dst] = struct{}{}
@@ -9219,20 +9265,6 @@ func safeOffset(offset int) int {
 	return limits.Offset(offset)
 }
 
-func normalizeRepoRelPath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return ""
-	}
-	// Normalize common caller variations: forward slashes, leading ./, etc.
-	path = filepath.FromSlash(path)
-	path = filepath.Clean(path)
-	if path == "." {
-		return ""
-	}
-	return path
-}
-
 func quoteFTS(query string) string {
 	tokens := strings.Fields(query)
 	for i, token := range tokens {
@@ -9253,16 +9285,17 @@ func (s *Store) FileIDByPath(ctx context.Context, repoID int64, path string) (in
 
 // ListFiles returns indexed files for a repository, optionally filtered by path prefix.
 func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, limit, offset int) ([]map[string]any, error) {
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return nil, err
+	}
 	query := `SELECT path, language, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`
 	args := []any{repoID}
 	if pathFilter != "" {
-		variants := storedPathVariants(CanonicalRelPath(pathFilter))
-		query += ` AND (` + strings.TrimRight(strings.Repeat("path LIKE ? OR ", len(variants)), " OR ") + `)`
-		for _, variant := range variants {
-			args = append(args, variant+"%")
-		}
+		prefix := CanonicalRelPath(pathFilter)
+		query += ` AND path LIKE ?`
+		args = append(args, prefix+"%")
 	}
-	query += ` ORDER BY REPLACE(path, char(92), '/') ASC LIMIT ? OFFSET ?`
+	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
 	args = append(args, safeLimit(limit), safeOffset(offset))
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -9279,7 +9312,7 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 			return nil, err
 		}
 		out = append(out, map[string]any{
-			"path":       filepath.ToSlash(path),
+			"path":       path,
 			"language":   language,
 			"size_bytes": sizeBytes,
 		})
@@ -9312,7 +9345,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Test%'
 		  AND s.name NOT LIKE 'Benchmark%'
 		  AND s.name NOT LIKE 'Example%'
-		ORDER BY REPLACE(f.path, char(92), '/') ASC, s.start_line ASC,
+		ORDER BY f.path ASC, s.start_line ASC,
 		         s.start_col ASC, s.qualified_name ASC, s.kind ASC, s.name ASC,
 		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ? OFFSET ?
@@ -9334,7 +9367,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 			"symbol":     qualifiedName,
 			"kind":       kind,
 			"name":       name,
-			"file":       filepath.ToSlash(path),
+			"file":       path,
 			"language":   language,
 			"start_line": startLine,
 			"end_line":   endLine,
@@ -9453,7 +9486,7 @@ func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float
 			JOIN symbols s ON s.id = se.symbol_id
 			JOIN files f ON f.id = s.file_id
 			WHERE se.repo_id = ?
-			ORDER BY se.updated_at DESC, REPLACE(f.path, char(92), '/') ASC,
+			ORDER BY se.updated_at DESC, f.path ASC,
 			         s.qualified_name ASC, s.kind ASC, s.signature ASC,
 			         s.stable_key ASC, s.start_line ASC, s.start_col ASC,
 			         s.end_line ASC, s.end_col ASC
@@ -9507,12 +9540,8 @@ func (s *Store) scanAndRankVectors(rows *sql.Rows, queryVec []float32, limit, of
 		vec := bytesToFloat32(blob)
 		sim := cosineSimilarity(queryVec, vec)
 		if sim > 0 {
-			// Canonical form: HybridSearch fuses these entries with SearchSymbols
-			// results keyed on `file + "::" + qualified_name`, and SearchSymbols
-			// reports the slash form. Left native, the two halves of the fusion
-			// would never meet on Windows and every hit would score as if it had
-			// been found by one searcher only.
-			candidates = append(candidates, scored{id: symbolID, file: CanonicalRelPath(filePath), symbol: qualName, kind: kind, signature: sig, stableKey: stableKey, startLine: startLine, startCol: startCol, endLine: endLine, endCol: endCol, score: sim})
+			// files.path is already the logical repository identity.
+			candidates = append(candidates, scored{id: symbolID, file: filePath, symbol: qualName, kind: kind, signature: sig, stableKey: stableKey, startLine: startLine, startCol: startCol, endLine: endLine, endCol: endCol, score: sim})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -9780,7 +9809,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	topDirs := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT SUBSTR(REPLACE(path, char(92), '/') , 1, INSTR(REPLACE(path, char(92), '/') || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC, dir ASC LIMIT 20`,
+			`SELECT SUBSTR(path, 1, INSTR(path || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC, dir ASC LIMIT 20`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: directories: %w", err)
@@ -9914,7 +9943,6 @@ func (s *Store) AllImports(ctx context.Context, repoID int64) (map[string][]stri
 		if err := rows.Scan(&path, &importPath); err != nil {
 			return nil, err
 		}
-		path = filepath.ToSlash(path)
 		result[path] = append(result[path], importPath)
 	}
 	if err := rows.Err(); err != nil {
@@ -9928,7 +9956,7 @@ func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT path FROM files
 		WHERE repo_id = ? AND is_deleted = 0
-		ORDER BY REPLACE(path, char(92), '/')`, repoID)
+		ORDER BY path`, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -9940,7 +9968,7 @@ func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error
 		if err := rows.Scan(&path); err != nil {
 			return nil, err
 		}
-		paths = append(paths, filepath.ToSlash(path))
+		paths = append(paths, path)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -9976,23 +10004,14 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 		paths := firstUniqueCanonicalPaths(results, 10)
 		// Cap at 10 files to mirror context_for_task defaults.
 		if len(paths) > 0 {
-			// SemanticSearch reports canonical (slash) paths; `files.path` holds the
-			// indexing host's native form. Bind both, or this predicate matches
-			// nothing on Windows and the benchmark reports a zero-byte context.
-			bound := make([]string, 0, len(paths)*2)
-			for _, p := range paths {
-				bound = append(bound, storedPathVariants(p)...)
-			}
-			placeholders := strings.TrimRight(strings.Repeat("?,", len(bound)), ",")
-			args := make([]any, 0, len(bound)+1)
+			// SemanticSearch returns logical repository paths, the same identities
+			// persisted in files.path.
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(paths)), ",")
+			args := make([]any, 0, len(paths)+1)
 			args = append(args, repoID)
-			for _, p := range bound {
+			for _, p := range paths {
 				args = append(args, p)
 			}
-			// Rows, not aggregates: a database that holds both forms of one path (a
-			// graph.sqlite carried between hosts) would otherwise count that file
-			// twice and overstate the context it charges for. Folding on the canonical
-			// path counts each logical file once.
 			rows, err := s.db.QueryContext(ctx,
 				`SELECT path, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+placeholders+`)`,
 				args...,
@@ -10008,7 +10027,7 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 					_ = rows.Close()
 					return nil, fmt.Errorf("benchmark context bytes: %w", err)
 				}
-				sizes[CanonicalRelPath(path)] = size
+				sizes[path] = size
 			}
 			if err := rows.Err(); err != nil {
 				_ = rows.Close()
@@ -10069,7 +10088,6 @@ func firstUniqueCanonicalPaths(results []map[string]any, limit int) []string {
 		if !ok || path == "" {
 			continue
 		}
-		path = CanonicalRelPath(path)
 		if _, ok := seen[path]; ok {
 			continue
 		}

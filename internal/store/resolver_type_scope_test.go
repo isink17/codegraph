@@ -29,6 +29,126 @@ func newTypeScopeFixture(t *testing.T) *typeScopeFixture {
 	return &typeScopeFixture{newGateFixture(t)}
 }
 
+func TestFileIDsByPathsUsesCanonicalPaths(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	b := f.file(t, "pkg/b.py", "python")
+	a := f.file(t, "pkg/a.py", "python")
+	otherRepo, err := f.store.UpsertRepo(f.ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if _, err := insertTestFileLang(f.ctx, f.store, otherRepo.ID, "pkg/a.py", "python"); err != nil {
+		t.Fatalf("insert other-repo file error = %v", err)
+	}
+
+	got, err := fileIDsByPaths(f.ctx, f.store.db, f.repoID, []string{"pkg/b.py", "pkg/a.py", "pkg/b.py", "missing.py"})
+	if err != nil {
+		t.Fatalf("fileIDsByPaths() error = %v", err)
+	}
+	want := []int64{a, b}
+	if a > b {
+		want[0], want[1] = want[1], want[0]
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("fileIDsByPaths() = %v, want %v", got, want)
+	}
+}
+
+// TestTypeScopeNamesForChangedPathsKeepsDistinctLogicalIdentities pins the
+// generic changed-file lookup to raw `files.path` bytes. `pkg/x\y.py` and
+// `pkg/x/y.py` are two stored files, each carrying its own unresolved bare type
+// name. A batch naming the backslash file must re-decide that file's names and
+// not its slash sibling's. The former CanonicalRelPath call in fileIDsByPaths
+// folded the backslash spelling onto the sibling on Windows, so the batch
+// carried the wrong file's names there; on POSIX the old code also passes, and
+// a Windows host is where it reverse-fails.
+func TestTypeScopeNamesForChangedPathsKeepsDistinctLogicalIdentities(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	backslashFile := f.file(t, `pkg/x\y.py`, "python")
+	slashFile := f.file(t, "pkg/x/y.py", "python")
+	backslashRun := f.symbolKind(t, backslashFile, "run", `pkg/x\y.run`, "function", "python")
+	slashRun := f.symbolKind(t, slashFile, "run", "pkg/x/y.run", "function", "python")
+	f.edge(t, backslashFile, backslashRun, "BackslashType")
+	f.edge(t, slashFile, slashRun, "SlashType")
+
+	ids, err := fileIDsByPaths(f.ctx, f.store.db, f.repoID, []string{`pkg/x\y.py`})
+	if err != nil {
+		t.Fatalf("fileIDsByPaths() error = %v", err)
+	}
+	if len(ids) != 1 || ids[0] != backslashFile {
+		t.Fatalf("fileIDsByPaths(pkg/x\\y.py) = %v, want [%d]", ids, backslashFile)
+	}
+	ids, err = fileIDsByPaths(f.ctx, f.store.db, f.repoID, []string{"pkg/x/y.py"})
+	if err != nil {
+		t.Fatalf("fileIDsByPaths() error = %v", err)
+	}
+	if len(ids) != 1 || ids[0] != slashFile {
+		t.Fatalf("fileIDsByPaths(pkg/x/y.py) = %v, want [%d]", ids, slashFile)
+	}
+
+	names, err := f.store.typeScopeNamesForChangedPaths(f.ctx, f.repoID, []string{`pkg/x\y.py`}, newImportScopeCache(f.store, f.repoID))
+	if err != nil {
+		t.Fatalf("typeScopeNamesForChangedPaths() error = %v", err)
+	}
+	if len(names) != 1 || names[0] != "BackslashType" {
+		t.Fatalf("names for changed pkg/x\\y.py = %v, want [BackslashType]", names)
+	}
+	names, err = f.store.typeScopeNamesForChangedPaths(f.ctx, f.repoID, []string{"pkg/x/y.py"}, newImportScopeCache(f.store, f.repoID))
+	if err != nil {
+		t.Fatalf("typeScopeNamesForChangedPaths() error = %v", err)
+	}
+	if len(names) != 1 || names[0] != "SlashType" {
+		t.Fatalf("names for changed pkg/x/y.py = %v, want [SlashType]", names)
+	}
+}
+
+func TestLoadImportFileIndexPreservesStoredLogicalPaths(t *testing.T) {
+	f := newTypeScopeFixture(t)
+	if err := f.store.EnsureCanonicalRepositoryPaths(f.ctx, f.repoID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
+	}
+	goFile := f.file(t, "src/pkg/a.go", "go")
+	header := f.file(t, "include/pkg/a.h", "cpp")
+	weird := f.file(t, `pkg/weird\name.go`, "go")
+
+	index, pathByID, err := loadImportFileIndex(f.ctx, f.store.db, f.repoID)
+	if err != nil {
+		t.Fatalf("loadImportFileIndex() error = %v", err)
+	}
+	for id, want := range map[int64]string{
+		goFile: "src/pkg/a.go",
+		header: "include/pkg/a.h",
+		weird:  `pkg/weird\name.go`,
+	} {
+		if got := pathByID[id]; got != want {
+			t.Errorf("pathByID[%d] = %q, want %q", id, got, want)
+		}
+		if ids := index.byPath[want]; len(ids) != 1 || ids[0] != id {
+			t.Errorf("byPath[%q] = %v, want [%d]", want, ids, id)
+		}
+	}
+	if ids := index.byBase["src/pkg/a"]; len(ids) != 1 || ids[0] != goFile {
+		t.Errorf("byBase[src/pkg/a] = %v, want [%d]", ids, goFile)
+	}
+	hasID := func(ids []int64, want int64) bool {
+		for _, id := range ids {
+			if id == want {
+				return true
+			}
+		}
+		return false
+	}
+	if ids := index.bySuffix["pkg/a"]; len(ids) != 2 || !hasID(ids, goFile) || !hasID(ids, header) {
+		t.Errorf("bySuffix[pkg/a] = %v, want [%d %d]", ids, goFile, header)
+	}
+	if ids := index.bySuffix["weird\\name"]; len(ids) != 1 || ids[0] != weird {
+		t.Errorf("bySuffix[weird\\name] = %v, want [%d]", ids, weird)
+	}
+	if ids := index.byHeaderSuffix["pkg/a"]; len(ids) != 1 || ids[0] != header {
+		t.Errorf("byHeaderSuffix[pkg/a] = %v, want [%d]", ids, header)
+	}
+}
+
 // importPath records that a file's source named a specifier, exactly as the
 // parsers persist it: the module path, never the imported symbol.
 func (f *typeScopeFixture) importPath(t *testing.T, fileID int64, specifier string) {
