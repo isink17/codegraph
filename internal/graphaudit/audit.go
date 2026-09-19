@@ -284,7 +284,16 @@ var edgeCheckCatalogue = []edgeCheck{
 // fired, two GROUP BY distributions, one summary, and one paged walk of the
 // unresolved population -- so the query count depends on how many checks fire,
 // never on how many edges exist.
+//
+// Run is a repository-data entrypoint outside query.Service, so it owns the
+// same precondition the Service applies: an index whose path identity predates
+// P23 is refused with store.ErrRepositoryPathFormatRebuild before any graph
+// row is read, for every caller (CLI, MCP, or a direct user of this package).
 func Run(ctx context.Context, s *store.Store, opts Options) (*Report, error) {
+	if err := s.RequireCanonicalRepositoryPaths(ctx, opts.RepoID); err != nil {
+		return nil, err
+	}
+
 	exampleLimit := opts.ExampleLimit
 	if exampleLimit == 0 {
 		exampleLimit = DefaultExampleLimit

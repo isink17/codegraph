@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,8 +23,18 @@ import (
 // subject under test cannot be the same handle.
 func fixture(t *testing.T, write func(t *testing.T, db *sql.DB, repoID int64)) (*store.Store, int64) {
 	t.Helper()
+	return fixtureAt(t, filepath.Join(t.TempDir(), "graph.sqlite"), write)
+}
+
+// fixtureAt is fixture with a caller-chosen database path, for tests that need
+// to reopen the file afterwards (for example to snapshot it).
+//
+// The repository is marked with the current path-format marker the way a full
+// index would mark it, because Run refuses an unmarked repository before it
+// reads a row; tests that want the pre-P23 state remove the marker in write.
+func fixtureAt(t *testing.T, dbPath string, write func(t *testing.T, db *sql.DB, repoID int64)) (*store.Store, int64) {
+	t.Helper()
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
 
 	rw, err := store.Open(dbPath)
 	if err != nil {
@@ -31,6 +43,9 @@ func fixture(t *testing.T, write func(t *testing.T, db *sql.DB, repoID int64)) (
 	repo, err := rw.UpsertRepo(ctx, t.TempDir())
 	if err != nil {
 		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	if err := rw.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths() error = %v", err)
 	}
 	if err := rw.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -456,5 +471,117 @@ func TestReportJSONUsesStableFieldNames(t *testing.T) {
 		if !strings.Contains(string(payload), field) {
 			t.Errorf("report JSON is missing the %s field: %s", field, payload)
 		}
+	}
+}
+
+// snapshotPathState captures every byte the path-format gate must leave alone:
+// files.path, dirty_files.path, the settings table, and the row counts.
+func snapshotPathState(t *testing.T, dbPath string) string {
+	t.Helper()
+	db, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var b strings.Builder
+	for _, q := range []string{
+		`SELECT id, hex(path), is_deleted FROM files ORDER BY id`,
+		`SELECT hex(path), reason, queued_at FROM dirty_files ORDER BY path`,
+		`SELECT key, value FROM settings ORDER BY key`,
+		`SELECT (SELECT COUNT(*) FROM files), (SELECT COUNT(*) FROM dirty_files), (SELECT COUNT(*) FROM symbols), (SELECT COUNT(*) FROM edges)`,
+	} {
+		rows, err := db.Query(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		cols, _ := rows.Columns()
+		for rows.Next() {
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatal(err)
+			}
+			for _, v := range vals {
+				if bs, ok := v.([]byte); ok {
+					b.Write(bs)
+				} else {
+					fmt.Fprint(&b, v)
+				}
+				b.WriteByte('|')
+			}
+			b.WriteByte('\n')
+		}
+		rows.Close()
+		b.WriteString("--\n")
+	}
+	return b.String()
+}
+
+// seedLegacyShapedGraph writes a populated graph whose file path carries the
+// pre-P23 native spelling and whose edge dangles, so an ungated audit would
+// return an error-status report naming the legacy path.
+func seedLegacyShapedGraph(t *testing.T, db *sql.DB, repoID int64) {
+	t.Helper()
+	edgeID, _ := seedCallEdge(t, db, repoID)
+	if _, err := db.Exec(`UPDATE files SET path = 'src\pkg\file.go' WHERE repo_id = ?`, repoID); err != nil {
+		t.Fatalf("legacy-spell files.path: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO dirty_files(repo_id, path, reason, queued_at) VALUES(?, 'src\pkg\file.go', 'legacy', '2026-01-01T00:00:00Z')`, repoID); err != nil {
+		t.Fatalf("insert dirty row: %v", err)
+	}
+	if _, err := db.Exec(`
+		UPDATE edges SET dst_symbol_id = 999999, resolution_strategy = ?, resolution_confidence = ? WHERE id = ?
+	`, store.ResolutionStrategyExactName, store.ResolutionConfidenceHigh, edgeID); err != nil {
+		t.Fatalf("bind edge to a missing symbol: %v", err)
+	}
+}
+
+// TestLegacyPathFormatFailsClosedBeforeAnyRead proves Run owns the P23
+// precondition for every caller: on a populated repository without the current
+// path-format marker it returns store.ErrRepositoryPathFormatRebuild, no
+// report, no legacy-spelled path, and leaves every byte of the database alone.
+// The same rows under the marker audit normally, so the gate keys on the
+// marker and nothing else.
+func TestLegacyPathFormatFailsClosedBeforeAnyRead(t *testing.T) {
+	legacyDB := filepath.Join(t.TempDir(), "legacy.sqlite")
+	s, repoID := fixtureAt(t, legacyDB, func(t *testing.T, db *sql.DB, repoID int64) {
+		seedLegacyShapedGraph(t, db, repoID)
+		if _, err := db.Exec(`DELETE FROM settings WHERE value = 'logical-slash-v1'`); err != nil {
+			t.Fatalf("remove marker: %v", err)
+		}
+	})
+	before := snapshotPathState(t, legacyDB)
+	if !strings.Contains(before, "7372635C") { // hex(`src\`)
+		t.Fatalf("fixture did not produce a native-spelled files.path:\n%s", before)
+	}
+	if strings.Contains(before, "logical-slash-v1") {
+		t.Fatalf("fixture still carries the current marker:\n%s", before)
+	}
+
+	report, err := graphaudit.Run(context.Background(), s, graphaudit.Options{RepoID: repoID})
+	if !errors.Is(err, store.ErrRepositoryPathFormatRebuild) {
+		t.Fatalf("Run() on legacy index: err = %v, want ErrRepositoryPathFormatRebuild", err)
+	}
+	if report != nil {
+		t.Fatalf("Run() on legacy index returned a report: %+v", report)
+	}
+	if strings.Contains(err.Error(), `src\pkg`) {
+		t.Fatalf("error leaked a legacy path: %v", err)
+	}
+	if after := snapshotPathState(t, legacyDB); after != before {
+		t.Fatalf("Run() mutated the legacy database:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+
+	// Positive control: identical rows, marker present, audit runs and reports.
+	current, currentRepo := fixture(t, seedLegacyShapedGraph)
+	report = run(t, current, currentRepo, graphaudit.Options{})
+	if report.Status != graphaudit.StatusError {
+		t.Fatalf("status on marked repository = %q, want error", report.Status)
+	}
+	if f := findingFor(report, graphaudit.CodeDanglingEdgeTarget); f == nil || f.Count != 1 {
+		t.Fatalf("marked repository did not report the dangling edge: %+v", report.Findings)
 	}
 }

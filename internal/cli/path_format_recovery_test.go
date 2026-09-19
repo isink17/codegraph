@@ -156,6 +156,9 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 		{"find_related_tests", repoRoot, "--symbol", "Thing"},
 		{"stats", repoRoot},
 		{"graph", "export", repoRoot},
+		// audit reads the store through graphaudit.Run, not query.Service;
+		// the gate it inherits is graphaudit's own.
+		{"audit", repoRoot},
 	} {
 		out.Reset()
 		err := Run(context.Background(), args, &out, &errOut)
@@ -241,5 +244,12 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"file": "src/pkg/file.go"`) || strings.Contains(out.String(), `src\\pkg`) {
 		t.Fatalf("find-symbol after rebuild does not report the logical path: %s", out.String())
+	}
+	out.Reset()
+	if err := Run(context.Background(), []string{"audit", repoRoot}, &out, &errOut); err != nil {
+		t.Fatalf("Run(audit) after rebuild: %v", err)
+	}
+	if !strings.Contains(out.String(), `"schema": "codegraph.graph_audit/v1"`) {
+		t.Fatalf("audit after rebuild did not print a report: %s", out.String())
 	}
 }

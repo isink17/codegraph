@@ -17,10 +17,10 @@ import (
 )
 
 // legacyPathFormatTools is one call per MCP tool that reads indexed
-// repository data through query.Service. Session, scan-log and process
-// metadata tools are not repository-graph reads and are excluded on purpose.
-// `audit` reads the store directly through graphaudit.Run, not through the
-// Service, and is not gated by this tranche; it is deliberately absent here.
+// repository data. Session, scan-log and process metadata tools are not
+// repository-graph reads and are excluded on purpose. `audit` reads the store
+// through graphaudit.Run rather than query.Service and is gated by graphaudit
+// itself; it is listed so the MCP surface proves it inherits that gate too.
 var legacyPathFormatTools = []struct {
 	name string
 	args map[string]any
@@ -46,6 +46,7 @@ var legacyPathFormatTools = []struct {
 	{"graph_analytics", map[string]any{"analysis": "coupling"}},
 	{"graph_analytics", map[string]any{"analysis": "cycles"}},
 	{"graph_stats", map[string]any{}},
+	{"audit", map[string]any{}},
 }
 
 func snapshotServerDB(t *testing.T, raw *sql.DB) string {

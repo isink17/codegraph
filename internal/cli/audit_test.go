@@ -46,6 +46,11 @@ func indexedRepo(t *testing.T, seed func(t *testing.T, db *sql.DB, repoID int64)
 	if err != nil {
 		t.Fatalf("UpsertRepo: %v", err)
 	}
+	// Mark the empty repository the way a full index would: graphaudit refuses
+	// an unmarked repository before reading a row.
+	if err := s.EnsureCanonicalRepositoryPaths(context.Background(), repo.ID, true); err != nil {
+		t.Fatalf("EnsureCanonicalRepositoryPaths: %v", err)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
