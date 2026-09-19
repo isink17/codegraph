@@ -41,10 +41,16 @@ type RustResolutionStats struct {
 	BatchApplyOps         int
 }
 
+// filepathSlash folds backslashes for rust_module_evidence.external_path, whose
+// spelling the Rust adapter still derives with native filepath calls. It must
+// never be applied to files.path: that column is logical repository identity
+// where '/' is the only directory separator and a backslash is filename data.
 func filepathSlash(path string) string { return strings.ReplaceAll(path, "\\", "/") }
 
+// conventionalRustRoot returns path itself when its file name is lib.rs or
+// main.rs, and "" otherwise. path is a stored files.path, so the file name is
+// whatever follows the last '/'; a backslash never separates directories.
 func conventionalRustRoot(path string) string {
-	path = filepathSlash(path)
 	base := path[strings.LastIndex(path, "/")+1:]
 	if base == "lib.rs" || base == "main.rs" {
 		return path
@@ -53,10 +59,9 @@ func conventionalRustRoot(path string) string {
 }
 
 // rustCrateRootPredicateParams is how many parameters one crate root binds in
-// rustCrateRootPredicate: the persisted root, the root path in both stored
-// spellings, and the directory prefix in both. Every batched Rust statement
-// budgets from this.
-const rustCrateRootPredicateParams = 5
+// rustCrateRootPredicate: the persisted root, the root path, and the directory
+// prefix. Every batched Rust statement budgets from this.
+const rustCrateRootPredicateParams = 3
 
 // rustCrateRootPredicate renders the crate-membership predicate for one batch
 // of crate roots: membership already persisted on the evidence row, or a file
@@ -64,25 +69,24 @@ const rustCrateRootPredicateParams = 5
 // yet. It is a *discovery* predicate -- it decides which rows a statement
 // loads, never which memberships are true.
 //
-// crate_root is always written slashed (conventionalRustRoot normalises it),
-// but files.path still holds whichever separator the indexing host used, so the
-// path half of the predicate has to spell both. Dropping the native spelling
-// would silently lose the blank-root branch on a Windows-written database --
-// which is exactly the branch that rediscovers a file whose `mod` declaration
-// has just been restored.
+// crate_root and files.path share one logical spelling: '/' is the only
+// directory separator, so the root matches by exact stored identity and a
+// descendant by a LIKE prefix filter on the root's '/'-terminated directory
+// (a discovery superset; the graph decides membership). A backslash in
+// files.path is filename data and never puts a file under a root.
 func rustCrateRootPredicate(fileAlias, evidenceAlias string, roots []string) (string, []any) {
 	args := make([]any, 0, len(roots)*rustCrateRootPredicateParams)
 	for _, root := range roots {
 		args = append(args, root)
 	}
-	paths := make([]any, 0, len(roots)*2)
-	likes := make([]string, 0, len(roots)*2)
-	likeArgs := make([]any, 0, len(roots)*2)
+	paths := make([]any, 0, len(roots))
+	likes := make([]string, 0, len(roots))
+	likeArgs := make([]any, 0, len(roots))
 	for _, root := range roots {
 		dir := root[:strings.LastIndex(root, "/")+1]
-		paths = append(paths, root, strings.ReplaceAll(root, "/", `\`))
-		likes = append(likes, fileAlias+".path LIKE ?", fileAlias+".path LIKE ?")
-		likeArgs = append(likeArgs, dir+"%", strings.ReplaceAll(dir, "/", `\`)+"%")
+		paths = append(paths, root)
+		likes = append(likes, fileAlias+".path LIKE ?")
+		likeArgs = append(likeArgs, dir+"%")
 	}
 	args = append(args, paths...)
 	args = append(args, likeArgs...)
@@ -109,7 +113,7 @@ func sortedRustRoots(roots map[string]struct{}) []string {
 
 // rustRootPredicateMaxRoots bounds a batch by SQLite's expression-tree depth,
 // which is capped independently of the parameter count (SQLITE_MAX_EXPR_DEPTH,
-// 1000 by default). One root contributes two terms to the left-deep OR chain of
+// 1000 by default). One root contributes one term to the left-deep OR chain of
 // directory prefix tests, so the parameter budget alone would stop protecting
 // the statement if sqliteInClauseBatchSize were ever raised.
 const rustRootPredicateMaxRoots = 150
@@ -284,7 +288,7 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 			return nil, err
 		}
 		if len(candidates) == 0 {
-			rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND language='rust' AND is_deleted=0 AND (path LIKE '%/lib.rs' OR path LIKE '%/main.rs' OR path LIKE '%\lib.rs' OR path LIKE '%\main.rs' OR path IN ('lib.rs','main.rs'))`, repoID)
+			rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND language='rust' AND is_deleted=0 AND (path LIKE '%/lib.rs' OR path LIKE '%/main.rs' OR path IN ('lib.rs','main.rs'))`, repoID)
 			if err != nil {
 				return nil, err
 			}
@@ -294,10 +298,9 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 					_ = rows.Close()
 					return nil, err
 				}
-				// A crate root is a slashed identity everywhere else (it is what
-				// crate_root persists), so normalise the stored spelling here
-				// rather than leaking a backslashed root into the predicates.
-				candidates = append(candidates, filepathSlash(path))
+				// The stored path is the crate root identity crate_root
+				// persists; it is used byte for byte.
+				candidates = append(candidates, path)
 			}
 			if err := rows.Close(); err != nil {
 				return nil, err
@@ -307,7 +310,7 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 			matched := ""
 			for _, root := range candidates {
 				dir := root[:strings.LastIndex(root, "/")+1]
-				if strings.HasPrefix(filepathSlash(path), dir) {
+				if strings.HasPrefix(path, dir) {
 					if matched != "" {
 						matched = ""
 						break
@@ -577,7 +580,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			base := strings.TrimSuffix(filepathSlash(m.external), "/")
 			matches := []int64{}
 			for id, f := range files {
-				path := filepathSlash(f.path)
+				path := f.path
 				stem := strings.TrimSuffix(path, ".rs")
 				if strings.HasSuffix(stem, "/mod") {
 					stem = strings.TrimSuffix(stem, "/mod")

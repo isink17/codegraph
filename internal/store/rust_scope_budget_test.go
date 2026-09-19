@@ -25,7 +25,7 @@ type rustBudgetFixture struct {
 // rustBudgetCrateCount is the smallest crate count that is still load-bearing:
 // one root past the point where a single unbatched predicate would exceed the
 // portable variable contract. At rustCrateRootPredicateParams parameters per
-// root that is 200 crates, which also spans more than one rustRootBatchSize
+// root that is 334 crates, which also spans more than one rustRootBatchSize
 // batch (150), so the cross-batch guarantees stay under test. The tests below
 // assert both properties, so shrinking this constant fails loudly rather than
 // quietly proving nothing.
