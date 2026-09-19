@@ -87,34 +87,68 @@ func canonicalRepositoryPathsKey(repoID int64) string {
 	return canonicalRepositoryPathsSettingKey + "." + strconv.FormatInt(repoID, 10)
 }
 
+type canonicalRepositoryPathsState uint8
+
+const (
+	canonicalRepositoryPathsCurrent canonicalRepositoryPathsState = iota
+	canonicalRepositoryPathsMissingEmpty
+	canonicalRepositoryPathsMissingPopulated
+	canonicalRepositoryPathsForeign
+)
+
+func (s *Store) canonicalRepositoryPathsState(ctx context.Context, repoID int64) (canonicalRepositoryPathsState, error) {
+	var marker sql.NullString
+	var files, dirtyFiles int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT value FROM settings WHERE key=?),
+			(SELECT COUNT(*) FROM files WHERE repo_id=?),
+			(SELECT COUNT(*) FROM dirty_files WHERE repo_id=?)
+	`, canonicalRepositoryPathsKey(repoID), repoID, repoID).Scan(&marker, &files, &dirtyFiles)
+	if err != nil {
+		return 0, err
+	}
+	if marker.Valid {
+		if marker.String == "logical-slash-v1" {
+			return canonicalRepositoryPathsCurrent, nil
+		}
+		return canonicalRepositoryPathsForeign, nil
+	}
+	if files == 0 && dirtyFiles == 0 {
+		return canonicalRepositoryPathsMissingEmpty, nil
+	}
+	return canonicalRepositoryPathsMissingPopulated, nil
+}
+
 // RequireCanonicalRepositoryPaths is the read-only format gate for all public
 // path-sensitive operations. It never blesses or changes an older database.
 func (s *Store) RequireCanonicalRepositoryPaths(ctx context.Context, repoID int64) error {
-	var value string
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, canonicalRepositoryPathsKey(repoID)).Scan(&value)
-	if err == nil && value == "logical-slash-v1" {
+	state, err := s.canonicalRepositoryPathsState(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if state == canonicalRepositoryPathsCurrent || state == canonicalRepositoryPathsMissingEmpty {
 		return nil
 	}
-	if err == nil || errors.Is(err, sql.ErrNoRows) {
-		return ErrRepositoryPathFormatRebuild
-	}
-	return err
+	return ErrRepositoryPathFormatRebuild
 }
 
 // EnsureCanonicalRepositoryPaths refuses populated indexes whose path identity
 // predates P23. A marker is created only for an empty repository during a full
 // index, before any canonical rows are written.
 func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64, fullIndex bool) error {
-	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err == nil {
+	state, err := s.canonicalRepositoryPathsState(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	switch state {
+	case canonicalRepositoryPathsCurrent:
 		return nil
-	} else if !errors.Is(err, ErrRepositoryPathFormatRebuild) {
-		return err
-	}
-	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM files WHERE repo_id=?) + (SELECT COUNT(*) FROM dirty_files WHERE repo_id=?)`, repoID, repoID).Scan(&n); err != nil {
-		return err
-	}
-	if n != 0 || !fullIndex {
+	case canonicalRepositoryPathsMissingEmpty:
+		if !fullIndex {
+			return ErrRepositoryPathFormatRebuild
+		}
+	case canonicalRepositoryPathsMissingPopulated, canonicalRepositoryPathsForeign:
 		return ErrRepositoryPathFormatRebuild
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, 'logical-slash-v1') ON CONFLICT(key) DO NOTHING`, canonicalRepositoryPathsKey(repoID)); err != nil {
@@ -9285,7 +9319,7 @@ func (s *Store) FileIDByPath(ctx context.Context, repoID int64, path string) (in
 
 // ListFiles returns indexed files for a repository, optionally filtered by path prefix.
 func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, limit, offset int) ([]map[string]any, error) {
-	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
 		return nil, err
 	}
 	query := `SELECT path, language, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`

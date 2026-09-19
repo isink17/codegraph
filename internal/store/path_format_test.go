@@ -22,8 +22,8 @@ func TestCanonicalRepositoryPathFormatMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RequireCanonicalRepositoryPaths(ctx, repo.ID); !errors.Is(err, ErrRepositoryPathFormatRebuild) {
-		t.Fatalf("missing marker: %v", err)
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repo.ID); err != nil {
+		t.Fatalf("missing marker on empty repo: %v", err)
 	}
 	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, false); !errors.Is(err, ErrRepositoryPathFormatRebuild) {
 		t.Fatalf("non-full initialize: %v", err)
@@ -170,7 +170,25 @@ func TestCanonicalRepositoryPathFormatMatrix(t *testing.T) {
 
 	t.Run("A_new_empty_repo", func(t *testing.T) {
 		s, repoID := openUnmarkedRepo(t)
-		requireRebuild(t, "Require on empty unmarked repo", s.RequireCanonicalRepositoryPaths(ctx, repoID))
+		if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
+			t.Fatalf("Require on empty unmarked repo: %v", err)
+		}
+		before := snapshotPathState(t, s, repoID)
+		files, err := s.ListFiles(ctx, repoID, "", 10, 0)
+		if err != nil || len(files) != 0 {
+			t.Fatalf("ListFiles on empty unmarked repo = %v, %v", files, err)
+		}
+		if after := snapshotPathState(t, s, repoID); after != before {
+			t.Fatalf("read-only empty-repo gate mutated the database:\nbefore:\n%s\nafter:\n%s", before, after)
+		}
+		if _, ok := pathFormatMarker(t, s, repoID); ok {
+			t.Fatal("read-only empty-repo operation created a marker")
+		}
+		before = snapshotPathState(t, s, repoID)
+		requireRebuild(t, "QueueDirtyFile on empty unmarked repo", s.QueueDirtyFile(ctx, repoID, "src/pkg/file.go", "update"))
+		if after := snapshotPathState(t, s, repoID); after != before {
+			t.Fatalf("rejected write mutated the database:\nbefore:\n%s\nafter:\n%s", before, after)
+		}
 		requireRebuild(t, "Ensure(incremental) on empty unmarked repo", s.EnsureCanonicalRepositoryPaths(ctx, repoID, false))
 		if _, ok := pathFormatMarker(t, s, repoID); ok {
 			t.Fatal("incremental Ensure created a marker on an empty repo")
@@ -260,6 +278,23 @@ func TestCanonicalRepositoryPathFormatMatrix(t *testing.T) {
 		}
 		if after := snapshotPathState(t, s, repoID); after != before {
 			t.Fatalf("database mutated by rejected calls:\nbefore:\n%s\nafter:\n%s", before, after)
+		}
+	})
+
+	t.Run("D_empty_wrong_marker", func(t *testing.T) {
+		s, repoID := openUnmarkedRepo(t)
+		setPathFormatMarker(t, s, repoID, "native-v0")
+		before := snapshotPathState(t, s, repoID)
+		requireRebuild(t, "Require", s.RequireCanonicalRepositoryPaths(ctx, repoID))
+		if _, err := s.ListFiles(ctx, repoID, "", 10, 0); !errors.Is(err, ErrRepositoryPathFormatRebuild) {
+			t.Fatalf("ListFiles = %v, want rebuild error", err)
+		}
+		requireRebuild(t, "Ensure(full)", s.EnsureCanonicalRepositoryPaths(ctx, repoID, true))
+		if got, ok := pathFormatMarker(t, s, repoID); !ok || got != "native-v0" {
+			t.Fatalf("marker = %q,%v; want native-v0 left untouched", got, ok)
+		}
+		if after := snapshotPathState(t, s, repoID); after != before {
+			t.Fatalf("database mutated:\nbefore:\n%s\nafter:\n%s", before, after)
 		}
 	})
 

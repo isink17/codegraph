@@ -50,6 +50,29 @@ func newPathFormatFixture(t *testing.T) *pathFormatFixture {
 	return &pathFormatFixture{svc: New(s, nil), repoID: repo.ID, raw: raw}
 }
 
+func TestServiceFreshEmptyUnmarkedRepositoryReads(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(s, nil)
+	if got, err := svc.Stats(ctx, repo.ID); err != nil || got.Files != 0 || got.Symbols != 0 || got.Edges != 0 {
+		t.Fatalf("Stats on fresh empty repo = %+v, %v", got, err)
+	}
+	if got, err := svc.FindSymbolExactResult(ctx, repo.ID, "Thing", 10, 0); err != nil || len(got.Matches) != 0 {
+		t.Fatalf("FindSymbolExactResult on fresh empty repo = %+v, %v", got, err)
+	}
+	if got, err := svc.ListFiles(ctx, repo.ID, "", 10, 0); err != nil || len(got) != 0 {
+		t.Fatalf("ListFiles on fresh empty repo = %v, %v", got, err)
+	}
+}
+
 // degradeToLegacy removes the format marker and rewrites files.path to the
 // native spelling a pre-P23 Windows index could have stored.
 func (f *pathFormatFixture) degradeToLegacy(t *testing.T) {
