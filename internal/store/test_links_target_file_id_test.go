@@ -72,6 +72,10 @@ func TestHelper(t *testing.T) { Helper() }
 	if !foundTestFile {
 		t.Fatalf("RelatedTests did not surface helper_test.go: %+v", got)
 	}
+	symbolResult, err := s.RelatedTestsResult(ctx, repo.ID, "Helper", "", 10, 0)
+	if err != nil || !symbolResult.TargetFound || len(symbolResult.Tests) == 0 {
+		t.Fatalf("RelatedTestsResult(symbol=Helper) = %+v, %v; want found with tests", symbolResult, err)
+	}
 
 	// End-to-end purge: deleting helper.go must drop the linked row, which
 	// only works if target_file_id was populated so the purge DELETE matches.
@@ -95,6 +99,10 @@ func TestHelper(t *testing.T) { Helper() }
 	if resultAfter.TargetFound || len(resultAfter.Tests) != 0 {
 		t.Fatalf("RelatedTestsResult(file=helper.go) post-purge = %+v, want missing-empty", resultAfter)
 	}
+	symbolAfter, err := s.RelatedTestsResult(ctx, repo.ID, "Helper", "", 10, 0)
+	if err != nil || symbolAfter.TargetFound || len(symbolAfter.Tests) != 0 {
+		t.Fatalf("RelatedTestsResult(symbol=Helper) post-purge = %+v, %v; want missing-empty", symbolAfter, err)
+	}
 
 	// Re-adding the same path reactivates its existing files row and rebuilds
 	// the test-link evidence through the normal indexer lifecycle.
@@ -113,5 +121,9 @@ func Helper() {}
 	}
 	if !resultReadded.TargetFound || len(resultReadded.Tests) == 0 {
 		t.Fatalf("RelatedTestsResult(file=helper.go) after re-add = %+v, want found with rebuilt evidence", resultReadded)
+	}
+	symbolReadded, err := s.RelatedTestsResult(ctx, repo.ID, "Helper", "", 10, 0)
+	if err != nil || !symbolReadded.TargetFound || len(symbolReadded.Tests) == 0 {
+		t.Fatalf("RelatedTestsResult(symbol=Helper) after re-add = %+v, %v; want found with rebuilt evidence", symbolReadded, err)
 	}
 }

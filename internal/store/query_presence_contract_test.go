@@ -2,11 +2,249 @@ package store
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
+
+func TestSymbolSeedPresenceTracksActiveFileLifecycle(t *testing.T) {
+	s, repoID := newQueryTestStore(t)
+	ctx := testContext()
+	targetFile, err := insertTestFile(ctx, s, repoID, "target.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := insertTestSymbol(ctx, s, repoID, targetFile, "Target", "pkg.Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFile, err := insertTestFile(ctx, s, repoID, "other.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerID, err := insertTestSymbol(ctx, s, repoID, otherFile, "Caller", "pkg.Caller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calleeID, err := insertTestSymbol(ctx, s, repoID, otherFile, "Callee", "pkg.Callee")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hintID, err := insertTestSymbol(ctx, s, repoID, otherFile, "Hint", "pkg.Hint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerEdge, err := insertTestEdge(ctx, s, repoID, otherFile, callerID, "pkg.Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calleeEdge, err := insertTestEdge(ctx, s, repoID, targetFile, targetID, "pkg.Callee")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, targetID, callerEdge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = ? WHERE id = ?`, calleeID, calleeEdge); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Target", "Missing"} {
+		if _, err := insertTestEdge(ctx, s, repoID, otherFile, hintID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	testFile, err := insertTestFile(ctx, s, repoID, "target_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testID, err := insertTestSymbol(ctx, s, repoID, testFile, "TestTarget", "pkg.TestTarget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score)
+		VALUES(?, ?, ?, ?, ?, 'test_calls', 0.9)
+	`, repoID, testFile, testID, targetFile, targetID); err != nil {
+		t.Fatal(err)
+	}
+
+	assertFound := func() {
+		t.Helper()
+		if id, err := s.lookupSymbolID(ctx, repoID, "Target", 0); err != nil || id != targetID {
+			t.Fatalf("lookupSymbolID(active) = %d, %v; want %d", id, err, targetID)
+		}
+		if id, err := s.lookupSymbolID(ctx, repoID, "ignored", targetID); err != nil || id != targetID {
+			t.Fatalf("lookupSymbolID(active ID) = %d, %v; want %d", id, err, targetID)
+		}
+		if identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, targetID); err != nil || !ok || identity.ID != targetID {
+			t.Fatalf("lookupSymbolIdentity(active) = %+v, %v, %v", identity, ok, err)
+		}
+		for _, result := range []NeighborResult{
+			must(s.FindCallersResult(ctx, repoID, "Target", 0, 1, 100)),
+			must(s.FindCallersResult(ctx, repoID, "ignored", targetID, 1, 100)),
+			must(s.FindCalleesResult(ctx, repoID, "Target", 0, 1, 100)),
+			must(s.FindCalleesResult(ctx, repoID, "ignored", targetID, 1, 100)),
+		} {
+			if !result.TargetFound {
+				t.Fatalf("active high-offset neighbor result = %+v, want found", result)
+			}
+		}
+		if result := must(s.RelatedTestsResult(ctx, repoID, "Target", "", 1, 100)); !result.TargetFound || len(result.Tests) != 0 {
+			t.Fatalf("active high-offset related tests = %+v, want found-empty", result)
+		}
+		impact := must(s.ImpactRadius(ctx, repoID, []string{"Target"}, nil, 0, 10, 0))
+		if presence := impact["seed_presence"].(ImpactSeedPresence); presence.Found != 1 || len(presence.Missing) != 0 {
+			t.Fatalf("active impact presence = %+v", presence)
+		}
+	}
+	assertFound()
+
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, targetFile); err != nil {
+		t.Fatal(err)
+	}
+	type snapshot struct {
+		deleted, symbols, edges, links int
+		symbolID                       int64
+	}
+	snapshotState := func() snapshot {
+		t.Helper()
+		var got snapshot
+		if err := s.db.QueryRowContext(ctx, `SELECT is_deleted FROM files WHERE id = ?`, targetFile).Scan(&got.deleted); err != nil {
+			t.Fatal(err)
+		}
+		for query, dst := range map[string]*int{
+			`SELECT COUNT(*) FROM symbols WHERE repo_id = ?`:    &got.symbols,
+			`SELECT COUNT(*) FROM edges WHERE repo_id = ?`:      &got.edges,
+			`SELECT COUNT(*) FROM test_links WHERE repo_id = ?`: &got.links,
+		} {
+			if err := s.db.QueryRowContext(ctx, query, repoID).Scan(dst); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM symbols WHERE id = ?`, targetID).Scan(&got.symbolID); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	before := snapshotState()
+	if result := must(s.RelatedTestsResult(ctx, repoID, "Target", "", 10, 0)); result.TargetFound || len(result.Tests) != 0 {
+		t.Fatalf("deleted related-test seed = %+v, want absent", result)
+	}
+	if ids, err := s.lookupSymbolIDs(ctx, repoID, "Target", 0); err != nil || len(ids) != 0 {
+		t.Fatalf("lookupSymbolIDs(deleted) = %v, %v; want absent", ids, err)
+	}
+	if _, err := s.lookupSymbolID(ctx, repoID, "Target", 0); !errors.Is(err, ErrSymbolNotFound) {
+		t.Fatalf("lookupSymbolID(deleted) error = %v, want ErrSymbolNotFound", err)
+	}
+	if _, err := s.lookupSymbolID(ctx, repoID, "ignored", targetID); !errors.Is(err, ErrSymbolNotFound) {
+		t.Fatalf("lookupSymbolID(deleted ID) error = %v, want ErrSymbolNotFound", err)
+	}
+	if _, ok, err := s.lookupSymbolIdentity(ctx, repoID, targetID); err != nil || ok {
+		t.Fatalf("lookupSymbolIdentity(deleted) = ok %v, err %v; want absent", ok, err)
+	}
+	deletedCallers := must(s.FindCallersResult(ctx, repoID, "Target", 0, 10, 0))
+	missingCallers := must(s.FindCallersResult(ctx, repoID, "Missing", 0, 10, 0))
+	if deletedCallers.TargetFound || len(deletedCallers.UnresolvedHints) != 1 || len(missingCallers.UnresolvedHints) != 1 || deletedCallers.UnresolvedHints[0].ID != missingCallers.UnresolvedHints[0].ID {
+		t.Fatalf("deleted/missing callers = %+v / %+v; want matching absent-name hints", deletedCallers, missingCallers)
+	}
+	deletedCallerRows := must(s.FindCallers(ctx, repoID, "Target", 0, 10, 0))
+	missingCallerRows := must(s.FindCallers(ctx, repoID, "Missing", 0, 10, 0))
+	if len(deletedCallerRows) != 1 || len(missingCallerRows) != 1 || deletedCallerRows[0].ID != missingCallerRows[0].ID {
+		t.Fatalf("deleted/missing FindCallers = %+v / %+v; want matching hints", deletedCallerRows, missingCallerRows)
+	}
+	if rows := must(s.FindCallers(ctx, repoID, "ignored", targetID, 10, 0)); len(rows) != 0 {
+		t.Fatalf("FindCallers(deleted ID) = %+v, want empty", rows)
+	}
+	if result := must(s.FindCallersResult(ctx, repoID, "ignored", targetID, 10, 0)); result.TargetFound || len(result.Callers) != 0 || len(result.UnresolvedHints) != 0 {
+		t.Fatalf("deleted exact-ID callers = %+v", result)
+	}
+	for _, result := range []NeighborResult{
+		must(s.FindCalleesResult(ctx, repoID, "Target", 0, 10, 0)),
+		must(s.FindCalleesResult(ctx, repoID, "ignored", targetID, 10, 0)),
+	} {
+		if result.TargetFound || len(result.Callees) != 0 {
+			t.Fatalf("deleted callee seed = %+v, want absent", result)
+		}
+	}
+	for _, rows := range [][]graph.Symbol{
+		must(s.FindCallees(ctx, repoID, "Target", 0, 10, 0)),
+		must(s.FindCallees(ctx, repoID, "ignored", targetID, 10, 0)),
+	} {
+		if len(rows) != 0 {
+			t.Fatalf("FindCallees(deleted seed) = %+v, want empty", rows)
+		}
+	}
+	if tests, err := s.RelatedTests(ctx, repoID, "Target", "", 10, 0); !errors.Is(err, ErrSymbolNotFound) || tests != nil {
+		t.Fatalf("RelatedTests(deleted) = %+v, %v; want ErrSymbolNotFound", tests, err)
+	}
+	impact := must(s.ImpactRadius(ctx, repoID, []string{"Target"}, nil, 0, 10, 0))
+	if presence := impact["seed_presence"].(ImpactSeedPresence); presence.Found != 0 || len(presence.Missing) != 1 {
+		t.Fatalf("deleted impact presence = %+v, want missing", presence)
+	}
+	if after := snapshotState(); after != before {
+		t.Fatalf("queries mutated soft-deleted graph: before=%+v after=%+v", before, after)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 0 WHERE id = ?`, targetFile); err != nil {
+		t.Fatal(err)
+	}
+	assertFound()
+	foreignRepo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.lookupSymbolIdentity(ctx, foreignRepo.ID, targetID); err != nil || ok {
+		t.Fatalf("lookupSymbolIdentity(foreign active ID) = ok %v, err %v; want absent", ok, err)
+	}
+	if _, ok, err := s.lookupSymbolIdentity(ctx, repoID, targetID+999999); err != nil || ok {
+		t.Fatalf("lookupSymbolIdentity(missing ID) = ok %v, err %v; want absent", ok, err)
+	}
+}
+
+func TestSymbolSeedLookupFiltersDeletedCandidatesBeforeCascade(t *testing.T) {
+	s, repoID := newQueryTestStore(t)
+	ctx := testContext()
+	tests := []struct {
+		name, query, symbolName, qualified string
+	}{
+		{"qualified exact", "pkg.Qualified", "Qualified", "pkg.Qualified"},
+		{"name exact", "Named", "Named", "pkg.Named"},
+		{"qualified suffix", "ns.Suffix", "Other", "root.ns.Suffix"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			activeFile, err := insertTestFile(ctx, s, repoID, tt.name+"-active.go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			activeID, err := insertTestSymbol(ctx, s, repoID, activeFile, tt.symbolName, tt.qualified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			deletedFile, err := insertTestFile(ctx, s, repoID, tt.name+"-deleted.go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := insertTestSymbol(ctx, s, repoID, deletedFile, tt.symbolName, tt.qualified); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, deletedFile); err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := s.lookupSymbolIDs(ctx, repoID, tt.query, 0); err != nil || len(ids) != 1 || ids[0] != activeID {
+				t.Fatalf("lookupSymbolIDs(%q) = %v, %v; want active %d only", tt.query, ids, err, activeID)
+			}
+			if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, activeFile); err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := s.lookupSymbolIDs(ctx, repoID, tt.query, 0); err != nil || len(ids) != 0 {
+				t.Fatalf("lookupSymbolIDs(%q) with deleted-only candidates = %v, %v; want absent", tt.query, ids, err)
+			}
+		})
+	}
+}
 
 func TestQueryPresenceContractIsPageIndependent(t *testing.T) {
 	s, repoID := newQueryTestStore(t)
