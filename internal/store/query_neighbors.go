@@ -176,7 +176,11 @@ func symbolPageSQL(candidateCTE string) string {
 		-- construction a subset of the symbols.
 		FROM candidates c
 		CROSS JOIN symbols s ON s.id = c.id
-		JOIN files f ON f.id = s.file_id
+		-- Candidate ids come straight off edges, which outlive the file they
+		-- describe: a neighbour in a soft-deleted file is not user-visible, and
+		-- the exclusion is here rather than after the page so a ghost cannot
+		-- consume a LIMIT/OFFSET slot.
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ?
 		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?

@@ -150,7 +150,7 @@ func (s *Store) SymbolsForRefs(ctx context.Context, repoID int64, refs []SymbolR
 				SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 				       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 				FROM symbols s
-				JOIN files f ON f.id = s.file_id
+				JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 				WHERE s.repo_id = ?
 				  AND f.path IN (` + placeholders(len(pathBatch)) + `)
 				  AND ` + nameMatch + `
@@ -225,6 +225,10 @@ func (s *Store) SymbolNameCounts(ctx context.Context, repoID int64, names []stri
 		rows, err := s.db.QueryContext(ctx, `
 			SELECT s.name, COUNT(*)
 			FROM symbols s
+			-- Ambiguity is an active-graph property. Counting a ghost symbol
+			-- here would suppress legitimate short-name expansion for the
+			-- active symbol that still carries the name.
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND s.name IN (`+placeholders(len(chunk))+`)
 			GROUP BY s.name
 		`, args...)

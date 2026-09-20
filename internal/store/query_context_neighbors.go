@@ -709,7 +709,9 @@ func partitionedNeighborPageSQL(ctes []string, candidateSQL string) string {
 			-- re-evaluate the candidate co-routine per symbol row.
 			FROM cand c
 			CROSS JOIN symbols s ON s.id = c.nid
-			JOIN files f ON f.id = s.file_id
+			-- Inside the window's input, so a ghost neighbour cannot consume a
+			-- ROW_NUMBER and push an active neighbour out of the fanout.
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ?
 		)
 		SELECT idx, sid, file_id, language, kind, name, qualified_name, container_name, signature, visibility,
