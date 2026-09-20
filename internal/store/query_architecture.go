@@ -27,8 +27,10 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 		return nil, fmt.Errorf("topDegreeSymbols: unsupported column %q", degreeCol)
 	}
 	otherCol := "src_symbol_id"
+	oppositeVisible := "osf.id IS NOT NULL"
 	if degreeCol == "src_symbol_id" {
 		otherCol = "dst_symbol_id"
+		oppositeVisible = "e.dst_symbol_id IS NULL OR osf.id IS NOT NULL"
 	}
 	out := []map[string]any{}
 	rows, err := s.db.QueryContext(ctx, `
@@ -43,10 +45,11 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 			-- Unresolved far ends keep counting exactly as before.
 			JOIN symbols ds ON ds.id = e.`+degreeCol+`
 			JOIN files df ON df.id = ds.file_id AND df.is_deleted = 0
+			JOIN files ef ON ef.id = e.file_id AND ef.repo_id = e.repo_id AND ef.is_deleted = 0
 			LEFT JOIN symbols os ON os.id = e.`+otherCol+`
-			LEFT JOIN files osf ON osf.id = os.file_id
+			LEFT JOIN files osf ON osf.id = os.file_id AND osf.is_deleted = 0
 			WHERE e.repo_id = ? AND e.`+degreeCol+` IS NOT NULL
-			  AND (os.id IS NULL OR osf.is_deleted = 0)
+			  AND (`+oppositeVisible+`)
 			GROUP BY e.`+degreeCol+`
 		), cutoff AS (
 			SELECT MIN(degree) AS degree FROM (
@@ -100,8 +103,10 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 		return out, nil
 	}
 	otherCol := "src_symbol_id"
+	oppositeVisible := "osf.id IS NOT NULL"
 	if degreeCol == "src_symbol_id" {
 		otherCol = "dst_symbol_id"
+		oppositeVisible = "e.dst_symbol_id IS NULL OR osf.id IS NOT NULL"
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT s.qualified_name, s.kind, f.path
@@ -113,11 +118,12 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 		  -- either, or a symbol whose only edges point at ghosts would vanish
 		  -- from the overview rather than appear with degree 0.
 		  AND NOT EXISTS (
-		      SELECT 1 FROM edges e
+			  SELECT 1 FROM edges e
+			  JOIN files ef ON ef.id = e.file_id AND ef.repo_id = e.repo_id AND ef.is_deleted = 0
 		      LEFT JOIN symbols os ON os.id = e.`+otherCol+`
-		      LEFT JOIN files osf ON osf.id = os.file_id
+		      LEFT JOIN files osf ON osf.id = os.file_id AND osf.is_deleted = 0
 		      WHERE e.repo_id = ? AND e.`+degreeCol+` = s.id
-		        AND (os.id IS NULL OR osf.is_deleted = 0)
+		        AND (`+oppositeVisible+`)
 		  )
 		ORDER BY f.path ASC, s.qualified_name ASC,
 		         s.kind ASC, s.signature ASC, s.stable_key ASC,

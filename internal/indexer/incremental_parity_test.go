@@ -1678,6 +1678,33 @@ func TestUpdateLifecycleMovesSymbolOutputVisibility(t *testing.T) {
 		if found.Matched != want {
 			t.Fatalf("%s: search Matched = %v, want %v", stage, found.Matched, want)
 		}
+		graphSymbols, graphEdges, err := r.store.GraphSnapshot(r.ctx, r.repoID, "", 2)
+		if err != nil {
+			t.Fatalf("%s: GraphSnapshot: %v", stage, err)
+		}
+		graphHasRenew := false
+		for _, sym := range graphSymbols {
+			if sym.FilePath == "helpers_a.py" && sym.Name == "Renew" {
+				graphHasRenew = true
+			}
+		}
+		if graphHasRenew != want {
+			t.Fatalf("%s: graph Renew visible = %v, want %v", stage, graphHasRenew, want)
+		}
+		stats, err := r.store.Stats(r.ctx, r.repoID)
+		if err != nil {
+			t.Fatalf("%s: Stats: %v", stage, err)
+		}
+		if stats.Symbols != int64(len(graphSymbols)) || stats.Edges != int64(len(graphEdges)) {
+			t.Fatalf("%s: Stats/GraphSnapshot mismatch: stats=%+v graph=%d/%d", stage, stats, len(graphSymbols), len(graphEdges))
+		}
+		trace, err := r.store.TraceDependenciesResult(r.ctx, r.repoID, "Renew", "downstream", 1, 50, 0)
+		if err != nil {
+			t.Fatalf("%s: TraceDependenciesResult: %v", stage, err)
+		}
+		if trace.TargetFound != want {
+			t.Fatalf("%s: trace TargetFound = %v, want %v", stage, trace.TargetFound, want)
+		}
 	}
 
 	visible("indexed", true)

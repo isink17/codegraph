@@ -467,6 +467,17 @@ type ExportEdge struct {
 	TargetClassification string `json:"target_classification,omitempty"`
 }
 
+// activeEdgeJoinsSQL owns the public graph edge domain. The evidence file is
+// the parsed source file; resolved edges additionally need an active target.
+const activeEdgeJoinsSQL = `
+	JOIN symbols src ON src.id = e.src_symbol_id AND src.repo_id = e.repo_id
+	JOIN files srcf ON srcf.id = src.file_id AND srcf.repo_id = e.repo_id AND srcf.is_deleted = 0
+	JOIN files f ON f.id = e.file_id AND f.repo_id = e.repo_id AND f.is_deleted = 0
+	LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id AND dst.repo_id = e.repo_id
+	LEFT JOIN files dstf ON dstf.id = dst.file_id AND dstf.repo_id = e.repo_id AND dstf.is_deleted = 0`
+
+const visibleEdgeDestinationSQL = `e.dst_symbol_id IS NULL OR dstf.id IS NOT NULL`
+
 type ReplaceFileGraphInput struct {
 	Path        string
 	Language    string
@@ -7064,9 +7075,9 @@ func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 		SELECT
 			r.root_path,
 			(SELECT COUNT(1) FROM files f WHERE f.repo_id = r.id AND f.is_deleted = 0) AS files_count,
-			(SELECT COUNT(1) FROM symbols s WHERE s.repo_id = r.id) AS symbols_count,
-			(SELECT COUNT(1) FROM references_tbl rt WHERE rt.repo_id = r.id) AS refs_count,
-			(SELECT COUNT(1) FROM edges e WHERE e.repo_id = r.id) AS edges_count,
+			(SELECT COUNT(1) FROM symbols s JOIN files sf ON sf.id = s.file_id AND sf.repo_id = s.repo_id AND sf.is_deleted = 0 WHERE s.repo_id = r.id) AS symbols_count,
+			(SELECT COUNT(1) FROM references_tbl rt JOIN files rf ON rf.id = rt.file_id AND rf.repo_id = rt.repo_id AND rf.is_deleted = 0 WHERE rt.repo_id = r.id) AS refs_count,
+			(SELECT COUNT(1) FROM edges e `+activeEdgeJoinsSQL+` WHERE e.repo_id = r.id AND (`+visibleEdgeDestinationSQL+`)) AS edges_count,
 			(SELECT COUNT(1) FROM dirty_files d WHERE d.repo_id = r.id) AS dirty_count,
 			(SELECT COALESCE(MAX(sc.id), 0) FROM scans sc WHERE sc.repo_id = r.id) AS last_scan_id
 		FROM repos r
@@ -7295,7 +7306,7 @@ func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, sym
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
-			WHERE s.repo_id = ? AND f.path = ?
+			WHERE s.repo_id = ? AND f.path = ? AND f.is_deleted = 0
 		`, repoID, logical)
 		if err != nil {
 			return nil, nil, ImpactSeedPresence{}, 0, 0, err
@@ -7418,6 +7429,7 @@ func (s *Store) impactUnresolvedEvidence(ctx context.Context, repoID int64, symb
 		args := append([]any{repoID}, int64SliceToAny(chunk)...)
 		rows, err := s.db.QueryContext(ctx, `SELECT e.dst_name, COUNT(*)
 			FROM edges e
+			JOIN files ef ON ef.id = e.file_id AND ef.repo_id = e.repo_id AND ef.is_deleted = 0
 			WHERE e.repo_id = ? AND e.src_symbol_id IN (`+placeholders+`)
 			  AND e.dst_symbol_id IS NULL AND e.dst_name != ''
 			GROUP BY e.dst_name`, args...)
@@ -7465,7 +7477,8 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM edges e
 			JOIN symbols s ON s.repo_id = e.repo_id AND s.id = e.src_symbol_id
-			JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id
+			JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id AND f.is_deleted = 0
+			JOIN files ef ON ef.repo_id = e.repo_id AND ef.id = e.file_id AND ef.is_deleted = 0
 			WHERE e.repo_id = ? AND e.dst_symbol_id IN (` + placeholders + `)
 			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		`
@@ -7475,7 +7488,8 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 				       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 				FROM edges e
 				JOIN symbols s ON s.repo_id = e.repo_id AND s.id = e.dst_symbol_id
-				JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id
+				JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id AND f.is_deleted = 0
+				JOIN files ef ON ef.repo_id = e.repo_id AND ef.id = e.file_id AND ef.is_deleted = 0
 				WHERE e.repo_id = ? AND e.src_symbol_id IN (` + placeholders + `) AND e.dst_symbol_id IS NOT NULL
 				ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			`
@@ -7762,7 +7776,7 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM symbols s
-		JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 		WHERE s.repo_id = ?
 		ORDER BY s.id ASC
 		LIMIT ?
@@ -7783,10 +7797,11 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
 	pageSize := exportLimit(limit)
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT qualified_name
-		FROM symbols
-		WHERE repo_id = ? AND qualified_name <> ''
-		ORDER BY qualified_name ASC
+		SELECT DISTINCT s.qualified_name
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
+		WHERE s.repo_id = ? AND s.qualified_name <> ''
+		ORDER BY s.qualified_name ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, pageSize, safeOffset(offset))
@@ -7811,11 +7826,8 @@ func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit,
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+exportEdgeColumnsSQL+`
-		FROM edges e
-		LEFT JOIN symbols src ON src.id = e.src_symbol_id
-		LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
-		LEFT JOIN files f ON f.id = e.file_id
-		WHERE e.repo_id = ?
+		FROM edges e `+activeEdgeJoinsSQL+`
+		WHERE e.repo_id = ? AND (`+visibleEdgeDestinationSQL+`)
 		ORDER BY e.id ASC
 		LIMIT ?
 		OFFSET ?
@@ -7839,7 +7851,7 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s
-			JOIN files f ON f.id = s.file_id
+			JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 			WHERE s.repo_id = ?
 		`, repoID)
 		if err != nil {
@@ -7854,7 +7866,7 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s
-			JOIN files f ON f.id = s.file_id
+			JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND s.id IN (` + placeholders + `)
 		`
 		args := make([]any, 0, len(chunk)+1)
@@ -7879,11 +7891,8 @@ func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs 
 	if len(symbolIDs) == 0 {
 		rows, err := s.db.QueryContext(ctx, `
 			SELECT `+exportEdgeColumnsSQL+`
-			FROM edges e
-			LEFT JOIN symbols src ON src.id = e.src_symbol_id
-			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
-			LEFT JOIN files f ON f.id = e.file_id
-			WHERE e.repo_id = ?
+			FROM edges e `+activeEdgeJoinsSQL+`
+			WHERE e.repo_id = ? AND (`+visibleEdgeDestinationSQL+`)
 		`, repoID)
 		if err != nil {
 			return nil, err
@@ -7902,11 +7911,9 @@ func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs 
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
 			SELECT ` + exportEdgeColumnsSQL + `
-			FROM edges e
-			LEFT JOIN symbols src ON src.id = e.src_symbol_id
-			LEFT JOIN symbols dst ON dst.id = e.dst_symbol_id
-			LEFT JOIN files f ON f.id = e.file_id
-			WHERE e.repo_id = ? AND (e.src_symbol_id IN (` + placeholders + `) OR e.dst_symbol_id IN (` + placeholders + `))
+			FROM edges e ` + activeEdgeJoinsSQL + `
+			WHERE e.repo_id = ? AND (` + visibleEdgeDestinationSQL + `)
+			  AND (e.src_symbol_id IN (` + placeholders + `) OR e.dst_symbol_id IN (` + placeholders + `))
 		`
 		args := make([]any, 0, (len(chunk)*2)+1)
 		args = append(args, repoID)
@@ -8636,11 +8643,11 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 	seedName := strings.TrimSpace(strings.TrimPrefix(symbol, "::"))
 	seedRows, err := s.db.QueryContext(ctx,
 		`SELECT s.id, s.qualified_name, s.kind, s.name, f.path
-			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
+			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND s.qualified_name = ?
 			UNION ALL
 		 SELECT s.id, s.qualified_name, s.kind, s.name, f.path
-			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
+			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND s.qualified_name <> ? AND s.name = ?`,
 		repoID, seedName, repoID, seedName, seedName)
 	if err != nil {
@@ -8704,12 +8711,14 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 		if dir == "downstream" {
 			query = `SELECT DISTINCT s.id, s.qualified_name, s.kind, s.name, f.path
 				FROM edges e JOIN symbols s ON s.repo_id = e.repo_id AND s.id = e.dst_symbol_id
-				JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id
+				JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id AND f.is_deleted = 0
+				JOIN files ef ON ef.repo_id = e.repo_id AND ef.id = e.file_id AND ef.is_deleted = 0
 				WHERE e.repo_id = ? AND e.src_symbol_id = ? AND e.dst_symbol_id IS NOT NULL`
 		} else {
 			query = `SELECT DISTINCT s.id, s.qualified_name, s.kind, s.name, f.path
 				FROM edges e JOIN symbols s ON s.repo_id = e.repo_id AND s.id = e.src_symbol_id
-				JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id
+				JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id AND f.is_deleted = 0
+				JOIN files ef ON ef.repo_id = e.repo_id AND ef.id = e.file_id AND ef.is_deleted = 0
 				WHERE e.repo_id = ? AND e.dst_symbol_id = ?`
 		}
 
@@ -9145,10 +9154,11 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 	cRows, err := s.db.QueryContext(ctx, `
 		SELECT f1.path as file_a, f2.path as file_b, COUNT(*) as edge_count
 		FROM edges e
-		JOIN symbols s1 ON s1.id = e.src_symbol_id
-		JOIN symbols s2 ON s2.id = e.dst_symbol_id
-		JOIN files f1 ON f1.id = s1.file_id
-		JOIN files f2 ON f2.id = s2.file_id
+		JOIN symbols s1 ON s1.id = e.src_symbol_id AND s1.repo_id = e.repo_id
+		JOIN symbols s2 ON s2.id = e.dst_symbol_id AND s2.repo_id = e.repo_id
+		JOIN files f1 ON f1.id = s1.file_id AND f1.repo_id = e.repo_id AND f1.is_deleted = 0
+		JOIN files f2 ON f2.id = s2.file_id AND f2.repo_id = e.repo_id AND f2.is_deleted = 0
+		JOIN files ef ON ef.id = e.file_id AND ef.repo_id = e.repo_id AND ef.is_deleted = 0
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f1.id != f2.id
 		GROUP BY f1.path, f2.path
 		-- The tie-break is the pair of grouping keys, which is unique per row, so
@@ -9201,10 +9211,11 @@ func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]ma
 	dRows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT f1.path, f2.path
 		FROM edges e
-		JOIN symbols s1 ON s1.id = e.src_symbol_id
-		JOIN symbols s2 ON s2.id = e.dst_symbol_id
-		JOIN files f1 ON f1.id = s1.file_id
-		JOIN files f2 ON f2.id = s2.file_id
+		JOIN symbols s1 ON s1.id = e.src_symbol_id AND s1.repo_id = e.repo_id
+		JOIN symbols s2 ON s2.id = e.dst_symbol_id AND s2.repo_id = e.repo_id
+		JOIN files f1 ON f1.id = s1.file_id AND f1.repo_id = e.repo_id AND f1.is_deleted = 0
+		JOIN files f2 ON f2.id = s2.file_id AND f2.repo_id = e.repo_id AND f2.is_deleted = 0
+		JOIN files ef ON ef.id = e.file_id AND ef.repo_id = e.repo_id AND ef.is_deleted = 0
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f1.id != f2.id`, repoID)
 	if err != nil {
 		return nil, err
@@ -9935,7 +9946,8 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	edgeKinds := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT edge_kind, COUNT(*) as count FROM edges WHERE repo_id = ? GROUP BY edge_kind ORDER BY count DESC, edge_kind ASC`,
+			`SELECT e.edge_kind, COUNT(*) as count FROM edges e `+activeEdgeJoinsSQL+`
+			 WHERE e.repo_id = ? AND (`+visibleEdgeDestinationSQL+`) GROUP BY e.edge_kind ORDER BY count DESC, e.edge_kind ASC`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: edge kinds: %w", err)
@@ -9973,7 +9985,9 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	// Only the reference count has no breakdown to sum.
 	var references int64
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(1) FROM references_tbl WHERE repo_id = ?`, repoID).Scan(&references); err != nil {
+		`SELECT COUNT(1) FROM references_tbl rt
+		 JOIN files rf ON rf.id = rt.file_id AND rf.repo_id = rt.repo_id AND rf.is_deleted = 0
+		 WHERE rt.repo_id = ?`, repoID).Scan(&references); err != nil {
 		return nil, fmt.Errorf("architecture overview: references: %w", err)
 	}
 
