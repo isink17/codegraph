@@ -8008,6 +8008,9 @@ func (s *Store) QueueDirtyFiles(ctx context.Context, repoID int64, paths []strin
 	if len(paths) == 0 {
 		return nil
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -8043,6 +8046,9 @@ func (s *Store) QueueDirtyFiles(ctx context.Context, repoID int64, paths []strin
 }
 
 func (s *Store) HasDirtyFiles(ctx context.Context, repoID int64) (bool, error) {
+	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
+		return false, err
+	}
 	var exists int
 	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM dirty_files WHERE repo_id = ? LIMIT 1`, repoID).Scan(&exists)
 	if err == sql.ErrNoRows {
@@ -8062,6 +8068,9 @@ func (s *Store) HasDirtyFiles(ctx context.Context, repoID int64) (bool, error) {
 func (s *Store) ClaimDirtyFiles(ctx context.Context, repoID int64, claimAt, claimReason string) ([]string, error) {
 	if claimAt == "" {
 		return nil, fmt.Errorf("claimAt must be non-empty")
+	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return nil, err
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -8132,6 +8141,9 @@ func (s *Store) DeleteClaimedDirtyFiles(ctx context.Context, repoID int64, paths
 	if claimedAt == "" {
 		return fmt.Errorf("claimedAt must be non-empty")
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -8168,6 +8180,9 @@ func (s *Store) DeleteClaimedDirtyFiles(ctx context.Context, repoID int64, paths
 }
 
 func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, error) {
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
+		return nil, err
+	}
 	// Take a write lock up-front so that events queued concurrently cannot be
 	// inserted until after we delete the drained rows. Also ensures we can safely
 	// rollback if scanning fails/cancels (avoids losing work on partial reads).
