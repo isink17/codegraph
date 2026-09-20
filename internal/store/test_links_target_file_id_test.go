@@ -88,4 +88,30 @@ func TestHelper(t *testing.T) { Helper() }
 	if len(gotAfter) != 0 {
 		t.Fatalf("RelatedTests(file=helper.go) post-purge = %d rows, want 0: %+v", len(gotAfter), gotAfter)
 	}
+	resultAfter, err := s.RelatedTestsResult(ctx, repo.ID, "", "helper.go", 10, 0)
+	if err != nil {
+		t.Fatalf("RelatedTestsResult(file=helper.go) post-purge error = %v", err)
+	}
+	if resultAfter.TargetFound || len(resultAfter.Tests) != 0 {
+		t.Fatalf("RelatedTestsResult(file=helper.go) post-purge = %+v, want missing-empty", resultAfter)
+	}
+
+	// Re-adding the same path reactivates its existing files row and rebuilds
+	// the test-link evidence through the normal indexer lifecycle.
+	if err := os.WriteFile(filepath.Join(repoRoot, "helper.go"), []byte(`package pkg
+
+func Helper() {}
+`), 0o644); err != nil {
+		t.Fatalf("rewrite helper.go: %v", err)
+	}
+	if _, err := idx.Update(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatalf("Update(after re-add) error = %v", err)
+	}
+	resultReadded, err := s.RelatedTestsResult(ctx, repo.ID, "", "helper.go", 10, 0)
+	if err != nil {
+		t.Fatalf("RelatedTestsResult(file=helper.go) after re-add error = %v", err)
+	}
+	if !resultReadded.TargetFound || len(resultReadded.Tests) == 0 {
+		t.Fatalf("RelatedTestsResult(file=helper.go) after re-add = %+v, want found with rebuilt evidence", resultReadded)
+	}
 }

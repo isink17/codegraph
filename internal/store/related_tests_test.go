@@ -321,3 +321,87 @@ func TestRelatedTests_FileScopedNonGoTestFile(t *testing.T) {
 		t.Fatalf("RelatedTests(file=pkg/utils.py) = %+v, want the python test file", got)
 	}
 }
+
+func TestRelatedTestsExcludesDeletedTestFilesBeforePagination(t *testing.T) {
+	f := newTestLinkFixture(t)
+	targetFile := f.file("target.go", "go")
+	targetSymbol := f.symbolWithKey(targetFile, "Target", "go", "func:pkg::Target")
+
+	linkedTest := func(path, name string, deleted bool) {
+		t.Helper()
+		fileID := f.file(path, "go")
+		symbolID := f.symbolWithKey(fileID, name, "go", "func:pkg::"+name)
+		if _, err := f.store.db.ExecContext(f.ctx, `
+			INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score)
+			VALUES(?, ?, ?, ?, ?, 'test_name_match', 0.8)
+		`, f.repoID, fileID, symbolID, targetFile, targetSymbol); err != nil {
+			t.Fatal(err)
+		}
+		if deleted {
+			f.markFileDeleted(fileID)
+		}
+	}
+	linkedTest("a_active_link_test.go", "TestActiveLink", false)
+	linkedTest("b_deleted_link_test.go", "TestDeletedLink", true)
+
+	callTest := func(path, name string, deleted bool) {
+		t.Helper()
+		fileID := f.file(path, "go")
+		symbolID := f.linkedTestSymbol(fileID, name)
+		f.callEdge(symbolID, targetSymbol, fileID)
+		if deleted {
+			f.markFileDeleted(fileID)
+		}
+	}
+	callTest("c_active_call_test.go", "TestActiveCall", false)
+	callTest("d_deleted_call_test.go", "TestDeletedCall", true)
+
+	var linksBefore, edgesBefore, deletedBefore int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM test_links WHERE repo_id = ?`, f.repoID).Scan(&linksBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id = ?`, f.repoID).Scan(&edgesBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted != 0`, f.repoID).Scan(&deletedBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, seed := range []struct {
+		name, symbol, file string
+	}{
+		{name: "file", file: "target.go"},
+		{name: "symbol", symbol: "Target"},
+	} {
+		t.Run(seed.name, func(t *testing.T) {
+			got, err := f.store.RelatedTests(f.ctx, f.repoID, seed.symbol, seed.file, 10, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 2 || got[0].File != "c_active_call_test.go" || got[1].File != "a_active_link_test.go" {
+				t.Fatalf("RelatedTests() = %+v, want active call then active link", got)
+			}
+			for offset, want := range []string{"c_active_call_test.go", "a_active_link_test.go"} {
+				page, err := f.store.RelatedTests(f.ctx, f.repoID, seed.symbol, seed.file, 1, offset)
+				if err != nil || len(page) != 1 || page[0].File != want {
+					t.Fatalf("RelatedTests(limit=1, offset=%d) = %+v, %v; want %q", offset, page, err, want)
+				}
+			}
+		})
+	}
+
+	var linksAfter, edgesAfter, deletedAfter int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM test_links WHERE repo_id = ?`, f.repoID).Scan(&linksAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM edges WHERE repo_id = ?`, f.repoID).Scan(&edgesAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted != 0`, f.repoID).Scan(&deletedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if linksAfter != linksBefore || edgesAfter != edgesBefore || deletedAfter != deletedBefore {
+		t.Fatalf("read mutated stale evidence: links %d->%d edges %d->%d deleted %d->%d",
+			linksBefore, linksAfter, edgesBefore, edgesAfter, deletedBefore, deletedAfter)
+	}
+}

@@ -153,7 +153,7 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 		{"find_callers", repoRoot, "Thing"},
 		{"find_callees", repoRoot, "Thing"},
 		{"get_impact_radius", repoRoot, "--symbols", "Thing"},
-		{"find_related_tests", repoRoot, "--symbol", "Thing"},
+		{"find_related_tests", "--repo-root", repoRoot, "src/pkg/file.go"},
 		{"stats", repoRoot},
 		{"graph", "export", repoRoot},
 		// audit reads the store through graphaudit.Run, not query.Service;
@@ -259,6 +259,10 @@ func TestRunIndexLegacyPathFormatRequiresRebuildThenRecovers(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"file": "src/pkg/file.go"`) || strings.Contains(out.String(), `src\\pkg`) {
 		t.Fatalf("find-symbol after rebuild does not report the logical path: %s", out.String())
+	}
+	out.Reset()
+	if err := Run(context.Background(), []string{"find_related_tests", "--repo-root", repoRoot, "src/pkg/file.go"}, &out, &errOut); err != nil {
+		t.Fatalf("Run(find_related_tests) after rebuild: %v", err)
 	}
 	out.Reset()
 	if err := Run(context.Background(), []string{"audit", repoRoot}, &out, &errOut); err != nil {
