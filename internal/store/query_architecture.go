@@ -26,12 +26,27 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 	if degreeCol != "dst_symbol_id" && degreeCol != "src_symbol_id" {
 		return nil, fmt.Errorf("topDegreeSymbols: unsupported column %q", degreeCol)
 	}
+	otherCol := "src_symbol_id"
+	if degreeCol == "src_symbol_id" {
+		otherCol = "dst_symbol_id"
+	}
 	out := []map[string]any{}
 	rows, err := s.db.QueryContext(ctx, `
 		WITH degrees AS (
 			SELECT e.`+degreeCol+` AS sid, COUNT(1) AS degree
 			FROM edges e
+			-- Degree is reported over the active resolved graph. Both the
+			-- counted symbol and, when the far end is resolved, its counterpart
+			-- must live in an active file: an edge only one visible symbol
+			-- takes part in is not evidence the user can see, and a ghost
+			-- symbol must not reach the cutoff and consume a top-N slot.
+			-- Unresolved far ends keep counting exactly as before.
+			JOIN symbols ds ON ds.id = e.`+degreeCol+`
+			JOIN files df ON df.id = ds.file_id AND df.is_deleted = 0
+			LEFT JOIN symbols os ON os.id = e.`+otherCol+`
+			LEFT JOIN files osf ON osf.id = os.file_id
 			WHERE e.repo_id = ? AND e.`+degreeCol+` IS NOT NULL
+			  AND (os.id IS NULL OR osf.is_deleted = 0)
 			GROUP BY e.`+degreeCol+`
 		), cutoff AS (
 			SELECT MIN(degree) AS degree FROM (
@@ -43,7 +58,7 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 		SELECT s.qualified_name, s.kind, f.path, d.degree
 		FROM degrees d
 		JOIN symbols s ON s.id = d.sid
-		JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND d.degree >= (SELECT degree FROM cutoff)
 		ORDER BY d.degree DESC, f.path ASC,
 		         s.qualified_name ASC, s.kind ASC, s.signature ASC,
@@ -84,13 +99,25 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 	if need <= 0 {
 		return out, nil
 	}
+	otherCol := "src_symbol_id"
+	if degreeCol == "src_symbol_id" {
+		otherCol = "dst_symbol_id"
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT s.qualified_name, s.kind, f.path
 		FROM symbols s
-		JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ?
+		  -- Mirrors the degrees CTE: an edge that no longer counts towards
+		  -- degree must not disqualify its symbol from the zero-degree padding
+		  -- either, or a symbol whose only edges point at ghosts would vanish
+		  -- from the overview rather than appear with degree 0.
 		  AND NOT EXISTS (
-		      SELECT 1 FROM edges e WHERE e.repo_id = ? AND e.`+degreeCol+` = s.id
+		      SELECT 1 FROM edges e
+		      LEFT JOIN symbols os ON os.id = e.`+otherCol+`
+		      LEFT JOIN files osf ON osf.id = os.file_id
+		      WHERE e.repo_id = ? AND e.`+degreeCol+` = s.id
+		        AND (os.id IS NULL OR osf.is_deleted = 0)
 		  )
 		ORDER BY f.path ASC, s.qualified_name ASC,
 		         s.kind ASC, s.signature ASC, s.stable_key ASC,

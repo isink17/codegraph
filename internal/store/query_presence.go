@@ -58,6 +58,9 @@ func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, que
 		WITH matches AS MATERIALIZED (
 			SELECT s.id
 			FROM symbol_fts fts JOIN symbols s ON s.id = fts.symbol_id
+			-- Presence and the page share one candidate domain, so the
+			-- matched flag can never claim a symbol the page may not show.
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND symbol_fts MATCH ?
 		), page AS (
 			SELECT matches.id FROM matches
@@ -80,6 +83,7 @@ func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, que
 	return search(`
 		WITH matches AS MATERIALIZED (
 			SELECT s.id FROM symbols s
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
 		), page AS (
 			SELECT matches.id FROM matches
@@ -103,7 +107,10 @@ func (s *Store) FindSymbolExactResult(ctx context.Context, repoID int64, query s
 		return SymbolSearchResult{}, err
 	}
 	var found int
-	err = s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM symbols WHERE repo_id = ? AND (name = ? OR qualified_name = ?))`, repoID, query, query).Scan(&found)
+	err = s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM symbols s
+		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
+		WHERE s.repo_id = ? AND (s.name = ? OR s.qualified_name = ?))`, repoID, query, query).Scan(&found)
 	return SymbolSearchResult{Matched: found != 0, Matches: matches}, err
 }
 
@@ -111,6 +118,7 @@ func (s *Store) searchSymbolsMatched(ctx context.Context, repoID int64, query st
 	var matched int
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM symbol_fts fts JOIN symbols s ON s.id = fts.symbol_id
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND symbol_fts MATCH ?
 	)`, repoID, quoteFTS(query)).Scan(&matched)
 	if err == nil {
@@ -121,7 +129,10 @@ func (s *Store) searchSymbolsMatched(ctx context.Context, repoID int64, query st
 
 func (s *Store) likeSymbolsMatched(ctx context.Context, repoID int64, query string) (bool, error) {
 	var matched int
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM symbols WHERE repo_id = ? AND (name LIKE ? OR qualified_name LIKE ?))`, repoID, "%"+query+"%", "%"+query+"%").Scan(&matched)
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM symbols s
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
+		WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?))`, repoID, "%"+query+"%", "%"+query+"%").Scan(&matched)
 	return matched != 0, err
 }
 

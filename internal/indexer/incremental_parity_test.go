@@ -1646,3 +1646,45 @@ func TestRustCrateLifecycleParityAcrossCrates(t *testing.T) {
 	r.assertFreshParity(t, "module moved between crates")
 	assertRustResolved(t, r, "alt/main.rs", "crate::extra::extra", "alt/extra.rs")
 }
+
+// TestUpdateLifecycleMovesSymbolOutputVisibility pins the F6A3 contract through
+// the real indexer path rather than a hand-marked fixture: a symbol is visible
+// to direct symbol output while its file is indexed, absent once the file is
+// removed and the update run has marked it deleted, and visible again when the
+// file comes back.
+func TestUpdateLifecycleMovesSymbolOutputVisibility(t *testing.T) {
+	const helper = "def Renew():\n    return 1\n"
+	r := newLifecycleRepo(t, tree{"helpers_a.py": helper, "main.py": pyCaller})
+
+	visible := func(stage string, want bool) {
+		t.Helper()
+		syms, err := r.store.FindSymbolExact(r.ctx, r.repoID, "Renew", 50, 0)
+		if err != nil {
+			t.Fatalf("%s: FindSymbolExact: %v", stage, err)
+		}
+		got := false
+		for _, sym := range syms {
+			if sym.FilePath == "helpers_a.py" {
+				got = true
+			}
+		}
+		if got != want {
+			t.Fatalf("%s: exact symbol visible = %v, want %v", stage, got, want)
+		}
+		found, err := r.store.SearchSymbolsResult(r.ctx, r.repoID, "Renew", 50, 0)
+		if err != nil {
+			t.Fatalf("%s: SearchSymbolsResult: %v", stage, err)
+		}
+		if found.Matched != want {
+			t.Fatalf("%s: search Matched = %v, want %v", stage, found.Matched, want)
+		}
+	}
+
+	visible("indexed", true)
+	r.remove(t, "helpers_a.py")
+	r.update(t)
+	visible("after deletion", false)
+	r.write(t, "helpers_a.py", helper)
+	r.update(t)
+	visible("after re-add", true)
+}

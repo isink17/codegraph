@@ -7121,6 +7121,11 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			SELECT s.id AS id
 			FROM symbol_fts fts
 			JOIN symbols s ON s.id = fts.symbol_id
+			-- A symbol whose file is soft-deleted is not user-visible, and the
+			-- exclusion belongs here rather than after the page: a ghost row
+			-- selected into the page would consume a LIMIT/OFFSET slot that an
+			-- active symbol should have had.
+			JOIN files pf ON pf.id = s.file_id AND pf.is_deleted = 0
 			WHERE s.repo_id = ? AND symbol_fts MATCH ?
 			ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
 			         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
@@ -7134,7 +7139,7 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 		-- than be probed once per symbol in the repository.
 		FROM page p
 		CROSS JOIN symbols s ON s.id = p.id
-		JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
 		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
 	`, repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset))
@@ -7143,7 +7148,7 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s
-			JOIN files f ON f.id = s.file_id
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
 			ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
 			         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
@@ -7166,7 +7171,7 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM symbols s
-		JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND (s.name = ? OR s.qualified_name = ?)
 		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
@@ -7659,7 +7664,9 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		SELECT s.id, f.path, COALESCE(s.qualified_name, ''), SUM(st.weight) AS score
 		FROM symbol_tokens st
 		JOIN symbols s ON s.id = st.symbol_id
-		JOIN files f ON f.id = s.file_id
+		-- Active owning file, before GROUP BY/ORDER BY/LIMIT: a ghost symbol
+		-- must not score, rank or consume a page slot.
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND st.token IN (` + placeholders + `)
 		GROUP BY s.id, f.path, s.qualified_name
 		-- Score alone is not a total order: weights come from a small fixed set,
@@ -8527,7 +8534,7 @@ func (s *Store) symbolsByIDs(ctx context.Context, repoID int64, ids []int64, lim
 		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM symbols s
-		JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
+		JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND s.id IN (`+placeholders+`)
 		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 		LIMIT ?
@@ -8868,9 +8875,19 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 	// SQLite sort every edge row cost ~40ms on the same fixture. Per-source
 	// destination order is irrelevant, because every destination of one source
 	// receives the identical share.
+	//
+	// Both endpoints must be active symbols. Filtering the ranked output
+	// instead would be too late: a ghost node still joins allNodes, so it
+	// changes n, the damping base, every source's outgoing share and therefore
+	// the score of every active symbol. The graph PageRank runs on is the
+	// active resolved graph or it is not the graph the user can see.
 	rows2, err := s.db.QueryContext(ctx,
-		`SELECT src_symbol_id, dst_symbol_id FROM edges
-		 WHERE repo_id = ? AND dst_symbol_id IS NOT NULL`, repoID)
+		`SELECT e.src_symbol_id, e.dst_symbol_id FROM edges e
+		 JOIN symbols src ON src.id = e.src_symbol_id
+		 JOIN files srcf ON srcf.id = src.file_id AND srcf.is_deleted = 0
+		 JOIN symbols dst ON dst.id = e.dst_symbol_id
+		 JOIN files dstf ON dstf.id = dst.file_id AND dstf.is_deleted = 0
+		 WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL`, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -9375,19 +9392,24 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		SELECT s.id, s.qualified_name, s.kind, s.name, f.path, f.language,
 		       s.start_line, s.start_col, s.end_line, s.end_col
 		FROM symbols s
-		JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		-- f.repo_id is implied by the join (a symbol's file is in the symbol's
 		-- repo), but stating it lets SQLite seek idx_files_repo_path instead of
 		-- scanning every repo's files, which is also what makes the (f.path,
 		-- s.start_line) ordering come out of the indexes rather than a sort.
 		WHERE s.repo_id = ? AND f.repo_id = ?
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
+		  -- Classification, not just the page, runs on the active graph: a use
+		  -- recorded in a soft-deleted file is not a use the reader can see, so
+		  -- counting it would keep an orphaned symbol out of the answer.
 		  AND NOT EXISTS (
 		      SELECT 1 FROM edges e
+		      JOIN files ef ON ef.id = e.file_id AND ef.is_deleted = 0
 		      WHERE e.repo_id = s.repo_id AND e.dst_symbol_id = s.id
 		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM references_tbl r
+		      JOIN files rf ON rf.id = r.file_id AND rf.is_deleted = 0
 		      WHERE r.repo_id = s.repo_id AND r.symbol_id = s.id
 		  )
 		  AND s.name NOT IN ('main', 'init', 'Main', 'Init')
@@ -9525,6 +9547,11 @@ func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float
 
 	// Guard against loading too many embeddings into memory.
 	var embCount int64
+	// Deliberately the raw count, not the active one: this only picks which
+	// scan runs, and the raw count can only over-estimate. Over-estimating
+	// takes the capped path, whose LIMIT is now spent on active candidates, so
+	// the answer is the same either way -- and a single indexed count is much
+	// cheaper than joining two tables on every vector query to choose a branch.
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&embCount)
 	if embCount > int64(scanCap) {
 		rows, err := s.db.QueryContext(ctx, `
@@ -9533,7 +9560,9 @@ func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float
 				   s.start_line, s.start_col, s.end_line, s.end_col, f.path
 			FROM symbol_embeddings se
 			JOIN symbols s ON s.id = se.symbol_id
-			JOIN files f ON f.id = s.file_id
+			-- The cap applies to active candidates: a ghost embedding must not
+			-- consume one of scanCap's slots before ranking sees the page.
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE se.repo_id = ?
 			ORDER BY se.updated_at DESC, f.path ASC,
 			         s.qualified_name ASC, s.kind ASC, s.signature ASC,
@@ -9553,7 +9582,7 @@ func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float
 			   s.start_line, s.start_col, s.end_line, s.end_col, f.path
 		FROM symbol_embeddings se
 		JOIN symbols s ON s.id = se.symbol_id
-		JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE se.repo_id = ?
 	`, repoID)
 	if err != nil {
@@ -9881,7 +9910,9 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	symbolKinds := []map[string]any{}
 	{
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT kind, COUNT(*) as count FROM symbols WHERE repo_id = ? GROUP BY kind ORDER BY count DESC, kind ASC`,
+			`SELECT s.kind, COUNT(*) as count FROM symbols s
+			 JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
+			 WHERE s.repo_id = ? GROUP BY s.kind ORDER BY count DESC, s.kind ASC`,
 			repoID)
 		if err != nil {
 			return nil, fmt.Errorf("architecture overview: symbol kinds: %w", err)
