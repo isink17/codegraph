@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"runtime"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -112,6 +113,81 @@ func TestRelatedTestFilesPresentPreservesRequestedOrder(t *testing.T) {
 			t.Fatalf("RelatedTestFilesPresent() = %v, want %v", got, want)
 		}
 	}
+}
+
+func TestRelatedTestsFilePresenceTracksActiveLifecycle(t *testing.T) {
+	f := newTestLinkFixture(t)
+	targetFile := f.file("target.go", "go")
+	testFile := f.file("target_test.go", "go")
+	testSymbol := f.symbolWithKey(testFile, "TestTarget", "go", "func:TestTarget")
+	if _, err := f.store.db.ExecContext(f.ctx, `
+		INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score)
+		VALUES(?, ?, ?, ?, NULL, 'test_file_name_match', 0.8)
+	`, f.repoID, testFile, testSymbol, targetFile); err != nil {
+		t.Fatal(err)
+	}
+
+	assertResult := func(wantFound bool, wantTests int) {
+		t.Helper()
+		result, err := f.store.RelatedTestsResult(f.ctx, f.repoID, "", "target.go", 10, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.TargetFound != wantFound || len(result.Tests) != wantTests {
+			t.Fatalf("RelatedTestsResult() = %+v, want found=%v tests=%d", result, wantFound, wantTests)
+		}
+	}
+	assertResult(true, 1)
+
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, targetFile); err != nil {
+		t.Fatal(err)
+	}
+	assertResult(false, 0)
+	if tests, err := f.store.RelatedTests(f.ctx, f.repoID, "", "target.go", 10, 0); err != nil || len(tests) != 0 {
+		t.Fatalf("RelatedTests() for deleted target = %+v, %v; want empty", tests, err)
+	}
+
+	f.file("active.go", "go")
+	deleted := f.file("deleted.go", "go")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, deleted); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.store.RelatedTestFilesPresent(f.ctx, f.repoID, []string{
+		"active.go", "deleted.go", "missing.go", "active.go", "deleted.go", "../invalid.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []bool{true, false, false, true, false, false}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("RelatedTestFilesPresent() = %v, want %v", got, want)
+		}
+	}
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{{"active.go", true}, {"deleted.go", false}, {"missing.go", false}, {"../invalid.go", false}} {
+		present, err := f.store.filePresent(f.ctx, f.repoID, tc.path)
+		if err != nil || present != tc.want {
+			t.Fatalf("filePresent(%q) = %v, %v; want %v", tc.path, present, err, tc.want)
+		}
+	}
+	if runtime.GOOS != "windows" {
+		backslash := f.file(`d/x\y.go`, "go")
+		f.file("d/x/y.go", "go")
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, backslash); err != nil {
+			t.Fatal(err)
+		}
+		got, err := f.store.RelatedTestFilesPresent(f.ctx, f.repoID, []string{`d/x\y.go`, "d/x/y.go"})
+		if err != nil || len(got) != 2 || got[0] || !got[1] {
+			t.Fatalf("separator siblings after exact delete = %v, %v; want [false true]", got, err)
+		}
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted = 0 WHERE id = ?`, targetFile); err != nil {
+		t.Fatal(err)
+	}
+	assertResult(true, 1)
 }
 
 func TestFindCalleesPresenceSurvivesHighOffset(t *testing.T) {

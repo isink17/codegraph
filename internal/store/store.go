@@ -7512,7 +7512,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 	var err error
 	if file != "" {
 		var targetFileID int64
-		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? ORDER BY id`, repoID, file)
+		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0 ORDER BY id`, repoID, file)
 		if err != nil {
 			return nil, err
 		}
@@ -7563,7 +7563,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 						CASE t.reason WHEN 'test_name_match' THEN 2
 							WHEN '`+testLinkFileReason+`' THEN 1 ELSE 0 END AS reason_rank
 					FROM test_links t
-					JOIN files f ON f.id = t.test_file_id
+					JOIN files f ON f.id = t.test_file_id AND f.is_deleted = 0
 					LEFT JOIN symbols s ON s.id = t.test_symbol_id
 					WHERE t.repo_id = ? AND t.target_file_id = ?
 					UNION ALL
@@ -7571,7 +7571,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 					FROM edges e
 					JOIN test_links tl ON tl.repo_id = e.repo_id AND tl.test_symbol_id = e.src_symbol_id
 					JOIN symbols ts ON ts.id = e.src_symbol_id
-					JOIN files tf ON tf.id = ts.file_id
+					JOIN files tf ON tf.id = ts.file_id AND tf.is_deleted = 0
 					WHERE e.repo_id = ? AND e.edge_kind = 'calls'
 					  AND ts.file_id != ?
 					  AND e.dst_symbol_id IN (SELECT id FROM symbols WHERE repo_id = ? AND file_id = ?)
@@ -7610,7 +7610,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 						CASE t.reason WHEN 'test_name_match' THEN 2
 							WHEN '`+testLinkFileReason+`' THEN 1 ELSE 0 END AS reason_rank
 					FROM test_links t
-					JOIN files f ON f.id = t.test_file_id
+					JOIN files f ON f.id = t.test_file_id AND f.is_deleted = 0
 					LEFT JOIN symbols s ON s.id = t.test_symbol_id
 					WHERE t.repo_id = ? AND t.target_symbol_id = ?
 					UNION ALL
@@ -7618,7 +7618,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 					FROM edges e
 					JOIN test_links tl ON tl.repo_id = e.repo_id AND tl.test_symbol_id = e.src_symbol_id
 					JOIN symbols ts ON ts.id = e.src_symbol_id
-					JOIN files tf ON tf.id = ts.file_id
+					JOIN files tf ON tf.id = ts.file_id AND tf.is_deleted = 0
 					WHERE e.repo_id = ? AND e.edge_kind = 'calls' AND e.dst_symbol_id = ?
 				)
 				GROUP BY path, symbol

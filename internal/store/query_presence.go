@@ -244,7 +244,7 @@ func (s *Store) RelatedTestFilesPresent(ctx context.Context, repoID int64, files
 		return present, nil
 	}
 	found := map[string]struct{}{}
-	if err := sqliteBatchedQuery(ctx, s.db, `SELECT path FROM files WHERE repo_id = ?`, ` AND path IN (%s)`,
+	if err := sqliteBatchedQuery(ctx, s.db, `SELECT path FROM files WHERE repo_id = ? AND is_deleted = 0`, ` AND path IN (%s)`,
 		[]any{repoID}, stringSliceToAny(paths), true,
 		func(rows *sql.Rows) error {
 			var path string
@@ -269,7 +269,7 @@ func (s *Store) filePresent(ctx context.Context, repoID int64, file string) (boo
 		return false, nil
 	}
 	var id sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? LIMIT 1`, repoID, canonical).Scan(&id)
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0 LIMIT 1`, repoID, canonical).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
