@@ -94,6 +94,75 @@ func TestFindContextNeighborsRejectsInactiveExplicitSeeds(t *testing.T) {
 	if len(got[0].Callers) != 1 || len(got[0].Callees) != 1 {
 		t.Fatalf("reactivated explicit seed = %+v, want both neighbors", got[0])
 	}
+
+	// A deleted middle seed must leave its output slot in place between two
+	// active seeds with distinct graph evidence.
+	seedA, err := insertTestSymbol(ctx, s, repo.ID, activeFile, "ActiveA", "pkg.ActiveA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedC, err := insertTestSymbol(ctx, s, repo.ID, activeFile, "ActiveC", "pkg.ActiveC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerA, err := insertTestSymbol(ctx, s, repo.ID, activeFile, "CallerA", "pkg.CallerA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calleeC, err := insertTestSymbol(ctx, s, repo.ID, activeFile, "CalleeC", "pkg.CalleeC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]int64{{callerA, seedA}, {seedC, calleeC}} {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, file_id, line) VALUES(?, ?, ?, '', 'call', ?, 1)`, repo.ID, edge[0], edge[1], activeFile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, deletedFile); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := s.FindContextNeighbors(ctx, repo.ID, []ContextSeed{
+		{SymbolID: seedA, QualifiedName: "pkg.ActiveA", ShortName: "ActiveA"},
+		seedInput,
+		{SymbolID: seedC, QualifiedName: "pkg.ActiveC", ShortName: "ActiveC"},
+	}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mixed) != 3 || len(mixed[0].Callers) != 1 || mixed[0].Callers[0].QualifiedName != "pkg.CallerA" ||
+		len(mixed[0].Callees) != 0 || len(mixed[1].Callers) != 0 || len(mixed[1].Callees) != 0 ||
+		len(mixed[2].Callers) != 0 || len(mixed[2].Callees) != 1 || mixed[2].Callees[0].QualifiedName != "pkg.CalleeC" {
+		t.Fatalf("mixed seed slots = %+v, want A neighbors, empty B, C neighbors", mixed)
+	}
+
+	// A valid symbol ID from another repository is inactive for this query,
+	// even when its textual identity is populated.
+	foreignRepo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignFile, err := insertTestFile(ctx, s, foreignRepo.ID, "foreign.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignSeed, err := insertTestSymbol(ctx, s, foreignRepo.ID, foreignFile, "ForeignSeed", "pkg.ForeignSeed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignCaller, err := insertTestSymbol(ctx, s, foreignRepo.ID, foreignFile, "ForeignCaller", "pkg.ForeignCaller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, file_id, line) VALUES(?, ?, ?, '', 'call', ?, 1)`, foreignRepo.ID, foreignCaller, foreignSeed, foreignFile); err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := s.FindContextNeighbors(ctx, repo.ID, []ContextSeed{{SymbolID: foreignSeed, QualifiedName: "pkg.ForeignSeed", ShortName: "ForeignSeed", AllowShortEvidence: true}}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(foreign) != 1 || len(foreign[0].Callers) != 0 || len(foreign[0].Callees) != 0 {
+		t.Fatalf("foreign explicit seed = %+v, want empty slot", foreign)
+	}
 }
 
 func newAmbiguityFixture(t *testing.T) *ambiguityFixture {
