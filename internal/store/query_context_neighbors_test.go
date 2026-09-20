@@ -28,6 +28,74 @@ type ambiguityFixture struct {
 	fileID int64
 }
 
+func TestFindContextNeighborsRejectsInactiveExplicitSeeds(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeFile, err := insertTestFile(ctx, s, repo.ID, "active.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletedFile, err := insertTestFile(ctx, s, repo.ID, "deleted.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller, err := insertTestSymbol(ctx, s, repo.ID, activeFile, "ActiveCaller", "pkg.ActiveCaller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := insertTestSymbol(ctx, s, repo.ID, deletedFile, "DeletedSeed", "pkg.DeletedSeed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callee, err := insertTestSymbol(ctx, s, repo.ID, activeFile, "ActiveCallee", "pkg.ActiveCallee")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]int64{{caller, seed}, {seed, callee}} {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, file_id, line) VALUES(?, ?, ?, '', 'call', ?, 1)`, repo.ID, edge[0], edge[1], activeFile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, deletedFile); err != nil {
+		t.Fatal(err)
+	}
+	seedInput := ContextSeed{SymbolID: seed, QualifiedName: "pkg.DeletedSeed", ShortName: "DeletedSeed", AllowShortEvidence: true}
+	got, err := s.FindContextNeighbors(ctx, repo.ID, []ContextSeed{seedInput}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || len(got[0].Callers) != 0 || len(got[0].Callees) != 0 {
+		t.Fatalf("deleted explicit seed = %+v, want empty slot", got)
+	}
+	for _, id := range []int64{seed, seed + 999999} {
+		got, err := s.FindContextNeighbors(ctx, repo.ID, []ContextSeed{{SymbolID: id, QualifiedName: "pkg.DeletedSeed", ShortName: "DeletedSeed", AllowShortEvidence: true}}, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got[0].Callers) != 0 || len(got[0].Callees) != 0 {
+			t.Fatalf("inactive explicit id %d got neighbors: %+v", id, got[0])
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 0 WHERE id = ?`, deletedFile); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.FindContextNeighbors(ctx, repo.ID, []ContextSeed{seedInput}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got[0].Callers) != 1 || len(got[0].Callees) != 1 {
+		t.Fatalf("reactivated explicit seed = %+v, want both neighbors", got[0])
+	}
+}
+
 func newAmbiguityFixture(t *testing.T) *ambiguityFixture {
 	t.Helper()
 	ctx := context.Background()
