@@ -8366,7 +8366,7 @@ func (s *Store) lookupImpactSymbolSeeds(ctx context.Context, repoID int64, symbo
 				(req.short <> '' AND (s.qualified_name LIKE '%::' || req.short OR s.qualified_name LIKE '%.' || req.short)) OR
 				(req.short <> req.name AND req.short <> '' AND s.name = req.short)
 			)
-			JOIN files f ON f.id = s.file_id
+			JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 		)
 		SELECT ord, id FROM candidates
 		ORDER BY ord, rank, qualified_name, path, start_line, start_col, id`, args...)
@@ -8417,7 +8417,7 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 			sql: `
 				SELECT DISTINCT s.id
 				FROM symbols s
-				JOIN files f ON f.id = s.file_id
+				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND s.qualified_name = ?
 				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			`,
@@ -8427,7 +8427,7 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 			sql: `
 				SELECT DISTINCT s.id
 				FROM symbols s
-				JOIN files f ON f.id = s.file_id
+				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND s.name = ?
 				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			`,
@@ -8442,7 +8442,7 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 			sql: `
 				SELECT DISTINCT s.id
 				FROM symbols s
-				JOIN files f ON f.id = s.file_id
+				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND (s.qualified_name LIKE ? OR s.qualified_name LIKE ?)
 				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			`,
@@ -8457,7 +8457,7 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 			sql: `
 				SELECT DISTINCT s.id
 				FROM symbols s
-				JOIN files f ON f.id = s.file_id
+				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND s.name = ?
 				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
 			`,
@@ -9041,7 +9041,7 @@ func (s *Store) lookupSymbolIdentity(ctx context.Context, repoID, symbolID int64
 		SELECT s.id, s.repo_id, s.name, s.qualified_name, s.language,
 		       s.kind, COALESCE(f.path, ''), s.start_line, s.start_col
 		FROM symbols s
-		LEFT JOIN files f ON f.id = s.file_id
+		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND s.id = ?
 	`, repoID, symbolID).Scan(
 		&identity.ID, &identity.RepoID, &identity.Name,
