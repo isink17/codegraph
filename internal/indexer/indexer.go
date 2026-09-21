@@ -1560,14 +1560,9 @@ func matchPattern(path, pattern string) bool {
 		return false
 	}
 	pattern = strings.TrimPrefix(pattern, "/")
-	// Logical hierarchy uses slash only. A slash-bearing glob must not let
-	// '*' consume a literal backslash component separator.
-	if strings.Contains(pattern, "/") && strings.Contains(path, `\`) {
-		return false
-	}
 	if strings.HasSuffix(pattern, "/**") {
 		prefix := strings.TrimSuffix(pattern, "/**")
-		if strings.HasPrefix(path, prefix) {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
 			return true
 		}
 	}

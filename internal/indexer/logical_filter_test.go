@@ -44,3 +44,45 @@ func TestLogicalIgnoreAncestorUsesSlashHierarchy(t *testing.T) {
 		t.Fatal("backslash component changed ancestor hierarchy")
 	}
 }
+
+func TestLogicalGlobBoundariesAndBackslashComponents(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		pattern string
+		want    bool
+	}{
+		{"backslash component", `dir\name/file.go`, "**/*.go", true},
+		{"backslash component basename", `dir\name/file.go`, "*.go", true},
+		{"backslash is not hierarchy", `src\file.go`, "src/**", false},
+		{"backslash nested is not hierarchy", `vendor\private/file.go`, "vendor/**", false},
+		{"prefix collision", "vendor2/file.go", "vendor/**", false},
+		{"old prefix collision", "vendor-old/file.go", "vendor/**", false},
+		{"root", "vendor", "vendor/**", true},
+		{"direct child", "vendor/file.go", "vendor/**", true},
+		{"descendant", "vendor/private/file.go", "vendor/**", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := matchPattern(tt.path, tt.pattern); got != tt.want {
+				t.Fatalf("matchPattern(%q, %q) = %v, want %v", tt.path, tt.pattern, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLogicalGlobBoundaryHelpers(t *testing.T) {
+	if shouldSkipFile(`dir\name/file.go`, []string{"**/*.go"}, nil) {
+		t.Fatal("backslash component rejected by include")
+	}
+	if shouldIgnorePath("vendor2/file.go", []string{"vendor/**"}) {
+		t.Fatal("vendor glob affected sibling prefix")
+	}
+	if !shouldIgnorePath("vendor/file.go", []string{"vendor/**"}) {
+		t.Fatal("vendor glob missed direct child")
+	}
+	excludes := []string{"vendor/**", "!vendor/keep.go"}
+	if shouldIgnorePath("vendor/keep.go", excludes) || shouldIgnorePath("vendor2/keep.go", excludes) {
+		t.Fatal("vendor negation boundary changed")
+	}
+}
