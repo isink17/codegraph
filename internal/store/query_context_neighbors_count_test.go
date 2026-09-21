@@ -308,10 +308,10 @@ func TestContextNeighborsSplitOversizedSeedEvidence(t *testing.T) {
 			t.Fatalf("caller[%d] = %s, public = %s", i, got[0].Callers[i].QualifiedName, want[i].QualifiedName)
 		}
 	}
-	// With unresolved name evidence excluded, one bound-edge page per direction
-	// is sufficient.
-	if stmts := s.contextNeighborStatements(); stmts != 2 {
-		t.Fatalf("%d statements; want one bound-edge page per direction", stmts)
+	// The active-seed validation adds one fixed statement to the two bound-edge
+	// pages; it remains independent of the evidence size.
+	if stmts := s.contextNeighborStatements(); stmts != 3 {
+		t.Fatalf("%d statements; want one validation plus one page per direction", stmts)
 	}
 }
 

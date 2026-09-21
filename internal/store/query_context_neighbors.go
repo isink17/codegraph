@@ -121,9 +121,13 @@ func (s *Store) FindContextNeighbors(ctx context.Context, repoID int64, seeds []
 
 	// A seed without a resolved id has no exact identity to expand from. It can
 	// still carry name evidence, so it is not dropped -- only its id legs are.
+	activeIDs, err := s.activeContextSeedIDs(ctx, repoID, seeds)
+	if err != nil {
+		return nil, err
+	}
 	live := make([]int, 0, len(seeds))
 	for i, sd := range seeds {
-		if sd.SymbolID != 0 || sd.QualifiedName != "" {
+		if (sd.SymbolID != 0 && activeIDs[sd.SymbolID]) || (sd.SymbolID == 0 && sd.QualifiedName != "") {
 			live = append(live, i)
 		}
 	}
@@ -138,6 +142,54 @@ func (s *Store) FindContextNeighbors(ctx context.Context, repoID int64, seeds []
 		return nil, err
 	}
 	return out, nil
+}
+
+// activeContextSeedIDs returns the exact explicit seed identities that are
+// still visible in repoID. A nonzero seed id is authoritative; its text is not
+// a fallback when the row is missing or its owning file is deleted.
+func (s *Store) activeContextSeedIDs(ctx context.Context, repoID int64, seeds []ContextSeed) (map[int64]bool, error) {
+	ids := make([]int64, 0, len(seeds))
+	seen := make(map[int64]bool, len(seeds))
+	for _, seed := range seeds {
+		if seed.SymbolID != 0 && !seen[seed.SymbolID] {
+			seen[seed.SymbolID] = true
+			ids = append(ids, seed.SymbolID)
+		}
+	}
+	active := make(map[int64]bool, len(ids))
+	for _, chunk := range chunkInt64s(ids, sqliteInClauseBatchSize-1) {
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		args = append(args, int64SliceToAny(chunk)...)
+		rows, err := s.neighborQuery(ctx, `
+			SELECT s.id
+			FROM symbols s
+			JOIN files f
+			  ON f.repo_id = s.repo_id
+			 AND f.id = s.file_id
+			 AND f.is_deleted = 0
+			WHERE s.repo_id = ? AND s.id IN (`+placeholders(len(chunk))+`)
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			active[id] = true
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return active, nil
 }
 
 // idPair is a (seed index, symbol id) association. Seed identity travels with
