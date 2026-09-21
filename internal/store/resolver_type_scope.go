@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"path"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -581,8 +580,10 @@ var cFamilyIncludeExtensions = map[string]struct{}{
 // Turning them away instead would drop Python, Java and Kotlin out of the rule
 // entirely, which is most of the population it exists to protect.
 func importSpecifierPath(importerPath, specifier, language string) (string, bool) {
-	spec := filepath.ToSlash(strings.TrimSpace(specifier))
-	if spec == "" || strings.ContainsAny(spec, " \t\"'()[]{}<>*:;,") {
+	spec := strings.TrimSpace(specifier)
+	// Backslash is literal/unsupported source evidence. Never reinterpret it
+	// according to the analysis host's filesystem rules.
+	if spec == "" || strings.ContainsAny(spec, `\`+" \t\"'()[]{}<>*:;,") {
 		return "", false
 	}
 	switch {
