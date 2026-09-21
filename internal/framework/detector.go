@@ -1,7 +1,7 @@
 package framework
 
 import (
-	"path/filepath"
+	"path"
 	"strings"
 )
 
@@ -63,12 +63,6 @@ func Detect(files []string, imports map[string][]string) []Detection {
 		totalFiles = 1
 	}
 
-	// Build a set of file basenames for file-based detection.
-	fileSet := make(map[string]bool, len(files))
-	for _, f := range files {
-		fileSet[filepath.ToSlash(f)] = true
-	}
-
 	type match struct {
 		files []string
 	}
@@ -93,8 +87,7 @@ func Detect(files []string, imports map[string][]string) []Detection {
 
 	// File-based detection for Rails.
 	for _, f := range files {
-		normalized := filepath.ToSlash(f)
-		if strings.HasSuffix(normalized, "config/routes.rb") {
+		if f == "config/routes.rb" || strings.HasSuffix(f, "/config/routes.rb") {
 			m, ok := matches["rails"]
 			if !ok {
 				m = &match{}
@@ -106,8 +99,7 @@ func Detect(files []string, imports map[string][]string) []Detection {
 
 	// File-based detection for Laravel (artisan file).
 	for _, f := range files {
-		base := filepath.Base(f)
-		if base == "artisan" {
+		if path.Base(f) == "artisan" {
 			m, ok := matches["laravel"]
 			if !ok {
 				m = &match{}
