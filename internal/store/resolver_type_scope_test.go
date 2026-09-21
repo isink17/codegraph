@@ -646,7 +646,7 @@ func TestImportSpecifierPath(t *testing.T) {
 		{"empty", "a.py", "", "python", "", false},
 		{"rust_scoped", "a.rs", "std::fs", "rust", "", false},
 		{"quoted_noise", "a.py", `numpy as np`, "python", "", false},
-		{"backslash_is_unsupported", "a.py", `pkg\\module`, "python", "", false},
+		{"backslash_is_unsupported", "a.py", `pkg\module`, "python", "", false},
 		{"escapes_repo", "a.py", "../../outside", "python", "", false},
 	}
 	for _, tc := range cases {
@@ -657,6 +657,30 @@ func TestImportSpecifierPath(t *testing.T) {
 			}
 			if ok && got != tc.want {
 				t.Fatalf("importSpecifierPath(%q, %q, %q) = %q; want %q", tc.importer, tc.specifier, tc.language, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolverTypeScopeRejectsSingleBackslashSpecifier(t *testing.T) {
+	for _, slash := range []string{`pkg\target`, "pkg/target"} {
+		t.Run(slash, func(t *testing.T) {
+			f := newTypeScopeFixture(t)
+			targetFile := f.file(t, "pkg/target.py", "python")
+			target := f.class(t, targetFile, "Target", "target.Target", "python")
+			callerFile := f.file(t, "pkg/caller.py", "python")
+			source := f.symbolKind(t, callerFile, "run", "caller.run", "function", "python")
+			edge := f.edge(t, callerFile, source, "Target")
+			f.importPath(t, callerFile, slash)
+			if _, err := f.store.ResolveEdges(f.ctx, f.repoID); err != nil {
+				t.Fatalf("ResolveEdges() error = %v", err)
+			}
+			got, resolved := f.dstSymbolID(t, edge)
+			if slash == `pkg\target` && resolved {
+				t.Fatalf("single-backslash specifier resolved Target (%d); want unresolved", got)
+			}
+			if slash == "pkg/target" && (!resolved || got != target) {
+				t.Fatalf("slash specifier resolved (%d, %v); want Target (%d)", got, resolved, target)
 			}
 		})
 	}

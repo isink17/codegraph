@@ -41,14 +41,38 @@ func TestResolveImportSpecifierPathIsHostIndependent(t *testing.T) {
 		ok                              bool
 	}{
 		{name: "relative", importer: "pkg/main.ts", specifier: "./model", want: "pkg/model", ok: true},
-		{name: "backslash_unsupported", importer: "pkg/main.ts", specifier: `pkg\\model`, ok: false},
-		{name: "backslash_relative_unsupported", importer: "pkg/main.ts", specifier: `.\\model`, ok: false},
+		{name: "backslash_unsupported", importer: "pkg/main.ts", specifier: `pkg\model`, ok: false},
+		{name: "backslash_relative_unsupported", importer: "pkg/main.ts", specifier: `.\model`, ok: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, ok := resolveImportSpecifierPath(tt.importer, tt.specifier)
 			if ok != tt.ok || (ok && got != tt.want) {
 				t.Fatalf("resolveImportSpecifierPath(%q, %q) = %q, %v; want %q, %v", tt.importer, tt.specifier, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestCrossLanguageLinksRejectSingleBackslashSpecifier(t *testing.T) {
+	for _, specifier := range []string{`src\shared\model`, "src/shared/model"} {
+		t.Run(specifier, func(t *testing.T) {
+			f := newGateFixture(t)
+			spec := crossLangSpec{
+				files: []crossLangFile{
+					{path: "src/client.ts", language: "typescript", symbols: []crossLangSymbol{{name: "Encode", qualified: "client.Encode"}}},
+					{path: "src/shared/model.py", language: "python", symbols: []crossLangSymbol{{name: "Encode", qualified: "model.Encode"}}},
+				},
+				imports: []crossLangImport{{fromPath: "src/client.ts", path: specifier}},
+			}
+			spec.build(t, f, 1)
+			created := f.resolveCrossLanguage(t)
+			links := crossLangLinks(t, f)
+			if specifier == `src\shared\model` && (created != 0 || len(links) != 0) {
+				t.Fatalf("single-backslash specifier created %d links: %v; want none", created, links)
+			}
+			if specifier == "src/shared/model" && (created != 1 || len(links) != 1) {
+				t.Fatalf("slash specifier created %d links: %v; want one", created, links)
 			}
 		})
 	}
