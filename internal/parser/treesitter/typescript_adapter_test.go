@@ -6,7 +6,34 @@ import (
 	"context"
 	"reflect"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
+
+func TestTypeScriptParsePreservesLogicalPathIdentity(t *testing.T) {
+	parse := func(name string) graph.ParsedFile {
+		pf, err := NewTypeScript().Parse(context.Background(), name, []byte("function run() {}\nfunction testRun() {}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pf
+	}
+	slash := parse("pkg/x/y.ts")
+	backslash := parse(`pkg/x\y.ts`)
+	if slash.Symbols[0].QualifiedName != "pkg/x/y.run" || slash.Symbols[0].ContainerName != "pkg/x/y" || slash.Symbols[0].StableKey != "func:typescript:pkg/x/y:run" {
+		t.Fatalf("slash identity = %+v", slash.Symbols[0])
+	}
+	if backslash.Symbols[0].QualifiedName != `pkg/x\y.run` || backslash.Symbols[0].ContainerName != `pkg/x\y` || backslash.Symbols[0].StableKey != `func:typescript:pkg/x\y:run` {
+		t.Fatalf("backslash identity = %+v", backslash.Symbols[0])
+	}
+	if slash.Symbols[0].StableKey == backslash.Symbols[0].StableKey || len(backslash.TestLinks) != 1 || backslash.TestLinks[0].TargetName != `pkg/x\y.Run` || backslash.TestLinks[0].TargetStableKey != `func:typescript:pkg/x\y:Run` {
+		t.Fatalf("logical test identity = %+v", backslash.TestLinks)
+	}
+	js := parse(`pkg/x\client.js`)
+	if js.Symbols[0].QualifiedName != `pkg/x\client.run` {
+		t.Fatalf("JavaScript logical identity = %+v", js.Symbols[0])
+	}
+}
 
 func TestTypeScriptCallEvidenceUsesSemanticCalleeNames(t *testing.T) {
 	const oneLine = `function run() { fn(); client.request("/health"); a.b.c(); factory()(); factory().run(); arr[0](); optional?.call(); }`

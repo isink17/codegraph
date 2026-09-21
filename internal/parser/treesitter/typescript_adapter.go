@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -33,8 +34,8 @@ func (a *TypeScriptAdapter) Supports(path string) bool {
 	return false
 }
 
-func (a *TypeScriptAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
-	ext := strings.ToLower(filepath.Ext(path))
+func (a *TypeScriptAdapter) Parse(ctx context.Context, logicalPath string, content []byte) (graph.ParsedFile, error) {
+	ext := strings.ToLower(path.Ext(logicalPath))
 	lang := typescript.GetLanguage()
 	if ext == ".js" || ext == ".jsx" || ext == ".mjs" {
 		lang = javascript.GetLanguage()
@@ -45,7 +46,7 @@ func (a *TypeScriptAdapter) Parse(ctx context.Context, path string, content []by
 		return graph.ParsedFile{}, err
 	}
 
-	module := strings.TrimSuffix(filepath.ToSlash(path), filepath.Ext(path))
+	module := strings.TrimSuffix(logicalPath, path.Ext(logicalPath))
 	pf := graph.ParsedFile{
 		Language:   "typescript",
 		FileTokens: computeFileTokens(content),
