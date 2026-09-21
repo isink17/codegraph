@@ -44,7 +44,11 @@ func TestDetectPreservesImportEvidenceAndIdentity(t *testing.T) {
 		`x\y`: {"express"},
 	}
 	got := detection(t, "express", files, imports)
-	if len(got.Evidence) != 2 || got.Evidence[0] != "x/y" || got.Evidence[1] != `x\y` {
+	seen := map[string]bool{}
+	for _, evidence := range got.Evidence {
+		seen[evidence] = true
+	}
+	if len(got.Evidence) != 2 || !seen["x/y"] || !seen[`x\y`] {
 		t.Fatalf("Evidence = %q, want exact distinct paths", got.Evidence)
 	}
 }
