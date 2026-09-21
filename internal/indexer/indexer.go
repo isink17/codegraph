@@ -390,14 +390,18 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			if err != nil {
 				return err
 			}
-			rel = filepath.Clean(rel)
-			if d.IsDir() && shouldSkipDir(rel, opts.Exclude) {
+			nativeRel := filepath.Clean(rel)
+			logicalRel, err := platform.NativeRelativeToLogical(nativeRel)
+			if err != nil {
+				return err
+			}
+			if d.IsDir() && shouldSkipDir(logicalRel, opts.Exclude) {
 				return filepath.SkipDir
 			}
 			if d.IsDir() {
 				return nil
 			}
-			if shouldSkipFile(rel, opts.Include, opts.Exclude) {
+			if shouldSkipFile(logicalRel, opts.Include, opts.Exclude) {
 				return nil
 			}
 			info, err := entryFileInfo(path, d)
@@ -407,11 +411,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			if info == nil {
 				return nil
 			}
-			logicalRel, err := platform.NativeRelativeToLogical(rel)
-			if err != nil {
-				return err
-			}
-			adapter := i.registry.AdapterFor(rel)
+			adapter := i.registry.AdapterFor(nativeRel)
 			language := ""
 			if adapter != nil {
 				language = adapter.Language()
@@ -1411,8 +1411,7 @@ func ShouldIgnorePath(rel string, excludes []string) bool {
 }
 
 func shouldSkipDir(rel string, excludes []string) bool {
-	rel = filepath.ToSlash(rel)
-	base := filepath.Base(rel)
+	base := pathpkg.Base(rel)
 
 	// Always skip hardcoded directories - not overridable.
 	for _, skip := range config.HardcodedSkips {
@@ -1449,12 +1448,12 @@ func shouldSkipFile(rel string, includes, excludes []string) bool {
 }
 
 func shouldIgnorePath(rel string, excludes []string) bool {
-	current := filepath.Clean(rel)
+	current := rel
 	for current != "." && current != "" {
 		if shouldSkipDir(current, excludes) {
 			return true
 		}
-		next := filepath.Dir(current)
+		next := pathpkg.Dir(current)
 		if next == current {
 			break
 		}
@@ -1464,7 +1463,6 @@ func shouldIgnorePath(rel string, excludes []string) bool {
 }
 
 func matchesAny(path string, globs []string) bool {
-	path = filepath.ToSlash(path)
 	for _, glob := range globs {
 		if matchPattern(path, glob) {
 			return true
@@ -1514,10 +1512,9 @@ func coverageExtensionKey(relPath string) string {
 }
 
 func matchesIgnore(path string, patterns []string) bool {
-	path = filepath.ToSlash(path)
 	ignored := false
 	for _, raw := range patterns {
-		pattern := strings.TrimSpace(filepath.ToSlash(raw))
+		pattern := strings.TrimSpace(raw)
 		if pattern == "" {
 			continue
 		}
@@ -1538,13 +1535,13 @@ func matchesIgnore(path string, patterns []string) bool {
 }
 
 func hasNegationWithin(dir string, patterns []string) bool {
-	dir = strings.Trim(filepath.ToSlash(dir), "/")
+	dir = strings.Trim(dir, "/")
 	if dir == "" || dir == "." {
 		return false
 	}
 	prefix := dir + "/"
 	for _, raw := range patterns {
-		pattern := strings.TrimSpace(filepath.ToSlash(raw))
+		pattern := strings.TrimSpace(raw)
 		if !strings.HasPrefix(pattern, "!") {
 			continue
 		}
@@ -1558,21 +1555,21 @@ func hasNegationWithin(dir string, patterns []string) bool {
 }
 
 func matchPattern(path, pattern string) bool {
-	pattern = strings.TrimSpace(filepath.ToSlash(pattern))
+	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
 		return false
 	}
 	pattern = strings.TrimPrefix(pattern, "/")
 	if strings.HasSuffix(pattern, "/**") {
 		prefix := strings.TrimSuffix(pattern, "/**")
-		if strings.HasPrefix(path, prefix) {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
 			return true
 		}
 	}
 	if ok, _ := pathpkg.Match(pattern, path); ok {
 		return true
 	}
-	if ok, _ := filepath.Match(pattern, filepath.Base(path)); ok {
+	if ok, _ := pathpkg.Match(pattern, pathpkg.Base(path)); ok {
 		return true
 	}
 	return false

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -106,17 +107,15 @@ func (w *Watcher) Stats() WatchStats {
 }
 
 func isRelPathWithinRepo(rel string) bool {
-	rel = filepath.ToSlash(filepath.Clean(rel))
 	return rel != ".." && !strings.HasPrefix(rel, "../")
 }
 
 func isWatcherConfigPath(rel string) bool {
-	rel = filepath.ToSlash(filepath.Clean(rel))
 	rel = strings.TrimPrefix(rel, "./")
 	if strings.EqualFold(rel, ".codegraphignore") {
 		return true
 	}
-	if strings.EqualFold(rel, filepath.ToSlash(filepath.Join(config.RepoArtifactsDir, "config.json"))) {
+	if strings.EqualFold(rel, pathpkg.Join(config.RepoArtifactsDir, "config.json")) {
 		return true
 	}
 	return false
@@ -171,9 +170,13 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				if relErr != nil {
 					return relErr
 				}
-				rel = filepath.Clean(rel)
-				if d.IsDir() && indexer.ShouldSkipDir(rel, excludes) {
-					if filepath.Base(rel) == config.RepoArtifactsDir {
+				nativeRel := filepath.Clean(rel)
+				logicalRel, logicalErr := platform.NativeRelativeToLogical(nativeRel)
+				if logicalErr != nil {
+					return logicalErr
+				}
+				if d.IsDir() && indexer.ShouldSkipDir(logicalRel, excludes) {
+					if pathpkg.Base(logicalRel) == config.RepoArtifactsDir {
 						// Keep watching repo-local config updates even though artifacts are
 						// never indexable.
 						if addErr := target.Add(path); addErr != nil {
