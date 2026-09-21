@@ -646,6 +646,7 @@ func TestImportSpecifierPath(t *testing.T) {
 		{"empty", "a.py", "", "python", "", false},
 		{"rust_scoped", "a.rs", "std::fs", "rust", "", false},
 		{"quoted_noise", "a.py", `numpy as np`, "python", "", false},
+		{"backslash_is_unsupported", "a.py", `pkg\\module`, "python", "", false},
 		{"escapes_repo", "a.py", "../../outside", "python", "", false},
 	}
 	for _, tc := range cases {

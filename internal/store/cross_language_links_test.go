@@ -35,6 +35,25 @@ type crossLangImport struct {
 	path     string
 }
 
+func TestResolveImportSpecifierPathIsHostIndependent(t *testing.T) {
+	tests := []struct {
+		name, importer, specifier, want string
+		ok                              bool
+	}{
+		{name: "relative", importer: "pkg/main.ts", specifier: "./model", want: "pkg/model", ok: true},
+		{name: "backslash_unsupported", importer: "pkg/main.ts", specifier: `pkg\\model`, ok: false},
+		{name: "backslash_relative_unsupported", importer: "pkg/main.ts", specifier: `.\\model`, ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := resolveImportSpecifierPath(tt.importer, tt.specifier)
+			if ok != tt.ok || (ok && got != tt.want) {
+				t.Fatalf("resolveImportSpecifierPath(%q, %q) = %q, %v; want %q, %v", tt.importer, tt.specifier, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
 // build inserts the spec. order picks the insertion order of files and of the
 // symbols inside each file: +1 forward, -1 reverse, 0 an interleave that is
 // neither (odd indices first), so equivalent graphs get genuinely different

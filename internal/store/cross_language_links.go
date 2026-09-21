@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -467,8 +466,10 @@ func crossLanguageImportTarget(
 // path-shaped ones can name a file, and reading dots as extensions is what let
 // `import app.models` match a root-level `app.ts`.
 func resolveImportSpecifierPath(importerPath, specifier string) (string, bool) {
-	spec := filepath.ToSlash(strings.TrimSpace(specifier))
-	if spec == "" || strings.ContainsAny(spec, " \t\"'()[]{}<>*:;,") {
+	spec := strings.TrimSpace(specifier)
+	// Backslash is literal/unsupported source evidence. Never reinterpret it
+	// according to the analysis host's filesystem rules.
+	if spec == "" || strings.ContainsAny(spec, `\`+" \t\"'()[]{}<>*:;,") {
 		return "", false
 	}
 	relative := strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../")
