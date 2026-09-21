@@ -103,6 +103,42 @@ class Unknown { void F() { Service.Run(); } }`,
 	}
 }
 
+func TestCSharpGlobalUsingFailsClosedWithoutProjectScope(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"A.cs":      `namespace A; public class Service { public static void Run() {} }`,
+		"Global.cs": `global using A; namespace One; class Caller { void F() { Service.Run(); } }`,
+		"Alias.cs":  `global using S = A.Service; namespace Two; class Caller { void F() { S.Run(); } }`,
+		"Static.cs": `global using static A.Service; namespace Three; class Caller { void F() { Run(); } }`,
+	}
+	for path, content := range files {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := s.ExportEdgesPage(context.Background(), repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range edges {
+		if edge.DstSymbolID != nil {
+			t.Errorf("%s:%s resolved to %q without project scope", edge.FilePath, edge.DstName, edge.DstQualifiedName)
+		}
+	}
+}
+
 func TestCSharpBareArityRespectsStaticCaller(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "C.cs"), []byte(`class C {
