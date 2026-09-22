@@ -135,6 +135,19 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	manifestChanged := false
+	for _, rel := range candidatePaths {
+		if pathpkg.Base(rel) == "Package.swift" {
+			manifestChanged = true
+			break
+		}
+	}
+	// Package.swift owns scope facts for every Swift file below its package.
+	// Re-scan the repository when one changes so additions, removals, moves,
+	// nested manifests, and manifest deletion cannot leave stale ownership.
+	if manifestChanged {
+		candidatePaths = nil
+	}
 	repoCfg, err := config.LoadRepo(opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -376,7 +389,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					language:     language,
 					swiftModule:  swiftModules.moduleFor(rel),
 					swiftPackage: swiftModules.packageFor(rel),
-					swiftProject: swiftModules.manifests,
+					swiftProject: manifestChanged,
 				}
 				select {
 				case tasks <- task:
@@ -434,7 +447,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				language:     language,
 				swiftModule:  swiftModules.moduleFor(logicalRel),
 				swiftPackage: swiftModules.packageFor(logicalRel),
-				swiftProject: swiftModules.manifests,
+				swiftProject: manifestChanged,
 			}
 			select {
 			case tasks <- task:
