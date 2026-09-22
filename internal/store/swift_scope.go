@@ -58,6 +58,7 @@ type swiftScopeSymbol struct {
 	dispatchFacts            int64
 	finalFacts               int64
 	dispatchMin, dispatchMax string
+	visibility               string
 }
 
 type swiftScopeFact struct {
@@ -150,8 +151,12 @@ func swiftSelfCall(evidence, dst string, arity sql.NullInt64) (method, strategy 
 }
 
 func (s *Store) resolveSwiftScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
+	buildScopes, err := loadSwiftBuildScopes(ctx, q, repoID)
+	if err != nil {
+		return 0, err
+	}
 	var edges []swiftScopeEdge
-	err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
+	err = sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
 	FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id JOIN files sf ON sf.id=src.file_id
 WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls' AND e.dst_symbol_id IS NULL
 	  AND sf.id=e.file_id AND sf.is_deleted=0 AND src.repo_id=e.repo_id AND src.language='swift' AND src.kind='function' AND src.container_name<>''`,
@@ -233,9 +238,9 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 		return 0, err
 	}
 	var symbols []swiftScopeSymbol
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'') FROM symbols s JOIN tmp_swift_scope_candidates c ON c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature) AND c.is_static=s.is_static JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),''),s.visibility FROM symbols s JOIN tmp_swift_scope_candidates c ON c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature) AND c.is_static=s.is_static JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,s.visibility`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
 		var x swiftScopeSymbol
-		if err := rows.Scan(&x.id, &x.file, &x.name, &x.owner, &x.sig, &x.kind, &x.static, &x.arityMin, &x.arityMax, &x.dispatchFacts, &x.finalFacts, &x.dispatchMin, &x.dispatchMax); err != nil {
+		if err := rows.Scan(&x.id, &x.file, &x.name, &x.owner, &x.sig, &x.kind, &x.static, &x.arityMin, &x.arityMax, &x.dispatchFacts, &x.finalFacts, &x.dispatchMin, &x.dispatchMax, &x.visibility); err != nil {
 			return err
 		}
 		symbols = append(symbols, x)
@@ -257,6 +262,7 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 	}
 	blockedAny := map[string]bool{}
 	blockedProd := map[string]bool{}
+	blockedFiles := map[string][]int64{}
 	for _, f := range facts {
 		if f.kind != graph.ScopeImportSwiftMemberValue && f.kind != graph.ScopeImportSwiftEnumCase {
 			continue
@@ -266,6 +272,7 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 		}
 		key := swiftCandidateKey(f.owner, f.name, "", f.static)
 		blockedAny[key] = true
+		blockedFiles[key] = append(blockedFiles[key], f.file)
 		if _, test := tests[f.file]; !test {
 			blockedProd[key] = true
 		}
@@ -289,6 +296,9 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 			if c.owner != e.owner || c.name != method || !c.static.Valid || c.static.Int64 != wantStatic {
 				continue
 			}
+			if swiftScopeKnownIneligible(buildScopes.candidateEligible(e.file, c.file, c.visibility)) {
+				continue
+			}
 			if len(shape.trailingLabels) == 0 {
 				if c.sig != selector {
 					continue
@@ -309,7 +319,22 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 		}
 		_, callerTest := tests[e.file]
 		blockKey := swiftCandidateKey(e.owner, method, "", wantStatic)
-		if (callerTest && blockedAny[blockKey]) || (!callerTest && blockedProd[blockKey]) {
+		blocked := blockedAny[blockKey]
+		if callerTest {
+			blocked = blockedAny[blockKey]
+		} else {
+			blocked = blockedProd[blockKey]
+		}
+		if blocked {
+			for _, blockerFile := range blockedFiles[blockKey] {
+				if swiftScopeKnownIneligible(buildScopes.candidateEligible(e.file, blockerFile, "internal")) {
+					blocked = false
+					continue
+				}
+				break
+			}
+		}
+		if blocked {
 			continue
 		}
 		res[e.id] = swiftScopeBinding{dst: found.id, strategy: strategy}

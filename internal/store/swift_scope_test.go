@@ -110,6 +110,52 @@ func (f *swiftScopeFixture) declarationFact(file, symbol int64, final bool) {
 	f.dispatchFact(file, symbol, final, "instance")
 }
 
+func (f *swiftScopeFixture) buildScope(file int64, packageID, module string) {
+	f.t.Helper()
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name,module_path) VALUES(?,?, 'swift',?,?)`, f.repoID, file, packageID, module); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestSwiftSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	alpha := f.mainFile
+	beta := f.file("Beta.swift")
+	f.buildScope(alpha, ".", "Alpha")
+	f.buildScope(beta, ".", "Beta")
+	alphaType := f.symbol(alpha, "Service", "", "struct", "", false)
+	betaType := f.symbol(beta, "Service", "", "struct", "", false)
+	alphaWork := f.symbol(alpha, "work", "Service", "function", "work()", false)
+	betaWork := f.symbol(beta, "work", "Service", "function", "work()", false)
+	f.declarationFact(alpha, alphaWork, false)
+	f.declarationFact(beta, betaWork, false)
+	f.blocker(beta, "Service", "work", graph.ScopeImportSwiftMemberValue, false)
+	caller := f.symbol(alpha, "run", "Service", "function", "run()", false)
+	edge := f.call(alpha, caller, "self.work", "swift:self", 0, 1)
+	f.reference(alpha, caller, "self.work", 1)
+	f.resolve()
+	assertSwiftBinding(t, f, edge, alphaWork, ResolutionStrategySwiftSelfScope)
+	_ = alphaType
+	_ = betaType
+}
+
+func TestSwiftInitializerKnownModuleExcludesForeignSameQName(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	alpha := f.mainFile
+	beta := f.file("Beta.swift")
+	f.buildScope(alpha, ".", "Alpha")
+	f.buildScope(beta, ".", "Beta")
+	f.symbol(alpha, "Service", "", "struct", "", false)
+	f.symbol(beta, "Service", "", "struct", "", false)
+	alphaInit := swiftInitCandidate(f, alpha, "Service", "init()", 0, 0)
+	swiftInitCandidate(f, beta, "Service", "init()", 0, 0)
+	caller := f.symbol(alpha, "run", "", "function", "run()", false)
+	edge := f.call(alpha, caller, "Service", "swift:initializer", 0, 1)
+	f.reference(alpha, caller, "Service", 1)
+	f.resolve()
+	assertSwiftInitBinding(t, f, edge, alphaInit)
+}
+
 func (f *swiftScopeFixture) dispatchFact(file, symbol int64, final bool, dispatch string) {
 	f.t.Helper()
 	v := 0
