@@ -127,6 +127,9 @@ func TestSwiftSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
 	betaType := f.symbol(beta, "Service", "", "struct", "", false)
 	alphaWork := f.symbol(alpha, "work", "Service", "function", "work()", false)
 	betaWork := f.symbol(beta, "work", "Service", "function", "work()", false)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='fileprivate' WHERE id=?`, alphaWork); err != nil {
+		t.Fatal(err)
+	}
 	f.declarationFact(alpha, alphaWork, false)
 	f.declarationFact(beta, betaWork, false)
 	f.blocker(beta, "Service", "work", graph.ScopeImportSwiftMemberValue, false)

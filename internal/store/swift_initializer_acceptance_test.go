@@ -515,6 +515,7 @@ func TestSwiftInitializerAcceptanceDefaultsVariadicsAndVisibility(t *testing.T) 
 		})
 	}
 	fileprivate := newSwiftScopeFixture(t)
+	fileprivate.buildScope(fileprivate.mainFile, ".", "ArgumentParser")
 	owner := fileprivate.symbol(fileprivate.mainFile, "Service", "", "struct", "", false)
 	init := swiftInitCandidate(fileprivate, fileprivate.mainFile, "Service", "init()", 0, 0)
 	for id := range map[int64]struct{}{owner: {}, init: {}} {

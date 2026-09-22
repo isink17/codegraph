@@ -18,6 +18,7 @@ type swiftScopeRelation uint8
 
 const (
 	swiftScopeUnknown swiftScopeRelation = iota
+	swiftScopeSameFile
 	swiftScopeSameModule
 	swiftScopeSamePackage
 	swiftScopeDifferentPackage
@@ -62,6 +63,9 @@ func loadSwiftBuildScopes(ctx context.Context, q javaQuery, repoID int64) (swift
 }
 
 func (s swiftBuildScopes) relation(caller, candidate int64) swiftScopeRelation {
+	if caller == candidate {
+		return swiftScopeSameFile
+	}
 	a, aOK := s.files[caller]
 	b, bOK := s.files[candidate]
 	if !aOK || !bOK || a.packageID == "" || b.packageID == "" {
@@ -81,7 +85,7 @@ func (s swiftBuildScopes) relation(caller, candidate int64) swiftScopeRelation {
 
 func (s swiftBuildScopes) candidateEligible(caller, candidate int64, visibility string) swiftScopeRelation {
 	relation := s.relation(caller, candidate)
-	if relation == swiftScopeUnknown {
+	if relation == swiftScopeSameFile || relation == swiftScopeUnknown {
 		return relation
 	}
 	if visibility == "private" || visibility == "fileprivate" {
