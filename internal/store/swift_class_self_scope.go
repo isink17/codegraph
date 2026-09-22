@@ -93,6 +93,10 @@ func swiftInheritedTrailingCandidate(call swiftSelfCallShape, candidate swiftInh
 // finality and a complete absence of active ancestry/conformance evidence are
 // proofs this resolver alone owns.
 func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
+	buildScopes, err := loadSwiftBuildScopes(ctx, q, repoID)
+	if err != nil {
+		return 0, err
+	}
 	var edges []swiftScopeEdge
 	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity,
 		COALESCE(sd.facts,0),COALESCE(sd.dispatch_min,''),COALESCE(sd.dispatch_max,'')
@@ -226,6 +230,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		count := 0
 		var owner swiftClassSelfOwner
 		for _, o := range ownersForName {
+			if swiftScopeKnownIneligible(buildScopes.candidateEligible(e.file, o.file, "")) {
+				continue
+			}
 			if !callerTest {
 				if _, test := tests[o.file]; test {
 					continue

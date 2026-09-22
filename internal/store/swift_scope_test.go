@@ -139,6 +139,29 @@ func TestSwiftSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
 	_ = betaType
 }
 
+func TestSwiftClassSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
+	for _, foreignFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "foreign-first", false: "local-first"}[foreignFirst], func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			alpha, beta := f.mainFile, f.file("Beta.swift")
+			f.buildScope(alpha, ".", "Alpha")
+			f.buildScope(beta, ".", "Beta")
+			alphaOwner := f.symbol(alpha, "Service", "", "class", "", false)
+			betaOwner := f.symbol(beta, "Service", "", "class", "", false)
+			alphaWork := f.symbol(alpha, "make", "Service", "function", "make()", true)
+			f.symbol(beta, "make", "Service", "function", "make()", true)
+			f.declarationFact(alpha, alphaOwner, true)
+			f.declarationFact(beta, betaOwner, true)
+			f.dispatchFact(alpha, alphaWork, true, "class")
+			caller := f.symbol(alpha, "run", "Service", "function", "run()", true)
+			edge := f.call(alpha, caller, "Self.make", "swift:Self", 0, 1)
+			f.reference(alpha, caller, "Self.make", 1)
+			f.resolve()
+			assertSwiftBinding(t, f, edge, alphaWork, ResolutionStrategySwiftClassSelfTypeFinalScope)
+		})
+	}
+}
+
 func TestSwiftSelfMixedBlockersOrderIndependent(t *testing.T) {
 	for _, foreignFirst := range []bool{true, false} {
 		t.Run(map[bool]string{true: "foreign-first", false: "local-first"}[foreignFirst], func(t *testing.T) {

@@ -407,8 +407,12 @@ func swiftSuperExtensionTargetAncestryClosed(selectedOwner string, file int64, r
 }
 
 func (s *Store) resolveSwiftSuperScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
+	buildScopes, err := loadSwiftBuildScopes(ctx, q, repoID)
+	if err != nil {
+		return 0, err
+	}
 	var edges []swiftSuperEdge
-	err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.name,src.is_static,e.call_arity,src.start_line,src.start_col,src.end_line,src.end_col
+	err = sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.name,src.is_static,e.call_arity,src.start_line,src.start_col,src.end_line,src.end_col
 FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id JOIN files sf ON sf.id=src.file_id
 	WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls' AND e.dst_symbol_id IS NULL
 	  AND (e.evidence='swift:super' OR e.evidence LIKE 'swift:super;%')
@@ -634,6 +638,9 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 			var found swiftSuperCandidate
 			var foundProvenance swiftSuperCandidateOwnerKind
 			for _, blocker := range blockers[current+"\x00"+p.call.method] {
+				if swiftScopeKnownIneligible(buildScopes.candidateEligible(p.edge.file, blocker.file, "internal")) {
+					continue
+				}
 				if p.mode == swiftSuperInstanceSource && blocker.kind == graph.ScopeImportSwiftMemberValue && blocker.static != 0 {
 					continue
 				}
@@ -650,6 +657,9 @@ WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=
 					continue
 				}
 				if _, candidateTest := tests[c.file]; candidateTest && !callerTest {
+					continue
+				}
+				if swiftScopeKnownIneligible(buildScopes.candidateEligible(p.edge.file, c.file, c.visibility)) {
 					continue
 				}
 				if c.file != p.edge.file && (c.visibility == "private" || c.visibility == "fileprivate") {
