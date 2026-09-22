@@ -319,19 +319,18 @@ WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='cal
 		}
 		_, callerTest := tests[e.file]
 		blockKey := swiftCandidateKey(e.owner, method, "", wantStatic)
-		blocked := blockedAny[blockKey]
-		if callerTest {
-			blocked = blockedAny[blockKey]
-		} else {
-			blocked = blockedProd[blockKey]
-		}
-		if blocked {
+		blocked := false
+		if (callerTest && blockedAny[blockKey]) || (!callerTest && blockedProd[blockKey]) {
 			for _, blockerFile := range blockedFiles[blockKey] {
-				if swiftScopeKnownIneligible(buildScopes.candidateEligible(e.file, blockerFile, "internal")) {
-					blocked = false
-					continue
+				if !callerTest {
+					if _, blockerTest := tests[blockerFile]; blockerTest {
+						continue
+					}
 				}
-				break
+				if !swiftScopeKnownIneligible(buildScopes.candidateEligible(e.file, blockerFile, "internal")) {
+					blocked = true
+					break
+				}
 			}
 		}
 		if blocked {

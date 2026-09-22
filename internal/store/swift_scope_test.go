@@ -139,6 +139,34 @@ func TestSwiftSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
 	_ = betaType
 }
 
+func TestSwiftSelfMixedBlockersOrderIndependent(t *testing.T) {
+	for _, foreignFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "foreign-first", false: "local-first"}[foreignFirst], func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			alpha, beta := f.mainFile, f.file("Beta.swift")
+			f.buildScope(alpha, ".", "Alpha")
+			f.buildScope(beta, ".", "Beta")
+			f.symbol(alpha, "Service", "", "struct", "", false)
+			work := f.symbol(alpha, "work", "Service", "function", "work()", false)
+			f.declarationFact(alpha, work, false)
+			caller := f.symbol(alpha, "run", "Service", "function", "run()", false)
+			edge := f.call(alpha, caller, "self.work", "swift:self", 0, 1)
+			f.reference(alpha, caller, "self.work", 1)
+			addForeign := func() { f.blocker(beta, "Service", "work", graph.ScopeImportSwiftMemberValue, false) }
+			addLocal := func() { f.blocker(alpha, "Service", "work", graph.ScopeImportSwiftMemberValue, false) }
+			if foreignFirst {
+				addForeign()
+				addLocal()
+			} else {
+				addLocal()
+				addForeign()
+			}
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f, edge)
+		})
+	}
+}
+
 func TestSwiftInitializerKnownModuleExcludesForeignSameQName(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	alpha := f.mainFile
