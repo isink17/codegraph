@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/isink17/codegraph/internal/platform"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 const phpComposerManifestPath = "composer.json"
@@ -36,6 +37,17 @@ type phpComposerPSR4Discovery struct {
 	Mappings    []phpComposerPSR4Mapping
 	Fingerprint string
 	State       phpComposerPSR4State
+}
+
+func phpComposerStoreMappings(mappings []phpComposerPSR4Mapping) []store.PHPComposerPSR4Mapping {
+	out := make([]store.PHPComposerPSR4Mapping, len(mappings))
+	for i, mapping := range mappings {
+		out[i] = store.PHPComposerPSR4Mapping{
+			ManifestPath: mapping.ManifestPath, MappingRole: mapping.MappingRole,
+			NamespacePrefix: mapping.NamespacePrefix, RootPath: mapping.RootPath, RootOrdinal: mapping.RootOrdinal,
+		}
+	}
+	return out
 }
 
 // discoverPHPComposerPSR4 reads only root/composer.json. Invalid Composer
