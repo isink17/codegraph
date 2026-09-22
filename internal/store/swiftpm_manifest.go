@@ -6,7 +6,7 @@ import (
 	"strconv"
 )
 
-const swiftPMManifestFingerprintSettingKey = "scope.swiftpm_manifest_fingerprint.v1"
+const swiftPMManifestFingerprintSettingKey = "scope.swiftpm_manifest_fingerprint.v2"
 
 func swiftPMManifestFingerprintKey(repoID int64) string {
 	return swiftPMManifestFingerprintSettingKey + "." + strconv.FormatInt(repoID, 10)

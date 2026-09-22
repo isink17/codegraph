@@ -22,42 +22,27 @@ type swiftTarget struct {
 }
 
 type swiftModuleMap struct {
-	files       map[string]string
-	packages    map[string]string
+	ownership   map[string]swiftFileOwnership
 	manifests   bool
 	fingerprint string
 	swiftFiles  []string
 }
 
+type swiftFileOwnership struct {
+	packageName, module string
+	ambiguous           bool
+}
+
 func (m swiftModuleMap) moduleFor(rel string) string {
-	keys := make([]string, 0, len(m.files))
-	for prefix := range m.files {
-		keys = append(keys, prefix)
-	}
-	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
-	for _, prefix := range keys {
-		module := m.files[prefix]
-		if strings.HasSuffix(prefix, "/") && strings.HasPrefix(rel, prefix) {
-			return module
-		}
-		if rel == prefix {
-			return module
-		}
+	if owner, ok := m.ownership[rel]; ok && !owner.ambiguous {
+		return owner.module
 	}
 	return ""
 }
 
 func (m swiftModuleMap) packageFor(rel string) string {
-	keys := make([]string, 0, len(m.packages))
-	for prefix := range m.packages {
-		keys = append(keys, prefix)
-	}
-	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
-	for _, prefix := range keys {
-		root := strings.TrimSuffix(prefix, "/")
-		if root == "" || rel == root || strings.HasPrefix(rel, root+"/") {
-			return m.packages[prefix]
-		}
+	if owner, ok := m.ownership[rel]; ok && !owner.ambiguous {
+		return owner.packageName
 	}
 	return ""
 }
@@ -65,7 +50,7 @@ func (m swiftModuleMap) packageFor(rel string) string {
 var swiftTargetCall = regexp.MustCompile(`\.(target|executableTarget|testTarget|plugin|macro)\s*\(`)
 
 func discoverSwiftModules(root string) (swiftModuleMap, error) {
-	m := swiftModuleMap{files: map[string]string{}, packages: map[string]string{}}
+	m := swiftModuleMap{ownership: map[string]swiftFileOwnership{}}
 	var manifests []string
 	err := walkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -92,7 +77,7 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 	}
 	sort.Strings(manifests)
 	h := sha256.New()
-	h.Write([]byte("swiftpm-manifests-v1\x00"))
+	h.Write([]byte("swiftpm-manifests-v2\x00"))
 	for _, manifest := range manifests {
 		data, err := os.ReadFile(manifest)
 		if err != nil {
@@ -142,36 +127,15 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 				}
 			}
 			base = pathpkg.Clean(pathpkg.Join(pkgRoot, base))
-			m.packages[base+"/"] = packageScope
-			m.files[base+"/"] = target.name
-			if target.sourcesKnown {
-				target.paths = target.sources
-			}
-			if !target.sourcesKnown {
-				for _, file := range m.swiftFiles {
-					if file == base || strings.HasPrefix(file, base+"/") {
-						if !swiftExcludedPath(base, file, target.excludes) {
-							m.files[file] = target.name
-						} else {
-							m.files[file] = ""
-						}
-					}
-				}
-				continue
-			}
-			for _, candidate := range target.paths {
-				if target.sourcesKnown {
-					candidate = pathpkg.Join(base, candidate)
-				} else {
-					candidate = base
-				}
-				if swiftExcludedPath(base, candidate, target.excludes) {
+			for _, file := range m.swiftFiles {
+				if !swiftTargetOwnsFile(base, file, target) {
 					continue
 				}
-				if old, ok := m.files[candidate]; ok && old != target.name {
-					m.files[candidate] = ""
-				} else {
-					m.files[candidate] = target.name
+				old, claimed := m.ownership[file]
+				if claimed && (old.module != target.name || old.packageName != packageScope) {
+					m.ownership[file] = swiftFileOwnership{ambiguous: true}
+				} else if !claimed {
+					m.ownership[file] = swiftFileOwnership{packageName: packageScope, module: target.name}
 				}
 			}
 		}
@@ -179,6 +143,23 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 	}
 	m.fingerprint = hex.EncodeToString(h.Sum(nil))
 	return m, nil
+}
+
+func swiftTargetOwnsFile(base, file string, target parsedSwiftTarget) bool {
+	if file != base && !strings.HasPrefix(file, base+"/") || swiftExcludedPath(base, file, target.excludes) {
+		return false
+	}
+	if !target.sourcesKnown {
+		return true
+	}
+	rel := strings.TrimPrefix(file, base+"/")
+	for _, source := range target.sources {
+		source = strings.Trim(source, "/")
+		if rel == source || strings.HasPrefix(rel, source+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 type parsedSwiftTarget struct {
