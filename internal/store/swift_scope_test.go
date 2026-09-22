@@ -162,6 +162,57 @@ func TestSwiftClassSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
 	}
 }
 
+func TestSwiftSuperExtensionKnownModuleExcludesForeignCandidateAndQueries(t *testing.T) {
+	for _, foreignFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "local-first", true: "foreign-first"}[foreignFirst], func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			alpha, beta := f.mainFile, f.file("Beta.swift")
+			f.buildScope(alpha, ".", "Alpha")
+			f.buildScope(beta, ".", "Beta")
+			var betaBase, betaRun, betaChild int64
+			if foreignFirst {
+				betaBase = f.symbol(beta, "Base", "", "class", "", false)
+				betaRun = f.symbol(beta, "run", "Base", "function", "run()", false)
+				betaChild = f.symbol(beta, "Child", "", "class", "", false)
+			}
+			base := f.symbol(alpha, "Base", "", "class", "", false)
+			alphaRun := f.symbol(alpha, "run", "Base", "function", "run()", false)
+			child := f.symbol(alpha, "Child", "", "class", "", false)
+			caller := f.symbol(alpha, "call", "Child", "function", "call()", false)
+			if !foreignFirst {
+				betaBase = f.symbol(beta, "Base", "", "class", "", false)
+				betaRun = f.symbol(beta, "run", "Base", "function", "run()", false)
+				betaChild = f.symbol(beta, "Child", "", "class", "", false)
+			}
+			_ = base
+			_ = child
+			_ = betaBase
+			_ = betaRun
+			_ = betaChild
+			f.relation(alpha, "Child", "Base", "superclass", false, false)
+			swiftExtensionMembership(t, f, alpha, caller, "Child", 1, 1, 0, 0)
+			f.dispatchFact(alpha, alphaRun, false, "instance")
+			f.dispatchFact(alpha, caller, false, "instance")
+			f.arity(alphaRun, 0, 0)
+			edge := f.call(alpha, caller, "super.run", "swift:super", 0, 1)
+			f.resolve()
+			if got := f.dst(edge); !got.Valid || got.Int64 != alphaRun {
+				t.Fatalf("dst=%v, want Alpha.Base.run=%d", got, alphaRun)
+			}
+			callees, err := f.store.FindCallees(f.ctx, f.repoID, "Child.call", caller, 20, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertQNames(t, "callees", callees, "Base.run")
+			callers, err := f.store.FindCallers(f.ctx, f.repoID, "Base.run", alphaRun, 20, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertQNames(t, "callers", callers, "Child.call")
+		})
+	}
+}
+
 func TestSwiftSelfMixedBlockersOrderIndependent(t *testing.T) {
 	for _, foreignFirst := range []bool{true, false} {
 		t.Run(map[bool]string{true: "foreign-first", false: "local-first"}[foreignFirst], func(t *testing.T) {
