@@ -110,6 +110,157 @@ func (f *swiftScopeFixture) declarationFact(file, symbol int64, final bool) {
 	f.dispatchFact(file, symbol, final, "instance")
 }
 
+func (f *swiftScopeFixture) buildScope(file int64, packageID, module string) {
+	f.t.Helper()
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name,module_path) VALUES(?,?, 'swift',?,?)`, f.repoID, file, packageID, module); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestSwiftSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	alpha := f.mainFile
+	beta := f.file("Beta.swift")
+	f.buildScope(alpha, ".", "Alpha")
+	f.buildScope(beta, ".", "Beta")
+	alphaType := f.symbol(alpha, "Service", "", "struct", "", false)
+	betaType := f.symbol(beta, "Service", "", "struct", "", false)
+	alphaWork := f.symbol(alpha, "work", "Service", "function", "work()", false)
+	betaWork := f.symbol(beta, "work", "Service", "function", "work()", false)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='fileprivate' WHERE id=?`, alphaWork); err != nil {
+		t.Fatal(err)
+	}
+	f.declarationFact(alpha, alphaWork, false)
+	f.declarationFact(beta, betaWork, false)
+	f.blocker(beta, "Service", "work", graph.ScopeImportSwiftMemberValue, false)
+	caller := f.symbol(alpha, "run", "Service", "function", "run()", false)
+	edge := f.call(alpha, caller, "self.work", "swift:self", 0, 1)
+	f.reference(alpha, caller, "self.work", 1)
+	f.resolve()
+	assertSwiftBinding(t, f, edge, alphaWork, ResolutionStrategySwiftSelfScope)
+	_ = alphaType
+	_ = betaType
+}
+
+func TestSwiftClassSelfKnownModuleExcludesForeignSameQName(t *testing.T) {
+	for _, foreignFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "foreign-first", false: "local-first"}[foreignFirst], func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			alpha, beta := f.mainFile, f.file("Beta.swift")
+			f.buildScope(alpha, ".", "Alpha")
+			f.buildScope(beta, ".", "Beta")
+			alphaOwner := f.symbol(alpha, "Service", "", "class", "", false)
+			betaOwner := f.symbol(beta, "Service", "", "class", "", false)
+			alphaWork := f.symbol(alpha, "make", "Service", "function", "make()", true)
+			f.symbol(beta, "make", "Service", "function", "make()", true)
+			f.declarationFact(alpha, alphaOwner, true)
+			f.declarationFact(beta, betaOwner, true)
+			f.dispatchFact(alpha, alphaWork, true, "class")
+			caller := f.symbol(alpha, "run", "Service", "function", "run()", true)
+			edge := f.call(alpha, caller, "Self.make", "swift:Self", 0, 1)
+			f.reference(alpha, caller, "Self.make", 1)
+			f.resolve()
+			assertSwiftBinding(t, f, edge, alphaWork, ResolutionStrategySwiftClassSelfTypeFinalScope)
+		})
+	}
+}
+
+func TestSwiftSuperExtensionKnownModuleExcludesForeignCandidateAndQueries(t *testing.T) {
+	for _, foreignFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "local-first", true: "foreign-first"}[foreignFirst], func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			alpha, beta := f.mainFile, f.file("Beta.swift")
+			f.buildScope(alpha, ".", "Alpha")
+			f.buildScope(beta, ".", "Beta")
+			var betaBase, betaRun, betaChild int64
+			if foreignFirst {
+				betaBase = f.symbol(beta, "Base", "", "class", "", false)
+				betaRun = f.symbol(beta, "run", "Base", "function", "run()", false)
+				betaChild = f.symbol(beta, "Child", "", "class", "", false)
+			}
+			base := f.symbol(alpha, "Base", "", "class", "", false)
+			alphaRun := f.symbol(alpha, "run", "Base", "function", "run()", false)
+			child := f.symbol(alpha, "Child", "", "class", "", false)
+			caller := f.symbol(alpha, "call", "Child", "function", "call()", false)
+			if !foreignFirst {
+				betaBase = f.symbol(beta, "Base", "", "class", "", false)
+				betaRun = f.symbol(beta, "run", "Base", "function", "run()", false)
+				betaChild = f.symbol(beta, "Child", "", "class", "", false)
+			}
+			_ = base
+			_ = child
+			_ = betaBase
+			_ = betaRun
+			_ = betaChild
+			f.relation(alpha, "Child", "Base", "superclass", false, false)
+			swiftExtensionMembership(t, f, alpha, caller, "Child", 1, 1, 0, 0)
+			f.dispatchFact(alpha, alphaRun, false, "instance")
+			f.dispatchFact(alpha, caller, false, "instance")
+			f.arity(alphaRun, 0, 0)
+			edge := f.call(alpha, caller, "super.run", "swift:super", 0, 1)
+			f.resolve()
+			if got := f.dst(edge); !got.Valid || got.Int64 != alphaRun {
+				t.Fatalf("dst=%v, want Alpha.Base.run=%d", got, alphaRun)
+			}
+			callees, err := f.store.FindCallees(f.ctx, f.repoID, "Child.call", caller, 20, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertQNames(t, "callees", callees, "Base.run")
+			callers, err := f.store.FindCallers(f.ctx, f.repoID, "Base.run", alphaRun, 20, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertQNames(t, "callers", callers, "Child.call")
+		})
+	}
+}
+
+func TestSwiftSelfMixedBlockersOrderIndependent(t *testing.T) {
+	for _, foreignFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "foreign-first", false: "local-first"}[foreignFirst], func(t *testing.T) {
+			f := newSwiftScopeFixture(t)
+			alpha, beta := f.mainFile, f.file("Beta.swift")
+			f.buildScope(alpha, ".", "Alpha")
+			f.buildScope(beta, ".", "Beta")
+			f.symbol(alpha, "Service", "", "struct", "", false)
+			work := f.symbol(alpha, "work", "Service", "function", "work()", false)
+			f.declarationFact(alpha, work, false)
+			caller := f.symbol(alpha, "run", "Service", "function", "run()", false)
+			edge := f.call(alpha, caller, "self.work", "swift:self", 0, 1)
+			f.reference(alpha, caller, "self.work", 1)
+			addForeign := func() { f.blocker(beta, "Service", "work", graph.ScopeImportSwiftMemberValue, false) }
+			addLocal := func() { f.blocker(alpha, "Service", "work", graph.ScopeImportSwiftMemberValue, false) }
+			if foreignFirst {
+				addForeign()
+				addLocal()
+			} else {
+				addLocal()
+				addForeign()
+			}
+			f.resolve()
+			assertSwiftEdgeUnresolved(t, f, edge)
+		})
+	}
+}
+
+func TestSwiftInitializerKnownModuleExcludesForeignSameQName(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	alpha := f.mainFile
+	beta := f.file("Beta.swift")
+	f.buildScope(alpha, ".", "Alpha")
+	f.buildScope(beta, ".", "Beta")
+	f.symbol(alpha, "Service", "", "struct", "", false)
+	f.symbol(beta, "Service", "", "struct", "", false)
+	alphaInit := swiftInitCandidate(f, alpha, "Service", "init()", 0, 0)
+	swiftInitCandidate(f, beta, "Service", "init()", 0, 0)
+	caller := f.symbol(alpha, "run", "", "function", "run()", false)
+	edge := f.call(alpha, caller, "Service", "swift:initializer", 0, 1)
+	f.reference(alpha, caller, "Service", 1)
+	f.resolve()
+	assertSwiftInitBinding(t, f, edge, alphaInit)
+}
+
 func (f *swiftScopeFixture) dispatchFact(file, symbol int64, final bool, dispatch string) {
 	f.t.Helper()
 	v := 0

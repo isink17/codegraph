@@ -43,11 +43,14 @@ type Indexer struct {
 }
 
 type fileTask struct {
-	path     string
-	rel      string
-	info     fs.FileInfo
-	adapter  parser.Adapter
-	language string
+	path         string
+	rel          string
+	info         fs.FileInfo
+	adapter      parser.Adapter
+	language     string
+	swiftModule  string
+	swiftPackage string
+	swiftProject bool
 }
 
 type fileResult struct {
@@ -155,6 +158,18 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, len(candidatePaths) == 0 && scanKind != "update"); err != nil {
 		return store.ScanSummary{}, err
+	}
+	swiftModules, err := discoverSwiftModules(opts.RepoRoot)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	previousFingerprint, fingerprintKnown, err := i.store.SwiftPMManifestFingerprint(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	manifestChanged := !fingerprintKnown || previousFingerprint != swiftModules.fingerprint
+	if manifestChanged {
+		candidatePaths = nil
 	}
 	// Asked before pass 1 writes anything, because that is the only moment an
 	// empty graph still means "this repository has never been indexed". It gates
@@ -306,7 +321,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 	ctxRun, cancel := context.WithCancel(ctx)
 	defer cancel()
-
 	go func() {
 		<-existingReady
 		if loadErr != nil {
@@ -362,11 +376,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					language = adapter.Language()
 				}
 				task := fileTask{
-					path:     abs,
-					rel:      rel,
-					info:     info,
-					adapter:  adapter,
-					language: language,
+					path:         abs,
+					rel:          rel,
+					info:         info,
+					adapter:      adapter,
+					language:     language,
+					swiftModule:  swiftModules.moduleFor(rel),
+					swiftPackage: swiftModules.packageFor(rel),
+					swiftProject: manifestChanged,
 				}
 				select {
 				case tasks <- task:
@@ -417,11 +434,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				language = adapter.Language()
 			}
 			task := fileTask{
-				path:     path,
-				rel:      logicalRel,
-				info:     info,
-				adapter:  adapter,
-				language: language,
+				path:         path,
+				rel:          logicalRel,
+				info:         info,
+				adapter:      adapter,
+				language:     language,
+				swiftModule:  swiftModules.moduleFor(logicalRel),
+				swiftPackage: swiftModules.packageFor(logicalRel),
+				swiftProject: manifestChanged,
 			}
 			select {
 			case tasks <- task:
@@ -1134,6 +1154,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
 		return summary, err
 	}
+	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
+		return summary, err
+	}
 	return summary, nil
 }
 
@@ -1166,6 +1189,9 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 		if _, stale := reparseLanguages[task.language]; stale {
 			force = true
 		}
+	}
+	if task.language == "swift" && task.swiftProject {
+		force = true
 	}
 	// Eligibility under THIS run's configuration, decided before change
 	// detection rather than after it. The size cap is a property of the run,
@@ -1268,6 +1294,10 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	}
 	if parsed.Language == "" {
 		parsed.Language = task.language
+	}
+	if parsed.Language == "swift" {
+		parsed.Scope.Package = task.swiftPackage
+		parsed.Scope.ModulePath = task.swiftModule
 	}
 	result.parsed = parsed
 	result.action = "replace"

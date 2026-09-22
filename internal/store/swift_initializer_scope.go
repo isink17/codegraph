@@ -113,6 +113,10 @@ type swiftInitializerCandidate struct {
 }
 
 func (s *Store) resolveSwiftInitializerScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
+	buildScopes, err := loadSwiftBuildScopes(ctx, q, repoID)
+	if err != nil {
+		return 0, err
+	}
 	var edges []swiftScopeEdge
 	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,e.evidence,src.container_name,src.is_static,e.call_arity
 		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_symbol_id JOIN files sf ON sf.id=src.file_id
@@ -201,6 +205,9 @@ func (s *Store) resolveSwiftInitializerScope(ctx context.Context, q javaQuery, r
 		var found swiftInitializerCandidate
 		for _, c := range candidates[shape.owner] {
 			if !swiftInitializerCandidateMatches(shape, c) || c.visibility == "private" {
+				continue
+			}
+			if swiftScopeKnownIneligible(buildScopes.candidateEligible(e.file, c.file, c.visibility)) {
 				continue
 			}
 			if _, test := tests[c.file]; test {
