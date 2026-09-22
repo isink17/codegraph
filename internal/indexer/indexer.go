@@ -43,11 +43,14 @@ type Indexer struct {
 }
 
 type fileTask struct {
-	path     string
-	rel      string
-	info     fs.FileInfo
-	adapter  parser.Adapter
-	language string
+	path         string
+	rel          string
+	info         fs.FileInfo
+	adapter      parser.Adapter
+	language     string
+	swiftModule  string
+	swiftPackage string
+	swiftProject bool
 }
 
 type fileResult struct {
@@ -306,6 +309,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 	ctxRun, cancel := context.WithCancel(ctx)
 	defer cancel()
+	swiftModules, err := discoverSwiftModules(opts.RepoRoot)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
 
 	go func() {
 		<-existingReady
@@ -362,11 +369,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					language = adapter.Language()
 				}
 				task := fileTask{
-					path:     abs,
-					rel:      rel,
-					info:     info,
-					adapter:  adapter,
-					language: language,
+					path:         abs,
+					rel:          rel,
+					info:         info,
+					adapter:      adapter,
+					language:     language,
+					swiftModule:  swiftModules.moduleFor(rel),
+					swiftPackage: swiftModules.packageFor(rel),
+					swiftProject: swiftModules.manifests,
 				}
 				select {
 				case tasks <- task:
@@ -417,11 +427,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				language = adapter.Language()
 			}
 			task := fileTask{
-				path:     path,
-				rel:      logicalRel,
-				info:     info,
-				adapter:  adapter,
-				language: language,
+				path:         path,
+				rel:          logicalRel,
+				info:         info,
+				adapter:      adapter,
+				language:     language,
+				swiftModule:  swiftModules.moduleFor(logicalRel),
+				swiftPackage: swiftModules.packageFor(logicalRel),
+				swiftProject: swiftModules.manifests,
 			}
 			select {
 			case tasks <- task:
@@ -1167,6 +1180,9 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 			force = true
 		}
 	}
+	if task.language == "swift" && task.swiftProject {
+		force = true
+	}
 	// Eligibility under THIS run's configuration, decided before change
 	// detection rather than after it. The size cap is a property of the run,
 	// not of the file, so "nothing about the file changed" is not an answer to
@@ -1268,6 +1284,10 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	}
 	if parsed.Language == "" {
 		parsed.Language = task.language
+	}
+	if parsed.Language == "swift" {
+		parsed.Scope.Package = task.swiftPackage
+		parsed.Scope.ModulePath = task.swiftModule
 	}
 	result.parsed = parsed
 	result.action = "replace"
