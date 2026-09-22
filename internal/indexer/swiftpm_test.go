@@ -92,3 +92,55 @@ func TestSwiftPackageNestedIdentityAndManifestScope(t *testing.T) {
 		t.Fatalf("manifest package %q", got)
 	}
 }
+
+func TestSwiftPackageExcludesAreComponentSafe(t *testing.T) {
+	root := t.TempDir()
+	for _, rel := range []string{"Sources/Core/Excluded.swift", "Sources/Core/ExcludedSupport.swift", "Sources/Core/Dir/Hidden.swift", "Sources/Other/Hidden.swift"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel), []byte("import Foundation\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := `.target(name: "Core", exclude: ["Excluded.swift", "Dir"])
+.target(name: "Other", path: "Sources/Other")`
+	if err := os.WriteFile(filepath.Join(root, "Package.swift"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := discoverSwiftModules(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		"Sources/Core/Excluded.swift":        "",
+		"Sources/Core/ExcludedSupport.swift": "Core",
+		"Sources/Core/Dir/Hidden.swift":      "",
+		"Sources/Other/Hidden.swift":         "Other",
+	} {
+		if got := m.moduleFor(path); got != want {
+			t.Errorf("%s: module %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestSwiftPackageLiteralBackslashRoot(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("literal backslash is a path separator on Windows")
+	}
+	root := t.TempDir()
+	pkg := filepath.Join(root, "Vendor\\Foo")
+	if err := os.MkdirAll(filepath.Join(pkg, "Sources", "Core"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "Package.swift"), []byte(`.target(name: "Core")`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := discoverSwiftModules(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.packageFor(`Vendor\Foo/Sources/Core/A.swift`); got != `Vendor\Foo` {
+		t.Fatalf("package scope %q", got)
+	}
+}

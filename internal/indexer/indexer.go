@@ -135,19 +135,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
-	manifestChanged := false
-	for _, rel := range candidatePaths {
-		if pathpkg.Base(rel) == "Package.swift" {
-			manifestChanged = true
-			break
-		}
-	}
-	// Package.swift owns scope facts for every Swift file below its package.
-	// Re-scan the repository when one changes so additions, removals, moves,
-	// nested manifests, and manifest deletion cannot leave stale ownership.
-	if manifestChanged {
-		candidatePaths = nil
-	}
 	repoCfg, err := config.LoadRepo(opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -171,6 +158,18 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, len(candidatePaths) == 0 && scanKind != "update"); err != nil {
 		return store.ScanSummary{}, err
+	}
+	swiftModules, err := discoverSwiftModules(opts.RepoRoot)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	previousFingerprint, fingerprintKnown, err := i.store.SwiftPMManifestFingerprint(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	manifestChanged := !fingerprintKnown || previousFingerprint != swiftModules.fingerprint
+	if manifestChanged {
+		candidatePaths = nil
 	}
 	// Asked before pass 1 writes anything, because that is the only moment an
 	// empty graph still means "this repository has never been indexed". It gates
@@ -322,11 +321,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 	ctxRun, cancel := context.WithCancel(ctx)
 	defer cancel()
-	swiftModules, err := discoverSwiftModules(opts.RepoRoot)
-	if err != nil {
-		return store.ScanSummary{}, err
-	}
-
 	go func() {
 		<-existingReady
 		if loadErr != nil {
@@ -1158,6 +1152,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100
 	}
 	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
+		return summary, err
+	}
+	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
 		return summary, err
 	}
 	return summary, nil

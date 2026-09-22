@@ -1,6 +1,9 @@
 package indexer
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -8,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/platform"
 )
 
 type swiftTarget struct {
@@ -17,9 +22,11 @@ type swiftTarget struct {
 }
 
 type swiftModuleMap struct {
-	files     map[string]string
-	packages  map[string]string
-	manifests bool
+	files       map[string]string
+	packages    map[string]string
+	manifests   bool
+	fingerprint string
+	swiftFiles  []string
 }
 
 func (m swiftModuleMap) moduleFor(rel string) string {
@@ -64,6 +71,17 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 		if err != nil {
 			return err
 		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".swift") {
+			rel, e := filepath.Rel(root, path)
+			if e != nil {
+				return e
+			}
+			logical, e := platform.NativeRelativeToLogical(filepath.Clean(rel))
+			if e != nil {
+				return e
+			}
+			m.swiftFiles = append(m.swiftFiles, logical)
+		}
 		if !d.IsDir() && d.Name() == "Package.swift" {
 			manifests = append(manifests, path)
 		}
@@ -73,6 +91,8 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 		return m, err
 	}
 	sort.Strings(manifests)
+	h := sha256.New()
+	h.Write([]byte("swiftpm-manifests-v1\x00"))
 	for _, manifest := range manifests {
 		data, err := os.ReadFile(manifest)
 		if err != nil {
@@ -82,7 +102,14 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 		if err != nil {
 			return m, err
 		}
-		pkgRoot = strings.ReplaceAll(pkgRoot, "\\", "/")
+		if filepath.Clean(pkgRoot) == "." {
+			pkgRoot = ""
+		} else {
+			pkgRoot, err = platform.NativeRelativeToLogical(filepath.Clean(pkgRoot))
+			if err != nil {
+				return m, err
+			}
+		}
 		if pkgRoot == "." {
 			pkgRoot = ""
 		}
@@ -90,7 +117,20 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 		if packageScope == "" {
 			packageScope = "."
 		}
+		manifestRel, err := filepath.Rel(root, manifest)
+		if err != nil {
+			return m, err
+		}
+		manifestRel, err = platform.NativeRelativeToLogical(filepath.Clean(manifestRel))
+		if err != nil {
+			return m, err
+		}
+		writeSwiftFingerprintField(h, manifestRel)
+		writeSwiftFingerprintField(h, string(data))
 		for _, target := range parseSwiftTargets(string(data)) {
+			if !target.excludesKnown {
+				continue
+			}
 			base := target.path
 			if base == "" {
 				base = "Sources/" + target.name
@@ -103,8 +143,21 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 			}
 			base = pathpkg.Clean(pathpkg.Join(pkgRoot, base))
 			m.packages[base+"/"] = packageScope
+			m.files[base+"/"] = target.name
 			if target.sourcesKnown {
 				target.paths = target.sources
+			}
+			if !target.sourcesKnown {
+				for _, file := range m.swiftFiles {
+					if file == base || strings.HasPrefix(file, base+"/") {
+						if !swiftExcludedPath(base, file, target.excludes) {
+							m.files[file] = target.name
+						} else {
+							m.files[file] = ""
+						}
+					}
+				}
+				continue
 			}
 			for _, candidate := range target.paths {
 				if target.sourcesKnown {
@@ -112,18 +165,19 @@ func discoverSwiftModules(root string) (swiftModuleMap, error) {
 				} else {
 					candidate = base
 				}
+				if swiftExcludedPath(base, candidate, target.excludes) {
+					continue
+				}
 				if old, ok := m.files[candidate]; ok && old != target.name {
 					m.files[candidate] = ""
 				} else {
 					m.files[candidate] = target.name
 				}
 			}
-			if !target.sourcesKnown {
-				m.files[base+"/"] = target.name
-			}
 		}
 		m.manifests = true
 	}
+	m.fingerprint = hex.EncodeToString(h.Sum(nil))
 	return m, nil
 }
 
@@ -131,6 +185,7 @@ type parsedSwiftTarget struct {
 	name, kind, path  string
 	sources, excludes []string
 	sourcesKnown      bool
+	excludesKnown     bool
 	paths             []string
 }
 
@@ -149,7 +204,7 @@ func parseSwiftTargets(src string) []parsedSwiftTarget {
 		if !ok {
 			continue
 		}
-		t := parsedSwiftTarget{name: name, kind: strings.ToLower(kind)}
+		t := parsedSwiftTarget{name: name, kind: strings.ToLower(kind), excludesKnown: true}
 		if hasSwiftArgument(body, "path") {
 			var pathOK bool
 			t.path, pathOK = swiftStringArgument(body, "path")
@@ -160,12 +215,47 @@ func parseSwiftTargets(src string) []parsedSwiftTarget {
 		if hasSwiftArgument(body, "sources") && !strings.Contains(body, "sources: [") {
 			continue
 		}
+		if hasSwiftArgument(body, "exclude") {
+			values, ok := swiftStringArrayArgument(body, "exclude")
+			if !ok {
+				t.excludesKnown = false
+			} else {
+				t.excludes = values
+			}
+		}
 		if values, ok := swiftStringArrayArgument(body, "sources"); ok {
 			t.sources, t.sourcesKnown, t.paths = values, true, values
 		}
 		out = append(out, t)
 	}
 	return out
+}
+
+func swiftExcludedPath(base, candidate string, excludes []string) bool {
+	rel := candidate
+	if base != "" && base != "." {
+		if rel == base {
+			rel = ""
+		} else if strings.HasPrefix(rel, base+"/") {
+			rel = strings.TrimPrefix(rel, base+"/")
+		} else {
+			return false
+		}
+	}
+	for _, exclude := range excludes {
+		exclude = strings.Trim(exclude, "/")
+		if rel == exclude || strings.HasPrefix(rel, exclude+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func writeSwiftFingerprintField(h interface{ Write([]byte) (int, error) }, value string) {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(len(value)))
+	h.Write(buf[:])
+	h.Write([]byte(value))
 }
 
 func hasSwiftArgument(body, key string) bool {
@@ -217,7 +307,7 @@ func swiftStringArrayArgument(body, key string) ([]string, bool) {
 	}
 	vals := regexp.MustCompile(`"([^"]*)"`).FindAllStringSubmatch(m[1], -1)
 	if len(vals) == 0 {
-		return nil, false
+		return []string{}, strings.TrimSpace(m[1]) == ""
 	}
 	out := make([]string, 0, len(vals))
 	for _, v := range vals {
