@@ -89,6 +89,13 @@ func (f *phpFixture) call(t *testing.T, fileID int64, src sql.NullInt64, dst str
 	return id
 }
 
+func (f *phpFixture) composer(t *testing.T, mappings ...PHPComposerPSR4Mapping) {
+	t.Helper()
+	if err := f.store.ReplacePHPComposerPSR4Mappings(f.ctx, f.repoID, mappings); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (f *phpFixture) reference(t *testing.T, fileID int64, name string, line int) {
 	t.Helper()
 	if _, err := f.store.db.ExecContext(f.ctx, `
@@ -372,6 +379,202 @@ func TestPHPScopeStrategiesRegistered(t *testing.T) {
 	if !strings.Contains(resolverBindableCandidateSQL, phpScopeVetoSQL) {
 		t.Fatal("generic bind gate does not carry the PHP ownership veto")
 	}
+}
+
+func TestPHPComposerPSR4DisambiguatesDuplicateTypes(t *testing.T) {
+	f := newPHPFixture(t)
+	src := f.phpFile(t, "src/Service.php")
+	legacy := f.phpFile(t, "legacy/Service.php")
+	callerFile := f.phpFile(t, "src/Caller.php")
+	f.typ(t, src, "App.Service")
+	run := f.method(t, src, "App.Service.run", "public", true)
+	f.typ(t, legacy, "App.Service")
+	f.method(t, legacy, "App.Service.run", "public", true)
+	f.typ(t, callerFile, "App.Caller")
+	caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+	f.use(t, callerFile, "App.Service", "S", "php_type", "App")
+	f.composer(t, PHPComposerPSR4Mapping{ManifestPath: "composer.json", MappingRole: "autoload", NamespacePrefix: "App\\", RootPath: "src", RootOrdinal: 0})
+	for i, call := range []string{"Service::run", "S::run", `\App\Service::run`} {
+		edge := f.call(t, callerFile, srcOf(caller), call, i+1)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "App.Service.run|php_composer_psr4|high" {
+			t.Fatalf("%s = %s", call, got)
+		}
+	}
+	callees, err := f.store.FindCallees(f.ctx, f.repoID, "", caller, 10, 0)
+	if err != nil || len(callees) != 1 || callees[0].ID != run {
+		t.Fatalf("FindCallees = %#v, %v", callees, err)
+	}
+	callers, err := f.store.FindCallers(f.ctx, f.repoID, "", run, 10, 0)
+	if err != nil || len(callers) != 1 || callers[0].ID != caller {
+		t.Fatalf("FindCallers = %#v, %v", callers, err)
+	}
+}
+
+func TestPHPComposerPSR4TypeSelectionRules(t *testing.T) {
+	newCase := func(t *testing.T, root string, mappings []PHPComposerPSR4Mapping) (*phpFixture, int64, int64, int64) {
+		t.Helper()
+		f := newPHPFixture(t)
+		selectedFile := f.phpFile(t, root+"/Service.php")
+		otherFile := f.phpFile(t, "legacy/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, selectedFile, "App.Service")
+		selected := f.method(t, selectedFile, "App.Service.run", "public", true)
+		f.typ(t, otherFile, "App.Service")
+		f.method(t, otherFile, "App.Service.run", "public", true)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		f.composer(t, mappings...)
+		return f, callerFile, caller, selected
+	}
+	mapApp := func(root string, ordinal int) PHPComposerPSR4Mapping {
+		return PHPComposerPSR4Mapping{ManifestPath: "composer.json", MappingRole: "autoload", NamespacePrefix: "App\\", RootPath: root, RootOrdinal: ordinal}
+	}
+	t.Run("unique ignores mismatch", func(t *testing.T) {
+		f := newPHPFixture(t)
+		service := f.phpFile(t, "src/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, service, "App.Service")
+		f.method(t, service, "App.Service.run", "public", true)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		f.composer(t, mapApp("wrong", 0))
+		edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "App.Service.run|php_type_scope|high" {
+			t.Fatal(got)
+		}
+	})
+	t.Run("no mapping and autoload dev abstain", func(t *testing.T) {
+		for _, role := range []string{"none", "autoload-dev"} {
+			t.Run(role, func(t *testing.T) {
+				mappings := []PHPComposerPSR4Mapping(nil)
+				if role != "none" {
+					mappings = []PHPComposerPSR4Mapping{{ManifestPath: "composer.json", MappingRole: role, NamespacePrefix: "App\\", RootPath: "src", RootOrdinal: 0}}
+				}
+				f, callerFile, caller, _ := newCase(t, "src", mappings)
+				edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
+				f.resolveVia(t, "full", nil, nil)
+				if got := f.binding(t, edge); got != "<unresolved>" {
+					t.Fatal(got)
+				}
+			})
+		}
+	})
+	t.Run("ordered roots and first existing source mismatch", func(t *testing.T) {
+		f, callerFile, caller, selected := newCase(t, "src", []PHPComposerPSR4Mapping{mapApp("missing", 0), mapApp("src", 1)})
+		edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "App.Service.run|php_composer_psr4|high" {
+			t.Fatal(got)
+		}
+		_ = selected
+		f2 := newPHPFixture(t)
+		first := f2.phpFile(t, "first/Service.php")
+		second := f2.phpFile(t, "second/Service.php")
+		caller2 := f2.phpFile(t, "src/Caller.php")
+		f2.typ(t, first, "Wrong.Service")
+		f2.typ(t, second, "App.Service")
+		f2.method(t, second, "App.Service.run", "public", true)
+		legacy := f2.phpFile(t, "legacy/Service.php")
+		f2.typ(t, legacy, "App.Service")
+		f2.method(t, legacy, "App.Service.run", "public", true)
+		f2.typ(t, caller2, "App.Caller")
+		source := f2.method(t, caller2, "App.Caller.f", "public", false)
+		f2.composer(t, mapApp("first", 0), mapApp("second", 1))
+		mismatch := f2.call(t, caller2, srcOf(source), "Service::run", 1)
+		f2.resolveVia(t, "full", nil, nil)
+		if got := f2.binding(t, mismatch); got != "<unresolved>" {
+			t.Fatal(got)
+		}
+	})
+	t.Run("longest prefix case and source authority", func(t *testing.T) {
+		f := newPHPFixture(t)
+		src := f.phpFile(t, "src/Special/Service.php")
+		special := f.phpFile(t, "special/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, src, "App.Special.Service")
+		f.method(t, src, "App.Special.Service.run", "public", true)
+		f.typ(t, special, "App.Special.Service")
+		run := f.method(t, special, "App.Special.Service.run", "public", true)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		f.composer(t, mapApp("src", 0), PHPComposerPSR4Mapping{ManifestPath: "composer.json", MappingRole: "autoload", NamespacePrefix: "App\\Special\\", RootPath: "special", RootOrdinal: 0})
+		edge := f.call(t, callerFile, srcOf(caller), `\App\Special\Service::run`, 1)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "App.Special.Service.run|php_composer_psr4|high" {
+			t.Fatal(got)
+		}
+		var dst int64
+		if err := f.store.db.QueryRowContext(f.ctx, "SELECT dst_symbol_id FROM edges WHERE id=?", edge).Scan(&dst); err != nil || dst != run {
+			t.Fatalf("dst=%d err=%v", dst, err)
+		}
+		caseFile := f.phpFile(t, "case/Service.php")
+		f.typ(t, caseFile, "app.Service")
+		f.method(t, caseFile, "app.Service.run", "public", true)
+		legacy := f.phpFile(t, "case-legacy/Service.php")
+		f.typ(t, legacy, "app.Service")
+		f.method(t, legacy, "app.Service.run", "public", true)
+		caseEdge := f.call(t, callerFile, srcOf(caller), `\app\Service::run`, 2)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, caseEdge); got != "<unresolved>" {
+			t.Fatal(got)
+		}
+	})
+	t.Run("selected file owns method and logical root", func(t *testing.T) {
+		f := newPHPFixture(t)
+		selected := f.phpFile(t, `src\literal/Service.php`)
+		legacy := f.phpFile(t, "legacy/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, selected, "App.Service")
+		f.typ(t, legacy, "App.Service")
+		f.method(t, legacy, "App.Service.run", "public", true)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		f.composer(t, mapApp(`src\literal`, 0))
+		edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "<unresolved>" {
+			t.Fatal(got)
+		}
+		f.method(t, selected, "App.Service.run", "public", false)
+		f.clearAll(t)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "<unresolved>" {
+			t.Fatal(got)
+		}
+		f.method(t, selected, "App.Service.run", "private", true)
+		f.clearAll(t)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "<unresolved>" {
+			t.Fatal(got)
+		}
+	})
+	t.Run("first matching root wins and same file duplicate abstains", func(t *testing.T) {
+		f := newPHPFixture(t)
+		first := f.phpFile(t, "first/Service.php")
+		second := f.phpFile(t, "second/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, first, "App.Service")
+		firstRun := f.method(t, first, "App.Service.run", "public", true)
+		f.typ(t, second, "App.Service")
+		f.method(t, second, "App.Service.run", "public", true)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		f.composer(t, mapApp("first", 0), mapApp("second", 1))
+		edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
+		f.resolveVia(t, "full", nil, nil)
+		var dst int64
+		if err := f.store.db.QueryRowContext(f.ctx, "SELECT dst_symbol_id FROM edges WHERE id=?", edge).Scan(&dst); err != nil || dst != firstRun {
+			t.Fatalf("dst=%d err=%v", dst, err)
+		}
+		f.typ(t, first, "App.Service")
+		f.clearAll(t)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "<unresolved>" {
+			t.Fatal(got)
+		}
+	})
 }
 
 // A repository without PHP has nothing for the PHP repair to re-decide: the

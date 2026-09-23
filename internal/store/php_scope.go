@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"path"
 	"sort"
 	"strings"
 
@@ -65,6 +66,7 @@ var phpScopeStrategies = []string{
 	ResolutionStrategyPHPSelfStatic,
 	ResolutionStrategyPHPThisInstance,
 	ResolutionStrategyPHPTypedProperty,
+	ResolutionStrategyPHPComposerPSR4,
 }
 
 // phpScopeOwnedSQL is the SQL twin of phpScopeOwned: the edge spellings this
@@ -90,6 +92,8 @@ func phpScopeOwned(dstName string) bool {
 
 type phpScopeSymbol struct {
 	id                                int64
+	fileID                            int64
+	path                              string
 	name, qname, container, kind, vis string
 	static                            sql.NullInt64
 }
@@ -113,6 +117,11 @@ type phpScopeEdge struct {
 
 type phpScopeImport struct {
 	source, local, kind, owner string
+}
+
+type phpComposerPSR4Mapping struct {
+	prefix, root string
+	ordinal      int
 }
 
 // phpScopeQuery is the read/write surface the pass needs; *sql.Tx and *sql.DB
@@ -221,6 +230,22 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND (`+phpSco
 	if err := phpLoadSymbolsByQName(ctx, q, repoID, sortedKeys(wanted), byQName); err != nil {
 		return 0, err
 	}
+	composerNeeded := false
+	for _, d := range decisions {
+		if d.typeQ != "" && phpTypeCount(byQName[d.typeQ]) > 1 {
+			composerNeeded = true
+			break
+		}
+	}
+	var composer []phpComposerPSR4Mapping
+	if composerNeeded {
+		var err error
+		composer, err = phpLoadComposerPSR4Mappings(ctx, q, repoID)
+		if err != nil {
+			return 0, err
+		}
+	}
+	types := map[string]phpTypeSelection{}
 
 	res := map[int64]struct {
 		dst      int64
@@ -231,30 +256,39 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND (`+phpSco
 		if d.typeQ == "" {
 			continue
 		}
-		if !phpUniqueType(byQName[d.typeQ]) {
+		selection, seen := types[d.typeQ]
+		if !seen {
+			selected, err := phpSelectType(ctx, q, repoID, d.typeQ, byQName[d.typeQ], composer)
+			if err != nil {
+				return 0, err
+			}
+			selection = selected
+			types[d.typeQ] = selection
+		}
+		if !selection.ok {
 			continue
 		}
 		if property, _, propertyStrategy, propertyOK := phpThisCall(e.name); propertyOK {
 			if property == "" {
-				if dst, found := phpChooseInstanceMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType); found {
+				if dst, found := phpChooseInstanceMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType, selection.fileID); found {
 					res[e.id] = struct {
 						dst      int64
 						strategy string
-					}{dst.id, propertyStrategy}
+					}{dst.id, phpSelectionStrategy(propertyStrategy, selection.composerUsed)}
 				}
-			} else if dst, found := phpChooseInstanceMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType); found {
+			} else if dst, found := phpChooseInstanceMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType, selection.fileID); found {
 				res[e.id] = struct {
 					dst      int64
 					strategy string
-				}{dst.id, propertyStrategy}
+				}{dst.id, phpSelectionStrategy(propertyStrategy, selection.composerUsed)}
 			}
 			continue
 		}
-		if dst, ok := phpChooseStaticMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType); ok {
+		if dst, ok := phpChooseStaticMethod(byQName[d.typeQ+"."+d.method], d.typeQ, e.currentType, selection.fileID); ok {
 			res[e.id] = struct {
 				dst      int64
 				strategy string
-			}{dst.id, d.strategy}
+			}{dst.id, phpSelectionStrategy(d.strategy, selection.composerUsed)}
 		}
 	}
 	if len(res) == 0 {
@@ -315,12 +349,12 @@ func phpLoadSymbolsByQName(ctx context.Context, q phpScopeQuery, repoID int64, q
 	for _, qn := range qnames {
 		delete(byQName, qn)
 	}
-	return sqliteBatchedQuery(ctx, q, `SELECT s.id,s.name,s.qualified_name,s.container_name,s.kind,s.visibility,s.is_static
+	return sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,f.path,s.name,s.qualified_name,s.container_name,s.kind,s.visibility,s.is_static
 FROM symbols s JOIN files f ON f.id=s.file_id
 WHERE s.repo_id=? AND s.language='php' AND f.is_deleted=0 AND s.kind IN ('type','function')`, " AND s.qualified_name IN (%s)", []any{repoID}, stringSliceToAny(qnames), true,
 		func(rows *sql.Rows) error {
 			var s phpScopeSymbol
-			if err := rows.Scan(&s.id, &s.name, &s.qname, &s.container, &s.kind, &s.vis, &s.static); err != nil {
+			if err := rows.Scan(&s.id, &s.fileID, &s.path, &s.name, &s.qname, &s.container, &s.kind, &s.vis, &s.static); err != nil {
 				return err
 			}
 			byQName[s.qname] = append(byQName[s.qname], s)
@@ -509,27 +543,134 @@ func phpThisCall(name string) (property, method, strategy string, ok bool) {
 	return "", "", "", false
 }
 
-// phpUniqueType reports whether exactly one active type row claims the qname.
-// PHP has no partial types: two rows are an ambiguous identity, not one type.
-func phpUniqueType(rows []phpScopeSymbol) bool {
+type phpTypeSelection struct {
+	fileID       int64
+	composerUsed bool
+	ok           bool
+}
+
+func phpLoadComposerPSR4Mappings(ctx context.Context, q phpScopeQuery, repoID int64) ([]phpComposerPSR4Mapping, error) {
+	var mappings []phpComposerPSR4Mapping
+	err := sqliteScanRows(ctx, q, `SELECT namespace_prefix,root_path,root_ordinal
+		FROM php_composer_psr4_mapping
+		WHERE repo_id=? AND mapping_role='autoload' AND namespace_prefix<>''
+		ORDER BY namespace_prefix,root_ordinal,root_path`, []any{repoID}, func(rows *sql.Rows) error {
+		var mapping phpComposerPSR4Mapping
+		if err := rows.Scan(&mapping.prefix, &mapping.root, &mapping.ordinal); err != nil {
+			return err
+		}
+		mappings = append(mappings, mapping)
+		return nil
+	})
+	return mappings, err
+}
+
+func phpSelectType(ctx context.Context, q phpScopeQuery, repoID int64, typeQ string, rows []phpScopeSymbol, mappings []phpComposerPSR4Mapping) (phpTypeSelection, error) {
+	var types []phpScopeSymbol
+	for _, s := range rows {
+		if s.kind == "type" {
+			types = append(types, s)
+		}
+	}
+	if len(types) == 1 {
+		return phpTypeSelection{fileID: types[0].fileID, ok: true}, nil
+	}
+	if len(types) == 0 {
+		return phpTypeSelection{}, nil
+	}
+	class := strings.ReplaceAll(typeQ, ".", `\`)
+	best := -1
+	for _, mapping := range mappings {
+		if phpComposerPrefixMatches(class, mapping.prefix) && len(mapping.prefix) > best {
+			best = len(mapping.prefix)
+		}
+	}
+	if best < 0 {
+		return phpTypeSelection{}, nil
+	}
+	for _, mapping := range mappings {
+		if len(mapping.prefix) != best || !phpComposerPrefixMatches(class, mapping.prefix) {
+			continue
+		}
+		expected := phpComposerExpectedPath(mapping.root, strings.TrimPrefix(class, mapping.prefix))
+		fileID, exists, err := phpActiveFileID(ctx, q, repoID, expected)
+		if err != nil {
+			return phpTypeSelection{}, err
+		}
+		if !exists {
+			continue
+		}
+		var match phpScopeSymbol
+		n := 0
+		for _, candidate := range types {
+			if candidate.fileID == fileID {
+				match, n = candidate, n+1
+			}
+		}
+		if n == 1 {
+			return phpTypeSelection{fileID: match.fileID, composerUsed: true, ok: true}, nil
+		}
+		return phpTypeSelection{}, nil
+	}
+	return phpTypeSelection{}, nil
+}
+
+func phpTypeCount(rows []phpScopeSymbol) int {
 	n := 0
 	for _, s := range rows {
 		if s.kind == "type" {
 			n++
 		}
 	}
-	return n == 1
+	return n
+}
+
+func phpActiveFileID(ctx context.Context, q phpScopeQuery, repoID int64, path string) (int64, bool, error) {
+	var id int64
+	err := sqliteScanRows(ctx, q, `SELECT id FROM files WHERE repo_id=? AND is_deleted=0 AND path=?`, []any{repoID, path}, func(rows *sql.Rows) error {
+		return rows.Scan(&id)
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return id, id != 0, nil
+}
+
+func phpComposerPrefixMatches(class, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	if strings.HasSuffix(prefix, `\`) {
+		return strings.HasPrefix(class, prefix)
+	}
+	return class == prefix || strings.HasPrefix(class, prefix+`\`)
+}
+
+func phpComposerExpectedPath(root, relative string) string {
+	relative = strings.TrimPrefix(relative, `\`)
+	file := strings.ReplaceAll(relative, `\`, "/") + ".php"
+	if root == "." {
+		return file
+	}
+	return path.Join(root, file)
+}
+
+func phpSelectionStrategy(strategy string, composerUsed bool) string {
+	if composerUsed {
+		return ResolutionStrategyPHPComposerPSR4
+	}
+	return strategy
 }
 
 // phpChooseStaticMethod picks the one syntax-proven static method on typeQ the
 // caller may see: kind function, container exactly typeQ, is_static = 1, and
 // public unless the caller's containing type is typeQ itself. Zero or several
 // survivors bind nothing.
-func phpChooseStaticMethod(rows []phpScopeSymbol, typeQ, currentType string) (phpScopeSymbol, bool) {
+func phpChooseStaticMethod(rows []phpScopeSymbol, typeQ, currentType string, fileID int64) (phpScopeSymbol, bool) {
 	var out phpScopeSymbol
 	n := 0
 	for _, s := range rows {
-		if s.kind != "function" || s.container != typeQ {
+		if s.kind != "function" || s.container != typeQ || (fileID != 0 && s.fileID != fileID) {
 			continue
 		}
 		if !s.static.Valid || s.static.Int64 != 1 {
@@ -547,11 +688,11 @@ func phpChooseStaticMethod(rows []phpScopeSymbol, typeQ, currentType string) (ph
 	return out, n == 1
 }
 
-func phpChooseInstanceMethod(rows []phpScopeSymbol, typeQ, currentType string) (phpScopeSymbol, bool) {
+func phpChooseInstanceMethod(rows []phpScopeSymbol, typeQ, currentType string, fileID int64) (phpScopeSymbol, bool) {
 	var out phpScopeSymbol
 	n := 0
 	for _, s := range rows {
-		if s.kind != "function" || s.container != typeQ || !s.static.Valid || s.static.Int64 != 0 {
+		if s.kind != "function" || s.container != typeQ || (fileID != 0 && s.fileID != fileID) || !s.static.Valid || s.static.Int64 != 0 {
 			continue
 		}
 		if typeQ == currentType {
