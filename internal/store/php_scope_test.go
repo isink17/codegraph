@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 // phpFixture builds PHP graphs directly in the Store with the P22.43 fact
@@ -573,6 +575,29 @@ func TestPHPComposerPSR4TypeSelectionRules(t *testing.T) {
 		f.resolveVia(t, "full", nil, nil)
 		if got := f.binding(t, edge); got != "<unresolved>" {
 			t.Fatal(got)
+		}
+	})
+	t.Run("typed property uses selected file", func(t *testing.T) {
+		f := newPHPFixture(t)
+		src := f.phpFile(t, "src/Service.php")
+		legacy := f.phpFile(t, "legacy/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, src, "App.Service")
+		run := f.method(t, src, "App.Service.run", "public", false)
+		f.typ(t, legacy, "App.Service")
+		f.method(t, legacy, "App.Service.run", "public", false)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		f.use(t, callerFile, `\App\Service`, "service", graph.ScopeImportTypedBinding, "App.Caller")
+		f.composer(t, mapApp("src", 0))
+		edge := f.call(t, callerFile, srcOf(caller), "$this->service->run", 1)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "App.Service.run|php_composer_psr4|high" {
+			t.Fatal(got)
+		}
+		var dst int64
+		if err := f.store.db.QueryRowContext(f.ctx, "SELECT dst_symbol_id FROM edges WHERE id=?", edge).Scan(&dst); err != nil || dst != run {
+			t.Fatalf("dst=%d err=%v", dst, err)
 		}
 	})
 }
