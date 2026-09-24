@@ -160,7 +160,7 @@ func TestCrossLanguageLinksUnchangedUpgradeRebuildsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.ExecContext(r.ctx, `DELETE FROM settings WHERE key = ?`, "derived.cross_language_links_current.v1."+strconv.FormatInt(r.repoID, 10)); err != nil {
+	if _, err := raw.ExecContext(r.ctx, `DELETE FROM settings WHERE key = ?`, "derived.cross_language_links_current.v2."+strconv.FormatInt(r.repoID, 10)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := raw.ExecContext(r.ctx, `DELETE FROM edges WHERE repo_id = ? AND edge_kind = 'cross_language_ref'`, r.repoID); err != nil {
