@@ -1238,15 +1238,15 @@ func TestTypeScopeRepairSparesCrossLanguageLinks(t *testing.T) {
 }
 
 // TestTypeScopeUngatedFileOnTheHopInvalidates covers the early exit. The import
-// index is language-blind and the re-export hop follows any file's relative
-// specifiers, so a file in an ungated language can sit ON the hop: here a Ruby
-// `pkg.rb` is what makes `tcp.py` visible to a Python caller. Testing the
+// index is language-blind and the re-export hop follows any non-Ruby file's relative
+// specifiers, so a file in an ungated language can sit ON the hop: here a PHP
+// `pkg.php` is what makes `tcp.py` visible to a Python caller. Testing the
 // CHANGED file's own language would skip the pass for an edit to it.
 func TestTypeScopeUngatedFileOnTheHopInvalidates(t *testing.T) {
 	f := newTypeScopeFixture(t)
 	tcpFile := f.file(t, "app/tcp.py", "python")
 	layer := f.class(t, tcpFile, "Layer", "tcp.Layer", "python")
-	bridge := f.file(t, "app/pkg.rb", "ruby")
+	bridge := f.file(t, "app/pkg.php", "php")
 	f.importPath(t, bridge, "./tcp")
 	callFile := f.file(t, "app/caller.py", "python")
 	f.importPath(t, callFile, "app.pkg")
@@ -1263,7 +1263,7 @@ func TestTypeScopeUngatedFileOnTheHopInvalidates(t *testing.T) {
 	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM file_imports WHERE file_id = ?`, bridge); err != nil {
 		t.Fatalf("delete file_imports error = %v", err)
 	}
-	if _, err := f.store.ResolveEdgesForPathsAndNames(f.ctx, f.repoID, []string{"app/pkg.rb"}, nil); err != nil {
+	if _, err := f.store.ResolveEdgesForPathsAndNames(f.ctx, f.repoID, []string{"app/pkg.php"}, nil); err != nil {
 		t.Fatalf("ResolveEdgesForPathsAndNames() error = %v", err)
 	}
 	if got, ok := f.dstSymbolID(t, edgeID); ok {

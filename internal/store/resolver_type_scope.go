@@ -363,8 +363,8 @@ type importFileIndex struct {
 // `__init__.py` merely depends on some distant module (`import app.types`) buys
 // no scope at all -- which is why `pathlib.Path` in
 // `mitmproxy/addons/maplocal.py` stays unable to reach mitmproxy's own
-// `types.Path`. And it is not restricted to barrel FILE NAMES: any file's
-// relative imports are followed, not just `__init__`/`index`/`mod`. That is
+// `types.Path`. And it is not restricted to barrel FILE NAMES: any non-Ruby
+// file's relative imports are followed, not just `__init__`/`index`/`mod`. That is
 // correct for Python, where a module has no export control and
 // `from a import X` reaches anything `a.py` imported; it is wider than
 // TypeScript's rule, where only `export ... from` re-exports and the adapter
@@ -378,6 +378,13 @@ type importFileIndex struct {
 // only "could this file see that declaration", and the destination itself is
 // still chosen by the resolver's ordinary uniqueness rule. Refusing on
 // ambiguity here would silently narrow scope rather than narrow evidence.
+//
+// Ruby `file_imports` rows are excluded at the query, as importers and as
+// re-export hops alike. Ruby cross-file visibility is constant lookup over
+// whatever runtime loading defined, not import visibility, and a `require`
+// string is not namespace or re-export evidence -- whatever it happens to look
+// like in another language's syntax. A Ruby file stays a possible TARGET of
+// another language's own specifier.
 func importScopeForRepo(ctx context.Context, q queryContexter, repoID int64) (map[int64]map[int64]struct{}, error) {
 	index, pathByID, err := loadImportFileIndex(ctx, q, repoID)
 	if err != nil {
@@ -386,7 +393,7 @@ func importScopeForRepo(ctx context.Context, q queryContexter, repoID int64) (ma
 	rows, err := q.QueryContext(ctx, `
 		SELECT fi.file_id, fi.import_path, f.language FROM file_imports fi
 		JOIN files f ON f.id = fi.file_id
-		WHERE f.repo_id = ?
+		WHERE f.repo_id = ? AND f.language <> 'ruby'
 	`, repoID)
 	if err != nil {
 		return nil, err
@@ -808,10 +815,11 @@ func (s *Store) typeScopeNamesForChangedPaths(ctx context.Context, repoID int64,
 	}
 	// The exit condition is "this repository holds no file this rule governs",
 	// NOT "no changed file is governed". The import index is language-blind and
-	// the re-export hop follows any file's relative specifiers, so a file in an
-	// ungated language can sit ON the hop: a Ruby `pkg.rb` doing `./tcp` is what
-	// makes `tcp.py` visible to a Python caller that imports `pkg`, and testing
-	// the changed file's own language would skip the pass for an edit to it. It
+	// the re-export hop follows the relative specifiers of any non-Ruby file, so
+	// a file in an ungated language can sit ON the hop: a PHP `pkg.php` doing
+	// `include "./tcp"` makes `tcp.py` visible to a Python caller that imports
+	// `pkg`, and testing the changed file's own language would skip the pass for
+	// an edit to it. It
 	// still keeps the whole pass, import-scope build included, off every update
 	// to a Go-only or Java-only repository.
 	var hasGatedFile int
@@ -1221,7 +1229,10 @@ func (c *importScopeCache) get(ctx context.Context, s *Store, repoID int64) (map
 // written since P22.9 already carries `.v1`. A second repair entry running the
 // same function under a second key would have made a pre-P22.9 database pay for
 // two identical repo-wide scans, the second one provably finding nothing.
-const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v2"
+//
+// v3 removes Ruby require rows from generic import scope/re-export semantics,
+// so a binding a Ruby hop granted has to be re-decided once.
+const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v3"
 
 const referenceIdentityRepairSettingKey = "resolver.reference_identity_repaired.v1"
 

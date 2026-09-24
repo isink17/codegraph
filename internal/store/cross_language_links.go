@@ -22,6 +22,15 @@ import (
 // The only cross-language fact this repository extracts is an import: a
 // `file_imports` row whose specifier names a file written in another language.
 // Nothing else -- no FFI, binding, or codegen marker -- reaches the database.
+//
+// `file_imports` is heterogeneous parser metadata, not a uniform import model.
+// Ruby rows are never bridge evidence: they hold raw `require` /
+// `require_relative` strings with neither the call kind nor the load path that
+// gives them meaning (`require "./x"` resolves against the working directory,
+// `require_relative "./x"` against the caller), and neither form ever loads a
+// `.py` or `.ts` file. A Ruby file may still be a bridge DESTINATION when
+// another language's own import names it.
+//
 // So one rule covers every link:
 //
 //	A cross-language link requires an import bridge: file A holds an import
@@ -71,7 +80,9 @@ const (
 	crossLangEdgeValuesBatchRows = 98
 )
 
-const crossLanguageLinksCurrentSettingKey = "derived.cross_language_links_current.v1"
+// v2 excludes Ruby importer rows. A v1-current database may still hold a link
+// bridged from a Ruby require string, so v1 is never read as current.
+const crossLanguageLinksCurrentSettingKey = "derived.cross_language_links_current.v2"
 
 func crossLanguageLinksCurrentKey(repoID int64) string {
 	return crossLanguageLinksCurrentSettingKey + "." + strconv.FormatInt(repoID, 10)
@@ -365,7 +376,7 @@ func crossLanguageBridges(
 		SELECT f.id, f.path, f.language, fi.import_path
 		FROM file_imports fi
 		JOIN files f ON f.id = fi.file_id
-		WHERE f.repo_id = ? AND f.is_deleted = 0
+		WHERE f.repo_id = ? AND f.is_deleted = 0 AND f.language <> 'ruby'
 		ORDER BY f.path, fi.import_path, f.id
 	`, repoID)
 	if err != nil {
