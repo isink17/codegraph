@@ -122,6 +122,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyPHPSelfStatic,
 		ResolutionStrategyPHPThisInstance,
 		ResolutionStrategyPHPTypedProperty,
+		ResolutionStrategyPHPComposerPSR4,
 		ResolutionStrategyRubyImplicitSelf,
 		ResolutionStrategyRubyExplicitSelf,
 		ResolutionStrategyRubyLexicalConstant,

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 )
 
 // ReconcileReferenceIdentities derives reference identities from the persisted
@@ -9,7 +10,13 @@ import (
 // Keeping this as one set-based pass prevents reference binding from becoming
 // a second resolver or a Go-side join.
 func (s *Store) ReconcileReferenceIdentities(ctx context.Context, repoID int64) error {
-	_, err := s.db.ExecContext(ctx, `
+	return reconcileReferenceIdentities(ctx, s.db, repoID)
+}
+
+func reconcileReferenceIdentities(ctx context.Context, q interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, repoID int64) error {
+	_, err := q.ExecContext(ctx, `
 		WITH matched AS (
 			SELECT r.id AS reference_id, e.id AS edge_id,
 				e.src_symbol_id, e.dst_symbol_id

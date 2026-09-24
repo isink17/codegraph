@@ -183,6 +183,7 @@ const (
 	ResolutionStrategyPHPSelfStatic    = "php_self_static"
 	ResolutionStrategyPHPThisInstance  = "php_this_instance"
 	ResolutionStrategyPHPTypedProperty = "php_typed_property"
+	ResolutionStrategyPHPComposerPSR4  = "php_composer_psr4"
 	ResolutionStrategyRubyImplicitSelf = "ruby_implicit_self"
 	ResolutionStrategyRubyExplicitSelf = "ruby_explicit_self"
 
@@ -307,6 +308,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyPHPSelfStatic:                                              ResolutionConfidenceHigh,
 	ResolutionStrategyPHPThisInstance:                                            ResolutionConfidenceHigh,
 	ResolutionStrategyPHPTypedProperty:                                           ResolutionConfidenceHigh,
+	ResolutionStrategyPHPComposerPSR4:                                            ResolutionConfidenceHigh,
 	ResolutionStrategyRubyImplicitSelf:                                           ResolutionConfidenceHigh,
 	ResolutionStrategyRubyExplicitSelf:                                           ResolutionConfidenceHigh,
 	ResolutionStrategyRubyLexicalConstant:                                        ResolutionConfidenceHigh,
@@ -403,6 +405,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyPHPSelfStatic,
 	ResolutionStrategyPHPThisInstance,
 	ResolutionStrategyPHPTypedProperty,
+	ResolutionStrategyPHPComposerPSR4,
 	ResolutionStrategyRubyImplicitSelf,
 	ResolutionStrategyRubyExplicitSelf,
 	ResolutionStrategyRubyLexicalConstant,

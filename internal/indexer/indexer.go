@@ -159,6 +159,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, len(candidatePaths) == 0 && scanKind != "update"); err != nil {
 		return store.ScanSummary{}, err
 	}
+	composer, err := discoverPHPComposerPSR4(opts.RepoRoot)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	previousComposerFingerprint, composerFingerprintKnown, err := i.store.PHPComposerPSR4Fingerprint(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	composerChanged := !composerFingerprintKnown || previousComposerFingerprint != composer.Fingerprint
 	swiftModules, err := discoverSwiftModules(opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -1153,6 +1162,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
 		return summary, err
+	}
+	if composerChanged {
+		if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+			return summary, err
+		}
+		if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+			return summary, err
+		}
 	}
 	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
 		return summary, err
