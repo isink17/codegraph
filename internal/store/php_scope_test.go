@@ -434,13 +434,16 @@ func TestPHPComposerPSR4TypeSelectionRules(t *testing.T) {
 	}
 	t.Run("unique ignores mismatch", func(t *testing.T) {
 		f := newPHPFixture(t)
-		service := f.phpFile(t, "src/Service.php")
+		mapped := f.phpFile(t, "mapped/Service.php")
+		service := f.phpFile(t, "legacy/Service.php")
 		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, mapped, "Wrong.Service")
+		f.method(t, mapped, "Wrong.Service.run", "public", true)
 		f.typ(t, service, "App.Service")
 		f.method(t, service, "App.Service.run", "public", true)
 		f.typ(t, callerFile, "App.Caller")
 		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
-		f.composer(t, mapApp("wrong", 0))
+		f.composer(t, mapApp("mapped", 0))
 		edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
 		f.resolveVia(t, "full", nil, nil)
 		if got := f.binding(t, edge); got != "App.Service.run|php_type_scope|high" {

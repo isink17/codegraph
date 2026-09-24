@@ -281,10 +281,12 @@ class Caller { public function call() { Service::run(); } }
 
 	r.write("src/Service.php", service("Wrong"))
 	r.update("src/Service.php")
-	r.assertUnresolved("src/Caller.php", "Service::run")
+	r.assertTarget("src/Caller.php", "Service::run", "App.Service.run", "php_type_scope")
+	r.assertFreshParity()
 	r.write("src/Service.php", service("App"))
 	r.update("src/Service.php")
 	r.assertTarget("src/Caller.php", "Service::run", "App.Service.run", "php_composer_psr4")
+	r.assertFreshParity()
 
 	if _, err := raw.ExecContext(context.Background(), `UPDATE edges SET dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE repo_id=?`, r.repoID); err != nil {
 		t.Fatal(err)
