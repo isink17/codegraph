@@ -241,7 +241,7 @@ func TestPHPComposerPSR4Lifecycle(t *testing.T) {
 	if _, err := raw.ExecContext(ctx, `DELETE FROM php_composer_psr4_mapping WHERE repo_id=?`, repo.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.ExecContext(ctx, `DELETE FROM settings WHERE key=?`, "scope.php_composer_psr4.v1."+strconv.FormatInt(repo.ID, 10)); err != nil {
+	if _, err := raw.ExecContext(ctx, `DELETE FROM settings WHERE key=?`, "scope.php_composer_psr4.v2."+strconv.FormatInt(repo.ID, 10)); err != nil {
 		t.Fatal(err)
 	}
 	update()

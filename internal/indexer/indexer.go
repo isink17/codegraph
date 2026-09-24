@@ -1164,7 +1164,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, err
 	}
 	if composerChanged {
-		if err := i.store.ReplacePHPComposerPSR4Mappings(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+		if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
 			return summary, err
 		}
 		if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {

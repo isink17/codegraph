@@ -82,6 +82,56 @@ func TestPHPComposerPSR4FingerprintLifecycle(t *testing.T) {
 	}
 }
 
+func TestPHPComposerPSR4ReconcileBindingsAndReferencesAtomically(t *testing.T) {
+	f := newPHPFixture(t)
+	src := f.phpFile(t, "src/Service.php")
+	legacy := f.phpFile(t, "legacy/Service.php")
+	callerFile := f.phpFile(t, "src/Caller.php")
+	f.typ(t, src, "App.Service")
+	srcRun := f.method(t, src, "App.Service.run", "public", true)
+	f.typ(t, legacy, "App.Service")
+	legacyRun := f.method(t, legacy, "App.Service.run", "public", true)
+	f.typ(t, callerFile, "App.Caller")
+	caller := f.method(t, callerFile, "App.Caller.call", "public", false)
+	edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
+	f.reference(t, callerFile, "Service::run", 1)
+	srcMapping := PHPComposerPSR4Mapping{ManifestPath: "composer.json", MappingRole: "autoload", NamespacePrefix: "App\\", RootPath: "src", RootOrdinal: 0}
+	legacyMapping := srcMapping
+	legacyMapping.RootPath = "legacy"
+	f.composer(t, srcMapping)
+	f.resolveVia(t, "full", nil, nil)
+	if err := f.store.ReconcileReferenceIdentities(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.binding(t, edge); got != "App.Service.run|php_composer_psr4|high" {
+		t.Fatal(got)
+	}
+	f.assertReference(t, 1, srcOf(srcRun), srcOf(caller))
+
+	if err := f.store.ReconcilePHPComposerPSR4(f.ctx, f.repoID, []PHPComposerPSR4Mapping{legacyMapping}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.binding(t, edge); got != "App.Service.run|php_composer_psr4|high" {
+		t.Fatal(got)
+	}
+	f.assertReference(t, 1, srcOf(legacyRun), srcOf(caller))
+
+	if _, err := f.store.db.ExecContext(f.ctx, `CREATE TRIGGER fail_composer_reference BEFORE UPDATE ON references_tbl BEGIN SELECT RAISE(ABORT, 'forced'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ReconcilePHPComposerPSR4(f.ctx, f.repoID, []PHPComposerPSR4Mapping{srcMapping}); err == nil {
+		t.Fatal("reconcile unexpectedly succeeded")
+	}
+	if got := f.binding(t, edge); got != "App.Service.run|php_composer_psr4|high" {
+		t.Fatalf("rollback binding = %s", got)
+	}
+	f.assertReference(t, 1, srcOf(legacyRun), srcOf(caller))
+	mappings, err := f.store.PHPComposerPSR4Mappings(f.ctx, f.repoID)
+	if err != nil || !reflect.DeepEqual(mappings, []PHPComposerPSR4Mapping{legacyMapping}) {
+		t.Fatalf("rollback mappings = %#v, %v", mappings, err)
+	}
+}
+
 func TestMigrationPHPComposerPSR4Mapping(t *testing.T) {
 	const migrationVersion = 41
 	ctx := context.Background()

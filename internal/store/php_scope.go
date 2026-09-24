@@ -232,7 +232,7 @@ WHERE e.repo_id=? AND f.language='php' AND e.dst_symbol_id IS NULL AND (`+phpSco
 	}
 	composerNeeded := false
 	for _, d := range decisions {
-		if d.typeQ != "" && phpTypeCount(byQName[d.typeQ]) > 1 {
+		if d.typeQ != "" {
 			composerNeeded = true
 			break
 		}
@@ -572,9 +572,6 @@ func phpSelectType(ctx context.Context, q phpScopeQuery, repoID int64, typeQ str
 			types = append(types, s)
 		}
 	}
-	if len(types) == 1 {
-		return phpTypeSelection{fileID: types[0].fileID, ok: true}, nil
-	}
 	if len(types) == 0 {
 		return phpTypeSelection{}, nil
 	}
@@ -586,6 +583,9 @@ func phpSelectType(ctx context.Context, q phpScopeQuery, repoID int64, typeQ str
 		}
 	}
 	if best < 0 {
+		if len(types) == 1 {
+			return phpTypeSelection{fileID: types[0].fileID, ok: true}, nil
+		}
 		return phpTypeSelection{}, nil
 	}
 	for _, mapping := range mappings {
@@ -600,6 +600,15 @@ func phpSelectType(ctx context.Context, q phpScopeQuery, repoID int64, typeQ str
 		if !exists {
 			continue
 		}
+		if len(types) == 1 {
+			// An existing expected Composer file that does not emit this source
+			// type makes the mapping evidence refuse the otherwise unique type.
+			// An absent expected file remains irrelevant to unique source evidence.
+			if types[0].fileID == fileID {
+				return phpTypeSelection{fileID: fileID, ok: true}, nil
+			}
+			return phpTypeSelection{}, nil
+		}
 		var match phpScopeSymbol
 		n := 0
 		for _, candidate := range types {
@@ -612,17 +621,10 @@ func phpSelectType(ctx context.Context, q phpScopeQuery, repoID int64, typeQ str
 		}
 		return phpTypeSelection{}, nil
 	}
-	return phpTypeSelection{}, nil
-}
-
-func phpTypeCount(rows []phpScopeSymbol) int {
-	n := 0
-	for _, s := range rows {
-		if s.kind == "type" {
-			n++
-		}
+	if len(types) == 1 {
+		return phpTypeSelection{fileID: types[0].fileID, ok: true}, nil
 	}
-	return n
+	return phpTypeSelection{}, nil
 }
 
 func phpActiveFileID(ctx context.Context, q phpScopeQuery, repoID int64, path string) (int64, bool, error) {

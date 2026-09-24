@@ -6,7 +6,7 @@ import (
 	"strconv"
 )
 
-const phpComposerPSR4FingerprintSettingKey = "scope.php_composer_psr4.v1"
+const phpComposerPSR4FingerprintSettingKey = "scope.php_composer_psr4.v2"
 
 type PHPComposerPSR4Mapping struct {
 	ManifestPath    string
@@ -44,6 +44,13 @@ func (s *Store) ReplacePHPComposerPSR4Mappings(ctx context.Context, repoID int64
 		return err
 	}
 	defer tx.Rollback()
+	if err := replacePHPComposerPSR4Mappings(ctx, tx, repoID, mappings); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func replacePHPComposerPSR4Mappings(ctx context.Context, tx *sql.Tx, repoID int64, mappings []PHPComposerPSR4Mapping) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM php_composer_psr4_mapping WHERE repo_id=?`, repoID); err != nil {
 		return err
 	}
@@ -59,6 +66,30 @@ func (s *Store) ReplacePHPComposerPSR4Mappings(ctx context.Context, repoID int64
 		if _, err := stmt.ExecContext(ctx, repoID, mapping.ManifestPath, mapping.MappingRole, mapping.NamespacePrefix, mapping.RootPath, mapping.RootOrdinal); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ReconcilePHPComposerPSR4 atomically converges Composer evidence, only the
+// bindings it owns, and reference identities derived from those bindings.
+func (s *Store) ReconcilePHPComposerPSR4(ctx context.Context, repoID int64, mappings []PHPComposerPSR4Mapping) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := replacePHPComposerPSR4Mappings(ctx, tx, repoID, mappings); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+		WHERE repo_id=? AND resolution_strategy=?`, repoID, ResolutionStrategyPHPComposerPSR4); err != nil {
+		return err
+	}
+	if _, err := resolvePHPScope(ctx, tx, repoID, nil); err != nil {
+		return err
+	}
+	if err := reconcileReferenceIdentities(ctx, tx, repoID); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

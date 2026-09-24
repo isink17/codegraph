@@ -218,6 +218,87 @@ func (r *phpRepo) assertFreshParity() {
 	}
 }
 
+func TestPHPComposerPSR4BindingLifecycle(t *testing.T) {
+	service := func(namespace string) string {
+		return "<?php\nnamespace " + namespace + ";\nclass Service { public static function run() {} }\n"
+	}
+	caller := `<?php
+namespace App;
+class Caller { public function call() { Service::run(); } }
+`
+	r := newPHPRepo(t, map[string]string{
+		"composer.json":      `{"autoload":{"psr-4":{"App\\":"src/"}}}`,
+		"src/Service.php":    service("App"),
+		"legacy/Service.php": service("App"),
+		"src/Caller.php":     caller,
+	})
+	assertFingerprint := func() {
+		t.Helper()
+		got, known, err := r.s.PHPComposerPSR4Fingerprint(context.Background(), r.repoID)
+		want, err := discoverPHPComposerPSR4(r.root)
+		if err != nil || !known || got != want.Fingerprint {
+			t.Fatalf("v2 fingerprint = %q known=%v err=%v; want %q", got, known, err, want.Fingerprint)
+		}
+	}
+	assertFingerprint()
+	r.assertTarget("src/Caller.php", "Service::run", "App.Service.run", "php_composer_psr4")
+	assertCallers(t, r.s, r.repoID, "App.Service.run", "App.Caller.call")
+	assertCallees(t, r.s, r.repoID, "App.Caller.call", "App.Service.run")
+
+	r.write("composer.json", `{"autoload":{"psr-4":{"App\\":"legacy/"}}}`)
+	if summary := r.update("src/Caller.php"); summary.FilesChanged != 0 {
+		t.Fatalf("Composer-only reconciliation reparsed %d files", summary.FilesChanged)
+	} // composer discovery is root-wide, not path-event scoped.
+	assertFingerprint()
+	r.assertTarget("src/Caller.php", "Service::run", "App.Service.run", "php_composer_psr4")
+	raw := r.raw()
+	defer raw.Close()
+	var got string
+	if err := raw.QueryRowContext(context.Background(), `
+		SELECT f.path FROM edges e JOIN symbols s ON s.id=e.dst_symbol_id JOIN files f ON f.id=s.file_id
+		WHERE e.repo_id=? AND e.file_id=(SELECT id FROM files WHERE repo_id=? AND path='src/Caller.php') AND e.dst_name='Service::run'`, r.repoID, r.repoID).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "legacy/Service.php" {
+		t.Fatalf("mapping switch target file = %q", got)
+	}
+	r.assertFreshParity()
+
+	r.remove("composer.json")
+	r.update("composer.json")
+	assertFingerprint()
+	r.assertUnresolved("src/Caller.php", "Service::run")
+	r.assertFreshParity()
+
+	r.write("composer.json", `{`)
+	r.update("composer.json")
+	assertFingerprint()
+	r.assertUnresolved("src/Caller.php", "Service::run")
+
+	r.write("composer.json", `{"autoload":{"psr-4":{"App\\":"src/"}}}`)
+	r.update("composer.json")
+	r.assertTarget("src/Caller.php", "Service::run", "App.Service.run", "php_composer_psr4")
+
+	r.write("src/Service.php", service("Wrong"))
+	r.update("src/Service.php")
+	r.assertUnresolved("src/Caller.php", "Service::run")
+	r.write("src/Service.php", service("App"))
+	r.update("src/Service.php")
+	r.assertTarget("src/Caller.php", "Service::run", "App.Service.run", "php_composer_psr4")
+
+	if _, err := raw.ExecContext(context.Background(), `UPDATE edges SET dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE repo_id=?`, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `DELETE FROM settings WHERE key=?`, "scope.php_composer_psr4.v2."+strconv.FormatInt(r.repoID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `INSERT INTO settings(key,value) VALUES(?,?)`, "scope.php_composer_psr4.v1."+strconv.FormatInt(r.repoID, 10), "old"); err != nil {
+		t.Fatal(err)
+	}
+	r.update()
+	r.assertTarget("src/Caller.php", "Service::run", "App.Service.run", "php_composer_psr4")
+}
+
 // -- BASE reproduction / acceptance -------------------------------------------
 
 const phpAcceptanceFixture = `<?php

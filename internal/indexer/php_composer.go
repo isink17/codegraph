@@ -70,7 +70,7 @@ func discoverPHPComposerPSR4(root string) (phpComposerPSR4Discovery, error) {
 
 func phpComposerDiscovery(state phpComposerPSR4State, raw []byte, mappings []phpComposerPSR4Mapping) phpComposerPSR4Discovery {
 	h := sha256.New()
-	h.Write([]byte("php-composer-psr4-v1\x00"))
+	h.Write([]byte("php-composer-psr4-v2\x00"))
 	writePHPComposerFingerprintField(h, string(state))
 	if state != phpComposerPSR4Absent {
 		writePHPComposerFingerprintField(h, phpComposerManifestPath)
