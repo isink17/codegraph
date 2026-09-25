@@ -243,7 +243,7 @@ func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymb
 	return out, true, strategy
 }
 func javaTypeEligible(s javaScopeSymbol) bool {
-	return s.language == "java" && s.kind == "type" || s.language == "kotlin" && s.kind == "class"
+	return s.language == "java" && s.kind == "type"
 }
 
 func javaVisibleToJava(s javaScopeSymbol, fromPkg string) bool {

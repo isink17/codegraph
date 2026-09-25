@@ -160,7 +160,7 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 			}
 		} else {
 			owner := kotlinType(e.name, e, syms, imports[e.file])
-			if owner.language == "java" {
+			if owner.language == "java" && kotlinJavaConstructible(owner, e, syms) {
 				dst, strategy = owner, kotlinOwnerStrategy(owner.qname, e.name, imports[e.file])
 			} else {
 				dst, strategy = kotlinBare(e, syms, imports[e.file])
@@ -300,6 +300,27 @@ func kotlinTypeEligible(s kotlinScopeSymbol) bool {
 		return s.kind == "type" && s.container == s.pkg
 	}
 	return s.kind == "class" || s.kind == "interface" || s.kind == "object" || s.kind == "enum"
+}
+
+// kotlinJavaConstructible preserves Kotlin's constructor-as-type identity
+// without guessing an overload. An absent Java constructor symbol may be the
+// implicit default constructor, but when source facts do contain constructors,
+// at least one must be visible to this Kotlin caller.
+func kotlinJavaConstructible(owner kotlinScopeSymbol, e struct {
+	id, file                             int64
+	name, kind, evidence, pkg, container string
+}, syms []kotlinScopeSymbol) bool {
+	seen := false
+	for _, s := range syms {
+		if s.language != "java" || s.kind != "constructor" || !strings.HasPrefix(s.qname, owner.qname+".") {
+			continue
+		}
+		seen = true
+		if kotlinVisible(s, e) {
+			return true
+		}
+	}
+	return !seen
 }
 
 func kotlinOwnerStrategy(owner, local string, imports []kotlinScopeImport) string {
