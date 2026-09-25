@@ -7,8 +7,9 @@ import (
 )
 
 type kotlinScopeSymbol struct {
-	id, file                                                 int64
-	name, qname, container, kind, visibility, signature, pkg string
+	id, file                                                           int64
+	name, qname, container, kind, visibility, signature, pkg, language string
+	static                                                             sql.NullInt64
 }
 
 type kotlinScopeImport struct {
@@ -61,10 +62,14 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	for _, e := range edges {
 		fileIDs[e.file] = struct{}{}
 		packages[e.pkg] = struct{}{}
-		for _, p := range strings.Split(e.name, ".") {
+		parts := strings.Split(e.name, ".")
+		for _, p := range parts {
 			if p != "" {
 				names[p] = struct{}{}
 			}
+		}
+		for i := 1; i < len(parts); i++ {
+			packages[strings.Join(parts[:i], ".")] = struct{}{}
 		}
 	}
 	scopeFileIDs := sortedIDs(fileIDs)
@@ -103,14 +108,14 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 		for _, n := range nameChunk {
 			fixed = append(fixed, n)
 		}
-		if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.visibility,s.signature,COALESCE(fs.package_name,'')
+		if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.visibility,s.signature,COALESCE(fs.package_name,''),f.language,s.is_static
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.repo_id=s.repo_id AND fs.file_id=s.file_id
-		WHERE s.repo_id=? AND f.language='kotlin' AND f.is_deleted=0 AND s.name IN (`+sqlitePlaceholders(len(nameChunk))+`)`,
+		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0 AND s.name IN (`+sqlitePlaceholders(len(nameChunk))+`)`,
 			" AND COALESCE(fs.package_name,'') IN (%s)",
 			fixed, stringSliceToAny(packageList), true,
 			func(rows *sql.Rows) error {
 				var s kotlinScopeSymbol
-				if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.visibility, &s.signature, &s.pkg); err != nil {
+				if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.visibility, &s.signature, &s.pkg, &s.language, &s.static); err != nil {
 					return err
 				}
 				syms = append(syms, s)
@@ -142,9 +147,6 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	for _, e := range edges {
 		var dst kotlinScopeSymbol
 		strategy := ""
-		if e.kind == "constructs" {
-			continue
-		}
 		if strings.Contains(e.name, ".") {
 			parts := strings.Split(e.name, ".")
 			member := parts[len(parts)-1]
@@ -152,9 +154,17 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 			owner := kotlinType(qualifier, e, syms, imports[e.file])
 			if owner.id != 0 {
 				dst, strategy = kotlinMember(owner, member, e, syms)
+				if dst.language == "java" {
+					strategy = kotlinOwnerStrategy(owner.qname, qualifier, imports[e.file])
+				}
 			}
 		} else {
-			dst, strategy = kotlinBare(e, syms, imports[e.file])
+			owner := kotlinType(e.name, e, syms, imports[e.file])
+			if owner.language == "java" {
+				dst, strategy = owner, kotlinOwnerStrategy(owner.qname, e.name, imports[e.file])
+			} else {
+				dst, strategy = kotlinBare(e, syms, imports[e.file])
+			}
 		}
 		if dst.id != 0 {
 			res = append(res, struct {
@@ -189,7 +199,7 @@ func kotlinType(name string, e struct {
 }, syms []kotlinScopeSymbol, imports []kotlinScopeImport) kotlinScopeSymbol {
 	var c []kotlinScopeSymbol
 	for _, s := range syms {
-		if s.kind != "class" && s.kind != "interface" && s.kind != "object" && s.kind != "enum" {
+		if !kotlinTypeEligible(s) {
 			continue
 		}
 		if s.qname == name || s.qname == kotlinJoin(e.pkg, name) {
@@ -225,14 +235,14 @@ func kotlinBare(e struct {
 	var c []kotlinScopeSymbol
 	strategy := "kotlin_package_scope"
 	for _, s := range syms {
-		if s.name == e.name && s.kind == "function" && s.pkg == e.pkg && s.container == e.pkg && kotlinVisible(s, e) && !kotlinExtension(s) {
+		if s.language == "kotlin" && s.name == e.name && s.kind == "function" && s.pkg == e.pkg && s.container == e.pkg && kotlinVisible(s, e) && !kotlinExtension(s) {
 			c = append(c, s)
 		}
 	}
 	if e.container != "" {
 		owner := kotlinJoin(e.pkg, e.container)
 		for _, s := range syms {
-			if s.name == e.name && s.kind == "function" && s.qname == owner+"."+e.name && kotlinVisible(s, e) && !kotlinExtension(s) {
+			if s.language == "kotlin" && s.name == e.name && s.kind == "function" && s.qname == owner+"."+e.name && kotlinVisible(s, e) && !kotlinExtension(s) {
 				c = append(c, s)
 			}
 		}
@@ -240,7 +250,7 @@ func kotlinBare(e struct {
 	for _, i := range imports {
 		if i.wildcard {
 			for _, s := range syms {
-				if s.qname == i.source+"."+e.name && s.kind == "function" && kotlinVisible(s, e) && !kotlinExtension(s) {
+				if s.language == "kotlin" && s.qname == i.source+"."+e.name && s.kind == "function" && kotlinVisible(s, e) && !kotlinExtension(s) {
 					c = append(c, s)
 				}
 			}
@@ -249,7 +259,7 @@ func kotlinBare(e struct {
 		}
 		if i.local == e.name {
 			for _, s := range syms {
-				if s.qname == i.source && s.kind == "function" && kotlinVisible(s, e) && !kotlinExtension(s) {
+				if s.language == "kotlin" && s.qname == i.source && s.kind == "function" && kotlinVisible(s, e) && !kotlinExtension(s) {
 					c = append(c, s)
 				}
 			}
@@ -264,6 +274,17 @@ func kotlinMember(owner kotlinScopeSymbol, name string, e struct {
 	name, kind, evidence, pkg, container string
 }, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
 	var c []kotlinScopeSymbol
+	if owner.language == "java" {
+		for _, s := range syms {
+			if s.language == "java" && s.name == name && s.kind == "function" && s.qname == owner.qname+"."+name && s.static.Valid && s.static.Int64 != 0 && kotlinVisible(s, e) {
+				c = append(c, s)
+			}
+		}
+		if len(c) != 1 {
+			return kotlinScopeSymbol{}, ""
+		}
+		return c[0], "kotlin_package_scope"
+	}
 	for _, s := range syms {
 		if s.name == name && s.pkg == owner.pkg && s.container == strings.TrimPrefix(owner.qname, owner.pkg+".") && kotlinVisible(s, e) && !kotlinExtension(s) {
 			c = append(c, s)
@@ -273,6 +294,24 @@ func kotlinMember(owner kotlinScopeSymbol, name string, e struct {
 		return kotlinScopeSymbol{}, ""
 	}
 	return c[0], "kotlin_package_scope"
+}
+func kotlinTypeEligible(s kotlinScopeSymbol) bool {
+	if s.language == "java" {
+		return s.kind == "type" && s.container == s.pkg
+	}
+	return s.kind == "class" || s.kind == "interface" || s.kind == "object" || s.kind == "enum"
+}
+
+func kotlinOwnerStrategy(owner, local string, imports []kotlinScopeImport) string {
+	if strings.Contains(local, ".") {
+		return "kotlin_package_scope"
+	}
+	for _, i := range imports {
+		if i.wildcard && strings.HasPrefix(owner, i.source+".") || !i.wildcard && i.local == local {
+			return "kotlin_import_scope"
+		}
+	}
+	return "kotlin_package_scope"
 }
 func kotlinUnique(c []kotlinScopeSymbol) kotlinScopeSymbol {
 	if len(c) != 1 {
@@ -293,6 +332,16 @@ func kotlinVisible(s kotlinScopeSymbol, e struct {
 	id, file                             int64
 	name, kind, evidence, pkg, container string
 }) bool {
+	if s.language == "java" {
+		switch s.visibility {
+		case "private":
+			return false
+		case "package", "protected":
+			return s.pkg == e.pkg
+		default:
+			return true
+		}
+	}
 	switch s.visibility {
 	case "private":
 		return s.file == e.file

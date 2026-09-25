@@ -1237,6 +1237,7 @@ const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v3"
 const referenceIdentityRepairSettingKey = "resolver.reference_identity_repaired.v1"
 
 const jvmScopePrecisionRepairSettingKey = "resolver.jvm_scope_precision_repaired.v1"
+const jvmCoreInteropRepairSettingKey = "resolver.jvm_core_interop_repaired.v1"
 
 func (s *Store) jvmScopePrecisionRepairApplies(ctx context.Context, repoID int64) (bool, error) {
 	var found bool
@@ -1257,6 +1258,16 @@ func (s *Store) repairJVMScopePrecisionBindings(ctx context.Context, repoID int6
 	}
 	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
 	return err
+}
+
+func (s *Store) jvmCoreInteropRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT language)=2 FROM files WHERE repo_id=? AND is_deleted=0 AND language IN ('java','kotlin')`, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairJVMCoreInteropBindings(ctx context.Context, repoID int64) error {
+	return s.repairJVMScopePrecisionBindings(ctx, repoID)
 }
 
 // repairTypeScopeBindingsOnce clears this repository's pre-P22.9 bindings the
@@ -1343,6 +1354,12 @@ var (
 		key:              jvmScopePrecisionRepairSettingKey,
 		run:              (*Store).repairJVMScopePrecisionBindings,
 		applies:          (*Store).jvmScopePrecisionRepairApplies,
+		resolvesRepoWide: true,
+	}
+	jvmCoreInteropRepair = resolverRepair{
+		key:              jvmCoreInteropRepairSettingKey,
+		run:              (*Store).repairJVMCoreInteropBindings,
+		applies:          (*Store).jvmCoreInteropRepairApplies,
 		resolvesRepoWide: true,
 	}
 	phpScopeRepair = resolverRepair{
@@ -1481,7 +1498,7 @@ var (
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,
