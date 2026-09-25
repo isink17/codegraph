@@ -185,7 +185,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 	if i := strings.LastIndex(name, "."); i >= 0 { // fully qualified or nested spelling
 		var exact []javaScopeSymbol
 		for _, s := range byQName[name] {
-			if javaTypeEligible(s) {
+			if javaTypeIdentityEligible(s) {
 				exact = append(exact, s)
 			}
 		}
@@ -193,7 +193,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 	}
 	var c []javaScopeSymbol
 	for _, s := range byName[name] {
-		if !javaTypeEligible(s) {
+		if !javaTypeIdentityEligible(s) {
 			continue
 		}
 		if container != "" && (s.qname == pkg+"."+container+"."+name || s.qname == container+"."+name) {
@@ -211,7 +211,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		if !i.wildcard && i.local == name {
 			c = nil
 			for _, s := range byQName[i.source] {
-				if javaTypeEligible(s) {
+				if javaTypeIdentityEligible(s) {
 					c = append(c, s)
 				}
 			}
@@ -219,7 +219,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		}
 		if i.wildcard {
 			for _, s := range byQName[i.source+"."+name] {
-				if javaTypeEligible(s) {
+				if javaTypeIdentityEligible(s) {
 					c = append(c, s)
 				}
 			}
@@ -242,8 +242,8 @@ func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymb
 	}
 	return out, true, strategy
 }
-func javaTypeEligible(s javaScopeSymbol) bool {
-	return s.language == "java" && s.kind == "type"
+func javaTypeIdentityEligible(s javaScopeSymbol) bool {
+	return s.language == "java" && s.kind == "type" || s.language == "kotlin" && s.kind == "class"
 }
 
 func javaVisibleToJava(s javaScopeSymbol, fromPkg string) bool {
@@ -287,8 +287,8 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	if !ok {
 		return javaScopeSymbol{}, ""
 	}
-	if t.language == "kotlin" {
-		return t, "java_constructor"
+	if t.language != "java" {
+		return javaScopeSymbol{}, ""
 	}
 	want := javaArity(e.evidence)
 	var out javaScopeSymbol

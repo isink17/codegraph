@@ -1,11 +1,48 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
 )
 
 func TestJVMCoreInteropScopes(t *testing.T) {
+	t.Run("java_peer_kotlin_class_makes_type_identity_ambiguous", func(t *testing.T) {
+		f := newGateFixture(t)
+		callerFile := f.file(t, "Caller.java", "java")
+		caller := f.symbolKind(t, callerFile, "call", "app.Caller.call", "function", "java")
+		javaFile := f.file(t, "JavaService.java", "java")
+		javaType := f.symbolKind(t, javaFile, "Service", "lib.Service", "type", "java")
+		javaRun := f.symbolKind(t, javaFile, "run", "lib.Service.run", "function", "java")
+		kotlinFile := f.file(t, "KotlinService.kt", "kotlin")
+		f.symbolKind(t, kotlinFile, "Service", "lib.Service", "class", "kotlin")
+		for _, x := range []struct {
+			file int64
+			lang string
+			pkg  string
+		}{{callerFile, "java", "app"}, {javaFile, "java", "lib"}, {kotlinFile, "kotlin", "lib"}} {
+			if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?,?,?)`, f.repoID, x.file, x.lang, x.pkg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='lib' WHERE id=?`, javaType); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='public',is_static=1 WHERE id=?`, javaRun); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,?,?,?,?,?)`, f.repoID, callerFile, "java", "lib.Service", "Service", "Service", "named"); err != nil {
+			t.Fatal(err)
+		}
+		edge := f.edge(t, callerFile, caller, "Service.run")
+		if _, err := resolveJavaScope(f.ctx, f.store.db, f.repoID, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := f.dstSymbolID(t, edge); ok {
+			t.Fatalf("Java peer Kotlin class did not make owner ambiguous: bound %d", got)
+		}
+	})
+
 	t.Run("java_refuses_kotlin_source_forms", func(t *testing.T) {
 		f := newGateFixture(t)
 		callerFile := f.file(t, "src/Caller.java", "java")
@@ -121,6 +158,16 @@ func TestJVMCoreInteropRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	edge := f.edge(t, callerFile, caller, "Service.run")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls' WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	var line int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT line FROM edges WHERE id=?`, edge).Scan(&line); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO references_tbl(repo_id,file_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col) VALUES(?,?, 'call','run','Service.run',?,1,?,1)`, f.repoID, callerFile, line, line); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.store.markRepairDone(f.ctx, jvmScopePrecisionRepairSettingKey, f.repoID); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +177,10 @@ func TestJVMCoreInteropRepair(t *testing.T) {
 	if got, ok := f.dstSymbolID(t, edge); !ok || got != target {
 		t.Fatalf("B2 repair target=(%d,%v), want (%d,true)", got, ok, target)
 	}
+	var reference sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil || !reference.Valid || reference.Int64 != target {
+		t.Fatalf("B2 repair reference=(%v,%v), want %d", reference, err, target)
+	}
 	key := fmt.Sprintf("%s.%d", jvmCoreInteropRepairSettingKey, f.repoID)
 	var value string
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, key).Scan(&value); err != nil || value != "1" {
@@ -137,5 +188,84 @@ func TestJVMCoreInteropRepair(t *testing.T) {
 	}
 	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || ran {
 		t.Fatalf("second B2 repair=(%v,%v), want (false,nil)", ran, err)
+	}
+}
+
+func TestJVMCoreInteropRepairClearsJavaBindingForKotlinPeer(t *testing.T) {
+	f := newGateFixture(t)
+	callerFile := f.file(t, "Caller.java", "java")
+	caller := f.symbolKind(t, callerFile, "call", "app.Caller.call", "function", "java")
+	javaFile := f.file(t, "JavaService.java", "java")
+	javaType := f.symbolKind(t, javaFile, "Service", "lib.Service", "type", "java")
+	javaRun := f.symbolKind(t, javaFile, "run", "lib.Service.run", "function", "java")
+	kotlinFile := f.file(t, "KotlinService.kt", "kotlin")
+	f.symbolKind(t, kotlinFile, "Service", "lib.Service", "class", "kotlin")
+	for _, x := range []struct {
+		file int64
+		lang string
+		pkg  string
+	}{{callerFile, "java", "app"}, {javaFile, "java", "lib"}, {kotlinFile, "kotlin", "lib"}} {
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?,?,?)`, f.repoID, x.file, x.lang, x.pkg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='lib' WHERE id=?`, javaType); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='public',is_static=1 WHERE id=?`, javaRun); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,?,?,?,?,?)`, f.repoID, callerFile, "java", "lib.Service", "Service", "Service", "named"); err != nil {
+		t.Fatal(err)
+	}
+	edge := f.edge(t, callerFile, caller, "Service.run")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls' WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy='java_import_scope',resolution_confidence='high' WHERE id=?`, javaRun, edge); err != nil {
+		t.Fatal(err)
+	}
+	var line int
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT line FROM edges WHERE id=?`, edge).Scan(&line); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO references_tbl(repo_id,file_id,symbol_id,context_symbol_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col) VALUES(?,?,?,?, 'call','run','Service.run',?,1,?,1)`, f.repoID, callerFile, javaRun, caller, line, line); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.markRepairDone(f.ctx, jvmScopePrecisionRepairSettingKey, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
+		t.Fatalf("B2 repair=(%v,%v), want (true,nil)", ran, err)
+	}
+	if _, ok := f.dstSymbolID(t, edge); ok {
+		t.Fatal("B2 repair retained Java binding despite Kotlin peer")
+	}
+	var reference sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil || reference.Valid {
+		t.Fatalf("B2 repair reference=(%v,%v), want NULL", reference, err)
+	}
+}
+
+func TestJVMCoreInteropRepairAppliesOnlyToActiveMixedRepos(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		langs []string
+		want  bool
+	}{
+		{"java only", []string{"java"}, false},
+		{"kotlin only", []string{"kotlin"}, false},
+		{"mixed", []string{"java", "kotlin"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGateFixture(t)
+			for i, language := range tc.langs {
+				f.file(t, fmt.Sprintf("%d.%s", i, language), language)
+			}
+			got, err := f.store.jvmCoreInteropRepairApplies(f.ctx, f.repoID)
+			if err != nil || got != tc.want {
+				t.Fatalf("applies=(%v,%v), want %v", got, err, tc.want)
+			}
+		})
 	}
 }
