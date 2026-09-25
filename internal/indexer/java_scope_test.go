@@ -47,3 +47,21 @@ func TestJavaWildcardImportResolvesSingleCandidate(t *testing.T) {
 		t.Fatalf("wildcard import = %s", got)
 	}
 }
+
+func TestJavaTypeMemberRequiresUniqueStaticMethodAndOwnerProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name, target, caller, want string
+	}{
+		{"ambiguous static overload", `package app; class Service { static void run(String x) {} static void run(byte[] x) {} }`, `package app; class Caller { void call() { Service.run(null); } }`, ":: [/]"},
+		{"instance refusal", `package app; class Service { void run() {} }`, `package app; class Caller { void call() { Service.run(); } }`, ":: [/]"},
+		{"same package static", `package app; class Service { static void run() {} }`, `package app; class Caller { void call() { Service.run(); } }`, "java_package_scope/high"},
+		{"import provenance", `package lib; public class Service { public static void run() {} }`, `package app; import lib.Service; class Caller { void call() { Service.run(); } }`, "java_import_scope/high"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newLifecycleRepo(t, tree{"Service.java": tc.target, "Caller.java": tc.caller})
+			if got := r.edgeState(t, "Caller.java", "Service.run"); !strings.Contains(got, tc.want) {
+				t.Fatalf("Service.run = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}

@@ -1236,6 +1236,59 @@ const typeScopeRepairSettingKey = "resolver.type_scope_repaired.v3"
 
 const referenceIdentityRepairSettingKey = "resolver.reference_identity_repaired.v1"
 
+const jvmScopePrecisionRepairSettingKey = "resolver.jvm_scope_precision_repaired.v1"
+const jvmCoreInteropRepairSettingKey = "resolver.jvm_core_interop_repaired.v1"
+const cppExternCSignatureRepairSettingKey = "resolver.cpp_extern_c_signature_repaired.v1"
+
+func (s *Store) jvmScopePrecisionRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND is_deleted=0 AND language IN ('java','kotlin'))`, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairJVMScopePrecisionBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE repo_id=? AND dst_symbol_id IS NOT NULL AND (
+				(file_id IN (SELECT id FROM files WHERE repo_id=? AND language='java')
+				 AND resolution_strategy IN ('java_package_scope','java_import_scope','java_static_import','java_constructor',''))
+				OR (file_id IN (SELECT id FROM files WHERE repo_id=? AND language='kotlin')
+				 AND resolution_strategy IN ('kotlin_package_scope','kotlin_import_scope'))
+			)`, repoID, repoID, repoID)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
+}
+
+func (s *Store) jvmCoreInteropRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT language)=2 FROM files WHERE repo_id=? AND is_deleted=0 AND language IN ('java','kotlin')`, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairJVMCoreInteropBindings(ctx context.Context, repoID int64) error {
+	return s.repairJVMScopePrecisionBindings(ctx, repoID)
+}
+
+func (s *Store) cppExternCSignatureRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND is_deleted=0 AND language='cpp')`, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairCppExternCSignatureBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE repo_id=? AND dst_symbol_id IS NOT NULL AND file_id IN
+			(SELECT id FROM files WHERE repo_id=? AND language='cpp')
+			AND resolution_strategy IN ('exact_name','exact_qualified')`, repoID, repoID)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
+}
+
 // repairTypeScopeBindingsOnce clears this repository's pre-P22.9 bindings the
 // first time any resolve runs against it, and does nothing afterwards.
 //
@@ -1314,6 +1367,24 @@ var (
 	dotTailAmbiguityRepair = resolverRepair{
 		key:              dotTailAmbiguityRepairSettingKey,
 		run:              (*Store).repairDotTailAmbiguityBindings,
+		resolvesRepoWide: true,
+	}
+	jvmScopePrecisionRepair = resolverRepair{
+		key:              jvmScopePrecisionRepairSettingKey,
+		run:              (*Store).repairJVMScopePrecisionBindings,
+		applies:          (*Store).jvmScopePrecisionRepairApplies,
+		resolvesRepoWide: true,
+	}
+	jvmCoreInteropRepair = resolverRepair{
+		key:              jvmCoreInteropRepairSettingKey,
+		run:              (*Store).repairJVMCoreInteropBindings,
+		applies:          (*Store).jvmCoreInteropRepairApplies,
+		resolvesRepoWide: true,
+	}
+	cppExternCSignatureRepair = resolverRepair{
+		key:              cppExternCSignatureRepairSettingKey,
+		run:              (*Store).repairCppExternCSignatureBindings,
+		applies:          (*Store).cppExternCSignatureRepairApplies,
 		resolvesRepoWide: true,
 	}
 	phpScopeRepair = resolverRepair{
@@ -1452,7 +1523,7 @@ var (
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, cppExternCSignatureRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,

@@ -8,9 +8,9 @@ import (
 )
 
 type javaScopeSymbol struct {
-	id, file                                                 int64
-	name, qname, container, kind, signature, visibility, pkg string
-	static                                                   sql.NullInt64
+	id, file                                                           int64
+	name, qname, container, kind, signature, visibility, pkg, language string
+	static                                                             sql.NullInt64
 }
 
 type javaScopeImport struct {
@@ -87,13 +87,13 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	symbols := map[int64]javaScopeSymbol{}
 	byQName := map[string][]javaScopeSymbol{}
 	byName := map[string][]javaScopeSymbol{}
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,'')
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
-		WHERE s.repo_id=? AND f.language='java' AND f.is_deleted=0`, " AND s.name IN (%s)",
+		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0`, " AND s.name IN (%s)",
 		[]any{repoID}, stringSliceToAny(nameList), true,
 		func(rows *sql.Rows) error {
 			var s javaScopeSymbol
-			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg); err != nil {
+			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language); err != nil {
 				return err
 			}
 			symbols[s.id] = s
@@ -185,7 +185,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 	if i := strings.LastIndex(name, "."); i >= 0 { // fully qualified or nested spelling
 		var exact []javaScopeSymbol
 		for _, s := range byQName[name] {
-			if s.kind == "type" {
+			if javaTypeIdentityEligible(s) {
 				exact = append(exact, s)
 			}
 		}
@@ -193,7 +193,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 	}
 	var c []javaScopeSymbol
 	for _, s := range byName[name] {
-		if s.kind != "type" {
+		if !javaTypeIdentityEligible(s) {
 			continue
 		}
 		if container != "" && (s.qname == pkg+"."+container+"."+name || s.qname == container+"."+name) {
@@ -211,7 +211,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		if !i.wildcard && i.local == name {
 			c = nil
 			for _, s := range byQName[i.source] {
-				if s.kind == "type" {
+				if javaTypeIdentityEligible(s) {
 					c = append(c, s)
 				}
 			}
@@ -219,7 +219,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		}
 		if i.wildcard {
 			for _, s := range byQName[i.source+"."+name] {
-				if s.kind == "type" {
+				if javaTypeIdentityEligible(s) {
 					c = append(c, s)
 				}
 			}
@@ -232,12 +232,25 @@ func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymb
 	var out javaScopeSymbol
 	n := 0
 	for _, s := range c {
-		if javaVisible(s, pkg, s.pkg) {
+		if javaVisibleToJava(s, pkg) {
 			out = s
 			n++
 		}
 	}
-	return out, n == 1, strategy
+	if n != 1 {
+		return javaScopeSymbol{}, false, ""
+	}
+	return out, true, strategy
+}
+func javaTypeIdentityEligible(s javaScopeSymbol) bool {
+	return s.language == "java" && s.kind == "type" || s.language == "kotlin" && s.kind == "class"
+}
+
+func javaVisibleToJava(s javaScopeSymbol, fromPkg string) bool {
+	if s.language == "kotlin" {
+		return s.visibility == "" || s.visibility == "public"
+	}
+	return javaVisible(s, fromPkg, s.pkg)
 }
 func javaVisible(s javaScopeSymbol, fromPkg, ownerPkg string) bool {
 	if s.visibility == "private" {
@@ -274,6 +287,9 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	if !ok {
 		return javaScopeSymbol{}, ""
 	}
+	if t.language != "java" {
+		return javaScopeSymbol{}, ""
+	}
 	want := javaArity(e.evidence)
 	var out javaScopeSymbol
 	n := 0
@@ -295,18 +311,21 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	}
 	if strings.HasPrefix(name, "this.") {
 		name = strings.TrimPrefix(name, "this.")
-		s, ok, strategy := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope")
-		return s, strategyIf(ok, strategy)
+		s, _, strategy := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false)
+		return s, strategy
 	}
 	if dot := strings.LastIndex(name, "."); dot >= 0 {
-		owner, ok, _ := javaType(name[:dot], e.pkg, e.container, byQName, byName, imps[e.file])
+		owner, ok, ownerStrategy := javaType(name[:dot], e.pkg, e.container, byQName, byName, imps[e.file])
 		if !ok {
 			return javaScopeSymbol{}, ""
 		}
-		s, ok, strategy := javaMethods(owner.qname, name[dot+1:], e.pkg, e.container, byQName, "java_package_scope")
-		return s, strategyIf(ok, strategy)
+		if owner.language == "kotlin" {
+			return javaScopeSymbol{}, ""
+		}
+		s, _, strategy := javaMethods(owner.qname, name[dot+1:], e.pkg, e.container, byQName, ownerStrategy, true)
+		return s, strategy
 	}
-	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope"); ok {
+	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false); ok {
 		return s, str
 	}
 	var staticCandidates []javaScopeSymbol
@@ -321,14 +340,14 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 			}
 			owner := i.source[:p]
 			for _, s := range byQName[owner+"."+name] {
-				if s.static.Valid && s.static.Int64 != 0 && javaVisible(s, e.pkg, s.pkg) {
+				if s.language == "java" && s.static.Valid && s.static.Int64 != 0 && javaVisible(s, e.pkg, s.pkg) {
 					staticCandidates = append(staticCandidates, s)
 				}
 			}
 		}
 		if i.static && i.wildcard {
 			for _, s := range byQName[i.source+"."+name] {
-				if s.kind == "function" && s.static.Valid && s.static.Int64 != 0 && javaVisible(s, e.pkg, s.pkg) {
+				if s.language == "java" && s.kind == "function" && s.static.Valid && s.static.Int64 != 0 && javaVisible(s, e.pkg, s.pkg) {
 					staticCandidates = append(staticCandidates, s)
 				}
 			}
@@ -340,20 +359,17 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	return javaScopeSymbol{}, ""
 }
 
-func strategyIf(ok bool, strategy string) string {
-	if ok {
-		return strategy
-	}
-	return ""
-}
-func javaMethods(owner, name, pkg, caller string, byQName map[string][]javaScopeSymbol, strategy string) (javaScopeSymbol, bool, string) {
+func javaMethods(owner, name, pkg, caller string, byQName map[string][]javaScopeSymbol, strategy string, requireStatic bool) (javaScopeSymbol, bool, string) {
 	var out javaScopeSymbol
 	n := 0
 	for _, s := range byQName[owner+"."+name] {
-		if s.kind == "function" && javaVisibleFrom(s, pkg, s.pkg, owner == caller) {
+		if s.kind == "function" && (!requireStatic || (s.static.Valid && s.static.Int64 != 0)) && javaVisibleFrom(s, pkg, s.pkg, owner == caller) {
 			out = s
 			n++
 		}
 	}
-	return out, n == 1, strategy
+	if n != 1 {
+		return javaScopeSymbol{}, false, ""
+	}
+	return out, true, strategy
 }

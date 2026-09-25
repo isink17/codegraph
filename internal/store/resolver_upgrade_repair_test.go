@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"strconv"
 	"testing"
@@ -423,5 +424,169 @@ func TestUpgradeRepairBindsEdgeTheWidenedIncludeScopeNowProves(t *testing.T) {
 	}
 	if got, want := f.binding(t, edge), "foo::widget|exact_name|high"; got != want {
 		t.Fatalf("after second repair: got %q, want %q", got, want)
+	}
+}
+
+func TestJVMScopePrecisionRepairRebindsImportedJavaMethod(t *testing.T) {
+	f := newParityFixture(t, "")
+	targetFile := f.file(t, "lib/Service.java", "java")
+	callerFile := f.file(t, "app/Caller.java", "java")
+	for _, x := range []struct {
+		file int64
+		pkg  string
+	}{{targetFile, "lib"}, {callerFile, "app"}} {
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?, 'java',?)`, f.repoID, x.file, x.pkg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.symbolIn(t, targetFile, "Service", "lib.Service", "type", "lib", "java")
+	target := f.symbolIn(t, targetFile, "run", "lib.Service.run", "function", "Service", "java")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	caller := f.symbolIn(t, callerFile, "call", "app.Caller.call", "function", "Caller", "java")
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,local_name,import_kind) VALUES(?,?, 'java','lib.Service','Service','named')`, f.repoID, callerFile); err != nil {
+		t.Fatal(err)
+	}
+	edge := f.edge(t, callerFile, caller, "Service.run")
+	f.setBinding(t, edge, target, ResolutionStrategyJavaPackageScope, ResolutionConfidenceHigh)
+	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, jvmScopePrecisionRepair); err != nil || !ran {
+		t.Fatalf("jvm repair = (%v,%v), want (true,nil)", ran, err)
+	}
+	if got, want := f.binding(t, edge), "lib.Service.run|java_import_scope|high"; got != want {
+		t.Fatalf("after repair = %q, want %q", got, want)
+	}
+	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, jvmScopePrecisionRepair); err != nil || ran {
+		t.Fatalf("second jvm repair = (%v,%v), want (false,nil)", ran, err)
+	}
+}
+
+func TestJVMScopePrecisionRepairClearsLegacyJavaOverloadAndReference(t *testing.T) {
+	f := newParityFixture(t, "")
+	targetFile := f.file(t, "app/Service.java", "java")
+	callerFile := f.file(t, "app/Caller.java", "java")
+	for _, file := range []int64{targetFile, callerFile} {
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?, 'java','app')`, f.repoID, file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.symbolIn(t, targetFile, "Service", "app.Service", "type", "app", "java")
+	first := f.symbolIn(t, targetFile, "run", "app.Service.run", "function", "Service", "java")
+	second := f.symbolIn(t, targetFile, "run", "app.Service.run", "function", "Service", "java")
+	for _, symbol := range []int64{first, second} {
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, symbol); err != nil {
+			t.Fatal(err)
+		}
+	}
+	caller := f.symbolIn(t, callerFile, "call", "app.Caller.call", "function", "Caller", "java")
+	edge := f.edge(t, callerFile, caller, "Service.run")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls' WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "full", nil, nil)
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("fresh overload state = %q, want unresolved", got)
+	}
+	f.setBinding(t, edge, second, "", ResolutionConfidenceHigh)
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO references_tbl(repo_id,file_id,symbol_id,context_symbol_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col) VALUES(?,?,?,?, 'call','run','Service.run',1,1,1,1)`, f.repoID, callerFile, second, caller); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("repaired overload state = %q, want unresolved", got)
+	}
+	var target sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&target); err != nil || target.Valid {
+		t.Fatalf("repaired overload reference = (%v,%v), want NULL", target, err)
+	}
+	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, jvmScopePrecisionRepair); err != nil || ran {
+		t.Fatalf("second jvm repair = (%v,%v), want (false,nil)", ran, err)
+	}
+}
+
+func TestJVMScopePrecisionRepairClearsStaticFormInstanceBinding(t *testing.T) {
+	f := newParityFixture(t, "")
+	file := f.file(t, "app/Service.java", "java")
+	callerFile := f.file(t, "app/Caller.java", "java")
+	for _, id := range []int64{file, callerFile} {
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?, 'java','app')`, f.repoID, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.symbolIn(t, file, "Service", "app.Service", "type", "app", "java")
+	target := f.symbolIn(t, file, "run", "app.Service.run", "function", "Service", "java")
+	caller := f.symbolIn(t, callerFile, "call", "app.Caller.call", "function", "Caller", "java")
+	edge := f.edge(t, callerFile, caller, "Service.run")
+	f.resolveVia(t, "full", nil, nil)
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("fresh static-form state = %q", got)
+	}
+	f.setBinding(t, edge, target, ResolutionStrategyJavaPackageScope, ResolutionConfidenceHigh)
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.binding(t, edge); got != "<unresolved>" {
+		t.Fatalf("repaired static-form state = %q", got)
+	}
+}
+
+func TestJVMScopePrecisionRepairCorrectsKotlinPackageReference(t *testing.T) {
+	f := newParityFixture(t, "")
+	aFile, bFile, callerFile := f.file(t, "a/Service.kt", "kotlin"), f.file(t, "b/Service.kt", "kotlin"), f.file(t, "c/Caller.kt", "kotlin")
+	for _, x := range []struct {
+		file int64
+		pkg  string
+	}{{aFile, "a"}, {bFile, "b"}, {callerFile, "c"}} {
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?, 'kotlin',?)`, f.repoID, x.file, x.pkg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.symbolIn(t, aFile, "Service", "a.Service", "class", "a", "kotlin")
+	aRun := f.symbolIn(t, aFile, "run", "a.Service.run", "function", "Service", "kotlin")
+	f.symbolIn(t, bFile, "Service", "b.Service", "class", "b", "kotlin")
+	bRun := f.symbolIn(t, bFile, "run", "b.Service.run", "function", "Service", "kotlin")
+	caller := f.symbolIn(t, callerFile, "call", "c.call", "function", "", "kotlin")
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,local_name,import_kind) VALUES(?,?, 'kotlin','a.Service','Service','named')`, f.repoID, callerFile); err != nil {
+		t.Fatal(err)
+	}
+	edge := f.edge(t, callerFile, caller, "Service.run")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls' WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	f.resolveVia(t, "full", nil, nil)
+	if got, want := f.binding(t, edge), "a.Service.run|kotlin_package_scope|high"; got != want {
+		t.Fatalf("fresh Kotlin state = %q, want %q", got, want)
+	}
+	f.setBinding(t, edge, bRun, ResolutionStrategyKotlinPackageScope, ResolutionConfidenceHigh)
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO references_tbl(repo_id,file_id,symbol_id,context_symbol_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col) VALUES(?,?,?,?, 'call','run','Service.run',1,1,1,1)`, f.repoID, callerFile, bRun, caller); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.binding(t, edge), "a.Service.run|kotlin_package_scope|high"; got != want {
+		t.Fatalf("repaired Kotlin state = %q, want %q", got, want)
+	}
+	var target sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&target); err != nil || !target.Valid || target.Int64 != aRun {
+		t.Fatalf("repaired Kotlin reference = (%v,%v), want %d", target, err, aRun)
+	}
+}
+
+func TestJVMScopePrecisionRepairSkipsNonJVMRepository(t *testing.T) {
+	f := newParityFixture(t, "")
+	file := f.file(t, "app/main.py", "python")
+	caller := f.symbol(t, file, "call", "app.call", "function", "python")
+	f.edge(t, file, caller, "missing")
+	repair := jvmScopePrecisionRepair
+	repair.run = func(*Store, context.Context, int64) error {
+		t.Fatal("JVM repair ran for a non-JVM repository")
+		return nil
+	}
+	ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, repair)
+	if err != nil || ran {
+		t.Fatalf("non-JVM repair = (%v,%v), want (false,nil)", ran, err)
 	}
 }

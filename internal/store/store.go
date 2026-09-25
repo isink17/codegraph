@@ -4878,6 +4878,16 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		return ResolveEdgesForNamesStats{}, err
 	}
 	names = mergeResolverNames(names, scopeNames)
+	jvmNames, err := s.jvmScopeEdgeNames(ctx, repoID, names)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, jvmNames)
+	jvmPathNames, err := s.jvmScopeEdgeNamesForPaths(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, jvmPathNames)
 	swiftChanged, err := s.swiftPathsChanged(ctx, repoID, paths)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -4922,6 +4932,78 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		err = s.ReconcileReferenceIdentities(ctx, repoID)
 	}
 	return stats, err
+}
+
+// jvmScopeEdgeNames expands a changed Java/Kotlin declaration name to the
+// scoped edge spellings whose owner or member decision can change. The normal
+// name pass only recognizes a dotted edge by its final component; `Service`
+// changing must also reconsider `Service.run`. This remains a single batched
+// SQL selection over JVM callers, never a repository-wide resolve.
+func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	for _, chunk := range chunkStrings(names, sqliteBatchSize(1, 3)) {
+		terms := make([]string, 0, len(chunk)*3)
+		args := []any{repoID}
+		for _, name := range chunk {
+			if name == "" {
+				continue
+			}
+			terms = append(terms, "e.dst_name=?", "e.dst_name LIKE ?", "e.dst_name LIKE ?")
+			args = append(args, name, name+".%", "%."+name+".%")
+		}
+		if len(terms) == 0 {
+			continue
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT e.dst_name FROM edges e JOIN files f ON f.id=e.file_id
+			WHERE e.repo_id=? AND f.language IN ('java','kotlin') AND (`+strings.Join(terms, " OR ")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			seen[name] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return sortedKeys(seen), nil
+}
+
+// jvmScopeEdgeNamesForPaths adds every scoped spelling owned by changed JVM
+// caller files. Import/package edits carry no changed declaration name, but
+// can still redirect an existing bound edge; selecting only those callers
+// keeps the re-decision path path-scoped.
+func (s *Store) jvmScopeEdgeNamesForPaths(ctx context.Context, repoID int64, paths []string) ([]string, error) {
+	ids, err := fileIDsByPaths(ctx, s.db, repoID, paths)
+	if err != nil || len(ids) == 0 {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	err = sqliteBatchedIDQuery(ctx, s.db, ids, `SELECT e.dst_name FROM edges e JOIN files f ON f.id=e.file_id
+		WHERE e.repo_id=? AND f.language IN ('java','kotlin') AND e.file_id IN (`, []any{repoID}, func(scan func(...any) error) error {
+		var name string
+		if err := scan(&name); err != nil {
+			return err
+		}
+		if name != "" {
+			seen[name] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sortedKeys(seen), nil
 }
 
 // resolveDotSuffixIncrementally reruns only the active weak strategy after the

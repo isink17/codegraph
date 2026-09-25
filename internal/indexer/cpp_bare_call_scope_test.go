@@ -62,6 +62,26 @@ void caller() {
 	}
 }
 
+func TestCppExternCDeclarationPlainDefinitionResolves(t *testing.T) {
+	r := newCppRepo(t)
+	r.write("api.h", `extern "C" void foo(int x);`)
+	r.write("api.cpp", `void foo(int x) {}`)
+	r.write("caller.cpp", "#include \"api.h\"\nvoid caller() { foo(1); }")
+	r.run("index")
+	if got, want := cppTargets(r, "foo"), []string{"foo"}; !equalStrings(got, want) {
+		t.Fatalf("extern-C bridge targets = %v, want %v", got, want)
+	}
+	symbols, err := r.store.ExportSymbolsPage(context.Background(), r.repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, symbol := range symbols {
+		if symbol.Kind == "declaration" && symbol.Name == "foo" && !strings.HasPrefix(symbol.Signature, "extern_c:") {
+			t.Fatalf("declaration signature = %q, want extern_c prefix", symbol.Signature)
+		}
+	}
+}
+
 func TestCppBareCallNamespaceLifecycle(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("target.h", `namespace a { inline void foo() {} }`)

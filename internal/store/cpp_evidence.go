@@ -147,7 +147,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 					if declarationSignatures[c.qualified] == nil {
 						declarationSignatures[c.qualified] = map[string]struct{}{}
 					}
-					declarationSignatures[c.qualified][c.signature] = struct{}{}
+					declarationSignatures[c.qualified][cppResolverSignature(c.signature)] = struct{}{}
 					return nil
 				}
 				candidates = append(candidates, c)
@@ -306,7 +306,7 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 			familySignatures[signature] = struct{}{}
 		}
 		for _, candidate := range byQualified[eligible[0].qualified] {
-			familySignatures[candidate.signature] = struct{}{}
+			familySignatures[cppResolverSignature(candidate.signature)] = struct{}{}
 		}
 		if len(familySignatures) != 1 {
 			continue
@@ -356,7 +356,13 @@ func resolveCppEvidenceEdgesWith(ctx context.Context, q queryContexter, exec cpp
 }
 
 func cppEvidenceKey(qualified, signature string) string {
-	return qualified + "\x00" + signature
+	return qualified + "\x00" + cppResolverSignature(signature)
+}
+
+// cppResolverSignature preserves source signatures but compares extern "C"
+// declarations with their otherwise-identical definitions as one family.
+func cppResolverSignature(signature string) string {
+	return strings.TrimPrefix(signature, "extern_c:")
 }
 
 func augmentCppOutOfLineScopes(ctx context.Context, q queryContexter, repoID int64, edges []edgeTarget, candidates []cppEvidenceCandidate, imports map[int64]map[int64]struct{}, classScopes, callerClasses, callerNamespaces, namespaceScopes map[int64]string) error {
