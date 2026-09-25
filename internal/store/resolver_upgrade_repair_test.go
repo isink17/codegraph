@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"strconv"
 	"testing"
@@ -571,5 +572,21 @@ func TestJVMScopePrecisionRepairCorrectsKotlinPackageReference(t *testing.T) {
 	var target sql.NullInt64
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&target); err != nil || !target.Valid || target.Int64 != aRun {
 		t.Fatalf("repaired Kotlin reference = (%v,%v), want %d", target, err, aRun)
+	}
+}
+
+func TestJVMScopePrecisionRepairSkipsNonJVMRepository(t *testing.T) {
+	f := newParityFixture(t, "")
+	file := f.file(t, "app/main.py", "python")
+	caller := f.symbol(t, file, "call", "app.call", "function", "python")
+	f.edge(t, file, caller, "missing")
+	repair := jvmScopePrecisionRepair
+	repair.run = func(*Store, context.Context, int64) error {
+		t.Fatal("JVM repair ran for a non-JVM repository")
+		return nil
+	}
+	ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, repair)
+	if err != nil || ran {
+		t.Fatalf("non-JVM repair = (%v,%v), want (false,nil)", ran, err)
 	}
 }
