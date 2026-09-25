@@ -1238,6 +1238,7 @@ const referenceIdentityRepairSettingKey = "resolver.reference_identity_repaired.
 
 const jvmScopePrecisionRepairSettingKey = "resolver.jvm_scope_precision_repaired.v1"
 const jvmCoreInteropRepairSettingKey = "resolver.jvm_core_interop_repaired.v1"
+const cppExternCSignatureRepairSettingKey = "resolver.cpp_extern_c_signature_repaired.v1"
 
 func (s *Store) jvmScopePrecisionRepairApplies(ctx context.Context, repoID int64) (bool, error) {
 	var found bool
@@ -1268,6 +1269,24 @@ func (s *Store) jvmCoreInteropRepairApplies(ctx context.Context, repoID int64) (
 
 func (s *Store) repairJVMCoreInteropBindings(ctx context.Context, repoID int64) error {
 	return s.repairJVMScopePrecisionBindings(ctx, repoID)
+}
+
+func (s *Store) cppExternCSignatureRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND is_deleted=0 AND language='cpp')`, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairCppExternCSignatureBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE repo_id=? AND dst_symbol_id IS NOT NULL AND file_id IN
+			(SELECT id FROM files WHERE repo_id=? AND language='cpp')
+			AND resolution_strategy IN ('exact_name','exact_qualified')`, repoID, repoID)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
 }
 
 // repairTypeScopeBindingsOnce clears this repository's pre-P22.9 bindings the
@@ -1360,6 +1379,12 @@ var (
 		key:              jvmCoreInteropRepairSettingKey,
 		run:              (*Store).repairJVMCoreInteropBindings,
 		applies:          (*Store).jvmCoreInteropRepairApplies,
+		resolvesRepoWide: true,
+	}
+	cppExternCSignatureRepair = resolverRepair{
+		key:              cppExternCSignatureRepairSettingKey,
+		run:              (*Store).repairCppExternCSignatureBindings,
+		applies:          (*Store).cppExternCSignatureRepairApplies,
 		resolvesRepoWide: true,
 	}
 	phpScopeRepair = resolverRepair{
@@ -1498,7 +1523,7 @@ var (
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, cppExternCSignatureRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,

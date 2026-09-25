@@ -12,6 +12,10 @@ func TestCppEvidenceRefusesUnmodeledOverloadChoice(t *testing.T) {
 		{name: "distinct_signatures_refused", declarations: []string{"(int)", "(const char*)"}, definitions: []string{"(int)"}},
 		{name: "one_signature_resolves", declarations: []string{"(int)"}, definitions: []string{"(int)"}, wantBound: true},
 		{name: "duplicate_same_signature_resolves", declarations: []string{"(int)", "(int)"}, definitions: []string{"(int)"}, wantBound: true},
+		{name: "extern_c_declaration_plain_definition_resolves", declarations: []string{"extern_c:(int)"}, definitions: []string{"(int)"}, wantBound: true},
+		{name: "plain_declaration_extern_c_definition_resolves", declarations: []string{"(int)"}, definitions: []string{"extern_c:(int)"}, wantBound: true},
+		{name: "extern_c_duplicates_one_family", declarations: []string{"extern_c:(int)", "(int)", "extern_c:(int)"}, definitions: []string{"(int)"}, wantBound: true},
+		{name: "extern_c_does_not_hide_overload", declarations: []string{"extern_c:(int)", "(double)"}, definitions: []string{"(int)"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -39,6 +43,16 @@ func TestCppEvidenceRefusesUnmodeledOverloadChoice(t *testing.T) {
 				t.Fatalf("bound = %v, want %v", bound, tt.wantBound)
 			}
 		})
+	}
+}
+
+func TestCppResolverSignature(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"extern_c:(int)", "(int)"}, {"extern_c:()", "()"}, {"static:(int)", "static:(int)"}, {"other:(int)", "other:(int)"},
+	} {
+		if got := cppResolverSignature(tc.in); got != tc.want {
+			t.Errorf("cppResolverSignature(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 
