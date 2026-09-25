@@ -51,6 +51,7 @@ fun call() { Service.run() }`
 	r.write(t, "Service.java", `package lib; public class Service { public void run() {} }`)
 	r.update(t, "Service.java")
 	assertJVMUnresolved(t, r, "Caller.kt", "Service.run")
+	assertJVMReference(t, r, "Caller.kt", "Service.run", false)
 	r.assertFreshParity(t, "staticness")
 }
 
@@ -107,7 +108,12 @@ func TestJVMCoreInteropKotlinJavaStaticOwnerForms(t *testing.T) {
 				"Caller.kt":    tc.caller,
 				"Service.java": "package " + pkg + "; public class Service { public static void run() {} }",
 			})
+			if tc.name == "fully qualified" {
+				r.write(t, "other/Service.java", "package other; public class Service { public static void run() {} }")
+				r.update(t, "other/Service.java")
+			}
 			assertJVMResolved(t, r, "Caller.kt", tc.edge, "Service.java", tc.strategy)
+			assertJVMQueryRelation(t, r, "app.call", pkg+".Service.run")
 		})
 	}
 }
@@ -184,13 +190,126 @@ func TestJVMCoreInteropQueryParity(t *testing.T) {
 		"Caller.kt":    "package app\nimport lib.Service\nfun call() { Service.run() }",
 		"Service.java": "package lib; public class Service { public static void run() {} }",
 	})
-	callees, err := r.store.FindCallees(r.ctx, r.repoID, "app.call", 0, 10, 0)
-	if err != nil || !hasSymbolQName(callees, "lib.Service.run") {
-		t.Fatalf("FindCallees(app.call) = %#v, %v", callees, err)
+	assertJVMQueryRelation(t, r, "app.call", "lib.Service.run")
+}
+
+func TestJVMCoreInteropRefusalQueryMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name, callerPath, caller, edge, callerQName, targetQName string
+		files                                                    tree
+	}{
+		{"java Kotlin construction", "Caller.java", "package app; import lib.Service; class Caller { void call() { new Service(); } }", "Service", "app.Caller.call", "lib.Service", tree{"Service.kt": "package lib\nclass Service"}},
+		{"java Kotlin member", "Caller.java", "package app; import lib.Service; class Caller { void call() { Service.run(); } }", "Service.run", "app.Caller.call", "lib.Service.run", tree{"Service.kt": "package lib\nclass Service { fun run() {} }"}},
+		{"java explicit static import Kotlin", "Caller.java", "package app; import static lib.Service.run; class Caller { void call() { run(); } }", "run", "app.Caller.call", "lib.Service.run", tree{"Service.kt": "package lib\nclass Service { fun run() {} }"}},
+		{"java wildcard static import Kotlin", "Caller.java", "package app; import static lib.Service.*; class Caller { void call() { run(); } }", "run", "app.Caller.call", "lib.Service.run", tree{"Service.kt": "package lib\nclass Service { fun run() {} }"}},
+		{"Kotlin private Java static", "Caller.kt", "package lib\nfun call() { Service.run() }", "Service.run", "lib.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { private static void run() {} }"}},
+		{"Kotlin cross package package static", "Caller.kt", "package app\nimport lib.Service\nfun call() { Service.run() }", "Service.run", "app.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { static void run() {} }"}},
+		{"Kotlin cross package protected static", "Caller.kt", "package app\nimport lib.Service\nfun call() { Service.run() }", "Service.run", "app.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { protected static void run() {} }"}},
+		{"Kotlin Java instance", "Caller.kt", "package app\nimport lib.Service\nfun call() { Service.run() }", "Service.run", "app.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { public void run() {} }"}},
+		{"Kotlin Java static overload", "Caller.kt", "package app\nimport lib.Service\nfun call() { Service.run() }", "Service.run", "app.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { public static void run() {} public static void run(int n) {} }"}},
+		{"Kotlin nested Java type", "Caller.kt", "package app\nimport lib.Outer\nfun call() { Outer.Nested.run() }", "Outer.Nested.run", "app.call", "lib.Outer.Nested.run", tree{"Outer.java": "package lib; public class Outer { public static class Nested { public static void run() {} } }"}},
+		{"public Java Kotlin peer ambiguity", "Caller.java", "package app; import lib.Service; class Caller { void call() { Service.run(); } }", "Service.run", "app.Caller.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { public static void run() {} }", "Service.kt": "package lib\nclass Service"}},
+		{"Kotlin bare Java member", "Caller.kt", "package app\nimport lib.Service\nfun call() { run() }", "run", "app.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { public static void run() {} }"}},
+		{"synthetic facade spelling", "Caller.java", "package app; import lib.FileNameKt; class Caller { void call() { FileNameKt.run(); } }", "FileNameKt.run", "app.Caller.call", "lib.run", tree{"FileName.kt": "package lib\nfun run() {}"}},
+		{"synthetic companion shadow", "Caller.java", "package app; import lib.Address; class Caller { void call() { Address.toString(null); } }", "Address.toString", "app.Caller.call", "lib.Address.toString", tree{"Address.kt": "package lib\nclass Address { fun toString(): String = \"\"; companion object { @JvmStatic fun toString(x: Array<String>): String = \"\" } }"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := tree{tc.callerPath: tc.caller}
+			for path, source := range tc.files {
+				files[path] = source
+			}
+			r := newLifecycleRepo(t, files)
+			if tc.name == "java Kotlin construction" {
+				assertJVMConstructUnresolved(t, r, tc.callerPath, tc.edge)
+				assertJVMNoReference(t, r, tc.callerPath, tc.edge)
+			} else {
+				assertJVMUnresolved(t, r, tc.callerPath, tc.edge)
+				assertJVMReference(t, r, tc.callerPath, tc.edge, false)
+			}
+			if tc.name != "synthetic companion shadow" {
+				assertJVMNoQueryRelation(t, r, tc.callerQName, tc.targetQName)
+			}
+		})
 	}
-	callers, err := r.store.FindCallers(r.ctx, r.repoID, "lib.Service.run", 0, 10, 0)
-	if err != nil || !hasSymbolQName(callers, "app.call") {
-		t.Fatalf("FindCallers(lib.Service.run) = %#v, %v", callers, err)
+}
+
+func TestJVMCoreInteropJavaPeerVisibility(t *testing.T) {
+	for _, tc := range []struct {
+		visibility string
+		resolved   bool
+	}{
+		{"public", false},
+		{"internal", true},
+		{"private", true},
+	} {
+		t.Run(tc.visibility, func(t *testing.T) {
+			r := newLifecycleRepo(t, tree{
+				"Caller.java":  "package app; import lib.Service; class Caller { void call() { Service.run(); } }",
+				"Service.java": "package lib; public class Service { public static void run() {} }",
+				"Service.kt":   "package lib\n" + tc.visibility + " class Service",
+			})
+			if tc.resolved {
+				assertJVMResolved(t, r, "Caller.java", "Service.run", "Service.java", "java_import_scope")
+				assertJVMQueryRelation(t, r, "app.Caller.call", "lib.Service.run")
+			} else {
+				assertJVMUnresolved(t, r, "Caller.java", "Service.run")
+				assertJVMReference(t, r, "Caller.java", "Service.run", false)
+				assertJVMNoQueryRelation(t, r, "app.Caller.call", "lib.Service.run")
+			}
+		})
+	}
+}
+
+func TestJVMCoreInteropVisibilityLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Caller.kt":    "package app\nimport lib.Service\nfun call() { Service.run() }",
+		"Service.java": "package lib; public class Service { public static void run() {} }",
+	})
+	assertJVMQueryRelation(t, r, "app.call", "lib.Service.run")
+	assertJVMReference(t, r, "Caller.kt", "Service.run", true)
+	r.write(t, "Service.java", "package lib; public class Service { private static void run() {} }")
+	r.update(t, "Service.java")
+	assertJVMUnresolved(t, r, "Caller.kt", "Service.run")
+	assertJVMReference(t, r, "Caller.kt", "Service.run", false)
+	assertJVMNoQueryRelation(t, r, "app.call", "lib.Service.run")
+	r.assertFreshParity(t, "public to private")
+	r.write(t, "Service.java", "package lib; public class Service { public static void run() {} }")
+	r.update(t, "Service.java")
+	assertJVMQueryRelation(t, r, "app.call", "lib.Service.run")
+	assertJVMReference(t, r, "Caller.kt", "Service.run", true)
+	r.assertFreshParity(t, "private to public")
+}
+
+func TestJVMCoreInteropPackageAndProtectedLifecycle(t *testing.T) {
+	for _, visibility := range []string{"", "protected "} {
+		t.Run(strings.TrimSpace(visibility)+" package", func(t *testing.T) {
+			r := newLifecycleRepo(t, tree{
+				"Caller.kt":    "package lib\nfun call() { Service.run() }",
+				"Service.java": "package lib; public class Service { " + visibility + "static void run() {} }",
+			})
+			assertJVMQueryRelation(t, r, "lib.call", "lib.Service.run")
+			assertJVMReference(t, r, "Caller.kt", "Service.run", true)
+			r.write(t, "Caller.kt", "package app\nimport lib.Service\nfun call() { Service.run() }")
+			r.update(t, "Caller.kt")
+			assertJVMUnresolved(t, r, "Caller.kt", "Service.run")
+			assertJVMReference(t, r, "Caller.kt", "Service.run", false)
+			assertJVMNoQueryRelation(t, r, "app.call", "lib.Service.run")
+			r.assertFreshParity(t, "cross package")
+			if visibility == "" {
+				r.write(t, "Service.java", "package lib; public class Service { public static void run() {} }")
+				r.update(t, "Service.java")
+			} else {
+				r.write(t, "Caller.kt", "package lib\nfun call() { Service.run() }")
+				r.update(t, "Caller.kt")
+			}
+			caller := "lib.call"
+			if visibility == "" {
+				caller = "app.call"
+			}
+			assertJVMQueryRelation(t, r, caller, "lib.Service.run")
+			assertJVMReference(t, r, "Caller.kt", "Service.run", true)
+			r.assertFreshParity(t, "same package restore")
+		})
 	}
 }
 
@@ -214,9 +333,11 @@ func TestJVMCoreInteropAliasAndWildcardLifecycle(t *testing.T) {
 		"b/Service.java": "package b; public class Service { public static void run() {} }",
 	})
 	assertJVMUnresolved(t, wildcard, "Caller.kt", "Service.run")
+	assertJVMReference(t, wildcard, "Caller.kt", "Service.run", false)
 	wildcard.remove(t, "b/Service.java")
 	wildcard.update(t, "b/Service.java")
 	assertJVMResolved(t, wildcard, "Caller.kt", "Service.run", "a/Service.java", "kotlin_import_scope")
+	assertJVMReference(t, wildcard, "Caller.kt", "Service.run", true)
 	wildcard.assertFreshParity(t, "wildcard competitor delete")
 }
 
@@ -241,6 +362,21 @@ func assertJVMUnresolved(t *testing.T, r *lifecycleRepo, path, name string) {
 	}
 }
 
+func assertJVMConstructUnresolved(t *testing.T, r *lifecycleRepo, path, name string) {
+	t.Helper()
+	prefix := "edge " + path + ":"
+	needle := `-> "` + name + `"`
+	for _, line := range r.projection(t) {
+		if strings.HasPrefix(line, prefix) && strings.Contains(line, needle) {
+			if strings.Contains(line, ":: [/]") {
+				return
+			}
+			t.Fatalf("%s = %s, want unresolved", name, line)
+		}
+	}
+	t.Fatalf("%s has no construct edge", name)
+}
+
 func assertJVMReference(t *testing.T, r *lifecycleRepo, path, name string, bound bool) {
 	t.Helper()
 	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
@@ -252,5 +388,49 @@ func assertJVMReference(t *testing.T, r *lifecycleRepo, path, name string, bound
 	err = db.QueryRowContext(r.ctx, `SELECT r.symbol_id FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path=? AND r.ref_kind='call' AND r.qualified_name=?`, r.repoID, path, name).Scan(&symbol)
 	if err != nil || symbol.Valid != bound {
 		t.Fatalf("reference %s bound=(%v,%v), want %v", name, symbol, err, bound)
+	}
+}
+
+func assertJVMNoReference(t *testing.T, r *lifecycleRepo, path, name string) {
+	t.Helper()
+	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	err = db.QueryRowContext(r.ctx, `SELECT COUNT(*) FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path=? AND r.qualified_name=?`, r.repoID, path, name).Scan(&n)
+	if err != nil || n != 0 {
+		t.Fatalf("reference %s count=(%d,%v), want 0", name, n, err)
+	}
+}
+
+func assertJVMQueryRelation(t *testing.T, r *lifecycleRepo, caller, target string) {
+	t.Helper()
+	callees, err := r.store.FindCallees(r.ctx, r.repoID, caller, 0, 10, 0)
+	if err != nil || !hasSymbolQName(callees, target) {
+		t.Fatalf("FindCallees(%s) = %#v, %v; want %s", caller, callees, err, target)
+	}
+	callers, err := r.store.FindCallers(r.ctx, r.repoID, target, 0, 10, 0)
+	if err != nil || !hasSymbolQName(callers, caller) {
+		t.Fatalf("FindCallers(%s) = %#v, %v; want %s", target, callers, err, caller)
+	}
+}
+
+func assertJVMNoQueryRelation(t *testing.T, r *lifecycleRepo, caller, target string) {
+	t.Helper()
+	callees, err := r.store.FindCallees(r.ctx, r.repoID, caller, 0, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasSymbolQName(callees, target) {
+		t.Fatalf("FindCallees(%s) unexpectedly contains %s: %#v", caller, target, callees)
+	}
+	callers, err := r.store.FindCallers(r.ctx, r.repoID, target, 0, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasSymbolQName(callers, caller) {
+		t.Fatalf("FindCallers(%s) unexpectedly contains %s: %#v", target, caller, callers)
 	}
 }

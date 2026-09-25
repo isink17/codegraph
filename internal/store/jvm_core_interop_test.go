@@ -256,11 +256,17 @@ func TestJVMCoreInteropRepairAppliesOnlyToActiveMixedRepos(t *testing.T) {
 		{"java only", []string{"java"}, false},
 		{"kotlin only", []string{"kotlin"}, false},
 		{"mixed", []string{"java", "kotlin"}, true},
+		{"deleted Kotlin peer", []string{"java", "kotlin"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newGateFixture(t)
 			for i, language := range tc.langs {
-				f.file(t, fmt.Sprintf("%d.%s", i, language), language)
+				file := f.file(t, fmt.Sprintf("%d.%s", i, language), language)
+				if tc.name == "deleted Kotlin peer" && language == "kotlin" {
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, file); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 			got, err := f.store.jvmCoreInteropRepairApplies(f.ctx, f.repoID)
 			if err != nil || got != tc.want {
