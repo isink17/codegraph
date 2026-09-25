@@ -26,7 +26,11 @@ func buildJavaBudgetFixture(t *testing.T, s *Store, repoID int64, edgeCount int)
 	if _, err := insertTestSymbolKind(ctx, s, repoID, owner, "Util", "a.Util", "type", "a", "java"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := insertTestSymbolKind(ctx, s, repoID, owner, "run", "a.Util.run", "function", "Util", "java"); err != nil {
+	run, err := insertTestSymbolKind(ctx, s, repoID, owner, "run", "a.Util.run", "function", "Util", "java")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, run); err != nil {
 		t.Fatal(err)
 	}
 

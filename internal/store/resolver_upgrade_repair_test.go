@@ -425,3 +425,37 @@ func TestUpgradeRepairBindsEdgeTheWidenedIncludeScopeNowProves(t *testing.T) {
 		t.Fatalf("after second repair: got %q, want %q", got, want)
 	}
 }
+
+func TestJVMScopePrecisionRepairRebindsImportedJavaMethod(t *testing.T) {
+	f := newParityFixture(t, "")
+	targetFile := f.file(t, "lib/Service.java", "java")
+	callerFile := f.file(t, "app/Caller.java", "java")
+	for _, x := range []struct {
+		file int64
+		pkg  string
+	}{{targetFile, "lib"}, {callerFile, "app"}} {
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?, 'java',?)`, f.repoID, x.file, x.pkg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.symbolIn(t, targetFile, "Service", "lib.Service", "type", "lib", "java")
+	target := f.symbolIn(t, targetFile, "run", "lib.Service.run", "function", "Service", "java")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	caller := f.symbolIn(t, callerFile, "call", "app.Caller.call", "function", "Caller", "java")
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,local_name,import_kind) VALUES(?,?, 'java','lib.Service','Service','named')`, f.repoID, callerFile); err != nil {
+		t.Fatal(err)
+	}
+	edge := f.edge(t, callerFile, caller, "Service.run")
+	f.setBinding(t, edge, target, ResolutionStrategyJavaPackageScope, ResolutionConfidenceHigh)
+	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, jvmScopePrecisionRepair); err != nil || !ran {
+		t.Fatalf("jvm repair = (%v,%v), want (true,nil)", ran, err)
+	}
+	if got, want := f.binding(t, edge), "lib.Service.run|java_import_scope|high"; got != want {
+		t.Fatalf("after repair = %q, want %q", got, want)
+	}
+	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, jvmScopePrecisionRepair); err != nil || ran {
+		t.Fatalf("second jvm repair = (%v,%v), want (false,nil)", ran, err)
+	}
+}

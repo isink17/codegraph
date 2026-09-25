@@ -237,7 +237,10 @@ func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymb
 			n++
 		}
 	}
-	return out, n == 1, strategy
+	if n != 1 {
+		return javaScopeSymbol{}, false, ""
+	}
+	return out, true, strategy
 }
 func javaVisible(s javaScopeSymbol, fromPkg, ownerPkg string) bool {
 	if s.visibility == "private" {
@@ -295,18 +298,18 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	}
 	if strings.HasPrefix(name, "this.") {
 		name = strings.TrimPrefix(name, "this.")
-		s, ok, strategy := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope")
-		return s, strategyIf(ok, strategy)
+		s, _, strategy := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false)
+		return s, strategy
 	}
 	if dot := strings.LastIndex(name, "."); dot >= 0 {
-		owner, ok, _ := javaType(name[:dot], e.pkg, e.container, byQName, byName, imps[e.file])
+		owner, ok, ownerStrategy := javaType(name[:dot], e.pkg, e.container, byQName, byName, imps[e.file])
 		if !ok {
 			return javaScopeSymbol{}, ""
 		}
-		s, ok, strategy := javaMethods(owner.qname, name[dot+1:], e.pkg, e.container, byQName, "java_package_scope")
-		return s, strategyIf(ok, strategy)
+		s, _, strategy := javaMethods(owner.qname, name[dot+1:], e.pkg, e.container, byQName, ownerStrategy, true)
+		return s, strategy
 	}
-	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope"); ok {
+	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false); ok {
 		return s, str
 	}
 	var staticCandidates []javaScopeSymbol
@@ -340,20 +343,17 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	return javaScopeSymbol{}, ""
 }
 
-func strategyIf(ok bool, strategy string) string {
-	if ok {
-		return strategy
-	}
-	return ""
-}
-func javaMethods(owner, name, pkg, caller string, byQName map[string][]javaScopeSymbol, strategy string) (javaScopeSymbol, bool, string) {
+func javaMethods(owner, name, pkg, caller string, byQName map[string][]javaScopeSymbol, strategy string, requireStatic bool) (javaScopeSymbol, bool, string) {
 	var out javaScopeSymbol
 	n := 0
 	for _, s := range byQName[owner+"."+name] {
-		if s.kind == "function" && javaVisibleFrom(s, pkg, s.pkg, owner == caller) {
+		if s.kind == "function" && (!requireStatic || (s.static.Valid && s.static.Int64 != 0)) && javaVisibleFrom(s, pkg, s.pkg, owner == caller) {
 			out = s
 			n++
 		}
 	}
-	return out, n == 1, strategy
+	if n != 1 {
+		return javaScopeSymbol{}, false, ""
+	}
+	return out, true, strategy
 }

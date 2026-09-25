@@ -265,7 +265,7 @@ func kotlinMember(owner kotlinScopeSymbol, name string, e struct {
 }, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
 	var c []kotlinScopeSymbol
 	for _, s := range syms {
-		if s.name == name && s.container == strings.TrimPrefix(owner.qname, owner.pkg+".") && kotlinVisible(s, e) && !kotlinExtension(s) {
+		if s.name == name && s.pkg == owner.pkg && s.container == strings.TrimPrefix(owner.qname, owner.pkg+".") && kotlinVisible(s, e) && !kotlinExtension(s) {
 			c = append(c, s)
 		}
 	}
