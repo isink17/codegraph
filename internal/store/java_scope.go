@@ -84,7 +84,6 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		return 0, nil
 	}
 
-	symbols := map[int64]javaScopeSymbol{}
 	byQName := map[string][]javaScopeSymbol{}
 	byName := map[string][]javaScopeSymbol{}
 	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language
@@ -96,9 +95,36 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language); err != nil {
 				return err
 			}
-			symbols[s.id] = s
 			byQName[s.qname] = append(byQName[s.qname], s)
 			byName[s.name] = append(byName[s.name], s)
+			return nil
+		}); err != nil {
+		return 0, err
+	}
+	// Kotlin file facades are source facts, not symbols. Each distinct owner
+	// joins the lookup maps as an in-memory type candidate only, so Java's own
+	// package/import rules select it and a same-spelling type makes it
+	// ambiguous instead of being substituted.
+	facades := map[string][]javaFacadePart{}
+	if err := sqliteBatchedQuery(ctx, q, `SELECT fs.file_id,fs.package_name,fs.jvm_facade_class,fs.jvm_multifile
+		FROM file_scope_evidence fs JOIN files f ON f.id=fs.file_id AND f.repo_id=fs.repo_id
+		WHERE fs.repo_id=? AND fs.language='kotlin' AND fs.jvm_facade_class!='' AND f.is_deleted=0`, " AND fs.jvm_facade_class IN (%s)",
+		[]any{repoID}, stringSliceToAny(nameList), true,
+		func(rows *sql.Rows) error {
+			var part javaFacadePart
+			var pkg, class string
+			var multifile int
+			if err := rows.Scan(&part.file, &pkg, &class, &multifile); err != nil {
+				return err
+			}
+			part.multifile = multifile != 0
+			owner := kotlinJoin(pkg, class)
+			if len(facades[owner]) == 0 {
+				f := javaScopeSymbol{name: class, qname: owner, container: pkg, pkg: pkg, kind: kotlinFileFacadeKind, language: "kotlin", visibility: "public"}
+				byQName[owner] = append(byQName[owner], f)
+				byName[class] = append(byName[class], f)
+			}
+			facades[owner] = append(facades[owner], part)
 			return nil
 		}); err != nil {
 		return 0, err
@@ -143,7 +169,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		if e.kind == "constructs" {
 			dst, strategy = javaConstructor(e, byQName, byName, imports)
 		} else {
-			dst, strategy = javaMember(e, byQName, byName, imports, symbols)
+			dst, strategy = javaMember(e, byQName, byName, imports, facades)
 		}
 		if dst.id != 0 {
 			res[e.id] = struct {
@@ -243,7 +269,7 @@ func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymb
 	return out, true, strategy
 }
 func javaTypeIdentityEligible(s javaScopeSymbol) bool {
-	return s.language == "java" && s.kind == "type" || s.language == "kotlin" && (s.kind == "class" || s.kind == "object")
+	return s.language == "java" && s.kind == "type" || s.language == "kotlin" && (s.kind == "class" || s.kind == "object" || s.kind == kotlinFileFacadeKind)
 }
 
 func javaVisibleToJava(s javaScopeSymbol, fromPkg string) bool {
@@ -304,7 +330,7 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	}
 	return out, "java_constructor"
 }
-func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport, symbols map[int64]javaScopeSymbol) (javaScopeSymbol, string) {
+func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport, facades map[string][]javaFacadePart) (javaScopeSymbol, string) {
 	name := e.name
 	if name == "super." || strings.HasPrefix(name, "super.") {
 		return javaScopeSymbol{}, ""
@@ -328,8 +354,11 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 			return javaScopeSymbol{}, ""
 		}
 		if owner.language == "kotlin" {
-			if owner.kind == "object" {
+			switch owner.kind {
+			case "object":
 				return kotlinObjectMember(owner, memberName, e, byQName, ownerStrategy, true)
+			case kotlinFileFacadeKind:
+				return kotlinFacadeMember(owner, memberName, e, byQName, facades[owner.qname], ownerStrategy)
 			}
 			return javaScopeSymbol{}, ""
 		}
@@ -388,6 +417,56 @@ func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 		return javaScopeSymbol{}, ""
 	}
 	return out, strategy
+}
+
+// kotlinFileFacadeKind marks the in-memory facade owner candidate. It never
+// reaches the symbols table and is never a destination.
+const kotlinFileFacadeKind = "kotlin_file_facade"
+
+type javaFacadePart struct {
+	file      int64
+	multifile bool
+}
+
+// kotlinFacadeMember resolves `Facade.name()` to the one top-level Kotlin
+// function declared in a file whose persisted facade is exactly owner. Parts
+// sharing an owner must all be @JvmMultifileClass, or the JVM classes clash.
+func kotlinFacadeMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, parts []javaFacadePart, strategy string) (javaScopeSymbol, string) {
+	files := make(map[int64]struct{}, len(parts))
+	for _, part := range parts {
+		if len(parts) > 1 && !part.multifile {
+			return javaScopeSymbol{}, ""
+		}
+		files[part.file] = struct{}{}
+	}
+	var out javaScopeSymbol
+	n := 0
+	for _, s := range byQName[kotlinJoin(owner.pkg, name)] {
+		if _, inFacade := files[s.file]; inFacade && s.language == "kotlin" && s.kind == "function" && s.container == s.pkg {
+			out = s
+			n++
+		}
+	}
+	if n != 1 || !javaVisibleToJava(out, e.pkg) || !kotlinFacadeCallable(out.name, out.signature) || !kotlinNoArgCall(e.evidence) || !kotlinNoArgFunction(out.signature) {
+		return javaScopeSymbol{}, ""
+	}
+	return out, strategy
+}
+
+// kotlinFacadeCallable excludes declarations whose Java-visible form is not
+// the plain static `name()` modelled here: extensions, renamed, synthetic,
+// suspend, expect and reified functions.
+func kotlinFacadeCallable(name, signature string) bool {
+	fun := strings.Index(signature, "fun ")
+	if fun < 0 || kotlinExtensionSignature(name, signature) || kotlinHasJvmName(signature) || strings.Contains(signature, "reified ") {
+		return false
+	}
+	for _, token := range strings.Fields(signature[:fun]) {
+		if token == "suspend" || token == "expect" || strings.HasPrefix(token, "@JvmSynthetic") || strings.HasPrefix(token, "@kotlin.jvm.JvmSynthetic") {
+			return false
+		}
+	}
+	return true
 }
 
 func kotlinNoArgCall(evidence string) bool {

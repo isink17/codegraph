@@ -800,6 +800,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					changedSymbolNameSet[name] = struct{}{}
 				}
 			}
+			// A Kotlin JVM facade owns `Facade.member` spellings like a
+			// declaration, and its parts can live in other, unchanged files.
+			if name := res.parsed.Scope.JVMFacade.Class; name != "" {
+				changedSymbolNameSet[name] = struct{}{}
+			}
 			summary.FilesChanged++
 			summary.FilesIndexed++
 			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Indexed: 1})

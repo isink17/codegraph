@@ -12,6 +12,9 @@ func TestCgoRegistryProfiles(t *testing.T) {
 		if lang.Language == "csharp" {
 			want = "treesitter:csharp:v4"
 		}
+		if lang.Language == "kotlin" {
+			want = "treesitter:kotlin:v2"
+		}
 		if lang.Language == "php" {
 			want = "treesitter:php:v3"
 		}
