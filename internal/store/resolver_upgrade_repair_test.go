@@ -163,6 +163,177 @@ func TestUpgradeRepairLeavesOtherStrategiesAlone(t *testing.T) {
 	}
 }
 
+func TestJVMCommonCallableABIUpgradeRepair(t *testing.T) {
+	f := newParityFixture(t, "")
+	callerFile := f.file(t, "app/Caller.java", "java")
+	caller := f.symbol(t, callerFile, "call", "app.Caller.call", "function", "java")
+	targetFile := f.file(t, "lib/Service.kt", "kotlin")
+	f.symbolIn(t, targetFile, "Service", "lib.Service", "object", "lib", "kotlin")
+	target := f.symbolIn(t, targetFile, "run", "lib.Service.run", "function", "Service", "kotlin")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='public',signature='fun run() {}' WHERE id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		file int64
+		lang string
+		pkg  string
+	}{{callerFile, "java", "app"}, {targetFile, "kotlin", "lib"}} {
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?,?,?)`, f.repoID, item.file, item.lang, item.pkg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,?,?,?,?,?)`, f.repoID, callerFile, "java", "lib.Service", "Service", "Service", "named"); err != nil {
+		t.Fatal(err)
+	}
+	edge := f.edge(t, callerFile, caller, "Service.INSTANCE.run")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='Service.INSTANCE.run()' WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO references_tbl(repo_id,file_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col,context_symbol_id) VALUES(?,?,'call','Service.INSTANCE.run','Service.INSTANCE.run',1,1,1,1,?)`, f.repoID, callerFile, caller); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{jvmScopePrecisionRepairSettingKey, jvmCoreInteropRepairSettingKey} {
+		if err := f.store.markRepairDone(f.ctx, key, f.repoID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.binding(t, edge), "lib.Service.run|java_import_scope|high"; got != want {
+		t.Fatalf("ABI edge after repair = %q, want %q", got, want)
+	}
+	var reference sql.NullInt64
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil || !reference.Valid || reference.Int64 != target {
+		t.Fatalf("ABI reference after repair = (%v,%v), want target %d", reference, err, target)
+	}
+	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, jvmCommonCallableABIRepair); err != nil || ran {
+		t.Fatalf("second ABI repair = (%v,%v), want (false,nil)", ran, err)
+	}
+}
+
+func TestJVMCommonCallableABIRepairAppliesOnlyToActiveB5Shapes(t *testing.T) {
+	for _, tc := range []struct {
+		name, shape string
+		want        bool
+	}{
+		{"java only", "", false},
+		{"kotlin only", "", false},
+		{"mixed without B5 shape", "", false},
+		{"ordinary B2 Kotlin-to-Java call", "b2", false},
+		{"ordinary Kotlin class member", "class", false},
+		{"object INSTANCE call", "instance", true},
+		{"object JvmStatic call", "static", true},
+		{"private object member", "private", false},
+		{"renamed object member", "jvmname", false},
+		{"extension object member", "extension", false},
+		{"overloaded object member", "overload", false},
+		{"argument-bearing object member", "arguments", false},
+		{"deleted Java caller", "deleted-java", false},
+		{"deleted Kotlin object", "deleted-kotlin", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGateFixture(t)
+			javaFile, kotlinFile := int64(0), int64(0)
+			if tc.name != "kotlin only" {
+				javaFile = f.file(t, "Caller.java", "java")
+			}
+			if tc.name != "java only" {
+				kotlinFile = f.file(t, "Service.kt", "kotlin")
+			}
+			if tc.shape != "" {
+				if tc.shape == "b2" {
+					caller := f.symbolKind(t, kotlinFile, "call", "app.Caller.call", "function", "kotlin")
+					owner := f.symbolKind(t, javaFile, "Service", "lib.Service", "type", "java")
+					f.symbolKind(t, javaFile, "run", "lib.Service.run", "function", "java")
+					edge := f.edge(t, kotlinFile, caller, "lib.Service.run")
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='Service.run()' WHERE id=?`, edge); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='lib' WHERE id=?`, owner); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					caller := f.symbolKind(t, javaFile, "call", "app.Caller.call", "function", "java")
+					ownerKind, ownerSig, edgeName := "object", "", "Service.INSTANCE.run"
+					memberSig := "fun run() {}"
+					visibility := "public"
+					if tc.shape == "class" {
+						ownerKind, edgeName = "class", "Service.run"
+					}
+					if tc.shape == "static" {
+						memberSig, edgeName = "@JvmStatic fun run() {}", "Service.run"
+					}
+					switch tc.shape {
+					case "private":
+						memberSig, visibility = "private fun run() {}", "private"
+					case "jvmname":
+						memberSig = `@JvmName("renamed") fun run() {}`
+					case "extension":
+						memberSig = "fun String.run() {}"
+					case "arguments":
+						memberSig, edgeName = "fun run(value: Int) {}", "Service.INSTANCE.run"
+					}
+					owner := f.symbolKind(t, kotlinFile, "Service", "lib.Service", ownerKind, "kotlin")
+					member := f.symbolKind(t, kotlinFile, "run", "lib.Service.run", "function", "kotlin")
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',signature=?,visibility='public' WHERE id=?`, ownerSig, owner); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',signature=?,visibility=? WHERE id=?`, memberSig, visibility, member); err != nil {
+						t.Fatal(err)
+					}
+					if tc.shape == "overload" {
+						overload := f.symbolKind(t, kotlinFile, "run", "lib.Service.run", "function", "kotlin")
+						if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',signature='fun run(value: Int) {}',visibility='public' WHERE id=?`, overload); err != nil {
+							t.Fatal(err)
+						}
+					}
+					for _, item := range []struct {
+						file int64
+						lang string
+						pkg  string
+					}{{javaFile, "java", "app"}, {kotlinFile, "kotlin", "lib"}} {
+						if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?,?,?)`, f.repoID, item.file, item.lang, item.pkg); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,'java','lib.Service','Service','Service','named')`, f.repoID, javaFile); err != nil {
+						t.Fatal(err)
+					}
+					edge := f.edge(t, javaFile, caller, edgeName)
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence=? WHERE id=?`, edgeName+"()", edge); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if tc.name == "deleted Java caller" {
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, javaFile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.name == "deleted Kotlin object" {
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, kotlinFile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := f.store.jvmCommonCallableABIRepairApplies(f.ctx, f.repoID)
+			if err != nil || got != tc.want {
+				t.Fatalf("repair applies = (%v,%v), want %v", got, err, tc.want)
+			}
+			if !tc.want {
+				repair := jvmCommonCallableABIRepair
+				repair.run = func(*Store, context.Context, int64) error {
+					t.Fatal("common ABI repair ran without active B5 evidence")
+					return nil
+				}
+				if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, repair); err != nil || ran {
+					t.Fatalf("gated repair = (%v,%v), want (false,nil)", ran, err)
+				}
+			}
+		})
+	}
+}
+
 // The gate that keeps a first index from paying for a repair it cannot need.
 // It is load-bearing for performance and invisible in the graph, so it needs a
 // test of its own: without it every fresh index runs a second repo-wide resolve.

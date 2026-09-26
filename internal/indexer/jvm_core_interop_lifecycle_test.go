@@ -55,6 +55,161 @@ fun call() { Service.run() }`
 	r.assertFreshParity(t, "staticness")
 }
 
+func TestJVMObjectGeneratedCallableABILifecycle(t *testing.T) {
+	java := `package app;
+import lib.Service;
+class Caller { void call() {
+    Service.INSTANCE.run();
+    Service.staticRun();
+    Service.regular();
+} }`
+	object := `package lib
+object Service {
+    fun run() {}
+    @JvmStatic fun staticRun() {}
+    fun regular() {}
+}`
+	r := newLifecycleRepo(t, tree{"Caller.java": java, "Service.kt": object})
+	assertJVMResolved(t, r, "Caller.java", "Service.INSTANCE.run", "Service.kt", "java_import_scope")
+	assertJVMResolved(t, r, "Caller.java", "Service.staticRun", "Service.kt", "java_import_scope")
+	assertJVMUnresolved(t, r, "Caller.java", "Service.regular")
+	assertJVMNoQueryRelation(t, r, "app.Caller.call", "lib.Service.regular")
+	assertJVMReference(t, r, "Caller.java", "Service.INSTANCE.run", true)
+	assertJVMReference(t, r, "Caller.java", "Service.staticRun", true)
+	assertJVMReference(t, r, "Caller.java", "Service.regular", false)
+	assertJVMQueryRelation(t, r, "app.Caller.call", "lib.Service.run")
+	assertJVMQueryRelation(t, r, "app.Caller.call", "lib.Service.staticRun")
+	r.assertFreshParity(t, "object and JvmStatic")
+
+	r.write(t, "Service.kt", "package lib\nclass Service { fun run() {} }")
+	if summary := r.update(t, "Service.kt"); summary.ResolveMode != "paths+names" {
+		t.Fatalf("object-to-class update mode = %q, want paths+names", summary.ResolveMode)
+	}
+	assertJVMUnresolved(t, r, "Caller.java", "Service.INSTANCE.run")
+	assertJVMUnresolved(t, r, "Caller.java", "Service.staticRun")
+	assertJVMNoQueryRelation(t, r, "app.Caller.call", "lib.Service.run")
+	assertJVMReference(t, r, "Caller.java", "Service.INSTANCE.run", false)
+	r.assertFreshParity(t, "object changed to class")
+
+	r.write(t, "Service.kt", object)
+	r.update(t, "Service.kt")
+	assertJVMResolved(t, r, "Caller.java", "Service.INSTANCE.run", "Service.kt", "java_import_scope")
+	assertJVMResolved(t, r, "Caller.java", "Service.staticRun", "Service.kt", "java_import_scope")
+	r.assertFreshParity(t, "object restored")
+
+	r.write(t, "OtherService.kt", "package lib\nobject Service { fun run() {} }")
+	r.update(t, "OtherService.kt")
+	assertJVMUnresolved(t, r, "Caller.java", "Service.INSTANCE.run")
+	r.assertFreshParity(t, "object competitor")
+
+	r.remove(t, "OtherService.kt")
+	r.update(t, "OtherService.kt")
+	assertJVMResolved(t, r, "Caller.java", "Service.INSTANCE.run", "Service.kt", "java_import_scope")
+	r.assertFreshParity(t, "object competitor removed")
+
+	r.write(t, "Service.kt", strings.Replace(object, "@JvmStatic ", "", 1))
+	r.update(t, "Service.kt")
+	assertJVMResolved(t, r, "Caller.java", "Service.INSTANCE.run", "Service.kt", "java_import_scope")
+	assertJVMUnresolved(t, r, "Caller.java", "Service.staticRun")
+	assertJVMReference(t, r, "Caller.java", "Service.staticRun", false)
+	r.assertFreshParity(t, "JvmStatic removed")
+
+	r.write(t, "Service.kt", object)
+	r.update(t, "Service.kt")
+	assertJVMResolved(t, r, "Caller.java", "Service.staticRun", "Service.kt", "java_import_scope")
+	r.assertFreshParity(t, "JvmStatic restored")
+}
+
+func TestJVMObjectJvmStaticExcludesInstanceABIAndTracksLifecycle(t *testing.T) {
+	java := `package app;
+import lib.Service;
+class Caller { void call() {
+    Service.INSTANCE.run();
+} void callStatic() { Service.run(); } }`
+	regular := "package lib\nobject Service { fun run() {} }"
+	annotated := "package lib\nobject Service { @JvmStatic fun run() {} }"
+	r := newLifecycleRepo(t, tree{"Caller.java": java, "Service.kt": regular})
+	assertJVMResolved(t, r, "Caller.java", "Service.INSTANCE.run", "Service.kt", "java_import_scope")
+	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
+	assertJVMReference(t, r, "Caller.java", "Service.INSTANCE.run", true)
+	assertJVMReference(t, r, "Caller.java", "Service.run", false)
+	assertJVMQueryRelation(t, r, "app.Caller.call", "lib.Service.run")
+	assertJVMNoQueryRelation(t, r, "app.Caller.callStatic", "lib.Service.run")
+	r.assertFreshParity(t, "unannotated object member")
+
+	r.write(t, "Service.kt", annotated)
+	r.update(t, "Service.kt")
+	assertJVMUnresolved(t, r, "Caller.java", "Service.INSTANCE.run")
+	assertJVMResolved(t, r, "Caller.java", "Service.run", "Service.kt", "java_import_scope")
+	assertJVMReference(t, r, "Caller.java", "Service.INSTANCE.run", false)
+	assertJVMReference(t, r, "Caller.java", "Service.run", true)
+	assertJVMNoQueryRelation(t, r, "app.Caller.call", "lib.Service.run")
+	assertJVMQueryRelation(t, r, "app.Caller.callStatic", "lib.Service.run")
+	r.assertFreshParity(t, "JvmStatic added")
+
+	r.write(t, "Service.kt", regular)
+	r.update(t, "Service.kt")
+	assertJVMResolved(t, r, "Caller.java", "Service.INSTANCE.run", "Service.kt", "java_import_scope")
+	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
+	assertJVMReference(t, r, "Caller.java", "Service.INSTANCE.run", true)
+	assertJVMReference(t, r, "Caller.java", "Service.run", false)
+	assertJVMQueryRelation(t, r, "app.Caller.call", "lib.Service.run")
+	assertJVMNoQueryRelation(t, r, "app.Caller.callStatic", "lib.Service.run")
+	r.assertFreshParity(t, "JvmStatic removed")
+}
+
+func TestJVMGeneratedABINameAndCompanionRefusals(t *testing.T) {
+	t.Run("fake Kt class is not a facade", func(t *testing.T) {
+		r := newLifecycleRepo(t, tree{
+			"Caller.java": "package app; import lib.ActionsKt; class Caller { void call() { ActionsKt.run(); } }",
+			"Other.kt":    "package lib\nclass ActionsKt { fun run() {} }",
+		})
+		assertJVMUnresolved(t, r, "Caller.java", "ActionsKt.run")
+		assertJVMReference(t, r, "Caller.java", "ActionsKt.run", false)
+		r.assertFreshParity(t, "fake facade type")
+	})
+	t.Run("extension and parameterized function forms stay unresolved", func(t *testing.T) {
+		r := newLifecycleRepo(t, tree{
+			"Caller.java": "package app; import lib.ActionsKt; class Caller { void call() { ActionsKt.run(1); } }",
+			"Actions.kt": `package lib
+fun String.run() {}
+fun run(value: Int) {}`,
+		})
+		assertJVMUnresolved(t, r, "Caller.java", "ActionsKt.run")
+		assertJVMReference(t, r, "Caller.java", "ActionsKt.run", false)
+		r.assertFreshParity(t, "out of scope callable signatures")
+	})
+	t.Run("companion is not synthesized", func(t *testing.T) {
+		r := newLifecycleRepo(t, tree{
+			"Caller.java": "package app; import lib.Service; class Caller { void call() { Service.Companion.run(); Service.run(); } }",
+			"Service.kt": `package lib
+class Service { companion object {
+    fun run() {}
+    @JvmStatic fun staticRun() {}
+} }`,
+		})
+		assertJVMUnresolved(t, r, "Caller.java", "Service.Companion.run")
+		assertJVMUnresolved(t, r, "Caller.java", "Service.run")
+		assertJVMReference(t, r, "Caller.java", "Service.Companion.run", false)
+		assertJVMReference(t, r, "Caller.java", "Service.run", false)
+		callees, err := r.store.FindCallees(r.ctx, r.repoID, "app.Caller.call", 0, 10, 0)
+		if err != nil || hasSymbolQName(callees, "lib.Service.run") {
+			t.Fatalf("FindCallees with unpersisted companion member = %#v, %v", callees, err)
+		}
+		r.assertFreshParity(t, "unsupported companion evidence")
+	})
+	t.Run("ordinary nested Companion name is not companion evidence", func(t *testing.T) {
+		r := newLifecycleRepo(t, tree{
+			"Caller.java": "package app; import lib.Service; class Caller { void call() { Service.Companion.run(); } }",
+			"Service.kt": `package lib
+class Service { class Companion { fun run() {} } }`,
+		})
+		assertJVMUnresolved(t, r, "Caller.java", "Service.Companion.run")
+		assertJVMReference(t, r, "Caller.java", "Service.Companion.run", false)
+		r.assertFreshParity(t, "ordinary Companion nested class")
+	})
+}
+
 func TestJVMCoreInteropConstructorSafety(t *testing.T) {
 	t.Run("Kotlin refuses only private Java constructor", func(t *testing.T) {
 		r := newLifecycleRepo(t, tree{
@@ -210,7 +365,7 @@ func TestJVMCoreInteropRefusalQueryMatrix(t *testing.T) {
 		{"Kotlin nested Java type", "Caller.kt", "package app\nimport lib.Outer\nfun call() { Outer.Nested.run() }", "Outer.Nested.run", "app.call", "lib.Outer.Nested.run", tree{"Outer.java": "package lib; public class Outer { public static class Nested { public static void run() {} } }"}},
 		{"public Java Kotlin peer ambiguity", "Caller.java", "package app; import lib.Service; class Caller { void call() { Service.run(); } }", "Service.run", "app.Caller.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { public static void run() {} }", "Service.kt": "package lib\nclass Service"}},
 		{"Kotlin bare Java member", "Caller.kt", "package app\nimport lib.Service\nfun call() { run() }", "run", "app.call", "lib.Service.run", tree{"Service.java": "package lib; public class Service { public static void run() {} }"}},
-		{"synthetic facade spelling", "Caller.java", "package app; import lib.FileNameKt; class Caller { void call() { FileNameKt.run(); } }", "FileNameKt.run", "app.Caller.call", "lib.run", tree{"FileName.kt": "package lib\nfun run() {}"}},
+		{"wrong synthetic facade spelling", "Caller.java", "package app; import lib.ActionsKt; class Caller { void call() { ActionsKt.run(); } }", "ActionsKt.run", "app.Caller.call", "lib.run", tree{"FileName.kt": "package lib\nfun run() {}"}},
 		{"synthetic companion shadow", "Caller.java", "package app; import lib.Address; class Caller { void call() { Address.toString(null); } }", "Address.toString", "app.Caller.call", "lib.Address.toString", tree{"Address.kt": "package lib\nclass Address { fun toString(): String = \"\"; companion object { @JvmStatic fun toString(x: Array<String>): String = \"\" } }"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
