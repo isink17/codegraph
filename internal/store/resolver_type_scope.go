@@ -1387,6 +1387,12 @@ var (
 		applies:          (*Store).cppExternCSignatureRepairApplies,
 		resolvesRepoWide: true,
 	}
+	typescriptJSSpecifierRepair = resolverRepair{
+		key:              typescriptJSSpecifierRepairSettingKey,
+		run:              (*Store).repairTypeScriptJSSpecifierBindings,
+		applies:          (*Store).typescriptJSSpecifierRepairApplies,
+		resolvesRepoWide: true,
+	}
 	phpScopeRepair = resolverRepair{
 		key:              phpScopeRepairSettingKey,
 		run:              (*Store).repairPHPScopeBindings,
@@ -1523,7 +1529,7 @@ var (
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, cppExternCSignatureRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, cppExternCSignatureRepair, typescriptJSSpecifierRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,

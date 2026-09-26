@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,6 +58,50 @@ func typescriptModuleCandidatePaths(sourceFile, specifier string) []string {
 	default:
 		return nil
 	}
+}
+
+// typescriptExplicitModuleCandidates returns, in precedence order, the
+// implementation files an explicit relative module path names; the first
+// active one wins, so coexisting candidates are never ambiguous.
+//
+// TypeScript looks a runtime `.js` spelling up as `.ts`, `.tsx`, `.d.ts`,
+// `.js`, `.jsx`, and a runtime `.jsx` spelling (the `jsx: preserve` output of
+// `.tsx`) as `.tsx` before `.jsx`. A declaration file is not a call-edge
+// implementation target, so `stem.d.ts` is never built and never shadows a
+// later candidate; the filter below keeps a `./x.d.js` spelling from naming
+// `x.d.ts`. Every other spelling names itself alone.
+func typescriptExplicitModuleCandidates(p string) []string {
+	var candidates []string
+	switch path.Ext(p) {
+	case ".js":
+		stem := strings.TrimSuffix(p, ".js")
+		candidates = []string{stem + ".ts", stem + ".tsx", p, stem + ".jsx"}
+	case ".jsx":
+		candidates = []string{strings.TrimSuffix(p, ".jsx") + ".tsx", p}
+	default:
+		return []string{p}
+	}
+	out := candidates[:0]
+	for _, c := range candidates {
+		if !strings.HasSuffix(c, ".d.ts") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// typescriptRuntimeSpellings inverts typescriptExplicitModuleCandidates: the
+// runtime spellings other than itself under which a changed implementation
+// file may have been imported.
+func typescriptRuntimeSpellings(p string) []string {
+	var out []string
+	stem := strings.TrimSuffix(p, path.Ext(p))
+	for _, ext := range []string{".js", ".jsx"} {
+		if spelling := stem + ext; spelling != p && slices.Contains(typescriptExplicitModuleCandidates(spelling), p) {
+			out = append(out, spelling)
+		}
+	}
+	return out
 }
 
 // resolveTypeScriptScope is the sole TS/JS implicit resolver. It loads all
@@ -148,7 +193,9 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 						return nil
 					}
 					for _, candidate := range typescriptModuleCandidatePaths(from.path, spec) {
-						candidatePaths[candidate] = struct{}{}
+						for _, p := range typescriptExplicitModuleCandidates(candidate) {
+							candidatePaths[p] = struct{}{}
+						}
 					}
 					return nil
 				}); err != nil {
@@ -258,8 +305,12 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			return 0, false
 		}
 		if path.Ext(base) != "" {
-			id, ok := byPath[base]
-			return id, ok
+			for _, p := range typescriptExplicitModuleCandidates(base) {
+				if id, ok := byPath[p]; ok {
+					return id, true
+				}
+			}
+			return 0, false
 		}
 		var id int64
 		n := 0
@@ -509,9 +560,14 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 	for len(frontier) > 0 {
 		// The whole frontier level is read before the next one is formed, so
 		// batching never truncates the dependent module closure.
+		// A dependent may name a module by its runtime spelling, and
+		// candidate rows persist only that spelling, so both are looked up.
 		pathArgs := make([]any, 0, len(frontier))
 		for _, p := range frontier {
 			pathArgs = append(pathArgs, p)
+			for _, spelling := range typescriptRuntimeSpellings(p) {
+				pathArgs = append(pathArgs, spelling)
+			}
 		}
 		next := make([]string, 0)
 		if err := sqliteBatchedQuery(ctx, q, `
@@ -575,4 +631,43 @@ func invalidateTypeScriptScopeBindingsQuery(ctx context.Context, q execQuerier, 
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// typescriptJSSpecifierRepairSettingKey records that a repository's TypeScript
+// module-scope decisions have been re-made once under the runtime `.js`/`.jsx`
+// specifier precedence (typescriptExplicitModuleCandidates).
+//
+// No parser fact changes, so an upgraded repository reparses nothing. Its edges
+// through `./foo.js` to `foo.ts` are still unresolved (no strategy reconsiders
+// them without a name event), and an edge bound to `foo.js` beside `foo.ts`
+// (or to `view.jsx` beside `view.tsx`) now belongs to the higher candidate.
+// The repair clears the owned module-scope bindings and runs the repo-wide
+// resolve in the same transaction.
+const typescriptJSSpecifierRepairSettingKey = "resolver.typescript_js_specifier_repaired.v1"
+
+// typescriptJSSpecifierRepairApplies limits the repair to repositories where
+// the precedence can change a decision: an active file that can answer a
+// runtime spelling other than itself (`.ts`, `.tsx` or `.jsx`; never `.d.ts`)
+// and an active file importing a relative `.js` or `.jsx` spelling. Other
+// repositories are marked without work.
+func (s *Store) typescriptJSSpecifierRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM files WHERE repo_id=? AND is_deleted=0 AND language='typescript' AND ((path GLOB '*.ts' AND path NOT GLOB '*.d.ts') OR path GLOB '*.tsx' OR path GLOB '*.jsx'))
+		AND EXISTS(SELECT 1 FROM scope_import_evidence i JOIN files f ON f.id=i.file_id
+			WHERE i.repo_id=? AND f.is_deleted=0 AND i.language='typescript'
+			  AND (i.source_specifier GLOB './*' OR i.source_specifier GLOB '../*')
+			  AND (i.source_specifier GLOB '*.js' OR i.source_specifier GLOB '*.jsx'))`, repoID, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairTypeScriptJSSpecifierBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE repo_id=? AND dst_symbol_id IS NOT NULL AND resolution_strategy='`+tsScopeStrategy+`'
+			AND file_id IN (SELECT id FROM files WHERE repo_id=? AND language='typescript')`, repoID, repoID)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
 }
