@@ -16,11 +16,11 @@ func (a *GoAdapter) Profile() parser.Profile     { return tsProfile("go") }
 func (a *PythonAdapter) Profile() parser.Profile { return tsProfile("python") }
 func (a *JavaAdapter) Profile() parser.Profile   { return tsProfile("java") }
 
-// Kotlin v2 adds file_scope_evidence JVM facade facts (@file:JvmName,
-// @file:JvmMultifileClass, default FileNameKt). Unchanged bytes persist new
-// facts the Java resolver requires, so every Kotlin file has to reparse.
+// Kotlin v3 adds structured companion declarations and members to persisted
+// symbols. Unchanged bytes persist new source facts, so every Kotlin file has
+// to reparse.
 func (a *KotlinAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:kotlin:v2", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:kotlin:v3", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}

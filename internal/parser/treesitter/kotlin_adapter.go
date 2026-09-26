@@ -199,10 +199,45 @@ func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string
 		case "interface_declaration":
 			kotlinAddType(child, module, container, "interface", content, pf)
 		case "function_declaration":
-			if ownerKind == "type" || ownerKind == "module" {
+			if ownerKind == "type" || ownerKind == "module" || ownerKind == "companion" {
 				kotlinAddFunction(child, module, container, content, pf)
 			}
+		case "companion_object":
+			if ownerKind == "type" {
+				kotlinAddCompanion(child, module, container, content, pf)
+			}
 		}
+	}
+}
+
+func kotlinAddCompanion(node *sitter.Node, module, outerContainer string, content []byte, pf *graph.ParsedFile) {
+	if outerContainer == "" {
+		return
+	}
+	nameNode := childByFieldName(node, "name")
+	if nameNode == nil {
+		nameNode = firstChild(node, "type_identifier")
+	}
+	name := "Companion"
+	if nameNode != nil {
+		name = nodeText(nameNode, content)
+	}
+	container := outerContainer + "." + name
+	qualified := kotlinQualified(module, container)
+	pf.Symbols = append(pf.Symbols, graph.Symbol{
+		Language:      "kotlin",
+		Kind:          "companion_object",
+		Name:          name,
+		QualifiedName: qualified,
+		ContainerName: outerContainer,
+		Visibility:    kotlinVisibility(node, content),
+		Range:         nodeRange(node),
+		DocSummary:    prevCommentText(node, content),
+		StableKey:     "companion:kotlin:" + qualified,
+	})
+
+	if body := firstChild(node, "class_body"); body != nil {
+		kotlinExtractSymbols(body, module, container, "companion", content, pf)
 	}
 }
 
