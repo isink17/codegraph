@@ -90,7 +90,7 @@ class Caller { void call() {
 		qname, strategy string
 		resolved        bool
 	}{
-		"ActionsKt.run":                  {"", "", false},
+		"ActionsKt.run":                  {"lib.run", "java_import_scope", true}, // B6A file facade evidence
 		"Service.INSTANCE.run":           {"lib.Service.run", "java_import_scope", true},
 		"Service.staticRun":              {"lib.Service.staticRun", "java_import_scope", true},
 		"CompanionService.Companion.run": {"", "", false},

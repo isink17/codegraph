@@ -41,6 +41,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	}
 
 	kotlinExtractImports(root, content, &pf)
+	pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports)
 	kotlinExtractSymbols(root, module, "", "module", content, &pf)
 	kotlinExtractCalls(root, content, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
@@ -57,6 +58,134 @@ func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFil
 		}
 		addKotlinScope(nodeText(imp, content), &pf.Scope.Imports)
 	}
+}
+
+// kotlinJVMFacade derives the JVM class holding this file's top-level
+// declarations from the file name and the structured @file: annotations. The
+// preamble must parse cleanly, an annotation of ours must have the one form
+// proven here, and every name must fall in the plain Java identifier subset;
+// anything else yields no facade rather than a guessed one.
+func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []graph.ScopeImport) graph.JVMFileFacade {
+	if filepath.Ext(path) != ".kt" {
+		return graph.JVMFileFacade{} // scripts compile to a script class
+	}
+	for _, imp := range imports {
+		for _, simple := range []string{"JvmName", "JvmMultifileClass"} {
+			// An alias of ours, or another annotation under our name, makes the
+			// annotation spellings below unreliable.
+			if !imp.Wildcard && (imp.SourceSpecifier == "kotlin.jvm."+simple) != (imp.LocalName == simple) {
+				return graph.JVMFileFacade{}
+			}
+		}
+	}
+	var facade graph.JVMFileFacade
+	topLevel, preamble := false, true
+	for i := range int(root.ChildCount()) {
+		child := root.Child(i)
+		switch child.Type() {
+		case "function_declaration", "property_declaration":
+			topLevel = true
+		}
+		if !preamble {
+			continue
+		}
+		if child.IsError() || child.HasError() {
+			return graph.JVMFileFacade{}
+		}
+		switch child.Type() {
+		case "file_annotation":
+			for j := range int(child.NamedChildCount()) {
+				if !kotlinFileAnnotation(child.NamedChild(j), content, &facade) {
+					return graph.JVMFileFacade{}
+				}
+			}
+		case "package_header", "import_list", "import_header", "shebang_line", "line_comment", "multiline_comment":
+		default:
+			preamble = false // annotations after this point are not file-targeted
+		}
+	}
+	if !topLevel {
+		return graph.JVMFileFacade{}
+	}
+	if !facade.Explicit {
+		stem := strings.TrimSuffix(filepath.Base(path), ".kt")
+		if !kotlinPlainJavaIdentifier(stem) {
+			return graph.JVMFileFacade{}
+		}
+		facade.Class = strings.ToUpper(stem[:1]) + stem[1:] + "Kt"
+	}
+	return facade
+}
+
+// kotlinFileAnnotation records one annotation inside `@file:`. It reports
+// false for a JvmName/JvmMultifileClass spelling it cannot prove.
+func kotlinFileAnnotation(node *sitter.Node, content []byte, facade *graph.JVMFileFacade) bool {
+	switch node.Type() {
+	case "user_type":
+		switch kotlinJVMAnnotationName(nodeText(node, content)) {
+		case "JvmMultifileClass":
+			if facade.Multifile {
+				return false
+			}
+			facade.Multifile = true
+		case "JvmName":
+			return false
+		}
+	case "constructor_invocation":
+		typ := firstChild(node, "user_type")
+		if typ == nil {
+			return false
+		}
+		switch kotlinJVMAnnotationName(nodeText(typ, content)) {
+		case "JvmName":
+			name, ok := kotlinSingleStringArgument(node, content)
+			if !ok || facade.Explicit || !kotlinPlainJavaIdentifier(name) {
+				return false
+			}
+			facade.Class, facade.Explicit = name, true
+		case "JvmMultifileClass":
+			return false
+		}
+	}
+	return true
+}
+
+func kotlinJVMAnnotationName(spelling string) string {
+	return strings.TrimPrefix(spelling, "kotlin.jvm.")
+}
+
+// kotlinSingleStringArgument returns the content of `("Name")`: exactly one
+// positional argument that is a plain string literal with no interpolation or
+// escape.
+func kotlinSingleStringArgument(node *sitter.Node, content []byte) (string, bool) {
+	args := firstChild(node, "value_arguments")
+	if args == nil || args.NamedChildCount() != 1 {
+		return "", false
+	}
+	arg := args.NamedChild(0)
+	if arg.Type() != "value_argument" || arg.NamedChildCount() != 1 {
+		return "", false
+	}
+	lit := arg.NamedChild(0)
+	if lit.Type() != "string_literal" || lit.NamedChildCount() != 1 || lit.NamedChild(0).Type() != "string_content" {
+		return "", false
+	}
+	return nodeText(lit.NamedChild(0), content), true
+}
+
+// kotlinPlainJavaIdentifier is the conservative name subset whose JVM class
+// spelling is unambiguous: ASCII letters, digits and '_', not starting with a
+// digit. Kotlin sanitizes anything else by rules this adapter does not model.
+func kotlinPlainJavaIdentifier(name string) bool {
+	if name == "" || name[0] >= '0' && name[0] <= '9' {
+		return false
+	}
+	for _, r := range name {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, pf *graph.ParsedFile) {

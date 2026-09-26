@@ -2665,7 +2665,7 @@ func insertParsedFileGraph(
 		}
 	}
 	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path) VALUES(?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path, jvm_facade_class, jvm_facade_explicit, jvm_multifile) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath, parsed.Scope.JVMFacade.Class, boolInt(parsed.Scope.JVMFacade.Explicit), boolInt(parsed.Scope.JVMFacade.Multifile)); err != nil {
 			return nil, err
 		}
 	}
@@ -3390,20 +3390,18 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 		return nil, nil
 	}
 	names := map[string]struct{}{}
-	// The statement names the chunk twice and binds the repo id twice, so each
-	// path costs two parameters on top of two fixed ones.
-	pathBatch := sqliteBatchSize(2, 2)
+	// The statement names the chunk three times and binds the repo id three
+	// times, so each path costs three parameters on top of three fixed ones.
+	pathBatch := sqliteBatchSize(3, 3)
 	for start := 0; start < len(paths); start += pathBatch {
 		end := min(start+pathBatch, len(paths))
 		chunk := paths[start:end]
-		args := make([]any, 0, 2*len(chunk)+2)
-		args = append(args, repoID)
-		for _, path := range chunk {
-			args = append(args, path)
-		}
-		args = append(args, repoID)
-		for _, path := range chunk {
-			args = append(args, path)
+		args := make([]any, 0, 3*len(chunk)+3)
+		for range 3 {
+			args = append(args, repoID)
+			for _, path := range chunk {
+				args = append(args, path)
+			}
 		}
 		// Driven from `files`, not from `symbols`: a `symbols.repo_id` predicate
 		// makes SQLite scan the repository's whole symbol table before joining,
@@ -3426,6 +3424,10 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 				WHERE repo_id = ? AND is_deleted = 0
 				  AND path IN (`+sqlitePlaceholders(len(chunk))+`)
 			)
+			UNION
+			`+jvmFacadeNamesSelect+`
+			WHERE f.repo_id = ? AND f.is_deleted = 0
+			  AND f.path IN (`+sqlitePlaceholders(len(chunk))+`)
 			)
 		`, args...)
 		if err != nil {
@@ -3437,6 +3439,14 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 	}
 	return setToSlice(names), nil
 }
+
+// jvmFacadeNamesSelect lists a Kotlin file's JVM facade class as a previous
+// name. The facade is not a symbol, but it owns Java spellings exactly as a
+// declaration does: a part leaving or changing its facade re-decides
+// `Facade.member` callers bound into other, unchanged parts. Driven from
+// `files` so the (repo_id, file_id) key is used; callers append the WHERE.
+const jvmFacadeNamesSelect = `SELECT DISTINCT fs.jvm_facade_class AS name
+			FROM files f JOIN file_scope_evidence fs ON fs.repo_id = f.repo_id AND fs.file_id = f.id AND fs.jvm_facade_class != ''`
 
 // PreviousSymbolNamesForDeletedInScan is the same fact for files this scan just
 // marked deleted. Their rows survive until PurgeDeletedFileGraphsForScan runs,
@@ -3491,8 +3501,11 @@ func (s *Store) PreviousSymbolNamesForDeletedInScan(ctx context.Context, repoID,
 			SELECT id FROM files
 			WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
 		)
+		UNION
+		`+jvmFacadeNamesSelect+`
+		WHERE f.repo_id = ? AND f.is_deleted = 1 AND f.last_scan_id = ?
 		)
-	`, repoID, scanID, repoID, scanID)
+	`, repoID, scanID, repoID, scanID, repoID, scanID)
 	if err != nil {
 		return nil, err
 	}

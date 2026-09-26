@@ -108,6 +108,18 @@ type ScopeEvidence struct {
 	Modules              []RustModule
 	GoLocals             []GoLocalBinding
 	SwiftLexicalBindings []SwiftLexicalBinding
+	JVMFacade            JVMFileFacade
+}
+
+// JVMFileFacade is the JVM class a Kotlin source file compiles its top-level
+// declarations into. Class is the simple name (the package is Package); it is
+// empty when the file has no top-level callable or the parser could not prove
+// the name. Explicit reports a proven @file:JvmName, Multifile a proven
+// @file:JvmMultifileClass. The facade is a source fact, never a symbol.
+type JVMFileFacade struct {
+	Class     string
+	Explicit  bool
+	Multifile bool
 }
 
 // SwiftLexicalBinding is conservative, range-bearing negative evidence for a
