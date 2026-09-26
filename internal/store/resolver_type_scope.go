@@ -1238,6 +1238,7 @@ const referenceIdentityRepairSettingKey = "resolver.reference_identity_repaired.
 
 const jvmScopePrecisionRepairSettingKey = "resolver.jvm_scope_precision_repaired.v1"
 const jvmCoreInteropRepairSettingKey = "resolver.jvm_core_interop_repaired.v1"
+const jvmCommonCallableABIRepairSettingKey = "resolver.jvm_common_callable_abi_repaired.v1"
 const cppExternCSignatureRepairSettingKey = "resolver.cpp_extern_c_signature_repaired.v1"
 
 func (s *Store) jvmScopePrecisionRepairApplies(ctx context.Context, repoID int64) (bool, error) {
@@ -1269,6 +1270,51 @@ func (s *Store) jvmCoreInteropRepairApplies(ctx context.Context, repoID int64) (
 
 func (s *Store) repairJVMCoreInteropBindings(ctx context.Context, repoID int64) error {
 	return s.repairJVMScopePrecisionBindings(ctx, repoID)
+}
+
+func (s *Store) jvmCommonCallableABIRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1
+		FROM edges e
+		JOIN files jf ON jf.id=e.file_id AND jf.repo_id=e.repo_id AND jf.language='java' AND jf.is_deleted=0
+		JOIN symbols caller ON caller.id=e.src_symbol_id AND caller.repo_id=e.repo_id
+		LEFT JOIN file_scope_evidence jfs ON jfs.file_id=jf.id AND jfs.repo_id=jf.repo_id
+		JOIN symbols owner ON owner.repo_id=e.repo_id AND owner.language='kotlin' AND owner.kind='object'
+		JOIN files kf ON kf.id=owner.file_id AND kf.repo_id=owner.repo_id AND kf.is_deleted=0
+		JOIN file_scope_evidence kfs ON kfs.file_id=kf.id AND kfs.repo_id=kf.repo_id
+		JOIN symbols member ON member.repo_id=owner.repo_id AND member.language='kotlin' AND member.kind='function'
+			AND member.qualified_name=owner.qualified_name||'.'||member.name AND member.container_name=owner.name
+		WHERE e.repo_id=? AND e.edge_kind='calls'
+		AND member.visibility IN ('','public')
+		AND instr(member.signature,'@JvmName')=0
+		AND instr(member.signature,'.'||member.name||'(')=0
+		AND (SELECT COUNT(*) FROM symbols overload JOIN files mf ON mf.id=overload.file_id AND mf.repo_id=overload.repo_id AND mf.is_deleted=0
+			WHERE overload.repo_id=member.repo_id AND overload.language='kotlin' AND overload.kind='function' AND overload.qualified_name=member.qualified_name)=1
+		AND ((
+			(e.dst_name=owner.name||'.INSTANCE.'||member.name OR e.dst_name=owner.qualified_name||'.INSTANCE.'||member.name)
+			AND e.evidence=e.dst_name||'()'
+			AND instr(member.signature,'fun '||member.name||'()')>0
+		) OR (
+			(e.dst_name=owner.name||'.'||member.name OR e.dst_name=owner.qualified_name||'.'||member.name)
+			AND e.evidence=e.dst_name||'()'
+			AND instr(member.signature,'fun '||member.name||'()')>0
+			AND (instr(member.signature,'@JvmStatic')>0 OR instr(member.signature,'@kotlin.jvm.JvmStatic')>0)
+		))
+		AND (
+			e.dst_name LIKE owner.qualified_name||'.%'
+			OR (jfs.package_name=kfs.package_name AND e.dst_name LIKE owner.name||'.%')
+			OR EXISTS (SELECT 1 FROM scope_import_evidence imp WHERE imp.repo_id=e.repo_id AND imp.file_id=jf.id AND imp.language='java' AND imp.local_name=owner.name AND imp.source_specifier=owner.qualified_name)
+			OR EXISTS (SELECT 1 FROM scope_import_evidence imp WHERE imp.repo_id=e.repo_id AND imp.file_id=jf.id AND imp.language='java' AND imp.wildcard=1 AND imp.source_specifier=kfs.package_name AND e.dst_name LIKE owner.name||'.%')
+		)
+		LIMIT 1
+	)`, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairJVMCommonCallableABIBindings(ctx context.Context, repoID int64) error {
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, nil)
+	return err
 }
 
 func (s *Store) cppExternCSignatureRepairApplies(ctx context.Context, repoID int64) (bool, error) {
@@ -1379,6 +1425,12 @@ var (
 		key:              jvmCoreInteropRepairSettingKey,
 		run:              (*Store).repairJVMCoreInteropBindings,
 		applies:          (*Store).jvmCoreInteropRepairApplies,
+		resolvesRepoWide: true,
+	}
+	jvmCommonCallableABIRepair = resolverRepair{
+		key:              jvmCommonCallableABIRepairSettingKey,
+		run:              (*Store).repairJVMCommonCallableABIBindings,
+		applies:          (*Store).jvmCommonCallableABIRepairApplies,
 		resolvesRepoWide: true,
 	}
 	cppExternCSignatureRepair = resolverRepair{
@@ -1529,7 +1581,7 @@ var (
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, cppExternCSignatureRepair, typescriptJSSpecifierRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, jvmCommonCallableABIRepair, cppExternCSignatureRepair, typescriptJSSpecifierRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,

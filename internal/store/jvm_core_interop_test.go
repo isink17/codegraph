@@ -132,6 +132,114 @@ func TestJVMCoreInteropScopes(t *testing.T) {
 	})
 }
 
+func TestJVMGeneratedCallableABIScopes(t *testing.T) {
+	addScope := func(t *testing.T, f *gateFixture, file int64, language, pkg string) {
+		t.Helper()
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?,?,?)`, f.repoID, file, language, pkg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addImport := func(t *testing.T, f *gateFixture, file int64, source, local string) {
+		t.Helper()
+		if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,?,?,?,?,?)`, f.repoID, file, "java", source, local, local, "named"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setCallEvidence := func(t *testing.T, f *gateFixture, edge int64, evidence string) {
+		t.Helper()
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET evidence=? WHERE id=?`, evidence, edge); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("object INSTANCE requires Kotlin object structure", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, kind, signature string
+			resolved              bool
+		}{
+			{"object", "object", "fun run() {}", true},
+			{"object static method", "object", "@JvmStatic fun run() {}", false},
+			{"ordinary class", "class", "fun run() {}", false},
+			{"renamed JVM method", "object", `@JvmName("renamed") fun run() {}`, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newGateFixture(t)
+				callerFile := f.file(t, "app/Caller.java", "java")
+				caller := f.symbolKind(t, callerFile, "call", "app.Caller.call", "function", "java")
+				ownerFile := f.file(t, "lib/Service.kt", "kotlin")
+				addScope(t, f, callerFile, "java", "app")
+				addScope(t, f, ownerFile, "kotlin", "lib")
+				addImport(t, f, callerFile, "lib.Service", "Service")
+				f.symbolKind(t, ownerFile, "Service", "lib.Service", tc.kind, "kotlin")
+				run := f.symbolKind(t, ownerFile, "run", "lib.Service.run", "function", "kotlin")
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',visibility='public',signature=? WHERE id=?`, tc.signature, run); err != nil {
+					t.Fatal(err)
+				}
+				edge := f.edge(t, callerFile, caller, "Service.INSTANCE.run")
+				setCallEvidence(t, f, edge, "Service.INSTANCE.run()")
+				if _, err := resolveJavaScope(f.ctx, f.store.db, f.repoID, nil); err != nil {
+					t.Fatal(err)
+				}
+				dst, ok := f.dstSymbolID(t, edge)
+				got := "<unresolved>"
+				if ok {
+					got = f.qualifiedNameOf(t, dst)
+				}
+				if ok != tc.resolved || ok && got != "lib.Service.run" {
+					t.Fatalf("INSTANCE binding = %q, want resolved=%v", got, tc.resolved)
+				}
+			})
+		}
+	})
+
+	t.Run("static object call requires persisted JvmStatic annotation", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, signature, visibility string
+			resolved, overload          bool
+		}{
+			{"annotated", "@JvmStatic fun run() {}", "public", true, false},
+			{"unannotated", "fun run() {}", "public", false, false},
+			{"qualified annotation", "@kotlin.jvm.JvmStatic fun run() {}", "public", true, false},
+			{"private", "@JvmStatic fun run() {}", "private", false, false},
+			{"overload", "@JvmStatic fun run() {}", "public", false, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newGateFixture(t)
+				callerFile := f.file(t, "app/Caller.java", "java")
+				caller := f.symbolKind(t, callerFile, "call", "app.Caller.call", "function", "java")
+				ownerFile := f.file(t, "lib/Service.kt", "kotlin")
+				addScope(t, f, callerFile, "java", "app")
+				addScope(t, f, ownerFile, "kotlin", "lib")
+				addImport(t, f, callerFile, "lib.Service", "Service")
+				f.symbolKind(t, ownerFile, "Service", "lib.Service", "object", "kotlin")
+				run := f.symbolKind(t, ownerFile, "run", "lib.Service.run", "function", "kotlin")
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',visibility=?,signature=? WHERE id=?`, tc.visibility, tc.signature, run); err != nil {
+					t.Fatal(err)
+				}
+				if tc.overload {
+					overload := f.symbolKind(t, ownerFile, "run", "lib.Service.run", "function", "kotlin")
+					if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',visibility='public',signature='@JvmStatic fun run(value: Int) {}' WHERE id=?`, overload); err != nil {
+						t.Fatal(err)
+					}
+				}
+				edge := f.edge(t, callerFile, caller, "Service.run")
+				setCallEvidence(t, f, edge, "Service.run()")
+				if _, err := resolveJavaScope(f.ctx, f.store.db, f.repoID, nil); err != nil {
+					t.Fatal(err)
+				}
+				dst, ok := f.dstSymbolID(t, edge)
+				got := "<unresolved>"
+				if ok {
+					got = f.qualifiedNameOf(t, dst)
+				}
+				if ok != tc.resolved || ok && got != "lib.Service.run" {
+					t.Fatalf("static binding = %q, want resolved=%v", got, tc.resolved)
+				}
+			})
+		}
+	})
+}
+
 func TestJVMCoreInteropRepair(t *testing.T) {
 	f := newGateFixture(t)
 	callerFile := f.file(t, "Caller.kt", "kotlin")

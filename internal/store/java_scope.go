@@ -243,7 +243,7 @@ func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymb
 	return out, true, strategy
 }
 func javaTypeIdentityEligible(s javaScopeSymbol) bool {
-	return s.language == "java" && s.kind == "type" || s.language == "kotlin" && s.kind == "class"
+	return s.language == "java" && s.kind == "type" || s.language == "kotlin" && (s.kind == "class" || s.kind == "object")
 }
 
 func javaVisibleToJava(s javaScopeSymbol, fromPkg string) bool {
@@ -315,14 +315,25 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		return s, strategy
 	}
 	if dot := strings.LastIndex(name, "."); dot >= 0 {
-		owner, ok, ownerStrategy := javaType(name[:dot], e.pkg, e.container, byQName, byName, imps[e.file])
+		ownerName, memberName := name[:dot], name[dot+1:]
+		if strings.HasSuffix(ownerName, ".INSTANCE") {
+			owner, ok, ownerStrategy := javaType(strings.TrimSuffix(ownerName, ".INSTANCE"), e.pkg, e.container, byQName, byName, imps[e.file])
+			if !ok || owner.language != "kotlin" || owner.kind != "object" {
+				return javaScopeSymbol{}, ""
+			}
+			return kotlinObjectMember(owner, memberName, e, byQName, ownerStrategy, false)
+		}
+		owner, ok, ownerStrategy := javaType(ownerName, e.pkg, e.container, byQName, byName, imps[e.file])
 		if !ok {
 			return javaScopeSymbol{}, ""
 		}
 		if owner.language == "kotlin" {
+			if owner.kind == "object" {
+				return kotlinObjectMember(owner, memberName, e, byQName, ownerStrategy, true)
+			}
 			return javaScopeSymbol{}, ""
 		}
-		s, _, strategy := javaMethods(owner.qname, name[dot+1:], e.pkg, e.container, byQName, ownerStrategy, true)
+		s, _, strategy := javaMethods(owner.qname, memberName, e.pkg, e.container, byQName, ownerStrategy, true)
 		return s, strategy
 	}
 	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false); ok {
@@ -357,6 +368,73 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		return staticCandidates[0], "java_static_import"
 	}
 	return javaScopeSymbol{}, ""
+}
+
+func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
+	var out javaScopeSymbol
+	n := 0
+	for _, s := range byQName[owner.qname+"."+name] {
+		if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(owner.qname, owner.pkg+".") || !javaVisibleToJava(s, e.pkg) {
+			continue
+		}
+		out = s
+		n++
+		jvmStatic := kotlinHasJvmStatic(s.signature)
+		if kotlinExtensionSignature(s.name, s.signature) || kotlinHasJvmName(s.signature) || !kotlinNoArgCall(e.evidence) || !kotlinNoArgFunction(s.signature) || jvmStatic != requireJvmStatic {
+			return javaScopeSymbol{}, ""
+		}
+	}
+	if n != 1 {
+		return javaScopeSymbol{}, ""
+	}
+	return out, strategy
+}
+
+func kotlinNoArgCall(evidence string) bool {
+	evidence = strings.TrimSpace(evidence)
+	close := strings.LastIndexByte(evidence, ')')
+	open := strings.LastIndexByte(evidence, '(')
+	return close == len(evidence)-1 && open >= 0 && open < close && strings.TrimSpace(evidence[open+1:close]) == ""
+}
+
+func kotlinNoArgFunction(signature string) bool {
+	fun := strings.Index(signature, "fun ")
+	if fun < 0 {
+		return false
+	}
+	open := strings.IndexByte(signature[fun:], '(')
+	if open < 0 {
+		return false
+	}
+	open += fun
+	close := strings.IndexByte(signature[open+1:], ')')
+	return close >= 0 && strings.TrimSpace(signature[open+1:open+1+close]) == ""
+}
+
+func kotlinHasJvmStatic(signature string) bool {
+	fun := strings.Index(signature, "fun ")
+	if fun < 0 {
+		return false
+	}
+	for _, annotation := range strings.Fields(signature[:fun]) {
+		if annotation == "@JvmStatic" || annotation == "@kotlin.jvm.JvmStatic" {
+			return true
+		}
+	}
+	return false
+}
+
+func kotlinHasJvmName(signature string) bool {
+	fun := strings.Index(signature, "fun ")
+	if fun < 0 {
+		return false
+	}
+	for _, annotation := range strings.Fields(signature[:fun]) {
+		if strings.HasPrefix(annotation, "@JvmName") || strings.HasPrefix(annotation, "@kotlin.jvm.JvmName") {
+			return true
+		}
+	}
+	return false
 }
 
 func javaMethods(owner, name, pkg, caller string, byQName map[string][]javaScopeSymbol, strategy string, requireStatic bool) (javaScopeSymbol, bool, string) {

@@ -347,7 +347,11 @@ func kotlinJoin(a, b string) string {
 	return a + "." + b
 }
 func kotlinExtension(s kotlinScopeSymbol) bool {
-	return strings.Contains(strings.TrimSpace(s.signature), "."+s.name+"(")
+	return kotlinExtensionSignature(s.name, s.signature)
+}
+
+func kotlinExtensionSignature(name, signature string) bool {
+	return strings.Contains(strings.TrimSpace(signature), "."+name+"(")
 }
 func kotlinVisible(s kotlinScopeSymbol, e struct {
 	id, file                             int64
