@@ -57,6 +57,9 @@ class Caller { void call() {
 		"Object.kt|run":                 {"kotlin", "lib.Service.run", "Service", "function", "fun run() {}", "public", "lib", sql.NullInt64{}},
 		"Object.kt|staticRun":           {"kotlin", "lib.Service.staticRun", "Service", "function", "@JvmStatic fun staticRun() {}", "public", "lib", sql.NullInt64{}},
 		"Companion.kt|CompanionService": {"kotlin", "lib.CompanionService", "lib", "class", "", "public", "lib", sql.NullInt64{}},
+		"Companion.kt|Companion":        {"kotlin", "lib.CompanionService.Companion", "CompanionService", "companion_object", "", "public", "lib", sql.NullInt64{}},
+		"Companion.kt|run":              {"kotlin", "lib.CompanionService.Companion.run", "CompanionService.Companion", "function", "fun run() {}", "public", "lib", sql.NullInt64{}},
+		"Companion.kt|staticRun":        {"kotlin", "lib.CompanionService.Companion.staticRun", "CompanionService.Companion", "function", "@JvmStatic fun staticRun() {}", "public", "lib", sql.NullInt64{}},
 		"Caller.java|Caller":            {"java", "app.Caller", "app", "type", "", "package", "app", sql.NullInt64{}},
 		"Caller.java|call":              {"java", "app.Caller.call", "Caller", "function", "void call()", "package", "app", sql.NullInt64{Int64: 0, Valid: true}},
 	}
