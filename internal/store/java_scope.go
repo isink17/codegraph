@@ -86,6 +86,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 
 	byQName := map[string][]javaScopeSymbol{}
 	byName := map[string][]javaScopeSymbol{}
+	companions := map[string][]javaScopeSymbol{}
 	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
 		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0`, " AND s.name IN (%s)",
@@ -97,6 +98,33 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 			}
 			byQName[s.qname] = append(byQName[s.qname], s)
 			byName[s.name] = append(byName[s.name], s)
+			return nil
+		}); err != nil {
+		return 0, err
+	}
+	// Companion rows are owner evidence, not Java types. Load only companions
+	// from Kotlin class files already selected by the edge's outer name. The
+	// file_id lookup uses the existing symbol index and avoids a repo-wide scan.
+	outerFiles := map[int64]struct{}{}
+	for _, candidates := range byName {
+		for _, candidate := range candidates {
+			if candidate.language == "kotlin" && candidate.kind == "class" {
+				outerFiles[candidate.file] = struct{}{}
+			}
+		}
+	}
+	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(outerFiles), `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language
+		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
+		WHERE s.repo_id=? AND f.language='kotlin' AND s.kind='companion_object' AND f.is_deleted=0 AND s.file_id IN (`,
+		[]any{repoID},
+		func(scan func(...any) error) error {
+			var s javaScopeSymbol
+			if err := scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language); err != nil {
+				return err
+			}
+			byQName[s.qname] = append(byQName[s.qname], s)
+			byName[s.name] = append(byName[s.name], s)
+			companions[kotlinJoin(s.pkg, s.container)] = append(companions[kotlinJoin(s.pkg, s.container)], s)
 			return nil
 		}); err != nil {
 		return 0, err
@@ -169,7 +197,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		if e.kind == "constructs" {
 			dst, strategy = javaConstructor(e, byQName, byName, imports)
 		} else {
-			dst, strategy = javaMember(e, byQName, byName, imports, facades)
+			dst, strategy = javaMember(e, byQName, byName, imports, facades, companions)
 		}
 		if dst.id != 0 {
 			res[e.id] = struct {
@@ -330,7 +358,7 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	}
 	return out, "java_constructor"
 }
-func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport, facades map[string][]javaFacadePart) (javaScopeSymbol, string) {
+func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport, facades map[string][]javaFacadePart, companions map[string][]javaScopeSymbol) (javaScopeSymbol, string) {
 	name := e.name
 	if name == "super." || strings.HasPrefix(name, "super.") {
 		return javaScopeSymbol{}, ""
@@ -349,6 +377,17 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 			}
 			return kotlinObjectMember(owner, memberName, e, byQName, ownerStrategy, false)
 		}
+		if fieldDot := strings.LastIndex(ownerName, "."); fieldDot >= 0 {
+			outerName, fieldName := ownerName[:fieldDot], ownerName[fieldDot+1:]
+			if outer, ok, strategy := javaType(outerName, e.pkg, e.container, byQName, byName, imps[e.file]); ok && outer.language == "kotlin" && outer.kind == "class" {
+				if companion, unique := kotlinOwnedCompanion(outer, fieldName, e.pkg, companions); unique {
+					return kotlinCompanionMember(companion, memberName, e, byQName, strategy, false)
+				}
+				// A nested object or class with the same spelling is not evidence
+				// for the companion field ABI.
+				return javaScopeSymbol{}, ""
+			}
+		}
 		owner, ok, ownerStrategy := javaType(ownerName, e.pkg, e.container, byQName, byName, imps[e.file])
 		if !ok {
 			return javaScopeSymbol{}, ""
@@ -357,6 +396,8 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 			switch owner.kind {
 			case "object":
 				return kotlinObjectMember(owner, memberName, e, byQName, ownerStrategy, true)
+			case "class":
+				return kotlinCompanionStaticMember(owner, memberName, e, byQName, companions, ownerStrategy)
 			case kotlinFileFacadeKind:
 				return kotlinFacadeMember(owner, memberName, e, byQName, facades[owner.qname], ownerStrategy)
 			}
@@ -397,6 +438,54 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		return staticCandidates[0], "java_static_import"
 	}
 	return javaScopeSymbol{}, ""
+}
+
+func kotlinOwnedCompanion(outer javaScopeSymbol, field, pkg string, companions map[string][]javaScopeSymbol) (javaScopeSymbol, bool) {
+	wantContainer := strings.TrimPrefix(outer.qname, outer.pkg+".")
+	var out javaScopeSymbol
+	n := 0
+	for _, s := range companions[outer.qname] {
+		if s.language == "kotlin" && s.kind == "companion_object" && s.name == field && s.qname == outer.qname+"."+field && s.container == wantContainer && javaVisibleToJava(s, pkg) {
+			out = s
+			n++
+		}
+	}
+	return out, n == 1
+}
+
+func kotlinCompanionStaticMember(outer javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, companions map[string][]javaScopeSymbol, strategy string) (javaScopeSymbol, string) {
+	owned := companions[outer.qname]
+	var companion javaScopeSymbol
+	count := 0
+	for _, candidate := range owned {
+		if candidate.kind == "companion_object" && candidate.qname == outer.qname+"."+candidate.name && candidate.container == strings.TrimPrefix(outer.qname, outer.pkg+".") && javaVisibleToJava(candidate, e.pkg) {
+			companion = candidate
+			count++
+		}
+	}
+	if count != 1 {
+		return javaScopeSymbol{}, ""
+	}
+	return kotlinCompanionMember(companion, name, e, byQName, strategy, true)
+}
+
+func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
+	var out javaScopeSymbol
+	n := 0
+	for _, s := range byQName[companion.qname+"."+name] {
+		if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(companion.qname, companion.pkg+".") || !javaVisibleToJava(s, e.pkg) {
+			continue
+		}
+		out = s
+		n++
+		if !kotlinFacadeCallable(s.name, s.signature) || !kotlinNoArgCall(e.evidence) || !kotlinNoArgFunction(s.signature) || requireJvmStatic && !kotlinHasJvmStatic(s.signature) {
+			return javaScopeSymbol{}, ""
+		}
+	}
+	if n != 1 {
+		return javaScopeSymbol{}, ""
+	}
+	return out, strategy
 }
 
 func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {

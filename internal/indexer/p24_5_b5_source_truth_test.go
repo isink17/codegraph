@@ -96,8 +96,8 @@ class Caller { void call() {
 		"ActionsKt.run":                  {"lib.run", "java_import_scope", true}, // B6A file facade evidence
 		"Service.INSTANCE.run":           {"lib.Service.run", "java_import_scope", true},
 		"Service.staticRun":              {"lib.Service.staticRun", "java_import_scope", true},
-		"CompanionService.Companion.run": {"", "", false},
-		"CompanionService.staticRun":     {"", "", false},
+		"CompanionService.Companion.run": {"lib.CompanionService.Companion.run", "java_import_scope", true},
+		"CompanionService.staticRun":     {"lib.CompanionService.Companion.staticRun", "java_import_scope", true},
 	}
 	for rows.Next() {
 		var path, kind, dstName, evidence, strategy, refName, refQName string

@@ -60,14 +60,17 @@ class Caller {
     void companionInstance() { Service.INSTANCE.run(); }
     void companionDirect() { Service.run(); }
     void companionStatic() { Service.staticRun(); }
+    void companionInstanceValid() { Service.Companion.run(); }
     void namedField() { NamedService.Factory.INSTANCE.run(); }
     void namedDirect() { NamedService.Factory.staticRun(); }
+    void namedInstanceValid() { NamedService.Factory.run(); }
     void namedOuterInstance() { NamedService.INSTANCE.run(); }
     void namedOuterDirect() { NamedService.run(); }
     void explicitCompanionField() { ExplicitCompanionService.Companion.INSTANCE.run(); }
     void explicitCompanionOuterInstance() { ExplicitCompanionService.INSTANCE.run(); }
     void explicitCompanionDirect() { ExplicitCompanionService.run(); }
     void explicitCompanionNamedStatic() { ExplicitCompanionService.Companion.staticRun(); }
+    void explicitCompanionInstanceValid() { ExplicitCompanionService.Companion.run(); }
     void objectInstance() { ObjectService.INSTANCE.run(); }
     void objectDirect() { ObjectService.run(); }
     void objectStatic() { ObjectService.staticRun(); }
@@ -76,15 +79,22 @@ class Caller {
 	})
 
 	for _, name := range []string{
-		"Service.Companion.INSTANCE.run", "Service.INSTANCE.run", "Service.run", "Service.staticRun",
-		"NamedService.Factory.INSTANCE.run", "NamedService.Factory.staticRun", "NamedService.INSTANCE.run", "NamedService.run",
-		"ExplicitCompanionService.Companion.INSTANCE.run", "ExplicitCompanionService.INSTANCE.run", "ExplicitCompanionService.run", "ExplicitCompanionService.Companion.staticRun",
+		"Service.Companion.INSTANCE.run", "Service.INSTANCE.run", "Service.run",
+		"NamedService.Factory.INSTANCE.run", "NamedService.INSTANCE.run", "NamedService.run",
+		"ExplicitCompanionService.Companion.INSTANCE.run", "ExplicitCompanionService.INSTANCE.run", "ExplicitCompanionService.run",
 		"ObjectService.run", "ObjectService.INSTANCE.staticRun",
 	} {
 		assertJVMUnresolved(t, r, "Caller.java", name)
 	}
 	assertJVMResolved(t, r, "Caller.java", "ObjectService.INSTANCE.run", "ObjectService.kt", "java_import_scope")
 	assertJVMResolved(t, r, "Caller.java", "ObjectService.staticRun", "ObjectService.kt", "java_import_scope")
+	for _, call := range []struct{ name, file string }{
+		{"Service.staticRun", "Service.kt"}, {"Service.Companion.run", "Service.kt"},
+		{"NamedService.Factory.staticRun", "NamedService.kt"}, {"NamedService.Factory.run", "NamedService.kt"},
+		{"ExplicitCompanionService.Companion.staticRun", "ExplicitCompanionService.kt"}, {"ExplicitCompanionService.Companion.run", "ExplicitCompanionService.kt"},
+	} {
+		assertJVMResolved(t, r, "Caller.java", call.name, call.file, "java_import_scope")
+	}
 	for _, name := range []string{"Service.run", "Service.Companion.run", "NamedService.Factory.run", "ExplicitCompanionService.Companion.run"} {
 		assertJVMUnresolved(t, r, "KotlinCaller.kt", name)
 	}
@@ -110,8 +120,8 @@ class Caller {
 		t.Fatalf("FindCallees for unresolved companion call = %#v, %v", callees, err)
 	}
 	callers, err := r.store.FindCallers(r.ctx, r.repoID, "lib.ExplicitCompanionService.Companion.run", 0, 10, 0)
-	if err != nil || len(callers) != 0 {
-		t.Fatalf("FindCallers for unbound companion member = %#v, %v", callers, err)
+	if err != nil || len(callers) != 1 {
+		t.Fatalf("FindCallers for canonical companion member = %d callers, %v; want Java ABI projection", len(callers), err)
 	}
 	r.assertFreshParity(t, "P24.6-B companion does not inherit B5 object ABI")
 }
@@ -204,7 +214,7 @@ class Service {
 	assertPersistedCompanionMember(t, r, "Service.kt", "lib.Service.Companion.run", "Service.Companion", "@JvmStatic fun run() {}", "public", "func:kotlin:lib.Service.Companion.run")
 	assertPersistedCompanionMember(t, r, "Service.kt", "lib.Service.Companion.hidden", "Service.Companion", "private fun hidden() {}", "private", "func:kotlin:lib.Service.Companion.hidden")
 	assertPersistedCompanionMember(t, r, "Service.kt", "lib.Service.Companion.internalOnly", "Service.Companion", "@JvmName(\"execute\")\n        internal fun internalOnly() {}", "internal", "func:kotlin:lib.Service.Companion.internalOnly")
-	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
+	assertJVMResolved(t, r, "Caller.java", "Service.run", "Service.kt", "java_import_scope")
 
 	stableID := p246SymbolID(t, r, "Service.kt", "companion:kotlin:lib.Service.Companion")
 	r.write(t, "Other.java", "package app; class Other {}")
@@ -224,7 +234,7 @@ class Service {
 	assertNoPersistedCompanion(t, r, "Service.kt", "lib.Service.Companion", "companion:kotlin:lib.Service.Companion")
 	assertPersistedCompanion(t, r, "Service.kt", "lib.Service.Factory", "Factory", "Service", "companion:kotlin:lib.Service.Factory")
 	assertPersistedCompanionMember(t, r, "Service.kt", "lib.Service.Factory.run", "Service.Factory", "@JvmStatic fun run() {}", "public", "func:kotlin:lib.Service.Factory.run")
-	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
+	assertJVMResolved(t, r, "Caller.java", "Service.run", "Service.kt", "java_import_scope")
 	r.assertFreshParity(t, "unnamed to named companion")
 
 	r.write(t, "Service.kt", unnamed)
