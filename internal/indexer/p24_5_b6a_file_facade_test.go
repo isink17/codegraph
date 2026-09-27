@@ -291,17 +291,22 @@ func TestJVMFileFacadeKeepsObjectABI(t *testing.T) {
 	java := `package app;
 import lib.Service;
 import lib.ServiceKt;
+import lib.Api;
 class Caller {
     void instance() { Service.INSTANCE.run(); }
     void direct() { Service.run(); }
     void staticCall() { Service.staticRun(); }
     void staticInstance() { Service.INSTANCE.staticRun(); }
     void facade() { ServiceKt.top(); }
+    void companion() { Api.Companion.run(); }
 }`
 	r := newLifecycleRepo(t, tree{"Caller.java": java, "Service.kt": `package lib
 object Service {
     fun run() {}
     @JvmStatic fun staticRun() {}
+}
+class Api {
+    companion object { fun run() {} }
 }
 fun top() {}`})
 	assertKotlinFacade(t, r.dbPath, r.repoID, "Service.kt", "lib.ServiceKt|explicit=0|multifile=0")
@@ -310,7 +315,9 @@ fun top() {}`})
 	assertJVMResolved(t, r, "Caller.java", "Service.staticRun", "Service.kt", "java_import_scope")
 	assertJVMUnresolved(t, r, "Caller.java", "Service.INSTANCE.staticRun")
 	assertJVMResolved(t, r, "Caller.java", "ServiceKt.top", "Service.kt", "java_import_scope")
+	assertJVMResolved(t, r, "Caller.java", "Api.Companion.run", "Service.kt", "java_import_scope")
 	assertJVMQueryRelation(t, r, "app.Caller.facade", "lib.top")
+	assertJVMQueryRelation(t, r, "app.Caller.companion", "lib.Api.Companion.run")
 	assertJVMNoQueryRelation(t, r, "app.Caller.direct", "lib.Service.run")
 	r.assertFreshParity(t, "object and facade in one file")
 }

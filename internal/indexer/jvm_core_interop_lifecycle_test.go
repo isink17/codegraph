@@ -179,7 +179,7 @@ fun run(value: Int) {}`,
 		assertJVMReference(t, r, "Caller.java", "ActionsKt.run", false)
 		r.assertFreshParity(t, "out of scope callable signatures")
 	})
-	t.Run("companion is not synthesized", func(t *testing.T) {
+	t.Run("persisted companion maps to canonical member", func(t *testing.T) {
 		r := newLifecycleRepo(t, tree{
 			"Caller.java": "package app; import lib.Service; class Caller { void call() { Service.Companion.run(); Service.run(); } }",
 			"Service.kt": `package lib
@@ -188,13 +188,13 @@ class Service { companion object {
     @JvmStatic fun staticRun() {}
 } }`,
 		})
-		assertJVMUnresolved(t, r, "Caller.java", "Service.Companion.run")
+		assertJVMResolved(t, r, "Caller.java", "Service.Companion.run", "Service.kt", "java_import_scope")
 		assertJVMUnresolved(t, r, "Caller.java", "Service.run")
-		assertJVMReference(t, r, "Caller.java", "Service.Companion.run", false)
+		assertJVMReference(t, r, "Caller.java", "Service.Companion.run", true)
 		assertJVMReference(t, r, "Caller.java", "Service.run", false)
 		callees, err := r.store.FindCallees(r.ctx, r.repoID, "app.Caller.call", 0, 10, 0)
-		if err != nil || hasSymbolQName(callees, "lib.Service.run") {
-			t.Fatalf("FindCallees with unpersisted companion member = %#v, %v", callees, err)
+		if err != nil || !hasSymbolQName(callees, "lib.Service.Companion.run") {
+			t.Fatalf("FindCallees with persisted companion member = %#v, %v", callees, err)
 		}
 		r.assertFreshParity(t, "unsupported companion evidence")
 	})
