@@ -9,7 +9,7 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
-// Sentinel errors for the two ways a parser-profile transition can stop a scan.
+// Sentinel errors for parser-profile safety stops.
 // Callers (CLI, MCP, watcher) branch on these with errors.Is; nothing in this
 // repository is allowed to match on the message text, which exists only to be
 // actionable to a human.
@@ -21,11 +21,9 @@ var (
 	// binary, so the scan refuses BEFORE mutating anything.
 	ErrParserDowngradeRefused = errors.New("parser downgrade refused")
 
-	// ErrParserProfileTransitionRequired: a path-scoped scan (watcher flush,
-	// explicit paths) is about to touch a language whose existing files were
-	// indexed by a different -- or unknown -- parser. Honouring it would convert
-	// the repository one file at a time and leave a same-language mixed graph,
-	// so the scan refuses and asks for one full run to converge the language.
+	// ErrParserProfileTransitionRequired: a selected language transition cannot
+	// include every stale file because filters or parser coverage exclude part of
+	// that language. The scan refuses rather than leave a mixed-profile graph.
 	ErrParserProfileTransitionRequired = errors.New("parser profile transition required")
 )
 
@@ -102,7 +100,6 @@ func (p parserProfilePlan) languages() []string {
 //	E. stored unknown, current has no call edges  -> ErrParserDowngradeRefused
 //	   (an unknown graph may have been richer; "it has no edges right now" is
 //	    not proof that it never did, so this fails closed)
-//	   path-scoped, any transition                -> ErrParserProfileTransitionRequired
 //	B/D. otherwise                                -> reparse the language
 func planParserProfiles(
 	groups []store.FileParserProfileGroup,
@@ -170,15 +167,6 @@ func planParserProfiles(
 					StoredCallEdges: blocking.CallEdges,
 					Current:         profile,
 				}
-			}
-		}
-		if pathScoped {
-			return parserProfilePlan{}, &ParserProfileError{
-				Reason:          ErrParserProfileTransitionRequired,
-				Language:        language,
-				Stored:          stale[0].Profile,
-				StoredCallEdges: stale[0].CallEdges,
-				Current:         profile,
 			}
 		}
 		plan.reparseLanguages[language] = struct{}{}

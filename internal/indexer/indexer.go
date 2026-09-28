@@ -243,6 +243,26 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	if pathScoped && len(profilePlan.reparseLanguages) > 0 {
+		// A parser profile belongs to a language, not one selected file. Expand a
+		// path-scoped request to every live file in each selected stale language
+		// so the index cannot persist a mixed parser interpretation.
+		languages := profilePlan.languages()
+		profilePaths, err := i.store.FilePathsForLanguages(ctx, repo.ID, languages)
+		if err != nil {
+			return store.ScanSummary{}, err
+		}
+		for _, rel := range profilePaths {
+			adapter := i.registry.AdapterFor(rel)
+			if shouldIgnorePath(rel, opts.Exclude) || shouldSkipFile(rel, opts.Include, opts.Exclude) || adapter == nil {
+				language := languages[0]
+				return store.ScanSummary{}, &ParserProfileError{Reason: ErrParserProfileTransitionRequired, Language: language, Current: currentProfiles[language]}
+			}
+		}
+		candidatePaths = append(candidatePaths, profilePaths...)
+		slices.Sort(candidatePaths)
+		candidatePaths = slices.Compact(candidatePaths)
+	}
 
 	// P22.11: a repository indexed by an older release holds C/C++ call edges
 	// whose destination lost its receiver (`v.size()` persisted as `size`), and

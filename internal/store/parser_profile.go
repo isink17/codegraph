@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"slices"
 	"sort"
 )
 
@@ -154,4 +155,47 @@ func (s *Store) FileParserProfileGroups(ctx context.Context, repoID int64) ([]Fi
 		return out[i].Profile < out[j].Profile
 	})
 	return out, nil
+}
+
+// FilePathsForLanguages returns live paths owned by selected languages in
+// deterministic order. Indexer uses it to widen a path-scoped parser-profile
+// transition to every file that must share the new profile.
+func (s *Store) FilePathsForLanguages(ctx context.Context, repoID int64, languages []string) ([]string, error) {
+	if len(languages) == 0 {
+		return nil, nil
+	}
+	languages = slices.Clone(languages)
+	sort.Strings(languages)
+	languages = slices.Compact(languages)
+	var paths []string
+	for start := 0; start < len(languages); start += sqliteInClauseBatchSize {
+		end := min(start+sqliteInClauseBatchSize, len(languages))
+		chunk := languages[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoID)
+		for _, language := range chunk {
+			args = append(args, language)
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND is_deleted=0 AND language IN (`+placeholders(len(chunk))+`) ORDER BY path`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			paths = append(paths, path)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	slices.Sort(paths)
+	return slices.Compact(paths), nil
 }

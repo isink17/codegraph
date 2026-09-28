@@ -850,8 +850,8 @@ func TestSwiftV2ProfileSafety(t *testing.T) {
 	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: v3.ID, CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": fallback}, all, false); !errors.Is(err, ErrParserDowngradeRefused) {
 		t.Fatalf("downgrade error=%v, want refusal", err)
 	}
-	if _, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: "treesitter:swift:v2", CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": v3}, all, true); !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("path transition error=%v, want refusal", err)
+	if plan, err := planParserProfiles([]store.FileParserProfileGroup{{Language: "swift", Profile: "treesitter:swift:v2", CallEdges: true, Files: 1}}, map[string]parser.Profile{"swift": v3}, all, true); err != nil || strings.Join(plan.languages(), ",") != "swift" {
+		t.Fatalf("path transition plan=%v, err=%v", plan.languages(), err)
 	}
 }
 

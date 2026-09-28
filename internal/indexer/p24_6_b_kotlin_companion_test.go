@@ -5,7 +5,6 @@ package indexer
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -159,28 +158,21 @@ class Service {
 	profilesBefore := p246Profiles(t, s.raw(t), repo)
 
 	upgraded := New(s.Store, lifecycleRegistry(), nil)
-	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"Service.kt"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("path-scoped transition error = %v, want ErrParserProfileTransitionRequired", err)
-	}
-	if got := p246CompanionRows(t, s.raw(t), repo, "Service.kt"); got != 0 {
-		t.Fatalf("path-scoped transition mutated v2 symbols: %d companion rows", got)
-	}
-
 	r.idx = upgraded
-	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"Service.kt"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if summary.FilesChanged != 2 || summary.FilesIndexed != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
-		t.Fatalf("v2 to v3 update = %+v, want only two Kotlin files reparsed", summary)
+		t.Fatalf("path-scoped v2 to v5 update = %+v, want only two Kotlin files reparsed", summary)
 	}
 	if got := p246CompanionRows(t, s.raw(t), repo, "Service.kt"); got != 1 {
-		t.Fatalf("v3 companion symbols = %d, want 1", got)
+		t.Fatalf("v5 companion symbols = %d, want 1", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v4" {
+	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v5" {
 		t.Fatalf("upgraded profile = %q", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v4" {
+	if got := p246FileProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v5" {
 		t.Fatalf("other Kotlin profile = %q", got)
 	}
 	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
@@ -354,6 +346,70 @@ func (a kotlinV3WithoutFixedArity) Parse(ctx context.Context, path string, conte
 	return parsed, err
 }
 
+type kotlinV4WithoutJVMCallableEvidence struct{ *tsparser.KotlinAdapter }
+
+func (a kotlinV4WithoutJVMCallableEvidence) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:kotlin:v4", EmitsCallEdges: true}
+}
+func (a kotlinV4WithoutJVMCallableEvidence) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	parsed, err := a.KotlinAdapter.Parse(ctx, path, content)
+	parsed.KotlinJVMCallableEvidence = nil
+	return parsed, err
+}
+
+func TestP247KotlinV4ToV5EvidenceConvergence(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	files := map[string]string{
+		"Caller.java": `package app; import lib.ActionsKt; class Caller { void call() { ActionsKt.run(1); } }`,
+		"Actions.kt":  "package lib\n@JvmOverloads fun run(a: kotlin.Int, b: kotlin.String = \"\") {}",
+		"Other.kt":    "package lib\nfun helper() {}",
+		"main.go":     "package main\nfunc main() {}\n",
+		"caller.ts":   "export function caller(): void {}\n",
+	}
+	for path, content := range files {
+		writeProfileFile(t, filepath.Join(root, path), content)
+	}
+	s := newProfileStore(t)
+	legacyRegistry := parser.NewRegistry(tsparser.NewJava(), kotlinV4WithoutJVMCallableEvidence{tsparser.NewKotlin()}, goparser.New(), tsparser.NewTypeScript())
+	legacy := New(s.Store, legacyRegistry, nil)
+	if _, err := legacy.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: New(s.Store, lifecycleRegistry(), nil), repoID: repo}
+	assertJVMUnresolved(t, r, "Caller.java", "ActionsKt.run")
+	if got := p246FileProfile(t, s.raw(t), repo, "Caller.java"); got != "treesitter:java:v2" {
+		t.Fatalf("Java profile=%q", got)
+	}
+	summary, err := r.idx.Update(ctx, Options{RepoRoot: root, Paths: []string{"Actions.kt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FilesChanged != 2 || summary.FilesIndexed != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
+		t.Fatalf("v4-to-v5 update=%+v", summary)
+	}
+	for _, path := range []string{"Actions.kt", "Other.kt"} {
+		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v5" {
+			t.Fatalf("%s profile=%q", path, got)
+		}
+	}
+	for _, path := range []string{"Caller.java", "main.go", "caller.ts"} {
+		got := p246FileProfile(t, s.raw(t), repo, path)
+		want := map[string]string{"Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
+		if got != want {
+			t.Fatalf("unrelated %s profile=%q want %q", path, got, want)
+		}
+	}
+	assertJVMResolved(t, r, "Caller.java", "ActionsKt.run", "Actions.kt", "java_import_scope")
+	assertJVMReference(t, r, "Caller.java", "ActionsKt.run", true)
+	r.assertFreshParity(t, "Kotlin v4-to-v5 evidence convergence")
+	again, err := r.idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil || again.FilesChanged != 0 || again.FilesIndexed != 0 {
+		t.Fatalf("second update=%+v, %v", again, err)
+	}
+}
+
 func TestP247JavaKotlinArityProfileConvergence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -384,16 +440,17 @@ func TestP247JavaKotlinArityProfileConvergence(t *testing.T) {
 	assertJVMUnresolved(t, &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, repoID: repo}, "Caller.java", "ActionsKt.run")
 
 	upgraded := New(s.Store, lifecycleRegistry(), nil)
-	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"Caller.java"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("path-scoped transition error=%v, want ErrParserProfileTransitionRequired", err)
+	javaSummary, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"Caller.java"}})
+	if err != nil || javaSummary.FilesChanged != 2 || strings.Join(javaSummary.ParserProfileLanguages, ",") != "java" {
+		t.Fatalf("path-scoped Java transition=%+v, %v", javaSummary, err)
 	}
 	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: upgraded, repoID: repo}
 	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.FilesChanged != 4 || summary.FilesIndexed != 4 || strings.Join(summary.ParserProfileLanguages, ",") != "java,kotlin" {
-		t.Fatalf("profile convergence summary=%+v, want 4 files in Java/Kotlin", summary)
+	if summary.FilesChanged != 2 || summary.FilesIndexed != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
+		t.Fatalf("profile convergence summary=%+v, want 2 Kotlin files", summary)
 	}
 	for _, path := range []string{"Caller.java", "Second.java"} {
 		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:java:v2" {
@@ -401,7 +458,7 @@ func TestP247JavaKotlinArityProfileConvergence(t *testing.T) {
 		}
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v4" {
+		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v5" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}

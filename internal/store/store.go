@@ -2301,6 +2301,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM swift_lexical_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM kotlin_jvm_callable_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM go_local_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2453,6 +2456,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM swift_declaration_facts WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM kotlin_jvm_callable_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM swift_extension_memberships WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2732,6 +2738,25 @@ func insertParsedFileGraph(
 			args = append(args, repoID, fileID, symbolIDs[fact.SymbolIndex], boolInt(fact.Final), boolInt(fact.Override), fact.Dispatch)
 		}
 		if err := execBatchInsert(ctx, tx, "swift_declaration_facts", "repo_id, file_id, symbol_id, is_final, is_override, dispatch_kind", 6, args, stats); err != nil {
+			return nil, err
+		}
+	}
+	if len(parsed.KotlinJVMCallableEvidence) > 0 {
+		args := make([]any, 0, len(parsed.KotlinJVMCallableEvidence)*6)
+		for _, fact := range parsed.KotlinJVMCallableEvidence {
+			if fact.SymbolIndex < 0 || fact.SymbolIndex >= len(symbolIDs) || parsed.Symbols[fact.SymbolIndex].Language != "kotlin" || parsed.Symbols[fact.SymbolIndex].Kind != "function" {
+				return nil, fmt.Errorf("invalid Kotlin JVM callable evidence symbol index %d", fact.SymbolIndex)
+			}
+			var minArity, maxArity any
+			if fact.Known {
+				if fact.ArityMin < 0 || fact.ArityMax < fact.ArityMin {
+					return nil, fmt.Errorf("invalid Kotlin JVM callable arity range %d..%d", fact.ArityMin, fact.ArityMax)
+				}
+				minArity, maxArity = fact.ArityMin, fact.ArityMax
+			}
+			args = append(args, repoID, fileID, symbolIDs[fact.SymbolIndex], boolInt(fact.Known), minArity, maxArity)
+		}
+		if err := execBatchInsert(ctx, tx, "kotlin_jvm_callable_evidence", "repo_id, file_id, symbol_id, is_known, jvm_arity_min, jvm_arity_max", 6, args, stats); err != nil {
 			return nil, err
 		}
 	}

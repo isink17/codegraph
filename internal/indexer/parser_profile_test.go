@@ -273,12 +273,12 @@ func TestPlanParserProfilesCases(t *testing.T) {
 		}
 	})
 
-	t.Run("path-scoped transition refuses", func(t *testing.T) {
-		_, err := planParserProfiles(
+	t.Run("path-scoped transition plans language convergence", func(t *testing.T) {
+		plan, err := planParserProfiles(
 			[]store.FileParserProfileGroup{{Language: "java", Profile: heurJava.ID, Files: 1}},
 			map[string]parser.Profile{"java": tsJava}, all, true)
-		if !errors.Is(err, ErrParserProfileTransitionRequired) {
-			t.Fatalf("err = %v, want ErrParserProfileTransitionRequired", err)
+		if err != nil || strings.Join(plan.languages(), ",") != "java" {
+			t.Fatalf("plan=%v, err=%v; want [java]", plan.languages(), err)
 		}
 	})
 
@@ -287,9 +287,9 @@ func TestPlanParserProfilesCases(t *testing.T) {
 			{Language: "java", Profile: tsJava.ID, CallEdges: true, Files: 2},
 			{Language: "java", Profile: heurJava.ID, Files: 1},
 		}
-		_, err := planParserProfiles(groups, map[string]parser.Profile{"java": tsJava}, all, true)
-		if !errors.Is(err, ErrParserProfileTransitionRequired) {
-			t.Fatalf("path-scoped err = %v, want transition required", err)
+		pathPlan, err := planParserProfiles(groups, map[string]parser.Profile{"java": tsJava}, all, true)
+		if err != nil || strings.Join(pathPlan.languages(), ",") != "java" {
+			t.Fatalf("path-scoped plan=%v, err=%v; want [java]", pathPlan.languages(), err)
 		}
 		plan, err := planParserProfiles(groups, map[string]parser.Profile{"java": tsJava}, all, false)
 		if err != nil {
@@ -438,7 +438,7 @@ func TestParserProfileDowngradeRefusedWithZeroMutation(t *testing.T) {
 	}
 }
 
-func TestParserProfilePathScopedTransitionRefused(t *testing.T) {
+func TestParserProfilePathScopedTransitionExpandsSelectedLanguage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	writeProfileFile(t, filepath.Join(root, "A.java"), "class A {}\n")
@@ -453,13 +453,9 @@ func TestParserProfilePathScopedTransitionRefused(t *testing.T) {
 	}
 
 	upgraded := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "treesitter:java:v1"), goAdapter), nil)
-	before := graphSnapshot(t, s)
-	_, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}})
-	if !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("err = %v, want ErrParserProfileTransitionRequired", err)
-	}
-	if after := graphSnapshot(t, s); before != after {
-		t.Fatalf("path-scoped refusal mutated the graph:\nbefore %#v\nafter  %#v", before, after)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}})
+	if err != nil || summary.FilesChanged != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "java" {
+		t.Fatalf("path-scoped transition=%+v, err=%v; want both Java files only", summary, err)
 	}
 
 	// A Go-only path-scoped scan is unaffected by the stale Java profile.
@@ -467,9 +463,9 @@ func TestParserProfilePathScopedTransitionRefused(t *testing.T) {
 		t.Fatalf("Go-only path scan err = %v, want nil", err)
 	}
 
-	// One full run converges the language, after which path scans resume.
-	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
-		t.Fatalf("full Update() error = %v", err)
+	// Full update is now a no-op; selected path transitions already converged Java.
+	if summary, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil || summary.FilesChanged != 0 {
+		t.Fatalf("post-transition full update=%+v, %v", summary, err)
 	}
 	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); err != nil {
 		t.Fatalf("post-convergence path scan err = %v, want nil", err)
@@ -666,11 +662,11 @@ func TestParserProfileUnknownLegacyProvenance(t *testing.T) {
 		}
 	})
 
-	t.Run("path-scoped run refuses while provenance is unknown", func(t *testing.T) {
+	t.Run("path-scoped run converges unknown provenance", func(t *testing.T) {
 		s, root := setup(t)
 		upgraded := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "treesitter:java:v1")), nil)
-		if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
-			t.Fatalf("err = %v, want ErrParserProfileTransitionRequired", err)
+		if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); err != nil {
+			t.Fatalf("err = %v, want language-scoped convergence", err)
 		}
 	})
 }
@@ -760,9 +756,9 @@ func TestParserProfilePathScopedIgnoresUnparsedCandidates(t *testing.T) {
 	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}, Exclude: []string{"A.java"}}); err != nil {
 		t.Fatalf("excluded-path flush err = %v, want nil", err)
 	}
-	// A path the run WOULD parse still refuses.
-	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("err = %v, want ErrParserProfileTransitionRequired", err)
+	// A selected stale language expands to every indexed file in that language.
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}}); err != nil {
+		t.Fatalf("err = %v, want language-scoped convergence", err)
 	}
 }
 
@@ -824,23 +820,16 @@ func TestParserProfileEvidenceOnlyFilesPinProvenance(t *testing.T) {
 
 	upgraded := New(s.Store, parser.NewRegistry(callCapable("typescript", ".ts", "treesitter:typescript:v1")), nil)
 
-	// A path-scoped scan cannot converge a language, so it must refuse rather
-	// than rewrite one evidence-only file under the new parser.
-	before := graphSnapshot(t, s)
-	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"bootstrap.ts"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
-		t.Fatalf("path-scoped err = %v, want ErrParserProfileTransitionRequired", err)
-	}
-	if after := graphSnapshot(t, s); before != after {
-		t.Fatalf("path-scoped refusal mutated the graph:\nbefore %#v\nafter  %#v", before, after)
+	// A path-scoped transition expands to every indexed TypeScript file.
+	pathSummary, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"bootstrap.ts"}})
+	if err != nil || pathSummary.FilesChanged != 2 || strings.Join(pathSummary.ParserProfileLanguages, ",") != "typescript" {
+		t.Fatalf("path-scoped transition=%+v, err=%v", pathSummary, err)
 	}
 
 	// A full run converges them and stamps the current profile.
 	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
-	if err != nil {
-		t.Fatalf("full Update() error = %v", err)
-	}
-	if summary.FilesChanged != 2 {
-		t.Fatalf("FilesChanged = %d, want 2 (both evidence-only files reparsed)", summary.FilesChanged)
+	if err != nil || summary.FilesChanged != 0 {
+		t.Fatalf("post-transition full Update()=%+v, %v", summary, err)
 	}
 	groups = profilesInDB(t, s, repoID(t, s, root))
 	if len(groups) != 1 || groups[0].Profile != "treesitter:typescript:v1" || groups[0].Files != 2 || !groups[0].CallEdges {

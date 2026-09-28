@@ -20,11 +20,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
 }
 
-// Kotlin v4 adds exact fixed arity facts for the conservative Java-callable
-// subset. Unchanged bytes persist new source facts, so every Kotlin file has
-// to reparse.
+// Kotlin v5 adds JVM callable arity evidence for default parameters and
+// @JvmOverloads. Unchanged Kotlin source can now persist this evidence.
 func (a *KotlinAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:kotlin:v4", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:kotlin:v5", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}

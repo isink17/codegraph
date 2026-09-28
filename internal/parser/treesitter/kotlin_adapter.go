@@ -319,6 +319,169 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "func:kotlin:" + qualified,
 	})
+	if fact, ok := kotlinJVMCallableEvidence(node, content, imports, len(pf.Symbols)-1); ok {
+		pf.KotlinJVMCallableEvidence = append(pf.KotlinJVMCallableEvidence, fact)
+	}
+}
+
+// kotlinJVMCallableEvidence records Java arities only for defaulted functions
+// or functions explicitly annotated with JvmOverloads. Parameter boundaries
+// and defaults come from tree-sitter nodes; source text is used only to classify
+// annotation spellings in the modifier region.
+func kotlinJVMCallableEvidence(node *sitter.Node, content []byte, imports []graph.ScopeImport, symbolIndex int) (graph.KotlinJVMCallableEvidence, bool) {
+	unknown := graph.KotlinJVMCallableEvidence{SymbolIndex: symbolIndex}
+	if node == nil || node.HasError() {
+		return unknown, false
+	}
+	fun := childByFieldName(node, "name")
+	if fun == nil {
+		fun = firstChild(node, "simple_identifier")
+	}
+	params := firstChild(node, "function_value_parameters")
+	if fun == nil || params == nil || params.HasError() {
+		return unknown, false
+	}
+	prefix := string(content[node.StartByte():fun.StartByte()])
+	defaultCount, count, hasVararg, hasIntroducedParam := 0, 0, false, false
+	paramTypes := make([]*sitter.Node, 0, params.NamedChildCount())
+	for i := range int(params.ChildCount()) {
+		param := params.Child(i)
+		if param.Type() != "parameter" {
+			continue // tree-sitter represents a default expression as a sibling
+		}
+		if param.HasError() {
+			return unknown, true
+		}
+		count++
+		var typ *sitter.Node
+		nextParam := params.EndByte()
+		for j := i + 1; j < int(params.ChildCount()); j++ {
+			if params.Child(j).Type() == "parameter" {
+				nextParam = params.Child(j).StartByte()
+				break
+			}
+		}
+		hasDefault := false
+		for j := i + 1; j < int(params.ChildCount()) && params.Child(j).StartByte() < nextParam; j++ {
+			hasDefault = hasDefault || params.Child(j).Type() == "="
+		}
+		for j := range int(param.ChildCount()) {
+			child := param.Child(j)
+			switch child.Type() {
+			case "parameter_modifiers":
+				if strings.Contains(nodeText(child, content), "vararg") {
+					hasVararg = true
+				}
+			case ":":
+				if j+1 < int(param.ChildCount()) {
+					typ = param.Child(j + 1)
+				}
+			}
+		}
+		if hasDefault && kotlinHasAnnotation(nodeText(param, content), "IntroducedAt", "kotlin.IntroducedAt", imports) {
+			hasIntroducedParam = true
+		}
+		if hasDefault {
+			defaultCount++
+		}
+		paramTypes = append(paramTypes, typ)
+	}
+	parameterSource := nodeText(params, content)
+	hasVararg = hasVararg || kotlinHasToken(parameterSource, "vararg")
+	hasIntroducedParam = hasIntroducedParam || kotlinHasAnnotation(parameterSource, "IntroducedAt", "kotlin.IntroducedAt", imports)
+	hasOverloads := kotlinHasAnnotation(prefix, "JvmOverloads", "kotlin.jvm.JvmOverloads", imports)
+	hasIntroduced := kotlinHasAnnotation(prefix, "IntroducedAt", "kotlin.IntroducedAt", imports)
+	if defaultCount == 0 && !hasOverloads && !hasIntroduced && !hasIntroducedParam {
+		return unknown, false
+	}
+	unknown.Known = false
+	if hasIntroduced || hasIntroducedParam || hasVararg || kotlinHasToken(prefix, "suspend") || kotlinHasToken(prefix, "internal") || kotlinHasToken(prefix, "external") || kotlinHasToken(prefix, "expect") || kotlinHasAnnotation(prefix, "JvmExposeBoxed", "kotlin.jvm.JvmExposeBoxed", imports) || kotlinHasAnnotation(prefix, "JvmName", "kotlin.jvm.JvmName", imports) || kotlinHasUnknownAliasedJVMAnnotation(prefix+parameterSource, imports) {
+		return unknown, true
+	}
+	name := childByFieldName(node, "name")
+	if name == nil {
+		name = firstChild(node, "simple_identifier")
+	}
+	if name == nil {
+		return unknown, true
+	}
+	var funToken *sitter.Node
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		if child.Type() == "fun" {
+			funToken = child
+			continue
+		}
+		if child.Type() == "type_parameters" {
+			return unknown, true
+		}
+		if funToken != nil && child.StartByte() >= funToken.EndByte() && child.EndByte() <= name.StartByte() && child.Type() != "type_parameters" {
+			return unknown, true // extension receiver
+		}
+	}
+	if funToken == nil || name == nil {
+		return unknown, true
+	}
+	for _, typ := range paramTypes {
+		if !kotlinPlainJavaType(typ, content) {
+			return unknown, true
+		}
+	}
+	if result, explicit := kotlinFunctionReturnType(node); explicit && !kotlinPlainJavaType(result, content) {
+		return unknown, true
+	}
+	if _, explicit := kotlinFunctionReturnType(node); !explicit {
+		body := firstChild(node, "function_body")
+		if body == nil || strings.HasPrefix(strings.TrimSpace(nodeText(body, content)), "=") {
+			return unknown, true
+		}
+	}
+	if !hasOverloads {
+		defaultCount = 0
+	}
+	unknown.Known = true
+	unknown.ArityMin, unknown.ArityMax = count-defaultCount, count
+	return unknown, true
+}
+
+func kotlinHasAnnotation(prefix, simple, qualified string, imports []graph.ScopeImport) bool {
+	for _, spelling := range []string{"@" + simple, "@" + qualified} {
+		if kotlinAnnotationPresent(prefix, spelling) {
+			return true
+		}
+	}
+	for _, imp := range imports {
+		if imp.SourceSpecifier == qualified && !imp.Wildcard && imp.LocalName != "" && kotlinAnnotationPresent(prefix, "@"+imp.LocalName) {
+			return true
+		}
+	}
+	return false
+}
+
+func kotlinAnnotationPresent(source, spelling string) bool {
+	for start := 0; ; {
+		rel := strings.Index(source[start:], spelling)
+		if rel < 0 {
+			return false
+		}
+		end := start + rel + len(spelling)
+		if end == len(source) || source[end] == '(' || source[end] == '[' || source[end] == ':' || source[end] == ' ' || source[end] == '\t' || source[end] == '\r' || source[end] == '\n' {
+			return true
+		}
+		start = end
+	}
+}
+
+func kotlinHasUnknownAliasedJVMAnnotation(source string, imports []graph.ScopeImport) bool {
+	for _, imp := range imports {
+		if strings.HasPrefix(imp.SourceSpecifier, "kotlin.jvm.") && !imp.Wildcard && imp.LocalName != "" && imp.LocalName != imp.ImportedName && kotlinAnnotationPresent(source, "@"+imp.LocalName) {
+			if imp.SourceSpecifier == "kotlin.jvm.JvmOverloads" || imp.SourceSpecifier == "kotlin.jvm.JvmSynthetic" || imp.SourceSpecifier == "kotlin.jvm.JvmStatic" {
+				continue
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // kotlinFixedJavaCallableArity persists exact arity only for declarations
