@@ -32,7 +32,7 @@ func TestMigrationKotlinJVMCallableEvidenceFrom042(t *testing.T) {
 		t.Fatalf("primary-key index count=%d, err=%v", primaryIndex, err)
 	}
 	var version int
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 43 {
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 44 {
 		t.Fatalf("migration ceiling=%d, err=%v", version, err)
 	}
 }

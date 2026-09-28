@@ -382,7 +382,7 @@ func TestJVMFileFacadeKotlinV1ProfileUpgrade(t *testing.T) {
 		t.Fatalf("upgraded binding = %q", got)
 	}
 	var profile string
-	if err := s.raw(t).QueryRowContext(ctx, `SELECT parser_profile FROM files WHERE repo_id=? AND path='Actions.kt'`, repo).Scan(&profile); err != nil || profile != "treesitter:kotlin:v5" {
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT parser_profile FROM files WHERE repo_id=? AND path='Actions.kt'`, repo).Scan(&profile); err != nil || profile != "treesitter:kotlin:v6" {
 		t.Fatalf("upgraded profile = %q, %v", profile, err)
 	}
 	fresh := newProfileStore(t)
