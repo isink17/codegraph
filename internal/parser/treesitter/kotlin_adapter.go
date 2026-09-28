@@ -42,7 +42,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 
 	kotlinExtractImports(root, content, &pf)
 	pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports)
-	kotlinExtractSymbols(root, module, "", "module", content, &pf)
+	kotlinExtractSymbols(root, module, "", "module", content, pf.Scope.Imports, &pf)
 	kotlinExtractCalls(root, content, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
@@ -188,29 +188,29 @@ func kotlinPlainJavaIdentifier(name string) bool {
 	return true
 }
 
-func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, pf *graph.ParsedFile) {
+func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
 		case "class_declaration":
-			kotlinAddType(child, module, container, "class", content, pf)
+			kotlinAddType(child, module, container, "class", content, imports, pf)
 		case "object_declaration":
-			kotlinAddType(child, module, container, "object", content, pf)
+			kotlinAddType(child, module, container, "object", content, imports, pf)
 		case "interface_declaration":
-			kotlinAddType(child, module, container, "interface", content, pf)
+			kotlinAddType(child, module, container, "interface", content, imports, pf)
 		case "function_declaration":
 			if ownerKind == "type" || ownerKind == "module" || ownerKind == "companion" {
-				kotlinAddFunction(child, module, container, content, pf)
+				kotlinAddFunction(child, module, container, content, imports, pf)
 			}
 		case "companion_object":
 			if ownerKind == "type" {
-				kotlinAddCompanion(child, module, container, content, pf)
+				kotlinAddCompanion(child, module, container, content, imports, pf)
 			}
 		}
 	}
 }
 
-func kotlinAddCompanion(node *sitter.Node, module, outerContainer string, content []byte, pf *graph.ParsedFile) {
+func kotlinAddCompanion(node *sitter.Node, module, outerContainer string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
 	if outerContainer == "" {
 		return
 	}
@@ -237,11 +237,11 @@ func kotlinAddCompanion(node *sitter.Node, module, outerContainer string, conten
 	})
 
 	if body := firstChild(node, "class_body"); body != nil {
-		kotlinExtractSymbols(body, module, container, "companion", content, pf)
+		kotlinExtractSymbols(body, module, container, "companion", content, imports, pf)
 	}
 }
 
-func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byte, pf *graph.ParsedFile) {
+func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		nameNode = firstChild(node, "type_identifier")
@@ -278,11 +278,11 @@ func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byt
 		if parent != "" {
 			nextContainer = parent + "." + name
 		}
-		kotlinExtractSymbols(body, module, nextContainer, "type", content, pf)
+		kotlinExtractSymbols(body, module, nextContainer, "type", content, imports, pf)
 	}
 }
 
-func kotlinAddFunction(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {
+func kotlinAddFunction(node *sitter.Node, module, container string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		nameNode = firstChild(node, "simple_identifier")
@@ -300,6 +300,10 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 		qualified = kotlinQualified(module, container+"."+name)
 	}
 	sig := kotlinDeclarationSignature(node, content)
+	var arityMin, arityMax *int
+	if arity := kotlinFixedJavaCallableArity(node, content, imports); arity != nil {
+		arityMin, arityMax = arity, arity
+	}
 
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
 		Language:      "kotlin",
@@ -309,10 +313,148 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 		ContainerName: effectiveContainer,
 		Signature:     sig,
 		Visibility:    kotlinVisibility(node, content),
+		ArityMin:      arityMin,
+		ArityMax:      arityMax,
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "func:kotlin:" + qualified,
 	})
+}
+
+// kotlinFixedJavaCallableArity persists exact arity only for declarations
+// whose source parameter count is also a plain Java JVM call shape. Fully
+// qualified built-in types avoid package declarations and aliases shadowing
+// short names such as Int. Unknown types remain unknown; no type resolution is
+// attempted here.
+func kotlinFixedJavaCallableArity(node *sitter.Node, content []byte, imports []graph.ScopeImport) *int {
+	if node == nil || node.HasError() {
+		return nil
+	}
+	var fun, name *sitter.Node
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		if child.Type() == "fun" {
+			fun = child
+		}
+	}
+	name = childByFieldName(node, "name")
+	if name == nil {
+		name = firstChild(node, "simple_identifier")
+	}
+	if fun == nil || name == nil {
+		return nil
+	}
+	prefix := string(content[node.StartByte():fun.StartByte()])
+	for _, forbidden := range []string{"JvmName", "JvmSynthetic", "JvmOverloads", "JvmExposeBoxed"} {
+		if strings.Contains(prefix, forbidden) || kotlinUsesAliasedJVMAnnotation(prefix, imports, forbidden) {
+			return nil
+		}
+	}
+	if kotlinUsesAliasedJVMAnnotation(prefix, imports, "JvmStatic") {
+		return nil
+	}
+	for _, modifier := range []string{"suspend", "internal", "external", "expect"} {
+		if kotlinHasToken(prefix, modifier) {
+			return nil
+		}
+	}
+
+	// Any receiver node between `fun` and the declared name is an extension
+	// receiver. A generic type-parameter list is the only permitted node there.
+	for i := range int(node.ChildCount()) {
+		child := node.Child(i)
+		if child.StartByte() < fun.EndByte() || child.EndByte() > name.StartByte() || child == fun {
+			continue
+		}
+		if child.Type() != "type_parameters" {
+			return nil
+		}
+		if strings.Contains(nodeText(child, content), "reified") {
+			return nil
+		}
+	}
+
+	params := firstChild(node, "function_value_parameters")
+	if params == nil || params.HasError() {
+		return nil
+	}
+	count := 0
+	for i := range int(params.NamedChildCount()) {
+		param := params.NamedChild(i)
+		if param.Type() != "parameter" || param.HasError() {
+			return nil
+		}
+		var typ *sitter.Node
+		for j := range int(param.ChildCount()) {
+			child := param.Child(j)
+			if child.Type() == "=" || child.Type() == "parameter_modifiers" {
+				return nil
+			}
+			if child.Type() == ":" && j+1 < int(param.ChildCount()) {
+				typ = param.Child(j + 1)
+			}
+		}
+		if !kotlinPlainJavaType(typ, content) {
+			return nil
+		}
+		count++
+	}
+
+	if result, explicit := kotlinFunctionReturnType(node); explicit {
+		if !kotlinPlainJavaType(result, content) {
+			return nil
+		}
+	} else {
+		body := firstChild(node, "function_body")
+		if body == nil || strings.HasPrefix(strings.TrimSpace(nodeText(body, content)), "=") {
+			return nil
+		}
+	}
+	return &count
+}
+
+func kotlinFunctionReturnType(node *sitter.Node) (*sitter.Node, bool) {
+	for i := range int(node.ChildCount()) {
+		if node.Child(i).Type() == ":" && i+1 < int(node.ChildCount()) {
+			return node.Child(i + 1), true
+		}
+	}
+	return nil, false
+}
+
+func kotlinPlainJavaType(node *sitter.Node, content []byte) bool {
+	if node == nil || node.HasError() || node.Type() != "user_type" && node.Type() != "nullable_type" {
+		return false
+	}
+	typ := strings.Join(strings.Fields(nodeText(node, content)), "")
+	switch typ {
+	case "kotlin.Boolean", "kotlin.Boolean?", "kotlin.Byte", "kotlin.Byte?", "kotlin.Char", "kotlin.Char?",
+		"kotlin.Double", "kotlin.Double?", "kotlin.Float", "kotlin.Float?", "kotlin.Int", "kotlin.Int?",
+		"kotlin.Long", "kotlin.Long?", "kotlin.Short", "kotlin.Short?", "kotlin.String", "kotlin.String?",
+		"kotlin.Unit", "kotlin.Unit?", "kotlin.Any", "kotlin.Any?", "java.lang.String", "java.lang.String?":
+		return true
+	default:
+		return false
+	}
+}
+
+func kotlinHasToken(source, token string) bool {
+	for _, part := range strings.Fields(source) {
+		part = strings.Trim(part, "@()[],:;")
+		if part == token {
+			return true
+		}
+	}
+	return false
+}
+
+func kotlinUsesAliasedJVMAnnotation(prefix string, imports []graph.ScopeImport, name string) bool {
+	for _, imp := range imports {
+		if imp.SourceSpecifier == "kotlin.jvm."+name && imp.LocalName != name && strings.Contains(prefix, "@"+imp.LocalName) {
+			return true
+		}
+	}
+	return false
 }
 
 func kotlinQualified(pkg, name string) string {

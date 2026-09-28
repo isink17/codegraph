@@ -259,6 +259,7 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Kind:        "calls",
 			Evidence:    nodeText(call, content),
 			Line:        line,
+			CallArity:   javaMethodCallArity(call),
 		})
 		pf.References = append(pf.References, graph.Reference{
 			Kind:          "call",
@@ -267,6 +268,26 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+func javaMethodCallArity(call *sitter.Node) *int {
+	args := childByFieldName(call, "arguments")
+	if args == nil || args.HasError() {
+		return nil
+	}
+	count := 0
+	for i := range int(args.NamedChildCount()) {
+		child := args.NamedChild(i)
+		switch child.Type() {
+		case "line_comment", "block_comment":
+			continue
+		}
+		if child.IsError() {
+			return nil
+		}
+		count++
+	}
+	return &count
 }
 
 func javaCallName(call *sitter.Node, name string, content []byte) string {

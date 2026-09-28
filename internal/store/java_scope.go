@@ -10,7 +10,9 @@ import (
 type javaScopeSymbol struct {
 	id, file                                                           int64
 	name, qname, container, kind, signature, visibility, pkg, language string
-	static                                                             sql.NullInt64
+	static, arityMin, arityMax                                         sql.NullInt64
+	jvmStaticAlias                                                     bool
+	jvmNameAliases                                                     string
 }
 
 type javaScopeImport struct {
@@ -22,6 +24,7 @@ type javaScopeEdge struct {
 	id                                   int64
 	name, kind, evidence, pkg, container string
 	file                                 int64
+	callArity                            sql.NullInt64
 	scoped                               bool
 }
 
@@ -39,7 +42,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	}
 	onlyIDs := sortedIDs(only)
 	var edges []javaScopeEdge
-	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.dst_name,e.edge_kind,e.evidence,e.file_id,s.container_name,COALESCE(fs.package_name,''),fs.file_id IS NOT NULL
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.dst_name,e.edge_kind,e.evidence,e.file_id,s.container_name,COALESCE(fs.package_name,''),fs.file_id IS NOT NULL,e.call_arity
 		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols s ON s.id=e.src_symbol_id
 		LEFT JOIN file_scope_evidence fs ON fs.file_id=e.file_id AND fs.repo_id=e.repo_id
 		WHERE e.repo_id=? AND f.language='java' AND e.dst_symbol_id IS NULL`, " AND e.id IN (%s)",
@@ -47,7 +50,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		func(rows *sql.Rows) error {
 			var x javaScopeEdge
 			var scoped int
-			if err := rows.Scan(&x.id, &x.name, &x.kind, &x.evidence, &x.file, &x.container, &x.pkg, &scoped); err != nil {
+			if err := rows.Scan(&x.id, &x.name, &x.kind, &x.evidence, &x.file, &x.container, &x.pkg, &scoped, &x.callArity); err != nil {
 				return err
 			}
 			x.scoped = scoped != 0
@@ -87,15 +90,19 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	byQName := map[string][]javaScopeSymbol{}
 	byName := map[string][]javaScopeSymbol{}
 	companions := map[string][]javaScopeSymbol{}
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,
+		EXISTS(SELECT 1 FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmStatic' AND ki.local_name!='JvmStatic'),
+		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),'')
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
 		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0`, " AND s.name IN (%s)",
 		[]any{repoID}, stringSliceToAny(nameList), true,
 		func(rows *sql.Rows) error {
 			var s javaScopeSymbol
-			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language); err != nil {
+			var alias int
+			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &alias, &s.jvmNameAliases); err != nil {
 				return err
 			}
+			s.jvmStaticAlias = alias != 0
 			byQName[s.qname] = append(byQName[s.qname], s)
 			byName[s.name] = append(byName[s.name], s)
 			return nil
@@ -113,15 +120,19 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 			}
 		}
 	}
-	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(outerFiles), `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language
+	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(outerFiles), `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,
+		EXISTS(SELECT 1 FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmStatic' AND ki.local_name!='JvmStatic'),
+		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),'')
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
 		WHERE s.repo_id=? AND f.language='kotlin' AND s.kind='companion_object' AND f.is_deleted=0 AND s.file_id IN (`,
 		[]any{repoID},
 		func(scan func(...any) error) error {
 			var s javaScopeSymbol
-			if err := scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language); err != nil {
+			var alias int
+			if err := scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &alias, &s.jvmNameAliases); err != nil {
 				return err
 			}
+			s.jvmStaticAlias = alias != 0
 			byQName[s.qname] = append(byQName[s.qname], s)
 			byName[s.name] = append(byName[s.name], s)
 			companions[kotlinJoin(s.pkg, s.container)] = append(companions[kotlinJoin(s.pkg, s.container)], s)
@@ -156,6 +167,66 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 			return nil
 		}); err != nil {
 		return 0, err
+	}
+	// @JvmName can make a declaration with a different Kotlin source name share
+	// this Java spelling. Load functions only from the already-resolved object,
+	// companion, and facade files so those declarations can participate in
+	// uniqueness without scanning the repository's Kotlin function population.
+	callNames := map[string]struct{}{}
+	for _, e := range edges {
+		name := e.name
+		if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+			name = name[dot+1:]
+		}
+		if name != "" {
+			callNames[name] = struct{}{}
+		}
+	}
+	ownerFiles := map[int64]struct{}{}
+	for _, candidates := range byName {
+		for _, candidate := range candidates {
+			if candidate.language == "kotlin" && (candidate.kind == "class" || candidate.kind == "object") {
+				ownerFiles[candidate.file] = struct{}{}
+			}
+		}
+	}
+	for _, parts := range facades {
+		for _, part := range parts {
+			ownerFiles[part.file] = struct{}{}
+		}
+	}
+	if files := sortedIDs(ownerFiles); len(files) != 0 && len(callNames) != 0 {
+		if err := sqliteBatchedIDQuery(ctx, q, files, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,
+			EXISTS(SELECT 1 FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmStatic' AND ki.local_name!='JvmStatic'),
+			COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),'')
+			FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
+			WHERE s.repo_id=? AND f.language='kotlin' AND s.kind='function' AND f.is_deleted=0 AND s.file_id IN (`,
+			[]any{repoID}, func(scan func(...any) error) error {
+				var s javaScopeSymbol
+				var staticAlias int
+				if err := scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &staticAlias, &s.jvmNameAliases); err != nil {
+					return err
+				}
+				s.jvmStaticAlias = staticAlias != 0
+				javaNames := kotlinJavaNameCandidates(s, callNames)
+				for _, javaName := range javaNames {
+					owner := kotlinJoin(s.pkg, s.container)
+					if s.container == s.pkg {
+						for _, parts := range facades {
+							for _, part := range parts {
+								if part.file == s.file {
+									appendJavaNameCandidate(byQName, kotlinJoin(s.pkg, javaName), s)
+								}
+							}
+						}
+					} else {
+						appendJavaNameCandidate(byQName, owner+"."+javaName, s)
+					}
+				}
+				return nil
+			}); err != nil {
+			return 0, err
+		}
 	}
 	imports := map[int64][]javaScopeImport{}
 	// Load the evidence by file rather than through the selected edges: the
@@ -470,39 +541,87 @@ func kotlinCompanionStaticMember(outer javaScopeSymbol, name string, e javaScope
 }
 
 func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	var out javaScopeSymbol
-	n := 0
-	for _, s := range byQName[companion.qname+"."+name] {
-		if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(companion.qname, companion.pkg+".") || !javaVisibleToJava(s, e.pkg) {
-			continue
+	if kotlinNoArgCall(e.evidence) {
+		var out javaScopeSymbol
+		n := 0
+		for _, s := range byQName[companion.qname+"."+name] {
+			if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(companion.qname, companion.pkg+".") || !javaVisibleToJava(s, e.pkg) {
+				continue
+			}
+			out = s
+			n++
+			if !kotlinFacadeCallable(s.name, s.signature) || !kotlinNoArgFunction(s.signature) || requireJvmStatic && !kotlinHasJvmStatic(s.signature) {
+				return javaScopeSymbol{}, ""
+			}
 		}
-		out = s
-		n++
-		if !kotlinFacadeCallable(s.name, s.signature) || !kotlinNoArgCall(e.evidence) || !kotlinNoArgFunction(s.signature) || requireJvmStatic && !kotlinHasJvmStatic(s.signature) {
+		if n != 1 {
 			return javaScopeSymbol{}, ""
 		}
+		return out, strategy
 	}
-	if n != 1 {
+	var out javaScopeSymbol
+	n := 0
+	unknown := false
+	for _, s := range byQName[companion.qname+"."+name] {
+		if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(companion.qname, companion.pkg+".") {
+			continue
+		}
+		staticMode := 2 // companion field calls support ordinary and @JvmStatic members
+		if requireJvmStatic {
+			staticMode = 1
+		}
+		if status := kotlinCallableArityStatus(s, e, name, staticMode); status < 0 {
+			unknown = true
+		} else if status > 0 {
+			out = s
+			n++
+		}
+	}
+	if unknown || n != 1 {
 		return javaScopeSymbol{}, ""
 	}
 	return out, strategy
 }
 
 func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	var out javaScopeSymbol
-	n := 0
-	for _, s := range byQName[owner.qname+"."+name] {
-		if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(owner.qname, owner.pkg+".") || !javaVisibleToJava(s, e.pkg) {
-			continue
+	if kotlinNoArgCall(e.evidence) {
+		var out javaScopeSymbol
+		n := 0
+		for _, s := range byQName[owner.qname+"."+name] {
+			if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(owner.qname, owner.pkg+".") || !javaVisibleToJava(s, e.pkg) {
+				continue
+			}
+			out = s
+			n++
+			jvmStatic := kotlinHasJvmStatic(s.signature)
+			if kotlinExtensionSignature(s.name, s.signature) || kotlinHasJvmName(s.signature) || !kotlinNoArgFunction(s.signature) || jvmStatic != requireJvmStatic {
+				return javaScopeSymbol{}, ""
+			}
 		}
-		out = s
-		n++
-		jvmStatic := kotlinHasJvmStatic(s.signature)
-		if kotlinExtensionSignature(s.name, s.signature) || kotlinHasJvmName(s.signature) || !kotlinNoArgCall(e.evidence) || !kotlinNoArgFunction(s.signature) || jvmStatic != requireJvmStatic {
+		if n != 1 {
 			return javaScopeSymbol{}, ""
 		}
+		return out, strategy
 	}
-	if n != 1 {
+	var out javaScopeSymbol
+	n := 0
+	unknown := false
+	for _, s := range byQName[owner.qname+"."+name] {
+		if s.language != "kotlin" || s.kind != "function" || s.container != strings.TrimPrefix(owner.qname, owner.pkg+".") {
+			continue
+		}
+		staticMode := 0
+		if requireJvmStatic {
+			staticMode = 1
+		}
+		if status := kotlinCallableArityStatus(s, e, name, staticMode); status < 0 {
+			unknown = true
+		} else if status > 0 {
+			out = s
+			n++
+		}
+	}
+	if unknown || n != 1 {
 		return javaScopeSymbol{}, ""
 	}
 	return out, strategy
@@ -528,18 +647,159 @@ func kotlinFacadeMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 		}
 		files[part.file] = struct{}{}
 	}
+	if kotlinNoArgCall(e.evidence) {
+		var out javaScopeSymbol
+		n := 0
+		for _, s := range byQName[kotlinJoin(owner.pkg, name)] {
+			if _, inFacade := files[s.file]; inFacade && s.language == "kotlin" && s.kind == "function" && s.container == s.pkg {
+				out = s
+				n++
+			}
+		}
+		if n != 1 || !javaVisibleToJava(out, e.pkg) || !kotlinFacadeCallable(out.name, out.signature) || !kotlinNoArgFunction(out.signature) {
+			return javaScopeSymbol{}, ""
+		}
+		return out, strategy
+	}
 	var out javaScopeSymbol
 	n := 0
+	unknown := false
 	for _, s := range byQName[kotlinJoin(owner.pkg, name)] {
-		if _, inFacade := files[s.file]; inFacade && s.language == "kotlin" && s.kind == "function" && s.container == s.pkg {
+		if _, inFacade := files[s.file]; !inFacade || s.language != "kotlin" || s.kind != "function" || s.container != s.pkg {
+			continue
+		}
+		if status := kotlinCallableArityStatus(s, e, name, 0); status < 0 {
+			unknown = true
+		} else if status > 0 {
 			out = s
 			n++
 		}
 	}
-	if n != 1 || !javaVisibleToJava(out, e.pkg) || !kotlinFacadeCallable(out.name, out.signature) || !kotlinNoArgCall(e.evidence) || !kotlinNoArgFunction(out.signature) {
+	if unknown || n != 1 {
 		return javaScopeSymbol{}, ""
 	}
 	return out, strategy
+}
+
+// kotlinCallableArityStatus returns 1 for a fixed-arity ABI candidate, 0 for a
+// candidate proven irrelevant to this Java spelling, and -1 when unsupported
+// syntax could still participate and must veto selection.
+func kotlinCallableArityStatus(s javaScopeSymbol, e javaScopeEdge, javaName string, staticMode int) int {
+	if s.visibility == "private" {
+		return 0
+	}
+	if s.visibility != "" && s.visibility != "public" {
+		return -1
+	}
+	if kotlinHasJvmSynthetic(s.signature) {
+		return 0
+	}
+	if renamed, known := kotlinJvmNameForSymbol(s); known {
+		if renamed != javaName {
+			return 0
+		}
+		return -1
+	}
+	if s.jvmNameAliases != "" || kotlinHasJvmName(s.signature) || kotlinExtensionSignature(s.name, s.signature) || !kotlinFacadeCallable(s.name, s.signature) {
+		return -1
+	}
+	jvmStatic := kotlinHasJvmStatic(s.signature)
+	if staticMode != 2 && (staticMode == 1) != jvmStatic {
+		if s.jvmStaticAlias {
+			return -1
+		}
+		return 0
+	}
+	if !e.callArity.Valid || e.callArity.Int64 <= 0 || !s.arityMin.Valid || !s.arityMax.Valid || s.arityMin.Int64 != s.arityMax.Int64 {
+		return -1
+	}
+	if e.callArity.Int64 != s.arityMin.Int64 {
+		return 0
+	}
+	if !javaVisibleToJava(s, e.pkg) {
+		return -1
+	}
+	return 1
+}
+
+func kotlinHasJvmSynthetic(signature string) bool {
+	fun := strings.Index(signature, "fun ")
+	if fun < 0 {
+		return false
+	}
+	prefix := signature[:fun]
+	return strings.Contains(prefix, "@JvmSynthetic") || strings.Contains(prefix, "@kotlin.jvm.JvmSynthetic")
+}
+
+func kotlinJvmName(signature string) (string, bool) {
+	fun := strings.Index(signature, "fun ")
+	if fun < 0 {
+		return "", false
+	}
+	prefix := signature[:fun]
+	for _, annotation := range []string{"@JvmName(\"", "@kotlin.jvm.JvmName(\""} {
+		if at := strings.Index(prefix, annotation); at >= 0 {
+			value := prefix[at+len(annotation):]
+			end := strings.IndexByte(value, '"')
+			if end >= 0 && !strings.ContainsAny(value[:end], "\\$") && kotlinPlainJavaName(value[:end]) {
+				return value[:end], true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func kotlinJvmNameForSymbol(s javaScopeSymbol) (string, bool) {
+	if name, known := kotlinJvmName(s.signature); known {
+		return name, true
+	}
+	for _, alias := range strings.Split(s.jvmNameAliases, ",") {
+		if alias == "" {
+			continue
+		}
+		annotation := "@" + alias + "(\""
+		if at := strings.Index(s.signature, annotation); at >= 0 {
+			value := s.signature[at+len(annotation):]
+			end := strings.IndexByte(value, '"')
+			if end >= 0 && !strings.ContainsAny(value[:end], "\\$") && kotlinPlainJavaName(value[:end]) {
+				return value[:end], true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func kotlinJavaNameCandidates(s javaScopeSymbol, callNames map[string]struct{}) []string {
+	if name, known := kotlinJvmNameForSymbol(s); known {
+		return []string{name}
+	}
+	if kotlinHasJvmName(s.signature) || s.jvmNameAliases != "" {
+		return sortedKeys(callNames)
+	}
+	return nil
+}
+
+func appendJavaNameCandidate(byQName map[string][]javaScopeSymbol, qname string, candidate javaScopeSymbol) {
+	for _, existing := range byQName[qname] {
+		if existing.id == candidate.id {
+			return
+		}
+	}
+	byQName[qname] = append(byQName[qname], candidate)
+}
+
+func kotlinPlainJavaName(name string) bool {
+	if name == "" || name[0] >= '0' && name[0] <= '9' {
+		return false
+	}
+	for _, c := range name {
+		if !(c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // kotlinFacadeCallable excludes declarations whose Java-visible form is not

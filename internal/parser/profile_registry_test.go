@@ -48,7 +48,7 @@ func TestRegistryAdapterWithoutProfileIsReported(t *testing.T) {
 // The registry refuses to guess and reports the language as profile-less.
 func TestRegistryConflictingProfilesForOneLanguageAreRejected(t *testing.T) {
 	registry := NewRegistry(
-		profiled("java", ".java", "treesitter:java:v1"),
+		profiled("java", ".java", "treesitter:java:v2"),
 		profiled("java", ".jav", "heuristic:java:v1"),
 	)
 	if got := registry.LanguagesMissingProfile(); len(got) != 1 || got[0] != "java" {

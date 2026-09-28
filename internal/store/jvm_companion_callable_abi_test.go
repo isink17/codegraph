@@ -139,6 +139,55 @@ func TestJVMKotlinCompanionCallableABIRefusesOverloadsAndAmbiguousOwners(t *test
 	})
 }
 
+func TestJVMKotlinCompanionFixedAritySelectionAndVeto(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		secondName    string
+		secondSig     string
+		secondArity   any
+		wantResolved  bool
+		wantQualified string
+	}{
+		{name: "unique arity", wantResolved: true, wantQualified: "lib.Service.Companion.run"},
+		{name: "different arity sibling", secondName: "run", secondSig: "fun run(x: kotlin.Int, y: kotlin.Int) {}", secondArity: 2, wantResolved: true, wantQualified: "lib.Service.Companion.run"},
+		{name: "same arity overload", secondName: "run", secondSig: "fun run(x: kotlin.String) {}", secondArity: 1},
+		{name: "unknown overload veto", secondName: "run", secondSig: `@JvmOverloads fun run(x: kotlin.String = "") {}`},
+		{name: "suspend sibling veto", secondName: "run", secondSig: "suspend fun run(x: kotlin.String) {}"},
+		{name: "renamed source sibling veto", secondName: "other", secondSig: `@JvmName("run") fun other(x: kotlin.String) {}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCompanionScopeFixture(t, "Companion", "fun run(x: kotlin.Int) {}", "public", "public")
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET arity_min=1,arity_max=1 WHERE id=?`, f.target); err != nil {
+				t.Fatal(err)
+			}
+			if tc.secondSig != "" {
+				var ownerFile int64
+				if err := f.store.db.QueryRowContext(f.ctx, `SELECT file_id FROM symbols WHERE id=?`, f.target).Scan(&ownerFile); err != nil {
+					t.Fatal(err)
+				}
+				extra := f.symbolKind(t, ownerFile, tc.secondName, "lib.Service.Companion."+tc.secondName, "function", "kotlin")
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service.Companion',visibility='public',signature=?,arity_min=?,arity_max=? WHERE id=?`, tc.secondSig, tc.secondArity, tc.secondArity, extra); err != nil {
+					t.Fatal(err)
+				}
+			}
+			edge := f.edge(t, f.callerFile, f.caller, "Service.Companion.run")
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='Service.Companion.run(1)',call_arity=1 WHERE id=?`, edge); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := resolveJavaScope(f.ctx, f.store.db, f.repoID, nil); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := f.dstSymbolID(t, edge)
+			if ok != tc.wantResolved {
+				t.Fatalf("resolved=%v target=%d, want %v", ok, got, tc.wantResolved)
+			}
+			if ok && f.qualifiedNameOf(t, got) != tc.wantQualified {
+				t.Fatalf("target=%q", f.qualifiedNameOf(t, got))
+			}
+		})
+	}
+}
+
 func TestJVMCompanionRepairGateAndConvergence(t *testing.T) {
 	f := newCompanionScopeFixture(t, "Factory", "fun run() {}", "public", "public")
 	edge := f.edge(t, f.callerFile, f.caller, "Service.Factory.run")

@@ -177,10 +177,10 @@ class Service {
 	if got := p246CompanionRows(t, s.raw(t), repo, "Service.kt"); got != 1 {
 		t.Fatalf("v3 companion symbols = %d, want 1", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v3" {
+	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v4" {
 		t.Fatalf("upgraded profile = %q", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v3" {
+	if got := p246FileProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v4" {
 		t.Fatalf("other Kotlin profile = %q", got)
 	}
 	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
@@ -326,6 +326,99 @@ func p246Profiles(t *testing.T, db *sql.DB, repoID int64) map[string]string {
 		t.Fatal(err)
 	}
 	return out
+}
+
+type javaV1WithoutCallArity struct{ *tsparser.JavaAdapter }
+
+func (a javaV1WithoutCallArity) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:java:v1", EmitsCallEdges: true}
+}
+func (a javaV1WithoutCallArity) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	parsed, err := a.JavaAdapter.Parse(ctx, path, content)
+	for i := range parsed.Edges {
+		parsed.Edges[i].CallArity = nil
+	}
+	return parsed, err
+}
+
+type kotlinV3WithoutFixedArity struct{ *tsparser.KotlinAdapter }
+
+func (a kotlinV3WithoutFixedArity) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:kotlin:v3", EmitsCallEdges: true}
+}
+func (a kotlinV3WithoutFixedArity) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	parsed, err := a.KotlinAdapter.Parse(ctx, path, content)
+	for i := range parsed.Symbols {
+		parsed.Symbols[i].ArityMin, parsed.Symbols[i].ArityMax = nil, nil
+	}
+	return parsed, err
+}
+
+func TestP247JavaKotlinArityProfileConvergence(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	files := map[string]string{
+		"Caller.java": `package app; import lib.ActionsKt; class Caller { void call() { ActionsKt.run(1); } }`,
+		"Second.java": `package app; class Second { void call() {} }`,
+		"Actions.kt":  "package lib\nfun run(value: kotlin.Int) {}",
+		"Other.kt":    "package lib\nfun helper(value: kotlin.Int) {}",
+		"main.go":     "package main\nfunc main() {}\n",
+		"caller.ts":   "export function caller(): void {}\n",
+	}
+	for path, content := range files {
+		writeProfileFile(t, filepath.Join(root, path), content)
+	}
+	s := newProfileStore(t)
+	old := New(s.Store, parser.NewRegistry(javaV1WithoutCallArity{tsparser.NewJava()}, kotlinV3WithoutFixedArity{tsparser.NewKotlin()}, goparser.New(), tsparser.NewTypeScript()), nil)
+	if _, err := old.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	var callArity, minArity, maxArity sql.NullInt64
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT e.call_arity,s.arity_min,s.arity_max FROM edges e JOIN symbols s ON s.qualified_name='lib.run' WHERE e.dst_name='ActionsKt.run' AND e.repo_id=?`, repo).Scan(&callArity, &minArity, &maxArity); err != nil {
+		t.Fatal(err)
+	}
+	if callArity.Valid || minArity.Valid || maxArity.Valid {
+		t.Fatalf("legacy arities = (%v,%v,%v), want NULL", callArity, minArity, maxArity)
+	}
+	assertJVMUnresolved(t, &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, repoID: repo}, "Caller.java", "ActionsKt.run")
+
+	upgraded := New(s.Store, lifecycleRegistry(), nil)
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root, Paths: []string{"Caller.java"}}); !errors.Is(err, ErrParserProfileTransitionRequired) {
+		t.Fatalf("path-scoped transition error=%v, want ErrParserProfileTransitionRequired", err)
+	}
+	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: upgraded, repoID: repo}
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FilesChanged != 4 || summary.FilesIndexed != 4 || strings.Join(summary.ParserProfileLanguages, ",") != "java,kotlin" {
+		t.Fatalf("profile convergence summary=%+v, want 4 files in Java/Kotlin", summary)
+	}
+	for _, path := range []string{"Caller.java", "Second.java"} {
+		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:java:v2" {
+			t.Fatalf("%s profile=%q", path, got)
+		}
+	}
+	for _, path := range []string{"Actions.kt", "Other.kt"} {
+		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v4" {
+			t.Fatalf("%s profile=%q", path, got)
+		}
+	}
+	for _, path := range []string{"main.go", "caller.ts"} {
+		want := map[string]string{"main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
+		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
+			t.Fatalf("unrelated %s profile=%q", path, got)
+		}
+	}
+	assertJVMResolved(t, r, "Caller.java", "ActionsKt.run", "Actions.kt", "java_import_scope")
+	assertJVMReference(t, r, "Caller.java", "ActionsKt.run", true)
+	assertJVMQueryRelation(t, r, "app.Caller.call", "lib.run")
+	r.assertFreshParity(t, "Java/Kotlin arity parser-profile transition")
+	again, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil || again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update=%+v, %v; want no-op", again, err)
+	}
 }
 
 func sameProfiles(before, after map[string]string, changed ...string) bool {
