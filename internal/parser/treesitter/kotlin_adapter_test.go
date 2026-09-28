@@ -29,7 +29,10 @@ func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 		{"boxed veto", `@kotlin.jvm.JvmExposeBoxed @JvmOverloads fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
 		{"suspend veto", `@JvmOverloads suspend fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
 		{"internal veto", `@JvmOverloads internal fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
-		{"JvmName veto", `@JvmName("renamed") @JvmOverloads fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"known JvmName keeps arity", `@JvmName("renamed") @JvmOverloads fun run(a: kotlin.Int = 0) {}`, true, 0, 1},
+		{"known JvmName plain default", `@JvmName("renamed") fun run(a: kotlin.Int, b: kotlin.String = "") {}`, true, 2, 2},
+		{"unknown JvmName veto", `@JvmName(NAME) @JvmOverloads fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"foreign JvmName veto", "import other.JvmName\n@JvmName(\"renamed\") @JvmOverloads fun run(a: kotlin.Int = 0) {}", false, 0, 0},
 		{"overloads without defaults", `@JvmOverloads fun run(a: kotlin.Int) {}`, true, 1, 1},
 	}
 	for _, tt := range tests {
@@ -259,6 +262,7 @@ object Service {
     fun kotlin.String.extension(value: kotlin.Int) {}
     suspend fun suspended(value: kotlin.Int) {}
     @JvmName("renamed") fun renamed(value: kotlin.Int) {}
+    @JvmName(NAME) fun unknownRenamed(value: kotlin.Int) {}
     @JvmSynthetic fun hidden(value: kotlin.Int) {}
     inline fun <reified T> reified(value: kotlin.Int) {}
     fun inferred(value: kotlin.Int) = Token(value)
@@ -280,6 +284,7 @@ object Service {
 		"explicitUnit": arityPair(1),
 		"inlineRun":    arityPair(1),
 		"multiline":    arityPair(2),
+		"renamed":      arityPair(1),
 	}
 	for _, symbol := range p.Symbols {
 		if symbol.Kind != "function" {

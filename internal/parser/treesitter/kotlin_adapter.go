@@ -65,18 +65,24 @@ func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFil
 // preamble must parse cleanly, an annotation of ours must have the one form
 // proven here, and every name must fall in the plain Java identifier subset;
 // anything else yields no facade rather than a guessed one.
+//
+// Every root child must also be preamble syntax or a top-level declaration
+// node. The Kotlin grammar can silently parse legal source such as an
+// annotated function as a top-level expression, dropping the declaration or
+// its annotations without an ERROR node; a facade built from the surviving
+// declarations could then bind a Java call the compiler rejects or finds
+// ambiguous. Recovery nodes nested inside a declaration (a MISSING automatic
+// semicolon in a one-line body) do not change the root shape and are kept.
+//
+// The refusal is deliberate and costs recall: a top-level annotation with
+// arguments on its own line before `fun` (@Deprecated("x"), @Throws(...),
+// @Suppress("..."), @OptIn(...)) is split by the grammar into a root
+// expression plus an unannotated function, so the whole file loses its
+// facade. A missed Java binding is preferred to a false one; recovering the
+// split shape is separate parser work.
 func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []graph.ScopeImport) graph.JVMFileFacade {
 	if filepath.Ext(path) != ".kt" {
 		return graph.JVMFileFacade{} // scripts compile to a script class
-	}
-	for _, imp := range imports {
-		for _, simple := range []string{"JvmName", "JvmMultifileClass"} {
-			// An alias of ours, or another annotation under our name, makes the
-			// annotation spellings below unreliable.
-			if !imp.Wildcard && (imp.SourceSpecifier == "kotlin.jvm."+simple) != (imp.LocalName == simple) {
-				return graph.JVMFileFacade{}
-			}
-		}
 	}
 	var facade graph.JVMFileFacade
 	topLevel, preamble := false, true
@@ -86,22 +92,26 @@ func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []g
 		case "function_declaration", "property_declaration":
 			topLevel = true
 		}
-		if !preamble {
-			continue
-		}
-		if child.IsError() || child.HasError() {
-			return graph.JVMFileFacade{}
-		}
-		switch child.Type() {
-		case "file_annotation":
-			for j := range int(child.NamedChildCount()) {
-				if !kotlinFileAnnotation(child.NamedChild(j), content, &facade) {
+		if preamble {
+			switch child.Type() {
+			case "file_annotation", "package_header", "import_list", "import_header", "shebang_line", "line_comment", "multiline_comment":
+				if child.HasError() {
 					return graph.JVMFileFacade{}
 				}
+				if child.Type() == "file_annotation" {
+					for j := range int(child.NamedChildCount()) {
+						if !kotlinFileAnnotation(child.NamedChild(j), content, imports, &facade) {
+							return graph.JVMFileFacade{}
+						}
+					}
+				}
+				continue
+			default:
+				preamble = false // annotations after this point are not file-targeted
 			}
-		case "package_header", "import_list", "import_header", "shebang_line", "line_comment", "multiline_comment":
-		default:
-			preamble = false // annotations after this point are not file-targeted
+		}
+		if child.IsError() || !kotlinTopLevelDeclarationNode(child.Type()) {
+			return graph.JVMFileFacade{}
 		}
 	}
 	if !topLevel {
@@ -117,41 +127,95 @@ func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []g
 	return facade
 }
 
+// kotlinTopLevelDeclarationNode is the tree-sitter-kotlin root child set a
+// .kt file may hold after its preamble: the grammar's declaration kinds
+// (enum, interface, annotation, data and value classes are all
+// class_declaration; accessors of a top-level property are separate getter and
+// setter children), comments, and statement separators.
+func kotlinTopLevelDeclarationNode(kind string) bool {
+	switch kind {
+	case "class_declaration", "object_declaration", "function_declaration", "property_declaration",
+		"getter", "setter", "type_alias", "line_comment", "multiline_comment", ";":
+		return true
+	}
+	return false
+}
+
 // kotlinFileAnnotation records one annotation inside `@file:`. It reports
-// false for a JvmName/JvmMultifileClass spelling it cannot prove.
-func kotlinFileAnnotation(node *sitter.Node, content []byte, facade *graph.JVMFileFacade) bool {
+// false for a JvmName/JvmMultifileClass spelling it cannot prove: an aliased
+// use of either (deferred), or a simple name an import shadows or hides.
+func kotlinFileAnnotation(node *sitter.Node, content []byte, imports []graph.ScopeImport, facade *graph.JVMFileFacade) bool {
+	var typ *sitter.Node
 	switch node.Type() {
 	case "user_type":
-		switch kotlinJVMAnnotationName(nodeText(node, content)) {
-		case "JvmMultifileClass":
-			if facade.Multifile {
-				return false
-			}
-			facade.Multifile = true
-		case "JvmName":
-			return false
-		}
+		typ = node
 	case "constructor_invocation":
-		typ := firstChild(node, "user_type")
-		if typ == nil {
+		if typ = firstChild(node, "user_type"); typ == nil {
 			return false
 		}
-		switch kotlinJVMAnnotationName(nodeText(typ, content)) {
-		case "JvmName":
-			name, ok := kotlinSingleStringArgument(node, content)
-			if !ok || facade.Explicit || !kotlinPlainJavaIdentifier(name) {
-				return false
-			}
-			facade.Class, facade.Explicit = name, true
-		case "JvmMultifileClass":
+	default:
+		return true
+	}
+	spelling := nodeText(typ, content)
+	var simple string
+	for _, candidate := range []string{"JvmName", "JvmMultifileClass"} {
+		ours, uncertain := kotlinJVMAnnotationSpelling(spelling, candidate, imports)
+		if uncertain || ours && spelling != candidate && spelling != "kotlin.jvm."+candidate {
 			return false
 		}
+		if ours {
+			simple = candidate
+		}
+	}
+	switch simple {
+	case "JvmMultifileClass":
+		if node.Type() != "user_type" || facade.Multifile {
+			return false
+		}
+		facade.Multifile = true
+	case "JvmName":
+		if node.Type() != "constructor_invocation" {
+			return false
+		}
+		name, ok := kotlinSingleStringArgument(node, content)
+		if !ok || facade.Explicit || !kotlinPlainJavaIdentifier(name) {
+			return false
+		}
+		facade.Class, facade.Explicit = name, true
 	}
 	return true
 }
 
-func kotlinJVMAnnotationName(spelling string) string {
-	return strings.TrimPrefix(spelling, "kotlin.jvm.")
+// kotlinJVMAnnotationSpelling classifies an annotation type spelling against
+// kotlin.jvm.<simple>. ours means the spelling names that annotation: its
+// qualified form, an explicit import (aliased or not), or the default-imported
+// simple name. uncertain means the spelling is the simple name but an explicit
+// import rebinds it to another declaration, or an aliased import of ours hides
+// the simple name, so it cannot be proven either way. Same-package and
+// star-import shadowing of the default import are not modelled, as for file
+// facades.
+func kotlinJVMAnnotationSpelling(spelling, simple string, imports []graph.ScopeImport) (ours, uncertain bool) {
+	qualified := "kotlin.jvm." + simple
+	if spelling == qualified {
+		return true, false
+	}
+	for _, imp := range imports {
+		if !imp.Wildcard && imp.LocalName == spelling {
+			if imp.SourceSpecifier == qualified {
+				return true, false
+			}
+			return false, spelling == simple
+		}
+	}
+	if spelling != simple {
+		return false, false
+	}
+	for _, imp := range imports {
+		if !imp.Wildcard && imp.SourceSpecifier == qualified && imp.LocalName != simple {
+			return false, true
+		}
+	}
+	return true, false
 }
 
 // kotlinSingleStringArgument returns the content of `("Name")`: exactly one
@@ -301,7 +365,9 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 	}
 	sig := kotlinDeclarationSignature(node, content)
 	var arityMin, arityMax *int
-	if arity := kotlinFixedJavaCallableArity(node, content, imports); arity != nil {
+	jvmName, renamed, knownRename := kotlinDeclarationJVMName(node, content, imports)
+	unknownRename := renamed && !knownRename
+	if arity := kotlinFixedJavaCallableArity(node, content, imports, unknownRename); arity != nil {
 		arityMin, arityMax = arity, arity
 	}
 
@@ -319,16 +385,71 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "func:kotlin:" + qualified,
 	})
-	if fact, ok := kotlinJVMCallableEvidence(node, content, imports, len(pf.Symbols)-1); ok {
+	if fact, ok := kotlinJVMCallableEvidence(node, content, imports, len(pf.Symbols)-1, unknownRename); ok {
 		pf.KotlinJVMCallableEvidence = append(pf.KotlinJVMCallableEvidence, fact)
 	}
+	if renamed {
+		pf.KotlinJVMNameEvidence = append(pf.KotlinJVMNameEvidence, graph.KotlinJVMNameEvidence{SymbolIndex: len(pf.Symbols) - 1, Known: knownRename, JVMName: jvmName})
+	}
+}
+
+// kotlinDeclarationJVMName reads a function's own @JvmName from its structured
+// modifier annotations. present reports any annotation that is, or may be,
+// kotlin.jvm.JvmName; known additionally proves the exact JVM method name: one
+// such annotation with one positional plain string literal in the ASCII
+// identifier subset. Named, constant, concatenated, raw, escaped or templated
+// arguments, repeated annotations and shadowed spellings stay unknown -- the
+// parser evaluates no Kotlin expressions.
+func kotlinDeclarationJVMName(node *sitter.Node, content []byte, imports []graph.ScopeImport) (name string, present, known bool) {
+	mods := firstChild(node, "modifiers")
+	if mods == nil {
+		return "", false, false
+	}
+	count := 0
+	for i := range int(mods.NamedChildCount()) {
+		annotation := mods.NamedChild(i)
+		if annotation.Type() != "annotation" {
+			continue
+		}
+		for j := range int(annotation.NamedChildCount()) {
+			entry := annotation.NamedChild(j)
+			typ := entry
+			if entry.Type() == "constructor_invocation" {
+				typ = firstChild(entry, "user_type")
+			} else if entry.Type() != "user_type" {
+				continue
+			}
+			if typ == nil {
+				continue
+			}
+			ours, uncertain := kotlinJVMAnnotationSpelling(nodeText(typ, content), "JvmName", imports)
+			if !ours && !uncertain {
+				continue
+			}
+			count++
+			known = false
+			if args := firstChild(entry, "value_arguments"); ours && args != nil && !strings.Contains(nodeText(args, content), `"""`) {
+				if literal, ok := kotlinSingleStringArgument(entry, content); ok && kotlinPlainJavaIdentifier(literal) {
+					name, known = literal, true
+				}
+			}
+		}
+	}
+	if count == 0 {
+		return "", false, false
+	}
+	if count > 1 || !known {
+		return "", true, false
+	}
+	return name, true, true
 }
 
 // kotlinJVMCallableEvidence records Java arities only for defaulted functions
 // or functions explicitly annotated with JvmOverloads. Parameter boundaries
 // and defaults come from tree-sitter nodes; source text is used only to classify
 // annotation spellings in the modifier region.
-func kotlinJVMCallableEvidence(node *sitter.Node, content []byte, imports []graph.ScopeImport, symbolIndex int) (graph.KotlinJVMCallableEvidence, bool) {
+// unknownRename reports a declaration @JvmName whose JVM name is unprovable.
+func kotlinJVMCallableEvidence(node *sitter.Node, content []byte, imports []graph.ScopeImport, symbolIndex int, unknownRename bool) (graph.KotlinJVMCallableEvidence, bool) {
 	unknown := graph.KotlinJVMCallableEvidence{SymbolIndex: symbolIndex}
 	if node == nil || node.HasError() {
 		return unknown, false
@@ -395,7 +516,7 @@ func kotlinJVMCallableEvidence(node *sitter.Node, content []byte, imports []grap
 		return unknown, false
 	}
 	unknown.Known = false
-	if hasIntroduced || hasIntroducedParam || hasVararg || kotlinHasToken(prefix, "suspend") || kotlinHasToken(prefix, "internal") || kotlinHasToken(prefix, "external") || kotlinHasToken(prefix, "expect") || kotlinHasAnnotation(prefix, "JvmExposeBoxed", "kotlin.jvm.JvmExposeBoxed", imports) || kotlinHasAnnotation(prefix, "JvmName", "kotlin.jvm.JvmName", imports) || kotlinHasUnknownAliasedJVMAnnotation(prefix+parameterSource, imports) {
+	if hasIntroduced || hasIntroducedParam || hasVararg || kotlinHasToken(prefix, "suspend") || kotlinHasToken(prefix, "internal") || kotlinHasToken(prefix, "external") || kotlinHasToken(prefix, "expect") || kotlinHasAnnotation(prefix, "JvmExposeBoxed", "kotlin.jvm.JvmExposeBoxed", imports) || unknownRename || kotlinHasUnknownAliasedJVMAnnotation(prefix+parameterSource, imports) {
 		return unknown, true
 	}
 	name := childByFieldName(node, "name")
@@ -475,7 +596,8 @@ func kotlinAnnotationPresent(source, spelling string) bool {
 func kotlinHasUnknownAliasedJVMAnnotation(source string, imports []graph.ScopeImport) bool {
 	for _, imp := range imports {
 		if strings.HasPrefix(imp.SourceSpecifier, "kotlin.jvm.") && !imp.Wildcard && imp.LocalName != "" && imp.LocalName != imp.ImportedName && kotlinAnnotationPresent(source, "@"+imp.LocalName) {
-			if imp.SourceSpecifier == "kotlin.jvm.JvmOverloads" || imp.SourceSpecifier == "kotlin.jvm.JvmSynthetic" || imp.SourceSpecifier == "kotlin.jvm.JvmStatic" {
+			// JvmName is classified structurally by kotlinDeclarationJVMName.
+			if imp.SourceSpecifier == "kotlin.jvm.JvmOverloads" || imp.SourceSpecifier == "kotlin.jvm.JvmSynthetic" || imp.SourceSpecifier == "kotlin.jvm.JvmStatic" || imp.SourceSpecifier == "kotlin.jvm.JvmName" {
 				continue
 			}
 			return true
@@ -489,7 +611,7 @@ func kotlinHasUnknownAliasedJVMAnnotation(source string, imports []graph.ScopeIm
 // qualified built-in types avoid package declarations and aliases shadowing
 // short names such as Int. Unknown types remain unknown; no type resolution is
 // attempted here.
-func kotlinFixedJavaCallableArity(node *sitter.Node, content []byte, imports []graph.ScopeImport) *int {
+func kotlinFixedJavaCallableArity(node *sitter.Node, content []byte, imports []graph.ScopeImport, unknownRename bool) *int {
 	if node == nil || node.HasError() {
 		return nil
 	}
@@ -508,7 +630,12 @@ func kotlinFixedJavaCallableArity(node *sitter.Node, content []byte, imports []g
 		return nil
 	}
 	prefix := string(content[node.StartByte():fun.StartByte()])
-	for _, forbidden := range []string{"JvmName", "JvmSynthetic", "JvmOverloads", "JvmExposeBoxed"} {
+	// A proven declaration rename changes the JVM method name, not its
+	// parameters; an unprovable one keeps the callable unknown.
+	if unknownRename {
+		return nil
+	}
+	for _, forbidden := range []string{"JvmSynthetic", "JvmOverloads", "JvmExposeBoxed"} {
 		if strings.Contains(prefix, forbidden) || kotlinUsesAliasedJVMAnnotation(prefix, imports, forbidden) {
 			return nil
 		}

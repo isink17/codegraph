@@ -20,10 +20,12 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
 }
 
-// Kotlin v5 adds JVM callable arity evidence for default parameters and
-// @JvmOverloads. Unchanged Kotlin source can now persist this evidence.
+// Kotlin v6 persists declaration-level @JvmName evidence (known or unknown
+// JVM method name) and proven arity for renamed functions, and suppresses a
+// .kt file facade whose root holds anything but preamble and declaration
+// syntax. Unchanged Kotlin source can now persist different facts.
 func (a *KotlinAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:kotlin:v5", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:kotlin:v6", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}

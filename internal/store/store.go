@@ -2304,6 +2304,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM kotlin_jvm_callable_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM kotlin_jvm_name_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM go_local_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2459,6 +2462,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM kotlin_jvm_callable_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM kotlin_jvm_name_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM swift_extension_memberships WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2757,6 +2763,25 @@ func insertParsedFileGraph(
 			args = append(args, repoID, fileID, symbolIDs[fact.SymbolIndex], boolInt(fact.Known), minArity, maxArity)
 		}
 		if err := execBatchInsert(ctx, tx, "kotlin_jvm_callable_evidence", "repo_id, file_id, symbol_id, is_known, jvm_arity_min, jvm_arity_max", 6, args, stats); err != nil {
+			return nil, err
+		}
+	}
+	if len(parsed.KotlinJVMNameEvidence) > 0 {
+		args := make([]any, 0, len(parsed.KotlinJVMNameEvidence)*5)
+		for _, fact := range parsed.KotlinJVMNameEvidence {
+			if fact.SymbolIndex < 0 || fact.SymbolIndex >= len(symbolIDs) || parsed.Symbols[fact.SymbolIndex].Language != "kotlin" || parsed.Symbols[fact.SymbolIndex].Kind != "function" {
+				return nil, fmt.Errorf("invalid Kotlin JVM name evidence symbol index %d", fact.SymbolIndex)
+			}
+			var name any
+			if fact.Known {
+				if fact.JVMName == "" {
+					return nil, fmt.Errorf("empty known Kotlin JVM name for symbol index %d", fact.SymbolIndex)
+				}
+				name = fact.JVMName
+			}
+			args = append(args, repoID, fileID, symbolIDs[fact.SymbolIndex], boolInt(fact.Known), name)
+		}
+		if err := execBatchInsert(ctx, tx, "kotlin_jvm_name_evidence", "repo_id, file_id, symbol_id, is_known, jvm_name", 5, args, stats); err != nil {
 			return nil, err
 		}
 	}

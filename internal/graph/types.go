@@ -74,6 +74,7 @@ type ParsedFile struct {
 	SwiftDeclarationFacts     []SwiftDeclarationFact
 	SwiftExtensionMemberships []SwiftExtensionMembership
 	KotlinJVMCallableEvidence []KotlinJVMCallableEvidence
+	KotlinJVMNameEvidence     []KotlinJVMNameEvidence
 }
 
 // KotlinJVMCallableEvidence describes Java-visible value-parameter arities
@@ -83,6 +84,16 @@ type KotlinJVMCallableEvidence struct {
 	Known       bool
 	ArityMin    int
 	ArityMax    int
+}
+
+// KotlinJVMNameEvidence records a declaration-level @JvmName on a Kotlin
+// function. Known carries the exact JVM method name; an unknown fact means a
+// rename exists whose name the parser cannot prove, so the source name is
+// retired without a replacement. Functions without @JvmName have no fact.
+type KotlinJVMNameEvidence struct {
+	SymbolIndex int
+	Known       bool
+	JVMName     string
 }
 
 type SwiftInheritanceRelation struct {

@@ -12,6 +12,8 @@ type javaScopeSymbol struct {
 	name, qname, container, kind, signature, visibility, pkg, language string
 	static, arityMin, arityMax                                         sql.NullInt64
 	jvmEvidence, jvmKnown, jvmArityMin, jvmArityMax                    sql.NullInt64
+	jvmNameEvidence, jvmNameKnown                                      sql.NullInt64
+	jvmName                                                            sql.NullString
 	jvmStaticAlias                                                     bool
 	jvmNameAliases, jvmSyntheticAliases                                string
 }
@@ -94,15 +96,17 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,ke.symbol_id,ke.is_known,ke.jvm_arity_min,ke.jvm_arity_max,
 		EXISTS(SELECT 1 FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmStatic' AND ki.local_name!='JvmStatic'),
 		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),''),
-		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmSynthetic' AND ki.local_name!='JvmSynthetic' AND instr(s.signature,'@'||ki.local_name)>0),'')
+		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmSynthetic' AND ki.local_name!='JvmSynthetic' AND instr(s.signature,'@'||ki.local_name)>0),''),
+		kn.symbol_id,kn.is_known,kn.jvm_name
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
 		LEFT JOIN kotlin_jvm_callable_evidence ke ON ke.repo_id=s.repo_id AND ke.symbol_id=s.id
+		LEFT JOIN kotlin_jvm_name_evidence kn ON kn.repo_id=s.repo_id AND kn.symbol_id=s.id
 		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0`, " AND s.name IN (%s)",
 		[]any{repoID}, stringSliceToAny(nameList), true,
 		func(rows *sql.Rows) error {
 			var s javaScopeSymbol
 			var alias int
-			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &s.jvmEvidence, &s.jvmKnown, &s.jvmArityMin, &s.jvmArityMax, &alias, &s.jvmNameAliases, &s.jvmSyntheticAliases); err != nil {
+			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &s.jvmEvidence, &s.jvmKnown, &s.jvmArityMin, &s.jvmArityMax, &alias, &s.jvmNameAliases, &s.jvmSyntheticAliases, &s.jvmNameEvidence, &s.jvmNameKnown, &s.jvmName); err != nil {
 				return err
 			}
 			s.jvmStaticAlias = alias != 0
@@ -172,9 +176,12 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		return 0, err
 	}
 	// @JvmName can make a declaration with a different Kotlin source name share
-	// this Java spelling. Load functions only from the already-resolved object,
-	// companion, and facade files so those declarations can participate in
-	// uniqueness without scanning the repository's Kotlin function population.
+	// this Java spelling. Load renamed functions only from the already-resolved
+	// object, companion, and facade files so those declarations can participate
+	// in uniqueness without scanning the repository's Kotlin function
+	// population. Only rows carrying name evidence -- or, for a file an older
+	// parser wrote, visible JvmName syntax -- are read; every other function in
+	// those files keeps its source name and is already in the lookup maps.
 	callNames := map[string]struct{}{}
 	for _, e := range edges {
 		name := e.name
@@ -199,21 +206,25 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		}
 	}
 	if files := sortedIDs(ownerFiles); len(files) != 0 && len(callNames) != 0 {
-		if err := sqliteBatchedIDQuery(ctx, q, files, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,
+		allCallNames := sortedKeys(callNames)
+		if err := sqliteBatchedIDQuery(ctx, q, files, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,ke.symbol_id,ke.is_known,ke.jvm_arity_min,ke.jvm_arity_max,
 			EXISTS(SELECT 1 FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmStatic' AND ki.local_name!='JvmStatic'),
-			COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),'')
+			COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),'') AS name_aliases,
+			COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmSynthetic' AND ki.local_name!='JvmSynthetic' AND instr(s.signature,'@'||ki.local_name)>0),''),
+			kn.symbol_id,kn.is_known,kn.jvm_name
 			FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
-			WHERE s.repo_id=? AND f.language='kotlin' AND s.kind='function' AND f.is_deleted=0 AND s.file_id IN (`,
+			LEFT JOIN kotlin_jvm_callable_evidence ke ON ke.repo_id=s.repo_id AND ke.symbol_id=s.id
+			LEFT JOIN kotlin_jvm_name_evidence kn ON kn.repo_id=s.repo_id AND kn.symbol_id=s.id
+			WHERE s.repo_id=? AND f.language='kotlin' AND s.kind='function' AND f.is_deleted=0
+			AND (kn.symbol_id IS NOT NULL OR instr(s.signature,'JvmName')>0 OR name_aliases!='') AND s.file_id IN (`,
 			[]any{repoID}, func(scan func(...any) error) error {
 				var s javaScopeSymbol
 				var staticAlias int
-				if err := scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &staticAlias, &s.jvmNameAliases); err != nil {
+				if err := scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &s.jvmEvidence, &s.jvmKnown, &s.jvmArityMin, &s.jvmArityMax, &staticAlias, &s.jvmNameAliases, &s.jvmSyntheticAliases, &s.jvmNameEvidence, &s.jvmNameKnown, &s.jvmName); err != nil {
 					return err
 				}
 				s.jvmStaticAlias = staticAlias != 0
-				javaNames := kotlinJavaNameCandidates(s, callNames)
-				for _, javaName := range javaNames {
-					owner := kotlinJoin(s.pkg, s.container)
+				for _, javaName := range kotlinJavaNameCandidates(s, callNames, allCallNames) {
 					if s.container == s.pkg {
 						for _, parts := range facades {
 							for _, part := range parts {
@@ -223,7 +234,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 							}
 						}
 					} else {
-						appendJavaNameCandidate(byQName, owner+"."+javaName, s)
+						appendJavaNameCandidate(byQName, kotlinJoin(s.pkg, s.container)+"."+javaName, s)
 					}
 				}
 				return nil
@@ -544,7 +555,7 @@ func kotlinCompanionStaticMember(outer javaScopeSymbol, name string, e javaScope
 }
 
 func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	if kotlinNoArgCall(e.evidence) && !kotlinHasJVMArityEvidence(byQName[companion.qname+"."+name]) {
+	if kotlinNoArgCall(e.evidence) && !kotlinNeedsJVMEvidenceClassification(byQName[companion.qname+"."+name]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[companion.qname+"."+name] {
@@ -587,7 +598,7 @@ func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEd
 }
 
 func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	if kotlinNoArgCall(e.evidence) && !kotlinHasJVMArityEvidence(byQName[owner.qname+"."+name]) {
+	if kotlinNoArgCall(e.evidence) && !kotlinNeedsJVMEvidenceClassification(byQName[owner.qname+"."+name]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[owner.qname+"."+name] {
@@ -650,7 +661,7 @@ func kotlinFacadeMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 		}
 		files[part.file] = struct{}{}
 	}
-	if kotlinNoArgCall(e.evidence) && !kotlinHasJVMArityEvidence(byQName[kotlinJoin(owner.pkg, name)]) {
+	if kotlinNoArgCall(e.evidence) && !kotlinNeedsJVMEvidenceClassification(byQName[kotlinJoin(owner.pkg, name)]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[kotlinJoin(owner.pkg, name)] {
@@ -684,9 +695,14 @@ func kotlinFacadeMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 	return out, strategy
 }
 
-func kotlinHasJVMArityEvidence(candidates []javaScopeSymbol) bool {
+// kotlinNeedsJVMEvidenceClassification reports whether a zero-argument call
+// must use the evidence-aware candidate status instead of the historical
+// signature path: some candidate carries JVM arity or JVM name evidence, or
+// older-parser rename syntax (including an aliased JvmName) that only the
+// status path can refuse.
+func kotlinNeedsJVMEvidenceClassification(candidates []javaScopeSymbol) bool {
 	for _, candidate := range candidates {
-		if candidate.jvmEvidence.Valid {
+		if candidate.jvmEvidence.Valid || candidate.jvmNameEvidence.Valid || candidate.jvmNameAliases != "" {
 			return true
 		}
 	}
@@ -706,13 +722,10 @@ func kotlinCallableArityStatus(s javaScopeSymbol, e javaScopeEdge, javaName stri
 	if s.visibility != "" && s.visibility != "public" {
 		return -1
 	}
-	if renamed, known := kotlinJvmNameForSymbol(s); known {
-		if renamed != javaName {
-			return 0
-		}
-		return -1
+	if status := kotlinJVMNameStatus(s, javaName); status <= 0 {
+		return status
 	}
-	if s.jvmNameAliases != "" || kotlinHasJvmName(s.signature) || kotlinExtensionSignature(s.name, s.signature) || !kotlinFacadeCallable(s.name, s.signature) {
+	if kotlinExtensionSignature(s.name, s.signature) || !kotlinCallableShape(s.name, s.signature) {
 		return -1
 	}
 	if !javaVisibleToJava(s, e.pkg) {
@@ -784,6 +797,59 @@ func kotlinAnnotationPresent(source, spelling string) bool {
 	}
 }
 
+// kotlinJVMNameStatus classifies a candidate's Java method spelling: 1 when
+// it is javaName, 0 when it provably is not, -1 when it cannot be known.
+// Persisted name evidence is authoritative. A row without it keeps its source
+// name, unless an older parser wrote it and JvmName syntax is visible: that
+// legacy signature reading can only refuse, never select a renamed call.
+func kotlinJVMNameStatus(s javaScopeSymbol, javaName string) int {
+	if s.jvmNameEvidence.Valid {
+		if s.jvmNameKnown.Int64 == 0 || !s.jvmName.Valid || s.jvmName.String == "" {
+			return -1
+		}
+		if s.jvmName.String != javaName || !javaSourceMethodName(javaName) {
+			return 0
+		}
+		return 1
+	}
+	if renamed, known := kotlinJvmNameForSymbol(s); known {
+		if renamed != javaName {
+			return 0
+		}
+		return -1
+	}
+	if s.jvmNameAliases != "" || kotlinHasJvmName(s.signature) {
+		return -1
+	}
+	if s.name != javaName {
+		return 0
+	}
+	return 1
+}
+
+// javaReservedWords are the Java 17 keywords and literals that can never be a
+// method name in Java source, although the JVM accepts them. Contextual
+// keywords such as var, record and yield remain valid qualified method names.
+var javaReservedWords = map[string]struct{}{
+	"_": {}, "abstract": {}, "assert": {}, "boolean": {}, "break": {}, "byte": {}, "case": {}, "catch": {},
+	"char": {}, "class": {}, "const": {}, "continue": {}, "default": {}, "do": {}, "double": {}, "else": {},
+	"enum": {}, "extends": {}, "false": {}, "final": {}, "finally": {}, "float": {}, "for": {}, "goto": {},
+	"if": {}, "implements": {}, "import": {}, "instanceof": {}, "int": {}, "interface": {}, "long": {},
+	"native": {}, "new": {}, "null": {}, "package": {}, "private": {}, "protected": {}, "public": {},
+	"return": {}, "short": {}, "static": {}, "strictfp": {}, "super": {}, "switch": {}, "synchronized": {},
+	"this": {}, "throw": {}, "throws": {}, "transient": {}, "true": {}, "try": {}, "void": {}, "volatile": {},
+	"while": {},
+}
+
+// javaSourceMethodName reports whether a JVM method name can be spelled as a
+// method call in Java source, within the conservative ASCII identifier subset.
+func javaSourceMethodName(name string) bool {
+	if _, reserved := javaReservedWords[name]; reserved {
+		return false
+	}
+	return kotlinPlainJavaName(name)
+}
+
 func kotlinJvmName(signature string) (string, bool) {
 	fun := strings.Index(signature, "fun ")
 	if fun < 0 {
@@ -824,12 +890,24 @@ func kotlinJvmNameForSymbol(s javaScopeSymbol) (string, bool) {
 	return "", false
 }
 
-func kotlinJavaNameCandidates(s javaScopeSymbol, callNames map[string]struct{}) []string {
+// kotlinJavaNameCandidates lists the Java spellings under which a renamed
+// function joins the lookup maps: its exact known JVM name, or every call name
+// when the name is unknown so the declaration vetoes instead of vanishing.
+func kotlinJavaNameCandidates(s javaScopeSymbol, callNames map[string]struct{}, allCallNames []string) []string {
+	if s.jvmNameEvidence.Valid {
+		if s.jvmNameKnown.Int64 == 1 && s.jvmName.Valid {
+			if _, called := callNames[s.jvmName.String]; called {
+				return []string{s.jvmName.String}
+			}
+			return nil
+		}
+		return allCallNames
+	}
 	if name, known := kotlinJvmNameForSymbol(s); known {
 		return []string{name}
 	}
 	if kotlinHasJvmName(s.signature) || s.jvmNameAliases != "" {
-		return sortedKeys(callNames)
+		return allCallNames
 	}
 	return nil
 }
@@ -856,11 +934,18 @@ func kotlinPlainJavaName(name string) bool {
 }
 
 // kotlinFacadeCallable excludes declarations whose Java-visible form is not
-// the plain static `name()` modelled here: extensions, renamed, synthetic,
-// suspend, expect and reified functions.
+// the plain static `name()` modelled by the historical zero-argument path:
+// renamed functions and every kotlinCallableShape exclusion.
 func kotlinFacadeCallable(name, signature string) bool {
+	return !kotlinHasJvmName(signature) && kotlinCallableShape(name, signature)
+}
+
+// kotlinCallableShape excludes declarations whose JVM method is not a plain
+// call on the owner: extensions, synthetic, suspend, expect and reified
+// functions. The JVM method name is classified separately.
+func kotlinCallableShape(name, signature string) bool {
 	fun := strings.Index(signature, "fun ")
-	if fun < 0 || kotlinExtensionSignature(name, signature) || kotlinHasJvmName(signature) || strings.Contains(signature, "reified ") {
+	if fun < 0 || kotlinExtensionSignature(name, signature) || strings.Contains(signature, "reified ") {
 		return false
 	}
 	for _, token := range strings.Fields(signature[:fun]) {
