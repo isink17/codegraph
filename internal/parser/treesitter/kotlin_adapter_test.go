@@ -182,3 +182,98 @@ class Service {
 		})
 	}
 }
+
+func TestKotlinFixedJavaCallableArity(t *testing.T) {
+	src := `package lib
+typealias Alias = Token
+@JvmInline value class Token(val value: kotlin.Int)
+object Service {
+    fun zero() {}
+    fun run(value: kotlin.Int) {}
+    fun run(value: kotlin.Int, other: kotlin.String) {}
+    @JvmStatic fun staticRun(value: kotlin.Int) {}
+    fun nullable(value: kotlin.Int?) {}
+    fun noResult(value: kotlin.String) {}
+    fun explicitUnit(value: kotlin.Int): kotlin.Unit {}
+    inline fun inlineRun(value: kotlin.Int) {}
+    fun unqualified(value: Int) {}
+    fun custom(value: Token) {}
+    fun valueClassReturn(value: kotlin.Int): Token { return Token(value) }
+    fun valueClassAlias(value: Alias) {}
+    fun nestedValueClass(value: kotlin.collections.List<Token>) {}
+    fun generic(value: kotlin.collections.List<kotlin.Int>) {}
+    fun defaulted(value: kotlin.Int = 1) {}
+    @JvmOverloads fun overloaded(value: kotlin.Int = 1) {}
+    fun variadic(vararg values: kotlin.Int) {}
+    fun kotlin.String.extension(value: kotlin.Int) {}
+    suspend fun suspended(value: kotlin.Int) {}
+    @JvmName("renamed") fun renamed(value: kotlin.Int) {}
+    @JvmSynthetic fun hidden(value: kotlin.Int) {}
+    inline fun <reified T> reified(value: kotlin.Int) {}
+    fun inferred(value: kotlin.Int) = Token(value)
+    @JvmExposeBoxed("boxed") fun exposed(value: Token) {}
+    fun multiline(
+        value: kotlin.Int,
+        other: kotlin.String,
+    ) {}
+	}`
+	p, err := NewKotlin().Parse(context.Background(), "Service.kt", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]*[2]int{
+		"zero":         arityPair(0),
+		"staticRun":    arityPair(1),
+		"nullable":     arityPair(1),
+		"noResult":     arityPair(1),
+		"explicitUnit": arityPair(1),
+		"inlineRun":    arityPair(1),
+		"multiline":    arityPair(2),
+	}
+	for _, symbol := range p.Symbols {
+		if symbol.Kind != "function" {
+			continue
+		}
+		if symbol.Name == "run" {
+			wantArity := 1
+			if strings.Contains(symbol.Signature, "other: kotlin.String") {
+				wantArity = 2
+			}
+			if symbol.ArityMin == nil || symbol.ArityMax == nil || *symbol.ArityMin != wantArity || *symbol.ArityMax != wantArity {
+				t.Errorf("%s arity = (%v,%v), want (%d,%d)", symbol.Signature, symbol.ArityMin, symbol.ArityMax, wantArity, wantArity)
+			}
+			continue
+		}
+		if pair, ok := want[symbol.Name]; ok && symbol.Name != "run" {
+			if pair == nil || symbol.ArityMin == nil || symbol.ArityMax == nil || *symbol.ArityMin != pair[0] || *symbol.ArityMax != pair[1] {
+				t.Errorf("%s arity = (%v,%v), want (%d,%d)", symbol.Signature, symbol.ArityMin, symbol.ArityMax, pair[0], pair[1])
+			}
+			continue
+		}
+		if symbol.ArityMin != nil || symbol.ArityMax != nil {
+			t.Errorf("unsupported %s has arity=(%v,%v), want unknown", symbol.Signature, symbol.ArityMin, symbol.ArityMax)
+		}
+	}
+}
+
+func TestKotlinFixedArityLeavesAliasedJvmStaticUnknown(t *testing.T) {
+	p, err := NewKotlin().Parse(context.Background(), "Service.kt", []byte(`package lib
+import kotlin.jvm.JvmStatic as Static
+object Service {
+    @Static fun run(value: kotlin.Int) {}
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, symbol := range p.Symbols {
+		if symbol.Kind == "function" && symbol.Name == "run" {
+			if symbol.ArityMin != nil || symbol.ArityMax != nil {
+				t.Fatalf("aliased JvmStatic arity=(%v,%v), want unknown", symbol.ArityMin, symbol.ArityMax)
+			}
+			return
+		}
+	}
+	t.Fatal("aliased JvmStatic method not parsed")
+}
+
+func arityPair(n int) *[2]int { return &[2]int{n, n} }

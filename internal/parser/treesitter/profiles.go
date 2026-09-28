@@ -14,13 +14,17 @@ func tsProfile(language string) parser.Profile {
 
 func (a *GoAdapter) Profile() parser.Profile     { return tsProfile("go") }
 func (a *PythonAdapter) Profile() parser.Profile { return tsProfile("python") }
-func (a *JavaAdapter) Profile() parser.Profile   { return tsProfile("java") }
 
-// Kotlin v3 adds structured companion declarations and members to persisted
-// symbols. Unchanged bytes persist new source facts, so every Kotlin file has
+// Java v2 persists direct AST argument counts on method-invocation edges.
+func (a *JavaAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
+}
+
+// Kotlin v4 adds exact fixed arity facts for the conservative Java-callable
+// subset. Unchanged bytes persist new source facts, so every Kotlin file has
 // to reparse.
 func (a *KotlinAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:kotlin:v3", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:kotlin:v4", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}

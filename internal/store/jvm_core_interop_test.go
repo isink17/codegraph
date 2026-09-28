@@ -240,6 +240,63 @@ func TestJVMGeneratedCallableABIScopes(t *testing.T) {
 	})
 }
 
+func TestJVMObjectFixedArityCallable(t *testing.T) {
+	for _, tc := range []struct {
+		name, signature, call, secondName, secondSignature string
+		secondArity                                        any
+		want                                               bool
+	}{
+		{"INSTANCE", "fun run(x: kotlin.Int) {}", "Service.INSTANCE.run(1)", "", "", nil, true},
+		{"static JvmStatic", "@JvmStatic fun run(x: kotlin.Int) {}", "Service.run(1)", "", "", nil, true},
+		{"static without JvmStatic", "fun run(x: kotlin.Int) {}", "Service.run(1)", "", "", nil, false},
+		{"INSTANCE refuses JvmStatic", "@JvmStatic fun run(x: kotlin.Int) {}", "Service.INSTANCE.run(1)", "", "", nil, false},
+		{"different arity sibling", "fun run(x: kotlin.Int) {}", "Service.INSTANCE.run(1)", "run", "fun run(x: kotlin.Int, y: kotlin.Int) {}", 2, true},
+		{"same arity sibling", "fun run(x: kotlin.Int) {}", "Service.INSTANCE.run(1)", "run", "fun run(x: kotlin.String) {}", 1, false},
+		{"unsupported sibling veto", "fun run(x: kotlin.Int) {}", "Service.INSTANCE.run(1)", "run", `@JvmOverloads fun run(x: kotlin.String = "") {}`, nil, false},
+		{"renamed source sibling veto", "fun run(x: kotlin.Int) {}", "Service.INSTANCE.run(1)", "other", `@JvmName("run") fun other(x: kotlin.String) {}`, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGateFixture(t)
+			callerFile := f.file(t, "app/Caller.java", "java")
+			caller := f.symbolKind(t, callerFile, "call", "app.Caller.call", "function", "java")
+			ownerFile := f.file(t, "lib/Service.kt", "kotlin")
+			for _, x := range []struct {
+				file      int64
+				lang, pkg string
+			}{{callerFile, "java", "app"}, {ownerFile, "kotlin", "lib"}} {
+				if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(?,?,?,?)`, f.repoID, x.file, x.lang, x.pkg); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind) VALUES(?,?,?,?,?,?,?)`, f.repoID, callerFile, "java", "lib.Service", "Service", "Service", "named"); err != nil {
+				t.Fatal(err)
+			}
+			f.symbolKind(t, ownerFile, "Service", "lib.Service", "object", "kotlin")
+			target := f.symbolKind(t, ownerFile, "run", "lib.Service.run", "function", "kotlin")
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',visibility='public',signature=?,arity_min=1,arity_max=1 WHERE id=?`, tc.signature, target); err != nil {
+				t.Fatal(err)
+			}
+			if tc.secondSignature != "" {
+				extra := f.symbolKind(t, ownerFile, tc.secondName, "lib.Service."+tc.secondName, "function", "kotlin")
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Service',visibility='public',signature=?,arity_min=?,arity_max=? WHERE id=?`, tc.secondSignature, tc.secondArity, tc.secondArity, extra); err != nil {
+					t.Fatal(err)
+				}
+			}
+			edge := f.edge(t, callerFile, caller, tc.call[:len(tc.call)-3])
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence=?,call_arity=1 WHERE id=?`, tc.call, edge); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := resolveJavaScope(f.ctx, f.store.db, f.repoID, nil); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := f.dstSymbolID(t, edge)
+			if ok != tc.want || ok && got != target {
+				t.Fatalf("binding=(%d,%v), want target=%d resolved=%v", got, ok, target, tc.want)
+			}
+		})
+	}
+}
+
 func TestJVMCoreInteropRepair(t *testing.T) {
 	f := newGateFixture(t)
 	callerFile := f.file(t, "Caller.kt", "kotlin")

@@ -82,7 +82,7 @@ func TestDoctorReportsDegradedParsers(t *testing.T) {
 }
 
 func TestDoctorParserProvenanceStates(t *testing.T) {
-	tsJava := parser.LanguageSupport{Language: "java", ParserProfile: "treesitter:java:v1", CallEdges: true}
+	tsJava := parser.LanguageSupport{Language: "java", ParserProfile: "treesitter:java:v2", CallEdges: true}
 	heurJava := parser.LanguageSupport{Language: "java", ParserProfile: "heuristic:java:v1"}
 
 	cases := []struct {
@@ -91,12 +91,12 @@ func TestDoctorParserProvenanceStates(t *testing.T) {
 		current []parser.LanguageSupport
 		want    string
 	}{
-		{"current", [][3]any{{"java", "treesitter:java:v1", true}}, langs(tsJava), parserStateCurrent},
+		{"current", [][3]any{{"java", "treesitter:java:v2", true}}, langs(tsJava), parserStateCurrent},
 		{"upgrade required", [][3]any{{"java", "heuristic:java:v1", false}}, langs(tsJava), parserStateUpgradeRequired},
-		{"downgrade refused", [][3]any{{"java", "treesitter:java:v1", true}}, langs(heurJava), parserStateDowngradeRefused},
+		{"downgrade refused", [][3]any{{"java", "treesitter:java:v2", true}}, langs(heurJava), parserStateDowngradeRefused},
 		{"unknown legacy", [][3]any{{"java", "", false}}, langs(tsJava), parserStateUnknownLegacy},
 		{"mixed", [][3]any{
-			{"java", "treesitter:java:v1", true},
+			{"java", "treesitter:java:v2", true},
 			{"java", "heuristic:java:v1", false},
 		}, langs(tsJava), parserStateMixed},
 	}

@@ -216,6 +216,52 @@ func TestJVMKotlinFileFacadeSamePackage(t *testing.T) {
 	}
 }
 
+func TestJVMKotlinFileFacadeFixedArityCallable(t *testing.T) {
+	for _, tc := range []struct {
+		name, secondName, secondSignature, secondVisibility string
+		secondArity                                         any
+		want                                                bool
+	}{
+		{"unique", "run", "", "public", nil, true},
+		{"different arity overload", "run", "fun run(x: kotlin.Int, y: kotlin.Int) {}", "public", 2, true},
+		{"same arity overload", "run", "fun run(x: kotlin.String) {}", "public", 1, false},
+		{"unknown default overload veto", "run", `@JvmOverloads fun run(x: kotlin.String = "") {}`, "public", nil, false},
+		{"private sibling is irrelevant", "run", "private fun run(x: kotlin.String) {}", "private", nil, true},
+		{"synthetic sibling is irrelevant", "run", "@JvmSynthetic fun run(x: kotlin.String) {}", "public", nil, true},
+		{"different JVM name is irrelevant", "run", `@JvmName("other") fun run(x: kotlin.String) {}`, "public", nil, true},
+		{"renamed source sibling veto", "other", `@JvmName("run") fun other(x: kotlin.String) {}`, "public", nil, false},
+		{"internal sibling veto", "run", "internal fun run(x: kotlin.String) {}", "internal", nil, false},
+		{"vararg sibling veto", "run", "fun run(vararg x: kotlin.Int) {}", "public", nil, false},
+		{"suspend sibling veto", "run", "suspend fun run(x: kotlin.String) {}", "public", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFacadeFixture(t, "lib.ActionsKt")
+			file := f.kotlinFile(t, "lib/Actions.kt", "ActionsKt", false)
+			target := f.topLevel(t, file, "run", "fun run(x: kotlin.Int) {}", "public")
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET arity_min=1,arity_max=1 WHERE id=?`, target); err != nil {
+				t.Fatal(err)
+			}
+			if tc.secondSignature != "" {
+				extra := f.topLevel(t, file, tc.secondName, tc.secondSignature, tc.secondVisibility)
+				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET arity_min=?,arity_max=? WHERE id=?`, tc.secondArity, tc.secondArity, extra); err != nil {
+					t.Fatal(err)
+				}
+			}
+			edge := f.edge(t, f.callerFile, f.caller, "ActionsKt.run")
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='ActionsKt.run(1)',call_arity=1 WHERE id=?`, edge); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := resolveJavaScope(f.ctx, f.store.db, f.repoID, nil); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := f.dstSymbolID(t, edge)
+			if ok != tc.want || ok && got != target {
+				t.Fatalf("binding=(%d,%v), want target=%d resolved=%v", got, ok, target, tc.want)
+			}
+		})
+	}
+}
+
 func TestMigrationKotlinJVMFileFacade(t *testing.T) {
 	const migrationVersion = 42
 	ctx := t.Context()
