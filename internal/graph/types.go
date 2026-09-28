@@ -73,6 +73,16 @@ type ParsedFile struct {
 	SwiftInheritanceRelations []SwiftInheritanceRelation
 	SwiftDeclarationFacts     []SwiftDeclarationFact
 	SwiftExtensionMemberships []SwiftExtensionMembership
+	KotlinJVMCallableEvidence []KotlinJVMCallableEvidence
+}
+
+// KotlinJVMCallableEvidence describes Java-visible value-parameter arities
+// without manufacturing symbols for compiler-generated overloads.
+type KotlinJVMCallableEvidence struct {
+	SymbolIndex int
+	Known       bool
+	ArityMin    int
+	ArityMax    int
 }
 
 type SwiftInheritanceRelation struct {

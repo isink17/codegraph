@@ -11,8 +11,9 @@ type javaScopeSymbol struct {
 	id, file                                                           int64
 	name, qname, container, kind, signature, visibility, pkg, language string
 	static, arityMin, arityMax                                         sql.NullInt64
+	jvmEvidence, jvmKnown, jvmArityMin, jvmArityMax                    sql.NullInt64
 	jvmStaticAlias                                                     bool
-	jvmNameAliases                                                     string
+	jvmNameAliases, jvmSyntheticAliases                                string
 }
 
 type javaScopeImport struct {
@@ -90,16 +91,18 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	byQName := map[string][]javaScopeSymbol{}
 	byName := map[string][]javaScopeSymbol{}
 	companions := map[string][]javaScopeSymbol{}
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,ke.symbol_id,ke.is_known,ke.jvm_arity_min,ke.jvm_arity_max,
 		EXISTS(SELECT 1 FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmStatic' AND ki.local_name!='JvmStatic'),
-		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),'')
+		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),''),
+		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmSynthetic' AND ki.local_name!='JvmSynthetic' AND instr(s.signature,'@'||ki.local_name)>0),'')
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.file_id=s.file_id AND fs.repo_id=s.repo_id
+		LEFT JOIN kotlin_jvm_callable_evidence ke ON ke.repo_id=s.repo_id AND ke.symbol_id=s.id
 		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0`, " AND s.name IN (%s)",
 		[]any{repoID}, stringSliceToAny(nameList), true,
 		func(rows *sql.Rows) error {
 			var s javaScopeSymbol
 			var alias int
-			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &alias, &s.jvmNameAliases); err != nil {
+			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &s.jvmEvidence, &s.jvmKnown, &s.jvmArityMin, &s.jvmArityMax, &alias, &s.jvmNameAliases, &s.jvmSyntheticAliases); err != nil {
 				return err
 			}
 			s.jvmStaticAlias = alias != 0
@@ -541,7 +544,7 @@ func kotlinCompanionStaticMember(outer javaScopeSymbol, name string, e javaScope
 }
 
 func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	if kotlinNoArgCall(e.evidence) {
+	if kotlinNoArgCall(e.evidence) && !kotlinHasJVMArityEvidence(byQName[companion.qname+"."+name]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[companion.qname+"."+name] {
@@ -584,7 +587,7 @@ func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEd
 }
 
 func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	if kotlinNoArgCall(e.evidence) {
+	if kotlinNoArgCall(e.evidence) && !kotlinHasJVMArityEvidence(byQName[owner.qname+"."+name]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[owner.qname+"."+name] {
@@ -647,7 +650,7 @@ func kotlinFacadeMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 		}
 		files[part.file] = struct{}{}
 	}
-	if kotlinNoArgCall(e.evidence) {
+	if kotlinNoArgCall(e.evidence) && !kotlinHasJVMArityEvidence(byQName[kotlinJoin(owner.pkg, name)]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[kotlinJoin(owner.pkg, name)] {
@@ -681,18 +684,27 @@ func kotlinFacadeMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 	return out, strategy
 }
 
+func kotlinHasJVMArityEvidence(candidates []javaScopeSymbol) bool {
+	for _, candidate := range candidates {
+		if candidate.jvmEvidence.Valid {
+			return true
+		}
+	}
+	return false
+}
+
 // kotlinCallableArityStatus returns 1 for a fixed-arity ABI candidate, 0 for a
 // candidate proven irrelevant to this Java spelling, and -1 when unsupported
 // syntax could still participate and must veto selection.
 func kotlinCallableArityStatus(s javaScopeSymbol, e javaScopeEdge, javaName string, staticMode int) int {
+	if kotlinHasJvmSynthetic(s.signature) || kotlinHasAliasedAnnotation(s.signature, s.jvmSyntheticAliases) {
+		return 0
+	}
 	if s.visibility == "private" {
 		return 0
 	}
 	if s.visibility != "" && s.visibility != "public" {
 		return -1
-	}
-	if kotlinHasJvmSynthetic(s.signature) {
-		return 0
 	}
 	if renamed, known := kotlinJvmNameForSymbol(s); known {
 		if renamed != javaName {
@@ -703,6 +715,9 @@ func kotlinCallableArityStatus(s javaScopeSymbol, e javaScopeEdge, javaName stri
 	if s.jvmNameAliases != "" || kotlinHasJvmName(s.signature) || kotlinExtensionSignature(s.name, s.signature) || !kotlinFacadeCallable(s.name, s.signature) {
 		return -1
 	}
+	if !javaVisibleToJava(s, e.pkg) {
+		return -1
+	}
 	jvmStatic := kotlinHasJvmStatic(s.signature)
 	if staticMode != 2 && (staticMode == 1) != jvmStatic {
 		if s.jvmStaticAlias {
@@ -710,16 +725,40 @@ func kotlinCallableArityStatus(s javaScopeSymbol, e javaScopeEdge, javaName stri
 		}
 		return 0
 	}
-	if !e.callArity.Valid || e.callArity.Int64 <= 0 || !s.arityMin.Valid || !s.arityMax.Valid || s.arityMin.Int64 != s.arityMax.Int64 {
+	if !e.callArity.Valid {
+		return -1
+	}
+	if s.jvmEvidence.Valid {
+		if s.jvmKnown.Int64 == 0 || !s.jvmArityMin.Valid || !s.jvmArityMax.Valid {
+			return -1
+		}
+		if e.callArity.Int64 < s.jvmArityMin.Int64 || e.callArity.Int64 > s.jvmArityMax.Int64 {
+			return 0
+		}
+		return 1
+	}
+	if e.callArity.Int64 == 0 {
+		if kotlinNoArgFunction(s.signature) {
+			return 1
+		}
+		return 0
+	}
+	if e.callArity.Int64 < 0 || !s.arityMin.Valid || !s.arityMax.Valid || s.arityMin.Int64 != s.arityMax.Int64 {
 		return -1
 	}
 	if e.callArity.Int64 != s.arityMin.Int64 {
 		return 0
 	}
-	if !javaVisibleToJava(s, e.pkg) {
-		return -1
-	}
 	return 1
+}
+
+func kotlinHasAliasedAnnotation(signature, aliases string) bool {
+	for _, alias := range strings.Split(aliases, ",") {
+		if alias != "" && kotlinAnnotationPresent(signature, "@"+alias) {
+			return true
+		}
+	}
+	return false
 }
 
 func kotlinHasJvmSynthetic(signature string) bool {
@@ -728,7 +767,21 @@ func kotlinHasJvmSynthetic(signature string) bool {
 		return false
 	}
 	prefix := signature[:fun]
-	return strings.Contains(prefix, "@JvmSynthetic") || strings.Contains(prefix, "@kotlin.jvm.JvmSynthetic")
+	return kotlinAnnotationPresent(prefix, "@JvmSynthetic") || kotlinAnnotationPresent(prefix, "@kotlin.jvm.JvmSynthetic")
+}
+
+func kotlinAnnotationPresent(source, spelling string) bool {
+	for start := 0; ; {
+		rel := strings.Index(source[start:], spelling)
+		if rel < 0 {
+			return false
+		}
+		end := start + rel + len(spelling)
+		if end == len(source) || source[end] == '(' || source[end] == '[' || source[end] == ':' || source[end] == ' ' || source[end] == '\t' || source[end] == '\r' || source[end] == '\n' {
+			return true
+		}
+		start = end
+	}
 }
 
 func kotlinJvmName(signature string) (string, bool) {

@@ -13,12 +13,9 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
-// A watcher's first flush against an already-indexed repository is path-scoped.
-// If that repository's parser provenance is unknown (every database written
-// before migration 036) the scan refuses it and asks for one full pass. The
-// watcher must perform that pass instead of returning the error, which would
-// abort the run permanently and leave the claimed paths in flight.
-func TestWatcherConvergesInsteadOfDyingOnProfileTransition(t *testing.T) {
+// A path-scoped watcher flush converges all files in its selected stale
+// language, without broadening into unrelated languages or a watcher retry.
+func TestWatcherPathScopedUpdateConvergesProfile(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc helper() {}\n\nfunc main() { helper() }\n"), 0o644); err != nil {
@@ -51,15 +48,11 @@ func TestWatcherConvergesInsteadOfDyingOnProfileTransition(t *testing.T) {
 	raw.Close()
 
 	w := New(s, idx)
-	// The bare path-scoped run is what the flush would have returned.
-	if _, err := idx.Update(ctx, indexer.Options{RepoRoot: root, ScanKind: "watch", Paths: []string{"main.go"}}); err == nil {
-		t.Fatal("path-scoped update succeeded, expected a parser-profile transition error")
-	}
 	if err := w.updateConverging(ctx, root, indexer.Options{RepoRoot: root, ScanKind: "watch", Paths: []string{"main.go"}}); err != nil {
 		t.Fatalf("updateConverging() error = %v, want nil", err)
 	}
-	if got := w.Stats().ProfileConverges; got != 1 {
-		t.Fatalf("ProfileConverges = %d, want 1", got)
+	if got := w.Stats().ProfileConverges; got != 0 {
+		t.Fatalf("ProfileConverges = %d, want no fallback convergence", got)
 	}
 
 	repo, err := s.UpsertRepo(ctx, root)
@@ -78,7 +71,7 @@ func TestWatcherConvergesInsteadOfDyingOnProfileTransition(t *testing.T) {
 	if err := w.updateConverging(ctx, root, indexer.Options{RepoRoot: root, ScanKind: "watch", Paths: []string{"main.go"}}); err != nil {
 		t.Fatalf("second updateConverging() error = %v", err)
 	}
-	if got := w.Stats().ProfileConverges; got != 1 {
-		t.Fatalf("ProfileConverges = %d after convergence, want 1", got)
+	if got := w.Stats().ProfileConverges; got != 0 {
+		t.Fatalf("ProfileConverges = %d after convergence, want 0", got)
 	}
 }

@@ -10,6 +10,57 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 )
 
+func TestKotlinJVMCallableArityEvidence(t *testing.T) {
+	tests := []struct {
+		name, source string
+		known        bool
+		min, max     int
+	}{
+		{"plain default", `fun run(a: kotlin.Int, b: kotlin.String = "") {}`, true, 2, 2},
+		{"overloads", `@JvmOverloads fun run(a: kotlin.Int, b: kotlin.String = "", c: kotlin.Long = 0L) {}`, true, 1, 3},
+		{"mixed defaults", `@JvmOverloads fun run(a: kotlin.Int = 0, b: kotlin.String, c: kotlin.Long = 0L) {}`, true, 1, 3},
+		{"complex default", `@JvmOverloads fun run(a: kotlin.Int, b: kotlin.String = call(1, nested(2, 3))) {}`, true, 1, 2},
+		{"generated zero arg", `@JvmOverloads fun run(a: kotlin.Int = 0) {}`, true, 0, 1},
+		{"introduced veto", `fun run(@kotlin.IntroducedAt(2) a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"custom type veto", `@JvmOverloads fun run(a: custom.Type = custom.Type()) {}`, false, 0, 0},
+		{"vararg veto", `@JvmOverloads fun run(vararg a: kotlin.Int) {}`, false, 0, 0},
+		{"extension veto", `@JvmOverloads fun kotlin.String.run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"generic veto", `@JvmOverloads fun <T> run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"boxed veto", `@kotlin.jvm.JvmExposeBoxed @JvmOverloads fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"suspend veto", `@JvmOverloads suspend fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"internal veto", `@JvmOverloads internal fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"JvmName veto", `@JvmName("renamed") @JvmOverloads fun run(a: kotlin.Int = 0) {}`, false, 0, 0},
+		{"overloads without defaults", `@JvmOverloads fun run(a: kotlin.Int) {}`, true, 1, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed, err := NewKotlin().Parse(context.Background(), "Actions.kt", []byte(tt.source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(parsed.KotlinJVMCallableEvidence) != 1 {
+				t.Fatalf("facts = %+v", parsed.KotlinJVMCallableEvidence)
+			}
+			fact := parsed.KotlinJVMCallableEvidence[0]
+			if fact.SymbolIndex < 0 || fact.SymbolIndex >= len(parsed.Symbols) || parsed.Symbols[fact.SymbolIndex].Kind != "function" {
+				t.Fatalf("fact does not target exact symbol: %+v", fact)
+			}
+			if fact.Known != tt.known || tt.known && (fact.ArityMin != tt.min || fact.ArityMax != tt.max) {
+				t.Fatalf("fact = %+v", fact)
+			}
+		})
+	}
+
+	parsed, err := NewKotlin().Parse(context.Background(), "Actions.kt", []byte("import kotlin.jvm.JvmOverloads as JO\n@JO fun run(a: kotlin.Int, b: kotlin.String = \"\") {}"))
+	if err != nil || len(parsed.KotlinJVMCallableEvidence) != 1 || !parsed.KotlinJVMCallableEvidence[0].Known || parsed.KotlinJVMCallableEvidence[0].ArityMin != 1 {
+		t.Fatalf("aliased JvmOverloads evidence = %+v, err = %v", parsed.KotlinJVMCallableEvidence, err)
+	}
+	parsed, err = NewKotlin().Parse(context.Background(), "Actions.kt", []byte("import kotlin.jvm.JvmExposeBoxed as Boxed\nimport kotlin.jvm.JvmOverloads\n@Boxed @JvmOverloads fun run(a: kotlin.Int = 0) {}"))
+	if err != nil || len(parsed.KotlinJVMCallableEvidence) != 1 || parsed.KotlinJVMCallableEvidence[0].Known {
+		t.Fatalf("aliased unsupported JVM annotation = %+v, err = %v", parsed.KotlinJVMCallableEvidence, err)
+	}
+}
+
 func TestKotlinCompanionSourceSymbols(t *testing.T) {
 	tests := []struct {
 		name string
