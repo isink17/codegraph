@@ -74,7 +74,7 @@ func recoveryTree() tree {
 // source name, JvmSynthetic hides, JvmOverloads widens arity, and an unknown
 // or colliding spelling stays unresolved. The swallowed declaration stays
 // fail closed.
-func TestP247HRecoveredTopLevelAnnotations(t *testing.T) {
+func TestKotlinDetachedAnnotationRecovery(t *testing.T) {
 	r := newLifecycleRepo(t, recoveryTree())
 	for path, facade := range map[string]string{
 		"lib/Split.kt": "lib.SplitKt", "lib/Common.kt": "lib.CommonKt", "lib/Synth.kt": "lib.SynthKt", "lib/Over.kt": "lib.OverKt",
@@ -128,7 +128,7 @@ func TestP247HRecoveredTopLevelAnnotations(t *testing.T) {
 // Moving an annotation between its own line and the declaration's line only
 // changes the grammar's tree, never the compiler's meaning, so bindings and
 // evidence stay the same across the layout lifecycle.
-func TestP247HAnnotationLayoutLifecycle(t *testing.T) {
+func TestKotlinDetachedAnnotationLayoutLifecycle(t *testing.T) {
 	caller := "package app;\nimport lib.ActionsKt;\nclass Caller {\n    void viaRun() { ActionsKt.run(1); }\n    void viaExecute() { ActionsKt.execute(1); }\n}"
 	sameLine := "package lib\n@JvmName(\"execute\") fun run(x: kotlin.Int) {}\nfun other() {}\n"
 	ownLine := "package lib\n@JvmName(\"execute\")\nfun run(x: kotlin.Int) {}\nfun other() {}\n"
@@ -155,10 +155,10 @@ func TestP247HAnnotationLayoutLifecycle(t *testing.T) {
 	}
 }
 
-// The P24.7-F JvmName lifecycle on the own-line layout: rename, collision and
-// delete/restore re-decide through the recovered evidence and the existing
-// owner-name invalidation.
-func TestP247HOwnLineJvmNameLifecycle(t *testing.T) {
+// The declaration-level JvmName lifecycle on the own-line layout: rename,
+// collision and delete/restore re-decide through the recovered evidence and
+// the existing owner-name invalidation.
+func TestKotlinDetachedAnnotationJvmNameLifecycle(t *testing.T) {
 	caller := "package app;\nimport lib.ActionsKt;\nclass Caller {\n    void viaRun() { ActionsKt.run(1); }\n    void viaExecute() { ActionsKt.execute(1); }\n    void viaPerform() { ActionsKt.perform(1); }\n}"
 	file := func(annotation string, extra ...string) string {
 		src := "package lib\n"
@@ -217,7 +217,7 @@ func TestP247HOwnLineJvmNameLifecycle(t *testing.T) {
 // stale Kotlin reparses to the current profile, recovered facades and evidence appear, and the
 // unchanged Java v2 callers re-decide without reparsing -- the hidden function
 // staying hidden once its facade exists.
-func TestP247HKotlinV6ToV7Convergence(t *testing.T) {
+func TestKotlinV6ToV7DetachedAnnotationRecoveryConvergence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	files := map[string]string{
@@ -257,7 +257,7 @@ func TestP247HKotlinV6ToV7Convergence(t *testing.T) {
 		t.Fatalf("v6-to-v7 update=%+v", summary)
 	}
 	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v9", "Synth.kt": "treesitter:kotlin:v9", "Other.kt": "treesitter:kotlin:v9", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}
 	}

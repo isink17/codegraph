@@ -9,7 +9,7 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
-func TestP245B5PersistedSourceTruth(t *testing.T) {
+func TestKotlinJavaInteropPersistedSourceTruth(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Actions.kt": "package lib\nfun run() {}",
 		"Object.kt": `package lib
@@ -93,7 +93,7 @@ class Caller { void call() {
 		qname, strategy string
 		resolved        bool
 	}{
-		"ActionsKt.run":                  {"lib.run", "java_import_scope", true}, // B6A file facade evidence
+		"ActionsKt.run":                  {"lib.run", "java_import_scope", true}, // Kotlin file-facade evidence
 		"Service.INSTANCE.run":           {"lib.Service.run", "java_import_scope", true},
 		"Service.staticRun":              {"lib.Service.staticRun", "java_import_scope", true},
 		"CompanionService.Companion.run": {"lib.CompanionService.Companion.run", "java_import_scope", true},

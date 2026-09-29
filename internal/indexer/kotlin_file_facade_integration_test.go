@@ -286,7 +286,7 @@ class Caller {
 	r.assertFreshParity(t, "other package part")
 }
 
-// B5 object ABI is unaffected by facade evidence in the same file.
+// Kotlin object ABI is unaffected by facade evidence in the same file.
 func TestJVMFileFacadeKeepsObjectABI(t *testing.T) {
 	java := `package app;
 import lib.Service;
@@ -323,7 +323,7 @@ fun top() {}`})
 }
 
 // kotlinV1Adapter reproduces genuine treesitter:kotlin:v1 output: the current
-// parser minus the B6A facade facts it did not persist.
+// parser minus the file-facade facts it did not persist.
 type kotlinV1Adapter struct {
 	*tsparser.KotlinAdapter
 }

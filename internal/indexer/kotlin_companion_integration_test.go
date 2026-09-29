@@ -16,7 +16,7 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
-func TestP246BCompanionsStayOutOfB5ObjectABI(t *testing.T) {
+func TestKotlinCompanionsDoNotUseObjectABI(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Service.kt": `package lib
 class Service {
@@ -122,10 +122,10 @@ class Caller {
 	if err != nil || len(callers) != 1 {
 		t.Fatalf("FindCallers for canonical companion member = %d callers, %v; want Java ABI projection", len(callers), err)
 	}
-	r.assertFreshParity(t, "P24.6-B companion does not inherit B5 object ABI")
+	r.assertFreshParity(t, "companion does not inherit Kotlin object ABI")
 }
 
-func TestP246BKotlinV2ProfileUpgradeAddsCompanionSymbols(t *testing.T) {
+func TestKotlinV2ProfileUpgradeAddsCompanionSymbols(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	files := map[string]string{
@@ -142,20 +142,20 @@ class Service {
 		writeProfileFile(t, filepath.Join(root, path), content)
 	}
 	s := newProfileStore(t)
-	old := New(s.Store, p246Registry(kotlinV2WithoutCompanions{tsparser.NewKotlin()}), nil)
+	old := New(s.Store, profileTestRegistry(kotlinV2WithoutCompanions{tsparser.NewKotlin()}), nil)
 	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: old}
 	if _, err := old.Index(ctx, Options{RepoRoot: root}); err != nil {
 		t.Fatal(err)
 	}
 	repo := repoID(t, s, root)
 	r.repoID = repo
-	if got := p246CompanionRows(t, s.raw(t), repo, "Service.kt"); got != 0 {
+	if got := companionSymbolCount(t, s.raw(t), repo, "Service.kt"); got != 0 {
 		t.Fatalf("v2 companion symbols = %d, want 0", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v2" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v2" {
 		t.Fatalf("v2 profile = %q", got)
 	}
-	profilesBefore := p246Profiles(t, s.raw(t), repo)
+	profilesBefore := repoFileProfiles(t, s.raw(t), repo)
 
 	upgraded := New(s.Store, lifecycleRegistry(), nil)
 	r.idx = upgraded
@@ -166,17 +166,17 @@ class Service {
 	if summary.FilesChanged != 2 || summary.FilesIndexed != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("path-scoped v2 to v5 update = %+v, want only two Kotlin files reparsed", summary)
 	}
-	if got := p246CompanionRows(t, s.raw(t), repo, "Service.kt"); got != 1 {
+	if got := companionSymbolCount(t, s.raw(t), repo, "Service.kt"); got != 1 {
 		t.Fatalf("v5 companion symbols = %d, want 1", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v9" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v9" {
 		t.Fatalf("upgraded profile = %q", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v9" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v9" {
 		t.Fatalf("other Kotlin profile = %q", got)
 	}
 	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
-	if got := p246Profiles(t, s.raw(t), repo); !sameProfiles(profilesBefore, got, "Service.kt", "Other.kt") {
+	if got := repoFileProfiles(t, s.raw(t), repo); !sameProfiles(profilesBefore, got, "Service.kt", "Other.kt") {
 		t.Fatalf("unrelated Java/Go/TypeScript profiles changed: before=%v after=%v", profilesBefore, got)
 	}
 	r.assertFreshParity(t, "Kotlin v2 to v3 companion profile upgrade")
@@ -190,7 +190,7 @@ class Service {
 	}
 }
 
-func TestP246BCompanionRenameAndDeleteLifecycle(t *testing.T) {
+func TestKotlinCompanionRenameAndDeleteLifecycle(t *testing.T) {
 	unnamed := `package lib
 class Service {
     @SomeAnnotation
@@ -208,10 +208,10 @@ class Service {
 	assertPersistedCompanionMember(t, r, "Service.kt", "lib.Service.Companion.internalOnly", "Service.Companion", "@JvmName(\"execute\")\n        internal fun internalOnly() {}", "internal", "func:kotlin:lib.Service.Companion.internalOnly")
 	assertJVMResolved(t, r, "Caller.java", "Service.run", "Service.kt", "java_import_scope")
 
-	stableID := p246SymbolID(t, r, "Service.kt", "companion:kotlin:lib.Service.Companion")
+	stableID := symbolIDByStableKey(t, r, "Service.kt", "companion:kotlin:lib.Service.Companion")
 	r.write(t, "Other.java", "package app; class Other {}")
 	r.update(t, "Other.java")
-	if got := p246SymbolID(t, r, "Service.kt", "companion:kotlin:lib.Service.Companion"); got != stableID {
+	if got := symbolIDByStableKey(t, r, "Service.kt", "companion:kotlin:lib.Service.Companion"); got != stableID {
 		t.Fatalf("unrelated update changed companion symbol id %d to %d", stableID, got)
 	}
 
@@ -237,7 +237,7 @@ class Service {
 
 	r.remove(t, "Service.kt")
 	r.update(t)
-	if got := p246CompanionRows(t, p246DB(t, r), r.repoID, "Service.kt"); got != 0 {
+	if got := companionSymbolCount(t, openLifecycleTestDB(t, r), r.repoID, "Service.kt"); got != 0 {
 		t.Fatalf("deleted file companion symbols = %d, want 0", got)
 	}
 	r.assertFreshParity(t, "companion source deletion")
@@ -267,11 +267,11 @@ func (a kotlinV2WithoutCompanions) Parse(ctx context.Context, path string, conte
 	return parsed, nil
 }
 
-func p246Registry(kotlin parser.Adapter) *parser.Registry {
+func profileTestRegistry(kotlin parser.Adapter) *parser.Registry {
 	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), kotlin, tsparser.NewRust())
 }
 
-func p246DB(t *testing.T, r *lifecycleRepo) *sql.DB {
+func openLifecycleTestDB(t *testing.T, r *lifecycleRepo) *sql.DB {
 	t.Helper()
 	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
 	if err != nil {
@@ -281,7 +281,7 @@ func p246DB(t *testing.T, r *lifecycleRepo) *sql.DB {
 	return db
 }
 
-func p246CompanionRows(t *testing.T, db *sql.DB, repoID int64, path string) int {
+func companionSymbolCount(t *testing.T, db *sql.DB, repoID int64, path string) int {
 	t.Helper()
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.kind='companion_object'`, repoID, path).Scan(&n); err != nil {
@@ -290,7 +290,7 @@ func p246CompanionRows(t *testing.T, db *sql.DB, repoID int64, path string) int 
 	return n
 }
 
-func p246FileProfile(t *testing.T, db *sql.DB, repoID int64, path string) string {
+func fileParserProfile(t *testing.T, db *sql.DB, repoID int64, path string) string {
 	t.Helper()
 	var profile string
 	if err := db.QueryRow(`SELECT parser_profile FROM files WHERE repo_id=? AND path=?`, repoID, path).Scan(&profile); err != nil {
@@ -299,7 +299,7 @@ func p246FileProfile(t *testing.T, db *sql.DB, repoID int64, path string) string
 	return profile
 }
 
-func p246Profiles(t *testing.T, db *sql.DB, repoID int64) map[string]string {
+func repoFileProfiles(t *testing.T, db *sql.DB, repoID int64) map[string]string {
 	t.Helper()
 	rows, err := db.Query(`SELECT path,parser_profile FROM files WHERE repo_id=?`, repoID)
 	if err != nil {
@@ -357,7 +357,7 @@ func (a kotlinV4WithoutJVMCallableEvidence) Parse(ctx context.Context, path stri
 	return parsed, err
 }
 
-func TestP247KotlinV4ToV5EvidenceConvergence(t *testing.T) {
+func TestKotlinV4ToV5JvmCallableEvidenceConvergence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	files := map[string]string{
@@ -379,7 +379,7 @@ func TestP247KotlinV4ToV5EvidenceConvergence(t *testing.T) {
 	repo := repoID(t, s, root)
 	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: New(s.Store, lifecycleRegistry(), nil), repoID: repo}
 	assertJVMUnresolved(t, r, "Caller.java", "ActionsKt.run")
-	if got := p246FileProfile(t, s.raw(t), repo, "Caller.java"); got != "treesitter:java:v2" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Caller.java"); got != "treesitter:java:v2" {
 		t.Fatalf("Java profile=%q", got)
 	}
 	summary, err := r.idx.Update(ctx, Options{RepoRoot: root, Paths: []string{"Actions.kt"}})
@@ -390,12 +390,12 @@ func TestP247KotlinV4ToV5EvidenceConvergence(t *testing.T) {
 		t.Fatalf("v4-to-v5 update=%+v", summary)
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
 	for _, path := range []string{"Caller.java", "main.go", "caller.ts"} {
-		got := p246FileProfile(t, s.raw(t), repo, path)
+		got := fileParserProfile(t, s.raw(t), repo, path)
 		want := map[string]string{"Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
 		if got != want {
 			t.Fatalf("unrelated %s profile=%q want %q", path, got, want)
@@ -410,7 +410,7 @@ func TestP247KotlinV4ToV5EvidenceConvergence(t *testing.T) {
 	}
 }
 
-func TestP247JavaKotlinArityProfileConvergence(t *testing.T) {
+func TestJavaKotlinArityProfileConvergence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	files := map[string]string{
@@ -453,18 +453,18 @@ func TestP247JavaKotlinArityProfileConvergence(t *testing.T) {
 		t.Fatalf("profile convergence summary=%+v, want 2 Kotlin files", summary)
 	}
 	for _, path := range []string{"Caller.java", "Second.java"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:java:v2" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:java:v2" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
 	for _, path := range []string{"main.go", "caller.ts"} {
 		want := map[string]string{"main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("unrelated %s profile=%q", path, got)
 		}
 	}
@@ -494,10 +494,10 @@ func sameProfiles(before, after map[string]string, changed ...string) bool {
 	return true
 }
 
-func p246SymbolID(t *testing.T, r *lifecycleRepo, path, stableKey string) int64 {
+func symbolIDByStableKey(t *testing.T, r *lifecycleRepo, path, stableKey string) int64 {
 	t.Helper()
 	var id int64
-	if err := p246DB(t, r).QueryRow(`SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.stable_key=?`, r.repoID, path, stableKey).Scan(&id); err != nil {
+	if err := openLifecycleTestDB(t, r).QueryRow(`SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.stable_key=?`, r.repoID, path, stableKey).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -506,11 +506,11 @@ func p246SymbolID(t *testing.T, r *lifecycleRepo, path, stableKey string) int64 
 func assertPersistedCompanion(t *testing.T, r *lifecycleRepo, path, qname, name, container, stableKey string) {
 	t.Helper()
 	var count int
-	if err := p246DB(t, r).QueryRow(`SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.kind='companion_object' AND s.qualified_name=?`, r.repoID, path, qname).Scan(&count); err != nil || count != 1 {
+	if err := openLifecycleTestDB(t, r).QueryRow(`SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.kind='companion_object' AND s.qualified_name=?`, r.repoID, path, qname).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("companion rows for %s = %d, %v; want exactly one", qname, count, err)
 	}
 	var gotName, gotQName, gotContainer, gotKey, kind string
-	if err := p246DB(t, r).QueryRow(`SELECT s.name,s.qualified_name,s.container_name,s.stable_key,s.kind FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.qualified_name=?`, r.repoID, path, qname).Scan(&gotName, &gotQName, &gotContainer, &gotKey, &kind); err != nil {
+	if err := openLifecycleTestDB(t, r).QueryRow(`SELECT s.name,s.qualified_name,s.container_name,s.stable_key,s.kind FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.qualified_name=?`, r.repoID, path, qname).Scan(&gotName, &gotQName, &gotContainer, &gotKey, &kind); err != nil {
 		t.Fatal(err)
 	}
 	if kind != "companion_object" || gotName != name || gotQName != qname || gotContainer != container || gotKey != stableKey {
@@ -521,11 +521,11 @@ func assertPersistedCompanion(t *testing.T, r *lifecycleRepo, path, qname, name,
 func assertPersistedCompanionMember(t *testing.T, r *lifecycleRepo, path, qname, container, signature, visibility, stableKey string) {
 	t.Helper()
 	var count int
-	if err := p246DB(t, r).QueryRow(`SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.kind='function' AND s.qualified_name=?`, r.repoID, path, qname).Scan(&count); err != nil || count != 1 {
+	if err := openLifecycleTestDB(t, r).QueryRow(`SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.kind='function' AND s.qualified_name=?`, r.repoID, path, qname).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("companion member rows for %s = %d, %v; want exactly one", qname, count, err)
 	}
 	var gotContainer, gotSignature, gotVisibility, gotKey, kind string
-	if err := p246DB(t, r).QueryRow(`SELECT s.container_name,s.signature,s.visibility,s.stable_key,s.kind FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.qualified_name=?`, r.repoID, path, qname).Scan(&gotContainer, &gotSignature, &gotVisibility, &gotKey, &kind); err != nil {
+	if err := openLifecycleTestDB(t, r).QueryRow(`SELECT s.container_name,s.signature,s.visibility,s.stable_key,s.kind FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND s.qualified_name=?`, r.repoID, path, qname).Scan(&gotContainer, &gotSignature, &gotVisibility, &gotKey, &kind); err != nil {
 		t.Fatal(err)
 	}
 	if kind != "function" || gotContainer != container || gotSignature != signature || gotVisibility != visibility || gotKey != stableKey {
@@ -536,7 +536,7 @@ func assertPersistedCompanionMember(t *testing.T, r *lifecycleRepo, path, qname,
 func assertNoPersistedCompanion(t *testing.T, r *lifecycleRepo, path, qname, stableKey string) {
 	t.Helper()
 	var n int
-	if err := p246DB(t, r).QueryRow(`SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND (s.qualified_name=? OR s.qualified_name LIKE ? OR s.stable_key=?)`, r.repoID, path, qname, qname+".%", stableKey).Scan(&n); err != nil {
+	if err := openLifecycleTestDB(t, r).QueryRow(`SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.path=? AND (s.qualified_name=? OR s.qualified_name LIKE ? OR s.stable_key=?)`, r.repoID, path, qname, qname+".%", stableKey).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {

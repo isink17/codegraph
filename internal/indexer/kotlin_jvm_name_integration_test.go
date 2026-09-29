@@ -224,7 +224,7 @@ func jvmNameTree() tree {
 // Every supported owner family resolves the compiler-proven Java spelling to
 // the canonical Kotlin source symbol; the source spelling retires, and
 // ambiguity or ABI uncertainty stays unresolved.
-func TestP247FJvmNameOwnerFamilies(t *testing.T) {
+func TestKotlinJvmNameOwnerFamilies(t *testing.T) {
 	r := newLifecycleRepo(t, jvmNameTree())
 	type target struct{ qname, sig string }
 	actions := func(sig string) target {
@@ -288,11 +288,12 @@ func TestP247FJvmNameOwnerFamilies(t *testing.T) {
 	r.assertFreshParity(t, "JvmName owner families")
 }
 
-// P24.7-E false positive: the grammar drops an annotated top-level function
-// without an ERROR node. The facade is refused, so a surviving sibling cannot
-// bind a call javac rejects or finds ambiguous. The own-line split that only
-// detaches the annotation is recovered by v7 (P24.7-H) and binds as javac does.
-func TestP247FTopLevelMisparseNoFalsePositive(t *testing.T) {
+// Top-level misparse false positive: the grammar drops an annotated top-level
+// function without an ERROR node. The facade is refused, so a surviving sibling
+// cannot bind a call javac rejects or finds ambiguous. The own-line split that
+// only detaches the annotation is recovered by v7 detached-annotation recovery
+// and binds as javac does.
+func TestKotlinJvmNameTopLevelMisparseNoFalsePositive(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Caller.java": `package app;
 import lib.GuardKt;
@@ -319,7 +320,7 @@ class Caller {
 // The Kotlin source name never changes; only the persisted JVM name does.
 // Owner-name invalidation must retire the old spelling and activate the new
 // one, through known, unknown and absent evidence, deletion and collisions.
-func TestP247FJvmNameLifecycle(t *testing.T) {
+func TestKotlinJvmNameLifecycle(t *testing.T) {
 	caller := `package app;
 import lib.ActionsKt;
 class Caller {
@@ -408,7 +409,7 @@ class Caller {
 
 // Object and companion owners follow the same owner-name invalidation: the
 // renamed member spelling re-decides when the owner file changes.
-func TestP247FJvmNameMemberOwnerLifecycle(t *testing.T) {
+func TestKotlinJvmNameMemberOwnerLifecycle(t *testing.T) {
 	caller := `package app;
 import lib.Service;
 import lib.Holder;
@@ -483,7 +484,7 @@ func (a kotlinV5WithoutJVMNameEvidence) Parse(ctx context.Context, path string, 
 // An existing v5 database converges on a path-scoped update: stale Kotlin
 // reparses to v6 and persists name evidence, untouched Java v2 callers are
 // re-decided through owner names, and nothing else reparses.
-func TestP247FKotlinV5ToV6JvmNameConvergence(t *testing.T) {
+func TestKotlinV5ToV6JvmNameConvergence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	files := map[string]string{
@@ -524,7 +525,7 @@ func TestP247FKotlinV5ToV6JvmNameConvergence(t *testing.T) {
 		t.Fatalf("v5-to-v6 update=%+v", summary)
 	}
 	for path, want := range map[string]string{"Actions.kt": "treesitter:kotlin:v9", "Service.kt": "treesitter:kotlin:v9", "Other.kt": "treesitter:kotlin:v9", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}
 	}
