@@ -337,22 +337,22 @@ func TestJVMCoreInteropRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-		t.Fatalf("B2 repair=(%v,%v), want (true,nil)", ran, err)
+		t.Fatalf("JVM core interop repair=(%v,%v), want (true,nil)", ran, err)
 	}
 	if got, ok := f.dstSymbolID(t, edge); !ok || got != target {
-		t.Fatalf("B2 repair target=(%d,%v), want (%d,true)", got, ok, target)
+		t.Fatalf("JVM core interop repair target=(%d,%v), want (%d,true)", got, ok, target)
 	}
 	var reference sql.NullInt64
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil || !reference.Valid || reference.Int64 != target {
-		t.Fatalf("B2 repair reference=(%v,%v), want %d", reference, err, target)
+		t.Fatalf("JVM core interop repair reference=(%v,%v), want %d", reference, err, target)
 	}
 	key := fmt.Sprintf("%s.%d", jvmCoreInteropRepairSettingKey, f.repoID)
 	var value string
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, key).Scan(&value); err != nil || value != "1" {
-		t.Fatalf("B2 marker=(%q,%v), want 1", value, err)
+		t.Fatalf("JVM core interop marker=(%q,%v), want 1", value, err)
 	}
 	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || ran {
-		t.Fatalf("second B2 repair=(%v,%v), want (false,nil)", ran, err)
+		t.Fatalf("second JVM core interop repair=(%v,%v), want (false,nil)", ran, err)
 	}
 }
 
@@ -401,14 +401,14 @@ func TestJVMCoreInteropRepairClearsJavaBindingForKotlinPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-		t.Fatalf("B2 repair=(%v,%v), want (true,nil)", ran, err)
+		t.Fatalf("JVM core interop repair=(%v,%v), want (true,nil)", ran, err)
 	}
 	if _, ok := f.dstSymbolID(t, edge); ok {
-		t.Fatal("B2 repair retained Java binding despite Kotlin peer")
+		t.Fatal("JVM core interop repair retained Java binding despite Kotlin peer")
 	}
 	var reference sql.NullInt64
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil || reference.Valid {
-		t.Fatalf("B2 repair reference=(%v,%v), want NULL", reference, err)
+		t.Fatalf("JVM core interop repair reference=(%v,%v), want NULL", reference, err)
 	}
 }
 

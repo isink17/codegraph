@@ -152,7 +152,7 @@ func TestContextForTaskThroughHandlerReturnsRealContext(t *testing.T) {
 
 // The intended workflow: budgeted discovery, then explicit source drill-down
 // with the identity the discovery returned.
-func TestContextForTaskIdentityDrivesP13DrillDown(t *testing.T) {
+func TestContextForTaskIdentityDrivesDetailDrillDown(t *testing.T) {
 	server := newContextServer(t)
 	data := contextData(t, callToolViaServe(t, server, "context_for_task", map[string]any{
 		"task": "process payment retry",

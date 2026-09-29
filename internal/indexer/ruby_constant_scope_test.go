@@ -930,7 +930,7 @@ func rubyProfileV3ToV4Hazard(t *testing.T, source, line string) {
 	}
 	repo := repoID(t, s, root)
 	if got := rubyVisibilityFactRows(t, s, repo); got != "" {
-		t.Fatalf("v3 fixture already carries P22.48 facts:\n%s", got)
+		t.Fatalf("v3 fixture already carries treesitter:ruby:v4 facts:\n%s", got)
 	}
 	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
 		t.Fatal(err)

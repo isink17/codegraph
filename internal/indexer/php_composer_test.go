@@ -97,7 +97,7 @@ func TestDiscoverPHPComposerPSR4AbsentNestedAndFingerprint(t *testing.T) {
 	}
 }
 
-func TestPHPComposerRootPathP23Backslash(t *testing.T) {
+func TestPHPComposerRootPathKeepsLiteralBackslash(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("backslash is a native hierarchy separator")
 	}

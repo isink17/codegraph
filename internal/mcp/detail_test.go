@@ -201,9 +201,9 @@ func TestDetailLevelsExposeTheDocumentedFields(t *testing.T) {
 	}
 }
 
-// TestFullPreservesEveryPreP13Field pins the compatibility promise: whatever the
-// pre-P13 response carried is still reachable, at detail=full.
-func TestFullPreservesEveryPreP13Field(t *testing.T) {
+// TestFullPreservesEveryLegacySymbolField pins the compatibility promise: whatever the
+// legacy response carried is still reachable, at detail=full.
+func TestFullPreservesEveryLegacySymbolField(t *testing.T) {
 	s, ctx := detailFixture(t)
 	full, _ := callToolJSON(t, s, ctx, "find_symbol", map[string]any{"query": "Area", "detail": "full"})
 	area := findRecord(t, recordsOf(t, full, "matches"), "Area")
@@ -215,7 +215,7 @@ func TestFullPreservesEveryPreP13Field(t *testing.T) {
 		"stable_key", "file",
 	} {
 		if _, ok := area[field]; !ok {
-			t.Fatalf("detail=full dropped the pre-P13 field %q: %v", field, area)
+			t.Fatalf("detail=full dropped the legacy field %q: %v", field, area)
 		}
 	}
 	rng := area["range"].(map[string]any)

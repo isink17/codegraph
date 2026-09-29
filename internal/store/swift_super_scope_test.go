@@ -1312,7 +1312,7 @@ func TestSwiftSuperMultilevelInheritedMethodScopeUpgradeRepair(t *testing.T) {
 	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
 	refID := swiftReferenceID(t, f.swiftScopeFixture, f.edge)
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSuperMultilevelInheritedMethodRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)).Scan(new(string)); err == nil {
-		t.Fatal("P22.81 marker unexpectedly present")
+		t.Fatal("super multilevel inherited method repair marker unexpectedly present")
 	}
 	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || !run {
@@ -2915,7 +2915,7 @@ func TestSwiftSuperScopeCrossFileCompetitorAndReferences(t *testing.T) {
 	}
 }
 
-func TestSwiftSuperScopeP7AndCrossFileVisibility(t *testing.T) {
+func TestSwiftSuperScopeTestShadowAndCrossFileVisibility(t *testing.T) {
 	t.Run("test competitor does not poison production", func(t *testing.T) {
 		f := newSwiftSuperAcceptanceFixture(t)
 		testFile := f.file("Tests/BaseTests.swift")

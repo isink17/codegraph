@@ -182,7 +182,7 @@ func TestRubyRequireFalseCrossLanguageLinkSelfHeals(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := rubySourceCrossLanguageEdges(t, r); got != 1 {
-		t.Fatalf("simulated pre-B1 database holds %d false links, want 1", got)
+		t.Fatalf("simulated v1-marker database holds %d false links, want 1", got)
 	}
 	if current, err := r.store.CrossLanguageLinksCurrent(r.ctx, r.repoID); err != nil || current {
 		t.Fatalf("v1 marker read as current = %v, %v", current, err)
