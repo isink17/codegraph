@@ -97,9 +97,9 @@ func hasRow(report usage.Report, name string) bool {
 	return false
 }
 
-// TestUsageStatsIsNotAdvertisedInEitherMode is the P16 invariant P17 must not
-// spend: a meter that made every session pay for its own schema would cost more
-// context than it could ever account for.
+// TestUsageStatsIsNotAdvertisedInEitherMode guards the tools/list budget the
+// usage meter must not spend: a meter that made every session pay for its own
+// schema would cost more context than it could ever account for.
 func TestUsageStatsIsNotAdvertisedInEitherMode(t *testing.T) {
 	for _, mode := range []ToolMode{ToolModeFull, ToolModeGateway} {
 		names := toolNames(listedTools(t, newGatewayTestServer(t, mode)))
@@ -109,7 +109,8 @@ func TestUsageStatsIsNotAdvertisedInEitherMode(t *testing.T) {
 			}
 		}
 	}
-	// The advertised payloads are byte-identical to what P16 shipped.
+	// Usage metering does not change the advertised tool sets: full mode keeps
+	// the pre-gateway tool set, while gateway mode keeps the expected gateway set.
 	if got := len(toolNames(staticToolDefinitions)); got != len(preGatewayToolNames) {
 		t.Fatalf("full tools/list = %d tools, want %d", got, len(preGatewayToolNames))
 	}
@@ -494,14 +495,16 @@ func TestToolsListAccountingCountsEveryCall(t *testing.T) {
 			t.Fatalf("%s report tool_mode = %q", tc.mode, report.Session.ToolMode)
 		}
 	}
-	// Gateway discovery is materially cheaper, which is the whole point of P16.
+	// Gateway discovery is materially cheaper, which is the whole point of
+	// gateway mode.
 	if gatewayToolDefinitionsBytes >= staticToolDefinitionsBytes {
 		t.Fatalf("gateway discovery %d is not smaller than full %d",
 			gatewayToolDefinitionsBytes, staticToolDefinitionsBytes)
 	}
 }
 
-// TestFormatBucketsSeparateJSONFromCompact is the P15 saving made observable.
+// TestFormatBucketsSeparateJSONFromCompact is the compact-format saving made
+// observable.
 func TestFormatBucketsSeparateJSONFromCompact(t *testing.T) {
 	server := newBulkUsageTestServer(t)
 	args := func(format string) map[string]any {
@@ -545,8 +548,9 @@ func TestFormatBucketsSeparateJSONFromCompact(t *testing.T) {
 	}
 }
 
-// TestDetailBucketsOrderByRealCost is the P13 saving made observable: the meter's
-// ordering must be the serialized payloads' ordering, measured not assumed.
+// TestDetailBucketsOrderByRealCost is the detail-level saving made observable:
+// the meter's ordering must be the serialized payloads' ordering, measured not
+// assumed.
 func TestDetailBucketsOrderByRealCost(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
 	levels := []string{"card", "skeleton", "excerpt", "full"}
@@ -586,9 +590,9 @@ func TestDetailBucketsOrderByRealCost(t *testing.T) {
 	}
 }
 
-// TestContextForTaskPagesCountIndependently: P14's own budget is a property of
-// the context document; the meter measures the tool envelope, and each page is a
-// separate model-visible call.
+// TestContextForTaskPagesCountIndependently: context_for_task's own token
+// budget is a property of the context document; the meter measures the tool
+// envelope, and each page is a separate model-visible call.
 func TestContextForTaskPagesCountIndependently(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
 	isErr, first := callResult(t, server, "context_for_task",
@@ -622,9 +626,10 @@ func TestContextForTaskPagesCountIndependently(t *testing.T) {
 	if row.Format != "" || row.Detail != "" {
 		t.Fatalf("context_for_task claimed dimensions it has no arguments for: %+v", row)
 	}
-	// P14's estimated_tokens describes the context document; P17 measures the
-	// model-visible envelope that carries it. The envelope is the larger of the
-	// two, and the difference is the JSON wrapper, not double counting.
+	// context_for_task's estimated_tokens describes the context document; the
+	// usage meter measures the model-visible envelope that carries it. The
+	// envelope is the larger of the two, and the difference is the JSON
+	// wrapper, not double counting.
 	if envelope.Data.EstimatedTokens > row.ResponseEstimatedTokens {
 		t.Fatalf("context document estimate %d exceeds the envelope estimate %d",
 			envelope.Data.EstimatedTokens, row.ResponseEstimatedTokens)
@@ -834,7 +839,8 @@ func TestSessionTotalsMatchTheSumOfParts(t *testing.T) {
 	}
 }
 
-// TestOversizedRequestIsMetered covers the accounting side of P18. A rejected
+// TestOversizedRequestIsMetered covers the accounting side of the public size
+// policy. A rejected
 // request still crossed the wire in both directions, so it still costs context
 // and must still be counted -- once, under its own tool name.
 func TestOversizedRequestIsMetered(t *testing.T) {
@@ -863,8 +869,8 @@ func TestOversizedRequestIsMetered(t *testing.T) {
 }
 
 // TestOversizedRequestThroughTheGatewayIsNotDoubleCounted checks that the extra
-// validation P18 adds did not give the gateway a second place to charge for the
-// same rejection.
+// size-policy validation did not give the gateway a second place to charge for
+// the same rejection.
 func TestOversizedRequestThroughTheGatewayIsNotDoubleCounted(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeGateway)
 	usageReport(t, server, true)

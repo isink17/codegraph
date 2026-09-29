@@ -40,15 +40,16 @@ func TestSeedEvidencePolicyFollowsShortNameAmbiguity(t *testing.T) {
 		if sd.AllowShortEvidence {
 			t.Fatalf("%s allows short evidence, but `Renew` names two symbols", qname)
 		}
-		// The recall half of P19: the gate must not also take the exact
-		// qualified name away.
+		// The recall half of the ambiguity gate: it must not also take the
+		// exact qualified name away.
 		if sd.QualifiedName != qname || sd.SymbolID == 0 {
 			t.Fatalf("%s lost its exact identity: %+v", qname, sd)
 		}
 	}
 }
 
-// A short name only one symbol carries keeps the pre-P19 recall.
+// A short name only one symbol carries keeps its short-name evidence recall:
+// the ambiguity gate does not close it.
 func TestSeedEvidencePolicyKeepsUniqueShortNameRecall(t *testing.T) {
 	fx := newContextFixture(t)
 	opts := fullOpts()
@@ -85,7 +86,7 @@ func TestAmbiguousSeedDoesNotInheritTheOtherPackagesCallers(t *testing.T) {
 }
 
 // The candidate universe is a function of the ranking options and the graph --
-// never of the token budget. P14's cursor contract lets max_tokens change
+// never of the token budget. The context cursor contract lets max_tokens change
 // between pages of one sequence, so a universe that grew with the budget would
 // make page 2 point into a different stream than page 1 was cut from.
 func TestCandidateUniverseIsIndependentOfMaxTokens(t *testing.T) {
@@ -144,8 +145,8 @@ func TestWideContextPaginationIsComplete(t *testing.T) {
 			break
 		}
 		call.Cursor = res.NextCursor
-		// Vary the budget between pages: P14 allows it, and the candidate
-		// universe must not notice.
+		// Vary the budget between pages: the cursor contract allows it, and
+		// the candidate universe must not notice.
 		call.MaxTokens = 700 + 300*(page%3)
 	}
 

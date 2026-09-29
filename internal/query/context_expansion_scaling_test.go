@@ -6,14 +6,14 @@ import (
 	"testing"
 )
 
-// The regression guard for P19's central claim, stated at the layer an agent
-// actually calls: neighbour expansion is one batched round trip whatever the
-// seed count.
+// The regression guard for batched expansion's central claim, stated at the
+// layer an agent actually calls: neighbour expansion is one batched round trip
+// whatever the seed count.
 //
-// The pre-P19 shape made two store calls per expanded seed. If this test starts
-// reporting a count that tracks the seed count, expansion has grown a per-seed
-// loop again -- which is the failure the eight-seed ceiling existed to contain,
-// and the ceiling is gone.
+// The unbatched expansion made two store calls per expanded seed. If this test
+// starts reporting a count that tracks the seed count, expansion has grown a
+// per-seed loop again -- which is the failure the eight-seed ceiling existed to
+// contain, and the ceiling is gone.
 func TestNeighbourExpansionDoesNotScaleWithSeedCount(t *testing.T) {
 	for _, seeds := range []int{1, 8, 12, 30} {
 		t.Run(fmt.Sprintf("seeds%d", seeds), func(t *testing.T) {
@@ -73,9 +73,9 @@ func batchSizes(c *countingContextStore) []int {
 	return out
 }
 
-// BenchmarkContextExpansionBySeedCount is the measurement behind P19's latency
-// claim. Before batching the expansion stage was linear in the seed count; it
-// is now dominated by the fixed pipeline.
+// BenchmarkContextExpansionBySeedCount is the measurement behind batched
+// expansion's latency claim. Before batching the expansion stage was linear in
+// the seed count; it is now dominated by the fixed pipeline.
 func BenchmarkContextExpansionBySeedCount(b *testing.B) {
 	for _, seeds := range []int{1, 8, 30} {
 		b.Run(fmt.Sprintf("seeds%d", seeds), func(b *testing.B) {
@@ -95,8 +95,8 @@ func BenchmarkContextExpansionBySeedCount(b *testing.B) {
 }
 
 // BenchmarkContextRelatedTestsShare isolates the related-test leg, which is
-// still one query per returned file. P19 deliberately left it alone; this is
-// the measurement that says whether that is still defensible.
+// still one query per returned file. Batching deliberately left it alone; this
+// is the measurement that says whether that is still defensible.
 func BenchmarkContextRelatedTestsShare(b *testing.B) {
 	for _, tests := range []bool{false, true} {
 		b.Run(fmt.Sprintf("tests%v", tests), func(b *testing.B) {

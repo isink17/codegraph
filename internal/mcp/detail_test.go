@@ -208,7 +208,8 @@ func TestFullPreservesEveryLegacySymbolField(t *testing.T) {
 	full, _ := callToolJSON(t, s, ctx, "find_symbol", map[string]any{"query": "Area", "detail": "full"})
 	area := findRecord(t, recordsOf(t, full, "matches"), "Area")
 
-	// These are exactly the JSON names graph.Symbol serialized before P13.
+	// These are exactly the JSON names graph.Symbol serialized in the legacy
+	// symbol response.
 	for _, field := range []string{
 		"symbol_id", "file_id", "language", "kind", "name", "qualified_name",
 		"container_name", "signature", "visibility", "range", "doc_summary",

@@ -17,11 +17,11 @@ import (
 
 // MCP end-to-end latency for the local graph tools.
 //
-// P12's budget is stated for the store, but nothing reaches a user through the
-// store: it reaches them through tool dispatch, a handler, and JSON encoding.
-// This benchmark measures the same query at three layers against one graph, so
-// the report can say where the time actually goes instead of assuming the store
-// number is the whole story:
+// The 50ms query budget is stated for the store, but nothing reaches a user
+// through the store: it reaches them through tool dispatch, a handler, and JSON
+// encoding. This benchmark measures the same query at three layers against one
+// graph, so the report can say where the time actually goes instead of assuming
+// the store number is the whole story:
 //
 //	store    -- the store call on its own
 //	dispatch -- argument validation, unmarshal, handler, response map

@@ -8,9 +8,9 @@ import (
 	"github.com/isink17/codegraph/internal/tokenest"
 )
 
-// TestOversizedRequestIsRejectedBeforeAnyQuery proves the ordering P18 depends
-// on: an out-of-range argument must cost a string comparison, not a hundred
-// million rows followed by an apology.
+// TestOversizedRequestIsRejectedBeforeAnyQuery proves the ordering the public
+// size policy depends on: an out-of-range argument must cost a string
+// comparison, not a hundred million rows followed by an apology.
 //
 // The proof is negative and exact. The store is closed first, so every code
 // path that reaches the database fails loudly; a clean validation message can
@@ -109,8 +109,8 @@ func TestRejectedRequestPayloadStaysSmall(t *testing.T) {
 	}
 }
 
-// TestResultsBelowTheCeilingAreUnchanged is the compatibility half: P18 bounds
-// the extremes and must not alter an ordinary page.
+// TestResultsBelowTheCeilingAreUnchanged is the compatibility half: the public
+// size policy bounds the extremes and must not alter an ordinary page.
 func TestResultsBelowTheCeilingAreUnchanged(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
 	for _, limit := range []int{1, 5, limits.DefaultPage, 100} {

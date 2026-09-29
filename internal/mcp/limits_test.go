@@ -9,7 +9,7 @@ import (
 	"github.com/isink17/codegraph/internal/limits"
 )
 
-// noDriverErrorSubstring is the string P18 exists to keep off the public
+// noDriverErrorSubstring is the raw driver error that must stay off the public
 // surface. A caller that reads it learns nothing about its own request and may
 // well conclude the index is broken.
 const noDriverErrorSubstring = "sql: no rows in result set"
@@ -50,9 +50,10 @@ func withArgs(base map[string]any, extra map[string]any) map[string]any {
 	return out
 }
 
-// TestEveryPagedToolRejectsAnAbsurdLimit is the P18 headline. Before this
-// phase, limit=100000000 travelled through validation, through the query layer,
-// and into SQLite as a real LIMIT on every one of these tools.
+// TestEveryPagedToolRejectsAnAbsurdLimit is the public size policy's headline.
+// Before public result pages were bounded, limit=100000000 travelled through
+// validation, through the query layer, and into SQLite as a real LIMIT on every
+// one of these tools.
 func TestEveryPagedToolRejectsAnAbsurdLimit(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
 	for _, tool := range pagedTools {
@@ -317,10 +318,10 @@ func searchNamesPage(t *testing.T, server *Server, limit, offset int) []string {
 	return out
 }
 
-// TestSelfBoundedToolsKeepTheirOwnPolicy guards the two tools P18 deliberately
-// left alone. Both were already bounded, and both clamp rather than reject;
-// routing them through the shared policy would change a working contract for no
-// safety gain.
+// TestSelfBoundedToolsKeepTheirOwnPolicy guards the two tools the shared page
+// policy deliberately leaves alone. Both were already bounded, and both clamp
+// rather than reject; routing them through the shared policy would change a
+// working contract for no safety gain.
 func TestSelfBoundedToolsKeepTheirOwnPolicy(t *testing.T) {
 	gateway := newGatewayTestServer(t, ToolModeGateway)
 	data := searchTools(t, gateway, map[string]any{"query": "symbol", "limit": 100})
@@ -336,8 +337,8 @@ func TestSelfBoundedToolsKeepTheirOwnPolicy(t *testing.T) {
 }
 
 // TestContextForTaskBudgetSemanticsAreUnchanged checks that the shared numeric
-// validator did not reinterpret P14's arguments. max_tokens keeps its own
-// zero-means-default and clamp-above-maximum behaviour.
+// validator did not reinterpret context_for_task's budget arguments. max_tokens
+// keeps its own zero-means-default and clamp-above-maximum behaviour.
 func TestContextForTaskBudgetSemanticsAreUnchanged(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
 	for _, args := range []map[string]any{

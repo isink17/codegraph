@@ -17,9 +17,10 @@ import (
 // the stored value is the logical repository identity on every host. Before the
 // fix SymbolsForRefs keyed its wanted-set on a rewritten path and compared it
 // against the scanned symbol's path, so on Windows no seed ever matched and
-// context_for_task returned `{"files":null}` again -- the exact bug P14 set out
-// to fix. The store-level tests could not catch it because they insert
-// `billing/renew.go` literally, which is one spelling on every host.
+// context_for_task returned `{"files":null}` again -- the exact bug the
+// seed-contract fix addressed. The store-level tests could not catch it because
+// they insert `billing/renew.go` literally, which is one spelling on every
+// host.
 func TestSeedRefRoundTripThroughProductionIndexer(t *testing.T) {
 	ctx := context.Background()
 	for name, fx := range map[string]*contextFixture{

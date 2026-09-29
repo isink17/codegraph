@@ -7,9 +7,9 @@ import (
 
 // TestSemanticSeedContractReproduction pins the producer contract of both
 // semantic-search paths and proves that ContextForTask consumes it. Before the
-// P14 fix, parseSeedSymbols read r["name"], a key neither producer emits, so
-// every seed was dropped and ContextForTask returned {"files":null} while
-// reporting success.
+// seed-contract fix, parseSeedSymbols read r["name"], a key neither producer
+// emits, so every seed was dropped and ContextForTask returned {"files":null}
+// while reporting success.
 func TestSemanticSeedContractReproduction(t *testing.T) {
 	ctx := context.Background()
 	fx := newContextFixture(t)

@@ -90,8 +90,8 @@ func snapshotServerDB(t *testing.T, raw *sql.DB) string {
 
 // TestMCPRepositoryToolsFailClosedOnLegacyPathFormat proves the MCP surface
 // inherits the Service gate: every repository-data tool answers a current
-// index, and on the same index degraded to a pre-P23 shape every one returns
-// an isError tool result carrying the rebuild-required message, never a
+// index, and on the same index degraded to the legacy path format every one
+// returns an isError tool result carrying the rebuild-required message, never a
 // legacy-spelled file path, and never touches the database.
 func TestMCPRepositoryToolsFailClosedOnLegacyPathFormat(t *testing.T) {
 	ctx := context.Background()
