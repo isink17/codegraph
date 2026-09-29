@@ -45,7 +45,8 @@ func benchHandle(b *testing.B, metered bool, name string, args json.RawMessage) 
 	}
 }
 
-// BenchmarkUsageMeterCallPath is every instruction P17 adds to one tools/call:
+// BenchmarkUsageMeterCallPath is every instruction the usage meter adds to one
+// tools/call:
 // the per-call record, the context that carries it, both annotations, and the
 // aggregate update. The A/B pairs below isolate the aggregate alone, so this is
 // the number to quote for total per-call overhead.

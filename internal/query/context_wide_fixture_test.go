@@ -125,7 +125,7 @@ func TestWideFixtureSeedOrderIsPackageOrder(t *testing.T) {
 	}
 }
 
-// P19: a seed past the old eight-seed ceiling contributes graph context.
+// A seed past the old eight-seed expansion ceiling contributes graph context.
 //
 // The seed itself was always there -- it is a direct match, and MaxSymbols
 // covers it. What the ceiling removed was its neighbourhood, which is the half

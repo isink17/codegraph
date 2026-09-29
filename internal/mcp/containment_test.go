@@ -74,8 +74,8 @@ func mcpGraphState(t *testing.T, s *store.Store, repoID int64) (repos []string, 
 	return repos, files, len(scanRows)
 }
 
-// TestRepoRootContainmentMatrix is P22.31 item 25: which repository roots a tool
-// call may name. The active repository may be asserted under any alias that
+// TestRepoRootContainmentMatrix pins which repository roots a tool call may
+// name. The active repository may be asserted under any alias that
 // really identifies it; nothing else is accepted, and a subdirectory of the
 // active root is not the active root.
 func TestRepoRootContainmentMatrix(t *testing.T) {
@@ -150,9 +150,9 @@ func TestRepoRootSymlinkAlias(t *testing.T) {
 	}
 }
 
-// TestRepoRootRepoPathConflictMatrix is P22.31 item 24. Both fields are
-// validated, so a conflicting second field can never be silently ignored the way
-// first-non-empty-wins ignored it.
+// TestRepoRootRepoPathConflictMatrix covers repo_root/repo_path conflicts. Both
+// fields are validated, so a conflicting second field can never be silently
+// ignored the way first-non-empty-wins ignored it.
 func TestRepoRootRepoPathConflictMatrix(t *testing.T) {
 	server, _, _, repoA, repoB := containmentEnv(t)
 
@@ -220,9 +220,10 @@ func TestIndexRepoRootEscapeRejectedZeroMutation(t *testing.T) {
 	}
 }
 
-// TestIndexRepoRootEscapePrecedesConfigLoad is P22.31 item 10. Repo B carries a
-// malformed CodeGraph config; the caller must see the scope violation, never a
-// parse error from B, which would prove containment ran after config.LoadRepo.
+// TestIndexRepoRootEscapePrecedesConfigLoad pins containment before config
+// loading. Repo B carries a malformed CodeGraph config; the caller must see the
+// scope violation, never a parse error from B, which would prove containment
+// ran after config.LoadRepo.
 func TestIndexRepoRootEscapePrecedesConfigLoad(t *testing.T) {
 	server, _, _, _, repoB := containmentEnv(t)
 	writeRepoFile(t, repoB, filepath.Join(".codegraph", "config.json"), "{ this is not json")
@@ -236,8 +237,9 @@ func TestIndexRepoRootEscapePrecedesConfigLoad(t *testing.T) {
 	}
 }
 
-// TestUpdateGraphPathEscapeRejectedZeroMutation is P22.31 item 27: a path-scoped
-// call cannot smuggle an outside file through even with repo_root left alone.
+// TestUpdateGraphPathEscapeRejectedZeroMutation pins path containment: a
+// path-scoped call cannot smuggle an outside file through even with repo_root
+// left alone.
 func TestUpdateGraphPathEscapeRejectedZeroMutation(t *testing.T) {
 	ctx := context.Background()
 	server, s, repoID, _, repoB := containmentEnv(t)
@@ -273,8 +275,8 @@ func TestUpdateGraphPathEscapeRejectedZeroMutation(t *testing.T) {
 	}
 }
 
-// TestIndexToolsSameRepoRegression is P22.31 item 28: hardening must not cost
-// any legitimate shape.
+// TestIndexToolsSameRepoRegression is the compatibility check for containment
+// hardening: it must not cost any legitimate shape.
 func TestIndexToolsSameRepoRegression(t *testing.T) {
 	ctx := context.Background()
 	server, s, repoID, repoA, _ := containmentEnv(t)
@@ -312,7 +314,7 @@ func TestIndexToolsSameRepoRegression(t *testing.T) {
 	}
 }
 
-// TestGatewayIndexEscapeRejected is P22.31 item 22. The gateway reaches
+// TestGatewayIndexEscapeRejected covers the gateway route. The gateway reaches
 // index_repo through tool_call, which re-enters the same dispatcher, so it must
 // inherit containment without the gateway holding a copy of the rule.
 func TestGatewayIndexEscapeRejected(t *testing.T) {
@@ -363,7 +365,7 @@ func TestGatewayIndexEscapeRejected(t *testing.T) {
 // `Action: index_repo` does reach handleIndex. What must hold is that it lands
 // on the contained handler and the refusal comes back as an observation instead
 // of an indexed repository. The LLM backend itself is out of the loop here --
-// per P22.31 item 23, the call path is structurally shared and unit-tested.
+// the call path is structurally shared and unit-tested.
 func TestAgenticQueryLoopCannotEscape(t *testing.T) {
 	server, s, repoID, _, repoB := containmentEnv(t)
 	reposBefore, _, scansBefore := mcpGraphState(t, s, repoID)

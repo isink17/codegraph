@@ -226,12 +226,13 @@ func TestSameNameSeedExpandsOwnGraph(t *testing.T) {
 	if rel, ok := names["subscription.Renew"]; ok && rel != relevanceDirectMatch {
 		t.Fatalf("subscription.Renew appeared as %q rather than as its own search hit", rel)
 	}
-	// The association itself, not the proxy this test used to assert. Before
-	// P22.6 both bare `Renew` calls were unresolved and only the ambiguous-
-	// short-name gate kept them apart, so "SubscriptionDriver is absent" stood
-	// in for "the other Renew's caller was not followed". Now the edges
-	// themselves are right, and SubscriptionDriver legitimately arrives through
-	// subscription.Renew's own graph -- so the claim is checked directly.
+	// The association itself, not the proxy this test used to assert. Before Go
+	// package-scope resolution both bare `Renew` calls were unresolved and only
+	// the ambiguous-short-name gate kept them apart, so "SubscriptionDriver is
+	// absent" stood in for "the other Renew's caller was not followed". Now the
+	// edges themselves are right, and SubscriptionDriver legitimately arrives
+	// through subscription.Renew's own graph -- so the claim is checked
+	// directly.
 	assertCallersAre(t, fx, "billing.Renew", []string{"billing.BillingDriver", "billing.TestRenew"})
 	assertCallersAre(t, fx, "subscription.Renew", []string{"subscription.SubscriptionDriver"})
 }

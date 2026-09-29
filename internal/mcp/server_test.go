@@ -138,7 +138,7 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	if len(languages) == 0 {
 		t.Fatalf("languages = %v, want non-empty", languages)
 	}
-	// Pinned public contract (P22.29): the pre-existing fields stay, and every
+	// Pinned public contract: the pre-existing fields stay, and every
 	// entry additionally discloses which parser serves the language and whether
 	// it produces call edges, so a client can tell a degraded index apart from a
 	// complete one without guessing from the build.

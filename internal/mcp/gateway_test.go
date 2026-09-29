@@ -179,8 +179,9 @@ func callResult(t *testing.T, server *Server, name string, args any) (bool, stri
 //
 // The message is read out of the envelope rather than matched against the raw
 // text: the payload is JSON, so a message containing a quoted tool name is
-// escaped on the wire. Decoding it is also the assertion that the P14 escaping fix
-// still holds through the gateway -- a spliced blob would not parse.
+// escaped on the wire. Decoding it is also the assertion that error documents
+// are still marshalled, not spliced, when they pass through the gateway -- a
+// spliced blob would not parse.
 func callError(t *testing.T, server *Server, name string, args any) string {
 	t.Helper()
 	isError, text := callResult(t, server, name, args)
@@ -290,14 +291,15 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // style rule: if a deliberate edit moves it, update it here and say so in the
 // commit, which is exactly the review the number deserves.
 //
-// P18 moved these deliberately. The public size policy is now machine-readable:
-// every advertised `limit`, `offset`, and `depth` carries the minimum and
-// maximum the validator actually enforces, and get_impact_radius and
-// trace_dependencies gained the limit/offset pair that bounds their traversal.
-// P18 moved these: full tools/list 11870 -> 12000 bytes (+130) and gateway
-// 3968 -> 4062 (+94), buying machine-readable bounds.
+// Bounding public result pages moved these deliberately. The public size policy
+// is now machine-readable: every advertised `limit`, `offset`, and `depth`
+// carries the minimum and maximum the validator actually enforces, and
+// get_impact_radius and trace_dependencies gained the limit/offset pair that
+// bounds their traversal. Full tools/list went 11870 -> 12000 bytes (+130) and
+// gateway 3968 -> 4062 (+94), buying machine-readable bounds.
 //
-// P22.31 moves them again: 12000 -> 12535 bytes (+535, +134 estimated tokens).
+// Repository containment moves them again: 12000 -> 12535 bytes (+535, +134
+// estimated tokens).
 // index_repo and update_graph now say they act on *this server's active
 // repository*, and repo_root/repo_path carry a one-line description saying they
 // may only assert that repository, never retarget the server. The rule is
@@ -440,9 +442,9 @@ func TestGatewayHidesTheSpecializedToolsButKeepsTheirSchemas(t *testing.T) {
 	}
 }
 
-// TestGatewayToolsListSavesTokens is the measurement P16 exists for. The floor is
-// asserted, not the exact number, so an honest description edit does not fail the
-// build -- but a gateway that stops being small does.
+// TestGatewayToolsListSavesTokens is the measurement gateway mode exists for.
+// The floor is asserted, not the exact number, so an honest description edit
+// does not fail the build -- but a gateway that stops being small does.
 func TestGatewayToolsListSavesTokens(t *testing.T) {
 	fullBytes, err := json.Marshal(listedTools(t, newGatewayTestServer(t, ToolModeFull)))
 	if err != nil {
@@ -597,20 +599,21 @@ func TestToolSearchExactNameReturnsTheCanonicalSchema(t *testing.T) {
 // answered by a full-mode server directly and by a gateway server through
 // tool_call; the model-visible text and the error flag must be identical.
 //
-// The cases cover a flat query tool, a P13 detail tool, two P15 compact tools, a
-// P14 budgeted context call, an admin read, a mutating tool, and five kinds of
-// invalid argument -- the places a second validation path or a second serializer
-// would show up.
+// The cases cover a flat query tool, a detail-level tool, two compact-format
+// tools, a token-budgeted context call, an admin read, a mutating tool, and
+// five kinds of invalid argument -- the places a second validation path or a
+// second serializer would show up.
 func TestToolCallMatchesDirectCallExactly(t *testing.T) {
 	// One server, two modes. A second server would sit on a different temp
 	// repository root, and every path in the payload would differ for reasons that
 	// have nothing to do with the gateway.
 	server := newGatewayTestServer(t, ToolModeFull)
 
-	// Every case is held to byte equality. There used to be an `unstable` escape
-	// hatch here for graph_analytics pagerank, whose own output was not stable
-	// across two identical calls; P19 gave the analytics a semantic total order,
-	// so the waiver is gone and the tool is compared like any other.
+	// Every case is held to byte equality. There used to be an `unstable`
+	// escape hatch here for graph_analytics pagerank, whose own output was not
+	// stable across two identical calls; the analytics now break ties in a
+	// semantic total order, so the waiver is gone and the tool is compared like
+	// any other.
 	//
 	// pagerank is the case that carries that: this fixture has enough symbols
 	// and edges to produce a real ranked page. The coupling and cycles cases
@@ -679,7 +682,7 @@ func TestToolCallMatchesDirectCallExactly(t *testing.T) {
 // Direct/gateway parity is only meaningful if the tool is stable against
 // itself: two identical direct calls that disagree would make the parity
 // assertion above a coin flip rather than a statement about the gateway. This
-// is the assumption the P16 waiver was hiding.
+// is the assumption the old `unstable` pagerank waiver was hiding.
 func TestGraphAnalyticsRepeatedDirectCallsAreIdentical(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
 	for _, analysis := range []string{"pagerank", "coupling", "cycles"} {
@@ -733,9 +736,10 @@ func TestToolCallDoesNotDoubleEncode(t *testing.T) {
 	}
 }
 
-// TestContextForTaskThroughTheGatewayIsNotRebudgeted checks that the P14 budget
-// contract survives both the direct core call and a cursor continuation. The
-// gateway must not trim, re-rank, or re-budget anything.
+// TestContextForTaskThroughTheGatewayIsNotRebudgeted checks that the
+// context_for_task token-budget contract survives both the direct core call and
+// a cursor continuation. The gateway must not trim, re-rank, or re-budget
+// anything.
 func TestContextForTaskThroughTheGatewayIsNotRebudgeted(t *testing.T) {
 	gateway := newGatewayTestServer(t, ToolModeGateway)
 	isError, text := callResult(t, gateway, "context_for_task",
@@ -876,8 +880,9 @@ func TestGatewayKeepsEveryCapabilityReachable(t *testing.T) {
 	}
 }
 
-// TestRegistryIsTheOnlySourceOfTruth guards the invariant the P16 refactor bought:
-// one row per tool feeding the definitions, the validator, and dispatch.
+// TestRegistryIsTheOnlySourceOfTruth guards the invariant the registry refactor
+// bought: one row per tool feeding the definitions, the validator, and
+// dispatch.
 func TestRegistryIsTheOnlySourceOfTruth(t *testing.T) {
 	if len(toolByName) != len(toolRegistry) {
 		t.Fatalf("toolByName has %d entries, registry has %d", len(toolByName), len(toolRegistry))
@@ -936,8 +941,8 @@ func TestRegistryIsTheOnlySourceOfTruth(t *testing.T) {
 	if len(unlisted) != len(preGatewayToolNames)-len(core) {
 		t.Errorf("gateway-unlisted tools = %d, want %d", len(unlisted), len(preGatewayToolNames)-len(core))
 	}
-	// Diagnostics are advertised nowhere, which is the property that keeps both
-	// tools/list payloads the size P16 left them.
+	// Diagnostics are hidden in both modes, so they never contribute an entry to
+	// either tools/list payload.
 	if !reflect.DeepEqual(diagnostic, []string{"usage_stats"}) {
 		t.Errorf("hidden diagnostics = %v, want [usage_stats]", diagnostic)
 	}

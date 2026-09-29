@@ -113,7 +113,7 @@ func contextData(t *testing.T, payload map[string]any) map[string]any {
 	return data
 }
 
-// The regression that started P14: the production handler used to answer
+// The empty-context regression: the production handler used to answer
 // {"files":null} for an indexed repository and call it a success.
 func TestContextForTaskThroughHandlerReturnsRealContext(t *testing.T) {
 	server := newContextServer(t)

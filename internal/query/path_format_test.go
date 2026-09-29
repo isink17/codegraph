@@ -17,7 +17,7 @@ import (
 )
 
 // pathFormatFixture indexes one tiny repository for real and hands back the
-// raw database so a test can degrade it into a pre-P23 shape.
+// raw database so a test can degrade it into the legacy path format.
 type pathFormatFixture struct {
 	svc    *Service
 	repoID int64
@@ -74,7 +74,8 @@ func TestServiceFreshEmptyUnmarkedRepositoryReads(t *testing.T) {
 }
 
 // degradeToLegacy removes the format marker and rewrites files.path to the
-// native spelling a pre-P23 Windows index could have stored.
+// native spelling a Windows index built before canonical repository paths
+// could have stored.
 func (f *pathFormatFixture) degradeToLegacy(t *testing.T) {
 	t.Helper()
 	for _, stmt := range []string{
@@ -258,11 +259,11 @@ func TestServiceMatrixCoversEveryExportedMethod(t *testing.T) {
 	}
 }
 
-// TestServiceRepositoryReadsFailClosedOnLegacyPathFormat is the F4A4 gate
-// proof: every exported Service method works on a current-format index and,
-// once the same index is degraded to a pre-P23 shape, every one of them fails
-// with ErrRepositoryPathFormatRebuild, returns nothing, and leaves the
-// database byte-identical.
+// TestServiceRepositoryReadsFailClosedOnLegacyPathFormat is the legacy
+// path-format gate proof: every exported Service method works on a
+// current-format index and, once the same index is degraded to the legacy path
+// format, every one of them fails with ErrRepositoryPathFormatRebuild, returns
+// nothing, and leaves the database byte-identical.
 func TestServiceRepositoryReadsFailClosedOnLegacyPathFormat(t *testing.T) {
 	ctx := context.Background()
 	f := newPathFormatFixture(t)

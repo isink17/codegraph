@@ -55,7 +55,8 @@ func callToolRaw(t *testing.T, s *Server, ctx context.Context, name string, args
 	if part["type"] != "text" {
 		t.Fatalf("content type = %v, want text", part["type"])
 	}
-	// P15 did not introduce structuredContent: the payload must be sent once.
+	// Compact encoding does not add structuredContent: the payload must be sent
+	// once.
 	if _, ok := result["structuredContent"]; ok {
 		t.Fatalf("result carries structuredContent as well as text: %v", result)
 	}
@@ -704,7 +705,7 @@ func TestImpactSectionsCoverEveryTraversalKey(t *testing.T) {
 
 // TestToolsListGrowthIsModest measures the schema cost of the new argument. The
 // budget is deliberately tight: tools/list is paid once per session by every
-// client, and P13 and P14 already grew it.
+// client, and the detail and context-budget arguments already grew it.
 func TestToolsListGrowthIsModest(t *testing.T) {
 	payload, err := json.Marshal(staticToolDefinitions)
 	if err != nil {
@@ -731,7 +732,7 @@ func TestToolsListGrowthIsModest(t *testing.T) {
 }
 
 // TestCompactSavesTokens is the reason the format exists. The threshold is the
-// phase target for bulk card pages, measured on model-visible content through
+// design target for bulk card pages, measured on model-visible content through
 // the production path.
 func TestCompactSavesTokens(t *testing.T) {
 	s, ctx := bulkFixture(t)
@@ -895,9 +896,10 @@ func BenchmarkSearchSymbolsCompactVsJSON(b *testing.B) {
 	}
 }
 
-// BenchmarkHubPageEncoding measures a 100-row page off P12's hub fixture -- one
-// symbol with thousands of callers -- through the production content path, so the
-// two encodings are compared where a per-row cost would actually show up.
+// BenchmarkHubPageEncoding measures a 100-row page off the latency hub fixture
+// -- one symbol with thousands of callers -- through the production content
+// path, so the two encodings are compared where a per-row cost would actually
+// show up.
 func BenchmarkHubPageEncoding(b *testing.B) {
 	ctx := context.Background()
 	server, _, _ := setupMCPHubServer(b)

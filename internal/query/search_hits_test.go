@@ -6,9 +6,10 @@ import (
 	"testing"
 )
 
-// The adapter honours the documented keys and nothing else. This is the test the
-// pre-P14 code lacked: a consumer read a key ("name") no producer emitted, and
-// nothing failed until context_for_task returned an empty document.
+// The adapter honours the documented keys and nothing else. This is the test
+// the original seed parser lacked: a consumer read a key ("name") no producer
+// emitted, and nothing failed until context_for_task returned an empty
+// document.
 func TestParseSearchHitsPinsProducerContract(t *testing.T) {
 	hits := parseSearchHits([]map[string]any{
 		// Current contract, as emitted by Store.SemanticSearch.
