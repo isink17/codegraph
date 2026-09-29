@@ -141,7 +141,7 @@ func (a kotlinV7Visibility) Parse(ctx context.Context, path string, content []by
 // A v7 database persisted false-public private functions (their Java callers
 // bound) and a false-private public function and class (their Java callers
 // unresolved). A
-// path-scoped update reparses only the stale Kotlin to v8; the unchanged Java
+// path-scoped update reparses only the stale Kotlin to the current profile; the unchanged Java
 // v2 caller re-decides both edges without being reparsed.
 func TestP247JKotlinV7ToV8VisibilityConvergence(t *testing.T) {
 	ctx := context.Background()
@@ -194,7 +194,7 @@ func TestP247JKotlinV7ToV8VisibilityConvergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v7-to-v8 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"lib/Vis.kt": "treesitter:kotlin:v8", "lib/Service.kt": "treesitter:kotlin:v8", "Other.kt": "treesitter:kotlin:v8", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"lib/Vis.kt": "treesitter:kotlin:v9", "lib/Service.kt": "treesitter:kotlin:v9", "Other.kt": "treesitter:kotlin:v9", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
 		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}

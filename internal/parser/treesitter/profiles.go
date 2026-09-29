@@ -20,22 +20,28 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
 }
 
-// Kotlin v8 derives declaration visibility from the structured
-// visibility_modifier children of the declaration's modifiers, rather than
-// from source text an annotation argument could truncate (`@A(x = 1)
-// private fun`) or contaminate (`@Suppress("private") fun`). v7 structurally
-// recovers a proven detached top-level annotation run
-// before modifier-less fun/object declarations: the file keeps its facade and
-// the declaration persists the recovered annotations in its signature and its
-// JVM name and arity evidence. v6 persisted declaration-level @JvmName
-// evidence and suppressed a .kt facade whose root holds anything but preamble
-// and declaration syntax. Unchanged Kotlin source can now persist different
-// facts.
+// Kotlin v9 structurally recovers one swallowed declaration: an annotated
+// top-level `private fun N() { ... }` the grammar parsed as an expression
+// becomes an ordinary private function whose file keeps its facade, and the
+// two call nodes spelling its head are no longer extracted as calls. v8
+// derives declaration visibility from the structured visibility_modifier
+// children of the declaration's modifiers, rather than from source text an
+// annotation argument could truncate (`@A(x = 1) private fun`) or contaminate
+// (`@Suppress("private") fun`). v7 structurally recovers a proven detached
+// top-level annotation run before modifier-less fun/object declarations: the
+// file keeps its facade and the declaration persists the recovered
+// annotations in its signature and its JVM name and arity evidence. v6
+// persisted declaration-level @JvmName evidence and suppressed a .kt facade
+// whose root holds anything but preamble and declaration syntax. Unchanged
+// Kotlin source can now persist different facts.
 func (a *KotlinAdapter) Profile() parser.Profile {
-	if a.v6 {
+	switch a.legacy {
+	case 6:
 		return parser.Profile{ID: "treesitter:kotlin:v6", EmitsCallEdges: true}
+	case 8:
+		return parser.Profile{ID: "treesitter:kotlin:v8", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:kotlin:v8", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:kotlin:v9", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}
