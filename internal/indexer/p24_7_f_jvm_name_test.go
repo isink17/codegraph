@@ -289,8 +289,9 @@ func TestP247FJvmNameOwnerFamilies(t *testing.T) {
 }
 
 // P24.7-E false positive: the grammar drops an annotated top-level function
-// (or only its annotation) without an ERROR node. The facade is refused, so a
-// surviving sibling cannot bind a call javac rejects or finds ambiguous.
+// without an ERROR node. The facade is refused, so a surviving sibling cannot
+// bind a call javac rejects or finds ambiguous. The own-line split that only
+// detaches the annotation is recovered by v7 (P24.7-H) and binds as javac does.
 func TestP247FTopLevelMisparseNoFalsePositive(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Caller.java": `package app;
@@ -305,12 +306,11 @@ class Caller {
 		"lib/Guard.kt": "package lib\n@JvmName(\"execute\") fun a() { println() }\nfun execute(): kotlin.Int { return 1 }\n",
 		"lib/Split.kt": "package lib\n@JvmName(\"renamed\")\nfun split(x: kotlin.Int) {}\nfun other() {}\n",
 	})
-	for _, path := range []string{"lib/Guard.kt", "lib/Split.kt"} {
-		assertKotlinFacade(t, r.dbPath, r.repoID, path, "")
-	}
-	for _, caller := range []string{"ambiguous", "renamedSource", "renamed", "sibling"} {
-		if got, _ := jvmNameCall(t, r, "app.Caller."+caller); got != "" {
-			t.Errorf("%s -> %q, want unresolved", caller, got)
+	assertKotlinFacade(t, r.dbPath, r.repoID, "lib/Guard.kt", "")
+	assertKotlinFacade(t, r.dbPath, r.repoID, "lib/Split.kt", "lib.SplitKt|explicit=0|multifile=0")
+	for caller, want := range map[string]string{"ambiguous": "", "renamedSource": "", "renamed": "lib.split|", "sibling": "lib.other|"} {
+		if got, _ := jvmNameCall(t, r, "app.Caller."+caller); want == "" && got != "" || !strings.HasPrefix(got, want) {
+			t.Errorf("%s -> %q, want %q", caller, got, want)
 		}
 	}
 	r.assertFreshParity(t, "top-level misparse")
@@ -523,7 +523,7 @@ func TestP247FKotlinV5ToV6JvmNameConvergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v5-to-v6 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"Actions.kt": "treesitter:kotlin:v6", "Service.kt": "treesitter:kotlin:v6", "Other.kt": "treesitter:kotlin:v6", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"Actions.kt": "treesitter:kotlin:v7", "Service.kt": "treesitter:kotlin:v7", "Other.kt": "treesitter:kotlin:v7", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
 		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}

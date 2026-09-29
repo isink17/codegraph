@@ -20,12 +20,18 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
 }
 
-// Kotlin v6 persists declaration-level @JvmName evidence (known or unknown
-// JVM method name) and proven arity for renamed functions, and suppresses a
-// .kt file facade whose root holds anything but preamble and declaration
-// syntax. Unchanged Kotlin source can now persist different facts.
+// Kotlin v7 structurally recovers a proven detached top-level annotation run
+// before modifier-less fun/object declarations: the file keeps its facade and
+// the declaration persists the recovered annotations in its signature and its
+// JVM name and arity evidence. v6 persisted declaration-level @JvmName
+// evidence and suppressed a .kt facade whose root holds anything but preamble
+// and declaration syntax. Unchanged Kotlin source can now persist different
+// facts.
 func (a *KotlinAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:kotlin:v6", EmitsCallEdges: true}
+	if a.v6 {
+		return parser.Profile{ID: "treesitter:kotlin:v6", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:kotlin:v7", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}

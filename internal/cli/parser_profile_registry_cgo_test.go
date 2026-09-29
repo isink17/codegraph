@@ -13,7 +13,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:csharp:v4"
 		}
 		if lang.Language == "kotlin" {
-			want = "treesitter:kotlin:v6"
+			want = "treesitter:kotlin:v7"
 		}
 		if lang.Language == "java" {
 			want = "treesitter:java:v2"
