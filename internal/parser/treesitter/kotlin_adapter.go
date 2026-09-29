@@ -15,9 +15,18 @@ import (
 )
 
 // KotlinAdapter parses Kotlin source files using tree-sitter.
-type KotlinAdapter struct{}
+type KotlinAdapter struct {
+	// v6 disables detached-annotation recovery: the treesitter:kotlin:v6
+	// parser, kept so profile-transition tests can write the databases it did.
+	v6 bool
+}
 
 func NewKotlin() *KotlinAdapter { return &KotlinAdapter{} }
+
+// NewKotlinV6 returns the previous treesitter:kotlin:v6 parser, which refuses
+// a .kt facade on any detached root annotation instead of recovering it. It
+// exists only to reproduce v6 databases in profile-transition tests.
+func NewKotlinV6() *KotlinAdapter { return &KotlinAdapter{v6: true} }
 
 func (a *KotlinAdapter) Language() string     { return "kotlin" }
 func (a *KotlinAdapter) Extensions() []string { return []string{".kt", ".kts"} }
@@ -41,8 +50,13 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	}
 
 	kotlinExtractImports(root, content, &pf)
-	pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports)
-	kotlinExtractSymbols(root, module, "", "module", content, pf.Scope.Imports, &pf)
+	// Scripts may legally hold top-level expressions, so the split shape is
+	// only proven, and only recovered, in .kt files.
+	views, clean := kotlinRootDeclarations(root, content, !a.v6 && filepath.Ext(path) == ".kt")
+	if clean {
+		pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports)
+	}
+	kotlinExtractSymbols(root, module, "", "module", content, pf.Scope.Imports, views, &pf)
 	kotlinExtractCalls(root, content, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
@@ -64,22 +78,8 @@ func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFil
 // declarations from the file name and the structured @file: annotations. The
 // preamble must parse cleanly, an annotation of ours must have the one form
 // proven here, and every name must fall in the plain Java identifier subset;
-// anything else yields no facade rather than a guessed one.
-//
-// Every root child must also be preamble syntax or a top-level declaration
-// node. The Kotlin grammar can silently parse legal source such as an
-// annotated function as a top-level expression, dropping the declaration or
-// its annotations without an ERROR node; a facade built from the surviving
-// declarations could then bind a Java call the compiler rejects or finds
-// ambiguous. Recovery nodes nested inside a declaration (a MISSING automatic
-// semicolon in a one-line body) do not change the root shape and are kept.
-//
-// The refusal is deliberate and costs recall: a top-level annotation with
-// arguments on its own line before `fun` (@Deprecated("x"), @Throws(...),
-// @Suppress("..."), @OptIn(...)) is split by the grammar into a root
-// expression plus an unannotated function, so the whole file loses its
-// facade. A missed Java binding is preferred to a false one; recovering the
-// split shape is separate parser work.
+// anything else yields no facade rather than a guessed one. It is only called
+// for a root kotlinRootDeclarations reports clean.
 func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []graph.ScopeImport) graph.JVMFileFacade {
 	if filepath.Ext(path) != ".kt" {
 		return graph.JVMFileFacade{} // scripts compile to a script class
@@ -92,26 +92,19 @@ func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []g
 		case "function_declaration", "property_declaration":
 			topLevel = true
 		}
-		if preamble {
-			switch child.Type() {
-			case "file_annotation", "package_header", "import_list", "import_header", "shebang_line", "line_comment", "multiline_comment":
-				if child.HasError() {
+		if !preamble || !kotlinPreambleNode(child.Type()) {
+			preamble = false // annotations after this point are not file-targeted
+			continue
+		}
+		if child.HasError() {
+			return graph.JVMFileFacade{}
+		}
+		if child.Type() == "file_annotation" {
+			for j := range int(child.NamedChildCount()) {
+				if !kotlinFileAnnotation(child.NamedChild(j), content, imports, &facade) {
 					return graph.JVMFileFacade{}
 				}
-				if child.Type() == "file_annotation" {
-					for j := range int(child.NamedChildCount()) {
-						if !kotlinFileAnnotation(child.NamedChild(j), content, imports, &facade) {
-							return graph.JVMFileFacade{}
-						}
-					}
-				}
-				continue
-			default:
-				preamble = false // annotations after this point are not file-targeted
 			}
-		}
-		if child.IsError() || !kotlinTopLevelDeclarationNode(child.Type()) {
-			return graph.JVMFileFacade{}
 		}
 	}
 	if !topLevel {
@@ -139,6 +132,222 @@ func kotlinTopLevelDeclarationNode(kind string) bool {
 		return true
 	}
 	return false
+}
+
+// kotlinPreambleNode is the root child set that may precede the first
+// top-level declaration: file annotations, package and imports.
+func kotlinPreambleNode(kind string) bool {
+	switch kind {
+	case "file_annotation", "package_header", "import_list", "import_header", "shebang_line", "line_comment", "multiline_comment":
+		return true
+	}
+	return false
+}
+
+// kotlinAnnotationEntry is one annotation application: its type and its
+// argument list -- value_arguments, or for a recovered split annotation the
+// parenthesized_expression standing in for exactly one positional argument.
+type kotlinAnnotationEntry struct{ typ, args *sitter.Node }
+
+// kotlinDeclarationView is a declaration as the compiler sees it. start is
+// where its source begins (the first recovered detached annotation, else the
+// declaration node), first anchors its documentation, and annotations are the
+// recovered entries in source order that the declaration's own modifiers lack.
+type kotlinDeclarationView struct {
+	decl        *sitter.Node
+	start       uint32
+	first       *sitter.Node
+	annotations []kotlinAnnotationEntry
+}
+
+func kotlinPlainView(node *sitter.Node) kotlinDeclarationView {
+	return kotlinDeclarationView{decl: node, start: node.StartByte(), first: node}
+}
+
+// kotlinRootDeclarations scans the root once. clean reports that every root
+// child is preamble, top-level declaration syntax, or -- when recovery is set
+// -- a proven detached annotation run; views maps each declaration start byte
+// to the annotations recovered for it.
+//
+// The Kotlin grammar can silently parse legal source such as an annotated
+// function as a top-level expression, dropping the declaration or its
+// annotations without an ERROR node; a facade built from the surviving
+// declarations could then bind a Java call the compiler rejects or finds
+// ambiguous. Recovery nodes nested inside a declaration (a MISSING automatic
+// semicolon in a one-line body) do not change the root shape and are kept.
+//
+// Only one split is recovered, and only from structure: an own-line
+// annotation with one argument before a later declaration becomes
+// prefix_expression(annotation("@" user_type), parenthesized_expression)
+// followed by a modifier-less function or object. A run is R1..Rn D where each
+// Ri is a root annotation or, last and at most once, such a prefix_expression
+// chain; only comments and whitespace separate them (checked on the bytes, as
+// the grammar can swallow a `;`); D is the next function_declaration or
+// object_declaration and starts with its `fun`/`object` keyword; nothing in
+// the run has a parse error. Every other root expression -- including a
+// declaration the grammar swallowed whole, which cannot be rebuilt from its
+// tree -- leaves the root unclean, and an unclean root recovers nothing.
+func kotlinRootDeclarations(root *sitter.Node, content []byte, recovery bool) (map[uint32]kotlinDeclarationView, bool) {
+	var views map[uint32]kotlinDeclarationView
+	clean, preamble := true, true
+	var run *kotlinDeclarationView
+	var runEnd uint32
+	chained := false
+	fail := func() { clean, run, chained = false, nil, false }
+	extend := func(node *sitter.Node, entries []kotlinAnnotationEntry) {
+		if run == nil {
+			run = &kotlinDeclarationView{start: node.StartByte(), first: node}
+		}
+		run.annotations = append(run.annotations, entries...)
+		runEnd = node.EndByte()
+	}
+	for i := range int(root.ChildCount()) {
+		child := root.Child(i)
+		kind := child.Type()
+		if preamble && kotlinPreambleNode(kind) {
+			continue
+		}
+		preamble = false
+		if run != nil && !kotlinBlank(content[runEnd:child.StartByte()]) {
+			fail()
+		}
+		switch kind {
+		case "line_comment", "multiline_comment":
+			if run != nil {
+				runEnd = child.EndByte()
+			}
+			continue
+		case "annotation", "prefix_expression":
+			if !recovery || chained {
+				fail()
+				continue
+			}
+			var entries []kotlinAnnotationEntry
+			ok := false
+			if kind == "annotation" {
+				entries, ok = kotlinPlainAnnotation(child)
+			} else {
+				entries, ok = kotlinDetachedAnnotationChain(child, content)
+				chained = ok
+			}
+			if !ok {
+				fail()
+				continue
+			}
+			extend(child, entries)
+			continue
+		case "function_declaration", "object_declaration":
+			if run == nil {
+				continue
+			}
+			keyword := "fun"
+			if kind == "object_declaration" {
+				keyword = "object"
+			}
+			if !chained || child.HasError() || child.ChildCount() == 0 || child.Child(0).Type() != keyword {
+				fail()
+				continue
+			}
+			run.decl = child
+			if views == nil {
+				views = map[uint32]kotlinDeclarationView{}
+			}
+			views[child.StartByte()] = *run
+			run, chained = nil, false
+			continue
+		}
+		if run != nil {
+			fail()
+		}
+		if child.IsError() || !kotlinTopLevelDeclarationNode(kind) {
+			clean = false
+		}
+	}
+	if run != nil {
+		clean = false // a dangling annotation annotates nothing
+	}
+	if !clean {
+		return nil, false // an unexplained root keeps every declaration unrecovered
+	}
+	return views, true
+}
+
+func kotlinBlank(gap []byte) bool {
+	for _, c := range gap {
+		if c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '\f' {
+			return false
+		}
+	}
+	return true
+}
+
+// kotlinAnnotationEntries lists the applications in one annotation node:
+// `@T`, `@T(args)` or each entry of `@[...]`.
+func kotlinAnnotationEntries(annotation *sitter.Node) []kotlinAnnotationEntry {
+	var entries []kotlinAnnotationEntry
+	for i := range int(annotation.NamedChildCount()) {
+		switch entry := annotation.NamedChild(i); entry.Type() {
+		case "user_type":
+			entries = append(entries, kotlinAnnotationEntry{typ: entry})
+		case "constructor_invocation":
+			if typ := firstChild(entry, "user_type"); typ != nil {
+				entries = append(entries, kotlinAnnotationEntry{typ: typ, args: firstChild(entry, "value_arguments")})
+			}
+		}
+	}
+	return entries
+}
+
+// kotlinPlainAnnotation accepts a detached annotation node made only of `@`,
+// annotation types, constructor invocations and brackets, with `@` touching
+// what follows it as kotlinc requires. A use-site target is refused: stripping
+// it would change what the annotation applies to.
+func kotlinPlainAnnotation(node *sitter.Node) ([]kotlinAnnotationEntry, bool) {
+	if node.Type() != "annotation" || node.HasError() || node.ChildCount() < 2 || node.Child(0).Type() != "@" || node.Child(0).EndByte() != node.Child(1).StartByte() {
+		return nil, false
+	}
+	for i := 1; i < int(node.ChildCount()); i++ {
+		switch node.Child(i).Type() {
+		case "user_type", "constructor_invocation", "[", "]":
+		default:
+			return nil, false
+		}
+	}
+	entries := kotlinAnnotationEntries(node)
+	return entries, len(entries) > 0
+}
+
+// kotlinDetachedAnnotationChain reads prefix_expression(annotation, operand)
+// where the operand is another such chain or, at the end, the parenthesized
+// argument the grammar split from `@T(arg)`: the annotation is exactly `@` and
+// a type, the `(` follows the type with no byte between, and the parentheses
+// hold one expression.
+func kotlinDetachedAnnotationChain(node *sitter.Node, content []byte) ([]kotlinAnnotationEntry, bool) {
+	if node.Type() != "prefix_expression" || node.HasError() || node.ChildCount() != 2 {
+		return nil, false
+	}
+	annotation, operand := node.Child(0), node.Child(1)
+	if !kotlinBlank(content[annotation.EndByte():operand.StartByte()]) {
+		return nil, false
+	}
+	entries, ok := kotlinPlainAnnotation(annotation)
+	if !ok {
+		return nil, false
+	}
+	switch operand.Type() {
+	case "prefix_expression":
+		rest, ok := kotlinDetachedAnnotationChain(operand, content)
+		return append(entries, rest...), ok
+	case "parenthesized_expression":
+		if annotation.ChildCount() != 2 || annotation.Child(1).Type() != "user_type" || annotation.EndByte() != operand.StartByte() {
+			return nil, false
+		}
+		if operand.ChildCount() != 3 || operand.Child(0).Type() != "(" || !operand.Child(1).IsNamed() || operand.Child(2).Type() != ")" {
+			return nil, false
+		}
+		return []kotlinAnnotationEntry{{typ: annotation.Child(1), args: operand}}, true
+	}
+	return nil, false
 }
 
 // kotlinFileAnnotation records one annotation inside `@file:`. It reports
@@ -177,7 +386,7 @@ func kotlinFileAnnotation(node *sitter.Node, content []byte, imports []graph.Sco
 		if node.Type() != "constructor_invocation" {
 			return false
 		}
-		name, ok := kotlinSingleStringArgument(node, content)
+		name, ok := kotlinSingleStringArgument(firstChild(node, "value_arguments"), content)
 		if !ok || facade.Explicit || !kotlinPlainJavaIdentifier(name) {
 			return false
 		}
@@ -220,17 +429,28 @@ func kotlinJVMAnnotationSpelling(spelling, simple string, imports []graph.ScopeI
 
 // kotlinSingleStringArgument returns the content of `("Name")`: exactly one
 // positional argument that is a plain string literal with no interpolation or
-// escape.
-func kotlinSingleStringArgument(node *sitter.Node, content []byte) (string, bool) {
-	args := firstChild(node, "value_arguments")
-	if args == nil || args.NamedChildCount() != 1 {
+// escape. args is a value_arguments node, or the parenthesized_expression a
+// recovered split annotation holds its one argument in.
+func kotlinSingleStringArgument(args *sitter.Node, content []byte) (string, bool) {
+	var lit *sitter.Node
+	switch {
+	case args == nil:
 		return "", false
+	case args.Type() == "parenthesized_expression":
+		if args.ChildCount() != 3 {
+			return "", false
+		}
+		lit = args.Child(1)
+	default:
+		if args.NamedChildCount() != 1 {
+			return "", false
+		}
+		arg := args.NamedChild(0)
+		if arg.Type() != "value_argument" || arg.NamedChildCount() != 1 {
+			return "", false
+		}
+		lit = arg.NamedChild(0)
 	}
-	arg := args.NamedChild(0)
-	if arg.Type() != "value_argument" || arg.NamedChildCount() != 1 {
-		return "", false
-	}
-	lit := arg.NamedChild(0)
 	if lit.Type() != "string_literal" || lit.NamedChildCount() != 1 || lit.NamedChild(0).Type() != "string_content" {
 		return "", false
 	}
@@ -252,19 +472,25 @@ func kotlinPlainJavaIdentifier(name string) bool {
 	return true
 }
 
-func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
+// kotlinExtractSymbols walks one declaration container. views holds the root's
+// recovered detached annotations and is nil for every nested body.
+func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, imports []graph.ScopeImport, views map[uint32]kotlinDeclarationView, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
+		view, ok := views[child.StartByte()]
+		if !ok || view.decl != child {
+			view = kotlinPlainView(child)
+		}
 		switch child.Type() {
 		case "class_declaration":
-			kotlinAddType(child, module, container, "class", content, imports, pf)
+			kotlinAddType(view, module, container, "class", content, imports, pf)
 		case "object_declaration":
-			kotlinAddType(child, module, container, "object", content, imports, pf)
+			kotlinAddType(view, module, container, "object", content, imports, pf)
 		case "interface_declaration":
-			kotlinAddType(child, module, container, "interface", content, imports, pf)
+			kotlinAddType(view, module, container, "interface", content, imports, pf)
 		case "function_declaration":
 			if ownerKind == "type" || ownerKind == "module" || ownerKind == "companion" {
-				kotlinAddFunction(child, module, container, content, imports, pf)
+				kotlinAddFunction(view, module, container, content, imports, pf)
 			}
 		case "companion_object":
 			if ownerKind == "type" {
@@ -294,18 +520,19 @@ func kotlinAddCompanion(node *sitter.Node, module, outerContainer string, conten
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: outerContainer,
-		Visibility:    kotlinVisibility(node, content),
+		Visibility:    kotlinVisibility(kotlinPlainView(node), content),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "companion:kotlin:" + qualified,
 	})
 
 	if body := firstChild(node, "class_body"); body != nil {
-		kotlinExtractSymbols(body, module, container, "companion", content, imports, pf)
+		kotlinExtractSymbols(body, module, container, "companion", content, imports, nil, pf)
 	}
 }
 
-func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
+func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
+	node := view.decl
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		nameNode = firstChild(node, "type_identifier")
@@ -327,9 +554,9 @@ func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byt
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: container,
-		Visibility:    kotlinVisibility(node, content),
+		Visibility:    kotlinVisibility(view, content),
 		Range:         nodeRange(node),
-		DocSummary:    prevCommentText(node, content),
+		DocSummary:    prevCommentText(view.first, content),
 		StableKey:     "type:kotlin:" + qualified,
 	})
 
@@ -342,11 +569,12 @@ func kotlinAddType(node *sitter.Node, module, parent, kind string, content []byt
 		if parent != "" {
 			nextContainer = parent + "." + name
 		}
-		kotlinExtractSymbols(body, module, nextContainer, "type", content, imports, pf)
+		kotlinExtractSymbols(body, module, nextContainer, "type", content, imports, nil, pf)
 	}
 }
 
-func kotlinAddFunction(node *sitter.Node, module, container string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
+func kotlinAddFunction(view kotlinDeclarationView, module, container string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
+	node := view.decl
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		nameNode = firstChild(node, "simple_identifier")
@@ -363,11 +591,11 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 	if container != "" && container != module {
 		qualified = kotlinQualified(module, container+"."+name)
 	}
-	sig := kotlinDeclarationSignature(node, content)
+	sig := kotlinDeclarationSignature(view, content)
 	var arityMin, arityMax *int
-	jvmName, renamed, knownRename := kotlinDeclarationJVMName(node, content, imports)
+	jvmName, renamed, knownRename := kotlinDeclarationJVMName(view, content, imports)
 	unknownRename := renamed && !knownRename
-	if arity := kotlinFixedJavaCallableArity(node, content, imports, unknownRename); arity != nil {
+	if arity := kotlinFixedJavaCallableArity(view, content, imports, unknownRename); arity != nil {
 		arityMin, arityMax = arity, arity
 	}
 
@@ -378,14 +606,14 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Signature:     sig,
-		Visibility:    kotlinVisibility(node, content),
+		Visibility:    kotlinVisibility(view, content),
 		ArityMin:      arityMin,
 		ArityMax:      arityMax,
 		Range:         nodeRange(node),
-		DocSummary:    prevCommentText(node, content),
+		DocSummary:    prevCommentText(view.first, content),
 		StableKey:     "func:kotlin:" + qualified,
 	})
-	if fact, ok := kotlinJVMCallableEvidence(node, content, imports, len(pf.Symbols)-1, unknownRename); ok {
+	if fact, ok := kotlinJVMCallableEvidence(view, content, imports, len(pf.Symbols)-1, unknownRename); ok {
 		pf.KotlinJVMCallableEvidence = append(pf.KotlinJVMCallableEvidence, fact)
 	}
 	if renamed {
@@ -394,44 +622,32 @@ func kotlinAddFunction(node *sitter.Node, module, container string, content []by
 }
 
 // kotlinDeclarationJVMName reads a function's own @JvmName from its structured
-// modifier annotations. present reports any annotation that is, or may be,
+// modifier annotations and the detached ones recovered for it. present reports any annotation that is, or may be,
 // kotlin.jvm.JvmName; known additionally proves the exact JVM method name: one
 // such annotation with one positional plain string literal in the ASCII
 // identifier subset. Named, constant, concatenated, raw, escaped or templated
 // arguments, repeated annotations and shadowed spellings stay unknown -- the
 // parser evaluates no Kotlin expressions.
-func kotlinDeclarationJVMName(node *sitter.Node, content []byte, imports []graph.ScopeImport) (name string, present, known bool) {
-	mods := firstChild(node, "modifiers")
-	if mods == nil {
-		return "", false, false
+func kotlinDeclarationJVMName(view kotlinDeclarationView, content []byte, imports []graph.ScopeImport) (name string, present, known bool) {
+	entries := view.annotations
+	if mods := firstChild(view.decl, "modifiers"); mods != nil {
+		for i := range int(mods.NamedChildCount()) {
+			if annotation := mods.NamedChild(i); annotation.Type() == "annotation" {
+				entries = append(entries[:len(entries):len(entries)], kotlinAnnotationEntries(annotation)...)
+			}
+		}
 	}
 	count := 0
-	for i := range int(mods.NamedChildCount()) {
-		annotation := mods.NamedChild(i)
-		if annotation.Type() != "annotation" {
+	for _, entry := range entries {
+		ours, uncertain := kotlinJVMAnnotationSpelling(nodeText(entry.typ, content), "JvmName", imports)
+		if !ours && !uncertain {
 			continue
 		}
-		for j := range int(annotation.NamedChildCount()) {
-			entry := annotation.NamedChild(j)
-			typ := entry
-			if entry.Type() == "constructor_invocation" {
-				typ = firstChild(entry, "user_type")
-			} else if entry.Type() != "user_type" {
-				continue
-			}
-			if typ == nil {
-				continue
-			}
-			ours, uncertain := kotlinJVMAnnotationSpelling(nodeText(typ, content), "JvmName", imports)
-			if !ours && !uncertain {
-				continue
-			}
-			count++
-			known = false
-			if args := firstChild(entry, "value_arguments"); ours && args != nil && !strings.Contains(nodeText(args, content), `"""`) {
-				if literal, ok := kotlinSingleStringArgument(entry, content); ok && kotlinPlainJavaIdentifier(literal) {
-					name, known = literal, true
-				}
+		count++
+		known = false
+		if ours && entry.args != nil && !strings.Contains(nodeText(entry.args, content), `"""`) {
+			if literal, ok := kotlinSingleStringArgument(entry.args, content); ok && kotlinPlainJavaIdentifier(literal) {
+				name, known = literal, true
 			}
 		}
 	}
@@ -449,7 +665,8 @@ func kotlinDeclarationJVMName(node *sitter.Node, content []byte, imports []graph
 // and defaults come from tree-sitter nodes; source text is used only to classify
 // annotation spellings in the modifier region.
 // unknownRename reports a declaration @JvmName whose JVM name is unprovable.
-func kotlinJVMCallableEvidence(node *sitter.Node, content []byte, imports []graph.ScopeImport, symbolIndex int, unknownRename bool) (graph.KotlinJVMCallableEvidence, bool) {
+func kotlinJVMCallableEvidence(view kotlinDeclarationView, content []byte, imports []graph.ScopeImport, symbolIndex int, unknownRename bool) (graph.KotlinJVMCallableEvidence, bool) {
+	node := view.decl
 	unknown := graph.KotlinJVMCallableEvidence{SymbolIndex: symbolIndex}
 	if node == nil || node.HasError() {
 		return unknown, false
@@ -462,7 +679,7 @@ func kotlinJVMCallableEvidence(node *sitter.Node, content []byte, imports []grap
 	if fun == nil || params == nil || params.HasError() {
 		return unknown, false
 	}
-	prefix := string(content[node.StartByte():fun.StartByte()])
+	prefix := string(content[view.start:fun.StartByte()])
 	defaultCount, count, hasVararg, hasIntroducedParam := 0, 0, false, false
 	paramTypes := make([]*sitter.Node, 0, params.NamedChildCount())
 	for i := range int(params.ChildCount()) {
@@ -611,7 +828,8 @@ func kotlinHasUnknownAliasedJVMAnnotation(source string, imports []graph.ScopeIm
 // qualified built-in types avoid package declarations and aliases shadowing
 // short names such as Int. Unknown types remain unknown; no type resolution is
 // attempted here.
-func kotlinFixedJavaCallableArity(node *sitter.Node, content []byte, imports []graph.ScopeImport, unknownRename bool) *int {
+func kotlinFixedJavaCallableArity(view kotlinDeclarationView, content []byte, imports []graph.ScopeImport, unknownRename bool) *int {
+	node := view.decl
 	if node == nil || node.HasError() {
 		return nil
 	}
@@ -629,7 +847,7 @@ func kotlinFixedJavaCallableArity(node *sitter.Node, content []byte, imports []g
 	if fun == nil || name == nil {
 		return nil
 	}
-	prefix := string(content[node.StartByte():fun.StartByte()])
+	prefix := string(content[view.start:fun.StartByte()])
 	// A proven declaration rename changes the JVM method name, not its
 	// parameters; an unprovable one keeps the callable unknown.
 	if unknownRename {
@@ -751,8 +969,8 @@ func kotlinQualified(pkg, name string) string {
 	return strings.Trim(strings.TrimSpace(pkg)+"."+strings.TrimSpace(name), ".")
 }
 
-func kotlinVisibility(node *sitter.Node, content []byte) string {
-	text := string(content[node.StartByte():node.EndByte()])
+func kotlinVisibility(view kotlinDeclarationView, content []byte) string {
+	text := string(content[view.start:view.decl.EndByte()])
 	if brace := strings.IndexByte(text, '{'); brace >= 0 {
 		text = text[:brace]
 	}
@@ -771,12 +989,14 @@ func kotlinVisibility(node *sitter.Node, content []byte) string {
 	return "public"
 }
 
-func kotlinDeclarationSignature(node *sitter.Node, content []byte) string {
-	end := node.EndByte()
-	if body := childByFieldName(node, "body"); body != nil {
+// kotlinDeclarationSignature starts at the view, so a recovered declaration
+// persists its detached annotations exactly as an attached one would.
+func kotlinDeclarationSignature(view kotlinDeclarationView, content []byte) string {
+	end := view.decl.EndByte()
+	if body := childByFieldName(view.decl, "body"); body != nil {
 		end = body.StartByte()
 	}
-	return strings.TrimSpace(string(content[node.StartByte():end]))
+	return strings.TrimSpace(string(content[view.start:end]))
 }
 
 func kotlinExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {

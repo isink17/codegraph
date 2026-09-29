@@ -100,10 +100,11 @@ func TestKotlinJVMNameEvidenceTargetsExactOverload(t *testing.T) {
 	}
 }
 
-// A .kt root may hold only preamble and declaration nodes. The grammar
-// silently parses some legal annotated zero-argument functions as a top-level
-// expression, dropping the declaration; the facade must then be absent so the
-// surviving sibling cannot bind a call javac finds ambiguous.
+// A .kt root may hold only preamble, declaration nodes and recovered detached
+// annotation runs. The grammar silently parses some legal annotated
+// zero-argument functions as a top-level expression, dropping the declaration;
+// the facade must then be absent so the surviving sibling cannot bind a call
+// javac finds ambiguous.
 func TestKotlinJVMFacadeTopLevelGuard(t *testing.T) {
 	facade := graph.JVMFileFacade{Class: "ActionsKt"}
 	none := graph.JVMFileFacade{}
@@ -119,15 +120,18 @@ func TestKotlinJVMFacadeTopLevelGuard(t *testing.T) {
 		{"own-line annotation before a modifier", "package lib\n@JvmName(\"execute\")\npublic fun run(x: kotlin.Int) {}\nfun other() {}", facade},
 		{"own-line annotation before another annotation", "package lib\n@JvmName(\"execute\")\n@JvmOverloads\nfun run(x: kotlin.Int = 0) {}\nfun other() {}", facade},
 		// The grammar splits `@Ann(args)` + newline + `fun` into a top-level
-		// annotated parenthesized expression and an unannotated function.
-		{"own-line annotation split from fun", "package lib\n@JvmName(\"execute\")\nfun run(x: kotlin.Int) {}\nfun other() {}", none},
-		{"own-line Deprecated split", "package lib\n@Deprecated(\"x\")\nfun run(x: kotlin.Int) {}\nfun other() {}", none},
-		{"own-line Throws split", "package lib\n@Throws(Exception::class)\nfun run(x: kotlin.Int) {}\nfun other() {}", none},
-		{"own-line Suppress split", "package lib\n@Suppress(\"UNUSED\")\nfun run(x: kotlin.Int) {}\nfun other() {}", none},
-		{"own-line OptIn split", "package lib\n@OptIn(ExperimentalStdlibApi::class)\nfun run(x: kotlin.Int) {}\nfun other() {}", none},
-		{"own-line last annotation split from fun", "package lib\n@JvmOverloads\n@JvmName(\"execute\")\nfun run(x: kotlin.Int = 0) {}\nfun other() {}", none},
+		// annotated parenthesized expression and an unannotated function; v7
+		// recovers that exact shape (see kotlin_annotation_recovery_test.go).
+		{"own-line annotation split from fun", "package lib\n@JvmName(\"execute\")\nfun run(x: kotlin.Int) {}\nfun other() {}", facade},
+		{"own-line Deprecated split", "package lib\n@Deprecated(\"x\")\nfun run(x: kotlin.Int) {}\nfun other() {}", facade},
+		{"own-line Throws split", "package lib\n@Throws(Exception::class)\nfun run(x: kotlin.Int) {}\nfun other() {}", facade},
+		{"own-line Suppress split", "package lib\n@Suppress(\"UNUSED\")\nfun run(x: kotlin.Int) {}\nfun other() {}", facade},
+		{"own-line OptIn split", "package lib\n@OptIn(ExperimentalStdlibApi::class)\nfun run(x: kotlin.Int) {}\nfun other() {}", facade},
+		{"own-line last annotation split from fun", "package lib\n@JvmOverloads\n@JvmName(\"execute\")\nfun run(x: kotlin.Int = 0) {}\nfun other() {}", facade},
+		{"annotated zero-arg split on own line", "package lib\n@Deprecated(\"x\")\nfun dep() {}\nfun run() {}", facade},
+		// A declaration the grammar swallows whole cannot be rebuilt.
 		{"annotated zero-arg misparse", "package lib\n@JvmName(\"execute\") fun a() { println() }\nfun execute(): kotlin.Int { return 1 }\n", none},
-		{"annotated zero-arg misparse on own line", "package lib\n@Deprecated(\"x\")\nfun dep() {}\nfun run() {}", none},
+		{"two own-line argument annotations swallow fun", "package lib\n@Deprecated(\"x\")\n@JvmName(\"execute\")\nfun run(x: kotlin.Int) {}\nfun other() {}", none},
 		{"top-level expression", "package lib\nprintln(1)\nfun run() {}", none},
 		{"root error node", "package lib\nfun interface F { fun f() }\nfun run() {}", none},
 		{"recovery inside a declaration", "package lib\nclass Api {\n    companion object { fun run() {} }\n}\nfun run() {}", facade},
