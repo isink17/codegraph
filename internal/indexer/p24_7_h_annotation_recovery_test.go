@@ -256,7 +256,7 @@ func TestP247HKotlinV6ToV7Convergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v6-to-v7 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v8", "Synth.kt": "treesitter:kotlin:v8", "Other.kt": "treesitter:kotlin:v8", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v9", "Synth.kt": "treesitter:kotlin:v9", "Other.kt": "treesitter:kotlin:v9", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
 		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}

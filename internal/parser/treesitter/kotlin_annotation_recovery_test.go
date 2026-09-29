@@ -65,7 +65,7 @@ func kotlinRecoveredViews(t *testing.T, src string) (map[uint32]kotlinDeclaratio
 	if err != nil {
 		t.Fatal(err)
 	}
-	return kotlinRootDeclarations(root, []byte(src), true)
+	return kotlinRootDeclarations(root, []byte(src), kotlinRecovery{detached: true, swallowed: true})
 }
 
 // A later top-level declaration is what makes the grammar split an own-line
@@ -305,7 +305,7 @@ func TestKotlinV6ParserKeepsDetachedAnnotationFailClosed(t *testing.T) {
 	if got := NewKotlinV6().Profile().ID; got != "treesitter:kotlin:v6" {
 		t.Fatalf("v6 profile = %q", got)
 	}
-	if got := NewKotlin().Profile().ID; got != "treesitter:kotlin:v8" {
+	if got := NewKotlin().Profile().ID; got != "treesitter:kotlin:v9" {
 		t.Fatalf("current profile = %q", got)
 	}
 	old := kotlinParseFacts(t, NewKotlinV6(), src, "run")

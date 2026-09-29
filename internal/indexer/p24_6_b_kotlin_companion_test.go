@@ -169,10 +169,10 @@ class Service {
 	if got := p246CompanionRows(t, s.raw(t), repo, "Service.kt"); got != 1 {
 		t.Fatalf("v5 companion symbols = %d, want 1", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v8" {
+	if got := p246FileProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v9" {
 		t.Fatalf("upgraded profile = %q", got)
 	}
-	if got := p246FileProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v8" {
+	if got := p246FileProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v9" {
 		t.Fatalf("other Kotlin profile = %q", got)
 	}
 	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
@@ -390,7 +390,7 @@ func TestP247KotlinV4ToV5EvidenceConvergence(t *testing.T) {
 		t.Fatalf("v4-to-v5 update=%+v", summary)
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v8" {
+		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
@@ -458,7 +458,7 @@ func TestP247JavaKotlinArityProfileConvergence(t *testing.T) {
 		}
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v8" {
+		if got := p246FileProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}

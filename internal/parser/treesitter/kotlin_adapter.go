@@ -15,10 +15,11 @@ import (
 
 // KotlinAdapter parses Kotlin source files using tree-sitter.
 type KotlinAdapter struct {
-	// v6 disables detached-annotation recovery, reproducing the
-	// treesitter:kotlin:v6 facade and annotation facts for profile-transition
-	// tests. Visibility follows the current parser, not v6's text scan.
-	v6 bool
+	// legacy selects a retired profile for profile-transition tests: 6
+	// recovers no root declaration, 8 recovers detached annotations but no
+	// swallowed function, 0 is the current parser. Every other fact follows
+	// the current parser.
+	legacy int
 }
 
 func NewKotlin() *KotlinAdapter { return &KotlinAdapter{} }
@@ -27,7 +28,13 @@ func NewKotlin() *KotlinAdapter { return &KotlinAdapter{} }
 // .kt facade on any detached root annotation instead of recovering it. It
 // exists only to reproduce v6 detached-annotation databases in
 // profile-transition tests; its visibility is the current structural one.
-func NewKotlinV6() *KotlinAdapter { return &KotlinAdapter{v6: true} }
+func NewKotlinV6() *KotlinAdapter { return &KotlinAdapter{legacy: 6} }
+
+// NewKotlinV8 returns a parser that reports treesitter:kotlin:v8 and leaves a
+// swallowed private function unrecovered: no symbol, no facade for its file,
+// and its declaration head extracted as calls. It exists only to reproduce v8
+// databases in profile-transition tests.
+func NewKotlinV8() *KotlinAdapter { return &KotlinAdapter{legacy: 8} }
 
 func (a *KotlinAdapter) Language() string     { return "kotlin" }
 func (a *KotlinAdapter) Extensions() []string { return []string{".kt", ".kts"} }
@@ -51,14 +58,15 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	}
 
 	kotlinExtractImports(root, content, &pf)
-	// Scripts may legally hold top-level expressions, so the split shape is
-	// only proven, and only recovered, in .kt files.
-	views, clean := kotlinRootDeclarations(root, content, !a.v6 && filepath.Ext(path) == ".kt")
+	// Scripts may legally hold top-level expressions, so the split and
+	// swallowed shapes are only proven, and only recovered, in .kt files.
+	kt := filepath.Ext(path) == ".kt"
+	views, clean := kotlinRootDeclarations(root, content, kotlinRecovery{detached: kt && a.legacy != 6, swallowed: kt && a.legacy == 0})
 	if clean {
-		pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports)
+		pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports, views)
 	}
 	kotlinExtractSymbols(root, module, "", "module", content, pf.Scope.Imports, views, &pf)
-	kotlinExtractCalls(root, content, &pf)
+	kotlinExtractCalls(root, content, kotlinSwallowedHeads(views), &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
 	})
@@ -80,13 +88,17 @@ func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFil
 // preamble must parse cleanly, an annotation of ours must have the one form
 // proven here, and every name must fall in the plain Java identifier subset;
 // anything else yields no facade rather than a guessed one. It is only called
-// for a root kotlinRootDeclarations reports clean.
-func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []graph.ScopeImport) graph.JVMFileFacade {
+// for a root kotlinRootDeclarations reports clean; a swallowed function it
+// recovered is a top-level function too.
+func kotlinJVMFacade(root *sitter.Node, path string, content []byte, imports []graph.ScopeImport, views map[uint32]kotlinDeclarationView) graph.JVMFileFacade {
 	if filepath.Ext(path) != ".kt" {
 		return graph.JVMFileFacade{} // scripts compile to a script class
 	}
 	var facade graph.JVMFileFacade
 	topLevel, preamble := false, true
+	for _, view := range views {
+		topLevel = topLevel || view.swallowed != nil
+	}
 	for i := range int(root.ChildCount()) {
 		child := root.Child(i)
 		switch child.Type() {
@@ -150,25 +162,50 @@ func kotlinPreambleNode(kind string) bool {
 // parenthesized_expression standing in for exactly one positional argument.
 type kotlinAnnotationEntry struct{ typ, args *sitter.Node }
 
-// kotlinDeclarationView is a declaration as the compiler sees it. start is
-// where its source begins (the first recovered detached annotation, else the
-// declaration node), first anchors its documentation, and annotations are the
-// recovered entries in source order that the declaration's own modifiers lack.
+// kotlinDeclarationView is a declaration as the compiler sees it. decl is its
+// declaration node, nil for a swallowed function; start is where its source
+// begins (the first recovered annotation, else the declaration node); first
+// anchors its documentation; annotations are the recovered entries in source
+// order that the declaration's own modifiers lack.
 type kotlinDeclarationView struct {
 	decl        *sitter.Node
 	start       uint32
 	first       *sitter.Node
 	annotations []kotlinAnnotationEntry
+	swallowed   *kotlinSwallowedFunction
+}
+
+// kotlinSwallowedFunction is a top-level function the grammar parsed as an
+// expression, proven by kotlinSwallowedPrivateFunction. root spans the whole
+// declaration; fun is the keyword the grammar read as an identifier; params
+// is the empty argument list standing in for its empty parameter list; body is
+// the lambda standing in for its block body; heads are the two call nodes the
+// grammar built from the declaration head, which are not calls.
+type kotlinSwallowedFunction struct {
+	root, fun, name, params, body *sitter.Node
+	heads                         [2]*sitter.Node
 }
 
 func kotlinPlainView(node *sitter.Node) kotlinDeclarationView {
 	return kotlinDeclarationView{decl: node, start: node.StartByte(), first: node}
 }
 
+// node is the tree node spanning the declaration's source.
+func (v kotlinDeclarationView) node() *sitter.Node {
+	if v.swallowed != nil {
+		return v.swallowed.root
+	}
+	return v.decl
+}
+
+// kotlinRecovery selects the root shapes kotlinRootDeclarations may rebuild.
+type kotlinRecovery struct{ detached, swallowed bool }
+
 // kotlinRootDeclarations scans the root once. clean reports that every root
-// child is preamble, top-level declaration syntax, or -- when recovery is set
-// -- a proven detached annotation run; views maps each declaration start byte
-// to the annotations recovered for it.
+// child is preamble, top-level declaration syntax, or -- when recovery allows
+// it -- a proven detached annotation run or swallowed function; views maps each
+// declaration start byte to the annotations recovered for it, and each
+// swallowed function's root expression start byte to its declaration.
 //
 // The Kotlin grammar can silently parse legal source such as an annotated
 // function as a top-level expression, dropping the declaration or its
@@ -177,7 +214,7 @@ func kotlinPlainView(node *sitter.Node) kotlinDeclarationView {
 // ambiguous. Recovery nodes nested inside a declaration (a MISSING automatic
 // semicolon in a one-line body) do not change the root shape and are kept.
 //
-// Only one split is recovered, and only from structure: an own-line
+// With recovery.detached, one split is recovered, and only from structure: an own-line
 // annotation with one argument before a later declaration becomes
 // prefix_expression(annotation("@" user_type), parenthesized_expression)
 // followed by a modifier-less function or object. A run is R1..Rn D where each
@@ -188,7 +225,11 @@ func kotlinPlainView(node *sitter.Node) kotlinDeclarationView {
 // the run has a parse error. Every other root expression -- including a
 // declaration the grammar swallowed whole, which cannot be rebuilt from its
 // tree -- leaves the root unclean, and an unclean root recovers nothing.
-func kotlinRootDeclarations(root *sitter.Node, content []byte, recovery bool) (map[uint32]kotlinDeclarationView, bool) {
+//
+// The one exception, with recovery.swallowed, is the private zero-parameter
+// function kotlinSwallowedPrivateFunction proves from its expression tree; its
+// view is keyed by the start byte of the root expression it replaces.
+func kotlinRootDeclarations(root *sitter.Node, content []byte, recovery kotlinRecovery) (map[uint32]kotlinDeclarationView, bool) {
 	var views map[uint32]kotlinDeclarationView
 	clean, preamble := true, true
 	var run *kotlinDeclarationView
@@ -219,7 +260,16 @@ func kotlinRootDeclarations(root *sitter.Node, content []byte, recovery bool) (m
 			}
 			continue
 		case "annotation", "prefix_expression":
-			if !recovery || chained {
+			if kind == "prefix_expression" && run == nil && recovery.swallowed {
+				if view, ok := kotlinSwallowedPrivateFunction(child, content); ok {
+					if views == nil {
+						views = map[uint32]kotlinDeclarationView{}
+					}
+					views[child.StartByte()] = view
+					continue
+				}
+			}
+			if !recovery.detached || chained {
 				fail()
 				continue
 			}
@@ -280,6 +330,98 @@ func kotlinBlank(gap []byte) bool {
 		}
 	}
 	return true
+}
+
+// kotlinSwallowedPrivateFunction proves one swallowed declaration shape: an
+// annotated `private fun N() { ... }` that is not the file's last declaration
+// parses as
+//
+//	prefix_expression(annotation, ... prefix_expression(annotation,
+//	  infix_expression(simple_identifier "private", simple_identifier "fun",
+//	    call_expression(call_expression(simple_identifier N, call_suffix(value_arguments "(" ")")),
+//	      call_suffix(annotated_lambda(lambda_literal "{" [statements] "}"))))))
+//
+// `fun` is a hard keyword, so no expression spells it as an identifier; each
+// node's children are counted exactly, so no argument, lambda parameter,
+// label, receiver, second lambda or comment fits; only whitespace separates
+// the annotations and the head tokens; nothing in the tree has a parse error;
+// and every annotation is plain, without a use-site target. The name comes
+// from the call's function node, the empty parameter list from its empty
+// argument list, and the declaration ends with the lambda. Only `private` is
+// accepted: no other modifier's swallow has been shown worth recovering.
+func kotlinSwallowedPrivateFunction(root *sitter.Node, content []byte) (kotlinDeclarationView, bool) {
+	view := kotlinDeclarationView{start: root.StartByte(), first: root}
+	if root.HasError() {
+		return view, false
+	}
+	node := root
+	for node.Type() == "prefix_expression" {
+		if node.ChildCount() != 2 {
+			return view, false
+		}
+		annotation, operand := node.Child(0), node.Child(1)
+		entries, ok := kotlinPlainAnnotation(annotation)
+		if !ok || !kotlinBlank(content[annotation.EndByte():operand.StartByte()]) {
+			return view, false
+		}
+		view.annotations = append(view.annotations, entries...)
+		node = operand
+	}
+	if node.Type() != "infix_expression" || node.ChildCount() != 3 {
+		return view, false
+	}
+	modifier, fun, call := node.Child(0), node.Child(1), node.Child(2)
+	if modifier.Type() != "simple_identifier" || nodeText(modifier, content) != "private" || fun.Type() != "simple_identifier" || nodeText(fun, content) != "fun" ||
+		!kotlinBlank(content[modifier.EndByte():fun.StartByte()]) || !kotlinBlank(content[fun.EndByte():call.StartByte()]) {
+		return view, false
+	}
+	if call.Type() != "call_expression" || call.ChildCount() != 2 {
+		return view, false
+	}
+	head, suffix := call.Child(0), call.Child(1)
+	if head.Type() != "call_expression" || head.ChildCount() != 2 || suffix.Type() != "call_suffix" || suffix.ChildCount() != 1 {
+		return view, false
+	}
+	name, headSuffix := head.Child(0), head.Child(1)
+	if name.Type() != "simple_identifier" || headSuffix.Type() != "call_suffix" || headSuffix.ChildCount() != 1 {
+		return view, false
+	}
+	params := headSuffix.Child(0)
+	if params.Type() != "value_arguments" || params.ChildCount() != 2 || params.Child(0).Type() != "(" || params.Child(1).Type() != ")" {
+		return view, false
+	}
+	lambda := suffix.Child(0)
+	if lambda.Type() != "annotated_lambda" || lambda.ChildCount() != 1 {
+		return view, false
+	}
+	body := lambda.Child(0)
+	n := int(body.ChildCount())
+	if body.Type() != "lambda_literal" || n < 2 || n > 3 || body.Child(0).Type() != "{" || body.Child(n-1).Type() != "}" || n == 3 && body.Child(1).Type() != "statements" {
+		return view, false
+	}
+	if body.EndByte() != root.EndByte() {
+		return view, false
+	}
+	view.swallowed = &kotlinSwallowedFunction{root: root, fun: fun, name: name, params: params, body: body, heads: [2]*sitter.Node{call, head}}
+	return view, true
+}
+
+// kotlinSwallowedHeads is the exact set of call nodes that spell a recovered
+// swallowed declaration's head rather than a call.
+func kotlinSwallowedHeads(views map[uint32]kotlinDeclarationView) map[*sitter.Node]bool {
+	var heads map[*sitter.Node]bool
+	for _, view := range views {
+		if view.swallowed == nil {
+			continue
+		}
+		if heads == nil {
+			heads = map[*sitter.Node]bool{}
+		}
+		for _, head := range view.swallowed.heads {
+			heads[head] = true
+		}
+	}
+	return heads
 }
 
 // kotlinAnnotationEntries lists the applications in one annotation node:
@@ -474,11 +616,15 @@ func kotlinPlainJavaIdentifier(name string) bool {
 }
 
 // kotlinExtractSymbols walks one declaration container. views holds the root's
-// recovered detached annotations and is nil for every nested body.
+// recovered declarations and is nil for every nested body.
 func kotlinExtractSymbols(node *sitter.Node, module, container, ownerKind string, content []byte, imports []graph.ScopeImport, views map[uint32]kotlinDeclarationView, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		view, ok := views[child.StartByte()]
+		if ok && view.swallowed != nil && view.swallowed.root == child {
+			kotlinAddFunction(view, module, container, content, imports, pf)
+			continue
+		}
 		if !ok || view.decl != child {
 			view = kotlinPlainView(child)
 		}
@@ -575,11 +721,8 @@ func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, cont
 }
 
 func kotlinAddFunction(view kotlinDeclarationView, module, container string, content []byte, imports []graph.ScopeImport, pf *graph.ParsedFile) {
-	node := view.decl
-	nameNode := childByFieldName(node, "name")
-	if nameNode == nil {
-		nameNode = firstChild(node, "simple_identifier")
-	}
+	parts := kotlinFunctionPartsOf(view)
+	nameNode := kotlinFunctionName(view)
 	if nameNode == nil {
 		return
 	}
@@ -596,7 +739,7 @@ func kotlinAddFunction(view kotlinDeclarationView, module, container string, con
 	var arityMin, arityMax *int
 	jvmName, renamed, knownRename := kotlinDeclarationJVMName(view, content, imports)
 	unknownRename := renamed && !knownRename
-	if arity := kotlinFixedJavaCallableArity(view, content, imports, unknownRename); arity != nil {
+	if arity := kotlinFixedJavaCallableArity(view, parts, content, imports, unknownRename); arity != nil {
 		arityMin, arityMax = arity, arity
 	}
 
@@ -607,14 +750,14 @@ func kotlinAddFunction(view kotlinDeclarationView, module, container string, con
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Signature:     sig,
-		Visibility:    kotlinVisibility(node),
+		Visibility:    kotlinDeclarationVisibility(view),
 		ArityMin:      arityMin,
 		ArityMax:      arityMax,
-		Range:         nodeRange(node),
+		Range:         nodeRange(view.node()),
 		DocSummary:    prevCommentText(view.first, content),
 		StableKey:     "func:kotlin:" + qualified,
 	})
-	if fact, ok := kotlinJVMCallableEvidence(view, content, imports, len(pf.Symbols)-1, unknownRename); ok {
+	if fact, ok := kotlinJVMCallableEvidence(view, parts, content, imports, len(pf.Symbols)-1, unknownRename); ok {
 		pf.KotlinJVMCallableEvidence = append(pf.KotlinJVMCallableEvidence, fact)
 	}
 	if renamed {
@@ -666,17 +809,9 @@ func kotlinDeclarationJVMName(view kotlinDeclarationView, content []byte, import
 // and defaults come from tree-sitter nodes; source text is used only to classify
 // annotation spellings in the modifier region.
 // unknownRename reports a declaration @JvmName whose JVM name is unprovable.
-func kotlinJVMCallableEvidence(view kotlinDeclarationView, content []byte, imports []graph.ScopeImport, symbolIndex int, unknownRename bool) (graph.KotlinJVMCallableEvidence, bool) {
-	node := view.decl
+func kotlinJVMCallableEvidence(view kotlinDeclarationView, parts kotlinFunctionParts, content []byte, imports []graph.ScopeImport, symbolIndex int, unknownRename bool) (graph.KotlinJVMCallableEvidence, bool) {
 	unknown := graph.KotlinJVMCallableEvidence{SymbolIndex: symbolIndex}
-	if node == nil || node.HasError() {
-		return unknown, false
-	}
-	fun := childByFieldName(node, "name")
-	if fun == nil {
-		fun = firstChild(node, "simple_identifier")
-	}
-	params := firstChild(node, "function_value_parameters")
+	fun, params := parts.name, parts.params
 	if fun == nil || params == nil || params.HasError() {
 		return unknown, false
 	}
@@ -737,28 +872,8 @@ func kotlinJVMCallableEvidence(view kotlinDeclarationView, content []byte, impor
 	if hasIntroduced || hasIntroducedParam || hasVararg || kotlinHasToken(prefix, "suspend") || kotlinHasToken(prefix, "internal") || kotlinHasToken(prefix, "external") || kotlinHasToken(prefix, "expect") || kotlinHasAnnotation(prefix, "JvmExposeBoxed", "kotlin.jvm.JvmExposeBoxed", imports) || unknownRename || kotlinHasUnknownAliasedJVMAnnotation(prefix+parameterSource, imports) {
 		return unknown, true
 	}
-	name := childByFieldName(node, "name")
-	if name == nil {
-		name = firstChild(node, "simple_identifier")
-	}
-	if name == nil {
-		return unknown, true
-	}
-	var funToken *sitter.Node
-	for i := range int(node.ChildCount()) {
-		child := node.Child(i)
-		if child.Type() == "fun" {
-			funToken = child
-			continue
-		}
-		if child.Type() == "type_parameters" {
-			return unknown, true
-		}
-		if funToken != nil && child.StartByte() >= funToken.EndByte() && child.EndByte() <= name.StartByte() && child.Type() != "type_parameters" {
-			return unknown, true // extension receiver
-		}
-	}
-	if funToken == nil || name == nil {
+	// Generic functions and extension receivers are unsupported.
+	if parts.fun == nil || parts.typeParameters || len(parts.between) > 0 {
 		return unknown, true
 	}
 	for _, typ := range paramTypes {
@@ -766,14 +881,11 @@ func kotlinJVMCallableEvidence(view kotlinDeclarationView, content []byte, impor
 			return unknown, true
 		}
 	}
-	if result, explicit := kotlinFunctionReturnType(node); explicit && !kotlinPlainJavaType(result, content) {
+	if parts.explicitResult && !kotlinPlainJavaType(parts.result, content) {
 		return unknown, true
 	}
-	if _, explicit := kotlinFunctionReturnType(node); !explicit {
-		body := firstChild(node, "function_body")
-		if body == nil || strings.HasPrefix(strings.TrimSpace(nodeText(body, content)), "=") {
-			return unknown, true
-		}
+	if !parts.explicitResult && (parts.body == nil || strings.HasPrefix(strings.TrimSpace(nodeText(parts.body, content)), "=")) {
+		return unknown, true
 	}
 	if !hasOverloads {
 		defaultCount = 0
@@ -829,23 +941,9 @@ func kotlinHasUnknownAliasedJVMAnnotation(source string, imports []graph.ScopeIm
 // qualified built-in types avoid package declarations and aliases shadowing
 // short names such as Int. Unknown types remain unknown; no type resolution is
 // attempted here.
-func kotlinFixedJavaCallableArity(view kotlinDeclarationView, content []byte, imports []graph.ScopeImport, unknownRename bool) *int {
-	node := view.decl
-	if node == nil || node.HasError() {
-		return nil
-	}
-	var fun, name *sitter.Node
-	for i := range int(node.ChildCount()) {
-		child := node.Child(i)
-		if child.Type() == "fun" {
-			fun = child
-		}
-	}
-	name = childByFieldName(node, "name")
-	if name == nil {
-		name = firstChild(node, "simple_identifier")
-	}
-	if fun == nil || name == nil {
+func kotlinFixedJavaCallableArity(view kotlinDeclarationView, parts kotlinFunctionParts, content []byte, imports []graph.ScopeImport, unknownRename bool) *int {
+	fun := parts.fun
+	if fun == nil || parts.name == nil {
 		return nil
 	}
 	prefix := string(content[view.start:fun.StartByte()])
@@ -870,11 +968,7 @@ func kotlinFixedJavaCallableArity(view kotlinDeclarationView, content []byte, im
 
 	// Any receiver node between `fun` and the declared name is an extension
 	// receiver. A generic type-parameter list is the only permitted node there.
-	for i := range int(node.ChildCount()) {
-		child := node.Child(i)
-		if child.StartByte() < fun.EndByte() || child.EndByte() > name.StartByte() || child == fun {
-			continue
-		}
+	for _, child := range parts.between {
 		if child.Type() != "type_parameters" {
 			return nil
 		}
@@ -883,7 +977,7 @@ func kotlinFixedJavaCallableArity(view kotlinDeclarationView, content []byte, im
 		}
 	}
 
-	params := firstChild(node, "function_value_parameters")
+	params := parts.params
 	if params == nil || params.HasError() {
 		return nil
 	}
@@ -909,17 +1003,66 @@ func kotlinFixedJavaCallableArity(view kotlinDeclarationView, content []byte, im
 		count++
 	}
 
-	if result, explicit := kotlinFunctionReturnType(node); explicit {
-		if !kotlinPlainJavaType(result, content) {
+	if parts.explicitResult {
+		if !kotlinPlainJavaType(parts.result, content) {
 			return nil
 		}
-	} else {
-		body := firstChild(node, "function_body")
-		if body == nil || strings.HasPrefix(strings.TrimSpace(nodeText(body, content)), "=") {
-			return nil
-		}
+	} else if parts.body == nil || strings.HasPrefix(strings.TrimSpace(nodeText(parts.body, content)), "=") {
+		return nil
 	}
 	return &count
+}
+
+// kotlinFunctionParts are the pieces of a function declaration its JVM
+// evidence reads: the last `fun` keyword, the declared name, the parameter
+// list, an explicit return type, the body, whether any type-parameter list is
+// present, and the nodes between `fun` and the name (type parameters or an
+// extension receiver). A swallowed function supplies them from its proven
+// tree: its empty argument list is its parameter list and its lambda its block
+// body. A declaration with a parse error has no parts: no evidence reads it.
+type kotlinFunctionParts struct {
+	fun, name, params, result, body *sitter.Node
+	explicitResult, typeParameters  bool
+	between                         []*sitter.Node
+}
+
+func kotlinFunctionPartsOf(view kotlinDeclarationView) kotlinFunctionParts {
+	if sw := view.swallowed; sw != nil {
+		return kotlinFunctionParts{fun: sw.fun, name: sw.name, params: sw.params, body: sw.body}
+	}
+	node := view.decl
+	if node == nil || node.HasError() {
+		return kotlinFunctionParts{}
+	}
+	parts := kotlinFunctionParts{name: kotlinFunctionName(view), params: firstChild(node, "function_value_parameters"), body: firstChild(node, "function_body")}
+	parts.result, parts.explicitResult = kotlinFunctionReturnType(node)
+	for i := range int(node.ChildCount()) {
+		switch child := node.Child(i); child.Type() {
+		case "fun":
+			parts.fun = child
+		case "type_parameters":
+			parts.typeParameters = true
+		}
+	}
+	if parts.fun != nil && parts.name != nil {
+		for i := range int(node.ChildCount()) {
+			if child := node.Child(i); child.StartByte() >= parts.fun.EndByte() && child.EndByte() <= parts.name.StartByte() && child != parts.fun {
+				parts.between = append(parts.between, child)
+			}
+		}
+	}
+	return parts
+}
+
+// kotlinFunctionName is the declared name node of a function view.
+func kotlinFunctionName(view kotlinDeclarationView) *sitter.Node {
+	if view.swallowed != nil {
+		return view.swallowed.name
+	}
+	if name := childByFieldName(view.decl, "name"); name != nil {
+		return name
+	}
+	return firstChild(view.decl, "simple_identifier")
 }
 
 func kotlinFunctionReturnType(node *sitter.Node) (*sitter.Node, bool) {
@@ -995,18 +1138,33 @@ func kotlinVisibility(node *sitter.Node) string {
 	return "public"
 }
 
+// kotlinDeclarationVisibility is the structural visibility of a declaration
+// node; a swallowed function carries no modifiers node, and its proof accepts
+// only the private modifier the grammar read as an identifier.
+func kotlinDeclarationVisibility(view kotlinDeclarationView) string {
+	if view.swallowed != nil {
+		return "private"
+	}
+	return kotlinVisibility(view.decl)
+}
+
 // kotlinDeclarationSignature starts at the view, so a recovered declaration
 // persists its detached annotations exactly as an attached one would.
 func kotlinDeclarationSignature(view kotlinDeclarationView, content []byte) string {
-	end := view.decl.EndByte()
-	if body := childByFieldName(view.decl, "body"); body != nil {
+	end := view.node().EndByte()
+	if body := childByFieldName(view.node(), "body"); body != nil {
 		end = body.StartByte()
 	}
 	return strings.TrimSpace(string(content[view.start:end]))
 }
 
-func kotlinExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+// kotlinExtractCalls emits every call expression except skip, the heads of
+// recovered swallowed declarations; calls inside their bodies are kept.
+func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node]bool, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
+		if skip[call] {
+			continue
+		}
 		fnNode := childByFieldName(call, "function")
 		if fnNode == nil && call.ChildCount() > 0 {
 			fnNode = call.Child(0)
