@@ -156,9 +156,9 @@ func TestRubyRequireRowsPersistButBridgeNothing(t *testing.T) {
 	r.assertRubyFreshParity(t, "deleted file")
 }
 
-// A database written before B1 holds the false Ruby -> Python link under a
-// current v1 marker. One no-byte update must rebuild it away under v2, and the
-// next no-op update must trust v2 and do nothing.
+// A database written before Ruby require isolation holds the false Ruby ->
+// Python link under a current v1 marker. One no-byte update must rebuild it
+// away under v2, and the next no-op update must trust v2 and do nothing.
 func TestRubyRequireFalseCrossLanguageLinkSelfHeals(t *testing.T) {
 	r := newRubyRequireRepo(t, rubyRequireTree())
 	want := r.projection(t)

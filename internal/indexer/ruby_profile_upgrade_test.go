@@ -50,7 +50,8 @@ end
 // rubyV2Adapter reproduces the treesitter:ruby:v2 call-edge set for
 // rubyUpgradeSource: everything v3 emits, plus the three shapes v3 now refuses.
 // It stamps the v2 profile id, which is the only thing planParserProfiles
-// compares, so a repository indexed with it is a genuine pre-P22.47 graph.
+// compares, so a repository indexed with it is a genuine treesitter:ruby:v2
+// graph.
 type rubyV2Adapter struct {
 	*tsparser.RubyAdapter
 }
@@ -255,9 +256,10 @@ func renderRubyCalls(rows []rubyCallRow) string {
 	return strings.Join(out, "\n")
 }
 
-// P22.29: a call-capable Ruby graph never degrades to the call-less heuristic
-// parser, and a refused scan changes nothing. The stored side is the real v3
-// profile rather than a literal, so the check cannot rot with the next bump.
+// Parser-profile downgrade safety: a call-capable Ruby graph never degrades to
+// the call-less heuristic parser, and a refused scan changes nothing. The
+// stored side is the real v3 profile rather than a literal, so the check cannot
+// rot with the next bump.
 func TestRubyProfileNoCgoDowngradeStillRefused(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

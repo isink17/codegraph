@@ -1368,8 +1368,9 @@ func TestRemovedNameDoesNotCrossLanguages(t *testing.T) {
 	r.assertFreshParity(t, "after cross-language removal")
 }
 
-// P22.11: a receiver-qualified C++ spelling matches nothing at any evidence
-// level, and a removal that makes a bare `size` unique must not change that.
+// C++ receiver preservation: a receiver-qualified C++ spelling matches nothing
+// at any evidence level, and a removal that makes a bare `size` unique must not
+// change that.
 func TestRemovedDeclarationDoesNotWakeCppReceiverCall(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"a.cc":      "struct Holder {\n  int size() const { return 1; }\n};\n",

@@ -1403,10 +1403,12 @@ class Caller {
 // -- upgrade repair -------------------------------------------------------------
 
 // TestPHPStaticScopeUpgradeRepairConvergesWithoutReparse simulates a database
-// indexed by a P22.43 binary: parser facts present, scoped calls unresolved,
-// and one PHP-owned edge carrying a generic target the PHP resolver refuses.
-// A plain update over an unchanged tree must converge without any reparse and
-// without --force, and a second run must be a no-op.
+// indexed by a binary that persisted PHP namespace facts but predates scoped
+// static-call resolution and its resolver.php_scope_repaired.v1 repair: parser
+// facts present, scoped calls unresolved, and one PHP-owned edge carrying a
+// generic target the PHP resolver refuses. A plain update over an unchanged
+// tree must converge without any reparse and without --force, and a second run
+// must be a no-op.
 func TestPHPStaticScopeUpgradeRepairConvergesWithoutReparse(t *testing.T) {
 	r := newPHPRepo(t, map[string]string{"Acceptance.php": phpAcceptanceFixture})
 	before := r.projection()

@@ -711,8 +711,8 @@ func TestRubyTopLevelVisibilityIgnored(t *testing.T) {
 	}
 }
 
-// The constant-receiver call shapes P22.48 resolves keep their exact spelling,
-// and the operator is the only thing that differs between them.
+// The constant-receiver call shapes the resolver binds keep their exact
+// spelling, and the operator is the only thing that differs between them.
 func TestRubyConstantReceiverSpellings(t *testing.T) {
 	p := parseRuby(t, `module App
   class Caller
