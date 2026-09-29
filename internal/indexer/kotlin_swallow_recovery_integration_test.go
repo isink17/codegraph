@@ -200,7 +200,7 @@ func TestKotlinV8ToV9SwallowRecoveryConvergence(t *testing.T) {
 	}
 	repo := repoID(t, s, root)
 	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: New(s.Store, lifecycleRegistry(), nil), repoID: repo}
-	if got := p246FileProfile(t, s.raw(t), repo, "lib/Screens.kt"); got != "treesitter:kotlin:v8" {
+	if got := fileParserProfile(t, s.raw(t), repo, "lib/Screens.kt"); got != "treesitter:kotlin:v8" {
 		t.Fatalf("legacy profile = %q", got)
 	}
 	assertKotlinFacade(t, s.path, repo, "lib/Screens.kt", "")
@@ -224,7 +224,7 @@ func TestKotlinV8ToV9SwallowRecoveryConvergence(t *testing.T) {
 		t.Fatalf("v8-to-v9 update=%+v", summary)
 	}
 	for path, want := range map[string]string{"lib/Screens.kt": "treesitter:kotlin:v9", "Other.kt": "treesitter:kotlin:v9", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}
 	}

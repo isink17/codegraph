@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestP246CCompanionCallableABILifecycle(t *testing.T) {
+func TestKotlinCompanionCallableABILifecycle(t *testing.T) {
 	java := `package app;
 import lib.Service;
 class Caller {
@@ -127,7 +127,7 @@ class Service {
 	r.assertFreshParity(t, "companion file restored")
 }
 
-func TestP246CExistingV3DatabaseResolverRepair(t *testing.T) {
+func TestKotlinCompanionExistingV3DatabaseResolverRepair(t *testing.T) {
 	java := `package app; import lib.Service; class Caller { void call() { Service.Companion.run(); } }`
 	kotlin := `package lib
 class Service {
@@ -155,7 +155,7 @@ class Service {
 	r.assertFreshParity(t, "v3 resolver-only upgrade repair")
 }
 
-func TestP246CJavaCompanionOuterScopeForms(t *testing.T) {
+func TestJavaCompanionOuterScopeForms(t *testing.T) {
 	kotlin := `package lib
 class Service {
     companion object Factory { @JvmStatic fun run() {} }
@@ -182,7 +182,7 @@ class Service {
 	}
 }
 
-func TestP246COuterTypeCollisionAndRenameLifecycle(t *testing.T) {
+func TestKotlinCompanionOuterTypeCollisionAndRenameLifecycle(t *testing.T) {
 	service := `package lib
 class Service {
     companion object { @JvmStatic fun run() {} }

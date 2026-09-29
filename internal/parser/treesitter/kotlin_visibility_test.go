@@ -37,9 +37,9 @@ func TestKotlinStructuralVisibility(t *testing.T) {
 		{"members and companions", "package lib\nclass S {\n    private companion object\n    protected fun a() {}\n    @Suppress(names = [\"x\"]) protected open fun b() {}\n    protected object O\n}\nclass T {\n    @Suppress(names = [\"x\"])\n    internal companion object Factory {\n        @Ann(a = 1) private fun c() {}\n    }\n}\nclass U {\n    @Suppress(\"private\") companion object\n}\n",
 			map[string]string{"lib.S": "public", "lib.S.Companion": "private", "lib.S.a": "protected", "lib.S.b": "protected", "lib.S.O": "protected",
 				"lib.T": "public", "lib.T.Factory": "internal", "lib.T.Factory.c": "private", "lib.U": "public", "lib.U.Companion": "public"}},
-		// P24.7-H recovers only modifier-less declarations: the detached
-		// annotations are not modifiers, so the default holds even when their
-		// text spells a visibility.
+		// Detached-annotation recovery covers only modifier-less declarations: the
+		// detached annotations are not modifiers, so the default holds even when
+		// their text spells a visibility.
 		{"recovered detached annotations", "package lib\n@JvmName(\"execute\")\nfun a(x: kotlin.Int) {}\n@Suppress(\"private\")\nfun b(x: kotlin.Int) {}\nfun other() {}\n",
 			map[string]string{"lib.a": "public", "lib.b": "public", "lib.other": "public"}},
 	} {

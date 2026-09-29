@@ -10,7 +10,7 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
-func TestP247OverloadAndCallArityLifecycle(t *testing.T) {
+func TestKotlinJavaOverloadAndCallArityLifecycle(t *testing.T) {
 	kotlin := func(extra string) string {
 		return "package lib\nfun run(x: kotlin.Int) {}\n" + extra
 	}
@@ -132,7 +132,7 @@ class Caller {
 	r.assertFreshParity(t, "callsite arity 2 to 1")
 }
 
-func TestP247ArgumentBearingJVMABIFamilies(t *testing.T) {
+func TestKotlinArgumentBearingJvmABIFamilies(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Caller.java": `package app;
 import lib.Obj;
@@ -213,7 +213,7 @@ fun second(x: kotlin.Int) {}`,
 	r.assertFreshParity(t, "aliased JvmStatic remains unknown")
 }
 
-func TestP247DefaultAndJvmOverloadsArityLifecycle(t *testing.T) {
+func TestKotlinDefaultAndJvmOverloadsArityLifecycle(t *testing.T) {
 	caller := `package app;
 import lib.ActionsKt;
 class Caller {
@@ -347,7 +347,7 @@ class Caller {
 	r.assertFreshParity(t, "restore Kotlin evidence owner")
 }
 
-func TestP247JvmOverloadsExistingABIFamilies(t *testing.T) {
+func TestKotlinJvmOverloadsExistingABIFamilies(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Caller.java": `package app;
 import lib.Obj;
@@ -390,12 +390,12 @@ class Service {
 		assertJVMResolved(t, r, "Caller.java", call.name, call.path, "java_import_scope")
 		assertJVMReference(t, r, "Caller.java", call.name, true)
 	}
-	assertJVMUnresolved(t, r, "Caller.java", "Obj.INSTANCE.staticRun") // preserve B5's @JvmStatic INSTANCE refusal
+	assertJVMUnresolved(t, r, "Caller.java", "Obj.INSTANCE.staticRun") // preserve the Kotlin object ABI's @JvmStatic INSTANCE refusal
 	assertJVMReference(t, r, "Caller.java", "Obj.INSTANCE.staticRun", false)
 	r.assertFreshParity(t, "@JvmOverloads across object/facade/companion ABI families")
 }
 
-func TestP247GeneratedOverloadAmbiguityAndPlainDefaultSibling(t *testing.T) {
+func TestKotlinGeneratedOverloadAmbiguityAndPlainDefaultSibling(t *testing.T) {
 	t.Run("two generated declarations remain ambiguous", func(t *testing.T) {
 		r := newLifecycleRepo(t, tree{
 			"Caller.java": `package app;

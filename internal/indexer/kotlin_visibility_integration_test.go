@@ -60,7 +60,7 @@ func kotlinVisibilities(t *testing.T, r *lifecycleRepo) string {
 // Java call javac rejects stays unresolved; annotation text spelling a
 // visibility never hides a public function. The internal, renamed and
 // JvmSynthetic functions keep their own refusals.
-func TestP247JKotlinStructuralVisibilityJavaAccess(t *testing.T) {
+func TestKotlinStructuralVisibilityJavaAccess(t *testing.T) {
 	r := newLifecycleRepo(t, tree{"Caller.java": visibilityCaller, "lib/Vis.kt": visibilityKotlin, "lib/Service.kt": visibilityService})
 	if got := kotlinVisibilities(t, r); got != "lib.helper=private,lib.hidden=private,lib.inner=internal,lib.last=public,lib.run=private,lib.visible=public" {
 		t.Fatalf("visibility = %q", got)
@@ -143,7 +143,7 @@ func (a kotlinV7Visibility) Parse(ctx context.Context, path string, content []by
 // unresolved). A
 // path-scoped update reparses only the stale Kotlin to the current profile; the unchanged Java
 // v2 caller re-decides both edges without being reparsed.
-func TestP247JKotlinV7ToV8VisibilityConvergence(t *testing.T) {
+func TestKotlinV7ToV8VisibilityConvergence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	files := map[string]string{
@@ -167,7 +167,7 @@ func TestP247JKotlinV7ToV8VisibilityConvergence(t *testing.T) {
 	}
 	repo := repoID(t, s, root)
 	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: New(s.Store, lifecycleRegistry(), nil), repoID: repo}
-	if got := p246FileProfile(t, s.raw(t), repo, "lib/Vis.kt"); got != "treesitter:kotlin:v7" {
+	if got := fileParserProfile(t, s.raw(t), repo, "lib/Vis.kt"); got != "treesitter:kotlin:v7" {
 		t.Fatalf("legacy profile = %q", got)
 	}
 	if got := kotlinVisibilities(t, r); got != "lib.helper=public,lib.hidden=public,lib.inner=public,lib.last=public,lib.run=public,lib.visible=private" {
@@ -195,7 +195,7 @@ func TestP247JKotlinV7ToV8VisibilityConvergence(t *testing.T) {
 		t.Fatalf("v7-to-v8 update=%+v", summary)
 	}
 	for path, want := range map[string]string{"lib/Vis.kt": "treesitter:kotlin:v9", "lib/Service.kt": "treesitter:kotlin:v9", "Other.kt": "treesitter:kotlin:v9", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
-		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}
 	}
