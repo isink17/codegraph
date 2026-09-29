@@ -214,7 +214,7 @@ func TestP247HOwnLineJvmNameLifecycle(t *testing.T) {
 
 // An existing v6 database, written by the genuine v6 parser that refused the
 // facade on every detached annotation, converges on a path-scoped update:
-// stale Kotlin reparses to v7, recovered facades and evidence appear, and the
+// stale Kotlin reparses to the current profile, recovered facades and evidence appear, and the
 // unchanged Java v2 callers re-decide without reparsing -- the hidden function
 // staying hidden once its facade exists.
 func TestP247HKotlinV6ToV7Convergence(t *testing.T) {
@@ -256,7 +256,7 @@ func TestP247HKotlinV6ToV7Convergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v6-to-v7 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v7", "Synth.kt": "treesitter:kotlin:v7", "Other.kt": "treesitter:kotlin:v7", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v8", "Synth.kt": "treesitter:kotlin:v8", "Other.kt": "treesitter:kotlin:v8", "Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
 		if got := p246FileProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}

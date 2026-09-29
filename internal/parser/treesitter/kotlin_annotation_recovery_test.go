@@ -305,7 +305,7 @@ func TestKotlinV6ParserKeepsDetachedAnnotationFailClosed(t *testing.T) {
 	if got := NewKotlinV6().Profile().ID; got != "treesitter:kotlin:v6" {
 		t.Fatalf("v6 profile = %q", got)
 	}
-	if got := NewKotlin().Profile().ID; got != "treesitter:kotlin:v7" {
+	if got := NewKotlin().Profile().ID; got != "treesitter:kotlin:v8" {
 		t.Fatalf("current profile = %q", got)
 	}
 	old := kotlinParseFacts(t, NewKotlinV6(), src, "run")
@@ -314,7 +314,7 @@ func TestKotlinV6ParserKeepsDetachedAnnotationFailClosed(t *testing.T) {
 	}
 	current := kotlinParseFacts(t, NewKotlin(), src, "run")
 	if current.Facade.Class != "ActionsKt" || current.NameFact == nil || !current.NameFact.Known {
-		t.Fatalf("v7 facts = %+v %+v", current, current.NameFact)
+		t.Fatalf("current facts = %+v %+v", current, current.NameFact)
 	}
 	// Scripts are never recovered: top-level statements are legal there.
 	p, err := NewKotlin().Parse(context.Background(), "build.kts", []byte("@JvmName(\"execute\")\nfun run(x: kotlin.Int) {}\nfun other() {}\n"))
