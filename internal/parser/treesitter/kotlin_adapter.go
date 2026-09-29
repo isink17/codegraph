@@ -5,7 +5,6 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -16,16 +15,18 @@ import (
 
 // KotlinAdapter parses Kotlin source files using tree-sitter.
 type KotlinAdapter struct {
-	// v6 disables detached-annotation recovery: the treesitter:kotlin:v6
-	// parser, kept so profile-transition tests can write the databases it did.
+	// v6 disables detached-annotation recovery, reproducing the
+	// treesitter:kotlin:v6 facade and annotation facts for profile-transition
+	// tests. Visibility follows the current parser, not v6's text scan.
 	v6 bool
 }
 
 func NewKotlin() *KotlinAdapter { return &KotlinAdapter{} }
 
-// NewKotlinV6 returns the previous treesitter:kotlin:v6 parser, which refuses
-// a .kt facade on any detached root annotation instead of recovering it. It
-// exists only to reproduce v6 databases in profile-transition tests.
+// NewKotlinV6 returns a parser that reports treesitter:kotlin:v6 and refuses a
+// .kt facade on any detached root annotation instead of recovering it. It
+// exists only to reproduce v6 detached-annotation databases in
+// profile-transition tests; its visibility is the current structural one.
 func NewKotlinV6() *KotlinAdapter { return &KotlinAdapter{v6: true} }
 
 func (a *KotlinAdapter) Language() string     { return "kotlin" }
@@ -520,7 +521,7 @@ func kotlinAddCompanion(node *sitter.Node, module, outerContainer string, conten
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: outerContainer,
-		Visibility:    kotlinVisibility(kotlinPlainView(node), content),
+		Visibility:    kotlinVisibility(node),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "companion:kotlin:" + qualified,
@@ -554,7 +555,7 @@ func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, cont
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: container,
-		Visibility:    kotlinVisibility(view, content),
+		Visibility:    kotlinVisibility(node),
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(view.first, content),
 		StableKey:     "type:kotlin:" + qualified,
@@ -606,7 +607,7 @@ func kotlinAddFunction(view kotlinDeclarationView, module, container string, con
 		QualifiedName: qualified,
 		ContainerName: effectiveContainer,
 		Signature:     sig,
-		Visibility:    kotlinVisibility(view, content),
+		Visibility:    kotlinVisibility(node),
 		ArityMin:      arityMin,
 		ArityMax:      arityMax,
 		Range:         nodeRange(node),
@@ -969,22 +970,27 @@ func kotlinQualified(pkg, name string) string {
 	return strings.Trim(strings.TrimSpace(pkg)+"."+strings.TrimSpace(name), ".")
 }
 
-func kotlinVisibility(view kotlinDeclarationView, content []byte) string {
-	text := string(content[view.start:view.decl.EndByte()])
-	if brace := strings.IndexByte(text, '{'); brace >= 0 {
-		text = text[:brace]
+// kotlinVisibility reads a declaration's visibility from the
+// visibility_modifier children of its own modifiers node. Annotation types and
+// arguments sit beside them as annotation nodes, so no annotation text can
+// hide or invent a visibility; no modifier is the default, public. Detached
+// annotations recovered for a declaration carry no modifiers. Should the
+// grammar accept conflicting modifiers, the most restrictive wins.
+func kotlinVisibility(node *sitter.Node) string {
+	mods := firstChild(node, "modifiers")
+	if mods == nil {
+		return "public"
 	}
-	if eq := strings.IndexByte(text, '='); eq >= 0 {
-		text = text[:eq]
+	found := map[string]bool{}
+	for i := range int(mods.NamedChildCount()) {
+		if m := mods.NamedChild(i); m.Type() == "visibility_modifier" && m.ChildCount() == 1 {
+			found[m.Child(0).Type()] = true
+		}
 	}
-	if regexp.MustCompile(`\bprivate\b`).MatchString(text) {
-		return "private"
-	}
-	if regexp.MustCompile(`\bprotected\b`).MatchString(text) {
-		return "protected"
-	}
-	if regexp.MustCompile(`\binternal\b`).MatchString(text) {
-		return "internal"
+	for _, visibility := range []string{"private", "protected", "internal"} {
+		if found[visibility] {
+			return visibility
+		}
 	}
 	return "public"
 }
