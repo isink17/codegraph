@@ -19,7 +19,7 @@ import (
 // value of the report was the shape of the code, not the expectation that was
 // derived from it.
 //
-// What changed in P22.11 is the contract, not the fixture. #80 pinned
+// The receiver fix changed the contract, not the fixture. #80 pinned
 // `pcsApmMap->LoadWorldMap()` and `map.LoadWorldMap()` as callers of
 // `ApmMap::LoadWorldMap`. Both are correct *at the source level* -- and neither
 // is provable from anything CodeGraph models. The adapter extracts no field or
@@ -144,7 +144,7 @@ func TestCppCallGraphUnprovenReceiverStaysUnresolved(t *testing.T) {
 
 	// FindCallers/FindCallees must not rebuild the refused relation from the
 	// name evidence either -- a receiver-bearing spelling shares no qualifier
-	// with `ApmMap::LoadWorldMap` (P22.1).
+	// with `ApmMap::LoadWorldMap`.
 	callers, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 20, 0)
 	if err != nil {
 		t.Fatalf("FindCallers() error = %v", err)
@@ -167,15 +167,16 @@ func TestCppCallGraphUnprovenReceiverStaysUnresolved(t *testing.T) {
 	// shapes a user actually types. A bare identity shares no qualifier with
 	// `pcsApmMap.LoadWorldMap`, so the suffix leg must not extend it either.
 	//
-	// The genuinely unqualified call site in `Internal` may not answer either,
-	// and that is the P22.15 closeout (cpp_class_scope.go): `Internal` is a FREE
-	// function, `ApmMap::LoadWorldMap` is a class member, and an unqualified call
-	// in a free function does not reach a member in C++ -- the graph held that
-	// relation only because `LoadWorldMap` happened to name one thing in this
-	// repository, which is the same non-evidence the receiver half of this test
-	// already refuses. The resolver never bound this edge (`exact_name` matches
-	// `symbols.name`, which is `ApmMap::LoadWorldMap` here); the claim existed
-	// only on the query surface's short-name leg, so this is where it dies.
+	// The genuinely unqualified call site in `Internal` may not answer either, and
+	// that is the bare-call class-member rule (cpp_class_scope.go): `Internal` is
+	// a FREE function, `ApmMap::LoadWorldMap` is a class member, and an
+	// unqualified call in a free function does not reach a member in C++ -- the
+	// graph held that relation only because `LoadWorldMap` happened to name one
+	// thing in this repository, which is the same non-evidence the receiver half
+	// of this test already refuses. The resolver never bound this edge
+	// (`exact_name` matches `symbols.name`, which is `ApmMap::LoadWorldMap` here);
+	// the claim existed only on the query surface's short-name leg, so this is
+	// where it dies.
 	for _, spelling := range []string{"LoadWorldMap", "::LoadWorldMap"} {
 		bare, err := s.FindCallers(ctx, repo.ID, spelling, 0, 20, 0)
 		if err != nil {

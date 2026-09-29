@@ -219,12 +219,12 @@ const cppSizeCaller = `void caller(A* a, B* b) {
 }
 `
 
-// TestCppUnknownReceiverIgnoresGlobalUniqueness is the uniqueness/lifecycle
-// control (P22.11): a variable receiver is not type evidence, so a member call
-// must not bind a method merely because that method's name became globally
-// unique. The binding must be refused with three candidates, with one, and with
-// none -- the answer cannot depend on how many other classes happen to declare
-// the same member.
+// TestCppUnknownReceiverIgnoresGlobalUniqueness is the receiver-call
+// uniqueness/lifecycle control: a variable receiver is not type evidence, so a
+// member call must not bind a method merely because that method's name became
+// globally unique. The binding must be refused with three candidates, with one,
+// and with none -- the answer cannot depend on how many other classes happen to
+// declare the same member.
 func TestCppUnknownReceiverIgnoresGlobalUniqueness(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.hpp", "struct A { int size() { return 1; } };\n")
@@ -255,7 +255,7 @@ func TestCppUnknownReceiverIgnoresGlobalUniqueness(t *testing.T) {
 
 	// Re-resolve the caller through the incremental binder while `C::size` is the
 	// only candidate: the path-scoped pipeline is a second implementation of the
-	// same policy (P22.8) and must refuse the same binding the repo-wide one does.
+	// same policy and must refuse the same binding the repo-wide one does.
 	r.write("caller.cpp", cppSizeCaller+"\n// touched\n")
 	r.run("update")
 	for _, dst := range []string{"a.size", "b.size"} {
@@ -394,8 +394,8 @@ void user() {
 }
 
 // TestCppQualifiedCallFullUpdateParity pins the evidence-backed half over the
-// P22.8 lifecycle matrix: fresh, caller first, target first, and each side
-// edited, all converge on the same projection.
+// full-index / incremental parity lifecycle matrix: fresh, caller first, target
+// first, and each side edited, all converge on the same projection.
 func TestCppQualifiedCallFullUpdateParity(t *testing.T) {
 	const target = "struct Buf {\n    int size();\n};\nint Buf::size() { return 1; }\n"
 	const targetEdited = "struct Buf {\n    int size();\n};\nint Buf::size() { return 2; }\n"
@@ -473,12 +473,13 @@ func TestCppQualifiedCallFullUpdateParity(t *testing.T) {
 	}
 }
 
-// TestCppLegacyDatabaseLosesReceiverDiscardedBindings is the upgrade contract
-// (P22.11). A database written by an older release holds the lossy bare-tail
-// destination and the binding it produced; the parser fix alone would only
-// reach files that happen to change afterwards, so the false relation would
-// survive indefinitely on an existing index. One normal `update` run with the
-// new binary must remove it, and the run after that must change nothing.
+// TestCppLegacyDatabaseLosesReceiverDiscardedBindings is the C++
+// receiver-reparse upgrade contract. A database written by an older release
+// holds the lossy bare-tail destination and the binding it produced; the parser
+// fix alone would only reach files that happen to change afterwards, so the
+// false relation would survive indefinitely on an existing index. One normal
+// `update` run with the new binary must remove it, and the run after that must
+// change nothing.
 func TestCppLegacyDatabaseLosesReceiverDiscardedBindings(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("project.hpp", "struct ProjectType { int size() { return 0; } };\n")
@@ -513,9 +514,9 @@ func TestCppLegacyDatabaseLosesReceiverDiscardedBindings(t *testing.T) {
 	}
 }
 
-// legacyDowngrade rewrites a current database into the pre-P22.11 shape: member
-// call destinations lose their receiver and bind the project method whose bare
-// name matches.
+// legacyDowngrade rewrites a current database into the shape written before the
+// receiver fix: member call destinations lose their receiver and bind the
+// project method whose bare name matches.
 func legacyDowngrade(t *testing.T, dbPath string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", dbPath)
@@ -588,10 +589,10 @@ func TestCppQualifiedCallAmbiguityFailsClosed(t *testing.T) {
 	}
 }
 
-// TestCppSameClassBareCallUnchanged is the P22.11 scope boundary (section 10):
-// `foo()` inside `A::caller` is not receiver-discard syntax and its handling is
-// the repository-wide bare-name rule every language shares. Preserving
-// receivers must not change it.
+// TestCppSameClassBareCallUnchanged is the receiver-preservation scope
+// boundary: `foo()` inside `A::caller` is not receiver-discard syntax and its
+// handling is the repository-wide bare-name rule every language shares.
+// Preserving receivers must not change it.
 func TestCppSameClassBareCallUnchanged(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A {\n    void helper() {}\n    void caller();\n};\nvoid A::caller() {\n    helper();\n}\n")
@@ -623,19 +624,19 @@ func TestCppThisReceiverStaysUnresolved(t *testing.T) {
 }
 
 // TestCppUpgradeSkippedWithoutCallCapableAdapter guards the non-cgo build. The
-// heuristic C/C++ adapter emits symbols but no call edges, so forcing the
-// P22.11 reparse there would delete a C++ call graph a cgo build had produced
+// heuristic C/C++ adapter emits symbols but no call edges, so forcing the C++
+// receiver reparse there would delete a C++ call graph a cgo build had produced
 // rather than rebuild it. The mark must not fire, and the graph must survive an
 // ordinary update run.
 //
-// Since P22.29 the run does not merely decline the mark: parser-profile safety
-// refuses the scan outright, before BeginScan, because replacing tree-sitter
-// C++ evidence with symbols-only heuristic output is the destructive downgrade
-// that contract exists to stop. The property under test is unchanged -- the
-// C++ call graph must survive -- and it is now enforced one step earlier. The
-// P22.11 capability probe stays in place: it still gates the mark for the
-// cases parser profiles do not cover (a repository whose C++ files already
-// carry the current profile but predate the receiver fix).
+// The run no longer merely declines the mark: parser-profile safety refuses the
+// scan outright, before BeginScan, because replacing tree-sitter C++ evidence
+// with symbols-only heuristic output is the destructive downgrade that contract
+// exists to stop. The property under test is unchanged -- the C++ call graph
+// must survive -- and it is now enforced one step earlier. The receiver-reparse
+// capability probe stays in place: it still gates the mark for the cases parser
+// profiles do not cover (a repository whose C++ files already carry the current
+// profile but predate the receiver fix).
 func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A { int size() { return 1; } };\nvoid caller(A* a) {\n    a->size();\n}\n")
@@ -659,8 +660,8 @@ func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
 	}
 }
 
-// clearCppUpgradeMarker makes a database look like one written before P22.11,
-// with the one-time C/C++ reparse still pending.
+// clearCppUpgradeMarker makes a database look like one written before the
+// receiver fix, with the one-time C/C++ reparse still pending.
 func clearCppUpgradeMarker(t *testing.T, dbPath string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", dbPath)

@@ -173,13 +173,13 @@ void boundary_a(unsigned long value); void boundary_b(unsignedlong renamed);
 }
 
 // TestCppCallDstNameKeepsReceiver pins the persisted destination identity for
-// every C++ call syntax the adapter emits (P22.11).
+// every C++ call syntax the adapter emits.
 //
 // The contract: a call written with a receiver keeps that receiver in
-// `dst_name`. Before P22.11 the adapter returned the bare tail for `.` and `->`
-// calls and kept the receiver only in `evidence`, so `v.size()` entered the
-// resolver as `size` and bound whichever project method named `size` was
-// unique. `::`-qualified, bare, and non-call syntax are unchanged.
+// `dst_name`. Before the receiver fix the adapter returned the bare tail for
+// `.` and `->` calls and kept the receiver only in `evidence`, so `v.size()`
+// entered the resolver as `size` and bound whichever project method named
+// `size` was unique. `::`-qualified, bare, and non-call syntax are unchanged.
 func TestCppCallDstNameKeepsReceiver(t *testing.T) {
 	src := `namespace ns { struct Type { void foo() {} static void sfoo() {} }; }
 struct Base { void foo() {} };
@@ -236,9 +236,9 @@ void Obj::caller() {
 		"p.child().foo",  // outer call of a chain (outer node first)
 		"p.child",        // inner call of the same chain
 		"o.foo",          // multi-line receiver, whitespace collapsed
-		// Scope-qualified spelling: persisted verbatim, arrow and all. Predates
-		// P22.11 and is left alone -- it already carries a "::" qualifier, so it
-		// fails closed at every level the member rules gate on.
+		// Scope-qualified spelling: persisted verbatim, arrow and all. Predates the
+		// receiver fix and is left alone -- it already carries a "::" qualifier, so
+		// it fails closed at every level the member rules gate on.
 		"this->Base::foo",
 	}
 	if len(got) != len(want) {
@@ -258,10 +258,10 @@ void Obj::caller() {
 	}
 }
 
-// TestCppCallEvidenceFormat pins `evidence` for the three call shapes. The
-// P22.11 upgrade path deliberately does NOT parse this string -- it reparses
-// the file instead -- but the audits that classified the receiver-discard
-// bindings read it, so its shape is a contract.
+// TestCppCallEvidenceFormat pins `evidence` for the three call shapes. The C++
+// receiver-reparse upgrade path deliberately does NOT parse this string -- it
+// reparses the file instead -- but the audits that classified the
+// receiver-discard bindings read it, so its shape is a contract.
 func TestCppCallEvidenceFormat(t *testing.T) {
 	src := `struct A { void m() {} void c(); };
 void free_fn() {}
@@ -505,7 +505,7 @@ func parseCppSymbols(t *testing.T, path, src string) []graph.Symbol {
 }
 
 // TestCppPreprocessorArmsEmitDeclarations pins the preprocessor half of the
-// P22.15 wrapper contract: every arm of every conditional is a declaration
+// syntax-wrapper contract: every arm of every conditional is a declaration
 // scope, and none of the four arm node types hides its declarations.
 func TestCppPreprocessorArmsEmitDeclarations(t *testing.T) {
 	src := `#if FLAG
@@ -924,8 +924,9 @@ func TestCppBodyLocalDeclarationsStayLocal(t *testing.T) {
 }
 
 // TestCppUnsupportedDeclarationContainersStayOut pins the OUT half of the
-// P22.15 taxonomy audit, so a later phase that decides to support one of these
-// changes this fixture deliberately instead of discovering the behaviour.
+// declaration-wrapper taxonomy audit (cppTransparentDeclWrappers), so a later
+// phase that decides to support one of these changes this fixture deliberately
+// instead of discovering the behaviour.
 func TestCppUnsupportedDeclarationContainersStayOut(t *testing.T) {
 	src := `struct Embedded { int n; } instance;
 typedef struct { int n; } Typedefed;
@@ -956,9 +957,9 @@ class Host {
 // templates, and a linkage block, with call sites so the whole adapter runs.
 // It also opens with the gmock_main shape -- a function signature split across
 // `#ifdef`/`#else` -- so the whole file lands under one wide-fanout `ERROR`
-// recovery node. That is the path P22.15 made hot and the one where a
-// per-symbol scan of the parent's children turns quadratic, so a regression
-// there shows up here rather than only on a real 7870-line file.
+// recovery node. That is the path syntax-wrapper extraction made hot and the
+// one where a per-symbol scan of the parent's children turns quadratic, so a
+// regression there shows up here rather than only on a real 7870-line file.
 func benchCppSource(units int) []byte {
 	var b strings.Builder
 	b.WriteString("#include \"dep.h\"\n")

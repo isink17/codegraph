@@ -10,8 +10,8 @@ import (
 	"testing"
 )
 
-// P22.15 closeout: a bare C/C++ call may not claim a class member without
-// class-scope evidence (internal/store/cpp_class_scope.go).
+// Bare-call class-member scope: a bare C/C++ call may not claim a class member
+// without class-scope evidence (internal/store/cpp_class_scope.go).
 //
 // Every fixture here is real source through the real C++ adapter, because the
 // rule reads facts only the parser produces -- `container_name`, the class
@@ -114,8 +114,8 @@ func TestCppBareCallBindsOwnClassMemberOutOfLine(t *testing.T) {
 // is the only `foo` in the repository, and a caller in `A` still may not have
 // it. Repository-global uniqueness is not class scope.
 //
-// The caller INCLUDES the declaring header on purpose. Without the include,
-// P22.13's file scope would refuse the edge on its own and the fixture would
+// The caller INCLUDES the declaring header on purpose. Without the include, the
+// bare-call file scope would refuse the edge on its own and the fixture would
 // pass whatever this rule does; with it, the class rule is the only thing left
 // standing between the call and the wrong member.
 func TestCppBareCallRefusesOtherClassMember(t *testing.T) {
@@ -128,7 +128,7 @@ func TestCppBareCallRefusesOtherClassMember(t *testing.T) {
 	if got := r.unresolved("foo"); got != 1 {
 		t.Fatalf("unresolved foo = %d, want 1", got)
 	}
-	// P22.15 §18: the query surfaces may not rebuild what the resolver refused.
+	// The query surfaces may not rebuild what the resolver refused.
 	if got := r.callers("B::foo"); len(got) != 0 {
 		t.Fatalf("FindCallers(B::foo) = %v, want none", got)
 	}
@@ -137,10 +137,10 @@ func TestCppBareCallRefusesOtherClassMember(t *testing.T) {
 	}
 }
 
-// TestCppBareCallRefusesOtherClassMemberSameFile is P22.13's boundary: same-file
-// visibility is FILE evidence, and a class member is not reachable by it. Two
-// classes in one translation unit see each other's names, not each other's
-// members.
+// TestCppBareCallRefusesOtherClassMemberSameFile is the bare-call file-scope
+// boundary: same-file visibility is FILE evidence, and a class member is not
+// reachable by it. Two classes in one translation unit see each other's names,
+// not each other's members.
 func TestCppBareCallRefusesOtherClassMemberSameFile(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A {\n    void foo() {}\n};\nstruct B {\n    void caller() { foo(); }\n};\n")
@@ -169,7 +169,7 @@ func TestCppBareCallRefusesClassMemberFromFreeFunction(t *testing.T) {
 }
 
 // TestCppBareCallRefusesIncludedClassMember: an `#include` makes the class NAME
-// visible, it does not put the includer inside the class. P22.13's include
+// visible, it does not put the includer inside the class. Bare-call include
 // evidence is not class evidence.
 func TestCppBareCallRefusesIncludedClassMember(t *testing.T) {
 	r := newCppRepo(t)
@@ -210,10 +210,11 @@ func TestCppBareCallRefusesInheritedMember(t *testing.T) {
 	wantBound(t, r.boundTargets("base"))
 }
 
-// TestCppBareCallKeepsFreeFunctionRecall is the P22.13 control: this closeout
-// governs class members and nothing else, so an ordinary same-file free-function
-// call still binds -- including from inside a class body, which is the case a
-// rule written as "a member may only call its own class" would have broken.
+// TestCppBareCallKeepsFreeFunctionRecall is the bare-call file-scope control:
+// the class-member rule governs class members and nothing else, so an ordinary
+// same-file free-function call still binds -- including from inside a class
+// body, which is the case a rule written as "a member may only call its own
+// class" would have broken.
 func TestCppBareCallKeepsFreeFunctionRecall(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "void helper() {}\nvoid caller() { helper(); }\n"+
@@ -251,8 +252,8 @@ func TestCppBareCallScopedCandidateNotFirstRow(t *testing.T) {
 	for _, order := range [][]string{{"a.cpp", "b.h"}, {"b.h", "a.cpp"}} {
 		r := newCppRepo(t)
 		sources := map[string]string{
-			// The include is what makes `B::foo` reachable at P22.13's file
-			// level, so the only thing refusing it is its class.
+			// The include is what makes `B::foo` reachable at bare-call file scope,
+			// so the only thing refusing it is its class.
 			"a.cpp": "#include \"b.h\"\n\nstruct A {\n    void foo() {}\n    void caller() { foo(); }\n};\n",
 			"b.h":   "struct B {\n    void foo() {}\n};\n",
 		}
@@ -355,8 +356,8 @@ func TestCppBareCallClassRenameRedecides(t *testing.T) {
 
 // TestCppBareCallClassScopeReceiverControlsUnchanged is §32: this rule governs
 // the BARE spelling only. A call that names a qualifier still binds on that
-// qualifier, and a receiver CodeGraph cannot type still stays unresolved
-// (P22.11) -- neither answer moves.
+// qualifier, and a receiver CodeGraph cannot type still stays unresolved --
+// neither answer moves.
 func TestCppBareCallClassScopeReceiverControlsUnchanged(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A {\n    static void foo() {}\n};\n"+

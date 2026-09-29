@@ -12,7 +12,7 @@ import (
 	"github.com/isink17/codegraph/internal/store"
 )
 
-// C and C++ bare-call scope (P22.13).
+// C and C++ bare-call scope.
 //
 // A bare call -- `foo()`, with no receiver, no `::` and no member qualifier --
 // may bind only what the calling file can be shown to see: a declaration in the
@@ -47,7 +47,7 @@ func cppTargets(r *cppRepo, dstName string) []string {
 
 // TestCppBareCallSameFileResolves is the same-file positive control. A
 // declaration in the calling file is a scope every language admits, and this
-// phase must not cost it (P22.13 section 7).
+// rule must not cost it.
 func TestCppBareCallSameFileResolves(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("only.cpp", `void helper() {}
@@ -125,7 +125,7 @@ namespace b { void caller() { foo(); } }`)
 
 // TestCppBareCallDirectIncludeResolves is the include positive control: the
 // caller's own `#include` names the file that declares the target, which is
-// evidence the source itself wrote (P22.13 section 8).
+// evidence the source itself wrote.
 func TestCppBareCallDirectIncludeResolves(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("foo.h", `inline void foo() {}
@@ -146,10 +146,10 @@ void caller() {
 // a quoted single-segment include names the includer's OWN directory, which is
 // an exact path rather than a repository-wide tail match.
 //
-// The unrelated `vendor/foo.h` is the point of the fixture: before P22.13 a
-// single-segment specifier was answered by the extension-stripped suffix
-// bucket, so every `*/foo.*` in the repository became visible and granted bind
-// scope. Only `src/foo.h` may answer here.
+// The unrelated `vendor/foo.h` is the point of the fixture: before bare-call
+// scope, a single-segment specifier was answered by the extension-stripped
+// suffix bucket, so every `*/foo.*` in the repository became visible and
+// granted bind scope. Only `src/foo.h` may answer here.
 func TestCppBareCallSameDirectoryIncludeResolves(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("src/foo.h", `inline void near() {}
@@ -187,7 +187,7 @@ void dotted() {
 
 // TestCppBareCallUnrelatedFileStaysUnresolved is the load-bearing negative: the
 // declaration is the ONLY one in the repository, and the caller still cannot
-// see it, because nothing connects the two files (P22.13 section 9).
+// see it, because nothing connects the two files.
 //
 // Restoring a repository-global unique fallback fails exactly here.
 func TestCppBareCallUnrelatedFileStaysUnresolved(t *testing.T) {
@@ -300,8 +300,7 @@ void far() {
 
 // TestCppBareCallSystemIncludeDoesNotReachProject is the external-name control:
 // a system include is not a project file, so a project symbol that happens to
-// share the name of something the external header declares stays unreachable
-// (P22.13 section 10).
+// share the name of something the external header declares stays unreachable.
 func TestCppBareCallSystemIncludeDoesNotReachProject(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("helpers.h", `inline void helper() {}
@@ -320,7 +319,7 @@ void caller() {
 
 // TestCppBareCallAmbiguousIncludesStayUnresolved: two included headers both
 // declare the name, so nothing the call site wrote tells them apart and the
-// edge fails closed rather than picking a row (P22.13 section 11).
+// edge fails closed rather than picking a row.
 func TestCppBareCallAmbiguousIncludesStayUnresolved(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.h", `inline void twice() {}
@@ -398,7 +397,7 @@ func TestCppBareCallHeaderClassDeclarationReachesOutOfLineDefinition(t *testing.
 
 // TestCBareCallScopeAppliesToC is the C control: the adapter serves C too, and
 // the same visibility rule holds there through declarations and includes --
-// with no namespace or member semantics involved (P22.13 section 17).
+// with no namespace or member semantics involved.
 func TestCBareCallScopeAppliesToC(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("util.c", `void ctarget(void) {}
@@ -422,7 +421,7 @@ void localcaller(void) {
 	}
 }
 
-// TestCppBareCallScopeLeavesQualifiedSpellingsAlone is the P22.11/P22.1
+// TestCppBareCallScopeLeavesQualifiedSpellingsAlone is the qualified-spelling
 // no-regression control: this rule governs BARE spellings only. A receiver-
 // bearing member call keeps its own (refusing) path, and a `::`-qualified call
 // keeps its own (binding) one.

@@ -28,8 +28,9 @@ type rubyV3Adapter struct {
 }
 
 // rubyV4Adapter reproduces genuine treesitter:ruby:v4 output: it keeps
-// P22.48 singleton facts and non-root P22.48 identity hazards, while stripping
-// only P22.50 root identity/alias and constant-visibility facts.
+// the v4 singleton-visibility facts and non-root constant-identity hazards,
+// while stripping only the treesitter:ruby:v5 root identity/alias and
+// constant-visibility facts.
 type rubyV4Adapter struct {
 	*tsparser.RubyAdapter
 }
@@ -218,7 +219,7 @@ func TestRubyProfileV3ToV4ResolvesConstantReceivers(t *testing.T) {
 			}
 			repo := repoID(t, s, root)
 
-			// The v3 fixture really is a pre-P22.48 graph: no visibility facts,
+			// The v3 fixture really is a pre-v4 graph: no visibility facts,
 			// and every constant receiver unresolved.
 			if got := rubyVisibilityFactRows(t, s, repo); got != "" {
 				t.Fatalf("v3 fixture already carries visibility facts:\n%s", got)
@@ -648,11 +649,12 @@ end
 	}
 }
 
-// -- P22.48-F1: constant identity reassignment ---------------------------------
+// -- Constant identity reassignment --------------------------------------------
 
-// The P22.48-F1 wrong edge, end to end. Ruby binds `App::Service` to `Other`,
-// so `App::Caller.new.f` returns `Other.run` -- the declaration's own singleton
-// method is not the target, and no target this graph can prove is.
+// The constant-reassignment wrong edge, end to end. Ruby binds `App::Service`
+// to `Other`, so `App::Caller.new.f` returns `Other.run` -- the declaration's
+// own singleton method is not the target, and no target this graph can prove
+// is.
 const rubyConstantReassignedSource = `class Other
   def self.run
     :other
@@ -1068,7 +1070,8 @@ func TestRubyNestedObjectAliasFactLifecycle(t *testing.T) {
 
 // A reassignment written inside a wrapper class or module, and one inside a
 // class nested under control flow, are the shapes a direct-child walk or a
-// single-reading qname would miss -- and both are the F1 wrong edge.
+// single-reading qname would miss -- and both are the constant-reassignment
+// wrong edge.
 func TestRubyConstantIdentityReachesEveryOwnerShape(t *testing.T) {
 	caller := `module App
   class Caller
@@ -1199,11 +1202,11 @@ end
 	}
 }
 
-// -- P22.48-F2: literal constant receiver mutations ---------------------------
+// -- Literal constant receiver mutations --------------------------------------
 
-// The F2 wrong edge, end to end. `App.const_set(:Service, Other)` makes
-// `App::Service == Other`, so `App::Caller.new.f` returns `Other.run` -- and a
-// mutation whose receiver is a literal constant path is exactly as
+// The literal-mutation wrong edge, end to end. `App.const_set(:Service, Other)`
+// makes `App::Service == Other`, so `App::Caller.new.f` returns `Other.run` --
+// and a mutation whose receiver is a literal constant path is exactly as
 // syntax-proven as a bare assignment inside the module body.
 const rubyConstantMutatedSource = `class Other
   def self.run
@@ -1351,8 +1354,8 @@ end
 	}
 }
 
-// P7: a root-level literal mutation in a spec file must not veto a production
-// caller, and the same mutation in production code must.
+// Production/test separation: a root-level literal mutation in a spec file must
+// not veto a production caller, and the same mutation in production code must.
 func TestRubyLiteralConstantMutationRespectsTestFiles(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -1453,7 +1456,7 @@ end
 	step("mutation became dynamic", "App.Service.run")
 }
 
-// -- P22.48-F3: root-object receivers -----------------------------------------
+// -- Root-object receivers ----------------------------------------------------
 
 // `Object`, `Kernel` and `BasicObject` are ordinary constant receivers. Each
 // names its OWN constant, and this parser's semantic qnames already make
@@ -1489,8 +1492,9 @@ func TestRubyRootObjectMutationFailsClosed(t *testing.T) {
 	}
 }
 
-// rubyRootObjectSource is the F3 fixture: a caller nested in a root-object
-// owner reaching that owner's own `Service`, plus one trailing patch line.
+// rubyRootObjectSource is the root-object receiver fixture: a caller nested in
+// a root-object owner reaching that owner's own `Service`, plus one trailing
+// patch line.
 func rubyRootObjectSource(keyword, name, patch string) string {
 	return `class Other
   def self.run
