@@ -212,15 +212,15 @@ func TestJVMCommonCallableABIUpgradeRepair(t *testing.T) {
 	}
 }
 
-func TestJVMCommonCallableABIRepairAppliesOnlyToActiveB5Shapes(t *testing.T) {
+func TestJVMCommonCallableABIRepairAppliesOnlyToKotlinObjectCallShapes(t *testing.T) {
 	for _, tc := range []struct {
 		name, shape string
 		want        bool
 	}{
 		{"java only", "", false},
 		{"kotlin only", "", false},
-		{"mixed without B5 shape", "", false},
-		{"ordinary B2 Kotlin-to-Java call", "b2", false},
+		{"mixed without Kotlin object call", "", false},
+		{"ordinary Kotlin-to-Java call", "kotlin-to-java", false},
 		{"ordinary Kotlin class member", "class", false},
 		{"object INSTANCE call", "instance", true},
 		{"object JvmStatic call", "static", true},
@@ -242,7 +242,7 @@ func TestJVMCommonCallableABIRepairAppliesOnlyToActiveB5Shapes(t *testing.T) {
 				kotlinFile = f.file(t, "Service.kt", "kotlin")
 			}
 			if tc.shape != "" {
-				if tc.shape == "b2" {
+				if tc.shape == "kotlin-to-java" {
 					caller := f.symbolKind(t, kotlinFile, "call", "app.Caller.call", "function", "kotlin")
 					owner := f.symbolKind(t, javaFile, "Service", "lib.Service", "type", "java")
 					f.symbolKind(t, javaFile, "run", "lib.Service.run", "function", "java")
@@ -323,7 +323,7 @@ func TestJVMCommonCallableABIRepairAppliesOnlyToActiveB5Shapes(t *testing.T) {
 			if !tc.want {
 				repair := jvmCommonCallableABIRepair
 				repair.run = func(*Store, context.Context, int64) error {
-					t.Fatal("common ABI repair ran without active B5 evidence")
+					t.Fatal("common ABI repair ran without an active Kotlin object call")
 					return nil
 				}
 				if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, repair); err != nil || ran {

@@ -400,11 +400,11 @@ func TestAuditDoesNotMutateTheDatabase(t *testing.T) {
 	}
 }
 
-// TestPreP4SchemaReportsSkippedChecks covers the legacy path at report level:
+// TestPreResolutionMetadataSchemaReportsSkippedChecks covers the legacy path at report level:
 // on a database predating migration 019 the metadata checks must appear as
 // skipped, with a reason, and must NOT be silently absent (which would read as
 // "checked, nothing found") or fail the run.
-func TestPreP4SchemaReportsSkippedChecks(t *testing.T) {
+func TestPreResolutionMetadataSchemaReportsSkippedChecks(t *testing.T) {
 	s, repoID := fixture(t, func(t *testing.T, db *sql.DB, repoID int64) {
 		seedCallEdge(t, db, repoID)
 		// Drop the migration 019 columns to reproduce a pre-P4 database.

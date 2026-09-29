@@ -1184,7 +1184,7 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 		{"four_hop", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope}, {"final_child", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope},
 		{"qualified", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope}, {"reverse", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope},
 		{"labels", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope}, {"trailing", ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope},
-		{"same_owner_final_instance", ResolutionStrategySwiftClassSelfFinalMethodScope}, {"direct_p22_75", ResolutionStrategySwiftClassSelfInheritedFinalMethodScope}, {"same_owner_final_class", ResolutionStrategySwiftClassSelfFinalClassMethodScope},
+		{"same_owner_final_instance", ResolutionStrategySwiftClassSelfFinalMethodScope}, {"direct_inherited_final", ResolutionStrategySwiftClassSelfInheritedFinalMethodScope}, {"same_owner_final_class", ResolutionStrategySwiftClassSelfFinalClassMethodScope},
 		{"non_final", ""}, {"static_target", ""}, {"class_target", ""}, {"malformed_target", ""}, {"missing_target_fact", ""}, {"duplicate_target_fact", ""}, {"private_target", ""},
 		{"missing_first_relation", ""}, {"missing_intermediate_relation", ""}, {"duplicate_first_relation", ""}, {"duplicate_intermediate_relation", ""}, {"unproven_first", ""}, {"unproven_intermediate", ""}, {"conformance_first", ""}, {"conformance_intermediate", ""}, {"generic_first", ""}, {"generic_intermediate", ""}, {"constrained_first", ""}, {"constrained_intermediate", ""}, {"cycle", ""}, {"competing_first", ""}, {"competing_intermediate", ""},
 		{"missing_child", ""}, {"duplicate_child", ""}, {"missing_child_fact", ""}, {"duplicate_child_fact", ""}, {"missing_middle", ""}, {"duplicate_middle", ""}, {"missing_middle_fact", ""}, {"duplicate_middle_fact", ""}, {"missing_base", ""}, {"duplicate_base", ""},
@@ -1240,7 +1240,7 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 				t.Fatal(err)
 			}
 		}
-		if tc.name == "direct_p22_75" {
+		if tc.name == "direct_inherited_final" {
 			if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE child_qualified_name=?`, middleName); err != nil {
 				t.Fatal(err)
 			}
@@ -1470,7 +1470,7 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *test
 	if got := f.dst(samples["four_hop"]); !got.Valid || got.Int64 != targets["four_hop"] {
 		t.Fatalf("4-hop=%v", got)
 	}
-	if got := f.dst(samples["direct_p22_75"]); !got.Valid || got.Int64 != targets["direct_p22_75"] {
+	if got := f.dst(samples["direct_inherited_final"]); !got.Valid || got.Int64 != targets["direct_inherited_final"] {
 		t.Fatalf("direct=%v", got)
 	}
 	if got := f.dst(samples["non_final"]); got.Valid {
@@ -2475,7 +2475,7 @@ func TestSwiftClassSelfInheritedFinalMethodScopeCrossFileHazardLifecycle(t *test
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, hazard); err != nil {
 		t.Fatal(err)
 	}
@@ -2489,7 +2489,7 @@ func TestSwiftClassSelfInheritedFinalMethodScopeCrossFileHazardLifecycle(t *test
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 }
 
 func TestSwiftClassSelfInheritedFinalMethodScopeCrossFileRelationHazards(t *testing.T) {
@@ -2641,7 +2641,7 @@ func TestSwiftClassSelfInheritedFinalMethodScopeVisibilityAndRedeclaration(t *te
 			}
 			f.dispatchFact(f.mainFile, shadow, false, "instance")
 			f.resolve()
-			assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+			assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 		})
 	}
 }
@@ -2670,7 +2670,7 @@ func TestSwiftClassSelfInheritedFinalMethodScopeUnsafeBaseCompetitors(t *testing
 			}
 			_ = target
 			f.resolve()
-			assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+			assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 		})
 	}
 }
@@ -2690,7 +2690,7 @@ func TestSwiftClassSelfInheritedFinalMethodScopeUnsafeTrailingCompetitor(t *test
 		t.Fatal(err)
 	}
 	f.resolve()
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 }
 
 func TestSwiftClassSelfInheritedFinalMethodScopeBlockerFiltering(t *testing.T) {
@@ -2726,7 +2726,7 @@ func TestSwiftClassSelfInheritedFinalMethodScopeBlockerFiltering(t *testing.T) {
 			if tc.wantBound {
 				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
 			} else {
-				assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+				assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 			}
 		})
 	}
@@ -2953,7 +2953,7 @@ func TestSwiftClassSelfInheritedFinalMethodScopeUpgradeRepair(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(new(string)); err == nil {
 		t.Fatal("new repair marker unexpectedly present")
 	}
@@ -4384,7 +4384,7 @@ func assertSwiftReferenceCleared(t *testing.T, f *swiftScopeFixture, refID int64
 	}
 }
 
-func assertSwiftP22FinalClassEdgeUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
+func assertSwiftEdgeAndReferenceUnresolved(t *testing.T, f *swiftScopeFixture, edge int64) {
 	t.Helper()
 	assertSwiftEdgeUnresolved(t, f, edge)
 	assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
@@ -4892,7 +4892,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeHazards(t *testing.T) {
 			if tc.wantBound {
 				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
 			} else {
-				assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+				assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 			}
 		})
 	}
@@ -4932,7 +4932,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeBlockers(t *testing.T) {
 			if tc.wantBound {
 				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
 			} else {
-				assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+				assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 			}
 		})
 	}
@@ -4953,7 +4953,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeIdentityAndFiles(t *testing.T) {
 		target := f.symbol(other, "make", "Service", "function", "make()", true)
 		f.dispatchFact(other, target, true, "class")
 		f.resolve()
-		assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+		assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	})
 	t.Run("same file extension representation", func(t *testing.T) {
 		f, _, target, _, edge := newSwiftFinalClassSelfFixture(t, "Service", "")
@@ -5011,7 +5011,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeSelectorsTrailingAndAmbiguity(t 
 		duplicate := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
 		f.dispatchFact(f.mainFile, duplicate, true, "class")
 		f.resolve()
-		assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+		assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	})
 }
 
@@ -5027,7 +5027,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeNamesAndNegative(t *testing.T) {
 			if dispatch == "static" {
 				assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
 			} else {
-				assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+				assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 			}
 		})
 	}
@@ -5074,7 +5074,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeCrossFileHazardLifecycle(t *test
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE file_id=?`, hazard); err != nil {
 		t.Fatal(err)
 	}
@@ -5086,7 +5086,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeCrossFileHazardLifecycle(t *test
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 }
 
 func TestSwiftClassSelfTypeFinalClassMethodScopeUpgradeRepair(t *testing.T) {
@@ -5099,7 +5099,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeUpgradeRepair(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
 	if err != nil || !run {
 		t.Fatalf("repair=(%v,%v)", run, err)
@@ -5138,7 +5138,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeUnsafeExistingBindingRepair(t *t
 	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
 		t.Fatal(err)
 	}
-	assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	var marker string
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
 		t.Fatalf("marker=%q err=%v", marker, err)
@@ -5159,7 +5159,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeMalformedAndDuplicateFacts(t *te
 			t.Fatalf("facts=%d want 1", facts)
 		}
 		f.resolve()
-		assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+		assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	})
 	t.Run("duplicate final class facts", func(t *testing.T) {
 		f, _, target, _, edge := newSwiftFinalClassSelfFixture(t, "Service", "")
@@ -5172,7 +5172,7 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeMalformedAndDuplicateFacts(t *te
 			t.Fatalf("facts=%d want 2", facts)
 		}
 		f.resolve()
-		assertSwiftP22FinalClassEdgeUnresolved(t, f, edge)
+		assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 	})
 }
 
@@ -5606,8 +5606,8 @@ func TestSwiftClassSelfFinalClassMethodScope(t *testing.T) {
 	}{
 		{"final class", "class", true, false, ResolutionStrategySwiftClassSelfFinalClassMethodScope, true},
 		{"ordinary class", "class", false, false, "", false},
-		{"static target keeps P22.71", "static", false, false, ResolutionStrategySwiftClassSelfStaticMethodScope, true},
-		{"final static target keeps P22.71", "static", true, false, ResolutionStrategySwiftClassSelfStaticMethodScope, true},
+		{"static target keeps static method scope", "static", false, false, ResolutionStrategySwiftClassSelfStaticMethodScope, true},
+		{"final static target keeps static method scope", "static", true, false, ResolutionStrategySwiftClassSelfStaticMethodScope, true},
 		{"instance target", "instance", true, false, "", false},
 		{"missing fact", "", false, false, "", false},
 		{"duplicate class fact", "class", true, true, "", false},
@@ -8363,7 +8363,7 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeTargetBounded(t *
 		f.resolve()
 		assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 	})
-	t.Run("valid nearest owner stays with P22.76", func(t *testing.T) {
+	t.Run("valid nearest owner stays direct inherited static", func(t *testing.T) {
 		f, _, edge := newSwiftMultilevelStaticSelfFixture(t, 2, "instance")
 		candidate := f.symbol(f.mainFile, "make", "Middle", "function", "make()", true)
 		f.dispatchFact(f.mainFile, candidate, false, "static")
@@ -8650,7 +8650,7 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeTransitions(t *te
 		}
 	}
 
-	t.Run("P22.76 to P22.79 and back", func(t *testing.T) {
+	t.Run("direct to multilevel inherited static and back", func(t *testing.T) {
 		f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
 		f.resolve()
 		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope)
@@ -8842,7 +8842,7 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeNamesAndStats(t *
 		assertSwiftStats(t, f.resolveNames("make"), 1, 0, 1, 0)
 		assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 	})
-	t.Run("direct static stays P22.76", func(t *testing.T) {
+	t.Run("direct static stays direct inherited static scope", func(t *testing.T) {
 		f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
 		assertSwiftStats(t, f.resolveNames("make"), 1, 1, 0, 0)
 		assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope)

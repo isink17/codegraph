@@ -693,12 +693,12 @@ func TestAuditIsScopedToOneRepository(t *testing.T) {
 	}
 }
 
-// TestUnresolvedClassificationUsesP8Semantics asserts the counts come from
+// TestUnresolvedClassificationUsesClassifierSemantics asserts the counts come from
 // internal/classify rather than from a SQL restatement of it. The Python `len`
 // case is the discriminator: it is a builtin, but only until the project
 // defines a same-language symbol claiming that name, at which point the
 // classifier must abstain to `unknown`. No SQL-only counter would do that.
-func TestUnresolvedClassificationUsesP8Semantics(t *testing.T) {
+func TestUnresolvedClassificationUsesClassifierSemantics(t *testing.T) {
 	ctx, s, repoID, caps := auditFixture(t)
 
 	pyFile, _ := insertTestFileLang(ctx, s, repoID, "a.py", "python")
@@ -756,10 +756,10 @@ func TestUnresolvedClassificationPagesBeyondOnePage(t *testing.T) {
 	}
 }
 
-// TestAuditChecksRejectPreP4Schema pins the legacy path: without the migration
-// 019 columns the P4-dependent checks report ErrAuditCheckUnsupported rather
+// TestAuditChecksRejectPreResolutionMetadataSchema pins the legacy path: without the migration
+// 019 columns the resolution-metadata checks report ErrAuditCheckUnsupported rather
 // than failing the run or, worse, silently reporting zero violations.
-func TestAuditChecksRejectPreP4Schema(t *testing.T) {
+func TestAuditChecksRejectPreResolutionMetadataSchema(t *testing.T) {
 	ctx, s, repoID, _ := auditFixture(t)
 	legacy := GraphAuditCapabilities{SchemaVersion: 18, HasResolutionMetadata: false}
 

@@ -368,7 +368,7 @@ func TestCppBareCallClassScopeReceiverControlsUnchanged(t *testing.T) {
 	wantBound(t, r.boundTargets("A::foo"), "A::foo")
 	for _, spelling := range []string{"b.foo", "r.foo"} {
 		if got := r.unresolved(spelling); got != 1 {
-			t.Fatalf("unresolved %s = %d, want 1 (P22.11 receiver kept, not bound)", spelling, got)
+			t.Fatalf("unresolved %s = %d, want 1 (receiver-qualified spelling kept, not bound)", spelling, got)
 		}
 	}
 }

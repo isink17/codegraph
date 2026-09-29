@@ -569,7 +569,7 @@ func TestSwiftInitializerAcceptanceCrossFileOnlyRefuses(t *testing.T) {
 	}
 }
 
-func TestSwiftInitializerAcceptanceP7AndTrailingVeto(t *testing.T) {
+func TestSwiftInitializerAcceptanceTestShadowAndTrailingVeto(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	f.symbol(f.mainFile, "Service", "", "struct", "", false)
 	local := swiftInitCandidate(f, f.mainFile, "Service", "init()", 0, 0)

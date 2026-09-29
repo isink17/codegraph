@@ -182,7 +182,7 @@ func typeScopeScenarios() []typeScopeScenario {
 			// Kotlin itself resolves, and it must SURVIVE. It was scored a false
 			// positive only because that phase's truth set listed a function
 			// target for every call site.
-			name: "p224_kotlin_same_package_still_resolves",
+			name: "kotlin_same_package_still_resolves",
 			build: func(t *testing.T, f *typeScopeFixture) (int64, int64, string, string) {
 				defFile := f.file(t, "kotlin/A.kt", "kotlin")
 				dst := f.class(t, defFile, "A", "A.A", "kotlin")
@@ -196,7 +196,7 @@ func typeScopeScenarios() []typeScopeScenario {
 		{
 			// The second: swift/b.swift and swift/a.swift are one Swift module,
 			// where `Box()` needs no import either. Also survives.
-			name: "p224_swift_same_module_still_resolves",
+			name: "swift_same_module_still_resolves",
 			build: func(t *testing.T, f *typeScopeFixture) (int64, int64, string, string) {
 				defFile := f.file(t, "swift/a.swift", "swift")
 				dst := f.class(t, defFile, "Box", "a.Box", "swift")
