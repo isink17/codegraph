@@ -11,7 +11,10 @@ import (
 
 var quotedSource = regexp.MustCompile(`["']([^"']+)["']`)
 
-func packageEvidence(content []byte, language string) string {
+// legacyPackageEvidence is the raw-text package rule of treesitter:java:v2 and
+// treesitter:kotlin:v9: a comment or a string can name the package. It is kept
+// only for the legacy adapters that reproduce those profiles.
+func legacyPackageEvidence(content []byte, language string) string {
 	text := string(content)
 	var re *regexp.Regexp
 	switch language {

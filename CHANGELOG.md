@@ -9,6 +9,12 @@ function ownership at enclosing namespace scope, and explicit leading `::` call 
 qualified-name/stable-key projections changed; development databases require a fresh index. No
 migration or repair marker is provided.
 
+Java and Kotlin package identity now comes from the syntax tree (`package_declaration`,
+`package_header`), so a package spelled in a comment or string no longer names the file's package,
+qualified names, stable keys, or same-package bindings; an ambiguous or broken header yields no
+package. Parser profiles `treesitter:java:v3`, `treesitter:kotlin:v10` and `heuristic:kotlin:v2`
+make existing databases reparse those languages on the next update.
+
 Progressive disclosure: symbol-shaped MCP results are returned at the smallest useful size by
 default, and larger representations are asked for explicitly.
 

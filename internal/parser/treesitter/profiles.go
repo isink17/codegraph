@@ -15,12 +15,21 @@ func tsProfile(language string) parser.Profile {
 func (a *GoAdapter) Profile() parser.Profile     { return tsProfile("go") }
 func (a *PythonAdapter) Profile() parser.Profile { return tsProfile("python") }
 
-// Java v2 persists direct AST argument counts on method-invocation edges.
+// Java v3 reads the package from the package_declaration node instead of the
+// first `package x;` spelled anywhere in the raw text, so a comment or string
+// can no longer name it; the package prefixes every qualified name and stable
+// key. v2 persists direct AST argument counts on method-invocation edges.
 func (a *JavaAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
+	if a.legacyPackage {
+		return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v3", EmitsCallEdges: true}
 }
 
-// Kotlin v9 structurally recovers one swallowed declaration: an annotated
+// Kotlin v10 reads the package from the package_header node instead of the
+// first raw-text line starting with `package x`, so a comment or a multi-line
+// string can no longer name it; the package prefixes every qualified name and
+// stable key. v9 structurally recovers one swallowed declaration: an annotated
 // top-level `private fun N() { ... }` the grammar parsed as an expression
 // becomes an ordinary private function whose file keeps its facade, and the
 // two call nodes spelling its head are no longer extracted as calls. v8
@@ -40,8 +49,10 @@ func (a *KotlinAdapter) Profile() parser.Profile {
 		return parser.Profile{ID: "treesitter:kotlin:v6", EmitsCallEdges: true}
 	case 8:
 		return parser.Profile{ID: "treesitter:kotlin:v8", EmitsCallEdges: true}
+	case 9:
+		return parser.Profile{ID: "treesitter:kotlin:v9", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:kotlin:v9", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:kotlin:v10", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}

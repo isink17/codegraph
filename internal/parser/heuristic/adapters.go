@@ -205,10 +205,13 @@ type classScope struct {
 
 type stripState struct {
 	inBlockComment bool
-	inString       bool
-	stringQuote    byte
-	escaped        bool
-	heredocTerm    string
+	// nestedComment records a `/*` inside a block comment. Only Kotlin nests
+	// them, and the stripper does not, so its package reading fails closed.
+	nestedComment bool
+	inString      bool
+	stringQuote   byte
+	escaped       bool
+	heredocTerm   string
 }
 
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
@@ -349,13 +352,61 @@ func heuristicQualified(pkg, name string) string {
 	return strings.Trim(strings.TrimSpace(pkg)+"."+strings.TrimSpace(name), ".")
 }
 
-var heuristicKotlinPackageRE = regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)`)
+var heuristicKotlinPackageRE = regexp.MustCompile(`^package\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*;?$`)
 
+// heuristicKotlinPackage applies the grammar's header rule to comment- and
+// string-stripped lines: after a shebang and @file: annotations, the first
+// significant text must be the whole `package a.b` line. A package spelled in
+// a comment or string, anywhere later, or after a nested block comment is no
+// package.
 func heuristicKotlinPackage(content []byte) string {
+	state := stripState{}
+	depth := 0 // open ( and [ of a @file: annotation spanning lines
 	for _, line := range strings.Split(string(content), "\n") {
-		if m := heuristicKotlinPackageRE.FindStringSubmatch(line); len(m) == 2 {
+		var normalized string
+		normalized, state = stripForHeuristic(strings.TrimSuffix(line, "\r"), state, true, false)
+		if state.nestedComment {
+			return ""
+		}
+		rest := strings.TrimSpace(normalized)
+		if strings.HasPrefix(rest, "#!") {
+			continue
+		}
+		for depth > 0 || strings.HasPrefix(rest, "@file:") {
+			if depth == 0 {
+				rest = strings.TrimLeftFunc(rest[len("@file:"):], func(r rune) bool {
+					return r == '_' || r == '.' || unicode.IsLetter(r) || unicode.IsDigit(r)
+				})
+				rest = strings.TrimSpace(rest)
+				if !strings.HasPrefix(rest, "(") && !strings.HasPrefix(rest, "[") {
+					continue
+				}
+			}
+			end := len(rest)
+			for i := 0; i < len(rest); i++ {
+				switch rest[i] {
+				case '(', '[':
+					depth++
+				case ')', ']':
+					depth--
+				}
+				if depth == 0 {
+					end = i + 1
+					break
+				}
+			}
+			rest = strings.TrimSpace(rest[end:])
+			if depth > 0 {
+				break
+			}
+		}
+		if rest == "" {
+			continue
+		}
+		if m := heuristicKotlinPackageRE.FindStringSubmatch(rest); len(m) == 2 {
 			return m[1]
 		}
+		return ""
 	}
 	return ""
 }
@@ -457,6 +508,8 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 			if cStyle && ch == '*' && next == '/' {
 				state.inBlockComment = false
 				i++
+			} else if ch == '/' && next == '*' {
+				state.nestedComment = true
 			}
 			continue
 		}
@@ -508,7 +561,9 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 // a call-capable graph with one of them. See parser.Profile.
 func (a *Adapter) Profile() parser.Profile {
 	version := "v1"
-	if a.language == "csharp" {
+	// C# v2 added namespace scope evidence. Kotlin v2 reads its package only
+	// from the header position, never from a comment or a string.
+	if a.language == "csharp" || a.language == "kotlin" {
 		version = "v2"
 	}
 	return parser.Profile{ID: "heuristic:" + a.language + ":" + version, EmitsCallEdges: false}

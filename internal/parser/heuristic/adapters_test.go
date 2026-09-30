@@ -141,3 +141,44 @@ func hasSymbolName(parsed graph.ParsedFile, name string) bool {
 	}
 	return false
 }
+
+// The fallback applies the header rule to stripped lines, so a comment or a
+// string can never name the Kotlin package. Java has no heuristic package.
+func TestKotlinHeuristicPackageIgnoresCommentsAndStrings(t *testing.T) {
+	for src, want := range map[string]string{
+		"package com.real\nfun a() {}\n":                                      "com.real",
+		"/*\npackage com.fake\n*/\npackage com.real\nfun a() {}\n":            "com.real",
+		"/**\n package com.fake\n */\npackage com.real\nfun a() {}\n":         "com.real",
+		"// package com.fake\npackage com.real\nfun a() {}\n":                 "com.real",
+		"#!/usr/bin/env kotlin\n@file:JvmName(\"F\")\npackage com.real\n":     "com.real",
+		"/*\npackage com.fake\n*/\nfun a() {}\n":                              "",
+		"fun a() = \"\"\"\npackage com.fake\n\"\"\"\n":                        "",
+		"fun a() {}\npackage com.fake\n":                                      "",
+		"@file:JvmName(\"\"\"\npackage com.fake\n\"\"\")\npackage com.real\n": "com.real",
+		"@file:Suppress(\n    \"A\",\n    \"B\",\n)\npackage com.real\n":      "com.real",
+		"@file:[A B(\"x\")] @file:JvmSynthetic package com.real\n":            "com.real",
+		"/* /* nested */\npackage com.fake */\npackage com.real\n":            "",
+		"package com.`fake`\n":                                                "",
+		"package com . real\n":                                                "",
+	} {
+		pf, err := NewKotlin().Parse(context.Background(), "A.kt", []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pf.Scope.Package != want {
+			t.Errorf("%q: package = %q, want %q", src, pf.Scope.Package, want)
+		}
+		for _, s := range pf.Symbols {
+			if strings.Contains(s.QualifiedName, "fake") {
+				t.Errorf("%q: symbol %s carries a commented package", src, s.QualifiedName)
+			}
+		}
+	}
+	pf, err := NewJava().Parse(context.Background(), "A.java", []byte("/* package com.fake; */ package com.real;\nclass A {}\n"))
+	if err != nil || pf.Scope.Package != "" {
+		t.Fatalf("java heuristic package = %q, %v; want none", pf.Scope.Package, err)
+	}
+	if NewKotlin().Profile().ID != "heuristic:kotlin:v2" || NewJava().Profile().ID != "heuristic:java:v1" {
+		t.Fatalf("profiles = %s, %s", NewKotlin().Profile().ID, NewJava().Profile().ID)
+	}
+}
