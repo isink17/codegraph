@@ -127,6 +127,10 @@ columns once instead of repeating a JSON key on every row.
   being described. The previous `LEFT JOIN edges` had no `repo_id` predicate, so in a database
   holding several repositories the reported degrees summed across all of them.
 
+### Added
+
+- `DO_NOT_TRACK` and `CODEGRAPH_NO_UPDATE_CHECK` disable the GitHub Releases update check when set to a non-empty value other than `0` or `false`.
+
 ### Fixed
 
 - **`context_for_task` returned no context at all.** Both semantic-search paths report a hit as
