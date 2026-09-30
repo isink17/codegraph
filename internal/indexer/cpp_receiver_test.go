@@ -591,8 +591,11 @@ func TestCppQualifiedCallAmbiguityFailsClosed(t *testing.T) {
 
 // TestCppSameClassBareCallUnchanged is the receiver-preservation scope
 // boundary: `foo()` inside `A::caller` is not receiver-discard syntax and its
-// handling is the repository-wide bare-name rule every language shares.
-// Preserving receivers must not change it.
+// handling follows C/C++ bare-call scope: file/include visibility and namespace
+// scope, plus same-class evidence when the target is a class member. This
+// fixture has a same-file class declaration proving both caller and target
+// belong to A; repository-global name uniqueness alone would not suffice.
+// Preserving receivers must not change this admitted bare call.
 func TestCppSameClassBareCallUnchanged(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A {\n    void helper() {}\n    void caller();\n};\nvoid A::caller() {\n    helper();\n}\n")
