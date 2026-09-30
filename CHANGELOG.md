@@ -153,6 +153,17 @@ columns once instead of repeating a JSON key on every row.
   score alone while being collected from a map, so tied entries -- the common case -- changed
   places between runs and moved across page boundaries. Both now break ties on file path and
   qualified name.
+- **Order-dependent answers in three read tools.** `detect_frameworks` listed each framework's
+  evidence files in Go map order, which changes on every call; they are now sorted.
+  `find_related_tests` with `files` kept whichever evidence the first-listed file produced for a
+  test, so `reason` and `score` depended on argument order; it now keeps the strongest evidence
+  by the single-target rule. `graph_analytics` pagerank summed floats in row-id order, so
+  symbols with identical incoming contributions compared unequal in the last bit and their
+  order -- and which of them made a limited page -- depended on insertion order; ranks now
+  accumulate in fixed point, and such ties are broken by symbol identity. Fixed-point ranks
+  differ from the float ones by far less than the printed 1e-6 (printed values are identical on
+  the 100k-symbol fixture); rows that print the same rank may come back in a different, now
+  identity, order.
 - MCP tool errors whose message contained a double quote produced a response body the client
   could not parse (the message was spliced into a JSON literal after a `strings.Trim` that ate
   the closing escape). Error documents are now marshalled.

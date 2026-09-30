@@ -334,6 +334,92 @@ func TestPageRankTiesSurviveFloatingPointAccumulation(t *testing.T) {
 	}
 }
 
+// newSummationOrderGraph is the shape newFloatSensitiveGraph was looking for:
+// three addends, where float addition is not associative. Each target starts
+// from the damping base and receives one share a (a source of out-degree 1) and
+// one share b (a source of out-degree 3). t1's a-source is declared before its
+// b-source and t2's the other way round, so a float sum in row-id order adds
+// base+a+b for one target and base+b+a for the other -- which differ in the
+// last bit -- and reversing the insertion order swaps which target gets which.
+// That float sum fails this test. The targets are mathematically tied, so only
+// the identity tie-break may order them.
+func newSummationOrderGraph() analyticsGraph {
+	g := analyticsGraph{symbols: map[string][]string{}, edges: map[string][]string{}}
+	add := func(file, qname string) {
+		if _, ok := g.symbols[file]; !ok {
+			g.files = append(g.files, file)
+		}
+		g.symbols[file] = append(g.symbols[file], qname)
+	}
+	for _, spec := range []struct {
+		target  string
+		degrees []int
+	}{{"t1", []int{1, 3}}, {"t2", []int{3, 1}}} {
+		add(spec.target+"/target.go", spec.target+".Target")
+		for si, deg := range spec.degrees {
+			src := fmt.Sprintf("%s.Src%d", spec.target, si)
+			add(fmt.Sprintf("%s/src%d.go", spec.target, si), src)
+			dsts := []string{spec.target + ".Target"}
+			for f := 1; f < deg; f++ {
+				filler := fmt.Sprintf("%s.Fill%d_%d", spec.target, si, f)
+				add(fmt.Sprintf("%s/fill%d_%d.go", spec.target, si, f), filler)
+				dsts = append(dsts, filler)
+			}
+			g.edges[src] = dsts
+		}
+	}
+	return g
+}
+
+// Mathematically tied ranks must stay bitwise tied whatever order the graph was
+// inserted in, or the row id decides their order through the arithmetic.
+func TestPageRankIsSummationOrderIndependent(t *testing.T) {
+	g := newSummationOrderGraph()
+	forward, repoA := g.build(t, func(i int) int { return i })
+	reverse, repoB := g.build(t, func(i int) int { return len(g.files) - 1 - i })
+	for _, limit := range []int{1, 2, 20} {
+		a := analyticsJSON(t, forward, repoA, "pagerank", limit)
+		b := analyticsJSON(t, reverse, repoB, "pagerank", limit)
+		if a != b {
+			t.Fatalf("pagerank limit=%d differs by insertion order:\nforward: %s\nreverse: %s", limit, a, b)
+		}
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(analyticsJSON(t, forward, repoA, "pagerank", 2)), &rows); err != nil {
+		t.Fatalf("unmarshal error = %v", err)
+	}
+	if len(rows) != 2 || rows[0]["symbol"] != "t1.Target" || rows[1]["symbol"] != "t2.Target" || rows[0]["rank"] != rows[1]["rank"] {
+		t.Fatalf("tied targets not ordered by identity: %v", rows)
+	}
+}
+
+// With 32 nodes the damping base 0.15/32 = 0.0046875 sits exactly on a print
+// rounding half-way point. A node with no in-links ranks the base and must print
+// 0.004688, as the float computation did, not 0.004687.
+func TestPageRankBaseOnRoundingBoundaryPrintsRoundedUp(t *testing.T) {
+	g := analyticsGraph{symbols: map[string][]string{}, edges: map[string][]string{}}
+	g.files = append(g.files, "root.go")
+	g.symbols["root.go"] = []string{"root.Root"}
+	for i := range 31 {
+		file, qname := fmt.Sprintf("leaf%02d.go", i), fmt.Sprintf("leaf.L%02d", i)
+		g.files = append(g.files, file)
+		g.symbols[file] = []string{qname}
+		g.edges["root.Root"] = append(g.edges["root.Root"], qname)
+	}
+	s, repoID := g.build(t, func(i int) int { return i })
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(analyticsJSON(t, s, repoID, "pagerank", 50)), &rows); err != nil {
+		t.Fatalf("unmarshal error = %v", err)
+	}
+	if len(rows) != 32 {
+		t.Fatalf("pagerank rows = %d, want 32", len(rows))
+	}
+	last := rows[len(rows)-1]
+	if last["symbol"] != "root.Root" || last["rank"] != 0.004688 {
+		t.Fatalf("rank of node without in-links = %v, want root.Root at 0.004688", last)
+	}
+}
+
 // The coupling page's order is total by construction: the tie-break is the pair
 // of grouping keys, which are unique per row. This asserts the contract
 // directly, because the insertion-order fixture above cannot distinguish it --
