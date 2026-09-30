@@ -17,20 +17,22 @@ import (
 	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
 )
 
-// rubyV3Adapter reproduces genuine treesitter:ruby:v3 output: the current
-// parser minus everything P22.48 added. The profile id is not faked on its own
-// -- the singleton visibility facts are removed and every symbol's visibility
-// is cleared back to v3's silence -- so a repository indexed with it really
-// cannot resolve a constant receiver, really cannot know a private one, and
-// really carries no constant-identity hazard.
+// rubyV3Adapter models the pre-v4 fact boundary for these upgrade fixtures.
+// It wraps the current parser, removes singleton-visibility/unknown and
+// constant-identity-unknown facts, and clears every symbol's visibility.
+// Other current output, including v5 constant-visibility facts, is retained:
+// this is a selective compatibility fixture, not a historical parser snapshot.
+// The current resolver refuses these fixtures' constant receivers without
+// public singleton visibility; their constant-identity hazards are absent.
 type rubyV3Adapter struct {
 	*tsparser.RubyAdapter
 }
 
-// rubyV4Adapter reproduces genuine treesitter:ruby:v4 output: it keeps
-// the v4 singleton-visibility facts and non-root constant-identity hazards,
-// while stripping only the treesitter:ruby:v5 root identity/alias and
-// constant-visibility facts.
+// rubyV4Adapter models the v4 fact boundary for these upgrade fixtures.
+// It keeps singleton-visibility facts and non-root constant-identity hazards,
+// drops both constant-visibility fact kinds, and drops identity hazards whose
+// OwnerModule has no dot (root qnames, including Object's root aliases).
+// All other output comes from the current parser, not a historical snapshot.
 type rubyV4Adapter struct {
 	*tsparser.RubyAdapter
 }
@@ -190,10 +192,11 @@ const rubyConstantPrivateSource = `module App
 end
 `
 
-// The parser's fact set changed, so the profile is the compatibility boundary:
-// the same bytes, with no Force, no Paths and every resolver repair already
-// marked done, must reparse the file, produce the visibility facts, resolve the
-// constant receivers and converge on exactly the from-scratch v4 graph.
+// Singleton visibility was added in v4, so the profile is the compatibility
+// boundary: unchanged bytes, no Force, no Paths and completed resolver repairs
+// must still reparse, produce visibility facts and resolve eligible receivers.
+// Despite the historical V3ToV4 name, the destination is the current parser
+// (now v5), and the upgraded graph must equal its from-scratch graph.
 func TestRubyProfileV3ToV4ResolvesConstantReceivers(t *testing.T) {
 	for _, tc := range []struct {
 		name, source string
@@ -219,8 +222,8 @@ func TestRubyProfileV3ToV4ResolvesConstantReceivers(t *testing.T) {
 			}
 			repo := repoID(t, s, root)
 
-			// The v3 fixture really is a pre-v4 graph: no visibility facts,
-			// and every constant receiver unresolved.
+			// The synthetic v3 fixture lacks visibility facts for this source,
+			// and every constant receiver is unresolved.
 			if got := rubyVisibilityFactRows(t, s, repo); got != "" {
 				t.Fatalf("v3 fixture already carries visibility facts:\n%s", got)
 			}
@@ -899,10 +902,11 @@ end
 	}
 }
 
-// The identity hazard is a v4 parser fact, so a genuine v3 graph carries none
-// and the profile bump alone -- unchanged bytes, no Force, no Paths, every
-// repair pre-marked -- must reparse, produce it, keep the call unresolved, and
-// land on exactly the from-scratch v4 graph.
+// Non-root identity hazards were added in v4; rubyV3Adapter removes them.
+// The profile change alone -- unchanged bytes, no Force, no Paths, every repair
+// pre-marked -- must reparse, produce the hazard and keep the call unresolved.
+// The historical V3ToV4 name tests convergence to the current parser (now v5),
+// not to a separately instantiated historical v4 parser.
 func TestRubyProfileV3ToV4RecordsConstantIdentityHazards(t *testing.T) {
 	for name, tc := range map[string]struct {
 		source string
