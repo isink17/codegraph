@@ -17,8 +17,9 @@ import (
 type KotlinAdapter struct {
 	// legacy selects a retired profile for profile-transition tests: 6
 	// recovers no root declaration, 8 recovers detached annotations but no
-	// swallowed function, 0 is the current parser. Every other fact follows
-	// the current parser.
+	// swallowed function, 9 reads the package from raw text, 0 is the current
+	// parser. Every other fact follows the current parser, so only 9 has the
+	// raw-text package the retired profiles all had.
 	legacy int
 }
 
@@ -36,6 +37,12 @@ func NewKotlinV6() *KotlinAdapter { return &KotlinAdapter{legacy: 6} }
 // databases in profile-transition tests.
 func NewKotlinV8() *KotlinAdapter { return &KotlinAdapter{legacy: 8} }
 
+// NewKotlinV9 returns a parser that reports treesitter:kotlin:v9 and takes the
+// first line starting with `package x`, inside a comment or string included,
+// as its package and so as the prefix of every qualified name and stable key.
+// It exists only to reproduce v9 databases in profile-transition tests.
+func NewKotlinV9() *KotlinAdapter { return &KotlinAdapter{legacy: 9} }
+
 func (a *KotlinAdapter) Language() string     { return "kotlin" }
 func (a *KotlinAdapter) Extensions() []string { return []string{".kt", ".kts"} }
 
@@ -50,10 +57,13 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 		return graph.ParsedFile{}, err
 	}
 
-	module := packageEvidence(content, "kotlin")
+	module := kotlinPackage(root, content)
+	if a.legacy == 9 {
+		module = legacyPackageEvidence(content, "kotlin")
+	}
 	pf := graph.ParsedFile{
 		Language:   "kotlin",
-		Scope:      graph.ScopeEvidence{Package: packageEvidence(content, "kotlin")},
+		Scope:      graph.ScopeEvidence{Package: module},
 		FileTokens: computeFileTokens(content),
 	}
 
@@ -61,7 +71,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	// Scripts may legally hold top-level expressions, so the split and
 	// swallowed shapes are only proven, and only recovered, in .kt files.
 	kt := filepath.Ext(path) == ".kt"
-	views, clean := kotlinRootDeclarations(root, content, kotlinRecovery{detached: kt && a.legacy != 6, swallowed: kt && a.legacy == 0})
+	views, clean := kotlinRootDeclarations(root, content, kotlinRecovery{detached: kt && a.legacy != 6, swallowed: kt && (a.legacy == 0 || a.legacy == 9)})
 	if clean {
 		pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports, views)
 	}
@@ -71,6 +81,46 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
 	})
 	return pf, nil
+}
+
+// kotlinPackage reads the package from the file's package_header, a direct
+// child of the source file after any shebang and @file: annotations. Its name
+// is the simple_identifier segments of the header's identifier, so a comment
+// between them is not part of it. No header, a header with a syntax error, or
+// a backticked segment is no package rather than a guessed one. The grammar
+// yields at most one header: a second `package` line is error-recovered as an
+// expression and the first header stands; more than one header is refused
+// all the same.
+func kotlinPackage(root *sitter.Node, content []byte) string {
+	var header *sitter.Node
+	for i := range int(root.NamedChildCount()) {
+		if child := root.NamedChild(i); child.Type() == "package_header" {
+			if header != nil {
+				return ""
+			}
+			header = child
+		}
+	}
+	if header == nil || header.HasError() {
+		return ""
+	}
+	ident := firstChild(header, "identifier")
+	if ident == nil {
+		return ""
+	}
+	var parts []string
+	for i := range int(ident.NamedChildCount()) {
+		seg := ident.NamedChild(i)
+		if seg.Type() != "simple_identifier" {
+			continue // comments between segments
+		}
+		text := nodeText(seg, content)
+		if strings.HasPrefix(text, "`") {
+			return ""
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, ".")
 }
 
 func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {

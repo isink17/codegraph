@@ -14,9 +14,20 @@ import (
 )
 
 // JavaAdapter parses Java source files using tree-sitter.
-type JavaAdapter struct{}
+type JavaAdapter struct {
+	// legacyPackage reproduces treesitter:java:v2, which read the package
+	// from raw text, for profile-transition tests. Every other fact follows
+	// the current parser.
+	legacyPackage bool
+}
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
+
+// NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
+// first `package x;` spelled anywhere in the file, comments and strings
+// included, as its package. It exists only to reproduce v2 databases in
+// profile-transition tests.
+func NewJavaV2() *JavaAdapter { return &JavaAdapter{legacyPackage: true} }
 
 func (a *JavaAdapter) Language() string     { return "java" }
 func (a *JavaAdapter) Extensions() []string { return []string{".java"} }
@@ -33,8 +44,11 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 
 	pf := graph.ParsedFile{
 		Language:   "java",
-		Scope:      graph.ScopeEvidence{Package: packageEvidence(content, "java")},
+		Scope:      graph.ScopeEvidence{Package: javaPackage(root, content)},
 		FileTokens: computeFileTokens(content),
+	}
+	if a.legacyPackage {
+		pf.Scope.Package = legacyPackageEvidence(content, "java")
 	}
 
 	javaExtractImports(root, content, &pf)
@@ -44,6 +58,39 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 		return "func:java:" + testTargetModule(pf.Scope.Package, "Test", "Tests") + ":" + target
 	})
 	return pf, nil
+}
+
+// javaPackage reads the package from the file's one package_declaration, a
+// direct child of the program. Its name is the identifier leaves of the name
+// node, so neither a comment between them nor an annotation on the
+// declaration (package-info.java) is part of it. No declaration, more than
+// one, or a declaration with a syntax error is no package rather than a
+// guessed one.
+func javaPackage(root *sitter.Node, content []byte) string {
+	var decl *sitter.Node
+	for i := range int(root.NamedChildCount()) {
+		if child := root.NamedChild(i); child.Type() == "package_declaration" {
+			if decl != nil {
+				return ""
+			}
+			decl = child
+		}
+	}
+	if decl == nil || decl.HasError() {
+		return ""
+	}
+	for i := range int(decl.NamedChildCount()) {
+		name := decl.NamedChild(i)
+		if name.Type() != "identifier" && name.Type() != "scoped_identifier" {
+			continue
+		}
+		var parts []string
+		for _, id := range findDescendants(name, "identifier") {
+			parts = append(parts, nodeText(id, content))
+		}
+		return strings.Join(parts, ".")
+	}
+	return ""
 }
 
 func javaExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {

@@ -169,10 +169,10 @@ class Service {
 	if got := companionSymbolCount(t, s.raw(t), repo, "Service.kt"); got != 1 {
 		t.Fatalf("v5 companion symbols = %d, want 1", got)
 	}
-	if got := fileParserProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v9" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v10" {
 		t.Fatalf("upgraded profile = %q", got)
 	}
-	if got := fileParserProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v9" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v10" {
 		t.Fatalf("other Kotlin profile = %q", got)
 	}
 	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
@@ -379,7 +379,7 @@ func TestKotlinV4ToV5JvmCallableEvidenceConvergence(t *testing.T) {
 	repo := repoID(t, s, root)
 	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: New(s.Store, lifecycleRegistry(), nil), repoID: repo}
 	assertJVMUnresolved(t, r, "Caller.java", "ActionsKt.run")
-	if got := fileParserProfile(t, s.raw(t), repo, "Caller.java"); got != "treesitter:java:v2" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Caller.java"); got != "treesitter:java:v3" {
 		t.Fatalf("Java profile=%q", got)
 	}
 	summary, err := r.idx.Update(ctx, Options{RepoRoot: root, Paths: []string{"Actions.kt"}})
@@ -390,13 +390,13 @@ func TestKotlinV4ToV5JvmCallableEvidenceConvergence(t *testing.T) {
 		t.Fatalf("v4-to-v5 update=%+v", summary)
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v10" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
 	for _, path := range []string{"Caller.java", "main.go", "caller.ts"} {
 		got := fileParserProfile(t, s.raw(t), repo, path)
-		want := map[string]string{"Caller.java": "treesitter:java:v2", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
+		want := map[string]string{"Caller.java": "treesitter:java:v3", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
 		if got != want {
 			t.Fatalf("unrelated %s profile=%q want %q", path, got, want)
 		}
@@ -453,12 +453,12 @@ func TestJavaKotlinArityProfileConvergence(t *testing.T) {
 		t.Fatalf("profile convergence summary=%+v, want 2 Kotlin files", summary)
 	}
 	for _, path := range []string{"Caller.java", "Second.java"} {
-		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:java:v2" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:java:v3" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v9" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v10" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
