@@ -7807,6 +7807,34 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 	return out, rows.Err()
 }
 
+// StrongerRelatedTest reports whether a is stronger evidence than b for one
+// (file, symbol) related test. It is the `pick` rule of relatedTests' SQL --
+// the millesimal score, then reason rank test_calls > test_name_match >
+// test_file_name_match > anything else -- so a merge of several seeds keeps
+// the row a single seed would. Exact score, then reason, settle a pick tie so
+// the choice never falls back to the order the rows arrived in.
+func StrongerRelatedTest(a, b RelatedTest) bool {
+	pick := func(t RelatedTest) int64 {
+		rank := int64(0)
+		switch t.Reason {
+		case "test_calls":
+			rank = 3
+		case "test_name_match":
+			rank = 2
+		case testLinkFileReason:
+			rank = 1
+		}
+		return int64(math.Round(t.Score*1000))*4 + rank
+	}
+	if pa, pb := pick(a), pick(b); pa != pb {
+		return pa > pb
+	}
+	if a.Score != b.Score {
+		return a.Score > b.Score
+	}
+	return a.Reason < b.Reason
+}
+
 func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
 	tokens := texttoken.WeightsString(query)
 	if len(tokens) == 0 {
@@ -9005,30 +9033,23 @@ func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
 // qualified name, kind, then position. Never the row id, so two databases that
 // hold the same graph inserted in different orders produce the same page.
 //
-// The summation order is fixed for a second, latent reason. Contributions were
-// accumulated while ranging a map, and floating-point addition is not
-// associative, so two nodes whose ranks are mathematically equal could differ
-// in their last bits -- and then the tie-break above would never see a tie to
-// break. It is now summed in symbol-id order, which is stable for a given
-// database.
-//
-// Be precise about the limit of that. Id order is insertion order, so two
-// databases holding the same graph could still sum in different orders. Making
-// the arithmetic itself graph-ordered would mean loading identity for every
-// node before ranking, which measured as more than double this function's
-// runtime on a 100k-symbol graph -- and no fixture in the suite reproduces the
-// defect it would close, including one built specifically to try. The
-// insertion-order tests pass on the id-ordered sum.
+// The arithmetic is order-independent for a second reason. Floating-point
+// addition is not associative: base+a+b and base+b+a differ in the last bit, so
+// two nodes with identical incoming contributions, summed in different orders,
+// are bitwise unequal and the tie-break above never sees a tie to break. Summing in row-id order
+// only made that stable per database; two databases holding the same graph
+// inserted in different orders still ranked the tied pair -- and picked page
+// membership -- differently while printing the same rounded rank. Ranks are
+// therefore accumulated in fixed point (integer addition is associative), so no
+// iteration order reaches the scores, without the whole-graph identity load a
+// graph-ordered float sum would need.
 func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
 	limit = safeLimit(limit)
 
 	// Step 1: load all resolved edges.
 	//
-	// No ORDER BY: the only order that matters is the order sources are summed
-	// in, and sorting 100k source ids in Go is a few milliseconds where making
-	// SQLite sort every edge row cost ~40ms on the same fixture. Per-source
-	// destination order is irrelevant, because every destination of one source
-	// receives the identical share.
+	// No ORDER BY: the fixed-point accumulation in step 2 is order-independent,
+	// and making SQLite sort every edge row cost ~40ms on the 100k fixture.
 	//
 	// Both endpoints must be active symbols. Filtering the ranked output
 	// instead would be too late: a ghost node still joins allNodes, so it
@@ -9048,15 +9069,11 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 	defer rows2.Close()
 
 	outLinks := map[int64][]int64{} // src -> list of dst
-	var srcOrder []int64            // sources in ascending id order
 	allNodes := map[int64]struct{}{}
 	for rows2.Next() {
 		var src, dst int64
 		if err := rows2.Scan(&src, &dst); err != nil {
 			return nil, err
-		}
-		if len(outLinks[src]) == 0 {
-			srcOrder = append(srcOrder, src)
 		}
 		outLinks[src] = append(outLinks[src], dst)
 		allNodes[src] = struct{}{}
@@ -9071,42 +9088,40 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 		return []map[string]any{}, nil
 	}
 
-	// Node indices in id order. Iterating the node map here would make the
-	// slice layout -- and so the summation order below -- storage-dependent.
 	indexNode := make([]int64, 0, n)
 	for id := range allNodes {
 		indexNode = append(indexNode, id)
 	}
-	slices.Sort(indexNode)
-	slices.Sort(srcOrder)
 	nodeIndex := make(map[int64]int, n)
 	for i, id := range indexNode {
 		nodeIndex[id] = i
 	}
 
-	// Step 2: run PageRank.
-	const damping = 0.85
+	// Step 2: run PageRank in fixed point, damping 85/100. One unit is 2^-55:
+	// ranks sum to at most 1 plus n units, so rank*85 stays below 2^62, and the
+	// resolution is far below the 1e-6 the rank is printed at. Every share is
+	// one integer division per source, so the sums -- and the scores -- are the
+	// same in whatever order the sources are visited, including map order.
+	//
+	// base rounds up, never down. 0.15/n is exactly a 1e-6 half-way point for
+	// some n (32, 100000, ...); the float form computed 1-0.85 as slightly over
+	// 0.15 and printed those rounded up, and a floored base would print every
+	// node without in-links 1e-6 lower.
+	const one = int64(1) << 55
 	const iterations = 20
-	rank := make([]float64, n)
-	newRank := make([]float64, n)
-	initial := 1.0 / float64(n)
+	rank := make([]int64, n)
+	newRank := make([]int64, n)
 	for i := range rank {
-		rank[i] = initial
+		rank[i] = one / int64(n)
 	}
+	base := (15*one + 100*int64(n) - 1) / (100 * int64(n))
 
 	for range iterations {
-		base := (1.0 - damping) / float64(n)
 		for i := range newRank {
 			newRank[i] = base
 		}
-		// Ranging srcOrder, not outLinks: float addition is not associative, so
-		// map order here would perturb the scores themselves. srcOrder is sorted
-		// by symbol id -- see the function comment for what that does and does
-		// not guarantee.
-		for _, src := range srcOrder {
-			dsts := outLinks[src]
-			si := nodeIndex[src]
-			share := damping * rank[si] / float64(len(dsts))
+		for src, dsts := range outLinks {
+			share := rank[nodeIndex[src]] * 85 / (100 * int64(len(dsts)))
 			for _, dst := range dsts {
 				newRank[nodeIndex[dst]] += share
 			}
@@ -9135,7 +9150,7 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 	}
 	results := make([]ranked, n)
 	for i, id := range indexNode {
-		results[i] = ranked{id: id, score: rank[i]}
+		results[i] = ranked{id: id, score: float64(rank[i]) / float64(one)}
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].score > results[j].score })
 	cut := results[min(len(results), limit)-1].score

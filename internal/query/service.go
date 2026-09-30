@@ -166,7 +166,10 @@ func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files 
 	}
 	perFileLimit := min(max(50, limit+offset), 1000)
 
-	seen := map[string]bool{}
+	// One row per (file, symbol), holding the strongest evidence any seed file
+	// produced, so reason and score do not depend on the order files are given.
+	type testKey struct{ file, symbol string }
+	best := map[testKey]int{}
 	var all []store.RelatedTest
 	for _, f := range files {
 		tests, err := s.store.RelatedTests(ctx, repoID, "", f, perFileLimit, 0)
@@ -174,10 +177,12 @@ func (s *Service) RelatedTestsForFiles(ctx context.Context, repoID int64, files 
 			return nil, err
 		}
 		for _, t := range tests {
-			key := t.File + "::" + t.Symbol
-			if !seen[key] {
-				seen[key] = true
+			key := testKey{t.File, t.Symbol}
+			if i, ok := best[key]; !ok {
+				best[key] = len(all)
 				all = append(all, t)
+			} else if store.StrongerRelatedTest(t, all[i]) {
+				all[i] = t
 			}
 		}
 	}

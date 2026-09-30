@@ -1,6 +1,11 @@
 package framework
 
-import "testing"
+import (
+	"encoding/json"
+	"fmt"
+	"slices"
+	"testing"
+)
 
 func detection(t *testing.T, name string, files []string, imports map[string][]string) Detection {
 	t.Helper()
@@ -59,5 +64,44 @@ func TestDetectImportBehaviorUnchanged(t *testing.T) {
 	})
 	if got.Language != "python" || len(got.Evidence) != 1 || got.Evidence[0] != "src/app.py" {
 		t.Fatalf("Detection = %+v", got)
+	}
+}
+
+// Evidence is gathered by ranging the imports map, which Go reorders on every
+// range, and from a files slice whose order is the caller's. The answer must be
+// byte-identical across repeated calls and permuted input.
+func TestDetectIsOrderIndependent(t *testing.T) {
+	imports := map[string][]string{}
+	var files []string
+	for i := range 40 {
+		f := fmt.Sprintf("src/m%02d.js", i)
+		imports[f] = []string{"react", "react-dom", "express"}
+		files = append(files, f)
+	}
+	for i := range 5 {
+		files = append(files, fmt.Sprintf("app%d/config/routes.rb", i))
+	}
+	encode := func(files []string) string {
+		blob, err := json.Marshal(Detect(files, imports))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(blob)
+	}
+	want := encode(files)
+	reversed := slices.Clone(files)
+	slices.Reverse(reversed)
+	for i := range 20 {
+		in := files
+		if i%2 == 1 {
+			in = reversed
+		}
+		if got := encode(in); got != want {
+			t.Fatalf("call %d differs:\nfirst: %s\nnow  : %s", i+2, want, got)
+		}
+	}
+	react := detection(t, "react", files, imports)
+	if len(react.Evidence) != 40 || !slices.IsSorted(react.Evidence) {
+		t.Fatalf("react evidence = %q, want 40 sorted distinct files", react.Evidence)
 	}
 }

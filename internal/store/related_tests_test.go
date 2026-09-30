@@ -405,3 +405,21 @@ func TestRelatedTestsExcludesDeletedTestFilesBeforePagination(t *testing.T) {
 			linksBefore, linksAfter, edgesBefore, edgesAfter, deletedBefore, deletedAfter)
 	}
 }
+
+// StrongerRelatedTest is the Go form of relatedTests' SQL pick; each pair's
+// winner is what the SQL keeps, and every distinct pair has exactly one winner.
+func TestStrongerRelatedTestMatchesSQLPick(t *testing.T) {
+	for _, tc := range []struct{ win, lose RelatedTest }{
+		{RelatedTest{Reason: "test_calls", Score: 0.9}, RelatedTest{Reason: "test_name_match", Score: 0.8}},
+		{RelatedTest{Reason: "test_name_match", Score: 0.8}, RelatedTest{Reason: testLinkFileReason, Score: 0.8}},
+		{RelatedTest{Reason: testLinkFileReason, Score: 0.8}, RelatedTest{Reason: "other", Score: 0.8}},
+		{RelatedTest{Reason: "other", Score: 0.95}, RelatedTest{Reason: "test_calls", Score: 0.9}},
+		// Same pick: exact score, then reason, decide.
+		{RelatedTest{Reason: "b", Score: 0.80001}, RelatedTest{Reason: "a", Score: 0.8}},
+		{RelatedTest{Reason: "a", Score: 0.8}, RelatedTest{Reason: "b", Score: 0.8}},
+	} {
+		if !StrongerRelatedTest(tc.win, tc.lose) || StrongerRelatedTest(tc.lose, tc.win) {
+			t.Fatalf("StrongerRelatedTest: want %+v over %+v", tc.win, tc.lose)
+		}
+	}
+}

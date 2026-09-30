@@ -2,6 +2,7 @@ package framework
 
 import (
 	"path"
+	"slices"
 	"strings"
 )
 
@@ -116,15 +117,10 @@ func Detect(files []string, imports map[string][]string) []Detection {
 		if !ok {
 			continue
 		}
-		// Deduplicate evidence files.
-		seen := make(map[string]bool)
-		var evidence []string
-		for _, f := range m.files {
-			if !seen[f] {
-				seen[f] = true
-				evidence = append(evidence, f)
-			}
-		}
+		// Deduplicated and sorted: the files were gathered by ranging the
+		// imports map, whose order Go randomizes per run.
+		slices.Sort(m.files)
+		evidence := slices.Compact(m.files)
 
 		confidence := float64(len(evidence)) / float64(totalFiles)
 		if confidence > 1.0 {
