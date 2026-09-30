@@ -180,11 +180,11 @@ func TestCppBareCallRefusesIncludedClassMember(t *testing.T) {
 	wantBound(t, r.boundTargets("foo"))
 }
 
-// TestCppBareCallRefusesSameNamedClassInAnotherFile is the P22.16 boundary
-// control (§22): CodeGraph does not model namespaces, so two files may each
-// declare a `class A` that the current identity cannot tell apart. Comparing the
-// declaring FILE as well as the name is what makes that pair fail closed instead
-// of letting an `#include` hand one `A` the other's member.
+// TestCppBareCallRefusesSameNamedClassInAnotherFile checks class ownership,
+// independently of namespace-qualified symbol identity. These files declare
+// separate `A` class symbols with the same qualified name. Class-scope evidence
+// is anchored to the declaration in each member's own file, so an `#include`
+// cannot hand one `A` the other's member.
 func TestCppBareCallRefusesSameNamedClassInAnotherFile(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("b.h", "struct A {\n    void foo() {}\n};\n")
