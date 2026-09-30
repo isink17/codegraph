@@ -152,14 +152,12 @@ var cppSkipFuncs = map[string]bool{
 //	    wrapper class this phase owns, and one whose bodiless forms
 //	    (`class Foo* p;`) are references rather than definitions.
 //	field_declaration
-//	    The node a *bodiless* class member takes: `class C { void m(); };`
-//	    parses to `field_declaration`, while `void m() {}` parses to
-//	    `function_definition`. So the wrapper traversal below restores a
-//	    guarded member *definition* to its class, but a guarded member
-//	    *declaration* is still not emitted at all -- the same header-declaration
-//	    /`.cc`-definition gap P22.17 owns, reached through a different node.
-//	    TestCppClassMemberDeclarationStaysOut pins the current answer so it is a
-//	    recorded gap rather than a surprise.
+//	    A leaf member declaration, not a transparent scope. A direct
+//	    `function_declarator` emits a `declaration` evidence row, including
+//	    when reached through a preprocessor wrapper; an inline member body
+//	    is handled as a `function_definition`. Function-pointer fields are
+//	    not callable symbols. TestCppClassMemberDeclarationStaysOut retains
+//	    its historical name but now pins wrapped and plain method extraction.
 //	alias_declaration
 //	    `using Alias = T;`. A named type CodeGraph does not model at all yet
 //	    (500+ occurrences in fmt and googletest), so emitting it is a new symbol
