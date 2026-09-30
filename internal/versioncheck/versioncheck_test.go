@@ -68,6 +68,27 @@ func TestNotifyIfOutdatedHonorsOptOut(t *testing.T) {
 				if requests != 0 {
 					t.Fatalf("HTTP requests = %d, want 0", requests)
 				}
+
+				existingState := []byte(`{"current_version":"v2.0.0","latest_version":"v2.1.0"}`)
+				existingPath := filepath.Join(t.TempDir(), "config", stateFileName)
+				if err := os.MkdirAll(filepath.Dir(existingPath), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(existingPath, existingState, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("CODEGRAPH_HOME", filepath.Dir(filepath.Dir(existingPath)))
+				NotifyIfOutdated(context.Background(), &bytes.Buffer{})
+				got, err := os.ReadFile(existingPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, existingState) {
+					t.Fatalf("version-state.json changed: got %s", got)
+				}
+				if requests != 0 {
+					t.Fatalf("HTTP requests after existing state = %d, want 0", requests)
+				}
 			})
 		}
 	}
@@ -80,6 +101,45 @@ func TestEnvEnabled(t *testing.T) {
 	} {
 		if got := envEnabled(value); got != want {
 			t.Errorf("envEnabled(%q) = %t, want %t", value, got, want)
+		}
+	}
+}
+
+func TestNotifyIfOutdatedKeepsCheckForDisabledOptOutValues(t *testing.T) {
+	restoreURL, restoreClient := githubLatestReleaseURL, versionHTTPClient
+	t.Cleanup(func() {
+		githubLatestReleaseURL = restoreURL
+		versionHTTPClient = restoreClient
+	})
+
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = fmt.Fprint(w, `{"tag_name":"v2.1.0"}`)
+	}))
+	defer srv.Close()
+	githubLatestReleaseURL = srv.URL
+	versionHTTPClient = srv.Client()
+
+	for _, name := range []string{"DO_NOT_TRACK", "CODEGRAPH_NO_UPDATE_CHECK"} {
+		for _, value := range []string{"", "0", "FALSE"} {
+			t.Run(name+"="+value, func(t *testing.T) {
+				t.Setenv("DO_NOT_TRACK", "")
+				t.Setenv("CODEGRAPH_NO_UPDATE_CHECK", "")
+				t.Setenv(name, value)
+				home := t.TempDir()
+				t.Setenv("CODEGRAPH_HOME", home)
+
+				before := requests
+				NotifyIfOutdated(context.Background(), &bytes.Buffer{})
+				if requests != before+1 {
+					t.Fatalf("HTTP requests = %d, want %d", requests-before, 1)
+				}
+				statePath := filepath.Join(home, "config", stateFileName)
+				if _, err := os.Stat(statePath); err != nil {
+					t.Fatalf("version-state.json stat error = %v", err)
+				}
+			})
 		}
 	}
 }
