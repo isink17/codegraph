@@ -20,7 +20,7 @@ file, or subsystem discovery in an unfamiliar codebase.
 
 ## Known or suspected name → symbol
 
-- `find_symbol(query="<name or qualified name>")` — exact and fuzzy match.
+- `find_symbol(query="<name or qualified name>")` — exact or substring match.
 - `search_symbols(query="<keyword>")` — full-text over names, signatures,
   and doc comments; better for vocabulary you are not sure about.
 - `search_semantic(query="...")` — meaning-based ranking; strongest with
@@ -61,7 +61,7 @@ changes which rows are returned.
 ## Orientation in a new repository
 
 - `architecture_overview` — languages, directories, entry points, hubs.
-- `list_files(path=...)` — what is indexed under a directory.
+- `list_files(path_filter=...)` — what is indexed under a directory.
 - `graph_stats` — index size and freshness.
 
 ## Gateway discovery

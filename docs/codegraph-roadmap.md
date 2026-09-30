@@ -2,6 +2,12 @@
 
 This document captures the current CLI/help architecture of `codegraph` and proposes an incremental path to a cleaner command/help system without a big refactor up front.
 
+> **Status: historical.** The "Current" sections below describe the CLI when this
+> roadmap was written, not the current binary. Its core proposals have since
+> shipped: a `help [command]` subcommand, per-command help, and canonical
+> `snake_case` command names with the older names kept as aliases. Run
+> `codegraph help` for the current command list.
+
 ## Current CLI Architecture (As Implemented)
 
 - **Entrypoint:** `cmd/codegraph/main.go` calls `internal/cli.Run(ctx, os.Args[1:], stdout, stderr)`.

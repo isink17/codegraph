@@ -68,8 +68,9 @@ CodeGraph is evidence, not permission to guess.
 - An **empty callers/callees result is not proof** that no relationship
   exists: dynamic dispatch, code generation, and less-supported languages
   leave gaps. Confirm with source search before deleting or breaking.
-- **Ambiguous names:** several symbols can share a bare name, and a
-  relationship query answers for one of them. When a name may be ambiguous,
+- **Ambiguous names:** several symbols can share a bare name; a bare-name
+  query then merges them, uses one, or fails as ambiguous, depending on the
+  tool (see `references/trust.md`). When a name may be ambiguous,
   resolve it with `find_symbol` first and query by `qualified_name` or
   `symbol_id`. Never pick a same-name candidate because it "looks right".
 - **Freshness:** after editing source, run `update_graph` (MCP) or
