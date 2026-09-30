@@ -29,13 +29,24 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Use the runner temp volume
+        # Hosted Windows puts %TEMP% on the C: system volume, where every
+        # SQLite commit and file create in t.TempDir() is several times to
+        # tens of times slower than on the D: runner volume that holds the
+        # workspace and RUNNER_TEMP. The store suite opens roughly a thousand
+        # scratch databases and commits fixture rows one statement at a time,
+        # so on C: internal/store took 1200-1800s against 300-450s on Linux
+        # and repeatedly hit the 30m ceiling. On D: it runs near Linux parity.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+
       - name: Run tests
-        # Go's timeout is a failure ceiling, not a runtime target. Hosted
-        # Windows is materially slower because the store suite creates many
-        # SQLite databases and pays WAL/file flush costs. Windows has crossed
-        # 20 minutes as the semantic regression suite grew, so it gets 30m of
-        # finite headroom; Linux/macOS retain the tighter 20m ceiling. A
-        # passing run does not wait longer, and hangs still fail at 30m.
+        # Go's timeout is a failure ceiling, not a runtime target. A passing
+        # run does not wait longer, and hangs still fail at the ceiling.
+        # Windows keeps 30m to absorb its wider runner-to-runner variance.
         run: go test -timeout ${{ matrix.go_test_timeout }} ./...
 
       - name: Smoke native binary
