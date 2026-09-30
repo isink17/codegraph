@@ -4,6 +4,10 @@
 
 Protected v1 database compatibility baseline.
 
+### Added
+
+- `DO_NOT_TRACK` and `CODEGRAPH_NO_UPDATE_CHECK` disable the GitHub Releases update check when set to a non-empty value other than `0` or `false`.
+
 ### Fixed
 
 - Existing databases are inspected read-only before writable SQLite setup. Databases with a migration above 018 or a non-zero `PRAGMA user_version` are rejected with: `database created by a newer CodeGraph version; upgrade CodeGraph before opening it`.

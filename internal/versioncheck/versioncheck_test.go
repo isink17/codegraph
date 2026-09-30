@@ -36,6 +36,54 @@ func TestCheckerWritesCurrentVersion(t *testing.T) {
 	}
 }
 
+func TestNotifyIfOutdatedHonorsOptOut(t *testing.T) {
+	restoreURL, restoreClient := githubLatestReleaseURL, versionHTTPClient
+	t.Cleanup(func() {
+		githubLatestReleaseURL = restoreURL
+		versionHTTPClient = restoreClient
+	})
+
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	githubLatestReleaseURL = srv.URL
+	versionHTTPClient = srv.Client()
+
+	for _, name := range []string{"DO_NOT_TRACK", "CODEGRAPH_NO_UPDATE_CHECK"} {
+		for _, value := range []string{"1", "true", "yes"} {
+			t.Run(name+"="+value, func(t *testing.T) {
+				t.Setenv("DO_NOT_TRACK", "")
+				t.Setenv("CODEGRAPH_NO_UPDATE_CHECK", "")
+				t.Setenv(name, value)
+
+				statePath := filepath.Join(t.TempDir(), "config", "version-state.json")
+				t.Setenv("CODEGRAPH_HOME", filepath.Dir(filepath.Dir(statePath)))
+				NotifyIfOutdated(context.Background(), &bytes.Buffer{})
+				if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+					t.Fatalf("version-state.json exists or stat failed: %v", err)
+				}
+				if requests != 0 {
+					t.Fatalf("HTTP requests = %d, want 0", requests)
+				}
+			})
+		}
+	}
+}
+
+func TestEnvEnabled(t *testing.T) {
+	for value, want := range map[string]bool{
+		"": false, "0": false, "false": false, "FALSE": false,
+		"1": true, "true": true, "yes": true,
+	} {
+		if got := envEnabled(value); got != want {
+			t.Errorf("envEnabled(%q) = %t, want %t", value, got, want)
+		}
+	}
+}
+
 func TestCheckerPrintsUpdateNoticeWhenLatestIsNewer(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "version-state.json")
 	c := Checker{
