@@ -55,11 +55,18 @@ type Checker struct {
 }
 
 func NotifyIfOutdated(ctx context.Context, stderr io.Writer) {
+	if envEnabled(os.Getenv("DO_NOT_TRACK")) || envEnabled(os.Getenv("CODEGRAPH_NO_UPDATE_CHECK")) {
+		return
+	}
 	c, err := DefaultChecker()
 	if err != nil {
 		return
 	}
 	_ = c.Run(ctx, stderr)
+}
+
+func envEnabled(value string) bool {
+	return value != "" && value != "0" && !strings.EqualFold(value, "false")
 }
 
 func DefaultChecker() (Checker, error) {

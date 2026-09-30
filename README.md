@@ -158,6 +158,11 @@ codegraph version
 
 Prints the installed local version only. It does not contact GitHub.
 
+Normal commands check GitHub Releases at most once every 24 hours. Set
+`DO_NOT_TRACK` or `CODEGRAPH_NO_UPDATE_CHECK` to a non-empty value other than
+`0` or `false` to disable the check. This also prevents creation or update of
+the local version-check state file.
+
 ### 2. Auto-configure your AI tool
 
 ```bash
