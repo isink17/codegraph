@@ -904,21 +904,41 @@ dist/
 cmd/codegraph           CLI entrypoint
 internal/
   agent/                Agentic reasoning (ReAct loop over Ollama)
+  appname/              Centralized product and binary naming
+  audit/                Developer-only resolver-correctness harness (not a CLI/MCP command)
+  classify/             Classification of unresolved edge targets (builtin/stdlib/external/unknown)
   cli/                  Command handlers and MCP auto-configuration
+  compactfmt/           codegraph.compact/v1 encoding for format=compact
   config/               Config loading and path resolution
-  embedding/            Vector embedding (Ollama HTTP client)
+  detail/               Progressive symbol detail levels (card/skeleton/excerpt/full)
+  doctor/               codegraph doctor diagnostics
+  embedding/            Vector embedding (Ollama HTTP client, noop fallback)
   export/               JSON and DOT graph export
   framework/            Framework detection (20+ frameworks)
+  gotool/               Go binary path hints for install and doctor output
   graph/                Core types (Symbol, Edge, Reference, …)
+  graphaudit/           codegraph audit / MCP audit over an indexed graph
   indexer/              Repository scan, incremental updates, embedding
+  latency/              Percentile arithmetic shared by query benchmarks
+  limits/               Shared page, depth, and batch size bounds
+  logging/              slog logger construction
   mcp/                  MCP stdio server (29 tools)
   parser/               Parser interface and adapters
-    treesitter/         Tree-sitter adapters (12 languages)
-    golang/             Go AST parser (legacy)
-    python/             Python heuristic parser (legacy)
-    heuristic/          Regex-based parsers (legacy fallback)
+    treesitter/         Tree-sitter adapters (12 languages; CGO builds)
+    golang/             Go go/ast parser (CGO_ENABLED=0 builds)
+    python/             Pure-Go Python parser (CGO_ENABLED=0 builds; binding helpers reused by tree-sitter)
+    heuristic/          Regex symbol/import parsers for the other languages (CGO_ENABLED=0 builds)
+    gofixture/          Shared Go fixtures both Go adapters are tested against
+  platform/             Cross-platform path and OS helpers
   query/                Query orchestration and hybrid search
-  store/                SQLite storage, migrations, graph analytics
+  querybench/           Read-only query latency benchmark (bench-queries)
+  search/               Package doc only (no code)
+  store/                SQLite storage, migrations, edge resolution, graph analytics
+  texttoken/            Token weighting for full-text and semantic ranking
+  tokenest/             Deterministic token estimator (ceil(bytes/4))
+  usage/                In-process MCP context-usage meter (serve --usage-summary)
+  version/              Build and runtime version reporting
+  versioncheck/         Opt-out release check (CODEGRAPH_NO_UPDATE_CHECK, DO_NOT_TRACK)
   viz/                  Interactive D3.js graph visualization
   watcher/              File watch and debounced updates
 ```

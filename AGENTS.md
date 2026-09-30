@@ -20,15 +20,31 @@
 - `internal/graphaudit`: production audit of a user's already-indexed graph
   (`codegraph audit`, MCP `audit`); read-only, observational, never re-resolves
 - `internal/query`: symbol, caller, callee, impact, and stats queries
-- `internal/search`: lightweight local semantic ranking
+- `internal/search`: package doc only, no code; semantic search is implemented
+  in `internal/store` and `internal/query` (token weights in `internal/texttoken`)
+- `internal/texttoken`: token weighting for full-text and semantic ranking
+- `internal/embedding`: optional vector embeddings (Ollama client, noop fallback)
+- `internal/agent`: optional `agentic_query` ReAct loop over a local Ollama model
+- `internal/framework`: framework and library detection (`detect_frameworks`)
+- `internal/graph`: shared graph types (symbols, references, edges, parsed files)
 - `internal/mcp`: stdio MCP server and tool routing
+- `internal/usage`: in-process MCP context-usage meter (`serve --usage-summary`)
+- `internal/limits`: shared public size policy (page, depth, and batch bounds)
+- `internal/tokenest`: deterministic token estimator (ceil(bytes/4))
 - `internal/detail`: progressive symbol projections and bounded source detail
 - `internal/compactfmt`: `codegraph.compact/v1` tabular encoding for bulk MCP
   results (opt-in `format=compact`; JSON stays the default)
 - `internal/platform`: cross-platform path and OS helpers
 - `internal/version`: build and runtime version reporting
+- `internal/versioncheck`: opt-out release check against GitHub releases
+- `internal/doctor`: `codegraph doctor` diagnostics
+- `internal/gotool`: Go binary path hints used by install and doctor output
+- `internal/logging`: `slog` logger construction
 - `internal/export`: JSON and DOT export
+- `internal/viz`: single-file D3.js HTML graph (`codegraph visualize`; loads D3 from d3js.org)
 - `internal/watcher`: file watch and debounced updates
+- `internal/querybench`: read-only query latency benchmark (`codegraph bench-queries`)
+- `internal/latency`: percentile arithmetic shared by query benchmarks
 
 ## Working Rules
 

@@ -6,20 +6,26 @@ refactor or review.
 
 ## Kinds of answers — treat them differently
 
-- **Error ("symbol not found")** — the entity is not in the index. Check
-  the spelling and the index (`graph_stats`) before concluding anything.
-- **Empty result** — a valid answer, but for relationship queries it can
-  also mean the construct is not modeled: dynamic dispatch, code
-  generation, macros, or a language with weaker extraction. Absence of
-  graph evidence is not evidence of absence.
-- **Empty for an unknown symbol** — some relationship tools return an empty
-  list for a symbol that does not exist at all, so "no callers" and "no
-  such symbol" can look identical. When it matters, confirm the symbol
-  exists with `find_symbol` before interpreting an empty relationship.
-- **Ambiguous name** — several definitions can share a bare name, and a
-  relationship query answers for one of them. Disambiguate with
-  `find_symbol`, then query by `qualified_name` or `symbol_id`. Never
-  choose a same-name candidate without source evidence.
+- **Missing target** — an unknown name is not an error. `find_callers`,
+  `find_callees`, `find_related_tests`, and `trace_dependencies` succeed with
+  an empty result and `target_found: false`; `get_impact_radius` lists the
+  name under `seed_presence.missing`; `find_symbol` and `search_symbols`
+  return `matched: false`. Check the spelling and the index (`graph_stats`)
+  before concluding anything. `find_callers` on an unknown name may still
+  return `unresolved_hints`: unresolved call sites that spell the name, not
+  callers of an indexed symbol.
+- **Empty result with `target_found: true`** — a valid answer, but for
+  relationship queries it can also mean the construct is not modeled:
+  dynamic dispatch, code generation, macros, or a language with weaker
+  extraction. Absence of graph evidence is not evidence of absence.
+- **Ambiguous name** — several definitions can share a bare name, and tools
+  treat that differently: `find_callers` and `find_callees` merge the
+  results across the matching definitions; `get_impact_radius` and
+  `find_related_tests` use only the first candidate in a deterministic
+  lookup order; `trace_dependencies` fails closed with a `symbol is
+  ambiguous` error. None of these is a disambiguated answer. Resolve the
+  name with `find_symbol`, then query by `qualified_name` or `symbol_id`.
+  Never choose a same-name candidate without source evidence.
 
 ## Fail closed
 
@@ -50,11 +56,12 @@ with the code, or before trusting the graph for a high-stakes refactor.
 
 ## Cross-language links
 
-Cross-language links are created only by explicitly calling
-`cross_language_links` — indexing does not create them automatically. It
-writes conservative, low-confidence links from import-bridge evidence, and
-it mutates the graph. Treat every cross-language edge as a hint to verify
-in source, never as a confirmed relationship.
+`index` and `update` maintain cross-language links automatically as a
+derived set; `cross_language_links` re-derives the same set on demand and
+writes to the graph. Links are conservative and low-confidence: they need
+an import bridge between the two files, never a call site. Treat every
+cross-language edge as a hint to verify in source, never as a confirmed
+relationship.
 
 ## Graph vs source authority
 
