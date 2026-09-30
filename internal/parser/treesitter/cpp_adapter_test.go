@@ -648,16 +648,12 @@ void nsFn();
 	}
 }
 
-// TestCppClassMemberDeclarationStaysOut records the boundary of the ownership
-// contract above: it holds for a member *definition*, because that is a
-// `function_definition`. A bodiless member declaration is a `field_declaration`,
-// which the adapter does not emit at all -- wrapped or not -- so the wrapper
-// traversal cannot restore it either.
-//
-// That is the header-declaration / `.cc`-definition gap P22.17 owns, reached
-// through a different node than the `declaration` case. Pinned here so it is a
-// recorded limit rather than something the container fixture quietly avoids by
-// only ever using inline definitions.
+// TestCppClassMemberDeclarationStaysOut retains its historical name but now
+// pins class ownership for both wrapped and plain bodiless method declarations.
+// Each `field_declaration` emits a `declaration` evidence row; the inline
+// `function_definition` emits a separate callable definition. This is an
+// extraction check: cross-file resolution still requires visible declaration
+// evidence and an unambiguous matching definition.
 func TestCppClassMemberDeclarationStaysOut(t *testing.T) {
 	src := `class Cls {
 #if X
