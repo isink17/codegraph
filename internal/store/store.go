@@ -641,6 +641,9 @@ func validateExistingDatabase(path string) error {
 		if len(artifacts) == 1 {
 			db, err := openImmutableValidated(path, OpenOptions{})
 			if err != nil {
+				if isTransientSQLiteInspectionLock(err) {
+					continue
+				}
 				return err
 			}
 			validationErr := db.Close()
@@ -841,6 +844,12 @@ func sqlitePersistentArtifactPaths(path string) []string {
 }
 
 func readSQLiteInspectionArtifacts(path string) (map[string]sqliteInspectionArtifact, error) {
+	return retrySQLiteInspectionRead(func() (map[string]sqliteInspectionArtifact, error) {
+		return readSQLiteInspectionArtifactsOnce(path)
+	}, isTransientSQLiteInspectionLock)
+}
+
+func readSQLiteInspectionArtifactsOnce(path string) (map[string]sqliteInspectionArtifact, error) {
 	artifacts := make(map[string]sqliteInspectionArtifact, len(sqlitePersistentArtifactSuffixes))
 	for _, candidate := range sqlitePersistentArtifactPaths(path) {
 		artifact, err := streamSQLiteInspectionArtifact(candidate, nil)
@@ -853,6 +862,16 @@ func readSQLiteInspectionArtifacts(path string) (map[string]sqliteInspectionArti
 		}
 	}
 	return artifacts, nil
+}
+
+func retrySQLiteInspectionRead(read func() (map[string]sqliteInspectionArtifact, error), isLock func(error) bool) (map[string]sqliteInspectionArtifact, error) {
+	for attempt := 0; ; attempt++ {
+		artifacts, err := read()
+		if err == nil || !isLock(err) || attempt == 2 {
+			return artifacts, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+	}
 }
 
 func sqliteInspectionArtifactsEqual(left, right map[string]sqliteInspectionArtifact) bool {
