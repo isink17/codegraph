@@ -32,7 +32,7 @@ import (
 //
 // The candidate set per seed is unchanged from what the public queries return
 // for the same evidence policy -- see ContextSeed -- and the per-seed order is
-// the same total order: qualified_name, start_line, start_col, id.
+// path, qualified_name, kind, span, stable_key.
 
 const (
 	// contextSeedChunk bounds how many seeds share one page statement. The
@@ -620,7 +620,13 @@ func mergeNeighborPage(syms []graph.Symbol, fanout int) []graph.Symbol {
 		return []graph.Symbol{}
 	}
 	slices.SortStableFunc(syms, func(a, b graph.Symbol) int {
+		if c := cmp.Compare(a.FilePath, b.FilePath); c != 0 {
+			return c
+		}
 		if c := cmp.Compare(a.QualifiedName, b.QualifiedName); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Kind, b.Kind); c != 0 {
 			return c
 		}
 		if c := cmp.Compare(a.Range.StartLine, b.Range.StartLine); c != 0 {
@@ -629,7 +635,13 @@ func mergeNeighborPage(syms []graph.Symbol, fanout int) []graph.Symbol {
 		if c := cmp.Compare(a.Range.StartCol, b.Range.StartCol); c != 0 {
 			return c
 		}
-		return cmp.Compare(a.ID, b.ID)
+		if c := cmp.Compare(a.Range.EndLine, b.Range.EndLine); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Range.EndCol, b.Range.EndCol); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.StableKey, b.StableKey)
 	})
 	out := syms[:0]
 	var last int64
@@ -739,7 +751,7 @@ func (s *Store) pageNeighborChunk(
 // exactly as the LIMIT in symbolPageSQL makes it order the single candidate
 // set, but what crosses into Go is bounded by seeds*fanout.
 //
-// The ORDER BY inside the window is the same total order symbolPageSQL uses,
+// The ORDER BY inside the window is the same semantic order symbolPageSQL uses,
 // so a seed's neighbour page here is the same page, in the same order, that
 // FindCallers/FindCallees would return for the same evidence.
 func partitionedNeighborPageSQL(ctes []string, candidateSQL string) string {
@@ -754,7 +766,8 @@ func partitionedNeighborPageSQL(ctes []string, candidateSQL string) string {
 			       s.doc_summary AS doc_summary, s.stable_key AS stable_key, f.path AS path,
 			       ROW_NUMBER() OVER (
 			           PARTITION BY c.idx
-			           ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			           ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+			                    s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			       ) AS rn
 			-- CROSS JOIN for the reason symbolPageSQL gives: it pins the candidate
 			-- set as the outer loop instead of letting SQLite drive from symbols and
@@ -770,7 +783,8 @@ func partitionedNeighborPageSQL(ctes []string, candidateSQL string) string {
 		       start_line, start_col, end_line, end_col, doc_summary, stable_key, path
 		FROM ranked
 		WHERE rn <= ?
-		ORDER BY idx ASC, qualified_name ASC, start_line ASC, start_col ASC, sid ASC
+		ORDER BY idx ASC, path ASC, qualified_name ASC, kind ASC, start_line ASC, start_col ASC,
+		         end_line ASC, end_col ASC, stable_key ASC
 	`
 }
 

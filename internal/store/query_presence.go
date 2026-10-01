@@ -65,7 +65,9 @@ func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, que
 		), page AS (
 			SELECT matches.id FROM matches
 			JOIN symbols s ON s.id = matches.id
-			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
+			ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			LIMIT ? OFFSET ?
 		), meta AS (SELECT EXISTS(SELECT 1 FROM matches) AS matched)
 		SELECT meta.matched, s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
@@ -74,7 +76,8 @@ func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, que
 		LEFT JOIN page p ON 1 = 1
 		LEFT JOIN symbols s ON s.id = p.id
 		LEFT JOIN files f ON f.id = s.file_id
-		ORDER BY CASE WHEN s.id IS NULL THEN 0 ELSE 1 END, s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY CASE WHEN s.id IS NULL THEN 0 ELSE 1 END, f.path ASC, s.qualified_name ASC, s.kind ASC,
+		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC, s.stable_key ASC
 	`, args...)
 	if err == nil {
 		return result, nil
@@ -88,7 +91,9 @@ func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, que
 		), page AS (
 			SELECT matches.id FROM matches
 			JOIN symbols s ON s.id = matches.id
-			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
+			ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			LIMIT ? OFFSET ?
 		), meta AS (SELECT EXISTS(SELECT 1 FROM matches) AS matched)
 		SELECT meta.matched, s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
@@ -97,7 +102,8 @@ func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, que
 		LEFT JOIN page p ON 1 = 1
 		LEFT JOIN symbols s ON s.id = p.id
 		LEFT JOIN files f ON f.id = s.file_id
-		ORDER BY CASE WHEN s.id IS NULL THEN 0 ELSE 1 END, s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY CASE WHEN s.id IS NULL THEN 0 ELSE 1 END, f.path ASC, s.qualified_name ASC, s.kind ASC,
+		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC, s.stable_key ASC
 	`, repoID, "%"+query+"%", "%"+query+"%", safeLimit(limit), safeOffset(offset))
 }
 

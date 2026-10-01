@@ -3,9 +3,11 @@ package indexer
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +17,25 @@ import (
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
 	"github.com/isink17/codegraph/internal/store"
 )
+
+func TestParseSamplesUseSortedBoundedPaths(t *testing.T) {
+	var samples, forward, reverse []string
+	for i := 0; i < 25; i++ {
+		samples = append(samples, fmt.Sprintf("%02d.go: parse error", i))
+	}
+	for _, sample := range samples {
+		forward = addParseSample(forward, sample)
+	}
+	for i := len(samples) - 1; i >= 0; i-- {
+		reverse = addParseSample(reverse, samples[i])
+	}
+	if !slices.Equal(forward, reverse) {
+		t.Fatalf("parse samples depend on completion order:\nforward=%v\nreverse=%v", forward, reverse)
+	}
+	if len(forward) != 20 || forward[0] != "00.go: parse error" || forward[19] != "19.go: parse error" {
+		t.Fatalf("parse sample page = %v; want paths 00.go through 19.go", forward)
+	}
+}
 
 func TestIndexAndIncrementalUpdate(t *testing.T) {
 	ctx := context.Background()

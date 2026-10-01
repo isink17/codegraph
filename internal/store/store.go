@@ -7261,10 +7261,7 @@ func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 }
 
 func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
-	// The page is selected in a subquery that carries only the ordering keys.
-	// A broad term can match tens of thousands of symbols, and sorting rows
-	// that drag doc_summary and signature through the sorter costs far more
-	// than sorting (qualified_name, id) pairs and then fetching twenty rows.
+	// The page is selected in a subquery so only matching identities are sorted.
 	rows, err := s.db.QueryContext(ctx, `
 		WITH page AS (
 			SELECT s.id AS id
@@ -7276,8 +7273,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			-- active symbol should have had.
 			JOIN files pf ON pf.id = s.file_id AND pf.is_deleted = 0
 			WHERE s.repo_id = ? AND symbol_fts MATCH ?
-			ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
-			         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
+			ORDER BY pf.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			LIMIT ?
 			OFFSET ?
 		)
@@ -7289,8 +7286,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 		FROM page p
 		CROSS JOIN symbols s ON s.id = p.id
 		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
-		ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
-		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
+		ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 	`, repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset))
 	if err != nil {
 		rows, err = s.db.QueryContext(ctx, `
@@ -7299,8 +7296,8 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 			FROM symbols s
 			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
-			ORDER BY s.qualified_name ASC, s.kind ASC, s.container_name ASC, s.signature ASC, s.stable_key ASC,
-			         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC
+			ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			LIMIT ?
 			OFFSET ?
 		`, repoID, "%"+query+"%", "%"+query+"%", safeLimit(limit), safeOffset(offset))
@@ -7322,7 +7319,8 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND (s.name = ? OR s.qualified_name = ?)
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ?
 		OFFSET ?
 	`, repoID, query, query, safeLimit(limit), safeOffset(offset))
@@ -7536,13 +7534,22 @@ func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, sym
 		if symbolList[i].QualifiedName != symbolList[j].QualifiedName {
 			return symbolList[i].QualifiedName < symbolList[j].QualifiedName
 		}
+		if symbolList[i].Kind != symbolList[j].Kind {
+			return symbolList[i].Kind < symbolList[j].Kind
+		}
 		if symbolList[i].Range.StartLine != symbolList[j].Range.StartLine {
 			return symbolList[i].Range.StartLine < symbolList[j].Range.StartLine
 		}
 		if symbolList[i].Range.StartCol != symbolList[j].Range.StartCol {
 			return symbolList[i].Range.StartCol < symbolList[j].Range.StartCol
 		}
-		return symbolList[i].ID < symbolList[j].ID
+		if symbolList[i].Range.EndLine != symbolList[j].Range.EndLine {
+			return symbolList[i].Range.EndLine < symbolList[j].Range.EndLine
+		}
+		if symbolList[i].Range.EndCol != symbolList[j].Range.EndCol {
+			return symbolList[i].Range.EndCol < symbolList[j].Range.EndCol
+		}
+		return symbolList[i].StableKey < symbolList[j].StableKey
 	})
 	sort.Strings(fileList)
 	unresolvedEdges, unresolvedNames, err := s.impactUnresolvedEvidence(ctx, repoID, symbolList)
@@ -7618,7 +7625,8 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 			JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id AND f.is_deleted = 0
 			JOIN files ef ON ef.repo_id = e.repo_id AND ef.id = e.file_id AND ef.is_deleted = 0
 			WHERE e.repo_id = ? AND e.dst_symbol_id IN (` + placeholders + `)
-			ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+			ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		`
 		if !callers {
 			query = `
@@ -7629,7 +7637,8 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 				JOIN files f ON f.repo_id = e.repo_id AND f.id = s.file_id AND f.is_deleted = 0
 				JOIN files ef ON ef.repo_id = e.repo_id AND ef.id = e.file_id AND ef.is_deleted = 0
 				WHERE e.repo_id = ? AND e.src_symbol_id IN (` + placeholders + `) AND e.dst_symbol_id IS NOT NULL
-				ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+				ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+				         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			`
 		}
 		args := make([]any, 0, len(chunk)+1)
@@ -8631,7 +8640,8 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 				FROM symbols s
 				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND s.qualified_name = ?
-				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+				ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+				         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			`,
 			args: []any{repoID, symbol},
 		},
@@ -8641,7 +8651,8 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 				FROM symbols s
 				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND s.name = ?
-				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+				ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+				         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			`,
 			args: []any{repoID, symbol},
 		},
@@ -8656,7 +8667,8 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 				FROM symbols s
 				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND (s.qualified_name LIKE ? OR s.qualified_name LIKE ?)
-				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+				ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+				         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			`,
 			args: []any{repoID, "%::" + short, "%." + short},
 		})
@@ -8671,7 +8683,8 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 				FROM symbols s
 				JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 				WHERE s.repo_id = ? AND s.name = ?
-				ORDER BY s.qualified_name ASC, f.path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+				ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+				         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 			`,
 			args: []any{repoID, short},
 		})
@@ -8741,7 +8754,8 @@ func (s *Store) symbolsByIDs(ctx context.Context, repoID int64, ids []int64, lim
 		FROM symbols s
 		JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND s.id IN (`+placeholders+`)
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ?
 		OFFSET ?
 	`, append(append([]any{repoID}, int64SliceToAny(ids)...), safeLimit(limit), safeOffset(offset))...)
