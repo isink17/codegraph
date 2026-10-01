@@ -5014,6 +5014,11 @@ func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []str
 	if len(names) == 0 {
 		return nil, nil
 	}
+	// Without JVM callers no scoped spelling can change; avoid scanning edges.
+	applies, err := s.jvmScopePrecisionRepairApplies(ctx, repoID)
+	if err != nil || !applies {
+		return nil, err
+	}
 	seen := make(map[string]struct{})
 	for _, chunk := range chunkStrings(names, sqliteBatchSize(1, 3)) {
 		terms := make([]string, 0, len(chunk)*3)
