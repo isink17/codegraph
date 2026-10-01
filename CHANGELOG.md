@@ -8,6 +8,9 @@ and explicit symbol IDs keep precedence; database ordering never selects a targe
 Unknown callers serialize as an empty array. Full MCP tools/list grows by 141 bytes
 (35 estimated tokens) to document the contract; gateway definitions are unchanged.
 
+Incremental updates skip JVM scope-name edge scans when the repository has no
+active Java or Kotlin files; mixed/JVM repositories preserve existing behavior.
+
 v2 development uses separate SQLite storage: repo-local `.codegraph/codegraph.v2.sqlite`; custom/global stores use deterministic `codegraph.v2-<repo-hash>.sqlite` names. Legacy v1 `codegraph.sqlite` databases are not automatically migrated or modified; first v2 index may require a full rebuild, and v1/v2 databases can coexist safely.
 
 C++ qualified identity now preserves namespace nesting, file-scoped anonymous namespaces, friend
