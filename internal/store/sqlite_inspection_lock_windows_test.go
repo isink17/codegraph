@@ -21,3 +21,20 @@ func TestSQLiteInspectionLockClassifierRecognizesWindowsSharingErrors(t *testing
 		}
 	}
 }
+
+func TestSQLiteInspectionLockClassifierScopesAccessDeniedToJournalOpen(t *testing.T) {
+	journal := &os.PathError{Op: "open", Path: "db.sqlite-journal", Err: windows.ERROR_ACCESS_DENIED}
+	if !isTransientSQLiteInspectionLock(journal) {
+		t.Fatal("journal open access denied was not classified as transient")
+	}
+
+	main := &os.PathError{Op: "open", Path: "db.sqlite", Err: windows.ERROR_ACCESS_DENIED}
+	if isTransientSQLiteInspectionLock(main) {
+		t.Fatal("main database access denied was classified as transient")
+	}
+
+	stat := &os.PathError{Op: "stat", Path: "db.sqlite-journal", Err: windows.ERROR_ACCESS_DENIED}
+	if isTransientSQLiteInspectionLock(stat) {
+		t.Fatal("journal stat access denied was classified as transient")
+	}
+}
