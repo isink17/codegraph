@@ -3,7 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -563,7 +566,7 @@ func phpLoadComposerPSR4Mappings(ctx context.Context, q phpScopeQuery, repoID in
 	var mappings []phpComposerPSR4Mapping
 	err := sqliteScanRows(ctx, q, `SELECT namespace_prefix,root_path,root_ordinal
 		FROM php_composer_psr4_mapping
-		WHERE repo_id=? AND mapping_role='autoload' AND namespace_prefix<>''
+		WHERE repo_id=? AND mapping_role='autoload'
 		ORDER BY namespace_prefix,root_ordinal,root_path`, []any{repoID}, func(rows *sql.Rows) error {
 		var mapping phpComposerPSR4Mapping
 		if err := rows.Scan(&mapping.prefix, &mapping.root, &mapping.ordinal); err != nil {
@@ -589,38 +592,58 @@ func phpSelectType(ctx context.Context, q phpScopeQuery, repoID int64, typeQ str
 		return phpTypeSelection{}, nil
 	}
 	class := strings.ReplaceAll(typeQ, ".", `\`)
-	best := -1
+	// Composer tries matching namespace prefixes from longest to shortest.
+	// Within a prefix its directories retain manifest order. A missing file
+	// allows fallback; an existing file is authoritative even if it lacks the
+	// expected class, so that case fails closed.
+	prefixes := make([]string, 0, len(mappings))
+	seen := make(map[string]bool)
 	for _, mapping := range mappings {
-		if phpComposerPrefixMatches(class, mapping.prefix) && len(mapping.prefix) > best {
-			best = len(mapping.prefix)
+		if phpComposerPrefixMatches(class, mapping.prefix) && !seen[mapping.prefix] {
+			prefixes = append(prefixes, mapping.prefix)
+			seen[mapping.prefix] = true
 		}
 	}
-	if best < 0 {
-		return phpTypeSelection{}, nil
-	}
-	for _, mapping := range mappings {
-		if len(mapping.prefix) != best || !phpComposerPrefixMatches(class, mapping.prefix) {
-			continue
+	sort.Slice(prefixes, func(i, j int) bool {
+		if len(prefixes[i]) != len(prefixes[j]) {
+			return len(prefixes[i]) > len(prefixes[j])
 		}
-		expected := phpComposerExpectedPath(mapping.root, strings.TrimPrefix(class, mapping.prefix))
-		fileID, exists, err := phpActiveFileID(ctx, q, repoID, expected)
-		if err != nil {
-			return phpTypeSelection{}, err
-		}
-		if !exists {
-			continue
-		}
-		var match phpScopeSymbol
-		n := 0
-		for _, candidate := range types {
-			if candidate.fileID == fileID {
-				match, n = candidate, n+1
+		return prefixes[i] < prefixes[j]
+	})
+	for _, prefix := range prefixes {
+		for _, mapping := range mappings {
+			if mapping.prefix != prefix {
+				continue
 			}
+			expected := phpComposerExpectedPath(mapping.root, strings.TrimPrefix(class, prefix))
+			fileID, exists, err := phpActiveFileID(ctx, q, repoID, expected)
+			if err != nil {
+				return phpTypeSelection{}, err
+			}
+			if !exists {
+				physical, err := phpPhysicalFileExists(ctx, q, repoID, expected)
+				if err != nil {
+					return phpTypeSelection{}, err
+				}
+				if physical {
+					// Composer stops at the first physical target. It may be
+					// absent from this graph because indexing excluded it.
+					return phpTypeSelection{}, nil
+				}
+				continue
+			}
+			var match phpScopeSymbol
+			n := 0
+			for _, candidate := range types {
+				if candidate.fileID == fileID {
+					match, n = candidate, n+1
+				}
+			}
+			if n == 1 {
+				return phpTypeSelection{fileID: match.fileID, composerUsed: true, ok: true}, nil
+			}
+			return phpTypeSelection{}, nil
 		}
-		if n == 1 {
-			return phpTypeSelection{fileID: match.fileID, composerUsed: true, ok: true}, nil
-		}
-		return phpTypeSelection{}, nil
 	}
 	return phpTypeSelection{}, nil
 }
@@ -646,9 +669,40 @@ func phpActiveFileID(ctx context.Context, q phpScopeQuery, repoID int64, path st
 	return id, id != 0, nil
 }
 
+func phpPhysicalFileExists(ctx context.Context, q phpScopeQuery, repoID int64, rel string) (bool, error) {
+	var root string
+	rows, err := q.QueryContext(ctx, `SELECT root_path FROM repos WHERE id=?`, repoID)
+	if err != nil {
+		return false, err
+	}
+	if !rows.Next() {
+		err := rows.Err()
+		rows.Close()
+		if err != nil {
+			return false, err
+		}
+		return false, sql.ErrNoRows
+	}
+	err = rows.Scan(&root)
+	rows.Close()
+	if err != nil {
+		return false, err
+	}
+	target := filepath.Join(root, filepath.FromSlash(rel))
+	_, err = os.Stat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// Composer's ClassLoader uses file_exists, which also succeeds for directories.
+	return true, nil
+}
+
 func phpComposerPrefixMatches(class, prefix string) bool {
 	if prefix == "" {
-		return false
+		return true
 	}
 	if strings.HasSuffix(prefix, `\`) {
 		return strings.HasPrefix(class, prefix)
