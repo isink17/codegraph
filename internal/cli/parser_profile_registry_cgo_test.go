@@ -25,7 +25,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:ruby:v5"
 		}
 		if lang.Language == "rust" {
-			want = "treesitter:rust:v2"
+			want = "treesitter:rust:v3"
 		}
 		if lang.Language == "swift" {
 			want = "treesitter:swift:v7"

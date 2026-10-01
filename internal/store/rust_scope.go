@@ -402,31 +402,39 @@ func invalidateRustBindingsForRoots(ctx context.Context, q execQuerier, repoID i
 // resolveRustModuleScope is deliberately conservative: Rust edges are decided
 // here or remain unresolved; generic repository-name strategies never see them.
 func resolveRustModuleScope(ctx context.Context, tx *sql.Tx, repoID int64, only map[int64]struct{}) (map[int64]struct{}, error) {
-	return resolveRustModuleScopeWithStats(ctx, tx, repoID, only, nil)
+	return resolveRustModuleScopeWithStats(ctx, tx, repoID, only, nil, nil)
 }
 
-func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int64, only map[int64]struct{}, stats *RustResolutionStats) (map[int64]struct{}, error) {
+func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int64, only map[int64]struct{}, stats *RustResolutionStats, selectedRoots map[string]struct{}) (map[int64]struct{}, error) {
 	rootPath := conventionalRustRoot
 	// Incremental scope is bounded by the selected callers' proven crate roots.
 	// Newly written evidence may not have crate_root yet, so conventional root
 	// paths are accepted as a temporary seed and are validated by the graph.
+	callerFiles := map[int64]struct{}{}
 	roots := map[string]struct{}{}
+	// Changed root files may contain only module declarations and no edges.
+	// Keep their path-derived discovery seeds; membership is proven below.
+	for root := range selectedRoots {
+		roots[root] = struct{}{}
+	}
 	if only != nil && len(only) > 0 {
 		ids := make([]int64, 0, len(only))
 		for id := range only {
 			ids = append(ids, id)
 		}
 		for _, chunk := range chunkInt64s(ids, sqliteInClauseBatchSize) {
-			rows, err := tx.QueryContext(ctx, `SELECT f.path,COALESCE(e.crate_root,'') FROM edges x JOIN files f ON f.id=x.file_id LEFT JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE x.repo_id=? AND x.id IN (`+sqlitePlaceholders(len(chunk))+`)`, append([]any{repoID}, int64SliceToAny(chunk)...)...)
+			rows, err := tx.QueryContext(ctx, `SELECT f.id,f.path,COALESCE(e.crate_root,'') FROM edges x JOIN files f ON f.id=x.file_id LEFT JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE x.repo_id=? AND x.id IN (`+sqlitePlaceholders(len(chunk))+`)`, append([]any{repoID}, int64SliceToAny(chunk)...)...)
 			if err != nil {
 				return nil, err
 			}
 			for rows.Next() {
+				var fileID int64
 				var path, root string
-				if err := rows.Scan(&path, &root); err != nil {
+				if err := rows.Scan(&fileID, &path, &root); err != nil {
 					_ = rows.Close()
 					return nil, err
 				}
+				callerFiles[fileID] = struct{}{}
 				if root == "" {
 					root = rootPath(path)
 				}
@@ -455,10 +463,19 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	// loaded, so no decision is ever taken on a partial view.
 	filtered := only != nil
 	var scopedFiles []any
-	if filtered && len(rootList) > 0 {
-		scoped, err := rustScopedFileIDs(ctx, tx, repoID, rootList)
-		if err != nil {
-			return nil, err
+	if filtered {
+		scoped := map[int64]struct{}{}
+		if len(rootList) > 0 {
+			var err error
+			scoped, err = rustScopedFileIDs(ctx, tx, repoID, rootList)
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Rootless selected callers still own same-file associated functions.
+		// Including their file does not assert crate or module membership.
+		for id := range callerFiles {
+			scoped[id] = struct{}{}
 		}
 		ids := make([]int64, 0, len(scoped))
 		for id := range scoped {
@@ -923,15 +940,15 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 }
 
 func (s *Store) resolveRustModuleScopeStandalone(ctx context.Context, repoID int64, ids map[int64]struct{}) (map[int64]struct{}, error) {
-	return s.resolveRustModuleScopeStandaloneWithStats(ctx, repoID, ids, nil)
+	return s.resolveRustModuleScopeStandaloneWithStats(ctx, repoID, ids, nil, nil)
 }
 
-func (s *Store) resolveRustModuleScopeStandaloneWithStats(ctx context.Context, repoID int64, ids map[int64]struct{}, stats *RustResolutionStats) (map[int64]struct{}, error) {
+func (s *Store) resolveRustModuleScopeStandaloneWithStats(ctx context.Context, repoID int64, ids map[int64]struct{}, stats *RustResolutionStats, roots map[string]struct{}) (map[int64]struct{}, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	bound, err := resolveRustModuleScopeWithStats(ctx, tx, repoID, ids, stats)
+	bound, err := resolveRustModuleScopeWithStats(ctx, tx, repoID, ids, stats, roots)
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, err

@@ -139,3 +139,69 @@ func TestKotlinPackageOwnsDeclarationIdentity(t *testing.T) {
 		t.Fatalf("default package identity = package %q symbols %+v", p.Scope.Package, p.Symbols)
 	}
 }
+
+func TestRustNestedUseTree(t *testing.T) {
+	p, err := NewRust().Parse(context.Background(), "lib.rs", []byte(`mod caller { pub use crate /* prefix */ :: {a::{self, f /* alias */ as renamed, nested::{g, *}}, b :: h}; }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"crate::a|a|a|false", "crate::a::f|f|renamed|false", "crate::a::nested::g|g|g|false", "crate::a::nested|nested||true", "crate::b::h|h|h|false"}
+	if len(p.Scope.Imports) != len(want) {
+		t.Fatalf("imports = %+v", p.Scope.Imports)
+	}
+	for i, imp := range p.Scope.Imports {
+		got := fmt.Sprintf("%s|%s|%s|%t", imp.SourceSpecifier, imp.ImportedName, imp.LocalName, imp.Wildcard)
+		if got != want[i] || !imp.ReExport || imp.OwnerModule != "crate::caller" {
+			t.Fatalf("import %d = %+v, want %s", i, imp, want[i])
+		}
+	}
+}
+
+func TestRustUseTreeRelativePaths(t *testing.T) {
+	p, err := NewRust().Parse(context.Background(), "lib.rs", []byte(`mod caller {
+use self::{local::{helper as local_helper}};
+use super::{a::{helper as sibling}};
+use super::super::{root::{helper as root_helper}};
+use {crate::a::{helper as global}, self::local::{helper as nested}};
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"self::local::helper|local_helper",
+		"super::a::helper|sibling",
+		"super::super::root::helper|root_helper",
+		"crate::a::helper|global",
+		"self::local::helper|nested",
+	}
+	if len(p.Scope.Imports) != len(want) {
+		t.Fatalf("imports = %+v", p.Scope.Imports)
+	}
+	for i, imp := range p.Scope.Imports {
+		if got := imp.SourceSpecifier + "|" + imp.LocalName; got != want[i] || imp.ImportedName != "helper" || imp.OwnerModule != "crate::caller" {
+			t.Fatalf("import %d = %+v, want %s", i, imp, want[i])
+		}
+	}
+}
+
+func TestRustUseTreeUnsupportedAndMalformedFailClosed(t *testing.T) {
+	for _, src := range []string{
+		"use crate::{a::{helper as}};",
+		"use crate::{a::{helper, other};",
+		"use crate::a::;",
+		"use crate::a::helper as;",
+		"use crate::a::helper",
+		"use crate::{a::{helper as _}};",
+		"use *;",
+	} {
+		t.Run(src, func(t *testing.T) {
+			p, err := NewRust().Parse(context.Background(), "lib.rs", []byte(src))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(p.Scope.Imports) != 0 {
+				t.Fatalf("unsupported or malformed import emitted evidence: %+v", p.Scope.Imports)
+			}
+		})
+	}
+}

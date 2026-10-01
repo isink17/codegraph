@@ -53,7 +53,7 @@ func TestRustResolutionBatchStatsStaySetBased(t *testing.T) {
 	for _, n := range []int{1, 100} {
 		ids := makeBatch(n)
 		var stats RustResolutionStats
-		if _, err := s.resolveRustModuleScopeStandaloneWithStats(ctx, repo.ID, ids, &stats); err != nil {
+		if _, err := s.resolveRustModuleScopeStandaloneWithStats(ctx, repo.ID, ids, &stats, nil); err != nil {
 			t.Fatal(err)
 		}
 		if stats.AffectedCrates != 1 || stats.AffectedModules != 2 || stats.AffectedEdges != n || stats.BatchApplyOps != 1 || stats.ReExportEvidenceLoads != 1 {
