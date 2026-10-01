@@ -1506,6 +1506,12 @@ var (
 		applies:          (*Store).phpScopeRepairApplies,
 		resolvesRepoWide: true,
 	}
+	phpFunctionCandidateRepair = resolverRepair{
+		key:              phpFunctionCandidateRepairSettingKey,
+		run:              (*Store).repairPHPFunctionCandidateBindings,
+		applies:          (*Store).phpScopeRepairApplies,
+		resolvesRepoWide: true,
+	}
 	rubyConstantPathRepair = resolverRepair{
 		key:              rubyConstantPathRepairSettingKey,
 		run:              (*Store).repairRubyConstantPathBindings,
@@ -1636,7 +1642,7 @@ var (
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, jvmCommonCallableABIRepair, jvmCompanionCallableABIRepair, cppExternCSignatureRepair, typescriptJSSpecifierRepair, phpScopeRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, jvmCommonCallableABIRepair, jvmCompanionCallableABIRepair, cppExternCSignatureRepair, typescriptJSSpecifierRepair, phpScopeRepair, phpFunctionCandidateRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,

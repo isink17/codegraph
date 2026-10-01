@@ -114,6 +114,7 @@ func (s *Store) populateDotSuffixCandidates(ctx context.Context, tx *sql.Tx, rep
 			 AND s.qualified_name LIKE '%.' || n.dst_name
 			`+resolverCandidateJoinSQL+`
 			WHERE n.tier = ? AND s.language != ''
+			AND `+phpGenericCandidateSQL("s.")+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
 		`, repoID, pass.tier); err != nil {

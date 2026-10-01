@@ -1402,6 +1402,82 @@ class Caller {
 
 // -- upgrade repair -------------------------------------------------------------
 
+func TestPHPBareFunctionUpgradeRepairConvergesWithoutReparse(t *testing.T) {
+	r := newPHPRepo(t, map[string]string{
+		"Caller.php": `<?php namespace App;
+function call() {
+    methodOnly();
+    helper();
+    globalHelper();
+    strlen("x");
+    vendorHelper();
+    duplicate();
+}
+`,
+		"Bait.php": `<?php namespace App;
+class Service {
+    public function methodOnly() {}
+    public static function helper() {}
+    public function strlen() {}
+    public static function vendorHelper() {}
+}
+function helper() {}
+function duplicate() {}
+`,
+		"Global.php": `<?php function globalHelper() {}`,
+		"Vendor.php": `<?php namespace Vendor; function duplicate() {}`,
+	})
+	ctx := context.Background()
+	raw := r.raw()
+	defer raw.Close()
+	// Every old repair is marked complete. Remove only the newly registered
+	// candidate repair to model an upgrade over unchanged parser facts.
+	key := "resolver.php_function_candidates_repaired.v1." + strconv.FormatInt(r.repoID, 10)
+	if _, err := raw.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, key); err != nil {
+		t.Fatal(err)
+	}
+	// Old generic bindings, including a pre-provenance edge, and a function
+	// stranded unresolved by its same-name method candidate.
+	for name, strategy := range map[string]string{"methodOnly": "", "strlen": "exact_name", "vendorHelper": "receiver_method"} {
+		if _, err := raw.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = (SELECT id FROM symbols WHERE repo_id = ? AND qualified_name = ?), resolution_strategy = ?, resolution_confidence = 'high' WHERE repo_id = ? AND dst_name = ?`, r.repoID, "App.Service."+name, strategy, r.repoID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE edges SET dst_symbol_id = NULL, resolution_strategy = '', resolution_confidence = '' WHERE repo_id = ? AND dst_name = 'helper'`, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.s.ReconcileReferenceIdentities(ctx, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+
+	for run := 1; run <= 2; run++ {
+		summary := r.update()
+		if summary.FilesIndexed != 0 || summary.FilesChanged != 0 || len(summary.ParserProfileLanguages) != 0 {
+			t.Fatalf("update %d reparsed unchanged PHP: %+v", run, summary)
+		}
+		for _, name := range []string{"methodOnly", "strlen", "vendorHelper", "duplicate"} {
+			r.assertUnresolved("Caller.php", name)
+			if got := r.edge("Caller.php", name).TargetClassification; got != "unknown" {
+				t.Fatalf("%s classification = %q, want existing PHP unknown contract", name, got)
+			}
+		}
+		r.assertTarget("Caller.php", "helper", "App.helper", "exact_name")
+		r.assertTarget("Caller.php", "globalHelper", "globalHelper", "exact_qualified")
+		assertCallers(t, r.s, r.repoID, "App.Service.methodOnly")
+		assertCallers(t, r.s, r.repoID, "App.Service.strlen")
+		assertCallees(t, r.s, r.repoID, "App.call", "App.helper", "globalHelper")
+		trace, total, err := r.s.TraceDependencies(ctx, r.repoID, "App.call", "downstream", 2, 20, 0)
+		if err != nil || total != 3 || len(trace) != 3 {
+			t.Fatalf("trace = %#v, total=%d, err=%v; want caller and two functions", trace, total, err)
+		}
+		r.assertFreshParity()
+		var marker string
+		if err := raw.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&marker); err != nil || marker != "1" {
+			t.Fatalf("update %d repair marker = %q, err=%v", run, marker, err)
+		}
+	}
+}
+
 // TestPHPStaticScopeUpgradeRepairConvergesWithoutReparse simulates a database
 // indexed by a binary that persisted PHP namespace facts but predates scoped
 // static-call resolution and its resolver.php_scope_repaired.v1 repair: parser

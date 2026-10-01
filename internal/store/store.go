@@ -3967,6 +3967,7 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 				 AND s.qualified_name = n.lookup_name
 			` + resolverCandidateJoinSQL + `
 			WHERE s.language != ''
+			AND ` + phpGenericCandidateSQL("s.") + `
 			` + resolverQualifiedLookupFilter + `
 			GROUP BY n.dst_name, s.language
 		) g
@@ -3987,6 +3988,7 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 			` + resolverCandidateJoinSQL + `
 			WHERE ` + resolverBareNameLevelKindsSQL("s.") + `
 			AND s.language != ''
+			AND ` + phpGenericCandidateSQL("s.") + `
 			GROUP BY n.dst_name, s.language
 		) g
 		` + vetoScopes,
@@ -4196,6 +4198,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 				 AND s.qualified_name = n.lookup_name
 			`+resolverCandidateJoinSQL+`
 			WHERE s.language != ''
+			AND `+phpGenericCandidateSQL("s.")+`
 			`+resolverQualifiedLookupFilter+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
@@ -4234,6 +4237,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 			`+resolverCandidateJoinSQL+`
 			WHERE s.kind IN `+resolverBareNameKindsSQL+`
 			AND s.language != ''
+			AND `+phpGenericCandidateSQL("s.")+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
 		)
@@ -4289,6 +4293,7 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 			`+resolverCandidateJoinSQL+`
 			WHERE s.container_name != ''
 			AND s.language != ''
+			AND `+phpGenericCandidateSQL("s.")+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
 		)
@@ -4535,6 +4540,7 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 		 AND s.dot_tail3 = n.dst_name
 		`+resolverCandidateJoinSQL+`
 		WHERE s.dot_tail3 != '' AND s.language != ''
+		AND `+phpGenericCandidateSQL("s.")+`
 		GROUP BY n.dst_name, s.language
 		`+resolverCandidateHavingSQL+`
 	`, repoID); err != nil {
@@ -4687,6 +4693,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			 AND s.qualified_suffix = n.dst_name
 			`+resolverCandidateJoinSQL+`
 			WHERE s.qualified_suffix != '' AND s.language != ''
+			AND `+phpGenericCandidateSQL("s.")+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
 		`, repoID); err != nil {
@@ -4793,6 +4800,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			 AND s.dot_tail2 = n.dst_name
 			`+resolverCandidateJoinSQL+`
 			WHERE s.dot_tail2 != '' AND s.language != ''
+			AND `+phpGenericCandidateSQL("s.")+`
 			GROUP BY n.dst_name, s.language
 			`+resolverCandidateHavingSQL+`
 		`, repoID); err != nil {
@@ -7134,7 +7142,7 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 		query := `
 			SELECT ` + column + `, language, id, file_id, kind
 			FROM symbols
-			WHERE repo_id = ? AND language != '' AND ` + column + ` != '' AND ` + match + kindFilter + `
+			WHERE repo_id = ? AND language != '' AND ` + phpGenericCandidateSQL("") + ` AND ` + column + ` != '' AND ` + match + kindFilter + `
 		`
 		args := make([]any, 0, len(chunk)*2+1)
 		args = append(args, repoID)
