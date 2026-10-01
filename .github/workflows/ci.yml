@@ -49,6 +49,10 @@ jobs:
         # Windows keeps 30m to absorb its wider runner-to-runner variance.
         run: go test -timeout ${{ matrix.go_test_timeout }} ./...
 
+      - name: Repeat concurrent database open checks (Windows)
+        if: runner.os == 'Windows'
+        run: go test -timeout 30m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=200
+
       - name: Smoke native binary
         shell: pwsh
         run: |
