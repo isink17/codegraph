@@ -6,6 +6,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -74,9 +75,41 @@ func assertCallees(t *testing.T, s *store.Store, repoID int64, symbol string, wa
 	}
 }
 
+// callersForExactTargets explicitly unions identities for fixtures that intentionally
+// test several overloads or files. The public name-only query must reject them.
+func callersForExactTargets(t *testing.T, s *store.Store, repoID int64, name string) ([]graph.Symbol, error) {
+	t.Helper()
+	ctx := context.Background()
+	callers, err := s.FindCallers(ctx, repoID, name, 0, 50, 0)
+	if !errors.Is(err, store.ErrSymbolAmbiguous) {
+		return callers, err
+	}
+	targets, err := s.FindSymbolExact(ctx, repoID, name, 50, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) < 2 {
+		t.Fatalf("ambiguous fixture %s has no exact candidate set", name)
+	}
+	seen := map[int64]bool{}
+	for _, target := range targets {
+		rows, err := s.FindCallers(ctx, repoID, name, target.ID, 50, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			if !seen[row.ID] {
+				callers = append(callers, row)
+				seen[row.ID] = true
+			}
+		}
+	}
+	return callers, nil
+}
+
 func assertCallers(t *testing.T, s *store.Store, repoID int64, symbol string, want ...string) {
 	t.Helper()
-	got, err := s.FindCallers(context.Background(), repoID, symbol, 0, 50, 0)
+	got, err := callersForExactTargets(t, s, repoID, symbol)
 	if err != nil {
 		t.Fatalf("FindCallers(%s) error = %v", symbol, err)
 	}
@@ -91,7 +124,7 @@ func assertCallers(t *testing.T, s *store.Store, repoID int64, symbol string, wa
 func assertNoSelfEdges(t *testing.T, s *store.Store, repoID int64, symbols ...string) {
 	t.Helper()
 	for _, symbol := range symbols {
-		callers, err := s.FindCallers(context.Background(), repoID, symbol, 0, 50, 0)
+		callers, err := callersForExactTargets(t, s, repoID, symbol)
 		if err != nil {
 			t.Fatalf("FindCallers(%s) error = %v", symbol, err)
 		}

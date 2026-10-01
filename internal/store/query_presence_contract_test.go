@@ -541,17 +541,8 @@ func TestImpactSeedBatchKeepsQualifiedAndRepositoryResolution(t *testing.T) {
 		t.Fatalf("qualified seed traversal = %+v, want seed %d and neighbor %d", qualifiedSymbols, wantID, otherID)
 	}
 
-	bare := must(s.ImpactRadius(ctx, repoID, []string{"Shared", "pkg.two.Shared", "Absent", "Shared"}, nil, 0, 10, 0))
-	barePresence := bare["seed_presence"].(ImpactSeedPresence)
-	if barePresence.Requested != 4 || barePresence.Found != 3 || len(barePresence.Missing) != 1 {
-		t.Fatalf("batched seed presence = %+v", barePresence)
-	}
-	seen := map[int64]bool{}
-	for _, sym := range bare["symbols"].([]graph.Symbol) {
-		seen[sym.ID] = true
-	}
-	if !seen[wantID] || !seen[otherID] {
-		t.Fatalf("batched seed symbols lost deterministic resolution: %+v", bare["symbols"])
+	if result, err := s.ImpactRadius(ctx, repoID, []string{"Shared", "pkg.two.Shared", "Absent", "Shared"}, nil, 0, 10, 0); !errors.Is(err, ErrSymbolAmbiguous) || result != nil {
+		t.Fatalf("ambiguous batched seed = %+v, %v; want ambiguity and no partial closure", result, err)
 	}
 }
 

@@ -150,7 +150,7 @@ func (s *Store) FindCallersResult(ctx context.Context, repoID int64, symbol stri
 		ids = []int64{identity.ID}
 	} else {
 		var err error
-		ids, err = s.lookupSymbolIDs(ctx, repoID, symbol, 0)
+		ids, err = s.lookupQuerySymbolIDs(ctx, repoID, symbol, 0)
 		if err != nil {
 			return NeighborResult{}, err
 		}
@@ -159,7 +159,7 @@ func (s *Store) FindCallersResult(ctx context.Context, repoID int64, symbol stri
 	if err != nil {
 		return NeighborResult{}, err
 	}
-	result := NeighborResult{TargetFound: len(ids) > 0}
+	result := NeighborResult{TargetFound: len(ids) > 0, Callers: []graph.Symbol{}}
 	if result.TargetFound {
 		result.Callers = items
 	} else {
@@ -182,7 +182,7 @@ func (s *Store) FindCalleesResult(ctx context.Context, repoID int64, symbol stri
 		ids = []int64{identity.ID}
 	} else {
 		var err error
-		ids, err = s.lookupSymbolIDs(ctx, repoID, symbol, 0)
+		ids, err = s.lookupQuerySymbolIDs(ctx, repoID, symbol, 0)
 		if err != nil {
 			return NeighborResult{}, err
 		}

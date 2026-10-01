@@ -566,7 +566,7 @@ func assertJVMQueryRelation(t *testing.T, r *lifecycleRepo, caller, target strin
 	if err != nil || !hasSymbolQName(callees, target) {
 		t.Fatalf("FindCallees(%s) = %#v, %v; want %s", caller, callees, err, target)
 	}
-	callers, err := r.store.FindCallers(r.ctx, r.repoID, target, 0, 10, 0)
+	callers, err := callersForExactTargets(t, r.store, r.repoID, target)
 	if err != nil || !hasSymbolQName(callers, caller) {
 		t.Fatalf("FindCallers(%s) = %#v, %v; want %s", target, callers, err, caller)
 	}
@@ -581,7 +581,7 @@ func assertJVMNoQueryRelation(t *testing.T, r *lifecycleRepo, caller, target str
 	if hasSymbolQName(callees, target) {
 		t.Fatalf("FindCallees(%s) unexpectedly contains %s: %#v", caller, target, callees)
 	}
-	callers, err := r.store.FindCallers(r.ctx, r.repoID, target, 0, 10, 0)
+	callers, err := callersForExactTargets(t, r.store, r.repoID, target)
 	if err != nil {
 		t.Fatal(err)
 	}

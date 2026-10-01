@@ -18,14 +18,12 @@ refactor or review.
   relationship queries it can also mean the construct is not modeled:
   dynamic dispatch, code generation, macros, or a language with weaker
   extraction. Absence of graph evidence is not evidence of absence.
-- **Ambiguous name** — several definitions can share a bare name, and tools
-  treat that differently: `find_callers` and `find_callees` merge the
-  results across the matching definitions; `get_impact_radius` and
-  `find_related_tests` use only the first candidate in a deterministic
-  lookup order; `trace_dependencies` fails closed with a `symbol is
-  ambiguous` error. None of these is a disambiguated answer. Resolve the
-  name with `find_symbol`, then query by `qualified_name` or `symbol_id`.
-  Never choose a same-name candidate without source evidence.
+- **Ambiguous name** — callers, callees, impact, related tests, and trace
+  fail closed with `symbol is ambiguous` when multiple definitions match the
+  selected lookup tier. Exact qualified names take precedence over name
+  fallbacks; an exact `symbol_id` remains authoritative. Resolve the name with
+  `find_symbol`, then query by `qualified_name` or `symbol_id`. Never choose a
+  same-name candidate without source evidence.
 
 ## Fail closed
 
