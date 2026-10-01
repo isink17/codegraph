@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -675,6 +677,77 @@ func TestPHPComposerPSR4TypeSelectionRules(t *testing.T) {
 		f.resolveVia(t, "full", nil, nil)
 		if got := f.binding(t, caseEdge); got != "<unresolved>" {
 			t.Fatal(got)
+		}
+	})
+	t.Run("longest missing mapping falls back to shorter prefix", func(t *testing.T) {
+		f := newPHPFixture(t)
+		src := f.phpFile(t, "src/Special/Service.php")
+		legacy := f.phpFile(t, "legacy/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, src, "App.Special.Service")
+		run := f.method(t, src, "App.Special.Service.run", "public", true)
+		f.typ(t, legacy, "App.Special.Service")
+		f.method(t, legacy, "App.Special.Service.run", "public", true)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		// All mappings are replaced together; install both prefixes in one write.
+		if err := f.store.ReplacePHPComposerPSR4Mappings(f.ctx, f.repoID, []PHPComposerPSR4Mapping{
+			mapApp("src", 0),
+			{ManifestPath: "composer.json", MappingRole: "autoload", NamespacePrefix: "App\\Special\\", RootPath: "also-missing", RootOrdinal: 0},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		edge := f.call(t, callerFile, srcOf(caller), `\App\Special\Service::run`, 1)
+		f.resolveVia(t, "full", nil, nil)
+		var dst int64
+		if err := f.store.db.QueryRowContext(f.ctx, "SELECT dst_symbol_id FROM edges WHERE id=?", edge).Scan(&dst); err != nil || dst != run {
+			t.Fatalf("fallback dst=%d err=%v", dst, err)
+		}
+	})
+	t.Run("existing longer-prefix target blocks shorter fallback", func(t *testing.T) {
+		for _, indexed := range []bool{false, true} {
+			name := "physical but unindexed"
+			if indexed {
+				name = "indexed without requested type"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newPHPFixture(t)
+				shorter := f.phpFile(t, "src/Special/Service.php")
+				legacy := f.phpFile(t, "legacy/Service.php")
+				callerFile := f.phpFile(t, "src/Caller.php")
+				f.typ(t, shorter, "App.Special.Service")
+				f.method(t, shorter, "App.Special.Service.run", "public", true)
+				f.typ(t, legacy, "App.Special.Service")
+				f.method(t, legacy, "App.Special.Service.run", "public", true)
+				f.typ(t, callerFile, "App.Caller")
+				caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+				if indexed {
+					f.phpFile(t, "longer/Service.php")
+				} else {
+					var root string
+					if err := f.store.db.QueryRowContext(f.ctx, `SELECT root_path FROM repos WHERE id=?`, f.repoID).Scan(&root); err != nil {
+						t.Fatal(err)
+					}
+					target := filepath.Join(root, "longer", "Service.php")
+					if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(target, []byte("<?php // intentionally not indexed\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := f.store.ReplacePHPComposerPSR4Mappings(f.ctx, f.repoID, []PHPComposerPSR4Mapping{
+					mapApp("src", 0),
+					{ManifestPath: "composer.json", MappingRole: "autoload", NamespacePrefix: "App\\Special\\", RootPath: "longer", RootOrdinal: 0},
+				}); err != nil {
+					t.Fatal(err)
+				}
+				edge := f.call(t, callerFile, srcOf(caller), `\App\Special\Service::run`, 1)
+				f.resolveVia(t, "full", nil, nil)
+				if got := f.binding(t, edge); got != "<unresolved>" {
+					t.Fatalf("binding = %s, want unresolved", got)
+				}
+			})
 		}
 	})
 	t.Run("selected file owns method and logical root", func(t *testing.T) {

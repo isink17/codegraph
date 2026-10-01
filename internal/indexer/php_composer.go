@@ -95,7 +95,10 @@ func parsePHPComposerPSR4(root string, raw []byte) ([]phpComposerPSR4Mapping, er
 		return nil, errors.New("invalid Composer manifest")
 	}
 	var mappings []phpComposerPSR4Mapping
-	for _, section := range []struct{ name, role string }{{"autoload", "autoload"}, {"autoload-dev", "autoload-dev"}} {
+	// Composer's autoload-dev mappings are root-only development metadata.
+	// CodeGraph indexes repositories without a production/test context signal,
+	// so only production autoload mappings are safe resolution evidence.
+	for _, section := range []struct{ name, role string }{{"autoload", "autoload"}} {
 		sectionRaw, ok := document[section.name]
 		if !ok {
 			continue
@@ -124,7 +127,7 @@ func parsePHPComposerPSR4(root string, raw []byte) ([]phpComposerPSR4Mapping, er
 		}
 		sort.Strings(keys)
 		for _, prefix := range keys {
-			if prefix == "" || !strings.HasSuffix(prefix, `\`) {
+			if prefix != "" && !strings.HasSuffix(prefix, `\`) {
 				return nil, errors.New("invalid Composer PSR-4 namespace prefix")
 			}
 			roots, err := phpComposerRoots(root, prefixes[prefix])

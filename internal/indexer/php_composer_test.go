@@ -24,12 +24,12 @@ func TestDiscoverPHPComposerPSR4(t *testing.T) {
 		state    phpComposerPSR4State
 		want     []phpComposerPSR4Mapping
 	}{
-		{"scalar and dev", `{"autoload":{"psr-4":{"App\\":"src/"}},"autoload-dev":{"psr-4":{"App\\":"test/"}}}`, phpComposerPSR4Valid, []phpComposerPSR4Mapping{{"composer.json", "autoload", "App\\", "src", 0}, {"composer.json", "autoload-dev", "App\\", "test", 0}}},
+		{"scalar excludes dev", `{"autoload":{"psr-4":{"App\\":"src/"}},"autoload-dev":{"psr-4":{"App\\":"test/"}}}`, phpComposerPSR4Valid, []phpComposerPSR4Mapping{{"composer.json", "autoload", "App\\", "src", 0}}},
 		{"arrays and overlaps", `{"autoload":{"psr-4":{"App\\":["src","generated"],"App\\Special\\":"special"}}}`, phpComposerPSR4Valid, []phpComposerPSR4Mapping{{"composer.json", "autoload", "App\\", "src", 0}, {"composer.json", "autoload", "App\\", "generated", 1}, {"composer.json", "autoload", "App\\Special\\", "special", 0}}},
 		{"root and trailing slash", `{"autoload":{"psr-4":{"Root\\":"./","Src\\":"src/"}}}`, phpComposerPSR4Valid, []phpComposerPSR4Mapping{{"composer.json", "autoload", "Root\\", ".", 0}, {"composer.json", "autoload", "Src\\", "src", 0}}},
-		{"PHP Parser corpus shape", `{"autoload":{"psr-4":{"PhpParser\\":"lib/PhpParser"}},"autoload-dev":{"psr-4":{"PhpParser\\":"test/PhpParser"}}}`, phpComposerPSR4Valid, []phpComposerPSR4Mapping{{"composer.json", "autoload", "PhpParser\\", "lib/PhpParser", 0}, {"composer.json", "autoload-dev", "PhpParser\\", "test/PhpParser", 0}}},
+		{"PHP Parser corpus shape", `{"autoload":{"psr-4":{"PhpParser\\":"lib/PhpParser"}},"autoload-dev":{"psr-4":{"PhpParser\\":"test/PhpParser"}}}`, phpComposerPSR4Valid, []phpComposerPSR4Mapping{{"composer.json", "autoload", "PhpParser\\", "lib/PhpParser", 0}}},
 		{"invalid prefix", `{"autoload":{"psr-4":{"App":"src"}}}`, phpComposerPSR4Disabled, nil},
-		{"empty prefix", `{"autoload":{"psr-4":{"":"src"}}}`, phpComposerPSR4Disabled, nil},
+		{"empty fallback prefix", `{"autoload":{"psr-4":{"":"src"}}}`, phpComposerPSR4Valid, []phpComposerPSR4Mapping{{"composer.json", "autoload", "", "src", 0}}},
 		{"wrong root type", `{"autoload":{"psr-4":{"App\\":{}}}}`, phpComposerPSR4Disabled, nil},
 		{"malformed", `{`, phpComposerPSR4Disabled, nil},
 		{"traversal", `{"autoload":{"psr-4":{"App\\":"../outside"}}}`, phpComposerPSR4Disabled, nil},
@@ -114,7 +114,6 @@ func TestPHPComposerPSR4FirstIndexStates(t *testing.T) {
 	}{
 		{"valid", `{"autoload":{"psr-4":{"App\\":"src/"}},"autoload-dev":{"psr-4":{"App\\":"test/"}}}`, []store.PHPComposerPSR4Mapping{
 			{ManifestPath: "composer.json", MappingRole: "autoload", NamespacePrefix: "App\\", RootPath: "src", RootOrdinal: 0},
-			{ManifestPath: "composer.json", MappingRole: "autoload-dev", NamespacePrefix: "App\\", RootPath: "test", RootOrdinal: 0},
 		}},
 		{"absent", "", nil},
 		{"malformed", `{`, nil},
@@ -219,7 +218,7 @@ func TestPHPComposerPSR4Lifecycle(t *testing.T) {
 
 	setManifest(`{"autoload":{"psr-4":{"App\\":"src/"}},"autoload-dev":{"psr-4":{"App\\":"test/"}}}`)
 	update("src/a.go") // root discovery deliberately ignores path-scoped events.
-	assertEvidence([]store.PHPComposerPSR4Mapping{mapping("autoload", "src", 0), mapping("autoload-dev", "test", 0)})
+	assertEvidence([]store.PHPComposerPSR4Mapping{mapping("autoload", "src", 0)})
 
 	// Unchanged manifest does not replace evidence; AUTOINCREMENT makes rewrites observable.
 	raw, err := sql.Open(store.SQLiteDriverName(), dbPath)
@@ -245,7 +244,7 @@ func TestPHPComposerPSR4Lifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	update()
-	assertEvidence([]store.PHPComposerPSR4Mapping{mapping("autoload", "src", 0), mapping("autoload-dev", "test", 0)})
+	assertEvidence([]store.PHPComposerPSR4Mapping{mapping("autoload", "src", 0)})
 
 	setManifest(`{"autoload":{"psr-4":{"App\\":"lib/"}}}`)
 	update("src/a.go")
@@ -261,7 +260,7 @@ func TestPHPComposerPSR4Lifecycle(t *testing.T) {
 
 	setManifest(`{"autoload-dev":{"psr-4":{"App\\":"test/"}}}`)
 	update("composer.json")
-	assertEvidence([]store.PHPComposerPSR4Mapping{mapping("autoload-dev", "test", 0)})
+	assertEvidence(nil)
 
 	setManifest(`{"autoload":{"psr-4":{"App\\":["src","generated"]}}}`)
 	update()
