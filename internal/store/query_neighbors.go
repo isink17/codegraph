@@ -30,7 +30,7 @@ import (
 // The result set is unchanged. The candidate set is the same union (edges bound
 // to the target, plus unresolved edges whose `dst_name` names it), duplicates
 // are still removed, and the order is the same total order `sortSymbols`
-// produced: qualified_name, start_line, start_col, id.
+// produced, now ordered by path, qualified_name, kind, span, stable_key.
 //
 // P22.34 closed the half of the second point P12 left open. P12 removed the
 // *neighbour* set -- the one that grows with fan-in -- from the bound
@@ -182,7 +182,8 @@ func symbolPageSQL(candidateCTE string) string {
 		-- consume a LIMIT/OFFSET slot.
 		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ?
-		ORDER BY s.qualified_name ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+		ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ?
 		OFFSET ?
 	`
@@ -281,8 +282,8 @@ func (s *Store) symbolPage(ctx context.Context, target execQuerier, repoID int64
 	return out, nil
 }
 
-// FindCallers returns the symbols that call the named symbol, ordered by
-// qualified_name, start_line, start_col, id.
+// FindCallers returns symbols that call the named symbol, ordered by path,
+// qualified name, kind, source span, and stable key.
 //
 // For a known target, only edges whose `dst_symbol_id` is bound to that target
 // are relationships. If no indexed target matches, unresolved `dst_name`

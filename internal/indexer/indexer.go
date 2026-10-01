@@ -845,9 +845,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				ContentHash: res.hash,
 			})
 			summary.ParseErrors++
-			if len(summary.ParseSamples) < 20 {
-				summary.ParseSamples = append(summary.ParseSamples, fmt.Sprintf("%s: %s", res.task.rel, res.parseErr))
-			}
+			summary.ParseSamples = addParseSample(summary.ParseSamples, fmt.Sprintf("%s: %s", res.task.rel, res.parseErr))
 			if len(parseFailedBatch) >= metadataBatchSize {
 				if err := flushParseFailed(); err != nil {
 					runErr = err
@@ -1200,6 +1198,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return summary, err
 	}
 	return summary, nil
+}
+
+func addParseSample(samples []string, sample string) []string {
+	samples = append(samples, sample)
+	slices.Sort(samples)
+	if len(samples) > 20 {
+		samples = samples[:20]
+	}
+	return samples
 }
 
 func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFileMeta, hasPrev bool, force bool, maxFileSizeBytes int64, allowedLanguages []string, parseErrorPolicy string, hashLookup func(rel string) (string, bool, error), reparseLanguages map[string]struct{}) fileResult {
