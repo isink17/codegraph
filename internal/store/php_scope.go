@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -88,6 +89,15 @@ const phpScopeVetoSQL = `NOT (f.language = 'php' AND (instr(edges.dst_name, '::'
 // is the Go-side twin of phpScopeVetoSQL.
 func phpScopeOwned(dstName string) bool {
 	return strings.Contains(dstName, "::") || strings.Contains(dstName, "->")
+}
+
+// phpGenericCandidateSQL excludes PHP methods from every generic candidate
+// population, before uniqueness is counted. The parser records methods as
+// functions with syntax-proven staticness (including false); top-level functions
+// have NULL staticness even when their container names a namespace. Methods are
+// resolved only by the PHP scope pass, from receiver/type evidence.
+func phpGenericCandidateSQL(alias string) string {
+	return `(` + alias + `language != 'php' OR (` + alias + `kind != 'method' AND ` + alias + `is_static IS NULL))`
 }
 
 type phpScopeSymbol struct {
@@ -810,6 +820,33 @@ func (s *Store) phpStaleScopeBindings(ctx context.Context, repoID int64, wanted 
 // (resolverRepairs orders this before referenceIdentityRepair, and a repo-wide
 // repair drops the reference marker). Ordinary bare PHP calls are untouched.
 const phpScopeRepairSettingKey = "resolver.php_scope_repaired.v1"
+
+// Parser facts stay unchanged. A separate repair marker reaches repositories
+// that already completed the earlier scoped-call repair. Re-deciding generic
+// PHP edges also recovers functions stranded by same-name method ambiguity.
+const phpFunctionCandidateRepairSettingKey = "resolver.php_function_candidates_repaired.v1"
+
+func (s *Store) repairPHPFunctionCandidateBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE id IN (
+				SELECT e.id FROM edges e JOIN files f ON f.id = e.file_id
+				WHERE e.repo_id = ? AND f.language = 'php' AND e.dst_symbol_id IS NOT NULL
+				  AND e.edge_kind <> '`+EdgeKindCrossLanguageRef+`'
+				  AND NOT `+phpScopeOwnedSQL+`
+			)`, repoID)
+		if err != nil {
+			return err
+		}
+		// A failure after the edge commit must not leave stale reference
+		// identities marked current. Invalidate them in the same transaction.
+		_, err = tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, referenceIdentityRepairSettingKey+"."+strconv.FormatInt(repoID, 10))
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
+}
 
 // phpScopeRepairApplies limits the repair to repositories that hold PHP at
 // all: everywhere else there is nothing to clear, and running the repo-wide

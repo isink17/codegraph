@@ -111,6 +111,157 @@ func srcOf(id int64) sql.NullInt64 { return sql.NullInt64{Int64: id, Valid: true
 
 var phpEntryPoints = []string{"full", "paths", "names", "paths+names"}
 
+func TestPHPBareFunctionCandidateParity(t *testing.T) {
+	for _, entry := range phpEntryPoints {
+		t.Run(entry, func(t *testing.T) {
+			f := newPHPFixture(t)
+			file := f.phpFile(t, "Caller.php")
+			other := f.phpFile(t, "Other.php")
+			f.typ(t, file, "App.Caller")
+			caller := f.method(t, file, "App.Caller.call", "public", false)
+			methods := []int64{
+				f.method(t, file, "App.Caller.instanceOnly", "public", false),
+				f.method(t, other, "Vendor.Service.staticOnly", "public", true),
+				// Exercise exact-qualified filtering, not just name fallback.
+				f.method(t, other, "qualifiedBait", "public", false),
+				f.method(t, other, "Vendor.Service.tailOnly", "public", true),
+				f.insert(t, other, "method", "Legacy.legacyOnly", "public", sql.NullInt64{}),
+			}
+			f.method(t, other, "Vendor.Service.helper", "public", true)
+			f.fn(t, other, "App.helper")
+			f.fn(t, other, "globalHelper")
+			f.fn(t, file, "App.duplicate")
+			f.fn(t, other, "Vendor.duplicate")
+			cases := []struct{ name, binding string }{
+				{"instanceOnly", "<unresolved>"},
+				{"staticOnly", "<unresolved>"},
+				{"qualifiedBait", "<unresolved>"},
+				{"Service.tailOnly", "<unresolved>"},
+				{"Vendor.Service.tailOnly", "<unresolved>"},
+				{"legacyOnly", "<unresolved>"},
+				{"helper", "App.helper|exact_name|high"},
+				{"globalHelper", "globalHelper|exact_qualified|high"},
+				{"duplicate", "<unresolved>"},
+			}
+			ids := make([]int64, len(cases))
+			names := make([]string, len(cases))
+			for i, c := range cases {
+				ids[i] = f.call(t, file, srcOf(caller), c.name, i+1)
+				names[i] = c.name
+			}
+			f.resolveVia(t, entry, []string{"Caller.php", "Other.php"}, names)
+			for i, c := range cases {
+				if got := f.binding(t, ids[i]); got != c.binding {
+					t.Fatalf("%s = %s, want %s", c.name, got, c.binding)
+				}
+			}
+			for _, method := range methods {
+				callers, err := f.store.FindCallers(f.ctx, f.repoID, "", method, 20, 0)
+				if err != nil || len(callers) != 0 {
+					t.Fatalf("refused method callers = %#v, %v", callers, err)
+				}
+			}
+			callees, err := f.store.FindCallees(f.ctx, f.repoID, "", caller, 20, 0)
+			if err != nil || len(callees) != 2 {
+				t.Fatalf("callees = %#v, %v; want only the two functions", callees, err)
+			}
+		})
+	}
+}
+
+func TestPHPFunctionCandidateRepairReferenceRetry(t *testing.T) {
+	f := newPHPFixture(t)
+	file := f.phpFile(t, "Caller.php")
+	caller := f.fn(t, file, "caller")
+	method := f.method(t, file, "App.Service.methodOnly", "public", false)
+	wrong := f.call(t, file, srcOf(caller), "methodOnly", 1)
+	f.reference(t, file, "methodOnly", 1)
+	f.setBinding(t, wrong, method, ResolutionStrategyExactName, ResolutionConfidenceHigh)
+	if err := f.store.ReconcileReferenceIdentities(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	key := phpFunctionCandidateRepairSettingKey + "." + strconv.FormatInt(f.repoID, 10)
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key = ?`, key); err != nil {
+		t.Fatal(err)
+	}
+	// Stop at the boundary after the edge repair is marked complete, before
+	// the outer lifecycle can invalidate or reconcile derived references.
+	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, phpFunctionCandidateRepair); err != nil || !ran {
+		t.Fatalf("edge repair = %v, %v", ran, err)
+	}
+	if !f.markerSet(t, phpFunctionCandidateRepairSettingKey) || f.markerSet(t, referenceIdentityRepairSettingKey) {
+		t.Fatal("completed edge repair left the old reference marker trusted")
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	f.assertReference(t, 1, sql.NullInt64{}, srcOf(caller))
+}
+
+func TestPHPFunctionCandidateRepairAtomicAndOnce(t *testing.T) {
+	f := newPHPFixture(t)
+	file := f.phpFile(t, "Caller.php")
+	f.typ(t, file, "App.Caller")
+	caller := f.method(t, file, "App.Caller.call", "public", false)
+	method := f.method(t, file, "App.Caller.methodOnly", "public", false)
+	helper := f.fn(t, file, "helper")
+	wrong := f.call(t, file, srcOf(caller), "methodOnly", 1)
+	valid := f.call(t, file, srcOf(caller), "helper", 2)
+	f.reference(t, file, "methodOnly", 1)
+	f.reference(t, file, "helper", 2)
+	f.setBinding(t, wrong, method, ResolutionStrategyExactName, ResolutionConfidenceHigh)
+	if err := f.store.ReconcileReferenceIdentities(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
+		t.Fatal(err)
+	}
+	key := phpFunctionCandidateRepairSettingKey + "." + strconv.FormatInt(f.repoID, 10)
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key = ?`, key); err != nil {
+		t.Fatal(err)
+	}
+	// Fail after the pre-step cleared the wrong edge, during the valid rebind.
+	if _, err := f.store.db.ExecContext(f.ctx, `CREATE TRIGGER fail_php_function_rebind BEFORE UPDATE ON edges WHEN NEW.dst_name = 'helper' AND NEW.dst_symbol_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'repair rollback probe'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err == nil || !strings.Contains(err.Error(), "repair rollback probe") {
+		t.Fatalf("repair failure = %v, want injected rollback", err)
+	}
+	if f.markerSet(t, phpFunctionCandidateRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) || f.binding(t, wrong) != "App.Caller.methodOnly|exact_name|high" {
+		t.Fatal("failed repair marked complete or persisted a partial clear")
+	}
+	f.assertReference(t, 1, srcOf(method), srcOf(caller))
+	if _, err := f.store.db.ExecContext(f.ctx, `DROP TRIGGER fail_php_function_rebind`); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
+		t.Fatalf("repair = %v, %v; want repo-wide resolve", ran, err)
+	}
+	if got := f.binding(t, wrong); got != "<unresolved>" {
+		t.Fatalf("wrong edge after repair = %s", got)
+	}
+	if got := f.binding(t, valid); got != "helper|exact_qualified|high" {
+		t.Fatalf("valid edge after repair = %s", got)
+	}
+	f.assertReference(t, 1, sql.NullInt64{}, srcOf(caller))
+	f.assertReference(t, 2, srcOf(helper), srcOf(caller))
+	if !f.markerSet(t, phpFunctionCandidateRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) {
+		t.Fatal("successful repair did not mark edge and reference convergence")
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET resolution_confidence = 'probe' WHERE id = ?`, valid); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || ran {
+		t.Fatalf("second repair = %v, %v; want no-op", ran, err)
+	}
+	if got := f.binding(t, valid); got != "helper|exact_qualified|probe" {
+		t.Fatalf("second repair rewrote valid edge: %s", got)
+	}
+}
+
 // TestPHPScopeVetoSurvivesEveryGenericStrategy crafts repository symbols so
 // that every generic strategy has one tempting candidate for each owned PHP
 // spelling -- a symbol whose qualified name IS the spelling -- and requires the
