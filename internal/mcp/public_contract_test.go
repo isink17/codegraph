@@ -10,9 +10,9 @@ func TestQueryPublicDescriptionsStayTrustworthy(t *testing.T) {
 		"find_symbol":        {"exact", "substring"},
 		"find_callers":       {"resolved", "indexed", "unresolved hints"},
 		"find_callees":       {"resolved", "indexed"},
-		"get_impact_radius":  {"resolved", "uncertainty"},
-		"find_related_tests": {"target_found=false"},
-		"trace_dependencies": {"resolved", "exact"},
+		"get_impact_radius":  {"resolved", "uncertainty", "ambiguous"},
+		"find_related_tests": {"target_found=false", "ambiguous"},
+		"trace_dependencies": {"resolved", "exact", "ambiguous"},
 	}
 	for name, terms := range want {
 		desc := toolByName[name].description

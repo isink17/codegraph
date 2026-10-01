@@ -306,9 +306,12 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // enforced either way; without it on the wire, the only way for a model to
 // discover the rule is to trip over it, and the README is not visible to an MCP
 // client. The text is deliberately one line per property for this reason.
+//
+// Singular-query ambiguity descriptions move full tools/list to 12676 bytes
+// (+141 bytes, +35 estimated tokens); gateway definitions stay unchanged.
 const (
-	fullToolsListBytes  = 12535
-	fullToolsListTokens = 3134
+	fullToolsListBytes  = 12676
+	fullToolsListTokens = 3169
 	// The gateway payload is pinned for the same reason, and became load-bearing
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name

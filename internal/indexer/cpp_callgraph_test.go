@@ -145,7 +145,7 @@ func TestCppCallGraphUnprovenReceiverStaysUnresolved(t *testing.T) {
 	// FindCallers/FindCallees must not rebuild the refused relation from the
 	// name evidence either -- a receiver-bearing spelling shares no qualifier
 	// with `ApmMap::LoadWorldMap`.
-	callers, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 20, 0)
+	callers, err := callersForExactTargets(t, s, repo.ID, "ApmMap::LoadWorldMap")
 	if err != nil {
 		t.Fatalf("FindCallers() error = %v", err)
 	}
@@ -266,7 +266,7 @@ bool AlsoQualified() {
 		t.Fatalf("%d qualified ApmMap::LoadWorldMap calls left unresolved, want 0", n)
 	}
 
-	callers, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 20, 0)
+	callers, err := callersForExactTargets(t, s, repo.ID, "ApmMap::LoadWorldMap")
 	if err != nil {
 		t.Fatalf("FindCallers() error = %v", err)
 	}
@@ -283,12 +283,16 @@ bool AlsoQualified() {
 		t.Fatalf("FindCallees(Qualified) missing ApmMap::LoadWorldMap, got %+v", callees)
 	}
 
-	// Pagination over the two evidence-backed callers.
-	p0, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 1, 0)
+	// Pagination uses the persisted exact destination, not an ambiguous declaration/definition name.
+	if len(callees) != 1 {
+		t.Fatalf("Qualified destinations = %+v; want one exact destination", callees)
+	}
+	targetID := callees[0].ID
+	p0, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", targetID, 1, 0)
 	if err != nil {
 		t.Fatalf("FindCallers page0: %v", err)
 	}
-	p1, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", 0, 1, 1)
+	p1, err := s.FindCallers(ctx, repo.ID, "ApmMap::LoadWorldMap", targetID, 1, 1)
 	if err != nil {
 		t.Fatalf("FindCallers page1: %v", err)
 	}

@@ -134,13 +134,13 @@ var toolRegistry = []toolDescriptor{
 		handler: (*Server).handleFindCallees,
 	},
 	{
-		name: "get_impact_radius", description: "Estimate resolved dependency impact; report unresolved uncertainty separately",
+		name: "get_impact_radius", description: "Estimate resolved dependency impact; ambiguous symbol seeds fail closed; report unresolved uncertainty separately",
 		properties: []string{"symbols", "files", "depth", "limit", "offset", "detail", "format"},
 		category:   "graph",
 		handler:    (*Server).handleImpactRadius,
 	},
 	{
-		name: "find_related_tests", description: "Find likely related tests; missing symbol targets return target_found=false",
+		name: "find_related_tests", description: "Find likely related tests; ambiguous symbol targets fail closed; missing symbol targets return target_found=false",
 		properties: []string{"symbol", "file", "files", "limit", "offset", "format"},
 		category:   "tests",
 		handler:    (*Server).handleRelatedTests,
@@ -212,7 +212,7 @@ var toolRegistry = []toolDescriptor{
 		handler:  (*Server).handleArchitectureOverview,
 	},
 	{
-		name: "trace_dependencies", description: "Trace resolved dependency edges from an exact symbol (upstream callers or downstream callees)",
+		name: "trace_dependencies", description: "Trace resolved dependency edges from one symbol (upstream callers or downstream callees); exact qualified identity takes precedence; ambiguous names fail closed",
 		properties: []string{"symbol", "direction", "depth", "limit", "offset", "format"},
 		required:   []string{"symbol"},
 		category:   "graph",

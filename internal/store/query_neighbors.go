@@ -324,7 +324,7 @@ func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, sy
 		symbol = identity.QualifiedName
 		targetIDs = []int64{identity.ID}
 	} else {
-		targetIDs, err = s.lookupSymbolIDs(ctx, repoID, symbol, 0)
+		targetIDs, err = s.lookupQuerySymbolIDs(ctx, repoID, symbol, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -713,7 +713,7 @@ func (s *Store) unresolvedDstNamesExtending(ctx context.Context, repoID int64, q
 // destination identities are semantic relationships; unresolved destinations
 // remain evidence and are not promoted by query-time name lookup.
 func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	srcIDs, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
+	srcIDs, err := s.lookupQuerySymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
 		return nil, err
 	}

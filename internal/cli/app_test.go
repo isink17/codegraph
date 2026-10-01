@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -80,6 +81,73 @@ func HelloWorld() {}
 	}
 	if !strings.Contains(out.String(), "HelloWorld") {
 		t.Fatalf("find-symbol output missing symbol, output:\n%s", out.String())
+	}
+}
+
+func TestRunImpactAmbiguousSeedContract(t *testing.T) {
+	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "codegraph-home"))
+	repoRoot := t.TempDir()
+	for _, pkg := range []string{"first", "second"} {
+		dir := filepath.Join(repoRoot, pkg)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "helper.go"), []byte("package "+pkg+"\nfunc Helper() {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() { startupVersionCheck = prev })
+	ctx := context.Background()
+	if err := Run(ctx, []string{"index", repoRoot}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"callers", "callees", "find_callers", "find_callees"} {
+		var out bytes.Buffer
+		if err := Run(ctx, []string{command, repoRoot, "Helper"}, &out, io.Discard); !errors.Is(err, store.ErrSymbolAmbiguous) || out.Len() != 0 {
+			t.Fatalf("%s ambiguous target = %v, %q", command, err, out.String())
+		}
+		for _, symbol := range []string{"Absent", "first.Helper"} {
+			out.Reset()
+			if err := Run(ctx, []string{command, repoRoot, symbol}, &out, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			var result map[string]any
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			key := strings.TrimPrefix(command, "find_")
+			if rows, ok := result[key].([]any); !ok || len(rows) != 0 || result["target_found"] != (symbol != "Absent") {
+				t.Fatalf("%s(%s) = %s; want empty array with accurate presence", command, symbol, out.String())
+			}
+		}
+	}
+	for _, command := range []string{"impact", "get_impact_radius"} {
+		var out bytes.Buffer
+		if err := Run(ctx, []string{command, repoRoot, "Helper"}, &out, io.Discard); !errors.Is(err, store.ErrSymbolAmbiguous) || out.Len() != 0 {
+			t.Fatalf("%s ambiguous target = %v, %q; want ambiguity without partial output", command, err, out.String())
+		}
+		if err := Run(ctx, []string{command, repoRoot, "first.Helper"}, &out, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if symbols := result["symbols"].([]any); len(symbols) != 1 || symbols[0].(map[string]any)["qualified_name"] != "first.Helper" {
+			t.Fatalf("%s exact target = %s", command, out.String())
+		}
+		out.Reset()
+		if err := Run(ctx, []string{command, repoRoot, "Absent"}, &out, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if presence := result["seed_presence"].(map[string]any); presence["found"] != float64(0) || len(presence["missing"].([]any)) != 1 {
+			t.Fatalf("%s missing target = %s", command, out.String())
+		}
 	}
 }
 

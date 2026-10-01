@@ -454,8 +454,8 @@ the current repository. The `symbol` string is used to resolve a target only
 when `symbol_id` is not provided; a stale or foreign ID is not rescued by the
 string.
 
-Presence is independent of the current page: `matched` means a search query has
-at least one match, while `target_found` means the requested relationship,
+Presence is independent of the current page: `matched` on `find_symbol` and `search_symbols` means the query has
+at least one match (`search_semantic` does not expose presence metadata), while `target_found` means the requested relationship,
 test, or trace target resolved and its result may still be empty. A missing
 related-test or trace target is a successful result with `target_found: false`.
 
@@ -465,7 +465,7 @@ unresolved outgoing evidence in the full resolved impact closure; they do not
 expand traversal, map names to candidates, or change with page size/offset.
 
 `trace_dependencies` resolves one exact semantic seed and follows resolved
-edges only. Ambiguous exact short-name lookup fails closed; missing is distinct.
+edges only. Exact qualified identities take precedence; ambiguous name lookup fails closed.
 Its `total` is the full canonical traversal size before pagination, `offset` is
 the effective (clamped) page offset, and `truncated` says whether more canonical
 rows remain after the returned page. There is no CLI trace command.
@@ -528,7 +528,7 @@ built with either registry is unaffected.
 
 ### Gateway MCP mode (`--tool-mode`)
 
-Describing 29 tools costs a session 12,535 bytes, or 3,134 estimated tokens
+Describing 29 tools costs a session 12,676 bytes, or 3,169 estimated tokens
 (`ceil(bytes / 4)`), before it asks a single question. Gateway mode is an opt-in
 surface that charges a fraction of that without removing anything:
 
@@ -543,12 +543,11 @@ are already configured, it prints the `args` to change (`["serve", "--tool-mode"
 
 | Mode | `tools/list` | Estimated tokens |
 |---|---|---|
-| `full` (default) | all 29 tools | 3,134 (12,535 bytes) |
+| `full` (default) | all 29 tools | 3,169 (12,676 bytes) |
 | `gateway` | 4 core tools + `tool_search` + `tool_call` | 1,016 (4,062 bytes; about 68% fewer) |
 
-`full` remains the default, and it is unchanged: `codegraph serve` advertises the
-same tools with the same names, descriptions, and schemas it always has. The two
-gateway tools do not appear there.
+`full` remains the default and advertises all 29 tools. The two gateway tools
+appear only in gateway mode.
 
 In gateway mode the tools an ordinary navigation session uses on nearly every task
 stay direct — `context_for_task`, `find_symbol`, `find_callers`, `find_callees` —
@@ -633,8 +632,9 @@ An empty result and a missing entity are different answers and stay different:
 
 - a search with no matches is a valid empty result, not an error;
 - an indexed symbol that genuinely has no related tests returns an empty list;
-- an exact trace seed whose short name several definitions share fails closed as
-  ambiguous; this is distinct from a missing seed;
+- symbol targets in callers, callees, impact, trace, and related-test queries
+  prefer exact qualified names before name fallbacks; multiple candidates at the
+  selected tier fail closed as ambiguous, distinct from a missing seed;
 - a real database failure stays a database error and is never relabelled
   "not found".
 

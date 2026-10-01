@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/indexer"
 )
 
 // Missing related-test targets are successful domain results, not driver errors.
@@ -76,18 +79,49 @@ func TestUnknownSymbolKeepsItsExistingShapeOnTraversals(t *testing.T) {
 	}
 }
 
-// TestAmbiguousNameIsNotReportedAsMissing preserves the existing behaviour for
-// a name several definitions share: the deterministic first candidate answers.
-// Folding that into "not found" would be a lie about the index.
+// Singular name queries must report ambiguity identically through direct and
+// gateway calls, including compact output; absence remains a separate result.
 func TestAmbiguousNameIsNotReportedAsMissing(t *testing.T) {
 	server := newGatewayTestServer(t, ToolModeFull)
-	// "Helper" exists in the fixture; ask for it by its short name.
-	isErr, text := callResult(t, server, "find_related_tests", map[string]any{"symbol": "Helper"})
-	if isErr {
-		t.Fatalf("an existing symbol was reported as an error: %s", text)
+	writeRepoFile(t, server.repoRoot, "other/helper.go", "package other\nfunc Helper() int { return 2 }\n")
+	if _, err := server.indexer.Update(context.Background(), indexer.Options{RepoRoot: server.repoRoot}); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(text, "not found") {
-		t.Fatalf("an existing symbol was described as not found: %s", text)
+	for _, tool := range []string{"find_callers", "find_callees", "find_related_tests", "get_impact_radius", "trace_dependencies"} {
+		var ambiguityText string
+		for _, mode := range []ToolMode{ToolModeFull, ToolModeGateway} {
+			if err := server.SetToolMode(mode); err != nil {
+				t.Fatal(err)
+			}
+			for _, format := range []string{"json", "compact"} {
+				for _, symbol := range []string{"Helper", "main.Helper"} {
+					args := map[string]any{"symbol": symbol, "format": format}
+					if tool == "get_impact_radius" {
+						delete(args, "symbol")
+						args["symbols"] = []string{symbol}
+					}
+					name := tool
+					if mode == ToolModeGateway {
+						name, args = "tool_call", map[string]any{"name": tool, "arguments": args}
+					}
+					isErr, text := callResult(t, server, name, args)
+					if symbol == "main.Helper" {
+						if isErr {
+							t.Errorf("%s %s %s exact target errored: %s", tool, mode, format, text)
+						}
+						continue
+					}
+					if !isErr || !strings.Contains(text, "symbol is ambiguous") || strings.Contains(text, "not found") {
+						t.Errorf("%s %s %s ambiguity = %v, %s", tool, mode, format, isErr, text)
+					}
+					if ambiguityText == "" {
+						ambiguityText = text
+					} else if text != ambiguityText {
+						t.Errorf("%s ambiguity differs: %q / %q", tool, ambiguityText, text)
+					}
+				}
+			}
+		}
 	}
 }
 

@@ -3,10 +3,13 @@
 package indexer
 
 import (
+	"errors"
 	"path"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/store"
 )
 
 // TypeScript and JavaScript share one module graph (language `typescript`).
@@ -321,6 +324,23 @@ func assertTSNoResolvedRelation(t *testing.T, r *lifecycleRepo, caller, target s
 		t.Fatalf("FindCallees(%s) resolved %s: %#v", caller, target, callees.Callees)
 	}
 	callers, err := r.store.FindCallersResult(r.ctx, r.repoID, target, 0, 10, 0)
+	if errors.Is(err, store.ErrSymbolAmbiguous) {
+		matches, matchErr := r.store.FindSymbolExact(r.ctx, r.repoID, target, 50, 0)
+		if matchErr == nil && len(matches) == 0 {
+			short := target[strings.LastIndex(target, ".")+1:]
+			matches, matchErr = r.store.FindSymbolExact(r.ctx, r.repoID, short, 50, 0)
+		}
+		if matchErr != nil || len(matches) < 2 {
+			t.Fatalf("ambiguous fixture candidates = %+v, %v", matches, matchErr)
+		}
+		for _, match := range matches {
+			exact, exactErr := r.store.FindCallersResult(r.ctx, r.repoID, target, match.ID, 10, 0)
+			if exactErr != nil || hasSymbolQName(exact.Callers, caller) {
+				t.Fatalf("exact target %+v resolved refused caller %s: %+v, %v", match, caller, exact, exactErr)
+			}
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

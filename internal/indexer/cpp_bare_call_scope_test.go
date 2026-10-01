@@ -289,7 +289,11 @@ void far() {
 	// FindCallers builds its own legs, and a cpp TYPE target reaches them through
 	// typeOnlyGatedLanguages: subtracting cpp there would drop the bare leg
 	// outright and lose the same-file writer this scope exists to keep.
-	direct := r.callers("Message")
+	directRows, err := r.store.FindCallers(context.Background(), r.repo.ID, "Message", ownID, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := qnames(directRows)
 	if !slices.Contains(direct, "near") {
 		t.Fatalf("FindCallers lost the same-file writer of a cpp type: %v", direct)
 	}

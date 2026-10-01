@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -1335,7 +1336,10 @@ func TestTypeScopeQueryGateIsPerLanguage(t *testing.T) {
 	if _, err := f.store.ResolveEdges(f.ctx, f.repoID); err != nil {
 		t.Fatalf("ResolveEdges() error = %v", err)
 	}
-	callers, err := f.store.FindCallers(f.ctx, f.repoID, "Foo", 0, 20, 0)
+	if _, err := f.store.FindCallers(f.ctx, f.repoID, "Foo", 0, 20, 0); !errors.Is(err, ErrSymbolAmbiguous) {
+		t.Fatalf("bare Foo error = %v; want ambiguity", err)
+	}
+	callers, err := f.store.FindCallers(f.ctx, f.repoID, "types.Foo", 0, 20, 0)
 	if err != nil {
 		t.Fatalf("FindCallers(Foo) error = %v", err)
 	}

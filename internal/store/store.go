@@ -8491,6 +8491,7 @@ func chunkStrings(values []string, chunkSize int) [][]string {
 //	fmt.Errorf("%w: %q", ErrSymbolNotFound, symbol)
 var ErrSymbolNotFound = errors.New("symbol not found")
 
+// ErrSymbolAmbiguous reports multiple candidates at the selected lookup tier.
 var ErrSymbolAmbiguous = errors.New("symbol is ambiguous")
 
 // SymbolNotFoundError builds the wrapped not-found error for a requested name,
@@ -8506,7 +8507,7 @@ func SymbolNotFoundError(symbol string) error {
 func SymbolAmbiguousError(symbol string, count int) error {
 	symbol = strings.TrimSpace(symbol)
 	if count > 0 {
-		return fmt.Errorf("%w: %q (%d exact candidates)", ErrSymbolAmbiguous, symbol, count)
+		return fmt.Errorf("%w: %q (%d candidates)", ErrSymbolAmbiguous, symbol, count)
 	}
 	return fmt.Errorf("%w: %q", ErrSymbolAmbiguous, symbol)
 }
@@ -8516,26 +8517,45 @@ func (s *Store) lookupSymbolID(ctx context.Context, repoID int64, symbol string,
 	if err != nil {
 		return 0, err
 	}
-	if len(ids) == 0 {
-		// A name that matches several definitions is not reported here: the
-		// first candidate wins, in the deterministic order lookupSymbolIDs
-		// establishes. Only genuine absence is an error.
-		return 0, SymbolNotFoundError(symbol)
+	return singularSymbolID(symbol, ids)
+}
+
+// lookupQuerySymbolIDs keeps missing-target results empty while rejecting ambiguous
+// names consistently across public relationship queries. Exact IDs bypass names.
+func (s *Store) lookupQuerySymbolIDs(ctx context.Context, repoID int64, symbol string, symbolID int64) ([]int64, error) {
+	ids, err := s.lookupSymbolIDs(ctx, repoID, symbol, symbolID)
+	if err != nil {
+		return nil, err
 	}
-	return ids[0], nil
+	if len(ids) > 1 {
+		return nil, SymbolAmbiguousError(symbol, len(ids))
+	}
+	return ids, nil
+}
+
+// singularSymbolID validates the highest-precedence candidate set. Ordering
+// candidates makes plural results stable; it cannot disambiguate a singular seed.
+func singularSymbolID(symbol string, ids []int64) (int64, error) {
+	switch len(ids) {
+	case 0:
+		return 0, SymbolNotFoundError(symbol)
+	case 1:
+		return ids[0], nil
+	default:
+		return 0, SymbolAmbiguousError(symbol, len(ids))
+	}
 }
 
 // lookupImpactSymbolSeeds applies the user-input cascade to every requested
 // seed in one statement per bind-sized chunk. The row rank is the same
 // qualified, short, suffix, short-name precedence as lookupSymbolIDs.
 func (s *Store) lookupImpactSymbolSeeds(ctx context.Context, repoID int64, symbols []string) ([]int64, []bool, error) {
-	ids := make([]int64, len(symbols))
-	found := make([]bool, len(symbols))
+	candidates := make([][]int64, len(symbols))
 	const chunkSize = 300
 	for start := 0; start < len(symbols); start += chunkSize {
 		end := min(start+chunkSize, len(symbols))
 		var values strings.Builder
-		args := make([]any, 0, (end-start)*2+1)
+		args := make([]any, 0, (end-start)*3+1)
 		for i := start; i < end; i++ {
 			if values.Len() > 0 {
 				values.WriteString(",")
@@ -8556,15 +8576,17 @@ func (s *Store) lookupImpactSymbolSeeds(ctx context.Context, repoID int64, symbo
 			       END AS rank,
 			       s.qualified_name, f.path, s.start_line, s.start_col
 			FROM requested req
-			JOIN symbols s ON s.repo_id = ? AND (
+			JOIN symbols s ON s.repo_id = ? AND req.name <> '' AND (
 				s.qualified_name = req.name OR s.name = req.name OR
 				(req.short <> '' AND (s.qualified_name LIKE '%::' || req.short OR s.qualified_name LIKE '%.' || req.short)) OR
 				(req.short <> req.name AND req.short <> '' AND s.name = req.short)
 			)
 			JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
+		), prioritized AS (
+			SELECT *, MIN(rank) OVER (PARTITION BY ord) AS best_rank FROM candidates
 		)
-		SELECT ord, id FROM candidates
-		ORDER BY ord, rank, qualified_name, path, start_line, start_col, id`, args...)
+		SELECT ord, id FROM prioritized WHERE rank = best_rank
+		ORDER BY ord, qualified_name, path, start_line, start_col, id`, args...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -8575,15 +8597,25 @@ func (s *Store) lookupImpactSymbolSeeds(ctx context.Context, repoID int64, symbo
 				rows.Close()
 				return nil, nil, err
 			}
-			if !found[ord] {
-				ids[ord], found[ord] = id, true
-			}
+			candidates[ord] = append(candidates[ord], id)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			return nil, nil, err
 		}
 		rows.Close()
+	}
+	ids := make([]int64, len(symbols))
+	found := make([]bool, len(symbols))
+	for i, name := range symbols {
+		id, err := singularSymbolID(name, candidates[i])
+		if errors.Is(err, ErrSymbolNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		ids[i], found[i] = id, true
 	}
 	return ids, found, nil
 }
@@ -8819,18 +8851,16 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 		direction = "downstream"
 	}
 
-	// Resolve one exact semantic identity: qualified name first, then short name.
-	// A singular trace must not silently widen into several unrelated seeds.
-	seedName := strings.TrimSpace(strings.TrimPrefix(symbol, "::"))
-	seedRows, err := s.db.QueryContext(ctx,
-		`SELECT s.id, s.qualified_name, s.kind, s.name, f.path
-			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id AND f.is_deleted = 0
-			WHERE s.repo_id = ? AND s.qualified_name = ?
-			UNION ALL
-		 SELECT s.id, s.qualified_name, s.kind, s.name, f.path
-			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id AND f.is_deleted = 0
-			WHERE s.repo_id = ? AND s.qualified_name <> ? AND s.name = ?`,
-		repoID, seedName, repoID, seedName, seedName)
+	// Use the shared singular lookup: exact qualified identity takes precedence,
+	// and ambiguity at any fallback tier fails closed.
+	seedID, err := s.lookupSymbolID(ctx, repoID, symbol, 0)
+	if errors.Is(err, ErrSymbolNotFound) {
+		return TraceResult{Dependencies: []map[string]any{}}, nil
+	}
+	if err != nil {
+		return TraceResult{}, err
+	}
+	seedSymbols, err := s.symbolsByIDs(ctx, repoID, []int64{seedID}, 1, 0)
 	if err != nil {
 		return TraceResult{}, fmt.Errorf("trace_dependencies seed query: %w", err)
 	}
@@ -8842,20 +8872,8 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 		file          string
 	}
 	var seeds []symInfo
-	for seedRows.Next() {
-		var si symInfo
-		if err := seedRows.Scan(&si.id, &si.qualifiedName, &si.kind, &si.name, &si.file); err != nil {
-			seedRows.Close()
-			return TraceResult{}, err
-		}
-		seeds = append(seeds, si)
-	}
-	seedRows.Close()
-	if err := seedRows.Err(); err != nil {
-		return TraceResult{}, err
-	}
-	if len(seeds) > 1 {
-		return TraceResult{}, SymbolAmbiguousError(symbol, len(seeds))
+	for _, seed := range seedSymbols {
+		seeds = append(seeds, symInfo{seed.ID, seed.QualifiedName, seed.Kind, seed.Name, seed.FilePath})
 	}
 
 	type bfsEntry struct {
