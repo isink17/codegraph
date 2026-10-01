@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
-	php "github.com/smacker/go-tree-sitter/php"
+	php "github.com/tree-sitter/tree-sitter-php/bindings/go"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
@@ -21,7 +21,7 @@ func (a *PHPAdapter) Extensions() []string      { return []string{".php"} }
 func (a *PHPAdapter) Supports(path string) bool { return strings.EqualFold(filepath.Ext(path), ".php") }
 
 func (a *PHPAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
-	root, err := parse(ctx, php.GetLanguage(), content)
+	root, err := parse(ctx, sitter.NewLanguage(php.LanguagePHP()), content)
 	if err != nil {
 		return graph.ParsedFile{}, err
 	}
@@ -56,7 +56,9 @@ func phpExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) 
 					current = ns
 				}
 			case "namespace_use_declaration":
-				phpAddNamespaceUses(child, current, content, pf)
+				if !phpHasRecovery(child) {
+					phpAddNamespaceUses(child, current, content, pf)
+				}
 			case "program", "compound_statement":
 				walk(child, current)
 			}
@@ -86,7 +88,7 @@ func phpAddNamespaceUses(node *sitter.Node, owner string, content []byte, pf *gr
 			phpAddUseClause(child, "", phpUseKind(child, kind), owner, content, pf)
 		case "namespace_use_group":
 			for j := range int(child.ChildCount()) {
-				if clause := child.Child(j); clause.Type() == "namespace_use_group_clause" {
+				if clause := child.Child(j); clause.Type() == "namespace_use_clause" {
 					phpAddUseClause(clause, prefix, phpUseKind(clause, kind), owner, content, pf)
 				}
 			}
@@ -94,7 +96,7 @@ func phpAddNamespaceUses(node *sitter.Node, owner string, content []byte, pf *gr
 	}
 }
 
-// The pinned PHP grammar exposes anonymous `function` and `const` tokens as
+// The PHP grammar exposes anonymous `function` and `const` tokens as
 // direct children. Declaration-level tokens provide inheritance; mixed group
 // clauses carry their own child token. Comments and whitespace have no effect.
 func phpUseKind(node *sitter.Node, inherited string) string {
@@ -115,6 +117,9 @@ func phpAddUseClause(node *sitter.Node, prefix, kind, owner string, content []by
 		nameNode = firstChild(node, "namespace_name")
 	}
 	if nameNode == nil {
+		nameNode = firstChild(node, "name")
+	}
+	if nameNode == nil {
 		return
 	}
 	imported := nodeText(nameNode, content)
@@ -127,10 +132,8 @@ func phpAddUseClause(node *sitter.Node, prefix, kind, owner string, content []by
 		return
 	}
 	local := parts[len(parts)-1]
-	if alias := firstChild(node, "namespace_aliasing_clause"); alias != nil {
-		if n := firstChild(alias, "name"); n != nil {
-			local = nodeText(n, content)
-		}
+	if alias := childByFieldName(node, "alias"); alias != nil {
+		local = nodeText(alias, content)
 	}
 	pf.Imports = append(pf.Imports, imported)
 	pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
@@ -140,6 +143,9 @@ func phpAddUseClause(node *sitter.Node, prefix, kind, owner string, content []by
 }
 
 func phpExtractSymbols(node *sitter.Node, namespace, container string, content []byte, pf *graph.ParsedFile, namespaces *int, globalDecl *bool, onlyNamespace *string) {
+	if node == nil || node.Type() == "ERROR" || node.IsMissing() {
+		return
+	}
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
@@ -164,13 +170,16 @@ func phpExtractSymbols(node *sitter.Node, namespace, container string, content [
 				*globalDecl = true
 			}
 			phpAddFunction(child, namespace, container, container != "", content, pf)
-		case "program", "compound_statement", "declaration_list":
+		case "program", "compound_statement", "declaration_list", "colon_block", "if_statement", "else_if_clause", "else_clause":
 			phpExtractSymbols(child, namespace, container, content, pf, namespaces, globalDecl, onlyNamespace)
 		}
 	}
 }
 
 func phpAddType(node *sitter.Node, namespace string, content []byte, pf *graph.ParsedFile, namespaces *int, globalDecl *bool, onlyNamespace *string) {
+	if phpHasMissingChild(node) {
+		return
+	}
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
@@ -194,6 +203,9 @@ func phpAddFunction(node *sitter.Node, namespace, container string, method bool,
 		return
 	}
 	name := nodeText(nameNode, content)
+	if phpHasParameterRecovery(childByFieldName(node, "parameters"), content, method && name == "__construct") {
+		return
+	}
 	qualified := phpJoinQName(namespace, name)
 	if container != "" {
 		qualified = phpJoinQName(container, name)
@@ -213,7 +225,7 @@ func phpAddFunction(node *sitter.Node, namespace, container string, method bool,
 func phpExtractPropertyFacts(body *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
 	for i := range int(body.ChildCount()) {
 		child := body.Child(i)
-		if child.Type() == "property_declaration" {
+		if child.Type() == "property_declaration" && !phpHasRecovery(child) {
 			phpAddPropertyFacts(child, owner, content, pf)
 		}
 	}
@@ -343,28 +355,28 @@ func phpExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 	}
 	var walk func(*sitter.Node, bool)
 	walk = func(node *sitter.Node, nested bool) {
-		if node == nil {
+		if node == nil || node.Type() == "ERROR" || node.IsMissing() {
 			return
 		}
 		switch node.Type() {
-		case "anonymous_function_creation_expression", "arrow_function", "function_definition":
+		case "anonymous_function", "arrow_function", "function_definition":
 			nested = true
 		case "function_call_expression":
 			fn := childByFieldName(node, "function")
 			if fn == nil && node.ChildCount() > 0 {
 				fn = node.Child(0)
 			}
-			if fn != nil {
+			if fn != nil && !fn.IsMissing() {
 				add(node, nodeText(fn, content), nested)
 			}
 		case "scoped_call_expression":
 			scope, name := childByFieldName(node, "scope"), childByFieldName(node, "name")
-			if scope != nil && name != nil {
+			if scope != nil && name != nil && !scope.IsMissing() && !name.IsMissing() {
 				add(node, nodeText(scope, content)+"::"+nodeText(name, content), nested)
 			}
 		case "member_call_expression", "nullsafe_member_call_expression":
 			name, object := childByFieldName(node, "name"), childByFieldName(node, "object")
-			if name != nil && object != nil {
+			if name != nil && object != nil && !name.IsMissing() && !object.IsMissing() {
 				op := "->"
 				if node.Type() == "nullsafe_member_call_expression" {
 					op = "?->"
@@ -377,6 +389,60 @@ func phpExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		}
 	}
 	walk(root, false)
+}
+
+func phpHasRecovery(node *sitter.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Type() == "ERROR" || node.IsMissing() {
+		return true
+	}
+	for i := range int(node.ChildCount()) {
+		if phpHasRecovery(node.Child(i)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ABI14's grammar recovers PHP 8.4 setter visibility in promoted parameters
+// as ERROR. Accept only the complete, more restrictive modifier under a
+// constructor's structurally proven promotion; other signature recovery fails closed.
+func phpHasParameterRecovery(node *sitter.Node, content []byte, constructor bool) bool {
+	if node == nil {
+		return false
+	}
+	if node.IsMissing() {
+		return true
+	}
+	if node.Type() == "ERROR" {
+		parent := node.Parent()
+		if !constructor || parent == nil || parent.Type() != "property_promotion_parameter" {
+			return true
+		}
+		visibility := nodeText(childByFieldName(parent, "visibility"), content)
+		setter := strings.TrimSpace(nodeText(node, content))
+		return !(setter == "private(set)" && (visibility == "public" || visibility == "protected") || setter == "protected(set)" && visibility == "public")
+	}
+	for i := range int(node.ChildCount()) {
+		if phpHasParameterRecovery(node.Child(i), content, constructor) {
+			return true
+		}
+	}
+	return false
+}
+
+func phpHasMissingChild(node *sitter.Node) bool {
+	if node == nil {
+		return false
+	}
+	for i := range int(node.ChildCount()) {
+		if node.Child(i).IsMissing() {
+			return true
+		}
+	}
+	return false
 }
 
 // Normalize only syntax-proven PHP names; arbitrary runtime strings stay raw.

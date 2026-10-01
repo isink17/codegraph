@@ -133,8 +133,8 @@ namespace B { use Vendor\Two as X; class Caller {} function run() {} }
 	}
 }
 
-func TestPHPProfileV3(t *testing.T) {
-	if got := NewPHP().Profile(); got.ID != "treesitter:php:v3" || !got.EmitsCallEdges {
+func TestPHPProfileV4(t *testing.T) {
+	if got := NewPHP().Profile(); got.ID != "treesitter:php:v4" || !got.EmitsCallEdges {
 		t.Fatalf("profile = %+v", got)
 	}
 }
