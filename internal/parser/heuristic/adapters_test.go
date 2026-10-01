@@ -106,7 +106,7 @@ func TestCSharpHeuristicV2KeepsNamespaceIdentity(t *testing.T) {
 	if p.Scope.Package != "App.Core" || p.Symbols[len(p.Symbols)-1].QualifiedName != "App.Core.Outer.Inner.Run" {
 		t.Fatalf("C# heuristic facts = package %q symbols %+v", p.Scope.Package, p.Symbols)
 	}
-	if NewCSharp().Profile().ID != "heuristic:csharp:v2" || NewCSharp().Profile().EmitsCallEdges {
+	if NewCSharp().Profile().ID != "heuristic:csharp:v3" || NewCSharp().Profile().EmitsCallEdges {
 		t.Fatalf("C# heuristic profile = %+v", NewCSharp().Profile())
 	}
 }
@@ -178,7 +178,41 @@ func TestKotlinHeuristicPackageIgnoresCommentsAndStrings(t *testing.T) {
 	if err != nil || pf.Scope.Package != "" {
 		t.Fatalf("java heuristic package = %q, %v; want none", pf.Scope.Package, err)
 	}
-	if NewKotlin().Profile().ID != "heuristic:kotlin:v2" || NewJava().Profile().ID != "heuristic:java:v1" {
+	if NewKotlin().Profile().ID != "heuristic:kotlin:v3" || NewJava().Profile().ID != "heuristic:java:v1" {
 		t.Fatalf("profiles = %s, %s", NewKotlin().Profile().ID, NewJava().Profile().ID)
+	}
+}
+
+func TestScopeEvidenceIgnoresCommentedDeclarations(t *testing.T) {
+	pf, _ := NewKotlin().Parse(context.Background(), "A.kt", []byte("package com.real\npackage com.fake\nfun a() {}"))
+	if pf.Scope.Package != "" {
+		t.Fatalf("duplicate package = %q", pf.Scope.Package)
+	}
+
+	for _, src := range []string{
+		"/*\nimport fake.Target\n*/\nimport real.Target as Alias\nfun a() {}",
+		"val text = \"\"\"\nimport fake.Target\n\"\"\"\nimport real.Target as Alias\n",
+	} {
+		pf, err := NewKotlin().Parse(context.Background(), "A.kt", []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pf.Scope.Imports) != 1 || pf.Scope.Imports[0].SourceSpecifier != "real.Target" || pf.Scope.Imports[0].LocalName != "Alias" {
+			t.Fatalf("imports = %+v", pf.Scope.Imports)
+		}
+	}
+	for _, tc := range []struct{ src, want string }{
+		{"/*\nnamespace Fake;\n*/\nclass A {}", ""},
+		{"class A { string s = @\"\nnamespace Fake;\n\"; }", ""},
+		{"/*\nnamespace Fake;\n*/\nnamespace Real;\nclass A {}", "Real"},
+		{"// docs\nnamespace Real { class A { string s = \"}\"; } }", "Real"},
+	} {
+		pf, err := NewCSharp().Parse(context.Background(), "A.cs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pf.Scope.Package != tc.want {
+			t.Fatalf("package = %q, want %q", pf.Scope.Package, tc.want)
+		}
 	}
 }

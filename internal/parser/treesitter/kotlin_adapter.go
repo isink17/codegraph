@@ -89,8 +89,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 // between them is not part of it. No header, a header with a syntax error, or
 // a backticked segment is no package rather than a guessed one. The grammar
 // yields at most one header: a second `package` line is error-recovered as an
-// expression and the first header stands; more than one header is refused
-// all the same.
+// expression; that recovered duplicate is refused too.
 func kotlinPackage(root *sitter.Node, content []byte) string {
 	var header *sitter.Node
 	for i := range int(root.NamedChildCount()) {
@@ -99,6 +98,8 @@ func kotlinPackage(root *sitter.Node, content []byte) string {
 				return ""
 			}
 			header = child
+		} else if child.NamedChildCount() > 0 && nodeText(child.NamedChild(0), content) == "package" {
+			return "" // the grammar recovers duplicate headers as expressions
 		}
 	}
 	if header == nil || header.HasError() {
