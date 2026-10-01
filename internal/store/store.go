@@ -722,7 +722,7 @@ func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
 		}
 		snapshotPath, cleanup, err := vacuumSQLiteSnapshot(path, artifacts)
 		if err != nil {
-			if errors.Is(err, errSQLiteInspectionChanged) {
+			if errors.Is(err, errSQLiteInspectionChanged) || isTransientSQLiteInspectionLock(err) {
 				continue
 			}
 			return "", nil, err
