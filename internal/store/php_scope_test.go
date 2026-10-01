@@ -619,6 +619,24 @@ func TestPHPComposerPSR4TypeSelectionRules(t *testing.T) {
 			})
 		}
 	})
+	t.Run("empty prefix uses Composer fallback directory", func(t *testing.T) {
+		f := newPHPFixture(t)
+		fallback := f.phpFile(t, "fallback/App/Special/Service.php")
+		legacy := f.phpFile(t, "legacy/App/Special/Service.php")
+		callerFile := f.phpFile(t, "src/Caller.php")
+		f.typ(t, fallback, "App.Special.Service")
+		f.method(t, fallback, "App.Special.Service.run", "public", true)
+		f.typ(t, legacy, "App.Special.Service")
+		f.method(t, legacy, "App.Special.Service.run", "public", true)
+		f.typ(t, callerFile, "App.Caller")
+		caller := f.method(t, callerFile, "App.Caller.f", "public", false)
+		f.composer(t, PHPComposerPSR4Mapping{ManifestPath: "composer.json", MappingRole: "autoload", RootPath: "fallback", RootOrdinal: 0})
+		edge := f.call(t, callerFile, srcOf(caller), `\App\Special\Service::run`, 1)
+		f.resolveVia(t, "full", nil, nil)
+		if got := f.binding(t, edge); got != "App.Special.Service.run|php_composer_psr4|high" {
+			t.Fatal(got)
+		}
+	})
 	t.Run("ordered roots and first existing source mismatch", func(t *testing.T) {
 		f, callerFile, caller, selected := newCase(t, "src", []PHPComposerPSR4Mapping{mapApp("missing", 0), mapApp("src", 1)})
 		edge := f.call(t, callerFile, srcOf(caller), "Service::run", 1)
