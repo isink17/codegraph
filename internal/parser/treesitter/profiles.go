@@ -95,6 +95,6 @@ func (a *SwiftAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:swift:v7", EmitsCallEdges: true}
 }
 func (a *PHPAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:php:v3", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:php:v4", EmitsCallEdges: true}
 }
 func (a *CppAdapter) Profile() parser.Profile { return tsProfile("cpp") }

@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
+	github.com/tree-sitter/tree-sitter-php v0.23.12
 	golang.org/x/mod v0.27.0
 	modernc.org/sqlite v1.39.1
 )
