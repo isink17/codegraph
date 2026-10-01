@@ -26,7 +26,8 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:java:v3", EmitsCallEdges: true}
 }
 
-// Kotlin v10 reads the package from the package_header node instead of the
+// Kotlin v11 refuses duplicate package headers recovered as expressions.
+// v10 reads the package from the package_header node instead of the
 // first raw-text line starting with `package x`, so a comment or a multi-line
 // string can no longer name it; the package prefixes every qualified name and
 // stable key. v9 structurally recovers one swallowed declaration: an annotated
@@ -52,7 +53,7 @@ func (a *KotlinAdapter) Profile() parser.Profile {
 	case 9:
 		return parser.Profile{ID: "treesitter:kotlin:v9", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:kotlin:v10", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:kotlin:v11", EmitsCallEdges: true}
 }
 func (a *CSharpAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}

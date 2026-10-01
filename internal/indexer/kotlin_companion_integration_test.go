@@ -169,10 +169,10 @@ class Service {
 	if got := companionSymbolCount(t, s.raw(t), repo, "Service.kt"); got != 1 {
 		t.Fatalf("v5 companion symbols = %d, want 1", got)
 	}
-	if got := fileParserProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v10" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Service.kt"); got != "treesitter:kotlin:v11" {
 		t.Fatalf("upgraded profile = %q", got)
 	}
-	if got := fileParserProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v10" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Other.kt"); got != "treesitter:kotlin:v11" {
 		t.Fatalf("other Kotlin profile = %q", got)
 	}
 	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
@@ -390,7 +390,7 @@ func TestKotlinV4ToV5JvmCallableEvidenceConvergence(t *testing.T) {
 		t.Fatalf("v4-to-v5 update=%+v", summary)
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v10" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v11" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}
@@ -458,7 +458,7 @@ func TestJavaKotlinArityProfileConvergence(t *testing.T) {
 		}
 	}
 	for _, path := range []string{"Actions.kt", "Other.kt"} {
-		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v10" {
+		if got := fileParserProfile(t, s.raw(t), repo, path); got != "treesitter:kotlin:v11" {
 			t.Fatalf("%s profile=%q", path, got)
 		}
 	}

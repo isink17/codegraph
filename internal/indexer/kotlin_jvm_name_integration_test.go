@@ -524,7 +524,7 @@ func TestKotlinV5ToV6JvmNameConvergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v5-to-v6 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"Actions.kt": "treesitter:kotlin:v10", "Service.kt": "treesitter:kotlin:v10", "Other.kt": "treesitter:kotlin:v10", "Caller.java": "treesitter:java:v3", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"Actions.kt": "treesitter:kotlin:v11", "Service.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v3", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}

@@ -4,6 +4,7 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
 	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 // Each caller names package docs only in a comment and really lives in
@@ -122,7 +124,7 @@ func TestJVMRawTextPackageProfileConvergence(t *testing.T) {
 			t.Fatalf("%s reconvergence update = %+v", step.language, summary)
 		}
 	}
-	for path, want := range map[string]string{"com/real/Caller.java": "treesitter:java:v3", "docs/Helper.java": "treesitter:java:v3", "com/real/Caller.kt": "treesitter:kotlin:v10", "docs/Helper.kt": "treesitter:kotlin:v10", "com/real/Other.kt": "treesitter:kotlin:v10", "docs/User.java": "treesitter:java:v3", "docs/User.kt": "treesitter:kotlin:v10", "main.go": "go-ast:go:v1"} {
+	for path, want := range map[string]string{"com/real/Caller.java": "treesitter:java:v3", "docs/Helper.java": "treesitter:java:v3", "com/real/Caller.kt": "treesitter:kotlin:v11", "docs/Helper.kt": "treesitter:kotlin:v11", "com/real/Other.kt": "treesitter:kotlin:v11", "docs/User.java": "treesitter:java:v3", "docs/User.kt": "treesitter:kotlin:v11", "main.go": "go-ast:go:v1"} {
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile = %q, want %q", path, got, want)
 		}
@@ -132,5 +134,34 @@ func TestJVMRawTextPackageProfileConvergence(t *testing.T) {
 	again, err := r.idx.Update(ctx, Options{RepoRoot: root})
 	if err != nil || again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
 		t.Fatalf("second update = %+v, %v; want no-op", again, err)
+	}
+}
+
+func TestKotlinDuplicateHeaderProfileConvergence(t *testing.T) {
+	r := newLifecycleRepo(t, tree{"A.kt": "package real\npackage fake\nfun run() {}\n"})
+	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, query := range []string{
+		"UPDATE files SET parser_profile='treesitter:kotlin:v10'",
+		"UPDATE file_scope_evidence SET package_name='real'",
+	} {
+		if _, err := db.Exec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary := r.update(t)
+	if summary.FilesIndexed != 1 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
+		t.Fatalf("upgrade = %+v", summary)
+	}
+	var pkg string
+	if err := db.QueryRow("SELECT package_name FROM file_scope_evidence").Scan(&pkg); err != nil || pkg != "" {
+		t.Fatalf("package = %q, %v", pkg, err)
+	}
+	r.assertFreshParity(t, "duplicate Kotlin header profile transition")
+	if again := r.update(t); again.FilesIndexed != 0 {
+		t.Fatalf("second update = %+v", again)
 	}
 }

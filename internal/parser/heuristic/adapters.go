@@ -207,11 +207,14 @@ type stripState struct {
 	inBlockComment bool
 	// nestedComment records a `/*` inside a block comment. Only Kotlin nests
 	// them, and the stripper does not, so its package reading fails closed.
-	nestedComment bool
-	inString      bool
-	stringQuote   byte
-	escaped       bool
-	heredocTerm   string
+	nestedComment  bool
+	inString       bool
+	stringQuote    byte
+	stringDelim    int
+	stringRaw      bool
+	stringVerbatim bool
+	escaped        bool
+	heredocTerm    string
 }
 
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
@@ -223,11 +226,6 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 	if a.language == "kotlin" {
 		pf.Scope.Package = heuristicKotlinPackage(content)
-		for _, line := range lines {
-			if strings.HasPrefix(strings.TrimSpace(line), "import ") {
-				addHeuristicKotlinScope(line, &pf.Scope.Imports)
-			}
-		}
 		module = pf.Scope.Package
 	}
 	if a.language == "csharp" {
@@ -253,6 +251,9 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			classScopes = classScopes[:len(classScopes)-1]
 		}
 
+		if a.language == "kotlin" && !state.nestedComment && strings.HasPrefix(trimmed, "import ") {
+			addHeuristicKotlinScope(trimmed, &pf.Scope.Imports)
+		}
 		for _, imp := range a.imports {
 			if m := imp.re.FindStringSubmatch(normalized); len(m) > imp.nameGroup {
 				val := strings.TrimSpace(m[imp.nameGroup])
@@ -356,11 +357,13 @@ var heuristicKotlinPackageRE = regexp.MustCompile(`^package\s+([A-Za-z_][A-Za-z0
 
 // heuristicKotlinPackage applies the grammar's header rule to comment- and
 // string-stripped lines: after a shebang and @file: annotations, the first
-// significant text must be the whole `package a.b` line. A package spelled in
-// a comment or string, anywhere later, or after a nested block comment is no
+// significant text must be the whole `package a.b` line, with no second header.
+// A package spelled in a comment or string, anywhere later, or after a nested
+// block comment is no
 // package.
 func heuristicKotlinPackage(content []byte) string {
 	state := stripState{}
+	pkg := ""
 	depth := 0 // open ( and [ of a @file: annotation spanning lines
 	for _, line := range strings.Split(string(content), "\n") {
 		var normalized string
@@ -369,6 +372,12 @@ func heuristicKotlinPackage(content []byte) string {
 			return ""
 		}
 		rest := strings.TrimSpace(normalized)
+		if pkg != "" {
+			if fields := strings.Fields(rest); len(fields) > 0 && fields[0] == "package" {
+				return "" // a second header is ambiguous, even if its name is invalid
+			}
+			continue
+		}
 		if strings.HasPrefix(rest, "#!") {
 			continue
 		}
@@ -404,11 +413,12 @@ func heuristicKotlinPackage(content []byte) string {
 			continue
 		}
 		if m := heuristicKotlinPackageRE.FindStringSubmatch(rest); len(m) == 2 {
-			return m[1]
+			pkg = m[1]
+			continue
 		}
 		return ""
 	}
-	return ""
+	return pkg
 }
 
 func addHeuristicKotlinScope(line string, out *[]graph.ScopeImport) {
@@ -514,6 +524,16 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 			continue
 		}
 		if state.inString {
+			if state.stringRaw {
+				if ch == state.stringQuote && quoteRun(line, i) >= state.stringDelim {
+					i += state.stringDelim - 1
+					state.inString = false
+					state.stringRaw = false
+					state.stringQuote = 0
+					state.stringDelim = 0
+				}
+				continue
+			}
 			if state.escaped {
 				state.escaped = false
 				continue
@@ -522,9 +542,15 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 				state.escaped = true
 				continue
 			}
+			if state.stringVerbatim && ch == state.stringQuote && next == state.stringQuote {
+				i++ // doubled quote inside a C# verbatim string
+				continue
+			}
 			if ch == state.stringQuote {
 				state.inString = false
 				state.stringQuote = 0
+				state.stringDelim = 0
+				state.stringVerbatim = false
 			}
 			continue
 		}
@@ -539,9 +565,13 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 		if hashStyle && ch == '#' {
 			break
 		}
-		if ch == '"' || ch == '\'' || ch == '`' {
+		if quote, start, delim, raw, verbatim, ok := heuristicStringStart(line, i, cStyle); ok {
 			state.inString = true
-			state.stringQuote = ch
+			state.stringQuote = quote
+			state.stringDelim = delim
+			state.stringRaw = raw
+			state.stringVerbatim = verbatim
+			i = start
 			continue
 		}
 		if hashStyle && ch == '<' && next == '<' {
@@ -555,16 +585,53 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 	return b.String(), state
 }
 
+func heuristicStringStart(line string, i int, cStyle bool) (quote byte, quoteStart, delimiter int, raw, verbatim, ok bool) {
+	start := i
+	if cStyle {
+		for i < len(line) && line[i] == '$' {
+			i++
+		}
+		if i < len(line) && line[i] == '@' {
+			verbatim = true
+			i++
+		}
+		if i == start && line[i] == '@' {
+			verbatim = true
+			i++
+			for i < len(line) && line[i] == '$' {
+				i++
+			}
+		}
+	}
+	if i >= len(line) || (line[i] != '"' && line[i] != '\'' && line[i] != '`') {
+		return 0, start, 0, false, false, false
+	}
+	quote = line[i]
+	delimiter = 1
+	if quote == '"' {
+		delimiter = quoteRun(line, i)
+		raw = delimiter >= 3
+	}
+	return quote, i, delimiter, raw, verbatim, true
+}
+
+func quoteRun(line string, i int) int {
+	end := i
+	for end < len(line) && line[end] == '"' {
+		end++
+	}
+	return end - i
+}
+
 // Profile identifies the heuristic fallback for this adapter's language. These
 // adapters extract symbols and imports from regular expressions and emit NO
 // call edges at all -- which is exactly why the indexer must refuse to replace
 // a call-capable graph with one of them. See parser.Profile.
 func (a *Adapter) Profile() parser.Profile {
 	version := "v1"
-	// C# v2 added namespace scope evidence. Kotlin v2 reads its package only
-	// from the header position, never from a comment or a string.
+	// v4 handles raw and verbatim strings without leaking scope text.
 	if a.language == "csharp" || a.language == "kotlin" {
-		version = "v2"
+		version = "v4"
 	}
 	return parser.Profile{ID: "heuristic:" + a.language + ":" + version, EmitsCallEdges: false}
 }
@@ -586,7 +653,12 @@ func heuristicCSharpImport(value string) graph.ScopeImport {
 }
 
 func heuristicCSharpModule(content []byte) string {
-	text := string(content)
+	state := stripState{}
+	lines := strings.Split(string(content), "\n")
+	for i, line := range lines {
+		lines[i], state = stripForHeuristic(line, state, true, false)
+	}
+	text := strings.Join(lines, "\n")
 	matches := heuristicCSharpNamespaceRE.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) != 1 {
 		return ""

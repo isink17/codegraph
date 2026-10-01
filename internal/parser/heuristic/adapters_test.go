@@ -106,7 +106,7 @@ func TestCSharpHeuristicV2KeepsNamespaceIdentity(t *testing.T) {
 	if p.Scope.Package != "App.Core" || p.Symbols[len(p.Symbols)-1].QualifiedName != "App.Core.Outer.Inner.Run" {
 		t.Fatalf("C# heuristic facts = package %q symbols %+v", p.Scope.Package, p.Symbols)
 	}
-	if NewCSharp().Profile().ID != "heuristic:csharp:v2" || NewCSharp().Profile().EmitsCallEdges {
+	if NewCSharp().Profile().ID != "heuristic:csharp:v4" || NewCSharp().Profile().EmitsCallEdges {
 		t.Fatalf("C# heuristic profile = %+v", NewCSharp().Profile())
 	}
 }
@@ -146,20 +146,20 @@ func hasSymbolName(parsed graph.ParsedFile, name string) bool {
 // string can never name the Kotlin package. Java has no heuristic package.
 func TestKotlinHeuristicPackageIgnoresCommentsAndStrings(t *testing.T) {
 	for src, want := range map[string]string{
-		"package com.real\nfun a() {}\n":                                      "com.real",
-		"/*\npackage com.fake\n*/\npackage com.real\nfun a() {}\n":            "com.real",
-		"/**\n package com.fake\n */\npackage com.real\nfun a() {}\n":         "com.real",
-		"// package com.fake\npackage com.real\nfun a() {}\n":                 "com.real",
-		"#!/usr/bin/env kotlin\n@file:JvmName(\"F\")\npackage com.real\n":     "com.real",
-		"/*\npackage com.fake\n*/\nfun a() {}\n":                              "",
-		"fun a() = \"\"\"\npackage com.fake\n\"\"\"\n":                        "",
-		"fun a() {}\npackage com.fake\n":                                      "",
-		"@file:JvmName(\"\"\"\npackage com.fake\n\"\"\")\npackage com.real\n": "com.real",
-		"@file:Suppress(\n    \"A\",\n    \"B\",\n)\npackage com.real\n":      "com.real",
-		"@file:[A B(\"x\")] @file:JvmSynthetic package com.real\n":            "com.real",
-		"/* /* nested */\npackage com.fake */\npackage com.real\n":            "",
-		"package com.`fake`\n":                                                "",
-		"package com . real\n":                                                "",
+		"package com.real\nfun a() {}\n":                                                         "com.real",
+		"/*\npackage com.fake\n*/\npackage com.real\nfun a() {}\n":                               "com.real",
+		"/**\n package com.fake\n */\npackage com.real\nfun a() {}\n":                            "com.real",
+		"// package com.fake\npackage com.real\nfun a() {}\n":                                    "com.real",
+		"#!/usr/bin/env kotlin\n@file:JvmName(\"F\")\npackage com.real\n":                        "com.real",
+		"/*\npackage com.fake\n*/\nfun a() {}\n":                                                 "",
+		"fun a() = \"\"\"\npackage com.fake\n\"\"\"\n":                                           "",
+		"fun a() {}\npackage com.fake\n":                                                         "",
+		"@file:JvmName(\"\"\"\npackage com.fake\n text \" interior\n\"\"\")\npackage com.real\n": "com.real",
+		"@file:Suppress(\n    \"A\",\n    \"B\",\n)\npackage com.real\n":                         "com.real",
+		"@file:[A B(\"x\")] @file:JvmSynthetic package com.real\n":                               "com.real",
+		"/* /* nested */\npackage com.fake */\npackage com.real\n":                               "",
+		"package com.`fake`\n":                                                                   "",
+		"package com . real\n":                                                                   "",
 	} {
 		pf, err := NewKotlin().Parse(context.Background(), "A.kt", []byte(src))
 		if err != nil {
@@ -178,7 +178,86 @@ func TestKotlinHeuristicPackageIgnoresCommentsAndStrings(t *testing.T) {
 	if err != nil || pf.Scope.Package != "" {
 		t.Fatalf("java heuristic package = %q, %v; want none", pf.Scope.Package, err)
 	}
-	if NewKotlin().Profile().ID != "heuristic:kotlin:v2" || NewJava().Profile().ID != "heuristic:java:v1" {
+	if NewKotlin().Profile().ID != "heuristic:kotlin:v4" || NewJava().Profile().ID != "heuristic:java:v1" {
 		t.Fatalf("profiles = %s, %s", NewKotlin().Profile().ID, NewJava().Profile().ID)
+	}
+}
+
+func TestScopeEvidenceIgnoresCommentedDeclarations(t *testing.T) {
+	pf, _ := NewKotlin().Parse(context.Background(), "A.kt", []byte("package com.real\npackage com.fake\nfun a() {}"))
+	if pf.Scope.Package != "" {
+		t.Fatalf("duplicate package = %q", pf.Scope.Package)
+	}
+
+	for _, src := range []string{
+		"/*\nimport fake.Target\n*/\nimport real.Target as Alias\nfun a() {}",
+		"val text = \"\"\"\nimport fake.Target\n\"\"\"\nimport real.Target as Alias\n",
+	} {
+		pf, err := NewKotlin().Parse(context.Background(), "A.kt", []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pf.Scope.Imports) != 1 || pf.Scope.Imports[0].SourceSpecifier != "real.Target" || pf.Scope.Imports[0].LocalName != "Alias" {
+			t.Fatalf("imports = %+v", pf.Scope.Imports)
+		}
+	}
+	for _, tc := range []struct{ src, want string }{
+		{"/*\nnamespace Fake;\n*/\nclass A {}", ""},
+		{"class A { string s = @\"\nnamespace Fake;\n\"; }", ""},
+		{"/*\nnamespace Fake;\n*/\nnamespace Real;\nclass A {}", "Real"},
+		{"// docs\nnamespace Real { class A { string s = \"}\"; } }", "Real"},
+	} {
+		pf, err := NewCSharp().Parse(context.Background(), "A.cs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pf.Scope.Package != tc.want {
+			t.Fatalf("package = %q, want %q", pf.Scope.Package, tc.want)
+		}
+	}
+}
+
+func TestScopeEvidenceIgnoresRawAndVerbatimStrings(t *testing.T) {
+	for _, src := range []string{
+		"import real.Target\nval text = \"\"\"\n text \" interior\nimport fake.pkg.Name\n\"\"\"\nimport after.Target\n",
+		"val text = \"\"\"\npackage fake.pkg\n text \" interior\npackage another.fake\n\"\"\"\npackage real.pkg\n",
+		"val text = \"\"\" unterminated \" import fake.Target\nimport hidden.Target\n",
+		`val text = "escaped \" quote import fake.Target"` + "\nimport real.Target\n",
+	} {
+		pf, err := NewKotlin().Parse(context.Background(), "A.kt", []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(pf.Scope.Package, "fake") {
+			t.Fatalf("raw string leaked package from %q: %+v", src, pf.Scope)
+		}
+		for _, imp := range pf.Scope.Imports {
+			if strings.Contains(imp.SourceSpecifier, "fake") || strings.Contains(imp.SourceSpecifier, "hidden") {
+				t.Fatalf("raw string leaked import from %q: %+v", src, pf.Scope.Imports)
+			}
+		}
+	}
+
+	for _, tc := range []struct{ src, wantPackage string }{
+		{"var a = @\"\nnamespace Fake.Name;\n text \"\" interior\nusing Fake.Name;\n\";\nnamespace Real;\n", "Real"},
+		{"var a = $\"namespace Fake.Name; using Fake.Name;\";\nnamespace Real;\n", "Real"},
+		{`var a = $@"namespace Fake.Name; "" using Fake.Name;";` + "\nnamespace Real;\n", "Real"},
+		{`var a = $""""` + "\n text \"\"\" fragment\nusing Fake.Name;\n" + `"""";` + "\nnamespace Real;\n", "Real"},
+		{`var a = "escaped \" quote namespace Fake.Name;";` + "\nnamespace Real;\n", "Real"},
+		{"var a = $\"\"\"\nnamespace Fake.Name;\n text \" interior\nusing Fake.Name;\n\"\"\";\nnamespace Real;\n", "Real"},
+		{"var a = @\"unterminated namespace Fake.Name;\nnamespace Hidden;\n", ""},
+	} {
+		pf, err := NewCSharp().Parse(context.Background(), "A.cs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pf.Scope.Package != tc.wantPackage {
+			t.Fatalf("C# string namespace from %q = %q, want %q", tc.src, pf.Scope.Package, tc.wantPackage)
+		}
+		for _, imp := range pf.Scope.Imports {
+			if strings.Contains(imp.SourceSpecifier, "Fake") {
+				t.Fatalf("C# string leaked import from %q: %+v", tc.src, pf.Scope.Imports)
+			}
+		}
 	}
 }
