@@ -11,6 +11,12 @@ Unknown callers serialize as an empty array. Full MCP tools/list grows by 141 by
 Incremental updates skip JVM scope-name edge scans when the repository has no
 active Java or Kotlin files; mixed/JVM repositories preserve existing behavior.
 
+Rust nested `use` groups now derive import evidence recursively from syntax nodes,
+including grouped `self`, aliases and globs; malformed declarations fail closed.
+`treesitter:rust:v3` reparses unchanged Rust files on the next complete update.
+Multi-crate profile refresh now retains changed roots with no call edges during
+bounded module discovery, keeping unchanged-file updates equivalent to fresh indexing.
+
 v2 development uses separate SQLite storage: repo-local `.codegraph/codegraph.v2.sqlite`; custom/global stores use deterministic `codegraph.v2-<repo-hash>.sqlite` names. Legacy v1 `codegraph.sqlite` databases are not automatically migrated or modified; first v2 index may require a full rebuild, and v1/v2 databases can coexist safely.
 
 C++ qualified identity now preserves namespace nesting, file-scoped anonymous namespaces, friend

@@ -50,10 +50,10 @@ func (a *RustAdapter) Parse(ctx context.Context, path string, content []byte) (g
 func rustExtractImports(root *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
 	for i := range int(root.ChildCount()) {
 		child := root.Child(i)
-		if child.Type() == "use_declaration" {
+		if child.Type() == "use_declaration" && !child.HasError() {
 			if arg := childByFieldName(child, "argument"); arg != nil {
 				pf.Imports = append(pf.Imports, nodeText(arg, content))
-				addRustScope(nodeText(child, content), rustVisibility(child, content) == "public", module, &pf.Scope.Imports)
+				rustUseTree(arg, "", rustVisibility(child, content) == "public", module, content, &pf.Scope.Imports)
 			}
 		}
 		if child.Type() == "mod_item" {
@@ -63,6 +63,100 @@ func rustExtractImports(root *sitter.Node, module string, content []byte, pf *gr
 				}
 			}
 		}
+	}
+}
+
+// rustUseTree preserves syntax-tree grouping instead of splitting source on commas.
+func rustUseTree(node *sitter.Node, prefix string, public bool, owner string, content []byte, out *[]graph.ScopeImport) {
+	if node == nil || node.HasError() {
+		return
+	}
+	join := func(path string) string {
+		if path == "" {
+			return ""
+		}
+		if prefix == "" {
+			return path
+		}
+		if path == "self" {
+			return prefix
+		}
+		return prefix + "::" + path
+	}
+	switch node.Type() {
+	case "scoped_use_list":
+		path := childByFieldName(node, "path")
+		next := prefix
+		if path != nil {
+			next = join(rustUsePath(path, content))
+			if next == "" {
+				return
+			}
+		}
+		rustUseTree(childByFieldName(node, "list"), next, public, owner, content, out)
+		return
+	case "use_list":
+		for i := range int(node.NamedChildCount()) {
+			rustUseTree(node.NamedChild(i), prefix, public, owner, content, out)
+		}
+		return
+	}
+	path, alias, wildcard := "", "", false
+	switch node.Type() {
+	case "use_as_clause":
+		path = join(rustUsePath(childByFieldName(node, "path"), content))
+		alias = nodeText(childByFieldName(node, "alias"), content)
+		if alias == "" || alias == "_" {
+			return
+		}
+	case "use_wildcard":
+		wildcard = true
+		path = prefix
+		for i := range int(node.NamedChildCount()) {
+			child := node.NamedChild(i)
+			if child.Type() != "line_comment" && child.Type() != "block_comment" {
+				path = join(rustUsePath(child, content))
+				break
+			}
+		}
+	case "identifier", "scoped_identifier", "self", "super", "crate":
+		path = join(rustUsePath(node, content))
+	default:
+		return
+	}
+	if path == "" {
+		return
+	}
+	imported := path
+	if i := strings.LastIndex(path, "::"); i >= 0 {
+		imported = path[i+2:]
+	}
+	local := imported
+	if alias != "" {
+		local = alias
+	}
+	if wildcard {
+		local = ""
+	}
+	*out = append(*out, graph.ScopeImport{SourceSpecifier: path, ImportedName: imported, LocalName: local, Kind: graph.ScopeImportUse, Wildcard: wildcard, ReExport: public, OwnerModule: owner})
+}
+
+func rustUsePath(node *sitter.Node, content []byte) string {
+	if node == nil || node.HasError() {
+		return ""
+	}
+	switch node.Type() {
+	case "scoped_identifier":
+		path := rustUsePath(childByFieldName(node, "path"), content)
+		name := rustUsePath(childByFieldName(node, "name"), content)
+		if name == "" || (childByFieldName(node, "path") != nil && path == "") {
+			return ""
+		}
+		return path + "::" + name
+	case "identifier", "self", "super", "crate":
+		return nodeText(node, content)
+	default:
+		return ""
 	}
 }
 

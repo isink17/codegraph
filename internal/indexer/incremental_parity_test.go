@@ -1716,3 +1716,130 @@ func TestUpdateLifecycleMovesSymbolOutputVisibility(t *testing.T) {
 	r.update(t)
 	visible("after re-add", true)
 }
+
+func TestRustNestedUseTreeIncrementalParity(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib.rs":    "mod a; mod b; mod caller;",
+		"a.rs":      "pub fn helper() {}",
+		"b.rs":      "pub fn helper() {}",
+		"caller.rs": "use crate::{a::{helper as selected}, b::{helper as other}}; fn run() { selected(); other(); }",
+	})
+	assertRustResolved(t, r, "caller.rs", "selected", "a.rs")
+	assertRustResolved(t, r, "caller.rs", "other", "b.rs")
+	r.write(t, "caller.rs", "use crate::{a::{helper as other}, b::{helper as selected}}; fn run() { selected(); other(); }")
+	r.update(t, "caller.rs")
+	assertRustResolved(t, r, "caller.rs", "selected", "b.rs")
+	assertRustResolved(t, r, "caller.rs", "other", "a.rs")
+	r.assertFreshParity(t, "nested Rust use aliases changed")
+	// A stored older profile must refresh unchanged source and converge once.
+	raw, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec("UPDATE files SET parser_profile = 'treesitter:rust:v2' WHERE repo_id = ? AND language = 'rust'", r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate v2's incomplete nested-use evidence, not only an old profile tag.
+	if _, err := raw.Exec("DELETE FROM scope_import_evidence WHERE repo_id = ? AND language = 'rust'", r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("UPDATE edges SET dst_symbol_id = NULL, resolution_strategy = '', resolution_confidence = '' WHERE repo_id = ?", r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	summary := r.update(t)
+	if summary.FilesIndexed != 4 || len(summary.ParserProfileLanguages) != 1 || summary.ParserProfileLanguages[0] != "rust" {
+		t.Fatalf("profile update = %+v", summary)
+	}
+	assertRustResolved(t, r, "caller.rs", "selected", "b.rs")
+	assertRustResolved(t, r, "caller.rs", "other", "a.rs")
+	r.assertFreshParity(t, "unchanged Rust profile upgrade")
+	if again := r.update(t); again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update = %+v", again)
+	}
+}
+
+func TestRustNestedUseTreePathSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name, source, call, target string
+		files                      tree
+	}{
+		{"self", "caller.rs", "selected", "caller/local.rs", tree{
+			"lib.rs": "mod caller;", "caller.rs": "mod local; use self::{local::{helper as selected}}; fn run() { selected(); }", "caller/local.rs": "pub fn helper() {}",
+		}},
+		{"super", "caller.rs", "selected", "a.rs", tree{
+			"lib.rs": "mod a; mod caller;", "a.rs": "pub fn helper() {}", "caller.rs": "use super::{a::{helper as selected}}; fn run() { selected(); }",
+		}},
+		{"repeated super", "caller/inner.rs", "selected", "a.rs", tree{
+			"lib.rs": "mod a; mod caller;", "a.rs": "pub fn helper() {}", "caller/mod.rs": "mod inner;", "caller/inner.rs": "use super::super::{a::{helper as selected}}; fn run() { selected(); }",
+		}},
+		{"glob", "caller.rs", "helper", "a.rs", tree{
+			"lib.rs": "mod a; mod caller;", "a.rs": "pub fn helper() {}", "caller.rs": "use crate::{a::{*}}; fn run() { helper(); }",
+		}},
+		{"ambiguous glob", "caller.rs", "helper", "", tree{
+			"lib.rs": "mod a; mod b; mod caller;", "a.rs": "pub fn helper() {}", "b.rs": "pub fn helper() {}", "caller.rs": "use crate::{a::{*}, b::{*}}; fn run() { helper(); }",
+		}},
+		{"malformed", "caller.rs", "selected", "", tree{
+			"lib.rs": "mod a; mod caller;", "a.rs": "pub fn helper() {}", "caller.rs": "use crate::{a::{helper as selected}; fn run() { selected(); }",
+		}},
+		{"unnamed alias", "caller.rs", "helper", "", tree{
+			"lib.rs": "mod a; mod caller;", "a.rs": "pub fn helper() {}", "caller.rs": "use crate::{a::{helper as _}}; fn run() { helper(); }",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newLifecycleRepo(t, tc.files)
+			check := func() {
+				if tc.target == "" {
+					assertRustUnresolved(t, r, tc.source, tc.call)
+				} else {
+					assertRustResolved(t, r, tc.source, tc.call, tc.target)
+				}
+			}
+			check()
+			r.write(t, tc.source, tc.files[tc.source]+"\n// update\n")
+			r.update(t, tc.source)
+			check()
+			r.assertFreshParity(t, tc.name)
+		})
+	}
+}
+
+// Call-free roots must still seed discovery when a profile refresh rewrites all
+// Rust scope evidence in more than one crate.
+func TestRustMultiCrateProfileConvergence(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"tests/util.rs":        "pub struct Dir;\nimpl Dir { pub fn new() {} }\nfn setup() { Dir::new(); }\n",
+		"first/src/lib.rs":     "mod caller;",
+		"first/src/caller.rs":  "pub fn helper_first() {}\nfn run() { helper_first(); }\n",
+		"second/src/lib.rs":    "mod caller;",
+		"second/src/caller.rs": "pub fn helper_second() {}\nfn run() { helper_second(); }\n",
+	})
+	for _, crate := range []string{"first", "second"} {
+		assertRustResolved(t, r, crate+"/src/caller.rs", "helper_"+crate, crate+"/src/caller.rs")
+	}
+	assertRustResolved(t, r, "tests/util.rs", "Dir::new", "tests/util.rs")
+	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("UPDATE files SET parser_profile='treesitter:rust:v2' WHERE repo_id=?", r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	summary := r.update(t)
+	if summary.FilesIndexed != 5 {
+		t.Fatalf("profile refresh = %+v", summary)
+	}
+	for _, crate := range []string{"first", "second"} {
+		assertRustResolved(t, r, crate+"/src/caller.rs", "helper_"+crate, crate+"/src/caller.rs")
+	}
+	assertRustResolved(t, r, "tests/util.rs", "Dir::new", "tests/util.rs")
+	var root string
+	if err := db.QueryRow("SELECT e.crate_root FROM file_scope_evidence e JOIN files f ON f.id=e.file_id WHERE f.path='tests/util.rs'").Scan(&root); err != nil || root != "" {
+		t.Fatalf("rootless file membership = %q, %v", root, err)
+	}
+	r.assertFreshParity(t, "two call-free crate roots and rootless same-file target after profile refresh")
+	if again := r.update(t); again.FilesIndexed != 0 {
+		t.Fatalf("second update = %+v", again)
+	}
+}

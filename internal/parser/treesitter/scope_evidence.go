@@ -79,48 +79,6 @@ func addKotlinScope(text string, out *[]graph.ScopeImport) {
 	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: imported, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard})
 }
 
-func addRustScope(text string, public bool, owner string, out *[]graph.ScopeImport) {
-	text = strings.TrimSpace(strings.TrimSuffix(text, ";"))
-	text = strings.TrimSpace(strings.TrimPrefix(text, "use"))
-	if strings.HasPrefix(text, "pub ") {
-		public = true
-		text = strings.TrimSpace(strings.TrimPrefix(text, "pub"))
-	}
-	text = strings.TrimSpace(strings.TrimPrefix(text, "use"))
-	if i := strings.Index(text, "::{"); i >= 0 && strings.HasSuffix(text, "}") {
-		prefix := text[:i]
-		for _, item := range strings.Split(text[i+3:len(text)-1], ",") {
-			item = strings.TrimSpace(item)
-			if item == "" {
-				continue
-			}
-			addRustScope(prefix+"::"+item, public, owner, out)
-		}
-		return
-	}
-	wildcard := strings.HasSuffix(text, "::*")
-	path := strings.TrimSuffix(text, "::*")
-	alias := ""
-	if i := strings.Index(path, " as "); i >= 0 {
-		alias, path = strings.TrimSpace(path[i+4:]), strings.TrimSpace(path[:i])
-	}
-	imported := path
-	local := path
-	if i := strings.LastIndex(path, "::"); i >= 0 {
-		local = path[i+2:]
-	}
-	if alias != "" {
-		local = alias
-	}
-	if wildcard {
-		local = ""
-	}
-	if i := strings.LastIndex(imported, "::"); i >= 0 {
-		imported = imported[i+2:]
-	}
-	*out = append(*out, graph.ScopeImport{SourceSpecifier: path, ImportedName: imported, LocalName: local, Kind: graph.ScopeImportUse, Wildcard: wildcard, ReExport: public, OwnerModule: owner})
-}
-
 func addTypeScriptImport(text string, out *[]graph.ScopeImport) {
 	sourceMatch := quotedSource.FindStringSubmatch(text)
 	if len(sourceMatch) != 2 {

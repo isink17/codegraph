@@ -59,12 +59,14 @@ func (a *CSharpAdapter) Profile() parser.Profile {
 }
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
 
+// Rust v3 extracts nested use groups recursively from the syntax tree and
+// refuses malformed declarations instead of persisting guessed import paths.
 // Rust v2 changes rust_module_evidence.external_path from a checkout-absolute
 // candidate path to the candidate stem relative to the declaring file's
 // directory. Unchanged bytes persist a different row, and the resolver joins
 // the new spelling exactly, so every Rust file has to reach the parser again.
 func (a *RustAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:rust:v2", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:rust:v3", EmitsCallEdges: true}
 }
 
 // Ruby v5 adds constant identity and visibility facts. Ruby v4 adds P22.48 singleton visibility: `def self.run` and a `class <<

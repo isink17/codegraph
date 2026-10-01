@@ -6087,31 +6087,11 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 	}
 	if len(rustIDs) > 0 {
-		// The changed-file path pass has already selected the crate root. Keep
-		// that selection on the rewritten caller evidence before the standalone
-		// Rust pass derives its bounded file set.
-		if scopes != nil && len(scopes.rustRoots) == 1 {
-			var root string
-			for candidate := range scopes.rustRoots {
-				root = candidate
-			}
-			for _, target := range targets {
-				if target.srcLanguage != "rust" {
-					continue
-				}
-				if _, err := s.db.ExecContext(ctx, `UPDATE file_scope_evidence SET crate_root=? WHERE repo_id=? AND file_id=? AND crate_root=''`, root, repoID, target.srcFileID); err != nil {
-					return outcome, err
-				}
-				// The cached Rust file set was resolved from crate_root before
-				// this stamp, so it has to learn about the file the stamp just
-				// brought into the crate; otherwise the later name pass would
-				// treat it as out of scope.
-				if scopes.rustFiles != nil {
-					scopes.rustFiles[target.srcFileID] = struct{}{}
-				}
-			}
+		var roots map[string]struct{}
+		if scopes != nil {
+			roots = scopes.rustRoots
 		}
-		bound, err := s.resolveRustModuleScopeStandaloneWithStats(ctx, repoID, rustIDs, &outcome.rustStats)
+		bound, err := s.resolveRustModuleScopeStandaloneWithStats(ctx, repoID, rustIDs, &outcome.rustStats, roots)
 		if err != nil {
 			return outcome, err
 		}
