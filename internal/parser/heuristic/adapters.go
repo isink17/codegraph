@@ -207,11 +207,14 @@ type stripState struct {
 	inBlockComment bool
 	// nestedComment records a `/*` inside a block comment. Only Kotlin nests
 	// them, and the stripper does not, so its package reading fails closed.
-	nestedComment bool
-	inString      bool
-	stringQuote   byte
-	escaped       bool
-	heredocTerm   string
+	nestedComment  bool
+	inString       bool
+	stringQuote    byte
+	stringDelim    int
+	stringRaw      bool
+	stringVerbatim bool
+	escaped        bool
+	heredocTerm    string
 }
 
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
@@ -521,6 +524,16 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 			continue
 		}
 		if state.inString {
+			if state.stringRaw {
+				if ch == state.stringQuote && quoteRun(line, i) >= state.stringDelim {
+					i += state.stringDelim - 1
+					state.inString = false
+					state.stringRaw = false
+					state.stringQuote = 0
+					state.stringDelim = 0
+				}
+				continue
+			}
 			if state.escaped {
 				state.escaped = false
 				continue
@@ -529,9 +542,15 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 				state.escaped = true
 				continue
 			}
+			if state.stringVerbatim && ch == state.stringQuote && next == state.stringQuote {
+				i++ // doubled quote inside a C# verbatim string
+				continue
+			}
 			if ch == state.stringQuote {
 				state.inString = false
 				state.stringQuote = 0
+				state.stringDelim = 0
+				state.stringVerbatim = false
 			}
 			continue
 		}
@@ -546,9 +565,13 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 		if hashStyle && ch == '#' {
 			break
 		}
-		if ch == '"' || ch == '\'' || ch == '`' {
+		if quote, start, delim, raw, verbatim, ok := heuristicStringStart(line, i, cStyle); ok {
 			state.inString = true
-			state.stringQuote = ch
+			state.stringQuote = quote
+			state.stringDelim = delim
+			state.stringRaw = raw
+			state.stringVerbatim = verbatim
+			i = start
 			continue
 		}
 		if hashStyle && ch == '<' && next == '<' {
@@ -562,15 +585,53 @@ func stripForHeuristic(line string, state stripState, cStyle, hashStyle bool) (s
 	return b.String(), state
 }
 
+func heuristicStringStart(line string, i int, cStyle bool) (quote byte, quoteStart, delimiter int, raw, verbatim, ok bool) {
+	start := i
+	if cStyle {
+		for i < len(line) && line[i] == '$' {
+			i++
+		}
+		if i < len(line) && line[i] == '@' {
+			verbatim = true
+			i++
+		}
+		if i == start && line[i] == '@' {
+			verbatim = true
+			i++
+			for i < len(line) && line[i] == '$' {
+				i++
+			}
+		}
+	}
+	if i >= len(line) || (line[i] != '"' && line[i] != '\'' && line[i] != '`') {
+		return 0, start, 0, false, false, false
+	}
+	quote = line[i]
+	delimiter = 1
+	if quote == '"' {
+		delimiter = quoteRun(line, i)
+		raw = delimiter >= 3
+	}
+	return quote, i, delimiter, raw, verbatim, true
+}
+
+func quoteRun(line string, i int) int {
+	end := i
+	for end < len(line) && line[end] == '"' {
+		end++
+	}
+	return end - i
+}
+
 // Profile identifies the heuristic fallback for this adapter's language. These
 // adapters extract symbols and imports from regular expressions and emit NO
 // call edges at all -- which is exactly why the indexer must refuse to replace
 // a call-capable graph with one of them. See parser.Profile.
 func (a *Adapter) Profile() parser.Profile {
 	version := "v1"
-	// v3 excludes commented imports/namespaces and duplicate Kotlin headers.
+	// v4 handles raw and verbatim strings without leaking scope text.
 	if a.language == "csharp" || a.language == "kotlin" {
-		version = "v3"
+		version = "v4"
 	}
 	return parser.Profile{ID: "heuristic:" + a.language + ":" + version, EmitsCallEdges: false}
 }

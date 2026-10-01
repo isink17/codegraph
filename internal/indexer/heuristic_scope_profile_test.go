@@ -15,8 +15,8 @@ func TestHeuristicScopeProfileConvergence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	for path, source := range map[string]string{
-		"A.kt": "package real\n/*\nimport fake.Target\n*/\nimport real.Target as Alias\nfun run() {}\n",
-		"A.cs": "/*\nnamespace Fake;\n*/\nnamespace Real;\nclass A {}\n",
+		"A.kt": "package real\n/*\nimport fake.Target\n*/\nimport real.Target as Alias\nval raw = \"\"\"\n text \" interior\nimport raw.Fake\n\"\"\"\nfun run() {}\n",
+		"A.cs": "using Real.Target;\n/*\nnamespace Fake;\n*/\nnamespace Real;\nclass A { string raw = \"\"\"\nnamespace Fake.Name;\n text \" interior\nusing Fake.Name;\n\"\"\"; }\n",
 	} {
 		if err := os.WriteFile(filepath.Join(root, path), []byte(source), 0644); err != nil {
 			t.Fatal(err)
@@ -50,12 +50,12 @@ func TestHeuristicScopeProfileConvergence(t *testing.T) {
 		return out
 	}
 	fresh := snapshot()
-	if !reflect.DeepEqual(fresh, []string{"A.cs|Real||", "A.kt|real|real.Target|Alias"}) {
+	if !reflect.DeepEqual(fresh, []string{"A.cs|Real|Real.Target|Target", "A.kt|real|real.Target|Alias"}) {
 		t.Fatalf("fresh scope = %v", fresh)
 	}
-	// Simulate persisted v2 comment-derived scope while preserving source bytes.
+	// Simulate persisted v3 scope evidence while preserving source bytes.
 	for _, sql := range []string{
-		"UPDATE files SET parser_profile='heuristic:'||language||':v2'",
+		"UPDATE files SET parser_profile='heuristic:'||language||':v3'",
 		"UPDATE file_scope_evidence SET package_name='Fake' WHERE language='csharp'",
 		"UPDATE scope_import_evidence SET source_specifier='fake.Target' WHERE language='kotlin'",
 	} {

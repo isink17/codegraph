@@ -24,7 +24,7 @@ index/update. Malformed signatures remain fail closed.
 
 Heuristic Kotlin imports and C# namespaces now exclude comment/string text; duplicate
 Kotlin package headers fail closed in both backends. Backticked package segments
-remain unsupported. Profiles `heuristic:kotlin:v3`, `heuristic:csharp:v3`, and
+remain unsupported. Profiles `heuristic:kotlin:v4`, `heuristic:csharp:v4`, and
 `treesitter:kotlin:v11` refresh unchanged files on the next complete update.
 
 v2 development uses separate SQLite storage: repo-local `.codegraph/codegraph.v2.sqlite`; custom/global stores use deterministic `codegraph.v2-<repo-hash>.sqlite` names. Legacy v1 `codegraph.sqlite` databases are not automatically migrated or modified; first v2 index may require a full rebuild, and v1/v2 databases can coexist safely.
