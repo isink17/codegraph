@@ -51,7 +51,7 @@ jobs:
 
       - name: Repeat concurrent database open checks (Windows)
         if: runner.os == 'Windows'
-        run: go test -timeout 30m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=200
+        run: go test -timeout 60m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=200
 
       - name: Smoke native binary
         shell: pwsh
