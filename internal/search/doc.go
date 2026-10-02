@@ -1,5 +1,4 @@
+// Package search is documentation-only and contains no search implementation.
+// Semantic search is implemented in internal/store and internal/query, with
+// token weights provided by internal/texttoken.
 package search
-
-// Package search contains lightweight local search strategies. The current
-// milestone uses token overlap persisted in SQLite so a richer backend can be
-// added later without changing CLI or MCP contracts.
