@@ -130,3 +130,22 @@ resolved edges do not establish broad product-code recall. The checkout was
 about 41 MB; fresh indexing took about 9–10 seconds and needs only the normal
 CodeGraph SQLite database. No build, Gradle dependency resolution, or generated
 database is required. New ABI families remain out of scope.
+
+## Current v2.0 acceptance checkpoint (2026-10-02)
+
+CG-32 is Done. CG-35 and CG-36 remain In Progress. At v2.0
+`4b78a3281b55ffc0ac1cf8fbbd3e5efe2b1272a2`, the source-grounded checkpoint is
+51 resolved cross-language edges, all original 44 retained, 24 `parseCookie`
+calls unresolved, zero audited newly wrong bindings, and no recoveries from the
+latest type-identity investigation. The seven existing additions were checked
+against exact imports, owners and declarations; this is not a complete recall
+oracle over unresolved edges.
+
+The alias-mutation convergence defect is separate from callable type identity:
+an unrelated incremental suffix pass bypassed JVM scope refusal for one Kotlin
+edge/reference. Repairing that ownership must preserve the checkpoint above,
+including the refused `setLevel` and two `encodeQuery` helper controls.
+
+The remaining `parseCookie` recovery depends on CG-35's compilation-scope type
+identity evidence. See [bounded design](cg35-type-identity.md). Schedule that
+prerequisite separately; do not relax this acceptance contract or mark CG-36 Done.

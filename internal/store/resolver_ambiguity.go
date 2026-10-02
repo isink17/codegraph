@@ -196,6 +196,14 @@ const (
 	)`
 )
 
+// JVM scope owns every edge from a file with persisted scope evidence, even
+// when it refuses a target. Read that ownership directly: incremental suffix
+// passes do not run the scope resolvers that populate transaction-local vetoes.
+const resolverJVMScopeVetoSQL = `(f.language IN ('java','kotlin') AND EXISTS (
+	SELECT 1 FROM file_scope_evidence fs
+	WHERE fs.repo_id = edges.repo_id AND fs.file_id = edges.file_id
+))`
+
 // resolverBindableCandidateSQL is what a repo-wide strategy must satisfy to
 // write a destination at all: the P2 language gate, the requirement that the
 // candidate group actually holds an id this caller kind may bind (P7), the
@@ -221,8 +229,7 @@ var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
 		AND ` + resolverCppBareNamespaceScopeSQL + `
 		AND ` + resolverCppBareMemberScopeSQL + `
 		AND ` + rubyScopeVetoSQL + `
-		AND NOT EXISTS (SELECT 1 FROM tmp_java_scope_veto jsv WHERE jsv.edge_id = edges.id)` + `
-		AND NOT EXISTS (SELECT 1 FROM tmp_kotlin_scope_veto ksv WHERE ksv.edge_id = edges.id)` + `
+		AND NOT ` + resolverJVMScopeVetoSQL + `
 		AND NOT EXISTS (SELECT 1 FROM ` + csharpScopeVeto + ` csv WHERE csv.edge_id = edges.id)` + `
 		AND NOT EXISTS (SELECT 1 FROM ` + tsScopeVeto + ` tsv WHERE tsv.edge_id = edges.id)` + `
 		AND NOT EXISTS (SELECT 1 FROM ` + pyScopeVeto + ` psv WHERE psv.edge_id = edges.id)` + `
