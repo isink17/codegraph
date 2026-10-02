@@ -10,7 +10,7 @@ on:
     # Adding windows-stress to an open PR triggers the deep Windows gate.
     # Release-candidate checks use a PR targeting v2.0 with this label; no
     # workflow_dispatch or schedule can accidentally run against master.
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, edited, labeled]
 
 jobs:
   test-native:
