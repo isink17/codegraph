@@ -1,0 +1,5 @@
+# name URL repository-commit composer-json-sha256 S1-K fresh-agree-count s1-agree-count
+guzzle https://github.com/guzzle/guzzle.git 93939470950a9b11e2e84204166ef5e048c55fe4 98ff9c4def56556950ff12cdc5c58f168d536063fab95d9b1b6210f7a401679d 10 3329 3146
+composer https://github.com/composer/composer.git 25612018356ea810bce1b86fba84acd4634b5a96 b24d40d8599a285d7fcc12bf1c0a85e8922d6162d51e7d6b9ff12fecc2c31d28 10 4425 4259
+framework https://github.com/laravel/framework.git 6070a6d7e9804a490b12cb889173fbb926b8e3c8 569e7ab8a687a35d011999d64e2380dbda1cdb0e4c657cb310fcdbf19dee2a1a 30 23394 21795
+symfony https://github.com/symfony/symfony.git 3bf30ac8646b8c9bb9b9ce6fa93a59081926f767 fd3b7b0ea6f69f133eb420973d478fbc6f1d8cf1c4619e667db10a97df98e5b0 30 37296 37066
