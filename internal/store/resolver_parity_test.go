@@ -336,9 +336,7 @@ func TestIncrementalDotTail2HonorsBroadBareNameAmbiguity(t *testing.T) {
 		t.Fatalf("full resolver bound %q; want broad ambiguity veto", full)
 	}
 	f.clearAll(t)
-	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
+
 	f.resolveVia(t, "paths+names", []string{"app/defs.py"}, []string{"obj.run"})
 	if got := f.binding(t, edge); got != "<unresolved>" {
 		t.Fatalf("incremental resolver bound %q; want parity with full resolver (tail target %d)", got, tail)
@@ -360,9 +358,7 @@ func TestIncrementalDotTail3HonorsBroadBareNameAmbiguity(t *testing.T) {
 		t.Fatalf("full resolver bound %q; want broad ambiguity veto", got)
 	}
 	f.clearAll(t)
-	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
+
 	f.resolveVia(t, "paths+names", []string{"app/defs.py"}, []string{"a.obj.run"})
 	if got := f.binding(t, edge); got != "<unresolved>" {
 		t.Fatalf("incremental resolver bound %q; want parity with full resolver", got)
@@ -379,11 +375,7 @@ func TestExactQualifiedEvidenceBeatsBroadBareAmbiguity(t *testing.T) {
 			callerFile := f.file(t, "app/main.py", "python")
 			caller := f.symbol(t, callerFile, "main", "main", "function", "python")
 			edge := f.edge(t, callerFile, caller, "obj.run")
-			if entry != "full" {
-				if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
-					t.Fatal(err)
-				}
-			}
+
 			f.resolveVia(t, entry, []string{"app/main.py"}, []string{"obj.run"})
 			if got, want := f.binding(t, edge), "obj.run|exact_qualified|high"; got != want {
 				t.Fatalf("got %q, want %q (target %d)", got, want, target)
@@ -405,9 +397,7 @@ func TestDotTailBroadVetoKeepsCallerTestSemantics(t *testing.T) {
 			callerFile := f.file(t, callerPath, "python")
 			caller := f.symbol(t, callerFile, "main", "main", "function", "python")
 			edge := f.edge(t, callerFile, caller, "obj.run")
-			if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
-				t.Fatal(err)
-			}
+
 			f.resolveVia(t, "paths+names", []string{callerPath}, []string{"obj.run"})
 			got := f.binding(t, edge)
 			if strings.HasSuffix(callerPath, "_test.py") {

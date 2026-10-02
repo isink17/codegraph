@@ -1,7 +1,6 @@
 package store
 
-// Persisted `files.parse_state` values. The column has existed since migration
-// 001; these constants make it an enforced lifecycle contract rather than
+// Persisted `files.parse_state` values. These constants enforce lifecycle rather than
 // decorative metadata, and they are the vocabulary the indexer's re-entry
 // decision reads back (see ExistingFileMeta.ParseState).
 //
@@ -9,8 +8,7 @@ package store
 // describe the file's current bytes?". Only ParseStateIndexed and
 // ParseStateSkipped answer yes.
 const (
-	// ParseStatePending is the column default, and the marker repair
-	// migrations write (033/034/035) to force a reparse. It never claims the
+	// ParseStatePending is the column default for an incomplete parse. It never claims the
 	// graph is current.
 	ParseStatePending = "pending"
 

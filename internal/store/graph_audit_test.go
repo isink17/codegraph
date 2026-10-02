@@ -882,7 +882,7 @@ func TestAuditExampleColumnsMatchScanArity(t *testing.T) {
 }
 
 // splitSQLColumns splits a SELECT projection on its top-level commas, ignoring
-// commas nested inside call parentheses such as COALESCE(x, ''). A naive
+// commas nested inside call parentheses such as COALESCE(x, ”). A naive
 // strings.Split would count those and make the arity assertions meaningless.
 func splitSQLColumns(list string) []string {
 	var out []string

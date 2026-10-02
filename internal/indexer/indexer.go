@@ -77,39 +77,6 @@ func (i *Indexer) SupportedLanguages() []parser.LanguageSupport {
 	return i.registry.SupportedLanguages()
 }
 
-// cppProbeSource is parsed once per full run to answer one question: does this
-// binary's C/C++ adapter produce call edges? A capability flag on the Adapter
-// interface would be a second place for the answer to be wrong; asking the
-// adapter is the answer itself.
-const cppProbeSource = "void cg_probe_callee() {}\nvoid cg_probe_caller() { cg_probe_callee(); }\n"
-
-// cppAdapterEmitsCalls reports whether the registry's C/C++ adapter builds a
-// call graph. The tree-sitter adapter (cgo) does; the heuristic fallback used
-// by the non-cgo build emits symbols only. P22.11's upgrade reparses C/C++
-// files, which rebuilds their call edges under the first and would delete them
-// under the second.
-func cppAdapterEmitsCalls(ctx context.Context, registry *parser.Registry) bool {
-	if registry == nil {
-		return false
-	}
-	adapter := registry.AdapterFor("cg_probe.cpp")
-	if adapter == nil {
-		return false
-	}
-	probe, err := adapter.Parse(ctx, "cg_probe.cpp", []byte(cppProbeSource))
-	if err != nil {
-		return false
-	}
-	for _, edge := range probe.Edges {
-		if edge.Kind == "calls" {
-			return true
-		}
-	}
-	return false
-}
-
-// languageAllowed reports whether a run's `languages` allowlist admits a
-// language. An empty allowlist admits everything, matching processFileTask.
 func languageAllowed(allowed []string, language string) bool {
 	return len(allowed) == 0 || slices.Contains(allowed, language)
 }
@@ -180,15 +147,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if manifestChanged {
 		candidatePaths = nil
 	}
-	// Asked before pass 1 writes anything, because that is the only moment an
-	// empty graph still means "this repository has never been indexed". It gates
-	// the one-time resolver repairs below: a first index produces the current
-	// rules' answer by construction, so running a repair resolve against it
-	// would only duplicate its own resolve pass.
-	hadExistingGraph, err := i.store.RepoHasExistingGraph(ctx, repo.ID)
-	if err != nil {
-		return store.ScanSummary{}, err
-	}
 	pathScoped := len(candidatePaths) > 0
 	// Which languages a path-scoped run could mutate. Profile convergence is
 	// language-scoped, so a Go-only flush must not be refused because Java is
@@ -219,10 +177,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// database byte-identical, and the cheapest way to guarantee that is to
 	// decide before any row -- scan bookkeeping included -- is written.
 	//
-	// It is also before the C++ repair below and before change detection, for
-	// the same reason that repair marks files here: the decision is an input to
-	// which files this run parses, so a run that discovers it one phase later
-	// would not act on it until the next one.
+	// Profile planning precedes change detection because it decides which
+	// unchanged files this run must parse again.
 	// ------------------------------------------------------------------
 	currentProfiles := i.registry.LanguageProfiles()
 	profileGroups, err := i.store.FileParserProfileGroups(ctx, repo.ID)
@@ -264,47 +220,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		candidatePaths = slices.Compact(candidatePaths)
 	}
 
-	// P22.11: a repository indexed by an older release holds C/C++ call edges
-	// whose destination lost its receiver (`v.size()` persisted as `size`), and
-	// the wrong binding that produced. Unlike every earlier resolver upgrade
-	// this cannot be repaired by clearing bindings -- the persisted fact itself
-	// is lossy -- so the files have to reach the parser again. Marking them here
-	// rather than next to the other repair in Pass 2 is deliberate: change
-	// detection reads the file metadata below, so a marker written after that
-	// point would not take effect until the *next* run, leaving a known-wrong
-	// edge class live for one more update.
-	//
-	// Three shapes are skipped, each because the mark could not be honoured by
-	// the run that writes it:
-	//
-	//   - a path-scoped run walks only the caller's paths, so most marked files
-	//     would never be visited. The watcher drains this way on every ordinary
-	//     flush (watcher.go sets Options.Paths), so a repository that is only
-	//     ever watched keeps the old edges until someone runs `codegraph index`
-	//     or `codegraph update` -- a forced rescan is enough, an incremental
-	//     flush is not.
-	//   - a `languages` allowlist that excludes cpp makes processFileTask stop
-	//     at the allowlist check, before it reads the file, so the cleared
-	//     metadata would never be replaced and `file_state` would report the
-	//     sentinel mtime for the life of the index.
-	//   - no C/C++ adapter that produces call edges at all: the non-cgo build
-	//     falls back to the heuristic adapter, which emits none, so reparsing
-	//     there would delete a C++ call graph instead of rebuilding it.
-	//
-	// The pending check runs before the capability probe so a repository that is
-	// already upgraded costs one indexed SELECT rather than a parse.
-	// See store/cpp_receiver_upgrade.go.
-	if len(opts.Paths) == 0 && languageAllowed(opts.Languages, "cpp") {
-		pending, err := i.store.CppReceiverUpgradePending(ctx, repo.ID)
-		if err != nil {
-			return store.ScanSummary{}, err
-		}
-		if pending && cppAdapterEmitsCalls(ctx, i.registry) {
-			if err := i.store.MarkCppFilesForReparseOnce(ctx, repo.ID); err != nil {
-				return store.ScanSummary{}, err
-			}
-		}
-	}
 	scanID, started, err := i.store.BeginScan(ctx, repo.ID, scanKind)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -1014,37 +929,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// ---------------------------------------------------------------------
 	resolveStart := time.Now()
 
-	// Runs before the dispatch below, not inside it: a repository indexed by an
-	// older release holds bindings the current resolver refuses, no strategy
-	// reconsiders an already-bound edge, and a run over an unchanged tree
-	// resolves nothing at all -- so an upgrade would otherwise never converge.
-	// Guarded by a per-repository settings key, so it costs one indexed SELECT
-	// on every run after the first. See store/resolver_type_scope.go.
-	// `repairResolvedRepoWide` is what keeps the first scan after an upgrade from
-	// resolving the whole repository twice: a repair that had to clear bindings
-	// re-resolves inside its own transaction, and the repo-wide dispatch below
-	// would then repeat exactly that work.
-	repairResolvedRepoWide := false
-	markFreshResolverRepairs := false
-	deferReferenceRepair := len(changedPathSet) > 0 || len(removedSymbolNameSet) > 0
-	referenceRepairAfterEdgePass := false
-	if hadExistingGraph {
-		if deferReferenceRepair {
-			repairResolvedRepoWide, err = i.store.RepairResolverBindingsBeforeEdges(ctx, repo.ID)
-		} else {
-			repairResolvedRepoWide, err = i.store.RepairResolverBindingsOnce(ctx, repo.ID)
-		}
-		referenceRepairAfterEdgePass = deferReferenceRepair && repairResolvedRepoWide && !incrementalResolve
-	} else {
-		// Mark only after this scan's edge and reference Pass 2 succeeds. A
-		// failed fresh scan must not claim current derived-state semantics.
-		markFreshResolverRepairs = true
-	}
-	if err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
-	}
-
 	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
 		summary.ResolveMS = 0
 		summary.ResolveMode = "none"
@@ -1092,29 +976,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.ResolveCrossFile = &stats
 			summary.ResolveCrossFileTargets = stats.TargetsSelected
 		}
-	} else if repairResolvedRepoWide {
-		// The repair above already ran this exact pass over the same graph:
-		// every file is persisted before Pass 2 starts, so a second repo-wide
-		// resolve could only reach the same answer.
-		summary.ResolveMode = "repo"
 	} else {
 		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
 			return summary, resolveErr
 		}
 		summary.ResolveMode = "repo"
-	}
-	if markFreshResolverRepairs || deferReferenceRepair {
-		if referenceRepairAfterEdgePass {
-			if _, err := i.store.RepairResolverBindingsOnce(ctx, repo.ID); err != nil {
-				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-				return summary, err
-			}
-		}
-		if err := i.store.MarkResolverBindingsRepaired(ctx, repo.ID); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
-		}
 	}
 	xlangCurrent, err := i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
 	if err != nil {
@@ -1124,7 +991,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// Cross-language edges are a complete derived set. Any parser graph
 	// replacement, retirement, or deletion clears the durable currentness marker
 	// in the same store transaction; an absent marker also covers pre-P22.37
-	// databases and failed prior repairs.
+	// databases and incomplete prior scans.
 	if !xlangCurrent || len(changedPathSet) > 0 {
 		if _, err := i.store.ResolveCrossLanguageLinks(ctx, repo.ID); err != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
@@ -1137,9 +1004,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// the batch can change a binding anywhere), and it costs O(test_links) in a
 	// fixed number of set-based statements. It also runs for deletion-only
 	// updates (removing a production file must re-derive the file-level targets
-	// its tests were bound to) and unconditionally on a full `index` run, so an
-	// upgraded database gets its legacy rows cleaned and re-derived without
-	// needing any file to change first. Only a no-op incremental update skips
+	// its tests were bound to) and unconditionally on a full `index` run.
+	// Only a no-op incremental update skips
 	// it, keeping watch loops cheap.
 	if scanKind != "update" || len(changedPathSet) > 0 || summary.FilesDeleted > 0 {
 		testLinkStart := time.Now()
@@ -1250,9 +1116,9 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	// Does the persisted graph describe the bytes on disk? Only a prior state
 	// that actually produced a graph from them says yes. A file previously
 	// skipped as oversize, failed under best_effort, or marked pending by a
-	// repair migration says no, and must be re-evaluated even when its size and
+	// incomplete prior scan says no, and must be re-evaluated even when its size and
 	// mtime are byte-identical -- otherwise raising the cap, fixing a parser, or
-	// shipping a repair migration never reaches it.
+	// retrying an incomplete scan never reaches it.
 	priorDescribesBytes := hasPrev && store.ParseStateDescribesCurrentBytes(prev.ParseState)
 	unchangedOnDisk := hasPrev && prev.SizeBytes == task.info.Size() && prev.MtimeUnixNS == task.info.ModTime().UnixNano()
 
@@ -1280,7 +1146,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 		return result
 	}
 	// Otherwise fall through and parse. When the file did not move, what
-	// changed is the configuration, the parser, or a repair marker.
+	// changed is the configuration or the parser.
 
 	hash := ""
 	var content []byte

@@ -391,56 +391,6 @@ func TestFindCalleesMemberSpellingIsLiteral(t *testing.T) {
 	}
 }
 
-// TestMigration023ClearsMemberBareTailBindings: an existing database carries
-// bindings the retired member bare-tail fallback wrote; re-applying migration
-// 023 must clear exactly that class -- dotted slash-free bare_tail rows --
-// and leave bare, import-path, and dot_tail2 bindings untouched.
-//
-// P22.8 note: this resets version 23 only, so 027 stays recorded and does not
-// re-run. On a real upgrade 027 runs after 023 and does clear `slashKept` (an
-// import-path spelling degraded to its tail is exactly the class 027 retires)
-// and relabels `bareKept`. What this test pins is narrower and still true: 023
-// must not touch either of them for the MEMBER rule's reason.
-func TestMigration023ClearsMemberBareTailBindings(t *testing.T) {
-	f := newGateFixture(t)
-	defs := f.file(t, "src/go/app.go", "go")
-	dst := f.symbol(t, defs, "Close", "app.App.Close", "go")
-	caller := f.file(t, "src/go/db.go", "go")
-	src := f.symbol(t, caller, "Query", "db.Query", "go")
-
-	insertBound := func(dstName, strategy string) int64 {
-		res, err := f.store.db.ExecContext(f.ctx, `
-			INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line,
-				resolution_strategy, resolution_confidence)
-			VALUES(?, ?, ?, ?, 'call', '', ?, 1, ?, ?)`,
-			f.repoID, src, dst, dstName, caller, strategy, resolutionConfidenceFor(strategy))
-		if err != nil {
-			t.Fatalf("insert bound edge %q: %v", dstName, err)
-		}
-		id, err := res.LastInsertId()
-		if err != nil {
-			t.Fatalf("LastInsertId: %v", err)
-		}
-		return id
-	}
-	legacyMember := insertBound("rows.Close", ResolutionStrategyBareTail)
-	bareKept := insertBound("Close", ResolutionStrategyBareTail)
-	slashKept := insertBound("github.com/org/repo/app.Close", ResolutionStrategyBareTail)
-	tail2Kept := insertBound("App.Close", ResolutionStrategyDotTail2)
-
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM schema_migrations WHERE version = 23`); err != nil {
-		t.Fatalf("reset migration 23: %v", err)
-	}
-	if err := f.store.Migrate(); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	assertUnresolvedNoMetadata(t, f, legacyMember)
-	assertResolvedWithStrategy(t, f, bareKept, dst, ResolutionStrategyBareTail)
-	assertResolvedWithStrategy(t, f, slashKept, dst, ResolutionStrategyBareTail)
-	assertResolvedWithStrategy(t, f, tail2Kept, dst, ResolutionStrategyDotTail2)
-}
-
 func assertUnresolvedNoMetadata(t *testing.T, f *gateFixture, edgeID int64) {
 	t.Helper()
 	var dst any

@@ -131,30 +131,3 @@ func TestPHPComposerPSR4ReconcileBindingsAndReferencesAtomically(t *testing.T) {
 		t.Fatalf("rollback mappings = %#v, %v", mappings, err)
 	}
 }
-
-func TestMigrationPHPComposerPSR4Mapping(t *testing.T) {
-	const migrationVersion = 41
-	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
-	if versions := applyMigrationsBelow(t, ctx, dbPath, migrationVersion); len(versions) == 0 {
-		t.Fatal("no prior migrations")
-	}
-	s, err := Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='php_composer_psr4_mapping'`).Scan(&count); err != nil || count != 1 {
-		t.Fatalf("mapping table = %d, %v", count, err)
-	}
-	for _, name := range []string{"idx_php_composer_psr4_mapping_repo_role_prefix", "idx_php_composer_psr4_mapping_repo_root"} {
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&count); err != nil || count != 1 {
-			t.Fatalf("index %s = %d, %v", name, count, err)
-		}
-	}
-	var userVersion int
-	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil || userVersion != DatabaseFormatUserVersion {
-		t.Fatalf("user_version = %d, %v", userVersion, err)
-	}
-}

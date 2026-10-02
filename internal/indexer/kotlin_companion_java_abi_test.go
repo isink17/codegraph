@@ -3,7 +3,6 @@
 package indexer
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -127,34 +126,6 @@ class Service {
 	r.assertFreshParity(t, "companion file restored")
 }
 
-func TestKotlinCompanionExistingV3DatabaseResolverRepair(t *testing.T) {
-	java := `package app; import lib.Service; class Caller { void call() { Service.Companion.run(); } }`
-	kotlin := `package lib
-class Service {
-    companion object { fun run() {} }
-}`
-	r := newLifecycleRepo(t, tree{"Caller.java": java, "Service.kt": kotlin})
-	assertJVMResolved(t, r, "Caller.java", "Service.Companion.run", "Service.kt", "java_import_scope")
-	db := r.raw(t)
-	repoID := r.repoID
-	if _, err := db.Exec(`UPDATE edges SET dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE repo_id=? AND dst_name='Service.Companion.run'`, repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`UPDATE references_tbl SET symbol_id=NULL WHERE repo_id=? AND qualified_name='Service.Companion.run'`, repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`DELETE FROM settings WHERE key=?`, storeResolverCompanionRepairKey(repoID)); err != nil {
-		t.Fatal(err)
-	}
-	summary := r.update(t)
-	if summary.FilesChanged != 0 {
-		t.Fatalf("unchanged v3 update changed %d files", summary.FilesChanged)
-	}
-	assertJVMResolved(t, r, "Caller.java", "Service.Companion.run", "Service.kt", "java_import_scope")
-	assertJVMReference(t, r, "Caller.java", "Service.Companion.run", true)
-	r.assertFreshParity(t, "v3 resolver-only upgrade repair")
-}
-
 func TestJavaCompanionOuterScopeForms(t *testing.T) {
 	kotlin := `package lib
 class Service {
@@ -214,8 +185,4 @@ class Caller {
 	assertJVMUnresolved(t, r, "Caller.java", "Service.run")
 	assertJVMResolved(t, r, "Caller.java", "Renamed.run", "Service.kt", "java_import_scope")
 	r.assertFreshParity(t, "outer class rename")
-}
-
-func storeResolverCompanionRepairKey(repoID int64) string {
-	return "resolver.jvm_companion_callable_abi_repaired.v1." + fmt.Sprint(repoID)
 }

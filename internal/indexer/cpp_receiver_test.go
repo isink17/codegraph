@@ -473,47 +473,6 @@ func TestCppQualifiedCallFullUpdateParity(t *testing.T) {
 	}
 }
 
-// TestCppLegacyDatabaseLosesReceiverDiscardedBindings is the C++
-// receiver-reparse upgrade contract. A database written by an older release
-// holds the lossy bare-tail destination and the binding it produced; the parser
-// fix alone would only reach files that happen to change afterwards, so the
-// false relation would survive indefinitely on an existing index. One normal
-// `update` run with the new binary must remove it, and the run after that must
-// change nothing.
-func TestCppLegacyDatabaseLosesReceiverDiscardedBindings(t *testing.T) {
-	r := newCppRepo(t)
-	r.write("project.hpp", "struct ProjectType { int size() { return 0; } };\n")
-	r.write("user.cpp", "#include <vector>\nvoid user() {\n    std::vector<int> v;\n    v.size();\n}\n")
-	r.run("index")
-
-	fresh := r.projection()
-
-	// Rewrite the graph into the shape an older release persisted: the receiver
-	// discarded from `dst_name`, the edge bound to the project's own `size`.
-	legacyDowngrade(t, r.dbPath)
-	clearCppUpgradeMarker(t, r.dbPath)
-	if got := legacyBoundTargets(t, r.dbPath); got != 1 {
-		t.Fatalf("legacy downgrade left %d bound edges, want 1", got)
-	}
-
-	r.run("update")
-	if got := legacyBoundTargets(t, r.dbPath); got != 0 {
-		t.Fatalf("after upgrade update: %d receiver-discarded bindings remain, want 0", got)
-	}
-	upgraded := r.projection()
-	if strings.Join(upgraded, "\n") != strings.Join(fresh, "\n") {
-		t.Fatalf("upgraded projection differs from fresh:\ngot:\n%s\nwant:\n%s",
-			strings.Join(upgraded, "\n"), strings.Join(fresh, "\n"))
-	}
-
-	r.run("update")
-	again := r.projection()
-	if strings.Join(again, "\n") != strings.Join(upgraded, "\n") {
-		t.Fatalf("second upgrade run was not idempotent:\ngot:\n%s\nwant:\n%s",
-			strings.Join(again, "\n"), strings.Join(upgraded, "\n"))
-	}
-}
-
 // legacyDowngrade rewrites a current database into the shape written before the
 // receiver fix: member call destinations lose their receiver and bind the
 // project method whose bare name matches.
@@ -626,21 +585,8 @@ func TestCppThisReceiverStaysUnresolved(t *testing.T) {
 	}
 }
 
-// TestCppUpgradeSkippedWithoutCallCapableAdapter guards the non-cgo build. The
-// heuristic C/C++ adapter emits symbols but no call edges, so forcing the C++
-// receiver reparse there would delete a C++ call graph a cgo build had produced
-// rather than rebuild it. The mark must not fire, and the graph must survive an
-// ordinary update run.
-//
-// The run no longer merely declines the mark: parser-profile safety refuses the
-// scan outright, before BeginScan, because replacing tree-sitter C++ evidence
-// with symbols-only heuristic output is the destructive downgrade that contract
-// exists to stop. The property under test is unchanged -- the C++ call graph
-// must survive -- and it is now enforced one step earlier. The receiver-reparse
-// capability probe stays in place: it still gates the mark for the cases parser
-// profiles do not cover (a repository whose C++ files already carry the current
-// profile but predate the receiver fix).
-func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
+// A heuristic parser must not erase a persisted rich C++ call graph.
+func TestCppParserDowngradeRefusedWithoutCallCapableAdapter(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A { int size() { return 1; } };\nvoid caller(A* a) {\n    a->size();\n}\n")
 	r.run("index")
@@ -649,9 +595,6 @@ func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
 		t.Fatalf("fixture produced no call edges")
 	}
 
-	// Make the database look like one an older release wrote, so the upgrade is
-	// still pending, then swap in the registry a non-cgo build would use.
-	clearCppUpgradeMarker(t, r.dbPath)
 	r.useRegistry(parser.NewRegistry(heuristicparser.NewCAndCpp()))
 	if _, err := r.idx.Update(context.Background(), Options{RepoRoot: r.root}); !errors.Is(err, ErrParserDowngradeRefused) {
 		t.Fatalf("Update() error = %v, want ErrParserDowngradeRefused", err)
@@ -663,30 +606,11 @@ func TestCppUpgradeSkippedWithoutCallCapableAdapter(t *testing.T) {
 	}
 }
 
-// clearCppUpgradeMarker makes a database look like one written before the
-// receiver fix, with the one-time C/C++ reparse still pending.
-func clearCppUpgradeMarker(t *testing.T, dbPath string) {
-	t.Helper()
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("sql.Open() error = %v", err)
-	}
-	defer db.Close()
-	if _, err := db.Exec(`DELETE FROM settings WHERE key LIKE 'parser.cpp_receiver_reparsed%'`); err != nil {
-		t.Fatalf("clear upgrade marker error = %v", err)
-	}
-}
-
-// TestCppUpgradeSkippedWhenLanguageExcluded guards the `languages` allowlist.
-// processFileTask stops at the allowlist check before it ever reads the file,
-// so metadata cleared for a language the run will not parse would never be
-// rewritten: the row would keep the sentinel mtime and the empty hash for the
-// life of the index, and `file_state` would report them.
-func TestCppUpgradeSkippedWhenLanguageExcluded(t *testing.T) {
+// Excluding a language must preserve its persisted file metadata.
+func TestCppLanguageExcludedPreservesFileMetadata(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A { int size() { return 1; } };\n")
 	r.run("index")
-	clearCppUpgradeMarker(t, r.dbPath)
 
 	ctx := context.Background()
 	if _, err := r.idx.Index(ctx, Options{RepoRoot: r.root, ScanKind: "update", Languages: []string{"go"}}); err != nil {

@@ -1096,54 +1096,6 @@ func TestTypeScopeImportChangeInAnotherFileInvalidates(t *testing.T) {
 	}
 }
 
-// TestTypeScopeRepairsExistingDatabase pins the upgrade path. A database
-// written before this rule existed holds bindings the rule refuses, and no
-// resolver strategy reconsiders them -- every strategy matches
-// `dst_symbol_id IS NULL`. The repo-wide resolver therefore runs the rule's own
-// negation first, so the next index converges instead of leaving the graph
-// asserting a relationship its own resolver would refuse.
-func TestTypeScopeRepairsExistingDatabase(t *testing.T) {
-	f := newTypeScopeFixture(t)
-	defFile := f.file(t, "app/types.py", "python")
-	projectPath := f.class(t, defFile, "Path", "types.Path", "python")
-	callFile := f.file(t, "app/addons/maplocal.py", "python")
-	f.importPath(t, callFile, "pathlib")
-	load := f.symbolKind(t, callFile, "load", "maplocal.load", "function", "python")
-	edgeID := f.edge(t, callFile, load, "Path")
-
-	// The pre-P22.9 state: bound, with the strategy an older release wrote.
-	if _, err := f.store.db.ExecContext(f.ctx, `
-		UPDATE edges SET dst_symbol_id = ?, resolution_strategy = ?, resolution_confidence = ?
-		WHERE id = ?`, projectPath, ResolutionStrategyExactName, ResolutionConfidenceHigh, edgeID); err != nil {
-		t.Fatalf("seed stale binding error = %v", err)
-	}
-
-	if _, err := f.store.ResolveEdges(f.ctx, f.repoID); err != nil {
-		t.Fatalf("ResolveEdges() error = %v", err)
-	}
-	if got, ok := f.dstSymbolID(t, edgeID); ok {
-		t.Fatalf("stale binding survived a full resolve: still bound to %s", f.qualifiedNameOf(t, got))
-	}
-
-	// Idempotent, and it does not touch a binding the rule allows: the same pass
-	// over a legitimate same-file constructor leaves it alone.
-	localFile := f.file(t, "app/widget.py", "python")
-	widget := f.class(t, localFile, "Widget", "widget.Widget", "python")
-	make := f.symbolKind(t, localFile, "make", "widget.make", "function", "python")
-	localEdge := f.edge(t, localFile, make, "Widget")
-	for range 2 {
-		if _, err := f.store.ResolveEdges(f.ctx, f.repoID); err != nil {
-			t.Fatalf("ResolveEdges() error = %v", err)
-		}
-	}
-	if got, ok := f.dstSymbolID(t, localEdge); !ok || got != widget {
-		t.Fatalf("repair cleared a binding the rule allows: got %v/%d, want %d", ok, got, widget)
-	}
-	if got, ok := f.dstSymbolID(t, edgeID); ok {
-		t.Fatalf("stale binding came back: %s", f.qualifiedNameOf(t, got))
-	}
-}
-
 // TestTypeScopeBareQualifiedNameSeedIsGated covers the seed spelling a C++
 // top-level type actually has. `class Message` at file scope gets
 // `qualified_name = "Message"` -- bare -- so context expansion's QUALIFIED-name
@@ -1174,67 +1126,6 @@ func TestTypeScopeBareQualifiedNameSeedIsGated(t *testing.T) {
 	}
 	if containsSymbolID(neighbors[0].Callers, run) {
 		t.Fatalf("context expansion reported a caller of class Message that the resolver refused")
-	}
-}
-
-// TestTypeScopeRepairClearsNonRedecidableStrategies covers a binding the
-// incremental restriction deliberately spares but the repair must not.
-//
-// A nested `class Outer.Path` has both a name and a container, so
-// `receiver_method` binds it -- a strategy P22.8 keeps an incremental pass from
-// clearing, because an incremental pass could not rebuild it. The repo-wide
-// repair has the opposite premise: this rule refuses the binding, so nothing
-// should rebuild it, and sparing it would mark a repository repaired while it
-// still asserts the relation.
-func TestTypeScopeRepairClearsNonRedecidableStrategies(t *testing.T) {
-	f := newTypeScopeFixture(t)
-	defFile := f.file(t, "app/types.py", "python")
-	nested, err := insertTestSymbolKind(f.ctx, f.store, f.repoID, defFile,
-		"Path", "types.Outer.Path", "class", "Outer", "python")
-	if err != nil {
-		t.Fatalf("insertTestSymbolKind() error = %v", err)
-	}
-	callFile := f.file(t, "app/addons/maplocal.py", "python")
-	f.importPath(t, callFile, "pathlib")
-	load := f.symbolKind(t, callFile, "load", "maplocal.load", "function", "python")
-	edgeID := f.edge(t, callFile, load, "Path")
-	if _, err := f.store.db.ExecContext(f.ctx, `
-		UPDATE edges SET dst_symbol_id = ?, resolution_strategy = ?, resolution_confidence = ?
-		WHERE id = ?`, nested, ResolutionStrategyReceiverMethod, ResolutionConfidenceMedium, edgeID); err != nil {
-		t.Fatalf("seed stale binding error = %v", err)
-	}
-
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatalf("RepairResolverBindingsOnce() error = %v", err)
-	}
-	if got, ok := f.dstSymbolID(t, edgeID); ok {
-		t.Fatalf("repair spared a receiver_method binding the rule refuses: %s", f.qualifiedNameOf(t, got))
-	}
-}
-
-// TestTypeScopeRepairSparesCrossLanguageLinks pins the one exemption. P19b
-// inserts `cross_language_ref` edges already bound from import-bridge evidence
-// and no resolver strategy considers them, so clearing one would delete a
-// destination nothing rebuilds.
-func TestTypeScopeRepairSparesCrossLanguageLinks(t *testing.T) {
-	f := newTypeScopeFixture(t)
-	tsFile := f.file(t, "web/model.ts", "typescript")
-	model := f.class(t, tsFile, "Model", "model.Model", "typescript")
-	pyFile := f.file(t, "app/caller.py", "python")
-	caller := f.symbolKind(t, pyFile, "go", "caller.go", "function", "python")
-	var edgeID int64
-	if err := f.store.db.QueryRowContext(f.ctx, `
-		INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-		VALUES(?, ?, ?, 'Model', ?, '', ?, 1) RETURNING id`,
-		f.repoID, caller, model, EdgeKindCrossLanguageRef, pyFile).Scan(&edgeID); err != nil {
-		t.Fatalf("insert cross-language edge error = %v", err)
-	}
-
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatalf("RepairResolverBindingsOnce() error = %v", err)
-	}
-	if _, ok := f.dstSymbolID(t, edgeID); !ok {
-		t.Fatalf("repair cleared an explicit cross_language_ref link")
 	}
 }
 

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"context"
 	"database/sql"
 	"reflect"
 	"strconv"
@@ -190,90 +189,6 @@ func TestSwiftSuperScopeOwnershipMatrix(t *testing.T) {
 	}
 }
 
-func TestSwiftSuperExtensionTargetUpgradeRepair(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Base", "function", "run()", false)
-	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
-	caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller()", false)
-	swiftSetRange(t, f, base, 1, 1, 3, 20)
-	swiftSetRange(t, f, target, 5, 1, 5, 20)
-	swiftSetRange(t, f, child, 8, 1, 10, 20)
-	swiftSetRange(t, f, caller, 9, 1, 9, 20)
-	swiftSuperclass(t, f, f.mainFile, "Child", "Base")
-	swiftExtensionMembership(t, f, f.mainFile, target, "Base", 4, 6, 0, 0)
-	swiftFact(t, f, f.mainFile, target, "instance")
-	swiftFact(t, f, f.mainFile, caller, "instance")
-	f.arity(target, 0, 0)
-	edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 9)
-	f.reference(f.mainFile, caller, "super.run", 9)
-	ref := swiftReferenceID(t, f, edge)
-	for _, repair := range resolverRepairs {
-		if repair.key != swiftSuperExtensionTargetMethodRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !run {
-		t.Fatalf("first repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeMetadata(t, f, edge, target, ResolutionStrategySwiftSuperScope)
-	if got := swiftReferenceSymbol(t, f, ref); !got.Valid || got.Int64 != target {
-		t.Fatalf("reference dst=%v, want %d", got, target)
-	}
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSuperExtensionTargetMethodRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-}
-
-func TestSwiftSuperExtensionTargetUpgradeRepairRejectsAncestorAmbiguity(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	grand := f.symbol(f.mainFile, "Grand", "", "class", "", false)
-	grandRun := f.symbol(f.mainFile, "run", "Grand", "function", "run(_:)", false)
-	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Base", "function", "run(_:)", false)
-	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
-	caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller(_:)", false)
-	for id, span := range map[int64][2]int64{grand: {1, 3}, grandRun: {2, 2}, base: {5, 7}, target: {9, 9}, child: {12, 14}, caller: {13, 13}} {
-		swiftSetRange(t, f, id, span[0], 1, span[1], 20)
-	}
-	swiftSuperclass(t, f, f.mainFile, "Child", "Base")
-	swiftSuperclass(t, f, f.mainFile, "Base", "Grand")
-	swiftExtensionMembership(t, f, f.mainFile, target, "Base", 8, 10, 0, 0)
-	for _, symbol := range []int64{grandRun, target, caller} {
-		f.arity(symbol, 1, 1)
-		swiftFact(t, f, f.mainFile, symbol, "instance")
-	}
-	edge := f.call(f.mainFile, caller, "super.run", "swift:super;labels=_", 1, 13)
-	f.reference(f.mainFile, caller, "super.run", 13)
-	ref := swiftReferenceID(t, f, edge)
-	for _, repair := range resolverRepairs {
-		if repair.key != swiftSuperExtensionTargetMethodRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !run {
-		t.Fatalf("first repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	assertSwiftReferenceCleared(t, f, ref)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSuperExtensionTargetMethodRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-}
-
 func TestSwiftSuperExtensionTargetInstanceAncestorConflict(t *testing.T) {
 	for _, declaration := range []string{"exact_signature", "type_only_overload"} {
 		for _, sourceExtension := range []bool{false, true} {
@@ -364,43 +279,6 @@ func TestSwiftSuperExtensionTargetRequiresClosedAncestry(t *testing.T) {
 			f.resolve()
 			assertSwiftEdgeUnresolved(t, f, edge)
 		})
-	}
-}
-
-func TestSwiftSuperExtensionTargetUpgradeRepairRequiresClosedAncestry(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	ancestorFile := f.file("Grand.swift")
-	grand := f.symbol(ancestorFile, "Grand", "", "class", "", false)
-	base := f.symbol(f.mainFile, "Base", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Base", "function", "run()", false)
-	child := f.symbol(f.mainFile, "Child", "", "class", "", false)
-	caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller()", false)
-	for id, span := range map[int64][2]int64{grand: {1, 3}, base: {5, 7}, target: {9, 9}, child: {12, 14}, caller: {13, 13}} {
-		swiftSetRange(t, f, id, span[0], 1, span[1], 20)
-	}
-	swiftSuperclass(t, f, f.mainFile, "Child", "Base")
-	swiftSuperclass(t, f, f.mainFile, "Base", "Grand")
-	swiftExtensionMembership(t, f, f.mainFile, target, "Base", 8, 10, 0, 0)
-	f.arity(target, 0, 0)
-	swiftFact(t, f, f.mainFile, target, "instance")
-	swiftFact(t, f, f.mainFile, caller, "instance")
-	edge := f.call(f.mainFile, caller, "super.run", "swift:super", 0, 13)
-	f.reference(f.mainFile, caller, "super.run", 13)
-	ref := swiftReferenceID(t, f, edge)
-	for _, repair := range resolverRepairs {
-		if repair.key != swiftSuperExtensionTargetMethodRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !run {
-		t.Fatalf("first repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	assertSwiftReferenceCleared(t, f, ref)
-	if run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
 	}
 }
 
@@ -1298,83 +1176,6 @@ func TestSwiftSuperMultilevelInheritedMethodScopeNamesAndStats(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSwiftSuperMultilevelInheritedMethodScopeUpgradeRepair(t *testing.T) {
-	f, _ := newSwiftSuperMultilevelAcceptanceFixture(t)
-	for _, repair := range resolverRepairs {
-		if repair.key != swiftSuperMultilevelInheritedMethodRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
-	refID := swiftReferenceID(t, f.swiftScopeFixture, f.edge)
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSuperMultilevelInheritedMethodRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)).Scan(new(string)); err == nil {
-		t.Fatal("super multilevel inherited method repair marker unexpectedly present")
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("first repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f.swiftScopeFixture, f.edge, f.baseRun, ResolutionStrategySwiftSuperMultilevelInheritedMethodScope)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSuperMultilevelInheritedMethodRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	firstDst, firstStrategy, firstConfidence := edgeState(t, f.swiftScopeFixture, f.edge)
-	firstRef := swiftReferenceSymbol(t, f.swiftScopeFixture, refID)
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-	secondDst, secondStrategy, secondConfidence := edgeState(t, f.swiftScopeFixture, f.edge)
-	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstRef != swiftReferenceSymbol(t, f.swiftScopeFixture, refID) {
-		t.Fatal("second repair changed one of the five persisted fields")
-	}
-
-	resetMarker := func() {
-		t.Helper()
-		if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key=?`, swiftSuperMultilevelInheritedMethodRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='unproven' WHERE child_qualified_name='Middle'`); err != nil {
-		t.Fatal(err)
-	}
-	resetMarker()
-	if run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !run {
-		t.Fatalf("unsafe repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
-	assertSwiftReferenceCleared(t, f.swiftScopeFixture, refID)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='superclass' WHERE child_qualified_name='Middle'`); err != nil {
-		t.Fatal(err)
-	}
-	middleRun := f.symbol(f.mainFile, "run", "Middle", "function", "run()", false)
-	swiftSetRange(t, f.swiftScopeFixture, middleRun, 11, 1, 11, 20)
-	f.arity(middleRun, 0, 0)
-	swiftFact(t, f.swiftScopeFixture, f.mainFile, middleRun, "instance")
-	resetMarker()
-	if run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !run {
-		t.Fatalf("rebind repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f.swiftScopeFixture, f.edge, middleRun, ResolutionStrategySwiftSuperScope)
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_declaration_facts WHERE symbol_id=?`, middleRun); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET is_static=1 WHERE id=?`, f.baseRun); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, f.baseRun); err != nil {
-		t.Fatal(err)
-	}
-	resetMarker()
-	if run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !run {
-		t.Fatalf("malformed repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeUnresolved(t, f.swiftScopeFixture, f.edge)
 }
 
 func TestSwiftSuperMultilevelInheritedMethodScopeCandidateBlockerAndSourceLifecycle(t *testing.T) {
@@ -2721,21 +2522,6 @@ func TestSwiftSuperScopeTargetDispatchAndOwnership(t *testing.T) {
 	}
 }
 
-func TestSwiftSuperScopeEvidenceApplicabilityAndRepairTax(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	caller := f.symbol(f.mainFile, "caller", "Child", "function", "caller()", false)
-	for i, evidence := range []string{"swift:self", "swift:Self", "swift:bare", "swift:member", "swift:initializer", "swift:superficial"} {
-		f.call(f.mainFile, caller, "run", evidence, 0, i+1)
-	}
-	if applies, err := f.store.swiftSuperEvidenceApplies(f.ctx, f.repoID); err != nil || applies {
-		t.Fatalf("zero-super applies=(%v,%v)", applies, err)
-	}
-	f.call(f.mainFile, caller, "super.run", "swift:super", 0, 20)
-	if applies, err := f.store.swiftSuperEvidenceApplies(f.ctx, f.repoID); err != nil || !applies {
-		t.Fatalf("super applies=(%v,%v)", applies, err)
-	}
-}
-
 func TestSwiftSuperScopeSelectorsOverloadsAndTrailingLabels(t *testing.T) {
 	t.Run("distinct selector", func(t *testing.T) {
 		f := newSwiftSuperAcceptanceFixture(t)
@@ -3006,63 +2792,6 @@ func TestSwiftSuperScopeMalformedStoreEvidenceRefuses(t *testing.T) {
 	}
 }
 
-func TestSwiftSuperScopeVisibilityAndRepairFramework(t *testing.T) {
-	t.Run("private target refuses and fileprivate binds", func(t *testing.T) {
-		f := newSwiftSuperAcceptanceFixture(t)
-		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, f.baseRun); err != nil {
-			t.Fatal(err)
-		}
-		f.resolve()
-		if got := f.dst(f.edge); got.Valid {
-			t.Fatalf("private target resolved to %d", got.Int64)
-		}
-		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='fileprivate' WHERE id=?`, f.baseRun); err != nil {
-			t.Fatal(err)
-		}
-		f.resolve()
-		if got := f.dst(f.edge); !got.Valid || got.Int64 != f.baseRun {
-			t.Fatalf("fileprivate dst=%v, want %d", got, f.baseRun)
-		}
-	})
-	t.Run("repair binds and marks once", func(t *testing.T) {
-		f := newSwiftSuperAcceptanceFixture(t)
-		if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-			t.Fatalf("repair=(%v,%v)", ran, err)
-		}
-		if got := f.dst(f.edge); !got.Valid || got.Int64 != f.baseRun {
-			t.Fatalf("repair dst=%v, want %d", got, f.baseRun)
-		}
-		var marker string
-		if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSuperRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)).Scan(&marker); err != nil {
-			t.Fatal(err)
-		}
-		if marker != "1" {
-			t.Fatalf("marker=%q", marker)
-		}
-		if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || ran {
-			t.Fatalf("second repair=(%v,%v)", ran, err)
-		}
-	})
-	t.Run("repair cancellation retries", func(t *testing.T) {
-		f := newSwiftSuperAcceptanceFixture(t)
-		cancelled, cancel := context.WithCancel(f.ctx)
-		cancel()
-		if _, err := f.store.RepairResolverBindingsOnce(cancelled, f.repoID); err == nil {
-			t.Fatal("canceled repair succeeded")
-		}
-		var marker string
-		if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSuperRepairSettingKey+"."+strconv.FormatInt(f.repoID, 10)).Scan(&marker); err == nil {
-			t.Fatalf("canceled repair wrote marker %q", marker)
-		}
-		if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-			t.Fatalf("retry=(%v,%v)", ran, err)
-		}
-		if got := f.dst(f.edge); !got.Valid || got.Int64 != f.baseRun {
-			t.Fatalf("retry dst=%v, want %d", got, f.baseRun)
-		}
-	})
-}
-
 func TestSwiftSuperScopeStatsInvariantMixed(t *testing.T) {
 	f := newSwiftSuperAcceptanceFixture(t)
 	missing := f.call(f.mainFile, f.caller, "super.missing", "swift:super", 0, 8)
@@ -3101,4 +2830,24 @@ func TestSwiftSuperScopeBatchesOverSQLiteVariableBudget(t *testing.T) {
 	if bound != total {
 		t.Fatalf("bound=%d, want %d", bound, total)
 	}
+}
+
+func TestSwiftSuperScopeVisibility(t *testing.T) {
+	t.Run("private target refuses and fileprivate binds", func(t *testing.T) {
+		f := newSwiftSuperAcceptanceFixture(t)
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE id=?`, f.baseRun); err != nil {
+			t.Fatal(err)
+		}
+		f.resolve()
+		if got := f.dst(f.edge); got.Valid {
+			t.Fatalf("private target resolved to %d", got.Int64)
+		}
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='fileprivate' WHERE id=?`, f.baseRun); err != nil {
+			t.Fatal(err)
+		}
+		f.resolve()
+		if got := f.dst(f.edge); !got.Valid || got.Int64 != f.baseRun {
+			t.Fatalf("fileprivate dst=%v, want %d", got, f.baseRun)
+		}
+	})
 }

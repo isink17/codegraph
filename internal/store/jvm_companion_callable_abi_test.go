@@ -1,7 +1,6 @@
 package store
 
 import (
-	"database/sql"
 	"strings"
 	"testing"
 )
@@ -183,86 +182,6 @@ func TestJVMKotlinCompanionFixedAritySelectionAndVeto(t *testing.T) {
 			}
 			if ok && f.qualifiedNameOf(t, got) != tc.wantQualified {
 				t.Fatalf("target=%q", f.qualifiedNameOf(t, got))
-			}
-		})
-	}
-}
-
-func TestJVMCompanionRepairGateAndConvergence(t *testing.T) {
-	f := newCompanionScopeFixture(t, "Factory", "fun run() {}", "public", "public")
-	edge := f.edge(t, f.callerFile, f.caller, "Service.Factory.run")
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='Service.Factory.run()' WHERE id=?`, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO references_tbl(repo_id,file_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col,context_symbol_id) VALUES(?,?,'call','run','Service.Factory.run',1,1,1,1,?)`, f.repoID, f.callerFile, f.caller); err != nil {
-		t.Fatal(err)
-	}
-	if applies, err := f.store.jvmCompanionCallableABIRepairApplies(f.ctx, f.repoID); err != nil || !applies {
-		t.Fatalf("repair gate=(%v,%v), want active companion evidence", applies, err)
-	}
-	for _, marker := range []string{typeScopeRepairSettingKey, bareNameLevelRepairSettingKey, dotTailAmbiguityRepairSettingKey, jvmScopePrecisionRepairSettingKey, jvmCoreInteropRepairSettingKey, jvmCommonCallableABIRepairSettingKey} {
-		if err := f.store.markRepairDone(f.ctx, marker, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := f.dstSymbolID(t, edge); !ok || got != f.target {
-		t.Fatalf("repaired edge=(%d,%v), want target %d", got, ok, f.target)
-	}
-	var reference sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil {
-		t.Fatal(err)
-	}
-	if !reference.Valid || reference.Int64 != f.target {
-		t.Fatalf("repaired reference=%v, want target %d", reference, f.target)
-	}
-	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, jvmCompanionCallableABIRepair); err != nil || ran {
-		t.Fatalf("second repair=(%v,%v), want no-op", ran, err)
-	}
-}
-
-func TestJVMCompanionRepairGateSkipsUnsupportedEvidence(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		mutate func(t *testing.T, f *companionScopeFixture)
-	}{
-		{"argument-bearing call", func(t *testing.T, f *companionScopeFixture) {
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='Service.Factory.run(1)' WHERE repo_id=?`, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"renamed method", func(t *testing.T, f *companionScopeFixture) {
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET signature='@JvmName("go") fun run() {}' WHERE id=?`, f.target); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"private companion", func(t *testing.T, f *companionScopeFixture) {
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET visibility='private' WHERE qualified_name='lib.Service.Factory'`); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"ordinary object", func(t *testing.T, f *companionScopeFixture) {
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET kind='object' WHERE qualified_name='lib.Service.Factory'`); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"deleted caller", func(t *testing.T, f *companionScopeFixture) {
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE files SET is_deleted=1 WHERE id=?`, f.callerFile); err != nil {
-				t.Fatal(err)
-			}
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newCompanionScopeFixture(t, "Factory", "fun run() {}", "public", "public")
-			edge := f.edge(t, f.callerFile, f.caller, "Service.Factory.run")
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='Service.Factory.run()' WHERE id=?`, edge); err != nil {
-				t.Fatal(err)
-			}
-			tc.mutate(t, f)
-			if applies, err := f.store.jvmCompanionCallableABIRepairApplies(f.ctx, f.repoID); err != nil || applies {
-				t.Fatalf("repair gate=(%v,%v), want false", applies, err)
 			}
 		})
 	}

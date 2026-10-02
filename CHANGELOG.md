@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+The clean v2 baseline replaces all 44 development migrations and removes one-time
+resolver/reparse upgrades. Older development indexes are refused before mutation
+with `codegraph index <repo-path> --rebuild` guidance. Product generation remains
+`user_version=2`; parser-profile safety and current graph fingerprints remain.
+Legacy v1 databases are untouched.
+
 Symbol-target queries (callers, callees, impact, related tests, and trace) now fail
 closed on ambiguous names at the selected lookup tier. Exact qualified identities
 and explicit symbol IDs keep precedence; database ordering never selects a target.

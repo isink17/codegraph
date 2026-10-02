@@ -4,39 +4,6 @@ import (
 	"testing"
 )
 
-func TestMigrationKotlinJVMCallableEvidenceFrom042(t *testing.T) {
-	ctx := t.Context()
-	path := t.TempDir() + "/graph.sqlite"
-	if got := applyMigrationsBelow(t, ctx, path, 43); len(got) == 0 || got[len(got)-1] != 42 {
-		t.Fatalf("pre-upgrade migrations end at %v, want 42", got)
-	}
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	for _, column := range []string{"repo_id", "file_id", "symbol_id", "is_known", "jvm_arity_min", "jvm_arity_max"} {
-		var count int
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('kotlin_jvm_callable_evidence') WHERE name=?`, column).Scan(&count); err != nil || count != 1 {
-			t.Fatalf("column %s count=%d, err=%v", column, count, err)
-		}
-	}
-	for _, index := range []string{"idx_kotlin_jvm_callable_repo_file"} {
-		var count int
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&count); err != nil || count != 1 {
-			t.Fatalf("index %s count=%d, err=%v", index, count, err)
-		}
-	}
-	var primaryIndex int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('kotlin_jvm_callable_evidence') WHERE origin='pk'`).Scan(&primaryIndex); err != nil || primaryIndex != 1 {
-		t.Fatalf("primary-key index count=%d, err=%v", primaryIndex, err)
-	}
-	var version int
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 44 {
-		t.Fatalf("migration ceiling=%d, err=%v", version, err)
-	}
-}
-
 func TestKotlinJVMCallableEvidenceConstraints(t *testing.T) {
 	f := newGateFixture(t)
 	file := f.file(t, "lib/Actions.kt", "kotlin")

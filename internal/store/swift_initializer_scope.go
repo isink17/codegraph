@@ -7,9 +7,6 @@ import (
 	"strings"
 )
 
-const swiftInitializerRepairSettingKey = "resolver.swift_initializer_repaired.v1"
-const swiftTrailingInitializerRepairSettingKey = "resolver.swift_trailing_initializer_repaired.v1"
-
 type swiftInitializerCallShape struct {
 	owner                         string
 	regularLabels, trailingLabels []string
@@ -272,27 +269,4 @@ func (s *Store) redecideSwiftBindings(ctx context.Context, repoID int64) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-func (s *Store) swiftInitializerRepairApplies(ctx context.Context, repoID int64) (bool, error) {
-	return s.swiftInitializerRepairEvidenceApplies(ctx, repoID, false)
-}
-
-func (s *Store) swiftTrailingInitializerRepairApplies(ctx context.Context, repoID int64) (bool, error) {
-	return s.swiftInitializerRepairEvidenceApplies(ctx, repoID, true)
-}
-
-func (s *Store) swiftInitializerRepairEvidenceApplies(ctx context.Context, repoID int64, trailing bool) (bool, error) {
-	condition := `e.evidence NOT LIKE '%;trailing_labels=%'`
-	if trailing {
-		condition = `e.evidence LIKE '%;trailing_labels=%'`
-	}
-	var found bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM edges e JOIN files f ON f.id=e.file_id
-		WHERE e.repo_id=? AND f.language='swift' AND f.is_deleted=0 AND e.edge_kind='calls'
-		  AND (e.evidence='swift:initializer' OR e.evidence LIKE 'swift:initializer;%')
-		  AND `+condition+`
-	)`, repoID).Scan(&found)
-	return found, err
 }

@@ -433,32 +433,6 @@ func TestJavaExplicitStaticImportKotlinABI(t *testing.T) {
 	}
 }
 
-func TestJavaStaticImportKotlinABIRepairsOnUnchangedUpdate(t *testing.T) {
-	r := newLifecycleRepo(t, tree{
-		"Caller.java": "package app; import static lib.Api.run; class Caller { void call() { run(); } }",
-		"Api.kt":      "@file:JvmName(\"Api\")\npackage lib\nfun run() {}",
-	})
-	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err := db.ExecContext(r.ctx, `UPDATE edges SET dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE repo_id=? AND dst_name='run'`, r.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(r.ctx, `UPDATE references_tbl SET symbol_id=NULL WHERE repo_id=? AND qualified_name='run'`, r.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(r.ctx, `DELETE FROM settings WHERE key LIKE 'resolver.jvm_static_import_kotlin_abi_repaired.v1.%'`); err != nil {
-		t.Fatal(err)
-	}
-	if summary := r.update(t); summary.FilesChanged != 0 {
-		t.Fatalf("unchanged update reparsed %d files, want 0", summary.FilesChanged)
-	}
-	assertJVMResolved(t, r, "Caller.java", "run", "Api.kt", "java_static_import")
-	r.assertFreshParity(t, "static import ABI repair")
-}
-
 func TestJVMCoreInteropJavaPeerVisibility(t *testing.T) {
 	for _, tc := range []struct {
 		visibility string
