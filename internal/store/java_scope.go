@@ -78,10 +78,41 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	// candidate population to lexical components named by those edges; a local
 	// edit therefore cannot turn this pass into a repository-wide symbol scan.
 	scopeNames := map[string]struct{}{}
+	imports := map[int64][]javaScopeImport{}
+	importFiles := map[int64]struct{}{}
 	for _, e := range edges {
+		importFiles[e.file] = struct{}{}
 		for _, part := range strings.FieldsFunc(e.name, func(r rune) bool { return r == '.' || r == '$' }) {
 			if part != "" {
 				scopeNames[part] = struct{}{}
+			}
+		}
+	}
+	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(importFiles),
+		`SELECT file_id,source_specifier,local_name,wildcard,is_static FROM scope_import_evidence WHERE repo_id=? AND language='java' AND file_id IN (`,
+		[]any{repoID}, func(scan func(...any) error) error {
+			var file int64
+			var i javaScopeImport
+			var w, st int
+			if err := scan(&file, &i.source, &i.local, &w, &st); err != nil {
+				return err
+			}
+			i.wildcard = w != 0
+			i.static = st != 0
+			imports[file] = append(imports[file], i)
+			return nil
+		}); err != nil {
+		return 0, err
+	}
+	for _, fileImports := range imports {
+		for _, i := range fileImports {
+			if !i.static || i.wildcard {
+				continue
+			}
+			for _, part := range strings.FieldsFunc(i.source, func(r rune) bool { return r == '.' || r == '$' }) {
+				if part != "" {
+					scopeNames[part] = struct{}{}
+				}
 			}
 		}
 	}
@@ -242,33 +273,6 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 			return 0, err
 		}
 	}
-	imports := map[int64][]javaScopeImport{}
-	// Load the evidence by file rather than through the selected edges: the
-	// edges are already in hand and carry their file, and `imports` is only ever
-	// read as imports[e.file]. Batching an edge-id subquery would select the
-	// same file from several batches and duplicate its import rows, which the
-	// unique-candidate rules below read as ambiguity.
-	importFiles := map[int64]struct{}{}
-	for _, e := range edges {
-		importFiles[e.file] = struct{}{}
-	}
-	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(importFiles),
-		`SELECT file_id,source_specifier,local_name,wildcard,is_static FROM scope_import_evidence WHERE repo_id=? AND language='java' AND file_id IN (`,
-		[]any{repoID}, func(scan func(...any) error) error {
-			var file int64
-			var i javaScopeImport
-			var w, st int
-			if err := scan(&file, &i.source, &i.local, &w, &st); err != nil {
-				return err
-			}
-			i.wildcard = w != 0
-			i.static = st != 0
-			imports[file] = append(imports[file], i)
-			return nil
-		}); err != nil {
-		return 0, err
-	}
-
 	res := map[int64]struct {
 		dst      int64
 		strategy string
@@ -494,21 +498,28 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false); ok {
 		return s, str
 	}
+	explicitStaticOwners := map[string]struct{}{}
+	for _, i := range imps[e.file] {
+		if i.static && !i.wildcard && i.local == name {
+			p := strings.LastIndex(i.source, ".")
+			if p < 0 || i.source[p+1:] != name {
+				return javaScopeSymbol{}, ""
+			}
+			explicitStaticOwners[i.source[:p]] = struct{}{}
+		}
+	}
+	if len(explicitStaticOwners) > 1 {
+		return javaScopeSymbol{}, ""
+	}
 	var staticCandidates []javaScopeSymbol
 	for _, i := range imps[e.file] {
 		if !i.static {
 			continue
 		}
 		if !i.wildcard && i.local == name {
-			p := strings.LastIndex(i.source, ".")
-			if p < 0 {
-				return javaScopeSymbol{}, ""
-			}
-			owner := i.source[:p]
-			for _, s := range byQName[owner+"."+name] {
-				if s.language == "java" && s.static.Valid && s.static.Int64 != 0 && javaVisible(s, e.pkg, s.pkg) {
-					staticCandidates = append(staticCandidates, s)
-				}
+			owner := i.source[:strings.LastIndex(i.source, ".")]
+			if target := javaStaticImportMember(e, owner, name, byQName, byName, facades, companions); target.id != 0 {
+				staticCandidates = append(staticCandidates, target)
 			}
 		}
 		if i.static && i.wildcard {
@@ -523,6 +534,33 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		return staticCandidates[0], "java_static_import"
 	}
 	return javaScopeSymbol{}, ""
+}
+
+// javaStaticImportMember follows an explicit import's exact JVM owner. In
+// particular, Kotlin declarations participate only through their established
+// facade/object/companion ABI rules; bare-name candidates remain inadmissible.
+func javaStaticImportMember(e javaScopeEdge, ownerName, name string, byQName, byName map[string][]javaScopeSymbol, facades map[string][]javaFacadePart, companions map[string][]javaScopeSymbol) javaScopeSymbol {
+	owner, ok, strategy := javaType(ownerName, e.pkg, e.container, byQName, byName, nil)
+	if !ok {
+		return javaScopeSymbol{}
+	}
+	switch {
+	case owner.language == "java":
+		s, ok, _ := javaMethods(owner.qname, name, e.pkg, e.container, byQName, strategy, true)
+		if ok {
+			return s
+		}
+	case owner.kind == kotlinFileFacadeKind:
+		s, _ := kotlinFacadeMember(owner, name, e, byQName, facades[owner.qname], strategy)
+		return s
+	case owner.kind == "object":
+		s, _ := kotlinObjectMember(owner, name, e, byQName, strategy, true)
+		return s
+	case owner.kind == "class":
+		s, _ := kotlinCompanionStaticMember(owner, name, e, byQName, companions, strategy)
+		return s
+	}
+	return javaScopeSymbol{}
 }
 
 func kotlinOwnedCompanion(outer javaScopeSymbol, field, pkg string, companions map[string][]javaScopeSymbol) (javaScopeSymbol, bool) {
@@ -564,7 +602,7 @@ func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEd
 			}
 			out = s
 			n++
-			if !kotlinFacadeCallable(s.name, s.signature) || !kotlinNoArgFunction(s.signature) || requireJvmStatic && !kotlinHasJvmStatic(s.signature) {
+			if !kotlinFacadeCallable(s.name, s.signature) || kotlinHasAliasedAnnotation(s.signature, s.jvmSyntheticAliases) || !kotlinNoArgFunction(s.signature) || requireJvmStatic && !kotlinHasJvmStatic(s.signature) {
 				return javaScopeSymbol{}, ""
 			}
 		}
@@ -608,7 +646,7 @@ func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 			out = s
 			n++
 			jvmStatic := kotlinHasJvmStatic(s.signature)
-			if kotlinExtensionSignature(s.name, s.signature) || kotlinHasJvmName(s.signature) || !kotlinNoArgFunction(s.signature) || jvmStatic != requireJvmStatic {
+			if kotlinExtensionSignature(s.name, s.signature) || kotlinHasJvmName(s.signature) || kotlinHasJvmSynthetic(s.signature) || kotlinHasAliasedAnnotation(s.signature, s.jvmSyntheticAliases) || !kotlinNoArgFunction(s.signature) || jvmStatic != requireJvmStatic {
 				return javaScopeSymbol{}, ""
 			}
 		}

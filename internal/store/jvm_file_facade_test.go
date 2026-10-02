@@ -73,6 +73,39 @@ func (f *facadeFixture) resolve(t *testing.T, dstName, evidence string) string {
 	return f.qualifiedNameOf(t, dst) + "@" + path + "|" + strategy
 }
 
+func TestJavaLocalMethodShadowsExplicitKotlinStaticImport(t *testing.T) {
+	f := newFacadeFixture(t)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='app.Caller' WHERE id=?`, f.caller); err != nil {
+		t.Fatal(err)
+	}
+	local := f.symbolKind(t, f.callerFile, "setLevel", "app.Caller.setLevel", "function", "java")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='app.Caller',visibility='public',signature='setLevel(int)',arity_min=1,arity_max=1 WHERE id=?`, local); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind,wildcard,is_static) VALUES(?,?,?,?,?,?,?,0,1)`, f.repoID, f.callerFile, "java", "lib.Api.setLevel", "setLevel", "setLevel", "named"); err != nil {
+		t.Fatal(err)
+	}
+	kotlinFile := f.kotlinFile(t, "lib/Api.kt", "Api", false)
+	kotlin := f.topLevel(t, kotlinFile, "setLevel", "fun setLevel(x: Int) {}", "public")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET arity_min=1,arity_max=1 WHERE id=?`, kotlin); err != nil {
+		t.Fatal(err)
+	}
+	edge := f.edge(t, f.callerFile, f.caller, "setLevel")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET edge_kind='calls',evidence='setLevel(1)',call_arity=1 WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveJavaScope(f.ctx, f.store.db, f.repoID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := f.dstSymbolID(t, edge); !ok || got != local {
+		qualified := "<unresolved>"
+		if ok {
+			qualified = f.qualifiedNameOf(t, got)
+		}
+		t.Fatalf("shadowed static import target=%q, want Java local app.Caller.setLevel", qualified)
+	}
+}
+
 func TestJVMKotlinFileFacadeScopes(t *testing.T) {
 	const unresolved = "<unresolved>"
 	for _, tc := range []struct {

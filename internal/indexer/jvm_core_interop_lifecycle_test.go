@@ -388,6 +388,77 @@ func TestJVMCoreInteropRefusalQueryMatrix(t *testing.T) {
 	}
 }
 
+func TestJavaExplicitStaticImportKotlinABI(t *testing.T) {
+	for _, tc := range []struct {
+		name, caller, target, targetFile string
+		files                            tree
+	}{
+		{"file facade", "package app; import static lib.Api.run; class Caller { void call() { run(); } }", "lib.run", "Api.kt", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nfun run() {}"}},
+		{"object JvmStatic", "package app; import static lib.Api.run; class Caller { void call() { run(); } }", "lib.Api.run", "Api.kt", tree{"Api.kt": "package lib\nobject Api { @JvmStatic fun run() {} }"}},
+		{"other package same name", "package app; import static lib.Api.run; class Caller { void call() { run(); } }", "lib.run", "Api.kt", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nfun run() {}", "Other.kt": "package other\nfun run() {}"}},
+		{"Java local shadow", "package app; import static lib.Api.setLevel; class Caller { void setLevel(int x) {} void call() { setLevel(1); } }", "app.Caller.setLevel", "Caller.java", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nfun setLevel(x: kotlin.Int) {}"}},
+		{"competing Java same-name import", "package app; import static lib.Api.run; import static javahelpers.Helper.run; class Caller { void call() { run(); } }", "", "", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nfun run() {}", "Helper.java": "package javahelpers; public class Helper { public static void run() {} }"}},
+		{"ambiguous imports", "package app; import static a.Api.run; import static b.Api.run; class Caller { void call() { run(); } }", "", "", tree{"A.kt": "@file:JvmName(\"Api\")\npackage a\nfun run() {}", "B.kt": "@file:JvmName(\"Api\")\npackage b\nfun run() {}"}},
+		{"same-arity Kotlin overloads", "package app; import static lib.Api.run; class Caller { void call() { run(1); } }", "", "", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nfun run(x: Int) {}\nfun run(x: String) {}"}},
+		{"overload selected by arity", "package app; import static lib.Api.run; class Caller { void call() { run(1); } }", "lib.run", "Api.kt", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nfun run(x: kotlin.Int) {}\nfun run() {}"}},
+		{"object instance ABI refused", "package app; import static lib.Api.run; class Caller { void call() { run(); } }", "", "", tree{"Api.kt": "package lib\nobject Api { fun run() {} }"}},
+		{"companion without JvmStatic refused", "package app; import static lib.Api.run; class Caller { void call() { run(); } }", "", "", tree{"Api.kt": "package lib\nclass Api { companion object { fun run() {} } }"}},
+		{"private facade member refused", "package app; import static lib.Api.run; class Caller { void call() { run(); } }", "", "", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nprivate fun run() {}"}},
+		{"synthetic Kotlin ABI refused", "package app; import static lib.Api.run; class Caller { void call() { run(); } }", "", "", tree{"Api.kt": "package lib\nobject Api { @JvmSynthetic @JvmStatic fun run() {} }"}},
+		{"extension ABI refused", "package app; import static lib.Api.run; class Caller { void call() { run(\"x\"); } }", "", "", tree{"Api.kt": "@file:JvmName(\"Api\")\npackage lib\nfun String.run() {}"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := tree{"Caller.java": tc.caller}
+			for path, source := range tc.files {
+				files[path] = source
+			}
+			r := newLifecycleRepo(t, files)
+			if tc.name == "Java local shadow" {
+				// This parser fixture emits no call reference; the store-level
+				// resolver precedence is exercised directly in
+				// TestJavaLocalMethodShadowsExplicitKotlinStaticImport.
+				assertJVMNoQueryRelation(t, r, "app.Caller.call", "lib.setLevel")
+				return
+			}
+			if tc.target == "" {
+				assertJVMUnresolved(t, r, "Caller.java", "run")
+				assertJVMReference(t, r, "Caller.java", "run", false)
+				return
+			}
+			assertJVMResolved(t, r, "Caller.java", "run", tc.targetFile, "java_static_import")
+			if tc.name != "Java local shadow" {
+				assertJVMQueryRelation(t, r, "app.Caller.call", tc.target)
+			}
+		})
+	}
+}
+
+func TestJavaStaticImportKotlinABIRepairsOnUnchangedUpdate(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Caller.java": "package app; import static lib.Api.run; class Caller { void call() { run(); } }",
+		"Api.kt":      "@file:JvmName(\"Api\")\npackage lib\nfun run() {}",
+	})
+	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(r.ctx, `UPDATE edges SET dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE repo_id=? AND dst_name='run'`, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(r.ctx, `UPDATE references_tbl SET symbol_id=NULL WHERE repo_id=? AND qualified_name='run'`, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(r.ctx, `DELETE FROM settings WHERE key LIKE 'resolver.jvm_static_import_kotlin_abi_repaired.v1.%'`); err != nil {
+		t.Fatal(err)
+	}
+	if summary := r.update(t); summary.FilesChanged != 0 {
+		t.Fatalf("unchanged update reparsed %d files, want 0", summary.FilesChanged)
+	}
+	assertJVMResolved(t, r, "Caller.java", "run", "Api.kt", "java_static_import")
+	r.assertFreshParity(t, "static import ABI repair")
+}
+
 func TestJVMCoreInteropJavaPeerVisibility(t *testing.T) {
 	for _, tc := range []struct {
 		visibility string
