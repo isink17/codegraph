@@ -1,7 +1,4 @@
-package treesitter
-
-// Package treesitter is the seam for future Tree-sitter-backed adapters.
+// Package treesitter provides Tree-sitter-backed language adapters in CGO builds.
 //
-// The first milestone keeps the adapter boundary stable while shipping a
-// working Go parser based on the standard library so installation remains
-// simple across local development environments.
+// Non-CGO builds use the Go, Python, and heuristic adapters in sibling packages.
+package treesitter
