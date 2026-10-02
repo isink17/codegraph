@@ -73,7 +73,7 @@ jobs:
               if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
                 git fetch --no-tags --depth=1 origin $env:PR_BASE_SHA
                 if ($LASTEXITCODE -ne 0) { throw 'Could not fetch PR base SHA' }
-                $changed = git diff --name-only "$($env:PR_BASE_SHA)...HEAD"
+                $changed = git diff --name-only "$($env:PR_BASE_SHA)..HEAD"
               } elseif ($env:PUSH_BEFORE_SHA -and $env:PUSH_BEFORE_SHA -notmatch '^0+$') {
                 git fetch --no-tags --depth=1 origin $env:PUSH_BEFORE_SHA
                 if ($LASTEXITCODE -ne 0) { throw 'Could not fetch push before SHA' }
@@ -88,6 +88,9 @@ jobs:
               $runStress = $true
             }
           }
+          # GitHub Actions treats the last native-command status as the step
+          # result. A failed inspection is already handled by selecting stress.
+          $global:LASTEXITCODE = 0
           "run=$($runStress.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           if ($runStress) { Write-Host 'Deep Windows stress selected.' } else { Write-Host 'Deep Windows stress skipped for this change.' }
 
