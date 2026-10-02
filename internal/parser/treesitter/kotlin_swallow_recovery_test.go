@@ -115,6 +115,7 @@ func TestKotlinSwallowedPrivateFunctionOracleParity(t *testing.T) {
 	}{
 		{"minimal", "package lib\n@A\n@B\nprivate fun run() {}" + later, 1},
 		{"argument and argument-less annotations", "package lib\n@Preview(showBackground = true)\n@Composable\nprivate fun run() {}" + later, 1},
+		{"two own-line argument annotations with body call", "package lib\n@A(x)\n@B(y)\nprivate fun run() { target() }\nfun target() {}\n" + later, 1},
 		{"body calls", "package lib\n@Preview\n@Composable\nprivate fun run() { target() }\nfun target() {}\n", 1},
 		{"multiline body", "package lib\n@Preview\n@Composable\nprivate fun run() {\n    Theme {\n        target(1)\n    }\n}\nfun target(x: kotlin.Int) {}\nfun Theme(c: () -> Unit) {}\n", 1},
 		{"body on the next line", "package lib\n@Preview\n@Composable\nprivate fun run()\n{\n    target()\n}" + later, 1},
@@ -151,6 +152,86 @@ func TestKotlinSwallowedPrivateFunctionOracleParity(t *testing.T) {
 			old := kotlinParseForTest(t, NewKotlinV8(), "lib/Screens.kt", tc.src)
 			if old.Scope.JVMFacade != (graph.JVMFileFacade{}) || len(old.Symbols) != len(got.Symbols)-recovered {
 				t.Fatalf("v8 facade=%+v symbols=%d, want none and %d", old.Scope.JVMFacade, len(old.Symbols), len(got.Symbols)-recovered)
+			}
+		})
+	}
+}
+
+func TestKotlinSwallowedArgumentAnnotationShapesFailClosed(t *testing.T) {
+	for _, tc := range []struct{ name, src string }{
+		{"same-line argument annotation", "package lib\n@A(x) fun a() {}\nfun later() {}\n"},
+		{"two own-line argument annotations", "package lib\n@A(x)\n@B(y)\nfun a() {}\nfun later() {}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, _ := parse(context.Background(), kotlin.GetLanguage(), []byte(tc.src))
+			t.Log(kotlinTestSexp(root, []byte(tc.src)))
+			if views, clean := kotlinRecoveredViews(t, tc.src); clean || views != nil {
+				t.Fatalf("clean=%v views=%+v, want fail-closed", clean, views)
+			}
+			got := kotlinParseForTest(t, NewKotlin(), "lib/Screens.kt", tc.src)
+			if got.Scope.JVMFacade != (graph.JVMFileFacade{}) {
+				t.Fatalf("facade = %+v, want suppressed", got.Scope.JVMFacade)
+			}
+			for _, sym := range got.Symbols {
+				if sym.Name == "a" {
+					t.Fatalf("fabricated a declaration: %+v", sym)
+				}
+			}
+		})
+	}
+}
+
+// The detached-OptIn follow-up remains fail-closed until an exact source
+// fixture proves ownership. These controls must not let a future modifier
+// gate bind through intervening, malformed, or ambiguous roots.
+func TestKotlinDetachedOptInCandidateControlsFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name, body         string
+		clean              bool
+		annotated          int
+		candidateAnnotated bool
+		duplicatePair      bool
+	}{
+		{"intervening expression", "@OptIn(E::class)\nprintln(1)\n@Composable\nfun candidate() {}\nfun after() {}\n", false, 0, false, false},
+		{"annotation on another declaration", "@OptIn(E::class)\nval other = 1\n@Composable\nfun candidate() {}\nfun after() {}\n", true, 0, false, false},
+		{"malformed arguments", "@OptIn(E::class\n@Composable\nfun candidate() {}\nfun after() {}\n", false, 0, false, false},
+		{"dangling annotation", "@OptIn(E::class)\n", false, 0, false, false},
+		{"duplicate candidate names", "@OptIn(E::class)\n@Composable\nfun candidate() {}\n@Composable\nfun candidate() {}\n", true, 1, true, true},
+		{"multiple modifiers", "@OptIn(E::class)\n@Composable\nprivate suspend fun candidate(value: Int) {}\nfun after() {}\n", true, 1, true, false},
+		{"same-line modifiers", "@OptIn(E::class) @Composable private fun candidate(value: Int) {}\nfun after() {}\n", true, 1, true, false},
+		{"unrelated adjacent declarations", "fun before() {}\n@OptIn(E::class)\n@Composable\nprivate fun candidate(value: Int) {}\nfun after() {}\n", true, 1, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "package lib\n" + tc.body
+			views, clean := kotlinRecoveredViews(t, src)
+			if clean != tc.clean || len(views) != 0 {
+				t.Fatalf("clean=%v views=%+v, want clean=%v and no recovery", clean, views, tc.clean)
+			}
+			pf := kotlinParseForTest(t, NewKotlin(), "lib/OptIn.kt", src)
+			if !clean && pf.Scope.JVMFacade != (graph.JVMFileFacade{}) {
+				t.Fatalf("facade=%+v, want suppressed", pf.Scope.JVMFacade)
+			}
+			annotated, candidateAnnotations := 0, []bool{}
+			for _, symbol := range pf.Symbols {
+				got := strings.Contains(symbol.Signature, "@OptIn")
+				if got {
+					annotated++
+				}
+				if symbol.Name == "candidate" {
+					candidateAnnotations = append(candidateAnnotations, got)
+				}
+			}
+			if annotated != tc.annotated {
+				t.Fatalf("annotated symbols=%d, want %d: %+v", annotated, tc.annotated, pf.Symbols)
+			}
+			if tc.duplicatePair && (len(candidateAnnotations) != 2 || !candidateAnnotations[0] || candidateAnnotations[1]) {
+				t.Fatalf("duplicate candidate annotation ownership=%v, want [true false]", candidateAnnotations)
+			}
+			if !tc.duplicatePair && len(candidateAnnotations) > 0 && candidateAnnotations[0] != tc.candidateAnnotated {
+				t.Fatalf("candidate annotation ownership=%v, want %v", candidateAnnotations, tc.candidateAnnotated)
+			}
+			if len(pf.KotlinJVMNameEvidence) != 0 || len(pf.KotlinJVMCallableEvidence) != 0 {
+				t.Fatalf("unproven JVM facts: name=%+v callable=%+v", pf.KotlinJVMNameEvidence, pf.KotlinJVMCallableEvidence)
 			}
 		})
 	}
