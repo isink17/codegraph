@@ -3,9 +3,14 @@ name: CI
 on:
   push:
     branches:
-      - master
       - v2.0
   pull_request:
+    branches:
+      - v2.0
+    # Adding windows-stress to an open PR triggers the deep Windows gate.
+    # Release-candidate checks use a PR targeting v2.0 with this label; no
+    # workflow_dispatch or schedule can accidentally run against master.
+    types: [opened, synchronize, reopened, edited, labeled]
 
 jobs:
   test-native:
@@ -49,8 +54,48 @@ jobs:
         # Windows keeps 30m to absorb its wider runner-to-runner variance.
         run: go test -timeout ${{ matrix.go_test_timeout }} ./...
 
-      - name: Repeat concurrent database open checks (Windows)
+      - name: Check concurrent database open regression (Windows)
         if: runner.os == 'Windows'
+        run: go test -timeout 20m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=5
+
+      - name: Select deep Windows stress gate
+        id: windows-stress
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_STRESS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'windows-stress') }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          $runStress = $env:WINDOWS_STRESS_LABEL -eq 'true'
+          if (-not $runStress) {
+            try {
+              if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+                git fetch --no-tags --depth=1 origin $env:PR_BASE_SHA
+                if ($LASTEXITCODE -ne 0) { throw 'Could not fetch PR base SHA' }
+                $changed = git diff --name-only "$($env:PR_BASE_SHA)..HEAD"
+              } elseif ($env:PUSH_BEFORE_SHA -and $env:PUSH_BEFORE_SHA -notmatch '^0+$') {
+                git fetch --no-tags --depth=1 origin $env:PUSH_BEFORE_SHA
+                if ($LASTEXITCODE -ne 0) { throw 'Could not fetch push before SHA' }
+                $changed = git diff --name-only "$($env:PUSH_BEFORE_SHA)..HEAD"
+              } else {
+                throw 'Push has no before SHA; cannot rule out locking changes'
+              }
+              if ($LASTEXITCODE -ne 0) { throw 'Could not inspect changed paths' }
+              $runStress = @($changed | Where-Object { $_ -match '^(internal/store/|internal/indexer/|go\.mod$|go\.sum$)' }).Count -gt 0
+            } catch {
+              Write-Warning "Could not determine whether Windows stress is required; running it. $_"
+              $runStress = $true
+            }
+          }
+          # GitHub Actions treats the last native-command status as the step
+          # result. A failed inspection is already handled by selecting stress.
+          $global:LASTEXITCODE = 0
+          "run=$($runStress.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($runStress) { Write-Host 'Deep Windows stress selected.' } else { Write-Host 'Deep Windows stress skipped for this change.' }
+
+      - name: Repeat concurrent database open checks (Windows, deep stress)
+        if: runner.os == 'Windows' && steps.windows-stress.outputs.run == 'true'
         run: go test -timeout 120m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=200
 
       - name: Smoke native binary
