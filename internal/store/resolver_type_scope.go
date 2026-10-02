@@ -1240,6 +1240,7 @@ const jvmScopePrecisionRepairSettingKey = "resolver.jvm_scope_precision_repaired
 const jvmCoreInteropRepairSettingKey = "resolver.jvm_core_interop_repaired.v1"
 const jvmCommonCallableABIRepairSettingKey = "resolver.jvm_common_callable_abi_repaired.v1"
 const jvmCompanionCallableABIRepairSettingKey = "resolver.jvm_companion_callable_abi_repaired.v1"
+const jvmStaticImportKotlinABIRepairSettingKey = "resolver.jvm_static_import_kotlin_abi_repaired.v1"
 const cppExternCSignatureRepairSettingKey = "resolver.cpp_extern_c_signature_repaired.v1"
 
 func (s *Store) jvmScopePrecisionRepairApplies(ctx context.Context, repoID int64) (bool, error) {
@@ -1366,6 +1367,28 @@ func (s *Store) repairJVMCompanionCallableABIBindings(ctx context.Context, repoI
 	return err
 }
 
+func (s *Store) jvmStaticImportKotlinABIRepairApplies(ctx context.Context, repoID int64) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM files jf JOIN scope_import_evidence imp ON imp.repo_id=jf.repo_id AND imp.file_id=jf.id
+		WHERE jf.repo_id=? AND jf.language='java' AND jf.is_deleted=0 AND imp.language='java' AND imp.is_static=1
+	) AND EXISTS(
+		SELECT 1 FROM files kf WHERE kf.repo_id=? AND kf.language='kotlin' AND kf.is_deleted=0
+	)`, repoID, repoID).Scan(&found)
+	return found, err
+}
+
+func (s *Store) repairJVMStaticImportKotlinABIBindings(ctx context.Context, repoID int64) error {
+	clear := func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE repo_id=? AND resolution_strategy='java_static_import'
+			AND file_id IN (SELECT id FROM files WHERE repo_id=? AND language='java')`, repoID, repoID)
+		return err
+	}
+	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
+	return err
+}
+
 func (s *Store) cppExternCSignatureRepairApplies(ctx context.Context, repoID int64) (bool, error) {
 	var found bool
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND is_deleted=0 AND language='cpp')`, repoID).Scan(&found)
@@ -1486,6 +1509,12 @@ var (
 		key:              jvmCompanionCallableABIRepairSettingKey,
 		run:              (*Store).repairJVMCompanionCallableABIBindings,
 		applies:          (*Store).jvmCompanionCallableABIRepairApplies,
+		resolvesRepoWide: true,
+	}
+	jvmStaticImportKotlinABIRepair = resolverRepair{
+		key:              jvmStaticImportKotlinABIRepairSettingKey,
+		run:              (*Store).repairJVMStaticImportKotlinABIBindings,
+		applies:          (*Store).jvmStaticImportKotlinABIRepairApplies,
 		resolvesRepoWide: true,
 	}
 	cppExternCSignatureRepair = resolverRepair{
@@ -1642,7 +1671,7 @@ var (
 		resolvesRepoWide: false,
 	}
 	// Ordered: edge repairs finish before derived reference identities bind.
-	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, jvmCommonCallableABIRepair, jvmCompanionCallableABIRepair, cppExternCSignatureRepair, typescriptJSSpecifierRepair, phpScopeRepair, phpFunctionCandidateRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
+	resolverRepairs = []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, jvmScopePrecisionRepair, jvmCoreInteropRepair, jvmCommonCallableABIRepair, jvmCompanionCallableABIRepair, jvmStaticImportKotlinABIRepair, cppExternCSignatureRepair, typescriptJSSpecifierRepair, phpScopeRepair, phpFunctionCandidateRepair, rubyConstantPathRepair, swiftSelfRepair, swiftClassSelfRepair, swiftClassSelfTypeRepair, swiftClassSelfFinalMethodRepair, swiftClassSelfStaticMethodRepair, swiftClassSelfFinalClassMethodRepair, swiftClassSelfTypeStaticMethodRepair, swiftClassSelfTypeFinalClassMethodRepair, swiftClassSelfInheritedFinalMethodRepair, swiftClassSelfTypeInheritedStaticMethodRepair, swiftClassSelfTypeInheritedFinalClassMethodRepair, swiftClassSelfMultilevelInheritedFinalMethodRepair, swiftClassSelfTypeMultilevelInheritedStaticMethodRepair, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepair, swiftTrailingRepair, swiftInitializerRepair, swiftTrailingInitializerRepair, swiftSuperRepair, swiftSuperMultilevelInheritedMethodRepair, swiftSuperTypeMethodRepair, swiftSuperExtensionMethodRepair, swiftSuperExtensionTargetMethodRepair, referenceIdentityRepair}
 )
 
 // runResolverRepairOnce performs one repair unless its marker is already set,
