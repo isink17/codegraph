@@ -365,9 +365,7 @@ func TestJVMFileFacadeKotlinV1ProfileUpgrade(t *testing.T) {
 	}
 	// Every resolver repair is already recorded: only the profile reparse can
 	// bring the facade in.
-	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
-		t.Fatal(err)
-	}
+
 	upgraded := New(s.Store, parser.NewRegistry(tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewGo()), nil)
 	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
 	if err != nil {

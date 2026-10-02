@@ -1,7 +1,6 @@
 package store
 
 import (
-	"database/sql"
 	"testing"
 )
 
@@ -292,45 +291,5 @@ func TestJVMKotlinFileFacadeFixedArityCallable(t *testing.T) {
 				t.Fatalf("binding=(%d,%v), want target=%d resolved=%v", got, ok, target, tc.want)
 			}
 		})
-	}
-}
-
-func TestMigrationKotlinJVMFileFacade(t *testing.T) {
-	const migrationVersion = 42
-	ctx := t.Context()
-	dbPath := t.TempDir() + "/graph.sqlite"
-	if versions := applyMigrationsBelow(t, ctx, dbPath, migrationVersion); len(versions) == 0 {
-		t.Fatal("no prior migrations")
-	}
-	// A v1 Kotlin row predates the facade facts and must survive unchanged
-	// until a reparse replaces it.
-	legacy, err := sql.Open(sqliteDriverName, dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := legacy.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id,file_id,language,package_name) VALUES(1,7,'kotlin','lib')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := legacy.Close(); err != nil {
-		t.Fatal(err)
-	}
-	s, err := Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	var count int
-	for _, column := range []string{"jvm_facade_class", "jvm_facade_explicit", "jvm_multifile"} {
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('file_scope_evidence') WHERE name=? AND "notnull"=1`, column).Scan(&count); err != nil || count != 1 {
-			t.Fatalf("column %s = %d, %v", column, count, err)
-		}
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_file_scope_evidence_repo_jvm_facade'`).Scan(&count); err != nil || count != 1 {
-		t.Fatalf("facade index = %d, %v", count, err)
-	}
-	var pkg, class string
-	var explicit, multifile int
-	if err := s.db.QueryRowContext(ctx, `SELECT package_name,jvm_facade_class,jvm_facade_explicit,jvm_multifile FROM file_scope_evidence WHERE file_id=7`).Scan(&pkg, &class, &explicit, &multifile); err != nil || pkg != "lib" || class != "" || explicit != 0 || multifile != 0 {
-		t.Fatalf("legacy row = (%q,%q,%d,%d), %v", pkg, class, explicit, multifile, err)
 	}
 }

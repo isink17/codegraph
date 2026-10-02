@@ -73,13 +73,7 @@ import (
 // repo-wide per owner), and `ruby_singleton_visibility_unknown` marks an owner
 // whose singleton surface a dynamic form or `module_function` made unprovable.
 // Facts that disagree without a load order to break the tie fail closed.
-//
-// Constant-path semantics use a resolver repair because v5 parser facts already
-// contain the receiver spelling. The repair clears Ruby call bindings and
-// re-decides them without reparsing; parser profile remains treesitter:ruby:v5.
-
 const rubyScopeResolution = "tmp_ruby_scope_resolution"
-const rubyConstantPathRepairSettingKey = "resolver.ruby_constant_path_repaired.v1"
 
 // rubyScopeStrategies is every strategy this pass writes; the incremental
 // invalidation keys on it.
@@ -910,21 +904,4 @@ func (s *Store) resolveRubyScopeStandalone(ctx context.Context, repoID int64, on
 		return 0, err
 	}
 	return n, tx.Commit()
-}
-
-func (s *Store) rubyConstantPathRepairApplies(ctx context.Context, repoID int64) (bool, error) {
-	var found bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=? AND language='ruby' AND is_deleted=0)`, repoID).Scan(&found)
-	return found, err
-}
-
-func (s *Store) repairRubyConstantPathBindings(ctx context.Context, repoID int64) error {
-	clear := func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
-WHERE repo_id=? AND edge_kind='`+EdgeKindCalls+`'
-  AND file_id IN (SELECT id FROM files WHERE repo_id=? AND language='ruby')`, repoID, repoID)
-		return err
-	}
-	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
-	return err
 }

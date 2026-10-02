@@ -1053,6 +1053,28 @@ func validateMigrationMetadata(ctx context.Context, db migrationMetadataQuerier,
 		}
 		return fmt.Errorf("invalid database metadata at %s: schema_migrations table missing", path)
 	}
+	// Development migration numbers are not compatible with the clean v2
+	// baseline, including old databases that happened to stop at migration 1.
+	var applied int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil {
+		return fmt.Errorf("read database migrations %s: %w", path, err)
+	}
+	if applied > 0 {
+		var settingsPresent int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'`).Scan(&settingsPresent); err != nil {
+			return fmt.Errorf("read database baseline %s: %w", path, err)
+		}
+		var baseline string
+		if settingsPresent > 0 {
+			err := db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='format.schema_baseline'`).Scan(&baseline)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("read database baseline %s: %w", path, err)
+			}
+		}
+		if baseline != "v2-20261002" {
+			return fmt.Errorf("unsupported pre-v2 development index at %s; rebuild with: codegraph index <repo-path> --rebuild", path)
+		}
+	}
 	versions, ceiling, err := migrationVersions()
 	if err != nil {
 		return err
@@ -3419,28 +3441,6 @@ func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (i
 	return int(n), nil
 }
 
-// RepoHasExistingGraph reports whether this repository already holds
-// relationships from an earlier scan.
-//
-// It is the "was this database written by an earlier run?" question the
-// one-time resolver repairs need (resolver_ambiguity.go,
-// resolver_type_scope.go): a repository being indexed for the very first time
-// cannot hold bindings an older release made, and running a repo-wide repair
-// resolve against it would only duplicate the index run's own resolve pass. The
-// indexer therefore asks BEFORE pass 1 writes anything, when an empty answer
-// still means "no prior graph".
-func (s *Store) RepoHasExistingGraph(ctx context.Context, repoID int64) (bool, error) {
-	var present int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM edges WHERE repo_id = ? LIMIT 1`, repoID).Scan(&present)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, err
-	}
-	return true, nil
-}
-
 // PreviousSymbolNamesForPaths returns the distinct symbol names the given files
 // declare RIGHT NOW, before a write replaces or removes them (P22.12).
 //
@@ -4021,13 +4021,7 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 }
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
-	// Pre-P22.9 bindings this rule refuses are cleared once per repository, so an
-	// upgraded database converges instead of keeping relationships no strategy
-	// here would reconsider. See resolver_type_scope.go.
-	if err := s.repairTypeScopeBindingsOnce(ctx, repoID); err != nil {
-		return 0, err
-	}
-	n, err := s.resolveEdgesWithPreStep(ctx, repoID, nil)
+	n, err := s.resolveEdgesRepoWide(ctx, repoID)
 	if err != nil {
 		return 0, err
 	}
@@ -4037,16 +4031,8 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 	return n, nil
 }
 
-// resolveEdgesWithPreStep is ResolveEdges with an optional statement run inside
-// its transaction before any strategy does.
-//
-// It exists for the one-time repairs (resolver_ambiguity.go): a repair that
-// clears bindings and then re-resolves must not be two commits, because a
-// cancellation or an error between them would leave the repository with the
-// bindings gone and nothing put back -- visibly under-resolved on every query
-// until some later scan happens to succeed. Inside one transaction the pair is
-// all-or-nothing.
-func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre func(context.Context, *sql.Tx) error) (int, error) {
+// resolveEdgesRepoWide resolves the repository graph in one transaction.
+func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64) (int, error) {
 	totalResolved := 0
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -4055,11 +4041,6 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 	defer func() {
 		_ = tx.Rollback()
 	}()
-	if pre != nil {
-		if err := pre(ctx, tx); err != nil {
-			return 0, err
-		}
-	}
 
 	// Record, once, which files are test files (P7) and which names are already
 	// undecidable at the broadest evidence levels, so no later strategy can bind
@@ -4291,46 +4272,6 @@ func (s *Store) resolveEdgesWithPreStep(ctx context.Context, repoID int64, pre f
 		return 0, err
 	}
 	totalResolved += n
-
-	// Strategy 4: Method receiver match (e.g., DoSomething matches MyStruct.DoSomething),
-	// language-gated. Several receivers declaring the same method name are
-	// indistinguishable without receiver-type evidence, so they bind nothing.
-	if false { // receiver_method is legacy-only; bare calls do not prove a receiver.
-		res, err = tx.ExecContext(ctx, `
-		WITH distinct_names AS (
-			SELECT DISTINCT dst_name
-			FROM edges
-			WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name != ''
-		),
-		resolutions AS (
-			SELECT n.dst_name AS dst_name, s.language AS dst_language,
-				`+resolverCandidateAggregatesSQL+`
-			FROM distinct_names n
-			JOIN symbols s
-			  ON s.repo_id = ?
-			 AND s.name = n.dst_name
-			`+resolverCandidateJoinSQL+`
-			WHERE s.container_name != ''
-			AND s.language != ''
-			AND `+phpGenericCandidateSQL("s.")+`
-			GROUP BY n.dst_name, s.language
-			`+resolverCandidateHavingSQL+`
-		)
-		UPDATE edges
-		`+resolverSetResolvedSQL(ResolutionStrategyReceiverMethod)+`
-		FROM resolutions r, files f
-			`+resolverCallerTestJoinSQL+`
-		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
-		AND r.dst_name = edges.dst_name
-		AND `+resolverBindGateSQL+`
-	`, repoID, repoID, repoID)
-		if err != nil {
-			return 0, err
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			totalResolved += int(n)
-		}
-	}
 
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverAmbiguousNamesTable); err != nil {
 		return 0, err
@@ -4642,112 +4583,6 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 	}
 	totalResolved := 0
 
-	// Slash-suffix path: indexed equality JOIN against the persisted
-	// `qualified_suffix` column (`idx_symbols_repo_qsuffix`, migration 016)
-	// instead of a `SELECT id, qualified_name FROM symbols WHERE repo_id = ?`
-	// scan + Go-side neededSuffix hash filter. Suffixes shared by several
-	// same-language symbols bind nothing: the suffix is the whole evidence this
-	// strategy has, and it does not distinguish them.
-	{
-		needNames := make([]string, 0, len(neededSuffix))
-		for name := range neededSuffix {
-			needNames = append(needNames, name)
-		}
-
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_needed_suffix(dst_name TEXT PRIMARY KEY)`); err != nil {
-			return 0, err
-		}
-		droppedNeeded := false
-		defer func() {
-			if droppedNeeded {
-				return
-			}
-			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS tmp_resolver_needed_suffix`)
-		}()
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_resolver_needed_suffix`); err != nil {
-			return 0, err
-		}
-
-		// Keep well under SQLite's default variable limit (999).
-		const maxPerInsert = 400
-		for start := 0; start < len(needNames); start += maxPerInsert {
-			end := min(start+maxPerInsert, len(needNames))
-			chunk := needNames[start:end]
-			var b strings.Builder
-			b.WriteString(`INSERT OR IGNORE INTO tmp_resolver_needed_suffix(dst_name) VALUES `)
-			args := make([]any, 0, len(chunk))
-			for i, name := range chunk {
-				if i > 0 {
-					b.WriteString(",")
-				}
-				b.WriteString("(?)")
-				args = append(args, name)
-			}
-			if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
-				return 0, err
-			}
-		}
-
-		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_slash_suffix`); err != nil {
-			return 0, err
-		}
-		if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_symbol_slash_suffix(`+resolverCandidateColumnsDDL+`) WITHOUT ROWID`); err != nil {
-			return 0, err
-		}
-		droppedSlashSuffix := false
-		defer func() {
-			if droppedSlashSuffix {
-				return
-			}
-			_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_symbol_slash_suffix`)
-		}()
-
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tmp_symbol_slash_suffix(dst_name, dst_language, any_symbol_id, production_symbol_id)
-			SELECT n.dst_name, s.language,
-				`+resolverCandidateAggregatesSQL+`
-			FROM tmp_resolver_needed_suffix n
-			JOIN symbols s
-			  ON s.repo_id = ?
-			 AND s.qualified_suffix = n.dst_name
-			`+resolverCandidateJoinSQL+`
-			WHERE s.qualified_suffix != '' AND s.language != ''
-			AND `+phpGenericCandidateSQL("s.")+`
-			GROUP BY n.dst_name, s.language
-			`+resolverCandidateHavingSQL+`
-		`, repoID); err != nil {
-			return 0, err
-		}
-
-		if false { // slash_suffix is legacy-only; current parsers cannot prove it.
-			updateRes, err := tx.ExecContext(ctx, `
-			UPDATE edges
-			`+resolverSetResolvedSQL(ResolutionStrategySlashSuffix)+`
-			FROM tmp_symbol_slash_suffix r, files f
-			`+resolverCallerTestJoinSQL+`
-			WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
-			AND r.dst_name = edges.dst_name
-			AND `+resolverBindGateSQL+`
-		`, repoID)
-			if err != nil {
-				return 0, err
-			}
-			if _, err := tx.ExecContext(ctx, `DROP TABLE temp.tmp_symbol_slash_suffix`); err != nil {
-				return 0, err
-			}
-			droppedSlashSuffix = true
-			if _, err := tx.ExecContext(ctx, `DROP TABLE tmp_resolver_needed_suffix`); err != nil {
-				return 0, err
-			}
-			droppedNeeded = true
-			n, err := updateRes.RowsAffected()
-			if err != nil {
-				return 0, err
-			}
-			totalResolved += int(n)
-		}
-	}
-
 	// Dot-tail2 path: this branch matches `last-2-dot-segments(afterSlash)`.
 	// Schema-backed by `symbols.dot_tail2` (migration 017) + partial index
 	// `idx_symbols_repo_dot_tail2`, so the same matching is now an indexed
@@ -4934,9 +4769,6 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	// the answer for files the batch does not otherwise mention -- so the names
 	// whose visibility those edits could have flipped join the batch before
 	// anything is invalidated. See typeScopeNamesForChangedPaths.
-	if err := s.repairTypeScopeBindingsOnce(ctx, repoID); err != nil {
-		return ResolveEdgesForNamesStats{}, err
-	}
 	scopes := newImportScopeCache(s, repoID)
 	scopes.rustRoots, err = s.rustRootsForPaths(ctx, repoID, paths)
 	if err != nil {
@@ -5034,7 +4866,7 @@ func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []str
 		return nil, nil
 	}
 	// Without JVM callers no scoped spelling can change; avoid scanning edges.
-	applies, err := s.jvmScopePrecisionRepairApplies(ctx, repoID)
+	applies, err := s.repoHasJVMFiles(ctx, repoID)
 	if err != nil || !applies {
 		return nil, err
 	}
@@ -5272,7 +5104,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		}); err != nil {
 		return 0, err
 	}
-	legacyStale := map[int64]struct{}{}
+	scopedStale := map[int64]struct{}{}
 	// PHP scoped bindings have no '.' tail for the dotted selection below to
 	// find, so they are keyed on the bound destination instead.
 	phpStale, err := s.phpStaleScopeBindings(ctx, repoID, wanted)
@@ -5280,7 +5112,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		return 0, err
 	}
 	for _, id := range phpStale {
-		legacyStale[id] = struct{}{}
+		scopedStale[id] = struct{}{}
 	}
 	// Ruby constant bindings depend on the owner's visibility facts and on the
 	// caller's lexical nesting, neither of which is the destination's own name.
@@ -5289,22 +5121,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		return 0, err
 	}
 	for _, id := range rubyStale {
-		legacyStale[id] = struct{}{}
-	}
-	if err := sqliteBatchedQuery(ctx, s.db, `
-		SELECT id FROM edges
-		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
-		AND resolution_strategy IN ('receiver_method', 'slash_suffix')`, ` AND dst_name IN (%s)`,
-		[]any{repoID}, stringSliceToAny(unique), true,
-		func(rows *sql.Rows) error {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				return err
-			}
-			legacyStale[id] = struct{}{}
-			return nil
-		}); err != nil {
-		return 0, err
+		scopedStale[id] = struct{}{}
 	}
 	allNames := append([]string(nil), unique...)
 	allNames = append(allNames, contested...)
@@ -5328,7 +5145,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	// then one pass over the qualified bound population for `.<name>` tails.
 	// Migration 028 keeps the second one off a full table scan.
 	stale := map[int64]struct{}{}
-	for id := range legacyStale {
+	for id := range scopedStale {
 		stale[id] = struct{}{}
 	}
 	nameBatch := sqliteBatchSize(1, 1)

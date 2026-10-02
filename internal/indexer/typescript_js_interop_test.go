@@ -5,7 +5,7 @@ package indexer
 import (
 	"errors"
 	"path"
-	"strconv"
+
 	"strings"
 	"testing"
 
@@ -260,55 +260,6 @@ func TestTypeScriptJSSpecifierInteropLifecycle(t *testing.T) {
 
 	// An unrelated caller's refusal is untouched by every step above.
 	assertJVMUnresolved(t, r, "other.ts", "foo")
-}
-
-// An upgraded database carries decisions an older resolver made: the `.js`
-// spelling left unresolved, `./peer.js` bound to `peer.js` beside a `peer.ts`
-// that now wins, and `./widget.jsx` bound to `widget.jsx` beside a
-// `widget.tsx` that now wins. One ordinary update converges every edge and its
-// reference to a fresh index.
-func TestTypeScriptJSSpecifierInteropUpgradeRepair(t *testing.T) {
-	const foo = "export function foo() {}\n"
-	r := newLifecycleRepo(t, tree{
-		"foo.ts":            foo,
-		"caller.ts":         "import { foo } from \"./foo.js\";\nexport function run() { foo(); }\n",
-		"peer.js":           foo,
-		"peer.ts":           foo,
-		"peer-caller.ts":    "import { foo } from \"./peer.js\";\nexport function run() { foo(); }\n",
-		"widget.jsx":        foo,
-		"widget.tsx":        foo,
-		"widget-caller.jsx": "import { foo } from \"./widget.jsx\";\nexport function run() { foo(); }\n",
-		"unrelated.ts":      "export function unrelated() {}\n",
-	})
-	db := r.raw(t)
-	exec := func(q string, args ...any) {
-		t.Helper()
-		if _, err := db.ExecContext(r.ctx, q, args...); err != nil {
-			t.Fatal(err)
-		}
-	}
-	edgeIn := `SELECT e.id FROM edges e JOIN files f ON f.id=e.file_id WHERE f.path=? AND e.dst_name='foo'`
-	symbolIn := `SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id WHERE f.path=? AND s.name='foo'`
-	exec(`UPDATE edges SET dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE id=(`+edgeIn+`)`, "caller.ts")
-	exec(`UPDATE references_tbl SET symbol_id=NULL WHERE file_id=(SELECT id FROM files WHERE path='caller.ts') AND qualified_name='foo'`)
-	for caller, old := range map[string]string{"peer-caller.ts": "peer.js", "widget-caller.jsx": "widget.jsx"} {
-		exec(`UPDATE edges SET dst_symbol_id=(`+symbolIn+`),resolution_strategy='`+tsInteropStrategy+`',resolution_confidence='high' WHERE id=(`+edgeIn+`)`, old, caller)
-		exec(`UPDATE references_tbl SET symbol_id=(`+symbolIn+`) WHERE file_id=(SELECT id FROM files WHERE path=?) AND qualified_name='foo'`, old, caller)
-	}
-	exec(`DELETE FROM settings WHERE key=?`, "resolver.typescript_js_specifier_repaired.v1."+strconv.FormatInt(r.repoID, 10))
-	assertJVMUnresolved(t, r, "caller.ts", "foo")
-	assertJVMResolved(t, r, "peer-caller.ts", "foo", "peer.js:peer.foo(function)", tsInteropStrategy)
-	assertJVMResolved(t, r, "widget-caller.jsx", "foo", "widget.jsx:widget.foo(function)", tsInteropStrategy)
-
-	r.write(t, "unrelated.ts", "export function unrelated() { return 1; }\n")
-	r.update(t, "unrelated.ts")
-	assertJVMResolved(t, r, "caller.ts", "foo", "foo.ts:foo.foo(function)", tsInteropStrategy)
-	assertJVMReference(t, r, "caller.ts", "foo", true)
-	assertJVMResolved(t, r, "peer-caller.ts", "foo", "peer.ts:peer.foo(function)", tsInteropStrategy)
-	assertJVMReference(t, r, "peer-caller.ts", "foo", true)
-	assertJVMResolved(t, r, "widget-caller.jsx", "foo", "widget.tsx:widget.foo(function)", tsInteropStrategy)
-	assertJVMReference(t, r, "widget-caller.jsx", "foo", true)
-	r.assertFreshParity(t, "upgrade repair")
 }
 
 // assertTSNoResolvedRelation checks the resolved query surfaces only. With the

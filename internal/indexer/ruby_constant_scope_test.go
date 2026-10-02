@@ -234,9 +234,6 @@ func TestRubyProfileV3ToV4ResolvesConstantReceivers(t *testing.T) {
 					}
 				}
 			}
-			if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
-				t.Fatal(err)
-			}
 
 			upgraded := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
 			summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
@@ -938,9 +935,6 @@ func rubyProfileV3ToV4Hazard(t *testing.T, source, line string) {
 	if got := rubyVisibilityFactRows(t, s, repo); got != "" {
 		t.Fatalf("v3 fixture already carries treesitter:ruby:v4 facts:\n%s", got)
 	}
-	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
-		t.Fatal(err)
-	}
 
 	summary, err := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil).Update(ctx, Options{RepoRoot: root})
 	if err != nil {
@@ -1001,9 +995,7 @@ Object.const_set(:Root, Other)
 		strings.Contains(v4Facts, "ruby_constant_visibility") {
 		t.Fatalf("genuine v4 facts = %q", v4Facts)
 	}
-	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
-		t.Fatal(err)
-	}
+
 	upgraded := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)
 	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
 	if err != nil {

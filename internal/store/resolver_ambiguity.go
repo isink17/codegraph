@@ -1,8 +1,6 @@
 package store
 
 import (
-	"context"
-	"database/sql"
 	"slices"
 )
 
@@ -247,70 +245,3 @@ var resolverBindGateSQL = resolverBindableCandidateSQL + `
 			SELECT 1 FROM tmp_resolver_own_module_veto v
 			WHERE v.edge_id = edges.id
 		)`
-
-// -- one-time convergence for databases written before P22.12 -----------------
-
-// bareNameLevelRepairSettingKey records that a repository's persisted bindings
-// have been re-decided against the P22.12 bare-name level.
-//
-// Two pre-P22.12 defects leave a lasting mark on a database, and neither heals
-// on its own:
-//
-//   - WRONG bindings. The incremental binder counted only the callable half of
-//     the bare-name level, so it bound names the repo-wide veto refuses. No
-//     strategy reconsiders an already-bound edge, and invalidateNameEvidenceBindings
-//     only reaches names some batch mentions, so an unchanged tree keeps them.
-//   - MISSING bindings. An edge left unresolved because a declaration made its
-//     name ambiguous stayed unresolved after that declaration was removed,
-//     because the removal contributed no name to any batch. A no-change update
-//     has no old-name event either, so the under-resolution is permanent.
-//
-// The repair is the smallest thing that answers both: drop this repository's
-// `exact_name` bindings and run the repo-wide resolver once. Clearing is safe
-// precisely because the re-resolve follows in the same call -- every binding the
-// current rules still allow is rebuilt with the same strategy and confidence a
-// fresh index would give it, and the resolve also decides the unresolved edges
-// the second defect stranded. Restating the veto here to clear a narrower set
-// would duplicate the rule, which is the drift resolver_testfile.go forbids.
-//
-// Keyed per repository (one database holds several) and written only after the
-// resolve succeeds, so a failure re-runs rather than marking a repository
-// converged that is not.
-const bareNameLevelRepairSettingKey = "resolver.bare_name_level_repaired.v1"
-
-const dotTailAmbiguityRepairSettingKey = "resolver.dot_tail_ambiguity_repaired.v1"
-
-// repairBareNameLevelBindings re-decides a repository's bare-name bindings. The
-// once-per-repository guard lives in runResolverRepairOnce.
-func (s *Store) repairBareNameLevelBindings(ctx context.Context, repoID int64) error {
-	// One transaction for the pair. Clearing and re-resolving in two commits
-	// would let a cancellation between them leave the repository with every
-	// `exact_name` binding gone and nothing put back.
-	clear := func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-			UPDATE edges
-			SET `+resolverClearResolutionSQL+`
-			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
-			  AND resolution_strategy = ?
-		`, repoID, ResolutionStrategyExactName)
-		return err
-	}
-	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
-	return err
-}
-
-// repairDotTailAmbiguityBindings re-decides dot-tail bindings written before
-// the incremental binder consulted the broad bare-name veto.
-func (s *Store) repairDotTailAmbiguityBindings(ctx context.Context, repoID int64) error {
-	clear := func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-			UPDATE edges
-			SET `+resolverClearResolutionSQL+`
-			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
-			  AND resolution_strategy IN (?, ?)
-		`, repoID, ResolutionStrategyDotTail2, ResolutionStrategyDotTail3)
-		return err
-	}
-	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
-	return err
-}

@@ -10,12 +10,6 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 )
 
-const swiftSuperRepairSettingKey = "resolver.swift_super_method_repaired.v1"
-const swiftSuperMultilevelInheritedMethodRepairSettingKey = "resolver.swift_super_multilevel_inherited_method_repaired.v1"
-const swiftSuperTypeMethodRepairSettingKey = "resolver.swift_super_type_method_repaired.v1"
-const swiftSuperExtensionMethodRepairSettingKey = "resolver.swift_super_extension_method_repaired.v1"
-const swiftSuperExtensionTargetMethodRepairSettingKey = "resolver.swift_super_extension_target_method_repaired.v1"
-
 type swiftSuperSourceMode uint8
 
 const (
@@ -920,10 +914,6 @@ func (s *Store) redecideSwiftSuperBindings(ctx context.Context, repoID int64) er
 		return err
 	}
 	return tx.Commit()
-}
-
-func (s *Store) swiftSuperRepairApplies(ctx context.Context, repoID int64) (bool, error) {
-	return s.swiftSuperEvidenceApplies(ctx, repoID)
 }
 
 func (s *Store) swiftSuperEvidenceApplies(ctx context.Context, repoID int64) (bool, error) {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"path/filepath"
+
 	"reflect"
 	"strings"
 	"testing"
@@ -420,107 +420,6 @@ func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeNamesAndStats
 		stats := f.resolveNames("run")
 		assertSwiftStats(t, stats, 1, 0, 1, 0)
 		assertSwiftEdgeUnresolved(t, f, edge)
-	})
-}
-
-func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeRepair(t *testing.T) {
-	f, target, edge := newSwiftMultilevelInheritedFinalClassFixture(t, 2)
-	refID := swiftReferenceID(t, f, edge)
-	for _, repair := range resolverRepairs {
-		if repair.key != swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	assertSwiftReferenceCleared(t, f, refID)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != sql.ErrNoRows {
-		t.Fatalf("pre marker=%q err=%v", marker, err)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("first repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope)
-	assertSwiftReferenceTarget(t, f, refID, target)
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	firstDst, firstStrategy, firstConfidence := edgeState(t, f, edge)
-	firstReference := swiftReferenceSymbol(t, f, refID)
-	firstMarker := marker
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-	secondDst, secondStrategy, secondConfidence := edgeState(t, f, edge)
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	secondReference := swiftReferenceSymbol(t, f, refID)
-	secondMarker := marker
-	if secondDst != firstDst || secondStrategy != firstStrategy || secondConfidence != firstConfidence || secondReference != firstReference || secondMarker != firstMarker {
-		t.Fatalf("second repair changed binding/reference")
-	}
-}
-
-func TestSwiftClassSelfTypeMultilevelInheritedFinalClassMethodScopeUnsafeRepair(t *testing.T) {
-	setup := func(t *testing.T) (*swiftScopeFixture, int64, int64, int64) {
-		t.Helper()
-		f, target, edge := newSwiftMultilevelInheritedFinalClassFixture(t, 2)
-		f.resolve()
-		refID := swiftReferenceID(t, f, edge)
-		for _, repair := range resolverRepairs {
-			if repair.key != swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey {
-				if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
-		return f, target, edge, refID
-	}
-	marker := func(t *testing.T, f *swiftScopeFixture) {
-		t.Helper()
-		var value string
-		if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&value); err != nil || value != "1" {
-			t.Fatalf("marker=%q err=%v", value, err)
-		}
-	}
-	t.Run("finality lost clears", func(t *testing.T) {
-		f, target, edge, refID := setup(t)
-		f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target)
-		run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-		if err != nil || !run {
-			t.Fatalf("repair=(%v,%v)", run, err)
-		}
-		assertSwiftEdgeUnresolved(t, f, edge)
-		assertSwiftReferenceCleared(t, f, refID)
-		marker(t, f)
-	})
-	t.Run("static rebinds", func(t *testing.T) {
-		f, target, edge, refID := setup(t)
-		f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static',is_final=0 WHERE symbol_id=?`, target)
-		run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-		if err != nil || !run {
-			t.Fatalf("repair=(%v,%v)", run, err)
-		}
-		assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope)
-		assertSwiftReferenceTarget(t, f, refID, target)
-		marker(t, f)
-	})
-	t.Run("unsafe relation clears", func(t *testing.T) {
-		f, target, edge, refID := setup(t)
-		f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='unproven' WHERE child_qualified_name='Middle'`)
-		run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-		if err != nil || !run {
-			t.Fatalf("repair=(%v,%v)", run, err)
-		}
-		_ = target
-		assertSwiftEdgeUnresolved(t, f, edge)
-		assertSwiftReferenceCleared(t, f, refID)
-		marker(t, f)
 	})
 }
 
@@ -1125,58 +1024,6 @@ func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeLifecycle(t *testing.T
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope)
 }
 
-func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeRepair(t *testing.T) {
-	f, target, edge := newSwiftMultilevelSelfFixture(t, 2)
-	if got := f.dst(edge); got.Valid {
-		t.Fatalf("pre-repair dst=%v", got)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("RepairResolverBindingsOnce=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope)
-	assertSwiftReferenceTarget(t, f, swiftReferenceID(t, f, edge), target)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfMultilevelInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	firstDst, firstStrategy, firstConfidence := edgeState(t, f, edge)
-	firstReference := swiftReferenceSymbol(t, f, swiftReferenceID(t, f, edge))
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second RepairResolverBindingsOnce=(%v,%v)", run, err)
-	}
-	secondDst, secondStrategy, secondConfidence := edgeState(t, f, edge)
-	secondReference := swiftReferenceSymbol(t, f, swiftReferenceID(t, f, edge))
-	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference {
-		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v), second=(%v,%q,%q,%v)", firstDst, firstStrategy, firstConfidence, firstReference, secondDst, secondStrategy, secondConfidence, secondReference)
-	}
-}
-
-func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeUnsafeRepair(t *testing.T) {
-	f, target, edge := newSwiftMultilevelSelfFixture(t, 2)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE context_symbol_id=(SELECT src_symbol_id FROM edges WHERE id=?)`, target, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key != swiftClassSelfMultilevelInheritedFinalMethodRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-		t.Fatalf("RepairResolverBindingsOnce=(%v,%v)", ran, err)
-	}
-	assertSwiftBindingCleared(t, f, edge)
-}
-
 func TestSwiftClassSelfMultilevelInheritedFinalMethodScopeHardenedStress(t *testing.T) {
 	type stressCase struct{ name, strategy string }
 	cases := []stressCase{
@@ -1645,93 +1492,6 @@ func TestSwiftClassSelfTypeInheritedStaticMethodScopeRejectsUnsafeCandidates(t *
 			f.resolve()
 			assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 		})
-	}
-}
-
-func TestSwiftClassSelfTypeInheritedStaticMethodScopeUpgradeRepair(t *testing.T) {
-	f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeInheritedStaticMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
-	refID := swiftReferenceID(t, f, edge)
-	assertSwiftReferenceCleared(t, f, refID)
-	var marker string
-	markerErr := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker)
-	if markerErr != sql.ErrNoRows {
-		t.Fatalf("pre-repair marker=%q err=%v, want absent", marker, markerErr)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope)
-	assertSwiftReferenceTarget(t, f, refID, target)
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("post-repair marker=%q err=%v", marker, err)
-	}
-	var firstDst sql.NullInt64
-	var firstStrategy, firstConfidence string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&firstDst, &firstStrategy, &firstConfidence); err != nil {
-		t.Fatal(err)
-	}
-	firstReference := swiftReferenceSymbol(t, f, refID)
-	if !firstReference.Valid || firstReference.Int64 != target {
-		t.Fatalf("first reference=%v, want %d", firstReference, target)
-	}
-	firstMarker := marker
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-	var secondDst sql.NullInt64
-	var secondStrategy, secondConfidence string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&secondDst, &secondStrategy, &secondConfidence); err != nil {
-		t.Fatal(err)
-	}
-	secondReference := swiftReferenceSymbol(t, f, refID)
-	var secondMarker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&secondMarker); err != nil {
-		t.Fatal(err)
-	}
-	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference || firstMarker != secondMarker {
-		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v,%q), second=(%v,%q,%q,%v,%q)", firstDst, firstStrategy, firstConfidence, firstReference, firstMarker, secondDst, secondStrategy, secondConfidence, secondReference, secondMarker)
-	}
-}
-
-func TestSwiftClassSelfTypeInheritedStaticMethodScopeUnsafeRepair(t *testing.T) {
-	f, target, edge := newSwiftInheritedStaticSelfFixture(t, false)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeInheritedStaticMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-		t.Fatalf("repair=(%v,%v)", ran, err)
-	}
-	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
-	refID := swiftReferenceID(t, f, edge)
-	assertSwiftReferenceCleared(t, f, refID)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
 	}
 }
 
@@ -2840,82 +2600,6 @@ func TestSwiftClassSelfInheritedFinalMethodScopeSelectorsAndControls(t *testing.
 	})
 }
 
-func TestSwiftClassSelfInheritedFinalMethodScopeLifecycleAndRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
-	f.resolve()
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE child_qualified_name='Child'`); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	f.relation(f.mainFile, "Child", "Base", "superclass", false, false)
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfInheritedFinalMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	var ref sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&ref); err != nil {
-		t.Fatal(err)
-	}
-	if ref.Valid {
-		t.Fatalf("stale reference=%v", ref)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key=?`, swiftClassSelfInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)); err != nil {
-		t.Fatal(err)
-	}
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("rebind repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-}
-
 func TestSwiftClassSelfInheritedFinalMethodScopeRelationLifecycle(t *testing.T) {
 	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
 	f.resolve()
@@ -2941,72 +2625,6 @@ func TestSwiftClassSelfInheritedFinalMethodScopeRelationLifecycle(t *testing.T) 
 		t.Fatal(err)
 	}
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
-}
-
-func TestSwiftClassSelfInheritedFinalMethodScopeUpgradeRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfInheritedFinalMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(new(string)); err == nil {
-		t.Fatal("new repair marker unexpectedly present")
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-}
-
-func TestSwiftClassSelfInheritedFinalMethodScopeUnsafeRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfInheritedFinalMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	var ref sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&ref); err != nil {
-		t.Fatal(err)
-	}
-	if ref.Valid {
-		t.Fatalf("stale reference=%v", ref)
-	}
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfInheritedFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
 }
 
 func TestSwiftClassSelfInheritedFinalMethodScopeMixedStress(t *testing.T) {
@@ -3483,67 +3101,6 @@ func TestSwiftClassSelfFinalMethodHazardAndBlockerParity(t *testing.T) {
 	}
 }
 
-func TestSwiftClassSelfFinalMethodRepairMarkerOnly(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
-	f.reference(f.mainFile, caller, "self.run", 1)
-	f.declarationFact(f.mainFile, owner, false)
-	f.declarationFact(f.mainFile, target, true)
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfFinalMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !ran {
-		t.Fatalf("repair=(%v,%v)", ran, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfFinalMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || ran {
-		t.Fatalf("second repair=(%v,%v)", ran, err)
-	}
-}
-
-func TestSwiftClassSelfFinalMethodRepairClearsUnsafeBinding(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
-	f.reference(f.mainFile, caller, "self.run", 1)
-	f.declarationFact(f.mainFile, owner, false)
-	f.declarationFact(f.mainFile, target, false)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfFinalMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfFinalMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBindingCleared(t, f, edge)
-}
-
 func TestSwiftClassSelfFinalMethodMixedStress(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	type kind struct {
@@ -4012,150 +3569,6 @@ func TestSwiftClassSelfFinalMethodQualifiedOwnerUsesExactHazardKey(t *testing.T)
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalMethodScope)
 }
 
-func TestSwiftClassSelfRepairBindsAndMarksOnce(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
-	f.declarationFact(f.mainFile, owner, true)
-	didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftClassSelfRepair)
-	if err != nil || !didRun {
-		t.Fatalf("repair=(%v,%v)", didRun, err)
-	}
-	if got := f.dst(edge); !got.Valid || got.Int64 != target {
-		t.Fatalf("repaired binding=%v, want %d", got, target)
-	}
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker != "1" {
-		t.Fatalf("repair marker=%q", marker)
-	}
-	didRun, err = f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftClassSelfRepair)
-	if err != nil || didRun {
-		t.Fatalf("second repair=(%v,%v)", didRun, err)
-	}
-}
-
-func TestSwiftClassSelfPublicRepairBindsUnchangedSource(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
-	f.declarationFact(f.mainFile, owner, true)
-	f.reference(f.mainFile, caller, "self.run", 1)
-	if got := f.dst(edge); got.Valid {
-		t.Fatalf("pre-repair edge unexpectedly bound=%d", got.Int64)
-	}
-	ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !ran {
-		t.Fatalf("public repair=(%v,%v)", ran, err)
-	}
-	assertSwiftClassSelfBinding(t, f, edge, target)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker != "1" {
-		t.Fatalf("public repair marker=%q", marker)
-	}
-	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || ran {
-		t.Fatalf("second public repair=(%v,%v)", ran, err)
-	}
-}
-
-func TestSwiftClassSelfTypeRepairRunsAfterEarlierMarkers(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
-	f.reference(f.mainFile, caller, "Self.make", 1)
-	f.declarationFact(f.mainFile, owner, true)
-	f.dispatchFact(f.mainFile, target, false, "static")
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !ran {
-		t.Fatalf("public repair=(%v,%v)", ran, err)
-	}
-	assertSwiftClassSelfTypeBinding(t, f, edge, target)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("new repair marker=%q err=%v", marker, err)
-	}
-	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || ran {
-		t.Fatalf("second public repair=(%v,%v)", ran, err)
-	}
-}
-
-func TestSwiftClassSelfRepairClearsUnsafeBinding(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
-	f.declarationFact(f.mainFile, owner, true)
-	f.reference(f.mainFile, caller, "self.run", 1)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfFinalScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	f.relation(f.mainFile, "Service", "P", "conformance", false, false)
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBindingCleared(t, f, edge)
-}
-
-func TestSwiftClassSelfTypeRepairClearsUnsafeBinding(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
-	f.declarationFact(f.mainFile, owner, true)
-	f.dispatchFact(f.mainFile, target, false, "static")
-	f.reference(f.mainFile, caller, "Self.make", 1)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeFinalScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	f.relation(f.mainFile, "Service", "P", "conformance", false, false)
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	var dst, strategy, confidence string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT COALESCE(CAST(dst_symbol_id AS TEXT),''),COALESCE(resolution_strategy,''),COALESCE(resolution_confidence,'') FROM edges WHERE id=?`, edge).Scan(&dst, &strategy, &confidence); err != nil {
-		t.Fatal(err)
-	}
-	if dst != "" || strategy != "" || confidence != "" {
-		t.Fatalf("unsafe binding survived=(%q,%q,%q)", dst, strategy, confidence)
-	}
-	var reference sql.NullInt64
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, f.repoID).Scan(&reference); err != nil {
-		t.Fatal(err)
-	}
-	if reference.Valid {
-		t.Fatalf("unsafe reference survived=%d", reference.Int64)
-	}
-}
-
 func assertSwiftBindingCleared(t *testing.T, f *swiftScopeFixture, edge int64) {
 	t.Helper()
 	var dst, strategy, confidence string
@@ -4486,129 +3899,6 @@ func TestSwiftClassSelfTypeFinalClassMethodScope(t *testing.T) {
 			f.resolve()
 			assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
 		})
-	}
-}
-
-func TestSwiftClassSelfTypeFinalClassMethodScopeLifecycleAndRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftNonFinalStaticSelfFixture(t, "Service", "", "class", true)
-	f.resolve()
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeFinalClassMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(new(string)); err == nil {
-		t.Fatal("new repair marker unexpectedly present")
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key=?`, swiftClassSelfTypeFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)); err != nil {
-		t.Fatal(err)
-	}
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("rebind repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-}
-
-func TestSwiftClassSelfTypeStaticMethodScopeLifecycleAndRepair(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
-	edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
-	f.reference(f.mainFile, caller, "Self.make", 1)
-	f.declarationFact(f.mainFile, owner, false)
-	f.dispatchFact(f.mainFile, target, false, "static")
-	f.resolve()
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(new(string)); err == nil {
-		t.Fatal("new repair marker unexpectedly present")
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeStaticMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key=?`, swiftClassSelfTypeStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)); err != nil {
-		t.Fatal(err)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
 	}
 }
 
@@ -5089,62 +4379,6 @@ func TestSwiftClassSelfTypeFinalClassMethodScopeCrossFileHazardLifecycle(t *test
 	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
 }
 
-func TestSwiftClassSelfTypeFinalClassMethodScopeUpgradeRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftFinalClassSelfFixture(t, "Service", "")
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeFinalClassMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
-}
-
-func TestSwiftClassSelfTypeFinalClassMethodScopeUnsafeExistingBindingRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftFinalClassSelfFixture(t, "Service", "")
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeFinalClassMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftEdgeAndReferenceUnresolved(t, f, edge)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-}
-
 func TestSwiftClassSelfTypeFinalClassMethodScopeMalformedAndDuplicateFacts(t *testing.T) {
 	t.Run("single malformed dispatch", func(t *testing.T) {
 		f, _, target, _, edge := newSwiftFinalClassSelfFixture(t, "Service", "")
@@ -5494,58 +4728,6 @@ func TestSwiftClassSelfTypeStaticMethodScopeCrossFileHazardLifecycle(t *testing.
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
 	f.relation(hazard, "Service", "P", "conformance", false, false)
 	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Conformance.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-}
-
-func TestSwiftClassSelfTypeStaticMethodScopeUpgradeRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftNonFinalStaticSelfFixture(t, "Service", "", "static", false)
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeStaticMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	assertSwiftEdgeUnresolved(t, f, edge)
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
-}
-
-func TestSwiftClassSelfTypeStaticMethodScopeUnsafeExistingBindingRepair(t *testing.T) {
-	f, _, target, _, edge := newSwiftNonFinalStaticSelfFixture(t, "Service", "", "static", false)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeStaticMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
 		t.Fatal(err)
 	}
 	assertSwiftEdgeUnresolved(t, f, edge)
@@ -5950,64 +5132,6 @@ func TestSwiftClassSelfFinalClassMethodNames(t *testing.T) {
 	}
 }
 
-func TestSwiftClassSelfFinalClassMethodRepair(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
-	edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
-	f.reference(f.mainFile, caller, "self.make", 1)
-	f.declarationFact(f.mainFile, owner, false)
-	f.dispatchFact(f.mainFile, caller, false, "class")
-	f.dispatchFact(f.mainFile, target, true, "class")
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfFinalClassMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalClassMethodScope)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-}
-
-func TestSwiftClassSelfFinalClassMethodRepairClearsUnsafeExistingBinding(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
-	edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
-	f.reference(f.mainFile, caller, "self.make", 1)
-	f.declarationFact(f.mainFile, owner, false)
-	f.dispatchFact(f.mainFile, caller, false, "class")
-	f.dispatchFact(f.mainFile, target, false, "class")
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfFinalClassMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key=?`, swiftClassSelfFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBindingCleared(t, f, edge)
-}
-
 func TestSwiftClassSelfStaticMethodFinalPrecedenceAndLifecycle(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
@@ -6021,84 +5145,6 @@ func TestSwiftClassSelfStaticMethodFinalPrecedenceAndLifecycle(t *testing.T) {
 	f.resolve()
 	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfFinalScope)
 
-}
-
-func TestSwiftClassSelfStaticMethodUpgradeRepair(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
-	edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
-	f.reference(f.mainFile, caller, "self.make", 1)
-	f.declarationFact(f.mainFile, owner, false)
-	f.dispatchFact(f.mainFile, caller, false, "class")
-	f.dispatchFact(f.mainFile, target, false, "static")
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfStaticMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !ran {
-		t.Fatalf("repair=(%v,%v)", ran, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfStaticMethodScope)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfStaticMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("new repair marker=%q err=%v", marker, err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBindingCleared(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
-		t.Fatal(err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfStaticMethodScope)
-	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || ran {
-		t.Fatalf("second repair=(%v,%v)", ran, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfStaticMethodScope)
-}
-
-func TestSwiftClassSelfStaticMethodRepairClearsUnsafeExistingBinding(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
-	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
-	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", true)
-	edge := f.call(f.mainFile, caller, "self.make", "swift:self", 0, 1)
-	f.reference(f.mainFile, caller, "self.make", 1)
-	f.declarationFact(f.mainFile, owner, false)
-	f.dispatchFact(f.mainFile, caller, false, "class")
-	f.dispatchFact(f.mainFile, target, false, "class")
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfStaticMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=?`, target, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfStaticMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-		t.Fatalf("repair=(%v,%v)", ran, err)
-	}
-	assertSwiftBindingCleared(t, f, edge)
 }
 
 func TestSwiftClassSelfStaticMethodRejectsActualInstanceCaller(t *testing.T) {
@@ -6718,32 +5764,6 @@ func TestSwiftSelfScopeIncrementalCrossFileVetoesRebind(t *testing.T) {
 	}
 }
 
-func TestSwiftSelfScopeRepairBindsAndMarksOnce(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	f.symbol(f.mainFile, "Service", "", "struct", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
-	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
-	edge := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
-	didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftSelfRepair)
-	if err != nil || !didRun {
-		t.Fatalf("repair=(%v,%v), want (true,nil)", didRun, err)
-	}
-	if got := f.dst(edge); !got.Valid || got.Int64 != target {
-		t.Fatalf("repaired binding=%v, want %d", got, target)
-	}
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftSelfRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker != "1" {
-		t.Fatalf("repair marker=%q", marker)
-	}
-	didRun, err = f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftSelfRepair)
-	if err != nil || didRun {
-		t.Fatalf("second repair=(%v,%v), want (false,nil)", didRun, err)
-	}
-}
-
 func TestSwiftSelfCallAcceptsExactRegularLabelsOnly(t *testing.T) {
 	if got := swiftSelector("run", []string{"_", "cache:"}); got != "run(_:,cache:)" {
 		t.Fatalf("selector = %q", got)
@@ -6987,116 +6007,6 @@ func TestSwiftTrailingClosureSecondLabelAndBlocker(t *testing.T) {
 	}
 	if got := f.dst(edge); got.Valid {
 		t.Fatalf("member blocker left dst=%d", got.Int64)
-	}
-}
-
-func TestSwiftTrailingClosureRepairBindsAndMarksOnce(t *testing.T) {
-	f := newSwiftScopeFixture(t)
-	f.symbol(f.mainFile, "Service", "", "struct", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run(completion:)", false)
-	f.arity(target, 1, 1)
-	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
-	edge := f.call(f.mainFile, caller, "self.run", "swift:self;trailing_labels=_", 1, 1)
-	didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
-	if err != nil || !didRun {
-		t.Fatalf("repair=(%v,%v)", didRun, err)
-	}
-	if got := f.dst(edge); !got.Valid || got.Int64 != target {
-		t.Fatalf("repaired dst=%v want %d", got, target)
-	}
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftTrailingRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	didRun, err = f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
-	if err != nil || didRun {
-		t.Fatalf("second repair=(%v,%v)", didRun, err)
-	}
-}
-
-func TestSwiftTrailingRepairAppliesOnlyToTrailingCalls(t *testing.T) {
-	noSwift, repoID := newQueryTestStore(t)
-	if applies, err := noSwift.swiftTrailingRepairApplies(context.Background(), repoID); err != nil || applies {
-		t.Fatalf("no-Swift applies=(%v,%v), want false", applies, err)
-	}
-
-	f := newSwiftScopeFixture(t)
-	f.symbol(f.mainFile, "Service", "", "struct", "", false)
-	target := f.symbol(f.mainFile, "run", "Service", "function", "run()", false)
-	caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", false)
-	ordinary := f.call(f.mainFile, caller, "self.run", "swift:self", 0, 1)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy='sentinel' WHERE id=?`, target, ordinary); err != nil {
-		t.Fatal(err)
-	}
-	if applies, err := f.store.swiftTrailingRepairApplies(f.ctx, f.repoID); err != nil || applies {
-		t.Fatalf("ordinary-self applies=(%v,%v), want false", applies, err)
-	}
-	run, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
-	if err != nil || run {
-		t.Fatalf("ordinary-self repair=(%v,%v), want (false,nil)", run, err)
-	}
-	var strategy string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT resolution_strategy FROM edges WHERE id=?`, ordinary).Scan(&strategy); err != nil {
-		t.Fatal(err)
-	}
-	if strategy != "sentinel" {
-		t.Fatalf("ordinary-self strategy=%q, repair executed", strategy)
-	}
-}
-
-func TestSwiftTrailingRepairAppliesToUnresolvedAndBoundCalls(t *testing.T) {
-	for _, tc := range []struct {
-		name, evidence string
-	}{
-		{"unresolved", "swift:self;trailing_labels=_"},
-		{"bound", "swift:Self;trailing_labels=_"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newSwiftScopeFixture(t)
-			f.symbol(f.mainFile, "Service", "", "struct", "", false)
-			target := f.symbol(f.mainFile, "run", "Service", "function", "run(completion:)", tc.name == "bound")
-			f.arity(target, 1, 1)
-			caller := f.symbol(f.mainFile, "caller", "Service", "function", "caller()", tc.name == "bound")
-			dst := "self.run"
-			if tc.name == "bound" {
-				dst = "Self.run"
-			}
-			edge := f.call(f.mainFile, caller, dst, tc.evidence, 1, 1)
-			if tc.name == "bound" {
-				if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=? WHERE id=?`, target, edge); err != nil {
-					t.Fatal(err)
-				}
-			}
-			applies, err := f.store.swiftTrailingRepairApplies(f.ctx, f.repoID)
-			if err != nil || !applies {
-				t.Fatalf("applies=(%v,%v), want true", applies, err)
-			}
-			didRun, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, swiftTrailingRepair)
-			if err != nil || !didRun {
-				t.Fatalf("repair=(%v,%v), want (true,nil)", didRun, err)
-			}
-			if got := f.dst(edge); tc.name == "unresolved" && (!got.Valid || got.Int64 != target) {
-				t.Fatalf("repaired dst=%v, want %d", got, target)
-			}
-			if tc.name == "bound" && (!f.dst(edge).Valid || f.dst(edge).Int64 != target) {
-				t.Fatalf("bound dst changed: %v", f.dst(edge))
-			}
-		})
-	}
-}
-
-func TestSwiftTrailingRepairFreshRepositoriesAvoidTax(t *testing.T) {
-	s, _ := newQueryTestStore(t)
-	root := t.TempDir()
-	for i := 0; i < 16; i++ {
-		repo, err := s.UpsertRepo(context.Background(), filepath.Join(root, fmt.Sprintf("repo-%d", i)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		run, err := s.runResolverRepairOnce(context.Background(), repo.ID, swiftTrailingRepair)
-		if err != nil || run {
-			t.Fatalf("repo %d repair=(%v,%v), want (false,nil)", i, run, err)
-		}
 	}
 }
 
@@ -7867,97 +6777,6 @@ func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeControls(t *testing.T) 
 				assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
 			}
 		})
-	}
-}
-
-func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeUpgradeRepair(t *testing.T) {
-	f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	refID := swiftReferenceID(t, f, edge)
-	var preDst sql.NullInt64
-	var preStrategy, preConfidence string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&preDst, &preStrategy, &preConfidence); err != nil {
-		t.Fatal(err)
-	}
-	if preDst.Valid || preStrategy != "" || preConfidence != "" {
-		t.Fatalf("pre-repair=(%v,%q,%q), want empty", preDst, preStrategy, preConfidence)
-	}
-	assertSwiftReferenceCleared(t, f, refID)
-	var preMarker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&preMarker); err != sql.ErrNoRows {
-		t.Fatalf("pre-repair marker=%q err=%v, want absent", preMarker, err)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope)
-	assertSwiftReferenceTarget(t, f, refID, target)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
-	}
-	var firstDst sql.NullInt64
-	var firstStrategy, firstConfidence string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&firstDst, &firstStrategy, &firstConfidence); err != nil {
-		t.Fatal(err)
-	}
-	firstReference := swiftReferenceSymbol(t, f, refID)
-	firstMarker := marker
-	run, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || run {
-		t.Fatalf("second repair=(%v,%v)", run, err)
-	}
-	var secondDst sql.NullInt64
-	var secondStrategy, secondConfidence string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT dst_symbol_id,resolution_strategy,resolution_confidence FROM edges WHERE id=?`, edge).Scan(&secondDst, &secondStrategy, &secondConfidence); err != nil {
-		t.Fatal(err)
-	}
-	secondReference := swiftReferenceSymbol(t, f, refID)
-	var secondMarker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&secondMarker); err != nil {
-		t.Fatal(err)
-	}
-	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference || firstMarker != secondMarker {
-		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v,%q), second=(%v,%q,%q,%v,%q)", firstDst, firstStrategy, firstConfidence, firstReference, firstMarker, secondDst, secondStrategy, secondConfidence, secondReference, secondMarker)
-	}
-}
-
-func TestSwiftClassSelfTypeInheritedFinalClassMethodScopeUnsafeExistingBindingRepair(t *testing.T) {
-	f, target, edge := newSwiftInheritedFinalClassSelfFixture(t, false)
-	refID := swiftReferenceID(t, f, edge)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE id=?`, target, refID); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range resolverRepairs {
-		if repair.key == swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey {
-			continue
-		}
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
-		t.Fatal(err)
-	}
-	run, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !run {
-		t.Fatalf("repair=(%v,%v)", run, err)
-	}
-	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
-	var marker string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey+fmt.Sprintf(".%d", f.repoID)).Scan(&marker); err != nil || marker != "1" {
-		t.Fatalf("marker=%q err=%v", marker, err)
 	}
 }
 
@@ -8856,94 +7675,6 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeNamesAndStats(t *
 	})
 }
 
-func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeRepair(t *testing.T) {
-	f, target, edge := newSwiftMultilevelStaticSelfFixture(t, 2, "instance")
-	for _, repair := range resolverRepairs {
-		if repair.key != swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	assertSwiftInheritedStaticEdgeUnresolved(t, f, edge)
-	assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
-	assertSwiftRepairMarkerAbsent(t, f, swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey)
-
-	ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || !ran {
-		t.Fatalf("RepairResolverBindingsOnce=(%v,%v)", ran, err)
-	}
-	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope)
-	assertSwiftReferenceTarget(t, f, swiftReferenceID(t, f, edge), target)
-	assertSwiftRepairMarker(t, f, swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey)
-
-	firstDst, firstStrategy, firstConfidence := edgeState(t, f, edge)
-	firstReference := swiftReferenceSymbol(t, f, swiftReferenceID(t, f, edge))
-	firstMarker := swiftRepairMarkerValue(t, f, swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey)
-	if firstMarker != "1" {
-		t.Fatalf("first marker=%q want %q", firstMarker, "1")
-	}
-	ran, err = f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil || ran {
-		t.Fatalf("second RepairResolverBindingsOnce=(%v,%v)", ran, err)
-	}
-	secondDst, secondStrategy, secondConfidence := edgeState(t, f, edge)
-	secondReference := swiftReferenceSymbol(t, f, swiftReferenceID(t, f, edge))
-	secondMarker := swiftRepairMarkerValue(t, f, swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey)
-	if firstDst != secondDst || firstStrategy != secondStrategy || firstConfidence != secondConfidence || firstReference != secondReference || firstMarker != secondMarker {
-		t.Fatalf("second repair changed state: first=(%v,%q,%q,%v,%q), second=(%v,%q,%q,%v,%q)", firstDst, firstStrategy, firstConfidence, firstReference, firstMarker, secondDst, secondStrategy, secondConfidence, secondReference, secondMarker)
-	}
-}
-
-// swiftRepairMarkerValue reads the raw repair marker so a second pass can prove
-// the marker is byte-identical rather than merely still present.
-func swiftRepairMarkerValue(t *testing.T, f *swiftScopeFixture, key string) string {
-	t.Helper()
-	var value string
-	if err := f.store.db.QueryRowContext(f.ctx, `SELECT value FROM settings WHERE key=?`, fmt.Sprintf("%s.%d", key, f.repoID)).Scan(&value); err != nil {
-		t.Fatalf("marker %s: %v", key, err)
-	}
-	return value
-}
-
-func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeUnsafeRepair(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		edit func(*swiftScopeFixture, int64)
-	}{
-		{"class dispatch", func(f *swiftScopeFixture, target int64) {
-			f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target)
-		}},
-		{"unproven relation", func(f *swiftScopeFixture, _ int64) {
-			f.store.db.ExecContext(f.ctx, `UPDATE swift_inheritance_relations SET relation_kind='unproven' WHERE child_qualified_name='Middle'`)
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f, target, edge := newSwiftMultilevelStaticSelfFixture(t, 2, "instance")
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy=?,resolution_confidence=? WHERE id=?`, target, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope, ResolutionConfidenceHigh, edge); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id=? WHERE context_symbol_id=(SELECT src_symbol_id FROM edges WHERE id=?)`, target, edge); err != nil {
-				t.Fatal(err)
-			}
-			tc.edit(f, target)
-			for _, repair := range resolverRepairs {
-				if repair.key != swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey {
-					if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-			if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-				t.Fatalf("RepairResolverBindingsOnce=(%v,%v)", ran, err)
-			}
-			assertSwiftBindingCleared(t, f, edge)
-			assertSwiftReferenceCleared(t, f, swiftReferenceID(t, f, edge))
-			assertSwiftRepairMarker(t, f, swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey)
-		})
-	}
-}
-
 func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeHardenedStress(t *testing.T) {
 	const want = ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope
 	type stressCase struct{ name, strategy string }
@@ -9285,4 +8016,83 @@ func TestSwiftClassSelfTypeMultilevelInheritedStaticMethodScopeHardenedStress(t 
 	if second := readState(); !reflect.DeepEqual(second, first) {
 		t.Fatalf("second state=%+v, first=%+v", second, first)
 	}
+}
+
+func TestSwiftClassSelfTypeFinalClassMethodScopeLifecycle(t *testing.T) {
+	f, _, target, _, edge := newSwiftNonFinalStaticSelfFixture(t, "Service", "", "class", true)
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope)
+}
+
+func TestSwiftClassSelfTypeStaticMethodScopeLifecycle(t *testing.T) {
+	f := newSwiftScopeFixture(t)
+	owner := f.symbol(f.mainFile, "Service", "", "class", "", false)
+	target := f.symbol(f.mainFile, "make", "Service", "function", "make()", true)
+	caller := f.symbol(f.mainFile, "f", "Service", "function", "f()", false)
+	edge := f.call(f.mainFile, caller, "Self.make", "swift:Self", 0, 1)
+	f.reference(f.mainFile, caller, "Self.make", 1)
+	f.declarationFact(f.mainFile, owner, false)
+	f.dispatchFact(f.mainFile, target, false, "static")
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='class' WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET dispatch_kind='static' WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfTypeStaticMethodScope)
+}
+
+func TestSwiftClassSelfInheritedFinalMethodScopeLifecycle(t *testing.T) {
+	f, _, target, _, edge := newSwiftInheritedFinalSelfFixture(t, "Child", "Base")
+	f.resolve()
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=0 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE swift_declaration_facts SET is_final=1 WHERE symbol_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
+	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM swift_inheritance_relations WHERE child_qualified_name='Child'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftEdgeUnresolved(t, f, edge)
+	f.relation(f.mainFile, "Child", "Base", "superclass", false, false)
+	if err := f.store.ResolveEdgesForPaths(f.ctx, f.repoID, []string{"Service.swift"}); err != nil {
+		t.Fatal(err)
+	}
+	assertSwiftBinding(t, f, edge, target, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope)
 }

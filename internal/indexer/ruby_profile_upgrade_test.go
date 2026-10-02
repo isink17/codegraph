@@ -166,9 +166,6 @@ func TestRubyProfileV2ToV3ReplacesUnsafeCallEdges(t *testing.T) {
 	// Every resolver repair is already marked done, as it would be in a
 	// database this old (the first index marks them all). Convergence must not
 	// depend on clearing or re-running any of them.
-	if err := s.Store.MarkResolverBindingsRepaired(ctx, repo); err != nil {
-		t.Fatal(err)
-	}
 
 	// The upgrade: same bytes, same store, no Force, no Paths.
 	upgraded := New(s.Store, parser.NewRegistry(tsparser.NewRuby()), nil)

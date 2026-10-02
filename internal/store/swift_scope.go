@@ -12,22 +12,6 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 )
 
-const swiftSelfRepairSettingKey = "resolver.swift_explicit_self_repaired.v1"
-const swiftClassSelfRepairSettingKey = "resolver.swift_class_self_final_repaired.v1"
-const swiftClassSelfTypeRepairSettingKey = "resolver.swift_class_self_type_final_repaired.v1"
-const swiftClassSelfFinalMethodRepairSettingKey = "resolver.swift_class_self_final_method_repaired.v1"
-const swiftClassSelfStaticMethodRepairSettingKey = "resolver.swift_class_self_static_method_repaired.v1"
-const swiftClassSelfFinalClassMethodRepairSettingKey = "resolver.swift_class_self_final_class_method_repaired.v1"
-const swiftClassSelfTypeStaticMethodRepairSettingKey = "resolver.swift_class_self_type_static_method_repaired.v1"
-const swiftClassSelfTypeFinalClassMethodRepairSettingKey = "resolver.swift_class_self_type_final_class_method_repaired.v1"
-const swiftClassSelfInheritedFinalMethodRepairSettingKey = "resolver.swift_class_self_inherited_final_method_repaired.v1"
-const swiftClassSelfMultilevelInheritedFinalMethodRepairSettingKey = "resolver.swift_class_self_multilevel_inherited_final_method_repaired.v1"
-const swiftClassSelfTypeInheritedStaticMethodRepairSettingKey = "resolver.swift_class_self_type_inherited_static_method_repaired.v1"
-const swiftClassSelfTypeInheritedFinalClassMethodRepairSettingKey = "resolver.swift_class_self_type_inherited_final_class_method_repaired.v1"
-const swiftClassSelfTypeMultilevelInheritedStaticMethodRepairSettingKey = "resolver.swift_class_self_type_multilevel_inherited_static_method_repaired.v1"
-const swiftClassSelfTypeMultilevelInheritedFinalClassMethodRepairSettingKey = "resolver.swift_class_self_type_multilevel_inherited_final_class_method_repaired.v1"
-const swiftTrailingRepairSettingKey = "resolver.swift_trailing_closure_repaired.v1"
-
 var swiftSelfStrategies = []string{ResolutionStrategySwiftSelfScope, ResolutionStrategySwiftSelfTypeScope, ResolutionStrategySwiftClassSelfFinalScope, ResolutionStrategySwiftClassSelfTypeFinalScope, ResolutionStrategySwiftClassSelfFinalMethodScope, ResolutionStrategySwiftClassSelfStaticMethodScope, ResolutionStrategySwiftClassSelfFinalClassMethodScope, ResolutionStrategySwiftClassSelfTypeStaticMethodScope, ResolutionStrategySwiftClassSelfTypeFinalClassMethodScope, ResolutionStrategySwiftClassSelfInheritedFinalMethodScope, ResolutionStrategySwiftClassSelfMultilevelInheritedFinalMethodScope, ResolutionStrategySwiftClassSelfTypeInheritedStaticMethodScope, ResolutionStrategySwiftClassSelfTypeInheritedFinalClassMethodScope, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedStaticMethodScope, ResolutionStrategySwiftClassSelfTypeMultilevelInheritedFinalClassMethodScope}
 
 // Swift v3 call facts are owned here. Unsupported Swift calls must never fall
@@ -482,25 +466,6 @@ func (s *Store) resolveSwiftScopeStandalone(ctx context.Context, repoID int64, o
 	}
 	return n, tx.Commit()
 }
-func (s *Store) repairSwiftSelfBindings(ctx context.Context, repoID int64) error {
-	return s.redecideSwiftSelfBindings(ctx, repoID)
-}
-
-func (s *Store) repairSwiftTrailingBindings(ctx context.Context, repoID int64) error {
-	return s.redecideSwiftSelfBindings(ctx, repoID)
-}
-
-func (s *Store) swiftTrailingRepairApplies(ctx context.Context, repoID int64) (bool, error) {
-	var found bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM edges e JOIN files f ON f.id=e.file_id
-		WHERE e.repo_id=? AND f.repo_id=e.repo_id AND f.language='swift' AND f.is_deleted=0
-		  AND e.edge_kind='calls'
-		  AND (e.evidence LIKE 'swift:self;trailing_labels=%' OR e.evidence LIKE 'swift:self;labels=%;trailing_labels=%'
-		       OR e.evidence LIKE 'swift:Self;trailing_labels=%' OR e.evidence LIKE 'swift:Self;labels=%;trailing_labels=%')
-	)`, repoID).Scan(&found)
-	return found, err
-}
 
 func (s *Store) swiftPathsChanged(ctx context.Context, repoID int64, paths []string) (bool, error) {
 	if len(paths) == 0 {
@@ -533,22 +498,4 @@ func (s *Store) swiftPathsChanged(ctx context.Context, repoID int64, paths []str
 		return nil
 	})
 	return changed, err
-}
-
-func (s *Store) redecideSwiftSelfBindings(ctx context.Context, repoID int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+` WHERE repo_id=? AND edge_kind='calls' AND (evidence LIKE 'swift:self%' OR evidence LIKE 'swift:Self%')`, repoID); err != nil {
-		return err
-	}
-	if _, err := s.resolveSwiftScope(ctx, tx, repoID, nil); err != nil {
-		return err
-	}
-	if _, err := s.resolveSwiftClassSelf(ctx, tx, repoID, nil); err != nil {
-		return err
-	}
-	return tx.Commit()
 }

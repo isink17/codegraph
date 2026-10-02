@@ -555,55 +555,6 @@ func TestResolveTestLinks_Idempotent(t *testing.T) {
 	}
 }
 
-// TestMigration025ClearsTestMainLinks: an existing database carries rows the
-// retired TestMain linking wrote; re-applying migration 025 must delete exactly
-// the rows whose test symbol is named TestMain and leave every other row alone.
-func TestMigration025ClearsTestMainLinks(t *testing.T) {
-	f := newTestLinkFixture(t)
-	testFile := f.file("main_test.go", "go")
-	mainSym := f.symbolWithKey(testFile, "TestMain", "go", "func:pkg::TestMain")
-	helperSym := f.symbolWithKey(testFile, "TestHelper", "go", "func:pkg::TestHelper")
-	insert := func(symID int64, key string) int64 {
-		res, err := f.store.db.ExecContext(f.ctx, `
-			INSERT INTO test_links(repo_id, test_file_id, test_symbol_id, target_file_id, target_symbol_id, reason, score, target_stable_key)
-			VALUES(?, ?, ?, NULL, NULL, 'test_name_match', 0.8, ?)
-		`, f.repoID, testFile, symID, key)
-		if err != nil {
-			t.Fatalf("insert row: %v", err)
-		}
-		id, err := res.LastInsertId()
-		if err != nil {
-			t.Fatalf("LastInsertId: %v", err)
-		}
-		return id
-	}
-	legacy := insert(mainSym, "func:pkg::Main")
-	kept := insert(helperSym, "func:pkg::Helper")
-
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM schema_migrations WHERE version = 25`); err != nil {
-		t.Fatalf("reset migration 25: %v", err)
-	}
-	if err := f.store.Migrate(); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	var n int
-	if err := f.store.db.QueryRowContext(f.ctx,
-		`SELECT COUNT(*) FROM test_links WHERE id = ?`, legacy).Scan(&n); err != nil {
-		t.Fatalf("count legacy row: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("TestMain-minted row survived migration 025")
-	}
-	if err := f.store.db.QueryRowContext(f.ctx,
-		`SELECT COUNT(*) FROM test_links WHERE id = ?`, kept).Scan(&n); err != nil {
-		t.Fatalf("count kept row: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("unrelated row deleted by migration 025")
-	}
-}
-
 // TestResolveTestLinks_OnlyTouchesOwnRepo guards the repo_id filter.
 func TestResolveTestLinks_OnlyTouchesOwnRepo(t *testing.T) {
 	f := newTestLinkFixture(t)

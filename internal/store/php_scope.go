@@ -8,7 +8,6 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -62,8 +61,7 @@ import (
 
 const phpScopeResolution = "tmp_php_scope_resolution"
 
-// phpScopeStrategies is every strategy this pass writes; the one-time repair
-// and the incremental invalidation both key on it.
+// phpScopeStrategies is every strategy this pass writes; incremental invalidation keys on it.
 var phpScopeStrategies = []string{
 	ResolutionStrategyPHPTypeScope,
 	ResolutionStrategyPHPAliasStatic,
@@ -857,71 +855,4 @@ func (s *Store) phpStaleScopeBindings(ctx context.Context, repoID int64, wanted 
 			return nil
 		})
 	return stale, err
-}
-
-// -- one-time upgrade repair --------------------------------------------------
-
-// phpScopeRepairSettingKey records that a repository's PHP-owned scoped call
-// edges have been re-decided by this pass once.
-//
-// P22.44 changes no parser fact, so `treesitter:php:v2` stays and an indexed
-// repository reparses nothing on upgrade. Its owned edges are either still
-// unresolved (no strategy reconsiders them without a name event) or carry a
-// generic target this pass now refuses to let stand. The repair clears every
-// owned PHP edge's binding -- bound or not -- and runs the repo-wide resolve in
-// the same transaction, so the PHP pass re-decides them under its own rules and
-// the reference identities that derive from them converge afterwards
-// (resolverRepairs orders this before referenceIdentityRepair, and a repo-wide
-// repair drops the reference marker). Ordinary bare PHP calls are untouched.
-const phpScopeRepairSettingKey = "resolver.php_scope_repaired.v1"
-
-// Parser facts stay unchanged. A separate repair marker reaches repositories
-// that already completed the earlier scoped-call repair. Re-deciding generic
-// PHP edges also recovers functions stranded by same-name method ambiguity.
-const phpFunctionCandidateRepairSettingKey = "resolver.php_function_candidates_repaired.v1"
-
-func (s *Store) repairPHPFunctionCandidateBindings(ctx context.Context, repoID int64) error {
-	clear := func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-			UPDATE edges SET `+resolverClearResolutionSQL+`
-			WHERE id IN (
-				SELECT e.id FROM edges e JOIN files f ON f.id = e.file_id
-				WHERE e.repo_id = ? AND f.language = 'php' AND e.dst_symbol_id IS NOT NULL
-				  AND e.edge_kind <> '`+EdgeKindCrossLanguageRef+`'
-				  AND NOT `+phpScopeOwnedSQL+`
-			)`, repoID)
-		if err != nil {
-			return err
-		}
-		// A failure after the edge commit must not leave stale reference
-		// identities marked current. Invalidate them in the same transaction.
-		_, err = tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, referenceIdentityRepairSettingKey+"."+strconv.FormatInt(repoID, 10))
-		return err
-	}
-	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
-	return err
-}
-
-// phpScopeRepairApplies limits the repair to repositories that hold PHP at
-// all: everywhere else there is nothing to clear, and running the repo-wide
-// resolve anyway would make every upgraded Go/TypeScript/Python repository pay
-// for a pass that can only reproduce what it already has.
-func (s *Store) phpScopeRepairApplies(ctx context.Context, repoID int64) (bool, error) {
-	return repoHasPHP(ctx, s.db, repoID)
-}
-
-func (s *Store) repairPHPScopeBindings(ctx context.Context, repoID int64) error {
-	clear := func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-			UPDATE edges SET `+resolverClearResolutionSQL+`
-			WHERE id IN (
-				SELECT e.id FROM edges e JOIN files f ON f.id = e.file_id
-				WHERE e.repo_id = ? AND f.language = 'php' AND e.dst_symbol_id IS NOT NULL
-				  AND e.edge_kind <> '`+EdgeKindCrossLanguageRef+`'
-				  AND `+phpScopeOwnedSQL+`
-			)`, repoID)
-		return err
-	}
-	_, err := s.resolveEdgesWithPreStep(ctx, repoID, clear)
-	return err
 }

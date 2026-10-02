@@ -1,7 +1,6 @@
 package store
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -171,99 +170,6 @@ func TestPHPBareFunctionCandidateParity(t *testing.T) {
 	}
 }
 
-func TestPHPFunctionCandidateRepairReferenceRetry(t *testing.T) {
-	f := newPHPFixture(t)
-	file := f.phpFile(t, "Caller.php")
-	caller := f.fn(t, file, "caller")
-	method := f.method(t, file, "App.Service.methodOnly", "public", false)
-	wrong := f.call(t, file, srcOf(caller), "methodOnly", 1)
-	f.reference(t, file, "methodOnly", 1)
-	f.setBinding(t, wrong, method, ResolutionStrategyExactName, ResolutionConfidenceHigh)
-	if err := f.store.ReconcileReferenceIdentities(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	key := phpFunctionCandidateRepairSettingKey + "." + strconv.FormatInt(f.repoID, 10)
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key = ?`, key); err != nil {
-		t.Fatal(err)
-	}
-	// Stop at the boundary after the edge repair is marked complete, before
-	// the outer lifecycle can invalidate or reconcile derived references.
-	if ran, err := f.store.runResolverRepairOnce(f.ctx, f.repoID, phpFunctionCandidateRepair); err != nil || !ran {
-		t.Fatalf("edge repair = %v, %v", ran, err)
-	}
-	if !f.markerSet(t, phpFunctionCandidateRepairSettingKey) || f.markerSet(t, referenceIdentityRepairSettingKey) {
-		t.Fatal("completed edge repair left the old reference marker trusted")
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	f.assertReference(t, 1, sql.NullInt64{}, srcOf(caller))
-}
-
-func TestPHPFunctionCandidateRepairAtomicAndOnce(t *testing.T) {
-	f := newPHPFixture(t)
-	file := f.phpFile(t, "Caller.php")
-	f.typ(t, file, "App.Caller")
-	caller := f.method(t, file, "App.Caller.call", "public", false)
-	method := f.method(t, file, "App.Caller.methodOnly", "public", false)
-	helper := f.fn(t, file, "helper")
-	wrong := f.call(t, file, srcOf(caller), "methodOnly", 1)
-	valid := f.call(t, file, srcOf(caller), "helper", 2)
-	f.reference(t, file, "methodOnly", 1)
-	f.reference(t, file, "helper", 2)
-	f.setBinding(t, wrong, method, ResolutionStrategyExactName, ResolutionConfidenceHigh)
-	if err := f.store.ReconcileReferenceIdentities(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.MarkResolverBindingsRepaired(f.ctx, f.repoID); err != nil {
-		t.Fatal(err)
-	}
-	key := phpFunctionCandidateRepairSettingKey + "." + strconv.FormatInt(f.repoID, 10)
-	if _, err := f.store.db.ExecContext(f.ctx, `DELETE FROM settings WHERE key = ?`, key); err != nil {
-		t.Fatal(err)
-	}
-	// Fail after the pre-step cleared the wrong edge, during the valid rebind.
-	if _, err := f.store.db.ExecContext(f.ctx, `CREATE TRIGGER fail_php_function_rebind BEFORE UPDATE ON edges WHEN NEW.dst_name = 'helper' AND NEW.dst_symbol_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'repair rollback probe'); END`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err == nil || !strings.Contains(err.Error(), "repair rollback probe") {
-		t.Fatalf("repair failure = %v, want injected rollback", err)
-	}
-	if f.markerSet(t, phpFunctionCandidateRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) || f.binding(t, wrong) != "App.Caller.methodOnly|exact_name|high" {
-		t.Fatal("failed repair marked complete or persisted a partial clear")
-	}
-	f.assertReference(t, 1, srcOf(method), srcOf(caller))
-	if _, err := f.store.db.ExecContext(f.ctx, `DROP TRIGGER fail_php_function_rebind`); err != nil {
-		t.Fatal(err)
-	}
-	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || !ran {
-		t.Fatalf("repair = %v, %v; want repo-wide resolve", ran, err)
-	}
-	if got := f.binding(t, wrong); got != "<unresolved>" {
-		t.Fatalf("wrong edge after repair = %s", got)
-	}
-	if got := f.binding(t, valid); got != "helper|exact_qualified|high" {
-		t.Fatalf("valid edge after repair = %s", got)
-	}
-	f.assertReference(t, 1, sql.NullInt64{}, srcOf(caller))
-	f.assertReference(t, 2, srcOf(helper), srcOf(caller))
-	if !f.markerSet(t, phpFunctionCandidateRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) {
-		t.Fatal("successful repair did not mark edge and reference convergence")
-	}
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET resolution_confidence = 'probe' WHERE id = ?`, valid); err != nil {
-		t.Fatal(err)
-	}
-	if ran, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || ran {
-		t.Fatalf("second repair = %v, %v; want no-op", ran, err)
-	}
-	if got := f.binding(t, valid); got != "helper|exact_qualified|probe" {
-		t.Fatalf("second repair rewrote valid edge: %s", got)
-	}
-}
-
 // TestPHPScopeVetoSurvivesEveryGenericStrategy crafts repository symbols so
 // that every generic strategy has one tempting candidate for each owned PHP
 // spelling -- a symbol whose qualified name IS the spelling -- and requires the
@@ -415,80 +321,6 @@ func TestPHPScopeSourceNamespaceDerivation(t *testing.T) {
 	}
 	if got := f.binding(t, fromFunction); got != "App.Service.run|php_type_scope|high" {
 		t.Fatalf("top-level function source = %s", got)
-	}
-}
-
-// TestPHPScopeUpgradeRepairOldDatabase simulates a repository indexed by a
-// P22.43 binary and already carrying every earlier repair marker: PHP facts
-// present, one owned edge unresolved, one owned edge bound by a generic
-// strategy the PHP pass refuses. The repair must re-decide both, converge the
-// derived reference identities despite the existing reference marker, set its
-// own marker only after success, and do nothing on a second run.
-func TestPHPScopeUpgradeRepairOldDatabase(t *testing.T) {
-	f := newPHPFixture(t)
-	vendor := f.phpFile(t, "src/Vendor.php")
-	f.typ(t, vendor, "Vendor.Service")
-	run := f.method(t, vendor, "Vendor.Service.run", "public", true)
-	callerFile := f.phpFile(t, "src/Caller.php")
-	f.typ(t, callerFile, "App.Caller")
-	caller := f.method(t, callerFile, "App.Caller.f", "public", false)
-	helper := f.method(t, callerFile, "App.Caller.helper", "private", true)
-	f.use(t, callerFile, "Vendor.Service", "S", "php_type", "App")
-	provable := f.call(t, callerFile, srcOf(caller), "S::run", 1)
-	f.reference(t, callerFile, "S::run", 1)
-	late := f.call(t, callerFile, srcOf(caller), "static::helper", 2)
-	f.reference(t, callerFile, "static::helper", 2)
-	f.setBinding(t, late, helper, ResolutionStrategyExactQualified, ResolutionConfidenceHigh)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE references_tbl SET symbol_id = ?, context_symbol_id = ? WHERE start_line = 2`, helper, caller); err != nil {
-		t.Fatal(err)
-	}
-	for _, repair := range []resolverRepair{typeScopeRepair, bareNameLevelRepair, dotTailAmbiguityRepair, referenceIdentityRepair} {
-		if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// A failed pass must not mark the repository repaired.
-	canceled, cancel := context.WithCancel(f.ctx)
-	cancel()
-	if _, err := f.store.RepairResolverBindingsOnce(canceled, f.repoID); err == nil {
-		t.Fatal("repair under a canceled context succeeded")
-	}
-	if f.markerSet(t, phpScopeRepairSettingKey) {
-		t.Fatal("marker written after a failed repair")
-	}
-	if got := f.binding(t, late); got != "App.Caller.helper|exact_qualified|high" {
-		t.Fatalf("failed repair left half-cleared state: %s", got)
-	}
-
-	resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !resolvedRepoWide {
-		t.Fatal("PHP scope repair did not report a repo-wide resolve")
-	}
-	if got := f.binding(t, provable); got != "Vendor.Service.run|php_alias_static|high" {
-		t.Fatalf("provable edge after repair = %s", got)
-	}
-	if got := f.binding(t, late); got != "<unresolved>" {
-		t.Fatalf("static:: edge after repair = %s", got)
-	}
-	f.assertReference(t, 1, srcOf(run), srcOf(caller))
-	f.assertReference(t, 2, sql.NullInt64{}, srcOf(caller))
-	if !f.markerSet(t, phpScopeRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) {
-		t.Fatal("repair markers not set after success")
-	}
-
-	// Second run: nothing runs.
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET resolution_confidence = 'probe' WHERE id = ?`, provable); err != nil {
-		t.Fatal(err)
-	}
-	if resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID); err != nil || resolvedRepoWide {
-		t.Fatalf("second repair: resolvedRepoWide=%v err=%v", resolvedRepoWide, err)
-	}
-	if got := f.binding(t, provable); got != "Vendor.Service.run|php_alias_static|probe" {
-		t.Fatalf("second repair rewrote edges: %s", got)
 	}
 }
 
@@ -845,32 +677,6 @@ func TestPHPComposerPSR4TypeSelectionRules(t *testing.T) {
 			t.Fatalf("dst=%d err=%v", dst, err)
 		}
 	})
-}
-
-// A repository without PHP has nothing for the PHP repair to re-decide: the
-// marker is written, no repo-wide resolve is claimed, and the reference repair
-// marker is left alone.
-func TestPHPScopeRepairSkipsRepositoriesWithoutPHP(t *testing.T) {
-	f := newPHPFixture(t)
-	goFile := f.file(t, "main.go", "go")
-	f.symbol(t, goFile, "main", "main.main", "function", "go")
-	for _, repair := range resolverRepairs {
-		if repair.key != phpScopeRepairSettingKey {
-			if err := f.store.markRepairDone(f.ctx, repair.key, f.repoID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	resolvedRepoWide, err := f.store.RepairResolverBindingsOnce(f.ctx, f.repoID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolvedRepoWide {
-		t.Fatal("PHP repair claimed a repo-wide resolve on a repository without PHP")
-	}
-	if !f.markerSet(t, phpScopeRepairSettingKey) || !f.markerSet(t, referenceIdentityRepairSettingKey) {
-		t.Fatal("markers after a skipped PHP repair are not all set")
-	}
 }
 
 // TestPHPScopeBatchBudget drives the pass past the SQLite bound-variable

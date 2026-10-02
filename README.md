@@ -156,6 +156,12 @@ codegraph index . --rebuild
 Use this after parser or indexer changes when you need a true full reindex from scratch.
 `codegraph index . --rebuild` needs exclusive access to the repo database.
 If rebuild fails because the DB is in use, stop `codegraph serve` or other `codegraph` processes and retry.
+Before `v2.0.0`, the v2 database is a regenerable development cache. The clean
+baseline replaces historical development migrations; older v2 development indexes
+are refused before mutation. Rebuild them with `codegraph index . --rebuild`.
+This affects only `.codegraph/codegraph.v2.sqlite`; legacy v1 databases are never
+imported or upgraded. Normal forward migration compatibility begins at `v2.0.0`.
+
 Use `codegraph clean .` for database maintenance tasks like WAL checkpointing, VACUUM, FTS optimize, ANALYZE, and incremental vacuum.
 
 ### Version
