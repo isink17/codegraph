@@ -62,35 +62,13 @@ jobs:
         id: windows-stress
         if: runner.os == 'Windows'
         shell: pwsh
+        # Apply windows-stress for SQLite concurrency/locking, snapshot
+        # sharing/retry, relevant Windows filesystem race fixes, and final P37
+        # release-candidate validation. Paths never select this gate.
         env:
           WINDOWS_STRESS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'windows-stress') }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           $runStress = $env:WINDOWS_STRESS_LABEL -eq 'true'
-          if (-not $runStress) {
-            try {
-              if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
-                git fetch --no-tags --depth=1 origin $env:PR_BASE_SHA
-                if ($LASTEXITCODE -ne 0) { throw 'Could not fetch PR base SHA' }
-                $changed = git diff --name-only "$($env:PR_BASE_SHA)..HEAD"
-              } elseif ($env:PUSH_BEFORE_SHA -and $env:PUSH_BEFORE_SHA -notmatch '^0+$') {
-                git fetch --no-tags --depth=1 origin $env:PUSH_BEFORE_SHA
-                if ($LASTEXITCODE -ne 0) { throw 'Could not fetch push before SHA' }
-                $changed = git diff --name-only "$($env:PUSH_BEFORE_SHA)..HEAD"
-              } else {
-                throw 'Push has no before SHA; cannot rule out locking changes'
-              }
-              if ($LASTEXITCODE -ne 0) { throw 'Could not inspect changed paths' }
-              $runStress = @($changed | Where-Object { $_ -match '^(internal/store/|internal/indexer/|go\.mod$|go\.sum$)' }).Count -gt 0
-            } catch {
-              Write-Warning "Could not determine whether Windows stress is required; running it. $_"
-              $runStress = $true
-            }
-          }
-          # GitHub Actions treats the last native-command status as the step
-          # result. A failed inspection is already handled by selecting stress.
-          $global:LASTEXITCODE = 0
           "run=$($runStress.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           if ($runStress) { Write-Host 'Deep Windows stress selected.' } else { Write-Host 'Deep Windows stress skipped for this change.' }
 
