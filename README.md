@@ -973,6 +973,10 @@ codegraph index . --rebuild
 
 This rebuild path needs exclusive access to the repo database. If it fails because another `codegraph` process is holding the DB, stop that process and retry.
 
+### Continuous integration
+
+Pull requests target the `v2.0` branch. A change that touches only `CHANGELOG.md`, `README.md` or Markdown files under `docs/` runs a short documentation check (`git diff --check`, valid UTF-8, closed code fences, working relative links). Every other change, including a mix of documentation and code, runs the full suite: tests on Linux, macOS and Windows, race, quality and no-cgo jobs. The `windows-stress` label always runs the full suite plus the deep Windows stress gate. The aggregate `ci` check reports the result.
+
 ---
 
 ## License
