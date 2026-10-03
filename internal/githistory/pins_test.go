@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/githistory/gittest"
@@ -87,10 +88,19 @@ func TestUserMailmapDoesNotChangeAuthors(t *testing.T) {
 	if err := os.WriteFile(userMap, []byte("Zed <zed@example.com> <alice@example.com>\nYan <yan@example.com> <bob@example.com>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	writeUserConfig(t, "[mailmap]\n\tfile = "+userMap+"\n")
+	// Forward slashes: Git config reads backslashes in an unquoted value as
+	// escapes, and Git for Windows accepts slash paths.
+	writeUserConfig(t, "[mailmap]\n\tfile = "+filepath.ToSlash(userMap)+"\n")
 	got := filesAtHead(t, r)
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("user mailmap changed aggregates:\n got %+v\nwant %+v", got, want)
+		t.Fatalf("user mailmap file changed aggregates:\n got %+v\nwant %+v", got, want)
+	}
+	// The same map stored as a blob and named by mailmap.blob, which Git also
+	// reads in a repository with a working tree.
+	blob := strings.TrimSpace(r.Git("hash-object", "-w", userMap))
+	writeUserConfig(t, "[mailmap]\n\tblob = "+blob+"\n")
+	if got := filesAtHead(t, r); !reflect.DeepEqual(got, want) {
+		t.Fatalf("user mailmap blob changed aggregates:\n got %+v\nwant %+v", got, want)
 	}
 	// The repository .mailmap (alice@old.example -> alice@example.com) still applies.
 	if a := got["pkg/a2.go"]; a.Authors != 1 || a.TopAuthor != "alice@example.com" {
