@@ -135,6 +135,7 @@ func newCommandList() []*command {
 				{name: "--force", description: "re-index files even if unchanged"},
 				{name: "--rebuild", description: "remove the existing repo database before indexing (implies --force)"},
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
+				{name: "--no-history", description: "skip Git history enrichment (recorded as absent: disabled)"},
 			},
 			examples: []string{
 				"codegraph index .",
@@ -153,6 +154,7 @@ func newCommandList() []*command {
 			flags: []commandFlag{
 				{name: "--force", description: "re-index files even if unchanged"},
 				{name: "--jsonl", description: "stream line-delimited JSON events"},
+				{name: "--no-history", description: "skip Git history enrichment (recorded as absent: disabled)"},
 			},
 			examples: []string{
 				"codegraph update_graph .",
@@ -359,6 +361,29 @@ func newCommandList() []*command {
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runCheckConstraints(ctx, cfg, stdout, args)
+			},
+		},
+		{
+			name:        "file_history",
+			aliases:     []string{"file-history"},
+			description: "show file-level Git history stored by the last index or update",
+			usageLines: []string{
+				"  file_history [PATH] [--file FILE ...] [--path-filter PREFIX] [--limit N] [--offset N]",
+				"    add --repo-root PATH instead of the positional argument",
+			},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root (defaults to the git repo root)"},
+				{name: "--file FILE", description: "repository-relative file to report; repeatable"},
+				{name: "--path-filter PREFIX", description: "list only paths under this prefix"},
+				{name: "--limit N", description: "page size for the listing"},
+				{name: "--offset N", description: "page offset for the listing"},
+			},
+			examples: []string{
+				"codegraph file_history .",
+				"codegraph file_history . --file internal/store/store.go",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runFileHistory(ctx, cfg, stdout, args)
 			},
 		},
 		{

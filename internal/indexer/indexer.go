@@ -34,6 +34,8 @@ type Options struct {
 	GitBase   string
 	Paths     []string
 	ScanKind  string
+	// NoHistory skips Git history enrichment and records it as disabled.
+	NoHistory bool
 }
 
 type Indexer struct {
@@ -1063,6 +1065,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
 		return summary, err
 	}
+	history, historyMS, err := i.refreshHistory(ctx, repo.ID, opts.RepoRoot, opts.NoHistory)
+	if err != nil {
+		return summary, err
+	}
+	summary.History = &history
+	summary.HistoryMS = historyMS
 	return summary, nil
 }
 

@@ -302,6 +302,17 @@ var toolRegistry = []toolDescriptor{
 		handler:     (*Server).handleUsageStats,
 	},
 
+	// Specialized enrichment: callable and searchable, not advertised, so a
+	// default session's tools/list is unchanged by it.
+	{
+		name:        "file_history",
+		description: "File-level Git history from the last index: commit count, first/last commit, authors, line churn and reverts within the latest 250 first-parent commits. Enrichment only.",
+		properties:  []string{"files", "path_filter", "limit", "offset"},
+		category:    "history",
+		hidden:      true,
+		handler:     (*Server).handleFileHistory,
+	},
+
 	// Gateway meta tools. Absent from full mode on purpose: adding them there
 	// would charge every default session for a surface it does not need.
 	{

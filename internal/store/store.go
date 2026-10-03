@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/isink17/codegraph/internal/githistory"
 	"io"
 	"io/fs"
 	"math"
@@ -226,6 +227,10 @@ type ScanSummary struct {
 	FilesChanged   int      `json:"files_changed"`
 	FilesDeleted   int      `json:"files_deleted"`
 	FilesTotal     int      `json:"files_total,omitempty"`
+	// History is the file-level Git history state this run left behind. It
+	// is enrichment only and never part of the semantic graph.
+	History   *githistory.State `json:"history,omitempty"`
+	HistoryMS int64             `json:"history_ms,omitempty"`
 	// ParserProfileLanguages are the languages this scan reconverged because
 	// their persisted parser profile differed from the running binary's. Empty
 	// on every scan of an already-current repository.
