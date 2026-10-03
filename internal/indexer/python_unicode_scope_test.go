@@ -122,3 +122,55 @@ func runPythonNestedVisibilityCases(t *testing.T, reg *parser.Registry) {
 func TestPythonNestedVisibilityRegexAdapter(t *testing.T) {
 	runPythonNestedVisibilityCases(t, parser.NewRegistry(pyparser.New()))
 }
+
+// runPythonNFKCScopeCases indexes testdata/python_nfkc_scope, every file of
+// which CPython runs; run() returns what its call reaches. CPython binds the
+// NFKC form of a name (PEP 3131): `ｆｕｌｌ` is `full`, `ﬁnd` is `find`, `𝐟` is
+// `f`, `Ⅻ` is `XII`, in definitions, calls, attributes and imports alike, but
+// never in string or comment text. Expected states are CPython's verdicts.
+func runPythonNFKCScopeCases(t *testing.T, reg *parser.Registry) {
+	t.Helper()
+	dir := filepath.Join("testdata", "python_nfkc_scope")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{}
+	for _, e := range entries {
+		src, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[e.Name()] = string(src)
+	}
+	r := newPyRepo(t, reg, files)
+	for _, tc := range []struct{ file, dst, want string }{
+		// CPython: the local. A compatibility spelling of the imported name
+		// shadows the import.
+		{"n_local.py", "full", "<unresolved>"},
+		{"n_ligature.py", "find", "<unresolved>"},
+		{"n_param.py", "full", "<unresolved>"},
+		{"n_nested.py", "full", "<unresolved>"},
+		// CPython: lib.full, imported under a compatibility spelling.
+		{"n_import.py", "full", "lib.py:lib.full [python_import_scope]"},
+		{"n_alias.py", "my", "lib.py:lib.full [python_import_scope]"},
+		{"n_from_module.py", "full", "lib.py:lib.full [python_import_scope]"},
+		{"n_module.py", "lib.full", "lib.py:lib.full"},
+		{"n_attr.py", "lib.full", "lib.py:lib.full"},
+		// CPython: the module's own def, declared or called under a
+		// compatibility spelling.
+		{"n_def.py", "f", "n_def.py:n_def.f"},
+		{"n_call.py", "f", "n_call.py:n_call.f"},
+		{"n_roman.py", "XII", "n_roman.py:n_roman.XII"},
+		// CPython: lib.full. String and comment text binds nothing.
+		{"n_text.py", "full", "lib.py:lib.full [python_import_scope]"},
+	} {
+		if got := r.edgeState(t, tc.file, tc.dst); !strings.Contains(got, tc.want) {
+			t.Errorf("%s: %q = %s; want %s", tc.file, tc.dst, got, tc.want)
+		}
+	}
+}
+
+func TestPythonNFKCScopeRegexAdapter(t *testing.T) {
+	runPythonNFKCScopeCases(t, parser.NewRegistry(pyparser.New()))
+}

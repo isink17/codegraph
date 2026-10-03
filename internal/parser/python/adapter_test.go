@@ -7,6 +7,8 @@ import (
 	"testing"
 	"unicode"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/isink17/codegraph/internal/graph"
 )
 
@@ -268,9 +270,9 @@ def helper():
 
 // Python identifiers are Unicode (PEP 3131). Every verdict below is what
 // Python's own str.isidentifier() says about the name; the adapter must declare
-// exactly the valid ones, under exactly that name, and never a fragment of an
-// invalid one. The name is the source spelling: CPython binds its NFKC form
-// (`ｆｕｌｌ` binds `full`), which neither Python adapter models.
+// exactly the valid ones, and never a fragment of an invalid one. A valid name
+// is declared as the name CPython binds, its NFKC form: `ｆｕｌｌ` binds `full`,
+// and `e` plus a combining acute binds the precomposed `é`.
 func TestUnicodeDefinitionNamesFollowPython(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -297,11 +299,17 @@ func TestUnicodeDefinitionNamesFollowPython(t *testing.T) {
 		// TestPythonNamesFollowGoUnicodeTables before changing this case.
 		{"x\u1c89y", false},
 	}
+	// The names whose NFKC form differs from their spelling.
+	nfkc := map[string]string{"e\u0301": "\u00e9", "ｆｕｌｌ": "full"}
 	for _, tc := range cases {
 		src := "def " + tc.name + "():\n    pass\n\nclass " + tc.name + "_k:\n    pass\n"
 		want := []string(nil)
 		if tc.valid {
-			want = []string{tc.name, tc.name + "_k"}
+			binds := tc.name
+			if folded, ok := nfkc[tc.name]; ok {
+				binds = folded
+			}
+			want = []string{binds, binds + "_k"}
 		}
 		var got []string
 		for _, s := range parseSource(t, src).Symbols {
@@ -351,13 +359,17 @@ def caller():
 	}
 }
 
-// Which runes are Python names here comes from Go's unicode tables, so a Go
-// toolchain with newer tables changes what both Python adapters persist for
-// unchanged files. When this fails after a Go upgrade, bump treesitter:python
-// and python-regex:python, then update the expected version.
+// Which runes are Python names here comes from Go's unicode tables, and their
+// NFKC form from golang.org/x/text's, so a Go toolchain or x/text with newer
+// tables changes what both Python adapters persist for unchanged files. When
+// this fails after an upgrade, bump treesitter:python and python-regex:python,
+// then update the expected version.
 func TestPythonNamesFollowGoUnicodeTables(t *testing.T) {
 	if unicode.Version != "15.0.0" {
 		t.Fatalf("unicode.Version = %s; bump both Python parser profiles", unicode.Version)
+	}
+	if norm.Version != "15.0.0" {
+		t.Fatalf("norm.Version = %s; bump both Python parser profiles", norm.Version)
 	}
 }
 
