@@ -102,6 +102,85 @@ var rustGlobShadowCases = []struct {
 		"lib.rs": "mod a; use a::*; trait T { fn new(); }\nimpl T for S {\n    fn new() {}\n}\npub fn caller() {\n    S::new();\n}\n",
 		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
 	}, "a.rs:crate::a::S::new", "", "S::new"},
+	// An explicit import of the first segment shadows the glob as well. The
+	// call is not resolved through that import, so it stays unresolved.
+	{"explicit type use after glob, type path", tree{
+		"lib.rs": "mod a; mod b; use a::*; use b::S;\npub fn caller() {\n    S::new();\n}\n",
+		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
+		"b.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
+	}, "", "", "S::new"},
+	{"explicit type use before glob, type path", tree{
+		"lib.rs": "mod a; mod b; use b::S; use a::*;\npub fn caller() {\n    S::new();\n}\n",
+		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
+		"b.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
+	}, "", "", "S::new"},
+	{"explicit module use, module path", tree{
+		"lib.rs": "mod a; mod b; use a::*; use b::x;\npub fn caller() {\n    x::f();\n}\n",
+		"a.rs":   "pub mod x {\n    pub fn f() {}\n}\n",
+		"b.rs":   "pub mod x {\n    pub fn f() {}\n}\n",
+	}, "", "", "x::f"},
+	// Two explicit imports of one name must live in different namespaces;
+	// the function is the called value, in either order.
+	{"explicit struct then fn", tree{
+		"lib.rs": "mod b; mod c; use b::f; use c::f;\npub fn caller() {\n    f();\n}\n",
+		"b.rs":   "pub struct f { x: u8 }",
+		"c.rs":   "pub fn f() {}",
+	}, "c.rs:crate::c::f", "", ""},
+	{"explicit fn then struct", tree{
+		"lib.rs": "mod b; mod c; use c::f; use b::f;\npub fn caller() {\n    f();\n}\n",
+		"b.rs":   "pub struct f { x: u8 }",
+		"c.rs":   "pub fn f() {}",
+	}, "c.rs:crate::c::f", "", ""},
+	{"two explicit fns", tree{
+		"lib.rs": "mod b; mod c; use b::f; use c::f;\npub fn caller() {\n    f();\n}\n",
+		"b.rs":   "pub fn f() {}",
+		"c.rs":   "pub fn f() {}",
+	}, "", "", ""},
+	// An own module still answers through its own re-exports.
+	{"own module re-export path", tree{
+		"lib.rs":     "mod a; mod x; use a::*;\npub fn caller() {\n    x::f();\n}\n",
+		"a.rs":       "pub mod x {\n    pub fn f() {}\n}\n",
+		"x.rs":       "mod inner;\npub use inner::f;\n",
+		"x/inner.rs": "pub fn f() {}",
+	}, "x/inner.rs:crate::inner::f", "", "x::f"}, // persisted name is the parser's path guess
+	// A glob re-export may put a function beside the module's own type of the
+	// same name; Rust calls the function.
+	{"module glob re-export beside a struct", tree{
+		"lib.rs": "mod a; mod m;\npub fn caller() {\n    m::f();\n}\n",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "pub use crate::a::*;\npub struct f { x: u8 }\n",
+	}, "", "", "m::f"},
+	{"module glob re-export alone", tree{
+		"lib.rs": "mod a; mod m;\npub fn caller() {\n    m::f();\n}\n",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "pub use crate::a::*;\n",
+	}, "a.rs:crate::a::f", "", "m::f"},
+	// Another crate root's `crate::x` re-exports are not the caller's:
+	// here `x::f` is std's abort, which nothing in the repository declares.
+	{"other crate root's re-export", tree{
+		"src/lib.rs":  "mod a; mod x; mod z; use a::*;\npub fn caller() {\n    x::f();\n}\n",
+		"src/a.rs":    "pub mod x {\n    pub fn f() {}\n}\n",
+		"src/x.rs":    "pub use std::process::abort as f;\n",
+		"src/z.rs":    "pub fn f() {}",
+		"src/main.rs": "mod x {\n    pub use crate::z::f;\n}\nmod z {\n    pub fn f() {}\n}\nfn main() {}\n",
+	}, "", "src/lib.rs", "x::f"},
+	// A type reached through a re-export is just as unsafe to call when its
+	// own module imports by glob.
+	{"re-exported struct beside a glob", tree{
+		"lib.rs": "mod k; mod m;\npub fn caller() {\n    m::f();\n}\n",
+		"m.rs":   "pub use crate::k::f;\n",
+		"k.rs":   "pub use ext::*;\npub struct f { x: u8 }\n",
+	}, "", "", "m::f"},
+	{"re-exported struct alone", tree{
+		"lib.rs": "mod k; mod m;\npub fn caller() {\n    m::f();\n}\n",
+		"m.rs":   "pub use crate::k::f;\n",
+		"k.rs":   "pub struct f(u8);\n",
+	}, "k.rs:crate::k::f", "", "m::f"},
+	// One import spelled under two cfg arms is still one import.
+	{"cfg-duplicated explicit use", tree{
+		"lib.rs": "mod b;\n#[cfg(unix)]\nuse b::f;\n#[cfg(not(unix))]\nuse b::f;\npub fn caller() {\n    f();\n}\n",
+		"b.rs":   "pub fn f() {}",
+	}, "b.rs:crate::b::f", "", ""},
 	// Another crate root's `crate::f` is not the caller's own item.
 	{"other crate's own fn", tree{
 		"src/lib.rs":  "mod a; use a::*;\npub fn caller() {\n    f();\n}\n",
@@ -205,5 +284,60 @@ func TestRustGlobShadowingFollowsIncrementalChanges(t *testing.T) {
 		update()
 		r.assertFreshParity(t, "explicit use removed")
 		assertRustCallTarget(t, r, "explicit use removed", "lib.rs", "f", "a.rs:crate::a::f")
+	}
+}
+
+// TestRustGlobReexportBesideTypeFollowsIncrementalChanges adds and removes the
+// module's own type beside its glob re-export, and requires every step to match
+// a fresh index of the same tree.
+func TestRustGlobReexportBesideTypeFollowsIncrementalChanges(t *testing.T) {
+	const caller = "mod a; mod m;\npub fn caller() {\n    m::f();\n}\n"
+	for _, scoped := range []bool{true, false} {
+		r := newLifecycleRepo(t, tree{"lib.rs": caller, "a.rs": "pub fn f() {}", "m.rs": "pub use crate::a::*;\n"})
+		update := func() {
+			if scoped {
+				r.update(t, "m.rs")
+			} else {
+				r.update(t)
+			}
+		}
+		assertRustCallTarget(t, r, "glob re-export", "lib.rs", "m::f", "a.rs:crate::a::f")
+		r.write(t, "m.rs", "pub use crate::a::*;\npub struct f { x: u8 }\n")
+		update()
+		r.assertFreshParity(t, "struct added")
+		assertRustCallTarget(t, r, "struct added", "lib.rs", "m::f", "")
+		r.write(t, "m.rs", "pub use crate::a::*;\n")
+		update()
+		r.assertFreshParity(t, "struct removed")
+		assertRustCallTarget(t, r, "struct removed", "lib.rs", "m::f", "a.rs:crate::a::f")
+	}
+}
+
+// TestRustExplicitUseKindFlipFollowsIncrementalChanges flips an explicitly
+// imported item between a function and a struct while a glob supplies the same
+// name; every step must match a fresh index of the same tree.
+func TestRustExplicitUseKindFlipFollowsIncrementalChanges(t *testing.T) {
+	for _, scoped := range []bool{true, false} {
+		r := newLifecycleRepo(t, tree{
+			"lib.rs": "mod a; mod b; use a::*; use b::f;\npub fn caller() {\n    f();\n}\n",
+			"a.rs":   "pub fn f() {}",
+			"b.rs":   "pub fn f() {}",
+		})
+		update := func() {
+			if scoped {
+				r.update(t, "b.rs")
+			} else {
+				r.update(t)
+			}
+		}
+		assertRustCallTarget(t, r, "explicit fn", "lib.rs", "f", "b.rs:crate::b::f")
+		r.write(t, "b.rs", "pub struct f { x: u8 }")
+		update()
+		r.assertFreshParity(t, "flipped to struct")
+		assertRustCallTarget(t, r, "flipped to struct", "lib.rs", "f", "")
+		r.write(t, "b.rs", "pub fn f() {}")
+		update()
+		r.assertFreshParity(t, "flipped back")
+		assertRustCallTarget(t, r, "flipped back", "lib.rs", "f", "b.rs:crate::b::f")
 	}
 }
