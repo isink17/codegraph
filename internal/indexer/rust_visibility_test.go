@@ -113,14 +113,34 @@ var rustPrivateVisibilityCases = []struct {
 		"lib.rs": "mod a; fn helper() {}",
 		"a.rs":   "pub struct S;\nimpl S {\n    pub fn go() {\n        crate::helper();\n    }\n}\n",
 	}, "a.rs", "crate::helper", "lib.rs:crate::helper", false},
-	// Known limitation: local bindings are not modelled, so a closure named
-	// like a module function does not shadow it (rustc calls the closure).
+	// A parameter or local binding shadows a module fn of its name (rustc
+	// calls the closure / the parameter).
 	{"local closure named like a module fn", tree{
 		"lib.rs": "fn f() {}\npub fn c() {\n    let f = || {};\n    f();\n}\n",
-	}, "lib.rs", "f", "lib.rs:crate::f", false},
+	}, "lib.rs", "f", "", false},
+	{"fn parameter named like a module fn", tree{
+		"lib.rs": "fn f() {}\npub fn c(f: fn()) {\n    f();\n}\n",
+	}, "lib.rs", "f", "", false},
+	{"closure parameter named like a module fn", tree{
+		"lib.rs": "fn f() {}\npub fn c() {\n    let g = |f: fn()| f();\n    g(f);\n}\n",
+	}, "lib.rs", "f", "", false},
+	// A local binding is a value, not a module: `x::f()` is unaffected.
+	{"let binding does not shadow a path head", tree{
+		"lib.rs": "mod m;\npub fn c() {\n    let m = 1;\n    m::f();\n}\n",
+		"m.rs":   "pub fn f() {}",
+	}, "lib.rs", "m::f", "m.rs:crate::m::f", false},
+	// A trait impl's items have the trait's visibility, which the parser
+	// does not know, so they never answer; rustc calls the trait method.
 	{"single trait impl associated call", tree{
 		"lib.rs": "struct Cfg;\nimpl Default for Cfg {\n    fn default() -> Self {\n        Cfg\n    }\n}\npub fn c() {\n    Cfg::default();\n}\n",
-	}, "lib.rs", "Cfg::default", "lib.rs:crate::Cfg::default", false},
+	}, "lib.rs", "Cfg::default", "", false},
+	// A private inherent method is what `Type::m` finds first.
+	{"private inherent method", tree{
+		"lib.rs": "struct S;\nimpl S {\n    fn m() {}\n}\npub fn c() {\n    S::m();\n}\n",
+	}, "lib.rs", "S::m", "lib.rs:crate::S::m", false},
+	{"private inherent method beside a trait method", tree{
+		"lib.rs": "struct S;\nimpl S {\n    fn m() {}\n}\ntrait T {\n    fn m();\n}\nimpl T for S {\n    fn m() {}\n}\npub fn c() {\n    S::m();\n}\n",
+	}, "lib.rs", "S::m", "lib.rs:crate::S::m", false},
 	// A trait impl method is recorded under the type as the impl writes it,
 	// but `Type::m` finds an inherent method first, wherever its impl is.
 	// rustc calls the inherent nfa.rs NFA::swap in all three; the parser
@@ -140,10 +160,6 @@ var rustPrivateVisibilityCases = []struct {
 		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
 		"r.rs":   "use crate::nfa::NFA;\npub trait R {\n    fn swap(&mut self);\n}\nimpl R for NFA {\n    fn swap(&mut self) {\n        NFA::swap(self);\n    }\n}\n",
 	}, "r.rs", "NFA::swap", "", false},
-	// rustc: inherent S::m.
-	{"inherent and trait method of one name", tree{
-		"lib.rs": "struct S;\nimpl S {\n    fn m() {}\n}\ntrait T {\n    fn m();\n}\nimpl T for S {\n    fn m() {}\n}\npub fn c() {\n    S::m();\n}\n",
-	}, "lib.rs", "S::m", "", false},
 	// An item declared in a block shadows the module's item of that name
 	// throughout the block, nested items included; it is not recorded, so the
 	// call stays unresolved. rustc calls the block's item in each.
@@ -169,6 +185,76 @@ var rustPrivateVisibilityCases = []struct {
 	{"inner-block fn does not shadow outside its block", tree{
 		"lib.rs": "fn helper() {}\npub fn outer() {\n    {\n        fn helper() {}\n    }\n    helper();\n}\n",
 	}, "lib.rs", "helper", "lib.rs:crate::helper", false},
+	// The parser cannot see an inherent impl through a type alias, in a
+	// `const _` block, in a fn body or in a `#[path]` module, or a trait
+	// default or blanket method; the trait impl method never answers. rustc
+	// calls the inherent / other trait's method in each.
+	{"default method of another trait", tree{
+		"lib.rs": "mod t { pub trait Foo { fn m(); } }\ntrait Bar { fn m() {} }\nstruct S;\nimpl t::Foo for S {\n    fn m() {}\n}\nimpl Bar for S {}\npub fn caller() {\n    S::m();\n}\n",
+	}, "lib.rs", "S::m", "", false},
+	{"default method of another trait, trait in a child file", tree{
+		"lib.rs": "mod t;\ntrait Bar { fn m() {} }\nstruct S;\nimpl t::Foo for S {\n    fn m() {}\n}\nimpl Bar for S {}\npub fn caller() {\n    S::m();\n}\n",
+		"t.rs":   "pub trait Foo { fn m(); }\n",
+	}, "lib.rs", "S::m", "", false},
+	{"blanket trait in scope", tree{
+		"lib.rs": "mod t; mod u;\nuse u::Bar;\nstruct S;\nimpl t::Foo for S {\n    fn m() {}\n}\npub fn caller() {\n    S::m();\n}\n",
+		"t.rs":   "pub trait Foo { fn m(); }\n",
+		"u.rs":   "pub trait Bar { fn m(); }\nimpl<T> Bar for T {\n    fn m() {}\n}\n",
+	}, "lib.rs", "S::m", "", false},
+	{"inherent impl through a type alias", tree{
+		"lib.rs": "struct S;\ntype A = S;\nimpl A {\n    fn m() {}\n}\ntrait T { fn m(); }\nimpl T for S {\n    fn m() {}\n}\npub fn caller() {\n    S::m();\n}\n",
+	}, "lib.rs", "S::m", "", false},
+	{"inherent impl in a const block", tree{
+		"lib.rs": "struct S;\ntrait T { fn m(); }\nimpl T for S {\n    fn m() {}\n}\nconst _: () = {\n    impl S {\n        fn m() {}\n    }\n};\npub fn caller() {\n    S::m();\n}\n",
+	}, "lib.rs", "S::m", "", false},
+	{"inherent impl in a path-attribute module", tree{
+		"lib.rs":     "#[path = \"x/impls.rs\"]\nmod impls;\npub struct S;\ntrait T { fn m(); }\nimpl T for S {\n    fn m() {}\n}\npub fn caller() {\n    S::m();\n}\n",
+		"x/impls.rs": "impl super::S {\n    pub(crate) fn m() {}\n}\n",
+	}, "lib.rs", "S::m", "", false},
+	{"inherent impl in a fn body", tree{
+		"lib.rs": "struct S;\ntrait T { fn m(); }\nimpl T for S {\n    fn m() {}\n}\nfn setup() {\n    impl S {\n        fn m() {}\n    }\n}\npub fn caller() {\n    S::m();\n}\n",
+	}, "lib.rs", "S::m", "", false},
+	{"Self call inside a trait impl", tree{
+		"lib.rs": "mod t { pub trait Foo { fn m(); fn n(); } }\nstruct S;\nimpl t::Foo for S {\n    fn m() {}\n    fn n() { Self::m(); }\n}\npub fn caller() {}\n",
+	}, "lib.rs", "Self::m", "", false},
+	// A `mod` declared in a block is not the file's module: a call in it
+	// names that module's items (rustc: m::helper in each).
+	{"call inside a fn-body mod", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    mod m {\n        pub fn helper() {}\n        pub fn g() {\n            helper();\n        }\n    }\n    m::g();\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"call inside a fn-body mod, public module fn", tree{
+		"lib.rs": "pub fn helper() {}\npub fn outer() {\n    mod m {\n        pub fn helper() {}\n        pub fn g() {\n            helper();\n        }\n    }\n    m::g();\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"self path inside a fn-body mod", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    mod m {\n        fn helper() {}\n        pub fn g() {\n            self::helper();\n        }\n    }\n    m::g();\n}\n",
+	}, "lib.rs", "self::helper", "", false},
+	{"crate path inside a fn-body mod", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    mod m {\n        pub fn g() {\n            crate::helper();\n        }\n    }\n    m::g();\n}\n",
+	}, "lib.rs", "crate::helper", "lib.rs:crate::helper", false},
+	// `self::` skips the block's items (rustc: the module's helper).
+	{"self path past a block fn", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    fn helper() {}\n    self::helper();\n}\n",
+	}, "lib.rs", "self::helper", "lib.rs:crate::helper", false},
+	// A statement macro may declare the block's own helper (rustc: the
+	// macro's); std expression macros declare nothing.
+	{"statement macro in the block", tree{
+		"lib.rs": "fn helper() {}\nmacro_rules! mk { () => { fn helper() {} } }\npub fn outer() {\n    mk!();\n    helper();\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"std expression macro in the block", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    println!(\"x\");\n    helper();\n}\n",
+	}, "lib.rs", "helper", "lib.rs:crate::helper", false},
+	{"file macro shadowing a std macro name", tree{
+		"lib.rs": "fn helper() {}\nmacro_rules! println { () => { fn helper() {} } }\npub fn outer() {\n    println!();\n    helper();\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"unsafe block item", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    unsafe {\n        fn helper() {}\n        helper();\n    }\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"closure body block item", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    let c = || {\n        fn helper() {}\n        helper();\n    };\n    c();\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"match arm after a block item", tree{
+		"lib.rs": "fn helper() {}\npub fn outer(x: u8) {\n    fn helper() {}\n    match x { _ => helper() }\n}\n",
+	}, "lib.rs", "helper", "", false},
 	// Another crate root's private `crate::helper` is not the caller's.
 	{"other crate root", tree{
 		"lib.rs":  "fn helper() {}",
@@ -285,15 +371,16 @@ func TestRustPrivateVisibilityFollowsIncrementalChanges(t *testing.T) {
 	}
 }
 
-// TestRustShadowingFollowsIncrementalChanges adds and removes what shadows a
-// module item, a block item in the caller's file and an inherent method in
-// another file, through both update shapes; every step must match a fresh
-// index of the same tree.
+// TestRustShadowingFollowsIncrementalChanges turns an inherent impl into a
+// trait impl and adds and removes a block item and a parameter that shadow a
+// module fn, through both update shapes; every step must match a fresh index
+// of the same tree.
 func TestRustShadowingFollowsIncrementalChanges(t *testing.T) {
-	const cfg = "mod a;\nstruct Cfg;\nimpl Default for Cfg {\n    fn default() -> Self {\n        Cfg\n    }\n}\nfn helper() {}\npub fn c() {\n    Cfg::default();\n    helper();\n}\n"
-	const shadowed = "mod a;\nstruct Cfg;\nimpl Default for Cfg {\n    fn default() -> Self {\n        Cfg\n    }\n}\nfn helper() {}\npub fn c() {\n    fn helper() {}\n    Cfg::default();\n    helper();\n}\n"
+	src := func(impl, body, param string) string {
+		return "mod a;\nstruct Cfg;\ntrait Make {\n    fn make();\n}\n" + impl + " {\n    fn make() {}\n}\nfn helper() {}\npub fn c(" + param + ") {\n" + body + "    Cfg::make();\n    helper();\n}\n"
+	}
 	for _, scoped := range []bool{true, false} {
-		r := newLifecycleRepo(t, tree{"lib.rs": cfg, "a.rs": "pub fn f() {}"})
+		r := newLifecycleRepo(t, tree{"lib.rs": src("impl Cfg", "", ""), "a.rs": "pub fn f() {}"})
 		update := func(paths ...string) {
 			if scoped {
 				r.update(t, paths...)
@@ -301,25 +388,20 @@ func TestRustShadowingFollowsIncrementalChanges(t *testing.T) {
 				r.update(t)
 			}
 		}
-		step := func(name, def, help string) {
+		step := func(name, impl, body, param, make, help string) {
+			r.write(t, "lib.rs", src(impl, body, param))
+			update("lib.rs")
 			r.assertFreshParity(t, name)
-			assertRustCallTarget(t, r, name, "lib.rs", "Cfg::default", def)
+			assertRustCallTarget(t, r, name, "lib.rs", "Cfg::make", make)
 			assertRustCallTarget(t, r, name, "lib.rs", "helper", help)
 		}
-		step("initial", "lib.rs:crate::Cfg::default", "lib.rs:crate::helper")
-		r.write(t, "lib.rs", shadowed)
-		update("lib.rs")
-		step("block fn added", "lib.rs:crate::Cfg::default", "")
-		r.write(t, "lib.rs", cfg)
-		update("lib.rs")
-		step("block fn removed", "lib.rs:crate::Cfg::default", "lib.rs:crate::helper")
-		// Another type named Cfg with an inherent `default` may be the
-		// called one; the trait impl method no longer answers.
-		r.write(t, "a.rs", "pub struct Cfg;\nimpl Cfg {\n    pub fn default() -> Self {\n        Cfg\n    }\n}\n")
-		update("a.rs")
-		step("inherent elsewhere added", "", "lib.rs:crate::helper")
-		r.write(t, "a.rs", "pub fn f() {}")
-		update("a.rs")
-		step("inherent elsewhere removed", "lib.rs:crate::Cfg::default", "lib.rs:crate::helper")
+		assertRustCallTarget(t, r, "initial", "lib.rs", "Cfg::make", "lib.rs:crate::Cfg::make")
+		assertRustCallTarget(t, r, "initial", "lib.rs", "helper", "lib.rs:crate::helper")
+		step("trait impl", "impl Make for Cfg", "", "", "", "lib.rs:crate::helper")
+		step("inherent impl again", "impl Cfg", "", "", "lib.rs:crate::Cfg::make", "lib.rs:crate::helper")
+		step("block fn added", "impl Cfg", "    fn helper() {}\n", "", "lib.rs:crate::Cfg::make", "")
+		step("block fn removed", "impl Cfg", "", "", "lib.rs:crate::Cfg::make", "lib.rs:crate::helper")
+		step("parameter added", "impl Cfg", "", "helper: fn()", "lib.rs:crate::Cfg::make", "")
+		step("parameter removed", "impl Cfg", "", "", "lib.rs:crate::Cfg::make", "lib.rs:crate::helper")
 	}
 }
