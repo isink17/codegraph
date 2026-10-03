@@ -205,6 +205,32 @@ var rustGlobShadowCases = []struct {
 		"lib.rs": "mod m;",
 		"m.rs":   "pub struct S;\nimpl S {\n    pub fn empty() {}\n}\nmod tests {\n    use super::*;\n    fn t() {\n        S::empty();\n    }\n}\n",
 	}, "m.rs:crate::m::S::empty", "m.rs", "S::empty"},
+	// A module's own item hides its glob re-exports of the same name, even
+	// through a child's `pub use super::*` or `pub use crate::*`. The own
+	// item here is private, so the call stays unresolved; it never reaches
+	// the glob's function.
+	{"prelude of super with own private item", tree{
+		"lib.rs":   "mod other; fn f() {} pub use other::*;\npub mod prelude {\n    pub use super::*;\n}\nfn caller() {\n    prelude::f();\n}\n",
+		"other.rs": "pub fn f() {}",
+	}, "", "", "prelude::f"},
+	{"crate glob re-export with own private item", tree{
+		"lib.rs": "mod b; mod a; pub use b::*; fn f() {}\nfn caller() {\n    a::f();\n}\n",
+		"a.rs":   "pub use crate::*;\n",
+		"b.rs":   "pub fn f() {}",
+	}, "", "", "a::f"},
+	// A test module's own fn shadows its `use super::*` glob.
+	{"test module own fn beside glob of super", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "pub fn helper() {}\nmod tests {\n    use super::*;\n    fn helper() {}\n    fn t() {\n        helper();\n    }\n}\n",
+	}, "", "m.rs", "helper"},
+	{"glob of crate from a child", tree{
+		"lib.rs": "mod m; pub fn top() {}",
+		"m.rs":   "use crate::*;\nfn t() {\n    top();\n}\n",
+	}, "lib.rs:crate::top", "m.rs", "top"},
+	{"glob of super in a nested inline module", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod a {\n    pub fn f() {}\n    pub mod b {\n        use super::*;\n        fn t() {\n            f();\n        }\n    }\n}\n",
+	}, "m.rs:crate::m::a::f", "m.rs", "f"},
 	// Another crate root's `crate::f` is not the caller's own item.
 	{"other crate's own fn", tree{
 		"src/lib.rs":  "mod a; use a::*;\npub fn caller() {\n    f();\n}\n",

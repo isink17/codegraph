@@ -778,11 +778,20 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		// The recursion is over an in-memory export relation loaded above; this
 		// count is the observable proof that traversal is not DB-per-hop.
 		out := append([]rustScopeSymbol(nil), byQ[key]...)
+		// An item the module declares itself, whatever its visibility, hides
+		// its glob re-exports of the same name.
+		own := false
+		for _, c := range out {
+			own = own || rootOfFile[c.file] == root
+		}
 		for _, im := range imports {
 			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {
 				continue
 			}
 			if im.glob {
+				if own {
+					continue
+				}
 				out = append(out, exportCandidates(resolvePath(im.source, module), name, root, seen)...)
 			} else if im.local == name {
 				raw := resolvePath(im.source, module)
