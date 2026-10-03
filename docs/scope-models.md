@@ -215,9 +215,10 @@ A call is recorded only when its callee is a plain name or a chain of plain prop
 
 TypeScript resolution owns every TypeScript and JavaScript call edge. A call it cannot decide stays unresolved. Bindings work as follows:
 - A bare call binds through a non-type-only import of that local name.
-- With no import binding for the name, a bare call binds only to a unique same-file symbol of that name that is not a class method.
-- `ns.f()` binds through `import * as ns`, or through an imported `export * as ns`. A member call through a named or default import binds only when that import is a re-exported namespace; members of imported classes, objects and functions are not modelled, and the imported binding itself is never the callee.
-- Every binding needs exactly one target symbol.
+- With no import binding for the name, a bare call binds only to a unique same-file function or class of that name.
+- `ns.f()` binds through `import * as ns`, or through an imported `export * as ns`. A member call through a named or default import binds only when that import is a re-exported namespace; members of imported classes, objects and functions are not modelled, and the imported binding itself is never the callee. When `ns.f` is itself a re-exported namespace, the call stays unresolved.
+- Every binding needs exactly one callable target: a function or a class. A type alias, an interface or a class method never answers a call, whichever path found it, and a class merged with a same-named interface is called as the class.
+- `export … from` creates no binding in its own module, so a same-file call through `export * as ns from` or `export { foo } from` stays unresolved. A function that is default-exported or listed in `export { … }` is still a binding of its own module.
 
 Only relative specifiers inside the repository are followed. Package names, paths that leave the repository, trailing-slash specifiers and directory `index` files are not resolved. An extensionless specifier names `x.ts` or `x.tsx`, and having both makes it ambiguous.
 
@@ -284,7 +285,7 @@ On a change, these Python call edges are re-decided:
 - the bare class bindings of files that import a changed file
 - after a deletion, every such binding in the repository, checked against the current imports
 
-The non-CGO fallback parser extracts calls only inside functions; tree-sitter also extracts module-level calls.
+The non-CGO fallback parser extracts calls only inside functions and does not record keyword syntax (`with … as (…)`, a `match` statement, a `case` class pattern) as calls; tree-sitter also extracts module-level calls.
 
 ## C#
 
