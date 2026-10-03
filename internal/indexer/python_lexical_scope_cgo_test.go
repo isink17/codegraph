@@ -22,6 +22,15 @@ func TestPythonUnicodeScopeTreeSitterAdapter(t *testing.T) {
 	runPythonUnicodeScopeCases(t, parser.NewRegistry(tsparser.NewPython()))
 }
 
+func TestPythonLambdaMatchScopeTreeSitterAdapter(t *testing.T) {
+	runPythonLambdaMatchScopeCases(t, parser.NewRegistry(tsparser.NewPython()))
+}
+
+func TestTreeSitterPythonProfileLambdaMatchBindingsConverge(t *testing.T) {
+	runPythonLambdaMatchProfileConvergence(t,
+		pythonBindingsV4Adapter{Adapter: tsparser.NewPython(), id: "treesitter:python:v4"}, tsparser.NewPython())
+}
+
 func TestPythonNFKCScopeTreeSitterAdapter(t *testing.T) {
 	runPythonNFKCScopeCases(t, parser.NewRegistry(tsparser.NewPython()))
 }

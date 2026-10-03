@@ -485,7 +485,8 @@ func isPythonKeyword(name string) bool {
 // regex-driven but does build a call graph. See parser.Profile. v2 reads
 // Unicode names in declarations, calls, imports and local bindings. v3 stops
 // reading `as (`, match statements and case patterns as calls. v4 records
-// every name in its NFKC form, the name CPython binds (PEP 3131).
+// every name in its NFKC form, the name CPython binds (PEP 3131). v5 records
+// lambda parameters and match-case captures as local bindings.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v4", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v5", EmitsCallEdges: true}
 }

@@ -211,7 +211,8 @@ func importStatements(masked []string) (stmts map[int]string, consumed []bool) {
 
 // LocalBindings reports the names one Python lexical scope binds itself, given
 // that scope's source: its `def` header's parameters and every assignment,
-// loop target, `with`/`except` alias and nested declaration in its body.
+// loop target, `with`/`except` alias, lambda parameter, `case` capture and
+// nested declaration in its body.
 //
 // A nested declaration's name counts only inside a function scope, where it is
 // a local of the enclosing function. Module-level declarations are symbols this
@@ -428,6 +429,32 @@ func addPythonAssignedNames(stmt string, add func(string)) {
 		}
 		add(name)
 	}
+	// `lambda a, *b, c=1, **d: ...`. A lambda is not a scope this graph owns,
+	// so, like a comprehension target, its parameters are reported as the
+	// enclosing scope's: that refuses more calls than CPython would, never
+	// fewer.
+	for _, segment := range splitKeyword(stmt, "lambda") {
+		if r, _ := utf8.DecodeRuneInString(segment); isIdentifierRune(r) {
+			continue
+		}
+		if colon := lambdaColon(segment); colon >= 0 {
+			for _, param := range splitTopLevel(segment[:colon], ',') {
+				param = strings.TrimLeft(strings.TrimSpace(param), "*")
+				param, _, _ = strings.Cut(param, "=")
+				add(strings.TrimSpace(param))
+			}
+		}
+	}
+	// `case <pattern> [if guard]:` binds every capture name in the pattern, in
+	// the enclosing function for the whole function.
+	// The soft keyword may be followed directly by a bracket or a tab
+	// (`case(x):`, `case[x]:`), as the call-side pattern scan accepts.
+	if rest, ok := strings.CutPrefix(stmt, "case"); ok && rest != "" && strings.IndexByte(" \t([{-", rest[0]) >= 0 {
+		if colon := topLevelIndex(rest, ':'); colon >= 0 {
+			pattern, _, _ := strings.Cut(rest[:colon], " if ")
+			addPatternCaptures(pattern, add)
+		}
+	}
 	// `name := value` anywhere in the statement.
 	for i := 0; i+1 < len(stmt); i++ {
 		if stmt[i] == ':' && stmt[i+1] == '=' {
@@ -445,6 +472,94 @@ func addPythonAssignedNames(stmt string, add func(string)) {
 	for _, part := range strings.Split(head, "=") {
 		addTargets(part)
 	}
+}
+
+// addPatternCaptures reports the capture names of a match-case pattern: every
+// name that is not a dotted value (`Color.RED`), a class name (`Point(...)`), a
+// keyword-pattern attribute (`x=`), a mapping key, the wildcard `_` or a
+// literal. A string's prefix (`b"k"`) may read as a capture; that only refuses.
+func addPatternCaptures(pattern string, add func(string)) {
+	for i := 0; i < len(pattern); {
+		r, size := utf8.DecodeRuneInString(pattern[i:])
+		if !isIdentifierRune(r) {
+			i += size
+			continue
+		}
+		start := i
+		for i < len(pattern) {
+			r, size := utf8.DecodeRuneInString(pattern[i:])
+			if !isIdentifierRune(r) {
+				break
+			}
+			i += size
+		}
+		name := pattern[start:i]
+		before := strings.TrimRight(pattern[:start], " ")
+		after := strings.TrimLeft(pattern[i:], " ")
+		if strings.HasSuffix(before, ".") || after != "" && strings.IndexByte(".(=:", after[0]) >= 0 {
+			continue
+		}
+		switch name {
+		case "_", "None", "True", "False":
+			continue
+		}
+		add(name) // a number or a non-name is refused by addBinding
+	}
+}
+
+// lambdaColon returns the index of the colon that ends the parameters of the
+// lambda whose text follows the keyword, skipping the colon of every lambda
+// written in a default value, or -1 when there is none.
+func lambdaColon(text string) int {
+	depth, nested := 0, 0
+	for i := 0; i < len(text); i++ {
+		switch c := text[i]; {
+		case c == '(' || c == '[' || c == '{':
+			depth++
+		case c == ')' || c == ']' || c == '}':
+			if depth--; depth < 0 {
+				return -1
+			}
+		case depth != 0:
+		case c == ':':
+			if nested == 0 {
+				return i
+			}
+			nested--
+		case strings.HasPrefix(text[i:], "lambda") && isKeywordAt(text, i, len("lambda")):
+			nested++
+			i += len("lambda") - 1
+		}
+	}
+	return -1
+}
+
+// isKeywordAt reports whether text[i:i+n] is a whole word.
+func isKeywordAt(text string, i, n int) bool {
+	before, _ := utf8.DecodeLastRuneInString(text[:i])
+	after, _ := utf8.DecodeRuneInString(text[i+n:])
+	return (i == 0 || !isIdentifierRune(before)) && (i+n == len(text) || !isIdentifierRune(after))
+}
+
+// topLevelIndex returns the index of the first sep outside brackets, or -1 when
+// the text closes a bracket it did not open first.
+func topLevelIndex(text string, sep byte) int {
+	depth := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth--; depth < 0 {
+				return -1
+			}
+		case sep:
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // topLevelAssignment returns the index of the statement's assignment `=`, or -1

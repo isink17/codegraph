@@ -244,6 +244,18 @@ func TestLocalBindings(t *testing.T) {
 			want: []string{"value"},
 		},
 		{
+			name:     "lambda parameters bind in the enclosing scope",
+			src:      "def run():\n    f = lambda a, *b, c=lambda: 1, **d: a\n    g = lambda: 0\n    h = lambda / , *, e: e\n    m = lambda n=(lambda: 1), o=[lambda p: p][0]: n\n    sorted(xs, key=lambda k: k)\n    lambdax = 1\n",
+			function: true,
+			want:     []string{"f", "a", "b", "c", "d", "g", "h", "e", "k", "lambdax", "m", "n", "o", "p"},
+		},
+		{
+			name:     "case patterns bind their captures and nothing else",
+			src:      "def run(v):\n    match v:\n        case Color.RED | None | True | _ | 1.5 | -2j | \"s\":\n            pass\n        case [a, *b] | {\"k\": c, K.d: e, **f}:\n            pass\n        case Point(g, x=h) | P() as i if guard(j):\n            pass\n        case k: return k\n    case = 1\n",
+			function: true,
+			want:     []string{"v", "a", "b", "c", "e", "f", "g", "h", "i", "k", "case"},
+		},
+		{
 			name:     "strings and comments bind nothing",
 			src:      "def run():\n    text = \"fake = 1\"\n    # comment = 2\n    return text\n",
 			function: true,
