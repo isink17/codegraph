@@ -124,6 +124,29 @@ var rustPrivateVisibilityCases = []struct {
 	{"closure parameter named like a module fn", tree{
 		"lib.rs": "fn f() {}\npub fn c() {\n    let g = |f: fn()| f();\n    g(f);\n}\n",
 	}, "lib.rs", "f", "", false},
+	// Struct-pattern shorthand and other pattern forms bind too (rustc: the
+	// binding in each).
+	{"let struct shorthand binding", tree{
+		"lib.rs": "struct P { f: fn() }\nfn f() {}\npub fn c(p: P) {\n    let P { f } = p;\n    f();\n}\n",
+	}, "lib.rs", "f", "", false},
+	{"parameter struct shorthand binding", tree{
+		"lib.rs": "struct P { f: fn() }\nfn f() {}\npub fn c(P { f }: P) {\n    f();\n}\n",
+	}, "lib.rs", "f", "", false},
+	{"match arm struct shorthand binding", tree{
+		"lib.rs": "struct P { f: fn() }\nfn f() {}\npub fn c(p: P) {\n    match p {\n        P { f } => f(),\n    }\n}\n",
+	}, "lib.rs", "f", "", false},
+	{"ref mut struct shorthand binding", tree{
+		"lib.rs": "struct P { f: fn() }\nfn f() {}\npub fn c(mut p: P) {\n    let P { ref mut f } = p;\n    f();\n}\n",
+	}, "lib.rs", "f", "", false},
+	{"renamed field binding", tree{
+		"lib.rs": "struct P { g: fn() }\nfn f() {}\npub fn c(p: P) {\n    let P { g: f } = p;\n    f();\n}\n",
+	}, "lib.rs", "f", "", false},
+	{"captured and or-pattern bindings", tree{
+		"lib.rs": "fn f() {}\npub fn c(x: Option<fn()>) {\n    match x {\n        Some(f @ _) | Some(f) => f(),\n        None => {}\n    }\n}\n",
+	}, "lib.rs", "f", "", false},
+	{"tuple and slice pattern bindings", tree{
+		"lib.rs": "fn f() {}\npub fn c(t: (u8, fn()), s: &[fn()]) {\n    let (_, f) = t;\n    if let [f, ..] = s {\n        f();\n    }\n    f();\n}\n",
+	}, "lib.rs", "f", "", false},
 	// A local binding is a value, not a module: `x::f()` is unaffected.
 	{"let binding does not shadow a path head", tree{
 		"lib.rs": "mod m;\npub fn c() {\n    let m = 1;\n    m::f();\n}\n",
