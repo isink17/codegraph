@@ -13,7 +13,40 @@ on:
     types: [opened, synchronize, reopened, edited, labeled]
 
 jobs:
+  # Classifies the change. Only a change limited to CHANGELOG.md, README.md
+  # and docs/**/*.md, without the windows-stress label, is docs-only; it gets
+  # whitespace and Markdown checks here and skips the Go jobs. Every other
+  # change, and any classification that fails or cannot see both commits,
+  # runs the full suite. No workflow-level paths filter: every job always
+  # reports a result.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    env:
+      CI_EVENT: ${{ github.event_name }}
+      CI_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+      CI_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      CI_STRESS: ${{ contains(github.event.pull_request.labels.*.name, 'windows-stress') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test the classifier
+        run: bash .github/scripts/ci-changes_test.sh
+      - name: Classify changed files
+        id: classify
+        run: bash .github/scripts/ci-changes.sh classify >> "$GITHUB_OUTPUT"
+      - name: Check documentation
+        if: steps.classify.outputs.docs_only == 'true'
+        run: bash .github/scripts/ci-changes.sh check-docs
+
   test-native:
+    needs: changes
+    # Skipped only after a successful docs-only classification and docs check;
+    # any failure in the changes job runs the full suite.
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -125,6 +158,8 @@ jobs:
           }
 
   quality:
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -138,6 +173,8 @@ jobs:
       - run: go test -run '^$' -bench '^BenchmarkStoreFindCallers_Hub$' -benchtime=1x ./internal/store
 
   race:
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -151,6 +188,8 @@ jobs:
       - run: go test -race ./internal/mcp -run '^(TestConcurrentToolCallsAreMeteredSafely|TestGatewayToolsListIsByteIdentical|TestFullToolsListIsByteIdentical)$'
 
   no-cgo:
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -163,3 +202,26 @@ jobs:
       # Type-checks every package and its tests without cgo, so a test that
       # uses a cgo-only helper without the build tag fails here.
       - run: CGO_ENABLED=0 go vet ./...
+
+  # One stable result for branch rules: a skipped matrix job does not report
+  # its per-OS check names, so require this job rather than the matrix legs.
+  # Fails on any failed or cancelled job, and when classification failed.
+  ci:
+    needs: [changes, test-native, quality, race, no-cgo]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          echo "results: $RESULTS (docs_only=$DOCS_ONLY)"
+          for r in $RESULTS; do
+            case "$r" in
+              success) ;;
+              skipped) [ "$DOCS_ONLY" = true ] || { echo "a job was skipped without a docs-only classification"; exit 1; } ;;
+              *) exit 1 ;;
+            esac
+          done
