@@ -160,3 +160,6 @@ jobs:
           go-version-file: go.mod
       - run: CGO_ENABLED=0 go test ./internal/cli
       - run: CGO_ENABLED=0 go build ./cmd/codegraph
+      # Type-checks every package and its tests without cgo, so a test that
+      # uses a cgo-only helper without the build tag fails here.
+      - run: CGO_ENABLED=0 go vet ./...
