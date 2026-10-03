@@ -123,6 +123,7 @@ var javaArityTree = tree{
 	"app/DeclGenOnly.java": `package app; import java.util.Map; public class DeclGenOnly { public DeclGenOnly(Map<String, Integer> m) {} }`,
 	"app/Two.java":         `package app; public class Two { public Two(int a) {} public Two(int a, int b) {} }`,
 	"app/Ann.java":         `package app; public class Ann { public Ann(@SuppressWarnings({"a", "b"}) int a) {} public Ann(int a, int b) {} }`,
+	"app/Bad.java":         `package app; public class Bad { public Bad(int... a, int b) {} }`,
 	"app/Caller.java": `package app;
 
 import java.util.Map;
@@ -143,6 +144,9 @@ public class Caller {
     void two() { new Two(1, 2); }
     void one() { new Two(1); }
     void ann() { new Ann(1); }
+    void broken() { new Two(1,); }
+    void bad() { new Bad(1, 2); }
+    void anon() { new Two(1) { }; }
 }
 `,
 }
@@ -162,6 +166,9 @@ var javaArityWant = map[string]string{
 	"app.Caller.two":         "public Two(int a, int b)",
 	"app.Caller.one":         "public Two(int a)",
 	"app.Caller.ann":         `public Ann(@SuppressWarnings({"a", "b"}) int a)`,
+	"app.Caller.broken":      "", // the argument list does not parse, so its count is unknown
+	"app.Caller.bad":         "", // varargs before another parameter: the declared count is unknown
+	"app.Caller.anon":        "public Two(int a)",
 }
 
 func TestJavaConstructorArityIsCountedFromSyntax(t *testing.T) {
@@ -201,7 +208,11 @@ func TestJavaConstructorArityProfileConvergence(t *testing.T) {
 	}
 	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: New(s.Store, lifecycleRegistry(), nil), repoID: repo}
 	// Without arity facts no constructor call is decided.
-	for caller, target := range constructorTargets(t, r) {
+	legacyTargets := constructorTargets(t, r)
+	if len(legacyTargets) != len(javaArityWant) {
+		t.Fatalf("legacy constructs edges = %v, want one per caller in %v", legacyTargets, javaArityWant)
+	}
+	for caller, target := range legacyTargets {
 		if target != "" {
 			t.Fatalf("legacy %s bound %q with no arity evidence", caller, target)
 		}

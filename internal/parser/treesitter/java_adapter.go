@@ -355,8 +355,14 @@ func javaDeclarationArity(node *sitter.Node) (*int, *int) {
 	for i := range int(params.NamedChildCount()) {
 		switch params.NamedChild(i).Type() {
 		case "formal_parameter":
+			if varargs {
+				return nil, nil
+			}
 			fixed++
 		case "spread_parameter":
+			if varargs {
+				return nil, nil
+			}
 			varargs = true
 		case "receiver_parameter", "line_comment", "block_comment":
 		default:
