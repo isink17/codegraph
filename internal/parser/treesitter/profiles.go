@@ -21,7 +21,10 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:python:v2", EmitsCallEdges: true}
 }
 
-// Java v3 reads the package from the package_declaration node instead of the
+// Java v4 persists AST argument counts on constructor-call edges and AST
+// parameter counts on constructor declarations, so commas inside nested
+// calls, literals, lambdas or generic types no longer change a constructor's
+// arity. v3 reads the package from the package_declaration node instead of the
 // first `package x;` spelled anywhere in the raw text, so a comment or string
 // can no longer name it; the package prefixes every qualified name and stable
 // key. v2 persists direct AST argument counts on method-invocation edges.
@@ -29,7 +32,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyPackage {
 		return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:java:v3", EmitsCallEdges: true}
+	if a.legacyArity {
+		return parser.Profile{ID: "treesitter:java:v3", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v4", EmitsCallEdges: true}
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.
