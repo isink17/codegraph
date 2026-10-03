@@ -269,9 +269,9 @@ var resolverBindableCandidateRules = []resolverGateRule{
 		sql: resolverLanguageGateSQL},
 	{id: "caller_kind_candidate", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
 		sql: `(` + resolverChosenCandidateSQL + `) IS NOT NULL`},
-	{id: "cpp_evidence_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+	{id: ruleCppEvidenceOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"cpp"}, sql: cppScopeVetoSQL, owns: cppScopeOwned},
-	{id: "go_bare_package_scope", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+	{id: ruleGoBarePackageScope, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"go"}, sql: resolverGoBareScopeSQL, owns: goBareScopeOwned},
 	{id: "go_local_qualifier", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"go"}, sql: resolverGoLocalQualifierSQL},
@@ -281,7 +281,7 @@ var resolverBindableCandidateRules = []resolverGateRule{
 		languages: []string{"cpp"}, sql: resolverCppBareNamespaceScopeSQL},
 	{id: "cpp_bare_member_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
 		languages: []string{"cpp"}, sql: resolverCppBareMemberScopeSQL},
-	{id: "ruby_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+	{id: ruleRubyOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"ruby"}, sql: rubyScopeVetoSQL, owns: rubyScopeOwned},
 	{id: "jvm_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"java", "kotlin"}, sql: `NOT ` + resolverJVMScopeVetoSQL},
@@ -291,9 +291,9 @@ var resolverBindableCandidateRules = []resolverGateRule{
 		languages: []string{"typescript"}, sql: `NOT EXISTS (SELECT 1 FROM ` + tsScopeVeto + ` tsv WHERE tsv.edge_id = edges.id)`},
 	{id: "python_scope_claims", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"python"}, sql: `NOT EXISTS (SELECT 1 FROM ` + pyScopeVeto + ` psv WHERE psv.edge_id = edges.id)`},
-	{id: "php_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+	{id: rulePHPOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"php"}, sql: phpScopeVetoSQL, owns: phpScopeOwned},
-	{id: "swift_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+	{id: ruleSwiftOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"swift"}, sql: swiftScopeVetoSQL, owns: swiftScopeOwned},
 }
 
@@ -310,6 +310,50 @@ var resolverBindGateRules = append(slices.Clip(resolverBindableCandidateRules),
 			WHERE v.edge_id = edges.id
 		)`},
 )
+
+// The edge-local ownership rules: each carries the Go twin the binder uses to
+// withhold the edges it owns from the generic lookups.
+const (
+	ruleCppEvidenceOwnership resolverRuleID = "cpp_evidence_ownership"
+	ruleGoBarePackageScope   resolverRuleID = "go_bare_package_scope"
+	ruleRubyOwnership        resolverRuleID = "ruby_ownership"
+	rulePHPOwnership         resolverRuleID = "php_ownership"
+	ruleSwiftOwnership       resolverRuleID = "swift_ownership"
+)
+
+// The Go binder (resolveEdgeTargets) routes owned edges through these
+// predicates, taken from the inventory rather than named directly, so a
+// rule's SQL veto and the binder's withholding are one rule. Each language
+// keeps its own pass and its own outcome accounting; only which edges a pass
+// owns is read from here. The map is what the binder uses, keyed by rule, so
+// a route cannot be listed without its predicate; the inventory test
+// requires it to cover every rule with an edge-local twin.
+var binderOwnershipRoutes = map[resolverRuleID]func(edgeTarget) bool{
+	ruleCppEvidenceOwnership: resolverRuleOwns(ruleCppEvidenceOwnership),
+	ruleGoBarePackageScope:   resolverRuleOwns(ruleGoBarePackageScope),
+	ruleRubyOwnership:        resolverRuleOwns(ruleRubyOwnership),
+	rulePHPOwnership:         resolverRuleOwns(rulePHPOwnership),
+	ruleSwiftOwnership:       resolverRuleOwns(ruleSwiftOwnership),
+}
+
+var (
+	binderOwnsCpp    = binderOwnershipRoutes[ruleCppEvidenceOwnership]
+	binderOwnsGoBare = binderOwnershipRoutes[ruleGoBarePackageScope]
+	binderOwnsRuby   = binderOwnershipRoutes[ruleRubyOwnership]
+	binderOwnsPHP    = binderOwnershipRoutes[rulePHPOwnership]
+	binderOwnsSwift  = binderOwnershipRoutes[ruleSwiftOwnership]
+)
+
+// resolverRuleOwns returns an edge-local ownership rule's Go twin. An id with
+// no such rule is a programming error caught at package initialisation.
+func resolverRuleOwns(id resolverRuleID) func(edgeTarget) bool {
+	for _, rule := range resolverBindGateRules {
+		if rule.id == id && rule.owns != nil {
+			return rule.owns
+		}
+	}
+	panic("store: no edge-local ownership rule " + string(id))
+}
 
 var (
 	resolverBindableCandidateSQL = composeResolverGate(resolverBindableCandidateRules)
