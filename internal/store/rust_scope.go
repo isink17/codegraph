@@ -684,6 +684,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}
 		return module
 	}
+	// inCallerCrate reports whether the candidate's file is proven to hold its
+	// module in the caller's crate.
+	inCallerCrate := func(c rustScopeSymbol, caller rustScopeFile) bool {
+		module := candidateModule(c)
+		return c.file == caller.id || (moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id))
+	}
 	eligible := func(c rustScopeSymbol, caller rustScopeFile) bool {
 		module := candidateModule(c)
 		if c.visibility == "private" && caller.module != module && !strings.HasPrefix(caller.module, module+"::") {
@@ -823,6 +829,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			path := dst
 			strategy := ResolutionStrategyRustModuleScope
 			var globCandidates []rustScopeSymbol
+			explicit, shadowed := false, false
 			for _, im := range importsBy[file] {
 				if im.owner != owner {
 					continue
@@ -842,6 +849,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				if im.local == dst {
 					path = resolvePath(im.source, owner)
 					strategy = ResolutionStrategyRustUseScope
+					explicit = true
 					break
 				}
 			}
@@ -850,14 +858,38 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			} else if path == dst {
 				path = owner + "::" + dst
 			}
-			if path == owner+"::"+dst && len(globCandidates) > 0 {
-				path = ""
-				strategy = ResolutionStrategyRustUseScope
+			// Rust lets an explicit `use` and an item declared in the module
+			// shadow a glob import of the same name, whatever the order of the
+			// declarations. Only functions and structs can be the called value:
+			// a trait or enum does not shadow a glob-imported function, and a
+			// struct is a value only in its tuple or unit form, which the parser
+			// does not record, so a struct competing with a glob fails closed.
+			if explicit {
+				globCandidates = nil
+			} else if path == owner+"::"+dst && len(globCandidates) > 0 {
+				ownFunction, ownStruct := false, false
+				for _, c := range byQ[path] {
+					if inCallerCrate(c, caller) {
+						ownFunction = ownFunction || c.kind == "function"
+						ownStruct = ownStruct || c.kind == "struct"
+					}
+				}
+				if ownStruct && !ownFunction {
+					continue
+				}
+				if ownFunction {
+					// The own item also shadows the module's glob re-exports,
+					// so the re-export walk below must not reach them either.
+					globCandidates, shadowed = nil, true
+				} else {
+					path = ""
+					strategy = ResolutionStrategyRustUseScope
+				}
 			}
 			var chosen int64
 			count := 0
 			for _, c := range globCandidates {
-				if c.file == caller.id || (moduleProven(rootOfFile[caller.id], candidateModule(c)) && moduleMember(candidateModule(c), c.file, caller.id)) {
+				if inCallerCrate(c, caller) {
 					count++
 					chosen = c.id
 				}
@@ -866,13 +898,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				if stats != nil {
 					stats.CandidateRows++
 				}
-				module := candidateModule(c)
-				if eligible(c, caller) && (c.file == caller.id || (moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id))) {
+				if eligible(c, caller) && inCallerCrate(c, caller) {
 					count++
 					chosen = c.id
 				}
 			}
-			if count == 0 {
+			if count == 0 && !shadowed {
 				parts := strings.Split(path, "::")
 				if len(parts) > 1 {
 					for _, c := range exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], map[string]struct{}{}) {
