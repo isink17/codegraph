@@ -361,8 +361,17 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 	// recorded as package-private may be an interface member, which is
 	// implicitly public, so packages are not compared. Refusing costs every
 	// simple name that some member type also uses.
+	// A member type a single-type import names is exempt: an inherited member
+	// type that hides the import is a different type of that name, which
+	// still refuses.
+	imported := ""
+	for _, i := range imps {
+		if !i.static && !i.wildcard && i.local == name {
+			imported = i.source
+		}
+	}
 	for _, s := range byName[name] {
-		if javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" {
+		if javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" && s.qname != imported {
 			return javaScopeSymbol{}, false, ""
 		}
 	}

@@ -163,3 +163,22 @@ func TestJavaInterfaceMemberTypeFromAnotherPackageShadows(t *testing.T) {
 		t.Fatalf("Impl.raw bound %q, want unresolved (javac: other/I$Box)", got)
 	}
 }
+
+// A single-type import of a member type binds it when no other member type
+// shares the name; another member type of that name, which the caller could
+// inherit, still refuses. Oracle (javac 17): Use.raw new Box() -> other/T$Box.
+func TestJavaImportedMemberTypeBindsUnlessAnotherMemberShares(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"other/T.java": `package other; public class T { public static class Box { public Box() {} } }`,
+		"app/Use.java": "package app; import other.T.Box; public class Use {\n void raw() { new Box(); }\n}",
+	})
+	if got := javaConstructsTargets(t, r)["app.Use.raw"]; got != "other.T.Box.Box" {
+		t.Fatalf("Use.raw bound %q, want other.T.Box.Box", got)
+	}
+	r.write(t, "app/Base.java", `package app; public class Base { public static class Box { public Box() {} } }`)
+	r.update(t, "app/Base.java")
+	r.assertFreshParity(t, "second member type Box added")
+	if got := javaConstructsTargets(t, r)["app.Use.raw"]; got != "" {
+		t.Fatalf("Use.raw bound %q with another member type Box present, want unresolved", got)
+	}
+}
