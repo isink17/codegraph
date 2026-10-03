@@ -5872,7 +5872,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	}
 	swiftIDs := make(map[int64]struct{})
 	for _, target := range targets {
-		if swiftScopeOwned(target) {
+		if binderOwnsSwift(target) {
 			swiftIDs[target.edgeID] = struct{}{}
 		}
 	}
@@ -5952,7 +5952,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	// only while still unresolved.
 	cppIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
-		if cppScopeOwned(target) || cppEvidenceTarget(target) {
+		if binderOwnsCpp(target) || cppEvidenceTarget(target) {
 			cppIDs = append(cppIDs, target.edgeID)
 		}
 	}
@@ -5975,7 +5975,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	remaining := targets[:0]
 	for _, target := range targets {
 		_, unresolved := stillUnresolved[target.edgeID]
-		if cppScopeOwned(target) {
+		if binderOwnsCpp(target) {
 			if unresolved {
 				outcome.unresolved++
 			}
@@ -6157,7 +6157,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	// continue. This is the Go-side twin of phpScopeVetoSQL.
 	phpIDs := make(map[int64]struct{})
 	for _, target := range targets {
-		if phpScopeOwned(target) {
+		if binderOwnsPHP(target) {
 			phpIDs[target.edgeID] = struct{}{}
 		}
 	}
@@ -6185,7 +6185,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	// below. This is the Go-side twin of rubyScopeVetoSQL.
 	rubyIDs := make(map[int64]struct{})
 	for _, target := range targets {
-		if rubyScopeOwned(target) {
+		if binderOwnsRuby(target) {
 			rubyIDs[target.edgeID] = struct{}{}
 		}
 	}
@@ -6277,7 +6277,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if _, blocked := moduleVeto[target.edgeID]; blocked {
 			continue
 		}
-		if !goBareScopeOwned(target) {
+		if !binderOwnsGoBare(target) {
 			continue
 		}
 		goBare[target.edgeID] = struct{}{}

@@ -88,6 +88,16 @@ func TestResolverGateRuleInventory(t *testing.T) {
 			t.Errorf("parity record for %s names no rule", id)
 		}
 	}
+	for _, rule := range resolverBindGateRules {
+		if rule.owns != nil && binderOwnershipRoutes[rule.id] == nil {
+			t.Errorf("rule %s has an edge-local Go twin the binder does not route", rule.id)
+		}
+	}
+	for id, owns := range binderOwnershipRoutes {
+		if owns == nil {
+			t.Errorf("binder route %s has no predicate", id)
+		}
+	}
 	if len(resolverBindableCandidateRules) >= len(resolverBindGateRules) {
 		t.Fatal("the bind gate must extend the bindable-candidate rules")
 	}
