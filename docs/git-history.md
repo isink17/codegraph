@@ -41,7 +41,9 @@ Rules:
   is a subdirectory of the repository gets root-relative slash paths that join
   `files.path` directly. History from before a file moved into the root is outside
   the root and is not attributed. The window still counts repository commits.
-- **Submodules:** their histories are not traversed.
+- **Submodules:** their histories are not traversed, and indexed files inside a
+  submodule report `worktree_differs` true (the superproject tracks only the
+  submodule entry).
 - **Configuration:** `log.showRoot`, `log.diffMerges`, `diff.renames`,
   `diff.algorithm` (Myers), `diff.renameLimit` (1000), signatures and color are
   overridden. Only the repository's own `.mailmap` is read; user-level

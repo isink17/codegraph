@@ -22,20 +22,19 @@ import (
 // ancestor) and makes every stored value equal to a fresh computation.
 func (i *Indexer) refreshHistory(ctx context.Context, repoID int64, root string, disabled bool) (githistory.State, int64, error) {
 	start := time.Now()
-	indexed, err := i.store.LiveFilePaths(ctx, repoID)
+	state, files, changes, err := i.evaluateHistory(ctx, repoID, root, disabled)
 	if err != nil {
 		return githistory.State{}, 0, err
 	}
-	state, files, changes := i.evaluateHistory(ctx, repoID, root, indexed, disabled)
 	if err := i.store.ReplaceGitHistory(ctx, repoID, state, files, changes); err != nil {
 		return state, 0, err
 	}
 	return state, time.Since(start).Milliseconds(), nil
 }
 
-func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string, indexed []string, disabled bool) (githistory.State, []githistory.FileStats, []string) {
-	absent := func(reason string) (githistory.State, []githistory.FileStats, []string) {
-		return githistory.Absent(reason), []githistory.FileStats{}, nil
+func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string, disabled bool) (githistory.State, []githistory.FileStats, []string, error) {
+	absent := func(reason string) (githistory.State, []githistory.FileStats, []string, error) {
+		return githistory.Absent(reason), []githistory.FileStats{}, nil, nil
 	}
 	if disabled {
 		return absent(githistory.ReasonDisabled)
@@ -43,6 +42,10 @@ func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string
 	state, err := githistory.Probe(ctx, root)
 	if err != nil {
 		return absent(githistory.ReasonOf(err))
+	}
+	indexed, err := i.store.LiveFilePaths(ctx, repoID)
+	if err != nil {
+		return githistory.State{}, nil, nil, err
 	}
 	changes, err := githistory.WorktreeChanges(ctx, root, state.Watermark, indexed)
 	if err != nil {
@@ -60,12 +63,12 @@ func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string
 	if err == nil && found && state.Status == githistory.StatusOK && prev.Status == state.Status &&
 		prev.Watermark == state.Watermark && prev.WindowLimit == state.WindowLimit &&
 		prev.Algorithm == state.Algorithm && prev.Mailmap == state.Mailmap {
-		return prev, nil, changes
+		return prev, nil, changes, nil
 	}
 	files, n, err := githistory.Files(ctx, root, state.Watermark)
 	if err != nil {
 		return absent(githistory.ReasonOf(err))
 	}
 	state.WindowCommits = n
-	return state, files, changes
+	return state, files, changes, nil
 }
