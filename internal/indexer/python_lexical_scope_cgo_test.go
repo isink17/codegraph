@@ -201,3 +201,8 @@ func TestTreeSitterPythonProfileDefaultClassBindingsConverge(t *testing.T) {
 	runPythonDefaultClassProfileConvergence(t,
 		pythonBindingsV5Adapter{Adapter: tsparser.NewPython(), id: "treesitter:python:v5"}, tsparser.NewPython())
 }
+
+func TestTreeSitterPythonProfileNFKCHeaderBindingsConverge(t *testing.T) {
+	runPythonNFKCHeaderProfileConvergence(t,
+		pythonHeaderBindingsV6Adapter{Adapter: tsparser.NewPython(), id: "treesitter:python:v6"}, tsparser.NewPython(), true)
+}

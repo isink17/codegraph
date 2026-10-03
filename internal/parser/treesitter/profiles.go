@@ -22,9 +22,9 @@ func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 // records every name in its NFKC form, the name CPython binds (PEP 3131). v5
 // records lambda parameters and match-case captures as local bindings. v6
 // records lambdas in a def header's defaults, bodies on a header line and
-// class-body bindings.
+// class-body bindings. v7 matches a method header's names by their NFKC form.
 func (a *PythonAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:python:v6", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:python:v7", EmitsCallEdges: true}
 }
 
 // Java v6 spells a generic construction's class without its type arguments

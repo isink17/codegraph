@@ -63,6 +63,9 @@ func runPythonDefaultClassScopeCases(t *testing.T, reg *parser.Registry, headerC
 		{"meth_default.py", "full"},        // 'cls'
 		{"async_meth_class.py", "full"},    // 'cls'
 		{"modcls_meth_default.py", "full"}, // 'cls'
+		// The same default spelled in fullwidth letters: CPython binds an
+		// identifier's NFKC form.
+		{"meth_default_nfkc.py", "full"}, // 'cls'
 		// Two classes of one qualified name, one per branch: each answers for
 		// both bodies' bindings.
 		{"c_dup_class.py", "full"},    // 'cls'
