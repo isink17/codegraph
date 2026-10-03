@@ -628,3 +628,132 @@ func TestPythonRegexProfileLambdaMatchBindingsConverge(t *testing.T) {
 	runPythonLambdaMatchProfileConvergence(t,
 		pythonBindingsV4Adapter{Adapter: pyparser.New(), id: "python-regex:python:v4"}, pyparser.New())
 }
+
+// pythonDefaultClassSource is a program CPython runs: run() returns 'param'
+// and make() 'classattr', so neither call is lib.full.
+const pythonDefaultClassSource = `from lib import full
+
+
+def run(cb=lambda full: full()):
+    return cb(lambda: "param")
+
+
+def make():
+    class C:
+        full = lambda: "classattr"
+        g = full()
+    return C.g
+`
+
+// pythonBindingsV5Adapter reproduces, for pythonDefaultClassSource, what both
+// Python adapters wrote before a def header's default lambdas and a class body
+// in a function were scanned for bindings: the same rows without those. The v5
+// binaries wrote exactly these rows for this source. It stamps the old
+// profile id, which is all planParserProfiles compares.
+type pythonBindingsV5Adapter struct {
+	parser.Adapter
+	id string
+}
+
+func (a pythonBindingsV5Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: a.id, EmitsCallEdges: true}
+}
+
+func (a pythonBindingsV5Adapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	pf, err := a.Adapter.Parse(ctx, path, content)
+	if err != nil || filepath.Base(path) != "mod.py" {
+		return pf, err
+	}
+	kept := pf.Scope.Imports[:0]
+	for _, b := range pf.Scope.Imports {
+		if b.Kind == graph.ScopeImportClassBodyBinding || b.Kind == graph.ScopeImportClassHeaderBinding ||
+			b.Kind == graph.ScopeImportLocalBinding && b.LocalName == "full" {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	pf.Scope.Imports = kept
+	return pf, nil
+}
+
+// Recording a def header's default lambdas and a nested class body changes
+// what an unchanged file produces, so the profile bump alone must reparse it,
+// and every transition must equal a from-scratch index by the parser that
+// last ran.
+func runPythonDefaultClassProfileConvergence(t *testing.T, old pythonBindingsV5Adapter, current parser.Adapter) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "lib.py"), pythonNFKCLib)
+	path := filepath.Join(root, "mod.py")
+	writeProfileFile(t, path, pythonDefaultClassSource)
+	currentID := current.(parser.ProfileProvider).Profile().ID
+
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old index: %v", err)
+	}
+	oldGraph := pythonGraph(t, s)
+	// The wrong edge: CPython calls the class attribute. (The tree-sitter
+	// adapter also bound the default lambda's call on line 4; the regex
+	// adapter reads no calls from a def header.)
+	requireRows(t, oldGraph, "old graph", "prov|mod.py="+old.id+":1", "call|full@11->lib.full")
+
+	upgraded := New(s.Store, parser.NewRegistry(current), nil)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if summary.FilesChanged != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "python" {
+		t.Fatalf("profile bump did not reparse the unchanged files: changed=%d languages=%v",
+			summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	got := pythonGraph(t, s)
+	requireRows(t, got, "upgraded graph",
+		"prov|mod.py="+currentID+":1",
+		"scope|mod.py|run|local_binding|||full",
+		"scope|mod.py|make|class_body_binding|||full",
+		"call|full@11->")
+	if strings.Contains(got, "->lib.full") {
+		t.Fatalf("a call CPython does not make to lib.full is still bound:\n%s", got)
+	}
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+	again, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update reparsed: changed=%d languages=%v", again.FilesChanged, again.ParserProfileLanguages)
+	}
+
+	// An older binary on the same graph reparses back to its own output.
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old update over a new graph: %v", err)
+	}
+	if got := pythonGraph(t, s); got != oldGraph {
+		t.Fatalf("old update over a new graph:\n%s\nfrom-scratch old graph:\n%s", got, oldGraph)
+	}
+
+	// Back on the current parser, then edit the file: the edit converges like
+	// a fresh index. CPython: other() returns 0, len([]).
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, path, pythonDefaultClassSource+
+		"\n\ndef other():\n    class D:\n        for full in [len]:\n            pass\n        n = full([])\n    return D.n\n")
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update after edit: %v", err)
+	}
+	got = pythonGraph(t, s)
+	requireRows(t, got, "edited graph", "scope|mod.py|other|class_body_binding|||full", "call|full@19->")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("edited graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+}
+
+func TestPythonRegexProfileDefaultClassBindingsConverge(t *testing.T) {
+	runPythonDefaultClassProfileConvergence(t,
+		pythonBindingsV5Adapter{Adapter: pyparser.New(), id: "python-regex:python:v5"}, pyparser.New())
+}

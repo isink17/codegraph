@@ -273,7 +273,7 @@ func TestPythonNameIsShadowed(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pythonNameIsShadowed(locals, tc.at, tc.bound, tc.importOwner, tc.claimed); got != tc.want {
+			if got := pythonNameIsShadowed(locals, tc.at, 0, tc.bound, tc.importOwner, tc.claimed); got != tc.want {
 				t.Fatalf("pythonNameIsShadowed(%q, %q, %q, %v) = %v, want %v", tc.at, tc.bound, tc.importOwner, tc.claimed, got, tc.want)
 			}
 		})

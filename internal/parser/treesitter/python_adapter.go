@@ -114,8 +114,8 @@ func pyLexicalOwner(node *sitter.Node, content []byte) string {
 
 // pyExtractLocalBindings records what each lexical scope binds itself, using
 // the same text scan the regex adapter uses so the two adapters cannot disagree
-// about a shadow. Class bodies are not scopes a Python name lookup passes
-// through, so only the module and each function body are scanned.
+// about a shadow. The module and each function body are scanned as scopes;
+// class bodies are recorded by python.AddClassScopeBindings.
 func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
 	emit := func(owner, source string) {
 		for _, binding := range python.LocalBindings(source, owner != "") {
@@ -142,6 +142,7 @@ func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf
 		}
 		emit(owner+python.NormalizeIdentifier(nodeText(name, content)), nodeText(fn, content))
 	}
+	python.AddClassScopeBindings(module, strings.Split(string(content), "\n"), pf)
 }
 
 type pyScope struct {

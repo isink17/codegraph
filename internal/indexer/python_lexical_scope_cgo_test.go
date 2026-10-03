@@ -192,3 +192,12 @@ func TestTreeSitterPythonProfileConditionalDefsConverge(t *testing.T) {
 func TestPythonNestedVisibilityTreeSitterAdapter(t *testing.T) {
 	runPythonNestedVisibilityCases(t, parser.NewRegistry(tsparser.NewPython()))
 }
+
+func TestPythonDefaultClassScopeTreeSitterAdapter(t *testing.T) {
+	runPythonDefaultClassScopeCases(t, parser.NewRegistry(tsparser.NewPython()), true)
+}
+
+func TestTreeSitterPythonProfileDefaultClassBindingsConverge(t *testing.T) {
+	runPythonDefaultClassProfileConvergence(t,
+		pythonBindingsV5Adapter{Adapter: tsparser.NewPython(), id: "treesitter:python:v5"}, tsparser.NewPython())
+}

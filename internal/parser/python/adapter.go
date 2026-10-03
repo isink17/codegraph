@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -234,9 +236,8 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 // addPythonLocalBindings records what each lexical scope binds itself: the
 // module, and every function or method body now that their ranges are sealed.
-// Class bodies are not scopes a name lookup passes through in Python, so they
-// contribute nothing -- LocalBindings skips them from the module scan, and a
-// method scans only its own body.
+// A method scans only its own body; class bodies are recorded by
+// AddClassScopeBindings.
 func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile) {
 	emit := func(owner, source string) {
 		for _, binding := range LocalBindings(source, owner != "") {
@@ -261,6 +262,86 @@ func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile)
 			continue
 		}
 		emit(strings.TrimPrefix(sym.QualifiedName, module+"."), strings.Join(lines[start:end], "\n"))
+	}
+	AddClassScopeBindings(module, lines, pf)
+}
+
+// AddClassScopeBindings records what each class body binds, for the code that
+// runs directly in it, from the symbols already parsed out of lines. Both
+// Python adapters call it, so they record the same rows.
+//
+// A call written directly in a class body is attributed to the function the
+// class is written in, so the body's names are recorded under that function as
+// class-body bindings; a class outside every function has no such calls. A
+// direct method's parameter defaults and annotations are evaluated in the
+// class body too, but a call written in the method's `def` header is
+// attributed to the method, so the body's names are also recorded under each
+// direct method as header bindings, with the header's last line: they shadow
+// only the calls on the header's lines, never the method body, which skips the
+// class scope.
+func AddClassScopeBindings(module string, lines []string, pf *graph.ParsedFile) {
+	functions := map[string]bool{}
+	classes := map[string][]LocalBinding{}
+	for _, sym := range pf.Symbols {
+		start, end := sym.Range.StartLine-1, sym.Range.EndLine
+		switch {
+		case sym.Kind == "function" || sym.Kind == "method":
+			functions[sym.QualifiedName] = true
+		case sym.Kind == "class" && start >= 0 && end <= len(lines) && start < end:
+			// Classes sharing a qualified name (one per branch of an if/else
+			// or try/except) cannot be told apart by their methods' or
+			// children's parent name, so each answers for the union of their
+			// bindings: a shared name only ever refuses more.
+			for _, b := range ClassBodyBindings(strings.Join(lines[start:end], "\n")) {
+				if !slices.ContainsFunc(classes[sym.QualifiedName], func(o LocalBinding) bool { return o.Name == b.Name }) {
+					classes[sym.QualifiedName] = append(classes[sym.QualifiedName], b)
+				}
+			}
+		}
+	}
+	for _, sym := range pf.Symbols {
+		start, end := sym.Range.StartLine-1, sym.Range.EndLine
+		if start < 0 || end > len(lines) || start >= end {
+			continue
+		}
+		parent := sym.QualifiedName[:max(strings.LastIndexByte(sym.QualifiedName, '.'), 0)]
+		switch sym.Kind {
+		case "class":
+			// The innermost function the class is written in, if any.
+			owner := parent
+			for owner != "" && !functions[owner] {
+				owner = owner[:max(strings.LastIndexByte(owner, '.'), 0)]
+			}
+			if owner == "" {
+				continue
+			}
+			owner = strings.TrimPrefix(owner, module+".")
+			for _, binding := range classes[sym.QualifiedName] {
+				pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+					LocalName:   binding.Name,
+					Kind:        graph.ScopeImportClassBodyBinding,
+					OwnerModule: owner,
+				})
+			}
+		case "method":
+			bindings, ok := classes[parent]
+			if !ok {
+				continue
+			}
+			src := strings.Join(lines[start:end], "\n")
+			last := strconv.Itoa(start + 1 + DefHeaderEnd(src))
+			owner := strings.TrimPrefix(sym.QualifiedName, module+".")
+			// Only the names the header spells: a class's every name under
+			// its every method would grow with their product.
+			for _, binding := range DefHeaderNames(src, bindings) {
+				pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+					LocalName:    binding.Name,
+					ImportedName: last,
+					Kind:         graph.ScopeImportClassHeaderBinding,
+					OwnerModule:  owner,
+				})
+			}
+		}
 	}
 }
 
@@ -486,7 +567,9 @@ func isPythonKeyword(name string) bool {
 // Unicode names in declarations, calls, imports and local bindings. v3 stops
 // reading `as (`, match statements and case patterns as calls. v4 records
 // every name in its NFKC form, the name CPython binds (PEP 3131). v5 records
-// lambda parameters and match-case captures as local bindings.
+// lambda parameters and match-case captures as local bindings. v6 records
+// lambdas in a def header's defaults, bodies on a header line and class-body
+// bindings.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v5", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v6", EmitsCallEdges: true}
 }
