@@ -133,8 +133,7 @@ A dotted qualifier must match exactly one fully qualified type. For a simple typ
 
 Calls bind as follows:
 - `Type.m()` binds only a unique, visible static method. Overloads are not chosen between.
-- `new T(...)` binds a unique Java constructor with the call's argument count. An implicit default constructor is not a target.
-  Known defect: argument and parameter counts are currently read from source text. Commas inside nested calls or generic parameter types are counted too, which can select the wrong constructor.
+- `new T(...)` binds the unique Java constructor whose syntactic parameter count admits the call's syntactic argument count. A trailing varargs parameter admits any number of extra arguments. Argument types are not modelled, so constructors that admit the same count compete and the call stays unresolved. An implicit default constructor is not a target.
 - An unqualified call can bind through a static import.
 
 Visibility is checked as follows:
