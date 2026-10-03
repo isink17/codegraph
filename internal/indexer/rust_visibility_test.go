@@ -121,6 +121,29 @@ var rustPrivateVisibilityCases = []struct {
 	{"single trait impl associated call", tree{
 		"lib.rs": "struct Cfg;\nimpl Default for Cfg {\n    fn default() -> Self {\n        Cfg\n    }\n}\npub fn c() {\n    Cfg::default();\n}\n",
 	}, "lib.rs", "Cfg::default", "lib.rs:crate::Cfg::default", false},
+	// A trait impl method is recorded under the type as the impl writes it,
+	// but `Type::m` finds an inherent method first, wherever its impl is.
+	// rustc calls the inherent nfa.rs NFA::swap in all three; the parser
+	// cannot tell a trait impl from an inherent one, so each stays unresolved.
+	{"trait impl method of a module-qualified type", tree{
+		"lib.rs": "mod nfa; mod r;",
+		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
+		"r.rs":   "use crate::nfa;\npub trait R {\n    fn swap(&mut self);\n}\nimpl R for nfa::NFA {\n    fn swap(&mut self) {\n        nfa::NFA::swap(self);\n    }\n}\n",
+	}, "r.rs", "nfa::NFA::swap", "", false},
+	{"free fn beside a trait impl of a module-qualified type", tree{
+		"lib.rs": "mod nfa; mod r;",
+		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
+		"r.rs":   "use crate::nfa;\npub trait R {\n    fn swap(&mut self);\n}\nimpl R for nfa::NFA {\n    fn swap(&mut self) {}\n}\npub fn go(n: &mut nfa::NFA) {\n    nfa::NFA::swap(n);\n}\n",
+	}, "r.rs", "nfa::NFA::swap", "", false},
+	{"trait impl method of an imported type", tree{
+		"lib.rs": "mod nfa; mod r;",
+		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
+		"r.rs":   "use crate::nfa::NFA;\npub trait R {\n    fn swap(&mut self);\n}\nimpl R for NFA {\n    fn swap(&mut self) {\n        NFA::swap(self);\n    }\n}\n",
+	}, "r.rs", "NFA::swap", "", false},
+	// rustc: inherent S::m.
+	{"inherent and trait method of one name", tree{
+		"lib.rs": "struct S;\nimpl S {\n    fn m() {}\n}\ntrait T {\n    fn m();\n}\nimpl T for S {\n    fn m() {}\n}\npub fn c() {\n    S::m();\n}\n",
+	}, "lib.rs", "S::m", "", false},
 	// Another crate root's private `crate::helper` is not the caller's.
 	{"other crate root", tree{
 		"lib.rs":  "fn helper() {}",

@@ -718,6 +718,30 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		root := rootOfFile[caller.id]
 		return root != "" && globModules[[2]string{root, module}]
 	}
+	// A private impl method may be a trait impl's: the parser does not record
+	// which, and `Type::m` finds an inherent `m` of the type first, wherever
+	// in the crate its impl is. These two indexes let such a method answer
+	// only when the type is declared in the impl's own module and no other
+	// method of that name sits on any type of that name in the crate.
+	localTypes := map[string]bool{}
+	methodsOn := map[string]int{}
+	for _, s := range symbols {
+		module := candidateModule(s)
+		switch {
+		case s.kind == "struct" || s.kind == "enum":
+			localTypes[s.qualified] = true
+		case s.kind == "function" && s.container != module:
+			methodsOn[rootOfFile[s.file]+"\x00"+rustTypeLastSegment(s.container)+"\x00"+s.name]++
+		}
+	}
+	privateMethodProven := func(c rustScopeSymbol) bool {
+		module := candidateModule(c)
+		if c.container == module {
+			return true // a free function, not an impl method
+		}
+		return rustPlainIdent(c.container) && localTypes[module+"::"+c.container] &&
+			rootOfFile[c.file] != "" && methodsOn[rootOfFile[c.file]+"\x00"+c.container+"\x00"+c.name] == 1
+	}
 	eligible := func(c rustScopeSymbol, caller rustScopeFile) bool {
 		module := candidateModule(c)
 		// A private item (`pub(self)` says the same) is visible in its own
@@ -733,7 +757,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		//     The file's module is the caller's module or an ancestor of it,
 		//     so this can only under-approximate.
 		if c.visibility == "private" || c.visibility == "restricted:self" {
-			if c.qualified != symbols[c.id].qualified {
+			if c.qualified != symbols[c.id].qualified || !privateMethodProven(c) {
 				return false
 			}
 			if c.file != caller.id && !(moduleProven(rootOfFile[caller.id], caller.module) && moduleMember(caller.module, caller.id, caller.id)) {
@@ -1181,4 +1205,34 @@ func (s *Store) dropRustEdgesOutsideScope(ctx context.Context, repoID int64, sco
 			}
 			return nil
 		})
+}
+
+// rustPlainIdent reports whether an impl's type is written as one bare
+// identifier: no path, generics, reference or other type syntax.
+func rustPlainIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r != '_' && !('a' <= r && r <= 'z') && !('A' <= r && r <= 'Z') && !('0' <= r && r <= '9') && r <= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// rustTypeLastSegment names the type an impl's written type ends in:
+// `a::S<T>` and `&'a mut S` both give `S`. It over-approximates which types
+// may be the same, which is the safe side for refusing a binding.
+func rustTypeLastSegment(s string) string {
+	if i := strings.IndexByte(s, '<'); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.LastIndex(s, "::"); i >= 0 {
+		s = s[i+2:]
+	}
+	if i := strings.LastIndexAny(s, "& )]*"); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.TrimSpace(s)
 }
