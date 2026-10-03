@@ -19,6 +19,8 @@
   fixture (`go run ./internal/audit/cmd/resolveraudit`); not a CLI or MCP command
 - `internal/graphaudit`: production audit of a user's already-indexed graph
   (`codegraph audit`, MCP `audit`); read-only, observational, never re-resolves
+- `internal/constraints`: architectural constraints over an indexed graph
+  (`codegraph check_constraints`, MCP `check_constraints`); read-only
 - `internal/query`: symbol, caller, callee, impact, and stats queries
 - `internal/search`: package doc only, no code; semantic search is implemented
   in `internal/store` and `internal/query` (token weights in `internal/texttoken`)
