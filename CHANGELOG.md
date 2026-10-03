@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Rust: an item declared at a file's top level is no longer treated as a member of every inline module in that file. `m::x::f()` now resolves through x's own items and re-exports. Inline modules in crate roots resolve from other files. `use super::*` (and bare `self`/`crate` paths) now import the named module, so test modules see their parent's items through the glob.
+
+The CGO Python parser now records functions and classes defined under compound statements (`if`/`else`, `try`/`except`/`finally`, `with`, `for`, `while`, `match`/`case`), and the calls inside them; it previously skipped them. `treesitter:python:v3` reparses unchanged Python files.
+Python bare calls no longer bind to a function nested in another function or a class body, which the call cannot see, and `from mod import f` no longer binds mod's fallback `def f()` when mod also imports `f` (or uses `import *`) at module level.
+
 Scope-model documentation now covers Go, Rust, C/C++, Java, Kotlin, TypeScript/JavaScript, Python, C#, PHP and Swift alongside Ruby (`docs/scope-models.md`). Resolver behavior is unchanged.
 
 Rust: explicit imports now take precedence over glob imports for the first segment of qualified calls (`use b::S; S::new()`), and when two imports bring in the same name, only the one that is a function is used as the call target. A call that resolves to a non-function item in a module that also has glob imports is left unresolved instead of binding to the type; re-export walks stay inside the caller's crate root.
