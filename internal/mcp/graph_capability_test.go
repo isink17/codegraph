@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -24,6 +27,7 @@ var relationshipToolArgs = map[string]map[string]any{
 	"find_related_tests": {"symbol": "Helper"},
 	"find_dead_code":     {},
 	"graph_analytics":    {"analysis": "pagerank"},
+	"context_for_task":   {"task": "Helper"},
 }
 
 // capabilityFixture indexes a Go file (call-capable go/ast parser) and, when
@@ -144,9 +148,14 @@ func TestSymbolsOnlyLanguageDisclosedOnRelationshipTools(t *testing.T) {
 			}
 		}
 	}
+	// context_for_task answers from callers only when it expands them.
+	text, _ := callToolRaw(t, server, ctx, "context_for_task", map[string]any{"task": "Helper", "include_callers": false})
+	if strings.Contains(text, "limitations") {
+		t.Fatalf("context_for_task without callers discloses limitations: %s", text)
+	}
 	// The Java target itself: found, no callers, and the answer says why that
 	// emptiness proves nothing.
-	text, _ := callToolRaw(t, server, ctx, "find_callers", map[string]any{"symbol": "helper"})
+	text, _ = callToolRaw(t, server, ctx, "find_callers", map[string]any{"symbol": "helper"})
 	if !strings.Contains(text, `"callers":[]`) || !strings.Contains(text, `"target_found":true`) ||
 		!strings.Contains(text, `"limitations":[{"language":"java","graph_capability":"symbols_only"`) {
 		t.Fatalf("find_callers(helper) = %s", text)
@@ -179,5 +188,83 @@ func TestSupportedLanguagesReportsPersistedCapability(t *testing.T) {
 	text, _ = callToolRaw(t, rich, ctx, "supported_languages", map[string]any{})
 	if !strings.Contains(text, `"graph_capability":{"state":"call_capable","languages":[{"language":"go","graph_capability":"call_capable","parser_profiles":["go-ast:go:v1"]}]}`) {
 		t.Fatalf("rich supported_languages = %s", text)
+	}
+}
+
+// The capability report is a function of the persisted provenance, so a fresh
+// index and an incremental update of the same tree agree on it, after adding
+// and after removing a file of a call-capable and of a symbols-only language.
+func TestCapabilityReportFreshIndexEqualsUpdate(t *testing.T) {
+	registry := func() *parser.Registry { return parser.NewRegistry(goparser.New(), heuristicparser.NewJava()) }
+	capabilityOf := func(s *store.Store, repoRoot string) store.GraphCapability {
+		t.Helper()
+		repo, err := s.UpsertRepo(context.Background(), repoRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GraphCapability(context.Background(), repo.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		limitations, err := s.GraphLimitations(context.Background(), repo.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (len(limitations) > 0) != (got.State != store.GraphCallCapable && got.State != "") {
+			t.Fatalf("limitations %+v disagree with state %q", limitations, got.State)
+		}
+		return got
+	}
+	fresh := func(repoRoot string) store.GraphCapability {
+		t.Helper()
+		s := openTestStore(t)
+		defer s.Close()
+		if _, err := indexer.New(s, registry(), nil).Index(context.Background(), indexer.Options{RepoRoot: repoRoot}); err != nil {
+			t.Fatal(err)
+		}
+		return capabilityOf(s, repoRoot)
+	}
+
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeRepoFile(t, repoRoot, "lib/lib.go", "package lib\n\nfunc Helper() int { return 1 }\n")
+	s := openTestStore(t)
+	t.Cleanup(func() { s.Close() })
+	idx := indexer.New(s, registry(), nil)
+	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatal(err)
+	}
+	steps := []struct {
+		name  string
+		apply func()
+		state string
+	}{
+		{"add java and go", func() {
+			writeRepoFile(t, repoRoot, "src/Widget.java", "package demo;\n\npublic class Widget {\n    int size() { return 1; }\n}\n")
+			writeRepoFile(t, repoRoot, "lib/more.go", "package lib\n\nfunc More() int { return Helper() }\n")
+		}, store.GraphMixed},
+		{"remove go file", func() {
+			if err := os.Remove(filepath.Join(repoRoot, "lib/more.go")); err != nil {
+				t.Fatal(err)
+			}
+		}, store.GraphMixed},
+		{"remove java file", func() {
+			if err := os.Remove(filepath.Join(repoRoot, "src/Widget.java")); err != nil {
+				t.Fatal(err)
+			}
+		}, store.GraphCallCapable},
+	}
+	for _, step := range steps {
+		step.apply()
+		if _, err := idx.Update(ctx, indexer.Options{RepoRoot: repoRoot, ScanKind: "update"}); err != nil {
+			t.Fatalf("%s: update: %v", step.name, err)
+		}
+		updated := capabilityOf(s, repoRoot)
+		if want := fresh(repoRoot); !reflect.DeepEqual(updated, want) {
+			t.Fatalf("%s: update = %+v, fresh = %+v", step.name, updated, want)
+		}
+		if updated.State != step.state {
+			t.Fatalf("%s: state = %q, want %q", step.name, updated.State, step.state)
+		}
 	}
 }

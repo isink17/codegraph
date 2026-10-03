@@ -216,7 +216,7 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 		// returning the encoder's "document has no sections".
 		return "", fmt.Errorf("tool %q is registered for compact but has no encoder", name)
 	}
-	if relationshipTools[name] {
+	if disclosesLimitations(name, raw) {
 		limitations, err := s.graphLimitations(ctx)
 		if err != nil {
 			return "", err

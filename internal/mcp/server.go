@@ -285,7 +285,7 @@ func (s *Server) dispatchTool(ctx context.Context, name string, raw json.RawMess
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
 	result, err := desc.handler(s, ctx, raw)
-	if err != nil || result == nil || !relationshipTools[name] {
+	if err != nil || result == nil || !disclosesLimitations(name, raw) {
 		return result, err
 	}
 	limitations, err := s.graphLimitations(ctx)
@@ -310,6 +310,24 @@ var relationshipTools = map[string]bool{
 	"find_related_tests": true,
 	"find_dead_code":     true,
 	"graph_analytics":    true,
+}
+
+// disclosesLimitations reports whether a call answers from relationship edges.
+// context_for_task does when it expands callers, which it does unless the call
+// sets include_callers=false. Its token budget covers `data` only, so the
+// top-level limitations list does not change the reported estimate.
+func disclosesLimitations(name string, raw json.RawMessage) bool {
+	if relationshipTools[name] {
+		return true
+	}
+	if name != "context_for_task" {
+		return false
+	}
+	var req struct {
+		IncludeCallers *bool `json:"include_callers"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	return req.IncludeCallers == nil || *req.IncludeCallers
 }
 
 // graphLimitations reads the persisted graph's limitations for this server's
