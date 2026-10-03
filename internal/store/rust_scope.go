@@ -7,6 +7,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 type rustScopeFile struct {
@@ -896,7 +898,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			return nil, err
 		}
 	}
-	const edgeQuery = `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='rust' AND e.dst_symbol_id IS NULL`
+	const edgeQuery = `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,COALESCE(e.evidence,'') FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='rust' AND e.dst_symbol_id IS NULL`
 	for _, edgeBatch := range edgeBatches {
 		query := edgeQuery
 		if filteredEdges {
@@ -908,8 +910,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}
 		for rows.Next() {
 			var id, file, src int64
-			var dst string
-			if err := rows.Scan(&id, &file, &src, &dst); err != nil {
+			var dst, evidence string
+			if err := rows.Scan(&id, &file, &src, &dst, &evidence); err != nil {
 				return nil, err
 			}
 			if only != nil {
@@ -925,7 +927,9 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				continue
 			}
 			ss := symbols[src]
-			if strings.Contains(dst, ".") {
+			// A block around the call declares the path's first name, which
+			// shadows every module item of that name.
+			if strings.Contains(dst, ".") || evidence == graph.RustCallBlockScopeEvidence {
 				continue
 			}
 			owner := ss.container

@@ -332,11 +332,15 @@ func rustExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		evidence := name
+		if rustBlockDeclares(call, rustPathHead(name), content) {
+			evidence = graph.RustCallBlockScopeEvidence
+		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
 			DstName:     name,
 			Kind:        "calls",
-			Evidence:    name,
+			Evidence:    evidence,
 			Line:        line,
 		})
 		pf.References = append(pf.References, graph.Reference{
@@ -346,4 +350,76 @@ func rustExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+// rustPathHead is the first segment of a called path, the name a block's own
+// items can shadow. A global path, a qualified-self path and the keywords
+// `crate`, `self`, `super` and `Self` name nothing a block declares, so they
+// give "".
+func rustPathHead(name string) string {
+	head, _, _ := strings.Cut(name, "::")
+	head = strings.TrimSpace(head)
+	switch head {
+	case "", "crate", "self", "super", "Self":
+		return ""
+	}
+	if strings.ContainsAny(head, "<(.") {
+		return ""
+	}
+	return head
+}
+
+// rustBlockDeclares reports whether a block enclosing call declares head
+// itself: an item, an extern crate, or a `use` that imports it or imports by
+// glob. Such a name shadows the module's item of that name throughout the
+// block, nested items included, and the parser does not record block items,
+// so the call has no target the resolver can see.
+func rustBlockDeclares(call *sitter.Node, head string, content []byte) bool {
+	if head == "" {
+		return false
+	}
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		if node.Type() != "block" {
+			continue
+		}
+		for i := range int(node.ChildCount()) {
+			if rustDeclares(node.Child(i), head, content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func rustDeclares(item *sitter.Node, head string, content []byte) bool {
+	switch item.Type() {
+	case "use_declaration":
+		arg := childByFieldName(item, "argument")
+		if arg == nil || item.HasError() {
+			return true // unreadable: it may import anything
+		}
+		var imports []graph.ScopeImport
+		rustUseTree(arg, "", false, "", content, &imports)
+		for _, im := range imports {
+			if im.Wildcard || im.LocalName == head {
+				return true
+			}
+		}
+		return false
+	case "extern_crate_declaration":
+		if alias := childByFieldName(item, "alias"); alias != nil {
+			return nodeText(alias, content) == head
+		}
+	case "foreign_mod_item":
+		if body := childByFieldName(item, "body"); body != nil {
+			for i := range int(body.ChildCount()) {
+				if rustDeclares(body.Child(i), head, content) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	name := childByFieldName(item, "name")
+	return name != nil && nodeText(name, content) == head
 }

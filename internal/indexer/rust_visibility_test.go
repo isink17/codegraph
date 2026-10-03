@@ -144,6 +144,31 @@ var rustPrivateVisibilityCases = []struct {
 	{"inherent and trait method of one name", tree{
 		"lib.rs": "struct S;\nimpl S {\n    fn m() {}\n}\ntrait T {\n    fn m();\n}\nimpl T for S {\n    fn m() {}\n}\npub fn c() {\n    S::m();\n}\n",
 	}, "lib.rs", "S::m", "", false},
+	// An item declared in a block shadows the module's item of that name
+	// throughout the block, nested items included; it is not recorded, so the
+	// call stays unresolved. rustc calls the block's item in each.
+	{"fn-body fn shadows a module fn", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    fn helper() {}\n    helper();\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"fn-body fn seen from a nested fn", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    fn helper() {}\n    fn other() {\n        helper();\n    }\n    other();\n}\n",
+	}, "lib.rs", "helper", "", false},
+	{"fn-body use shadows a module fn", tree{
+		"lib.rs": "mod a; fn helper() {}\npub fn outer() {\n    use crate::a::helper;\n    helper();\n}\n",
+		"a.rs":   "pub fn helper() {}",
+	}, "lib.rs", "helper", "", false},
+	{"fn-body glob use shadows a module fn", tree{
+		"lib.rs": "mod a; fn helper() {}\npub fn outer() {\n    use crate::a::*;\n    helper();\n}\n",
+		"a.rs":   "pub fn helper() {}",
+	}, "lib.rs", "helper", "", false},
+	{"fn-body mod shadows a module", tree{
+		"lib.rs": "mod m;\npub fn outer() {\n    mod m {\n        pub fn f() {}\n    }\n    m::f();\n}\n",
+		"m.rs":   "pub fn f() {}",
+	}, "lib.rs", "m::f", "", false},
+	// rustc: the module's helper; the block's item ends with its block.
+	{"inner-block fn does not shadow outside its block", tree{
+		"lib.rs": "fn helper() {}\npub fn outer() {\n    {\n        fn helper() {}\n    }\n    helper();\n}\n",
+	}, "lib.rs", "helper", "lib.rs:crate::helper", false},
 	// Another crate root's private `crate::helper` is not the caller's.
 	{"other crate root", tree{
 		"lib.rs":  "fn helper() {}",
@@ -257,5 +282,44 @@ func TestRustPrivateVisibilityFollowsIncrementalChanges(t *testing.T) {
 		update("a.rs")
 		r.assertFreshParity(t, "narrowed to private")
 		assertRustCallTarget(t, r, "narrowed to private", "b.rs", "crate::a::shared", "")
+	}
+}
+
+// TestRustShadowingFollowsIncrementalChanges adds and removes what shadows a
+// module item, a block item in the caller's file and an inherent method in
+// another file, through both update shapes; every step must match a fresh
+// index of the same tree.
+func TestRustShadowingFollowsIncrementalChanges(t *testing.T) {
+	const cfg = "mod a;\nstruct Cfg;\nimpl Default for Cfg {\n    fn default() -> Self {\n        Cfg\n    }\n}\nfn helper() {}\npub fn c() {\n    Cfg::default();\n    helper();\n}\n"
+	const shadowed = "mod a;\nstruct Cfg;\nimpl Default for Cfg {\n    fn default() -> Self {\n        Cfg\n    }\n}\nfn helper() {}\npub fn c() {\n    fn helper() {}\n    Cfg::default();\n    helper();\n}\n"
+	for _, scoped := range []bool{true, false} {
+		r := newLifecycleRepo(t, tree{"lib.rs": cfg, "a.rs": "pub fn f() {}"})
+		update := func(paths ...string) {
+			if scoped {
+				r.update(t, paths...)
+			} else {
+				r.update(t)
+			}
+		}
+		step := func(name, def, help string) {
+			r.assertFreshParity(t, name)
+			assertRustCallTarget(t, r, name, "lib.rs", "Cfg::default", def)
+			assertRustCallTarget(t, r, name, "lib.rs", "helper", help)
+		}
+		step("initial", "lib.rs:crate::Cfg::default", "lib.rs:crate::helper")
+		r.write(t, "lib.rs", shadowed)
+		update("lib.rs")
+		step("block fn added", "lib.rs:crate::Cfg::default", "")
+		r.write(t, "lib.rs", cfg)
+		update("lib.rs")
+		step("block fn removed", "lib.rs:crate::Cfg::default", "lib.rs:crate::helper")
+		// Another type named Cfg with an inherent `default` may be the
+		// called one; the trait impl method no longer answers.
+		r.write(t, "a.rs", "pub struct Cfg;\nimpl Cfg {\n    pub fn default() -> Self {\n        Cfg\n    }\n}\n")
+		update("a.rs")
+		step("inherent elsewhere added", "", "lib.rs:crate::helper")
+		r.write(t, "a.rs", "pub fn f() {}")
+		update("a.rs")
+		step("inherent elsewhere removed", "lib.rs:crate::Cfg::default", "lib.rs:crate::helper")
 	}
 }

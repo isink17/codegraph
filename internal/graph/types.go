@@ -67,6 +67,12 @@ const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
 // members shadow the enclosing class's, so the enclosing class must not answer.
 const JavaCallNestedClassScopeEvidence = "java:nested_class_scope"
 
+// RustCallBlockScopeEvidence marks a Rust call whose first path segment a
+// block around it declares itself: an item, an extern crate or a `use`. The
+// block's name shadows the module's, and the adapter does not record block
+// items, so no module item may answer.
+const RustCallBlockScopeEvidence = "rust:block_scope_item"
+
 type ParsedFile struct {
 	Language                  string
 	Symbols                   []Symbol
