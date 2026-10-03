@@ -44,8 +44,9 @@ jobs:
 
   test-native:
     needs: changes
-    # !cancelled() keeps the suite running when classification fails.
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    # Skipped only after a successful docs-only classification and docs check;
+    # any failure in the changes job runs the full suite.
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -158,7 +159,7 @@ jobs:
 
   quality:
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -173,7 +174,7 @@ jobs:
 
   race:
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -188,7 +189,7 @@ jobs:
 
   no-cgo:
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

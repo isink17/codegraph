@@ -98,8 +98,42 @@ expect unknown-event docs_only=false "$(run workflow_dispatch "$base" "$docs")"
 expect empty-diff docs_only=false "$(run pull_request "$docs" "$docs")"
 expect check-docs-missing-base fail "$(docs_check "$missing" "$docs")"
 
-# git itself failing must not read as an empty, docs-only change.
-expect git-failure docs_only=false "$(cd "$repo" && PATH="$(mktemp -d)" CI_EVENT=pull_request CI_BASE=$base CI_HEAD=$docs /bin/bash "$script" classify 2>/dev/null)"
+# git diff failing must not read as an empty, docs-only change.
+fakebin=$(mktemp -d)
+realgit=$(command -v git)
+printf '#!/bin/sh\ncase "$1" in diff) exit 1 ;; esac\nexec "%s" "$@"\n' "$realgit" >"$fakebin/git"
+chmod +x "$fakebin/git"
+expect git-diff-failure docs_only=false "$(cd "$repo" && PATH="$fakebin:$PATH" CI_EVENT=pull_request CI_BASE=$base CI_HEAD=$docs bash "$script" classify 2>/dev/null)"
+rm -rf "$fakebin"
+
+# A sibling of the docs commit that changed code.
+git -C "$repo" checkout -q "$base"
+printf 'package x // sibling\n' >"$repo/internal/x.go"
+sibling=$(commit sibling)
+# A PR is measured from its merge base: code that landed on the base
+# branch after the PR branched off is not part of the PR.
+expect pr-base-moved-on docs_only=true "$(run pull_request "$sibling" "$docs")"
+# A force push compares trees, so the replaced code commit is seen.
+expect force-push-from-code-sibling docs_only=false "$(run push "$sibling" "$docs")"
+
+git -C "$repo" checkout -q "$base"
+printf '# Spaced\n' >"$repo/docs/a b.md"
+printf 'See [spaced](a%%20b.md) and [root](/README.md).\n' >>"$repo/docs/scope.md"
+spaced=$(commit spaced)
+expect pr-path-with-space docs_only=true "$(run pull_request "$base" "$spaced")"
+expect check-docs-space-and-root-links pass "$(docs_check "$base" "$spaced")"
+
+git -C "$repo" checkout -q "$base"
+printf '~~~\n```\n[in code](missing.md)\n~~~\n' >>"$repo/docs/scope.md"
+tilde=$(commit tilde)
+expect check-docs-backticks-inside-tilde-fence pass "$(docs_check "$base" "$tilde")"
+
+# Deleting a page breaks links in files the change did not touch.
+git -C "$repo" checkout -q "$base"
+git -C "$repo" rm -q docs/scope.md
+deleted=$(commit delete)
+expect pr-delete-docs docs_only=true "$(run pull_request "$base" "$deleted")"
+expect check-docs-deletion-breaks-link fail "$(docs_check "$base" "$deleted")"
 
 git -C "$repo" checkout -q "$base"
 printf 'trailing   \n' >>"$repo/README.md"

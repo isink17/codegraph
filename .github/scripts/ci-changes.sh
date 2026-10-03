@@ -83,38 +83,52 @@ classify() {
 	rm -f "$paths"
 }
 
+# FENCE_AWK tracks fenced code blocks: open is the opening fence while
+# inside one, "" outside. A block closes on a fence of the same character
+# that is at least as long.
+FENCE_AWK='
+	function fence_line(line,    f) {
+		sub(/^ ? ? ?/, "", line)
+		if (open == "") {
+			if (match(line, /^(```+|~~~+)/)) { open = substr(line, 1, RLENGTH); start = NR; return 1 }
+			return 0
+		}
+		if (match(line, /^(```+|~~~+)[ \t]*$/)) {
+			f = substr(line, 1, RLENGTH)
+			sub(/[ \t]+$/, "", f)
+			if (substr(f, 1, 1) == substr(open, 1, 1) && length(f) >= length(open)) open = ""
+		}
+		return 1
+	}
+'
+
 # check_fences FILE: every fenced code block is closed.
 check_fences() {
-	awk '
-		{
-			line = $0
-			sub(/^ {0,3}/, "", line)
-			if (open == "") {
-				if (match(line, /^(```+|~~~+)/)) { open = substr(line, 1, RLENGTH); start = NR }
-			} else if (match(line, /^(```+|~~~+)[ \t]*$/)) {
-				fence = substr(line, 1, RLENGTH)
-				sub(/[ \t]+$/, "", fence)
-				if (substr(fence, 1, 1) == substr(open, 1, 1) && length(fence) >= length(open)) open = ""
-			}
-		}
+	awk "$FENCE_AWK"'
+		{ fence_line($0) }
 		END { if (open != "") { printf "%s:%d: code fence never closed\n", FILENAME, start; exit 1 } }
 	' "$1"
 }
 
 # check_links FILE: relative Markdown link targets outside code exist.
+# "/x" resolves from the repository root, anything else from the file.
 check_links() {
-	local file=$1 dir target status=0
+	local file=$1 dir target path status=0
 	dir=$(dirname "$file")
 	while IFS= read -r target; do
 		target=${target%%#*}
+		target=${target//%20/ }
 		[ -n "$target" ] || continue
-		if [ ! -e "$dir/$target" ]; then
+		case "$target" in
+		/*) path=".$target" ;;
+		*) path="$dir/$target" ;;
+		esac
+		if [ ! -e "$path" ]; then
 			echo "$file: broken relative link: $target"
 			status=1
 		fi
-	done < <(awk '
-		/^ {0,3}(```|~~~)/ { fenced = !fenced; next }
-		fenced { next }
+	done < <(awk "$FENCE_AWK"'
+		fence_line($0) || open != "" { next }
 		{
 			line = $0
 			gsub(/`[^`]*`/, "", line)
@@ -146,6 +160,13 @@ check_docs() {
 		check_fences "$file" || status=1
 		check_links "$file" || status=1
 	done < <(git diff --no-renames --name-only -z --diff-filter=d "$range")
+	# A deleted or renamed page can break links in files the change did not
+	# touch, so then every documentation file is link-checked.
+	if [ -n "$(git diff --no-renames --name-only --diff-filter=D "$range")" ]; then
+		while IFS= read -r -d '' file; do
+			check_links "$file" || status=1
+		done < <(git ls-files -z CHANGELOG.md README.md 'docs/*.md')
+	fi
 	return $status
 }
 
