@@ -125,7 +125,7 @@ class C {
 			t.Fatal(err)
 		}
 		seen := map[string]bool{}
-		current := adapter.Profile().ID == "treesitter:java:v5"
+		current := adapter.Profile().ID != "treesitter:java:v4"
 		for _, e := range p.Edges {
 			if e.Kind != "calls" {
 				continue
@@ -140,6 +140,38 @@ class C {
 			if !seen[name] {
 				t.Errorf("%s: no call edge for %s", adapter.Profile().ID, name)
 			}
+		}
+	}
+}
+
+// TestJavaConstructionSpellsRawClass pins the class a construction names:
+// trailing type arguments are not part of it (v5 kept them). Type arguments
+// on an outer segment, which javac rejects, and a qualified creation, whose
+// class only outer's type can name, keep their source text.
+func TestJavaConstructionSpellsRawClass(t *testing.T) {
+	src := `package app; class C { void x() {
+		new Box<>(1); new Box<String>(1); new a.b.Box<>(); new Map<String, List<Integer>>();
+		new Outer<String>.Inner<Integer>(); new Box<>(1) {}; new Box(); new Box /* c */ <>(); new a.b.Raw();
+		o.new Inner<>(); new Outer.Inner<>(); new @A Box<>();
+	} }`
+	want := []string{"Box", "Box", "a.b.Box", "Map", "Outer<String>.Inner<Integer>", "Box", "Box", "Box", "a.b.Raw", "Inner<>", "Outer.Inner", "Box"}
+	legacy := []string{"Box<>", "Box<String>", "a.b.Box<>", "Map<String, List<Integer>>", "Outer<String>.Inner<Integer>", "Box<>", "Box", "Box /* c */ <>", "a.b.Raw", "Inner<>", "Outer.Inner<>", "Box<>"}
+	for _, tc := range []struct {
+		adapter *JavaAdapter
+		want    []string
+	}{{NewJava(), want}, {NewJavaV5(), legacy}} {
+		p, err := tc.adapter.Parse(context.Background(), "C.java", []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, e := range p.Edges {
+			if e.Kind == "constructs" {
+				got = append(got, e.DstName)
+			}
+		}
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("%s: constructs %q, want %q", tc.adapter.Profile().ID, got, tc.want)
 		}
 	}
 }

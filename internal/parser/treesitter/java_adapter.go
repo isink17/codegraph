@@ -26,6 +26,9 @@ type JavaAdapter struct {
 	// legacyNestedScope reproduces treesitter:java:v4, which did not mark
 	// calls inside anonymous, local or enum-constant class bodies.
 	legacyNestedScope bool
+	// legacyGenericConstruction reproduces treesitter:java:v5, which spelled
+	// a generic construction's class with its type arguments (`Box<>`).
+	legacyGenericConstruction bool
 }
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
@@ -33,19 +36,28 @@ func NewJava() *JavaAdapter { return &JavaAdapter{} }
 // NewJavaV3 returns a parser that reports treesitter:java:v3 and omits the
 // constructor arity facts v4 records. It exists only to reproduce v3
 // databases in profile-transition tests.
-func NewJavaV3() *JavaAdapter { return &JavaAdapter{legacyArity: true, legacyNestedScope: true} }
+func NewJavaV3() *JavaAdapter {
+	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true}
+}
 
 // NewJavaV4 returns a parser that reports treesitter:java:v4 and does not mark
 // calls inside nested class bodies. It exists only to reproduce v4 databases
 // in profile-transition tests.
-func NewJavaV4() *JavaAdapter { return &JavaAdapter{legacyNestedScope: true} }
+func NewJavaV4() *JavaAdapter {
+	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true}
+}
+
+// NewJavaV5 returns a parser that reports treesitter:java:v5 and spells a
+// generic construction's class with its type arguments. It exists only to
+// reproduce v5 databases in profile-transition tests.
+func NewJavaV5() *JavaAdapter { return &JavaAdapter{legacyGenericConstruction: true} }
 
 // NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
 // first `package x;` spelled anywhere in the file, comments and strings
 // included, as its package. It exists only to reproduce v2 databases in
 // profile-transition tests.
 func NewJavaV2() *JavaAdapter {
-	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true}
+	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true}
 }
 
 func (a *JavaAdapter) Language() string     { return "java" }
@@ -72,7 +84,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 
 	javaExtractImports(root, content, &pf)
 	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
-	javaExtractCalls(root, content, &pf, !a.legacyNestedScope)
+	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction)
 	if a.legacyArity {
 		for i := range pf.Edges {
 			if pf.Edges[i].Kind == "constructs" {
@@ -312,13 +324,16 @@ func javaVisibility(node *sitter.Node, content []byte) string {
 	return "package"
 }
 
-func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested bool) {
+func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction bool) {
 	for _, creation := range findDescendants(root, "object_creation_expression") {
 		typeNode := childByFieldName(creation, "type")
 		if typeNode == nil {
 			continue
 		}
 		name := nodeText(typeNode, content)
+		if rawConstruction {
+			name = javaRawTypeName(creation, typeNode, content)
+		}
 		if name == "" {
 			continue
 		}
@@ -419,6 +434,26 @@ func javaCallInNestedClassBody(call *sitter.Node) bool {
 		}
 	}
 	return false
+}
+
+// javaRawTypeName spells a constructed class without its type arguments:
+// `Box<>`, `Box<String>` and `a.b.Box<>` construct `Box` and `a.b.Box`. Java
+// chooses the class and the constructor without them, so the call carries the
+// same identity as a raw construction. Every other spelling keeps its source
+// text, which no class lookup matches: type arguments on an outer segment
+// (`Outer<A>.Inner<B>`, which javac rejects), and a qualified creation
+// (`outer.new Inner<>()`), whose class is a member of outer's type that a bare
+// lookup of `Inner` does not find.
+func javaRawTypeName(creation, typeNode *sitter.Node, content []byte) string {
+	text := nodeText(typeNode, content)
+	if typeNode.Type() != "generic_type" || creation.Child(0).Type() != "new" {
+		return text
+	}
+	raw := typeNode.NamedChild(0)
+	if raw == nil || raw.Type() == "type_arguments" || len(findDescendants(raw, "type_arguments")) > 0 {
+		return text
+	}
+	return nodeText(raw, content)
 }
 
 func javaMethodCallArity(call *sitter.Node) *int {
