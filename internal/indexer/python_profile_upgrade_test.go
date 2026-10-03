@@ -503,3 +503,128 @@ func TestPythonRegexProfileNFKCNamesConverge(t *testing.T) {
 	runPythonNFKCProfileConvergence(t,
 		pythonSpellingAdapter{Adapter: pyparser.New(), id: "python-regex:python:v3"}, pyparser.New())
 }
+
+// pythonLambdaMatchSource is a program CPython runs: lam()() calls the lambda's
+// parameter and cap(f) calls the capture, never lib.full.
+const pythonLambdaMatchSource = `from lib import full
+
+
+def lam():
+    g = lambda full: full()
+    return g
+
+
+def cap(x):
+    match x:
+        case full:
+            return full()
+`
+
+// pythonBindingsV4Adapter reproduces, for pythonLambdaMatchSource, what both
+// Python adapters wrote before lambda parameters and case captures were local
+// bindings: the same rows without those two. The v4 binaries wrote exactly
+// these rows for this source. It stamps the old profile id, which is all
+// planParserProfiles compares.
+type pythonBindingsV4Adapter struct {
+	parser.Adapter
+	id string
+}
+
+func (a pythonBindingsV4Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: a.id, EmitsCallEdges: true}
+}
+
+func (a pythonBindingsV4Adapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	pf, err := a.Adapter.Parse(ctx, path, content)
+	if err != nil || filepath.Base(path) != "mod.py" {
+		return pf, err
+	}
+	kept := pf.Scope.Imports[:0]
+	for _, b := range pf.Scope.Imports {
+		if b.Kind == graph.ScopeImportLocalBinding && b.LocalName == "full" {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	pf.Scope.Imports = kept
+	return pf, nil
+}
+
+// Recording lambda parameters and case captures changes what an unchanged
+// file produces, so the profile bump alone must reparse it, and every
+// transition must equal a from-scratch index by the parser that last ran.
+func runPythonLambdaMatchProfileConvergence(t *testing.T, old pythonBindingsV4Adapter, current parser.Adapter) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "lib.py"), pythonNFKCLib)
+	path := filepath.Join(root, "mod.py")
+	writeProfileFile(t, path, pythonLambdaMatchSource)
+	currentID := current.(parser.ProfileProvider).Profile().ID
+
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old index: %v", err)
+	}
+	oldGraph := pythonGraph(t, s)
+	requireRows(t, oldGraph, "old graph",
+		"prov|mod.py="+old.id+":1",
+		// The wrong edges: CPython calls the parameter and the capture.
+		"call|full@5->lib.full",
+		"call|full@12->lib.full")
+
+	upgraded := New(s.Store, parser.NewRegistry(current), nil)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if summary.FilesChanged != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "python" {
+		t.Fatalf("profile bump did not reparse the unchanged files: changed=%d languages=%v",
+			summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	got := pythonGraph(t, s)
+	requireRows(t, got, "upgraded graph",
+		"prov|mod.py="+currentID+":1",
+		"scope|mod.py|lam|local_binding|||full",
+		"scope|mod.py|cap|local_binding|||full",
+		"call|full@5->",
+		"call|full@12->")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+	again, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update reparsed: changed=%d languages=%v", again.FilesChanged, again.ParserProfileLanguages)
+	}
+
+	// An older binary on the same graph reparses back to its own output.
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old update over a new graph: %v", err)
+	}
+	if got := pythonGraph(t, s); got != oldGraph {
+		t.Fatalf("old update over a new graph:\n%s\nfrom-scratch old graph:\n%s", got, oldGraph)
+	}
+
+	// Back on the current parser, then edit the file: the edit converges like
+	// a fresh index.
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, path, pythonLambdaMatchSource+"\n\ndef pat(v):\n    match v:\n        case {**rest}:\n            return rest()\n")
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update after edit: %v", err)
+	}
+	got = pythonGraph(t, s)
+	requireRows(t, got, "edited graph", "scope|mod.py|pat|local_binding|||rest", "call|rest@18->")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("edited graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+}
+
+func TestPythonRegexProfileLambdaMatchBindingsConverge(t *testing.T) {
+	runPythonLambdaMatchProfileConvergence(t,
+		pythonBindingsV4Adapter{Adapter: pyparser.New(), id: "python-regex:python:v4"}, pyparser.New())
+}

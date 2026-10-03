@@ -19,9 +19,10 @@ func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 // locals now shadow, and a nested `def café` no longer binds the fragment `caf`.
 // v3 records defs and classes nested under compound statements (if, try, with,
 // for, while, match), which v2 skipped along with the calls inside them. v4
-// records every name in its NFKC form, the name CPython binds (PEP 3131).
+// records every name in its NFKC form, the name CPython binds (PEP 3131). v5
+// records lambda parameters and match-case captures as local bindings.
 func (a *PythonAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:python:v4", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:python:v5", EmitsCallEdges: true}
 }
 
 // Java v5 marks bare and `this.` calls inside anonymous, local and
