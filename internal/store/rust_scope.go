@@ -551,6 +551,9 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	// cache of a previous recomputation, and letting it seed membership would
 	// let it prove itself after the `mod` declaration behind it disappeared.
 	moduleFiles := map[string][]int64{}
+	// inlineModules marks the moduleFiles keys of inline `mod x { .. }`
+	// blocks, whose one member is the file that declares them.
+	inlineModules := map[string]bool{}
 	rootOfFile := map[int64]string{}
 	for _, f := range files {
 		if root := rootPath(f.path); root != "" {
@@ -589,6 +592,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			if m.inline {
 				if len(moduleFiles[key]) == 0 {
 					moduleFiles[key] = []int64{m.file}
+					inlineModules[key] = true
 					changed = true
 				}
 				continue
@@ -645,19 +649,35 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	// example src/bin/util.rs). The declaration graph is authoritative. A file
 	// may safely have several memberships, so add one lookup view per proven
 	// membership rather than overwriting the persisted symbol identity.
+	candidateModule := func(c rustScopeSymbol) string {
+		module := strings.TrimSuffix(c.qualified, "::"+c.name)
+		if c.container != "" && strings.Contains(c.qualified, "::"+c.container+"::") {
+			module = strings.TrimSuffix(c.qualified, "::"+c.container+"::"+c.name)
+		}
+		return module
+	}
 	byQ = map[string][]rustScopeSymbol{}
 	for _, original := range symbols {
 		added := false
+		// A file module's view carries each symbol at the same place below
+		// the file as the parser put it: a top-level item directly in the
+		// module, an inline `mod x` item under `x`. An inline module's own
+		// key is not a view of the whole file; its items are reached through
+		// the file module's view, and the file's other items are not its.
+		own := candidateModule(original)
+		below, inFile := strings.CutPrefix(own, files[original.file].module)
+		inFile = inFile && (below == "" || strings.HasPrefix(below, "::"))
 		for key, members := range moduleFiles {
 			sep := strings.IndexByte(key, 0)
-			if sep < 0 || len(members) != 1 || members[0] != original.file {
+			if sep < 0 || len(members) != 1 || members[0] != original.file || inlineModules[key] || !inFile {
 				continue
 			}
 			module := key[sep+1:]
 			s := original
-			if module != "crate" {
+			if module != "crate" || below != "" {
+				module += below
 				s.qualified = module + "::" + s.name
-				if s.container != "" && s.container != files[s.file].module && s.container != module {
+				if s.container != "" && s.container != own {
 					s.qualified = module + "::" + s.container + "::" + s.name
 				}
 			}
@@ -676,13 +696,6 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			}
 		}
 		return false
-	}
-	candidateModule := func(c rustScopeSymbol) string {
-		module := strings.TrimSuffix(c.qualified, "::"+c.name)
-		if c.container != "" && strings.Contains(c.qualified, "::"+c.container+"::") {
-			module = strings.TrimSuffix(c.qualified, "::"+c.container+"::"+c.name)
-		}
-		return module
 	}
 	// inCallerCrate reports whether the candidate's file is proven to hold its
 	// module in the caller's crate.
@@ -727,19 +740,25 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		if len(p) == 0 || p[0] == "" {
 			return ""
 		}
-		if p[0] == "crate" {
-			return "crate::" + strings.Join(p[1:], "::")
-		}
-		if p[0] == "self" {
-			return owner + "::" + strings.Join(p[1:], "::")
-		}
-		for len(p) > 0 && p[0] == "super" {
-			if i := strings.LastIndex(owner, "::"); i >= 0 {
-				owner = owner[:i]
-			} else {
-				owner = "crate"
-			}
+		switch p[0] {
+		case "crate":
+			owner, p = "crate", p[1:]
+		case "self":
 			p = p[1:]
+		default:
+			for len(p) > 0 && p[0] == "super" {
+				if i := strings.LastIndex(owner, "::"); i >= 0 {
+					owner = owner[:i]
+				} else {
+					owner = "crate"
+				}
+				p = p[1:]
+			}
+		}
+		// A bare `crate`, `self` or `super` (the source of `use super::*`)
+		// names the module itself.
+		if len(p) == 0 {
+			return owner
 		}
 		return owner + "::" + strings.Join(p, "::")
 	}

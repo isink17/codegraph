@@ -181,6 +181,30 @@ var rustGlobShadowCases = []struct {
 		"lib.rs": "mod b;\n#[cfg(unix)]\nuse b::f;\n#[cfg(not(unix))]\nuse b::f;\npub fn caller() {\n    f();\n}\n",
 		"b.rs":   "pub fn f() {}",
 	}, "b.rs:crate::b::f", "", ""},
+	// An inline module holds only its own items: the file module's `f` is
+	// not `m::x::f`, so x's re-export answers the call.
+	{"inline module re-export beside a file item", tree{
+		"lib.rs":   "mod m; mod other;\npub fn caller() {\n    m::x::f();\n}\n",
+		"m.rs":     "pub fn f() {}\npub mod x {\n    pub use crate::other::f;\n}\n",
+		"other.rs": "pub fn f() {}",
+	}, "other.rs:crate::other::f", "", "m::x::f"},
+	{"file item is not in an inline module", tree{
+		"lib.rs": "mod m;\npub fn caller() {\n    m::x::f();\n}\n",
+		"m.rs":   "pub fn f() {}\npub mod x {}\n",
+	}, "", "", "m::x::f"},
+	{"inline module item", tree{
+		"lib.rs": "mod m;\npub fn caller() {\n    m::x::g();\n}\n",
+		"m.rs":   "pub fn f() {}\npub mod x {\n    pub fn g() {}\n}\n",
+	}, "m.rs:crate::m::x::g", "", "m::x::g"},
+	{"file item beside an inline module", tree{
+		"lib.rs": "mod m;\npub fn caller() {\n    m::f();\n}\n",
+		"m.rs":   "pub fn f() {}\npub mod x {\n    pub fn f() {}\n}\n",
+	}, "m.rs:crate::m::f", "", "m::f"},
+	// `use super::*` imports the parent module itself, as a test module does.
+	{"glob of super from an inline module", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "pub struct S;\nimpl S {\n    pub fn empty() {}\n}\nmod tests {\n    use super::*;\n    fn t() {\n        S::empty();\n    }\n}\n",
+	}, "m.rs:crate::m::S::empty", "m.rs", "S::empty"},
 	// Another crate root's `crate::f` is not the caller's own item.
 	{"other crate's own fn", tree{
 		"src/lib.rs":  "mod a; use a::*;\npub fn caller() {\n    f();\n}\n",
@@ -339,5 +363,36 @@ func TestRustExplicitUseKindFlipFollowsIncrementalChanges(t *testing.T) {
 		update()
 		r.assertFreshParity(t, "flipped back")
 		assertRustCallTarget(t, r, "flipped back", "lib.rs", "f", "b.rs:crate::b::f")
+	}
+}
+
+// TestRustInlineModuleReexportFollowsIncrementalChanges adds and removes an
+// inline module's re-export beside a file item of the same name; every step
+// must match a fresh index of the same tree.
+func TestRustInlineModuleReexportFollowsIncrementalChanges(t *testing.T) {
+	const without = "pub fn f() {}\npub mod x {}\n"
+	const with = "pub fn f() {}\npub mod x {\n    pub use crate::other::f;\n}\n"
+	for _, scoped := range []bool{true, false} {
+		r := newLifecycleRepo(t, tree{
+			"lib.rs":   "mod m; mod other;\npub fn caller() {\n    m::x::f();\n}\n",
+			"m.rs":     without,
+			"other.rs": "pub fn f() {}",
+		})
+		update := func() {
+			if scoped {
+				r.update(t, "m.rs")
+			} else {
+				r.update(t)
+			}
+		}
+		assertRustCallTarget(t, r, "no re-export", "lib.rs", "m::x::f", "")
+		r.write(t, "m.rs", with)
+		update()
+		r.assertFreshParity(t, "re-export added")
+		assertRustCallTarget(t, r, "re-export added", "lib.rs", "m::x::f", "other.rs:crate::other::f")
+		r.write(t, "m.rs", without)
+		update()
+		r.assertFreshParity(t, "re-export removed")
+		assertRustCallTarget(t, r, "re-export removed", "lib.rs", "m::x::f", "")
 	}
 }
