@@ -510,17 +510,18 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	// enclosing it is in scope and shadows every static import (JLS 6.4.1).
 	// The call stays unresolved rather than binding an enclosing class's
 	// method: whether it is callable from here is not modelled.
-	for owner := javaEdgeOwner(e); owner != "" && owner != e.pkg; {
+	for rel := e.container; rel != ""; {
+		owner := javaEdgeOwner(javaScopeEdge{pkg: e.pkg, container: rel})
 		for _, s := range byQName[owner+"."+name] {
 			if s.kind == "function" {
 				return javaScopeSymbol{}, ""
 			}
 		}
-		dot := strings.LastIndex(owner, ".")
+		dot := strings.LastIndex(rel, ".")
 		if dot < 0 {
 			break
 		}
-		owner = owner[:dot]
+		rel = rel[:dot]
 	}
 	explicitStaticOwners := map[string]struct{}{}
 	for _, i := range imps[e.file] {

@@ -144,6 +144,24 @@ public class Caller {
 			calls:  []call{{"helper", ""}},
 		},
 		{
+			// The same shadowing through a class named like its package,
+			// whose members the adapter stores under the package name.
+			name:   "package-named enclosing class shadows a static import",
+			caller: "a/a.java",
+			src:    "package a;\n\nimport static a.Util.g;\n\npublic class a {\n    static void g() {}\n    static class b {\n        void h() { g(); }\n    }\n}\n",
+			others: tree{"a/Util.java": "package a;\n\npublic class Util {\n    public static void g() {}\n}\n"},
+			calls:  []call{{"g", ""}},
+		},
+		{
+			// Overloads in the calling class shadow the import even though
+			// neither is chosen.
+			name:   "own overloads shadow a static import",
+			caller: "a/a.java",
+			src:    "package a;\n\nimport static a.Util.g;\n\npublic class a {\n    void g(int x) {}\n    void g(String x) {}\n    void run() { g(1); }\n}\n",
+			others: tree{"a/Util.java": "package a;\n\npublic class Util {\n    public static void g(int x) {}\n}\n"},
+			calls:  []call{{"g", ""}},
+		},
+		{
 			// The adapter collapses a container equal to the package name.
 			name:   "class named like its package",
 			caller: "app/app.java",
