@@ -6682,12 +6682,14 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if err := tx.Commit(); err != nil {
 		return outcome, err
 	}
+	// Added to, not assigned: the language passes above have already counted
+	// what they bound in this batch.
 	if n, err := updateRes.RowsAffected(); err != nil {
 		// Every resolution targets a distinct, still-unresolved edge id, so the
 		// count is known exactly even when the driver cannot report it.
-		outcome.resolved = len(resolutions)
+		outcome.resolved += len(resolutions)
 	} else {
-		outcome.resolved = int(n)
+		outcome.resolved += int(n)
 	}
 	return outcome, nil
 }
