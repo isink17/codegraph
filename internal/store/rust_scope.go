@@ -721,10 +721,24 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	eligible := func(c rustScopeSymbol, caller rustScopeFile) bool {
 		module := candidateModule(c)
 		// A private item (`pub(self)` says the same) is visible in its own
-		// module and every module nested in it. caller.module is the file's
-		// module, which is the caller's module or an ancestor of it, so this
-		// can only under-approximate.
+		// module and every module nested in it. Both modules must be facts,
+		// not path guesses:
+		//   - the candidate is judged in its persisted module only. The lookup
+		//     views re-home every symbol of a file under each module the file
+		//     holds, inline ones included, which is safe for an item anyone
+		//     may see but not for one only its own module may.
+		//   - caller.module is the parser's reading of the file path, so it
+		//     counts only when the declaration graph proves the caller's file
+		//     holds that module (or the item is in the caller's own file).
+		//     The file's module is the caller's module or an ancestor of it,
+		//     so this can only under-approximate.
 		if c.visibility == "private" || c.visibility == "restricted:self" {
+			if c.qualified != symbols[c.id].qualified {
+				return false
+			}
+			if c.file != caller.id && !(moduleProven(rootOfFile[caller.id], caller.module) && moduleMember(caller.module, caller.id, caller.id)) {
+				return false
+			}
 			return caller.module == module || strings.HasPrefix(caller.module, module+"::")
 		}
 		if c.visibility == "public" {
@@ -797,16 +811,24 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {
 				continue
 			}
+			// Rust never re-exports a private item, so nothing private is
+			// reached through a re-export step.
+			var reached []rustScopeSymbol
 			if im.glob {
 				if own {
 					continue
 				}
-				out = append(out, exportCandidates(resolvePath(im.source, module), name, root, seen)...)
+				reached = exportCandidates(resolvePath(im.source, module), name, root, seen)
 			} else if im.local == name {
 				raw := resolvePath(im.source, module)
 				parts := strings.Split(raw, "::")
 				if len(parts) > 1 {
-					out = append(out, exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], root, seen)...)
+					reached = exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], root, seen)
+				}
+			}
+			for _, c := range reached {
+				if c.visibility != "private" && c.visibility != "restricted:self" {
+					out = append(out, c)
 				}
 			}
 		}
