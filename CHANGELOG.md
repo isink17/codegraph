@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Scope-model documentation now covers Go, Rust, C/C++, Java, Kotlin, TypeScript/JavaScript, Python, C#, PHP and Swift alongside Ruby (`docs/scope-models.md`), including known Java constructor-arity, Rust glob-shadowing and TypeScript member-binding defects. Resolver behavior is unchanged.
+
 Java `new` expressions now select constructors by syntactic argument and parameter counts. Commas inside nested calls, lambdas, string and char literals, annotation arguments or generic parameter types previously miscounted arity and could bind the wrong constructor; varargs constructors now accept their variable arity. Equal-arity overloads stay unresolved. The Java parser profile becomes `treesitter:java:v4`, so `codegraph update` re-parses existing Java files once.
 
 Ruby scope documentation now states that implicit calls are recognized only in call syntax (arguments, parentheses, a block, or a `?`/`!` method name); a bare argument-less identifier is not extracted as a call because the syntax tree cannot distinguish it from a local variable.
