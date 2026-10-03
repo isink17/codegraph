@@ -67,6 +67,13 @@ const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
 // members shadow the enclosing class's, so the enclosing class must not answer.
 const JavaCallNestedClassScopeEvidence = "java:nested_class_scope"
 
+// JavaLocalTypeScopeEvidence marks a Java construction or qualified call
+// whose class or owner's first name a local type -- one declared in an
+// enclosing method, constructor, initializer or lambda body, or in a class
+// body the adapter does not model -- may name. That type is not recorded and
+// hides every recorded type of that name, so none may answer.
+const JavaLocalTypeScopeEvidence = "java:local_type_scope"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,

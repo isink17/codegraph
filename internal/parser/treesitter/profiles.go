@@ -27,7 +27,9 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:python:v6", EmitsCallEdges: true}
 }
 
-// Java v5 marks bare and `this.` calls inside anonymous, local and
+// Java v6 spells a generic construction's class without its type arguments
+// (`new Box<>()` constructs `Box`), so it binds like a raw construction.
+// v5 marks bare and `this.` calls inside anonymous, local and
 // enum-constant class bodies, whose own members shadow the enclosing class's.
 // v4 persists AST argument counts on constructor-call edges and AST
 // parameter counts on constructor declarations, so commas inside nested
@@ -46,7 +48,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyNestedScope {
 		return parser.Profile{ID: "treesitter:java:v4", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:java:v5", EmitsCallEdges: true}
+	if a.legacyGenericConstruction {
+		return parser.Profile{ID: "treesitter:java:v5", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v6", EmitsCallEdges: true}
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.

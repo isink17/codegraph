@@ -479,7 +479,7 @@ func javaUnqualifiedCreation(evidence string) bool {
 }
 
 func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport) (javaScopeSymbol, string) {
-	if !javaUnqualifiedCreation(e.evidence) {
+	if e.evidence == graph.JavaLocalTypeScopeEvidence || !javaUnqualifiedCreation(e.evidence) {
 		return javaScopeSymbol{}, ""
 	}
 	t, ok, _ := javaType(e.name, e.pkg, e.container, byQName, byName, imps[e.file])
@@ -507,9 +507,10 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	if name == "super." || strings.HasPrefix(name, "super.") {
 		return javaScopeSymbol{}, ""
 	}
-	if e.evidence == graph.JavaCallNestedClassScopeEvidence {
+	if e.evidence == graph.JavaCallNestedClassScopeEvidence || e.evidence == graph.JavaLocalTypeScopeEvidence {
 		// The call's own class is one the adapter does not model, and its
-		// members shadow every enclosing class and static import.
+		// members shadow every enclosing class and static import; or its
+		// owner names a local type, which hides every recorded type.
 		return javaScopeSymbol{}, ""
 	}
 	if strings.HasPrefix(name, "this.") {
