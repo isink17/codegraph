@@ -7,7 +7,7 @@
   <a href="https://pkg.go.dev/github.com/isink17/codegraph"><img src="https://img.shields.io/badge/go-1.26.0+-00d4ff?style=flat-square&logo=go&logoColor=white" alt="Go version"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-ffaa44?style=flat-square" alt="License"/></a>
   <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-8899aa?style=flat-square" alt="Platforms"/>
-  <img src="https://img.shields.io/badge/MCP%20tools-29-00ff88?style=flat-square" alt="MCP Tools"/>
+  <img src="https://img.shields.io/badge/MCP%20tools-30-00ff88?style=flat-square" alt="MCP Tools"/>
 </p>
 
 <br/>
@@ -40,12 +40,12 @@ AI coding assistants are powerful, but they spend most of their token budget *di
 ```
 Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools ──▶ AI Assistant
                     │                   │                │
-               12 languages       symbols, edges      29 tools
+               12 languages       symbols, edges      30 tools
                framework detect   embeddings          agentic reasoning
                import resolution  session memory      hybrid search
 ```
 
-`codegraph index .` walks your repo, parses every file, resolves relationships with evidence-based, language-aware declaration, import/module, lexical-scope, ownership, and receiver/type facts, and writes a symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Ambiguous evidence remains unresolved. Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 29 structured tools — no hosted CodeGraph backend, no Docker, no API keys.
+`codegraph index .` walks your repo, parses every file, resolves relationships with evidence-based, language-aware declaration, import/module, lexical-scope, ownership, and receiver/type facts, and writes a symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Ambiguous evidence remains unresolved. Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 30 structured tools — no hosted CodeGraph backend, no Docker, no API keys.
 
 ---
 
@@ -70,7 +70,7 @@ Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools �
 
 ### 🤖 AI Integration
 
-- **29 MCP tools** — comprehensive API for AI coding assistants
+- **30 MCP tools** — comprehensive API for AI coding assistants
 - **Agentic reasoning** — ReAct loop over a local Ollama LLM that chains tools and synthesizes answers
 - **Context building** — one tool call returns everything an agent needs for a task
 - **Session memory** — persist reads, edits, decisions, and facts across sessions
@@ -284,7 +284,7 @@ both MCP modes (`full` and `gateway`) and the CLI fallback.
 
 ---
 
-## MCP Tools (29)
+## MCP Tools (30)
 
 ### Code Intelligence
 
@@ -324,6 +324,7 @@ both MCP modes (`full` and `gateway`) and the CLI fallback.
 | `list_scans` | List recent scans |
 | `latest_scan_errors` | List indexer errors from the last scan |
 | `audit` | Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only). Optional `examples` integer caps examples per finding; `0` means counts only |
+| `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; see [docs/constraints.md](docs/constraints.md) |
 
 ### Session Memory
 
@@ -583,7 +584,7 @@ built with either registry is unaffected.
 
 ### Gateway MCP mode (`--tool-mode`)
 
-Describing 29 tools costs a session 12,676 bytes, or 3,169 estimated tokens
+Describing 30 tools costs a session 12,974 bytes, or 3,244 estimated tokens
 (`ceil(bytes / 4)`), before it asks a single question. Gateway mode is an opt-in
 surface that charges a fraction of that without removing anything:
 
@@ -598,10 +599,10 @@ are already configured, it prints the `args` to change (`["serve", "--tool-mode"
 
 | Mode | `tools/list` | Estimated tokens |
 |---|---|---|
-| `full` (default) | all 29 tools | 3,169 (12,676 bytes) |
-| `gateway` | 4 core tools + `tool_search` + `tool_call` | 1,016 (4,062 bytes; about 68% fewer) |
+| `full` (default) | all 30 tools | 3,244 (12,974 bytes) |
+| `gateway` | 4 core tools + `tool_search` + `tool_call` | 1,016 (4,062 bytes; about 69% fewer) |
 
-`full` remains the default and advertises all 29 tools. The two gateway tools
+`full` remains the default and advertises all 30 tools. The two gateway tools
 appear only in gateway mode.
 
 In gateway mode the tools an ordinary navigation session uses on nearly every task
@@ -796,6 +797,10 @@ codegraph audit <path>                    # Audit the indexed graph for integrit
 codegraph audit <path> --examples 0       # Counts only, no examples
 codegraph audit <path> --fail-on error    # Exit non-zero when the graph has error findings
 
+# Architectural constraints (see docs/constraints.md)
+codegraph index . && codegraph check_constraints .   # Exit 0 ok, 1 violations, 2 cannot evaluate
+codegraph check-constraints . --config rules.json    # Alias; evaluate another constraints document
+
 # Query latency benchmark (read-only; never indexes or migrates)
 codegraph bench-queries <path>                    # Benchmark local graph queries on an indexed repo
 codegraph bench-queries <path> --runs 50          # More samples for a tighter p95
@@ -965,6 +970,7 @@ internal/
   cli/                  Command handlers and MCP auto-configuration
   compactfmt/           codegraph.compact/v1 encoding for format=compact
   config/               Config loading and path resolution
+  constraints/          codegraph check_constraints / MCP check_constraints
   detail/               Progressive symbol detail levels (card/skeleton/excerpt/full)
   doctor/               codegraph doctor diagnostics
   embedding/            Vector embedding (Ollama HTTP client, noop fallback)
@@ -977,7 +983,7 @@ internal/
   latency/              Percentile arithmetic shared by query benchmarks
   limits/               Shared page, depth, and batch size bounds
   logging/              slog logger construction
-  mcp/                  MCP stdio server (29 tools)
+  mcp/                  MCP stdio server (30 tools)
   parser/               Parser interface and adapters
     treesitter/         Tree-sitter adapters (12 languages; CGO builds)
     golang/             Go go/ast parser (CGO_ENABLED=0 builds)
