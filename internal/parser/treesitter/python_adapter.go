@@ -168,6 +168,12 @@ func pyExtractSymbols(node *sitter.Node, module string, scope pyScope, content [
 			if inner != nil {
 				pyExtractFunction(inner, module, scope, content, pf)
 			}
+		case "if_statement", "elif_clause", "else_clause", "try_statement", "except_clause",
+			"except_group_clause", "finally_clause", "with_statement", "for_statement",
+			"while_statement", "match_statement", "case_clause", "block":
+			// A compound statement opens no scope: a def under `if` or
+			// `try` is defined in the scope the statement is written in.
+			pyExtractSymbols(child, module, scope, content, pf)
 		}
 	}
 }

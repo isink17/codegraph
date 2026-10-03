@@ -17,8 +17,10 @@ func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding
 // evidence it shares with the non-cgo adapter: Unicode imports now bind, Unicode
 // locals now shadow, and a nested `def café` no longer binds the fragment `caf`.
+// v3 records defs and classes nested under compound statements (if, try, with,
+// for, while, match), which v2 skipped along with the calls inside them.
 func (a *PythonAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:python:v2", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:python:v3", EmitsCallEdges: true}
 }
 
 // Java v4 persists AST argument counts on constructor-call edges and AST

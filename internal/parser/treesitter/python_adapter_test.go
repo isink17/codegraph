@@ -6,6 +6,7 @@ import (
 	"context"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -153,4 +154,110 @@ class Service:
 	if len(got) == 0 {
 		t.Fatal("no scope evidence recorded")
 	}
+}
+
+// pythonConditionalDefsSource defines functions under every compound statement
+// Python has. None of them opens a scope, so each def belongs to the scope the
+// statement is written in.
+const pythonConditionalDefsSource = `import sys
+
+if sys.platform == "win32":
+    def pick():
+        return 1
+elif sys.platform == "darwin":
+    def pick():
+        return 2
+else:
+    def pick():
+        return 3
+
+try:
+    from fast import speed
+except ImportError:
+    def speed():
+        return 0
+else:
+    def ready():
+        return True
+finally:
+    def cleanup():
+        return None
+
+with open(__file__) as fh:
+    def reader():
+        return fh
+
+for _ in range(1):
+    def looped():
+        return 1
+else:
+    def after_loop():
+        return 2
+
+while False:
+    def never():
+        pass
+else:
+    def after_while():
+        pass
+
+match sys.platform:
+    case "linux":
+        def linux_only():
+            pass
+    case _:
+        def other():
+            pass
+
+
+class Service:
+    if sys.version_info >= (3, 11):
+        def run(self):
+            return helper()
+    else:
+        @staticmethod
+        def run():
+            return helper()
+
+
+def outer(flag):
+    if flag:
+        def inner():
+            return helper()
+        return inner()
+    try:
+        pass
+    except* ValueError:
+        def handler():
+            return helper()
+    return handler
+
+
+def helper():
+    return 1
+`
+
+// A def nested under if/elif/else, try/except/except*/else/finally, with,
+// for/else, while/else or match/case is a real definition in the enclosing
+// scope. The expected list is CPython's ast for the source: every def and
+// class with its scope-qualified name, kind and line.
+func TestPythonConditionalDefinitionsAreSymbols(t *testing.T) {
+	p, err := NewPython().Parse(context.Background(), "mod.py", []byte(pythonConditionalDefsSource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, s := range p.Symbols {
+		got = append(got, s.QualifiedName+"|"+s.Kind+"|"+strconv.Itoa(s.Range.StartLine))
+	}
+	sort.SliceStable(got, func(i, j int) bool { return lineOf(got[i]) < lineOf(got[j]) })
+	want := "mod.pick|function|4 mod.pick|function|7 mod.pick|function|10 mod.speed|function|16 mod.ready|function|19 mod.cleanup|function|22 mod.reader|function|26 mod.looped|function|30 mod.after_loop|function|33 mod.never|function|37 mod.after_while|function|40 mod.linux_only|function|45 mod.other|function|48 mod.Service|class|52 mod.Service.run|method|54 mod.Service.run|method|58 mod.outer|function|62 mod.outer.inner|function|64 mod.outer.handler|function|70 mod.helper|function|75"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("symbols:\n%s\nwant (CPython ast):\n%s", strings.Join(got, " "), want)
+	}
+}
+
+func lineOf(row string) int {
+	n, _ := strconv.Atoi(row[strings.LastIndexByte(row, '|')+1:])
+	return n
 }
