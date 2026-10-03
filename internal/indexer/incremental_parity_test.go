@@ -910,17 +910,15 @@ func TestRustModuleScopeAcceptanceMatrix(t *testing.T) {
 		}, func(r *lifecycleRepo, t *testing.T) {
 			assertRustResolved(t, r, "caller.rs", "run", "util.rs")
 		}},
-		// An inline module is not a file module: nothing on disk carries its
-		// contents, so a cross-file `use` of it stays fail-closed. The
-		// crate-root lifecycle must not start treating it like an external
-		// file module, and the sibling file module beside it must keep
-		// resolving.
-		{"O inline module stays fail-closed", tree{
+		// An inline module's items live in the file that declares it, so a
+		// cross-file `use` of one resolves there (as rustc does), and the
+		// sibling file module beside it must keep resolving.
+		{"O inline module item from another file", tree{
 			"lib.rs":    "mod caller; mod a; mod inner { pub fn helper() {} }",
 			"a.rs":      "pub fn helper() {}",
 			"caller.rs": "use crate::inner::helper; fn run() { helper(); }",
 		}, func(r *lifecycleRepo, t *testing.T) {
-			assertRustUnresolved(t, r, "caller.rs", "helper")
+			assertRustResolved(t, r, "caller.rs", "helper", "lib.rs")
 			r.write(t, "caller.rs", "use crate::a::helper; fn run() { helper(); }")
 			r.update(t, "caller.rs")
 		}, func(r *lifecycleRepo, t *testing.T) {
