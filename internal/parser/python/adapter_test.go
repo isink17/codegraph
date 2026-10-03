@@ -362,8 +362,8 @@ func TestPythonNamesFollowGoUnicodeTables(t *testing.T) {
 }
 
 // pythonKeywordCallSource holds every place a keyword or a soft keyword sits
-// right before `(` without being a call. The calls it does make are exactly
-// what CPython's ast reports for it: check@12, check@17, match@24, case@25.
+// right before `(` without being a call, and case guards however they are
+// spaced. The calls it does make are exactly what CPython's ast reports for it.
 const pythonKeywordCallSource = `def check(x):
     return x
 
@@ -382,6 +382,15 @@ def run(value, items, cm):
             pass
         case [a, b] if check(a):
             pass
+        case [a] if(check(a)):
+            pass
+        case (a)if check(a):
+            pass
+        case "s"if check(value):
+            pass
+        case 1	if check(value):
+            pass
+        case Point(x=0): check(value)
     match (
         value
     ):
@@ -402,14 +411,16 @@ def case(*args):
 
 // Keyword syntax is not a call: `with x as (a, b)` does not call `as`, a match
 // statement does not call `match`, and a case pattern -- `Point(x=0)` is a
-// class pattern -- calls nothing, though its guard and the match subject can.
+// class pattern -- calls nothing, though its guard, a same-line body and the
+// match subject can.
 // `match` and `case` stay ordinary names everywhere else.
 func TestKeywordSyntaxIsNotACall(t *testing.T) {
 	var got []string
 	for _, e := range parseSource(t, pythonKeywordCallSource).Edges {
 		got = append(got, e.DstName+"@"+strconv.Itoa(e.Line))
 	}
-	if want := "check@12 check@17 match@24 case@25"; strings.Join(got, " ") != want {
+	want := "check@12 check@17 check@19 check@21 check@23 check@25 check@27 match@33 case@34"
+	if strings.Join(got, " ") != want {
 		t.Fatalf("calls = %q, want %q", strings.Join(got, " "), want)
 	}
 }

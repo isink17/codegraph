@@ -316,22 +316,27 @@ func declaredName(header string) string {
 // pythonLogicalLines folds bracket and backslash continuations, reporting the
 // physical line each logical line started on.
 func pythonLogicalLines(lines []string) (logical []string, starts []int) {
-	depth := 0
 	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSuffix(lines[i], "\r")
-		start := i
-		stmt := line
-		depth = bracketDelta(line)
-		for (depth > 0 || strings.HasSuffix(strings.TrimSpace(stmt), "\\")) && i+1 < len(lines) {
-			i++
-			next := strings.TrimSuffix(lines[i], "\r")
-			stmt = strings.TrimSuffix(strings.TrimRight(stmt, " \t"), "\\") + " " + strings.TrimSpace(next)
-			depth += bracketDelta(next)
-		}
+		stmt, end := pythonLogicalLine(lines, i)
 		logical = append(logical, stmt)
-		starts = append(starts, start)
+		starts = append(starts, i)
+		i = end
 	}
 	return logical, starts
+}
+
+// pythonLogicalLine folds the bracket and backslash continuations of the
+// statement starting at lines[i], returning it and the index of its last line.
+func pythonLogicalLine(lines []string, i int) (string, int) {
+	stmt := strings.TrimSuffix(lines[i], "\r")
+	depth := bracketDelta(stmt)
+	for (depth > 0 || strings.HasSuffix(strings.TrimSpace(stmt), "\\")) && i+1 < len(lines) {
+		i++
+		next := strings.TrimSuffix(lines[i], "\r")
+		stmt = strings.TrimSuffix(strings.TrimRight(stmt, " \t"), "\\") + " " + strings.TrimSpace(next)
+		depth += bracketDelta(next)
+	}
+	return stmt, i
 }
 
 func bracketDelta(line string) int {

@@ -65,13 +65,6 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	// lines never reach call extraction. The bindings themselves are emitted
 	// inside the walk, where the enclosing lexical scope is known.
 	stmts, importLines := importStatements(maskedLines)
-	// statementAt holds each logical statement under the physical line it
-	// starts on, so a header split over several lines is still recognised.
-	statementAt := make([]string, len(lines))
-	logical, starts := pythonLogicalLines(maskedLines)
-	for i, stmt := range logical {
-		statementAt[starts[i]] = stmt
-	}
 	seenModules := make(map[string]struct{}, len(stmts))
 	// lastLine/lastLen track the most recent content line (not blank, not a
 	// comment). A scope popped by a dedent ends at that line: blank lines,
@@ -192,7 +185,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			continue
 		}
 		scan := masked
-		if from := patternSyntaxEnd(statementAt[i], masked); from > 0 {
+		if from := patternSyntaxEnd(maskedLines, i); from > 0 {
 			scan = strings.Repeat(" ", from) + masked[from:]
 		}
 		for _, loc := range callRE.FindAllStringSubmatchIndex(scan, -1) {
@@ -271,32 +264,76 @@ func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile)
 	}
 }
 
-// patternSyntaxEnd returns how much of a physical line is soft-keyword syntax
-// rather than expressions that can call: the `match` of a match statement
-// (its subject is an expression), or a whole case pattern up to its guard. A
-// pattern calls nothing -- `case Point(x=0):` is a class pattern -- while a
-// guard is an expression. stmt is the logical statement the line starts, and
-// `match`/`case` anywhere else are ordinary names.
-func patternSyntaxEnd(stmt, line string) int {
-	stmt = strings.TrimSpace(stmt)
-	if !strings.HasSuffix(stmt, ":") {
-		return 0
-	}
+// patternSyntaxEnd returns how much of masked line i is soft-keyword syntax
+// rather than expressions that can call: the `match` of a match statement (its
+// subject is an expression), or a case pattern up to its guard or the header's
+// colon. A pattern calls nothing -- `case Point(x=0):` is a class pattern --
+// while a guard and a same-line body are expressions. `match` and `case`
+// anywhere else are ordinary names.
+//
+// ponytail: a guard or header end on a continuation line is not seen; those
+// lines are skipped for calls anyway.
+func patternSyntaxEnd(masked []string, i int) int {
+	line := strings.TrimSuffix(masked[i], "\r")
+	trimmed := strings.TrimLeft(line, " \t")
 	for _, keyword := range []string{"match", "case"} {
-		rest, ok := strings.CutPrefix(stmt, keyword)
-		if r, _ := utf8.DecodeRuneInString(rest); !ok || rest == "" || isIdentifierRune(r) {
+		rest, ok := strings.CutPrefix(trimmed, keyword)
+		if !ok || rest == "" || strings.IndexByte(" \t([{-", rest[0]) < 0 {
 			continue
 		}
-		start := strings.Index(line, keyword) + len(keyword)
-		if keyword == "case" {
-			if guard := strings.Index(line, " if "); guard >= 0 {
-				return guard
-			}
-			return len(line)
+		stmt, _ := pythonLogicalLine(masked, i)
+		header := headerColon(stmt)
+		if header < 0 {
+			return 0
 		}
-		return start
+		start := len(line) - len(rest)
+		if keyword == "match" {
+			return start
+		}
+		end := min(header, len(line))
+		if guard := guardKeyword(line[start:end]); guard >= 0 {
+			return start + guard
+		}
+		return end
 	}
 	return 0
+}
+
+// headerColon is the index of the colon ending a compound statement header:
+// the first `:` outside brackets that is not a walrus.
+func headerColon(stmt string) int {
+	depth := 0
+	for i := 0; i < len(stmt); i++ {
+		switch stmt[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ':':
+			if depth == 0 && (i+1 == len(stmt) || stmt[i+1] != '=') {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// guardKeyword finds the `if` starting a case guard: the word itself, however
+// it is spaced (`if(`, `)if`, a tab before it), never part of a longer name.
+func guardKeyword(s string) int {
+	for from := 0; ; {
+		i := strings.Index(s[from:], "if")
+		if i < 0 {
+			return -1
+		}
+		i += from
+		before, _ := utf8.DecodeLastRuneInString(s[:i])
+		after, _ := utf8.DecodeRuneInString(s[i+2:])
+		if (i == 0 || !isIdentifierRune(before)) && (i+2 == len(s) || !isIdentifierRune(after)) {
+			return i
+		}
+		from = i + 2
+	}
 }
 
 // closeScopes pops every scope whose indent the current line dedents to (or
