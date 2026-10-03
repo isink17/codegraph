@@ -170,3 +170,7 @@ func TestTreeSitterPythonProfileConditionalDefsConverge(t *testing.T) {
 		t.Fatalf("edited graph:\n%s\nfrom-scratch graph:\n%s", got, want)
 	}
 }
+
+func TestPythonNestedVisibilityTreeSitterAdapter(t *testing.T) {
+	runPythonNestedVisibilityCases(t, parser.NewRegistry(tsparser.NewPython()))
+}
