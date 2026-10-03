@@ -361,6 +361,16 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 	for file, list := range imports {
 		bindings[file] = pythonBindingsOf(list)
 	}
+	// What each calling file declares decides whether a bare name can reach a
+	// declaration of that file at all. The claims-only caller skips it: its
+	// consumer reads only dotted names, which that decision never claims.
+	var callerSymbols map[int64]map[string]*pySymbolGroup
+	if !claimsOnly {
+		callerSymbols, err = pythonScopeTopLevelSymbols(ctx, q, repoID, sortedIDs(callerIDs))
+		if err != nil {
+			return answers, err
+		}
+	}
 
 	// Pass 1: decide, per edge, what its own lexical scope says its leading
 	// name means, and collect the module candidates every claim needs.
@@ -384,6 +394,12 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			continue
 		}
 		if !claimed {
+			if !claimsOnly && pythonNameOnlyNestedElsewhere(e.name, at, callerSymbols[e.file], locals[e.file], wildcardFiles[e.file]) {
+				// The file declares the name only inside other functions or
+				// class bodies, none of which the call can see: a same-name
+				// match anywhere would be a false edge.
+				answers.claimed[e.id] = struct{}{}
+			}
 			continue
 		}
 		var d pythonScopeDecision
@@ -476,9 +492,32 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			delete(targetFile, e.id)
 		}
 	}
+	for id := range callerIDs {
+		delete(symbolFiles, id)
+	}
 	topLevel, err := pythonScopeTopLevelSymbols(ctx, q, repoID, sortedIDs(symbolFiles))
 	if err != nil {
 		return answers, err
+	}
+	for id, group := range callerSymbols {
+		topLevel[id] = group
+	}
+	// A target module that may bind the wanted name by import at module level
+	// (`try: from fast import speed` / `except ImportError: def speed()`)
+	// does not answer for it with its own def: which one runs is not in the
+	// syntax.
+	targetFiles := map[int64]struct{}{}
+	for _, id := range targetFile {
+		if _, loaded := imports[id]; !loaded {
+			targetFiles[id] = struct{}{}
+		}
+	}
+	targetImports, _, err := pythonScopeImports(ctx, q, repoID, sortedIDs(targetFiles))
+	if err != nil {
+		return answers, err
+	}
+	for id, list := range imports {
+		targetImports[id] = list
 	}
 	// A package's own module-level bindings decide whether `from pkg import x`
 	// named the `pkg.x` submodule or something `pkg/__init__.py` bound itself.
@@ -523,11 +562,47 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			pythonPackageRebindsName(pkgPaths[pkg], pkgImports[pkg], pkgBindings[pkg], pkgLocals[pkg], topLevel[pkg], d.pkgName, d.paths) {
 			continue
 		}
+		if pythonModuleImportsName(targetImports[file], d.want) {
+			continue
+		}
 		if g := topLevel[file][d.want]; g != nil && g.declarations == 1 && len(g.topLevel) == 1 {
 			answers.imported[e.id] = g.topLevel[0]
 		}
 	}
 	return answers, nil
+}
+
+// pythonNameOnlyNestedElsewhere reports whether a bare call name is declared
+// in the calling file only below module level -- inside a function or a class
+// body -- and no enclosing function of the call declares it. Python finds a
+// bare name in the call's own and enclosing functions, then the module: a def
+// nested in a sibling function or a class body is never reached. A module-level
+// `from x import *` can bind any name, so it decides nothing.
+func pythonNameOnlyNestedElsewhere(name, at string, symbols map[string]*pySymbolGroup, locals []pyScopeLocal, wildcard bool) bool {
+	if wildcard || strings.Contains(name, ".") {
+		return false
+	}
+	g := symbols[name]
+	if g == nil || len(g.topLevel) > 0 {
+		return false
+	}
+	for _, local := range locals {
+		if local.declaration && local.name == name && pythonScopeVisible(local.owner, at) {
+			return false
+		}
+	}
+	return true
+}
+
+// pythonModuleImportsName reports whether a module binds name at module level
+// through an import, or may through `from x import *`.
+func pythonModuleImportsName(imports []pyScopeImport, name string) bool {
+	for _, imp := range imports {
+		if imp.owner == "" && (imp.wildcard || imp.local == name) {
+			return true
+		}
+	}
+	return false
 }
 
 // pythonNameIsShadowed reports whether the call site, or a scope between it and
@@ -802,13 +877,15 @@ type pySymbolGroup struct {
 // pythonScopeTopLevelSymbols indexes, per file, what that file declares. A
 // nested function or a method is not what a bare name or an imported name
 // reaches, and the parser records that distinction in the qualified name: a
-// module-level declaration is exactly `<module>.<name>`.
+// module-level declaration is exactly `<module>.<name>`, with the module read
+// from the file's basename as the parsers read it (`settings.local.py` is the
+// module `settings.local`).
 func pythonScopeTopLevelSymbols(ctx context.Context, q execQuerier, repoID int64, ids []int64) (map[int64]map[string]*pySymbolGroup, error) {
 	out := make(map[int64]map[string]*pySymbolGroup, len(ids))
-	err := chunkedInt64Query(ctx, q, ids, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.kind FROM symbols s WHERE s.repo_id=? AND s.language='python' AND s.file_id IN (`, repoID, func(scan func(...any) error) error {
+	err := chunkedInt64Query(ctx, q, ids, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.kind,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='python' AND s.file_id IN (`, repoID, func(scan func(...any) error) error {
 		var id, file int64
-		var name, qualified, kind string
-		if err := scan(&id, &file, &name, &qualified, &kind); err != nil {
+		var name, qualified, kind, filePath string
+		if err := scan(&id, &file, &name, &qualified, &kind, &filePath); err != nil {
 			return err
 		}
 		if name == "" {
@@ -823,7 +900,7 @@ func pythonScopeTopLevelSymbols(ctx context.Context, q execQuerier, repoID int64
 			out[file][name] = group
 		}
 		group.declarations++
-		if strings.Count(qualified, ".") != 1 || !strings.HasSuffix(qualified, "."+name) {
+		if pythonCallScope(qualified, filePath) != name {
 			return nil
 		}
 		group.topLevel = append(group.topLevel, id)

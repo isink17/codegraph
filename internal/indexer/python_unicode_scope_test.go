@@ -73,3 +73,52 @@ func runPythonUnicodeScopeCases(t *testing.T, reg *parser.Registry) {
 func TestPythonUnicodeScopeRegexAdapter(t *testing.T) {
 	runPythonUnicodeScopeCases(t, parser.NewRegistry(pyparser.New()))
 }
+
+// runPythonNestedVisibilityCases indexes testdata/python_nested_visibility,
+// which CPython runs (cg15 visibility oracle): a bare name reaches the module's
+// own names and the enclosing functions' locals, never a def nested in another
+// function or in a class body, and a module whose name may come from an import
+// does not answer for it with its fallback def.
+func runPythonNestedVisibilityCases(t *testing.T, reg *parser.Registry) {
+	t.Helper()
+	dir := filepath.Join("testdata", "python_nested_visibility")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{}
+	for _, e := range entries {
+		src, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[e.Name()] = string(src)
+	}
+	r := newPyRepo(t, reg, files)
+	for _, tc := range []struct{ file, dst, want string }{
+		// CPython: NameError. `h` is local to a(); `run` lives in the class body.
+		{"mod.py", "h", "<unresolved>"},
+		{"mod.py", "run", "<unresolved>"},
+		// CPython: the nested def the calling function encloses.
+		{"mod.py", "inner", "mod.py:mod.c.inner"},
+		// CPython: one of two platform defs; which one is not in the source.
+		{"mod.py", "pick", "<unresolved>"},
+		{"other.py", "pick", "<unresolved>"},
+		// CPython: fast.speed. mod binds `speed` by import before its fallback.
+		{"other.py", "speed", "<unresolved>"},
+		// CPython: lib.helper, defined after lib's `from base import *`. Which
+		// binding wins depends on statement order the evidence does not keep,
+		// so the call is refused: conservative, not wrong.
+		{"other.py", "helper", "<unresolved>"},
+		// A module-level def of a dotted-basename module is still module level.
+		{"settings.local.py", "configure", "settings.local.py:settings.local.configure [python_module_scope]"},
+	} {
+		if got := r.edgeState(t, tc.file, tc.dst); !strings.Contains(got, tc.want) {
+			t.Errorf("%s: %q = %s; want %s", tc.file, tc.dst, got, tc.want)
+		}
+	}
+}
+
+func TestPythonNestedVisibilityRegexAdapter(t *testing.T) {
+	runPythonNestedVisibilityCases(t, parser.NewRegistry(pyparser.New()))
+}
