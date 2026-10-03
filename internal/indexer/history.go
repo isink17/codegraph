@@ -13,7 +13,7 @@ import (
 // refreshHistory evaluates file-level Git history after the semantic graph is
 // complete. It never reads or writes graph rows (history is not semantic
 // evidence), and a Git problem becomes a stored absent reason rather than a
-// scan error. Only a store write failure is returned.
+// scan error. Only a store failure is returned.
 //
 // The window is bounded, so no update ever reads full history. While HEAD,
 // the window limit and the algorithm are unchanged, only the worktree change
@@ -22,14 +22,18 @@ import (
 // ancestor) and makes every stored value equal to a fresh computation.
 func (i *Indexer) refreshHistory(ctx context.Context, repoID int64, root string, disabled bool) (githistory.State, int64, error) {
 	start := time.Now()
-	state, files, changes := i.evaluateHistory(ctx, repoID, root, disabled)
+	indexed, err := i.store.LiveFilePaths(ctx, repoID)
+	if err != nil {
+		return githistory.State{}, 0, err
+	}
+	state, files, changes := i.evaluateHistory(ctx, repoID, root, indexed, disabled)
 	if err := i.store.ReplaceGitHistory(ctx, repoID, state, files, changes); err != nil {
 		return state, 0, err
 	}
 	return state, time.Since(start).Milliseconds(), nil
 }
 
-func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string, disabled bool) (githistory.State, []githistory.FileStats, []string) {
+func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string, indexed []string, disabled bool) (githistory.State, []githistory.FileStats, []string) {
 	absent := func(reason string) (githistory.State, []githistory.FileStats, []string) {
 		return githistory.Absent(reason), []githistory.FileStats{}, nil
 	}
@@ -40,7 +44,7 @@ func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string
 	if err != nil {
 		return absent(githistory.ReasonOf(err))
 	}
-	changes, err := githistory.WorktreeChanges(ctx, root, state.Watermark)
+	changes, err := githistory.WorktreeChanges(ctx, root, state.Watermark, indexed)
 	if err != nil {
 		return absent(githistory.ReasonOf(err))
 	}

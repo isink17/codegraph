@@ -195,7 +195,7 @@ func TestSubdirectoryRootUsesRelativePaths(t *testing.T) {
 	}
 	r.Write("pkg/new.go", "n\n")
 	r.Write("b.go", "outside\n")
-	changes, err := WorktreeChanges(context.Background(), root, state.Watermark)
+	changes, err := WorktreeChanges(context.Background(), root, state.Watermark, []string{"a2.go", "new.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,11 +222,15 @@ func TestWorktreeChanges(t *testing.T) {
 	r.Write("debug.log", "ignored\n")
 	// Same content, new mtime: not a change.
 	r.Write("same.go", "1\n")
-	changes, err := WorktreeChanges(context.Background(), r.Dir, sha)
+	r.Write("notindexed.go", "u\n")
+	// The indexer indexes debug.log although Git ignores it: it is not in the
+	// watermark, so it differs. notindexed.go is untracked but not indexed.
+	indexed := []string{"debug.log", "dir/untracked.go", "mod.go", "same.go", "staged.go"}
+	changes, err := WorktreeChanges(context.Background(), r.Dir, sha, indexed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"dir/untracked.go", "gone.go", "mod.go", "staged.go"}; !reflect.DeepEqual(changes, want) {
+	if want := []string{"debug.log", "dir/untracked.go", "gone.go", "mod.go", "staged.go"}; !reflect.DeepEqual(changes, want) {
 		t.Fatalf("changes = %v, want %v", changes, want)
 	}
 }
@@ -408,7 +412,8 @@ func TestUserConfigDoesNotChangeAggregates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, kv := range [][2]string{
-		{"log.showRoot", "false"}, {"log.diffMerges", "separate"}, {"diff.renames", "false"},
+		{"log.showRoot", "false"}, {"log.diffMerges", "remerge"},
+		{"diff.algorithm", "patience"}, {"diff.renameLimit", "1"}, {"diff.renames", "false"},
 		{"log.showSignature", "true"}, {"color.ui", "always"}, {"diff.relative", "true"},
 	} {
 		r.Git("config", kv[0], kv[1])

@@ -269,15 +269,18 @@ func TestHistoryJoinsFilesAndFlagsWorktree(t *testing.T) {
 	r := gittest.Init(t)
 	r.Write("pkg/sub/a.go", "package sub\n\nfunc A() {}\n")
 	r.Write("pkg/sub/b.go", "package sub\n\nfunc B() {}\n")
+	r.Write(".gitignore", "gen.go\n")
 	r.Commit("", "one")
 	r.Write("pkg/sub/a.go", "package sub\n\nfunc A() { B() }\n")
 	r.Write("pkg/sub/new.go", "package sub\n")
+	// Git ignores gen.go but codegraph indexes it; it is not in the watermark.
+	r.Write("pkg/sub/gen.go", "package sub\n\nfunc G() {}\n")
 
 	for _, tc := range []struct{ root, prefix string }{{r.Dir, "pkg/sub/"}, {filepath.Join(r.Dir, "pkg"), "sub/"}} {
 		s := newProfileStore(t)
 		index(t, s, tc.root, false, false)
 		got, err := s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Paths: []string{
-			filepath.FromSlash(tc.prefix + "a.go"), tc.prefix + "b.go", tc.prefix + "new.go",
+			filepath.FromSlash(tc.prefix + "a.go"), tc.prefix + "b.go", tc.prefix + "gen.go", tc.prefix + "new.go",
 		}})
 		if err != nil {
 			t.Fatal(err)
@@ -289,6 +292,7 @@ func TestHistoryJoinsFilesAndFlagsWorktree(t *testing.T) {
 		want := []string{
 			tc.prefix + "a.go indexed=true differs=true commits=1",
 			tc.prefix + "b.go indexed=true differs=false commits=1",
+			tc.prefix + "gen.go indexed=true differs=true commits=0",
 			tc.prefix + "new.go indexed=true differs=true commits=0",
 		}
 		if !reflect.DeepEqual(summary, want) {

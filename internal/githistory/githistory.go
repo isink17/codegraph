@@ -118,13 +118,18 @@ var scrubbedEnv = map[string]bool{
 	"GIT_DIR": true, "GIT_WORK_TREE": true, "GIT_INDEX_FILE": true, "GIT_PREFIX": true,
 	"GIT_COMMON_DIR": true, "GIT_OBJECT_DIRECTORY": true, "GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
 	"GIT_NAMESPACE": true,
+	// Configuration injected through the environment, and object or history
+	// rewrites, would change results without changing HEAD.
+	"GIT_CONFIG_PARAMETERS": true, "GIT_CONFIG_COUNT": true,
+	"GIT_REPLACE_REF_BASE": true, "GIT_NO_REPLACE_OBJECTS": true, "GIT_GRAFT_FILE": true,
+	"GIT_SHALLOW_FILE": true,
 }
 
 func gitEnv() []string {
 	env := make([]string, 0, len(os.Environ())+3)
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
-		if scrubbedEnv[name] {
+		if scrubbedEnv[name] || strings.HasPrefix(name, "GIT_CONFIG_KEY_") || strings.HasPrefix(name, "GIT_CONFIG_VALUE_") {
 			continue
 		}
 		env = append(env, kv)
@@ -203,22 +208,34 @@ func Probe(ctx context.Context, root string) (State, error) {
 
 // WorktreeChanges lists root-relative paths whose working-tree content
 // differs from the watermark commit: tracked files modified, staged or
-// deleted, plus untracked files that are not ignored. Sorted, unique.
-func WorktreeChanges(ctx context.Context, root, watermark string) ([]string, error) {
-	tracked, err := run(ctx, root, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-color", "--relative", watermark, "--")
+// deleted, plus every indexed path Git does not track. An indexed path is
+// compared against the tracked set rather than Git's untracked listing,
+// because codegraph indexes files that .gitignore excludes (generated code,
+// for example) and those differ from the watermark too. Sorted, unique.
+func WorktreeChanges(ctx context.Context, root, watermark string, indexed []string) ([]string, error) {
+	tracked, err := run(ctx, root, "-c", "core.fsmonitor=false", "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-color", "--relative", watermark, "--")
 	if err != nil {
 		return nil, err
 	}
-	untracked, err := run(ctx, root, "ls-files", "-z", "--others", "--exclude-standard")
+	listed, err := run(ctx, root, "-c", "core.fsmonitor=false", "ls-files", "-z", "--cached")
 	if err != nil {
 		return nil, err
+	}
+	known := map[string]bool{}
+	for _, p := range strings.Split(string(listed), "\x00") {
+		if p != "" {
+			known[p] = true
+		}
 	}
 	seen := map[string]bool{}
-	for _, chunk := range [][]byte{tracked, untracked} {
-		for _, p := range strings.Split(string(chunk), "\x00") {
-			if p != "" {
-				seen[p] = true
-			}
+	for _, p := range strings.Split(string(tracked), "\x00") {
+		if p != "" {
+			seen[p] = true
+		}
+	}
+	for _, p := range indexed {
+		if !known[p] {
+			seen[p] = true
 		}
 	}
 	paths := make([]string, 0, len(seen))
@@ -263,7 +280,13 @@ func Files(ctx context.Context, root, watermark string) ([]FileStats, int, error
 	// result: --root keeps the root commit's diff under log.showRoot=false, and
 	// log.diffMerges pins -m to the first-parent diff on Git versions where -m
 	// follows that setting (older versions ignore the key and already do).
-	out, err := run(ctx, root, "-c", "log.diffMerges=first-parent", "log", "-z", "--first-parent", "-m", "-M", "--root", "--numstat",
+	// The diff algorithm and rename limit change --numstat counts and rename
+	// pairing, and user-level mailmap settings change author identity, none of
+	// which moves HEAD; pin them so a reused result equals a fresh one. The
+	// repository's own .mailmap is still read (and fingerprinted by Probe).
+	out, err := run(ctx, root, "-c", "log.diffMerges=first-parent", "-c", "diff.renameLimit=1000",
+		"-c", "mailmap.file=", "-c", "mailmap.blob=",
+		"log", "-z", "--first-parent", "-m", "-M", "--diff-algorithm=myers", "--root", "--numstat",
 		"--no-color", "--no-ext-diff", "--no-show-signature", "--relative",
 		"--format=%x1e%H%x1f%ct%x1f%aE%x1f%B", "-n", strconv.Itoa(WindowLimit), watermark, "--")
 	if err != nil {

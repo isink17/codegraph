@@ -206,3 +206,22 @@ func scanGitFileHistory(rows *sql.Rows) ([]GitFileHistory, error) {
 	}
 	return out, rows.Err()
 }
+
+// LiveFilePaths returns every indexed (not deleted) path of the repository in
+// path order. History uses it to mark indexed files Git does not track.
+func (s *Store) LiveFilePaths(ctx context.Context, repoID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND is_deleted=0 ORDER BY path`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}

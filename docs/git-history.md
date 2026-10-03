@@ -43,10 +43,21 @@ Rules:
   the root and is not attributed. The window still counts repository commits.
 - **Submodules:** their histories are not traversed.
 - **Configuration:** `log.showRoot`, `log.diffMerges`, `diff.renames`,
-  signatures and color are overridden. A user-level `mailmap.file` is honoured as
-  Git honours it.
-- **Untracked files** appear with `commit_count` 0 and `worktree_differs` true.
-  codegraph's own `.codegraph/` directory is never a worktree change.
+  `diff.algorithm` (Myers), `diff.renameLimit` (1000), signatures and color are
+  overridden. Only the repository's own `.mailmap` is read; user-level
+  `mailmap.file`/`mailmap.blob` settings are ignored, because they could change
+  results without changing `HEAD`. Git configuration and object replacements
+  passed through the environment (`GIT_CONFIG_*`, `GIT_REPLACE_REF_BASE`,
+  `GIT_GRAFT_FILE`, ...) are ignored too, and `core.fsmonitor` is not run.
+- **Untracked files:** every indexed file Git does not track, including files
+  `.gitignore` excludes but codegraph indexes (generated code, for example),
+  appears with `commit_count` 0 and `worktree_differs` true. codegraph's own
+  `.codegraph/` directory is never a worktree change.
+- **Freshness:** history is evaluated by `index` and `update`. A commit that
+  changes no file (an empty commit, or a commit of already-indexed content) moves
+  `HEAD` without triggering a watch update, so the answer keeps the previous
+  `watermark` until the next scan; compare it with `git rev-parse HEAD` when that
+  matters.
 
 ## Repository state
 

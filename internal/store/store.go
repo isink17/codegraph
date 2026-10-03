@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/isink17/codegraph/internal/githistory"
 	"io"
 	"io/fs"
 	"math"
@@ -25,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/platform"
