@@ -350,26 +350,21 @@ func DefHeaderEnd(src string) int {
 
 // DefHeaderNames reports which of names the `def` header starting src spells
 // after its name -- in a parameter default or an annotation -- outside strings
-// and comments.
+// and comments. A spelling matches by its NFKC form, the name CPython binds.
 func DefHeaderNames(src string, names []LocalBinding) []LocalBinding {
 	header, _ := defHeader(src)
-	if open := strings.IndexByte(header, '('); open >= 0 {
-		header = header[open:]
-	} else {
+	open := strings.IndexByte(header, '(')
+	if open < 0 {
 		return nil
+	}
+	spelled := map[string]struct{}{}
+	for _, word := range strings.FieldsFunc(header[open:], func(r rune) bool { return !isIdentifierRune(r) }) {
+		spelled[NormalizeIdentifier(word)] = struct{}{}
 	}
 	var out []LocalBinding
 	for _, b := range names {
-		for i := strings.Index(header, b.Name); i >= 0; {
-			if isKeywordAt(header, i, len(b.Name)) {
-				out = append(out, b)
-				break
-			}
-			next := strings.Index(header[i+1:], b.Name)
-			if next < 0 {
-				break
-			}
-			i += next + 1
+		if _, ok := spelled[b.Name]; ok {
+			out = append(out, b)
 		}
 	}
 	return out

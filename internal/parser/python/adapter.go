@@ -569,7 +569,7 @@ func isPythonKeyword(name string) bool {
 // every name in its NFKC form, the name CPython binds (PEP 3131). v5 records
 // lambda parameters and match-case captures as local bindings. v6 records
 // lambdas in a def header's defaults, bodies on a header line and class-body
-// bindings.
+// bindings. v7 matches a method header's names by their NFKC form.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v6", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v7", EmitsCallEdges: true}
 }

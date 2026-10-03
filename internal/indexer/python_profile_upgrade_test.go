@@ -757,3 +757,100 @@ func TestPythonRegexProfileDefaultClassBindingsConverge(t *testing.T) {
 	runPythonDefaultClassProfileConvergence(t,
 		pythonBindingsV5Adapter{Adapter: pyparser.New(), id: "python-regex:python:v5"}, pyparser.New())
 }
+
+// pythonNFKCHeaderSource is a program CPython runs: run() returns 'cls', the
+// class attribute the fullwidth default spells, not lib.full.
+const pythonNFKCHeaderSource = `from lib import full
+
+
+def run():
+    class C:
+        full = lambda: "cls"
+
+        def m(self, x=ｆｕｌｌ()):
+            return x
+    return C().m()
+`
+
+// pythonHeaderBindingsV6Adapter reproduces, for pythonNFKCHeaderSource, what
+// both Python adapters wrote before a method header's names were matched by
+// their NFKC form: the same rows without the class_header_binding the
+// fullwidth spelling now records. It stamps the old profile id, which is all
+// planParserProfiles compares.
+type pythonHeaderBindingsV6Adapter struct {
+	parser.Adapter
+	id string
+}
+
+func (a pythonHeaderBindingsV6Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: a.id, EmitsCallEdges: true}
+}
+
+func (a pythonHeaderBindingsV6Adapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	pf, err := a.Adapter.Parse(ctx, path, content)
+	if err != nil || filepath.Base(path) != "mod.py" {
+		return pf, err
+	}
+	kept := pf.Scope.Imports[:0]
+	for _, b := range pf.Scope.Imports {
+		if b.Kind != graph.ScopeImportClassHeaderBinding {
+			kept = append(kept, b)
+		}
+	}
+	pf.Scope.Imports = kept
+	return pf, nil
+}
+
+// Matching a method header's names by their NFKC form records a
+// class_header_binding the previous profile did not, so the bump alone must
+// reparse the unchanged file and converge with a from-scratch index.
+// headerCalls says whether the adapter reads calls written in a def header.
+func runPythonNFKCHeaderProfileConvergence(t *testing.T, old pythonHeaderBindingsV6Adapter, current parser.Adapter, headerCalls bool) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "lib.py"), pythonNFKCLib)
+	writeProfileFile(t, filepath.Join(root, "mod.py"), pythonNFKCHeaderSource)
+	currentID := current.(parser.ProfileProvider).Profile().ID
+
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old index: %v", err)
+	}
+	if headerCalls {
+		requireRows(t, pythonGraph(t, s), "old graph", "prov|mod.py="+old.id+":1", "call|full@8->lib.full")
+	}
+
+	upgraded := New(s.Store, parser.NewRegistry(current), nil)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if summary.FilesChanged != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "python" {
+		t.Fatalf("profile bump did not reparse the unchanged files: changed=%d languages=%v",
+			summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	got := pythonGraph(t, s)
+	requireRows(t, got, "upgraded graph", "prov|mod.py="+currentID+":1", "scope|mod.py|run.C.m|class_header_binding||8|full")
+	if headerCalls {
+		requireRows(t, got, "upgraded graph", "call|full@8->")
+	}
+	if strings.Contains(got, "->lib.full") {
+		t.Fatalf("a call CPython does not make to lib.full is still bound:\n%s", got)
+	}
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+	again, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update reparsed: changed=%d languages=%v", again.FilesChanged, again.ParserProfileLanguages)
+	}
+}
+
+func TestPythonRegexProfileNFKCHeaderBindingsConverge(t *testing.T) {
+	runPythonNFKCHeaderProfileConvergence(t,
+		pythonHeaderBindingsV6Adapter{Adapter: pyparser.New(), id: "python-regex:python:v6"}, pyparser.New(), false)
+}
