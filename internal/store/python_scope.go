@@ -361,11 +361,15 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 	for file, list := range imports {
 		bindings[file] = pythonBindingsOf(list)
 	}
-	// What each calling file declares decides, before any claim is recorded,
-	// whether a bare name can reach a declaration of that file at all.
-	callerSymbols, err := pythonScopeTopLevelSymbols(ctx, q, repoID, sortedIDs(callerIDs))
-	if err != nil {
-		return answers, err
+	// What each calling file declares decides whether a bare name can reach a
+	// declaration of that file at all. The claims-only caller skips it: its
+	// consumer reads only dotted names, which that decision never claims.
+	var callerSymbols map[int64]map[string]*pySymbolGroup
+	if !claimsOnly {
+		callerSymbols, err = pythonScopeTopLevelSymbols(ctx, q, repoID, sortedIDs(callerIDs))
+		if err != nil {
+			return answers, err
+		}
 	}
 
 	// Pass 1: decide, per edge, what its own lexical scope says its leading
@@ -390,7 +394,7 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			continue
 		}
 		if !claimed {
-			if pythonNameOnlyNestedElsewhere(e.name, at, callerSymbols[e.file], locals[e.file], wildcardFiles[e.file]) {
+			if !claimsOnly && pythonNameOnlyNestedElsewhere(e.name, at, callerSymbols[e.file], locals[e.file], wildcardFiles[e.file]) {
 				// The file declares the name only inside other functions or
 				// class bodies, none of which the call can see: a same-name
 				// match anywhere would be a false edge.
@@ -504,11 +508,16 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 	// syntax.
 	targetFiles := map[int64]struct{}{}
 	for _, id := range targetFile {
-		targetFiles[id] = struct{}{}
+		if _, loaded := imports[id]; !loaded {
+			targetFiles[id] = struct{}{}
+		}
 	}
 	targetImports, _, err := pythonScopeImports(ctx, q, repoID, sortedIDs(targetFiles))
 	if err != nil {
 		return answers, err
+	}
+	for id, list := range imports {
+		targetImports[id] = list
 	}
 	// A package's own module-level bindings decide whether `from pkg import x`
 	// named the `pkg.x` submodule or something `pkg/__init__.py` bound itself.
@@ -868,13 +877,15 @@ type pySymbolGroup struct {
 // pythonScopeTopLevelSymbols indexes, per file, what that file declares. A
 // nested function or a method is not what a bare name or an imported name
 // reaches, and the parser records that distinction in the qualified name: a
-// module-level declaration is exactly `<module>.<name>`.
+// module-level declaration is exactly `<module>.<name>`, with the module read
+// from the file's basename as the parsers read it (`settings.local.py` is the
+// module `settings.local`).
 func pythonScopeTopLevelSymbols(ctx context.Context, q execQuerier, repoID int64, ids []int64) (map[int64]map[string]*pySymbolGroup, error) {
 	out := make(map[int64]map[string]*pySymbolGroup, len(ids))
-	err := chunkedInt64Query(ctx, q, ids, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.kind FROM symbols s WHERE s.repo_id=? AND s.language='python' AND s.file_id IN (`, repoID, func(scan func(...any) error) error {
+	err := chunkedInt64Query(ctx, q, ids, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.kind,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='python' AND s.file_id IN (`, repoID, func(scan func(...any) error) error {
 		var id, file int64
-		var name, qualified, kind string
-		if err := scan(&id, &file, &name, &qualified, &kind); err != nil {
+		var name, qualified, kind, filePath string
+		if err := scan(&id, &file, &name, &qualified, &kind, &filePath); err != nil {
 			return err
 		}
 		if name == "" {
@@ -889,7 +900,7 @@ func pythonScopeTopLevelSymbols(ctx context.Context, q execQuerier, repoID int64
 			out[file][name] = group
 		}
 		group.declarations++
-		if strings.Count(qualified, ".") != 1 || !strings.HasSuffix(qualified, "."+name) {
+		if pythonCallScope(qualified, filePath) != name {
 			return nil
 		}
 		group.topLevel = append(group.topLevel, id)

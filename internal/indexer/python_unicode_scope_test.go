@@ -106,6 +106,12 @@ func runPythonNestedVisibilityCases(t *testing.T, reg *parser.Registry) {
 		{"other.py", "pick", "<unresolved>"},
 		// CPython: fast.speed. mod binds `speed` by import before its fallback.
 		{"other.py", "speed", "<unresolved>"},
+		// CPython: lib.helper, defined after lib's `from base import *`. Which
+		// binding wins depends on statement order the evidence does not keep,
+		// so the call is refused: conservative, not wrong.
+		{"other.py", "helper", "<unresolved>"},
+		// A module-level def of a dotted-basename module is still module level.
+		{"settings.local.py", "configure", "settings.local.py:settings.local.configure [python_module_scope]"},
 	} {
 		if got := r.edgeState(t, tc.file, tc.dst); !strings.Contains(got, tc.want) {
 			t.Errorf("%s: %q = %s; want %s", tc.file, tc.dst, got, tc.want)
