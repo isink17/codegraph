@@ -1,7 +1,8 @@
 package python
 
 import (
-	"regexp"
+	"regexp/syntax"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -25,12 +26,28 @@ const (
 	identifier = `[` + identStart + `][` + identContinue + `]*`
 )
 
+// startRanges and continueRanges are the same two classes as sorted [lo, hi]
+// rune pairs, read from the regexp parser so a single rune is tested without
+// running a regexp and without a second spelling of the class.
 var (
-	identifierRE    = regexp.MustCompile(`^` + identifier + `$`)
-	identContinueRE = regexp.MustCompile(`^[` + identContinue + `]$`)
+	startRanges    = classRanges(identStart)
+	continueRanges = classRanges(identContinue)
 )
 
-func isIdentifierRune(r rune) bool { return identContinueRE.MatchString(string(r)) }
+func classRanges(class string) []rune {
+	re, err := syntax.Parse("["+class+"]", syntax.Perl)
+	if err != nil || re.Op != syntax.OpCharClass {
+		panic("python identifier class does not parse: " + class)
+	}
+	return re.Rune
+}
+
+func inRanges(r rune, ranges []rune) bool {
+	i := sort.Search(len(ranges)/2, func(i int) bool { return ranges[2*i+1] >= r })
+	return i < len(ranges)/2 && ranges[2*i] <= r
+}
+
+func isIdentifierRune(r rune) bool { return inRanges(r, continueRanges) }
 
 // ImportBindings converts one logical Python import statement into scope import
 // evidence. It records what the syntax says and nothing more: the module
@@ -142,7 +159,14 @@ func validDottedName(name string) bool {
 	return true
 }
 
-func validIdentifier(name string) bool { return identifierRE.MatchString(name) }
+func validIdentifier(name string) bool {
+	for i, r := range name {
+		if !isIdentifierRune(r) || i == 0 && !inRanges(r, startRanges) {
+			return false
+		}
+	}
+	return name != ""
+}
 
 // importStatements folds the masked source into logical import statements,
 // following parenthesised and backslash continuations. It reports the physical
@@ -280,7 +304,13 @@ func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
 // `async ` prefix already stripped.
 func declaredName(header string) string {
 	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(header, "def"), "class"))
-	return rest[:len(rest)-len(strings.TrimLeftFunc(rest, isIdentifierRune))]
+	name := rest[:len(rest)-len(strings.TrimLeftFunc(rest, isIdentifierRune))]
+	if len(name) < len(rest) && rest[len(name)] >= utf8.RuneSelf {
+		// The name goes on with a rune Go's tables do not know yet: the
+		// prefix read so far is not the name.
+		return ""
+	}
+	return name
 }
 
 // pythonLogicalLines folds bracket and backslash continuations, reporting the
@@ -466,7 +496,12 @@ func lastIdentifierBefore(text string) string {
 	for end > 0 && text[end-1] == ' ' {
 		end--
 	}
-	return text[len(strings.TrimRightFunc(text[:end], isIdentifierRune)):end]
+	start := len(strings.TrimRightFunc(text[:end], isIdentifierRune))
+	if start > 0 && text[start-1] >= utf8.RuneSelf {
+		// A rune Go's tables do not know yet starts the name.
+		return ""
+	}
+	return text[start:end]
 }
 
 // pythonInlineBody returns the statement a compound header carries on its own

@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
@@ -268,7 +269,8 @@ def helper():
 // Python identifiers are Unicode (PEP 3131). Every verdict below is what
 // Python's own str.isidentifier() says about the name; the adapter must declare
 // exactly the valid ones, under exactly that name, and never a fragment of an
-// invalid one.
+// invalid one. The name is the source spelling: CPython binds its NFKC form
+// (`ｆｕｌｌ` binds `full`), which neither Python adapter models.
 func TestUnicodeDefinitionNamesFollowPython(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -291,7 +293,8 @@ func TestUnicodeDefinitionNamesFollowPython(t *testing.T) {
 		{"٣x", false},
 		{"\u0301e", false},
 		// Python (Unicode 16) accepts U+1C89; Go's tables predate it, so the
-		// adapter declares nothing rather than the fragment before it.
+		// adapter declares nothing rather than the fragment before it. See
+		// TestPythonNamesFollowGoUnicodeTables before changing this case.
 		{"x\u1c89y", false},
 	}
 	for _, tc := range cases {
@@ -345,5 +348,15 @@ def caller():
 	want := "变量@3|℘x٣@6|Café@12|café_obj.métode@13|naïve_func@14"
 	if strings.Join(got, "|") != want {
 		t.Fatalf("calls = %q, want %q", got, want)
+	}
+}
+
+// Which runes are Python names here comes from Go's unicode tables, so a Go
+// toolchain with newer tables changes what both Python adapters persist for
+// unchanged files. When this fails after a Go upgrade, bump treesitter:python
+// and python-regex:python, then update the expected version.
+func TestPythonNamesFollowGoUnicodeTables(t *testing.T) {
+	if unicode.Version != "15.0.0" {
+		t.Fatalf("unicode.Version = %s; bump both Python parser profiles", unicode.Version)
 	}
 }
