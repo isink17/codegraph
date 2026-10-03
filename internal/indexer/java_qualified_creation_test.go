@@ -152,7 +152,7 @@ func TestJavaSimpleNameConstructionRespectsMemberTypes(t *testing.T) {
 
 // An interface's member types are implicitly public and inherited by its
 // implementers in any package, though recorded as package-private. Oracle
-// (javac 17): Impl.raw new Box() -> other/I$Box; Impl.st Box.m() -> other/I$Box.m.
+// (javac 17): Impl.raw new Box() -> other/I$Box.
 func TestJavaInterfaceMemberTypeFromAnotherPackageShadows(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"app/Box.java":  `package app; public class Box { public Box() {} public static void m() {} }`,
