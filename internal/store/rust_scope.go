@@ -846,11 +846,10 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 					}
 					continue
 				}
-				if im.local == dst {
+				if im.local == dst && !explicit {
 					path = resolvePath(im.source, owner)
 					strategy = ResolutionStrategyRustUseScope
 					explicit = true
-					break
 				}
 			}
 			if path == dst && strings.Contains(dst, "::") {
@@ -860,24 +859,40 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			}
 			// Rust lets an explicit `use` and an item declared in the module
 			// shadow a glob import of the same name, whatever the order of the
-			// declarations. Only functions and structs can be the called value:
-			// a trait or enum does not shadow a glob-imported function, and a
-			// struct is a value only in its tuple or unit form, which the parser
-			// does not record, so a struct competing with a glob fails closed.
+			// declarations, but only in the namespace that item lives in. Only a
+			// function is certainly the called value: a trait or enum does not
+			// shadow a glob-imported function, and a struct is a value only in
+			// its tuple or unit form, which the parser does not record, so a
+			// struct competing with a glob fails closed. The first segment of a
+			// qualified call is resolved in the type namespace, where an own
+			// module or type shadows a glob-imported one.
+			globCompetes := false
+			for _, c := range globCandidates {
+				globCompetes = globCompetes || inCallerCrate(c, caller)
+			}
 			if explicit {
 				globCandidates = nil
 			} else if path == owner+"::"+dst && len(globCandidates) > 0 {
-				ownFunction, ownStruct := false, false
-				for _, c := range byQ[path] {
-					if inCallerCrate(c, caller) {
-						ownFunction = ownFunction || c.kind == "function"
-						ownStruct = ownStruct || c.kind == "struct"
+				own, ownStruct := false, false
+				if seg, _, qualified := strings.Cut(dst, "::"); qualified {
+					for _, m := range decls {
+						own = own || (m.owner == owner && m.name == seg && rootOfFile[m.file] != "" && rootOfFile[m.file] == rootOfFile[caller.id])
+					}
+					for _, c := range byQ[owner+"::"+seg] {
+						own = own || (c.kind != "function" && inCallerCrate(c, caller))
+					}
+				} else {
+					for _, c := range byQ[path] {
+						if inCallerCrate(c, caller) {
+							own = own || c.kind == "function"
+							ownStruct = ownStruct || c.kind == "struct"
+						}
 					}
 				}
-				if ownStruct && !ownFunction {
+				if ownStruct && !own {
 					continue
 				}
-				if ownFunction {
+				if own {
 					// The own item also shadows the module's glob re-exports,
 					// so the re-export walk below must not reach them either.
 					globCandidates, shadowed = nil, true
@@ -918,7 +933,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 					}
 				}
 			}
-			if count != 1 {
+			if count != 1 || (explicit && globCompetes && symbols[chosen].kind != "function") {
 				continue
 			}
 			if strings.Contains(dst, "::") {
