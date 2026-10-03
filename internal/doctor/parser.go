@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -29,6 +30,17 @@ type ParserInfo struct {
 	// Languages carries the per-language detail behind Provenance, only for the
 	// languages that are not already current.
 	Languages []ParserLanguageState `json:"languages,omitempty"`
+	// GraphCapability is the persisted graph's call capability per repository
+	// in the database (store.ClassifyGraphCapability): what relationship
+	// answers over it can claim, whichever binary wrote it. Omitted when no
+	// repository holds parser evidence.
+	GraphCapability []RepoGraphCapability `json:"graph_capability,omitempty"`
+}
+
+// RepoGraphCapability is one repository's persisted graph capability.
+type RepoGraphCapability struct {
+	RepoID int64 `json:"repo_id"`
+	store.GraphCapability
 }
 
 type ParserLanguageState struct {
@@ -113,6 +125,32 @@ func inspectParser(ctx context.Context, languages []parser.LanguageSupport, dbPa
 		key := repoLanguage{repoID: group.RepoID, language: group.Language}
 		byLanguage[key] = append(byLanguage[key], group.FileParserProfileGroup)
 	}
+	byRepo := map[int64][]store.FileParserProfileGroup{}
+	for _, group := range groups {
+		byRepo[group.RepoID] = append(byRepo[group.RepoID], group.FileParserProfileGroup)
+	}
+	repoIDs := make([]int64, 0, len(byRepo))
+	for repoID := range byRepo {
+		repoIDs = append(repoIDs, repoID)
+	}
+	slices.Sort(repoIDs)
+	for _, repoID := range repoIDs {
+		capability := store.ClassifyGraphCapability(byRepo[repoID])
+		if capability.State == "" {
+			continue
+		}
+		info.GraphCapability = append(info.GraphCapability, RepoGraphCapability{RepoID: repoID, GraphCapability: capability})
+		if limitations := capability.Limitations(); len(limitations) > 0 {
+			parts := make([]string, len(limitations))
+			for i, l := range limitations {
+				parts[i] = l.Language + "=" + l.Capability
+			}
+			recommendations = append(recommendations, fmt.Sprintf(
+				"persisted graph is %s (%s): relationship answers disclose limitations; index with a native cgo build for complete call edges",
+				capability.State, strings.Join(parts, ", ")))
+		}
+	}
+
 	worst := parserStateCurrent
 	names := make([]repoLanguage, 0, len(byLanguage))
 	for key := range byLanguage {
