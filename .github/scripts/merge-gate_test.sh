@@ -17,19 +17,20 @@ cat >"$work/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
 "pr view")
-	if [[ "$*" == *mergeCommit* ]]; then echo "MERGED fedcba"; else echo "$STUB_PR"; fi ;;
+	if [[ "$*" == *mergeCommit* ]]; then echo "${STUB_AFTER:-MERGED fedcba}"; else echo "$STUB_PR"; fi ;;
 "pr merge") echo "$*" >>"$STUB_LOG" ;;
 "api repos/{owner}/{repo}/compare/"*) echo "$STUB_BEHIND" ;;
-"api repos/{owner}/{repo}/commits/"*) printf '%b' "$STUB_CHECKS" ;;
+"api --paginate") printf '%b' "$STUB_CHECKS" ;;
+"api repos/{owner}/{repo}/commits/"*) echo "$STUB_STATUS" ;;
 *) echo "unexpected gh $*" >&2; exit 1 ;;
 esac
 EOF
 chmod +x "$work/bin/gh"
 
 review_ok() {
-	printf 'Independent review\nPR: #42\nReviewed-Head: %s\nVerdict: APPROVE\nBlocking: 0\n' "$sha"
+	printf 'PR: #42\nReviewed-Head: %s\nVerdict: APPROVE\nBlocking: 0\n\nFindings.\n' "$sha"
 }
-green='ci\tcompleted\tsuccess\nquality\tcompleted\tskipped\nchanges\tcompleted\tsuccess\n'
+green='ci\tcompleted\tsuccess\tgithub-actions\nquality\tcompleted\tskipped\tgithub-actions\nchanges\tcompleted\tsuccess\tgithub-actions\n'
 
 # case NAME WANT(pass|block) [ARGS...] — environment overrides apply.
 case_() {
@@ -39,6 +40,7 @@ case_() {
 	if PATH="$work/bin:$PATH" STUB_LOG="$work/merge.log" \
 		STUB_PR="${PR_JSON:-OPEN false v2.0 $sha MERGEABLE}" \
 		STUB_BEHIND="${BEHIND:-0}" STUB_CHECKS="${CHECKS-$green}" \
+		STUB_STATUS="${STATUS:-0 pending}" STUB_AFTER="${AFTER:-}" \
 		bash "$script" "$@" >/dev/null 2>&1; then got=pass; else got=block; fi
 	if [ "$got" != "$want" ]; then
 		echo "FAIL $name: want $want, got $got"
@@ -60,12 +62,16 @@ PR_JSON="OPEN false master $sha MERGEABLE" case_ master-base block 42 "$sha" "$r
 PR_JSON="MERGED false v2.0 $sha UNKNOWN" case_ not-open block 42 "$sha" "$r"
 PR_JSON="OPEN false v2.0 $sha CONFLICTING" case_ conflict block 42 "$sha" "$r"
 BEHIND=3 case_ behind-base block 42 "$sha" "$r"
-CHECKS='ci\tin_progress\t\n' case_ pending-check block 42 "$sha" "$r"
-CHECKS='ci\tcompleted\tsuccess\nrace\tcompleted\tfailure\n' case_ failed-check block 42 "$sha" "$r"
-CHECKS='ci\tcompleted\tsuccess\nrace\tcompleted\tcancelled\n' case_ cancelled-check block 42 "$sha" "$r"
-CHECKS='quality\tcompleted\tsuccess\n' case_ no-ci-check block 42 "$sha" "$r"
-CHECKS='ci\tcompleted\tskipped\n' case_ ci-skipped block 42 "$sha" "$r"
+CHECKS='ci\tin_progress\t\tgithub-actions\n' case_ pending-check block 42 "$sha" "$r"
+CHECKS='ci\tcompleted\tsuccess\tgithub-actions\nrace\tcompleted\tfailure\tgithub-actions\n' case_ failed-check block 42 "$sha" "$r"
+CHECKS='ci\tcompleted\tsuccess\tgithub-actions\nrace\tcompleted\tcancelled\tgithub-actions\n' case_ cancelled-check block 42 "$sha" "$r"
+CHECKS='quality\tcompleted\tsuccess\tgithub-actions\n' case_ no-ci-check block 42 "$sha" "$r"
+CHECKS='ci\tcompleted\tskipped\tgithub-actions\n' case_ ci-skipped block 42 "$sha" "$r"
 CHECKS='' case_ no-checks block 42 "$sha" "$r"
+CHECKS='ci\tcompleted\tsuccess\tsome-other-app\n' case_ ci-from-other-app block 42 "$sha" "$r"
+STATUS='2 failure' case_ legacy-status-failure block 42 "$sha" "$r"
+STATUS='1 pending' case_ legacy-status-pending block 42 "$sha" "$r"
+STATUS='3 success' case_ legacy-status-success pass 42 "$sha" "$r"
 
 review_ok | sed "s/$sha/$other/" >"$work/r1.md"
 case_ review-other-head block 42 "$sha" "$work/r1.md"
@@ -79,6 +85,13 @@ case_ review-blocking-findings block 42 "$sha" "$work/r4.md"
 case_ review-approve-then-block block 42 "$sha" "$work/r5.md"
 grep -v '^Verdict' "$r" >"$work/r6.md"
 case_ review-started-only block 42 "$sha" "$work/r6.md"
+# Quoted header lines further down never count.
+printf 'PR: #42\nReviewed-Head: %s\nVerdict: APPROVE\nBlocking: 2\n\n> Blocking: 0\nBlocking: 0\n' "$sha" >"$work/r8.md"
+case_ review-spoofed-blocking block 42 "$sha" "$work/r8.md"
+printf 'Notes\nPR: #42\nReviewed-Head: %s\nVerdict: APPROVE\nBlocking: 0\n' "$sha" >"$work/r9.md"
+case_ review-header-not-first block 42 "$sha" "$work/r9.md"
+printf 'PR: #42\nReviewed-Head: %s\nVerdict: APPROVE\nBlocking: 0\nReviewed-Head: %s\n' "$other" "$sha" >"$work/r10.md"
+case_ review-old-head-new-sha-later block 42 "$sha" "$work/r10.md"
 # A prefix of the SHA in the review is not the head.
 review_ok | sed "s/$sha/${sha:0:12}/" >"$work/r7.md"
 case_ review-short-head block 42 "$sha" "$work/r7.md"
@@ -89,6 +102,9 @@ case_ merge-blocked-no-call block 42 "$sha" "$work/r3.md" --merge
 case_ merge-ok pass 42 "$sha" "$r" --merge
 grep -qx "pr merge 42 --squash --match-head-commit $sha" "$work/merge.log" ||
 	{ echo "FAIL merge-ok: merge call was: $(cat "$work/merge.log")"; failures=$((failures + 1)); }
+
+# The merge is read back: a PR still open afterwards fails the gate.
+AFTER='OPEN ' case_ merge-not-read-back block 42 "$sha" "$r" --merge
 
 if [ "$failures" -ne 0 ]; then
 	echo "$failures failure(s)"
