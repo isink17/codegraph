@@ -724,60 +724,6 @@ func (s goSymbolScope) blocksBareNameTypeClaim(spelling string) bool {
 	return typeScopeGatedLanguage(s.language) && goBareCallName(spelling) && isTypeSymbolKind(s.kind)
 }
 
-// typeOnlyGatedLanguages returns the languages in which EVERY symbol a query's
-// input matched is a type this rule governs.
-//
-// Per language, not over the whole match set, because a bare-name leg serves
-// all the matched symbols at once and cannot say which one an edge meant. If an
-// input matches a Python class and a Kotlin class, the Kotlin half is a
-// legitimate answer (Kotlin resolves a bare class name across files with no
-// import) while the Python half is the refused population -- "every target is a
-// type" would have dropped the leg for both, and "any" would have kept it for
-// both. The caller keeps the leg and subtracts only the languages that are
-// entirely type-and-gated from it.
-//
-// A language whose matched targets include a function keeps its leg: the
-// callers that leg finds are real callers of that function. A target with no
-// persisted language contributes nothing, since there is no language to decide.
-func typeOnlyGatedLanguages(scopes map[int64]goSymbolScope) map[string]struct{} {
-	typeOnly := map[string]bool{}
-	for _, scope := range scopes {
-		if scope.language == "" {
-			continue
-		}
-		// An all-kinds language (P22.13) is never "type-only" here: its bare leg
-		// is not dropped but scoped, by sqlGoBareSourceScope, so subtracting it
-		// would refuse the same-file writers that scope exists to keep.
-		eligible := isTypeSymbolKind(scope.kind) && typeScopeGatedLanguage(scope.language) &&
-			!bareNameScopeAllKinds(scope.language)
-		if seen, ok := typeOnly[scope.language]; ok {
-			typeOnly[scope.language] = seen && eligible
-			continue
-		}
-		typeOnly[scope.language] = eligible
-	}
-	out := map[string]struct{}{}
-	for language, only := range typeOnly {
-		if only {
-			out[language] = struct{}{}
-		}
-	}
-	return out
-}
-
-// languagesExcept returns `languages` without the excluded set, preserving the
-// input's order so statement text stays a function of the input.
-func languagesExcept(languages []string, excluded map[string]struct{}) []string {
-	out := make([]string, 0, len(languages))
-	for _, language := range languages {
-		if _, drop := excluded[language]; drop {
-			continue
-		}
-		out = append(out, language)
-	}
-	return out
-}
-
 // -- incremental invalidation ----------------------------------------------
 //
 // P22.9 makes import evidence a resolution input, and that opens the direction

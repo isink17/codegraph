@@ -228,12 +228,11 @@ func TestCppBareCallKeepsFreeFunctionRecall(t *testing.T) {
 	}
 }
 
-// TestCppBareCallMemberAndFreeFunctionFailsClosed is §15 and §16 together, and
-// it records a limitation rather than hiding it.
-//
-// Source-wise a free `caller()` reaches the free `foo`; the member is not an
-// eligible candidate and must not veto it.
-func TestCppBareCallMemberAndFreeFunctionFailsClosed(t *testing.T) {
+// TestCppBareCallFreeCallerBindsFreeFunctionNotMember is §15 and §16
+// together: a free `caller()` reaches the free `foo`, and the same-named class
+// member is not an eligible candidate, so it neither wins nor vetoes the free
+// function as an ambiguity competitor.
+func TestCppBareCallFreeCallerBindsFreeFunctionNotMember(t *testing.T) {
 	r := newCppRepo(t)
 	r.write("a.cpp", "struct A {\n    void foo() {}\n};\nvoid foo() {}\nvoid caller() { foo(); }\n")
 	r.run("index")
@@ -242,12 +241,14 @@ func TestCppBareCallMemberAndFreeFunctionFailsClosed(t *testing.T) {
 	if got := r.callers("A::foo"); len(got) != 0 {
 		t.Fatalf("FindCallers(A::foo) = %v, want none", got)
 	}
+	if got := r.callers("foo"); !reflect.DeepEqual(got, []string{"caller"}) {
+		t.Fatalf("FindCallers(foo) = %v, want [caller]", got)
+	}
 }
 
-// TestCppBareCallScopedCandidateNotFirstRow pins §17's safe half: with an
-// eligible `A::foo` and an ineligible `B::foo`, the answer is never `B::foo` and
-// never depends on which file was indexed first. (That the eligible one is not
-// bound either is the repo-wide ambiguity level documented above.)
+// TestCppBareCallScopedCandidateNotFirstRow pins §17 in both directions: with
+// the caller's own `A::foo` eligible and an included `B::foo` ineligible, the
+// bare call binds `A::foo` and never `B::foo`, whichever file is indexed first.
 func TestCppBareCallScopedCandidateNotFirstRow(t *testing.T) {
 	for _, order := range [][]string{{"a.cpp", "b.h"}, {"b.h", "a.cpp"}} {
 		r := newCppRepo(t)
@@ -261,10 +262,14 @@ func TestCppBareCallScopedCandidateNotFirstRow(t *testing.T) {
 			r.write(name, sources[name])
 		}
 		r.run("index")
-		for _, bound := range r.boundTargets("foo") {
-			if bound == "B::foo" {
-				t.Fatalf("order %v bound the ineligible B::foo", order)
-			}
+		if got := r.boundTargets("foo"); !reflect.DeepEqual(got, []string{"A::foo"}) {
+			t.Fatalf("order %v: bound targets = %v, want [A::foo]", order, got)
+		}
+		if got := r.callers("A::foo"); !reflect.DeepEqual(got, []string{"A::caller"}) {
+			t.Fatalf("order %v: FindCallers(A::foo) = %v, want [A::caller]", order, got)
+		}
+		if got := r.callees("A::caller"); !reflect.DeepEqual(got, []string{"A::foo"}) {
+			t.Fatalf("order %v: FindCallees(A::caller) = %v, want [A::foo]", order, got)
 		}
 		if got := r.callers("B::foo"); len(got) != 0 {
 			t.Fatalf("order %v: FindCallers(B::foo) = %v, want none", order, got)

@@ -286,9 +286,8 @@ void far() {
 		t.Fatalf("context expansion lost the same-file writer: %v", callers)
 	}
 
-	// FindCallers builds its own legs, and a cpp TYPE target reaches them through
-	// typeOnlyGatedLanguages: subtracting cpp there would drop the bare leg
-	// outright and lose the same-file writer this scope exists to keep.
+	// FindCallers answers a known target from its persisted bound edges only,
+	// so the same-file writer must arrive through the binding itself.
 	directRows, err := r.store.FindCallers(context.Background(), r.repo.ID, "Message", ownID, 50, 0)
 	if err != nil {
 		t.Fatal(err)
