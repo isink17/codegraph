@@ -501,8 +501,14 @@ func resolverRuleWithholds(id resolverRuleID) func(edgeTarget, *binderCandidateF
 // unresolved with no rule refusing it: no candidate, or a language pass that
 // owns the edge and proved nothing.
 func (s *Store) edgeRefusalReasons(ctx context.Context, repoID int64, edgeIDs []int64) (map[int64][]resolverRuleID, error) {
+	return edgeRefusalReasonsQuery(ctx, s.db, repoID, edgeIDs)
+}
+
+// edgeRefusalReasonsQuery is edgeRefusalReasons over any querier, so a caller
+// can read the edges and every fact they are judged on from one snapshot.
+func edgeRefusalReasonsQuery(ctx context.Context, q execQuerier, repoID int64, edgeIDs []int64) (map[int64][]resolverRuleID, error) {
 	var targets []edgeTarget
-	if err := sqliteBatchedIDQuery(ctx, s.db, edgeIDs,
+	if err := sqliteBatchedIDQuery(ctx, q, edgeIDs,
 		`SELECT e.id, e.dst_name, e.file_id, e.evidence, e.edge_kind, f.language
 		FROM edges e JOIN files f ON f.id = e.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.id IN (`,
@@ -519,11 +525,11 @@ func (s *Store) edgeRefusalReasons(ctx context.Context, repoID int64, edgeIDs []
 	var facts binderCandidateFacts
 	var err error
 	if hasGoTargets(targets) {
-		if facts.goLocalClaims, err = goLocalQualifierClaims(ctx, s.db, repoID); err != nil {
+		if facts.goLocalClaims, err = goLocalQualifierClaims(ctx, q, repoID); err != nil {
 			return nil, err
 		}
 	}
-	if facts.testFileIDs, err = testFileIDsForRepo(ctx, s.db, repoID); err != nil {
+	if facts.testFileIDs, err = testFileIDsForRepo(ctx, q, repoID); err != nil {
 		return nil, err
 	}
 	var dotted []string
@@ -534,21 +540,35 @@ func (s *Store) edgeRefusalReasons(ctx context.Context, repoID int64, edgeIDs []
 	}
 	// A name loaded twice in two chunks would count its candidates twice.
 	dotted = slices.Compact(slices.Sorted(slices.Values(dotted)))
-	if facts.byQualified, err = s.resolveSymbolsByQualifiedNames(ctx, repoID, dotted, facts.testFileIDs); err != nil {
+	if facts.byQualified, err = resolveSymbolCandidatesQuery(ctx, q, repoID, "qualified_name", dotted, facts.testFileIDs); err != nil {
 		return nil, err
 	}
-	if facts.bareLevel, err = s.resolveSymbolCandidates(ctx, repoID, "name", dotted, facts.testFileIDs); err != nil {
+	if facts.bareLevel, err = resolveSymbolCandidatesQuery(ctx, q, repoID, "name", dotted, facts.testFileIDs); err != nil {
 		return nil, err
 	}
 	out := map[int64][]resolverRuleID{}
 	for _, t := range targets {
 		for _, rule := range resolverBindGateRules {
+			if !edgeRefusalEvaluates(rule) {
+				continue
+			}
 			if (rule.owns != nil && rule.owns(t)) || (rule.withholds != nil && rule.withholds(t, &facts)) {
 				out[t.edgeID] = append(out[t.edgeID], rule.id)
 			}
 		}
 	}
 	return out, nil
+}
+
+// edgeRefusalSkipped are rules with a Go twin that edgeRefusalReasons still
+// does not consult: own_module_import's veto is computed by the pass that also
+// binds, so it cannot be decided without writing.
+var edgeRefusalSkipped = map[resolverRuleID]bool{ruleOwnModuleImport: true}
+
+// edgeRefusalEvaluates reports whether edgeRefusalReasons consults the rule:
+// it has a decide-only Go twin and is not skipped.
+func edgeRefusalEvaluates(rule resolverGateRule) bool {
+	return (rule.owns != nil || rule.withholds != nil) && !edgeRefusalSkipped[rule.id]
 }
 
 // binderCandidateRestrictions are the chosen-candidate restrictions the

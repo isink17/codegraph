@@ -1457,6 +1457,32 @@ func asInt64(value any) (int64, bool) {
 	}
 }
 
+// handleExplainEdge explains the selected edges from the current graph state
+// and returns the same document `codegraph explain` prints as `data`. A
+// selector that matches no edge is an error.
+func (s *Server) handleExplainEdge(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		EdgeID int64  `json:"edge_id"`
+		File   string `json:"file"`
+		Line   int    `json:"line"`
+		Name   string `json:"name"`
+		Limit  int    `json:"limit"`
+		Offset int    `json:"offset"`
+	}
+	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	res, err := s.store.ExplainEdges(ctx, s.repoID, store.EdgeSelector{
+		EdgeID: req.EdgeID, File: req.File, Line: req.Line, Name: req.Name, Limit: req.Limit, Offset: req.Offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": res}, nil
+}
+
 // handleCheckConstraints evaluates the repo-root constraints document against
 // the server's repository and returns the same result the CLI prints as `data`.
 //

@@ -387,6 +387,31 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			name:        "explain",
+			description: "explain why an edge is resolved or unresolved in the current graph",
+			usageLines: []string{
+				"  explain [PATH] --edge-id N",
+				"  explain [PATH] --file FILE --line N [--name NAME]",
+				"    explains the current graph state only, never how an edge was decided in the past",
+			},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root (defaults to the git repo root)"},
+				{name: "--edge-id N", description: "edge to explain"},
+				{name: "--file FILE", description: "repository-relative file of the edges to explain"},
+				{name: "--line N", description: "line of the edges to explain"},
+				{name: "--name NAME", description: "only the edge with this exact destination name"},
+				{name: "--limit N", description: "edges per page (default 20, max 500)"},
+				{name: "--offset N", description: "offset into the matching edges"},
+			},
+			examples: []string{
+				"codegraph explain . --file internal/app/main.go --line 42",
+				"codegraph explain . --edge-id 1234",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runExplain(ctx, cfg, stdout, args)
+			},
+		},
+		{
 			// bench_queries measures; audit judges. Keeping them separate keeps
 			// the audit report free of timing noise and this report free of
 			// correctness findings.

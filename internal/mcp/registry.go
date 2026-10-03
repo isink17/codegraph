@@ -291,7 +291,6 @@ var toolRegistry = []toolDescriptor{
 		category:   "audit",
 		handler:    (*Server).handleCheckConstraints,
 	},
-
 	// Hidden diagnostics. Callable and searchable, never advertised: the whole
 	// point of measuring context cost is not to add any.
 	{
@@ -316,6 +315,14 @@ var toolRegistry = []toolDescriptor{
 		category:    "history",
 		hidden:      true,
 		handler:     (*Server).handleFileHistory,
+	},
+	{
+		name:        "explain_edge",
+		description: "Explain why an edge is resolved or unresolved in the current graph: its persisted resolution, or the resolver rules that provably refuse it (read-only)",
+		properties:  []string{"edge_id", "file", "line", "name", "limit", "offset"},
+		category:    "audit",
+		hidden:      true,
+		handler:     (*Server).handleExplainEdge,
 	},
 
 	// Gateway meta tools. Absent from full mode on purpose: adding them there
@@ -458,7 +465,7 @@ func (d toolDescriptor) definition() map[string]any {
 // type and checked as another.
 func argType(prop string) string {
 	switch prop {
-	case "limit", "offset", "symbol_id", "depth", "max_files", "max_symbols", "max_steps", "examples", "max_tokens":
+	case "limit", "offset", "edge_id", "line", "symbol_id", "depth", "max_files", "max_symbols", "max_steps", "examples", "max_tokens":
 		return "integer"
 	case "force", "include_tests", "include_callers", "include_schema", "reset":
 		return "boolean"

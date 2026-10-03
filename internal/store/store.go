@@ -6885,6 +6885,12 @@ func (c symbolCandidates) names() map[string]struct{} {
 // literal, never caller input, and must be one of the four identity columns
 // the binder matches on.
 func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, column string, names []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
+	return resolveSymbolCandidatesQuery(ctx, s.db, repoID, column, names, testFileIDs)
+}
+
+// resolveSymbolCandidatesQuery is resolveSymbolCandidates over any querier, so
+// a read-only transaction can load the same candidates.
+func resolveSymbolCandidatesQuery(ctx context.Context, q queryContexter, repoID int64, column string, names []string, testFileIDs map[int64]struct{}) (symbolCandidates, error) {
 	switch column {
 	case "qualified_name", "name", "dot_tail2", "dot_tail3":
 	default:
@@ -6958,7 +6964,7 @@ func (s *Store) resolveSymbolCandidates(ctx context.Context, repoID int64, colum
 				args = append(args, name)
 			}
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := q.QueryContext(ctx, query, args...)
 		if err != nil {
 			return symbolCandidates{}, err
 		}

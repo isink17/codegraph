@@ -326,6 +326,7 @@ both MCP modes (`full` and `gateway`) and the CLI fallback.
 | `audit` | Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only). Optional `examples` integer caps examples per finding; `0` means counts only |
 | `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; see [docs/constraints.md](docs/constraints.md) |
 | `file_history` | File-level Git history from the last index (not in `tools/list`; call by name or find with `tool_search`). See [docs/git-history.md](docs/git-history.md) |
+| `explain_edge` | Explain why an edge is resolved (persisted strategy and confidence) or unresolved (the resolver rules that provably refuse it, or `unknown`) in the current graph (read-only; not in `tools/list`; call by name or find with `tool_search`). Select by `edge_id`, or `file` + `line` (+ `name`); `limit`/`offset` page; see [docs/explain.md](docs/explain.md) |
 
 ### Session Memory
 
@@ -805,6 +806,10 @@ codegraph check-constraints . --config rules.json    # Alias; evaluate another c
 # Git history (file level; see docs/git-history.md)
 codegraph file_history <path>             # Files with the most recent-window commits first
 codegraph file_history <path> --file F    # History of one or more files
+
+# Edge explanations (see docs/explain.md)
+codegraph explain . --file cmd/main.go --line 13     # Why each edge on that line is (un)resolved
+codegraph explain . --edge-id 1234                   # One edge by id
 
 # Query latency benchmark (read-only; never indexes or migrates)
 codegraph bench-queries <path>                    # Benchmark local graph queries on an indexed repo

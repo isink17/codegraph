@@ -948,10 +948,10 @@ func TestRegistryIsTheOnlySourceOfTruth(t *testing.T) {
 	if len(unlisted) != len(preGatewayToolNames)-len(core) {
 		t.Errorf("gateway-unlisted tools = %d, want %d", len(unlisted), len(preGatewayToolNames)-len(core))
 	}
-	// Hidden tools (the diagnostic and the history enrichment) never contribute
+	// Hidden tools (the diagnostic, the history enrichment and edge explanations) never contribute
 	// an entry to either tools/list payload.
-	if !reflect.DeepEqual(diagnostic, []string{"usage_stats", "file_history"}) {
-		t.Errorf("hidden tools = %v, want [usage_stats file_history]", diagnostic)
+	if !reflect.DeepEqual(diagnostic, []string{"usage_stats", "file_history", "explain_edge"}) {
+		t.Errorf("hidden tools = %v, want [usage_stats file_history explain_edge]", diagnostic)
 	}
 
 	// Every registry name has a category, so tool_search can rank it.
