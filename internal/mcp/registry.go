@@ -85,8 +85,12 @@ type toolDescriptor struct {
 	// session for its schema. A tool an agent needs on a normal task belongs in the
 	// list; a tool an agent reaches for when it is specifically asking about the
 	// tooling does not.
-	hidden  bool
-	handler toolHandler
+	hidden bool
+	// diagnostic marks a hidden tool about the tooling itself. tool_search
+	// orders it below every real capability unless asked for by exact name; a
+	// hidden capability such as file_history ranks normally.
+	diagnostic bool
+	handler    toolHandler
 
 	// acceptsFormat and acceptsDetail are derived from properties in init(). The
 	// usage meter reads them so a tool is only bucketed by an argument it actually
@@ -299,6 +303,7 @@ var toolRegistry = []toolDescriptor{
 		properties:  []string{"reset", "limit"},
 		category:    "overview",
 		hidden:      true,
+		diagnostic:  true,
 		handler:     (*Server).handleUsageStats,
 	},
 
@@ -360,6 +365,9 @@ func init() {
 		}
 		if desc.gatewayMeta && desc.gatewayCore {
 			panic("mcp: tool " + desc.name + " cannot be both a meta tool and a core tool")
+		}
+		if desc.diagnostic && !desc.hidden {
+			panic("mcp: diagnostic tool " + desc.name + " must be hidden")
 		}
 		if desc.hidden && (desc.gatewayCore || desc.gatewayMeta) {
 			panic("mcp: tool " + desc.name + " cannot be hidden and advertised at once")

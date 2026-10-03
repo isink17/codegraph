@@ -85,10 +85,15 @@ func dumpTables(t *testing.T, db *sql.DB, keep func(table string) bool, dropColu
 func isHistoryTable(name string) bool { return strings.HasPrefix(name, "git_") }
 
 // semanticDump is everything except history, scan bookkeeping and clocks.
+// dropIDs compares two separately built databases: row ids, and the full-text
+// index internals keyed by them, follow parallel insertion order there.
 func semanticDump(t *testing.T, s *profileStore, dropIDs bool) string {
 	return dumpTables(t, s.raw(t), func(table string) bool {
 		switch table {
 		case "scans", "scan_language_coverage", "schema_migrations", "sqlite_sequence", "session_events":
+			return false
+		}
+		if dropIDs && strings.Contains(table, "_fts") {
 			return false
 		}
 		return !isHistoryTable(table)
@@ -208,10 +213,11 @@ func TestHistoryFreshIncrementalAndRewriteParity(t *testing.T) {
 	// Worktree-only change: watermark unchanged, change set refreshed.
 	r.Write("b.go", "package h\n\nfunc B() {}\n")
 	r.Write("new.go", "package h\n")
+	r.Write(".codegraph/graph.sqlite-wal", "x") // codegraph's own artifacts
 	index(t, inc, r.Dir, true, false)
 	assertParity("dirty")
-	if !strings.Contains(historyDump(t, inc), "git_worktree_changes: 1|'new.go'") {
-		t.Fatalf("untracked file not recorded:\n%s", historyDump(t, inc))
+	if dump := historyDump(t, inc); !strings.Contains(dump, "git_worktree_changes: 1|'new.go'") || strings.Contains(dump, ".codegraph") {
+		t.Fatalf("worktree changes wrong:\n%s", dump)
 	}
 
 	// Rewrite: reset two commits back and commit something else. The old

@@ -2,8 +2,11 @@ package indexer
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/githistory"
 )
 
@@ -41,6 +44,11 @@ func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string
 	if err != nil {
 		return absent(githistory.ReasonOf(err))
 	}
+	// codegraph's own database lives under the root; it is not source and its
+	// WAL files come and go, so it must never read as a worktree change.
+	changes = slices.DeleteFunc(changes, func(p string) bool {
+		return strings.HasPrefix(p, config.RepoArtifactsDir+"/")
+	})
 	prev, found, err := i.store.GitHistoryState(ctx, repoID)
 	if err == nil && found && prev.Status == state.Status && prev.Watermark == state.Watermark &&
 		prev.WindowLimit == state.WindowLimit && prev.Algorithm == state.Algorithm {
