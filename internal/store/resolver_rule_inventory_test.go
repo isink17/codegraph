@@ -47,23 +47,23 @@ func TestResolverGateSQLMatchesHandComposedGate(t *testing.T) {
 // TestResolverGateRuleInventory, so the parity question is answered when the
 // rule is written rather than discovered later.
 var resolverRuleParity = map[resolverRuleID]string{
-	"language_gate":              "behavioural only: TestResolverLanguageGating_AllEntrypoints; the Go side keys candidates by language",
-	"caller_kind_candidate":      "behavioural only: TestResolverTestShadow_AllEntrypoints; candidateGroup.chosen",
+	"language_gate":              "TestResolverGateRuleFactParity, TestResolverLanguageGating_AllEntrypoints; parity only, the gate carries the candidate join and cannot be disabled alone",
+	"caller_kind_candidate":      "TestResolverGateRuleFactParity, TestResolverTestShadow_AllEntrypoints; parity only, per-strategy candidate choice refuses the same edges",
 	"cpp_evidence_ownership":     "TestResolverOwnershipRulesMatchGoTwins, TestCppScopeVetoSQLMatchesGoTwin",
 	"go_bare_package_scope":      "TestResolverOwnershipRulesMatchGoTwins",
 	"go_local_qualifier":         "TestGoLocalQualifierVetoSQLMatchesGoTwin",
-	"bare_type_scope":            "behavioural only: TestResolverTypeScope_AllEntrypoints; reads import scope facts",
+	"bare_type_scope":            "TestResolverGateRuleFactParity, TestResolverTypeScope_AllEntrypoints",
 	"cpp_bare_namespace_scope":   "no comparison: bare C++ edges never reach a generic strategy (cpp_evidence_ownership)",
-	"cpp_bare_member_scope":      "behavioural only: TestCppBareMemberScope_AllEntrypoints; kind list in TestCppClassMemberKindsSQLMatchesGoTwin",
+	"cpp_bare_member_scope":      "no comparison: bare C++ edges never reach a generic strategy (cpp_evidence_ownership); TestCppBareMemberScope_AllEntrypoints, kind list in TestCppClassMemberKindsSQLMatchesGoTwin",
 	"ruby_ownership":             "TestResolverOwnershipRulesMatchGoTwins, TestRubyScopeVetoSQLMatchesGoTwin",
-	"jvm_scope_ownership":        "behavioural only: reads file_scope_evidence; JVM fresh/incremental parity tests",
-	"csharp_scope_ownership":     "behavioural only: veto table filled by resolveCSharpScope",
-	"typescript_scope_ownership": "behavioural only: veto table filled by resolveTypeScriptScope",
-	"python_scope_claims":        "behavioural only: TestPythonScopeClaimsSurviveIntoTheWeakStrategy",
+	"jvm_scope_ownership":        "TestResolverGateRuleFactParity",
+	"csharp_scope_ownership":     "TestResolverGateRuleFactParity",
+	"typescript_scope_ownership": "TestResolverGateRuleFactParity",
+	"python_scope_claims":        "TestResolverGateRuleFactParity, TestPythonScopeClaimsSurviveIntoTheWeakStrategy",
 	"php_ownership":              "TestResolverOwnershipRulesMatchGoTwins",
 	"swift_ownership":            "TestResolverOwnershipRulesMatchGoTwins",
-	"broad_ambiguity":            "behavioural only: TestResolverAmbiguity_AllEntrypoints; candidateGroup.levelUndecidedFor",
-	"own_module_import":          "behavioural only: TestOwnModuleImportResolvesOnEveryEntryPoint",
+	"broad_ambiguity":            "TestResolverGateRuleFactParity, TestResolverAmbiguity_AllEntrypoints; parity only, per-strategy uniqueness refuses the same edges",
+	"own_module_import":          "TestResolverGateRuleFactParity, TestOwnModuleImportResolvesOnEveryEntryPoint; parity only, the own-module pass refuses the same edges",
 }
 
 func TestResolverGateRuleInventory(t *testing.T) {
