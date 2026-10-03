@@ -12,6 +12,8 @@
 - `internal/cli`: command handlers and JSON/text output
 - `internal/store`: SQLite connection, migrations, persistence
 - `internal/indexer`: repository scan, hashing, incremental updates
+- `internal/githistory`: bounded file-level Git history (enrichment only, never
+  semantic evidence); see `docs/git-history.md`
 - `internal/parser`: parser interfaces and language adapters
 - `internal/classify`: evidence-based classification of unresolved edge targets
   (builtin/stdlib/external/unknown); owns all per-language rules
