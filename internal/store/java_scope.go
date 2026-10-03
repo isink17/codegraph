@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
@@ -336,13 +338,42 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		}
 		return javaUniqueVisible(exact, pkg, "java_package_scope")
 	}
+	// A member type of an enclosing class shadows every import and package
+	// type (JLS 6.4.1). One the innermost class declares also hides any it
+	// inherits, so it is the answer. One a further-out class declares can be
+	// hidden by a member type a nearer class inherits, which the graph does
+	// not record, so the name stays unresolved.
+	for rel := container; rel != ""; {
+		var members []javaScopeSymbol
+		for _, s := range byName[name] {
+			if javaTypeIdentityEligible(s) && (s.qname == pkg+"."+rel+"."+name || s.qname == rel+"."+name) {
+				members = append(members, s)
+			}
+		}
+		if len(members) > 0 {
+			if rel != container || len(members) != 1 {
+				return javaScopeSymbol{}, false, ""
+			}
+			return members[0], true, "java_package_scope"
+		}
+		dot := strings.LastIndex(rel, ".")
+		if dot < 0 {
+			break
+		}
+		rel = rel[:dot]
+	}
+	// Supertypes are not recorded, so any member type of that name the
+	// caller's classes could inherit -- one not private, and not
+	// package-private in another package (JLS 8.5) -- may be the one meant.
+	// Refusing costs every simple name that some member type also uses.
+	for _, s := range byName[name] {
+		if javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" && (s.visibility != "package" || s.pkg == pkg) {
+			return javaScopeSymbol{}, false, ""
+		}
+	}
 	var c []javaScopeSymbol
 	for _, s := range byName[name] {
 		if !javaTypeIdentityEligible(s) {
-			continue
-		}
-		if container != "" && (s.qname == pkg+"."+container+"."+name || s.qname == container+"."+name) {
-			c = append(c, s)
 			continue
 		}
 		if s.pkg == pkg && s.container == s.pkg {
@@ -429,7 +460,24 @@ func javaConstructorAccepts(s javaScopeSymbol, call sql.NullInt64) bool {
 	return !s.arityMax.Valid || call.Int64 <= s.arityMax.Int64
 }
 
+// javaUnqualifiedCreation reports whether a construction's source text starts
+// with the `new` keyword. A qualified creation (`outer.new Inner()`,
+// `this.new Inner()`, `Outer.this.new Inner()`) starts with its qualifier and
+// constructs a member class of the qualifier's type (JLS 15.9.1), which a
+// lookup of the bare class name does not find; it stays unresolved.
+func javaUnqualifiedCreation(evidence string) bool {
+	rest, ok := strings.CutPrefix(evidence, "new")
+	if !ok {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return r != '_' && r != '$' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+}
+
 func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport) (javaScopeSymbol, string) {
+	if !javaUnqualifiedCreation(e.evidence) {
+		return javaScopeSymbol{}, ""
+	}
 	t, ok, _ := javaType(e.name, e.pkg, e.container, byQName, byName, imps[e.file])
 	if !ok {
 		return javaScopeSymbol{}, ""
