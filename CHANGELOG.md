@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+Scope-model documentation now covers Go, Rust, C/C++, Java, Kotlin, TypeScript/JavaScript, Python, C#, PHP and Swift alongside Ruby (`docs/scope-models.md`). Resolver behavior is unchanged.
+
+Rust: explicit imports now take precedence over glob imports for the first segment of qualified calls (`use b::S; S::new()`), and when two imports bring in the same name, only the one that is a function is used as the call target. A call that resolves to a non-function item in a module that also has glob imports is left unresolved instead of binding to the type; re-export walks stay inside the caller's crate root.
+
+TypeScript and JavaScript calls now bind only callable values. A type alias or interface no longer answers a call, whether it was found in the same file, through an import, or as a namespace member. `export ... from` re-exports no longer act as bindings in their own module, so a same-file `ns.bar()` or `foo()` through `export * as ns from` or `export { foo } from` stays unresolved, as does `ns.bar()` when `bar` is itself a re-exported namespace. Same-file calls to a function that is default-exported or listed in `export { … }` now bind the declaration.
+A class merged with a same-named interface is called as the class.
+
+Java calls in files with a package declaration now bind to the caller's own class: unqualified and `this.` calls, and private static methods called through their own class name, previously stayed unresolved. A single-static-import no longer binds a call that a method of the calling or an enclosing class shadows, and a private constructor of a same-named class in another package is no longer bound. Bare and `this.` calls inside anonymous classes, enum-constant bodies and local classes stay unresolved, because those classes' own members are not modelled. Inherited members remain unresolved. `treesitter:java:v5` reparses unchanged Java files on the next complete update.
+
+Performance: dot-suffix resolution no longer builds candidate groups for dotted names that only ordinary Ruby calls carry, since Ruby owns those calls and no generic strategy may bind them. On the Rails repository a full index dropped from about 250 s to about 77 s and a 5-file incremental update from about 200 s to about 31 s, with an identical graph.
+
+The non-CGO Python parser no longer records keyword syntax as calls: `with x as (a, b)`
+called `as`, a match statement called `match`, and a case pattern such as
+`case Point(x=0)` called `Point`. Match subjects, case guards and ordinary calls named
+`match` or `case` are kept. `python-regex:python:v3` reparses unchanged Python files.
+Case guards and same-line case bodies keep their calls.
+
+Rust: a bare call in a module with glob imports (`use a::*;`) no longer binds the glob's item when the module declares its own function of that name or explicitly imports one (`use b::f;`), in either declaration order. Glob imports now lose only to items in the same namespace, as in Rust. An explicit import or own item that may not be a value (a struct, whose tuple or braced form is not recorded) leaves the call unresolved rather than guessing. A trait or enum never shadows a glob-imported function. For qualified calls (`x::f()`), an own module or type shadows a glob-imported one.
+
+TypeScript and JavaScript calls no longer bind declarations their spelling cannot name. A bare call skips same-file class methods, and a member call through a named or default import (`Foo.bar()`) no longer binds the imported symbol itself; it binds only through a re-exported namespace and otherwise stays unresolved.
+
 Java `new` expressions now select constructors by syntactic argument and parameter counts. Commas inside nested calls, lambdas, string and char literals, annotation arguments or generic parameter types previously miscounted arity and could bind the wrong constructor; varargs constructors now accept their variable arity. Equal-arity overloads stay unresolved. The Java parser profile becomes `treesitter:java:v4`, so `codegraph update` re-parses existing Java files once.
 
 Ruby scope documentation now states that implicit calls are recognized only in call syntax (arguments, parentheses, a block, or a `?`/`!` method name); a bare argument-less identifier is not extracted as a call because the syntax tree cannot distinguish it from a local variable.
@@ -16,6 +37,8 @@ not shadow a module definition of the same name (a wrong call edge), and a neste
 `def café` bound the fragment `caf`, refusing a real `caf()` import edge.
 `treesitter:python:v2` and `python-regex:python:v2` reparse unchanged Python files on
 the next complete update.
+
+C++ calls the C++ evidence pass owns (`ns::foo()`, `A::foo()`, macro-unexpanded calls) no longer bind through generic name lookup on incremental updates when a fresh index refuses them.
 
 Ruby scope documentation now states supported static resolution and deferred runtime behavior, including the separation of `require` metadata and Rails/Zeitwerk conventions from scope evidence. Resolver behavior is unchanged.
 

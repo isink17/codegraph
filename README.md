@@ -121,6 +121,8 @@ Go (`go/ast`) and Python (pure fallback) call edges; Java, Kotlin, C#, TypeScrip
 JavaScript, Rust, Ruby, Swift, PHP, and C/C++ retain heuristic symbol/import
 navigation without call edges. They are not release-equivalent.
 
+Every language with call resolution uses a partial static scope model. [Language scope models](docs/scope-models.md) describes, for each language, the facts it proves, which calls it owns, lookup precedence, visibility, interop, unsupported forms and incremental behaviour.
+
 Ruby uses a partial static scope model. See [Ruby scope and limitations](docs/ruby-scope.md) for supported receivers, visibility, constant hazards, and why `require` and Rails/Zeitwerk conventions do not grant resolution evidence.
 
 > Node.js repos are supported; full tree-sitter node support is still in progress.
