@@ -19,15 +19,24 @@ type JavaAdapter struct {
 	// from raw text, for profile-transition tests. Every other fact follows
 	// the current parser.
 	legacyPackage bool
+	// legacyArity reproduces treesitter:java:v3, which recorded no AST
+	// argument count on constructor calls and no constructor parameter
+	// count, for profile-transition tests.
+	legacyArity bool
 }
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
+
+// NewJavaV3 returns a parser that reports treesitter:java:v3 and omits the
+// constructor arity facts v4 records. It exists only to reproduce v3
+// databases in profile-transition tests.
+func NewJavaV3() *JavaAdapter { return &JavaAdapter{legacyArity: true} }
 
 // NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
 // first `package x;` spelled anywhere in the file, comments and strings
 // included, as its package. It exists only to reproduce v2 databases in
 // profile-transition tests.
-func NewJavaV2() *JavaAdapter { return &JavaAdapter{legacyPackage: true} }
+func NewJavaV2() *JavaAdapter { return &JavaAdapter{legacyPackage: true, legacyArity: true} }
 
 func (a *JavaAdapter) Language() string     { return "java" }
 func (a *JavaAdapter) Extensions() []string { return []string{".java"} }
@@ -54,6 +63,18 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	javaExtractImports(root, content, &pf)
 	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
 	javaExtractCalls(root, content, &pf)
+	if a.legacyArity {
+		for i := range pf.Edges {
+			if pf.Edges[i].Kind == "constructs" {
+				pf.Edges[i].CallArity = nil
+			}
+		}
+		for i := range pf.Symbols {
+			if pf.Symbols[i].Kind == "constructor" {
+				pf.Symbols[i].ArityMin, pf.Symbols[i].ArityMax = nil, nil
+			}
+		}
+	}
 	linkTestsGeneric(pf.Scope.Package, &pf, func(target string) string {
 		return "func:java:" + testTargetModule(pf.Scope.Package, "Test", "Tests") + ":" + target
 	})
@@ -187,10 +208,14 @@ func javaAddMethod(node *sitter.Node, module, container string, content []byte, 
 	vis := javaMethodVisibility(node, content)
 
 	kind := "function"
+	var arityMin, arityMax *int
 	if node.Type() == "constructor_declaration" {
 		kind = "constructor"
+		arityMin, arityMax = javaDeclarationArity(node)
 	}
 	pf.Symbols = append(pf.Symbols, graph.Symbol{
+		ArityMin:      arityMin,
+		ArityMax:      arityMax,
 		Language:      "java",
 		Kind:          kind,
 		Name:          name,
@@ -287,7 +312,7 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if name == "" {
 			continue
 		}
-		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: nodeText(creation, content), Line: int(creation.StartPoint().Row) + 1})
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: nodeText(creation, content), Line: int(creation.StartPoint().Row) + 1, CallArity: javaMethodCallArity(creation)})
 	}
 	for _, call := range findDescendants(root, "method_invocation") {
 		nameNode := childByFieldName(call, "name")
@@ -315,6 +340,39 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+// javaDeclarationArity counts a declaration's parameters from the AST, so
+// generic types and annotation arguments never add to the count. A trailing
+// varargs parameter leaves the maximum unbounded (nil); a recovery error
+// leaves both unknown (nil, nil).
+func javaDeclarationArity(node *sitter.Node) (*int, *int) {
+	params := childByFieldName(node, "parameters")
+	if params == nil || params.HasError() {
+		return nil, nil
+	}
+	fixed, varargs := 0, false
+	for i := range int(params.NamedChildCount()) {
+		switch params.NamedChild(i).Type() {
+		case "formal_parameter":
+			if varargs {
+				return nil, nil
+			}
+			fixed++
+		case "spread_parameter":
+			if varargs {
+				return nil, nil
+			}
+			varargs = true
+		case "receiver_parameter", "line_comment", "block_comment":
+		default:
+			return nil, nil
+		}
+	}
+	if varargs {
+		return &fixed, nil
+	}
+	return &fixed, &fixed
 }
 
 func javaMethodCallArity(call *sitter.Node) *int {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Java `new` expressions now select constructors by syntactic argument and parameter counts. Commas inside nested calls, lambdas, string and char literals, annotation arguments or generic parameter types previously miscounted arity and could bind the wrong constructor; varargs constructors now accept their variable arity. Equal-arity overloads stay unresolved. The Java parser profile becomes `treesitter:java:v4`, so `codegraph update` re-parses existing Java files once.
+
 Ruby scope documentation now states that implicit calls are recognized only in call syntax (arguments, parentheses, a block, or a `?`/`!` method name); a bare argument-less identifier is not extracted as a call because the syntax tree cannot distinguish it from a local variable.
 
 Ruby methods defined as the only argument of `private`/`protected`/`public`, `private_class_method`/`public_class_method def self.m`, or `module_function` in a module body are now recorded with their body calls, and the wrapper call is no longer attributed to them as a call. `treesitter:ruby:v6` reparses unchanged Ruby files on the next complete update.

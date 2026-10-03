@@ -413,18 +413,20 @@ func javaVisibleFrom(s javaScopeSymbol, fromPkg, ownerPkg string, sameOwner bool
 	}
 	return javaVisible(s, fromPkg, ownerPkg)
 }
-func javaArity(sig string) int {
-	a := strings.Index(sig, "(")
-	b := strings.LastIndex(sig, ")")
-	if a < 0 || b < a {
-		return -1
+
+// javaConstructorAccepts reports whether a constructor declared with the
+// parser's AST parameter count accepts a call with the AST argument count.
+// Either count missing -- a recovery error, or a graph from a parser that did
+// not record them -- accepts nothing. A nil maximum is a trailing varargs
+// parameter. Argument types are not modelled, so every constructor the count
+// admits stays a competitor.
+func javaConstructorAccepts(s javaScopeSymbol, call sql.NullInt64) bool {
+	if !call.Valid || !s.arityMin.Valid || call.Int64 < s.arityMin.Int64 {
+		return false
 	}
-	x := strings.TrimSpace(sig[a+1 : b])
-	if x == "" {
-		return 0
-	}
-	return strings.Count(x, ",") + 1
+	return !s.arityMax.Valid || call.Int64 <= s.arityMax.Int64
 }
+
 func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport) (javaScopeSymbol, string) {
 	t, ok, _ := javaType(e.name, e.pkg, e.container, byQName, byName, imps[e.file])
 	if !ok {
@@ -433,11 +435,10 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	if t.language != "java" {
 		return javaScopeSymbol{}, ""
 	}
-	want := javaArity(e.evidence)
 	var out javaScopeSymbol
 	n := 0
 	for _, s := range byQName[t.qname+"."+t.name] {
-		if s.kind == "constructor" && javaArity(s.signature) == want && javaVisibleFrom(s, e.pkg, t.pkg, e.container == t.name) {
+		if s.kind == "constructor" && javaConstructorAccepts(s, e.callArity) && javaVisibleFrom(s, e.pkg, t.pkg, e.container == t.name) {
 			out = s
 			n++
 		}
