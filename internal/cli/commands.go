@@ -336,6 +336,32 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			// check_constraints is a CI gate, so unlike every other command its
+			// exit code is a contract: 0 ok, 1 violations, 2 when the graph or
+			// the config cannot be vouched for. See constraints.ExitCode.
+			name:        "check_constraints",
+			aliases:     []string{"check-constraints"},
+			description: "check architectural constraints between declared path groups",
+			usageLines: []string{
+				"  check_constraints [PATH]",
+				"    reads .codegraph-constraints.json at the repository root",
+				"    exits 0 ok, 1 violations, 2 stale, not indexed, not configured or invalid config",
+			},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root to check (defaults to the git repo root)"},
+				{name: "--config FILE", description: "constraints document to use instead of the repo-root file"},
+				{name: "--limit N", description: "findings per page and cycle cap (default 20, max 500)"},
+				{name: "--offset N", description: "offset into the findings"},
+			},
+			examples: []string{
+				"codegraph index . && codegraph check_constraints .",
+				"codegraph check-constraints . --limit 100",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runCheckConstraints(ctx, cfg, stdout, args)
+			},
+		},
+		{
 			// bench_queries measures; audit judges. Keeping them separate keeps
 			// the audit report free of timing noise and this report free of
 			// correctness findings.

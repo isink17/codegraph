@@ -281,6 +281,12 @@ var toolRegistry = []toolDescriptor{
 		category:   "audit",
 		handler:    (*Server).handleAudit,
 	},
+	{
+		name: "check_constraints", description: "Check architectural dependency constraints between declared path groups (read-only)",
+		properties: []string{"limit", "offset"},
+		category:   "audit",
+		handler:    (*Server).handleCheckConstraints,
+	},
 
 	// Hidden diagnostics. Callable and searchable, never advertised: the whole
 	// point of measuring context cost is not to add any.

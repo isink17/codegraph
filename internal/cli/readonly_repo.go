@@ -68,8 +68,8 @@ func openIndexedRepoReadOnly(ctx context.Context, cfg config.Config, repoRootCan
 		}
 	}
 	if dbPath == "" {
-		return nil, fmt.Errorf("%s is not indexed: no graph database found (run %s index %s)",
-			repoRoot, appname.BinaryName, repoRoot)
+		return nil, notIndexedError(fmt.Sprintf("%s is not indexed: no graph database found (run %s index %s)",
+			repoRoot, appname.BinaryName, repoRoot))
 	}
 
 	s, err := store.OpenReadOnly(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
@@ -83,8 +83,16 @@ func openIndexedRepoReadOnly(ctx context.Context, cfg config.Config, repoRootCan
 	}
 	if !found {
 		_ = s.Close()
-		return nil, fmt.Errorf("%s is not indexed: %s holds no graph for it (run %s index %s)",
-			repoRoot, dbPath, appname.BinaryName, repoRoot)
+		return nil, notIndexedError(fmt.Sprintf("%s is not indexed: %s holds no graph for it (run %s index %s)",
+			repoRoot, dbPath, appname.BinaryName, repoRoot))
 	}
 	return &readOnlyRepo{Store: s, Repo: repo, Root: repoRoot, DBPath: dbPath}, nil
 }
+
+// notIndexedError keeps the established message while letting callers that
+// report "not indexed" as a status, rather than a failure, recognise it with
+// errors.Is(err, store.ErrRepoNotIndexed).
+type notIndexedError string
+
+func (e notIndexedError) Error() string { return string(e) }
+func (e notIndexedError) Unwrap() error { return store.ErrRepoNotIndexed }

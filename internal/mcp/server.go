@@ -12,6 +12,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/agent"
 	"github.com/isink17/codegraph/internal/compactfmt"
+	"github.com/isink17/codegraph/internal/constraints"
 	"github.com/isink17/codegraph/internal/detail"
 	"github.com/isink17/codegraph/internal/framework"
 	"github.com/isink17/codegraph/internal/graph"
@@ -1433,4 +1434,35 @@ func asInt64(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// handleCheckConstraints evaluates the repo-root constraints document against
+// the server's repository and returns the same result the CLI prints as `data`.
+//
+// It takes no config path: a tool call must not be able to make the server read
+// an arbitrary file. Statuses such as not_configured or violations are data,
+// not tool errors; only invalid arguments and I/O or SQL failures are errors.
+// The handle is the server's read-write store, so read-only rests on the
+// evaluator issuing SELECT only, which the no-write test pins.
+func (s *Server) handleCheckConstraints(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Limit  int `json:"limit"`
+		Offset int `json:"offset"`
+	}
+	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	res, err := constraints.Check(ctx, constraints.Options{
+		RepoRoot: s.repoRoot,
+		Limit:    req.Limit,
+		Offset:   req.Offset,
+	}, func(context.Context) (*store.Store, int64, error) {
+		return s.store, s.repoID, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": res}, nil
 }
