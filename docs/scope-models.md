@@ -62,9 +62,9 @@ Lookup starts from the calling symbol's container, or otherwise from the file's 
 1. A `use` with a matching local name takes precedence.
 2. Otherwise, `crate::`, `self::`, `super::` and relative paths resolve against the starting module.
 3. A candidate must be visible, and either in the caller's file or in a module proven to belong to the caller's crate.
-4. If none qualifies, named and glob `pub use` re-exports are followed, with cycle protection.
+4. If none qualifies, named and glob `pub use` re-exports of the caller's own crate are followed, with cycle protection.
 
-Exactly one candidate binds. An explicit `use` and a function declared in the module shadow a glob import of the same name, whatever the declaration order, but only in the namespace they live in: a trait or enum does not shadow a glob-imported function, and a struct competing with a glob import fails closed because tuple and unit struct forms are not recorded. For a qualified call, an own module or type shadows a glob-imported one of its first segment.
+Exactly one candidate binds. An explicit `use` and a function declared in the module shadow a glob import of the same name, whatever the declaration order, but only in the namespace they live in: a trait or enum does not shadow a glob-imported function, and a struct competing with a glob import fails closed because tuple and unit struct forms are not recorded. For a qualified call, an explicit `use` or an own module or type shadows a glob-imported first segment. When two explicit imports bring in one name, only a function among them is the call target, and anything else fails closed; a call that resolves to a non-function item in a module that also imports by glob stays unresolved.
 
 Visibility works as follows:
 - `pub` items are always eligible.

@@ -4,6 +4,8 @@
 
 Scope-model documentation now covers Go, Rust, C/C++, Java, Kotlin, TypeScript/JavaScript, Python, C#, PHP and Swift alongside Ruby (`docs/scope-models.md`). Resolver behavior is unchanged.
 
+Rust: explicit imports now take precedence over glob imports for the first segment of qualified calls (`use b::S; S::new()`), and when two imports bring in the same name, only the one that is a function is used as the call target. A call that resolves to a non-function item in a module that also has glob imports is left unresolved instead of binding to the type; re-export walks stay inside the caller's crate root.
+
 TypeScript and JavaScript calls now bind only callable values. A type alias or interface no longer answers a call, whether it was found in the same file, through an import, or as a namespace member. `export ... from` re-exports no longer act as bindings in their own module, so a same-file `ns.bar()` or `foo()` through `export * as ns from` or `export { foo } from` stays unresolved, as does `ns.bar()` when `bar` is itself a re-exported namespace. Same-file calls to a function that is default-exported or listed in `export { … }` now bind the declaration.
 A class merged with a same-named interface is called as the class.
 
