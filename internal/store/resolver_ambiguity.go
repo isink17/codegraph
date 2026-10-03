@@ -256,6 +256,59 @@ type resolverGateRule struct {
 	// exactly the edges `NOT (sql)` selects. It is nil when the Go side decides
 	// the rule from loaded facts rather than from the edge alone.
 	owns func(edgeTarget) bool
+	// refuses is the Go binder's twin of a chosen-candidate restriction: it
+	// reports whether the rule refuses the candidate the binder chose for an
+	// edge, reading the facts the binder loaded for the batch. It is nil for
+	// every other rule.
+	refuses func(binderChosenCandidate) bool
+}
+
+// binderChosenCandidate is one edge and the candidate the binder chose for
+// it, with the batch facts the chosen-candidate restrictions read.
+type binderChosenCandidate struct {
+	target edgeTarget
+	dstID  int64
+	facts  *binderCandidateFacts
+}
+
+// binderCandidateFacts are the facts the binder loads once per batch for the
+// chosen-candidate restrictions. A nil map reads as "no fact", which every
+// restriction answers as its SQL twin answers an empty temp table.
+type binderCandidateFacts struct {
+	byQualified, byShort symbolCandidates
+	importScope          map[int64]map[int64]struct{}
+	// cppMemberTargets and cppNamespaceTargets map candidate symbol ids to
+	// their class and namespace scope; cppCallerClasses and
+	// cppCallerNamespaces map edge ids to the calling symbol's.
+	cppMemberTargets, cppCallerClasses       map[int64]string
+	cppNamespaceTargets, cppCallerNamespaces map[int64]string
+}
+
+// The chosen-candidate restrictions' Go twins. Each guards on the caller
+// language and the bare spelling first, exactly as its SQL twin does, so a
+// qualified spelling never consults the loaded facts.
+
+// bareTypeScopeRefuses is gated on the spelling rather than on the strategy,
+// so both levels a bare name can reach (a qualified_name that happens to be
+// bare, and the bare-name lookup) are covered. goBareCallName is the Go twin of
+// the SQL guard's sqlNotBareName and is not Go-specific despite the name.
+func bareTypeScopeRefuses(c binderChosenCandidate) bool {
+	t := c.target
+	return typeScopeGatedLanguage(t.srcLanguage) && goBareCallName(t.dstName) &&
+		(c.facts.byQualified.typeTargetOutOfScope(c.dstID, t.srcFileID, c.facts.importScope) ||
+			c.facts.byShort.typeTargetOutOfScope(c.dstID, t.srcFileID, c.facts.importScope))
+}
+
+func cppBareNamespaceScopeRefuses(c binderChosenCandidate) bool {
+	t := c.target
+	return bareNameScopeAllKinds(t.srcLanguage) && goBareCallName(t.dstName) &&
+		cppNamespaceTargetOutOfScope(t.edgeID, c.dstID, c.facts.cppNamespaceTargets, c.facts.cppCallerNamespaces)
+}
+
+func cppBareMemberScopeRefuses(c binderChosenCandidate) bool {
+	t := c.target
+	return bareNameScopeAllKinds(t.srcLanguage) && goBareCallName(t.dstName) &&
+		cppMemberTargetOutOfClassScope(t.edgeID, c.dstID, c.facts.cppMemberTargets, c.facts.cppCallerClasses)
 }
 
 // resolverBindableCandidateRules is what a repo-wide strategy must satisfy to
@@ -276,11 +329,14 @@ var resolverBindableCandidateRules = []resolverGateRule{
 	{id: "go_local_qualifier", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"go"}, sql: resolverGoLocalQualifierSQL},
 	{id: "bare_type_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
-		languages: slices.Sorted(maps.Keys(typeScopeGatedLanguages)), sql: resolverBareNameTypeScopeSQL},
+		languages: slices.Sorted(maps.Keys(typeScopeGatedLanguages)), sql: resolverBareNameTypeScopeSQL,
+		refuses: bareTypeScopeRefuses},
 	{id: "cpp_bare_namespace_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
-		languages: []string{"cpp"}, sql: resolverCppBareNamespaceScopeSQL},
+		languages: []string{"cpp"}, sql: resolverCppBareNamespaceScopeSQL,
+		refuses: cppBareNamespaceScopeRefuses},
 	{id: "cpp_bare_member_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
-		languages: []string{"cpp"}, sql: resolverCppBareMemberScopeSQL},
+		languages: []string{"cpp"}, sql: resolverCppBareMemberScopeSQL,
+		refuses: cppBareMemberScopeRefuses},
 	{id: ruleRubyOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"ruby"}, sql: rubyScopeVetoSQL, owns: rubyScopeOwned},
 	{id: "jvm_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
@@ -343,6 +399,32 @@ var (
 	binderOwnsPHP    = binderOwnershipRoutes[rulePHPOwnership]
 	binderOwnsSwift  = binderOwnershipRoutes[ruleSwiftOwnership]
 )
+
+// binderCandidateRestrictions are the chosen-candidate restrictions the
+// binder applies, in inventory order, taken from the rules that carry a Go
+// twin. A restriction added to the inventory with a twin is applied by the
+// binder with no second list to update.
+var binderCandidateRestrictions = func() []resolverGateRule {
+	var out []resolverGateRule
+	for _, rule := range resolverBindGateRules {
+		if rule.refuses != nil {
+			out = append(out, rule)
+		}
+	}
+	return out
+}()
+
+// binderRefusesChosen reports whether any chosen-candidate restriction refuses
+// the candidate the binder chose. Every refusal leaves the edge unresolved:
+// there is no weaker evidence level a refused candidate may fall back to.
+func binderRefusesChosen(c binderChosenCandidate) bool {
+	for _, rule := range binderCandidateRestrictions {
+		if rule.refuses(c) {
+			return true
+		}
+	}
+	return false
+}
 
 // resolverRuleOwns returns an edge-local ownership rule's Go twin. An id with
 // no such rule is a programming error caught at package initialisation.

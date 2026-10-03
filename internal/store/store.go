@@ -6440,6 +6440,12 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		shortNamesAnyLanguage[name] = struct{}{}
 	}
 
+	candidateFacts := binderCandidateFacts{
+		byQualified: byQualified, byShort: byShort, importScope: importScope,
+		cppMemberTargets: cppMemberTargets, cppCallerClasses: cppCallerClasses,
+		cppNamespaceTargets: cppNamespaceTargets, cppCallerNamespaces: cppCallerNamespaces,
+	}
+
 	type edgeResolution struct {
 		edgeID int64
 		dstID  int64
@@ -6546,35 +6552,15 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if matched {
 			dstID, ok = matchedGroup.chosen(callerIsTest)
 		}
-		if ok && dstID != 0 && typeScopeGatedLanguage(target.srcLanguage) && goBareCallName(target.dstName) &&
-			(byQualified.typeTargetOutOfScope(dstID, target.srcFileID, importScope) ||
-				byShort.typeTargetOutOfScope(dstID, target.srcFileID, importScope)) {
-			// A bare spelling naming a type the calling file neither declares nor
-			// imports. Repository-global uniqueness is not scope evidence for a
-			// class name (P22.9, resolver_type_scope.go), and there is nothing
-			// weaker to fall back to, so the edge stays unresolved -- exactly what
-			// resolverBareNameTypeScopeSQL does on the full path.
-			//
-			// Gated on the spelling rather than on the strategy so the two levels a
-			// bare name can reach (a qualified_name that happens to be bare, and
-			// the bare-name lookup) are both covered; goBareCallName is the Go twin
-			// of the SQL guard's sqlNotBareName and is not Go-specific despite the
-			// name.
-			outcome.unresolved++
-			continue
-		}
-		if ok && dstID != 0 && bareNameScopeAllKinds(target.srcLanguage) && goBareCallName(target.dstName) &&
-			cppNamespaceTargetOutOfScope(target.edgeID, dstID, cppNamespaceTargets, cppCallerNamespaces) {
-			outcome.unresolved++
-			continue
-		}
-		if ok && dstID != 0 && bareNameScopeAllKinds(target.srcLanguage) && goBareCallName(target.dstName) &&
-			cppMemberTargetOutOfClassScope(target.edgeID, dstID, cppMemberTargets, cppCallerClasses) {
-			// A bare C/C++ spelling naming a member of a class the calling symbol
-			// is not a member of. Same file is not class evidence and neither is an
-			// include, so there is nothing weaker to fall back to and the edge stays
-			// unresolved -- exactly what resolverCppBareMemberScopeSQL does on the
-			// full path (P22.15, cpp_class_scope.go).
+		if ok && dstID != 0 && binderRefusesChosen(binderChosenCandidate{target: target, dstID: dstID, facts: &candidateFacts}) {
+			// A chosen-candidate restriction refused the candidate: a bare
+			// spelling naming a type the calling file neither declares nor
+			// imports (resolver_type_scope.go), or a bare C/C++ spelling naming
+			// another namespace's function or another class's member
+			// (cpp_class_scope.go). Repository-global uniqueness is not
+			// scope evidence and there is nothing weaker to fall back to, so the
+			// edge stays unresolved -- exactly what the rule's SQL twin in
+			// resolverBindableCandidateRules does on the full path.
 			outcome.unresolved++
 			continue
 		}
@@ -6682,12 +6668,14 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if err := tx.Commit(); err != nil {
 		return outcome, err
 	}
+	// Added to, not assigned: the language passes above have already counted
+	// what they bound in this batch.
 	if n, err := updateRes.RowsAffected(); err != nil {
 		// Every resolution targets a distinct, still-unresolved edge id, so the
 		// count is known exactly even when the driver cannot report it.
-		outcome.resolved = len(resolutions)
+		outcome.resolved += len(resolutions)
 	} else {
-		outcome.resolved = int(n)
+		outcome.resolved += int(n)
 	}
 	return outcome, nil
 }
