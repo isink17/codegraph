@@ -33,8 +33,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Test the classifier
-        run: bash .github/scripts/ci-changes_test.sh
+      - name: Test the classifier and the merge gate
+        run: |
+          bash .github/scripts/ci-changes_test.sh
+          bash .github/scripts/merge-gate_test.sh
       - name: Classify changed files
         id: classify
         run: bash .github/scripts/ci-changes.sh classify >> "$GITHUB_OUTPUT"

@@ -64,6 +64,13 @@
 - For MCP changes, verify `codegraph serve` still answers `tools/list` and `tools/call`
 - Prefer MCP-backed checks (`tools/list`, `tools/call`) before adding ad-hoc local inspection scripts.
 
+## Merging
+
+- Pull requests target `v2.0` only; `master` is read-only.
+- The `v2.0 merge gate` ruleset requires a pull request, squash merges, and a green aggregate `ci` check on a branch that is up to date with `v2.0`. GitHub cannot check the independent review, so merge only through `.github/scripts/merge-gate.sh PR HEAD_SHA REVIEW_FILE --merge`. It blocks unless an independent review of that exact head SHA has completed (`PR: #N`, `Reviewed-Head: <sha>`, `Verdict: APPROVE`, `Blocking: 0`), every check on that head is green including the aggregate `ci` check, the head contains the current `v2.0` tip, and GitHub reports no conflict. It merges with `--match-head-commit`.
+- A review that has started is not a review that passed. Green CI, a session limit or a queue of PRs never replace it; if the review is late, the PR stays open.
+- Any new head (fix, rebase, branch update) needs green checks and a review that names the new SHA before merging.
+
 ## Release Hygiene
 
 - Keep `README.md` and `CHANGELOG.md` aligned with shipped behavior for each tag.
