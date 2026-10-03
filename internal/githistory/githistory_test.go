@@ -394,3 +394,30 @@ func TestRepositoryEnvironmentIsIgnored(t *testing.T) {
 		t.Fatalf("watermark = %s, want %s", state.Watermark, want)
 	}
 }
+
+// User configuration that changes log output must not change the aggregates.
+func TestUserConfigDoesNotChangeAggregates(t *testing.T) {
+	r, _ := historyRepo(t)
+	ctx := context.Background()
+	state, err := Probe(ctx, r.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _, err := Files(ctx, r.Dir, state.Watermark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range [][2]string{
+		{"log.showRoot", "false"}, {"log.diffMerges", "separate"}, {"diff.renames", "false"},
+		{"log.showSignature", "true"}, {"color.ui", "always"}, {"diff.relative", "true"},
+	} {
+		r.Git("config", kv[0], kv[1])
+	}
+	got, _, err := Files(ctx, r.Dir, state.Watermark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("with user config:\n got %+v\nwant %+v", got, want)
+	}
+}

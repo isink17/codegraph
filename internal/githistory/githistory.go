@@ -176,7 +176,7 @@ func Probe(ctx context.Context, root string) (State, error) {
 		return State{}, err
 	}
 	sha := strings.TrimSpace(string(out))
-	out, err = run(ctx, root, "show", "-s", "--format=%ct", sha)
+	out, err = run(ctx, root, "show", "-s", "--no-show-signature", "--format=%ct", sha)
 	if err != nil {
 		return State{}, err
 	}
@@ -195,7 +195,7 @@ func Probe(ctx context.Context, root string) (State, error) {
 // differs from the watermark commit: tracked files modified, staged or
 // deleted, plus untracked files that are not ignored. Sorted, unique.
 func WorktreeChanges(ctx context.Context, root, watermark string) ([]string, error) {
-	tracked, err := run(ctx, root, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--relative", watermark, "--")
+	tracked, err := run(ctx, root, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-color", "--relative", watermark, "--")
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +249,11 @@ type acc struct {
 // It returns the per-file stats sorted by path and the number of commits the
 // window actually holds.
 func Files(ctx context.Context, root, watermark string) ([]FileStats, int, error) {
-	out, err := run(ctx, root, "log", "-z", "--first-parent", "-m", "-M", "--numstat",
+	// Explicit flags override user configuration that would change the
+	// result: --root keeps the root commit's diff under log.showRoot=false, and
+	// log.diffMerges pins -m to the first-parent diff on Git versions where -m
+	// follows that setting (older versions ignore the key and already do).
+	out, err := run(ctx, root, "-c", "log.diffMerges=first-parent", "log", "-z", "--first-parent", "-m", "-M", "--root", "--numstat",
 		"--no-color", "--no-ext-diff", "--no-show-signature", "--relative",
 		"--format=%x1e%H%x1f%ct%x1f%aE%x1f%B", "-n", strconv.Itoa(WindowLimit), watermark, "--")
 	if err != nil {
