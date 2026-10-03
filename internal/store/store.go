@@ -5969,7 +5969,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}); err != nil {
 		return outcome, err
 	}
-	remaining := make([]edgeTarget, 0, len(targets))
+	// Filtered in place in one pass: each kept target is written at an index
+	// no greater than the one just read, so nothing is overwritten before it
+	// is visited.
+	remaining := targets[:0]
 	for _, target := range targets {
 		_, unresolved := stillUnresolved[target.edgeID]
 		if cppScopeOwned(target) {
