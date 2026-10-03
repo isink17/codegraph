@@ -765,6 +765,11 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			p = p[1:]
 		default:
 			for len(p) > 0 && p[0] == "super" {
+				// An impl method's owner is its type, not a module path, so
+				// `super` from it names no module the resolver can prove.
+				if owner != "crate" && !strings.HasPrefix(owner, "crate::") {
+					return ""
+				}
 				if i := strings.LastIndex(owner, "::"); i >= 0 {
 					owner = owner[:i]
 				} else {
