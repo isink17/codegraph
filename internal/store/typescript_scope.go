@@ -419,12 +419,18 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		var target tsScopeExport
 		parts := strings.Split(e.name, ".")
 		if len(parts) > 1 {
+			// Every path below, this one included, is narrowed to callable
+			// targets once, at the binding point after the loop.
 			for _, id := range byFileQName[e.file][e.name] {
 				target.symbols = append(target.symbols, id)
 			}
 			local := parts[0]
 			member := strings.Join(parts[1:], ".")
 			for _, i := range imports[e.file] {
+				if i.reexport {
+					// `export ... from` creates no binding in its own module.
+					continue
+				}
 				if i.local == local && !i.typeOnly && i.kind == "namespace" {
 					if m, ok := resolveModule(e.file, i.source); ok {
 						target = export(m, member, map[string]bool{})
@@ -443,12 +449,16 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 					}
 				}
 			}
-			if target.namespace != 0 {
-				target = export(target.namespace, member, map[string]bool{})
-			}
 		} else {
 			hasBindingEvidence := false
 			for _, i := range imports[e.file] {
+				if i.reexport {
+					// Export rows name what the module offers, not a binding
+					// in it: `export { x } from` binds nothing here, and a
+					// source-less row points at a declaration the same-file
+					// fallback below already finds.
+					continue
+				}
 				if i.local != parts[0] || i.kind == "side_effect" || i.typeOnly {
 					if i.local == parts[0] && i.kind != "side_effect" {
 						hasBindingEvidence = true
@@ -467,15 +477,22 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			}
 			if len(target.symbols) == 0 && target.namespace == 0 && !hasBindingEvidence {
 				for _, id := range byFileName[e.file][parts[0]] {
-					// A bare identifier resolves through module and function
-					// scope, where a class method is never a binding.
-					if symbols[id].kind == "method" {
-						continue
-					}
+					// A class method is never a module or function scope
+					// binding; the callable filter below drops it.
 					target.symbols = append(target.symbols, id)
 				}
 			}
 		}
+		// A call names a value: a function or a class. A type alias or an
+		// interface declares no value, and a class method is not a binding of
+		// the module, so neither can be the callee, whichever path found it.
+		callable := target.symbols[:0:0]
+		for _, id := range target.symbols {
+			if kind := symbols[id].kind; kind == "function" || kind == "class" {
+				callable = append(callable, id)
+			}
+		}
+		target.symbols = callable
 		target = uniqueExport(target)
 		if len(target.symbols) == 1 {
 			results[e.id] = target.symbols[0]
