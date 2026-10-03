@@ -67,11 +67,17 @@ const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
 // members shadow the enclosing class's, so the enclosing class must not answer.
 const JavaCallNestedClassScopeEvidence = "java:nested_class_scope"
 
-// RustCallBlockScopeEvidence marks a Rust call whose first path segment a
-// block around it declares itself: an item, an extern crate or a `use`. The
-// block's name shadows the module's, and the adapter does not record block
-// items, so no module item may answer.
+// RustCallBlockScopeEvidence marks a Rust call that something the adapter
+// does not record as a module item may answer: it sits in a `mod` declared
+// inside a block, or an enclosing block item, `use`, statement macro,
+// parameter or local binding may name its first path segment. No module item
+// may answer it.
 const RustCallBlockScopeEvidence = "rust:block_scope_item"
+
+// RustTraitImplVisibility is the visibility recorded for an item of a trait
+// impl (`impl Trait for T`). Such an item is as visible as the trait, which
+// the parser does not know, so it is neither private nor public.
+const RustTraitImplVisibility = "trait_impl"
 
 type ParsedFile struct {
 	Language                  string

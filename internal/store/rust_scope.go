@@ -720,29 +720,13 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		root := rootOfFile[caller.id]
 		return root != "" && globModules[[2]string{root, module}]
 	}
-	// A private impl method may be a trait impl's: the parser does not record
-	// which, and `Type::m` finds an inherent `m` of the type first, wherever
-	// in the crate its impl is. These two indexes let such a method answer
-	// only when the type is declared in the impl's own module and no other
-	// method of that name sits on any type of that name in the crate.
-	localTypes := map[string]bool{}
-	methodsOn := map[string]int{}
-	for _, s := range symbols {
-		module := candidateModule(s)
-		switch {
-		case s.kind == "struct" || s.kind == "enum":
-			localTypes[s.qualified] = true
-		case s.kind == "function" && s.container != module:
-			methodsOn[rootOfFile[s.file]+"\x00"+rustTypeLastSegment(s.container)+"\x00"+s.name]++
-		}
-	}
+	// A private impl method is an inherent impl's: a trait impl's items are
+	// recorded with their own visibility, which nothing here binds. An
+	// inherent `m` is what `Type::m` finds first, and a type has at most one
+	// (E0592). It answers only when the impl names its type as a bare
+	// identifier, so the caller's path names that type in the same module.
 	privateMethodProven := func(c rustScopeSymbol) bool {
-		module := candidateModule(c)
-		if c.container == module {
-			return true // a free function, not an impl method
-		}
-		return rustPlainIdent(c.container) && localTypes[module+"::"+c.container] &&
-			rootOfFile[c.file] != "" && methodsOn[rootOfFile[c.file]+"\x00"+c.container+"\x00"+c.name] == 1
+		return c.container == candidateModule(c) || rustPlainIdent(c.container)
 	}
 	eligible := func(c rustScopeSymbol, caller rustScopeFile) bool {
 		module := candidateModule(c)
@@ -1223,20 +1207,4 @@ func rustPlainIdent(s string) bool {
 		}
 	}
 	return true
-}
-
-// rustTypeLastSegment names the type an impl's written type ends in:
-// `a::S<T>` and `&'a mut S` both give `S`. It over-approximates which types
-// may be the same, which is the safe side for refusing a binding.
-func rustTypeLastSegment(s string) string {
-	if i := strings.IndexByte(s, '<'); i >= 0 {
-		s = s[:i]
-	}
-	if i := strings.LastIndex(s, "::"); i >= 0 {
-		s = s[i+2:]
-	}
-	if i := strings.LastIndexAny(s, "& )]*"); i >= 0 {
-		s = s[i+1:]
-	}
-	return strings.TrimSpace(s)
 }
