@@ -431,10 +431,14 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 					}
 				}
 				if i.local == local && !i.typeOnly && i.kind != "namespace" {
+					// The imported binding is only the head of the call. It names
+					// the callee only when it is a re-exported namespace; members
+					// of an imported class, object or function are not modelled,
+					// and the binding itself is never the callee.
+					target = tsScopeExport{}
 					if m, ok := resolveModule(e.file, i.source); ok {
-						target = export(m, i.imported, map[string]bool{})
-						if target.namespace != 0 {
-							target = export(target.namespace, member, map[string]bool{})
+						if head := export(m, i.imported, map[string]bool{}); head.namespace != 0 {
+							target = export(head.namespace, member, map[string]bool{})
 						}
 					}
 				}
@@ -463,6 +467,11 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			}
 			if len(target.symbols) == 0 && target.namespace == 0 && !hasBindingEvidence {
 				for _, id := range byFileName[e.file][parts[0]] {
+					// A bare identifier resolves through module and function
+					// scope, where a class method is never a binding.
+					if symbols[id].kind == "method" {
+						continue
+					}
 					target.symbols = append(target.symbols, id)
 				}
 			}
