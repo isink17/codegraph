@@ -81,6 +81,21 @@ var rustPrivateVisibilityCases = []struct {
 		"a.rs":   "pub(in crate) fn helper() {}",
 		"b.rs":   "pub fn outer() {\n    crate::a::helper();\n}\n",
 	}, "b.rs", "crate::a::helper", "", false},
+	// Inside an impl method the owner is the type, not a module, so `super`
+	// names nothing the resolver can prove (rustc: crate::a::helper).
+	{"super from an impl method", tree{
+		"lib.rs": "mod a; fn helper() {}",
+		"a.rs":   "mod m; fn helper() {}",
+		"a/m.rs": "pub struct S;\nimpl S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
+	}, "a/m.rs", "super::helper", "", false},
+	// Known limitation: local bindings are not modelled, so a closure named
+	// like a module function does not shadow it (rustc calls the closure).
+	{"local closure named like a module fn", tree{
+		"lib.rs": "fn f() {}\npub fn c() {\n    let f = || {};\n    f();\n}\n",
+	}, "lib.rs", "f", "lib.rs:crate::f", false},
+	{"single trait impl associated call", tree{
+		"lib.rs": "struct Cfg;\nimpl Default for Cfg {\n    fn default() -> Self {\n        Cfg\n    }\n}\npub fn c() {\n    Cfg::default();\n}\n",
+	}, "lib.rs", "Cfg::default", "lib.rs:crate::Cfg::default", false},
 	// Another crate root's private `crate::helper` is not the caller's.
 	{"other crate root", tree{
 		"lib.rs":  "fn helper() {}",
