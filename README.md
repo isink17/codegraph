@@ -325,6 +325,7 @@ both MCP modes (`full` and `gateway`) and the CLI fallback.
 | `latest_scan_errors` | List indexer errors from the last scan |
 | `audit` | Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only). Optional `examples` integer caps examples per finding; `0` means counts only |
 | `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; see [docs/constraints.md](docs/constraints.md) |
+| `file_history` | File-level Git history from the last index (not in `tools/list`; call by name or find with `tool_search`). See [docs/git-history.md](docs/git-history.md) |
 
 ### Session Memory
 
@@ -800,6 +801,10 @@ codegraph audit <path> --fail-on error    # Exit non-zero when the graph has err
 # Architectural constraints (see docs/constraints.md)
 codegraph index . && codegraph check_constraints .   # Exit 0 ok, 1 violations, 2 cannot evaluate
 codegraph check-constraints . --config rules.json    # Alias; evaluate another constraints document
+
+# Git history (file level; see docs/git-history.md)
+codegraph file_history <path>             # Files with the most recent-window commits first
+codegraph file_history <path> --file F    # History of one or more files
 
 # Query latency benchmark (read-only; never indexes or migrates)
 codegraph bench-queries <path>                    # Benchmark local graph queries on an indexed repo

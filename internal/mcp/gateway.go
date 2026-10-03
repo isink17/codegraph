@@ -159,7 +159,7 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 		if score := toolSearchScore(desc, query, terms); score > 0 {
 			matches = append(matches, scored{
 				desc:    desc,
-				demoted: desc.hidden && query != desc.name,
+				demoted: desc.diagnostic && query != desc.name,
 				score:   score,
 				order:   i,
 			})

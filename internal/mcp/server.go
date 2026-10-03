@@ -1030,6 +1030,27 @@ func (s *Server) handleAudit(ctx context.Context, raw json.RawMessage) (map[stri
 	return map[string]any{"ok": true, "data": report}, nil
 }
 
+func (s *Server) handleFileHistory(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Files      []string `json:"files"`
+		PathFilter string   `json:"path_filter"`
+		Limit      int      `json:"limit"`
+		Offset     int      `json:"offset"`
+	}
+	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	result, err := s.store.GitHistory(ctx, s.repoID, store.GitHistoryQuery{
+		Paths: req.Files, PathPrefix: req.PathFilter, Limit: req.Limit, Offset: req.Offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": result}, nil
+}
+
 func wrapData(key string, value any, err error) (map[string]any, error) {
 	if err != nil {
 		return nil, err

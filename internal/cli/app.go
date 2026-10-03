@@ -304,6 +304,44 @@ func runAudit(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	return nil
 }
 
+func runFileHistory(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("file_history", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root (optional)")
+	var q store.GitHistoryQuery
+	fs.Func("file", "repository-relative file; repeatable", func(v string) error {
+		q.Paths = append(q.Paths, v)
+		return nil
+	})
+	fs.StringVar(&q.PathPrefix, "path-filter", "", "path prefix")
+	fs.IntVar(&q.Limit, "limit", 0, "page size")
+	fs.IntVar(&q.Offset, "offset", 0, "page offset")
+	repoRootCandidate, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, "")
+	if err != nil {
+		return err
+	}
+	// The same bounds the MCP tool enforces before it runs.
+	if q.Limit < 0 || q.Limit > limits.MaxPage {
+		return fmt.Errorf("invalid --limit %d: want 0 to %d", q.Limit, limits.MaxPage)
+	}
+	if q.Offset < 0 {
+		return fmt.Errorf("invalid --offset %d: want 0 or more", q.Offset)
+	}
+	if len(q.Paths) > limits.MaxBatchItems {
+		return fmt.Errorf("too many --file values: at most %d", limits.MaxBatchItems)
+	}
+	opened, err := openIndexedRepoReadOnly(ctx, cfg, repoRootCandidate)
+	if err != nil {
+		return err
+	}
+	defer opened.Close()
+	result, err := opened.Store.GitHistory(ctx, opened.Repo.ID, q)
+	if err != nil {
+		return err
+	}
+	return writeJSON(stdout, result)
+}
+
 func runConfig(cfg config.Config, stdout io.Writer, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: %s config <show|edit-path|validate|init>", appname.BinaryName)
@@ -767,7 +805,7 @@ func runInstall(stdout io.Writer, args []string) error {
 }
 
 func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName string, args []string, update bool) error {
-	repoRootCandidate, jsonl, force, rebuild, err := parseIndexArgs(args)
+	repoRootCandidate, jsonl, force, rebuild, noHistory, err := parseIndexArgs(args)
 	if err != nil {
 		return err
 	}
@@ -792,7 +830,7 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	}
 	defer app.Close()
 	_ = repo
-	opts := indexer.Options{RepoRoot: repo.RootPath, Force: force || rebuild}
+	opts := indexer.Options{RepoRoot: repo.RootPath, Force: force || rebuild, NoHistory: noHistory}
 	var summary store.ScanSummary
 	if update {
 		opts.ScanKind = "update"
@@ -2493,9 +2531,11 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout, stderr io.
 	return nil
 }
 
-func parseIndexArgs(args []string) (repoRoot string, jsonl bool, force bool, rebuild bool, err error) {
+func parseIndexArgs(args []string) (repoRoot string, jsonl bool, force bool, rebuild bool, noHistory bool, err error) {
 	for _, arg := range args {
 		switch arg {
+		case "--no-history":
+			noHistory = true
 		case "--jsonl":
 			jsonl = true
 		case "--force":
@@ -2504,16 +2544,16 @@ func parseIndexArgs(args []string) (repoRoot string, jsonl bool, force bool, reb
 			rebuild = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return "", false, false, false, fmt.Errorf("flag provided but not defined: %s", arg)
+				return "", false, false, false, false, fmt.Errorf("flag provided but not defined: %s", arg)
 			}
 			if repoRoot == "" {
 				repoRoot = arg
 				continue
 			}
-			return "", false, false, false, fmt.Errorf("index accepts at most one repo path")
+			return "", false, false, false, false, fmt.Errorf("index accepts at most one repo path")
 		}
 	}
-	return repoRoot, jsonl, force, rebuild, nil
+	return repoRoot, jsonl, force, rebuild, noHistory, nil
 }
 
 func printUsage(w io.Writer) { printRootHelp(w) }
