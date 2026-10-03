@@ -123,9 +123,114 @@ func rubyExtractSymbolsIn(node *sitter.Node, container string, singleton bool, c
 				rubyAddVisibilityHazard(container, pf)
 			}
 		case "call":
+			if rubyWrappedDefinition(child, container, singleton, content, pf) {
+				continue
+			}
 			rubyVisibilityCall(child, container, singleton, content, pf)
 		}
 	}
+}
+
+// rubyWrappedDefinition records a `def` passed as the only argument of a
+// visibility modifier (`private def run`). Ruby evaluates the `def` first --
+// the method exists exactly as if it stood alone -- and the modifier then acts
+// on the name it returns. It reports whether the call was consumed; any other
+// shape falls through to rubyVisibilityCall unchanged.
+//
+//   - `private`/`protected`/`public def m`: an instance method in an ordinary
+//     body, a singleton method with that visibility inside `class << self`.
+//     Top level is the same as a bare top-level `def`. `private def self.m` in
+//     an ordinary body acts on the INSTANCE method `m` (NameError at load
+//     unless one exists), so its singleton is not modelled.
+//   - `private_class_method`/`public_class_method def self.m` in an ordinary
+//     body: a singleton method plus the same override fact the
+//     `private_class_method :m` spelling produces, instead of an owner hazard.
+//   - `module_function def m` in a module body: the instance method only. Its singleton copy
+//     would share the definition's range, and two symbols over one body would
+//     make source attribution pick between them; the owner hazard
+//     rubyVisibilityCall records for `module_function` stays.
+func rubyWrappedDefinition(call *sitter.Node, container string, singleton bool, content []byte, pf *graph.ParsedFile) bool {
+	if childByFieldName(call, "receiver") != nil {
+		return false
+	}
+	def, ok := rubyWrappedDefinitionNode(call)
+	if !ok {
+		return false
+	}
+	method := nodeText(childByFieldName(call, "method"), content)
+	if container == "" && method != "private" && method != "protected" && method != "public" {
+		return false
+	}
+	switch method {
+	case "private", "protected", "public":
+		if def.Type() != "method" {
+			return false
+		}
+		rubyAddMethod(def, container, singleton, method, content, pf)
+		return true
+	case "private_class_method", "public_class_method":
+		if singleton || def.Type() != "singleton_method" || nodeText(childByFieldName(def, "object"), content) != "self" {
+			return false
+		}
+		name := nodeText(childByFieldName(def, "name"), content)
+		if name == "" {
+			return false
+		}
+		rubyAddMethod(def, container, true, "public", content, pf)
+		specifier := "private"
+		if method == "public_class_method" {
+			specifier = "public"
+		}
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+			Kind: graph.ScopeImportRubySingletonVisibility, OwnerModule: container,
+			LocalName: name, SourceSpecifier: specifier, Static: true})
+		return true
+	case "module_function":
+		// Class undefines module_function: in a class body the call raises.
+		if singleton || def.Type() != "method" || !rubyDirectlyInModuleBody(call) {
+			return false
+		}
+		rubyAddMethod(def, container, false, "", content, pf)
+		rubyAddVisibilityHazard(container, pf)
+		return true
+	}
+	return false
+}
+
+// rubyDirectlyInModuleBody reports whether a call is a statement of a `module`
+// body rather than a class body.
+func rubyDirectlyInModuleBody(call *sitter.Node) bool {
+	parent := call.Parent()
+	if parent != nil && parent.Type() == "body_statement" {
+		parent = parent.Parent()
+	}
+	return parent != nil && parent.Type() == "module"
+}
+
+// rubyRecordedWrapper reports whether a call is a modifier whose definition
+// rubyWrappedDefinition recorded as a method. `private def run` starts on the
+// definition's own line, so its edge would be attributed to `run` as a call
+// `run` never makes. A wrapper whose definition was refused (a `def` nested in
+// a method body, `helper_method def m`) stays an ordinary call. Only
+// rubyWrappedDefinition records a `def` that is a call argument, so the
+// recorded range identifies exactly the calls it consumed.
+func rubyRecordedWrapper(call *sitter.Node, recorded map[graph.Position]bool) bool {
+	def, ok := rubyWrappedDefinitionNode(call)
+	return ok && recorded[nodeRange(def)]
+}
+
+// rubyWrappedDefinitionNode returns the definition when it is the call's only
+// argument.
+func rubyWrappedDefinitionNode(call *sitter.Node) (*sitter.Node, bool) {
+	args := childByFieldName(call, "arguments")
+	if args == nil || args.NamedChildCount() != 1 {
+		return nil, false
+	}
+	def := args.NamedChild(0)
+	if def == nil || (def.Type() != "method" && def.Type() != "singleton_method") {
+		return nil, false
+	}
+	return def, true
 }
 
 // rubyAddVisibilityHazard records that an owner's singleton visibility cannot
@@ -429,6 +534,12 @@ func rubyRebindsSelf(call *sitter.Node, content []byte) bool {
 }
 
 func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+	recorded := make(map[graph.Position]bool)
+	for _, sym := range pf.Symbols {
+		if sym.Kind == "function" {
+			recorded[sym.Range] = true
+		}
+	}
 	for _, call := range findDescendants(root, "call") {
 		methodNode := childByFieldName(call, "method")
 		method := nodeText(methodNode, content)
@@ -443,7 +554,7 @@ func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		// The reference is a real occurrence either way; only the call edge
 		// needs a receiver the parser can vouch for.
 		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
-		if rubyAssignmentTarget(call) || rubyBlockLocalDefinition(call) || rubyRebindsSelf(call, content) {
+		if rubyAssignmentTarget(call) || rubyBlockLocalDefinition(call) || rubyRebindsSelf(call, content) || rubyRecordedWrapper(call, recorded) {
 			continue
 		}
 		evidence := rubyCallEvidence(receiver, rubyCallOperator(receiver, methodNode, content))

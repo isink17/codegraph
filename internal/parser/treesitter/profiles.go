@@ -76,6 +76,12 @@ func (a *RustAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:rust:v3", EmitsCallEdges: true}
 }
 
+// Ruby v6 records a `def` passed as the only argument of a visibility modifier
+// (`private def run`, `private_class_method def self.build`, `module_function
+// def tool`) as the method it defines, with its body's calls, and no longer
+// emits the wrapper call as an edge of that method. Unchanged bytes now persist
+// new symbols, edges and visibility facts, so every Ruby file has to reach the
+// parser again.
 // Ruby v5 adds constant identity and visibility facts. Ruby v4 adds P22.48 singleton visibility: `def self.run` and a `class <<
 // self` body under the default state are stated public, a bare `private` /
 // `protected` inside `class << self` is carried on the method symbol, and
@@ -96,7 +102,7 @@ func (a *RustAdapter) Profile() parser.Profile {
 // otherwise a repository indexed under v2 would keep edges this parser refuses
 // to emit and never reparse.
 func (a *RubyAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:ruby:v5", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:ruby:v6", EmitsCallEdges: true}
 }
 func (a *SwiftAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:swift:v7", EmitsCallEdges: true}

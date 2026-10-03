@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -154,8 +155,8 @@ def run; end
 	}
 }
 
-func TestRubyProfileV5(t *testing.T) {
-	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v5" || !got.EmitsCallEdges {
+func TestRubyProfileV6(t *testing.T) {
+	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v6" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
 	}
 }
@@ -594,7 +595,6 @@ func TestRubySingletonVisibilityHazards(t *testing.T) {
 	cases := map[string]string{
 		"splat":            "private_class_method(*names)",
 		"variable":         "private_class_method name",
-		"inline def":       "private_class_method def self.x; end",
 		"no arguments":     "private_class_method",
 		"module_function":  "module_function :helper",
 		"bare mod func":    "module_function",
@@ -1102,5 +1102,193 @@ func TestRubyConstantIdentityReceiverSpellingFences(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A `def` passed straight to a visibility call is still a method definition:
+// Ruby defines the method, then applies the modifier to the name `def` returns
+// (verified with Ruby 4.0: `private def m` is a private instance method,
+// `private def m` inside `class << self` a private singleton,
+// `private_class_method def self.m` a private singleton, and
+// `module_function def m` a private instance method plus a singleton copy).
+func TestRubyModifierWrappedDefinitions(t *testing.T) {
+	p := parseRuby(t, `module App
+  class Service
+    def blocked(e)
+      emit(e)
+    end
+    private def emit(e)
+      format(e)
+    end
+    protected def peer(o) = o
+    public def open(x) = x
+    def format(e) = e
+    private_class_method def self.build; end
+    public_class_method def self.make; end
+    class << self
+      private def helper; end
+      protected def guarded; end
+    end
+  end
+  module Util
+    module_function def tool; end
+  end
+end
+`)
+	type method struct {
+		static     bool
+		visibility string
+	}
+	want := map[string]method{
+		"App.Service.emit":    {false, ""},
+		"App.Service.peer":    {false, ""},
+		"App.Service.open":    {false, ""},
+		"App.Service.build":   {true, "public"},
+		"App.Service.make":    {true, "public"},
+		"App.Service.helper":  {true, "private"},
+		"App.Service.guarded": {true, "protected"},
+		"App.Util.tool":       {false, ""},
+	}
+	got := map[string]method{}
+	for _, s := range p.Symbols {
+		if s.Kind == "function" && s.Static != nil {
+			if _, dup := got[s.QualifiedName]; dup {
+				t.Fatalf("%s recorded twice", s.QualifiedName)
+			}
+			got[s.QualifiedName] = method{*s.Static, s.Visibility}
+		}
+	}
+	for q, w := range want {
+		g, ok := got[q]
+		if !ok {
+			t.Errorf("no symbol for %s", q)
+			continue
+		}
+		if g != w {
+			t.Errorf("%s = %+v, want %+v", q, g, w)
+		}
+	}
+	// The class-method wrappers name a literal method, so they are the same
+	// override facts the `private_class_method :build` spelling produces, not
+	// an owner hazard. `module_function` keeps its owner hazard: the singleton
+	// copy it makes is not synthesised.
+	facts := rubyVisibilityFacts(p)
+	wantFacts := map[string]bool{"App.Service.build=private": true, "App.Service.make=public": true, "App.Util=?": true}
+	if len(facts) != len(wantFacts) {
+		t.Fatalf("facts = %#v, want %#v", facts, wantFacts)
+	}
+	for key := range wantFacts {
+		if !facts[key] {
+			t.Errorf("missing fact %s in %#v", key, facts)
+		}
+	}
+	// The body of a wrapped definition is a method body, and the wrapper call
+	// itself is not a call made by that method.
+	edges := map[string]int{}
+	for _, e := range p.Edges {
+		edges[e.DstName] = e.Line
+	}
+	if edges["emit"] != 4 || edges["format"] != 7 {
+		t.Fatalf("body calls missing: %#v", edges)
+	}
+	for _, wrapper := range []string{"private", "protected", "public", "private_class_method", "public_class_method", "module_function"} {
+		if line, ok := edges[wrapper]; ok {
+			t.Errorf("wrapper %s emitted a call edge at line %d", wrapper, line)
+		}
+	}
+}
+
+// Forms that are not a single plain definition under a recognised modifier
+// keep their old shape, including the wrapper's own call edge.
+func TestRubyModifierWrappedDefinitionNegatives(t *testing.T) {
+	cases := map[string]struct {
+		body    string
+		symbols []string
+		facts   []string
+		wrapper string // call edge that must survive, "" for none
+	}{
+		// Already a symbol through its own `def`; the symbol argument adds nothing.
+		"symbol argument": {"def m; end\n    private :m", []string{"App.Service.m"}, nil, ""},
+		// `private` acts on the INSTANCE method `m`: NameError at load unless one
+		// exists, and then `self.m` is a public singleton. Not modelled.
+		"private def self": {"private def self.m; end", nil, nil, ""},
+		// Not a visibility modifier; what it does with the name is not modelled.
+		"other wrapper": {"helper_method def m; end", nil, nil, ""},
+		// Two arguments are not one definition.
+		"def plus symbol": {"private_class_method def self.m; end, :n", nil, []string{"App.Service=?"}, ""},
+		// Class undefines module_function, so this raises NoMethodError at load.
+		"module_function in a class": {"module_function def m; end", nil, []string{"App.Service=?"}, ""},
+		// A class-method modifier inside `class << self` names the singleton's singleton.
+		"eigenclass class method": {"class << self\n      private_class_method def self.m; end\n    end", nil, []string{"App.Service=?"}, ""},
+		// A def nested in a method body is not a symbol, so the wrapper stays a
+		// call the enclosing method makes.
+		"nested in a method": {"def self.setup\n      private def inner; y(1); end\n    end", []string{"App.Service.setup"}, nil, "private"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := parseRuby(t, "module App\n  class Service\n    "+c.body+"\n  end\nend\n")
+			var syms []string
+			for _, s := range p.Symbols {
+				if s.Kind == "function" {
+					syms = append(syms, s.QualifiedName)
+				}
+			}
+			if strings.Join(syms, ",") != strings.Join(c.symbols, ",") {
+				t.Fatalf("symbols = %v, want %v", syms, c.symbols)
+			}
+			facts := rubyVisibilityFacts(p)
+			if len(facts) != len(c.facts) {
+				t.Fatalf("facts = %#v, want %v", facts, c.facts)
+			}
+			for _, f := range c.facts {
+				if !facts[f] {
+					t.Fatalf("missing fact %s in %#v", f, facts)
+				}
+			}
+			// Every wrapper in these cases is refused, so none may lose its edge.
+			wrappers := map[string]bool{}
+			for _, e := range p.Edges {
+				wrappers[e.DstName] = true
+			}
+			if c.wrapper != "" && !wrappers[c.wrapper] {
+				t.Fatalf("refused wrapper %s lost its call edge: %#v", c.wrapper, p.Edges)
+			}
+			for _, w := range []string{"helper_method", "private_class_method", "module_function"} {
+				if strings.Contains(c.body, w+" def") && !wrappers[w] {
+					t.Fatalf("refused wrapper %s lost its call edge: %#v", w, p.Edges)
+				}
+			}
+		})
+	}
+}
+
+// A top-level `private def m` defines a private method on Object, the same
+// owner a bare top-level `def` gets. The wrapper keeps its reference: only the
+// misattributed edge is dropped.
+func TestRubyModifierWrappedDefinitionAtTopLevel(t *testing.T) {
+	p := parseRuby(t, "private def helper\n  work(1)\nend\n")
+	var found bool
+	for _, s := range p.Symbols {
+		if s.Kind == "function" && s.QualifiedName == "helper" && s.Static != nil && !*s.Static {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no top-level helper symbol: %#v", p.Symbols)
+	}
+	var work, private bool
+	for _, e := range p.Edges {
+		work = work || e.DstName == "work"
+		private = private || e.DstName == "private"
+	}
+	if !work || private {
+		t.Fatalf("edges = %#v, want work and no private", p.Edges)
+	}
+	var ref bool
+	for _, r := range p.References {
+		ref = ref || r.Name == "private"
+	}
+	if !ref {
+		t.Fatal("the wrapper's reference was dropped")
 	}
 }
