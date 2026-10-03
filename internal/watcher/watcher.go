@@ -279,7 +279,16 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 	var seenMu sync.Mutex
 	seenSinceFlush := make(map[string]struct{})
 
-	go func() {
+	// The flush loop is owned by this call: it stops and is awaited before Run
+	// returns on any path, because the caller closes the store and indexer
+	// right after.
+	loopCtx, stopLoop := context.WithCancel(ctx)
+	var loopDone sync.WaitGroup
+	defer func() {
+		stopLoop()
+		loopDone.Wait()
+	}()
+	loopDone.Go(func() {
 		timer := time.NewTimer(debounce)
 		if !timer.Stop() {
 			select {
@@ -290,7 +299,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 		pending := false
 		for {
 			select {
-			case <-ctx.Done():
+			case <-loopCtx.Done():
 				return
 			case <-flushSignalCh:
 				pending = true
@@ -320,7 +329,7 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 				}
 			}
 		}
-	}()
+	})
 
 	for {
 		select {

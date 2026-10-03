@@ -8111,7 +8111,9 @@ func (s *Store) ClaimDirtyFiles(ctx context.Context, repoID int64, claimAt, clai
 		if committed {
 			return
 		}
-		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		// Detached from ctx: a cancelled ctx would skip the ROLLBACK and hand
+		// the pooled connection back still inside the write transaction.
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
 	}()
 
 	rows, err := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
@@ -8225,7 +8227,9 @@ func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, er
 		if committed {
 			return
 		}
-		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		// Detached from ctx: a cancelled ctx would skip the ROLLBACK and hand
+		// the pooled connection back still inside the write transaction.
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
 	}()
 
 	rows, err := conn.QueryContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ? RETURNING path, queued_at`, repoID)
