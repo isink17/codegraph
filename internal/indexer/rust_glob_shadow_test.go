@@ -27,16 +27,15 @@ var rustGlobShadowCases = []struct {
 		"lib.rs": "mod a; pub fn f() {} use a::*;\npub fn caller() {\n    f();\n}\n",
 		"a.rs":   "pub fn f() {}",
 	}, "lib.rs:crate::f", "", ""},
-	// The own item wins in Rust. Private items do not bind today, so the call
-	// stays unresolved; what must never happen is the glob winning.
+	// The module sees its own private items, so the own item wins here too.
 	{"private own fn", tree{
 		"lib.rs": "mod a; use a::*; fn f() {}\npub fn caller() {\n    f();\n}\n",
 		"a.rs":   "pub fn f() {}",
-	}, "", "", ""},
+	}, "lib.rs:crate::f", "", ""},
 	{"private own fn, glob re-export", tree{
 		"lib.rs": "mod a; pub use a::*; fn f() {}\npub fn caller() {\n    f();\n}\n",
 		"a.rs":   "pub fn f() {}",
-	}, "", "", ""},
+	}, "lib.rs:crate::f", "", ""},
 	{"explicit use after glob", tree{
 		"lib.rs": "mod a; mod b; use a::*; use b::f;\npub fn caller() {\n    f();\n}\n",
 		"a.rs":   "pub fn f() {}",

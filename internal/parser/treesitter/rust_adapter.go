@@ -289,7 +289,15 @@ func rustExtractImpl(node *sitter.Node, module, path string, content []byte, pf 
 	typeName := nodeText(typeNode, content)
 	body := childByFieldName(node, "body")
 	if body != nil {
+		first := len(pf.Symbols)
 		rustExtractSymbols(body, module, typeName, path, content, pf)
+		// A trait impl's items have the trait's visibility, not their own,
+		// and the parser does not know the trait's.
+		if childByFieldName(node, "trait") != nil {
+			for i := first; i < len(pf.Symbols); i++ {
+				pf.Symbols[i].Visibility = graph.RustTraitImplVisibility
+			}
+		}
 	}
 }
 
@@ -332,11 +340,15 @@ func rustExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		evidence := name
+		if rustCallShadowed(call, name, content) {
+			evidence = graph.RustCallBlockScopeEvidence
+		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
 			DstName:     name,
 			Kind:        "calls",
-			Evidence:    name,
+			Evidence:    evidence,
 			Line:        line,
 		})
 		pf.References = append(pf.References, graph.Reference{
@@ -346,4 +358,166 @@ func rustExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Range:         nodeRange(call),
 		})
 	}
+}
+
+// rustPathHead is the first segment of a called path, the name a block's own
+// items can shadow. A global path, a qualified-self path and the keywords
+// `crate`, `self`, `super` and `Self` name nothing a block declares, so they
+// give "".
+func rustPathHead(name string) string {
+	head, _, _ := strings.Cut(name, "::")
+	head = strings.TrimSpace(head)
+	switch head {
+	case "", "crate", "self", "super", "Self":
+		return ""
+	}
+	if strings.ContainsAny(head, "<(.") {
+		return ""
+	}
+	return head
+}
+
+// rustCallShadowed reports whether something the parser does not record as
+// a module item may answer the call instead of one: the call sits in a `mod`
+// declared inside a block, whose scope is not the file's module; or an
+// enclosing block declares the path's first name itself (an item, an extern
+// crate, a `use` naming it or a glob), or holds a statement macro that may
+// declare it; or, for a bare name, a parameter or pattern binding of an
+// enclosing function, closure, `let`, `for`, `match` arm or `if let` /
+// `while let` names it. Each shadows the module's item of that name.
+// Over-approximating scopes only leaves more calls unresolved.
+func rustCallShadowed(call *sitter.Node, name string, content []byte) bool {
+	head := rustPathHead(name)
+	bare := head != "" && !strings.Contains(name, "::")
+	inMod := false
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		switch node.Type() {
+		case "mod_item":
+			inMod = true
+		case "block":
+			if inMod {
+				// Only a `crate::` path means the same thing everywhere.
+				return !strings.HasPrefix(strings.TrimSpace(name), "crate::")
+			}
+			if head == "" {
+				continue
+			}
+			for i := range int(node.ChildCount()) {
+				child := node.Child(i)
+				if rustDeclares(child, head, content) || rustItemMacro(child, content) {
+					return true
+				}
+				if bare && child.Type() == "let_declaration" && rustPatternBinds(childByFieldName(child, "pattern"), head, content) {
+					return true
+				}
+			}
+		case "function_item", "closure_expression":
+			if bare && rustPatternBinds(childByFieldName(node, "parameters"), head, content) {
+				return true
+			}
+		case "for_expression", "match_arm":
+			if bare && rustPatternBinds(childByFieldName(node, "pattern"), head, content) {
+				return true
+			}
+		case "if_expression", "while_expression":
+			if bare && rustPatternBinds(childByFieldName(node, "condition"), head, content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rustPatternBinds reports whether any named leaf in a pattern, parameter
+// list or condition spells name: an identifier, a struct-pattern shorthand
+// (`P { f }`, a shorthand_field_identifier), or a binding inside `x @ ..`,
+// `ref`, `mut`, tuple, slice or or-patterns. Paths, field names and types
+// inside the pattern count too, which only refuses more.
+func rustPatternBinds(node *sitter.Node, name string, content []byte) bool {
+	if node == nil {
+		return false
+	}
+	if node.NamedChildCount() == 0 {
+		return nodeText(node, content) == name
+	}
+	for i := range int(node.NamedChildCount()) {
+		if rustPatternBinds(node.NamedChild(i), name, content) {
+			return true
+		}
+	}
+	return false
+}
+
+// rustExpressionMacros are std macros that expand to an expression and never
+// declare an item, so a statement calling one shadows nothing.
+var rustExpressionMacros = map[string]bool{
+	"assert": true, "assert_eq": true, "assert_ne": true, "debug_assert": true,
+	"debug_assert_eq": true, "debug_assert_ne": true, "dbg": true, "eprint": true,
+	"eprintln": true, "format": true, "format_args": true, "matches": true,
+	"panic": true, "print": true, "println": true, "todo": true,
+	"unimplemented": true, "unreachable": true, "vec": true, "write": true,
+	"writeln": true,
+}
+
+// rustItemMacro reports whether a block statement is a macro call that may
+// expand to items. A std expression macro is exempt unless the file defines
+// a macro of that name, which would shadow std's.
+func rustItemMacro(stmt *sitter.Node, content []byte) bool {
+	if stmt.Type() == "expression_statement" && stmt.NamedChildCount() > 0 {
+		stmt = stmt.NamedChild(0)
+	}
+	if stmt.Type() != "macro_invocation" {
+		return false
+	}
+	macro := childByFieldName(stmt, "macro")
+	if macro == nil || macro.Type() != "identifier" {
+		return true
+	}
+	name := nodeText(macro, content)
+	if !rustExpressionMacros[name] {
+		return true
+	}
+	root := stmt
+	for root.Parent() != nil {
+		root = root.Parent()
+	}
+	for _, def := range findDescendants(root, "macro_definition") {
+		if n := childByFieldName(def, "name"); n != nil && nodeText(n, content) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func rustDeclares(item *sitter.Node, head string, content []byte) bool {
+	switch item.Type() {
+	case "use_declaration":
+		arg := childByFieldName(item, "argument")
+		if arg == nil || item.HasError() {
+			return true // unreadable: it may import anything
+		}
+		var imports []graph.ScopeImport
+		rustUseTree(arg, "", false, "", content, &imports)
+		for _, im := range imports {
+			if im.Wildcard || im.LocalName == head {
+				return true
+			}
+		}
+		return false
+	case "extern_crate_declaration":
+		if alias := childByFieldName(item, "alias"); alias != nil {
+			return nodeText(alias, content) == head
+		}
+	case "foreign_mod_item":
+		if body := childByFieldName(item, "body"); body != nil {
+			for i := range int(body.ChildCount()) {
+				if rustDeclares(body.Child(i), head, content) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	name := childByFieldName(item, "name")
+	return name != nil && nodeText(name, content) == head
 }

@@ -7,6 +7,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 type rustScopeFile struct {
@@ -718,10 +720,36 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		root := rootOfFile[caller.id]
 		return root != "" && globModules[[2]string{root, module}]
 	}
+	// A private impl method is an inherent impl's: a trait impl's items are
+	// recorded with their own visibility, which nothing here binds. An
+	// inherent `m` is what `Type::m` finds first, and a type has at most one
+	// (E0592). It answers only when the impl names its type as a bare
+	// identifier, so the caller's path names that type in the same module.
+	privateMethodProven := func(c rustScopeSymbol) bool {
+		return c.container == candidateModule(c) || rustPlainIdent(c.container)
+	}
 	eligible := func(c rustScopeSymbol, caller rustScopeFile) bool {
 		module := candidateModule(c)
-		if c.visibility == "private" && caller.module != module && !strings.HasPrefix(caller.module, module+"::") {
-			return false
+		// A private item (`pub(self)` says the same) is visible in its own
+		// module and every module nested in it. Both modules must be facts,
+		// not path guesses:
+		//   - the candidate is judged in its persisted module only. The lookup
+		//     views re-home every symbol of a file under each module the file
+		//     holds, inline ones included, which is safe for an item anyone
+		//     may see but not for one only its own module may.
+		//   - caller.module is the parser's reading of the file path, so it
+		//     counts only when the declaration graph proves the caller's file
+		//     holds that module (or the item is in the caller's own file).
+		//     The file's module is the caller's module or an ancestor of it,
+		//     so this can only under-approximate.
+		if c.visibility == "private" || c.visibility == "restricted:self" {
+			if c.qualified != symbols[c.id].qualified || !privateMethodProven(c) {
+				return false
+			}
+			if c.file != caller.id && !(moduleProven(rootOfFile[caller.id], caller.module) && moduleMember(caller.module, caller.id, caller.id)) {
+				return false
+			}
+			return caller.module == module || strings.HasPrefix(caller.module, module+"::")
 		}
 		if c.visibility == "public" {
 			return true
@@ -747,6 +775,11 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			p = p[1:]
 		default:
 			for len(p) > 0 && p[0] == "super" {
+				// A module owner is `crate` or below it; anything else has
+				// no parent module to name.
+				if owner != "crate" && !strings.HasPrefix(owner, "crate::") {
+					return ""
+				}
 				if i := strings.LastIndex(owner, "::"); i >= 0 {
 					owner = owner[:i]
 				} else {
@@ -793,16 +826,24 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {
 				continue
 			}
+			// Rust never re-exports a private item, so nothing private is
+			// reached through a re-export step.
+			var reached []rustScopeSymbol
 			if im.glob {
 				if own {
 					continue
 				}
-				out = append(out, exportCandidates(resolvePath(im.source, module), name, root, seen)...)
+				reached = exportCandidates(resolvePath(im.source, module), name, root, seen)
 			} else if im.local == name {
 				raw := resolvePath(im.source, module)
 				parts := strings.Split(raw, "::")
 				if len(parts) > 1 {
-					out = append(out, exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], root, seen)...)
+					reached = exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], root, seen)
+				}
+			}
+			for _, c := range reached {
+				if c.visibility != "private" && c.visibility != "restricted:self" {
+					out = append(out, c)
 				}
 			}
 		}
@@ -841,7 +882,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			return nil, err
 		}
 	}
-	const edgeQuery = `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='rust' AND e.dst_symbol_id IS NULL`
+	const edgeQuery = `SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,COALESCE(e.evidence,'') FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='rust' AND e.dst_symbol_id IS NULL`
 	for _, edgeBatch := range edgeBatches {
 		query := edgeQuery
 		if filteredEdges {
@@ -853,8 +894,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}
 		for rows.Next() {
 			var id, file, src int64
-			var dst string
-			if err := rows.Scan(&id, &file, &src, &dst); err != nil {
+			var dst, evidence string
+			if err := rows.Scan(&id, &file, &src, &dst, &evidence); err != nil {
 				return nil, err
 			}
 			if only != nil {
@@ -870,12 +911,25 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				continue
 			}
 			ss := symbols[src]
-			if strings.Contains(dst, ".") {
+			// A block around the call declares the path's first name, which
+			// shadows every module item of that name.
+			if strings.Contains(dst, ".") || evidence == graph.RustCallBlockScopeEvidence {
 				continue
 			}
 			owner := ss.container
-			if owner == "" {
+			switch {
+			case owner == "":
 				owner = caller.module
+			case ss.qualified != owner+"::"+ss.name:
+				// An impl method: its container is the impl's type as written
+				// (`S`, `crate::a::S`), not a module path. Paths resolve from
+				// the module holding the impl, the prefix the parser put
+				// before `type::name`; any other shape names no module.
+				if m, ok := strings.CutSuffix(ss.qualified, "::"+ss.container+"::"+ss.name); ok {
+					owner = m
+				} else {
+					owner = "\x00impl"
+				}
 			}
 			path := dst
 			strategy := ResolutionStrategyRustModuleScope
@@ -1139,4 +1193,18 @@ func (s *Store) dropRustEdgesOutsideScope(ctx context.Context, repoID int64, sco
 			}
 			return nil
 		})
+}
+
+// rustPlainIdent reports whether an impl's type is written as one bare
+// identifier: no path, generics, reference or other type syntax.
+func rustPlainIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r != '_' && !('a' <= r && r <= 'z') && !('A' <= r && r <= 'Z') && !('0' <= r && r <= '9') && r <= 0x7f {
+			return false
+		}
+	}
+	return true
 }
