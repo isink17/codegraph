@@ -12,8 +12,14 @@ func tsProfile(language string) parser.Profile {
 	return parser.Profile{ID: "treesitter:" + language + ":v1", EmitsCallEdges: true}
 }
 
-func (a *GoAdapter) Profile() parser.Profile     { return tsProfile("go") }
-func (a *PythonAdapter) Profile() parser.Profile { return tsProfile("python") }
+func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
+
+// Python v2 reads Unicode names (PEP 3131) in the import and local-binding
+// evidence it shares with the non-cgo adapter: Unicode imports now bind, Unicode
+// locals now shadow, and a nested `def café` no longer binds the fragment `caf`.
+func (a *PythonAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:python:v2", EmitsCallEdges: true}
+}
 
 // Java v3 reads the package from the package_declaration node instead of the
 // first `package x;` spelled anywhere in the raw text, so a comment or string

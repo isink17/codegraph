@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Python names are now read as Unicode (PEP 3131) as Python reads them. The non-CGO
+parser previously dropped definitions and calls such as `café`, and could record the
+ASCII tail of a name as a call (`naïve_func()` as `ve_func`). Both parsers previously
+dropped Unicode import names and local bindings, so a Unicode local or parameter did
+not shadow a module definition of the same name (a wrong call edge), and a nested
+`def café` bound the fragment `caf`, refusing a real `caf()` import edge.
+`treesitter:python:v2` and `python-regex:python:v2` reparse unchanged Python files on
+the next complete update.
+
 Ruby scope documentation now states supported static resolution and deferred runtime behavior, including the separation of `require` metadata and Rails/Zeitwerk conventions from scope evidence. Resolver behavior is unchanged.
 
 The clean v2 baseline replaces all 44 development migrations and removes one-time

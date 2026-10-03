@@ -2,6 +2,8 @@ package python
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -260,5 +262,88 @@ def helper():
 		if !owned {
 			t.Fatalf("edge to %q at line %d is inside no function span", edge.DstName, edge.Line)
 		}
+	}
+}
+
+// Python identifiers are Unicode (PEP 3131). Every verdict below is what
+// Python's own str.isidentifier() says about the name; the adapter must declare
+// exactly the valid ones, under exactly that name, and never a fragment of an
+// invalid one.
+func TestUnicodeDefinitionNamesFollowPython(t *testing.T) {
+	cases := []struct {
+		name  string
+		valid bool
+	}{
+		{"café", true},
+		{"Ñandú", true},
+		{"变量", true},
+		{"℘x", true},      // Other_ID_Start
+		{"x٣", true},      // Arabic-Indic digit continues a name
+		{"e\u0301", true}, // combining mark continues a name
+		{"x·y", true},     // Other_ID_Continue
+		{"ｆｕｌｌ", true},    // fullwidth letters
+		{"_ñ", true},
+		{"€uro", false},
+		{"∑", false},
+		{"😀", false},
+		{"a\u00a0b", false}, // no-break space
+		{"·x", false},       // continue-only rune cannot start a name
+		{"٣x", false},
+		{"\u0301e", false},
+		// Python (Unicode 16) accepts U+1C89; Go's tables predate it, so the
+		// adapter declares nothing rather than the fragment before it.
+		{"x\u1c89y", false},
+	}
+	for _, tc := range cases {
+		src := "def " + tc.name + "():\n    pass\n\nclass " + tc.name + "_k:\n    pass\n"
+		want := []string(nil)
+		if tc.valid {
+			want = []string{tc.name, tc.name + "_k"}
+		}
+		var got []string
+		for _, s := range parseSource(t, src).Symbols {
+			got = append(got, s.Name)
+		}
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Errorf("%q: symbols = %q, want %q", tc.name, got, want)
+		}
+	}
+}
+
+// Calls to Unicode names keep their whole name. An ASCII-only identifier class
+// used to drop them, or worse emit the ASCII tail of the name as a call to a
+// different function (`naïve_func()` became `ve_func`).
+func TestUnicodeCallNamesAreWhole(t *testing.T) {
+	const src = `class Café:
+    def naïve_méthode(self):
+        return 变量()
+
+def 变量():
+    return ℘x٣()
+
+def ℘x٣():
+    pass
+
+def caller():
+    Café().naïve_méthode()
+    café_obj.métode()
+    naïve_func()
+    xᲉy()
+`
+	p := parseSource(t, src)
+	assertSpan(t, p, "mod.Café", 1, 3)
+	assertSpan(t, p, "mod.Café.naïve_méthode", 2, 3)
+	assertSpan(t, p, "mod.变量", 5, 6)
+	assertSpan(t, p, "mod.℘x٣", 8, 9)
+	if len(p.Symbols) != 5 {
+		t.Fatalf("symbols = %v, want exactly Café, naïve_méthode, 变量, ℘x٣, caller", p.Symbols)
+	}
+	var got []string
+	for _, e := range p.Edges {
+		got = append(got, e.DstName+"@"+strconv.Itoa(e.Line))
+	}
+	want := "变量@3|℘x٣@6|Café@12|café_obj.métode@13|naïve_func@14"
+	if strings.Join(got, "|") != want {
+		t.Fatalf("calls = %q, want %q", got, want)
 	}
 }

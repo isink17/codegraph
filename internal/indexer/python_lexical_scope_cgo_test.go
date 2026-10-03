@@ -12,3 +12,12 @@ import (
 func TestPythonLexicalScopeTreeSitterAdapter(t *testing.T) {
 	runPythonLexicalCases(t, parser.NewRegistry(tsparser.NewPython()))
 }
+
+func TestPythonUnicodeScopeTreeSitterAdapter(t *testing.T) {
+	runPythonUnicodeScopeCases(t, parser.NewRegistry(tsparser.NewPython()))
+}
+
+func TestTreeSitterPythonProfileUnicodeIdentifiersConverge(t *testing.T) {
+	runPythonUnicodeProfileConvergence(t,
+		pythonV1Adapter{Adapter: tsparser.NewPython(), id: "treesitter:python:v1"}, tsparser.NewPython())
+}
