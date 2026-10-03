@@ -3,6 +3,7 @@ package python
 import (
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -340,5 +341,63 @@ func TestLocalBindingsMarksNestedDeclarations(t *testing.T) {
 	want := []LocalBinding{{Name: "value"}, {Name: "inner", Declaration: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("LocalBindings() = %+v, want %+v", got, want)
+	}
+}
+
+// Unicode names (PEP 3131) bind like ASCII ones, and no binding is ever a
+// fragment of a Unicode name: `def café` once bound `caf` and `naïve :=`
+// bound `ve`, each able to shadow an unrelated import of that name.
+func TestLocalBindingsReadUnicodeNames(t *testing.T) {
+	src := `def run(café, *ñs, kw_ü=1, **opts):
+    thé = 1
+    (naïve := 2)
+    for ü, ö in pairs:
+        pass
+    with cm as ç:
+        pass
+    try:
+        pass
+    except E as é:
+        pass
+    def 变量():
+        pass
+    class Ñu:
+        pass
+`
+	var got []string
+	for _, b := range LocalBindings(src, true) {
+		name := b.Name
+		if b.Declaration {
+			name += "/decl"
+		}
+		got = append(got, name)
+	}
+	sort.Strings(got)
+	want := []string{"kw_ü", "naïve", "opts", "thé", "café", "ç", "é", "ñs", "ö", "ü", "Ñu/decl", "变量/decl"}
+	sort.Strings(want)
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("LocalBindings = %q, want %q", got, want)
+	}
+}
+
+func TestImportBindingsReadUnicodeNames(t *testing.T) {
+	cases := []struct{ stmt, want string }{
+		{"from café.módulo import thé as ñ, tea", "café.módulo|thé|ñ café.módulo|tea|tea"},
+		{"import café.módulo as m", "café.módulo|café.módulo|m"},
+		{"import café.módulo", "café.módulo|café|café"},
+		{"from . import ñu", ".|ñu|ñu"},
+		// Not identifiers: nothing is bound, not even a fragment.
+		{"from lib import €x", ""},
+		{"import a€", ""},
+		{"from lib import x as ·y", ""},
+	}
+	for _, tc := range cases {
+		var got []string
+		for _, b := range ImportBindings(tc.stmt) {
+			got = append(got, b.SourceSpecifier+"|"+b.ImportedName+"|"+b.LocalName)
+		}
+		if strings.Join(got, " ") != tc.want {
+			t.Errorf("ImportBindings(%q) = %q, want %q", tc.stmt, strings.Join(got, " "), tc.want)
+		}
 	}
 }

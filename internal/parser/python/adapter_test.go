@@ -290,14 +290,14 @@ func TestUnicodeDefinitionNamesFollowPython(t *testing.T) {
 		{"·x", false},       // continue-only rune cannot start a name
 		{"٣x", false},
 		{"\u0301e", false},
+		// Python (Unicode 16) accepts U+1C89; Go's tables predate it, so the
+		// adapter declares nothing rather than the fragment before it.
+		{"x\u1c89y", false},
 	}
 	for _, tc := range cases {
-		src := "def " + tc.name + "():\n    pass\n"
+		src := "def " + tc.name + "():\n    pass\n\nclass " + tc.name + "_k:\n    pass\n"
 		want := []string(nil)
 		if tc.valid {
-			// The class header pattern does not demand a terminator after
-			// the name, so it is only exercised with names Python accepts.
-			src += "\nclass " + tc.name + "_k:\n    pass\n"
 			want = []string{tc.name, tc.name + "_k"}
 		}
 		var got []string
@@ -328,6 +328,7 @@ def caller():
     Café().naïve_méthode()
     café_obj.métode()
     naïve_func()
+    xᲉy()
 `
 	p := parseSource(t, src)
 	assertSpan(t, p, "mod.Café", 1, 3)

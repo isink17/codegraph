@@ -1,10 +1,36 @@
 package python
 
 import (
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
+
+// identStart and identContinue are the rune classes of a Python name (PEP 3131):
+// an XID_Start rune or `_`, then XID_Continue runes. RE2 has no XID classes, so
+// these are the general categories XID is built from plus its Other_ID_Start /
+// Other_ID_Continue runes. That also admits 22 runes XID excludes (U+037A,
+// U+2E2F, U+FC5E..U+FC63, ...); Python rejects every one of them in the position
+// these classes would accept it, so on source Python compiles they read the same
+// names. Runes assigned after Go's unicode.Version are not names here.
+//
+// This is the one definition of a Python name in the package: both adapters'
+// declarations, calls, imports and local bindings are read with it.
+const (
+	identStart    = `_\p{L}\p{Nl}\x{1885}\x{1886}\x{2118}\x{212E}`
+	identContinue = identStart + `\p{Mn}\p{Mc}\p{Nd}\p{Pc}` +
+		`\x{00B7}\x{0387}\x{1369}-\x{1371}\x{19DA}\x{200C}\x{200D}\x{30FB}\x{FF65}`
+	identifier = `[` + identStart + `][` + identContinue + `]*`
+)
+
+var (
+	identifierRE    = regexp.MustCompile(`^` + identifier + `$`)
+	identContinueRE = regexp.MustCompile(`^[` + identContinue + `]$`)
+)
+
+func isIdentifierRune(r rune) bool { return identContinueRE.MatchString(string(r)) }
 
 // ImportBindings converts one logical Python import statement into scope import
 // evidence. It records what the syntax says and nothing more: the module
@@ -116,21 +142,7 @@ func validDottedName(name string) bool {
 	return true
 }
 
-func validIdentifier(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c == '_', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		case c >= '0' && c <= '9' && i > 0:
-		default:
-			return false
-		}
-	}
-	return true
-}
+func validIdentifier(name string) bool { return identifierRE.MatchString(name) }
 
 // importStatements folds the masked source into logical import statements,
 // following parenthesised and backslash continuations. It reports the physical
@@ -268,11 +280,7 @@ func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
 // `async ` prefix already stripped.
 func declaredName(header string) string {
 	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(header, "def"), "class"))
-	end := 0
-	for end < len(rest) && isIdentifierByte(rest[end]) {
-		end++
-	}
-	return rest[:end]
+	return rest[:len(rest)-len(strings.TrimLeftFunc(rest, isIdentifierRune))]
 }
 
 // pythonLogicalLines folds bracket and backslash continuations, reporting the
@@ -445,7 +453,7 @@ func splitKeyword(stmt, keyword string) []string {
 		if !strings.HasPrefix(stmt[i:], keyword) {
 			continue
 		}
-		if keyword[0] != ' ' && i > 0 && isIdentifierByte(stmt[i-1]) {
+		if r, _ := utf8.DecodeLastRuneInString(stmt[:i]); keyword[0] != ' ' && i > 0 && isIdentifierRune(r) {
 			continue
 		}
 		out = append(out, stmt[i+len(keyword):])
@@ -458,11 +466,7 @@ func lastIdentifierBefore(text string) string {
 	for end > 0 && text[end-1] == ' ' {
 		end--
 	}
-	start := end
-	for start > 0 && isIdentifierByte(text[start-1]) {
-		start--
-	}
-	return text[start:end]
+	return text[len(strings.TrimRightFunc(text[:end], isIdentifierRune)):end]
 }
 
 // pythonInlineBody returns the statement a compound header carries on its own
@@ -481,8 +485,4 @@ func pythonInlineBody(stmt string) (string, bool) {
 		return strings.TrimSpace(rest), true
 	}
 	return "", false
-}
-
-func isIdentifierByte(c byte) bool {
-	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
