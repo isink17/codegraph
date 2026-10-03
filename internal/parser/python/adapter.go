@@ -11,13 +11,24 @@ import (
 	"github.com/isink17/codegraph/internal/texttoken"
 )
 
+// identifier is a Python name (PEP 3131): an XID_Start rune or `_`, then XID_Continue
+// runes. RE2 has no XID classes, so these are the general categories XID is built
+// from plus its Other_ID_Start/Other_ID_Continue runes. That also admits 22 runes
+// XID excludes (U+037A, U+2E2F, U+FC5E..U+FC63, ...); Python rejects every one
+// of them in the position this class would accept it, so on source Python
+// compiles the class reads the same names. Runes assigned after Go's
+// unicode.Version are not names here.
+const identifier = `[_\p{L}\p{Nl}\x{1885}\x{1886}\x{2118}\x{212E}]` +
+	`[_\p{L}\p{Nl}\x{1885}\x{1886}\x{2118}\x{212E}\p{Mn}\p{Mc}\p{Nd}\p{Pc}` +
+	`\x{00B7}\x{0387}\x{1369}-\x{1371}\x{19DA}\x{200C}\x{200D}\x{30FB}\x{FF65}]*`
+
 var (
-	classRE = regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	defRE   = regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	classRE = regexp.MustCompile(`^\s*class\s+(` + identifier + `)`)
+	defRE   = regexp.MustCompile(`^\s*(?:async\s+)?def\s+(` + identifier + `)\s*\(`)
 	// callRE keeps the whole dotted receiver chain a call site actually wrote,
 	// so `helpers.load()` stays distinguishable from a bare `load()`. The chain
 	// is syntax, not a claim about what `helpers` is.
-	callRE = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)
+	callRE = regexp.MustCompile(`(` + identifier + `(?:\.` + identifier + `)*)\s*\(`)
 )
 
 type scope struct {
@@ -402,5 +413,5 @@ func isPythonKeyword(name string) bool {
 // Profile identifies the dedicated non-cgo Python adapter, which is
 // regex-driven but does build a call graph. See parser.Profile.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v1", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v2", EmitsCallEdges: true}
 }

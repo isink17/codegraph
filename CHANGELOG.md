@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+The non-CGO Python parser now reads Unicode identifiers (PEP 3131) as Python does.
+It previously dropped definitions and calls such as `café`, and could record the
+ASCII tail of a name as a call (`naïve_func()` as `ve_func`). `python-regex:python:v2`
+reparses unchanged Python files on the next complete update; native builds are unchanged.
+
 Ruby scope documentation now states supported static resolution and deferred runtime behavior, including the separation of `require` metadata and Rails/Zeitwerk conventions from scope evidence. Resolver behavior is unchanged.
 
 The clean v2 baseline replaces all 44 development migrations and removes one-time
