@@ -330,6 +330,13 @@ var resolverGoBareScopeSQL = `(
 		OR ` + sqlNotBareName("edges.dst_name") + `
 	)`
 
+// goBareScopeOwned is the Go binder's twin of resolverGoBareScopeSQL: the edges
+// only the package-scoped bare pass may answer. The SQL also withholds an
+// empty spelling, which no strategy on either side can bind.
+func goBareScopeOwned(t edgeTarget) bool {
+	return t.srcLanguage == "go" && goBareCallName(t.dstName)
+}
+
 // goBareScopeTables are the temp tables resolveGoPackageScopedBareNames owns.
 var goBareScopeTables = []string{"tmp_go_bare_edges", "tmp_go_bare_candidates"}
 

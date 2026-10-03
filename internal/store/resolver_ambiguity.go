@@ -1,7 +1,9 @@
 package store
 
 import (
+	"maps"
 	"slices"
+	"strings"
 )
 
 // resolverQualifiedLookupSQL derives a small lookup relation from unresolved
@@ -202,44 +204,123 @@ const resolverJVMScopeVetoSQL = `(f.language IN ('java','kotlin') AND EXISTS (
 	WHERE fs.repo_id = edges.repo_id AND fs.file_id = edges.file_id
 ))`
 
-// resolverBindableCandidateSQL is what a repo-wide strategy must satisfy to
-// write a destination at all: the P2 language gate, the requirement that the
-// candidate group actually holds an id this caller kind may bind (P7), the
-// P22.6 Go bare-name package-scope rule, the P22.9 bare-name type-target
-// scope rule, and the P22.15 rule that a bare C/C++ call may not claim a class
-// member without class evidence. The exact-qualified strategy carries this
-// without the veto below.
-//
-// The three scope rules sit here rather than beside the own-module veto because
-// they are properties of the *chosen candidate*, not of the edge alone: a
-// strategy that reaches a foreign-package candidate for a bare Go call, a class
-// the calling file neither declares nor imports for any bare call, or another
-// class's member for a bare C/C++ call, must bind nothing, whichever strategy
-// it is. See go_package_scope.go, resolver_type_scope.go and cpp_class_scope.go.
-var resolverBindableCandidateSQL = resolverLanguageGateSQL + `
-		AND (` + resolverChosenCandidateSQL + `) IS NOT NULL
-		AND ` + cppScopeVetoSQL + `
-		AND ` + resolverGoBareScopeSQL + `
-		AND ` + resolverGoLocalQualifierSQL + `
-		AND ` + resolverBareNameTypeScopeSQL + `
-		AND ` + resolverCppBareNamespaceScopeSQL + `
-		AND ` + resolverCppBareMemberScopeSQL + `
-		AND ` + rubyScopeVetoSQL + `
-		AND NOT ` + resolverJVMScopeVetoSQL + `
-		AND NOT EXISTS (SELECT 1 FROM ` + csharpScopeVeto + ` csv WHERE csv.edge_id = edges.id)` + `
-		AND NOT EXISTS (SELECT 1 FROM ` + tsScopeVeto + ` tsv WHERE tsv.edge_id = edges.id)` + `
-		AND NOT EXISTS (SELECT 1 FROM ` + pyScopeVeto + ` psv WHERE psv.edge_id = edges.id)` + `
-		AND ` + phpScopeVetoSQL + `
-		AND ` + swiftScopeVetoSQL
+// resolverRuleID names one rule of the repo-wide bind gate. The same identity
+// labels the rule's Go-side counterpart, so the SQL strategies, the Go binder
+// and their parity tests talk about one rule rather than two spellings of it.
+type resolverRuleID string
 
-// resolverBindGateSQL is what every repo-wide strategy's UPDATE must
-// satisfy before it may write a destination: the P2 language gate, the P7
-// caller-kind candidate choice, the P22.6 Go package-scope rule, and the P3
-// ambiguity veto. It is one value so a strategy cannot be added that applies
-// one rule and forgets the other.
-var resolverBindGateSQL = resolverBindableCandidateSQL + `
-		AND ` + resolverAmbiguousNamesSQL + `
-		AND NOT EXISTS (
+// resolverRuleStage places a rule relative to candidate selection. Stages are
+// labels, not an execution order: every rule is one conjunct of the same
+// WHERE clause, and moving a rule across selection (for example turning a
+// chosen-candidate restriction into a population filter) changes which
+// candidates count toward uniqueness, so it is a behaviour change.
+type resolverRuleStage uint8
+
+const (
+	// resolverStagePopulation decides which candidates exist for the caller.
+	resolverStagePopulation resolverRuleStage = iota + 1
+	// resolverStageOwnership withholds the edge from every generic strategy
+	// because a language pass owns it, whether that pass bound it or not.
+	resolverStageOwnership
+	// resolverStageChosenCandidate judges the candidate a strategy selected.
+	resolverStageChosenCandidate
+	// resolverStageBroadAmbiguity refuses names a broad evidence level found
+	// undecidable for this caller kind.
+	resolverStageBroadAmbiguity
+	// resolverStageOwnModule refuses edges an own-module import claimed.
+	resolverStageOwnModule
+)
+
+// resolverRuleDisposition is what a refusal by the rule means for the edge.
+type resolverRuleDisposition uint8
+
+const (
+	// resolverDispositionIneligible: no candidate this caller may bind.
+	resolverDispositionIneligible resolverRuleDisposition = iota + 1
+	// resolverDispositionOwned: another pass decides the edge, or nothing does.
+	resolverDispositionOwned
+	// resolverDispositionAmbiguous: several equally valid candidates.
+	resolverDispositionAmbiguous
+)
+
+// resolverGateRule is one conjunct of the repo-wide bind gate.
+type resolverGateRule struct {
+	id          resolverRuleID
+	stage       resolverRuleStage
+	disposition resolverRuleDisposition
+	// languages are the caller languages the rule can refuse; nil means every
+	// language.
+	languages []string
+	sql       string
+	// owns is the Go binder's twin of an edge-local ownership rule: it reports
+	// exactly the edges `NOT (sql)` selects. It is nil when the Go side decides
+	// the rule from loaded facts rather than from the edge alone.
+	owns func(edgeTarget) bool
+}
+
+// resolverBindableCandidateRules is what a repo-wide strategy must satisfy to
+// write a destination at all. The exact-qualified strategy carries this
+// without the broad-level vetoes in resolverBindGateRules.
+//
+// Order is part of the contract only through the composed SQL text, which is
+// pinned byte for byte; it is not a precedence.
+var resolverBindableCandidateRules = []resolverGateRule{
+	{id: "language_gate", stage: resolverStagePopulation, disposition: resolverDispositionIneligible,
+		sql: resolverLanguageGateSQL},
+	{id: "caller_kind_candidate", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
+		sql: `(` + resolverChosenCandidateSQL + `) IS NOT NULL`},
+	{id: "cpp_evidence_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"cpp"}, sql: cppScopeVetoSQL, owns: cppScopeOwned},
+	{id: "go_bare_package_scope", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"go"}, sql: resolverGoBareScopeSQL, owns: goBareScopeOwned},
+	{id: "go_local_qualifier", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"go"}, sql: resolverGoLocalQualifierSQL},
+	{id: "bare_type_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
+		languages: slices.Sorted(maps.Keys(typeScopeGatedLanguages)), sql: resolverBareNameTypeScopeSQL},
+	{id: "cpp_bare_namespace_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
+		languages: []string{"cpp"}, sql: resolverCppBareNamespaceScopeSQL},
+	{id: "cpp_bare_member_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
+		languages: []string{"cpp"}, sql: resolverCppBareMemberScopeSQL},
+	{id: "ruby_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"ruby"}, sql: rubyScopeVetoSQL, owns: rubyScopeOwned},
+	{id: "jvm_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"java", "kotlin"}, sql: `NOT ` + resolverJVMScopeVetoSQL},
+	{id: "csharp_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"csharp"}, sql: `NOT EXISTS (SELECT 1 FROM ` + csharpScopeVeto + ` csv WHERE csv.edge_id = edges.id)`},
+	{id: "typescript_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"typescript"}, sql: `NOT EXISTS (SELECT 1 FROM ` + tsScopeVeto + ` tsv WHERE tsv.edge_id = edges.id)`},
+	{id: "python_scope_claims", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"python"}, sql: `NOT EXISTS (SELECT 1 FROM ` + pyScopeVeto + ` psv WHERE psv.edge_id = edges.id)`},
+	{id: "php_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"php"}, sql: phpScopeVetoSQL, owns: phpScopeOwned},
+	{id: "swift_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"swift"}, sql: swiftScopeVetoSQL, owns: swiftScopeOwned},
+}
+
+// resolverBindGateRules is what every repo-wide strategy's UPDATE other than
+// exact-qualified must satisfy: the bindable-candidate rules plus the
+// broad-level ambiguity veto and the own-module veto. It is one list so a
+// strategy cannot be added that applies one rule and forgets another.
+var resolverBindGateRules = append(slices.Clip(resolverBindableCandidateRules),
+	resolverGateRule{id: "broad_ambiguity", stage: resolverStageBroadAmbiguity, disposition: resolverDispositionAmbiguous,
+		sql: resolverAmbiguousNamesSQL},
+	resolverGateRule{id: "own_module_import", stage: resolverStageOwnModule, disposition: resolverDispositionOwned,
+		languages: []string{"go"}, sql: `NOT EXISTS (
 			SELECT 1 FROM tmp_resolver_own_module_veto v
 			WHERE v.edge_id = edges.id
-		)`
+		)`},
+)
+
+var (
+	resolverBindableCandidateSQL = composeResolverGate(resolverBindableCandidateRules)
+	resolverBindGateSQL          = composeResolverGate(resolverBindGateRules)
+)
+
+// composeResolverGate joins rules into one WHERE-clause conjunction.
+func composeResolverGate(rules []resolverGateRule) string {
+	parts := make([]string, len(rules))
+	for i, rule := range rules {
+		parts[i] = rule.sql
+	}
+	return strings.Join(parts, "\n\t\tAND ")
+}
