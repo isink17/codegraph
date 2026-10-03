@@ -192,7 +192,8 @@ func loadTestConfig(t *testing.T) config.Config {
 func TestCheckConstraintsMCPParity(t *testing.T) {
 	root := constraintsRepo(t, true)
 	// A path with a character JSON encoders may HTML-escape: parity is
-	// byte-equality, so both surfaces must spell it the same way.
+	// byte-equality after json.Compact (the CLI indents, MCP does not), so
+	// both surfaces must spell it the same way.
 	amp := filepath.Join(root, "internal", "domain", "r&d.go")
 	if err := os.WriteFile(amp, []byte("package domain\n\nimport \"example.com/m/internal/infra\"\n\nfunc D() { infra.B() }\n"), 0o644); err != nil {
 		t.Fatal(err)

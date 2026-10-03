@@ -168,6 +168,9 @@ findings is not proof of zero dependencies.
 - **Same bytes for the same tree.** A fresh index and an incremental history of the
   same tree give byte-identical `findings`, `cycles`, `summary` and `coverage`.
   `index` is history metadata and is not part of that guarantee.
+- **CLI and MCP agree.** The MCP tool's `data` is the CLI result. The CLI prints it
+  indented and MCP compact; after removing insignificant whitespace (`json.Compact`) the
+  bytes are identical, including the escaping of `<`, `>` and `&`.
 
 ## Statuses and exit codes
 

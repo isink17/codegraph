@@ -681,3 +681,23 @@ func TestCycleWitnessPrefersShorterOverSmallerFirstHop(t *testing.T) {
 		t.Fatalf("cycles = %s", marshal(t, res.Cycles))
 	}
 }
+
+// TestCycleWitnessBreaksEqualLengthTiesInPathOrder: two shortest returns of
+// equal length share their last hop (a,b,d,a and a,c,d,a). The witness is the
+// lexicographically smaller one, which first-in-first-out search guarantees.
+func TestCycleWitnessBreaksEqualLengthTiesInPathOrder(t *testing.T) {
+	doc := `{"schema_version":1,"groups":{"a":{"include":["a/**"]},"b":{"include":["b/**"]},"c":{"include":["c/**"]},"d":{"include":["d/**"]}},
+		"rules":[{"id":"cyc","kind":"forbidden_cycles","groups":["a","b","c","d"]}]}`
+	f := newFixture(t)
+	a, b, c, d := f.sym("a/x.go", "A", 1), f.sym("b/x.go", "B", 1), f.sym("c/x.go", "C", 1), f.sym("d/x.go", "D", 1)
+	f.call(a, b, 1)
+	f.call(a, c, 1)
+	f.call(b, d, 1)
+	f.call(c, d, 1)
+	f.call(d, a, 1)
+	f.config(doc)
+	res := f.check(0, 0)
+	if len(res.Cycles) != 1 || strings.Join(res.Cycles[0].Witness, ",") != "a,b,d,a" {
+		t.Fatalf("cycles = %s", marshal(t, res.Cycles))
+	}
+}
