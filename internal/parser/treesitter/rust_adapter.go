@@ -428,14 +428,16 @@ func rustCallShadowed(call *sitter.Node, name string, content []byte) bool {
 	return false
 }
 
-// rustPatternBinds reports whether any identifier in a pattern, parameter
-// list or condition is name. Paths and field names inside the pattern count
-// too, which only refuses more.
+// rustPatternBinds reports whether any named leaf in a pattern, parameter
+// list or condition spells name: an identifier, a struct-pattern shorthand
+// (`P { f }`, a shorthand_field_identifier), or a binding inside `x @ ..`,
+// `ref`, `mut`, tuple, slice or or-patterns. Paths, field names and types
+// inside the pattern count too, which only refuses more.
 func rustPatternBinds(node *sitter.Node, name string, content []byte) bool {
 	if node == nil {
 		return false
 	}
-	if node.Type() == "identifier" {
+	if node.NamedChildCount() == 0 {
 		return nodeText(node, content) == name
 	}
 	for i := range int(node.NamedChildCount()) {
