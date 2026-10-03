@@ -765,8 +765,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			p = p[1:]
 		default:
 			for len(p) > 0 && p[0] == "super" {
-				// An impl method's owner is its type, not a module path, so
-				// `super` from it names no module the resolver can prove.
+				// A module owner is `crate` or below it; anything else (an
+				// impl method's owner) has no parent module to name.
 				if owner != "crate" && !strings.HasPrefix(owner, "crate::") {
 					return ""
 				}
@@ -905,8 +905,14 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				continue
 			}
 			owner := ss.container
-			if owner == "" {
+			switch {
+			case owner == "":
 				owner = caller.module
+			case ss.qualified != owner+"::"+ss.name:
+				// An impl method: its container is the impl's type as written
+				// (`S`, `crate::a::S`), not a module path, so no path resolves
+				// relative to it and `super` names no module.
+				owner = "\x00impl"
 			}
 			path := dst
 			strategy := ResolutionStrategyRustModuleScope

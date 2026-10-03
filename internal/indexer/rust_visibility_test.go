@@ -88,6 +88,22 @@ var rustPrivateVisibilityCases = []struct {
 		"a.rs":   "mod m; fn helper() {}",
 		"a/m.rs": "pub struct S;\nimpl S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
 	}, "a/m.rs", "super::helper", "", false},
+	// The impl's type may be written as a path; it is still no module.
+	// rustc: crate::a::helper in both, the free fn in the third.
+	{"super from an impl of a crate-qualified type", tree{
+		"lib.rs": "mod a; pub struct S; fn helper() {}",
+		"a.rs":   "mod m; fn helper() {}",
+		"a/m.rs": "impl crate::S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
+	}, "a/m.rs", "super::helper", "", false},
+	{"super from an impl of its own module's qualified type", tree{
+		"lib.rs": "mod a;",
+		"a.rs":   "mod m; fn helper() {}",
+		"a/m.rs": "pub struct S;\nfn helper() {}\nimpl crate::a::m::S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
+	}, "a/m.rs", "super::helper", "", false},
+	{"bare call from an impl of a qualified type", tree{
+		"lib.rs": "mod b;",
+		"b.rs":   "pub struct S;\nimpl S {\n    fn helper() {}\n}\nimpl crate::b::S {\n    pub fn go() {\n        helper();\n    }\n}\nfn helper() {}\n",
+	}, "b.rs", "helper", "", false},
 	// Known limitation: local bindings are not modelled, so a closure named
 	// like a module function does not shadow it (rustc calls the closure).
 	{"local closure named like a module fn", tree{
