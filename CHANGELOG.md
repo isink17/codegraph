@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Ruby scope documentation now states supported static resolution and deferred runtime behavior, including the separation of `require` metadata and Rails/Zeitwerk conventions from scope evidence. Resolver behavior is unchanged.
+
 The clean v2 baseline replaces all 44 development migrations and removes one-time
 resolver/reparse upgrades. Older development indexes are refused before mutation
 with `codegraph index <repo-path> --rebuild` guidance. Product generation remains
