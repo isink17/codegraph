@@ -75,6 +75,54 @@ func TestTypeScriptCallBindsOnlyNameableDeclarations(t *testing.T) {
 			others: tree{"foo.ts": "export function foo(): void {}\n"},
 			dst:    "foo", want: "foo.ts:foo.foo(function)",
 		},
+		{
+			// A type alias or an interface is not a value; nothing calls it.
+			name:   "bare call does not name a type alias",
+			caller: "main.ts", src: "type Foo = number;\nexport function caller() { Foo(); }\n",
+			others: tree{"other.ts": "export function unrelated() {}\n"},
+			dst:    "Foo",
+		},
+		{
+			name:   "bare call does not name an interface",
+			caller: "main.ts", src: "interface Foo {}\nexport function caller() { Foo(); }\n",
+			others: tree{"other.ts": "export function unrelated() {}\n"},
+			dst:    "Foo",
+		},
+		{
+			// ns.bar is itself a namespace object, not a function.
+			name:   "namespace member that is a namespace",
+			caller: "main.ts", src: "import * as ns from \"./foo\";\nexport function caller() { ns.bar(); }\n",
+			others: tree{"foo.ts": "export * as bar from \"./baz\";\n", "baz.ts": "export function bar(): void {}\n"},
+			dst:    "ns.bar",
+		},
+		{
+			// `export * as ns from` creates no binding in its own module.
+			name:   "same-file namespace re-export is not a local binding",
+			caller: "main.ts", src: "export * as ns from \"./y\";\nexport function caller() { ns.bar(); }\n",
+			others: tree{"y.ts": "export function bar(): void {}\n"},
+			dst:    "ns.bar",
+		},
+		{
+			// Neither does `export { foo } from`.
+			name:   "same-file named re-export is not a local binding",
+			caller: "main.ts", src: "export { foo } from \"./y\";\nexport function caller() { foo(); }\n",
+			others: tree{"y.ts": "export function foo(): void {}\n"},
+			dst:    "foo",
+		},
+		{
+			name:   "named import of a re-exported namespace",
+			caller: "main.ts", src: "import { ns } from \"./x\";\nexport function caller() { ns.bar(); }\n",
+			others: tree{"x.ts": "export * as ns from \"./y\";\n", "y.ts": "export function bar(): void {}\n"},
+			dst:    "ns.bar", want: "y.ts:y.bar(function)",
+		},
+		{
+			// A default-exported declaration is still a binding of its own
+			// module under its declared name.
+			name:   "same-file default-exported function",
+			caller: "main.ts", src: "export default function run(): void {}\nexport function caller() { run(); }\n",
+			others: tree{"other.ts": "export function unrelated() {}\n"},
+			dst:    "run", want: "main.ts:main.run(function)",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

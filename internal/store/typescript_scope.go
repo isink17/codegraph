@@ -425,6 +425,10 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			local := parts[0]
 			member := strings.Join(parts[1:], ".")
 			for _, i := range imports[e.file] {
+				if i.reexport {
+					// `export ... from` creates no binding in its own module.
+					continue
+				}
 				if i.local == local && !i.typeOnly && i.kind == "namespace" {
 					if m, ok := resolveModule(e.file, i.source); ok {
 						target = export(m, member, map[string]bool{})
@@ -443,12 +447,16 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 					}
 				}
 			}
-			if target.namespace != 0 {
-				target = export(target.namespace, member, map[string]bool{})
-			}
 		} else {
 			hasBindingEvidence := false
 			for _, i := range imports[e.file] {
+				if i.reexport {
+					// Export rows name what the module offers, not a binding
+					// in it: `export { x } from` binds nothing here, and a
+					// source-less row points at a declaration the same-file
+					// fallback below already finds.
+					continue
+				}
 				if i.local != parts[0] || i.kind == "side_effect" || i.typeOnly {
 					if i.local == parts[0] && i.kind != "side_effect" {
 						hasBindingEvidence = true
@@ -467,9 +475,10 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			}
 			if len(target.symbols) == 0 && target.namespace == 0 && !hasBindingEvidence {
 				for _, id := range byFileName[e.file][parts[0]] {
-					// A bare identifier resolves through module and function
-					// scope, where a class method is never a binding.
-					if symbols[id].kind == "method" {
+					// A bare call names a value binding of module or function
+					// scope: a function or a class. A class method is never
+					// such a binding, and a type alias or interface is no value.
+					if kind := symbols[id].kind; kind != "function" && kind != "class" {
 						continue
 					}
 					target.symbols = append(target.symbols, id)
