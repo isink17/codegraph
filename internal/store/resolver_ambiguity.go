@@ -1,6 +1,7 @@
 package store
 
 import (
+	"maps"
 	"slices"
 	"strings"
 )
@@ -275,7 +276,7 @@ var resolverBindableCandidateRules = []resolverGateRule{
 	{id: "go_local_qualifier", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"go"}, sql: resolverGoLocalQualifierSQL},
 	{id: "bare_type_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
-		languages: []string{"python", "typescript", "cpp"}, sql: resolverBareNameTypeScopeSQL},
+		languages: slices.Sorted(maps.Keys(typeScopeGatedLanguages)), sql: resolverBareNameTypeScopeSQL},
 	{id: "cpp_bare_namespace_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
 		languages: []string{"cpp"}, sql: resolverCppBareNamespaceScopeSQL},
 	{id: "cpp_bare_member_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,

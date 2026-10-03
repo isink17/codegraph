@@ -71,8 +71,9 @@ var phpScopeStrategies = []string{
 	ResolutionStrategyPHPComposerPSR4,
 }
 
-// phpScopeOwnedSQL is the SQL twin of phpScopeOwned: the edge spellings this
-// pass owns. It requires the edges table to be addressable as `e`.
+// phpScopeOwnedSQL is the spelling half of phpScopeOwned: the edge spellings
+// this pass owns. Callers supply the PHP language filter. It requires the edges
+// table to be addressable as `e`.
 const phpScopeOwnedSQL = `(instr(e.dst_name, '::') > 0 OR instr(e.dst_name, '->') > 0)`
 
 // phpScopeStaticSQL selects the owned spellings that can bind here: a scoped

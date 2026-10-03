@@ -114,7 +114,7 @@ func TestResolverOwnershipRulesMatchGoTwins(t *testing.T) {
 	}
 	// Edges with an empty spelling are excluded: no strategy on either side
 	// binds one, and the Go twins state their domain as named calls.
-	names := []string{"foo", "pkg.Foo", "a/b.Foo", "A::foo", "::foo", "x:y", "$o->foo", "obj.foo<int>", "a.b.c"}
+	names := []string{"foo", "pkg.Foo", "a/b.Foo", "a/b", "A::foo", "::foo", "x:y", "$o->foo", "obj.foo<int>", "a.b.c"}
 	kinds := []string{EdgeKindCalls, EdgeKindCrossLanguageRef}
 	evidences := []string{"", "direct:foo", "swift:call", "macro_unexpanded:M"}
 	byID := map[int64]edgeTarget{}
