@@ -257,3 +257,101 @@ func TestPythonRegexProfileUnicodeIdentifiersConverge(t *testing.T) {
 	runPythonUnicodeProfileConvergence(t,
 		pythonV1Adapter{Adapter: pyparser.New(), id: "python-regex:python:v1", regex: true}, pyparser.New())
 }
+
+// pythonRegexV2Adapter reproduces python-regex:python:v2 for
+// pythonKeywordSource: the same graph plus the calls v2 read out of keyword
+// syntax. The v2 binary wrote exactly these extra call rows for this source.
+type pythonRegexV2Adapter struct{ *pyparser.Adapter }
+
+func (pythonRegexV2Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: "python-regex:python:v2", EmitsCallEdges: true}
+}
+
+func (a pythonRegexV2Adapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	pf, err := a.Adapter.Parse(ctx, path, content)
+	if err != nil || filepath.Base(path) != "mod.py" {
+		return pf, err
+	}
+	for _, c := range []struct {
+		name string
+		line int
+	}{{"as", 6}, {"case", 9}, {"Point", 11}, {"Point", 11}, {"match", 13}} {
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: c.name, Kind: "calls", Line: c.line})
+		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: c.name, QualifiedName: c.name,
+			Range: graph.Position{StartLine: c.line, EndLine: c.line}})
+	}
+	return pf, nil
+}
+
+const pythonKeywordSource = `class Point:
+    pass
+
+
+def run(value, cm):
+    with cm as (a, b):
+        pass
+    match value:
+        case (1, 2):
+            pass
+        case Point(x=0) | Point(x=1):
+            pass
+    match (
+        value
+    ):
+        case _:
+            pass
+`
+
+// v3 stops reading keyword syntax as calls; the bump alone must drop the v2
+// rows from an unchanged file, and every transition must equal a fresh index.
+func TestPythonRegexProfileKeywordSyntaxConverges(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "mod.py")
+	writeProfileFile(t, path, pythonKeywordSource)
+	old, current := pythonRegexV2Adapter{pyparser.New()}, pyparser.New()
+
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	oldGraph := pythonGraph(t, s)
+	requireRows(t, oldGraph, "v2 graph", "call|as@6->", "call|case@9->", "call|match@13->")
+
+	upgraded := New(s.Store, parser.NewRegistry(current), nil)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FilesChanged != 1 || strings.Join(summary.ParserProfileLanguages, ",") != "python" {
+		t.Fatalf("profile bump did not reparse: changed=%d languages=%v", summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	got := pythonGraph(t, s)
+	if strings.Contains(got, "call|") {
+		t.Fatalf("keyword syntax still reads as calls after the upgrade:\n%s", got)
+	}
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+	if again, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil || again.FilesChanged != 0 {
+		t.Fatalf("second update: %v changed=%d", err, again.FilesChanged)
+	}
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if got := pythonGraph(t, s); got != oldGraph {
+		t.Fatalf("v2 update over a v3 graph:\n%s\nfrom-scratch v2 graph:\n%s", got, oldGraph)
+	}
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, path, pythonKeywordSource+"    match(value)\n")
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	got = pythonGraph(t, s)
+	requireRows(t, got, "edited graph", "call|match@18->")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("edited graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+}

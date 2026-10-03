@@ -65,6 +65,13 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	// lines never reach call extraction. The bindings themselves are emitted
 	// inside the walk, where the enclosing lexical scope is known.
 	stmts, importLines := importStatements(maskedLines)
+	// statementAt holds each logical statement under the physical line it
+	// starts on, so a header split over several lines is still recognised.
+	statementAt := make([]string, len(lines))
+	logical, starts := pythonLogicalLines(maskedLines)
+	for i, stmt := range logical {
+		statementAt[starts[i]] = stmt
+	}
 	seenModules := make(map[string]struct{}, len(stmts))
 	// lastLine/lastLen track the most recent content line (not blank, not a
 	// comment). A scope popped by a dedent ends at that line: blank lines,
@@ -184,7 +191,11 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		if lastFunction(scopes) < 0 {
 			continue
 		}
-		for _, loc := range callRE.FindAllStringSubmatchIndex(masked, -1) {
+		scan := masked
+		if from := patternSyntaxEnd(statementAt[i], masked); from > 0 {
+			scan = strings.Repeat(" ", from) + masked[from:]
+		}
+		for _, loc := range callRE.FindAllStringSubmatchIndex(scan, -1) {
 			if len(loc) != 4 {
 				continue
 			}
@@ -193,10 +204,10 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			// emits nothing rather than the tail alone. Neither does a match
 			// right after a non-ASCII rune: outside strings and comments that
 			// rune can only be part of a name `identifier` does not know.
-			if start := loc[2]; start > 0 && (strings.IndexByte(").]", masked[start-1]) >= 0 || masked[start-1] >= utf8.RuneSelf) {
+			if start := loc[2]; start > 0 && (strings.IndexByte(").]", scan[start-1]) >= 0 || scan[start-1] >= utf8.RuneSelf) {
 				continue
 			}
-			name := masked[loc[2]:loc[3]]
+			name := scan[loc[2]:loc[3]]
 			if !strings.Contains(name, ".") && isPythonKeyword(name) {
 				continue
 			}
@@ -258,6 +269,34 @@ func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile)
 		}
 		emit(strings.TrimPrefix(sym.QualifiedName, module+"."), strings.Join(lines[start:end], "\n"))
 	}
+}
+
+// patternSyntaxEnd returns how much of a physical line is soft-keyword syntax
+// rather than expressions that can call: the `match` of a match statement
+// (its subject is an expression), or a whole case pattern up to its guard. A
+// pattern calls nothing -- `case Point(x=0):` is a class pattern -- while a
+// guard is an expression. stmt is the logical statement the line starts, and
+// `match`/`case` anywhere else are ordinary names.
+func patternSyntaxEnd(stmt, line string) int {
+	stmt = strings.TrimSpace(stmt)
+	if !strings.HasSuffix(stmt, ":") {
+		return 0
+	}
+	for _, keyword := range []string{"match", "case"} {
+		rest, ok := strings.CutPrefix(stmt, keyword)
+		if r, _ := utf8.DecodeRuneInString(rest); !ok || rest == "" || isIdentifierRune(r) {
+			continue
+		}
+		start := strings.Index(line, keyword) + len(keyword)
+		if keyword == "case" {
+			if guard := strings.Index(line, " if "); guard >= 0 {
+				return guard
+			}
+			return len(line)
+		}
+		return start
+	}
+	return 0
 }
 
 // closeScopes pops every scope whose indent the current line dedents to (or
@@ -396,7 +435,7 @@ func visibility(name string) string {
 
 func isPythonKeyword(name string) bool {
 	switch name {
-	case "if", "for", "while", "return", "print", "with", "class", "def", "try", "except", "elif",
+	case "if", "for", "while", "return", "print", "with", "as", "class", "def", "try", "except", "elif",
 		"and", "or", "not", "in", "is", "lambda", "yield", "await", "assert", "del", "raise",
 		"global", "nonlocal", "pass", "else", "finally", "import", "from":
 		return true
@@ -407,7 +446,8 @@ func isPythonKeyword(name string) bool {
 
 // Profile identifies the dedicated non-cgo Python adapter, which is
 // regex-driven but does build a call graph. See parser.Profile. v2 reads
-// Unicode names in declarations, calls, imports and local bindings.
+// Unicode names in declarations, calls, imports and local bindings. v3 stops
+// reading `as (`, match statements and case patterns as calls.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v2", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v3", EmitsCallEdges: true}
 }
