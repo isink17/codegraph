@@ -422,7 +422,7 @@ func callerCandidateSQL(legs candidateLegs) (string, int) {
 		// one, where P22.13's is that the writer lives in the seed's own file.
 		// nm.lang is the seed's language in both cases, and the key expression
 		// is bareScopeKey, so the two rules cannot be given different keys here
-		// than the resolver and FindCallers give them. There is deliberately no
+		// than the resolver gives them. There is deliberately no
 		// `src.language <> 'go'` escape any more: before P22.7 that disjunct let
 		// non-Go writers through, and P22.7's whole point is that they were
 		// never really callers. A gated leg with an empty scope can match nobody

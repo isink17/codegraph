@@ -837,11 +837,12 @@ func goPackageScopedSymbolIDs(ctx context.Context, q queryContexter, repoID int6
 			// P22.15: the writer's file is not evidence that the writer is inside
 			// this candidate's class, so a C/C++ class member is not answerable from
 			// a bare name-evidence leg. Refused in the callee direction as well as
-			// the caller direction even though this path DOES hold the writer's own
-			// class (symbolScopesByIDs loads it): the caller direction's leg is
-			// driven by target scope keys with no writer identity in them, and one
-			// direction answering what the other refuses is a worse contract than
-			// both losing the same edges. What is lost is the same-class pair that
+			// in context expansion's caller legs (goBareTargetSeedScope) even though
+			// this path DOES hold the writer's own class (symbolScopesByIDs loads
+			// it): the caller legs are driven by seed scope keys with no writer
+			// identity in them, and one direction answering what the other refuses
+			// is a worse contract than both losing the same edges. What is lost is
+			// the same-class pair that
 			// the repository-wide bare-name ambiguity level left unresolved -- a
 			// pair the rule itself admits is BOUND, and a bound destination arrives
 			// through the id leg. Recovering the ambiguity-blocked remainder needs
