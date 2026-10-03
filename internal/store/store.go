@@ -6218,9 +6218,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	// P22.28: a Go selector call whose qualifier the calling file binds locally
 	// is answered by the receiver's proven type or by nothing, and never by a
 	// repo-wide coincidence. resolveGoReceiverScope binds what it can prove and
-	// claims the rest; the claim joins moduleVeto because both mean the same
-	// thing to everything below -- this edge is not the generic strategies' to
-	// answer. This is the Go-side twin of resolverGoLocalQualifierSQL.
+	// claims the rest; a claimed edge leaves the batch here, so nothing below
+	// answers it. The claim is the inventory's go_local_qualifier twin, and the
+	// own-module veto below is own_module_import's: two rules, two fact sets.
+	facts := binderCandidateFacts{ownModuleVeto: moduleVeto}
 	if hasGoTargets(targets) {
 		// The claim is taken before the pass runs, and never from what the pass
 		// happened to bind. It has to cover both halves of the outcome: the
@@ -6242,19 +6243,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			return outcome, err
 		}
 		outcome.resolved += n
-		if len(claimed) > 0 {
-			widened := make(map[int64]struct{}, len(moduleVeto)+len(claimed))
-			for id := range moduleVeto {
-				widened[id] = struct{}{}
-			}
-			for id := range claimed {
-				widened[id] = struct{}{}
-			}
-			moduleVeto = widened
-		}
+		facts.goLocalClaims = claimed
 		remaining := targets[:0]
 		for _, target := range targets {
-			if _, bound := claimed[target.edgeID]; bound {
+			if binderWithholdsGoLocal(target, &facts) {
 				// Withheld from every strategy below, but still an edge this
 				// batch decided: the ones the pass could not prove a type for
 				// stay unresolved on purpose, and dropping them from the count
@@ -6279,7 +6271,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	goBareNameSet := map[string]struct{}{}
 	goBareEdgeIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
-		if _, blocked := moduleVeto[target.edgeID]; blocked {
+		if binderWithholdsOwnModule(target, &facts) {
 			continue
 		}
 		if !binderOwnsGoBare(target) {
@@ -6292,7 +6284,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 
 	qualifiedSet := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
-		if _, blocked := moduleVeto[target.edgeID]; blocked {
+		if binderWithholdsOwnModule(target, &facts) {
 			continue
 		}
 		if _, bare := goBare[target.edgeID]; bare {
@@ -6405,7 +6397,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	cppBareEdgeIDs := make([]int64, 0, len(targets))
 	cppBareNameSet := map[string]struct{}{}
 	for _, target := range targets {
-		if _, blocked := moduleVeto[target.edgeID]; blocked {
+		if binderWithholdsOwnModule(target, &facts) {
 			continue
 		}
 		if !bareNameScopeAllKinds(target.srcLanguage) || !goBareCallName(target.dstName) {
@@ -6445,11 +6437,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		shortNamesAnyLanguage[name] = struct{}{}
 	}
 
-	candidateFacts := binderCandidateFacts{
-		byQualified: byQualified, byShort: byShort, importScope: importScope,
-		cppMemberTargets: cppMemberTargets, cppCallerClasses: cppCallerClasses,
-		cppNamespaceTargets: cppNamespaceTargets, cppCallerNamespaces: cppCallerNamespaces,
-	}
+	facts.byQualified, facts.byShort, facts.importScope = byQualified, byShort, importScope
+	facts.cppMemberTargets, facts.cppCallerClasses = cppMemberTargets, cppCallerClasses
+	facts.cppNamespaceTargets, facts.cppCallerNamespaces = cppNamespaceTargets, cppCallerNamespaces
+	facts.bareLevel, facts.testFileIDs = bareLevel, testFileIDs
 
 	type edgeResolution struct {
 		edgeID int64
@@ -6474,7 +6465,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, err
 	}
 	for _, target := range targets {
-		if _, blocked := moduleVeto[target.edgeID]; blocked {
+		if binderWithholdsOwnModule(target, &facts) {
 			continue
 		}
 		fallbackName, fallbackColumn := binderFallbackForTarget(target)
@@ -6524,16 +6515,15 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		strategy := ResolutionStrategyExactQualified
 		matchedGroup, matched := byQualified.groups[qualifiedKey]
 		if !matched {
-			if fallbackColumn == "dot_tail2" || fallbackColumn == "dot_tail3" {
-				if broad, found := bareLevel.groups[qualifiedKey]; found && broad.levelUndecidedFor(callerIsTest) {
-					outcome.unresolved++
-					if broad.ambiguousFor(callerIsTest) {
-						outcome.ambiguityBlocked++
-					} else if !broad.levelReachableFor(callerIsTest) {
-						outcome.testShadowBlocked++
-					}
-					continue
+			if binderWithholdsBroadDotTail(target, &facts) {
+				broad := bareLevel.groups[qualifiedKey]
+				outcome.unresolved++
+				if broad.ambiguousFor(callerIsTest) {
+					outcome.ambiguityBlocked++
+				} else if !broad.levelReachableFor(callerIsTest) {
+					outcome.testShadowBlocked++
 				}
+				continue
 			}
 			// Only when the qualified name matched nothing in this language may
 			// the fallback evidence level be consulted -- and which level that
@@ -6557,7 +6547,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if matched {
 			dstID, ok = matchedGroup.chosen(callerIsTest)
 		}
-		if ok && dstID != 0 && binderRefusesChosen(binderChosenCandidate{target: target, dstID: dstID, facts: &candidateFacts}) {
+		if ok && dstID != 0 && binderRefusesChosen(binderChosenCandidate{target: target, dstID: dstID, facts: &facts}) {
 			// A chosen-candidate restriction refused the candidate: a bare
 			// spelling naming a type the calling file neither declares nor
 			// imports (resolver_type_scope.go), or a bare C/C++ spelling naming
