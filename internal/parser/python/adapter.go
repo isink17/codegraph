@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -287,7 +288,15 @@ func AddClassScopeBindings(module string, lines []string, pf *graph.ParsedFile) 
 		case sym.Kind == "function" || sym.Kind == "method":
 			functions[sym.QualifiedName] = true
 		case sym.Kind == "class" && start >= 0 && end <= len(lines) && start < end:
-			classes[sym.QualifiedName] = ClassBodyBindings(strings.Join(lines[start:end], "\n"))
+			// Classes sharing a qualified name (one per branch of an if/else
+			// or try/except) cannot be told apart by their methods' or
+			// children's parent name, so each answers for the union of their
+			// bindings: a shared name only ever refuses more.
+			for _, b := range ClassBodyBindings(strings.Join(lines[start:end], "\n")) {
+				if !slices.ContainsFunc(classes[sym.QualifiedName], func(o LocalBinding) bool { return o.Name == b.Name }) {
+					classes[sym.QualifiedName] = append(classes[sym.QualifiedName], b)
+				}
+			}
 		}
 	}
 	for _, sym := range pf.Symbols {

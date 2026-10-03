@@ -63,6 +63,10 @@ func runPythonDefaultClassScopeCases(t *testing.T, reg *parser.Registry, headerC
 		{"meth_default.py", "full"},        // 'cls'
 		{"async_meth_class.py", "full"},    // 'cls'
 		{"modcls_meth_default.py", "full"}, // 'cls'
+		// Two classes of one qualified name, one per branch: each answers for
+		// both bodies' bindings.
+		{"c_dup_class.py", "full"},    // 'cls'
+		{"dup_class_meth.py", "full"}, // 'cls'
 	} {
 		want := "<unresolved>"
 		switch {
