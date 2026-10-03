@@ -6274,10 +6274,6 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if _, blocked := moduleVeto[target.edgeID]; blocked {
 			continue
 		}
-		if strings.HasPrefix(target.evidence, "macro_unexpanded:") {
-			outcome.unresolved++
-			continue
-		}
 		if target.srcLanguage != "go" || !goBareCallName(target.dstName) {
 			continue
 		}

@@ -81,3 +81,80 @@ func TestCppScopeVetoSQLMatchesGoTwin(t *testing.T) {
 		t.Fatalf("owned %d of %d rows; the fixture does not separate the two sides", owned, len(rows))
 	}
 }
+
+// A mixed incremental batch decides every edge exactly once, whatever position
+// the C++ edges take in it: owned C++ edges stay unresolved and are counted
+// once, a C++ member spelling the gate does not own still reaches the generic
+// lookups, and the other languages are untouched.
+func TestCppOwnedEdgesInMixedIncrementalBatch(t *testing.T) {
+	ctx := context.Background()
+	names := []string{"pkg.Target", "ns::foo", "obj.method", "foo"}
+	for run := 0; run < 8; run++ {
+		s, repo := openBudgetStore(t)
+		goFile, _ := insertTestFileLang(ctx, s, repo.ID, "pkg/pkg.go", "go")
+		goCaller, _ := insertTestSymbolLang(ctx, s, repo.ID, goFile, "Caller", "pkg.Caller", "go")
+		if _, err := insertTestSymbolLang(ctx, s, repo.ID, goFile, "Target", "pkg.Target", "go"); err != nil {
+			t.Fatal(err)
+		}
+		lib, _ := insertTestFileLang(ctx, s, repo.ID, "lib.cpp", "cpp")
+		insertTestSymbolKind(ctx, s, repo.ID, lib, "foo", "ns::foo", "function", "", "cpp")
+		insertTestSymbolLang(ctx, s, repo.ID, lib, "foo", "foo", "cpp")
+		insertTestSymbolLang(ctx, s, repo.ID, lib, "method", "obj.method", "cpp")
+		app, _ := insertTestFileLang(ctx, s, repo.ID, "app.cpp", "cpp")
+		cppCaller, _ := insertTestSymbolLang(ctx, s, repo.ID, app, "caller", "caller", "cpp")
+
+		edges := map[string]int64{}
+		add := func(key string, file, src int64, dst, evidence string) {
+			id, err := insertTestEdge(ctx, s, repo.ID, file, src, dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.ExecContext(ctx, `UPDATE edges SET evidence = ? WHERE id = ?`, evidence, id); err != nil {
+				t.Fatal(err)
+			}
+			edges[key] = id
+		}
+		// Vary which kind of edge comes first in id order as well as letting
+		// the name batch iterate in map order.
+		order := []string{"go", "owned", "member", "macro"}
+		for i := 0; i < run%len(order); i++ {
+			order = append(order[1:], order[0])
+		}
+		for _, key := range order {
+			switch key {
+			case "go":
+				add(key, goFile, goCaller, "pkg.Target", "")
+			case "owned":
+				add(key, app, cppCaller, "ns::foo", "static_qualified:ns::foo")
+			case "member":
+				add(key, app, cppCaller, "obj.method", "")
+			case "macro":
+				add(key, app, cppCaller, "foo", "macro_unexpanded:CALL")
+			}
+		}
+
+		stats, err := s.ResolveEdgesForPathsAndNames(ctx, repo.ID, nil, names)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bound := func(key string) string {
+			var dst string
+			if err := s.db.QueryRowContext(ctx, `
+				SELECT COALESCE((SELECT qualified_name FROM symbols WHERE id = e.dst_symbol_id), '')
+				FROM edges e WHERE e.id = ?`, edges[key]).Scan(&dst); err != nil {
+				t.Fatal(err)
+			}
+			return dst
+		}
+		want := map[string]string{"go": "pkg.Target", "owned": "", "member": "obj.method", "macro": ""}
+		for key, w := range want {
+			if got := bound(key); got != w {
+				t.Errorf("run %d order %v: %s edge bound %q, want %q", run, order, key, got, w)
+			}
+		}
+		if stats.TargetsSelected != 4 || stats.TargetsResolved != 2 || stats.TargetsUnresolved != 2 {
+			t.Errorf("run %d order %v: selected/resolved/unresolved = %d/%d/%d, want 4/2/2",
+				run, order, stats.TargetsSelected, stats.TargetsResolved, stats.TargetsUnresolved)
+		}
+	}
+}
