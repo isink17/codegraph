@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"maps"
 	"slices"
 	"strings"
@@ -482,6 +483,72 @@ func resolverRuleWithholds(id resolverRuleID) func(edgeTarget, *binderCandidateF
 		}
 	}
 	panic("store: no fact-decided rule " + string(id))
+}
+
+// edgeRefusalReasons is the decide-only reading of the inventory: for each of
+// the given edges that is still unresolved, the ids of the rules whose Go twin
+// withholds it from the generic strategies, in inventory order. Every id it
+// reports is a rule whose SQL conjunct refuses the edge in the repo-wide bind
+// gate; the twins are pinned to their SQL by TestResolverOwnershipRulesMatchGoTwins
+// and TestResolverFactTwinsMatchSQL. It only reads.
+//
+// An edge with no entry is unknown, not unrefused. Only the twins that can be
+// decided without writing are consulted: the edge-local ownership twins,
+// go_local_qualifier and the dotted-spelling half of broad_ambiguity. Not
+// consulted are the chosen-candidate restrictions (they judge the binder's
+// choice, which this does not make), own_module_import (the pass that computes
+// its veto also binds), and the rules with no Go twin. An edge can also stay
+// unresolved with no rule refusing it: no candidate, or a language pass that
+// owns the edge and proved nothing.
+func (s *Store) edgeRefusalReasons(ctx context.Context, repoID int64, edgeIDs []int64) (map[int64][]resolverRuleID, error) {
+	var targets []edgeTarget
+	if err := sqliteBatchedIDQuery(ctx, s.db, edgeIDs,
+		`SELECT e.id, e.dst_name, e.file_id, e.evidence, e.edge_kind, f.language
+		FROM edges e JOIN files f ON f.id = e.file_id
+		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND e.id IN (`,
+		[]any{repoID}, func(scan func(...any) error) error {
+			var t edgeTarget
+			if err := scan(&t.edgeID, &t.dstName, &t.srcFileID, &t.evidence, &t.edgeKind, &t.srcLanguage); err != nil {
+				return err
+			}
+			targets = append(targets, t)
+			return nil
+		}); err != nil {
+		return nil, err
+	}
+	var facts binderCandidateFacts
+	var err error
+	if hasGoTargets(targets) {
+		if facts.goLocalClaims, err = goLocalQualifierClaims(ctx, s.db, repoID); err != nil {
+			return nil, err
+		}
+	}
+	if facts.testFileIDs, err = testFileIDsForRepo(ctx, s.db, repoID); err != nil {
+		return nil, err
+	}
+	var dotted []string
+	for _, t := range targets {
+		if _, column := binderFallbackForTarget(t); column == "dot_tail2" || column == "dot_tail3" {
+			dotted = append(dotted, t.dstName)
+		}
+	}
+	// A name loaded twice in two chunks would count its candidates twice.
+	dotted = slices.Compact(slices.Sorted(slices.Values(dotted)))
+	if facts.byQualified, err = s.resolveSymbolsByQualifiedNames(ctx, repoID, dotted, facts.testFileIDs); err != nil {
+		return nil, err
+	}
+	if facts.bareLevel, err = s.resolveSymbolCandidates(ctx, repoID, "name", dotted, facts.testFileIDs); err != nil {
+		return nil, err
+	}
+	out := map[int64][]resolverRuleID{}
+	for _, t := range targets {
+		for _, rule := range resolverBindGateRules {
+			if (rule.owns != nil && rule.owns(t)) || (rule.withholds != nil && rule.withholds(t, &facts)) {
+				out[t.edgeID] = append(out[t.edgeID], rule.id)
+			}
+		}
+	}
+	return out, nil
 }
 
 // binderCandidateRestrictions are the chosen-candidate restrictions the

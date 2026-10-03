@@ -343,3 +343,68 @@ func TestGoLocalQualifierClaimWithholdsOnEveryEntryPoint(t *testing.T) {
 		})
 	}
 }
+
+// edgeRefusalReasons reports, per unresolved edge, only rules whose SQL
+// conjunct refuses that edge, names the expected rules on the cases they exist
+// for, reports nothing it cannot decide without writing (own-module), skips a
+// resolved edge, and leaves the database unchanged.
+func TestEdgeRefusalReasonsAreDecideOnly(t *testing.T) {
+	f := newFactTwinFixture(t)
+	resolved := f.edge(t, f.edgeByLabel(t, `go production "Open"`).srcFileID, 0, "Open")
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET dst_symbol_id = (SELECT MIN(id) FROM symbols) WHERE id = ?`, resolved); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := func() string {
+		var out string
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT group_concat(id || ':' || ifnull(dst_symbol_id, '') || ':' || resolution_strategy, ',') FROM (SELECT * FROM edges ORDER BY id)`).Scan(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	before := snapshot()
+	ids := []int64{resolved}
+	for id := range f.edges {
+		ids = append(ids, id)
+	}
+	reasons, err := f.store.edgeRefusalReasons(f.ctx, f.repoID, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := snapshot(); after != before {
+		t.Fatalf("edgeRefusalReasons wrote to edges:\nbefore %s\nafter  %s", before, after)
+	}
+	if _, ok := reasons[resolved]; ok {
+		t.Fatalf("a resolved edge has reasons %v", reasons[resolved])
+	}
+
+	rules := map[resolverRuleID]resolverGateRule{}
+	for _, rule := range resolverBindGateRules {
+		rules[rule.id] = rule
+	}
+	bySQL := map[resolverRuleID]map[int64]bool{}
+	for id, ruleIDs := range reasons {
+		for _, ruleID := range ruleIDs {
+			if bySQL[ruleID] == nil {
+				bySQL[ruleID] = f.sqlWithheld(t, rules[ruleID])
+			}
+			if !bySQL[ruleID][id] {
+				t.Errorf("%s: reason %s, but its SQL admits the edge", f.label[id], ruleID)
+			}
+		}
+	}
+	want := map[string][]resolverRuleID{
+		`go production "store.Get"`:                    {ruleGoLocalQualifier},
+		`go production "Open"`:                         {ruleGoBarePackageScope},
+		`go production "example.com/project/pkg.Open"`: nil, // own-module: not decidable read-only
+		`go production "other.Get"`:                    nil,
+		`python production "Two.run"`:                  {ruleBroadAmbiguity},
+		`python test "Tst.run"`:                        nil,
+		`python production "One.run"`:                  nil,
+		`python production "Q.run"`:                    nil,
+	}
+	for label, wantIDs := range want {
+		if got := reasons[f.edgeByLabel(t, label).edgeID]; !slices.Equal(got, wantIDs) {
+			t.Errorf("%s: reasons %v, want %v", label, got, wantIDs)
+		}
+	}
+}
