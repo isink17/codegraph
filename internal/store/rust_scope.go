@@ -690,17 +690,20 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		module := candidateModule(c)
 		return c.file == caller.id || (moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id))
 	}
-	// moduleHasGlob reports whether a module of the caller's crate imports
-	// anything by glob, which may put a function in the value namespace beside
-	// a type of its own.
+	// globModules holds every crate root and module that imports by glob. A
+	// glob may put a function in the module's value namespace beside a type of
+	// its own. Every glob counts, whatever its visibility: the parser records
+	// `pub` but not `pub(crate)` or `pub(super)`, so a glob that looks private
+	// may still be visible to the caller.
+	globModules := map[[2]string]bool{}
+	for _, im := range imports {
+		if root := rootOfFile[im.file]; im.glob && root != "" {
+			globModules[[2]string{root, im.owner}] = true
+		}
+	}
 	moduleHasGlob := func(module string, caller rustScopeFile) bool {
 		root := rootOfFile[caller.id]
-		for _, im := range imports {
-			if im.glob && im.owner == module && root != "" && rootOfFile[im.file] == root {
-				return true
-			}
-		}
-		return false
+		return root != "" && globModules[[2]string{root, module}]
 	}
 	eligible := func(c rustScopeSymbol, caller rustScopeFile) bool {
 		module := candidateModule(c)
@@ -740,8 +743,11 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}
 		return owner + "::" + strings.Join(p, "::")
 	}
-	var exportCandidates func(string, string, map[string]struct{}) []rustScopeSymbol
-	exportCandidates = func(module, name string, seen map[string]struct{}) []rustScopeSymbol {
+	// exportCandidates walks the re-exports of one crate root. A module path is
+	// only meaningful inside its crate, so another root's `crate::x` re-exports
+	// are not this module's.
+	var exportCandidates func(string, string, string, map[string]struct{}) []rustScopeSymbol
+	exportCandidates = func(module, name, root string, seen map[string]struct{}) []rustScopeSymbol {
 		key := module + "::" + name
 		if _, ok := seen[key]; ok {
 			return nil
@@ -754,16 +760,16 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		// count is the observable proof that traversal is not DB-per-hop.
 		out := append([]rustScopeSymbol(nil), byQ[key]...)
 		for _, im := range imports {
-			if im.owner != module || !im.reexport {
+			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {
 				continue
 			}
 			if im.glob {
-				out = append(out, exportCandidates(resolvePath(im.source, module), name, seen)...)
+				out = append(out, exportCandidates(resolvePath(im.source, module), name, root, seen)...)
 			} else if im.local == name {
 				raw := resolvePath(im.source, module)
 				parts := strings.Split(raw, "::")
 				if len(parts) > 1 {
-					out = append(out, exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], seen)...)
+					out = append(out, exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], root, seen)...)
 				}
 			}
 		}
@@ -859,25 +865,27 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 					}
 					continue
 				}
-				if im.local == dst {
-					explicitPaths = append(explicitPaths, resolvePath(im.source, owner))
+				// The same import spelled twice (say under two cfg arms)
+				// is one import.
+				if p := resolvePath(im.source, owner); im.local == dst && !slices.Contains(explicitPaths, p) {
+					explicitPaths = append(explicitPaths, p)
 				}
 			}
 			// Two explicit imports of one name are legal only when they live in
 			// different namespaces, so at most one of them is a value. Only a
 			// function is certainly that value; anything else fails closed.
 			if len(explicitPaths) > 1 {
-				count := 0
+				ids := map[int64]struct{}{}
 				var chosen int64
 				for _, p := range explicitPaths {
 					for _, c := range byQ[p] {
 						if c.kind == "function" && eligible(c, caller) && inCallerCrate(c, caller) {
-							count++
+							ids[c.id] = struct{}{}
 							chosen = c.id
 						}
 					}
 				}
-				if count == 1 {
+				if len(ids) == 1 {
 					resolutions = append(resolutions, rustResolution{edge: id, symbol: chosen, strategy: ResolutionStrategyRustUseScope})
 				}
 				continue
@@ -946,11 +954,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				}
 			}
 			var chosen int64
+			var chosenSym rustScopeSymbol
 			count := 0
 			for _, c := range globCandidates {
 				if inCallerCrate(c, caller) {
 					count++
-					chosen = c.id
+					chosen, chosenSym = c.id, c
 				}
 			}
 			for _, c := range byQ[path] {
@@ -959,20 +968,20 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				}
 				if eligible(c, caller) && inCallerCrate(c, caller) {
 					count++
-					chosen = c.id
+					chosen, chosenSym = c.id, c
 				}
 			}
 			if count == 0 && !shadowed {
 				parts := strings.Split(path, "::")
 				if len(parts) > 1 {
-					for _, c := range exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], map[string]struct{}{}) {
+					for _, c := range exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], rootOfFile[caller.id], map[string]struct{}{}) {
 						if stats != nil {
 							stats.CandidateRows++
 						}
 						module := candidateModule(c)
 						if eligible(c, caller) && moduleProven(rootOfFile[caller.id], module) && moduleMember(module, c.file, caller.id) {
 							count++
-							chosen = c.id
+							chosen, chosenSym = c.id, c
 						}
 					}
 				}
@@ -983,12 +992,16 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			// Only a function is certainly the called value. A struct, trait or
 			// enum may share its name with a glob-imported function, which
 			// Rust would call instead, so neither a competing glob nor a glob
-			// in the target's module lets it bind.
-			if kind := symbols[chosen].kind; kind != "function" {
+			// in the module the path names, or in the module a re-export
+			// reached, lets it bind.
+			if chosenSym.kind != "function" {
 				if explicit && globCompetes {
 					continue
 				}
 				if i := strings.LastIndex(path, "::"); i > 0 && moduleHasGlob(path[:i], caller) {
+					continue
+				}
+				if moduleHasGlob(candidateModule(chosenSym), caller) {
 					continue
 				}
 			}
