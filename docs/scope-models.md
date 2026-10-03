@@ -64,7 +64,7 @@ Lookup starts from the calling symbol's container, or otherwise from the file's 
 3. A candidate must be visible, and either in the caller's file or in a module proven to belong to the caller's crate.
 4. If none qualifies, named and glob `pub use` re-exports are followed, with cycle protection.
 
-Exactly one candidate binds. Known defect: if a glob import supplies an eligible candidate for a bare name, it currently wins over the module's own item of that name. Rust gives the own item precedence.
+Exactly one candidate binds. An explicit `use` and a function declared in the module shadow a glob import of the same name, whatever the declaration order, but only in the namespace they live in: a trait or enum does not shadow a glob-imported function, and a struct competing with a glob import fails closed because tuple and unit struct forms are not recorded. For a qualified call, an own module or type shadows a glob-imported one of its first segment.
 
 Visibility works as follows:
 - `pub` items are always eligible.
@@ -132,9 +132,10 @@ Every Java file gets a persisted scope record. The Java resolver owns every call
 A dotted qualifier must match exactly one fully qualified type. For a simple type name, a matching single-type import decides on its own. Otherwise, same-package types, member types of the caller's class and on-demand imports compete, and two visible candidates leave the call unresolved. That includes a same-package type that collides with an on-demand-imported type.
 
 Calls bind as follows:
+- An unqualified or `this.` call binds a unique method of that name declared in the caller's own class. A method of that name declared in the caller's class or an enclosing class shadows static imports; when no unique own method is chosen, the call stays unresolved.
 - `Type.m()` binds only a unique, visible static method. Overloads are not chosen between.
 - `new T(...)` binds the unique Java constructor whose syntactic parameter count admits the call's syntactic argument count. A trailing varargs parameter admits any number of extra arguments. Argument types are not modelled, so constructors that admit the same count compete and the call stays unresolved. An implicit default constructor is not a target.
-- An unqualified call can bind through a static import.
+- An unqualified call that no method of the caller's or an enclosing class shadows can bind through a static import.
 
 Visibility is checked as follows:
 - Private targets are visible only from their owner.
@@ -142,7 +143,8 @@ Visibility is checked as follows:
 - Access through subclassing is not modelled.
 
 The following stay unresolved:
-- In a file that declares a package, unqualified and `this.` calls to the caller's own methods are not currently bound.
+- Unqualified and `this.` calls inside anonymous classes, enum-constant bodies and local classes, whose own members are not modelled.
+- Methods declared only in an enclosing class.
 - `super.` calls.
 - Variable, field and expression receivers.
 - Inheritance and interface dispatch.
@@ -213,13 +215,9 @@ A call is recorded only when its callee is a plain name or a chain of plain prop
 
 TypeScript resolution owns every TypeScript and JavaScript call edge. A call it cannot decide stays unresolved. Bindings work as follows:
 - A bare call binds through a non-type-only import of that local name.
-- With no import binding for the name, a bare call binds only to a unique same-file symbol of that name.
-- `ns.f()` binds through `import * as ns`, or through an imported `export * as ns`.
+- With no import binding for the name, a bare call binds only to a unique same-file symbol of that name that is not a class method.
+- `ns.f()` binds through `import * as ns`, or through an imported `export * as ns`. A member call through a named or default import binds only when that import is a re-exported namespace; members of imported classes, objects and functions are not modelled, and the imported binding itself is never the callee.
 - Every binding needs exactly one target symbol.
-
-Known defects:
-- The same-file fallback also considers class methods, so a bare `run()` can bind a method `run`.
-- A member call whose head is a named or default import (`Foo.bar()`, `Foo.a.b()`) currently binds to the imported symbol itself rather than to the member.
 
 Only relative specifiers inside the repository are followed. Package names, paths that leave the repository, trailing-slash specifiers and directory `index` files are not resolved. An extensionless specifier names `x.ts` or `x.tsx`, and having both makes it ambiguous.
 

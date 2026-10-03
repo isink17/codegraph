@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Scope-model documentation now covers Go, Rust, C/C++, Java, Kotlin, TypeScript/JavaScript, Python, C#, PHP and Swift alongside Ruby (`docs/scope-models.md`), including known Rust glob-shadowing and TypeScript member-binding defects. Resolver behavior is unchanged.
+Scope-model documentation now covers Go, Rust, C/C++, Java, Kotlin, TypeScript/JavaScript, Python, C#, PHP and Swift alongside Ruby (`docs/scope-models.md`). Resolver behavior is unchanged.
 
 Java `new` expressions now select constructors by syntactic argument and parameter counts. Commas inside nested calls, lambdas, string and char literals, annotation arguments or generic parameter types previously miscounted arity and could bind the wrong constructor; varargs constructors now accept their variable arity. Equal-arity overloads stay unresolved. The Java parser profile becomes `treesitter:java:v4`, so `codegraph update` re-parses existing Java files once.
 
