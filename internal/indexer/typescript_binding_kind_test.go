@@ -116,6 +116,32 @@ func TestTypeScriptCallBindsOnlyNameableDeclarations(t *testing.T) {
 			dst:    "ns.bar", want: "y.ts:y.bar(function)",
 		},
 		{
+			name:   "imported type alias is not callable",
+			caller: "main.ts", src: "import { Foo } from \"./x\";\nexport function caller() { Foo(); }\n",
+			others: tree{"x.ts": "export type Foo = number;\n"},
+			dst:    "Foo",
+		},
+		{
+			name:   "namespace member interface is not callable",
+			caller: "main.ts", src: "import * as ns from \"./x\";\nexport function caller() { ns.Foo(); }\n",
+			others: tree{"x.ts": "export interface Foo {}\n"},
+			dst:    "ns.Foo",
+		},
+		{
+			// `export { foo }` names what the module offers; the declaration
+			// is still the module's own binding.
+			name:   "same-file function exported by a later export list",
+			caller: "main.ts", src: "function foo(): void {}\nexport { foo };\nexport function caller() { foo(); }\n",
+			others: tree{"other.ts": "export function unrelated() {}\n"},
+			dst:    "foo", want: "main.ts:main.foo(function)",
+		},
+		{
+			name:   "namespace import re-exported by an export list",
+			caller: "main.ts", src: "import * as ns from \"./y\";\nexport { ns };\nexport function caller() { ns.bar(); }\n",
+			others: tree{"y.ts": "export function bar(): void {}\n"},
+			dst:    "ns.bar", want: "y.ts:y.bar(function)",
+		},
+		{
 			// A default-exported declaration is still a binding of its own
 			// module under its declared name.
 			name:   "same-file default-exported function",

@@ -475,16 +475,22 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 			}
 			if len(target.symbols) == 0 && target.namespace == 0 && !hasBindingEvidence {
 				for _, id := range byFileName[e.file][parts[0]] {
-					// A bare call names a value binding of module or function
-					// scope: a function or a class. A class method is never
-					// such a binding, and a type alias or interface is no value.
-					if kind := symbols[id].kind; kind != "function" && kind != "class" {
-						continue
-					}
+					// A class method is never a module or function scope
+					// binding; the callable filter below drops it.
 					target.symbols = append(target.symbols, id)
 				}
 			}
 		}
+		// A call names a value: a function or a class. A type alias or an
+		// interface declares no value, and a class method is not a binding of
+		// the module, so neither can be the callee, whichever path found it.
+		callable := target.symbols[:0:0]
+		for _, id := range target.symbols {
+			if kind := symbols[id].kind; kind == "function" || kind == "class" {
+				callable = append(callable, id)
+			}
+		}
+		target.symbols = callable
 		target = uniqueExport(target)
 		if len(target.symbols) == 1 {
 			results[e.id] = target.symbols[0]
