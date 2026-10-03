@@ -339,22 +339,16 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		return javaUniqueVisible(exact, pkg, "java_package_scope")
 	}
 	// A member type of an enclosing class shadows every import and package
-	// type (JLS 6.4.1). One the innermost class declares also hides any it
-	// inherits, so it is the answer. One a further-out class declares can be
-	// hidden by a member type a nearer class inherits, which the graph does
-	// not record, so the name stays unresolved.
+	// type (JLS 6.4.1), but the graph cannot tell which one is meant: the
+	// edge may sit in an anonymous or local class body, credited to the
+	// enclosing method, whose own inherited or local type hides it, and a
+	// member type a nearer class inherits is not recorded either. So any
+	// enclosing member of that name leaves the name unresolved.
 	for rel := container; rel != ""; {
-		var members []javaScopeSymbol
 		for _, s := range byName[name] {
 			if javaTypeIdentityEligible(s) && (s.qname == pkg+"."+rel+"."+name || s.qname == rel+"."+name) {
-				members = append(members, s)
-			}
-		}
-		if len(members) > 0 {
-			if rel != container || len(members) != 1 {
 				return javaScopeSymbol{}, false, ""
 			}
-			return members[0], true, "java_package_scope"
 		}
 		dot := strings.LastIndex(rel, ".")
 		if dot < 0 {
@@ -362,12 +356,13 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		}
 		rel = rel[:dot]
 	}
-	// Supertypes are not recorded, so any member type of that name the
-	// caller's classes could inherit -- one not private, and not
-	// package-private in another package (JLS 8.5) -- may be the one meant.
-	// Refusing costs every simple name that some member type also uses.
+	// Supertypes are not recorded, so any non-private member type of that
+	// name the caller's classes could inherit may be the one meant. A member
+	// recorded as package-private may be an interface member, which is
+	// implicitly public, so packages are not compared. Refusing costs every
+	// simple name that some member type also uses.
 	for _, s := range byName[name] {
-		if javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" && (s.visibility != "package" || s.pkg == pkg) {
+		if javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" {
 			return javaScopeSymbol{}, false, ""
 		}
 	}
