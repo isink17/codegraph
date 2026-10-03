@@ -23,6 +23,9 @@ type JavaAdapter struct {
 	// argument count on constructor calls and no constructor parameter
 	// count, for profile-transition tests.
 	legacyArity bool
+	// legacyNestedScope reproduces treesitter:java:v4, which did not mark
+	// calls inside anonymous, local or enum-constant class bodies.
+	legacyNestedScope bool
 }
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
@@ -30,13 +33,20 @@ func NewJava() *JavaAdapter { return &JavaAdapter{} }
 // NewJavaV3 returns a parser that reports treesitter:java:v3 and omits the
 // constructor arity facts v4 records. It exists only to reproduce v3
 // databases in profile-transition tests.
-func NewJavaV3() *JavaAdapter { return &JavaAdapter{legacyArity: true} }
+func NewJavaV3() *JavaAdapter { return &JavaAdapter{legacyArity: true, legacyNestedScope: true} }
+
+// NewJavaV4 returns a parser that reports treesitter:java:v4 and does not mark
+// calls inside nested class bodies. It exists only to reproduce v4 databases
+// in profile-transition tests.
+func NewJavaV4() *JavaAdapter { return &JavaAdapter{legacyNestedScope: true} }
 
 // NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
 // first `package x;` spelled anywhere in the file, comments and strings
 // included, as its package. It exists only to reproduce v2 databases in
 // profile-transition tests.
-func NewJavaV2() *JavaAdapter { return &JavaAdapter{legacyPackage: true, legacyArity: true} }
+func NewJavaV2() *JavaAdapter {
+	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true}
+}
 
 func (a *JavaAdapter) Language() string     { return "java" }
 func (a *JavaAdapter) Extensions() []string { return []string{".java"} }
@@ -62,7 +72,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 
 	javaExtractImports(root, content, &pf)
 	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
-	javaExtractCalls(root, content, &pf)
+	javaExtractCalls(root, content, &pf, !a.legacyNestedScope)
 	if a.legacyArity {
 		for i := range pf.Edges {
 			if pf.Edges[i].Kind == "constructs" {
@@ -302,7 +312,7 @@ func javaVisibility(node *sitter.Node, content []byte) string {
 	return "package"
 }
 
-func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested bool) {
 	for _, creation := range findDescendants(root, "object_creation_expression") {
 		typeNode := childByFieldName(creation, "type")
 		if typeNode == nil {
@@ -325,11 +335,15 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		evidence := nodeText(call, content)
+		if obj := childByFieldName(call, "object"); markNested && (obj == nil || obj.Type() == "this") && javaCallInNestedClassBody(call) {
+			evidence = graph.JavaCallNestedClassScopeEvidence
+		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
 			DstName:     fullName,
 			Kind:        "calls",
-			Evidence:    nodeText(call, content),
+			Evidence:    evidence,
 			Line:        line,
 			CallArity:   javaMethodCallArity(call),
 		})
@@ -373,6 +387,38 @@ func javaDeclarationArity(node *sitter.Node) (*int, *int) {
 		return &fixed, nil
 	}
 	return &fixed, &fixed
+}
+
+// javaCallInNestedClassBody reports whether call sits in the body of a class
+// the adapter extracts no members of: an anonymous class, an enum constant
+// body, or a class, interface, enum or record declared inside a method,
+// constructor, initializer or lambda (or inside such a class). Lambdas
+// themselves are not class bodies: `this` and bare names in a lambda belong
+// to the enclosing class.
+func javaCallInNestedClassBody(call *sitter.Node) bool {
+	for n := call.Parent(); n != nil; n = n.Parent() {
+		switch n.Type() {
+		case "class_body", "interface_body", "enum_body", "annotation_type_body":
+		default:
+			continue
+		}
+		owner := n.Parent()
+		if owner == nil {
+			return false
+		}
+		switch owner.Type() {
+		case "object_creation_expression", "enum_constant":
+			return true
+		}
+		if outer := owner.Parent(); outer != nil {
+			switch outer.Type() {
+			case "program", "class_body", "interface_body", "enum_body", "enum_body_declarations", "annotation_type_body":
+			default:
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func javaMethodCallArity(call *sitter.Node) *int {

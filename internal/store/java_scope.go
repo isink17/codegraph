@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"sort"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 type javaScopeSymbol struct {
@@ -438,7 +440,7 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	var out javaScopeSymbol
 	n := 0
 	for _, s := range byQName[t.qname+"."+t.name] {
-		if s.kind == "constructor" && javaConstructorAccepts(s, e.callArity) && javaVisibleFrom(s, e.pkg, t.pkg, e.container == t.name) {
+		if s.kind == "constructor" && javaConstructorAccepts(s, e.callArity) && javaVisibleFrom(s, e.pkg, t.pkg, javaEdgeOwner(e) == t.qname) {
 			out = s
 			n++
 		}
@@ -453,9 +455,14 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	if name == "super." || strings.HasPrefix(name, "super.") {
 		return javaScopeSymbol{}, ""
 	}
+	if e.evidence == graph.JavaCallNestedClassScopeEvidence {
+		// The call's own class is one the adapter does not model, and its
+		// members shadow every enclosing class and static import.
+		return javaScopeSymbol{}, ""
+	}
 	if strings.HasPrefix(name, "this.") {
 		name = strings.TrimPrefix(name, "this.")
-		s, _, strategy := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false)
+		s, _, strategy := javaMethods(javaEdgeOwner(e), name, e.pkg, javaEdgeOwner(e), byQName, "java_package_scope", false)
 		return s, strategy
 	}
 	if dot := strings.LastIndex(name, "."); dot >= 0 {
@@ -493,11 +500,28 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 			}
 			return javaScopeSymbol{}, ""
 		}
-		s, _, strategy := javaMethods(owner.qname, memberName, e.pkg, e.container, byQName, ownerStrategy, true)
+		s, _, strategy := javaMethods(owner.qname, memberName, e.pkg, javaEdgeOwner(e), byQName, ownerStrategy, true)
 		return s, strategy
 	}
-	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false); ok {
+	if s, ok, str := javaMethods(javaEdgeOwner(e), name, e.pkg, javaEdgeOwner(e), byQName, "java_package_scope", false); ok {
 		return s, str
+	}
+	// A method of that name declared by the calling class or any class
+	// enclosing it is in scope and shadows every static import (JLS 6.4.1).
+	// The call stays unresolved rather than binding an enclosing class's
+	// method: whether it is callable from here is not modelled.
+	for rel := e.container; rel != ""; {
+		owner := javaEdgeOwner(javaScopeEdge{pkg: e.pkg, container: rel})
+		for _, s := range byQName[owner+"."+name] {
+			if s.kind == "function" {
+				return javaScopeSymbol{}, ""
+			}
+		}
+		dot := strings.LastIndex(rel, ".")
+		if dot < 0 {
+			break
+		}
+		rel = rel[:dot]
 	}
 	explicitStaticOwners := map[string]struct{}{}
 	for _, i := range imps[e.file] {
@@ -547,7 +571,7 @@ func javaStaticImportMember(e javaScopeEdge, ownerName, name string, byQName, by
 	}
 	switch {
 	case owner.language == "java":
-		s, ok, _ := javaMethods(owner.qname, name, e.pkg, e.container, byQName, strategy, true)
+		s, ok, _ := javaMethods(owner.qname, name, e.pkg, javaEdgeOwner(e), byQName, strategy, true)
 		if ok {
 			return s
 		}
@@ -1040,6 +1064,19 @@ func kotlinHasJvmName(signature string) bool {
 		}
 	}
 	return false
+}
+
+// javaEdgeOwner is the qualified name of the class whose body holds the
+// call. The caller's container is stored relative to its package (`Caller`,
+// `Outer.Inner`) while every member is declared under the package-qualified
+// name, so the two are joined here rather than compared as spelled.
+func javaEdgeOwner(e javaScopeEdge) string {
+	// The adapter collapses a container equal to the package to the package
+	// itself (a class named like its package declares `app.helper`).
+	if e.pkg == "" || e.container == e.pkg {
+		return e.container
+	}
+	return e.pkg + "." + e.container
 }
 
 func javaMethods(owner, name, pkg, caller string, byQName map[string][]javaScopeSymbol, strategy string, requireStatic bool) (javaScopeSymbol, bool, string) {

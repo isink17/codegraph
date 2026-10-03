@@ -223,7 +223,7 @@ func TestKotlinV8ToV9SwallowRecoveryConvergence(t *testing.T) {
 	if summary.FilesChanged != 2 || summary.FilesIndexed != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v8-to-v9 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"lib/Screens.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v4", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"lib/Screens.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v5", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}

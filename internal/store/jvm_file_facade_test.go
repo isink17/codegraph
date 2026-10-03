@@ -74,11 +74,12 @@ func (f *facadeFixture) resolve(t *testing.T, dstName, evidence string) string {
 
 func TestJavaLocalMethodShadowsExplicitKotlinStaticImport(t *testing.T) {
 	f := newFacadeFixture(t)
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='app.Caller' WHERE id=?`, f.caller); err != nil {
+	// The Java adapter stores a method's container relative to its package.
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Caller' WHERE id=?`, f.caller); err != nil {
 		t.Fatal(err)
 	}
 	local := f.symbolKind(t, f.callerFile, "setLevel", "app.Caller.setLevel", "function", "java")
-	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='app.Caller',visibility='public',signature='setLevel(int)',arity_min=1,arity_max=1 WHERE id=?`, local); err != nil {
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE symbols SET container_name='Caller',visibility='public',signature='setLevel(int)',arity_min=1,arity_max=1 WHERE id=?`, local); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO scope_import_evidence(repo_id,file_id,language,source_specifier,imported_name,local_name,import_kind,wildcard,is_static) VALUES(?,?,?,?,?,?,?,0,1)`, f.repoID, f.callerFile, "java", "lib.Api.setLevel", "setLevel", "setLevel", "named"); err != nil {
