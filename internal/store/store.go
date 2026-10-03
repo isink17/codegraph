@@ -5945,42 +5945,43 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	} else {
 		outcome.resolved += n
 	}
-	remaining := targets[:0]
+	// C++ edges the SQL gate withholds from every generic strategy
+	// (cppScopeOwned) are decided by the evidence pass above or by nothing:
+	// an edge it left unresolved stays unresolved rather than meeting a
+	// repo-wide name lookup. Evidence targets outside that ownership continue
+	// only while still unresolved.
 	cppIDs := make([]int64, 0, len(targets))
 	for _, target := range targets {
-		if cppEvidenceTarget(target) {
+		if cppScopeOwned(target) || cppEvidenceTarget(target) {
 			cppIDs = append(cppIDs, target.edgeID)
+		}
+	}
+	stillUnresolved := map[int64]struct{}{}
+	if err := sqliteBatchedIDQuery(ctx, s.db, cppIDs,
+		`SELECT id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND id IN (`,
+		[]any{repoID}, func(scan func(...any) error) error {
+			var id int64
+			if err := scan(&id); err != nil {
+				return err
+			}
+			stillUnresolved[id] = struct{}{}
+			return nil
+		}); err != nil {
+		return outcome, err
+	}
+	remaining := make([]edgeTarget, 0, len(targets))
+	for _, target := range targets {
+		_, unresolved := stillUnresolved[target.edgeID]
+		if cppScopeOwned(target) {
+			if unresolved {
+				outcome.unresolved++
+			}
+			continue
+		}
+		if cppEvidenceTarget(target) && !unresolved {
 			continue
 		}
 		remaining = append(remaining, target)
-	}
-	if len(cppIDs) > 0 {
-		stillUnresolved := map[int64]struct{}{}
-		for _, chunk := range chunkInt64s(cppIDs, sqliteInClauseBatchSize) {
-			args := append([]any{repoID}, int64SliceToAny(chunk)...)
-			rows, err := s.db.QueryContext(ctx, `SELECT id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NULL AND id IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)`, args...)
-			if err != nil {
-				return outcome, err
-			}
-			for rows.Next() {
-				var id int64
-				if err := rows.Scan(&id); err != nil {
-					rows.Close()
-					return outcome, err
-				}
-				stillUnresolved[id] = struct{}{}
-			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return outcome, err
-			}
-			rows.Close()
-		}
-		for _, target := range targets {
-			if _, ok := stillUnresolved[target.edgeID]; ok {
-				remaining = append(remaining, target)
-			}
-		}
 	}
 	targets = remaining
 	if len(targets) == 0 {
