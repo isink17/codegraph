@@ -256,6 +256,12 @@ func TestLocalBindings(t *testing.T) {
 			want:     []string{"v", "a", "b", "c", "e", "f", "g", "h", "i", "k", "case"},
 		},
 		{
+			name:     "lambdas in a def header's defaults bind in that function",
+			src:      "def run(\n    cb=lambda full, *a: full(),\n    d=lambda: 0,\n) -> int:\n    return cb()\n",
+			function: true,
+			want:     []string{"cb", "full", "a", "d"},
+		},
+		{
 			name:     "strings and comments bind nothing",
 			src:      "def run():\n    text = \"fake = 1\"\n    # comment = 2\n    return text\n",
 			function: true,
@@ -353,6 +359,28 @@ func TestLocalBindingsMarksNestedDeclarations(t *testing.T) {
 	want := []LocalBinding{{Name: "value"}, {Name: "inner", Declaration: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("LocalBindings() = %+v, want %+v", got, want)
+	}
+}
+
+// A class body binds what it assigns, declares and imports; its header's bases
+// and keywords and the bodies of its methods bind nothing in it.
+func TestClassBodyBindings(t *testing.T) {
+	src := "class C(Base, metaclass=lambda m: m):\n" +
+		"    from lib import NAME as full, other\n" +
+		"    import pkg.mod\n" +
+		"    g = (lambda h: h())(1)\n" +
+		"    for i in range(2):\n" +
+		"        pass\n" +
+		"    def method(self, p):\n" +
+		"        q = 1\n" +
+		"    class Inner:\n" +
+		"        r = 1\n" +
+		"    s: int = 1\n"
+	got := localBindingNames(ClassBodyBindings(src))
+	sort.Strings(got)
+	want := []string{"Inner", "full", "g", "h", "i", "method", "other", "pkg", "s"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ClassBodyBindings() = %v, want %v", got, want)
 	}
 }
 

@@ -20,9 +20,10 @@ func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 // v3 records defs and classes nested under compound statements (if, try, with,
 // for, while, match), which v2 skipped along with the calls inside them. v4
 // records every name in its NFKC form, the name CPython binds (PEP 3131). v5
-// records lambda parameters and match-case captures as local bindings.
+// records lambda parameters and match-case captures as local bindings. v6
+// records lambdas in a def header's defaults and class bodies in a function.
 func (a *PythonAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:python:v5", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:python:v6", EmitsCallEdges: true}
 }
 
 // Java v5 marks bare and `this.` calls inside anonymous, local and

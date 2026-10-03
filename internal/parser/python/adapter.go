@@ -234,9 +234,9 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 // addPythonLocalBindings records what each lexical scope binds itself: the
 // module, and every function or method body now that their ranges are sealed.
-// Class bodies are not scopes a name lookup passes through in Python, so they
-// contribute nothing -- LocalBindings skips them from the module scan, and a
-// method scans only its own body.
+// A class body is scanned for the calls made directly in it, which are
+// attributed to the function the class is written in; a class outside every
+// function has no such calls. A method scans only its own body.
 func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile) {
 	emit := func(owner, source string) {
 		for _, binding := range LocalBindings(source, owner != "") {
@@ -261,6 +261,37 @@ func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile)
 			continue
 		}
 		emit(strings.TrimPrefix(sym.QualifiedName, module+"."), strings.Join(lines[start:end], "\n"))
+	}
+	functions := map[string]bool{}
+	for _, sym := range pf.Symbols {
+		if sym.Kind == "function" || sym.Kind == "method" {
+			functions[sym.QualifiedName] = true
+		}
+	}
+	for _, sym := range pf.Symbols {
+		start, end := sym.Range.StartLine-1, sym.Range.EndLine
+		if sym.Kind != "class" || start < 0 || end > len(lines) || start >= end {
+			continue
+		}
+		// The innermost function the class is written in, if any.
+		owner := sym.QualifiedName
+		for owner != "" {
+			owner = owner[:max(strings.LastIndexByte(owner, '.'), 0)]
+			if functions[owner] {
+				break
+			}
+		}
+		if owner == "" {
+			continue
+		}
+		owner = strings.TrimPrefix(owner, module+".")
+		for _, binding := range ClassBodyBindings(strings.Join(lines[start:end], "\n")) {
+			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+				LocalName:   binding.Name,
+				Kind:        graph.ScopeImportClassBodyBinding,
+				OwnerModule: owner,
+			})
+		}
 	}
 }
 
@@ -486,7 +517,8 @@ func isPythonKeyword(name string) bool {
 // Unicode names in declarations, calls, imports and local bindings. v3 stops
 // reading `as (`, match statements and case patterns as calls. v4 records
 // every name in its NFKC form, the name CPython binds (PEP 3131). v5 records
-// lambda parameters and match-case captures as local bindings.
+// lambda parameters and match-case captures as local bindings. v6 records
+// lambdas in a def header's defaults and class bodies in a function.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v5", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v6", EmitsCallEdges: true}
 }

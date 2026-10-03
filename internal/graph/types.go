@@ -273,6 +273,13 @@ const (
 	// name the way any other local does, but the name it binds is a symbol this
 	// graph holds, so it is not a reason to refuse every other strategy.
 	ScopeImportNestedDeclaration = "nested_decl"
+
+	// ScopeImportClassBodyBinding is a name a Python class body binds itself,
+	// owned by the function the class is written in: a call made directly in
+	// a class body is attributed to that function. It shadows an import only
+	// for calls attributed to that function itself, never for the methods or
+	// nested functions under it, which skip the class's scope.
+	ScopeImportClassBodyBinding  = "class_body_binding"
 	ScopeImportRubyLexicalParent = "ruby_lexical_parent"
 
 	// ScopeImportRubySingletonVisibility is a syntax-proven visibility override

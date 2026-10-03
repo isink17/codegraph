@@ -114,8 +114,10 @@ func pyLexicalOwner(node *sitter.Node, content []byte) string {
 
 // pyExtractLocalBindings records what each lexical scope binds itself, using
 // the same text scan the regex adapter uses so the two adapters cannot disagree
-// about a shadow. Class bodies are not scopes a Python name lookup passes
-// through, so only the module and each function body are scanned.
+// about a shadow. The module and each function body are scanned as scopes. A
+// class body is scanned for the calls made directly in it, which are
+// attributed to the function the class is written in; a class outside every
+// function has no such calls.
 func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
 	emit := func(owner, source string) {
 		for _, binding := range python.LocalBindings(source, owner != "") {
@@ -141,6 +143,31 @@ func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf
 			owner += "."
 		}
 		emit(owner+python.NormalizeIdentifier(nodeText(name, content)), nodeText(fn, content))
+	}
+	for _, class := range findDescendants(root, "class_definition") {
+		fn := class.Parent()
+		for fn != nil && fn.Type() != "function_definition" {
+			fn = fn.Parent()
+		}
+		var name *sitter.Node
+		if fn != nil {
+			name = childByFieldName(fn, "name")
+		}
+		if name == nil {
+			continue
+		}
+		owner := pyLexicalOwner(fn, content)
+		if owner != "" {
+			owner += "."
+		}
+		owner += python.NormalizeIdentifier(nodeText(name, content))
+		for _, binding := range python.ClassBodyBindings(nodeText(class, content)) {
+			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+				LocalName:   binding.Name,
+				Kind:        graph.ScopeImportClassBodyBinding,
+				OwnerModule: owner,
+			})
+		}
 	}
 }
 

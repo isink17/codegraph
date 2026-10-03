@@ -129,6 +129,10 @@ type pyScopeLocal struct {
 	// any other local, but the name it binds is a symbol this graph holds, so
 	// it is not a reason to keep every other strategy off the call.
 	declaration bool
+	// classBody marks a name a class body binds, owned by the function the
+	// class is written in. It reaches only calls attributed to that function
+	// itself: a method or nested function skips the class's scope.
+	classBody bool
 }
 
 type pyScopeEdge struct {
@@ -620,7 +624,7 @@ func pythonModuleImportsName(imports []pyScopeImport, name string) bool {
 // itself otherwise.
 func pythonNameIsShadowed(locals []pyScopeLocal, at, name, importOwner string, claimed bool) bool {
 	for _, local := range locals {
-		if local.name != name || !pythonScopeVisible(local.owner, at) {
+		if local.name != name || !pythonScopeVisible(local.owner, at) || local.classBody && local.owner != at {
 			continue
 		}
 		if !claimed {
@@ -829,12 +833,14 @@ func pythonScopeImports(ctx context.Context, q execQuerier, repoID int64, ids []
 		if err := scan(&file, &imp.source, &imp.imported, &imp.local, &imp.kind, &wildcard, &imp.owner); err != nil {
 			return err
 		}
-		if imp.kind == graph.ScopeImportLocalBinding || imp.kind == graph.ScopeImportNestedDeclaration {
+		if imp.kind == graph.ScopeImportLocalBinding || imp.kind == graph.ScopeImportNestedDeclaration ||
+			imp.kind == graph.ScopeImportClassBodyBinding {
 			if imp.local != "" {
 				locals[file] = append(locals[file], pyScopeLocal{
 					owner:       imp.owner,
 					name:        imp.local,
 					declaration: imp.kind == graph.ScopeImportNestedDeclaration,
+					classBody:   imp.kind == graph.ScopeImportClassBodyBinding,
 				})
 			}
 			return nil

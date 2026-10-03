@@ -231,6 +231,21 @@ func importStatements(masked []string) (stmts map[int]string, consumed []bool) {
 // Both Python adapters call this with the same text, so neither can decide a
 // shadow the other does not see.
 func LocalBindings(src string, isFunctionScope bool) []LocalBinding {
+	return scopeBindings(src, isFunctionScope, false)
+}
+
+// ClassBodyBindings reports the names a class body binds, given the class's
+// source: every assignment, loop target, alias, lambda parameter, `case`
+// capture, import and nested declaration written directly in the body. Code
+// that runs directly in the class body reads them before any enclosing scope;
+// the methods and nested classes it declares do not, because a function body
+// skips its class's scope. The header's bases and keywords are evaluated in the
+// enclosing scope and bind nothing here.
+func ClassBodyBindings(src string) []LocalBinding {
+	return scopeBindings(src, true, true)
+}
+
+func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 	lines := maskPythonLines(strings.Split(src, "\n"))
 	var out []LocalBinding
 	seen := map[string]struct{}{}
@@ -256,9 +271,15 @@ func LocalBindings(src string, isFunctionScope bool) []LocalBinding {
 		if strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "from ") {
 			// An import that rebinds a name is recorded as an import with its
 			// own lexical owner. Reporting it here as well would make every
-			// import shadow itself.
+			// import shadow itself. A class body's imports are recorded nowhere
+			// else, so there they are bindings like any other.
 			if base < 0 {
 				base = indent
+			}
+			if classBody {
+				for _, b := range ImportBindings(trimmed) {
+					add(b.LocalName)
+				}
 			}
 			continue
 		}
@@ -266,8 +287,14 @@ func LocalBindings(src string, isFunctionScope bool) []LocalBinding {
 			base = indent
 			if isFunctionScope && isDecl && starts[i] == 0 {
 				// The scope's own header: its parameters are its bindings, and
-				// its body is not a nested scope.
-				addPythonParameters(header, add)
+				// its body is not a nested scope. A lambda in a default value
+				// is no owner either, so its parameters are reported as this
+				// function's, as they are for a lambda in the body. A class
+				// header's bases belong to the enclosing scope.
+				if !classBody {
+					addPythonParameters(header, add)
+					addLambdaParameters(header, add)
+				}
 				continue
 			}
 		}
@@ -429,22 +456,7 @@ func addPythonAssignedNames(stmt string, add func(string)) {
 		}
 		add(name)
 	}
-	// `lambda a, *b, c=1, **d: ...`. A lambda is not a scope this graph owns,
-	// so, like a comprehension target, its parameters are reported as the
-	// enclosing scope's: that refuses more calls than CPython would, never
-	// fewer.
-	for _, segment := range splitKeyword(stmt, "lambda") {
-		if r, _ := utf8.DecodeRuneInString(segment); isIdentifierRune(r) {
-			continue
-		}
-		if colon := lambdaColon(segment); colon >= 0 {
-			for _, param := range splitTopLevel(segment[:colon], ',') {
-				param = strings.TrimLeft(strings.TrimSpace(param), "*")
-				param, _, _ = strings.Cut(param, "=")
-				add(strings.TrimSpace(param))
-			}
-		}
-	}
+	addLambdaParameters(stmt, add)
 	// `case <pattern> [if guard]:` binds every capture name in the pattern, in
 	// the enclosing function for the whole function.
 	// The soft keyword may be followed directly by a bracket or a tab
@@ -471,6 +483,25 @@ func addPythonAssignedNames(stmt string, add func(string)) {
 	head = strings.TrimRight(head, "+-*/%&|^<>@")
 	for _, part := range strings.Split(head, "=") {
 		addTargets(part)
+	}
+}
+
+// addLambdaParameters reports the parameters of every lambda in a statement:
+// `lambda a, *b, c=1, **d: ...`. A lambda is not a scope this graph owns, so,
+// like a comprehension target, its parameters are reported as the enclosing
+// scope's: that refuses more calls than CPython would, never fewer.
+func addLambdaParameters(stmt string, add func(string)) {
+	for _, segment := range splitKeyword(stmt, "lambda") {
+		if r, _ := utf8.DecodeRuneInString(segment); isIdentifierRune(r) {
+			continue
+		}
+		if colon := lambdaColon(segment); colon >= 0 {
+			for _, param := range splitTopLevel(segment[:colon], ',') {
+				param = strings.TrimLeft(strings.TrimSpace(param), "*")
+				param, _, _ = strings.Cut(param, "=")
+				add(strings.TrimSpace(param))
+			}
+		}
 	}
 }
 
