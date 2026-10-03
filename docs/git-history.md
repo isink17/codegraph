@@ -42,6 +42,9 @@ Rules:
   `files.path` directly. History from before a file moved into the root is outside
   the root and is not attributed. The window still counts repository commits.
 - **Submodules:** their histories are not traversed.
+- **Configuration:** `log.showRoot`, `log.diffMerges`, `diff.renames`,
+  signatures and color are overridden. A user-level `mailmap.file` is honoured as
+  Git honours it.
 - **Untracked files** appear with `commit_count` 0 and `worktree_differs` true.
   codegraph's own `.codegraph/` directory is never a worktree change.
 
@@ -67,9 +70,11 @@ variables, so history always describes the repository that contains the root.
 
 ## Updates
 
-The state stores the watermark, the window size and the algorithm version
-(`file-v1`). When `HEAD`, the window size and the algorithm are unchanged, an
-update only re-reads the worktree change set. Otherwise the window is recomputed
+The state stores the watermark, the window size, the algorithm version
+(`file-v1`) and a fingerprint of the repository's `.mailmap`, which Git reads
+from the working tree. When all of them are unchanged and the clone is not
+shallow, an update only re-reads the worktree change set. A shallow clone is
+always recomputed, because deepening it grows the window without moving `HEAD`. Otherwise the window is recomputed
 from the new watermark — a bounded `git log -n 250`, never full history. That
 covers rebases, resets and branch switches (the old watermark need not be an
 ancestor) and keeps every stored value equal to a fresh index of the same state.

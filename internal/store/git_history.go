@@ -8,13 +8,22 @@ import (
 	"github.com/isink17/codegraph/internal/githistory"
 )
 
-// GitHistoryState returns the stored repository-level history state.
+// GitHistoryState returns the stored repository-level history state. A
+// read-only handle on a database written before the history migration has no
+// table yet, which reads as not computed.
 func (s *Store) GitHistoryState(ctx context.Context, repoID int64) (githistory.State, bool, error) {
+	var tables int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='git_history_state'`).Scan(&tables); err != nil {
+		return githistory.State{}, false, err
+	}
+	if tables == 0 {
+		return githistory.State{}, false, nil
+	}
 	var st githistory.State
 	err := s.db.QueryRowContext(ctx, `
-		SELECT status, absent_reason, watermark_sha, watermark_committer_time, window_limit, window_commits, algorithm
+		SELECT status, absent_reason, watermark_sha, watermark_committer_time, window_limit, window_commits, algorithm, mailmap_sha256
 		FROM git_history_state WHERE repo_id=?`, repoID).Scan(
-		&st.Status, &st.AbsentReason, &st.Watermark, &st.WatermarkTime, &st.WindowLimit, &st.WindowCommits, &st.Algorithm)
+		&st.Status, &st.AbsentReason, &st.Watermark, &st.WatermarkTime, &st.WindowLimit, &st.WindowCommits, &st.Algorithm, &st.Mailmap)
 	if errors.Is(err, sql.ErrNoRows) {
 		return githistory.State{}, false, nil
 	}
@@ -32,12 +41,13 @@ func (s *Store) ReplaceGitHistory(ctx context.Context, repoID int64, state githi
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO git_history_state(repo_id, status, absent_reason, watermark_sha, watermark_committer_time, window_limit, window_commits, algorithm)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO git_history_state(repo_id, status, absent_reason, watermark_sha, watermark_committer_time, window_limit, window_commits, algorithm, mailmap_sha256)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id) DO UPDATE SET status=excluded.status, absent_reason=excluded.absent_reason,
 			watermark_sha=excluded.watermark_sha, watermark_committer_time=excluded.watermark_committer_time,
-			window_limit=excluded.window_limit, window_commits=excluded.window_commits, algorithm=excluded.algorithm`,
-		repoID, state.Status, state.AbsentReason, state.Watermark, state.WatermarkTime, state.WindowLimit, state.WindowCommits, state.Algorithm); err != nil {
+			window_limit=excluded.window_limit, window_commits=excluded.window_commits, algorithm=excluded.algorithm,
+			mailmap_sha256=excluded.mailmap_sha256`,
+		repoID, state.Status, state.AbsentReason, state.Watermark, state.WatermarkTime, state.WindowLimit, state.WindowCommits, state.Algorithm, state.Mailmap); err != nil {
 		return err
 	}
 	if files != nil {

@@ -11,10 +11,12 @@ package githistory
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -60,6 +62,9 @@ type State struct {
 	WindowLimit   int    `json:"window_limit,omitempty"`
 	WindowCommits int    `json:"window_commits"`
 	Algorithm     string `json:"algorithm,omitempty"`
+	// Mailmap fingerprints the repository's working-tree .mailmap, which Git
+	// applies to %aE. Part of the reuse key only.
+	Mailmap string `json:"-"`
 }
 
 // Absent builds the state for a repository with no readable history.
@@ -161,11 +166,16 @@ func run(ctx context.Context, root string, args ...string) ([]byte, error) {
 // Probe resolves the watermark: the HEAD commit and whether the clone is
 // shallow. WindowCommits is left for Files to fill.
 func Probe(ctx context.Context, root string) (State, error) {
-	out, err := run(ctx, root, "rev-parse", "--is-shallow-repository")
+	out, err := run(ctx, root, "rev-parse", "--is-shallow-repository", "--show-toplevel")
 	if err != nil {
 		return State{}, err
 	}
-	shallow := strings.TrimSpace(string(out)) == "true"
+	shallowLine, toplevel, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	shallow := shallowLine == "true"
+	mailmap := ""
+	if data, err := os.ReadFile(filepath.Join(toplevel, ".mailmap")); err == nil {
+		mailmap = fmt.Sprintf("%x", sha256.Sum256(data))
+	}
 	// An unborn HEAD fails this quietly; a HEAD naming a missing or corrupt
 	// object passes it and fails `show` below as git_failed.
 	out, err = run(ctx, root, "rev-parse", "-q", "--verify", "HEAD")
@@ -188,7 +198,7 @@ func Probe(ctx context.Context, root string) (State, error) {
 	if shallow {
 		status = StatusTruncated
 	}
-	return State{Status: status, Watermark: sha, WatermarkTime: ct, WindowLimit: WindowLimit, Algorithm: Algorithm}, nil
+	return State{Status: status, Watermark: sha, WatermarkTime: ct, WindowLimit: WindowLimit, Algorithm: Algorithm, Mailmap: mailmap}, nil
 }
 
 // WorktreeChanges lists root-relative paths whose working-tree content

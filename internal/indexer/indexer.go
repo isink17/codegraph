@@ -1029,6 +1029,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.ResolveMode = "test_links"
 		}
 	}
+	// Git history runs after the semantic graph is final and reads none of it.
+	history, historyMS, err := i.refreshHistory(ctx, repo.ID, opts.RepoRoot, opts.NoHistory)
+	if err != nil {
+		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+		return summary, err
+	}
+	summary.History = &history
+	summary.HistoryMS = historyMS
 	summary.DurationMS = time.Since(started).Milliseconds()
 	summary.PhaseTimings = []store.ScanPhaseTiming{
 		{Phase: "existing_load", MS: summary.ExistingLoadMS},
@@ -1045,6 +1053,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		{Phase: "mark_missing", MS: summary.MarkMissingMS},
 		{Phase: "resolve_edges", MS: summary.ResolveMS - summary.ResolveTestLinksMS},
 		{Phase: "resolve_test_links", MS: summary.ResolveTestLinksMS},
+		{Phase: "history", MS: summary.HistoryMS},
 		{Phase: "total", MS: summary.DurationMS},
 	}
 	summary.FilesTotal = summary.FilesSeen + summary.FilesDeleted
@@ -1065,12 +1074,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
 		return summary, err
 	}
-	history, historyMS, err := i.refreshHistory(ctx, repo.ID, opts.RepoRoot, opts.NoHistory)
-	if err != nil {
-		return summary, err
-	}
-	summary.History = &history
-	summary.HistoryMS = historyMS
 	return summary, nil
 }
 

@@ -49,9 +49,13 @@ func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string
 	changes = slices.DeleteFunc(changes, func(p string) bool {
 		return strings.HasPrefix(p, config.RepoArtifactsDir+"/")
 	})
+	// A shallow clone can be deepened without moving HEAD, so its window is
+	// always recomputed. The mailmap fingerprint covers .mailmap edits, which
+	// Git reads from the working tree.
 	prev, found, err := i.store.GitHistoryState(ctx, repoID)
-	if err == nil && found && prev.Status == state.Status && prev.Watermark == state.Watermark &&
-		prev.WindowLimit == state.WindowLimit && prev.Algorithm == state.Algorithm {
+	if err == nil && found && state.Status == githistory.StatusOK && prev.Status == state.Status &&
+		prev.Watermark == state.Watermark && prev.WindowLimit == state.WindowLimit &&
+		prev.Algorithm == state.Algorithm && prev.Mailmap == state.Mailmap {
 		return prev, nil, changes
 	}
 	files, n, err := githistory.Files(ctx, root, state.Watermark)

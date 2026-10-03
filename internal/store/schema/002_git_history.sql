@@ -9,7 +9,8 @@ CREATE TABLE git_history_state (
     watermark_committer_time INTEGER NOT NULL DEFAULT 0,
     window_limit INTEGER NOT NULL DEFAULT 0,
     window_commits INTEGER NOT NULL DEFAULT 0,
-    algorithm TEXT NOT NULL DEFAULT ''
+    algorithm TEXT NOT NULL DEFAULT '',
+    mailmap_sha256 TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE git_file_history (

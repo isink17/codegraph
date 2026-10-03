@@ -220,6 +220,14 @@ func TestHistoryFreshIncrementalAndRewriteParity(t *testing.T) {
 		t.Fatalf("worktree changes wrong:\n%s", dump)
 	}
 
+	// A working-tree .mailmap edit changes attribution without moving HEAD.
+	r.Write(".mailmap", "Alice <alice@example.com> <bob@example.com>\n")
+	index(t, inc, r.Dir, true, false)
+	assertParity("mailmap")
+	if strings.Contains(historyDump(t, inc), "bob@example.com") {
+		t.Fatal("mailmap edit not applied")
+	}
+
 	// Rewrite: reset two commits back and commit something else. The old
 	// watermark is no longer reachable from HEAD.
 	r.Git("reset", "-q", "--hard", "HEAD~2")
@@ -293,5 +301,27 @@ func TestHistoryJoinsFilesAndFlagsWorktree(t *testing.T) {
 		if list.Total != 1 || len(list.Files) != 1 || list.Files[0].Path != tc.prefix+"new.go" {
 			t.Fatalf("prefix listing = %+v", list)
 		}
+	}
+}
+
+// Deepening a shallow clone grows the window without moving HEAD.
+func TestHistoryShallowDeepenParity(t *testing.T) {
+	src := goHistoryRepo(t)
+	src.Write("c.go", "package h\n\nfunc D() {}\n")
+	src.Commit("", "three")
+	clone := &gittest.Repo{T: t, Dir: filepath.Join(t.TempDir(), "clone")}
+	src.Git("clone", "-q", "--depth", "1", "file://"+filepath.ToSlash(src.Dir), clone.Dir)
+	inc := newProfileStore(t)
+	if sum := index(t, inc, clone.Dir, false, false); sum.History.Status != githistory.StatusTruncated || sum.History.WindowCommits != 1 {
+		t.Fatalf("shallow: %+v", sum.History)
+	}
+	clone.Git("fetch", "-q", "--deepen", "1")
+	if sum := index(t, inc, clone.Dir, true, false); sum.History.WindowCommits != 2 {
+		t.Fatalf("after deepen: %+v", sum.History)
+	}
+	fresh := newProfileStore(t)
+	index(t, fresh, clone.Dir, false, false)
+	if a, b := historyDump(t, inc), historyDump(t, fresh); a != b {
+		t.Fatalf("deepened incremental differs from fresh:\n%s\n---\n%s", a, b)
 	}
 }
