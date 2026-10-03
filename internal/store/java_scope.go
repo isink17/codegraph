@@ -455,7 +455,7 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	}
 	if strings.HasPrefix(name, "this.") {
 		name = strings.TrimPrefix(name, "this.")
-		s, _, strategy := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false)
+		s, _, strategy := javaMethods(javaEdgeOwner(e), name, e.pkg, javaEdgeOwner(e), byQName, "java_package_scope", false)
 		return s, strategy
 	}
 	if dot := strings.LastIndex(name, "."); dot >= 0 {
@@ -493,10 +493,10 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 			}
 			return javaScopeSymbol{}, ""
 		}
-		s, _, strategy := javaMethods(owner.qname, memberName, e.pkg, e.container, byQName, ownerStrategy, true)
+		s, _, strategy := javaMethods(owner.qname, memberName, e.pkg, javaEdgeOwner(e), byQName, ownerStrategy, true)
 		return s, strategy
 	}
-	if s, ok, str := javaMethods(e.container, name, e.pkg, e.container, byQName, "java_package_scope", false); ok {
+	if s, ok, str := javaMethods(javaEdgeOwner(e), name, e.pkg, javaEdgeOwner(e), byQName, "java_package_scope", false); ok {
 		return s, str
 	}
 	explicitStaticOwners := map[string]struct{}{}
@@ -547,7 +547,7 @@ func javaStaticImportMember(e javaScopeEdge, ownerName, name string, byQName, by
 	}
 	switch {
 	case owner.language == "java":
-		s, ok, _ := javaMethods(owner.qname, name, e.pkg, e.container, byQName, strategy, true)
+		s, ok, _ := javaMethods(owner.qname, name, e.pkg, javaEdgeOwner(e), byQName, strategy, true)
 		if ok {
 			return s
 		}
@@ -1040,6 +1040,17 @@ func kotlinHasJvmName(signature string) bool {
 		}
 	}
 	return false
+}
+
+// javaEdgeOwner is the qualified name of the class whose body holds the
+// call. The caller's container is stored relative to its package (`Caller`,
+// `Outer.Inner`) while every member is declared under the package-qualified
+// name, so the two are joined here rather than compared as spelled.
+func javaEdgeOwner(e javaScopeEdge) string {
+	if e.pkg == "" {
+		return e.container
+	}
+	return e.pkg + "." + e.container
 }
 
 func javaMethods(owner, name, pkg, caller string, byQName map[string][]javaScopeSymbol, strategy string, requireStatic bool) (javaScopeSymbol, bool, string) {
