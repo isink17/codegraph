@@ -53,9 +53,23 @@ func runPythonDefaultClassScopeCases(t *testing.T, reg *parser.Registry, headerC
 		// A class outside every function: no call in its body is attributed
 		// to any symbol, so there is no edge to bind.
 		{"c_module.py", "full"}, // 'classattr'
+		// A body on the class or def header line, and a lambda among a class
+		// header's keywords.
+		{"onel_class.py", "full"},    // 'cls'
+		{"onel_def.py", "full"},      // 'loc'
+		{"hdr_kw_lambda.py", "full"}, // 'param'
+		// A direct method's defaults are evaluated in the class body, though
+		// the call is attributed to the method.
+		{"meth_default.py", "full"},        // 'cls'
+		{"async_meth_class.py", "full"},    // 'cls'
+		{"modcls_meth_default.py", "full"}, // 'cls'
 	} {
 		want := "<unresolved>"
-		if tc.file == "c_module.py" || !headerCalls && strings.HasPrefix(tc.file, "d_") {
+		switch {
+		case tc.file == "c_module.py":
+			want = "<no edge>"
+		case !headerCalls && !strings.HasPrefix(tc.file, "c_"):
+			// Every other case calls on a `def` or `class` header line.
 			want = "<no edge>"
 		}
 		if got := r.edgeState(t, tc.file, tc.dst); !strings.HasPrefix(got, want) {
@@ -64,6 +78,21 @@ func runPythonDefaultClassScopeCases(t *testing.T, reg *parser.Registry, headerC
 	}
 	// CPython calls lib.full: nothing between the call and the import binds
 	// `full`, and a method skips its class's scope.
+	// meth_default_body.py: the default calls the class attribute, the body
+	// lib.full -- a method body skips the class scope.
+	var states []string
+	for _, line := range r.projection(t) {
+		if strings.HasPrefix(line, `edge meth_default_body.py "full" => `) {
+			states = append(states, strings.TrimPrefix(line, `edge meth_default_body.py "full" => `))
+		}
+	}
+	wantStates := "<unresolved> [] | " + imported
+	if !headerCalls {
+		wantStates = imported
+	}
+	if got := strings.Join(states, " | "); got != wantStates {
+		t.Errorf("meth_default_body.py: %q = %s; want %s", "full", got, wantStates)
+	}
 	for _, file := range []string{"d_noparam.py", "c_method.py", "c_module_method.py", "c_unbound.py"} {
 		want := imported
 		if file == "d_noparam.py" && !headerCalls {

@@ -290,10 +290,33 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 				// its body is not a nested scope. A lambda in a default value
 				// is no owner either, so its parameters are reported as this
 				// function's, as they are for a lambda in the body. A class
-				// header's bases belong to the enclosing scope.
+				// header's bases and keywords bind nothing in the body, but a
+				// lambda among them has no owner of its own either. A body
+				// written on the header line binds like any other.
+				colon := headerColon(header)
+				if colon < 0 {
+					colon = len(header)
+				}
 				if !classBody {
-					addPythonParameters(header, add)
-					addLambdaParameters(header, add)
+					addPythonParameters(header[:colon], add)
+				}
+				addLambdaParameters(header[:colon], add)
+				if colon == len(header) {
+					continue
+				}
+				for _, stmt := range splitTopLevel(header[colon+1:], ';') {
+					stmt = strings.TrimSpace(stmt)
+					if strings.HasPrefix(stmt, "import ") || strings.HasPrefix(stmt, "from ") {
+						// A function's imports are recorded as imports; only
+						// a class body's are recorded nowhere else.
+						if classBody {
+							for _, b := range ImportBindings(stmt) {
+								add(b.LocalName)
+							}
+						}
+						continue
+					}
+					addPythonAssignedNames(stmt, add)
 				}
 				continue
 			}
@@ -316,6 +339,44 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 		addPythonAssignedNames(trimmed, add)
 	}
 	return out
+}
+
+// DefHeaderEnd returns how many lines after its first the `def` header that
+// starts src runs on: the index of the header's last physical line.
+func DefHeaderEnd(src string) int {
+	_, end := defHeader(src)
+	return end
+}
+
+// DefHeaderNames reports which of names the `def` header starting src spells
+// after its name -- in a parameter default or an annotation -- outside strings
+// and comments.
+func DefHeaderNames(src string, names []LocalBinding) []LocalBinding {
+	header, _ := defHeader(src)
+	if open := strings.IndexByte(header, '('); open >= 0 {
+		header = header[open:]
+	} else {
+		return nil
+	}
+	var out []LocalBinding
+	for _, b := range names {
+		for i := strings.Index(header, b.Name); i >= 0; {
+			if isKeywordAt(header, i, len(b.Name)) {
+				out = append(out, b)
+				break
+			}
+			next := strings.Index(header[i+1:], b.Name)
+			if next < 0 {
+				break
+			}
+			i += next + 1
+		}
+	}
+	return out
+}
+
+func defHeader(src string) (string, int) {
+	return pythonLogicalLine(maskPythonLines(strings.Split(src, "\n")), 0)
 }
 
 // LocalBinding is one name a lexical scope binds itself. Declaration marks the

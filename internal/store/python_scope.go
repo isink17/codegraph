@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"math"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -133,11 +135,16 @@ type pyScopeLocal struct {
 	// class is written in. It reaches only calls attributed to that function
 	// itself: a method or nested function skips the class's scope.
 	classBody bool
+	// headerEnd, when set, marks a class-body name recorded under one of the
+	// class's direct methods: it reaches only the calls attributed to that
+	// method on its `def` header, which ends on this line.
+	headerEnd int
 }
 
 type pyScopeEdge struct {
 	id, file, src int64
 	name          string
+	line          int
 }
 
 // pythonScopeVisible reports whether evidence owned by lexical scope `owner`
@@ -391,7 +398,7 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 	for _, e := range edges {
 		at := scopes[e.src]
 		binding, member, claimed := pythonBindingFor(bindings[e.file], at, e.name)
-		if pythonNameIsShadowed(locals[e.file], at, pythonLeadingSegment(e.name), binding.owner, claimed) {
+		if pythonNameIsShadowed(locals[e.file], at, e.line, pythonLeadingSegment(e.name), binding.owner, claimed) {
 			// The call site bound the name itself. Whatever it holds, it is not
 			// a repository symbol this resolver can name.
 			answers.claimed[e.id] = struct{}{}
@@ -622,9 +629,10 @@ func pythonModuleImportsName(imports []pyScopeImport, name string) bool {
 // shadow, `def inner()` inside `run()` is the target of `inner()`, not a reason
 // to refuse one. It shadows an import as any local does, and answers for
 // itself otherwise.
-func pythonNameIsShadowed(locals []pyScopeLocal, at, name, importOwner string, claimed bool) bool {
+func pythonNameIsShadowed(locals []pyScopeLocal, at string, line int, name, importOwner string, claimed bool) bool {
 	for _, local := range locals {
-		if local.name != name || !pythonScopeVisible(local.owner, at) || local.classBody && local.owner != at {
+		if local.name != name || !pythonScopeVisible(local.owner, at) ||
+			(local.classBody || local.headerEnd > 0) && local.owner != at || local.headerEnd > 0 && line > local.headerEnd {
 			continue
 		}
 		if !claimed {
@@ -787,12 +795,12 @@ func pythonPackageRebindsName(pkgPath string, imports []pyScopeImport, bindings 
 func pythonScopeEdges(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}) ([]pyScopeEdge, error) {
 	var edges []pyScopeEdge
 	err := sqliteBatchedQuery(ctx, q,
-		`SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='python' AND f.is_deleted=0 AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND e.edge_kind <> 'cross_language_ref'`,
+		`SELECT e.id,e.file_id,e.src_symbol_id,e.dst_name,COALESCE(e.line,0) FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='python' AND f.is_deleted=0 AND e.dst_symbol_id IS NULL AND e.dst_name != '' AND e.edge_kind <> 'cross_language_ref'`,
 		` AND e.id IN (%s)`,
 		[]any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e pyScopeEdge
-			if err := rows.Scan(&e.id, &e.file, &e.src, &e.name); err != nil {
+			if err := rows.Scan(&e.id, &e.file, &e.src, &e.name, &e.line); err != nil {
 				return err
 			}
 			edges = append(edges, e)
@@ -834,13 +842,23 @@ func pythonScopeImports(ctx context.Context, q execQuerier, repoID int64, ids []
 			return err
 		}
 		if imp.kind == graph.ScopeImportLocalBinding || imp.kind == graph.ScopeImportNestedDeclaration ||
-			imp.kind == graph.ScopeImportClassBodyBinding {
+			imp.kind == graph.ScopeImportClassBodyBinding || imp.kind == graph.ScopeImportClassHeaderBinding {
+			headerEnd := 0
+			if imp.kind == graph.ScopeImportClassHeaderBinding {
+				// A header binding without a readable line shadows the
+				// method's every call rather than none.
+				headerEnd = math.MaxInt
+				if n, err := strconv.Atoi(imp.imported); err == nil && n > 0 {
+					headerEnd = n
+				}
+			}
 			if imp.local != "" {
 				locals[file] = append(locals[file], pyScopeLocal{
 					owner:       imp.owner,
 					name:        imp.local,
 					declaration: imp.kind == graph.ScopeImportNestedDeclaration,
 					classBody:   imp.kind == graph.ScopeImportClassBodyBinding,
+					headerEnd:   headerEnd,
 				})
 			}
 			return nil

@@ -666,7 +666,8 @@ func (a pythonBindingsV5Adapter) Parse(ctx context.Context, path string, content
 	}
 	kept := pf.Scope.Imports[:0]
 	for _, b := range pf.Scope.Imports {
-		if b.Kind == graph.ScopeImportClassBodyBinding || b.Kind == graph.ScopeImportLocalBinding && b.LocalName == "full" {
+		if b.Kind == graph.ScopeImportClassBodyBinding || b.Kind == graph.ScopeImportClassHeaderBinding ||
+			b.Kind == graph.ScopeImportLocalBinding && b.LocalName == "full" {
 			continue
 		}
 		kept = append(kept, b)

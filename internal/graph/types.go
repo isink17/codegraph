@@ -279,8 +279,16 @@ const (
 	// a class body is attributed to that function. It shadows an import only
 	// for calls attributed to that function itself, never for the methods or
 	// nested functions under it, which skip the class's scope.
-	ScopeImportClassBodyBinding  = "class_body_binding"
-	ScopeImportRubyLexicalParent = "ruby_lexical_parent"
+	ScopeImportClassBodyBinding = "class_body_binding"
+
+	// ScopeImportClassHeaderBinding is a name a Python class body binds,
+	// owned by one of the class's direct methods: the method's parameter
+	// defaults and annotations are evaluated in the class body, but a call in
+	// its `def` header is attributed to the method. ImportedName carries the
+	// header's last line; the binding shadows an import only for calls
+	// attributed to that method on or before that line.
+	ScopeImportClassHeaderBinding = "class_header_binding"
+	ScopeImportRubyLexicalParent  = "ruby_lexical_parent"
 
 	// ScopeImportRubySingletonVisibility is a syntax-proven visibility override
 	// for one singleton method, spelled by literal name: `private_class_method

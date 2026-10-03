@@ -262,6 +262,12 @@ func TestLocalBindings(t *testing.T) {
 			want:     []string{"cb", "full", "a", "d"},
 		},
 		{
+			name:     "a body on the def line binds, its imports do not",
+			src:      "def run(x) -> int: full = lambda: 1; import os; return full(x)\n",
+			function: true,
+			want:     []string{"x", "full"},
+		},
+		{
 			name:     "strings and comments bind nothing",
 			src:      "def run():\n    text = \"fake = 1\"\n    # comment = 2\n    return text\n",
 			function: true,
@@ -363,7 +369,8 @@ func TestLocalBindingsMarksNestedDeclarations(t *testing.T) {
 }
 
 // A class body binds what it assigns, declares and imports; its header's bases
-// and keywords and the bodies of its methods bind nothing in it.
+// and keywords (but for a lambda's parameters) and the bodies of its methods
+// bind nothing in it.
 func TestClassBodyBindings(t *testing.T) {
 	src := "class C(Base, metaclass=lambda m: m):\n" +
 		"    from lib import NAME as full, other\n" +
@@ -378,9 +385,36 @@ func TestClassBodyBindings(t *testing.T) {
 		"    s: int = 1\n"
 	got := localBindingNames(ClassBodyBindings(src))
 	sort.Strings(got)
-	want := []string{"Inner", "full", "g", "h", "i", "method", "other", "pkg", "s"}
+	want := []string{"Inner", "full", "g", "h", "i", "m", "method", "other", "pkg", "s"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ClassBodyBindings() = %v, want %v", got, want)
+	}
+}
+
+// A body on the class header line binds like one below it, and a lambda among
+// the header's keywords binds its parameters; the bases bind nothing.
+func TestClassBodyBindingsOnHeaderLine(t *testing.T) {
+	got := localBindingNames(ClassBodyBindings("class C(B, cb=lambda p: p()): full = lambda: 1; import os; g = full()\n"))
+	sort.Strings(got)
+	if want := []string{"full", "g", "os", "p"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ClassBodyBindings() = %v, want %v", got, want)
+	}
+}
+
+func TestDefHeaderEnd(t *testing.T) {
+	for src, want := range map[string]int{
+		"def m(self): return 1\n":                          0,
+		"def m(self,\n      x=f(\n   1)):\n    return x\n": 2,
+		"async def m(self, s=\"(\"):\n    pass\n":          0,
+	} {
+		if got := DefHeaderEnd(src); got != want {
+			t.Errorf("DefHeaderEnd(%q) = %d, want %d", src, got, want)
+		}
+	}
+	names := []LocalBinding{{Name: "full"}, {Name: "m"}, {Name: "x"}, {Name: "s"}}
+	got := DefHeaderNames("def m(self, a=full(),\n      b=\"x\") -> fullx:\n    return s\n", names)
+	if want := []LocalBinding{{Name: "full"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("DefHeaderNames() = %v, want %v", got, want)
 	}
 }
 
