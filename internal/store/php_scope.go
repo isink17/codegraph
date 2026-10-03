@@ -86,10 +86,10 @@ const phpScopeStaticSQL = `(instr(e.dst_name, '::') > 0 AND instr(e.dst_name, '-
 // ownership rows beside it in resolverBindableCandidateSQL.
 const phpScopeVetoSQL = `NOT (f.language = 'php' AND (instr(edges.dst_name, '::') > 0 OR instr(edges.dst_name, '->') > 0))`
 
-// phpScopeOwned reports whether a PHP call spelling belongs to this pass. It
-// is the Go-side twin of phpScopeVetoSQL.
-func phpScopeOwned(dstName string) bool {
-	return strings.Contains(dstName, "::") || strings.Contains(dstName, "->")
+// phpScopeOwned reports whether a PHP call edge belongs to this pass. It is the
+// Go-side twin of phpScopeVetoSQL.
+func phpScopeOwned(t edgeTarget) bool {
+	return t.srcLanguage == "php" && (strings.Contains(t.dstName, "::") || strings.Contains(t.dstName, "->"))
 }
 
 // phpGenericCandidateSQL excludes PHP methods from every generic candidate

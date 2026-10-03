@@ -6154,7 +6154,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	// continue. This is the Go-side twin of phpScopeVetoSQL.
 	phpIDs := make(map[int64]struct{})
 	for _, target := range targets {
-		if target.srcLanguage == "php" && phpScopeOwned(target.dstName) {
+		if phpScopeOwned(target) {
 			phpIDs[target.edgeID] = struct{}{}
 		}
 	}
@@ -6274,7 +6274,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		if _, blocked := moduleVeto[target.edgeID]; blocked {
 			continue
 		}
-		if target.srcLanguage != "go" || !goBareCallName(target.dstName) {
+		if !goBareScopeOwned(target) {
 			continue
 		}
 		goBare[target.edgeID] = struct{}{}
