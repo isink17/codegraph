@@ -149,3 +149,17 @@ func TestJavaSimpleNameConstructionRespectsMemberTypes(t *testing.T) {
 		t.Fatalf("Sub.raw bound %q after the member types were removed", got)
 	}
 }
+
+// An interface's member types are implicitly public and inherited by its
+// implementers in any package, though recorded as package-private. Oracle
+// (javac 17): Impl.raw new Box() -> other/I$Box; Impl.st Box.m() -> other/I$Box.m.
+func TestJavaInterfaceMemberTypeFromAnotherPackageShadows(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"app/Box.java":  `package app; public class Box { public Box() {} public static void m() {} }`,
+		"other/I.java":  `package other; public interface I { class Box { public Box() {} public static void m() {} } }`,
+		"app/Impl.java": "package app; public class Impl implements other.I {\n void raw() { new Box(); }\n}",
+	})
+	if got := javaConstructsTargets(t, r)["app.Impl.raw"]; got != "" {
+		t.Fatalf("Impl.raw bound %q, want unresolved (javac: other/I$Box)", got)
+	}
+}
