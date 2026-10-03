@@ -632,3 +632,52 @@ func TestLogicalConfigPath(t *testing.T) {
 		}
 	}
 }
+
+// TestMediumConfidenceEdgesAreEvaluated: the trust filter admits high and
+// medium edges, so a medium edge across a forbidden pair is a finding.
+func TestMediumConfidenceEdgesAreEvaluated(t *testing.T) {
+	f := newFixture(t)
+	a := f.sym("internal/domain/a.go", "A", 1)
+	b := f.sym("internal/infra/b.go", "B", 1)
+	f.edge(a, b, 5, "calls", "dot_suffix", "medium")
+	f.config(layersDoc(`{"id":"domain-no-infra","kind":"forbidden_dependency","from":["domain"],"to":["infra"]}`))
+	res := f.check(0, 0)
+	if res.Status != StatusViolations || len(res.Findings) != 1 {
+		t.Fatalf("medium edge not evaluated: %s", marshal(t, res))
+	}
+}
+
+// TestDiamondIsNoCycle: a->b, a->c, c->b reaches b twice but has no cycle.
+// Without Tarjan's on-stack check the cross edge c->b would merge a and c.
+func TestDiamondIsNoCycle(t *testing.T) {
+	doc := `{"schema_version":1,"groups":{"a":{"include":["a/**"]},"b":{"include":["b/**"]},"c":{"include":["c/**"]}},
+		"rules":[{"id":"cyc","kind":"forbidden_cycles","groups":["a","b","c"]}]}`
+	f := newFixture(t)
+	a, b, c := f.sym("a/x.go", "A", 1), f.sym("b/x.go", "B", 1), f.sym("c/x.go", "C", 1)
+	f.call(a, b, 1)
+	f.call(a, c, 1)
+	f.call(c, b, 1)
+	f.config(doc)
+	if res := f.check(0, 0); res.Status != StatusOK || res.Summary.Cycles != 0 {
+		t.Fatalf("diamond reported a cycle: %s", marshal(t, res))
+	}
+}
+
+// TestCycleWitnessPrefersShorterOverSmallerFirstHop: depth-first search from a
+// would follow b first and return a,b,c,a; the shortest return is a,d,a.
+func TestCycleWitnessPrefersShorterOverSmallerFirstHop(t *testing.T) {
+	doc := `{"schema_version":1,"groups":{"a":{"include":["a/**"]},"b":{"include":["b/**"]},"c":{"include":["c/**"]},"d":{"include":["d/**"]}},
+		"rules":[{"id":"cyc","kind":"forbidden_cycles","groups":["a","b","c","d"]}]}`
+	f := newFixture(t)
+	a, b, c, d := f.sym("a/x.go", "A", 1), f.sym("b/x.go", "B", 1), f.sym("c/x.go", "C", 1), f.sym("d/x.go", "D", 1)
+	f.call(a, b, 1)
+	f.call(b, c, 1)
+	f.call(c, a, 1)
+	f.call(a, d, 1)
+	f.call(d, a, 1)
+	f.config(doc)
+	res := f.check(0, 0)
+	if len(res.Cycles) != 1 || strings.Join(res.Cycles[0].Witness, ",") != "a,d,a" {
+		t.Fatalf("cycles = %s", marshal(t, res.Cycles))
+	}
+}

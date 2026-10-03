@@ -191,12 +191,21 @@ func loadTestConfig(t *testing.T) config.Config {
 // (opening a serve session does its own bookkeeping writes).
 func TestCheckConstraintsMCPParity(t *testing.T) {
 	root := constraintsRepo(t, true)
+	// A path with a character JSON encoders may HTML-escape: parity is
+	// byte-equality, so both surfaces must spell it the same way.
+	amp := filepath.Join(root, "internal", "domain", "r&d.go")
+	if err := os.WriteFile(amp, []byte("package domain\n\nimport \"example.com/m/internal/infra\"\n\nfunc D() { infra.B() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := runCLI(t, "index", root); err != nil {
 		t.Fatal(err)
 	}
 	cliOut, _, code := checkCLI(t, "check_constraints", root)
 	if code != 1 {
 		t.Fatalf("exit %d, want 1", code)
+	}
+	if !strings.Contains(cliOut, `r\u0026d.go`) {
+		t.Fatalf("CLI output lacks the r&d.go finding:\n%s", cliOut)
 	}
 	cfg := loadTestConfig(t)
 	serve := func(mode string, calls ...string) []map[string]json.RawMessage {

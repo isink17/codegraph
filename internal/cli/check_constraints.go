@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -74,7 +75,12 @@ func runCheckConstraints(ctx context.Context, cfg config.Config, stdout io.Write
 	if err != nil {
 		return &ExitError{Code: 2, Err: err}
 	}
-	if err := writeJSON(stdout, res); err != nil {
+	// Unlike writeJSON, keep encoding/json's default HTML escaping: the
+	// result must be byte-equal to the MCP tool's data, which json.Marshal
+	// encodes with `<`, `>` and `&` escaped.
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(res); err != nil {
 		return err
 	}
 	if code := constraints.ExitCode(res.Status); code != 0 {

@@ -225,8 +225,15 @@ func Check(ctx context.Context, opts Options, open Opener) (Result, error) {
 		if logical != "" {
 			where = logical
 		}
-		res.Errors = []Error{{Location: where, Code: StatusNotConfigured,
-			Message: fmt.Sprintf("no constraints config found; create %s at the repository root", ConfigFileName)}}
+		msg := fmt.Sprintf("no constraints config found; create %s at the repository root", ConfigFileName)
+		if opts.ConfigPath != "" {
+			// The caller named a file; do not point them at the default one.
+			msg = "the given constraints config file does not exist"
+			if logical == "" {
+				where = "--config"
+			}
+		}
+		res.Errors = []Error{{Location: where, Code: StatusNotConfigured, Message: msg}}
 		return res, nil
 	}
 	sum := sha256.Sum256(raw)
