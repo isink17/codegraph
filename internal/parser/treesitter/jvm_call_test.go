@@ -175,3 +175,48 @@ func TestJavaConstructionSpellsRawClass(t *testing.T) {
 		}
 	}
 }
+
+// TestJavaLocalTypeConstructionsAreMarked pins which constructions and
+// qualified calls name a type declared in an enclosing block or an unmodeled
+// class body. Member and top-level types are recorded symbols and stay
+// unmarked, as does a local type in a block that does not enclose the call.
+// v5 marked none.
+func TestJavaLocalTypeConstructionsAreMarked(t *testing.T) {
+	src := `package app;
+class Top {}
+class C {
+    class Member {}
+    void m() {
+        class L {}
+        new L(); new L.In(); L.make(); new Member(); new Top(); Member.make(); l.go();
+        Runnable r = () -> { record R() {} new R(); };
+        new Object() { class A {} void f() { new A(); } };
+        if (true) { interface Gone {} }
+        Gone.go();
+        this.go(); new Later(); enum Later {}
+    }
+}
+`
+	marked := map[string]bool{"L": true, "L.In": true, "L.make": true, "R": true, "A": true, "Later": true}
+	for _, adapter := range []*JavaAdapter{NewJava(), NewJavaV5()} {
+		p, err := adapter.Parse(context.Background(), "C.java", []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := adapter.Profile().ID == "treesitter:java:v6"
+		seen := 0
+		for _, e := range p.Edges {
+			if e.Kind != "calls" && e.Kind != "constructs" {
+				continue
+			}
+			seen++
+			want := current && marked[e.DstName]
+			if got := e.Evidence == graph.JavaLocalTypeScopeEvidence; got != want {
+				t.Errorf("%s %s %s evidence = %q, want marked %v", adapter.Profile().ID, e.Kind, e.DstName, e.Evidence, want)
+			}
+		}
+		if seen != 13 {
+			t.Errorf("%s: %d call and construct edges, want 13", adapter.Profile().ID, seen)
+		}
+	}
+}

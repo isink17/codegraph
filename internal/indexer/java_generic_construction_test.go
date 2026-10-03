@@ -142,3 +142,79 @@ func TestJavaGenericConstructionFollowsIncrementalChanges(t *testing.T) {
 		t.Fatalf("diamond1 bound %q after its constructor was removed", got)
 	}
 }
+
+// javaLocalTypeTree declares local types that share the top-level app.Box's
+// name. Oracle (javac 17, `javap -c -p`):
+//
+//	Local.raw            new Box()    invokespecial app/Local$1Box."<init>":(Lapp/Local;)V
+//	Local.generic        new Box<>()  invokespecial app/Local$2Box."<init>":(Lapp/Local;)V
+//	Local.record         Box.make()   invokestatic  app/Local$3Box.make:()V
+//	Local.lambda         new Box()    invokespecial app/Local$4Box."<init>":(Lapp/Local;)V
+//	Local.nested         new Box()    invokespecial app/Box."<init>":()V
+//	Local.sibling        new Box()    invokespecial app/Box."<init>":()V
+//	Local.siblingGeneric new Box<>()  invokespecial app/Box."<init>":()V
+//	Local.siblingStatic  Box.make()   invokestatic  app/Box.make:()V
+//
+// A local type is not a recorded symbol and hides app.Box, so a call it may
+// answer must stay unresolved; one declared in a block that does not enclose
+// the call, or in a sibling method, hides nothing.
+var javaLocalTypeTree = tree{
+	"app/Box.java": `package app; public class Box<T> { public Box() {} public static void make() {} }`,
+	"app/Local.java": `package app;
+public class Local {
+    void raw() { class Box { Box() {} } new Box(); }
+    void generic() { class Box<T> { Box() {} } new Box<>(); }
+    void record() { record Box() { static void make() {} } Box.make(); }
+    void lambda() { Runnable r = () -> { class Box { } new Box(); }; }
+    void nested() { if (true) { class Box { } } new Box(); }
+    void sibling() { new Box(); }
+    void siblingGeneric() { new Box<>(); }
+    void siblingStatic() { Box.make(); }
+}
+`,
+}
+
+func assertJavaLocalTypeTargets(t *testing.T, r *lifecycleRepo, step string) {
+	t.Helper()
+	edges, err := r.store.ExportEdgesPage(r.ctx, r.repoID, 100000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, e := range edges {
+		if (e.Kind == "constructs" || e.Kind == "calls") && strings.HasPrefix(e.SrcQualifiedName, "app.Local.") {
+			got[e.SrcQualifiedName+" "+e.Kind] = e.DstQualifiedName
+		}
+	}
+	for key, want := range map[string]string{
+		"app.Local.raw constructs":            "",
+		"app.Local.generic constructs":        "",
+		"app.Local.record calls":              "",
+		"app.Local.lambda constructs":         "",
+		"app.Local.nested constructs":         "app.Box.Box",
+		"app.Local.sibling constructs":        "app.Box.Box",
+		"app.Local.siblingGeneric constructs": "app.Box.Box",
+		"app.Local.siblingStatic calls":       "app.Box.make",
+	} {
+		if v, ok := got[key]; !ok || v != want {
+			t.Errorf("%s: %s bound %q (edge present %v), want %q", step, key, v, ok, want)
+		}
+	}
+}
+
+func TestJavaLocalTypeHidesTopLevelNamesake(t *testing.T) {
+	r := newLifecycleRepo(t, javaLocalTypeTree)
+	assertJavaLocalTypeTargets(t, r, "fresh")
+	local := javaLocalTypeTree["app/Local.java"]
+	// Removing the local declaration exposes app.Box; restoring it hides it.
+	r.write(t, "app/Local.java", strings.Replace(local, "class Box { Box() {} } ", "", 1))
+	r.update(t, "app/Local.java")
+	r.assertFreshParity(t, "local type removed")
+	if got := constructorTargets(t, r)["app.Local.raw"]; got != "public Box()" {
+		t.Fatalf("raw bound %q after its local type was removed", got)
+	}
+	r.write(t, "app/Local.java", local)
+	r.update(t, "app/Local.java")
+	r.assertFreshParity(t, "local type restored")
+	assertJavaLocalTypeTargets(t, r, "restored")
+}

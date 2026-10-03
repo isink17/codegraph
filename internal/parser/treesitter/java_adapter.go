@@ -337,7 +337,11 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 		if name == "" {
 			continue
 		}
-		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: nodeText(creation, content), Line: int(creation.StartPoint().Row) + 1, CallArity: javaMethodCallArity(creation)})
+		evidence := nodeText(creation, content)
+		if rawConstruction && javaLocalTypeShadows(creation, name, content) {
+			evidence = graph.JavaLocalTypeScopeEvidence
+		}
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: evidence, Line: int(creation.StartPoint().Row) + 1, CallArity: javaMethodCallArity(creation)})
 	}
 	for _, call := range findDescendants(root, "method_invocation") {
 		nameNode := childByFieldName(call, "name")
@@ -353,6 +357,8 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 		evidence := nodeText(call, content)
 		if obj := childByFieldName(call, "object"); markNested && (obj == nil || obj.Type() == "this") && javaCallInNestedClassBody(call) {
 			evidence = graph.JavaCallNestedClassScopeEvidence
+		} else if obj != nil && rawConstruction && javaLocalTypeShadows(call, fullName, content) {
+			evidence = graph.JavaLocalTypeScopeEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
@@ -431,6 +437,42 @@ func javaCallInNestedClassBody(call *sitter.Node) bool {
 			default:
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// javaLocalTypeShadows reports whether the first segment of a constructed
+// class or a call's owner names a class, interface, enum or record declared
+// in a block enclosing node -- a method, constructor, initializer or lambda
+// body, or the body of a class the adapter does not model. Such a local type
+// is not a recorded symbol and hides every package, member and imported type
+// of that name (JLS 6.4.1), so no recorded type may answer. A declaration
+// later in the block counts too, which only refuses more. A member type of a
+// modeled class is a recorded symbol and is left to the store.
+func javaLocalTypeShadows(node *sitter.Node, name string, content []byte) bool {
+	head, _, _ := strings.Cut(name, ".")
+	if head == "" || head == "this" || head == "super" {
+		return false
+	}
+	for n := node.Parent(); n != nil; n = n.Parent() {
+		for i := range int(n.NamedChildCount()) {
+			decl := n.NamedChild(i)
+			switch decl.Type() {
+			case "class_declaration", "interface_declaration", "enum_declaration", "record_declaration", "annotation_type_declaration":
+			default:
+				continue
+			}
+			if id := childByFieldName(decl, "name"); id == nil || nodeText(id, content) != head {
+				continue
+			}
+			switch n.Type() {
+			case "program", "class_body", "interface_body", "enum_body_declarations", "annotation_type_body":
+				if !javaCallInNestedClassBody(decl) {
+					continue
+				}
+			}
+			return true
 		}
 	}
 	return false
