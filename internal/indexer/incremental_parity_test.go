@@ -1841,3 +1841,110 @@ func TestRustMultiCrateProfileConvergence(t *testing.T) {
 		t.Fatalf("second update = %+v", again)
 	}
 }
+
+// crateRoots renders every file's persisted crate membership as path=root.
+func crateRoots(t *testing.T, dbPath string) []string {
+	t.Helper()
+	db, err := sql.Open(store.SQLiteDriverName(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT f.path,e.crate_root FROM file_scope_evidence e JOIN files f ON f.id=e.file_id ORDER BY f.path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var path, root string
+		if err := rows.Scan(&path, &root); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, path+"="+root)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// An update that re-reads every file must not stamp the one crate it finds on
+// files the crate never declared: a non-Rust file, an undeclared Rust file in
+// the crate's directory and one outside it keep the empty membership a fresh
+// index gives them.
+func TestRustCrateRootStaysOnProvenMembersAfterTouchUpdate(t *testing.T) {
+	files := tree{
+		"rust/src/lib.rs":          "mod util;\npub fn run() { crate::util::helper(); }\n",
+		"rust/src/util.rs":         "pub fn helper() {}\n",
+		"rust/src/orphan.rs":       "fn go() { crate::util::helper(); }\n",
+		"rust/src/unused.rs":       "pub fn unused() {}\n",
+		"src/rust/serializer_c.rs": "fn go() { crate::util::helper(); }\n",
+		"src/rust/serialize.rs":    "pub fn serialize(x: i32) -> i32 { x }\n",
+		"java/App.java":            "class App { void m() {} }\n",
+	}
+	r := newLifecycleRepo(t, files)
+	check := func(step string) {
+		t.Helper()
+		fresh := newLifecycleRepo(t, r.currentTree(t))
+		if got, want := strings.Join(crateRoots(t, r.dbPath), "\n"), strings.Join(crateRoots(t, fresh.dbPath), "\n"); got != want {
+			t.Fatalf("%s: crate_root after update:\n%s\nfresh:\n%s", step, got, want)
+		}
+		r.assertFreshParity(t, step)
+		assertRustResolved(t, r, "rust/src/lib.rs", "crate::util::helper", "rust/src/util.rs")
+		assertRustUnresolved(t, r, "src/rust/serializer_c.rs", "crate::util::helper")
+		assertRustUnresolved(t, r, "rust/src/orphan.rs", "crate::util::helper")
+	}
+	for rel, content := range files {
+		r.write(t, rel, content+"\n")
+	}
+	r.update(t)
+	check("touch every file")
+
+	// A batch with no Rust edge in it never reaches the edge pass that
+	// recomputes membership.
+	for _, rel := range []string{"rust/src/unused.rs", "src/rust/serialize.rs", "java/App.java"} {
+		r.write(t, rel, files[rel]+"\n\n")
+	}
+	r.update(t)
+	check("touch edge-free files")
+
+	// An out-of-crate file that gains a crate-relative call is not compiled
+	// as part of the crate, so the call stays unresolved.
+	r.write(t, "src/rust/serialize.rs", "pub fn serialize(x: i32) -> i32 { crate::util::helper(); x }\n")
+	r.update(t)
+	check("out-of-crate call added")
+	assertRustUnresolved(t, r, "src/rust/serialize.rs", "crate::util::helper")
+}
+
+// A crate with no calls selects no Rust edge, so no edge pass recomputes its
+// membership after an update; the discovered root must still not be persisted
+// on files no `mod` declaration reaches.
+func TestRustCrateRootWithoutRustEdgesMatchesFreshIndex(t *testing.T) {
+	files := tree{
+		"rust/src/lib.rs":    "mod util;\n",
+		"rust/src/util.rs":   "pub fn helper() {}\n",
+		"rust/src/unused.rs": "pub fn unused() {}\n",
+		"other/x.rs":         "pub fn x() {}\n",
+	}
+	r := newLifecycleRepo(t, files)
+	check := func(step string) {
+		t.Helper()
+		fresh := newLifecycleRepo(t, r.currentTree(t))
+		if got, want := strings.Join(crateRoots(t, r.dbPath), "\n"), strings.Join(crateRoots(t, fresh.dbPath), "\n"); got != want {
+			t.Fatalf("%s: crate_root after update:\n%s\nfresh:\n%s", step, got, want)
+		}
+		r.assertFreshParity(t, step)
+	}
+	for rel, content := range files {
+		r.write(t, rel, content+"\n")
+	}
+	r.update(t)
+	check("touch every file")
+
+	r.write(t, "other/x.rs", "pub fn x() { crate::util::helper(); crate::unused::unused(); }\n")
+	r.update(t, "other/x.rs")
+	check("crate-relative calls added outside the crate")
+	assertRustUnresolved(t, r, "other/x.rs", "crate::util::helper")
+	assertRustUnresolved(t, r, "other/x.rs", "crate::unused::unused")
+}

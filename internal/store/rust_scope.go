@@ -320,15 +320,14 @@ func (s *Store) rustRootsForPaths(ctx context.Context, repoID int64, paths []str
 			}
 		}
 	}
-	if len(roots) == 1 {
-		var root string
-		for candidate := range roots {
-			root = candidate
-		}
-		for _, path := range wanted {
-			if _, err := s.db.ExecContext(ctx, `UPDATE file_scope_evidence SET crate_root=? WHERE repo_id=? AND file_id IN (SELECT id FROM files WHERE repo_id=? AND path=?) AND crate_root=''`, root, repoID, repoID, path); err != nil {
-				return nil, err
-			}
+	// Changed evidence rows lose their crate_root, and the edge pass that
+	// recomputes membership runs only when a Rust edge is selected. Recompute
+	// it here from the declaration graph so a batch with no Rust edges still
+	// persists exactly the membership a fresh index proves -- never the
+	// discovered root stamped onto files it does not declare.
+	if len(roots) > 0 {
+		if _, err := s.resolveRustModuleScopeStandaloneWithStats(ctx, repoID, map[int64]struct{}{}, nil, roots); err != nil {
+			return nil, err
 		}
 	}
 	return roots, nil

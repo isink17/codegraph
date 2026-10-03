@@ -501,8 +501,10 @@ func TestRustRootsForPathsBackslashIsNotASeparator(t *testing.T) {
 		t.Fatalf("rustRootsForPaths(crate_a/src/x\\lib.rs) = %v, want the enclosing crate_a/src/lib.rs", got)
 	}
 	roots := f.crateRoots(t, ctx)
-	if roots[`crate_a/src/x\lib.rs`] != "crate_a/src/lib.rs" {
-		t.Fatalf("backslash file persisted crate_root %q, want crate_a/src/lib.rs", roots[`crate_a/src/x\lib.rs`])
+	// The recovered root is a discovery seed, not membership: no `mod`
+	// declaration reaches the backslash file, so it persists no crate.
+	if roots[`crate_a/src/x\lib.rs`] != "" {
+		t.Fatalf("backslash file persisted crate_root %q, want empty (undeclared)", roots[`crate_a/src/x\lib.rs`])
 	}
 	if roots["crate_a/src/x/lib.rs"] != "crate_a/src/x/lib.rs" {
 		t.Fatalf("nested crate root persisted %q, want itself", roots["crate_a/src/x/lib.rs"])
