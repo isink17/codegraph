@@ -81,29 +81,38 @@ var rustPrivateVisibilityCases = []struct {
 		"a.rs":   "pub(in crate) fn helper() {}",
 		"b.rs":   "pub fn outer() {\n    crate::a::helper();\n}\n",
 	}, "b.rs", "crate::a::helper", "", false},
-	// Inside an impl method the owner is the type, not a module, so `super`
-	// names nothing the resolver can prove (rustc: crate::a::helper).
+	// Inside an impl method `super` starts from the impl's module, not its
+	// type (rustc: crate::a::helper).
 	{"super from an impl method", tree{
 		"lib.rs": "mod a; fn helper() {}",
 		"a.rs":   "mod m; fn helper() {}",
 		"a/m.rs": "pub struct S;\nimpl S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
-	}, "a/m.rs", "super::helper", "", false},
-	// The impl's type may be written as a path; it is still no module.
-	// rustc: crate::a::helper in both, the free fn in the third.
+	}, "a/m.rs", "super::helper", "a.rs:crate::a::helper", true},
+	// Paths in an impl method resolve from the impl's module, however the
+	// type is written. rustc: crate::a::helper in both, the free fn (not the
+	// associated one) in the third.
 	{"super from an impl of a crate-qualified type", tree{
 		"lib.rs": "mod a; pub struct S; fn helper() {}",
 		"a.rs":   "mod m; fn helper() {}",
 		"a/m.rs": "impl crate::S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
-	}, "a/m.rs", "super::helper", "", false},
+	}, "a/m.rs", "super::helper", "a.rs:crate::a::helper", true},
 	{"super from an impl of its own module's qualified type", tree{
 		"lib.rs": "mod a;",
 		"a.rs":   "mod m; fn helper() {}",
 		"a/m.rs": "pub struct S;\nfn helper() {}\nimpl crate::a::m::S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
-	}, "a/m.rs", "super::helper", "", false},
+	}, "a/m.rs", "super::helper", "a.rs:crate::a::helper", true},
 	{"bare call from an impl of a qualified type", tree{
 		"lib.rs": "mod b;",
 		"b.rs":   "pub struct S;\nimpl S {\n    fn helper() {}\n}\nimpl crate::b::S {\n    pub fn go() {\n        helper();\n    }\n}\nfn helper() {}\n",
-	}, "b.rs", "helper", "", false},
+	}, "b.rs", "helper", "b.rs:crate::b::helper", false},
+	{"super from a trait impl in a child of the root", tree{
+		"lib.rs": "mod a; fn helper() {}",
+		"a.rs":   "pub struct S;\nimpl Default for S {\n    fn default() -> Self {\n        super::helper();\n        S\n    }\n}\n",
+	}, "a.rs", "super::helper", "lib.rs:crate::helper", false},
+	{"crate path from an impl method", tree{
+		"lib.rs": "mod a; fn helper() {}",
+		"a.rs":   "pub struct S;\nimpl S {\n    pub fn go() {\n        crate::helper();\n    }\n}\n",
+	}, "a.rs", "crate::helper", "lib.rs:crate::helper", false},
 	// Known limitation: local bindings are not modelled, so a closure named
 	// like a module function does not shadow it (rustc calls the closure).
 	{"local closure named like a module fn", tree{
