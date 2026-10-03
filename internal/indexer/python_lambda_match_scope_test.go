@@ -54,6 +54,11 @@ func runPythonLambdaMatchScopeCases(t *testing.T, reg *parser.Registry) {
 		{"m_class_pos.py", "full", unresolved}, // 'positional'
 		{"m_as.py", "full", unresolved},        // 'as'
 		{"m_or.py", "full", unresolved},        // 'or'
+		// `case` followed directly by a bracket or a tab is still a case clause.
+		{"m_paren.py", "full", unresolved},   // 'paren'
+		{"m_bracket.py", "full", unresolved}, // 'bracket'
+		{"m_brace.py", "full", unresolved},   // 'brace'
+		{"m_tab.py", "full", unresolved},     // 'tab'
 		// UnboundLocalError: the capture makes `full` local to the whole
 		// function, so a call before the match is not the import either.
 		{"m_before.py", "full", unresolved},

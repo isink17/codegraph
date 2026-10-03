@@ -447,7 +447,9 @@ func addPythonAssignedNames(stmt string, add func(string)) {
 	}
 	// `case <pattern> [if guard]:` binds every capture name in the pattern, in
 	// the enclosing function for the whole function.
-	if rest, ok := strings.CutPrefix(stmt, "case "); ok {
+	// The soft keyword may be followed directly by a bracket or a tab
+	// (`case(x):`, `case[x]:`), as the call-side pattern scan accepts.
+	if rest, ok := strings.CutPrefix(stmt, "case"); ok && rest != "" && strings.IndexByte(" \t([{-", rest[0]) >= 0 {
 		if colon := topLevelIndex(rest, ':'); colon >= 0 {
 			pattern, _, _ := strings.Cut(rest[:colon], " if ")
 			addPatternCaptures(pattern, add)
