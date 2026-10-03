@@ -102,7 +102,7 @@ func pyLexicalOwner(node *sitter.Node, content []byte) string {
 		switch parent.Type() {
 		case "function_definition", "class_definition":
 			if name := childByFieldName(parent, "name"); name != nil {
-				parts = append(parts, nodeText(name, content))
+				parts = append(parts, python.NormalizeIdentifier(nodeText(name, content)))
 			}
 		}
 	}
@@ -140,7 +140,7 @@ func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf
 		if owner != "" {
 			owner += "."
 		}
-		emit(owner+nodeText(name, content), nodeText(fn, content))
+		emit(owner+python.NormalizeIdentifier(nodeText(name, content)), nodeText(fn, content))
 	}
 }
 
@@ -183,7 +183,7 @@ func pyExtractClass(node *sitter.Node, module string, scope pyScope, content []b
 	if nameNode == nil {
 		return
 	}
-	name := nodeText(nameNode, content)
+	name := python.NormalizeIdentifier(nodeText(nameNode, content))
 	path := append(append([]string(nil), scope.path...), name)
 	qualified := module + "." + strings.Join(path, ".")
 	container := module
@@ -216,7 +216,7 @@ func pyExtractFunction(node *sitter.Node, module string, scope pyScope, content 
 	if nameNode == nil {
 		return
 	}
-	name := nodeText(nameNode, content)
+	name := python.NormalizeIdentifier(nodeText(nameNode, content))
 	kind := "function"
 	if scope.ownerKind == "class" {
 		kind = "method"
@@ -345,7 +345,7 @@ func pyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 func pyCallName(fnNode *sitter.Node, content []byte) string {
 	switch fnNode.Type() {
 	case "identifier":
-		return nodeText(fnNode, content)
+		return python.NormalizeIdentifier(nodeText(fnNode, content))
 	case "attribute":
 		object := childByFieldName(fnNode, "object")
 		attribute := childByFieldName(fnNode, "attribute")
@@ -356,7 +356,7 @@ func pyCallName(fnNode *sitter.Node, content []byte) string {
 		if prefix == "" {
 			return ""
 		}
-		return prefix + "." + nodeText(attribute, content)
+		return prefix + "." + python.NormalizeIdentifier(nodeText(attribute, content))
 	default:
 		return ""
 	}

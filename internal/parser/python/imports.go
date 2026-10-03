@@ -6,6 +6,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/isink17/codegraph/internal/graph"
 )
 
@@ -49,6 +51,13 @@ func inRanges(r rune, ranges []rune) bool {
 
 func isIdentifierRune(r rune) bool { return inRanges(r, continueRanges) }
 
+// NormalizeIdentifier is the name CPython binds for an identifier spelled s:
+// its NFKC form (PEP 3131), so `ｆｕｌｌ`, `ﬁnd` and `𝐟` are `full`, `find` and
+// `f`. Validity is decided on the spelling, as CPython does, before this runs.
+// It is for identifier tokens only (definitions, references, attribute and
+// import names): string, comment and file-name text keep their spelling.
+func NormalizeIdentifier(s string) string { return norm.NFKC.String(s) }
+
 // ImportBindings converts one logical Python import statement into scope import
 // evidence. It records what the syntax says and nothing more: the module
 // spelling exactly as written (leading dots kept, so a relative import stays
@@ -74,7 +83,7 @@ func ImportBindings(stmt string) []graph.ScopeImport {
 			}
 			if fields[0] == "*" {
 				out = append(out, graph.ScopeImport{
-					SourceSpecifier: module,
+					SourceSpecifier: NormalizeIdentifier(module),
 					Kind:            graph.ScopeImportNamed,
 					Wildcard:        true,
 				})
@@ -88,9 +97,9 @@ func ImportBindings(stmt string) []graph.ScopeImport {
 				continue
 			}
 			out = append(out, graph.ScopeImport{
-				SourceSpecifier: module,
-				ImportedName:    fields[0],
-				LocalName:       local,
+				SourceSpecifier: NormalizeIdentifier(module),
+				ImportedName:    NormalizeIdentifier(fields[0]),
+				LocalName:       NormalizeIdentifier(local),
 				Kind:            graph.ScopeImportNamed,
 			})
 		}
@@ -128,9 +137,9 @@ func ImportBindings(stmt string) []graph.ScopeImport {
 			local, bound = fields[2], module
 		}
 		out = append(out, graph.ScopeImport{
-			SourceSpecifier: module,
-			ImportedName:    bound,
-			LocalName:       local,
+			SourceSpecifier: NormalizeIdentifier(module),
+			ImportedName:    NormalizeIdentifier(bound),
+			LocalName:       NormalizeIdentifier(local),
 			Kind:            graph.ScopeImportNamespace,
 		})
 	}
@@ -290,7 +299,11 @@ type LocalBinding struct {
 }
 
 func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
-	if !validIdentifier(b.Name) || isPythonKeyword(b.Name) {
+	if !validIdentifier(b.Name) {
+		return
+	}
+	b.Name = NormalizeIdentifier(b.Name)
+	if isPythonKeyword(b.Name) {
 		return
 	}
 	if _, ok := seen[b.Name]; ok {

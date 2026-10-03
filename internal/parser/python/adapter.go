@@ -99,7 +99,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		lastLine, lastLen = lineNo, len(line)
 
 		if m := classRE.FindStringSubmatch(masked); len(m) == 2 {
-			name := m[1]
+			name := NormalizeIdentifier(m[1])
 			path := scopeNames(scopes)
 			qualified := qualifiedName(module, append(path, name))
 			container := module
@@ -127,7 +127,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 
 		if m := defRE.FindStringSubmatch(masked); len(m) == 2 {
-			name := m[1]
+			name := NormalizeIdentifier(m[1])
 			path := scopeNames(scopes)
 			container := module
 			kind := "function"
@@ -200,7 +200,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			if start := loc[2]; start > 0 && (strings.IndexByte(").]", scan[start-1]) >= 0 || scan[start-1] >= utf8.RuneSelf) {
 				continue
 			}
-			name := scan[loc[2]:loc[3]]
+			name := NormalizeIdentifier(scan[loc[2]:loc[3]])
 			if !strings.Contains(name, ".") && isPythonKeyword(name) {
 				continue
 			}
@@ -484,7 +484,8 @@ func isPythonKeyword(name string) bool {
 // Profile identifies the dedicated non-cgo Python adapter, which is
 // regex-driven but does build a call graph. See parser.Profile. v2 reads
 // Unicode names in declarations, calls, imports and local bindings. v3 stops
-// reading `as (`, match statements and case patterns as calls.
+// reading `as (`, match statements and case patterns as calls. v4 records
+// every name in its NFKC form, the name CPython binds (PEP 3131).
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v3", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v4", EmitsCallEdges: true}
 }

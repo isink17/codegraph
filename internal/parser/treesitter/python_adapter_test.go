@@ -4,6 +4,8 @@ package treesitter
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -260,4 +262,53 @@ func TestPythonConditionalDefinitionsAreSymbols(t *testing.T) {
 func lineOf(row string) int {
 	n, _ := strconv.Atoi(row[strings.LastIndexByte(row, '|')+1:])
 	return n
+}
+
+// Both Python adapters record the same NFKC names (PEP 3131) for the same
+// source: symbols, calls and scope evidence over every file of the
+// CPython-checked python_nfkc_scope fixture.
+func TestPythonNFKCNamesMatchRegexAdapter(t *testing.T) {
+	dir := filepath.Join("..", "..", "indexer", "testdata", "python_nfkc_scope")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	render := func(pf graph.ParsedFile) []string {
+		var out []string
+		for _, s := range pf.Symbols {
+			out = append(out, "sym|"+s.Kind+"|"+s.Name+"|"+s.QualifiedName+"|"+s.ContainerName+"|"+s.StableKey)
+		}
+		for _, e := range pf.Edges {
+			out = append(out, "call|"+e.DstName+"@"+strconv.Itoa(e.Line))
+		}
+		for _, b := range pf.Scope.Imports {
+			out = append(out, "scope|"+strings.Join([]string{b.Kind, b.OwnerModule, b.LocalName, b.ImportedName, b.SourceSpecifier}, "|"))
+		}
+		out = append(out, "imports|"+strings.Join(pf.Imports, ","))
+		sort.Strings(out)
+		return out
+	}
+	for _, e := range entries {
+		src, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := NewPython().Parse(context.Background(), e.Name(), src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		regex, err := python.New().Parse(context.Background(), e.Name(), src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, want := render(tree), render(regex)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: tree-sitter:\n%v\nregex:\n%v", e.Name(), got, want)
+		}
+		for _, row := range got {
+			if strings.ContainsFunc(row, func(r rune) bool { return r >= 0xFF00 && r <= 0xFFEF }) {
+				t.Errorf("%s: fullwidth spelling persisted: %s", e.Name(), row)
+			}
+		}
+	}
 }

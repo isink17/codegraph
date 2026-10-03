@@ -355,3 +355,151 @@ func TestPythonRegexProfileKeywordSyntaxConverges(t *testing.T) {
 		t.Fatalf("edited graph:\n%s\nfrom-scratch graph:\n%s", got, want)
 	}
 }
+
+const pythonNFKCLib = `def full():
+    return "lib.full"
+`
+
+// pythonNFKCSource is the d5 program CPython runs: the local `ｆｕｌｌ` binds
+// `full` and shadows the import, and `def ｇｏ` defines `go`.
+const pythonNFKCSource = `from lib import full
+
+
+def ｇｏ():
+    return "go"
+
+
+def run():
+    ｆｕｌｌ = lambda: "local"
+    ｇｏ()
+    return full()
+`
+
+// pythonSpellingAdapter reproduces, for pythonNFKCSource, what both Python
+// adapters wrote before names were NFKC-folded: every name as spelled. The
+// previous binaries wrote exactly these rows for this source. It stamps the
+// old profile id, which is all planParserProfiles compares.
+type pythonSpellingAdapter struct {
+	parser.Adapter
+	id string
+}
+
+func (a pythonSpellingAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: a.id, EmitsCallEdges: true}
+}
+
+func (a pythonSpellingAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	pf, err := a.Adapter.Parse(ctx, path, content)
+	if err != nil || filepath.Base(path) != "mod.py" {
+		return pf, err
+	}
+	spell := strings.NewReplacer("go", "ｇｏ").Replace
+	for i := range pf.Symbols {
+		if s := &pf.Symbols[i]; s.Name == "go" {
+			s.Name, s.QualifiedName, s.StableKey = spell(s.Name), spell(s.QualifiedName), spell(s.StableKey)
+		}
+	}
+	for i := range pf.Edges {
+		if e := &pf.Edges[i]; e.DstName == "go" {
+			e.DstName = spell(e.DstName)
+			if e.Evidence == "go" {
+				e.Evidence = e.DstName
+			}
+		}
+	}
+	for i := range pf.References {
+		if r := &pf.References[i]; r.Name == "go" {
+			r.Name, r.QualifiedName = spell(r.Name), spell(r.QualifiedName)
+		}
+	}
+	for i := range pf.Scope.Imports {
+		if b := &pf.Scope.Imports[i]; b.OwnerModule == "run" && b.LocalName == "full" {
+			b.LocalName = "ｆｕｌｌ"
+		}
+	}
+	return pf, nil
+}
+
+// NFKC-folding Python names changes what an unchanged file produces, so the
+// profile bump alone must reparse it, and every transition must equal a
+// from-scratch index by the parser that last ran.
+func runPythonNFKCProfileConvergence(t *testing.T, old pythonSpellingAdapter, current parser.Adapter) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "lib.py"), pythonNFKCLib)
+	path := filepath.Join(root, "mod.py")
+	writeProfileFile(t, path, pythonNFKCSource)
+	currentID := current.(parser.ProfileProvider).Profile().ID
+
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old index: %v", err)
+	}
+	oldGraph := pythonGraph(t, s)
+	requireRows(t, oldGraph, "old graph",
+		"prov|mod.py="+old.id+":1",
+		"sym|mod.ｇｏ|function|4-5",
+		"scope|mod.py|run|local_binding|||ｆｕｌｌ",
+		"call|ｇｏ@10->mod.ｇｏ",
+		// The wrong edge: CPython calls the local.
+		"call|full@11->lib.full")
+
+	upgraded := New(s.Store, parser.NewRegistry(current), nil)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if summary.FilesChanged != 2 || strings.Join(summary.ParserProfileLanguages, ",") != "python" {
+		t.Fatalf("profile bump did not reparse the unchanged files: changed=%d languages=%v",
+			summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	got := pythonGraph(t, s)
+	requireRows(t, got, "upgraded graph",
+		"prov|mod.py="+currentID+":1",
+		"sym|mod.go|function|4-5",
+		"scope|mod.py|run|local_binding|||full",
+		"call|go@10->mod.go",
+		"call|full@11->")
+	if strings.ContainsAny(got, "ｆｇ") {
+		t.Fatalf("a fullwidth spelling survived the upgrade:\n%s", got)
+	}
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+	again, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.FilesChanged != 0 || len(again.ParserProfileLanguages) != 0 {
+		t.Fatalf("second update reparsed: changed=%d languages=%v", again.FilesChanged, again.ParserProfileLanguages)
+	}
+
+	// An older binary on the same graph reparses back to its own output.
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old update over a new graph: %v", err)
+	}
+	if got := pythonGraph(t, s); got != oldGraph {
+		t.Fatalf("old update over a new graph:\n%s\nfrom-scratch old graph:\n%s", got, oldGraph)
+	}
+
+	// Back on the current parser, then edit the file: the edit converges like
+	// a fresh index.
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, path, pythonNFKCSource+"\n\ndef ﬁx(ｘ):\n    return x()\n")
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("update after edit: %v", err)
+	}
+	got = pythonGraph(t, s)
+	requireRows(t, got, "edited graph", "sym|mod.fix|function|14-15", "scope|mod.py|fix|local_binding|||x", "call|x@15->")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("edited graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+}
+
+func TestPythonRegexProfileNFKCNamesConverge(t *testing.T) {
+	runPythonNFKCProfileConvergence(t,
+		pythonSpellingAdapter{Adapter: pyparser.New(), id: "python-regex:python:v3"}, pyparser.New())
+}
