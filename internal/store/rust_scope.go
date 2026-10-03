@@ -778,11 +778,16 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		// The recursion is over an in-memory export relation loaded above; this
 		// count is the observable proof that traversal is not DB-per-hop.
 		out := append([]rustScopeSymbol(nil), byQ[key]...)
-		// An item the module declares itself, whatever its visibility, hides
-		// its glob re-exports of the same name.
+		// An item the module declares itself, or imports by name, hides its
+		// glob re-exports of the same name, whatever its visibility. Only a
+		// function or a struct can be the called value: a trait or enum
+		// leaves a glob-imported function visible.
 		own := false
 		for _, c := range out {
-			own = own || rootOfFile[c.file] == root
+			own = own || (rootOfFile[c.file] == root && (c.kind == "function" || c.kind == "struct"))
+		}
+		for _, im := range imports {
+			own = own || (im.owner == module && !im.glob && im.local == name && rootOfFile[im.file] == root)
 		}
 		for _, im := range imports {
 			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {

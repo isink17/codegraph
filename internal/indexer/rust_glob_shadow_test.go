@@ -218,6 +218,25 @@ var rustGlobShadowCases = []struct {
 		"a.rs":   "pub use crate::*;\n",
 		"b.rs":   "pub fn f() {}",
 	}, "", "", "a::f"},
+	// An explicit import of the name, private or not, hides the glob too.
+	{"prelude of super with explicit private use", tree{
+		"lib.rs": "mod a; mod b; use a::f; pub use b::*;\npub mod prelude {\n    pub use super::*;\n}\nfn caller() {\n    prelude::f();\n}\n",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+	}, "", "", "prelude::f"},
+	{"inline module with private use beside glob of super", tree{
+		"lib.rs": "mod a; mod b; mod m;\nfn caller() {\n    m::p::f();\n}\n",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "pub mod p {\n    use crate::a::f;\n    pub use super::*;\n}\npub use crate::b::*;\n",
+	}, "", "", "m::p::f"},
+	// A trait does not hide a glob-imported function, so the walk reaches
+	// both; with two candidates in different namespaces the call fails
+	// closed (rustc: b::f).
+	{"prelude of super with own trait", tree{
+		"lib.rs": "mod b; pub trait f {} pub use b::*;\npub mod prelude {\n    pub use super::*;\n}\nfn caller() {\n    prelude::f();\n}\n",
+		"b.rs":   "pub fn f() {}",
+	}, "", "", "prelude::f"},
 	// A test module's own fn shadows its `use super::*` glob.
 	{"test module own fn beside glob of super", tree{
 		"lib.rs": "mod m;",
