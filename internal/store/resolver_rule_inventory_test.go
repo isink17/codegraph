@@ -51,7 +51,7 @@ var resolverRuleParity = map[resolverRuleID]string{
 	"caller_kind_candidate":      "TestResolverGateRuleFactParity, TestResolverTestShadow_AllEntrypoints; parity only, per-strategy candidate choice refuses the same edges",
 	"cpp_evidence_ownership":     "TestResolverOwnershipRulesMatchGoTwins, TestCppScopeVetoSQLMatchesGoTwin",
 	"go_bare_package_scope":      "TestResolverOwnershipRulesMatchGoTwins",
-	"go_local_qualifier":         "TestGoLocalQualifierVetoSQLMatchesGoTwin",
+	"go_local_qualifier":         "TestResolverFactTwinsMatchSQL, TestGoLocalQualifierVetoSQLMatchesGoTwin, TestGoLocalQualifierClaimWithholdsOnEveryEntryPoint",
 	"bare_type_scope":            "TestResolverCandidateRestrictionsMatchGoTwins, TestResolverGateRuleFactParity, TestResolverTypeScope_AllEntrypoints",
 	"cpp_bare_namespace_scope":   "TestResolverCandidateRestrictionsMatchGoTwins (predicate only: bare C++ edges reach no generic strategy on either path, cpp_evidence_ownership)",
 	"cpp_bare_member_scope":      "TestResolverCandidateRestrictionsMatchGoTwins (predicate only: bare C++ edges reach no generic strategy on either path, cpp_evidence_ownership); TestCppBareMemberScope_AllEntrypoints, kind list in TestCppClassMemberKindsSQLMatchesGoTwin",
@@ -62,8 +62,8 @@ var resolverRuleParity = map[resolverRuleID]string{
 	"python_scope_claims":        "TestResolverGateRuleFactParity, TestPythonScopeClaimsSurviveIntoTheWeakStrategy",
 	"php_ownership":              "TestResolverOwnershipRulesMatchGoTwins",
 	"swift_ownership":            "TestResolverOwnershipRulesMatchGoTwins",
-	"broad_ambiguity":            "TestResolverGateRuleFactParity, TestResolverAmbiguity_AllEntrypoints; parity only, per-strategy uniqueness refuses the same edges",
-	"own_module_import":          "TestResolverGateRuleFactParity, TestOwnModuleImportResolvesOnEveryEntryPoint; parity only, the own-module pass refuses the same edges",
+	"broad_ambiguity":            "TestResolverFactTwinsMatchSQL (dotted spellings with no qualified match: the bare-level veto), TestResolverGateRuleFactParity, TestResolverAmbiguity_AllEntrypoints; elsewhere parity only, per-strategy uniqueness (candidateGroup.chosen) refuses the same edges",
+	"own_module_import":          "TestResolverFactTwinsMatchSQL, TestResolverGateRuleFactParity, TestOwnModuleImportResolvesOnEveryEntryPoint",
 }
 
 func TestResolverGateRuleInventory(t *testing.T) {

@@ -261,6 +261,12 @@ type resolverGateRule struct {
 	// edge, reading the facts the binder loaded for the batch. It is nil for
 	// every other rule.
 	refuses func(binderChosenCandidate) bool
+	// withholds is the Go binder's twin of a rule decided from facts the
+	// binder loads for the batch rather than from the edge alone: it reports
+	// whether the rule keeps the edge from every generic lookup. Within the
+	// twin's stated domain it reports exactly the edges `NOT (sql)` selects;
+	// outside it, it reports nothing. It is nil for every other rule.
+	withholds func(edgeTarget, *binderCandidateFacts) bool
 }
 
 // binderChosenCandidate is one edge and the candidate the binder chose for
@@ -272,7 +278,7 @@ type binderChosenCandidate struct {
 }
 
 // binderCandidateFacts are the facts the binder loads once per batch for the
-// chosen-candidate restrictions. A nil map reads as "no fact", which every
+// chosen-candidate restrictions and the fact-decided twins. A nil map reads as "no fact", which every
 // restriction answers as its SQL twin answers an empty temp table.
 type binderCandidateFacts struct {
 	byQualified, byShort symbolCandidates
@@ -282,6 +288,48 @@ type binderCandidateFacts struct {
 	// cppCallerNamespaces map edge ids to the calling symbol's.
 	cppMemberTargets, cppCallerClasses       map[int64]string
 	cppNamespaceTargets, cppCallerNamespaces map[int64]string
+	// ownModuleVeto holds the edges an own-module import mapped, and
+	// goLocalClaims the Go selector calls a locally bound qualifier claims.
+	ownModuleVeto, goLocalClaims map[int64]struct{}
+	// bareLevel is the bare-name level loaded for dotted fallback spellings,
+	// and testFileIDs the repository's test files.
+	bareLevel   symbolCandidates
+	testFileIDs map[int64]struct{}
+}
+
+// The Go twins of the rules the binder decides from loaded facts.
+
+// goLocalQualifierWithholds reads the claims goLocalQualifierClaims loads, the
+// Go twin of resolverGoLocalQualifierSQL.
+func goLocalQualifierWithholds(t edgeTarget, f *binderCandidateFacts) bool {
+	_, claimed := f.goLocalClaims[t.edgeID]
+	return claimed
+}
+
+// ownModuleImportWithholds reads the edges resolveOwnModuleImports mapped to
+// an own-module package, the set it also writes to the SQL veto table.
+func ownModuleImportWithholds(t edgeTarget, f *binderCandidateFacts) bool {
+	_, vetoed := f.ownModuleVeto[t.edgeID]
+	return vetoed
+}
+
+// broadDotTailAmbiguityWithholds is the bare-level half of broad_ambiguity
+// for dotted spellings. Its domain is a dot-tail spelling whose qualified name
+// matched nothing in the caller's language; there the SQL veto row for the
+// spelling can only come from the bare-name level. Every other spelling meets
+// the rule through candidate selection instead (candidateGroup.chosen), which
+// reads the same caller-kind counts but is a choice, not a refusal.
+func broadDotTailAmbiguityWithholds(t edgeTarget, f *binderCandidateFacts) bool {
+	if _, column := binderFallbackForTarget(t); column != "dot_tail2" && column != "dot_tail3" {
+		return false
+	}
+	key := symbolLangKey{name: t.dstName, language: t.srcLanguage}
+	if _, matched := f.byQualified.groups[key]; matched {
+		return false
+	}
+	broad, found := f.bareLevel.groups[key]
+	_, callerIsTest := f.testFileIDs[t.srcFileID]
+	return found && broad.levelUndecidedFor(callerIsTest)
 }
 
 // The chosen-candidate restrictions' Go twins. Each guards on the caller
@@ -326,8 +374,8 @@ var resolverBindableCandidateRules = []resolverGateRule{
 		languages: []string{"cpp"}, sql: cppScopeVetoSQL, owns: cppScopeOwned},
 	{id: ruleGoBarePackageScope, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"go"}, sql: resolverGoBareScopeSQL, owns: goBareScopeOwned},
-	{id: "go_local_qualifier", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
-		languages: []string{"go"}, sql: resolverGoLocalQualifierSQL},
+	{id: ruleGoLocalQualifier, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"go"}, sql: resolverGoLocalQualifierSQL, withholds: goLocalQualifierWithholds},
 	{id: "bare_type_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
 		languages: slices.Sorted(maps.Keys(typeScopeGatedLanguages)), sql: resolverBareNameTypeScopeSQL,
 		refuses: bareTypeScopeRefuses},
@@ -358,13 +406,13 @@ var resolverBindableCandidateRules = []resolverGateRule{
 // broad-level ambiguity veto and the own-module veto. It is one list so a
 // strategy cannot be added that applies one rule and forgets another.
 var resolverBindGateRules = append(slices.Clip(resolverBindableCandidateRules),
-	resolverGateRule{id: "broad_ambiguity", stage: resolverStageBroadAmbiguity, disposition: resolverDispositionAmbiguous,
-		sql: resolverAmbiguousNamesSQL},
-	resolverGateRule{id: "own_module_import", stage: resolverStageOwnModule, disposition: resolverDispositionOwned,
+	resolverGateRule{id: ruleBroadAmbiguity, stage: resolverStageBroadAmbiguity, disposition: resolverDispositionAmbiguous,
+		sql: resolverAmbiguousNamesSQL, withholds: broadDotTailAmbiguityWithholds},
+	resolverGateRule{id: ruleOwnModuleImport, stage: resolverStageOwnModule, disposition: resolverDispositionOwned,
 		languages: []string{"go"}, sql: `NOT EXISTS (
 			SELECT 1 FROM tmp_resolver_own_module_veto v
 			WHERE v.edge_id = edges.id
-		)`},
+		)`, withholds: ownModuleImportWithholds},
 )
 
 // The edge-local ownership rules: each carries the Go twin the binder uses to
@@ -375,6 +423,13 @@ const (
 	ruleRubyOwnership        resolverRuleID = "ruby_ownership"
 	rulePHPOwnership         resolverRuleID = "php_ownership"
 	ruleSwiftOwnership       resolverRuleID = "swift_ownership"
+)
+
+// The rules whose Go twin reads facts the binder loads for the batch.
+const (
+	ruleGoLocalQualifier resolverRuleID = "go_local_qualifier"
+	ruleBroadAmbiguity   resolverRuleID = "broad_ambiguity"
+	ruleOwnModuleImport  resolverRuleID = "own_module_import"
 )
 
 // The Go binder (resolveEdgeTargets) routes owned edges through these
@@ -399,6 +454,35 @@ var (
 	binderOwnsPHP    = binderOwnershipRoutes[rulePHPOwnership]
 	binderOwnsSwift  = binderOwnershipRoutes[ruleSwiftOwnership]
 )
+
+// binderFactRoutes are the fact-decided twins the binder applies, keyed by
+// rule like binderOwnershipRoutes. Each is applied at its own point in the
+// binder, because each refusal is accounted differently: a go-local claim is
+// counted as unresolved unless its own pass bound it, an own-module veto is
+// not counted at all (the own-module pass decides the edge), and a broad
+// ambiguity is counted as ambiguity or test shadow.
+var binderFactRoutes = map[resolverRuleID]func(edgeTarget, *binderCandidateFacts) bool{
+	ruleGoLocalQualifier: resolverRuleWithholds(ruleGoLocalQualifier),
+	ruleBroadAmbiguity:   resolverRuleWithholds(ruleBroadAmbiguity),
+	ruleOwnModuleImport:  resolverRuleWithholds(ruleOwnModuleImport),
+}
+
+var (
+	binderWithholdsGoLocal      = binderFactRoutes[ruleGoLocalQualifier]
+	binderWithholdsBroadDotTail = binderFactRoutes[ruleBroadAmbiguity]
+	binderWithholdsOwnModule    = binderFactRoutes[ruleOwnModuleImport]
+)
+
+// resolverRuleWithholds returns a fact-decided rule's Go twin. An id with no
+// such rule is a programming error caught at package initialisation.
+func resolverRuleWithholds(id resolverRuleID) func(edgeTarget, *binderCandidateFacts) bool {
+	for _, rule := range resolverBindGateRules {
+		if rule.id == id && rule.withholds != nil {
+			return rule.withholds
+		}
+	}
+	panic("store: no fact-decided rule " + string(id))
+}
 
 // binderCandidateRestrictions are the chosen-candidate restrictions the
 // binder applies, in inventory order, taken from the rules that carry a Go
