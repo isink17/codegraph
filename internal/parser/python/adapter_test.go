@@ -360,3 +360,67 @@ func TestPythonNamesFollowGoUnicodeTables(t *testing.T) {
 		t.Fatalf("unicode.Version = %s; bump both Python parser profiles", unicode.Version)
 	}
 }
+
+// pythonKeywordCallSource holds every place a keyword or a soft keyword sits
+// right before `(` without being a call, and case guards however they are
+// spaced. The calls it does make are exactly what CPython's ast reports for it.
+const pythonKeywordCallSource = `def check(x):
+    return x
+
+
+class Point:
+    pass
+
+
+def run(value, items, cm):
+    with cm as (a, b):
+        pass
+    match check(value):
+        case (1, 2):
+            pass
+        case Point(x=0) | Point(x=1):
+            pass
+        case [a, b] if check(a):
+            pass
+        case [a] if(check(a)):
+            pass
+        case (a)if check(a):
+            pass
+        case "s"if check(value):
+            pass
+        case 1	if check(value):
+            pass
+        case Point(x=0): check(value)
+    match (
+        value
+    ):
+        case _:
+            pass
+    match(value, items)
+    case(value)
+    return value
+
+
+def match(*args):
+    return args
+
+
+def case(*args):
+    return args
+`
+
+// Keyword syntax is not a call: `with x as (a, b)` does not call `as`, a match
+// statement does not call `match`, and a case pattern -- `Point(x=0)` is a
+// class pattern -- calls nothing, though its guard, a same-line body and the
+// match subject can.
+// `match` and `case` stay ordinary names everywhere else.
+func TestKeywordSyntaxIsNotACall(t *testing.T) {
+	var got []string
+	for _, e := range parseSource(t, pythonKeywordCallSource).Edges {
+		got = append(got, e.DstName+"@"+strconv.Itoa(e.Line))
+	}
+	want := "check@12 check@17 check@19 check@21 check@23 check@25 check@27 match@33 case@34"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("calls = %q, want %q", strings.Join(got, " "), want)
+	}
+}

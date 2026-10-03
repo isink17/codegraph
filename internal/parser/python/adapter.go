@@ -184,7 +184,11 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		if lastFunction(scopes) < 0 {
 			continue
 		}
-		for _, loc := range callRE.FindAllStringSubmatchIndex(masked, -1) {
+		scan := masked
+		if from := patternSyntaxEnd(maskedLines, i); from > 0 {
+			scan = strings.Repeat(" ", from) + masked[from:]
+		}
+		for _, loc := range callRE.FindAllStringSubmatchIndex(scan, -1) {
 			if len(loc) != 4 {
 				continue
 			}
@@ -193,10 +197,10 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			// emits nothing rather than the tail alone. Neither does a match
 			// right after a non-ASCII rune: outside strings and comments that
 			// rune can only be part of a name `identifier` does not know.
-			if start := loc[2]; start > 0 && (strings.IndexByte(").]", masked[start-1]) >= 0 || masked[start-1] >= utf8.RuneSelf) {
+			if start := loc[2]; start > 0 && (strings.IndexByte(").]", scan[start-1]) >= 0 || scan[start-1] >= utf8.RuneSelf) {
 				continue
 			}
-			name := masked[loc[2]:loc[3]]
+			name := scan[loc[2]:loc[3]]
 			if !strings.Contains(name, ".") && isPythonKeyword(name) {
 				continue
 			}
@@ -257,6 +261,78 @@ func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile)
 			continue
 		}
 		emit(strings.TrimPrefix(sym.QualifiedName, module+"."), strings.Join(lines[start:end], "\n"))
+	}
+}
+
+// patternSyntaxEnd returns how much of masked line i is soft-keyword syntax
+// rather than expressions that can call: the `match` of a match statement (its
+// subject is an expression), or a case pattern up to its guard or the header's
+// colon. A pattern calls nothing -- `case Point(x=0):` is a class pattern --
+// while a guard and a same-line body are expressions. `match` and `case`
+// anywhere else are ordinary names.
+//
+// ponytail: a guard or header end on a continuation line is not seen; those
+// lines are skipped for calls anyway.
+func patternSyntaxEnd(masked []string, i int) int {
+	line := strings.TrimSuffix(masked[i], "\r")
+	trimmed := strings.TrimLeft(line, " \t")
+	for _, keyword := range []string{"match", "case"} {
+		rest, ok := strings.CutPrefix(trimmed, keyword)
+		if !ok || rest == "" || strings.IndexByte(" \t([{-", rest[0]) < 0 {
+			continue
+		}
+		stmt, _ := pythonLogicalLine(masked, i)
+		header := headerColon(stmt)
+		if header < 0 {
+			return 0
+		}
+		start := len(line) - len(rest)
+		if keyword == "match" {
+			return start
+		}
+		end := min(header, len(line))
+		if guard := guardKeyword(line[start:end]); guard >= 0 {
+			return start + guard
+		}
+		return end
+	}
+	return 0
+}
+
+// headerColon is the index of the colon ending a compound statement header:
+// the first `:` outside brackets that is not a walrus.
+func headerColon(stmt string) int {
+	depth := 0
+	for i := 0; i < len(stmt); i++ {
+		switch stmt[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ':':
+			if depth == 0 && (i+1 == len(stmt) || stmt[i+1] != '=') {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// guardKeyword finds the `if` starting a case guard: the word itself, however
+// it is spaced (`if(`, `)if`, a tab before it), never part of a longer name.
+func guardKeyword(s string) int {
+	for from := 0; ; {
+		i := strings.Index(s[from:], "if")
+		if i < 0 {
+			return -1
+		}
+		i += from
+		before, _ := utf8.DecodeLastRuneInString(s[:i])
+		after, _ := utf8.DecodeRuneInString(s[i+2:])
+		if (i == 0 || !isIdentifierRune(before)) && (i+2 == len(s) || !isIdentifierRune(after)) {
+			return i
+		}
+		from = i + 2
 	}
 }
 
@@ -396,7 +472,7 @@ func visibility(name string) string {
 
 func isPythonKeyword(name string) bool {
 	switch name {
-	case "if", "for", "while", "return", "print", "with", "class", "def", "try", "except", "elif",
+	case "if", "for", "while", "return", "print", "with", "as", "class", "def", "try", "except", "elif",
 		"and", "or", "not", "in", "is", "lambda", "yield", "await", "assert", "del", "raise",
 		"global", "nonlocal", "pass", "else", "finally", "import", "from":
 		return true
@@ -407,7 +483,8 @@ func isPythonKeyword(name string) bool {
 
 // Profile identifies the dedicated non-cgo Python adapter, which is
 // regex-driven but does build a call graph. See parser.Profile. v2 reads
-// Unicode names in declarations, calls, imports and local bindings.
+// Unicode names in declarations, calls, imports and local bindings. v3 stops
+// reading `as (`, match statements and case patterns as calls.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v2", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v3", EmitsCallEdges: true}
 }
