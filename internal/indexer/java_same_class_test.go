@@ -3,8 +3,14 @@
 package indexer
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/parser"
+	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
 )
 
 // An unqualified or `this.`-qualified method call in a class body names a
@@ -87,6 +93,72 @@ public class Outer {
 			calls:  []call{{"Other.hidden", ""}},
 		},
 		{
+			// JLS 15.12.1: the anonymous, local or enum-constant class is the
+			// innermost class with a member named helper, so the enclosing
+			// class's helper is not the target. Those classes' members are not
+			// modelled, so the calls stay unresolved; a lambda is not a class
+			// and keeps binding the enclosing class's method.
+			name:   "nested class bodies",
+			caller: "app/Caller.java",
+			src: `package app;
+
+import static app.Util.util;
+
+public class Caller {
+    void helper() {}
+    void lambdaUser() {}
+    void run() {
+        new Runnable() {
+            public void run() { helper(); this.helper(); util(); }
+            void helper() {}
+            void util() {}
+        };
+        class Local {
+            void helper() {}
+            void go() { helper(); }
+        }
+        record Point(int x) {
+            void helper() {}
+            void go() { helper(); }
+        }
+        Runnable r = () -> lambdaUser();
+    }
+}
+`,
+			others: tree{"app/Util.java": "package app;\n\npublic class Util {\n    public static void util() {}\n}\n"},
+			calls: []call{
+				{"helper", ""},
+				{"this.helper", ""},
+				{"util", ""},
+				{"lambdaUser", "app/Caller.java:app.Caller.lambdaUser(function)"},
+			},
+		},
+		{
+			// JLS 6.4.1: Outer.helper is in scope in Inner and shadows the
+			// static import; whether it is callable from the static nested
+			// class is not modelled, so the call stays unresolved.
+			name:   "enclosing method shadows a static import",
+			caller: "app/Outer.java",
+			src:    "package app;\n\nimport static app.Util.helper;\n\npublic class Outer {\n    static void helper() {}\n    static class Inner {\n        void run() { helper(); }\n    }\n}\n",
+			others: tree{"app/Util.java": "package app;\n\npublic class Util {\n    public static void helper() {}\n}\n"},
+			calls:  []call{{"helper", ""}},
+		},
+		{
+			// The adapter collapses a container equal to the package name.
+			name:   "class named like its package",
+			caller: "app/app.java",
+			src:    "package app;\n\npublic class app {\n    void helper() {}\n    void run() { helper(); }\n}\n",
+			others: tree{"app/Other.java": "package app;\n\npublic class Other {\n    public void helper() {}\n}\n"},
+			calls:  []call{{"helper", "app/app.java:app.helper(function)"}},
+		},
+		{
+			name:   "default package anonymous class",
+			caller: "Caller.java",
+			src:    "public class Caller {\n    void helper() {}\n    void run() {\n        new Runnable() {\n            public void run() { helper(); }\n            void helper() {}\n        };\n    }\n}\n",
+			others: tree{"Other.java": "public class Other {\n    public void unrelated() {}\n}\n"},
+			calls:  []call{{"helper", ""}},
+		},
+		{
 			name:   "default package",
 			caller: "Caller.java",
 			src:    "public class Caller {\n    private void helper() {}\n    void run() { helper(); this.helper(); }\n}\n",
@@ -147,4 +219,68 @@ public class Outer {
 			}
 		})
 	}
+}
+
+// A private constructor is visible only inside its own class. A same-named
+// class in another package is a different owner, while the class itself may
+// construct itself through its private constructor.
+func TestJavaPrivateConstructorOwnerIsTheQualifiedClass(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib/Caller.java": "package lib;\n\npublic class Caller {\n    private Caller() {}\n}\n",
+		"app/Caller.java": "package app;\n\npublic class Caller {\n    private Caller(int x) {}\n    void foreign() { new lib.Caller(); }\n    static Caller make() { return new Caller(1); }\n}\n",
+	})
+	got := constructorTargets(t, r)
+	if got["app.Caller.foreign"] != "" {
+		t.Errorf("new lib.Caller() from app.Caller bound the private %q", got["app.Caller.foreign"])
+	}
+	if got["app.Caller.make"] != "private Caller(int x)" {
+		t.Errorf("new Caller(1) from Caller bound %q, want its private constructor", got["app.Caller.make"])
+	}
+}
+
+// A v4 graph carries no nested-class-scope marks, so calls inside anonymous
+// classes can still be bound to the enclosing class there. Updating with the
+// current parser re-parses Java files and must land where a fresh index does.
+func TestJavaNestedClassScopeProfileConvergence(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	files := tree{
+		"app/Caller.java": "package app;\n\npublic class Caller {\n    void helper() {}\n    void run() {\n        new Runnable() {\n            public void run() { helper(); }\n            void helper() {}\n        };\n        helper();\n    }\n}\n",
+	}
+	for path, content := range files {
+		abs := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeProfileFile(t, abs, content)
+	}
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(tsparser.NewJavaV4()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	if got := fileParserProfile(t, s.raw(t), repo, "app/Caller.java"); got != "treesitter:java:v4" {
+		t.Fatalf("legacy profile = %q", got)
+	}
+	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: New(s.Store, lifecycleRegistry(), nil), repoID: repo}
+	summary, err := r.idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(summary.ParserProfileLanguages, ",") != "java" {
+		t.Fatalf("update = %+v, want a java profile reparse", summary)
+	}
+	if got := fileParserProfile(t, s.raw(t), repo, "app/Caller.java"); got != "treesitter:java:v5" {
+		t.Fatalf("updated profile = %q", got)
+	}
+	bound := 0
+	for _, line := range r.projection(t) {
+		if strings.Contains(line, `-calls-> "helper"`) && strings.Contains(line, "app.Caller.helper(function)") {
+			bound++
+		}
+	}
+	if bound != 1 {
+		t.Fatalf("helper bound %d times after update, want only the call outside the anonymous class:\n%s", bound, strings.Join(r.projection(t), "\n"))
+	}
+	r.assertFreshParity(t, "java nested class scope profile convergence")
 }

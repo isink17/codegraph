@@ -98,3 +98,48 @@ func TestJavaMethodInvocationCallArityIsDirectASTArgumentCount(t *testing.T) {
 		t.Fatalf("nested call arities foo=%v List.of=%v Map.of=%v", nestedFoo, nestedList, nestedMap)
 	}
 }
+
+// Bare and `this.` calls inside a class body the adapter extracts no members
+// of are marked, so the resolver never answers them from an enclosing class.
+// Lambdas and member classes are not such bodies; qualified calls keep their
+// text.
+func TestJavaNestedClassBodyCallsAreMarked(t *testing.T) {
+	src := `package app;
+class C {
+    void m() {
+        new Runnable() { public void run() { anon(); this.anonThis(); C.qualified(); } };
+        class Local { void go() { local(); } }
+        record R(int x) { void go() { rec(); } }
+        interface I { default void go() { iface(); } }
+        Runnable r = () -> lambda();
+        plain();
+    }
+    class Member { void go() { member(); } }
+    enum E { A { void go() { constant(); } }; void go() { enumMember(); } }
+}
+`
+	marked := map[string]bool{"anon": true, "this.anonThis": true, "local": true, "rec": true, "iface": true, "constant": true}
+	for _, adapter := range []*JavaAdapter{NewJava(), NewJavaV4()} {
+		p, err := adapter.Parse(context.Background(), "C.java", []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := map[string]bool{}
+		current := adapter.Profile().ID == "treesitter:java:v5"
+		for _, e := range p.Edges {
+			if e.Kind != "calls" {
+				continue
+			}
+			seen[e.DstName] = true
+			want := current && marked[e.DstName]
+			if got := e.Evidence == graph.JavaCallNestedClassScopeEvidence; got != want {
+				t.Errorf("%s %s evidence = %q, marked=%v want %v", adapter.Profile().ID, e.DstName, e.Evidence, got, want)
+			}
+		}
+		for _, name := range []string{"anon", "this.anonThis", "C.qualified", "local", "rec", "iface", "lambda", "plain", "member", "constant", "enumMember"} {
+			if !seen[name] {
+				t.Errorf("%s: no call edge for %s", adapter.Profile().ID, name)
+			}
+		}
+	}
+}

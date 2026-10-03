@@ -60,6 +60,13 @@ type Edge struct {
 // inside an executable scope P22.45 does not model as a source symbol.
 const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
 
+// JavaCallNestedClassScopeEvidence marks a Java bare or `this.` method call
+// lexically inside a class body the adapter does not model as a source owner:
+// an anonymous class, an enum constant body, or a type declared inside a
+// method, constructor, initializer or lambda. That class's own and inherited
+// members shadow the enclosing class's, so the enclosing class must not answer.
+const JavaCallNestedClassScopeEvidence = "java:nested_class_scope"
+
 type ParsedFile struct {
 	Language                  string
 	Symbols                   []Symbol

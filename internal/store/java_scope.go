@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"sort"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 type javaScopeSymbol struct {
@@ -438,7 +440,7 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	var out javaScopeSymbol
 	n := 0
 	for _, s := range byQName[t.qname+"."+t.name] {
-		if s.kind == "constructor" && javaConstructorAccepts(s, e.callArity) && javaVisibleFrom(s, e.pkg, t.pkg, e.container == t.name) {
+		if s.kind == "constructor" && javaConstructorAccepts(s, e.callArity) && javaVisibleFrom(s, e.pkg, t.pkg, javaEdgeOwner(e) == t.qname) {
 			out = s
 			n++
 		}
@@ -451,6 +453,11 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport, facades map[string][]javaFacadePart, companions map[string][]javaScopeSymbol) (javaScopeSymbol, string) {
 	name := e.name
 	if name == "super." || strings.HasPrefix(name, "super.") {
+		return javaScopeSymbol{}, ""
+	}
+	if e.evidence == graph.JavaCallNestedClassScopeEvidence {
+		// The call's own class is one the adapter does not model, and its
+		// members shadow every enclosing class and static import.
 		return javaScopeSymbol{}, ""
 	}
 	if strings.HasPrefix(name, "this.") {
@@ -498,6 +505,22 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 	}
 	if s, ok, str := javaMethods(javaEdgeOwner(e), name, e.pkg, javaEdgeOwner(e), byQName, "java_package_scope", false); ok {
 		return s, str
+	}
+	// A method of that name declared by the calling class or any class
+	// enclosing it is in scope and shadows every static import (JLS 6.4.1).
+	// The call stays unresolved rather than binding an enclosing class's
+	// method: whether it is callable from here is not modelled.
+	for owner := javaEdgeOwner(e); owner != "" && owner != e.pkg; {
+		for _, s := range byQName[owner+"."+name] {
+			if s.kind == "function" {
+				return javaScopeSymbol{}, ""
+			}
+		}
+		dot := strings.LastIndex(owner, ".")
+		if dot < 0 {
+			break
+		}
+		owner = owner[:dot]
 	}
 	explicitStaticOwners := map[string]struct{}{}
 	for _, i := range imps[e.file] {
@@ -1047,7 +1070,9 @@ func kotlinHasJvmName(signature string) bool {
 // `Outer.Inner`) while every member is declared under the package-qualified
 // name, so the two are joined here rather than compared as spelled.
 func javaEdgeOwner(e javaScopeEdge) string {
-	if e.pkg == "" {
+	// The adapter collapses a container equal to the package to the package
+	// itself (a class named like its package declares `app.helper`).
+	if e.pkg == "" || e.container == e.pkg {
 		return e.container
 	}
 	return e.pkg + "." + e.container
