@@ -37,6 +37,25 @@ func cppEvidenceTarget(target edgeTarget) bool {
 			strings.ContainsAny(target.dstName, "<>()"))
 }
 
+// cppScopeVetoSQL keeps every repo-wide strategy off the C++ spellings the
+// evidence pass owns: macro-unexpanded calls, spellings with no '.', and
+// spellings with '::'. It requires the surroundings every strategy UPDATE
+// already has: the update target is `edges` and `files` is joined in as `f`.
+const cppScopeVetoSQL = `NOT (f.language = 'cpp' AND edges.evidence LIKE 'macro_unexpanded:%')
+		AND NOT (f.language = 'cpp' AND instr(edges.dst_name, '.') = 0 AND instr(edges.dst_name, '::') = 0)
+		AND NOT (f.language = 'cpp' AND (instr(edges.dst_name, '.') = 0 OR instr(edges.dst_name, '::') > 0))`
+
+// cppScopeOwned is the Go-side twin of cppScopeVetoSQL: an owned edge is
+// answered by the C++ evidence pass or stays unresolved, on every entrypoint.
+// The parser writes the macro prefix in exactly this spelling, so the exact
+// prefix check agrees with the SQL LIKE on every evidence value it produces.
+func cppScopeOwned(t edgeTarget) bool {
+	return t.srcLanguage == "cpp" &&
+		(strings.HasPrefix(t.evidence, "macro_unexpanded:") ||
+			!strings.Contains(t.dstName, ".") ||
+			strings.Contains(t.dstName, "::"))
+}
+
 func unresolvedCppEvidenceTargets(ctx context.Context, q queryContexter, repoID int64) ([]edgeTarget, error) {
 	rows, err := q.QueryContext(ctx, `
 		SELECT e.id, e.dst_name, e.file_id, e.evidence
