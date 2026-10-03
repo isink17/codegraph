@@ -181,13 +181,21 @@ func insertDotSuffixNames(ctx context.Context, tx *sql.Tx, names []string) (map[
 // Go string handling rather than nested SQL substring arithmetic. That is one
 // string per distinct unresolved multi-dot name, not per edge, and it is the
 // same set the old form's inline `SELECT DISTINCT` produced.
+//
+// A name carried only by edges the Ruby ownership rule withholds is left out.
+// That rule refuses the edge itself, whatever its candidates, and a candidate
+// group is keyed by dst_name, so the group such a name would get could only
+// ever be offered to edges the bind gate refuses. A name that also appears on
+// any other edge keeps its group unchanged. Ruby snake_case puts `_` in most
+// of these names, so they would otherwise take the unindexed scan tier.
 func (s *Store) dotSuffixNames(ctx context.Context, tx *sql.Tx, repoID int64) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT DISTINCT dst_name
-		FROM edges
-		WHERE repo_id = ? AND dst_symbol_id IS NULL
-		AND instr(dst_name, '.') > 0 AND instr(dst_name, '/') = 0
-		AND instr(substr(dst_name, instr(dst_name, '.') + 1), '.') > 0
+		SELECT DISTINCT edges.dst_name
+		FROM edges JOIN files f ON f.id = edges.file_id
+		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
+		AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
+		AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') > 0
+		AND `+rubyScopeVetoSQL+`
 	`, repoID)
 	if err != nil {
 		return nil, err

@@ -245,3 +245,94 @@ func TestResolveEdgesByDotSuffixSeedsAcrossStatementBatches(t *testing.T) {
 		}
 	}
 }
+
+// TestDotSuffixNamesSkipRubyOwnedCalls pins that the dot-suffix population
+// leaves out names only Ruby-owned calls carry, and that doing so binds
+// nothing differently: such a name's candidate group could only be offered to
+// edges the bind gate refuses. A name shared with any edge the Ruby rule does
+// not own keeps its group, and that edge still binds through it.
+func TestDotSuffixNamesSkipRubyOwnedCalls(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+	repo, err := s.UpsertRepo(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	must := func(id int64, err error) int64 {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	const (
+		shared    = "x.Mod.Klass.do_it"    // a Ruby call and a Go call
+		rubyOnly  = "y.Mod.Klass.only_it"  // Ruby calls only
+		rubyOther = "z.Mod.Klass.refer_it" // a Ruby edge that is not a call
+	)
+	goFile := must(insertTestFileLang(ctx, s, repo.ID, "caller.go", "go"))
+	rbFile := must(insertTestFileLang(ctx, s, repo.ID, "caller.rb", "ruby"))
+	goSrc := must(insertTestSymbolLang(ctx, s, repo.ID, goFile, "Caller", "Caller", "go"))
+	rbSrc := must(insertTestSymbolLang(ctx, s, repo.ID, rbFile, "caller", "Caller#caller", "ruby"))
+	goTarget := must(insertTestSymbolLang(ctx, s, repo.ID, goFile, "do_it", "root."+shared, "go"))
+	must(insertTestSymbolLang(ctx, s, repo.ID, rbFile, "do_it", "root."+shared, "ruby"))
+	must(insertTestSymbolLang(ctx, s, repo.ID, rbFile, "only_it", "root."+rubyOnly, "ruby"))
+	must(insertTestSymbolLang(ctx, s, repo.ID, rbFile, "refer_it", "root."+rubyOther, "ruby"))
+	goEdge := must(insertTestEdge(ctx, s, repo.ID, goFile, goSrc, shared))
+	rubyEdges := []int64{
+		must(insertTestEdge(ctx, s, repo.ID, rbFile, rbSrc, shared)),
+		must(insertTestEdge(ctx, s, repo.ID, rbFile, rbSrc, rubyOnly)),
+	}
+	for _, id := range rubyEdges {
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET edge_kind = ? WHERE id = ?`, EdgeKindCalls, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := must(insertTestEdge(ctx, s, repo.ID, rbFile, rbSrc, rubyOther))
+	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET edge_kind = 'references' WHERE id = ?`, other); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names, err := s.dotSuffixNames(ctx, tx, repo.ID)
+	_ = tx.Rollback()
+	if err != nil {
+		t.Fatalf("dotSuffixNames() error = %v", err)
+	}
+	got := strings.Join(names, ",")
+	for _, want := range []string{shared, rubyOther} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("population %q is missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, rubyOnly) {
+		t.Fatalf("population %q holds %q, which only Ruby-owned calls carry", got, rubyOnly)
+	}
+
+	if _, err := s.ResolveEdges(ctx, repo.ID); err != nil {
+		t.Fatalf("ResolveEdges() error = %v", err)
+	}
+	var dst *int64
+	var strategy string
+	if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id, resolution_strategy FROM edges WHERE id = ?`, goEdge).Scan(&dst, &strategy); err != nil {
+		t.Fatal(err)
+	}
+	if dst == nil || *dst != goTarget || strategy != ResolutionStrategyDotSuffix {
+		t.Fatalf("Go edge for %q = %v/%q, want symbol %d via %s", shared, dst, strategy, goTarget, ResolutionStrategyDotSuffix)
+	}
+	for _, id := range rubyEdges {
+		if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges WHERE id = ?`, id).Scan(&dst); err != nil {
+			t.Fatal(err)
+		}
+		if dst != nil {
+			t.Fatalf("Ruby call edge %d bound symbol %d; Ruby owns it", id, *dst)
+		}
+	}
+}
