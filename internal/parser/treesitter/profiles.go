@@ -80,6 +80,9 @@ func (a *CSharpAdapter) Profile() parser.Profile {
 }
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
 
+// Rust v4 marks a call whose first path segment a block around it declares
+// (graph.RustCallBlockScopeEvidence); unchanged bytes persist a different
+// edge evidence, so every Rust file has to reach the parser again.
 // Rust v3 extracts nested use groups recursively from the syntax tree and
 // refuses malformed declarations instead of persisting guessed import paths.
 // Rust v2 changes rust_module_evidence.external_path from a checkout-absolute
@@ -87,7 +90,7 @@ func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescr
 // directory. Unchanged bytes persist a different row, and the resolver joins
 // the new spelling exactly, so every Rust file has to reach the parser again.
 func (a *RustAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:rust:v3", EmitsCallEdges: true}
+	return parser.Profile{ID: "treesitter:rust:v4", EmitsCallEdges: true}
 }
 
 // Ruby v6 records a `def` passed as the only argument of a visibility modifier
