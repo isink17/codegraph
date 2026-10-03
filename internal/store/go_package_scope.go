@@ -312,29 +312,6 @@ func sqlGoPackageLevelDeclaration(alias string) string {
 		AND ` + sqlGoHasPackageName(alias+`.qualified_name`) + `)`
 }
 
-// sqlGoBareSourceScope restricts an unresolved-edge leg to sources whose Go
-// package scope is one of `n` bound keys. Non-Go sources are unaffected: this
-// rule is about Go's scoping, and other languages keep the evidence they had.
-//
-// It requires the surrounding statement to expose the edge's source symbol as
-// `src` and that symbol's file as `srcf`.
-func sqlGoBareSourceScope(setSQL string) string {
-	gated := `src.language <> 'go' AND src.language NOT IN ` + bareNameScopeAllKindsSQL
-	if setSQL == "" {
-		// No scoped destination to match: Go and C/C++ sources contribute
-		// nothing, but the leg still serves every other language.
-		//
-		// This is a refusal, so callers may only render it once a target
-		// identity exists. A query that matched no symbol has no scope to
-		// derive and must omit the predicate entirely rather than pass an
-		// empty set (P22.14); FindCallers is where that branch lives.
-		return `(` + gated + `)`
-	}
-	return `((` + gated + `) OR ` +
-		sqlBareScopeKeyForSymbol("src", "srcf.path") +
-		` IN ` + setSQL + `)`
-}
-
 // resolverGoBareScopeSQL is the repo-wide resolver's half of the rule: a Go
 // bare call is off limits to every generic strategy.
 //
@@ -558,27 +535,6 @@ func symbolScopesByIDs(ctx context.Context, q queryContexter, repoID int64, ids 
 	return out, nil
 }
 
-// symbolLanguagesOf returns the distinct persisted languages of a scope map, in
-// a sorted order so generated statement text and bound arguments are a function
-// of the graph rather than of map iteration. Symbols with no persisted language
-// contribute nothing: an unknown language is not evidence of a shared one.
-func symbolLanguagesOf(scopes map[int64]goSymbolScope) []string {
-	seen := make(map[string]struct{}, len(scopes))
-	out := make([]string, 0, len(scopes))
-	for _, scope := range scopes {
-		if scope.language == "" {
-			continue
-		}
-		if _, ok := seen[scope.language]; ok {
-			continue
-		}
-		seen[scope.language] = struct{}{}
-		out = append(out, scope.language)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // goSymbolScopesByEdgeSource loads the package scope of each edge's source
 // symbol, keyed by edge id.
 func goSymbolScopesByEdgeSource(ctx context.Context, q queryContexter, repoID int64, edgeIDs []int64) (map[int64]goSymbolScope, error) {
@@ -634,41 +590,6 @@ func scanGoSymbolScopes(rows *sql.Rows, out map[int64]goSymbolScope) error {
 		}
 	}
 	return rows.Err()
-}
-
-// goBareTargetScopes returns the scopes from which a bare call could name one
-// of the given symbols: the Go package of each package-level Go symbol, and the
-// file of each C/C++ symbol. A target in an ungated language contributes
-// nothing, and neither does a Go method, because no bare Go spelling names it.
-//
-// A C/C++ CLASS MEMBER contributes nothing either (P22.15): the file is not the
-// scope that decides such a call, the caller's class is, and a name-evidence leg
-// carries no class fact -- so the target is dropped rather than answered from
-// file evidence it does not have. When every matched target is one, the caller
-// renders sqlGoBareSourceScope(""), which refuses the leg for C/C++ writers; that
-// is the same population the resolver refused, and a relationship the class rule
-// DOES admit was bound and is answered through the id leg instead.
-//
-// The result is sorted so statement text and bound arguments are a function of
-// the input, never of map iteration.
-func goBareTargetScopes(scopes map[int64]goSymbolScope) []string {
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(scopes))
-	for _, scope := range scopes {
-		if !scope.bareScopeGated() || !scope.packageLevel || scope.key == goPackageScopeUnknown {
-			continue
-		}
-		if scope.cppClassMember() {
-			continue
-		}
-		if _, ok := seen[scope.key]; ok {
-			continue
-		}
-		seen[scope.key] = struct{}{}
-		out = append(out, scope.key)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // contextSeedScopes loads the persisted language -- and, for Go seeds, the

@@ -204,8 +204,7 @@ type idPair struct {
 // bare-name scope policy for that spelling: P22.6's for Go, P22.13's for C and
 // C++.
 //
-// Three states, matching sqlGoBareSourceScope exactly so the batched pipeline
-// and the public FindCallers answer the same question:
+// Three states:
 //
 //	gated == false            any writer may spell this name (every
 //	                          qualifier-bearing spelling, and every seed in a
