@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Ruby methods defined as the only argument of `private`/`protected`/`public`, `private_class_method`/`public_class_method def self.m`, or `module_function` in a module body are now recorded with their body calls, and the wrapper call is no longer attributed to them as a call. `treesitter:ruby:v6` reparses unchanged Ruby files on the next complete update.
+
 Python names are now read as Unicode (PEP 3131) as Python reads them. The non-CGO
 parser previously dropped definitions and calls such as `café`, and could record the
 ASCII tail of a name as a call (`naïve_func()` as `ve_func`). Both parsers previously

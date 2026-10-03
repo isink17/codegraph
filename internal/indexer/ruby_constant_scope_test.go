@@ -254,7 +254,7 @@ func TestRubyProfileV3ToV4ResolvesConstantReceivers(t *testing.T) {
 				t.Fatalf("the test modified the source file")
 			}
 			groups := profilesInDB(t, s, repo)
-			if len(groups) != 1 || groups[0].Profile != "treesitter:ruby:v5" || !groups[0].CallEdges {
+			if len(groups) != 1 || groups[0].Profile != tsparser.NewRuby().Profile().ID || !groups[0].CallEdges {
 				t.Fatalf("provenance after upgrade = %#v", groups)
 			}
 
@@ -950,7 +950,7 @@ func rubyProfileV3ToV4Hazard(t *testing.T, source, line string) {
 	if !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
 		t.Fatal("the test modified the source file")
 	}
-	if groups := profilesInDB(t, s, repo); len(groups) != 1 || groups[0].Profile != "treesitter:ruby:v5" || !groups[0].CallEdges {
+	if groups := profilesInDB(t, s, repo); len(groups) != 1 || groups[0].Profile != tsparser.NewRuby().Profile().ID || !groups[0].CallEdges {
 		t.Fatalf("provenance after upgrade = %#v", groups)
 	}
 	want := graph.ScopeImportRubyConstantIdentityUnknown + "|App.Service|Service|"
