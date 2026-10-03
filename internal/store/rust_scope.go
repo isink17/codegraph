@@ -720,8 +720,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	}
 	eligible := func(c rustScopeSymbol, caller rustScopeFile) bool {
 		module := candidateModule(c)
-		if c.visibility == "private" && caller.module != module && !strings.HasPrefix(caller.module, module+"::") {
-			return false
+		// A private item (`pub(self)` says the same) is visible in its own
+		// module and every module nested in it. caller.module is the file's
+		// module, which is the caller's module or an ancestor of it, so this
+		// can only under-approximate.
+		if c.visibility == "private" || c.visibility == "restricted:self" {
+			return caller.module == module || strings.HasPrefix(caller.module, module+"::")
 		}
 		if c.visibility == "public" {
 			return true
