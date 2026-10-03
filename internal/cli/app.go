@@ -1593,6 +1593,9 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if len(result.UnresolvedHints) > 0 {
 			payload["unresolved_hints"] = result.UnresolvedHints
 		}
+		if err := addGraphLimitations(ctx, app.Store, repoID, payload); err != nil {
+			return err
+		}
 		return writeJSON(stdout, payload)
 	case "callees":
 		if symbol == "" {
@@ -1603,7 +1606,11 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 		if err != nil {
 			return err
 		}
-		return writeJSON(stdout, map[string]any{"callees": items, "target_found": result.TargetFound, "count": len(items)})
+		payload := map[string]any{"callees": items, "target_found": result.TargetFound, "count": len(items)}
+		if err := addGraphLimitations(ctx, app.Store, repoID, payload); err != nil {
+			return err
+		}
+		return writeJSON(stdout, payload)
 	case "impact":
 		// Allow a positional symbol alongside --file, but do not override explicit --symbol flags.
 		if symbol != "" && len(symbols) == 0 {
@@ -1636,6 +1643,9 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 				projected["symbols"] = project(syms)
 				data = projected
 			}
+		}
+		if err := addGraphLimitations(ctx, app.Store, repoID, data); err != nil {
+			return err
 		}
 		return writeJSON(stdout, data)
 	default:
@@ -2450,10 +2460,14 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout io.Writer, 
 		if tests == nil {
 			tests = []store.RelatedTest{}
 		}
-		return writeJSON(stdout, map[string]any{
+		payload := map[string]any{
 			"affected_tests": tests,
 			"count":          len(tests),
-		})
+		}
+		if err := addGraphLimitations(ctx, app.Store, repoID, payload); err != nil {
+			return err
+		}
+		return writeJSON(stdout, payload)
 	}
 
 	seen := map[string]bool{}
@@ -2598,4 +2612,18 @@ func printCommandHelp(w io.Writer, cmd *command, invokedName string) {
 			fmt.Fprintf(w, "  %s\n", formatCommandExample(ex))
 		}
 	}
+}
+
+// addGraphLimitations adds the persisted graph's limitations to a relationship
+// command's JSON, under the same `limitations` key and shape the MCP tools use.
+// Nothing is added for a call-capable graph, so its output is unchanged.
+func addGraphLimitations(ctx context.Context, st *store.Store, repoID int64, payload map[string]any) error {
+	limitations, err := st.GraphLimitations(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if len(limitations) > 0 {
+		payload["limitations"] = limitations
+	}
+	return nil
 }

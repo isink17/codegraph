@@ -216,7 +216,28 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 		// returning the encoder's "document has no sections".
 		return "", fmt.Errorf("tool %q is registered for compact but has no encoder", name)
 	}
+	if relationshipTools[name] {
+		limitations, err := s.graphLimitations(ctx)
+		if err != nil {
+			return "", err
+		}
+		writeLimitations(doc, limitations)
+	}
 	return doc.Encode()
+}
+
+// limitationsSchema mirrors store.GraphLimitation. The section is written only
+// when there is a limitation, so a call-capable graph's document is unchanged.
+var limitationsSchema = compactfmt.Schema{Section: "limitations", Columns: []string{"language", "graph_capability", "effect"}}
+
+func writeLimitations(doc *compactfmt.Document, limitations []store.GraphLimitation) {
+	if len(limitations) == 0 {
+		return
+	}
+	sec := doc.Section(limitationsSchema)
+	for _, l := range limitations {
+		sec.Row([]compactfmt.Cell{compactfmt.Str(l.Language), compactfmt.Str(l.Capability), compactfmt.Str(l.Effect)})
+	}
 }
 
 var presenceSchema = compactfmt.Schema{Section: "presence", Columns: []string{"matched", "target_found", "requested", "found", "missing", "total", "offset", "truncated"}}
