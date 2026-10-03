@@ -363,6 +363,11 @@ func TestLocalBindingsReadUnicodeNames(t *testing.T) {
         pass
     class Ñu:
         pass
+    # U+1C89 is a letter in Python's Unicode 16 but unknown to Go's tables:
+    # neither name binds, and no fragment of it does.
+    def xᲉy():
+        pass
+    (aᲉb := 3)
 `
 	var got []string
 	for _, b := range LocalBindings(src, true) {
