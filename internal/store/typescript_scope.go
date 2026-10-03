@@ -419,6 +419,8 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 		var target tsScopeExport
 		parts := strings.Split(e.name, ".")
 		if len(parts) > 1 {
+			// Every path below, this one included, is narrowed to callable
+			// targets once, at the binding point after the loop.
 			for _, id := range byFileQName[e.file][e.name] {
 				target.symbols = append(target.symbols, id)
 			}

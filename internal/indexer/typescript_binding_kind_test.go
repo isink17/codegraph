@@ -128,6 +128,20 @@ func TestTypeScriptCallBindsOnlyNameableDeclarations(t *testing.T) {
 			dst:    "ns.Foo",
 		},
 		{
+			// A class and an interface of one name merge; only the class is a
+			// value, so it is the callee rather than an ambiguity.
+			name:   "imported class merged with an interface",
+			caller: "main.ts", src: "import { Foo } from \"./x\";\nexport function caller() { Foo(); }\n",
+			others: tree{"x.ts": "export class Foo {}\nexport interface Foo {}\n"},
+			dst:    "Foo", want: "x.ts:x.Foo(class)",
+		},
+		{
+			name:   "same-file class merged with an interface",
+			caller: "main.ts", src: "class Foo {}\ninterface Foo {}\nexport function caller() { Foo(); }\n",
+			others: tree{"other.ts": "export function unrelated() {}\n"},
+			dst:    "Foo", want: "main.ts:main.Foo(class)",
+		},
+		{
 			// `export { foo }` names what the module offers; the declaration
 			// is still the module's own binding.
 			name:   "same-file function exported by a later export list",
