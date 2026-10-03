@@ -119,7 +119,10 @@ Release archives use native CGO builds, so shipped binaries include the tree-sit
 parsers and relationship/call-edge support. Explicit `CGO_ENABLED=0` builds retain
 Go (`go/ast`) and Python (pure fallback) call edges; Java, Kotlin, C#, TypeScript,
 JavaScript, Rust, Ruby, Swift, PHP, and C/C++ retain heuristic symbol/import
-navigation without call edges. They are not release-equivalent.
+navigation without call edges. They are not release-equivalent: symbols, imports
+and search are not complete for any language in such a build, and the Python
+fallback misses some call sites. Relationship tools disclose this through
+`limitations` (see [Graph capability](#graph-capability-and-limitations)).
 
 Every language with call resolution uses a partial static scope model. [Language scope models](docs/scope-models.md) describes, for each language, the facts it proves, which calls it owns, lookup precedence, visibility, interop, unsupported forms and incremental behaviour.
 
@@ -478,6 +481,49 @@ edges only. Exact qualified identities take precedence; ambiguous name lookup fa
 Its `total` is the full canonical traversal size before pagination, `offset` is
 the effective (clamped) page offset, and `truncated` says whether more canonical
 rows remain after the returned page. There is no CLI trace command.
+
+#### Graph capability and `limitations`
+
+Call relationships are only as complete as the parsers that wrote the persisted
+graph, which may be a different build from the one answering. Each language's
+capability is read from the parser profiles stored per file:
+
+| `graph_capability` | Meaning |
+|---|---|
+| `call_capable` | Every file was written by one parser profile that emits call edges |
+| `symbols_only` | Every file was written by one profile that emits no call edges |
+| `unknown_provenance` | Some files predate recorded parser provenance |
+| `mixed` | The files were written by more than one profile or capability; at graph level, languages disagree |
+
+`supported_languages` adds `graph_capability` (`state` plus per-language
+`graph_capability` and `parser_profiles`) once the repository has a graph.
+
+`find_callers`, `find_callees`, `get_impact_radius`, `trace_dependencies`,
+`find_related_tests`, `find_dead_code`, `graph_analytics` and `context_for_task`
+(unless `include_callers` is `false`) add a top-level
+`limitations` list next to `ok` and `data` when the graph holds a language that is
+not fully call-capable:
+
+```json
+{"data":{"callers":[],"target_found":true},"limitations":[{"language":"java","graph_capability":"symbols_only","effect":"call edges absent: indexed symbols-only; an empty or short result is not evidence of no relationship"}],"ok":true}
+```
+
+The list is repository-wide: a caller, an impact path or a dead-code verdict can
+cross languages, so every affected language is listed. A `call_capable` language
+is also listed when its profile is the approximate `python-regex` fallback, which
+misses some call sites. When every language is call-capable through a complete
+parser the field is absent and the response is byte-for-byte unchanged. Compact
+responses (`format=compact`) carry the same rows in a `limitations` section, and
+the CLI `callers`, `callees`, `impact` and `find_related_tests --json` commands add
+the same `limitations` key to their JSON. `find_related_tests` without `--json`
+keeps stdout a path list and prints one `limitations:` line to stderr.
+`context_for_task`'s `estimated_tokens` covers `data` only, so the list does not
+change it. `codegraph doctor` reports the same four states per repository under
+`parser.graph_capability`, with a recommendation when the graph is reduced.
+
+Not covered: `architecture_overview` (hub symbols are ranked by call edges),
+`cross_language_links` and `agentic_query` answers carry no `limitations`
+field; read `supported_languages` for the graph's capability.
 
 ### Token budget and continuation (`context_for_task`)
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Relationship answers now say when the persisted graph cannot back them. Capability is read from the parser profiles stored per file, not from the running binary: `call_capable`, `symbols_only`, `unknown_provenance` or `mixed`, per language and for the graph. `supported_languages` reports it as `graph_capability`. `find_callers`, `find_callees`, `get_impact_radius`, `trace_dependencies`, `find_related_tests`, `find_dead_code`, `graph_analytics` and `context_for_task` (when it includes callers) add a `limitations` list (language, `graph_capability`, effect) when a language is not fully call-capable, for example Java indexed by a `CGO_ENABLED=0` build or Python indexed by its regex fallback. Compact responses and the CLI `callers`, `callees`, `impact` and `find_related_tests --json` commands carry the same list; `find_related_tests` in text mode prints it as one stderr line, and `codegraph doctor` reports the four states. On a call-capable graph the field is absent and responses are unchanged.
+
 Rust: an item declared at a file's top level is no longer treated as a member of every inline module in that file. `m::x::f()` now resolves through x's own items and re-exports. Inline modules in crate roots resolve from other files. `use super::*` (and bare `self`/`crate` paths) now import the named module, so test modules see their parent's items through the glob.
 
 The CGO Python parser now records functions and classes defined under compound statements (`if`/`else`, `try`/`except`/`finally`, `with`, `for`, `while`, `match`/`case`), and the calls inside them; it previously skipped them. `treesitter:python:v3` reparses unchanged Python files.

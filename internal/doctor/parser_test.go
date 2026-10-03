@@ -109,3 +109,31 @@ func TestDoctorParserProvenanceStates(t *testing.T) {
 		})
 	}
 }
+
+// Doctor reports the persisted graph's four-state capability, independent of
+// the running binary, and recommends a native build when it is reduced.
+func TestDoctorReportsPersistedGraphCapability(t *testing.T) {
+	tsJava := parser.LanguageSupport{Language: "java", ParserProfile: "treesitter:java:v2", CallEdges: true}
+	cases := []struct {
+		name string
+		rows [][3]any
+		want string
+	}{
+		{"call capable", [][3]any{{"java", "treesitter:java:v2", true}}, store.GraphCallCapable},
+		{"symbols only", [][3]any{{"java", "heuristic:java:v1", false}}, store.GraphSymbolsOnly},
+		{"unknown provenance", [][3]any{{"java", "", false}}, store.GraphUnknownProvenance},
+		{"mixed", [][3]any{{"java", "treesitter:java:v2", true}, {"java", "heuristic:java:v1", false}}, store.GraphMixed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, recommendations := inspectParser(context.Background(), langs(tsJava), seedDB(t, tc.rows))
+			if len(info.GraphCapability) != 1 || info.GraphCapability[0].State != tc.want {
+				t.Fatalf("GraphCapability = %+v, want %s", info.GraphCapability, tc.want)
+			}
+			disclosed := strings.Contains(strings.Join(recommendations, "\n"), "relationship answers disclose limitations")
+			if disclosed != (tc.want != store.GraphCallCapable) {
+				t.Fatalf("recommendations = %v", recommendations)
+			}
+		})
+	}
+}

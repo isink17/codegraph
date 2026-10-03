@@ -284,7 +284,57 @@ func (s *Server) dispatchTool(ctx context.Context, name string, raw json.RawMess
 	if !ok {
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
-	return desc.handler(s, ctx, raw)
+	result, err := desc.handler(s, ctx, raw)
+	if err != nil || result == nil || !disclosesLimitations(name, raw) {
+		return result, err
+	}
+	limitations, err := s.graphLimitations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(limitations) > 0 {
+		result["limitations"] = limitations
+	}
+	return result, nil
+}
+
+// relationshipTools answer from call and reference edges, so their answers are
+// only as complete as the persisted graph's call capability. Each discloses the
+// graph's limitations next to `data`; the field is absent when there are none,
+// which leaves a call-capable graph's response byte-for-byte unchanged.
+var relationshipTools = map[string]bool{
+	"find_callers":       true,
+	"find_callees":       true,
+	"get_impact_radius":  true,
+	"trace_dependencies": true,
+	"find_related_tests": true,
+	"find_dead_code":     true,
+	"graph_analytics":    true,
+}
+
+// disclosesLimitations reports whether a call answers from relationship edges.
+// context_for_task does when it expands callers, which it does unless the call
+// sets include_callers=false. Its token budget covers `data` only, so the
+// top-level limitations list does not change the reported estimate.
+func disclosesLimitations(name string, raw json.RawMessage) bool {
+	if relationshipTools[name] {
+		return true
+	}
+	if name != "context_for_task" {
+		return false
+	}
+	var req struct {
+		IncludeCallers *bool `json:"include_callers"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	return req.IncludeCallers == nil || *req.IncludeCallers
+}
+
+// graphLimitations reads the persisted graph's limitations for this server's
+// repository. A failure fails the call: a relationship answer that cannot tell
+// whether it is complete must not be served as if it were.
+func (s *Server) graphLimitations(ctx context.Context) ([]store.GraphLimitation, error) {
+	return s.store.GraphLimitations(ctx, s.repoID)
 }
 
 func (s *Server) handleFindSymbol(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
@@ -356,13 +406,18 @@ func (s *Server) handleGraphStats(ctx context.Context, _ json.RawMessage) (map[s
 	return map[string]any{"ok": true, "data": stats}, nil
 }
 
-func (s *Server) handleSupportedLanguages(_ context.Context, _ json.RawMessage) (map[string]any, error) {
-	return map[string]any{
-		"ok": true,
-		"data": map[string]any{
-			"languages": s.indexer.SupportedLanguages(),
-		},
-	}, nil
+func (s *Server) handleSupportedLanguages(ctx context.Context, _ json.RawMessage) (map[string]any, error) {
+	data := map[string]any{"languages": s.indexer.SupportedLanguages()}
+	// The languages above are what THIS binary parses; graph_capability is what
+	// the persisted graph can answer, which a different build may have written.
+	capability, err := s.store.GraphCapability(ctx, s.repoID)
+	if err != nil {
+		return nil, err
+	}
+	if capability.State != "" {
+		data["graph_capability"] = capability
+	}
+	return map[string]any{"ok": true, "data": data}, nil
 }
 
 func (s *Server) handleListRepos(ctx context.Context, raw json.RawMessage) (map[string]any, error) {

@@ -472,7 +472,7 @@ func newCommandList() []*command {
 				"git diff --name-only | codegraph find_related_tests --stdin",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
-				return runAffectedTests(ctx, cfg, stdout, invokedName, args)
+				return runAffectedTests(ctx, cfg, stdout, stderr, invokedName, args)
 			},
 		},
 		{
