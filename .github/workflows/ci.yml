@@ -202,7 +202,7 @@ jobs:
       - run: CGO_ENABLED=0 go test ./internal/cli
       # The reduced build's capability contract: persisted capability, disclosed
       # limitations, rich-graph byte stability, downgrade refusal.
-      - run: CGO_ENABLED=0 go test ./internal/store ./internal/mcp ./internal/indexer -run 'GraphCapability|RelationshipResponses|SymbolsOnlyLanguage|SupportedLanguagesReports|ParserProfile'
+      - run: CGO_ENABLED=0 go test ./internal/store ./internal/mcp ./internal/indexer ./internal/doctor -run 'GraphCapability|RelationshipResponses|SymbolsOnlyLanguage|SupportedLanguagesReports|FreshIndexEqualsUpdate|ParserProfile'
       - run: CGO_ENABLED=0 go build ./cmd/codegraph
       # Type-checks every package and its tests without cgo, so a test that
       # uses a cgo-only helper without the build tag fails here.

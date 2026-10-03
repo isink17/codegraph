@@ -499,7 +499,8 @@ capability is read from the parser profiles stored per file:
 `graph_capability` and `parser_profiles`) once the repository has a graph.
 
 `find_callers`, `find_callees`, `get_impact_radius`, `trace_dependencies`,
-`find_related_tests`, `find_dead_code` and `graph_analytics` add a top-level
+`find_related_tests`, `find_dead_code`, `graph_analytics` and `context_for_task`
+(unless `include_callers` is `false`) add a top-level
 `limitations` list next to `ok` and `data` when the graph holds a language that is
 not fully call-capable:
 
@@ -514,7 +515,15 @@ misses some call sites. When every language is call-capable through a complete
 parser the field is absent and the response is byte-for-byte unchanged. Compact
 responses (`format=compact`) carry the same rows in a `limitations` section, and
 the CLI `callers`, `callees`, `impact` and `find_related_tests --json` commands add
-the same `limitations` key to their JSON.
+the same `limitations` key to their JSON. `find_related_tests` without `--json`
+keeps stdout a path list and prints one `limitations:` line to stderr.
+`context_for_task`'s `estimated_tokens` covers `data` only, so the list does not
+change it. `codegraph doctor` reports the same four states per repository under
+`parser.graph_capability`, with a recommendation when the graph is reduced.
+
+Not covered: `architecture_overview` (hub symbols are ranked by call edges),
+`cross_language_links` and `agentic_query` answers carry no `limitations`
+field; read `supported_languages` for the graph's capability.
 
 ### Token budget and continuation (`context_for_task`)
 
