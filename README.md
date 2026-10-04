@@ -168,6 +168,8 @@ baseline replaces historical development migrations; older v2 development indexe
 are refused before mutation. Rebuild them with `codegraph index . --rebuild`.
 This affects v2 databases only; legacy v1 databases are never imported or upgraded. Normal forward migration compatibility begins at `v2.0.0`.
 
+Normal `codegraph update .` upgrades supported parser profiles and versioned resolver policies. A resolver-only policy change re-evaluates existing edges and call references once without reparsing unchanged source; later updates are no-ops. A newer or unreadable policy marker refuses the affected scan before graph writes. Full or forced indexing checks every language policy, even when a language filter limits parsing. Parser-fact changes still require a parser profile upgrade.
+
 Use `codegraph clean .` for database maintenance tasks like WAL checkpointing, VACUUM, FTS optimize, ANALYZE, and incremental vacuum.
 
 ### Version

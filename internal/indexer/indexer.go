@@ -117,17 +117,26 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if len(opts.Languages) == 0 {
 		opts.Languages = repoCfg.Languages
 	}
-	repo, err := i.store.UpsertRepo(ctx, opts.RepoRoot)
+	// A known repository is resolved read-only: UpsertRepo rewrites root_path
+	// and updated_at, and the refusals below must leave the database byte
+	// identical. An unknown repository has no markers or profiles to refuse, so
+	// it is created here; a known one is touched after both plans pass.
+	repo, repoKnown, err := i.store.FindRepo(ctx, opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
+	}
+	if !repoKnown {
+		if repo, err = i.store.UpsertRepo(ctx, opts.RepoRoot); err != nil {
+			return store.ScanSummary{}, err
+		}
 	}
 	scanKind := opts.ScanKind
 	if scanKind == "" {
 		scanKind = "index"
 	}
-	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, len(candidatePaths) == 0 && scanKind != "update"); err != nil {
-		return store.ScanSummary{}, err
-	}
+	// Read before any later step rewrites candidatePaths (manifest change,
+	// profile expansion): it is the caller's request, not the expanded plan.
+	fullIndexRequest := len(candidatePaths) == 0 && scanKind != "update"
 	composer, err := discoverPHPComposerPSR4(opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -220,6 +229,33 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		candidatePaths = append(candidatePaths, profilePaths...)
 		slices.Sort(candidatePaths)
 		candidatePaths = slices.Compact(candidatePaths)
+	}
+
+	// Resolver policy is decided here for the same reason: an unsupported
+	// marker refuses before BeginScan or any other write. Languages it returns
+	// have edges decided by an older resolver; they are decided again below.
+	//
+	// A full or forced index resolves the whole repository, and that resolve
+	// writes every language's edges whatever --languages selected for parsing.
+	// Its policy coverage is therefore every language, so a newer or unreadable
+	// marker of an unselected language refuses it too.
+	policyAffected := affectedLanguage
+	if !pathScoped && scanKind != "update" {
+		policyAffected = func(string) bool { return true }
+	}
+	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, policyAffected)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	// Every refusal is behind us: only now may a known repository row, or the
+	// canonical-path marker of an empty one, be written.
+	if repoKnown {
+		if repo, err = i.store.UpsertRepo(ctx, opts.RepoRoot); err != nil {
+			return store.ScanSummary{}, err
+		}
+	}
+	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, fullIndexRequest); err != nil {
+		return store.ScanSummary{}, err
 	}
 
 	scanID, started, err := i.store.BeginScan(ctx, repo.ID, scanKind)
@@ -930,6 +966,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// changed batch's introduced symbols for an incremental run.
 	// ---------------------------------------------------------------------
 	resolveStart := time.Now()
+	repoWideResolve := false
 
 	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
 		summary.ResolveMS = 0
@@ -979,11 +1016,37 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.ResolveCrossFileTargets = stats.TargetsSelected
 		}
 	} else {
-		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
+		// The policy markers of the stale languages commit with the edges they
+		// certify.
+		if _, resolveErr := i.store.ResolveEdgesRecordingPolicies(ctx, repo.ID, policyStale); resolveErr != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
 			return summary, resolveErr
 		}
 		summary.ResolveMode = "repo"
+		repoWideResolve = true
+	}
+	// A repo-wide resolve has just decided every edge with this binary and
+	// recorded the policy in the same transaction. Any other mode decided only
+	// the changed slice; the stale languages' unchanged edges are decided again
+	// here, without parsing, in one transaction with their reference identities
+	// and marker.
+	if len(policyStale) > 0 {
+		if !repoWideResolve {
+			policyStart := time.Now()
+			err := i.store.RedecideResolverPolicies(ctx, repo.ID, policyStale)
+			if summary.ResolveMode == "none" {
+				summary.ResolveMode = "resolver_policy"
+			} else {
+				summary.ResolveMode += "+resolver_policy"
+			}
+			if err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			summary.ResolverPolicyMS = time.Since(policyStart).Milliseconds()
+			summary.ResolveMS = time.Since(resolveStart).Milliseconds()
+		}
+		summary.ResolverPolicyLanguages = policyStale
 	}
 	xlangCurrent, err := i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
 	if err != nil {
@@ -1026,7 +1089,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			// removed-name condition matches the dispatch above: since P22.12 a
 			// deletion-only run DOES resolve, and reporting `test_links` there
 			// would deny work that happened.
-			summary.ResolveMode = "test_links"
+			if summary.ResolveMode == "resolver_policy" {
+				summary.ResolveMode += "+test_links"
+			} else {
+				summary.ResolveMode = "test_links"
+			}
 		}
 	}
 	// Git history runs after the semantic graph is final and reads none of it.
@@ -1051,7 +1118,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		{Phase: "write_replace", MS: summary.WriteReplaceMS},
 		{Phase: "embed", MS: summary.EmbedMS},
 		{Phase: "mark_missing", MS: summary.MarkMissingMS},
-		{Phase: "resolve_edges", MS: summary.ResolveMS - summary.ResolveTestLinksMS},
+		{Phase: "resolve_edges", MS: summary.ResolveMS - summary.ResolveTestLinksMS - summary.ResolverPolicyMS},
+		{Phase: "resolve_policy", MS: summary.ResolverPolicyMS},
 		{Phase: "resolve_test_links", MS: summary.ResolveTestLinksMS},
 		{Phase: "history", MS: summary.HistoryMS},
 		{Phase: "total", MS: summary.DurationMS},
