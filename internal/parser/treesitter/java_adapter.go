@@ -32,6 +32,9 @@ type JavaAdapter struct {
 	// legacyOwnMember reproduces treesitter:java:v6, which did not mark
 	// constructions of a member type the calling class declares.
 	legacyOwnMember bool
+	// legacyLineOnly reproduces treesitter:java:v7, whose edges carried no
+	// column, so methods sharing a line could not be told apart.
+	legacyLineOnly bool
 }
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
@@ -40,34 +43,39 @@ func NewJava() *JavaAdapter { return &JavaAdapter{} }
 // constructor arity facts v4 records. It exists only to reproduce v3
 // databases in profile-transition tests.
 func NewJavaV3() *JavaAdapter {
-	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true}
+	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
 }
 
 // NewJavaV4 returns a parser that reports treesitter:java:v4 and does not mark
 // calls inside nested class bodies. It exists only to reproduce v4 databases
 // in profile-transition tests.
 func NewJavaV4() *JavaAdapter {
-	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true}
+	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
 }
 
 // NewJavaV5 returns a parser that reports treesitter:java:v5 and spells a
 // generic construction's class with its type arguments. It exists only to
 // reproduce v5 databases in profile-transition tests.
 func NewJavaV5() *JavaAdapter {
-	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true}
+	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
 }
 
 // NewJavaV6 returns a parser that reports treesitter:java:v6 and does not mark
 // constructions of a member type the calling class declares. It exists only
 // to reproduce v6 databases in profile-transition tests.
-func NewJavaV6() *JavaAdapter { return &JavaAdapter{legacyOwnMember: true} }
+func NewJavaV6() *JavaAdapter { return &JavaAdapter{legacyOwnMember: true, legacyLineOnly: true} }
+
+// NewJavaV7 returns a parser that reports treesitter:java:v7 and records no
+// column on edges. It exists only to reproduce v7 databases in
+// profile-transition tests.
+func NewJavaV7() *JavaAdapter { return &JavaAdapter{legacyLineOnly: true} }
 
 // NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
 // first `package x;` spelled anywhere in the file, comments and strings
 // included, as its package. It exists only to reproduce v2 databases in
 // profile-transition tests.
 func NewJavaV2() *JavaAdapter {
-	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true}
+	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
 }
 
 func (a *JavaAdapter) Language() string     { return "java" }
@@ -94,7 +102,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 
 	javaExtractImports(root, content, &pf)
 	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
-	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember)
+	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember, !a.legacyLineOnly)
 	if a.legacyArity {
 		for i := range pf.Edges {
 			if pf.Edges[i].Kind == "constructs" {
@@ -334,7 +342,7 @@ func javaVisibility(node *sitter.Node, content []byte) string {
 	return "package"
 }
 
-func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember bool) {
+func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember, markColumn bool) {
 	for _, creation := range findDescendants(root, "object_creation_expression") {
 		typeNode := childByFieldName(creation, "type")
 		if typeNode == nil {
@@ -353,7 +361,7 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 		} else if markOwnMember && javaOwnMemberCreation(root, creation, name, content) {
 			evidence = graph.JavaOwnMemberTypeEvidence
 		}
-		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: evidence, Line: int(creation.StartPoint().Row) + 1, CallArity: javaMethodCallArity(creation)})
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: evidence, Line: int(creation.StartPoint().Row) + 1, Col: javaEdgeCol(creation, markColumn), CallArity: javaMethodCallArity(creation)})
 	}
 	for _, call := range findDescendants(root, "method_invocation") {
 		nameNode := childByFieldName(call, "name")
@@ -378,6 +386,7 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 			Kind:        "calls",
 			Evidence:    evidence,
 			Line:        line,
+			Col:         javaEdgeCol(call, markColumn),
 			CallArity:   javaMethodCallArity(call),
 		})
 		pf.References = append(pf.References, graph.Reference{
@@ -488,6 +497,15 @@ func javaLocalTypeShadows(node *sitter.Node, name string, content []byte) bool {
 		}
 	}
 	return false
+}
+
+// javaEdgeCol is the 1-based column node starts at, or 0 for a parser
+// reproducing a profile that recorded none.
+func javaEdgeCol(node *sitter.Node, mark bool) int {
+	if !mark {
+		return 0
+	}
+	return int(node.StartPoint().Column) + 1
 }
 
 // javaOwnMemberCreation reports whether creation is an unqualified `new` of

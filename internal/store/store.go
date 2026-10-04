@@ -2682,7 +2682,7 @@ func insertParsedFileGraph(
 		srcChooser := newSrcSymbolChooser(symbolIDs, parsed.Symbols)
 		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*8)
 		for _, edge := range parsed.Edges {
-			attribution := srcChooser.attribute(edge.Line)
+			attribution := srcChooser.attribute(edge.Line, edge.Col)
 			srcID := attribution.id
 			if srcID == 0 {
 				if stats != nil {
@@ -3273,9 +3273,9 @@ func ownsSourceEdges(kind string) bool {
 }
 
 type funcSpan struct {
-	start int
-	end   int
-	id    int64
+	start, startCol int
+	end, endCol     int
+	id              int64
 }
 
 type srcSymbolChooser struct {
@@ -3313,7 +3313,7 @@ func newSrcSymbolChooser(symbolIDs []int64, symbols []graph.Symbol) srcSymbolCho
 		if id == 0 {
 			continue
 		}
-		span := funcSpan{start: sym.Range.StartLine, end: sym.Range.EndLine, id: id}
+		span := funcSpan{start: sym.Range.StartLine, startCol: sym.Range.StartCol, end: sym.Range.EndLine, endCol: sym.Range.EndCol, id: id}
 		if n := len(out.spans); sorted && n > 0 && spanLess(span, out.spans[n-1]) {
 			sorted = false
 		}
@@ -3360,7 +3360,7 @@ func compareSpans(a, b funcSpan) int {
 // When no span contains the line — a top-level or file-scope reference — it
 // returns no owner rather than fabricating a caller.
 func (c srcSymbolChooser) Choose(line int) int64 {
-	return c.attribute(line).id
+	return c.attribute(line, 0).id
 }
 
 type sourceAttributionKind uint8
@@ -3377,9 +3377,15 @@ type sourceAttribution struct {
 	id   int64
 }
 
-func (c srcSymbolChooser) attribute(line int) sourceAttribution {
+// attribute credits an edge at line to its source symbol. A parser that
+// reports the edge's column (col > 0) lets methods sharing a line be told
+// apart; col == 0 means the line alone is all that is known.
+func (c srcSymbolChooser) attribute(line, col int) sourceAttribution {
 	if len(c.spans) == 0 {
 		return sourceAttribution{kind: sourceAttributionNoOwner}
+	}
+	if col > 0 {
+		return c.attributeAt(line, col)
 	}
 	i := sort.Search(len(c.spans), func(i int) bool { return c.spans[i].start > line }) - 1
 	// Spans are ordered by start line but can be nested or overlapping. Scan
@@ -3415,6 +3421,42 @@ func (c srcSymbolChooser) attribute(line int) sourceAttribution {
 		return sourceAttribution{kind: sourceAttributionExact, id: span.id}
 	}
 	return sourceAttribution{kind: sourceAttributionOutsideSpan}
+}
+
+// attributeAt is attribute for an edge whose column is known: a span contains
+// the position only if the position lies between its start and end, and the
+// innermost span is the one that starts last (ties: ends first). Identical
+// ranges owned by different symbols are still ambiguous.
+func (c srcSymbolChooser) attributeAt(line, col int) sourceAttribution {
+	before := func(l1, c1, l2, c2 int) bool { return l1 < l2 || (l1 == l2 && c1 <= c2) }
+	var best *funcSpan
+	ambiguous := false
+	for j := range c.spans {
+		span := &c.spans[j]
+		if !before(span.start, span.startCol, line, col) || !before(line, col, span.end, span.endCol) {
+			continue
+		}
+		switch {
+		case best == nil:
+		case span.start == best.start && span.startCol == best.startCol && span.end == best.end && span.endCol == best.endCol:
+			if span.id != best.id {
+				ambiguous = true
+			}
+			continue
+		case before(best.start, best.startCol, span.start, span.startCol) && !(best.start == span.start && best.startCol == span.startCol):
+		case span.start == best.start && span.startCol == best.startCol && before(span.end, span.endCol, best.end, best.endCol):
+		default:
+			continue
+		}
+		best, ambiguous = span, false
+	}
+	switch {
+	case best == nil:
+		return sourceAttribution{kind: sourceAttributionOutsideSpan}
+	case ambiguous:
+		return sourceAttribution{kind: sourceAttributionAmbiguous}
+	}
+	return sourceAttribution{kind: sourceAttributionExact, id: best.id}
 }
 
 func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (int, error) {
