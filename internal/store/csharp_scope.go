@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"slices"
 	"sort"
 	"strings"
 
@@ -476,38 +477,136 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 	if global {
 		return decide([]string{qualifier}, false)
 	}
-	var aliases []string
-	for _, i := range imports {
-		if i.owner == namespace || i.owner == "" {
-			if i.kind == "alias" && i.local == qualifier && !strings.HasPrefix(i.kind, "global_") {
-				aliases = append(aliases, i.source)
-			}
-		}
-	}
-	if len(aliases) > 0 {
-		return decide(aliases, true)
-	}
+	// Lookup follows C# 7.7.1: for each namespace level from the innermost
+	// outwards, a type declared in that level wins, then an alias, then the
+	// types imported by that level's using-namespace directives. Evidence
+	// carries only the canonical namespace of a directive's owner, never the
+	// declaration that encloses the call. Imports owned by an enclosing
+	// namespace are therefore not applied, and a result an import could
+	// overturn by sitting at a different level than assumed is refused,
+	// including one an enclosing namespace's import could preempt.
+	levels := []string{}
 	for current := namespace; current != ""; {
-		candidate := current + "." + qualifier
-		if len(semanticTypes([]string{candidate})) > 0 {
-			return decide([]string{candidate}, false)
-		}
+		levels = append(levels, current)
 		if dot := strings.LastIndexByte(current, '.'); dot >= 0 {
 			current = current[:dot]
 		} else {
 			current = ""
 		}
 	}
-	var usingTypes []string
-	for _, i := range imports {
-		if (i.owner == namespace || i.owner == "") && i.kind == "namespace" && !strings.HasPrefix(i.kind, "global_") {
-			usingTypes = append(usingTypes, i.source+"."+qualifier)
+	levels = append(levels, "")
+	// A dotted qualifier whose first segment names an alias is resolved by
+	// C# 7.7.1 through that alias (a namespace alias prefix), not through the
+	// declared namespaces. Evidence models only aliases of a whole type, so
+	// the lookup refuses rather than treat the segment as a namespace name.
+	if head, _, dotted := strings.Cut(qualifier, "."); dotted {
+		for _, i := range imports {
+			if i.kind == "alias" && i.local == head && slices.Contains(levels, i.owner) {
+				return "", true, false
+			}
 		}
 	}
-	if len(semanticTypes(usingTypes)) > 0 {
-		return decide(usingTypes, false)
+	candidate := func(level string) string {
+		if level == "" {
+			return qualifier
+		}
+		return level + "." + qualifier
 	}
-	return decide([]string{qualifier}, false)
+	imported := func(owner string) (aliases, namespaces []string) {
+		for _, i := range imports {
+			if i.owner != owner {
+				continue
+			}
+			switch i.kind {
+			case "alias":
+				if i.local == qualifier {
+					aliases = append(aliases, i.source)
+				}
+			case "namespace":
+				namespaces = append(namespaces, i.source+"."+qualifier)
+			}
+		}
+		return aliases, namespaces
+	}
+	// Directives with an empty owner are compilation-unit or file-scoped
+	// namespace directives; evidence cannot tell which level they sit at.
+	rootAliases, rootNamespaces := imported("")
+	rootTypes := semanticTypes(append(append([]string{}, rootAliases...), rootNamespaces...))
+	conflicts := func(qname string, qnames ...string) bool {
+		return len(qnames) > 0 && (len(qnames) != 1 || qnames[0] != qname)
+	}
+	// preempted reports whether a directive owned by an enclosing namespace
+	// level strictly inside the level that supplied qname could, by C# 7.7.1,
+	// supply the name first. Such a directive is never applied (the evidence
+	// cannot tell whether the call sits in its declaration), so it can only
+	// refuse: an alias of that name always, a using-namespace when it
+	// supplies a different indexed type. A namespace the graph has no type
+	// for is not modeled, as at the call's own level. found is the index of
+	// the supplying level; levels[0] is the call's own level, whose imports
+	// are applied, and the "" level carries root evidence handled above.
+	preempted := func(found int, qname string) bool {
+		for _, level := range levels[min(1, found):found] {
+			if level == "" {
+				continue
+			}
+			aliases, namespaces := imported(level)
+			if len(aliases) > 0 || conflicts(qname, semanticTypes(namespaces)...) {
+				return true
+			}
+		}
+		return false
+	}
+	for index, level := range levels {
+		ownType := semanticTypes([]string{candidate(level)})
+		var aliases, namespaces []string
+		if level == namespace {
+			aliases, namespaces = imported(level)
+		}
+		if len(ownType) > 0 || len(aliases) > 0 || len(semanticTypes(namespaces)) > 0 {
+			var qname string
+			var alias, ok bool
+			fromImport := len(ownType) == 0
+			switch {
+			case len(ownType) > 0 && len(aliases) > 0:
+				return "", true, false
+			case len(ownType) > 0:
+				qname, alias, ok = decide([]string{candidate(level)}, false)
+			case len(aliases) > 0:
+				qname, alias, ok = decide(aliases, true)
+			default:
+				qname, alias, ok = decide(namespaces, false)
+			}
+			if !ok {
+				return "", alias, false
+			}
+			if fromImport && level != "" {
+				for _, outer := range levels[index+1:] {
+					if conflicts(qname, semanticTypes([]string{candidate(outer)})...) {
+						return "", alias, false
+					}
+				}
+			}
+			if namespace != "" && !(level == namespace && !fromImport) && conflicts(qname, rootTypes...) {
+				return "", alias, false
+			}
+			if namespace != "" && level == "" && !fromImport && len(rootAliases) > 0 {
+				return "", true, false
+			}
+			if preempted(index, qname) {
+				return "", alias, false
+			}
+			return qname, alias, true
+		}
+	}
+	// Directives with an empty owner at the global level.
+	qname, alias, ok := decide(rootNamespaces, false)
+	if len(rootAliases) > 0 {
+		qname, alias, ok = decide(rootAliases, true)
+	}
+	if ok && preempted(len(levels), qname) {
+		return "", alias, false
+	}
+	return qname, alias, ok
 }
 
 func csharpTypeAccessibleByQName(qname, sourceContainer string, byQName map[string][]csharpScopeSymbol) bool {
