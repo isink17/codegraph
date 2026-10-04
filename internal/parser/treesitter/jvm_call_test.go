@@ -203,7 +203,7 @@ class C {
 		if err != nil {
 			t.Fatal(err)
 		}
-		current := adapter.Profile().ID == "treesitter:java:v6"
+		current := adapter.Profile().ID == "treesitter:java:v7"
 		seen := 0
 		for _, e := range p.Edges {
 			if e.Kind != "calls" && e.Kind != "constructs" {
