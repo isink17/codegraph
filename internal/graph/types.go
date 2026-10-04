@@ -74,6 +74,15 @@ const JavaCallNestedClassScopeEvidence = "java:nested_class_scope"
 // hides every recorded type of that name, so none may answer.
 const JavaLocalTypeScopeEvidence = "java:local_type_scope"
 
+// JavaOwnMemberTypeEvidence marks an unqualified Java construction of a simple
+// name directly in a method, constructor or lambda body of a class the adapter
+// models, where that class declares a member type of that name and no other
+// method or constructor covers the construction's line. The declared member
+// type hides every inherited, enclosing, imported and package type of that
+// name (JLS 6.4.1, 8.5), so it is the class constructed whatever the class
+// extends.
+const JavaOwnMemberTypeEvidence = "java:own_member_type"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,

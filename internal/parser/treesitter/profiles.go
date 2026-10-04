@@ -27,7 +27,9 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:python:v8", EmitsCallEdges: true}
 }
 
-// Java v6 spells a generic construction's class without its type arguments
+// Java v7 marks a construction of a member type the calling class declares
+// (graph.JavaOwnMemberTypeEvidence), which binds that member type.
+// v6 spells a generic construction's class without its type arguments
 // (`new Box<>()` constructs `Box`), so it binds like a raw construction.
 // v5 marks bare and `this.` calls inside anonymous, local and
 // enum-constant class bodies, whose own members shadow the enclosing class's.
@@ -51,7 +53,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyGenericConstruction {
 		return parser.Profile{ID: "treesitter:java:v5", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:java:v6", EmitsCallEdges: true}
+	if a.legacyOwnMember {
+		return parser.Profile{ID: "treesitter:java:v6", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v7", EmitsCallEdges: true}
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.

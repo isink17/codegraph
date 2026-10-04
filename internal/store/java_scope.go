@@ -478,11 +478,37 @@ func javaUnqualifiedCreation(evidence string) bool {
 	return r != '_' && r != '$' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
 }
 
-func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport) (javaScopeSymbol, string) {
-	if e.evidence == graph.JavaLocalTypeScopeEvidence || !javaUnqualifiedCreation(e.evidence) {
-		return javaScopeSymbol{}, ""
+// javaOwnMemberType returns the member type named e.name that the calling
+// class declares, for a construction the adapter marked as naming one. That
+// declaration hides every other type of the name, so its accessibility and
+// the caller's supertypes do not matter. A caller whose container the
+// adapter collapsed to the package (a class named like its package) is not
+// told apart from a top-level class there, so it finds nothing.
+func javaOwnMemberType(e javaScopeEdge, byQName map[string][]javaScopeSymbol) (javaScopeSymbol, bool) {
+	if e.container == "" || e.container == e.pkg {
+		return javaScopeSymbol{}, false
 	}
-	t, ok, _ := javaType(e.name, e.pkg, e.container, byQName, byName, imps[e.file])
+	var out javaScopeSymbol
+	n := 0
+	for _, s := range byQName[javaEdgeOwner(e)+"."+e.name] {
+		if s.language == "java" && s.kind == "type" && s.container == e.container {
+			out = s
+			n++
+		}
+	}
+	return out, n == 1
+}
+
+func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport) (javaScopeSymbol, string) {
+	var t javaScopeSymbol
+	var ok bool
+	switch {
+	case e.evidence == graph.JavaOwnMemberTypeEvidence:
+		t, ok = javaOwnMemberType(e, byQName)
+	case e.evidence == graph.JavaLocalTypeScopeEvidence || !javaUnqualifiedCreation(e.evidence):
+	default:
+		t, ok, _ = javaType(e.name, e.pkg, e.container, byQName, byName, imps[e.file])
+	}
 	if !ok {
 		return javaScopeSymbol{}, ""
 	}

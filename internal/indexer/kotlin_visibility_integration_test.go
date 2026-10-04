@@ -194,7 +194,7 @@ func TestKotlinV7ToV8VisibilityConvergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v7-to-v8 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"lib/Vis.kt": "treesitter:kotlin:v11", "lib/Service.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v6", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"lib/Vis.kt": "treesitter:kotlin:v11", "lib/Service.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v7", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}
