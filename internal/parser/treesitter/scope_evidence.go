@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 
+	sitter "github.com/smacker/go-tree-sitter"
+
 	"github.com/isink17/codegraph/internal/graph"
 )
 
@@ -33,7 +35,12 @@ func legacyPackageEvidence(content []byte, language string) string {
 	return ""
 }
 
-func addJavaScope(text string, out *[]graph.ScopeImport) {
+// legacyJavaScope is the raw-text import rule of treesitter:java:v9 and
+// earlier: it stripped a leading "static" from the name even when no
+// whitespace followed it (`import staticpkg.Bag;` recorded pkg.Bag) and missed
+// `static` followed by a tab, newline or comment. It is kept only for the
+// legacy adapters that reproduce those profiles.
+func legacyJavaScope(text string, out *[]graph.ScopeImport) {
 	text = strings.TrimSpace(strings.TrimSuffix(text, ";"))
 	text = strings.TrimSpace(strings.TrimPrefix(text, "import"))
 	static := strings.HasPrefix(text, "static ")
@@ -46,6 +53,47 @@ func addJavaScope(text string, out *[]graph.ScopeImport) {
 	}
 	if wildcard {
 		local = ""
+	}
+	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: local, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard, Static: static})
+}
+
+// addJavaScope records an import_declaration from its syntax nodes: the
+// `static` keyword token, the identifier leaves of the name and the asterisk
+// of an on-demand import. Whitespace and comments between tokens are not part
+// of the name, and a package whose name begins with "static" keeps it. A
+// declaration with a syntax error keeps its raw spelling, which is no dotted
+// name, so the store refuses to resolve through it.
+func addJavaScope(imp *sitter.Node, content []byte, out *[]graph.ScopeImport) {
+	if imp.HasError() {
+		*out = append(*out, graph.ScopeImport{SourceSpecifier: nodeText(imp, content), Kind: graph.ScopeImportNamed})
+		return
+	}
+	var static, wildcard bool
+	var parts []string
+	for i := range int(imp.ChildCount()) {
+		child := imp.Child(i)
+		switch child.Type() {
+		case "static":
+			static = true
+		case "asterisk":
+			wildcard = true
+		case "identifier":
+			parts = []string{nodeText(child, content)}
+		case "scoped_identifier":
+			parts = parts[:0]
+			for _, id := range findDescendants(child, "identifier") {
+				parts = append(parts, nodeText(id, content))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		*out = append(*out, graph.ScopeImport{SourceSpecifier: nodeText(imp, content), Kind: graph.ScopeImportNamed})
+		return
+	}
+	name := strings.Join(parts, ".")
+	local := ""
+	if !wildcard {
+		local = parts[len(parts)-1]
 	}
 	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: local, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard, Static: static})
 }

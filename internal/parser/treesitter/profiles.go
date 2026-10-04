@@ -27,7 +27,11 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:python:v8", EmitsCallEdges: true}
 }
 
-// Java v9 marks an unqualified construction in a class that, with every
+// Java v10 reads imports from their syntax nodes: a package whose name begins
+// with "static" keeps it (v9 recorded `import staticpkg.Bag;` as pkg.Bag), and
+// `static` followed by a tab, newline or comment, or comments and whitespace
+// inside the name, no longer change the import.
+// v9 marks an unqualified construction in a class that, with every
 // class enclosing it, spells no supertype (graph.JavaNoInheritedTypeEvidence),
 // so a member type declared elsewhere no longer blocks the package or import
 // type of that name.
@@ -68,7 +72,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyNoInherited {
 		return parser.Profile{ID: "treesitter:java:v8", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:java:v9", EmitsCallEdges: true}
+	if a.legacyImportText {
+		return parser.Profile{ID: "treesitter:java:v9", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v10", EmitsCallEdges: true}
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.
