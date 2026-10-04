@@ -20,7 +20,7 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		"python":     {"python-regex:python:v8", true},
 		"java":       {"heuristic:java:v1", false},
 		"kotlin":     {"heuristic:kotlin:v4", false},
-		"csharp":     {"heuristic:csharp:v4", false},
+		"csharp":     {"heuristic:csharp:v5", false},
 		"typescript": {"heuristic:typescript:v1", false},
 		"rust":       {"heuristic:rust:v1", false},
 		"ruby":       {"heuristic:ruby:v1", false},

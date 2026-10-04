@@ -24,6 +24,7 @@ type symbolPattern struct {
 }
 
 var heredocStartRE = regexp.MustCompile(`<<[-~]?['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+var heuristicCSharpStaticRE = regexp.MustCompile(`^static\s+`)
 var heuristicCSharpNamespaceRE = regexp.MustCompile(`(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_.]*)\s*(?:;|\{)`)
 
 type Adapter struct {
@@ -630,16 +631,22 @@ func quoteRun(line string, i int) int {
 func (a *Adapter) Profile() parser.Profile {
 	version := "v1"
 	// v4 handles raw and verbatim strings without leaking scope text.
-	if a.language == "csharp" || a.language == "kotlin" {
+	if a.language == "kotlin" {
 		version = "v4"
+	}
+	// C# v5 recognises `using static` followed by any whitespace.
+	if a.language == "csharp" {
+		version = "v5"
 	}
 	return parser.Profile{ID: "heuristic:" + a.language + ":" + version, EmitsCallEdges: false}
 }
 
 func heuristicCSharpImport(value string) graph.ScopeImport {
 	value = strings.TrimSpace(value)
-	if strings.HasPrefix(value, "static ") {
-		return graph.ScopeImport{SourceSpecifier: strings.TrimSpace(strings.TrimPrefix(value, "static ")), Kind: "static", Static: true}
+	// `static` is a keyword only when whitespace of any kind follows it;
+	// `staticns` is a namespace name.
+	if m := heuristicCSharpStaticRE.FindString(value); m != "" {
+		return graph.ScopeImport{SourceSpecifier: strings.TrimSpace(value[len(m):]), Kind: "static", Static: true}
 	}
 	if i := strings.Index(value, "="); i >= 0 {
 		source := strings.TrimSpace(value[i+1:])

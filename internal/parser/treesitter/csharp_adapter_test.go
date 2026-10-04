@@ -257,3 +257,55 @@ namespace B { class CallerB {} }`,
 		}
 	}
 }
+
+// C# using-directive evidence comes from the declaration's tokens. Spec: C#
+// 12 §14.5 using_directive (using_alias_directive, using_namespace_directive,
+// using_static_directive); `global` and `static` are keyword tokens, never a
+// prefix of the name that follows. No C# compiler was available.
+func TestCSharpUsingEvidenceFromSyntax(t *testing.T) {
+	for _, c := range []struct {
+		decl, source, local, kind string
+		static                    bool
+		raw                       bool // untrusted: raw spelling, kind named
+	}{
+		{"using staticns;", "staticns", "staticns", "namespace", false, false},
+		{"using globalns;", "globalns", "globalns", "namespace", false, false},
+		{"using static staticns.Util;", "staticns.Util", "Util", "static", true, false},
+		{"using static\tns.Util;", "ns.Util", "Util", "static", true, false},
+		{"using static\nns.Util;", "ns.Util", "Util", "static", true, false},
+		{"using /*c*/ static /*d*/ ns . /*e*/ Util;", "ns.Util", "Util", "static", true, false},
+		{"global using staticns;", "staticns", "staticns", "global_namespace", false, false},
+		{"global\tusing\tstatic\tns.Util;", "ns.Util", "Util", "global_static", true, false},
+		{"using A = staticns.Util;", "staticns.Util", "A", "alias", false, false},
+		{"global using A = ns.Util;", "ns.Util", "A", "global_alias", false, false},
+		{"using ns\t.\tUtil;", "ns.Util", "Util", "namespace", false, false},
+		{"using a.;", "using a.;", "", "named", false, true},
+		{"using static;", "using static;", "", "named", false, true},
+		{"using ns.*;", "using ns.*;", "", "named", false, true},
+		{"using unsafe ns.Util;", "using unsafe ns.Util;", "", "named", false, true},
+		{"using static A = ns.Util;", "using static A = ns.Util;", "", "named", false, true},
+	} {
+		p, err := NewCSharp().Parse(context.Background(), "C.cs", []byte(c.decl+"\nclass C {}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Scope.Imports) != 1 {
+			t.Fatalf("%q: imports = %+v", c.decl, p.Scope.Imports)
+		}
+		got := p.Scope.Imports[0]
+		if got.SourceSpecifier != c.source || got.LocalName != c.local || got.Kind != c.kind || got.Static != c.static {
+			t.Errorf("%q: import = %+v, want source %q local %q kind %q static %v", c.decl, got, c.source, c.local, c.kind, c.static)
+		}
+		if c.raw && len(p.Imports) != 0 {
+			t.Errorf("%q: untrusted import leaked into Imports %v", c.decl, p.Imports)
+		}
+	}
+	// The v4 text rule survives only in the legacy adapter.
+	p, err := NewCSharpV4().Parse(context.Background(), "C.cs", []byte("using staticns;\nclass C {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Scope.Imports) != 1 || p.Scope.Imports[0].SourceSpecifier != "ns" {
+		t.Fatalf("v4 imports = %+v, want the legacy ns", p.Scope.Imports)
+	}
+}

@@ -15,9 +15,18 @@ import (
 )
 
 // CSharpAdapter parses C# source files using tree-sitter.
-type CSharpAdapter struct{}
+type CSharpAdapter struct {
+	// legacyImportText reproduces treesitter:csharp:v4, which read using
+	// directives from raw text (csLegacyUsing).
+	legacyImportText bool
+}
 
 func NewCSharp() *CSharpAdapter { return &CSharpAdapter{} }
+
+// NewCSharpV4 returns a parser that reports treesitter:csharp:v4 and reads
+// using directives from raw text, so `using staticns;` names ns. It exists
+// only to reproduce v4 databases in profile-transition tests.
+func NewCSharpV4() *CSharpAdapter { return &CSharpAdapter{legacyImportText: true} }
 
 func (a *CSharpAdapter) Language() string     { return "csharp" }
 func (a *CSharpAdapter) Extensions() []string { return []string{".cs"} }
@@ -38,7 +47,7 @@ func (a *CSharpAdapter) Parse(ctx context.Context, path string, content []byte) 
 		FileTokens: computeFileTokens(content),
 	}
 
-	csExtractImports(root, "", content, &pf)
+	csExtractImports(root, "", content, &pf, a.legacyImportText)
 	csExtractSymbols(root, "", "", content, &pf)
 	if namespaces := csNamespaces(root, content); len(namespaces) == 1 && csTruthfulFileNamespace(pf.Symbols, namespaces[0]) {
 		pf.Scope.Package = namespaces[0]
@@ -50,50 +59,217 @@ func (a *CSharpAdapter) Parse(ctx context.Context, path string, content []byte) 
 	return pf, nil
 }
 
-func csExtractImports(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+func csExtractImports(node *sitter.Node, owner string, content []byte, pf *graph.ParsedFile, legacyText bool) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		switch child.Type() {
 		case "using_directive":
-			text := strings.TrimSpace(strings.TrimSuffix(nodeText(child, content), ";"))
-			global := strings.HasPrefix(text, "global ")
-			text = strings.TrimSpace(strings.TrimPrefix(text, "global"))
-			text = strings.TrimSpace(strings.TrimPrefix(text, "using"))
-			static := strings.HasPrefix(text, "static ")
-			text = strings.TrimSpace(strings.TrimPrefix(text, "static"))
-			local, source := "", text
-			kind := graph.ScopeImportNamed
-			if eq := strings.Index(source, "="); eq >= 0 {
-				local = strings.TrimSpace(source[:eq])
-				source = strings.TrimSpace(source[eq+1:])
-				kind = "alias"
+			var u csUsing
+			if legacyText {
+				u = csLegacyUsing(nodeText(child, content))
 			} else {
-				kind = "namespace"
-				if dot := strings.LastIndexByte(source, '.'); dot >= 0 {
-					local = source[dot+1:]
-				} else {
-					local = source
-				}
+				u = csUsingFromSyntax(child, content)
 			}
-			if static {
-				kind = "static"
+			if u.source == "" {
+				continue
 			}
-			if global {
-				kind = "global_" + kind
+			if u.trusted {
+				pf.Imports = append(pf.Imports, u.source)
 			}
-			if source != "" {
-				pf.Imports = append(pf.Imports, source)
-				pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{SourceSpecifier: source, ImportedName: source, LocalName: local, Kind: kind, Static: static, OwnerModule: owner})
-			}
+			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{SourceSpecifier: u.source, ImportedName: u.imported, LocalName: u.local, Kind: u.kind, Static: u.static, OwnerModule: owner})
 		case "namespace_declaration":
 			name := nodeText(childByFieldName(child, "name"), content)
 			if body := childByFieldName(child, "body"); body != nil {
-				csExtractImports(body, csJoinQName(owner, name), content, pf)
+				csExtractImports(body, csJoinQName(owner, name), content, pf, legacyText)
 			}
 		case "ERROR":
-			csExtractImports(child, owner, content, pf)
+			csExtractImports(child, owner, content, pf, legacyText)
 		}
 	}
+}
+
+// csUsing is one using directive as import evidence.
+type csUsing struct {
+	source, imported, local, kind string
+	static, trusted               bool
+}
+
+// csLegacyUsing is the raw-text rule of treesitter:csharp:v4 and earlier. It
+// stripped a leading "static" or "global" from the text even when no
+// whitespace followed it (`using staticns;` recorded ns) and missed `static`
+// followed by a tab or newline. Kept only for the legacy adapter.
+func csLegacyUsing(raw string) csUsing {
+	text := strings.TrimSpace(strings.TrimSuffix(raw, ";"))
+	global := strings.HasPrefix(text, "global ")
+	text = strings.TrimSpace(strings.TrimPrefix(text, "global"))
+	text = strings.TrimSpace(strings.TrimPrefix(text, "using"))
+	static := strings.HasPrefix(text, "static ")
+	text = strings.TrimSpace(strings.TrimPrefix(text, "static"))
+	u := csUsing{source: text, trusted: true}
+	if eq := strings.Index(text, "="); eq >= 0 {
+		u.local = strings.TrimSpace(text[:eq])
+		u.source = strings.TrimSpace(text[eq+1:])
+		u.kind = "alias"
+	} else {
+		u.kind = "namespace"
+		u.local = u.source
+		if dot := strings.LastIndexByte(u.source, '.'); dot >= 0 {
+			u.local = u.source[dot+1:]
+		}
+	}
+	u.imported = u.source
+	if static {
+		u.kind, u.static = "static", true
+	}
+	if global {
+		u.kind = "global_" + u.kind
+	}
+	return u
+}
+
+// csUsingFromSyntax reads a using_directive from its tokens: the `global`,
+// `static` and `unsafe` keywords, the alias identifier before `=`, and the
+// identifier leaves of the named namespace or type. Whitespace and comments
+// between tokens are not part of the name, and a namespace whose name begins
+// with "static" or "global" keeps it. A directive with a syntax error, a
+// name that is not a plain dotted identifier, or a modifier combination C#
+// does not allow (`using static A = X;`, `using unsafe N;`) is untrusted: it
+// keeps its raw spelling, which names nothing, so resolution cannot bind
+// through it.
+func csUsingFromSyntax(dir *sitter.Node, content []byte) csUsing {
+	untrusted := csUsing{source: strings.TrimSpace(nodeText(dir, content)), kind: graph.ScopeImportNamed}
+	if dir.HasError() {
+		return untrusted
+	}
+	var global, static, unsafe bool
+	var alias, name *sitter.Node
+	sawEq := false
+	for i := range int(dir.ChildCount()) {
+		child := dir.Child(i)
+		switch child.Type() {
+		case "global":
+			global = true
+		case "static":
+			static = true
+		case "unsafe":
+			unsafe = true
+		case "=":
+			sawEq = true
+		case "identifier", "qualified_name", "generic_name", "alias_qualified_name", "predefined_type", "nullable_type", "array_type", "pointer_type", "tuple_type":
+			if sawEq || (alias == nil && name == nil) {
+				if !sawEq && child.Type() == "identifier" && csNextIsEquals(dir, i) {
+					alias = child
+				} else {
+					name = child
+				}
+			} else {
+				return untrusted
+			}
+		}
+	}
+	if name == nil || (alias != nil) != sawEq || (alias != nil && static) || (alias == nil && unsafe) {
+		return untrusted
+	}
+	parts, ok := csDottedIdentifiers(name, content)
+	if !ok {
+		if alias == nil {
+			return untrusted
+		}
+		// An alias to a type that is no plain dotted name (`A = N.B<int>`,
+		// `A = int`) still declares the alias, which shadows other
+		// bindings of that name; its target names no symbol.
+		spelled := csTokenText(name, content)
+		u := csUsing{source: spelled, imported: spelled, local: nodeText(alias, content), kind: "alias", trusted: true}
+		if global {
+			u.kind = "global_alias"
+		}
+		return u
+	}
+	source := strings.Join(parts, ".")
+	u := csUsing{source: source, imported: source, trusted: true}
+	switch {
+	case alias != nil:
+		u.kind, u.local = "alias", nodeText(alias, content)
+	case static:
+		u.kind, u.static, u.local = "static", true, parts[len(parts)-1]
+	default:
+		u.kind, u.local = "namespace", parts[len(parts)-1]
+	}
+	if global {
+		u.kind = "global_" + u.kind
+	}
+	return u
+}
+
+// csTokenText is the text of a node's leaf tokens without comments, with one
+// space only where two adjacent tokens would otherwise fuse into one word.
+func csTokenText(node *sitter.Node, content []byte) string {
+	var b strings.Builder
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n.Type() == "comment" {
+			return
+		}
+		if n.ChildCount() == 0 {
+			t := nodeText(n, content)
+			if cur := b.String(); cur != "" && t != "" && csWordByte(cur[len(cur)-1]) && csWordByte(t[0]) {
+				b.WriteByte(' ')
+			}
+			b.WriteString(t)
+			return
+		}
+		for i := range int(n.ChildCount()) {
+			walk(n.Child(i))
+		}
+	}
+	walk(node)
+	return b.String()
+}
+
+func csWordByte(c byte) bool {
+	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80
+}
+
+// csNextIsEquals reports whether the next non-comment sibling after index i
+// is the `=` token.
+func csNextIsEquals(dir *sitter.Node, i int) bool {
+	for j := i + 1; j < int(dir.ChildCount()); j++ {
+		switch dir.Child(j).Type() {
+		case "comment":
+			continue
+		case "=":
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// csDottedIdentifiers returns the identifier leaves of an identifier or a
+// qualified_name built only from identifiers, skipping comments. Anything
+// else (generic, alias-qualified `global::N`, predefined, tuple, pointer) is
+// not a plain dotted name.
+func csDottedIdentifiers(node *sitter.Node, content []byte) ([]string, bool) {
+	switch node.Type() {
+	case "identifier":
+		return []string{nodeText(node, content)}, true
+	case "qualified_name":
+		var parts []string
+		for i := range int(node.ChildCount()) {
+			child := node.Child(i)
+			switch child.Type() {
+			case "comment", ".":
+			default:
+				sub, ok := csDottedIdentifiers(child, content)
+				if !ok {
+					return nil, false
+				}
+				parts = append(parts, sub...)
+			}
+		}
+		return parts, len(parts) >= 2
+	}
+	return nil, false
 }
 
 func csExtractSymbols(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {

@@ -107,8 +107,15 @@ func (a *KotlinAdapter) Profile() parser.Profile {
 	}
 	return parser.Profile{ID: "treesitter:kotlin:v11", EmitsCallEdges: true}
 }
+
+// C# v5 reads using directives from their syntax tokens: a namespace whose
+// name begins with "static" keeps it (v4 recorded `using staticns;` as ns),
+// and `static` followed by a tab, newline or comment is a static using.
 func (a *CSharpAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}
+	if a.legacyImportText {
+		return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:csharp:v5", EmitsCallEdges: true}
 }
 func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
 
