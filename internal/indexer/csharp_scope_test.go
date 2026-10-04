@@ -562,7 +562,7 @@ func TestCSharpScopeF3RelativeNamespaceLookup(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
 		"Global.cs":     `public class Service { public static void Run() {} }`,
-		"A.cs":          `namespace A; public class Service { public static void Run() {} }`,
+		"A.cs":          `namespace A; public class Service { public static void Run() {} } public class OnlyA { public static void Run() {} }`,
 		"AB.cs":         `namespace A.B; public class Service { public static void Run() {} }`,
 		"XService.cs":   `namespace X; public class Service { public static void Run() {} }`,
 		"XABService.cs": `namespace X.A.B; public class Service { public static void Run() {} }`,
@@ -570,7 +570,7 @@ func TestCSharpScopeF3RelativeNamespaceLookup(t *testing.T) {
 class Caller { void F() { Service.Run(); A.B.Service.Run(); global::A.B.Service.Run(); } }`,
 		"UsingCaller.cs": `using A;
 namespace Y;
-class Caller { void F() { Service.Run(); } }`,
+class Caller { void F() { OnlyA.Run(); } }`,
 		"GlobalCaller.cs": `namespace Z;
 class Caller { void F() { Service.Run(); } }`,
 	}
@@ -599,7 +599,7 @@ class Caller { void F() { Service.Run(); } }`,
 		"Caller.cs:Service.Run":             "X.Service.Run",
 		"Caller.cs:A.B.Service.Run":         "X.A.B.Service.Run",
 		"Caller.cs:global::A.B.Service.Run": "A.B.Service.Run",
-		"UsingCaller.cs:Service.Run":        "A.Service.Run",
+		"UsingCaller.cs:OnlyA.Run":          "A.OnlyA.Run",
 		"GlobalCaller.cs:Service.Run":       "Service.Run",
 	}
 	seen := map[string]bool{}
@@ -672,7 +672,9 @@ namespace Y; class Caller { void F() { Service.Run(); } }`)
 	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"UsingCaller.cs"}}); err != nil {
 		t.Fatal(err)
 	}
-	assertTarget("UsingCaller.cs", "Service.Run", "A.Service.Run")
+	// A global Service competes with the using-imported A.Service, and an
+	// empty-owner directive may sit at the file-scoped level: refused.
+	assertTarget("UsingCaller.cs", "Service.Run", "")
 	write("UsingCaller.cs", `namespace Y; class Caller { void F() { Service.Run(); } }`)
 	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"UsingCaller.cs"}}); err != nil {
 		t.Fatal(err)

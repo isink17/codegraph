@@ -476,38 +476,96 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 	if global {
 		return decide([]string{qualifier}, false)
 	}
-	var aliases []string
-	for _, i := range imports {
-		if i.owner == namespace || i.owner == "" {
-			if i.kind == "alias" && i.local == qualifier && !strings.HasPrefix(i.kind, "global_") {
-				aliases = append(aliases, i.source)
-			}
-		}
-	}
-	if len(aliases) > 0 {
-		return decide(aliases, true)
-	}
+	// Lookup follows C# 7.7.1: for each namespace level from the innermost
+	// outwards, a type declared in that level wins, then an alias, then the
+	// types imported by that level's using-namespace directives. Evidence
+	// carries only the canonical namespace of a directive's owner, never the
+	// declaration that encloses the call. Imports owned by an enclosing
+	// namespace are therefore not applied, and a result an import could
+	// overturn by sitting at a different level than assumed is refused.
+	levels := []string{}
 	for current := namespace; current != ""; {
-		candidate := current + "." + qualifier
-		if len(semanticTypes([]string{candidate})) > 0 {
-			return decide([]string{candidate}, false)
-		}
+		levels = append(levels, current)
 		if dot := strings.LastIndexByte(current, '.'); dot >= 0 {
 			current = current[:dot]
 		} else {
 			current = ""
 		}
 	}
-	var usingTypes []string
-	for _, i := range imports {
-		if (i.owner == namespace || i.owner == "") && i.kind == "namespace" && !strings.HasPrefix(i.kind, "global_") {
-			usingTypes = append(usingTypes, i.source+"."+qualifier)
+	levels = append(levels, "")
+	candidate := func(level string) string {
+		if level == "" {
+			return qualifier
+		}
+		return level + "." + qualifier
+	}
+	imported := func(owner string) (aliases, namespaces []string) {
+		for _, i := range imports {
+			if i.owner != owner {
+				continue
+			}
+			switch i.kind {
+			case "alias":
+				if i.local == qualifier {
+					aliases = append(aliases, i.source)
+				}
+			case "namespace":
+				namespaces = append(namespaces, i.source+"."+qualifier)
+			}
+		}
+		return aliases, namespaces
+	}
+	// Directives with an empty owner are compilation-unit or file-scoped
+	// namespace directives; evidence cannot tell which level they sit at.
+	rootAliases, rootNamespaces := imported("")
+	rootTypes := semanticTypes(append(append([]string{}, rootAliases...), rootNamespaces...))
+	conflicts := func(qname string, qnames ...string) bool {
+		return len(qnames) > 0 && (len(qnames) != 1 || qnames[0] != qname)
+	}
+	for index, level := range levels {
+		ownType := semanticTypes([]string{candidate(level)})
+		var aliases, namespaces []string
+		if level == namespace {
+			aliases, namespaces = imported(level)
+		}
+		if len(ownType) > 0 || len(aliases) > 0 || len(semanticTypes(namespaces)) > 0 {
+			var qname string
+			var alias, ok bool
+			fromImport := len(ownType) == 0
+			switch {
+			case len(ownType) > 0 && len(aliases) > 0:
+				return "", true, false
+			case len(ownType) > 0:
+				qname, alias, ok = decide([]string{candidate(level)}, false)
+			case len(aliases) > 0:
+				qname, alias, ok = decide(aliases, true)
+			default:
+				qname, alias, ok = decide(namespaces, false)
+			}
+			if !ok {
+				return "", alias, false
+			}
+			if fromImport && level != "" {
+				for _, outer := range levels[index+1:] {
+					if conflicts(qname, semanticTypes([]string{candidate(outer)})...) {
+						return "", alias, false
+					}
+				}
+			}
+			if namespace != "" && !(level == namespace && !fromImport) && conflicts(qname, rootTypes...) {
+				return "", alias, false
+			}
+			if namespace != "" && level == "" && !fromImport && len(rootAliases) > 0 {
+				return "", true, false
+			}
+			return qname, alias, true
 		}
 	}
-	if len(semanticTypes(usingTypes)) > 0 {
-		return decide(usingTypes, false)
+	// Directives with an empty owner at the global level.
+	if len(rootAliases) > 0 {
+		return decide(rootAliases, true)
 	}
-	return decide([]string{qualifier}, false)
+	return decide(rootNamespaces, false)
 }
 
 func csharpTypeAccessibleByQName(qname, sourceContainer string, byQName map[string][]csharpScopeSymbol) bool {
