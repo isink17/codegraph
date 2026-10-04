@@ -63,6 +63,22 @@ func TestCSharpNamespaceLevelLookupOrder(t *testing.T) {
 		{"file-scoped using vs outer type is unproven scope", map[string]string{"Defs.cs": defs, "App.cs": "namespace a.b;\nusing staticns;\n" + call}, ""},
 		{"outer type without import still binds", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { ` + call + ` }`}, "a.Util.Run"},
 		{"enclosing declaration using is not applied but own type wins", map[string]string{"Defs.cs": defs, "App.cs": `namespace a { using staticns; namespace b { ` + call + ` } }`}, "a.Util.Run"},
+		// -- a directive owned by an ancestor namespace is never applied, but
+		// it may preempt a more outer type: the edge is refused, not bound
+		{"ancestor using vs outer type", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { using other; namespace c { ` + call + ` } }`}, ""},
+		{"ancestor alias vs outer type", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { using Util = other.Util; namespace c { ` + call + ` } }`}, ""},
+		{"ancestor alias to an unindexed type vs outer type", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { using Util = ext.Thing; namespace c { ` + call + ` } }`}, ""},
+		{"ancestor using supplying the same type", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { using a; namespace c { ` + call + ` } }`}, "a.Util.Run"},
+		{"ancestor using vs root using", map[string]string{"Defs.cs": defs, "App.cs": `using staticns; namespace q.r { using other; namespace c { ` + call + ` } }`}, ""},
+		{"ancestor using, nothing outer binds", map[string]string{"Defs.cs": `namespace other { public static class Util { public static void Run() {} } }`, "App.cs": `namespace a.b { using other; namespace c { ` + call + ` } }`}, ""},
+		{"ancestor using with no matching type", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { using System; namespace c { ` + call + ` } }`}, "a.Util.Run"},
+		{"ancestor using of an unrelated name", map[string]string{"Defs.cs": defs + `namespace other2 { public static class Helper { } }`, "App.cs": `namespace a.b { using other2; namespace c { ` + call + ` } }`}, "a.Util.Run"},
+		{"ancestor using beyond the supplying level", map[string]string{"Defs.cs": defs, "App.cs": `namespace a { using other; namespace b.c { ` + call + ` } }`}, "a.Util.Run"},
+		{"own-level using still wins over ancestor and outer", map[string]string{"Defs.cs": csharpPrecedenceDefs, "App.cs": `namespace a.b { using other; namespace c { using staticns; ` + call + ` } }`}, ""},
+		{"own-level type beats ancestor using", map[string]string{"Defs.cs": defs + `namespace a.b.c { public static class Util { public static void Run() {} } }`, "App.cs": `namespace a.b { using other; namespace c { ` + call + ` } }`}, "a.b.c.Util.Run"},
+		{"ancestor using, file-scoped caller", map[string]string{"Defs.cs": defs, "App.cs": "namespace a.b.c;\n" + call + "\nnamespace a.b { using other; }"}, ""},
+		{"using in another file's declaration of the ancestor is out of scope", map[string]string{"Defs.cs": defs, "Other.cs": `namespace a.b { using other; }`, "App.cs": `namespace a.b { namespace c { ` + call + ` } }`}, "a.Util.Run"},
+		{"reopened ancestor in the same file", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { using other; } namespace a.b { namespace c { ` + call + ` } }`}, ""},
 		{"explicit global qualification", map[string]string{"Defs.cs": defs, "App.cs": `namespace a.b { using staticns; class Caller { void M() { global::a.Util.Run(); } } }`}, "a.Util.Run"},
 	}
 	for _, tc := range cases {
@@ -77,6 +93,43 @@ func TestCSharpNamespaceLevelLookupOrder(t *testing.T) {
 			}
 			assertCSharpFreshParity(t, s, root)
 		})
+	}
+}
+
+// The ancestor refusal follows edits made through both update shapes and a
+// repeated update changes nothing; every step matches a fresh index.
+func TestCSharpAncestorUsingFollowsIncrementalChanges(t *testing.T) {
+	steps := []struct{ name, app, want string }{
+		{"no ancestor using", `namespace a.b { namespace c { class Caller { void M() { Util.Run(); } } } }`, "a.Util.Run"},
+		{"ancestor using added", `namespace a.b { using other; namespace c { class Caller { void M() { Util.Run(); } } } }`, ""},
+		{"ancestor alias", `namespace a.b { using Util = other.Util; namespace c { class Caller { void M() { Util.Run(); } } } }`, ""},
+		{"ancestor using removed", `namespace a.b { namespace c { class Caller { void M() { Util.Run(); } } } }`, "a.Util.Run"},
+	}
+	for _, scoped := range []bool{true, false} {
+		s, idx, root := indexCSharpFiles(t, map[string]string{"Defs.cs": csharpPrecedenceDefs, "App.cs": steps[0].app})
+		for _, step := range steps {
+			if err := os.WriteFile(filepath.Join(root, "App.cs"), []byte(step.app), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			opts := Options{RepoRoot: root, ScanKind: "update"}
+			if scoped {
+				opts.Paths = []string{"App.cs"}
+			}
+			if _, err := idx.Update(context.Background(), opts); err != nil {
+				t.Fatal(err)
+			}
+			if got := csharpTarget(t, s, root, "App.cs", "Util.Run"); got != step.want {
+				t.Fatalf("scoped=%v %s: target=%q, want %q", scoped, step.name, got, step.want)
+			}
+			assertCSharpFreshParity(t, s, root)
+			before := csharpProjection(t, s, root)
+			if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update"}); err != nil {
+				t.Fatal(err)
+			}
+			if after := csharpProjection(t, s, root); len(before) != len(after) {
+				t.Fatalf("%s: repeated update changed edges: %v -> %v", step.name, before, after)
+			}
+		}
 	}
 }
 

@@ -482,7 +482,8 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 	// carries only the canonical namespace of a directive's owner, never the
 	// declaration that encloses the call. Imports owned by an enclosing
 	// namespace are therefore not applied, and a result an import could
-	// overturn by sitting at a different level than assumed is refused.
+	// overturn by sitting at a different level than assumed is refused,
+	// including one an enclosing namespace's import could preempt.
 	levels := []string{}
 	for current := namespace; current != ""; {
 		levels = append(levels, current)
@@ -522,6 +523,27 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 	conflicts := func(qname string, qnames ...string) bool {
 		return len(qnames) > 0 && (len(qnames) != 1 || qnames[0] != qname)
 	}
+	// preempted reports whether a directive owned by an enclosing namespace
+	// level strictly inside the level that supplied qname could, by C# 7.7.1,
+	// supply the name first. Such a directive is never applied (the evidence
+	// cannot tell whether the call sits in its declaration), so it can only
+	// refuse: an alias of that name always, a using-namespace when it
+	// supplies a different indexed type. A namespace the graph has no type
+	// for is not modeled, as at the call's own level. found is the index of
+	// the supplying level; levels[0] is the call's own level, whose imports
+	// are applied, and the "" level carries root evidence handled above.
+	preempted := func(found int, qname string) bool {
+		for _, level := range levels[min(1, found):found] {
+			if level == "" {
+				continue
+			}
+			aliases, namespaces := imported(level)
+			if len(aliases) > 0 || conflicts(qname, semanticTypes(namespaces)...) {
+				return true
+			}
+		}
+		return false
+	}
 	for index, level := range levels {
 		ownType := semanticTypes([]string{candidate(level)})
 		var aliases, namespaces []string
@@ -558,14 +580,21 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 			if namespace != "" && level == "" && !fromImport && len(rootAliases) > 0 {
 				return "", true, false
 			}
+			if preempted(index, qname) {
+				return "", alias, false
+			}
 			return qname, alias, true
 		}
 	}
 	// Directives with an empty owner at the global level.
+	qname, alias, ok := decide(rootNamespaces, false)
 	if len(rootAliases) > 0 {
-		return decide(rootAliases, true)
+		qname, alias, ok = decide(rootAliases, true)
 	}
-	return decide(rootNamespaces, false)
+	if ok && preempted(len(levels), qname) {
+		return "", alias, false
+	}
+	return qname, alias, ok
 }
 
 func csharpTypeAccessibleByQName(qname, sourceContainer string, byQName map[string][]csharpScopeSymbol) bool {
