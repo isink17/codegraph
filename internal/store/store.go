@@ -4087,25 +4087,35 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 }
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
-	n, err := s.resolveEdgesRepoWide(ctx, repoID, nil, nil)
-	if err != nil {
-		return 0, err
-	}
-	if err := s.ReconcileReferenceIdentities(ctx, repoID); err != nil {
-		return 0, err
-	}
-	return n, nil
+	return s.ResolveEdgesRecordingPolicies(ctx, repoID, nil)
+}
+
+// ResolveEdgesRecordingPolicies is ResolveEdges that also records the given
+// languages as decided by the current resolver policy. Edges, reference
+// identities and markers are one transaction, so a marker never certifies a
+// state that did not commit with it.
+func (s *Store) ResolveEdgesRecordingPolicies(ctx context.Context, repoID int64, languages []string) (int, error) {
+	return s.resolveEdgesRepoWide(ctx, repoID, nil, func(tx *sql.Tx) error {
+		if err := reconcileReferenceIdentities(ctx, tx, repoID); err != nil {
+			return err
+		}
+		return s.stampResolverPolicies(ctx, tx, repoID, languages)
+	})
 }
 
 // resolveEdgesRepoWide resolves the repository graph in one transaction.
 //
-// A non-empty languages narrows only what is cleared up front: edges whose
-// source file is in those languages. Every strategy below binds unresolved
-// edges, so the other languages' standing bindings are neither read nor
-// rewritten, while their unresolved edges are re-decided to the same answer.
+// A non-empty languages scopes every write, not only the clear: only edges whose
+// source file is in those languages are cleared or bound. Another language's
+// edges -- bound, unresolved from an older resolver, or decided by a newer
+// binary -- are never written, so a pass for one language cannot decide
+// another's. Passes of an unselected language are skipped (or, where a later
+// gate reads their veto table, run over no edges), and the repo-wide strategies
+// carry resolverScope.writeGate.
 // finish runs inside the transaction before it commits.
 func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, languages []string, finish func(*sql.Tx) error) (int, error) {
 	totalResolved := 0
+	scope := newResolverScope(languages)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -4141,27 +4151,27 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
-	if n, err := s.resolveSwiftInitializerScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := s.resolveSwiftInitializerScope(ctx, tx, repoID, scope.only("swift")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, err := s.resolveSwiftScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := s.resolveSwiftScope(ctx, tx, repoID, scope.only("swift")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, err := s.resolveSwiftClassSelf(ctx, tx, repoID, nil); err != nil {
+	if n, err := s.resolveSwiftClassSelf(ctx, tx, repoID, scope.only("swift")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, err := s.resolveSwiftSuperScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := s.resolveSwiftSuperScope(ctx, tx, repoID, scope.only("swift")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, err := resolveCSharpScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := resolveCSharpScope(ctx, tx, repoID, scope.only("csharp")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
@@ -4169,7 +4179,7 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	// PHP scoped calls: bound by namespace/import/type evidence or left
 	// unresolved; phpScopeVetoSQL keeps every strategy below off them and off
 	// PHP member calls. See php_scope.go.
-	if n, err := resolvePHPScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := resolvePHPScope(ctx, tx, repoID, scope.only("php")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
@@ -4177,48 +4187,54 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	// Ruby implicit/self calls: bound from the caller's own semantic container
 	// and staticness, or left unresolved; rubyScopeVetoSQL keeps every strategy
 	// below off every other ordinary Ruby call. See ruby_scope.go.
-	if n, err := resolveRubyScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := resolveRubyScope(ctx, tx, repoID, scope.only("ruby")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, err := resolveJavaScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := resolveJavaScope(ctx, tx, repoID, scope.only("java")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, err := resolveKotlinScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := resolveKotlinScope(ctx, tx, repoID, scope.only("kotlin")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, err := resolveTypeScriptScope(ctx, tx, repoID, nil); err != nil {
+	if n, err := resolveTypeScriptScope(ctx, tx, repoID, scope.only("typescript")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if n, _, err := resolvePythonScope(ctx, tx, repoID, nil, true); err != nil {
+	if n, _, err := resolvePythonScope(ctx, tx, repoID, scope.only("python"), true); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
 	}
-	if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
-		return 0, err
+	if scope.has("rust") {
+		if _, err := resolveRustModuleScope(ctx, tx, repoID, nil); err != nil {
+			return 0, err
+		}
 	}
-	if targets, err := unresolvedCppEvidenceTargets(ctx, tx, repoID); err != nil {
-		return 0, err
-	} else if n, err := resolveCppEvidenceEdgesWith(ctx, tx, tx, repoID, targets); err != nil {
-		return 0, err
-	} else {
-		totalResolved += n
+	if scope.has("cpp") {
+		if targets, err := unresolvedCppEvidenceTargets(ctx, tx, repoID); err != nil {
+			return 0, err
+		} else if n, err := resolveCppEvidenceEdgesWith(ctx, tx, tx, repoID, targets); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
-	if n, _, err := s.resolveOwnModuleImports(ctx, tx, repoID, nil); err != nil {
-		return 0, err
-	} else {
-		totalResolved += n
+	if scope.has("go") {
+		if n, _, err := s.resolveOwnModuleImports(ctx, tx, repoID, nil); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
 	}
 	// Go selector calls on a locally bound qualifier are answered by the
 	// receiver's proven type before any repo-wide strategy runs, and
@@ -4226,19 +4242,23 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	// including the ones that would otherwise rebuild the very miswire this
 	// slice removed, since `x.Method` matches a package function's dot_tail2 by
 	// construction. See go_receiver_scope.go.
-	if n, err := s.resolveGoReceiverScope(ctx, tx, repoID, nil); err != nil {
-		return 0, err
-	} else {
-		totalResolved += n
+	if scope.has("go") {
+		if n, err := s.resolveGoReceiverScope(ctx, tx, repoID, nil); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
 	}
 	// Go bare calls are answered by their own package before any repo-wide
 	// strategy runs, and resolverGoBareScopeSQL keeps those strategies off them
 	// afterwards. See go_package_scope.go for why package scope cannot be
 	// expressed as a filter on a repo-wide candidate group.
-	if n, err := s.resolveGoPackageScopedBareNames(ctx, tx, repoID); err != nil {
-		return 0, err
-	} else {
-		totalResolved += n
+	if scope.has("go") {
+		if n, err := s.resolveGoPackageScopedBareNames(ctx, tx, repoID); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
 	}
 	// Temp DDL is transactional in SQLite, so a rollback already discards these
 	// tables. The explicit drop before the commit below is what keeps populated
@@ -4300,7 +4320,7 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
-		AND `+resolverBindableCandidateSQL+`
+		AND `+resolverBindableCandidateSQL+scope.writeGate()+`
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -4338,7 +4358,7 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL AND edges.dst_name != ''
 		AND r.dst_name = edges.dst_name
-		AND `+resolverBindGateSQL+`
+		AND `+resolverBindGateSQL+scope.writeGate()+`
 	`, repoID, repoID, repoID)
 	if err != nil {
 		return 0, err
@@ -4350,7 +4370,7 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	// Strategy 3a: Suffix match for slash-qualified symbols (e.g., pkg.Func matches github.com/org/repo/pkg.Func).
 	// Strategy 3b: Two-segment dot-tail match (e.g., pkg.Func matches x.y.pkg.Func and also x.pkg.Func matches x.y.x.pkg.Func).
 	// Avoid per-edge LIKE scans by precomputing suffix maps once, then doing indexed equality updates.
-	n, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID)
+	n, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -4358,7 +4378,7 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 
 	// Strategy 3c: Dot-suffix fallback (for qualified names without a slash separator).
 	// Keep as a narrower fallback (multi-dot dst_name only) to preserve existing semantics without paying LIKE cost on common pkg.Func cases.
-	n, err = s.resolveEdgesByDotSuffix(ctx, tx, repoID)
+	n, err = s.resolveEdgesByDotSuffix(ctx, tx, repoID, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -4461,7 +4481,7 @@ func dotTail2(qname string) string {
 	return afterSlash[start:]
 }
 
-func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID int64, scope *resolverScope) (int, error) {
 	totalResolved := 0
 	if err := ensureResolverAmbiguousNamesTable(ctx, tx); err != nil {
 		return 0, err
@@ -4476,7 +4496,7 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 	// are offered to both passes; whatever this pass binds is simply no longer
 	// unresolved when the fallback runs.
 	{
-		n, err := s.resolveEdgesByDotTail3(ctx, tx, repoID)
+		n, err := s.resolveEdgesByDotTail3(ctx, tx, repoID, scope)
 		if err != nil {
 			return totalResolved, err
 		}
@@ -4515,7 +4535,7 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 		AND r.dst_name = edges.dst_name
-		AND `+resolverBindGateSQL+`
+		AND `+resolverBindGateSQL+scope.writeGate()+`
 	`, repoID)
 	if err != nil {
 		return 0, err
@@ -4541,7 +4561,7 @@ func (s *Store) resolveEdgesByDotSuffix(ctx context.Context, tx *sql.Tx, repoID 
 // ASCII case-insensitive and treats `_`/`%` inside dst_name as wildcards, so
 // this pass is the stricter of the two. Reordering the passes would therefore
 // change results, not just performance.
-func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID int64, scope *resolverScope) (int, error) {
 	if err := ensureResolverAmbiguousNamesTable(ctx, tx); err != nil {
 		return 0, err
 	}
@@ -4610,7 +4630,7 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 			`+resolverCallerTestJoinSQL+`
 		WHERE edges.repo_id = ? AND edges.dst_symbol_id IS NULL
 		AND r.dst_name = edges.dst_name
-		AND `+resolverBindGateSQL+`
+		AND `+resolverBindGateSQL+scope.writeGate()+`
 	`, repoID)
 	if err != nil {
 		return 0, err
@@ -4630,7 +4650,7 @@ func (s *Store) resolveEdgesByDotTail3(ctx context.Context, tx *sql.Tx, repoID i
 	return int(n), nil
 }
 
-func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoID int64) (int, error) {
+func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoID int64, scope *resolverScope) (int, error) {
 	// Restrict suffix maps to names that can actually be consumed by the unresolved edge set.
 	// This avoids building large Go maps for symbols that can't match any current unresolved edges.
 	neededSuffix := map[string]struct{}{}
@@ -4766,7 +4786,7 @@ func (s *Store) resolveEdgesBySlashSuffix(ctx context.Context, tx *sql.Tx, repoI
 			AND instr(edges.dst_name, '.') > 0 AND instr(edges.dst_name, '/') = 0
 			AND instr(substr(edges.dst_name, instr(edges.dst_name, '.') + 1), '.') = 0
 			AND r.dst_name = edges.dst_name
-			AND `+resolverBindGateSQL+`
+			AND `+resolverBindGateSQL+scope.writeGate()+`
 		`, repoID)
 		if err != nil {
 			return 0, err
@@ -5074,7 +5094,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err := recordPythonScopeClaims(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
-	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID)
+	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, nil)
 	if err != nil {
 		return 0, err
 	}

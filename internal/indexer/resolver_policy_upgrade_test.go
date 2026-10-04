@@ -49,7 +49,23 @@ func policyRegistry() *parser.Registry {
 	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewCSharp())
 }
 
+// newPolicyRepo indexes files under a staged registry: Rust only unless the
+// caller names others, so a test controls exactly which languages are stale.
 func newPolicyRepo(t *testing.T, files tree, policies map[string]int) *lifecycleRepo {
+	t.Helper()
+	if policies == nil {
+		policies = map[string]int{"rust": 1}
+	}
+	return buildPolicyRepo(t, files, policies)
+}
+
+// newRegisteredPolicyRepo indexes under the registry this binary ships.
+func newRegisteredPolicyRepo(t *testing.T, files tree) *lifecycleRepo {
+	t.Helper()
+	return buildPolicyRepo(t, files, nil)
+}
+
+func buildPolicyRepo(t *testing.T, files tree, policies map[string]int) *lifecycleRepo {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -155,6 +171,7 @@ func (r *lifecycleRepo) state(t *testing.T) string {
 	t.Helper()
 	var b strings.Builder
 	for _, q := range []string{
+		`SELECT id||'|'||root_path||'|'||canonical_path||'|'||created_at||'|'||updated_at FROM repos ORDER BY id`,
 		`SELECT key||'='||COALESCE(value,'') FROM settings ORDER BY key`,
 		`SELECT id||'|'||scan_kind||'|'||status FROM scans ORDER BY id`,
 		`SELECT id||'|'||dst_name||'|'||COALESCE(dst_symbol_id,'')||'|'||resolution_strategy||'|'||resolution_confidence FROM edges ORDER BY id`,

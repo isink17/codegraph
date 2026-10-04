@@ -76,7 +76,7 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnly(b *testing.B) {
 			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID, nil); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -154,7 +154,7 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2(b *testing.B) {
 			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID, nil); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -232,7 +232,7 @@ func BenchmarkResolveEdgesByDotSuffix(b *testing.B) {
 			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
+		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, nil); err != nil {
 			b.Fatalf("resolveEdgesByDotSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -313,7 +313,7 @@ func BenchmarkResolveEdgesByDotSuffixLargeScale(b *testing.B) {
 			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
+		if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, nil); err != nil {
 			b.Fatalf("resolveEdgesByDotSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -390,7 +390,7 @@ func BenchmarkResolveEdgesBySlashSuffix_SlashOnlyLargeScale(b *testing.B) {
 			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID, nil); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -474,7 +474,7 @@ func BenchmarkResolveEdgesBySlashSuffix_DotTail2LargeScale(b *testing.B) {
 			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID, nil); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
 		}
 		b.StopTimer()
@@ -539,7 +539,7 @@ func BenchmarkResolveEdgesBySlashSuffix_NoUnresolved(b *testing.B) {
 			b.Fatalf("create own-module veto: %v", err)
 		}
 		b.StartTimer()
-		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID); err != nil {
+		if _, err := s.resolveEdgesBySlashSuffix(ctx, tx, repoID, nil); err != nil {
 			b.Fatalf("resolveEdgesBySlashSuffix() error = %v", err)
 		}
 		b.StopTimer()

@@ -28,8 +28,26 @@ import (
 // above the registry means a newer binary has decided them; this one cannot
 // reproduce that decision and refuses before anything is written.
 var resolverPolicyRegistry = map[string]int{
-	// 1: a glob re-export passes on only what the re-exporting module sees.
-	"rust": 1,
+	// Epoch 1 for every language with a resolver: a graph written before
+	// policies were versioned has no marker, so its first update decides each
+	// language's edges once and records it. That clears every wrong binding an
+	// earlier resolver-only fix left on unchanged source (Rust glob
+	// re-exports, Java and C# import and namespace evidence, TypeScript
+	// development-index edges) without asking anyone to re-index.
+	//
+	// Bump a language's entry in the same change as any resolver-only fix to it.
+	// Rust's 1 is the glob re-export visibility rule.
+	"cpp":        1,
+	"csharp":     1,
+	"go":         1,
+	"java":       1,
+	"kotlin":     1,
+	"php":        1,
+	"python":     1,
+	"ruby":       1,
+	"rust":       1,
+	"swift":      1,
+	"typescript": 1,
 }
 
 var (
@@ -139,8 +157,15 @@ func parseResolverPolicyVersion(raw string) (int, bool) {
 	return version, true
 }
 
+// stampResolverPolicies records languages as decided by the current policy, in
+// the caller's transaction. The plan that allowed this scan was read before the
+// transaction, so a newer binary may have stamped a higher version since. The
+// upsert never lowers a marker, and the marker is read back: anything other
+// than the current version fails the transaction, which rolls back the edges
+// the caller just wrote instead of certifying them over a newer decision.
 func (s *Store) stampResolverPolicies(ctx context.Context, q interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, repoID int64, languages []string) error {
 	current := s.policies()
 	for _, language := range languages {
@@ -148,10 +173,24 @@ func (s *Store) stampResolverPolicies(ctx context.Context, q interface {
 		if !ok {
 			return fmt.Errorf("no resolver policy registered for %q", language)
 		}
-		if _, err := q.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-			resolverPolicyKeyPrefix(repoID)+language, strconv.Itoa(version)); err != nil {
+		key := resolverPolicyKeyPrefix(repoID) + language
+		if _, err := q.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?,?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value
+			WHERE CAST(settings.value AS INTEGER) < CAST(excluded.value AS INTEGER)`, key, strconv.Itoa(version)); err != nil {
 			return err
 		}
+		var stored string
+		if err := q.QueryRowContext(ctx, `SELECT COALESCE(value,'') FROM settings WHERE key=?`, key).Scan(&stored); err != nil {
+			return err
+		}
+		if stored == strconv.Itoa(version) {
+			continue
+		}
+		reason := ErrResolverPolicyUnreadable
+		if stored, ok := parseResolverPolicyVersion(stored); ok && stored > version {
+			reason = ErrResolverPolicyNewer
+		}
+		return &ResolverPolicyError{Reason: reason, Language: language, Stored: stored, Current: version}
 	}
 	return nil
 }

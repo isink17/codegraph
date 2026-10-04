@@ -95,7 +95,7 @@ func BenchmarkResolveEdgesByDotSuffix_ThreeDot(b *testing.B) {
 					b.Fatalf("create own-module veto: %v", err)
 				}
 				b.StartTimer()
-				if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID); err != nil {
+				if _, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, nil); err != nil {
 					b.Fatalf("resolveEdgesByDotSuffix() error = %v", err)
 				}
 				b.StopTimer()

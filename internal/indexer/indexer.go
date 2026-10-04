@@ -117,17 +117,26 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if len(opts.Languages) == 0 {
 		opts.Languages = repoCfg.Languages
 	}
-	repo, err := i.store.UpsertRepo(ctx, opts.RepoRoot)
+	// A known repository is resolved read-only: UpsertRepo rewrites root_path
+	// and updated_at, and the refusals below must leave the database byte
+	// identical. An unknown repository has no markers or profiles to refuse, so
+	// it is created here; a known one is touched after both plans pass.
+	repo, repoKnown, err := i.store.FindRepo(ctx, opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
+	}
+	if !repoKnown {
+		if repo, err = i.store.UpsertRepo(ctx, opts.RepoRoot); err != nil {
+			return store.ScanSummary{}, err
+		}
 	}
 	scanKind := opts.ScanKind
 	if scanKind == "" {
 		scanKind = "index"
 	}
-	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, len(candidatePaths) == 0 && scanKind != "update"); err != nil {
-		return store.ScanSummary{}, err
-	}
+	// Read before any later step rewrites candidatePaths (manifest change,
+	// profile expansion): it is the caller's request, not the expanded plan.
+	fullIndexRequest := len(candidatePaths) == 0 && scanKind != "update"
 	composer, err := discoverPHPComposerPSR4(opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -227,6 +236,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// have edges decided by an older resolver; they are decided again below.
 	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, affectedLanguage)
 	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	// Every refusal is behind us: only now may a known repository row, or the
+	// canonical-path marker of an empty one, be written.
+	if repoKnown {
+		if repo, err = i.store.UpsertRepo(ctx, opts.RepoRoot); err != nil {
+			return store.ScanSummary{}, err
+		}
+	}
+	if err := i.store.EnsureCanonicalRepositoryPaths(ctx, repo.ID, fullIndexRequest); err != nil {
 		return store.ScanSummary{}, err
 	}
 
@@ -988,38 +1007,37 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			summary.ResolveCrossFileTargets = stats.TargetsSelected
 		}
 	} else {
-		if _, resolveErr := i.store.ResolveEdges(ctx, repo.ID); resolveErr != nil {
+		// The policy markers of the stale languages commit with the edges they
+		// certify.
+		if _, resolveErr := i.store.ResolveEdgesRecordingPolicies(ctx, repo.ID, policyStale); resolveErr != nil {
 			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
 			return summary, resolveErr
 		}
 		summary.ResolveMode = "repo"
 		repoWideResolve = true
 	}
-	// A repo-wide resolve has just decided every edge with this binary, so
-	// recording the policy needs no second pass. Any other mode decided only the
-	// changed slice; the stale languages' unchanged edges are decided again here,
-	// without parsing, in one transaction with their reference identities and
-	// marker.
+	// A repo-wide resolve has just decided every edge with this binary and
+	// recorded the policy in the same transaction. Any other mode decided only
+	// the changed slice; the stale languages' unchanged edges are decided again
+	// here, without parsing, in one transaction with their reference identities
+	// and marker.
 	if len(policyStale) > 0 {
-		policyStart := time.Now()
-		var err error
-		if repoWideResolve {
-			err = i.store.StampResolverPolicies(ctx, repo.ID, policyStale)
-		} else {
-			err = i.store.RedecideResolverPolicies(ctx, repo.ID, policyStale)
+		if !repoWideResolve {
+			policyStart := time.Now()
+			err := i.store.RedecideResolverPolicies(ctx, repo.ID, policyStale)
 			if summary.ResolveMode == "none" {
 				summary.ResolveMode = "resolver_policy"
 			} else {
 				summary.ResolveMode += "+resolver_policy"
 			}
-		}
-		if err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			if err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			summary.ResolverPolicyMS = time.Since(policyStart).Milliseconds()
+			summary.ResolveMS = time.Since(resolveStart).Milliseconds()
 		}
 		summary.ResolverPolicyLanguages = policyStale
-		summary.ResolverPolicyMS = time.Since(policyStart).Milliseconds()
-		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
 	}
 	xlangCurrent, err := i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
 	if err != nil {
