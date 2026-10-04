@@ -4089,6 +4089,17 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64) (int, er
 		_ = tx.Rollback()
 	}()
 
+	// A repo-wide resolve decides every edge, not only the unbound ones: a
+	// re-index skips unchanged files and keeps their edges, and a binding one
+	// of them holds may be refused by facts another file changed. Every binding
+	// but a cross-language link's comes from the resolver, so clearing them
+	// gives the fresh index's graph; cross-language links are their own
+	// derived set.
+	if _, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+		WHERE repo_id = ? AND edge_kind <> '`+EdgeKindCrossLanguageRef+`'`, repoID); err != nil {
+		return 0, err
+	}
+
 	// Record, once, which files are test files (P7) and which names are already
 	// undecidable at the broadest evidence levels, so no later strategy can bind
 	// one of them by matching a narrower slice of the same candidates. See
@@ -5502,6 +5513,10 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 // repo whose dst_name matches (or ends with ".<name>") any of the provided
 // names. This is used to keep incremental update runs correct when newly
 // introduced symbols should resolve previously-unresolved edges in other files.
+//
+// Unlike ResolveEdges, ResolveEdgesForPaths and ResolveEdgesForPathsAndNames it
+// does not reconcile reference identities: a caller using it alone runs
+// ReconcileReferenceIdentities afterwards. The indexer never calls it alone.
 //
 // It returns the number of candidate edges selected for resolution.
 func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []string) (int, error) {
