@@ -595,11 +595,16 @@ var lifecycleCases = []lifecycleCase{
 // those cases the transitions guard against state carried between resolves
 // (temp veto tables), and the per-state parity is TestResolverGateRuleFactParity.
 func TestResolverGateRuleFactLifecycleConvergence(t *testing.T) {
+	checkLifecycleConvergence(t, lifecycleCases)
+}
+
+func checkLifecycleConvergence(t *testing.T, cases []lifecycleCase) {
+	t.Helper()
 	known := map[resolverRuleID]bool{}
 	for _, rule := range resolverBindGateRules {
 		known[rule.id] = true
 	}
-	for _, lc := range lifecycleCases {
+	for _, lc := range cases {
 		if !known[resolverRuleID(lc.rule)] {
 			t.Fatalf("lifecycle case names unknown rule %q", lc.rule)
 		}
