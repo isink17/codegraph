@@ -14,11 +14,14 @@ import (
 	"github.com/isink17/codegraph/internal/githistory/gittest"
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
+	"github.com/isink17/codegraph/internal/parser/heuristic"
 	"github.com/isink17/codegraph/internal/store"
 )
 
+// historyIndexer parses Go with body ranges and Java with the heuristic
+// adapter, whose single-line ranges symbol history must not trust.
 func historyIndexer(s *store.Store) *Indexer {
-	return New(s, parser.NewRegistry(goparser.New()), nil)
+	return New(s, parser.NewRegistry(goparser.New(), heuristic.NewJava()), nil)
 }
 
 // dumpTables renders every row of the selected tables, sorted, without the
@@ -220,6 +223,19 @@ func TestHistoryFreshIncrementalAndRewriteParity(t *testing.T) {
 		t.Fatalf("worktree changes wrong:\n%s", dump)
 	}
 
+	if strings.Contains(historyDump(t, inc), "git_symbol_history: 1|'b.go'") {
+		t.Fatal("dirty b.go kept symbol history")
+	}
+
+	// Clean again at the same watermark: b.go is blamed again on reuse.
+	r.Git("checkout", "--", "b.go")
+	r.Git("clean", "-q", "-f", "new.go")
+	index(t, inc, r.Dir, true, false)
+	assertParity("clean")
+	if !strings.Contains(historyDump(t, inc), "git_symbol_history: 1|'b.go'") {
+		t.Fatalf("clean b.go has no symbol history:\n%s", historyDump(t, inc))
+	}
+
 	// A working-tree .mailmap edit changes attribution without moving HEAD.
 	r.Write(".mailmap", "Alice <alice@example.com> <bob@example.com>\n")
 	index(t, inc, r.Dir, true, false)
@@ -327,5 +343,66 @@ func TestHistoryShallowDeepenParity(t *testing.T) {
 	index(t, fresh, clone.Dir, false, false)
 	if a, b := historyDump(t, inc), historyDump(t, fresh); a != b {
 		t.Fatalf("deepened incremental differs from fresh:\n%s\n---\n%s", a, b)
+	}
+}
+
+// symbolLines renders file_history symbols for comparison.
+func symbolLines(t *testing.T, s *profileStore, paths ...string) []string {
+	t.Helper()
+	got, err := s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Paths: paths, Symbols: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, f := range got.Files {
+		out = append(out, f.Path+" "+f.SymbolHistory)
+		for _, sym := range f.Symbols {
+			last := "before_window"
+			if sym.LastCommit != nil {
+				last = sym.LastCommit.SHA[:7] + " " + sym.LastAuthor
+			} else if !sym.BeforeWindow {
+				last = "missing"
+			}
+			out = append(out, fmt.Sprintf("  %s %d-%d %s", sym.QualifiedName, sym.StartLine, sym.EndLine, last))
+		}
+	}
+	return out
+}
+
+// Symbol last-touched history is git blame at the watermark, checked against
+// `git log -L`; dirty, untracked and heuristic-range files are withheld.
+func TestSymbolHistoryLastTouched(t *testing.T) {
+	r := goHistoryRepo(t)
+	r.Write("b.go", "package h\n\nfunc B() { C() }\n\nfunc C() {\n\tB()\n}\n")
+	r.Write("K.java", "class K {\n  void k() {\n  }\n}\n")
+	three := r.Commit("carol@example.com", "three")
+	two := r.Git("rev-parse", "HEAD~1")
+	r.Write("a.go", "package h\n\nfunc A() { B(); C() }\n") // dirty
+	r.Write("u.go", "package h\n\nfunc U() {}\n")           // untracked
+
+	s := newProfileStore(t)
+	index(t, s, r.Dir, false, false)
+	got := symbolLines(t, s, "a.go", "b.go", "u.go", "K.java", "gone.go")
+	want := []string{
+		"a.go worktree_differs",
+		"b.go ok",
+		"  h.B 3-3 " + two[:7] + " bob@example.com",
+		"  h.C 5-7 " + three[:7] + " carol@example.com",
+		"u.go worktree_differs",
+		"K.java untrusted_ranges",
+		"gone.go not_indexed",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("symbols:\n got %q\nwant %q", got, want)
+	}
+	for _, rg := range []string{"3,3", "5,7"} {
+		oracle := r.Git("log", "--first-parent", "-1", "--format=%h", "-L", rg+":b.go", "HEAD")
+		oracle, _, _ = strings.Cut(oracle, "\n")
+		if !strings.Contains(strings.Join(got, "\n"), " "+oracle+" ") {
+			t.Fatalf("git log -L %s:b.go = %s, not in %q", rg, oracle, got)
+		}
+	}
+	if _, err := s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Symbols: true}); err == nil {
+		t.Fatal("symbols on a listing accepted")
 	}
 }

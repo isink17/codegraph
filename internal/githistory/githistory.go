@@ -1,5 +1,5 @@
-// Package githistory reads bounded, file-level Git history for a repository
-// root. It is enrichment only: nothing here feeds symbol, edge or reference
+// Package githistory reads bounded Git history for a repository root: per-file
+// aggregates, and the window commit that last touched each symbol range. It is enrichment only: nothing here feeds symbol, edge or reference
 // resolution, and every failure degrades to an absent-with-reason state
 // instead of an error the scan would have to surface.
 //
@@ -29,7 +29,7 @@ const (
 	WindowLimit = 250
 	// Algorithm identifies the aggregation rules. A stored state with another
 	// value is recomputed, the way parser profiles invalidate parsed files.
-	Algorithm = "file-v1"
+	Algorithm = "file-v1+blame-v1"
 )
 
 // Status of a repository's history.
@@ -432,4 +432,147 @@ func count(s string) int64 {
 		return 0
 	}
 	return v
+}
+
+// Range is a 1-based inclusive line range of the watermark version of a file.
+type Range struct {
+	Start int
+	End   int
+}
+
+// SymbolStats is the newest window commit among the lines of one range, as
+// git blame attributes them at the watermark. LastSHA is empty when every line
+// was last touched before the window. Nothing here counts changes to a symbol:
+// blame only knows which commit last touched each surviving line.
+type SymbolStats struct {
+	Path       string
+	Range      Range
+	LastSHA    string
+	LastTime   int64
+	LastAuthor string
+}
+
+// trustedRangePrefixes are the parser profiles whose symbols carry body
+// ranges. Heuristic adapters emit single-line ranges, so blaming them would
+// publish a number for the declaration line only.
+var trustedRangePrefixes = []string{"treesitter:", "go-ast:", "python-regex:"}
+
+// TrustedRanges reports whether symbols parsed under profile have ranges
+// trustworthy enough for symbol-level history.
+func TrustedRanges(profile string) bool {
+	for _, p := range trustedRangePrefixes {
+		if strings.HasPrefix(profile, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// WindowBoundary returns the first-parent commit just outside the window, or
+// "" when the window reaches the root (or a shallow graft) of the history.
+func WindowBoundary(ctx context.Context, root, watermark string) string {
+	out, err := run(ctx, root, "rev-parse", "-q", "--verify", watermark+"~"+strconv.Itoa(WindowLimit)+"^{commit}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// Blame attributes each range of path to the newest window commit among its
+// lines, using `git blame --first-parent` at the watermark and stopping at the
+// window boundary. Ranges beyond the end of the file are clipped to it.
+//
+// In a shallow clone the oldest available commit has no parent, so it would
+// absorb every line older than the cut; it is a boundary there instead, and
+// those lines read as before the window.
+func Blame(ctx context.Context, root, watermark, boundary, path string, shallow bool, ranges []Range) ([]SymbolStats, error) {
+	args := []string{"-c", "mailmap.file=", "-c", "mailmap.blob=", "-c", "diff.algorithm=myers",
+		"-c", "blame.ignoreRevsFile=", "-c", "diff.renameLimit=1000",
+		"blame", "--porcelain", "--first-parent", "--no-textconv"}
+	// Blame follows whole-file renames on its own and reads .mailmap for
+	// author-mail. The overrides match Files: no user mailmap, no textconv,
+	// no ignore-revs list, Myers diff, and --root so the root commit is a
+	// window commit rather than a boundary.
+	if !shallow {
+		args = append(args, "--root")
+	}
+	rev := watermark
+	if boundary != "" {
+		rev = boundary + ".." + watermark
+	}
+	out, err := run(ctx, root, append(args, rev, "--", path)...)
+	if err != nil {
+		return nil, err
+	}
+	lines, commits, err := parseBlame(out)
+	if err != nil {
+		return nil, &Error{Reason: ReasonGitFailed, Err: fmt.Errorf("blame %s: %w", path, err)}
+	}
+	stats := make([]SymbolStats, 0, len(ranges))
+	for _, r := range ranges {
+		s := SymbolStats{Path: path, Range: r}
+		for line := max(r.Start, 1); line <= r.End && line <= len(lines); line++ {
+			c := commits[lines[line-1]]
+			if c.boundary {
+				continue
+			}
+			if s.LastSHA == "" || later(c.time, lines[line-1], s.LastTime, s.LastSHA) {
+				s.LastSHA, s.LastTime, s.LastAuthor = lines[line-1], c.time, c.author
+			}
+		}
+		stats = append(stats, s)
+	}
+	return stats, nil
+}
+
+type blameCommit struct {
+	time     int64
+	author   string
+	boundary bool
+}
+
+// parseBlame reads `git blame --porcelain`: the commit of every final line in
+// order, and the details of each commit, which porcelain prints once.
+func parseBlame(out []byte) ([]string, map[string]*blameCommit, error) {
+	var lines []string
+	commits := map[string]*blameCommit{}
+	var cur *blameCommit
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case line == "":
+		case line[0] == '\t':
+			cur = nil
+		case cur == nil:
+			// Header: <sha> <orig line> <final line> [<group size>].
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				return nil, nil, fmt.Errorf("malformed blame header %q", line)
+			}
+			final, err := strconv.Atoi(fields[2])
+			if err != nil || final != len(lines)+1 {
+				return nil, nil, fmt.Errorf("blame line out of order: %q", line)
+			}
+			lines = append(lines, fields[0])
+			cur = commits[fields[0]]
+			if cur == nil {
+				cur = &blameCommit{}
+				commits[fields[0]] = cur
+			}
+		default:
+			key, value, _ := strings.Cut(line, " ")
+			switch key {
+			case "committer-time":
+				t, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return nil, nil, fmt.Errorf("committer-time %q: %w", value, err)
+				}
+				cur.time = t
+			case "author-mail":
+				cur.author = strings.TrimSuffix(strings.TrimPrefix(value, "<"), ">")
+			case "boundary":
+				cur.boundary = true
+			}
+		}
+	}
+	return lines, commits, nil
 }

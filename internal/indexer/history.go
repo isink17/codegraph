@@ -2,12 +2,15 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/githistory"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 // refreshHistory evaluates file-level Git history after the semantic graph is
@@ -22,19 +25,19 @@ import (
 // ancestor) and makes every stored value equal to a fresh computation.
 func (i *Indexer) refreshHistory(ctx context.Context, repoID int64, root string, disabled bool) (githistory.State, int64, error) {
 	start := time.Now()
-	state, files, changes, err := i.evaluateHistory(ctx, repoID, root, disabled)
+	state, files, changes, symbols, err := i.evaluateHistory(ctx, repoID, root, disabled)
 	if err != nil {
 		return githistory.State{}, 0, err
 	}
-	if err := i.store.ReplaceGitHistory(ctx, repoID, state, files, changes); err != nil {
+	if err := i.store.ReplaceGitHistory(ctx, repoID, state, files, changes, symbols); err != nil {
 		return state, 0, err
 	}
 	return state, time.Since(start).Milliseconds(), nil
 }
 
-func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string, disabled bool) (githistory.State, []githistory.FileStats, []string, error) {
-	absent := func(reason string) (githistory.State, []githistory.FileStats, []string, error) {
-		return githistory.Absent(reason), []githistory.FileStats{}, nil, nil
+func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string, disabled bool) (githistory.State, []githistory.FileStats, []string, store.GitSymbolUpdate, error) {
+	absent := func(reason string) (githistory.State, []githistory.FileStats, []string, store.GitSymbolUpdate, error) {
+		return githistory.Absent(reason), []githistory.FileStats{}, nil, store.GitSymbolUpdate{All: true}, nil
 	}
 	if disabled {
 		return absent(githistory.ReasonDisabled)
@@ -45,7 +48,7 @@ func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string
 	}
 	indexed, err := i.store.LiveFilePaths(ctx, repoID)
 	if err != nil {
-		return githistory.State{}, nil, nil, err
+		return githistory.State{}, nil, nil, store.GitSymbolUpdate{}, err
 	}
 	changes, err := githistory.WorktreeChanges(ctx, root, state.Watermark, indexed)
 	if err != nil {
@@ -59,16 +62,101 @@ func (i *Indexer) evaluateHistory(ctx context.Context, repoID int64, root string
 	// A shallow clone can be deepened without moving HEAD, so its window is
 	// always recomputed. The mailmap fingerprint covers .mailmap edits, which
 	// Git reads from the working tree.
+	var files []githistory.FileStats
 	prev, found, err := i.store.GitHistoryState(ctx, repoID)
-	if err == nil && found && state.Status == githistory.StatusOK && prev.Status == state.Status &&
+	reuse := err == nil && found && state.Status == githistory.StatusOK && prev.Status == state.Status &&
 		prev.Watermark == state.Watermark && prev.WindowLimit == state.WindowLimit &&
-		prev.Algorithm == state.Algorithm && prev.Mailmap == state.Mailmap {
-		return prev, nil, changes, nil
+		prev.Algorithm == state.Algorithm && prev.Mailmap == state.Mailmap
+	if reuse {
+		state = prev
+	} else {
+		var n int
+		files, n, err = githistory.Files(ctx, root, state.Watermark)
+		if err != nil {
+			return absent(githistory.ReasonOf(err))
+		}
+		state.WindowCommits = n
 	}
-	files, n, err := githistory.Files(ctx, root, state.Watermark)
+	symbols, err := i.symbolHistory(ctx, repoID, root, state, changes, reuse)
 	if err != nil {
-		return absent(githistory.ReasonOf(err))
+		var gerr *githistory.Error
+		if errors.As(err, &gerr) {
+			return absent(gerr.Reason)
+		}
+		return githistory.State{}, nil, nil, store.GitSymbolUpdate{}, err
 	}
-	state.WindowCommits = n
-	return state, files, changes, nil
+	return state, files, changes, symbols, nil
+}
+
+// symbolHistory blames the files whose symbol ranges are trusted and whose
+// working-tree content equals the watermark; a dirty or untracked file gets
+// no symbol rows, because its ranges come from content blame cannot see.
+// Rows are a pure function of the reuse key and the file's ranges, so when
+// the watermark is reused only files whose range set changed are blamed
+// again, and the result equals a fresh evaluation.
+func (i *Indexer) symbolHistory(ctx context.Context, repoID int64, root string, state githistory.State, changes []string, reuse bool) (store.GitSymbolUpdate, error) {
+	want, err := i.store.GitSymbolRanges(ctx, repoID)
+	if err != nil {
+		return store.GitSymbolUpdate{}, err
+	}
+	for _, p := range changes {
+		delete(want, p)
+	}
+	update := store.GitSymbolUpdate{All: !reuse}
+	var blame []string
+	if reuse {
+		have, err := i.store.StoredGitSymbolRanges(ctx, repoID)
+		if err != nil {
+			return store.GitSymbolUpdate{}, err
+		}
+		for p := range have {
+			if _, ok := want[p]; !ok {
+				update.Paths = append(update.Paths, p)
+			}
+		}
+		for p, ranges := range want {
+			if !slices.Equal(have[p], ranges) {
+				update.Paths = append(update.Paths, p)
+				blame = append(blame, p)
+			}
+		}
+		slices.Sort(update.Paths)
+	} else {
+		for p := range want {
+			blame = append(blame, p)
+		}
+	}
+	if len(blame) == 0 {
+		return update, nil
+	}
+	slices.Sort(blame)
+	boundary := githistory.WindowBoundary(ctx, root, state.Watermark)
+	shallow := state.Status == githistory.StatusTruncated
+	results := make([][]githistory.SymbolStats, len(blame))
+	errs := make([]error, len(blame))
+	// ponytail: fixed pool of blame processes; Git does the work, so more
+	// workers mostly add contention.
+	var wg sync.WaitGroup
+	next := make(chan int)
+	for w := 0; w < min(4, len(blame)); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := range next {
+				results[k], errs[k] = githistory.Blame(ctx, root, state.Watermark, boundary, blame[k], shallow, want[blame[k]])
+			}
+		}()
+	}
+	for k := range blame {
+		next <- k
+	}
+	close(next)
+	wg.Wait()
+	for k := range blame {
+		if errs[k] != nil {
+			return store.GitSymbolUpdate{}, errs[k]
+		}
+		update.Rows = append(update.Rows, results[k]...)
+	}
+	return update, nil
 }

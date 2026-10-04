@@ -1032,10 +1032,11 @@ func (s *Server) handleAudit(ctx context.Context, raw json.RawMessage) (map[stri
 
 func (s *Server) handleFileHistory(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
 	var req struct {
-		Files      []string `json:"files"`
-		PathFilter string   `json:"path_filter"`
-		Limit      int      `json:"limit"`
-		Offset     int      `json:"offset"`
+		Files          []string `json:"files"`
+		PathFilter     string   `json:"path_filter"`
+		Limit          int      `json:"limit"`
+		Offset         int      `json:"offset"`
+		IncludeSymbols bool     `json:"include_symbols"`
 	}
 	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -1043,7 +1044,7 @@ func (s *Server) handleFileHistory(ctx context.Context, raw json.RawMessage) (ma
 		}
 	}
 	result, err := s.store.GitHistory(ctx, s.repoID, store.GitHistoryQuery{
-		Paths: req.Files, PathPrefix: req.PathFilter, Limit: req.Limit, Offset: req.Offset,
+		Paths: req.Files, PathPrefix: req.PathFilter, Limit: req.Limit, Offset: req.Offset, Symbols: req.IncludeSymbols,
 	})
 	if err != nil {
 		return nil, err

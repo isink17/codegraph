@@ -368,12 +368,13 @@ func newCommandList() []*command {
 			aliases:     []string{"file-history"},
 			description: "show file-level Git history stored by the last index or update",
 			usageLines: []string{
-				"  file_history [PATH] [--file FILE ...] [--path-filter PREFIX] [--limit N] [--offset N]",
+				"  file_history [PATH] [--file FILE ...] [--symbols] [--path-filter PREFIX] [--limit N] [--offset N]",
 				"    add --repo-root PATH instead of the positional argument",
 			},
 			flags: []commandFlag{
 				{name: "--repo-root PATH", description: "repository root (defaults to the git repo root)"},
 				{name: "--file FILE", description: "repository-relative file to report; repeatable"},
+				{name: "--symbols", description: "add each symbol's last-touching window commit (git blame) to every --file"},
 				{name: "--path-filter PREFIX", description: "list only paths under this prefix"},
 				{name: "--limit N", description: "page size for the listing"},
 				{name: "--offset N", description: "page offset for the listing"},
@@ -381,6 +382,7 @@ func newCommandList() []*command {
 			examples: []string{
 				"codegraph file_history .",
 				"codegraph file_history . --file internal/store/store.go",
+				"codegraph file_history . --file internal/store/store.go --symbols",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runFileHistory(ctx, cfg, stdout, args)

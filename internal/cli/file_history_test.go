@@ -83,6 +83,7 @@ func TestFileHistoryCLIAndMCPAgree(t *testing.T) {
 	}
 	mcpList := callTool(map[string]any{"limit": 1, "offset": 1})
 	mcpFiles := callTool(map[string]any{"files": []string{"lib/a.go", "main.go"}})
+	mcpSymbols := callTool(map[string]any{"files": []string{"lib/a.go", "main.go"}, "include_symbols": true})
 	if err := app.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +96,18 @@ func TestFileHistoryCLIAndMCPAgree(t *testing.T) {
 	// The repository database under .codegraph/ is untracked but never listed.
 	if cliList.History.Status != githistory.StatusOK || cliList.Total != 2 || len(cliList.Files) != 1 || cliList.Files[0].Path != "main.go" {
 		t.Fatalf("listing = %+v", cliList)
+	}
+	cliSymbols := run("file_history", r.Dir, "--file", "lib/a.go", "--file", "main.go", "--symbols")
+	if !reflect.DeepEqual(mcpSymbols, cliSymbols) {
+		t.Fatalf("CLI and MCP symbols differ:\nmcp %+v\ncli %+v", mcpSymbols, cliSymbols)
+	}
+	if sa, sm := cliSymbols.Files[0], cliSymbols.Files[1]; sa.SymbolHistory != store.SymbolHistoryOK || len(sa.Symbols) != 2 ||
+		sa.Symbols[0].Name != "A" || sa.Symbols[0].LastAuthor != "bob@example.com" || sa.Symbols[0].LastCommit == nil ||
+		sm.SymbolHistory != store.SymbolHistoryWorktreeDiffers || sm.Symbols != nil {
+		t.Fatalf("symbols = %+v", cliSymbols.Files)
+	}
+	if cliFiles.Files[0].SymbolHistory != "" || cliFiles.Files[0].Symbols != nil {
+		t.Fatalf("symbols without --symbols: %+v", cliFiles.Files[0])
 	}
 	a, m := cliFiles.Files[0], cliFiles.Files[1]
 	if a.CommitCount != 2 || a.AuthorCount != 2 || a.WorktreeDiffers || !m.WorktreeDiffers || m.CommitCount != 1 {

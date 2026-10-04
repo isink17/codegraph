@@ -310,8 +310,8 @@ var toolRegistry = []toolDescriptor{
 	// default session's tools/list is unchanged by it.
 	{
 		name:        "file_history",
-		description: "File-level Git history from the last index: commit count, first/last commit, authors, line churn and reverts within the latest 250 first-parent commits. Enrichment only.",
-		properties:  []string{"files", "path_filter", "limit", "offset"},
+		description: "File-level Git history from the last index: commit count, first/last commit, authors, line churn and reverts within the latest 250 first-parent commits. include_symbols with files adds each symbol's last-touching commit from git blame. Enrichment only.",
+		properties:  []string{"files", "path_filter", "limit", "offset", "include_symbols"},
 		category:    "history",
 		hidden:      true,
 		handler:     (*Server).handleFileHistory,
@@ -467,7 +467,7 @@ func argType(prop string) string {
 	switch prop {
 	case "limit", "offset", "edge_id", "line", "symbol_id", "depth", "max_files", "max_symbols", "max_steps", "examples", "max_tokens":
 		return "integer"
-	case "force", "include_tests", "include_callers", "include_schema", "reset":
+	case "force", "include_tests", "include_callers", "include_schema", "reset", "include_symbols":
 		return "boolean"
 	case "paths", "symbols", "files":
 		return "array"
