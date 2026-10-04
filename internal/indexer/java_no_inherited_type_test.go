@@ -24,6 +24,7 @@ import (
 //	Api.make         new Bag()                 app/Bag
 //	Nest$In.make     new Bag()                 app/Bag
 //	Imp.make         new Bag()                 other/Holder$Bag (single-type import)
+//	SImp.make        new Bag()                 other/Holder$Bag (single-static-import)
 //	Sub.make         new Bag()                 app/Base$Bag (inherited member)
 //	Impl$In.make     new Bag()                 app/Bag (Impl implements Runnable)
 //	Encl$In.make     new Bag()                 app/Encl$Bag (enclosing member)
@@ -31,8 +32,9 @@ import (
 //	Local.make       new Bag() after local class Bag  app/Local$1Bag
 //	Field.bag        field initializer new Bag()      app/Bag
 //
-// Impl$In and Field stay unresolved: an implements clause is not followed, and
-// a field initializer is not marked.
+// SImp, Impl$In and Field stay unresolved: a static import is not resolved
+// to a type, an implements clause is not followed, and a field initializer is
+// not marked.
 var javaNoInheritedTypeTree = tree{
 	"app/Bag.java":      `package app; public class Bag { public Bag() {} }`,
 	"app/Base.java":     `package app; public class Base { public static class Bag { public Bag() {} } }`,
@@ -41,6 +43,7 @@ var javaNoInheritedTypeTree = tree{
 	"app/Api.java":      "package app;\npublic interface Api {\n    default void make() {\n        new Bag();\n    }\n}\n",
 	"app/Nest.java":     "package app;\npublic class Nest {\n    static class In {\n        void make() {\n            new Bag();\n        }\n    }\n}\n",
 	"app/Imp.java":      "package app;\nimport other.Holder.Bag;\npublic class Imp {\n    void make() {\n        new Bag();\n    }\n}\n",
+	"app/SImp.java":     "package app;\nimport static other.Holder.Bag;\npublic class SImp {\n    void make() {\n        new Bag();\n    }\n}\n",
 	"app/Sub.java":      "package app;\npublic class Sub extends Base {\n    void make() {\n        new Bag();\n    }\n}\n",
 	"app/Impl.java":     "package app;\npublic class Impl implements Runnable {\n    public void run() {}\n    static class In {\n        void make() {\n            new Bag();\n        }\n    }\n}\n",
 	"app/Encl.java":     "package app;\npublic class Encl {\n    static class Bag { Bag() {} }\n    static class In {\n        void make() {\n            new Bag();\n        }\n    }\n}\n",
@@ -58,6 +61,7 @@ func assertJavaNoInheritedTypeTargets(t *testing.T, r *lifecycleRepo, step strin
 		"app.Api.make|Bag":     "app.Bag.Bag",
 		"app.Nest.In.make|Bag": "app.Bag.Bag",
 		"app.Imp.make|Bag":     "other.Holder.Bag.Bag",
+		"app.SImp.make|Bag":    "",
 		"app.Sub.make|Bag":     "",
 		"app.Impl.In.make|Bag": "",
 		"app.Encl.In.make|Bag": "",

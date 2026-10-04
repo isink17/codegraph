@@ -371,8 +371,15 @@ func javaTypeInScope(eName, pkg, container string, byQName map[string][]javaScop
 	// A member type a single-type import names is exempt: an inherited member
 	// type that hides the import is a different type of that name, which
 	// still refuses.
+	// A single-static-import of the name may import a member type, which
+	// shadows every package and on-demand type of that name (JLS 6.4.1,
+	// 7.5.3); a static import is not resolved to a type here, so the name
+	// stays unresolved.
 	imported := ""
 	for _, i := range imps {
+		if i.static && !i.wildcard && i.local == name {
+			return javaScopeSymbol{}, false, ""
+		}
 		if !i.static && !i.wildcard && i.local == name {
 			imported = i.source
 		}
