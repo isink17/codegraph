@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"slices"
 	"sort"
 	"strings"
 
@@ -494,6 +495,17 @@ func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScop
 		}
 	}
 	levels = append(levels, "")
+	// A dotted qualifier whose first segment names an alias is resolved by
+	// C# 7.7.1 through that alias (a namespace alias prefix), not through the
+	// declared namespaces. Evidence models only aliases of a whole type, so
+	// the lookup refuses rather than treat the segment as a namespace name.
+	if head, _, dotted := strings.Cut(qualifier, "."); dotted {
+		for _, i := range imports {
+			if i.kind == "alias" && i.local == head && slices.Contains(levels, i.owner) {
+				return "", true, false
+			}
+		}
+	}
 	candidate := func(level string) string {
 		if level == "" {
 			return qualifier
