@@ -328,6 +328,13 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 }
 
 func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps []javaScopeImport) (javaScopeSymbol, bool, string) {
+	return javaTypeInScope(eName, pkg, container, byQName, byName, imps, true)
+}
+
+// javaTypeInScope is javaType; mayInherit false states that the caller's
+// classes inherit no member type (graph.JavaNoInheritedTypeEvidence), so a
+// member type declared outside them does not block the name.
+func javaTypeInScope(eName, pkg, container string, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps []javaScopeImport, mayInherit bool) (javaScopeSymbol, bool, string) {
 	name := eName
 	if i := strings.LastIndex(name, "."); i >= 0 { // fully qualified or nested spelling
 		var exact []javaScopeSymbol
@@ -364,14 +371,27 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 	// A member type a single-type import names is exempt: an inherited member
 	// type that hides the import is a different type of that name, which
 	// still refuses.
+	// A single-static-import of the name may import a member type, which
+	// shadows every package and on-demand type of that name (JLS 6.4.1,
+	// 7.5.3); a static import is not resolved to a type here, so the name
+	// stays unresolved.
+	// The import evidence keeps a declaration's spelling, so a single import
+	// written with spaces or comments inside its name (`import a.B. Box;`)
+	// carries no usable local name; it may name this one, so it refuses.
 	imported := ""
 	for _, i := range imps {
+		if !i.wildcard && !javaDottedName(i.source) {
+			return javaScopeSymbol{}, false, ""
+		}
+		if i.static && !i.wildcard && i.local == name {
+			return javaScopeSymbol{}, false, ""
+		}
 		if !i.static && !i.wildcard && i.local == name {
 			imported = i.source
 		}
 	}
 	for _, s := range byName[name] {
-		if javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" && s.qname != imported {
+		if mayInherit && javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" && s.qname != imported {
 			return javaScopeSymbol{}, false, ""
 		}
 	}
@@ -406,6 +426,22 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		}
 	}
 	return javaUniqueVisible(c, pkg, "java_package_scope")
+}
+
+// javaDottedName reports whether s is Java identifiers joined by dots, with
+// nothing else between them.
+func javaDottedName(s string) bool {
+	for _, seg := range strings.Split(s, ".") {
+		if seg == "" {
+			return false
+		}
+		for k, r := range seg {
+			if r != '_' && r != '$' && !unicode.IsLetter(r) && (k == 0 || !unicode.IsDigit(r)) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymbol, bool, string) {
@@ -505,6 +541,13 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	switch {
 	case e.evidence == graph.JavaOwnMemberTypeEvidence:
 		t, ok = javaOwnMemberType(e, byQName)
+	case e.evidence == graph.JavaNoInheritedTypeEvidence:
+		// A caller whose container the adapter collapsed to the package is
+		// not told apart from a top-level class, so its enclosing member
+		// types cannot be checked; it finds nothing.
+		if e.container != "" && e.container != e.pkg {
+			t, ok, _ = javaTypeInScope(e.name, e.pkg, e.container, byQName, byName, imps[e.file], false)
+		}
 	case e.evidence == graph.JavaLocalTypeScopeEvidence || !javaUnqualifiedCreation(e.evidence):
 	default:
 		t, ok, _ = javaType(e.name, e.pkg, e.container, byQName, byName, imps[e.file])

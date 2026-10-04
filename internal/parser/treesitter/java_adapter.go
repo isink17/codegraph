@@ -35,6 +35,9 @@ type JavaAdapter struct {
 	// legacyLineOnly reproduces treesitter:java:v7, whose edges carried no
 	// column, so methods sharing a line could not be told apart.
 	legacyLineOnly bool
+	// legacyNoInherited reproduces treesitter:java:v8, which did not mark
+	// constructions in classes that spell no supertype.
+	legacyNoInherited bool
 }
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
@@ -43,39 +46,46 @@ func NewJava() *JavaAdapter { return &JavaAdapter{} }
 // constructor arity facts v4 records. It exists only to reproduce v3
 // databases in profile-transition tests.
 func NewJavaV3() *JavaAdapter {
-	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
+	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true}
 }
 
 // NewJavaV4 returns a parser that reports treesitter:java:v4 and does not mark
 // calls inside nested class bodies. It exists only to reproduce v4 databases
 // in profile-transition tests.
 func NewJavaV4() *JavaAdapter {
-	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
+	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true}
 }
 
 // NewJavaV5 returns a parser that reports treesitter:java:v5 and spells a
 // generic construction's class with its type arguments. It exists only to
 // reproduce v5 databases in profile-transition tests.
 func NewJavaV5() *JavaAdapter {
-	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
+	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true}
 }
 
 // NewJavaV6 returns a parser that reports treesitter:java:v6 and does not mark
 // constructions of a member type the calling class declares. It exists only
 // to reproduce v6 databases in profile-transition tests.
-func NewJavaV6() *JavaAdapter { return &JavaAdapter{legacyOwnMember: true, legacyLineOnly: true} }
+func NewJavaV6() *JavaAdapter {
+	return &JavaAdapter{legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true}
+}
 
 // NewJavaV7 returns a parser that reports treesitter:java:v7 and records no
 // column on edges. It exists only to reproduce v7 databases in
 // profile-transition tests.
-func NewJavaV7() *JavaAdapter { return &JavaAdapter{legacyLineOnly: true} }
+func NewJavaV7() *JavaAdapter { return &JavaAdapter{legacyLineOnly: true, legacyNoInherited: true} }
+
+// NewJavaV8 returns a parser that reports treesitter:java:v8 and does not mark
+// constructions in classes that spell no supertype. It exists only to
+// reproduce v8 databases in profile-transition tests.
+func NewJavaV8() *JavaAdapter { return &JavaAdapter{legacyNoInherited: true} }
 
 // NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
 // first `package x;` spelled anywhere in the file, comments and strings
 // included, as its package. It exists only to reproduce v2 databases in
 // profile-transition tests.
 func NewJavaV2() *JavaAdapter {
-	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true}
+	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true}
 }
 
 func (a *JavaAdapter) Language() string     { return "java" }
@@ -102,7 +112,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 
 	javaExtractImports(root, content, &pf)
 	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
-	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember, !a.legacyLineOnly)
+	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember, !a.legacyLineOnly, !a.legacyNoInherited)
 	if a.legacyArity {
 		for i := range pf.Edges {
 			if pf.Edges[i].Kind == "constructs" {
@@ -342,7 +352,7 @@ func javaVisibility(node *sitter.Node, content []byte) string {
 	return "package"
 }
 
-func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember, markColumn bool) {
+func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember, markColumn, markNoInherited bool) {
 	for _, creation := range findDescendants(root, "object_creation_expression") {
 		typeNode := childByFieldName(creation, "type")
 		if typeNode == nil {
@@ -360,6 +370,8 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 			evidence = graph.JavaLocalTypeScopeEvidence
 		} else if markOwnMember && javaOwnMemberCreation(root, creation, name, content) {
 			evidence = graph.JavaOwnMemberTypeEvidence
+		} else if markNoInherited && javaNoInheritedTypeCreation(root, creation, name, content) {
+			evidence = graph.JavaNoInheritedTypeEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "constructs", Evidence: evidence, Line: int(creation.StartPoint().Row) + 1, Col: javaEdgeCol(creation, markColumn), CallArity: javaMethodCallArity(creation)})
 	}
@@ -517,8 +529,61 @@ func javaEdgeCol(node *sitter.Node, mark bool) int {
 // is marked. Own-member marking remains conservatively line-based: no other
 // method or constructor declaration may cover the construction's line.
 func javaOwnMemberCreation(root, creation *sitter.Node, name string, content []byte) bool {
+	body := javaCreationClassBody(root, creation, name)
+	return body != nil && javaBodyDeclaresType(body, name, content)
+}
+
+// javaNoInheritedTypeCreation reports whether creation is an unqualified `new`
+// of a simple name made directly in a method, constructor or lambda body of a
+// class that, with every class enclosing it, spells no supertype clause and
+// declares no member type of that name. Only java.lang.Object, Enum or Record
+// is then inherited, and none declares a member type, so the name means the
+// type an import or the package gives it (graph.JavaNoInheritedTypeEvidence).
+// A declaration nested in anything but a class or interface body (an enum's
+// members, a method) is not walked and marks nothing.
+func javaNoInheritedTypeCreation(root, creation *sitter.Node, name string, content []byte) bool {
+	body := javaCreationClassBody(root, creation, name)
+	for body != nil {
+		if javaBodyDeclaresType(body, name, content) {
+			return false
+		}
+		decl := body.Parent()
+		if decl == nil {
+			return false
+		}
+		switch decl.Type() {
+		case "class_declaration", "interface_declaration", "record_declaration":
+		default:
+			return false
+		}
+		for i := range int(decl.NamedChildCount()) {
+			switch decl.NamedChild(i).Type() {
+			case "superclass", "super_interfaces", "extends_interfaces":
+				return false
+			}
+		}
+		switch outer := decl.Parent(); {
+		case outer == nil:
+			return false
+		case outer.Type() == "program":
+			return true
+		case outer.Type() == "class_body" || outer.Type() == "interface_body":
+			body = outer
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// javaCreationClassBody returns the class or interface body whose method,
+// constructor or lambda body holds creation directly, for an unqualified `new`
+// of a simple name outside any anonymous, local or enum-constant class body,
+// when no other method or constructor declaration covers the creation's line.
+// Otherwise it returns nil.
+func javaCreationClassBody(root, creation *sitter.Node, name string) *sitter.Node {
 	if first := creation.Child(0); first == nil || first.Type() != "new" || strings.Contains(name, ".") || javaCallInNestedClassBody(creation) {
-		return false
+		return nil
 	}
 	var method *sitter.Node
 	for n := creation.Parent(); n != nil && method == nil; n = n.Parent() {
@@ -526,38 +591,40 @@ func javaOwnMemberCreation(root, creation *sitter.Node, name string, content []b
 		case "method_declaration", "constructor_declaration":
 			method = n
 		case "program", "class_body", "interface_body", "enum_body", "enum_body_declarations", "annotation_type_body":
-			return false
+			return nil
 		}
 	}
 	if method == nil {
-		return false
+		return nil
 	}
 	body := method.Parent()
 	if body == nil || body.Type() != "class_body" && body.Type() != "interface_body" {
-		return false
-	}
-	declared := false
-	for i := range int(body.NamedChildCount()) {
-		decl := body.NamedChild(i)
-		switch decl.Type() {
-		case "class_declaration", "interface_declaration", "enum_declaration", "record_declaration", "annotation_type_declaration":
-			if id := childByFieldName(decl, "name"); id != nil && nodeText(id, content) == name {
-				declared = true
-			}
-		}
-	}
-	if !declared {
-		return false
+		return nil
 	}
 	row := creation.StartPoint().Row
 	for _, kind := range []string{"method_declaration", "constructor_declaration"} {
 		for _, other := range findDescendants(root, kind) {
 			if !other.Equal(method) && other.StartPoint().Row <= row && row <= other.EndPoint().Row {
-				return false
+				return nil
 			}
 		}
 	}
-	return true
+	return body
+}
+
+// javaBodyDeclaresType reports whether a class or interface body declares a
+// member type named name.
+func javaBodyDeclaresType(body *sitter.Node, name string, content []byte) bool {
+	for i := range int(body.NamedChildCount()) {
+		decl := body.NamedChild(i)
+		switch decl.Type() {
+		case "class_declaration", "interface_declaration", "enum_declaration", "record_declaration", "annotation_type_declaration":
+			if id := childByFieldName(decl, "name"); id != nil && nodeText(id, content) == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // javaRawTypeName spells a constructed class without its type arguments:

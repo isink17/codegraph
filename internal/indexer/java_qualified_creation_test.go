@@ -71,9 +71,8 @@ func assertJavaQualifiedCreationTargets(t *testing.T, r *lifecycleRepo, step str
 		// Outer$Inner).
 		"app.Outer.bare":    "app.Outer.Inner.Inner",
 		"app.Caller.viaVar": "",
-		// javac binds app.Inner, but Caller's supertypes are not recorded and
-		// a public member type Inner exists, so the name stays unresolved.
-		"app.Caller.plain": "",
+		// Caller spells no supertype, so no inherited Inner can hide app.Inner.
+		"app.Caller.plain": "app.Inner.Inner",
 	} {
 		if got[caller] != want {
 			t.Errorf("%s: %s bound %q, want %q", step, caller, got[caller], want)
@@ -88,8 +87,8 @@ func TestJavaQualifiedCreationNeverBindsTopLevelNamesake(t *testing.T) {
 	r.write(t, "app/Caller.java", strings.Replace(caller, "outer.new Inner();", "new Inner();", 1))
 	r.update(t, "app/Caller.java")
 	r.assertFreshParity(t, "qualified to plain")
-	if got := javaConstructsTargets(t, r)["app.Caller.viaVar"]; got != "" {
-		t.Fatalf("plain creation bound %q", got)
+	if got := javaConstructsTargets(t, r)["app.Caller.viaVar"]; got != "app.Inner.Inner" {
+		t.Fatalf("plain creation bound %q, want app.Inner.Inner", got)
 	}
 	r.write(t, "app/Caller.java", caller)
 	r.update(t, "app/Caller.java")
@@ -171,8 +170,10 @@ func TestJavaInterfaceMemberTypeFromAnotherPackageShadows(t *testing.T) {
 }
 
 // A single-type import of a member type binds it when no other member type
-// shares the name; another member type of that name, which the caller could
-// inherit, still refuses. Oracle (javac 17): Use.raw new Box() -> other/T$Box.
+// shares the name, or when the caller spells no supertype; another member
+// type of that name, which a caller with a supertype could inherit, still
+// refuses. Oracle (javac 17): Use.raw new Box() -> other/T$Box, and
+// app/Base$Box once Use extends Base.
 func TestJavaImportedMemberTypeBindsUnlessAnotherMemberShares(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"other/T.java": `package other; public class T { public static class Box { public Box() {} } }`,
@@ -184,8 +185,14 @@ func TestJavaImportedMemberTypeBindsUnlessAnotherMemberShares(t *testing.T) {
 	r.write(t, "app/Base.java", `package app; public class Base { public static class Box { public Box() {} } }`)
 	r.update(t, "app/Base.java")
 	r.assertFreshParity(t, "second member type Box added")
+	if got := javaConstructsTargets(t, r)["app.Use.raw"]; got != "other.T.Box.Box" {
+		t.Fatalf("Use.raw bound %q with no supertype, want other.T.Box.Box", got)
+	}
+	r.write(t, "app/Use.java", "package app; import other.T.Box; public class Use extends Base {\n void raw() { new Box(); }\n}")
+	r.update(t, "app/Use.java")
+	r.assertFreshParity(t, "Use extends Base")
 	if got := javaConstructsTargets(t, r)["app.Use.raw"]; got != "" {
-		t.Fatalf("Use.raw bound %q with another member type Box present, want unresolved", got)
+		t.Fatalf("Use.raw bound %q with an inheritable member type Box, want unresolved", got)
 	}
 }
 
@@ -339,15 +346,16 @@ func assertJavaOwnMemberTargets(t *testing.T, r *lifecycleRepo, step string) {
 func TestJavaOwnMemberTypeConstructionBinds(t *testing.T) {
 	r := newLifecycleRepo(t, javaOwnMemberTree)
 	assertJavaOwnMemberTargets(t, r, "fresh")
-	// Without Own's member Box, make names a Box that other member types
-	// share, so it stays unresolved; restoring the member binds it again.
-	// Each update must match a fresh index.
+	// Without Own's member Box, make names the package type app.Box: Own
+	// spells no supertype, so Base.Box cannot be inherited (javac: app/Box).
+	// Restoring the member binds it again. Each update must match a fresh
+	// index.
 	own := javaOwnMemberTree["app/Own.java"]
 	r.write(t, "app/Own.java", strings.Replace(own, "    static class Box { Box() {} }\n", "", 1))
 	r.update(t, "app/Own.java")
 	r.assertFreshParity(t, "own member removed")
-	if got := javaConstructsByCallee(t, r)["app.Own.make|Box"]; len(got) != 1 || got[0] != "" {
-		t.Fatalf("Own.make bound %q without the member type, want unresolved", got)
+	if got := javaConstructsByCallee(t, r)["app.Own.make|Box"]; len(got) != 1 || got[0] != "app.Box.Box" {
+		t.Fatalf("Own.make bound %q without the member type, want app.Box.Box", got)
 	}
 	r.write(t, "app/Own.java", own)
 	r.update(t, "app/Own.java")
