@@ -199,6 +199,23 @@ var factParityScenarios = []factScenario{
 		},
 	},
 	{
+		// The update entrypoint reruns the weak dotted strategies after its
+		// language passes; they must not bind what the TypeScript pass left.
+		rule: "typescript_scope_ownership", name: "a dotted spelling the pass leaves is not the weak strategies' to bind", dim: "negative",
+		paths: []string{"app/main.ts"}, names: []string{"helper"},
+		seed: func(t *testing.T, f *parityFixture) []factProbe {
+			lib := f.file(t, "lib/x.ts", "typescript")
+			f.symbol(t, lib, "helper", "lib/x.ns.mod.helper", "function", "typescript")
+			f.symbol(t, lib, "helper", "x.a.b.c.helper", "method", "typescript")
+			main := f.file(t, "app/main.ts", "typescript")
+			caller := f.symbol(t, main, "run", "app/main.run", "function", "typescript")
+			return []factProbe{
+				{f.edge(t, main, caller, "ns.mod.helper"), "<unresolved>"},
+				{f.edge(t, main, caller, "a.b.c.helper"), "<unresolved>"},
+			}
+		},
+	},
+	{
 		rule: "csharp_scope_ownership", name: "an unproven C# call is not the generic strategies' to bind", dim: "negative",
 		paths: []string{"App/Main.cs"}, names: []string{"Helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
