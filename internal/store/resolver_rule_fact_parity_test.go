@@ -199,7 +199,7 @@ var factParityScenarios = []factScenario{
 		},
 	},
 	{
-		rule: "csharp_scope_ownership", name: "an unproven C# call is not the generic strategies' to bind", dim: "missing_fact",
+		rule: "csharp_scope_ownership", name: "an unproven C# call is not the generic strategies' to bind", dim: "negative",
 		paths: []string{"App/Main.cs"}, names: []string{"Helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "App/Util.cs", "csharp")

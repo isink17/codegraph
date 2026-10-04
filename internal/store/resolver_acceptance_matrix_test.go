@@ -41,14 +41,14 @@ func (f *parityFixture) namedImport(t *testing.T, file int64, language, source, 
 // original fact-parity scenarios leave open.
 var acceptanceScenarios = []factScenario{
 	{
-		rule: "caller_kind_candidate", name: "production caller binds a production candidate", dim: "positive",
-		paths: []string{"app/main.py"}, names: []string{"helper"},
+		rule: "caller_kind_candidate", name: "test caller binds a test-only candidate", dim: "positive",
+		paths: []string{"app/test_main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
-			lib := f.file(t, "app/util.py", "python")
-			f.symbol(t, lib, "helper", "util.helper", "function", "python")
-			main := f.file(t, "app/main.py", "python")
-			caller := f.symbol(t, main, "run", "main.run", "function", "python")
-			return []factProbe{{f.edge(t, main, caller, "helper"), "util.helper|exact_name|high"}}
+			tests := f.file(t, "app/test_util.py", "python")
+			f.symbol(t, tests, "helper", "test_util.helper", "function", "python")
+			testMain := f.file(t, "app/test_main.py", "python")
+			caller := f.symbol(t, testMain, "test_run", "test_main.test_run", "function", "python")
+			return []factProbe{{f.edge(t, testMain, caller, "helper"), "test_util.helper|exact_name|high"}}
 		},
 	},
 	{
@@ -268,6 +268,19 @@ var acceptanceScenarios = []factScenario{
 			return []factProbe{{f.edge(t, main, caller, "Widget"), "<unresolved>"}}
 		},
 	},
+	{
+		rule: "python_scope_claims", name: "an imported module declaring the name twice stays refused", dim: "ambiguity",
+		paths: []string{"app/main.py"}, names: []string{"helper"},
+		seed: func(t *testing.T, f *parityFixture) []factProbe {
+			lib := f.file(t, "lib.py", "python")
+			f.symbol(t, lib, "helper", "lib.helper", "function", "python")
+			f.symbol(t, lib, "helper", "lib.helper", "function", "python")
+			main := f.file(t, "app/main.py", "python")
+			caller := f.symbol(t, main, "run", "main.run", "function", "python")
+			f.namedImport(t, main, "python", "lib", "helper")
+			return []factProbe{{f.edge(t, main, caller, "helper"), "<unresolved>"}}
+		},
+	},
 }
 
 func allFactParityScenarios() []factScenario {
@@ -342,10 +355,10 @@ var resolverAcceptanceMatrix = map[resolverRuleID]map[string]string{
 		"test_shadow": notShadow,
 	},
 	"csharp_scope_ownership": {
-		"positive": cellScenario, "missing_fact": cellScenario, "repo_isolation": cellScenario,
-		"negative":    "test:TestCSharpBareCallUnknownSourceStaticnessKeepsOnlyStaticCandidates",
-		"ambiguity":   notAmbiguity,
-		"test_shadow": notShadow,
+		"positive": cellScenario, "negative": cellScenario, "repo_isolation": cellScenario,
+		"missing_fact": "na: ownership is unconditional, every unresolved C# edge is vetoed; no fact gates it",
+		"ambiguity":    notAmbiguity,
+		"test_shadow":  notShadow,
 	},
 	"typescript_scope_ownership": {
 		"positive": cellScenario, "negative": cellScenario, "missing_fact": cellScenario, "repo_isolation": cellScenario,
@@ -354,7 +367,7 @@ var resolverAcceptanceMatrix = map[resolverRuleID]map[string]string{
 	},
 	"python_scope_claims": {
 		"positive": cellScenario, "negative": cellScenario, "missing_fact": cellScenario, "repo_isolation": cellScenario,
-		"ambiguity":   "test:TestPythonScopeClaimsSurviveIntoTheWeakStrategy",
+		"ambiguity":   cellScenario,
 		"test_shadow": notShadow,
 	},
 	"broad_ambiguity": {
@@ -462,7 +475,9 @@ type lifecycleCase struct {
 	// edge's own file is not reindexed, so only the name-scoped entrypoints
 	// can see the change and the edge keeps its binding until they run.
 	declChange bool
-	seed       func(t *testing.T, f *parityFixture) (edge int64, set func(state string))
+	// declPaths are the paths reindexed with the declaration change.
+	declPaths []string
+	seed      func(t *testing.T, f *parityFixture) (edge int64, set func(state string))
 }
 
 func (f *parityFixture) exec(t *testing.T, query string, args ...any) {
@@ -554,7 +569,7 @@ var lifecycleCases = []lifecycleCase{
 		},
 	},
 	{
-		rule: "broad_ambiguity", paths: []string{"app/main.py"}, names: []string{"helper"}, declChange: true,
+		rule: "broad_ambiguity", paths: []string{"app/main.py"}, names: []string{"helper"}, declChange: true, declPaths: []string{"app/other.py"},
 		want: map[string]string{"unique": "util.helper|exact_name|high", "competing": "<unresolved>"},
 		seed: func(t *testing.T, f *parityFixture) (int64, func(string)) {
 			lib := f.file(t, "app/util.py", "python")
@@ -576,7 +591,9 @@ var lifecycleCases = []lifecycleCase{
 // Changing a fact and resolving incrementally must give the binding a fresh
 // resolve gives the changed state, for every transition between states and
 // every incremental entrypoint. A fact of the caller's file changes together
-// with a reindex of that file, which re-extracts its edges unresolved.
+// with a reindex of that file, which re-extracts its edges unresolved; for
+// those cases the transitions guard against state carried between resolves
+// (temp veto tables), and the per-state parity is TestResolverGateRuleFactParity.
 func TestResolverGateRuleFactLifecycleConvergence(t *testing.T) {
 	known := map[resolverRuleID]bool{}
 	for _, rule := range resolverBindGateRules {
@@ -617,7 +634,11 @@ func TestResolverGateRuleFactLifecycleConvergence(t *testing.T) {
 					if !lc.declChange {
 						f.clearAll(t)
 					}
-					f.resolveVia(t, entry, lc.paths, lc.names)
+					paths := lc.paths
+					if lc.declChange {
+						paths = lc.declPaths
+					}
+					f.resolveVia(t, entry, paths, lc.names)
 					if got := f.binding(t, edge); got != lc.want[to] {
 						t.Errorf("%s: %s -> %s via %s bound %q, fresh %q", lc.rule, from, to, entry, got, lc.want[to])
 					}
