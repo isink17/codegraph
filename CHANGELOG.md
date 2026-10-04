@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Re-running `codegraph index` over an existing database now re-decides every edge, as a fresh index does. Unchanged files are skipped and keep their edges, and the repository-wide resolve used to decide only unbound ones, so a binding another file's change made ambiguous stayed bound: adding a second `helper` in `other.py` left `main.py`'s `helper()` bound to `util.helper`, where a fresh index and `update` leave it unresolved, and the call-site reference kept the old target. Cross-language links are kept. `update` and path-scoped runs are unchanged.
+
 Python: a dotted call `C.member()` whose receiver is a class declared in a function (a nested local class) now binds to that class's own member (strategy `python_local_class_scope`, high), never to a same-named class in another module. It stays unresolved when the nearest declaration of `C` is not exactly one class, a wildcard import is in the file, the name is `global`/`nonlocal`/`del`eted, the class is decorated, or the class body rebinds the member. A module-level class is left to the other strategies. `treesitter:python:v8` and `python-regex:python:v8` reparse unchanged Python files.
 
 Python: a direct method's `def` header now matches the class-body names it spells by their NFKC form. In `class C: full = lambda: "cls"` with `def m(self, x=ｆｕｌｌ()):`, the tree-sitter parser bound the fullwidth call to `from lib import full`, while CPython calls the class attribute; it now stays unresolved like the ASCII spelling. The regex parser reads no calls from a `def` header, so it had no wrong edge, but records the same binding. `treesitter:python:v7` and `python-regex:python:v7` reparse unchanged Python files.
