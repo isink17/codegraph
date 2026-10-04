@@ -127,14 +127,15 @@ mod n { const I: u8 = 1; mk!(j); }
 }
 
 // TestRustAttributeEvidence pins which attributes leave an item proven: only
-// the built-in, non-generative ones, and a derive only when every entry is a
-// built-in derive no import, macro or glob could shadow.
+// the built-in, non-generative ones. A derive is never proven: a macro_use in
+// another file may make any derive name a procedural one.
 func TestRustAttributeEvidence(t *testing.T) {
 	cases := []struct {
 		name, src string
 		want      []string
 	}{
-		{"builtin only", "#[derive(Debug, Clone)]\n#[allow(dead_code)]\n/// doc\nstruct S;\n#[inline]\n#[cfg(unix)]\nfn f() {}\n", nil},
+		{"builtin attributes", "#[allow(dead_code)]\n/// doc\nstruct S;\n#[inline]\n#[cfg(unix)]\nfn f() {}\n", nil},
+		{"builtin derives", "#[derive(Debug, Clone)]\nstruct S;\n", []string{"crate macro "}},
 		{"custom derive", "#[derive(Debug, procgen::Gen)]\nstruct S;\n", []string{"crate macro "}},
 		{"attribute macro on a fn", "#[tokio::main]\nasync fn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
 		{"attribute macro on a method", "struct S;\nimpl S {\n    #[rename]\n    fn m() {}\n}\n", []string{"crate unproven crate::S::m"}},
@@ -142,8 +143,9 @@ func TestRustAttributeEvidence(t *testing.T) {
 		{"attribute macro on a module", "#[x]\nmod n {\n    pub fn f() {}\n}\n", []string{"crate macro ", "crate unproven crate::n"}},
 		{"cfg_attr", "#[cfg_attr(a, derive(Debug))]\nstruct S;\n", []string{"crate macro ", "crate unproven crate::S"}},
 		{"derive alias", "use p::Gen as Clone;\n#[derive(Clone)]\nstruct S;\n", []string{"crate macro "}},
-		{"std import of a builtin name", "use std::fmt::Debug;\n#[derive(Debug)]\nstruct S;\n", nil},
-		{"glob is not counted", "use crate::a::*;\n#[derive(Debug)]\nstruct S;\n", nil},
+		{"std import of a derive name", "use std::fmt::Debug;\n#[derive(Debug)]\nstruct S;\n", []string{"crate macro "}},
+		{"derive beside a glob", "use crate::a::*;\n#[derive(Debug)]\nstruct S;\n", []string{"crate macro "}},
+		{"glob does not refuse a builtin attribute", "use crate::a::*;\n#[inline]\nfn f() {}\n", nil},
 		{"macro_use", "#[macro_use]\nextern crate p;\n#[inline]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
 		{"macro named like a builtin", "macro_rules! inline { () => {} }\n#[inline]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
 		{"block item is the block scope's concern", "fn f() {\n    #[derive(p::G)]\n    struct S;\n}\n", nil},

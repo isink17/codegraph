@@ -16,7 +16,8 @@ import (
 // may emit sibling items (a function of any name, shadowing a glob import),
 // and an attribute macro may also rewrite, rename or drop the item it sits on.
 // Only attributes proven to be the compiler's built-in, non-generative ones
-// leave an item as written; every other attribute is recorded as unproven.
+// leave an item as written; every other attribute, and every derive, is
+// recorded as unproven.
 
 type rustAttrKind int
 
@@ -37,17 +38,13 @@ var rustBuiltinAttrs = map[string]bool{
 	"test": true, "ignore": true, "should_panic": true,
 }
 
-var rustBuiltinDerives = map[string]bool{
-	"Clone": true, "Copy": true, "Debug": true, "Default": true, "Eq": true,
-	"Hash": true, "Ord": true, "PartialEq": true, "PartialOrd": true,
-}
-
-// rustAttrs is the file-wide evidence that a bare built-in attribute or derive
-// name may mean something else: a name some `use` (an alias included) or macro
+// rustAttrs is the file-wide evidence that a bare built-in attribute name may
+// mean something else: a name some `use` (an alias included) or macro
 // definition binds, or evidence that cannot be read (a `use` with a syntax
 // error, `#[macro_use]`). A glob import is not counted: it could bring in a
 // macro of that name, but counting every glob would refuse every `use super::*`
-// test module. That is the documented recall/soundness ceiling.
+// test module. That is the documented recall/soundness ceiling for attributes;
+// derives are never proven (see rustAttrItemKind).
 type rustAttrs struct {
 	names map[string]bool
 	any   bool
@@ -112,14 +109,11 @@ func rustAttrItemKind(item *sitter.Node, content []byte, attrs rustAttrs) rustAt
 		return rustAttrRewrite
 	}
 	if name == "derive" {
-		list := strings.TrimSpace(nodeText(childByFieldName(attr, "arguments"), content))
-		list = strings.TrimSuffix(strings.TrimPrefix(list, "("), ")")
-		for _, d := range strings.Split(list, ",") {
-			if d = strings.TrimSpace(d); d != "" && (!rustBuiltinDerives[d] || attrs.shadowed(d)) {
-				return rustAttrDerive
-			}
-		}
-		return rustAttrNeutral
+		// No derive is proven built-in: a crate-root `#[macro_use] extern
+		// crate` in another file, or a glob, may put a procedural derive named
+		// Clone or Debug in scope, and one file cannot see either. Every derive
+		// may emit sibling items. Documented recall ceiling.
+		return rustAttrDerive
 	}
 	if rustBuiltinAttrs[name] {
 		return rustAttrNeutral

@@ -64,6 +64,19 @@ var rustAttrShadowCases = []struct {
 		"b.rs":   "pub use crate::a::*;\n#[derive(procgen::Gen)]\npub struct Marker;\n",
 		"m.rs":   "pub fn c() {\n    crate::b::f();\n}\n",
 	}, "", "crate::b::f", ""},
+	// -- no derive is proven built-in: a #[macro_use] extern crate in the crate
+	// root (rustc 1.98.1 offline, rust-glob-derive-oracle) makes a procedural
+	// Clone available to a derive in another file, which emits its own fn f
+	{"builtin derive beside a glob, macro_use in the root file", tree{
+		"lib.rs": "#[macro_use]\nextern crate procgen;\nmod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a::*;\n#[derive(Clone)]\nstruct Marker;\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"builtin derive beside a glob", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a::*;\n#[derive(Debug, Clone)]\nstruct Marker;\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
 	// -- an attribute macro may transform or remove the item it sits on
 	{"attribute macro on a sibling item", tree{
 		"lib.rs": "mod a; mod m;",
@@ -124,7 +137,7 @@ var rustAttrShadowCases = []struct {
 	{"builtin derive in a function block, own fn", tree{
 		"lib.rs": "mod m;",
 		"m.rs":   "fn f() {}\npub fn c() {\n    #[derive(Debug)]\n    struct Marker;\n    f();\n}\n",
-	}, "", "", "m.rs:crate::m::f"},
+	}, "", "", ""},
 	{"own fn with builtin attributes", tree{
 		"lib.rs": "mod a; mod m;",
 		"a.rs":   "pub fn f() {}",
@@ -228,6 +241,7 @@ func TestRustAttributeShadowingFollowsIncrementalChanges(t *testing.T) {
 	steps := []struct{ name, m, target string }{
 		{"glob only", "use crate::a::*;\n" + caller, "a.rs:crate::a::f"},
 		{"custom derive added", "use crate::a::*;\n#[derive(procgen::Gen)]\nstruct M;\n" + caller, ""},
+		{"builtin derive replaces it", "use crate::a::*;\n#[derive(Clone)]\nstruct M;\n" + caller, ""},
 		{"attribute macro added", "use crate::a::*;\n#[procgen::x]\nstruct M;\n" + caller, ""},
 		{"derive removed", "use crate::a::*;\nstruct M;\n" + caller, "a.rs:crate::a::f"},
 	}
