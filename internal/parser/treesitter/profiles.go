@@ -27,7 +27,9 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:python:v8", EmitsCallEdges: true}
 }
 
-// Java v7 marks a construction of a member type the calling class declares
+// Java v8 records the column each edge starts at, so the store credits an
+// edge to the method whose body holds it when several methods share a line.
+// v7 marks a construction of a member type the calling class declares
 // (graph.JavaOwnMemberTypeEvidence), which binds that member type.
 // v6 spells a generic construction's class without its type arguments
 // (`new Box<>()` constructs `Box`), so it binds like a raw construction.
@@ -56,7 +58,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyOwnMember {
 		return parser.Profile{ID: "treesitter:java:v6", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:java:v7", EmitsCallEdges: true}
+	if a.legacyLineOnly {
+		return parser.Profile{ID: "treesitter:java:v7", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v8", EmitsCallEdges: true}
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.

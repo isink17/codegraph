@@ -324,9 +324,11 @@ func assertJavaOwnMemberTargets(t *testing.T, r *lifecycleRepo, step string) {
 		"app.Outer.Near.make|Inner": "app.Outer.Near.Inner.Inner",
 		// Mid could inherit an Inner from a supertype that is not recorded.
 		"app.Outer.Mid.make|Inner": "",
-		// Credited to C.other, which is not where the construction is.
-		"app.Two.C.other|Box": "",
-		"app.Iface.make|Box":  "app.Iface.Box.Box",
+		// Two.make shares its last line with C.other. The column credits the
+		// construction to make (javac: app/Two$Box), but the same-line
+		// resolver guard still leaves its target unresolved.
+		"app.Two.make|Box":   "",
+		"app.Iface.make|Box": "app.Iface.Box.Box",
 	} {
 		if g := got[key]; len(g) != 1 || g[0] != want {
 			t.Errorf("%s: %s bound %q, want [%q]", step, key, g, want)
