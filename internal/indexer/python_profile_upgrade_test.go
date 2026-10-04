@@ -877,6 +877,14 @@ def run2():
 def swap():
     global Q
     Q = 2
+
+
+def run3():
+    class R:
+        @property
+        def full(self): return 1
+    R.full = 3
+    return R.full(None)
 `
 
 // pythonLocalClassV7Adapter reproduces what both Python adapters persisted for
@@ -898,8 +906,12 @@ func (a pythonLocalClassV7Adapter) Parse(ctx context.Context, path string, conte
 	}
 	kept := pf.Scope.Imports[:0]
 	for _, b := range pf.Scope.Imports {
-		if b.Kind == graph.ScopeImportLocalBinding && b.OwnerModule == "" {
+		if b.Kind == graph.ScopeImportLocalBinding && (b.OwnerModule == "" || strings.Contains(b.LocalName, ".")) {
 			continue
+		}
+		if b.Kind == graph.ScopeImportClassBodyBinding {
+			// Before v8 a decorated member was as much a declaration as any.
+			b.ImportedName = "decl"
 		}
 		if b.Kind == graph.ScopeImportLocalBinding && b.LocalName == "C" {
 			b.Kind = graph.ScopeImportNestedDeclaration
@@ -926,7 +938,7 @@ func runPythonLocalClassProfileConvergence(t *testing.T, old pythonLocalClassV7A
 		t.Fatalf("old index: %v", err)
 	}
 	stale := pythonGraph(t, s)
-	requireRows(t, stale, "old graph", "call|C.full@8->mod.run.C.full", "call|Q.full@14->mod.run2.Q.full")
+	requireRows(t, stale, "old graph", "call|C.full@8->mod.run.C.full", "call|Q.full@14->mod.run2.Q.full", "call|R.full@27->mod.run3.R.full")
 
 	upgraded := New(s.Store, parser.NewRegistry(current), nil)
 	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
@@ -938,7 +950,7 @@ func runPythonLocalClassProfileConvergence(t *testing.T, old pythonLocalClassV7A
 			summary.FilesChanged, summary.ParserProfileLanguages)
 	}
 	got := pythonGraph(t, s)
-	requireRows(t, got, "upgraded graph", "prov|mod.py="+currentID+":1", "call|C.full@8->", "call|Q.full@14->")
+	requireRows(t, got, "upgraded graph", "prov|mod.py="+currentID+":1", "call|C.full@8->", "call|Q.full@14->", "call|R.full@27->")
 	if want := freshPythonGraph(t, root, current); got != want {
 		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
 	}
@@ -948,7 +960,7 @@ func runPythonLocalClassProfileConvergence(t *testing.T, old pythonLocalClassV7A
 		t.Fatalf("second update: %v", err)
 	}
 	got = pythonGraph(t, s)
-	requireRows(t, got, "graph after unrelated update", "call|C.full@8->", "call|Q.full@14->")
+	requireRows(t, got, "graph after unrelated update", "call|C.full@8->", "call|Q.full@14->", "call|R.full@27->")
 	if want := freshPythonGraph(t, root, current); got != want {
 		t.Fatalf("graph after unrelated update:\n%s\nfrom-scratch graph:\n%s", got, want)
 	}

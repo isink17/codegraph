@@ -299,6 +299,33 @@ func AddClassScopeBindings(module string, lines []string, pf *graph.ParsedFile) 
 			}
 		}
 	}
+	// A function that assigns an attribute of a class written in a function
+	// may replace that member with anything (`C.full = 3`). The row names
+	// `receiver.attr` and is not a binding of the receiver name: it only tells
+	// the resolver the member is not provably the one the class declares.
+	localClasses := map[string]bool{}
+	for _, sym := range pf.Symbols {
+		if sym.Kind == "class" && strings.Count(strings.TrimPrefix(sym.QualifiedName, module+"."), ".") > 0 {
+			localClasses[sym.Name] = true
+		}
+	}
+	for _, sym := range pf.Symbols {
+		start, end := sym.Range.StartLine-1, sym.Range.EndLine
+		if (sym.Kind != "function" && sym.Kind != "method") || start < 0 || end > len(lines) || start >= end {
+			continue
+		}
+		owner, seen := strings.TrimPrefix(sym.QualifiedName, module+"."), map[string]bool{}
+		for _, target := range AttrAssignTargets(strings.Join(lines[start:end], "\n")) {
+			if recv, _, _ := strings.Cut(target, "."); localClasses[recv] && !seen[target] {
+				seen[target] = true
+				pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
+					LocalName:   target,
+					Kind:        graph.ScopeImportLocalBinding,
+					OwnerModule: owner,
+				})
+			}
+		}
+	}
 	for _, sym := range pf.Symbols {
 		start, end := sym.Range.StartLine-1, sym.Range.EndLine
 		if start < 0 || end > len(lines) || start >= end {

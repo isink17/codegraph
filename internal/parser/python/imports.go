@@ -363,8 +363,9 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 				// this graph already holds, and reporting it here would make a
 				// module-level `def` shadow every call to itself.
 				// A decorator rebinds the name to whatever it returns, so a
-				// decorated class is not provably the class it declares.
-				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: !(wasDecorated && strings.HasPrefix(header, "class "))})
+				// decorated class, or a decorated member of a class body
+				// (`@property`), is not provably what it declares.
+				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: !(wasDecorated && (classBody || strings.HasPrefix(header, "class ")))})
 			}
 			continue
 		}
@@ -816,4 +817,57 @@ func (b LocalBinding) Owner(written string) string {
 		return ""
 	}
 	return written
+}
+
+// AttrAssignTargets reports the `name.attr` targets src assigns to, in the
+// forms `a.x = v`, `a.x: T = v`, `a.x += v` and chained `a.x = b.y = v`. A
+// target inside a tuple, loop or `with` is not read. The receiver is whatever
+// name the text spells: the caller decides which receivers it cares about.
+func AttrAssignTargets(src string) []string {
+	var out []string
+	logical, _ := pythonLogicalLines(maskPythonLines(strings.Split(src, "\n")))
+	var scan func(stmt string)
+	scan = func(line string) {
+		for _, stmt := range splitTopLevel(line, ';') {
+			stmt = strings.TrimSpace(stmt)
+			if rest, ok := pythonInlineBody(stmt); ok {
+				scan(rest)
+				continue
+			}
+			depth, last := 0, 0
+			var segments []string
+			for i := 0; i < len(stmt); i++ {
+				switch stmt[i] {
+				case '(', '[', '{':
+					depth++
+				case ')', ']', '}':
+					depth--
+				case '=':
+					if depth != 0 || i+1 < len(stmt) && stmt[i+1] == '=' || i > 0 && strings.IndexByte("=!<>:", stmt[i-1]) >= 0 {
+						continue
+					}
+					seg := stmt[last:i]
+					if n := len(seg); n > 0 && strings.IndexByte("+-*/%&|^@", seg[n-1]) >= 0 {
+						seg = strings.TrimRight(seg, "+-*/%&|^@<>")
+					}
+					segments = append(segments, seg)
+					last = i + 1
+				}
+			}
+			for _, seg := range segments {
+				if cut := topLevelIndex(seg, ':'); cut >= 0 {
+					seg = seg[:cut]
+				}
+				recv, attr, ok := strings.Cut(strings.TrimSpace(seg), ".")
+				recv, attr = strings.TrimSpace(recv), strings.TrimSpace(attr)
+				if ok && validIdentifier(recv) && validIdentifier(attr) {
+					out = append(out, NormalizeIdentifier(recv)+"."+NormalizeIdentifier(attr))
+				}
+			}
+		}
+	}
+	for _, line := range logical {
+		scan(strings.TrimSpace(line))
+	}
+	return out
 }

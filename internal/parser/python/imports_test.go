@@ -483,3 +483,29 @@ func TestImportBindingsReadUnicodeNames(t *testing.T) {
 		}
 	}
 }
+
+func TestAttrAssignTargets(t *testing.T) {
+	tests := []struct {
+		name, src string
+		want      []string
+	}{
+		{"plain", "C.full = 3\n", []string{"C.full"}},
+		{"annotated", "C.full: int = 3\n", []string{"C.full"}},
+		{"augmented", "C.full += 3\n", []string{"C.full"}},
+		{"chained", "o.x = C.full = 3\n", []string{"o.x", "C.full"}},
+		{"semicolon", "pass; C.full = 3\n", []string{"C.full"}},
+		{"inline body", "if k: C.full = 3\n", []string{"C.full"}},
+		{"comparison is not assignment", "ok = C.full == 3\n", nil},
+		{"keyword argument is not assignment", "f(C.full, x=C.full)\n", nil},
+		{"string is masked", "s = \"C.full = 3\"\n", nil},
+		{"subscript target", "C.full[0] = 3\n", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := AttrAssignTargets(tc.src)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("AttrAssignTargets() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

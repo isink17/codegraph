@@ -732,6 +732,11 @@ func pythonNestedClassTargets(ctx context.Context, q execQuerier, repoID int64, 
 				if l.classBody && !l.memberDecl && l.owner == owner && l.name == pythonLeadingSegment(member) {
 					ambiguous = true
 				}
+				// `C.member = ...` written in the file replaces the member
+				// the class declares; the row names no binding of `C`.
+				if !l.classBody && l.name == receiver+"."+pythonLeadingSegment(member) {
+					ambiguous = true
+				}
 			}
 			for _, c := range classes {
 				if c.file == paths[edge.file] && c.qualified == qname {
