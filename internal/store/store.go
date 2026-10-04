@@ -2090,6 +2090,7 @@ const fileGraphRowsPredicate = `(
 	OR EXISTS (SELECT 1 FROM scope_import_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM scope_module_candidate_evidence t WHERE t.repo_id = f.repo_id AND t.source_file_id = f.id)
 	OR EXISTS (SELECT 1 FROM rust_module_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM rust_value_item_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM go_local_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM file_scope_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM file_tokens t WHERE t.file_id = f.id)
@@ -2362,6 +2363,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM rust_module_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM rust_value_item_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM file_scope_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2526,6 +2530,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM rust_module_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM rust_value_item_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM file_scope_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2733,6 +2740,15 @@ func insertParsedFileGraph(
 			args = append(args, repoID, fileID, module.OwnerModule, module.Name, module.ExternalPath, boolInt(module.Inline), module.Visibility)
 		}
 		if err := execBatchInsert(ctx, tx, "rust_module_evidence", "repo_id, file_id, owner_module, module_name, external_path, is_inline, visibility", 7, args, stats); err != nil {
+			return nil, err
+		}
+	}
+	if len(parsed.Scope.RustValueItems) > 0 {
+		args := make([]any, 0, len(parsed.Scope.RustValueItems)*5)
+		for _, item := range parsed.Scope.RustValueItems {
+			args = append(args, repoID, fileID, item.OwnerModule, item.Name, item.Kind)
+		}
+		if err := execBatchInsert(ctx, tx, "rust_value_item_evidence", "repo_id, file_id, owner_module, name, kind", 5, args, stats); err != nil {
 			return nil, err
 		}
 	}

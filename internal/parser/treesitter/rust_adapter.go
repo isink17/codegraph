@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -207,6 +208,12 @@ func rustExtractSymbols(node *sitter.Node, module, container, path string, conte
 			rustAddType(child, module, "trait", content, pf)
 		case "impl_item":
 			rustExtractImpl(child, module, path, content, pf)
+		case "const_item", "static_item", "function_signature_item", "foreign_mod_item", "macro_invocation", "expression_statement", "ERROR":
+			// An impl body is walked with its type as container; its consts
+			// and macros are the type's, not the module's.
+			if container == "" {
+				rustAddValueItems(child, module, content, pf)
+			}
 		case "mod_item":
 			nameNode := childByFieldName(child, "name")
 			body := childByFieldName(child, "body")
@@ -225,6 +232,46 @@ func rustExtractSymbols(node *sitter.Node, module, container, path string, conte
 				}
 			}
 		}
+	}
+}
+
+// rustAddValueItems records what a module-level node declares in the value
+// namespace without a symbol: a const, a static or an extern-block function or
+// static, by name. A macro invocation, in the module or in an extern block, is
+// recorded as an unknown expansion: its output is never read, so it may declare
+// any item, a function of any name included. So is a node the grammar could
+// not parse, which may hide a declaration. Invocations inside a function
+// block are the block scope's concern (rustItemMacro), not the module's.
+func rustAddValueItems(node *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
+	add := func(name, kind string) {
+		item := graph.RustValueItem{OwnerModule: module, Name: name, Kind: kind}
+		if !slices.Contains(pf.Scope.RustValueItems, item) {
+			pf.Scope.RustValueItems = append(pf.Scope.RustValueItems, item)
+		}
+	}
+	switch node.Type() {
+	case "const_item", "static_item", "function_signature_item":
+		if name := childByFieldName(node, "name"); name != nil {
+			add(nodeText(name, content), graph.RustValueItemDecl)
+		}
+	case "foreign_mod_item":
+		if body := childByFieldName(node, "body"); body != nil {
+			for i := range int(body.ChildCount()) {
+				rustAddValueItems(body.Child(i), module, content, pf)
+			}
+		}
+	case "expression_statement":
+		if node.NamedChildCount() > 0 && node.NamedChild(0).Type() == "macro_invocation" {
+			rustAddValueItems(node.NamedChild(0), module, content, pf)
+		}
+	case "macro_invocation":
+		name := ""
+		if macro := childByFieldName(node, "macro"); macro != nil {
+			name = nodeText(macro, content)
+		}
+		add(name, graph.RustValueItemMacro)
+	case "ERROR":
+		add("", graph.RustValueItemMacro)
 	}
 }
 

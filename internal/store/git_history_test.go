@@ -48,8 +48,8 @@ func TestGitHistoryMigrationOnOlderDatabase(t *testing.T) {
 
 // A database from before symbol history (migration 2 only) keeps its stored
 // history when opened, gains the tables, and records migration 3. A database
-// from a newer binary is refused without a byte changing, which is what an
-// older binary does with migration 3.
+// from a newer binary (a migration this build lacks) is refused without a byte changing, which is what an
+// older binary does with migration 5.
 func TestGitSymbolHistoryMigrationUpgradeAndNewerRefusal(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
@@ -85,7 +85,7 @@ func TestGitSymbolHistoryMigrationUpgradeAndNewerRefusal(t *testing.T) {
 		t.Fatalf("after upgrade: tables=%d migration3=%d %v", tables, applied, err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (4, '2026-10-04T00:00:00Z')`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (5, '2026-10-04T00:00:00Z')`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {

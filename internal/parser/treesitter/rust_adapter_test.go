@@ -82,3 +82,44 @@ func TestRustModuleEvidenceKeepsBackslashFileNameAsData(t *testing.T) {
 		t.Fatalf("external_path(foo) = %q, want %q", got["foo"], `x\y/foo`)
 	}
 }
+
+// TestRustValueItemEvidence pins which module-level syntax is recorded as a
+// value item: const, static and extern-block items by name, any item-level
+// macro invocation (statement or braced form, in an extern block too) and an
+// unparsable span as an unread expansion. Impl bodies, function bodies and
+// macro definitions record nothing, and an inline module's items carry the
+// inline module's own owner.
+func TestRustValueItemEvidence(t *testing.T) {
+	src := `const A: u8 = 1;
+static mut B: u8 = 2;
+extern "C" { fn c(); static D: u8; mk!(); }
+mk!(e);
+thread_local! { static F: u8 = 0; }
+macro_rules! mk { () => {} }
+struct S;
+impl S { const G: u8 = 1; mk!(); }
+fn body() { const H: u8 = 1; mk!(); }
+mod n { const I: u8 = 1; mk!(j); }
+`
+	pf, err := NewRust().Parse(context.Background(), "src/lib.rs", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, item := range pf.Scope.RustValueItems {
+		got[item.OwnerModule+" "+item.Kind+" "+item.Name] = true
+	}
+	want := []string{
+		"crate decl A", "crate decl B", "crate decl c", "crate decl D",
+		"crate macro mk", "crate macro thread_local",
+		"crate::n decl I", "crate::n macro mk",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("value items = %v, want exactly %v", got, want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("value items = %v, missing %q", got, w)
+		}
+	}
+}
