@@ -159,10 +159,12 @@ func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64
 }
 
 type Store struct {
-	db          *sql.DB
-	cleanup     func() error
-	cleanupOnce sync.Once
-	cleanupErr  error
+	db *sql.DB
+	// resolverPolicies overrides resolverPolicyRegistry; nil outside tests.
+	resolverPolicies map[string]int
+	cleanup          func() error
+	cleanupOnce      sync.Once
+	cleanupErr       error
 	// neighborStmts counts the statements the batched context-neighbour
 	// pipeline issues. The number is the load-bearing property of P19 -- it must
 	// not grow with the seed count -- and wall-clock cannot prove that, so the
@@ -234,7 +236,13 @@ type ScanSummary struct {
 	// ParserProfileLanguages are the languages this scan reconverged because
 	// their persisted parser profile differed from the running binary's. Empty
 	// on every scan of an already-current repository.
-	ParserProfileLanguages  []string                   `json:"parser_profile_languages,omitempty"`
+	ParserProfileLanguages []string `json:"parser_profile_languages,omitempty"`
+	// ResolverPolicyLanguages are the languages whose resolver policy marker
+	// was missing or older, so their edges were decided again (or recorded
+	// current by a repo-wide resolve) in this scan; ResolverPolicyMS is that
+	// pass's wall time. Empty on every scan of a current repository.
+	ResolverPolicyLanguages []string                   `json:"resolver_policy_languages,omitempty"`
+	ResolverPolicyMS        int64                      `json:"resolver_policy_ms,omitempty"`
 	FilesDeletedPct         float64                    `json:"files_deleted_pct,omitempty"`
 	ParseErrors             int                        `json:"parse_errors,omitempty"`
 	ParseSamples            []string                   `json:"parse_samples,omitempty"`
@@ -4079,7 +4087,7 @@ func (s *Store) recordAmbiguousResolverNames(ctx context.Context, tx *sql.Tx, re
 }
 
 func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
-	n, err := s.resolveEdgesRepoWide(ctx, repoID)
+	n, err := s.resolveEdgesRepoWide(ctx, repoID, nil, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -4090,7 +4098,13 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 }
 
 // resolveEdgesRepoWide resolves the repository graph in one transaction.
-func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64) (int, error) {
+//
+// A non-empty languages narrows only what is cleared up front: edges whose
+// source file is in those languages. Every strategy below binds unresolved
+// edges, so the other languages' standing bindings are neither read nor
+// rewritten, while their unresolved edges are re-decided to the same answer.
+// finish runs inside the transaction before it commits.
+func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, languages []string, finish func(*sql.Tx) error) (int, error) {
 	totalResolved := 0
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -4106,8 +4120,17 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64) (int, er
 	// but a cross-language link's comes from the resolver, so clearing them
 	// gives the fresh index's graph; cross-language links are their own
 	// derived set.
-	if _, err := tx.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
-		WHERE repo_id = ? AND edge_kind <> '`+EdgeKindCrossLanguageRef+`'`, repoID); err != nil {
+	clearSQL := `UPDATE edges SET ` + resolverClearResolutionSQL + `
+		WHERE repo_id = ? AND edge_kind <> '` + EdgeKindCrossLanguageRef + `'`
+	clearArgs := []any{repoID}
+	if len(languages) > 0 {
+		clearSQL += ` AND file_id IN (SELECT id FROM files WHERE repo_id = ? AND language IN (` + placeholders(len(languages)) + `))`
+		clearArgs = append(clearArgs, repoID)
+		for _, language := range languages {
+			clearArgs = append(clearArgs, language)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, clearSQL, clearArgs...); err != nil {
 		return 0, err
 	}
 
@@ -4361,6 +4384,11 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64) (int, er
 	_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_resolver_own_module_resolution`)
 	vetoDropped = true
 
+	if finish != nil {
+		if err := finish(tx); err != nil {
+			return 0, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 )
 
 // ReconcileReferenceIdentities derives reference identities from the persisted
@@ -13,11 +14,11 @@ func (s *Store) ReconcileReferenceIdentities(ctx context.Context, repoID int64) 
 	return reconcileReferenceIdentities(ctx, s.db, repoID)
 }
 
-func reconcileReferenceIdentities(ctx context.Context, q interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, repoID int64) error {
-	_, err := q.ExecContext(ctx, `
-		WITH matched AS (
+// referenceIdentityDerivedSQL derives, for every call reference of the
+// repository, the symbol and context symbol its call edges agree on. The one %s
+// is an optional extra reference filter.
+const referenceIdentityDerivedSQL = `
+WITH matched AS (
 			SELECT r.id AS reference_id, e.id AS edge_id,
 				e.src_symbol_id, e.dst_symbol_id
 			FROM references_tbl r
@@ -57,13 +58,56 @@ func reconcileReferenceIdentities(ctx context.Context, q interface {
 				END AS context_symbol_id
 			FROM references_tbl r
 			LEFT JOIN matched m ON m.reference_id = r.id
-			WHERE r.repo_id = ?
+			WHERE r.repo_id = ?%s
 			GROUP BY r.id
 		)
+`
+
+func reconcileReferenceIdentities(ctx context.Context, q interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, repoID int64) error {
+	_, err := q.ExecContext(ctx, fmt.Sprintf(referenceIdentityDerivedSQL, "")+`
 		UPDATE references_tbl AS r
 		SET symbol_id = (SELECT d.symbol_id FROM derived d WHERE d.id = r.id),
 			context_symbol_id = (SELECT d.context_symbol_id FROM derived d WHERE d.id = r.id)
 		WHERE r.repo_id = ?
 	`, repoID, repoID, repoID)
+	return err
+}
+
+// reconcileReferenceIdentitiesForLanguages is reconcileReferenceIdentities for
+// the references of files in the given languages only. The scoped derivation is
+// materialised once and joined: written as the repo-wide statement with a file
+// filter, the planner re-runs the derivation per updated row (20 s against
+// 0.4 s for 24k references).
+func reconcileReferenceIdentitiesForLanguages(ctx context.Context, q interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, repoID int64, languages []string) error {
+	if len(languages) == 0 {
+		return reconcileReferenceIdentities(ctx, q, repoID)
+	}
+	scope := ` AND r.file_id IN (SELECT id FROM files WHERE repo_id = ? AND language IN (` + placeholders(len(languages)) + `))`
+	scopeArgs := []any{repoID}
+	for _, language := range languages {
+		scopeArgs = append(scopeArgs, language)
+	}
+	args := append([]any{repoID, repoID}, scopeArgs...)
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS temp.tmp_reference_identity`,
+		`CREATE TEMP TABLE tmp_reference_identity(id INTEGER PRIMARY KEY, symbol_id INTEGER, context_symbol_id INTEGER)`,
+	} {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	if _, err := q.ExecContext(ctx, fmt.Sprintf(referenceIdentityDerivedSQL, scope)+`
+		INSERT INTO tmp_reference_identity SELECT id, symbol_id, context_symbol_id FROM derived`, args...); err != nil {
+		return err
+	}
+	if _, err := q.ExecContext(ctx, `UPDATE references_tbl SET symbol_id = d.symbol_id, context_symbol_id = d.context_symbol_id
+		FROM tmp_reference_identity d WHERE references_tbl.id = d.id`); err != nil {
+		return err
+	}
+	_, err := q.ExecContext(ctx, `DROP TABLE temp.tmp_reference_identity`)
 	return err
 }

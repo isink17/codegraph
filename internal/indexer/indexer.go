@@ -222,6 +222,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		candidatePaths = slices.Compact(candidatePaths)
 	}
 
+	// Resolver policy is decided here for the same reason: an unsupported
+	// marker refuses before BeginScan or any other write. Languages it returns
+	// have edges decided by an older resolver; they are decided again below.
+	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, affectedLanguage)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+
 	scanID, started, err := i.store.BeginScan(ctx, repo.ID, scanKind)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -930,6 +938,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// changed batch's introduced symbols for an incremental run.
 	// ---------------------------------------------------------------------
 	resolveStart := time.Now()
+	repoWideResolve := false
 
 	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
 		summary.ResolveMS = 0
@@ -984,6 +993,33 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, resolveErr
 		}
 		summary.ResolveMode = "repo"
+		repoWideResolve = true
+	}
+	// A repo-wide resolve has just decided every edge with this binary, so
+	// recording the policy needs no second pass. Any other mode decided only the
+	// changed slice; the stale languages' unchanged edges are decided again here,
+	// without parsing, in one transaction with their reference identities and
+	// marker.
+	if len(policyStale) > 0 {
+		policyStart := time.Now()
+		var err error
+		if repoWideResolve {
+			err = i.store.StampResolverPolicies(ctx, repo.ID, policyStale)
+		} else {
+			err = i.store.RedecideResolverPolicies(ctx, repo.ID, policyStale)
+			if summary.ResolveMode == "none" {
+				summary.ResolveMode = "resolver_policy"
+			} else {
+				summary.ResolveMode += "+resolver_policy"
+			}
+		}
+		if err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		summary.ResolverPolicyLanguages = policyStale
+		summary.ResolverPolicyMS = time.Since(policyStart).Milliseconds()
+		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
 	}
 	xlangCurrent, err := i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
 	if err != nil {
@@ -1026,7 +1062,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			// removed-name condition matches the dispatch above: since P22.12 a
 			// deletion-only run DOES resolve, and reporting `test_links` there
 			// would deny work that happened.
-			summary.ResolveMode = "test_links"
+			if summary.ResolveMode == "resolver_policy" {
+				summary.ResolveMode += "+test_links"
+			} else {
+				summary.ResolveMode = "test_links"
+			}
 		}
 	}
 	// Git history runs after the semantic graph is final and reads none of it.
@@ -1051,7 +1091,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		{Phase: "write_replace", MS: summary.WriteReplaceMS},
 		{Phase: "embed", MS: summary.EmbedMS},
 		{Phase: "mark_missing", MS: summary.MarkMissingMS},
-		{Phase: "resolve_edges", MS: summary.ResolveMS - summary.ResolveTestLinksMS},
+		{Phase: "resolve_edges", MS: summary.ResolveMS - summary.ResolveTestLinksMS - summary.ResolverPolicyMS},
+		{Phase: "resolve_policy", MS: summary.ResolverPolicyMS},
 		{Phase: "resolve_test_links", MS: summary.ResolveTestLinksMS},
 		{Phase: "history", MS: summary.HistoryMS},
 		{Phase: "total", MS: summary.DurationMS},

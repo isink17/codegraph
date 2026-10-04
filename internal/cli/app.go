@@ -1069,6 +1069,10 @@ func runIndexSmoke(ctx context.Context, cfg config.Config, stdout io.Writer, cmd
 				summary.WriteParseFailedFlushes +
 				summary.WriteReplaceFlushes,
 		}
+		if len(summary.ResolverPolicyLanguages) > 0 {
+			out["resolver_policy_languages"] = summary.ResolverPolicyLanguages
+			out["resolver_policy_ms"] = summary.ResolverPolicyMS
+		}
 		if summary.WriteStats != nil {
 			out["write_tx_count"] = summary.WriteStats.TxCount
 			out["total_exec_statements"] = summary.WriteStats.TotalExecStatements
