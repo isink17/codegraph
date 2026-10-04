@@ -37,8 +37,14 @@ var resolverPolicyRegistry = map[string]int{
 	//
 	// Bump a language's entry in the same change as any resolver-only fix to it.
 	// Rust's 1 is the glob re-export visibility rule.
+	//
+	// C#'s 2 is the namespace policy that shipped in #330. A development build
+	// already stamped C# as 1 under epoch 1's meaning, so a graph that holds
+	// pre-#330 namespace bindings on unchanged source is indistinguishable from
+	// a current one by marker alone. Moving the shipped value to 2 makes that
+	// graph, and every graph with no marker, converge on the same decision.
 	"cpp":        1,
-	"csharp":     1,
+	"csharp":     2,
 	"go":         1,
 	"java":       1,
 	"kotlin":     1,
