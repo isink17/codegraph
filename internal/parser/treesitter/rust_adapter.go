@@ -441,12 +441,23 @@ func rustPathHead(name string) string {
 // declare it; or, for a bare name, a parameter or pattern binding of an
 // enclosing function, closure, `let`, `for`, `match` arm or `if let` /
 // `while let` names it. Each shadows the module's item of that name.
+// An enclosing function, impl, trait or mod an unknown attribute macro may
+// rewrite makes every call inside it unproven, whatever its path.
 // Over-approximating scopes only leaves more calls unresolved.
 func rustCallShadowed(call *sitter.Node, name string, content []byte, attrs rustAttrs) bool {
 	head := rustPathHead(name)
 	bare := head != "" && !strings.Contains(name, "::")
 	inMod := false
 	for node := call.Parent(); node != nil; node = node.Parent() {
+		switch node.Type() {
+		case "function_item", "impl_item", "trait_item", "mod_item":
+			// An attribute macro on an enclosing item may rewrite the whole
+			// body, `crate::` paths included, so none of its original calls is
+			// proven to bind what it names.
+			if rustItemAttrKind(node, content, attrs) == rustAttrRewrite {
+				return true
+			}
+		}
 		switch node.Type() {
 		case "mod_item":
 			inMod = true

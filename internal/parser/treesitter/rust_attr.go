@@ -29,12 +29,13 @@ const (
 
 // rustBuiltinAttrs never emit items and leave the item they sit on as written
 // (or, for cfg, remove it whole). cfg_attr is absent: it may name any attribute.
+// path is absent too: it moves a `mod` to a file the parser does not evaluate.
 var rustBuiltinAttrs = map[string]bool{
 	"allow": true, "warn": true, "deny": true, "forbid": true, "expect": true,
 	"inline": true, "doc": true, "cfg": true, "link_name": true, "link": true,
 	"link_section": true, "must_use": true, "deprecated": true, "repr": true,
 	"non_exhaustive": true, "no_mangle": true, "export_name": true, "used": true,
-	"track_caller": true, "cold": true, "path": true, "automatically_derived": true,
+	"track_caller": true, "cold": true, "automatically_derived": true,
 	"test": true, "ignore": true, "should_panic": true,
 }
 

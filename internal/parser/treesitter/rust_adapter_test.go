@@ -171,3 +171,56 @@ func TestRustAttributeEvidence(t *testing.T) {
 		}
 	}
 }
+
+// TestRustCallsInRewrittenItemAreUnproven pins that every call whose enclosing
+// fn, impl, trait or inline mod carries an attribute the parser cannot expand
+// is marked unproven, `crate::` paths included; builtin attributes, derives
+// and attributes on siblings leave the calls as written.
+func TestRustCallsInRewrittenItemAreUnproven(t *testing.T) {
+	cases := []struct {
+		name, src string
+		refused   bool
+	}{
+		{"fn", "#[x::inject]\nfn c() { g(); crate::g(); other::h(); }\n", true},
+		{"fn, self path", "#[x::inject]\nfn c() { self::g(); }\n", true},
+		{"nested closure", "#[x::inject]\nfn c() { let _f = || { g(); }; }\n", true},
+		{"nested fn", "#[x::inject]\nfn c() { fn d() { g(); } }\n", true},
+		{"impl", "#[x::inject]\nimpl S { fn c(&self) { g(); crate::g(); } }\n", true},
+		{"trait", "#[x::inject]\ntrait T { fn c(&self) { g(); crate::g(); } }\n", true},
+		{"inline mod", "#[x::inject]\nmod n { fn c() { g(); crate::g(); } }\n", true},
+		{"builtin attribute", "#[inline]\n#[allow(dead_code)]\nfn c() { g(); crate::g(); }\n", false},
+		{"builtin attribute on impl", "#[allow(dead_code)]\nimpl S { fn c(&self) { crate::g(); } }\n", false},
+		{"plain", "fn c() { g(); crate::g(); }\n", false},
+		{"unknown attribute on a sibling", "#[x::inject]\nfn o() {}\nfn c() { g(); crate::g(); }\n", false},
+		{"derive on a sibling", "#[derive(Clone)]\nstruct S;\nfn c() { g(); crate::g(); }\n", false},
+	}
+	for _, tc := range cases {
+		pf, err := NewRust().Parse(context.Background(), "src/lib.rs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		for _, e := range pf.Edges {
+			if e.Kind != "calls" {
+				continue
+			}
+			calls++
+			if got := e.Evidence == graph.RustCallBlockScopeEvidence; got != tc.refused {
+				t.Errorf("%s: call %q refused=%v, want %v", tc.name, e.DstName, got, tc.refused)
+			}
+		}
+		if calls == 0 {
+			t.Errorf("%s: no call edges", tc.name)
+		}
+	}
+}
+
+func TestRustPathAttributeDeclaresNoDefaultModule(t *testing.T) {
+	got := rustExternalModules(t, "src/lib.rs", "#[path = \"real.rs\"]\nmod child;\nmod plain;\n")
+	if _, ok := got["child"]; ok {
+		t.Errorf("path-attributed mod recorded a default ExternalPath: %v", got)
+	}
+	if got["plain"] != "plain" {
+		t.Errorf("plain mod lost its default path: %v", got)
+	}
+}

@@ -193,6 +193,114 @@ var rustAttrShadowCases = []struct {
 		"n.rs":   "pub fn f() {}",
 		"m.rs":   "pub fn c() {\n    crate::n::f();\n}\n",
 	}, "", "crate::n::f", "n.rs:crate::n::f"},
+	// -- an attribute macro on an enclosing item may rewrite its whole body
+	// (rustc 1.98.1 oracle: #[inject] fn caller() { g(); other::h(); } runs
+	// the injected g and other::h), so no original call inside it binds
+	{"rewriting attribute on the caller, own fn", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[procgen::inject]\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"rewriting attribute on the caller, own module path", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod other { pub fn f() {} }\n#[procgen::inject]\npub fn c() {\n    other::f();\n}\n",
+	}, "", "other::f", ""},
+	{"rewriting attribute on the caller, crate path", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "#[procgen::inject]\npub fn c() {\n    crate::a::f();\n}\n",
+	}, "", "crate::a::f", ""},
+	{"rewriting attribute on the caller, self path", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[procgen::inject]\npub fn c() {\n    self::f();\n}\n",
+	}, "", "self::f", ""},
+	{"rewriting attribute on the caller, glob", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a::*;\n#[procgen::inject]\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"rewriting attribute on the caller, explicit import", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a::f;\n#[procgen::inject]\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"rewriting attribute on a nested closure's fn", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[procgen::inject]\npub fn c() {\n    let _g = || { f(); };\n}\n",
+	}, "", "", ""},
+	{"rewriting attribute on the impl", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\npub struct S;\n#[procgen::inject]\nimpl S {\n    pub fn c(&self) {\n        f();\n    }\n}\n",
+	}, "", "", ""},
+	{"rewriting attribute on the impl, crate path", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "pub struct S;\n#[procgen::inject]\nimpl S {\n    pub fn c(&self) {\n        crate::a::f();\n    }\n}\n",
+	}, "", "crate::a::f", ""},
+	{"rewriting attribute on an inline mod", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "#[procgen::inject]\npub mod inner {\n    pub fn f() {}\n    pub fn c() {\n        f();\n    }\n}\n",
+	}, "", "", ""},
+	{"rewriting attribute on an inline mod, crate path", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "#[procgen::inject]\npub mod inner {\n    pub fn c() {\n        crate::a::f();\n    }\n}\n",
+	}, "", "crate::a::f", ""},
+	{"rewriting attribute on the outer fn, nested fn call", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[procgen::inject]\npub fn c() {\n    fn inner() {\n        f();\n    }\n}\n",
+	}, "", "", ""},
+	{"ordinary caller keeps its own fn", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\npub fn c() {\n    f();\n}\n",
+	}, "", "", "m.rs:crate::m::f"},
+	{"builtin attribute on the caller", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[inline]\n#[allow(dead_code)]\npub fn c() {\n    f();\n}\n",
+	}, "", "", "m.rs:crate::m::f"},
+	{"builtin derive on a sibling type keeps the own fn", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[derive(Clone)]\nstruct S;\npub fn c() {\n    f();\n}\n",
+	}, "", "", "m.rs:crate::m::f"},
+	{"rewriting attribute on a sibling fn keeps the caller", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[procgen::inject]\nfn other() {}\npub fn c() {\n    f();\n}\n",
+	}, "", "", "m.rs:crate::m::f"},
+	{"builtin attribute on the impl", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "pub struct S;\n#[allow(dead_code)]\nimpl S {\n    pub fn c(&self) {\n        crate::a::f();\n    }\n}\n",
+	}, "", "crate::a::f", "a.rs:crate::a::f"},
+	// -- #[path] moves the module to a file the parser does not evaluate
+	// (rustc 1.98.1 oracle: #[path = "real.rs"] mod child; calls real.rs, not
+	// an orphan child.rs)
+	{"path attribute, orphan default file", tree{
+		"lib.rs":   "#[path = \"real.rs\"]\nmod child;\nmod m;",
+		"real.rs":  "pub fn f() {}",
+		"child.rs": "pub fn f() {}",
+		"m.rs":     "pub fn c() {\n    crate::child::f();\n}\n",
+	}, "", "crate::child::f", ""},
+	{"path attribute, caller beside it", tree{
+		"lib.rs":   "#[path = \"real.rs\"]\nmod child;\nfn c() {\n    child::f();\n}\n",
+		"real.rs":  "pub fn f() {}",
+		"child.rs": "pub fn f() {}",
+	}, "lib.rs", "child::f", ""},
+	{"path attribute, import", tree{
+		"lib.rs":   "#[path = \"real.rs\"]\nmod child;\nmod m;",
+		"real.rs":  "pub fn f() {}",
+		"child.rs": "pub fn f() {}",
+		"m.rs":     "use crate::child::f;\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"path attribute, re-export", tree{
+		"lib.rs":   "#[path = \"real.rs\"]\nmod child;\npub use child::f;\nmod m;",
+		"real.rs":  "pub fn f() {}",
+		"child.rs": "pub fn f() {}",
+		"m.rs":     "pub fn c() {\n    crate::f();\n}\n",
+	}, "", "crate::f", ""},
+	{"mod without path attribute still resolves", tree{
+		"lib.rs":   "mod child;\nmod m;",
+		"child.rs": "pub fn f() {}",
+		"m.rs":     "pub fn c() {\n    crate::child::f();\n}\n",
+	}, "", "crate::child::f", "child.rs:crate::child::f"},
 	// -- statement macros in a block: rustc calls the macro's local fn, and a
 	// nested block's macro does not reach the call outside it
 	{"statement macro declaring f in the call's block", tree{
@@ -244,6 +352,8 @@ func TestRustAttributeShadowingFollowsIncrementalChanges(t *testing.T) {
 		{"builtin derive replaces it", "use crate::a::*;\n#[derive(Clone)]\nstruct M;\n" + caller, ""},
 		{"attribute macro added", "use crate::a::*;\n#[procgen::x]\nstruct M;\n" + caller, ""},
 		{"derive removed", "use crate::a::*;\nstruct M;\n" + caller, "a.rs:crate::a::f"},
+		{"attribute macro on the caller", "use crate::a::*;\n#[procgen::inject]\n" + caller, ""},
+		{"attribute macro removed from the caller", "use crate::a::*;\n" + caller, "a.rs:crate::a::f"},
 	}
 	for _, scoped := range []bool{true, false} {
 		r := newLifecycleRepo(t, tree{"lib.rs": "mod a; mod m;", "a.rs": "pub fn f() {}", "m.rs": steps[0].m})
