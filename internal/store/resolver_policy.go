@@ -99,40 +99,11 @@ func resolverPolicyKeyPrefix(repoID int64) string {
 // marker this binary cannot honour. It reads only, so a refusal precedes every
 // write of the scan.
 func (s *Store) PlanResolverPolicies(ctx context.Context, repoID int64, affected func(language string) bool) ([]string, error) {
-	prefix := resolverPolicyKeyPrefix(repoID)
-	rows, err := s.db.QueryContext(ctx, `SELECT key, COALESCE(value,'') FROM settings WHERE substr(key,1,?)=?`, len(prefix), prefix)
+	stored, err := s.storedResolverPolicies(ctx, s.db, repoID, affected)
 	if err != nil {
 		return nil, err
 	}
-	stored := map[string]string{}
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		stored[strings.TrimPrefix(key, prefix)] = value
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	_ = rows.Close()
-
 	current := s.policies()
-	for language, raw := range stored {
-		if !affected(language) {
-			continue
-		}
-		version, ok := parseResolverPolicyVersion(raw)
-		want, known := current[language]
-		switch {
-		case !ok || !known:
-			return nil, &ResolverPolicyError{Reason: ErrResolverPolicyUnreadable, Language: language, Stored: raw, Current: want}
-		case version > want:
-			return nil, &ResolverPolicyError{Reason: ErrResolverPolicyNewer, Language: language, Stored: raw, Current: want}
-		}
-	}
 	var stale []string
 	for language, want := range current {
 		if !affected(language) {
@@ -257,4 +228,48 @@ func (s *Store) languagesWithLiveFiles(ctx context.Context, repoID int64, langua
 		out = append(out, language)
 	}
 	return out, rows.Err()
+}
+
+type policyQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// storedResolverPolicies reads the repository's markers and refuses an affected
+// language whose marker this binary cannot honour.
+func (s *Store) storedResolverPolicies(ctx context.Context, q policyQuerier, repoID int64, affected func(language string) bool) (map[string]string, error) {
+	prefix := resolverPolicyKeyPrefix(repoID)
+	rows, err := q.QueryContext(ctx, `SELECT key, COALESCE(value,'') FROM settings WHERE substr(key,1,?)=?`, len(prefix), prefix)
+	if err != nil {
+		return nil, err
+	}
+	stored := map[string]string{}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		stored[strings.TrimPrefix(key, prefix)] = value
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	current := s.policies()
+	for language, raw := range stored {
+		if !affected(language) {
+			continue
+		}
+		version, ok := parseResolverPolicyVersion(raw)
+		want, known := current[language]
+		switch {
+		case !ok || !known:
+			return nil, &ResolverPolicyError{Reason: ErrResolverPolicyUnreadable, Language: language, Stored: raw, Current: want}
+		case version > want:
+			return nil, &ResolverPolicyError{Reason: ErrResolverPolicyNewer, Language: language, Stored: raw, Current: want}
+		}
+	}
+	return stored, nil
 }

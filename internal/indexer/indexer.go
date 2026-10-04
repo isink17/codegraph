@@ -234,7 +234,16 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// Resolver policy is decided here for the same reason: an unsupported
 	// marker refuses before BeginScan or any other write. Languages it returns
 	// have edges decided by an older resolver; they are decided again below.
-	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, affectedLanguage)
+	//
+	// A full or forced index resolves the whole repository, and that resolve
+	// writes every language's edges whatever --languages selected for parsing.
+	// Its policy coverage is therefore every language, so a newer or unreadable
+	// marker of an unselected language refuses it too.
+	policyAffected := affectedLanguage
+	if !pathScoped && scanKind != "update" {
+		policyAffected = func(string) bool { return true }
+	}
+	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, policyAffected)
 	if err != nil {
 		return store.ScanSummary{}, err
 	}

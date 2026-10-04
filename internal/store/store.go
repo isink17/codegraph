@@ -4096,6 +4096,11 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 // state that did not commit with it.
 func (s *Store) ResolveEdgesRecordingPolicies(ctx context.Context, repoID int64, languages []string) (int, error) {
 	return s.resolveEdgesRepoWide(ctx, repoID, nil, func(tx *sql.Tx) error {
+		// An unscoped resolve writes every language's edges, so every marker
+		// must be one this binary can honour; the error rolls the writes back.
+		if _, err := s.storedResolverPolicies(ctx, tx, repoID, func(string) bool { return true }); err != nil {
+			return err
+		}
 		if err := reconcileReferenceIdentities(ctx, tx, repoID); err != nil {
 			return err
 		}
