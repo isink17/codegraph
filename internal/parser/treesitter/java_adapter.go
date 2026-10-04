@@ -514,9 +514,8 @@ func javaEdgeCol(node *sitter.Node, mark bool) int {
 // models. A field initializer or initializer block is not credited to a
 // member of that class, and a construction inside an anonymous, local or
 // enum-constant class body may name a type that body inherits, so neither
-// is marked. Edges carry a line but no column, so the construction is
-// marked only when no other method or constructor declaration covers its
-// line: the store then credits it to the enclosing method.
+// is marked. Own-member marking remains conservatively line-based: no other
+// method or constructor declaration may cover the construction's line.
 func javaOwnMemberCreation(root, creation *sitter.Node, name string, content []byte) bool {
 	if first := creation.Child(0); first == nil || first.Type() != "new" || strings.Contains(name, ".") || javaCallInNestedClassBody(creation) {
 		return false
