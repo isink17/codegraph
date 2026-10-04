@@ -106,6 +106,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyTypeScriptModuleScope,
 		ResolutionStrategyPythonImportScope,
 		ResolutionStrategyPythonModuleScope,
+		ResolutionStrategyPythonLocalClassScope,
 		ResolutionStrategyCSharpSameType,
 		ResolutionStrategyCSharpThisScope,
 		ResolutionStrategyCSharpTypeScope,

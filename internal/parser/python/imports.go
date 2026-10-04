@@ -249,6 +249,7 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 	lines := maskPythonLines(strings.Split(src, "\n"))
 	var out []LocalBinding
 	seen := map[string]struct{}{}
+	escaped := map[string]bool{}
 	add := func(name string) { addBinding(&out, seen, LocalBinding{Name: name}) }
 
 	logical, starts := pythonLogicalLines(lines)
@@ -336,7 +337,24 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 			}
 			continue
 		}
+		if !classBody {
+			for _, stmt := range splitTopLevel(trimmed, ';') {
+				stmt = strings.TrimSpace(stmt)
+				for _, keyword := range []string{"global ", "nonlocal "} {
+					if rest, ok := strings.CutPrefix(stmt, keyword); ok {
+						for _, name := range splitTopLevel(rest, ',') {
+							escaped[NormalizeIdentifier(strings.TrimSpace(name))] = true
+						}
+					}
+				}
+			}
+		}
 		addPythonAssignedNames(trimmed, add)
+	}
+	// A `global`/`nonlocal` name the scope also assigns rebinds a name of an
+	// outer scope that no call below that scope can be shown to still see.
+	for i := range out {
+		out[i].Escapes = escaped[out[i].Name] && !out[i].Declaration
 	}
 	return out
 }
@@ -380,6 +398,9 @@ func defHeader(src string) (string, int) {
 type LocalBinding struct {
 	Name        string
 	Declaration bool
+	// Escapes marks a `global`/`nonlocal` name: the scope that owns it is not
+	// known here, so it is recorded at module level where every call sees it.
+	Escapes bool
 }
 
 func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
@@ -391,6 +412,15 @@ func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
 		return
 	}
 	if _, ok := seen[b.Name]; ok {
+		if !b.Declaration {
+			// A plain rebinding of a declared name (`C = make()` after
+			// `class C`) makes the name something other than the declaration.
+			for i := range *out {
+				if (*out)[i].Name == b.Name {
+					(*out)[i].Declaration = false
+				}
+			}
+		}
 		return
 	}
 	seen[b.Name] = struct{}{}
@@ -491,6 +521,16 @@ func addPythonAssignedNames(stmt string, add func(string)) {
 		if strings.HasPrefix(stmt, keyword) {
 			return
 		}
+	}
+	// `del x` makes x local to the scope for its whole body.
+	if rest, ok := strings.CutPrefix(stmt, "del "); ok {
+		for _, target := range splitTopLevel(rest, ',') {
+			target = strings.TrimSpace(strings.Trim(strings.TrimSpace(target), "()"))
+			if !strings.ContainsAny(target, ".[") {
+				add(target)
+			}
+		}
+		return
 	}
 	// A compound header carrying its body on one line (`if flag: h = 1`) binds
 	// what the body binds. Without this the scan would read `if flag` as the
@@ -740,4 +780,13 @@ func pythonInlineBody(stmt string) (string, bool) {
 		return strings.TrimSpace(rest), true
 	}
 	return "", false
+}
+
+// Owner is the lexical scope this binding is recorded under: the scope that
+// wrote it, or the module for a `global`/`nonlocal` name.
+func (b LocalBinding) Owner(written string) string {
+	if b.Escapes {
+		return ""
+	}
+	return written
 }

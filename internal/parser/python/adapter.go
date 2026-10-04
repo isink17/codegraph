@@ -248,7 +248,7 @@ func addPythonLocalBindings(module string, lines []string, pf *graph.ParsedFile)
 			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
 				LocalName:   binding.Name,
 				Kind:        kind,
-				OwnerModule: owner,
+				OwnerModule: binding.Owner(owner),
 			})
 		}
 	}

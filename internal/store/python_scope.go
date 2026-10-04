@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"math"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -238,15 +239,18 @@ type pythonScopeAnswers struct {
 	// or not.
 	claimed map[int64]struct{}
 	// imported and sameModule are the edges this pass can bind, by strategy.
-	imported, sameModule map[int64]int64
+	imported, sameModule, localClass map[int64]int64
 }
 
 func (a pythonScopeAnswers) handled() map[int64]struct{} {
-	out := make(map[int64]struct{}, len(a.claimed)+len(a.sameModule))
+	out := make(map[int64]struct{}, len(a.claimed)+len(a.sameModule)+len(a.localClass))
 	for id := range a.claimed {
 		out[id] = struct{}{}
 	}
 	for id := range a.sameModule {
+		out[id] = struct{}{}
+	}
+	for id := range a.localClass {
 		out[id] = struct{}{}
 	}
 	return out
@@ -295,6 +299,7 @@ func resolvePythonScope(ctx context.Context, q execQuerier, repoID int64, only m
 	}{
 		{answers.imported, ResolutionStrategyPythonImportScope},
 		{answers.sameModule, ResolutionStrategyPythonModuleScope},
+		{answers.localClass, ResolutionStrategyPythonLocalClassScope},
 	} {
 		n, err := pythonScopeApply(ctx, q, group.results, group.strategy)
 		if err != nil {
@@ -342,6 +347,7 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 		claimed:    map[int64]struct{}{},
 		imported:   map[int64]int64{},
 		sameModule: map[int64]int64{},
+		localClass: map[int64]int64{},
 	}
 	edges, err := pythonScopeEdges(ctx, q, repoID, only)
 	if err != nil || len(edges) == 0 {
@@ -365,6 +371,10 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 		return answers, err
 	}
 	scopes, err := pythonScopeCallScopes(ctx, q, repoID, sortedIDs(srcIDs), callerPaths)
+	if err != nil {
+		return answers, err
+	}
+	nestedClasses, localClassTargets, err := pythonNestedClassTargets(ctx, q, repoID, edges, callerPaths, scopes, imports)
 	if err != nil {
 		return answers, err
 	}
@@ -405,6 +415,13 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			continue
 		}
 		if !claimed {
+			if nestedClasses[e.id] {
+				answers.claimed[e.id] = struct{}{}
+				if target := localClassTargets[e.id]; target != 0 {
+					answers.localClass[e.id] = target
+				}
+				continue
+			}
 			if !claimsOnly && pythonNameOnlyNestedElsewhere(e.name, at, callerSymbols[e.file], locals[e.file], wildcardFiles[e.file]) {
 				// The file declares the name only inside other functions or
 				// class bodies, none of which the call can see: a same-name
@@ -581,6 +598,169 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 		}
 	}
 	return answers, nil
+}
+
+// pythonNestedClassTargets uses class declaration identity and the caller's
+// lexical scope to bind a dotted receiver only to its own class member.
+func pythonNestedClassTargets(ctx context.Context, q execQuerier, repoID int64, edges []pyScopeEdge, paths map[int64]string, scopes map[int64]string, imports map[int64][]pyScopeImport) (map[int64]bool, map[int64]int64, error) {
+	classNames, memberNames := map[string]struct{}{}, map[string]struct{}{}
+	for _, edge := range edges {
+		if strings.Contains(edge.name, ".") {
+			classNames[pythonLeadingSegment(edge.name)] = struct{}{}
+			memberNames[strings.TrimPrefix(edge.name, pythonLeadingSegment(edge.name)+".")] = struct{}{}
+		}
+	}
+	toArgs := func(set map[string]struct{}) []any {
+		names := make([]string, 0, len(set))
+		for name := range set {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		args := make([]any, len(names))
+		for i := range names {
+			args[i] = names[i]
+		}
+		return args
+	}
+	classArgs := toArgs(classNames)
+	memberArgs := toArgs(memberNames)
+	type pyClass struct{ name, qualified, file string }
+	classes := []pyClass{}
+	if err := sqliteBatchedQuery(ctx, q,
+		`SELECT s.name,s.qualified_name,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='python' AND s.kind='class'`,
+		` AND s.name IN (%s)`, []any{repoID}, classArgs, len(classArgs) > 0,
+		func(rows *sql.Rows) error {
+			var c pyClass
+			if err := rows.Scan(&c.name, &c.qualified, &c.file); err != nil {
+				return err
+			}
+			classes = append(classes, c)
+			return nil
+		}); err != nil {
+		return nil, nil, err
+	}
+	type pyMember struct {
+		id                    int64
+		name, qualified, file string
+	}
+	members := []pyMember{}
+	if err := sqliteBatchedQuery(ctx, q,
+		`SELECT s.id,s.name,s.qualified_name,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='python' AND s.kind IN ('function','method','class')`,
+		` AND s.name IN (%s)`, []any{repoID}, memberArgs, len(memberArgs) > 0,
+		func(rows *sql.Rows) error {
+			var m pyMember
+			if err := rows.Scan(&m.id, &m.name, &m.qualified, &m.file); err != nil {
+				return err
+			}
+			members = append(members, m)
+			return nil
+		}); err != nil {
+		return nil, nil, err
+	}
+	// Every class of a calling file, by qualified name: an owner that is a
+	// class body is not a scope a nested function can see through.
+	callerFiles := map[int64]struct{}{}
+	for _, edge := range edges {
+		callerFiles[edge.file] = struct{}{}
+	}
+	decls := map[string][]string{}
+	if err := chunkedInt64Query(ctx, q, sortedIDs(callerFiles), `SELECT s.qualified_name,s.kind,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND s.language='python' AND s.file_id IN (`, repoID, func(scan func(...any) error) error {
+		var qualified, kind, filePath string
+		if err := scan(&qualified, &kind, &filePath); err != nil {
+			return err
+		}
+		decls[filePath+"\x00"+qualified] = append(decls[filePath+"\x00"+qualified], kind)
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	wildcard := map[int64]bool{}
+	for file, list := range imports {
+		for _, imp := range list {
+			wildcard[file] = wildcard[file] || imp.wildcard
+		}
+	}
+	claimed, targets := map[int64]bool{}, map[int64]int64{}
+	for _, edge := range edges {
+		if !strings.Contains(edge.name, ".") {
+			continue
+		}
+		receiver := pythonLeadingSegment(edge.name)
+		member := strings.TrimPrefix(edge.name, receiver+".")
+		module := strings.TrimSuffix(path.Base(paths[edge.file]), path.Ext(paths[edge.file]))
+		at := scopes[edge.src]
+		owners := []string{at}
+		for owner := at; strings.Contains(owner, "."); {
+			owner = owner[:strings.LastIndexByte(owner, '.')]
+			owners = append(owners, owner)
+		}
+		owners = append(owners, "")
+		// The nearest scope that declares the receiver with any symbol owns
+		// it; only a single class there is provable. A wildcard import may
+		// rebind the name at run time, so it proves nothing either.
+		var local []pyClass
+		ambiguous := false
+		for i, owner := range owners {
+			qname := module + "." + receiver
+			if owner != "" {
+				qname = module + "." + owner + "." + receiver
+			}
+			kinds := decls[paths[edge.file]+"\x00"+qname]
+			if len(kinds) == 0 {
+				continue
+			}
+			// A class body's names reach only the statements written directly
+			// in it: a method or nested function skips that scope (CPython:
+			// NameError), so only the call's own scope may be a class.
+			if i > 0 && owner != "" && slices.Contains(decls[paths[edge.file]+"\x00"+module+"."+owner], "class") {
+				continue
+			}
+			if len(kinds) != 1 || kinds[0] != "class" || wildcard[edge.file] {
+				ambiguous = true
+				break
+			}
+			for _, c := range classes {
+				if c.file == paths[edge.file] && c.qualified == qname {
+					local = append(local, c)
+				}
+			}
+			break
+		}
+		if ambiguous {
+			claimed[edge.id] = true
+			continue
+		}
+		if len(local) == 1 {
+			claimed[edge.id] = true
+			var found []int64
+			for _, m := range members {
+				if m.file == local[0].file && m.name == member && m.qualified == local[0].qualified+"."+member {
+					found = append(found, m.id)
+				}
+			}
+			if len(found) == 1 {
+				targets[edge.id] = found[0]
+			}
+			continue
+		}
+		if len(local) > 1 {
+			claimed[edge.id] = true
+			continue
+		}
+		for _, c := range classes {
+			if c.name != receiver {
+				continue
+			}
+			classScope := pythonCallScope(c.qualified, c.file)
+			i := strings.LastIndexByte(classScope, '.')
+			inClassBody := slices.Contains(decls[c.file+"\x00"+module+"."+classScope[:max(i, 0)]], "class")
+			if i >= 0 && !(c.file == paths[edge.file] && pythonScopeVisible(classScope[:i], at) && (!inClassBody || classScope[:i] == at)) {
+				claimed[edge.id] = true
+				break
+			}
+		}
+	}
+	return claimed, targets, nil
 }
 
 // pythonNameOnlyNestedElsewhere reports whether a bare call name is declared
