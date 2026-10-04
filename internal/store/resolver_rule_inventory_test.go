@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"regexp"
 	"slices"
 	"testing"
 )
@@ -83,9 +84,15 @@ func TestResolverGateRuleInventory(t *testing.T) {
 			t.Errorf("rule %s has no parity record", rule.id)
 		}
 	}
-	for id := range resolverRuleParity {
+	tests := packageTestNames(t, ".", "../indexer")
+	for id, record := range resolverRuleParity {
 		if !seen[id] {
 			t.Errorf("parity record for %s names no rule", id)
+		}
+		for _, name := range regexp.MustCompile(`Test\w+`).FindAllString(record, -1) {
+			if !tests[name] {
+				t.Errorf("parity record for %s names missing test %s", id, name)
+			}
 		}
 	}
 	for _, rule := range resolverBindGateRules {
