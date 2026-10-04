@@ -87,6 +87,17 @@ const JavaLocalTypeScopeEvidence = "java:local_type_scope"
 // extends.
 const JavaOwnMemberTypeEvidence = "java:own_member_type"
 
+// JavaNoInheritedTypeEvidence marks an unqualified Java construction of a
+// simple name directly in a method, constructor or lambda body of a class the
+// adapter models, where that class and every class enclosing it spell no
+// extends, implements or interface-extends clause and declare no member type
+// of that name, and no other method or constructor covers the construction's
+// line. Such a class inherits only from java.lang.Object (or the implicit
+// Enum or Record superclass), none of which declares a member type, so no
+// inherited member type can hide an import or package type of that name
+// (JLS 6.4.1, 8.1.4, 8.5).
+const JavaNoInheritedTypeEvidence = "java:no_inherited_member_types"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,

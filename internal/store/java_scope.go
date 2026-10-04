@@ -328,6 +328,13 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 }
 
 func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps []javaScopeImport) (javaScopeSymbol, bool, string) {
+	return javaTypeInScope(eName, pkg, container, byQName, byName, imps, true)
+}
+
+// javaTypeInScope is javaType; mayInherit false states that the caller's
+// classes inherit no member type (graph.JavaNoInheritedTypeEvidence), so a
+// member type declared outside them does not block the name.
+func javaTypeInScope(eName, pkg, container string, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps []javaScopeImport, mayInherit bool) (javaScopeSymbol, bool, string) {
 	name := eName
 	if i := strings.LastIndex(name, "."); i >= 0 { // fully qualified or nested spelling
 		var exact []javaScopeSymbol
@@ -371,7 +378,7 @@ func javaType(eName, pkg, container string, byQName map[string][]javaScopeSymbol
 		}
 	}
 	for _, s := range byName[name] {
-		if javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" && s.qname != imported {
+		if mayInherit && javaTypeIdentityEligible(s) && s.qname != s.name && s.qname != s.pkg+"."+s.name && s.visibility != "private" && s.qname != imported {
 			return javaScopeSymbol{}, false, ""
 		}
 	}
@@ -505,6 +512,13 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	switch {
 	case e.evidence == graph.JavaOwnMemberTypeEvidence:
 		t, ok = javaOwnMemberType(e, byQName)
+	case e.evidence == graph.JavaNoInheritedTypeEvidence:
+		// A caller whose container the adapter collapsed to the package is
+		// not told apart from a top-level class, so its enclosing member
+		// types cannot be checked; it finds nothing.
+		if e.container != "" && e.container != e.pkg {
+			t, ok, _ = javaTypeInScope(e.name, e.pkg, e.container, byQName, byName, imps[e.file], false)
+		}
 	case e.evidence == graph.JavaLocalTypeScopeEvidence || !javaUnqualifiedCreation(e.evidence):
 	default:
 		t, ok, _ = javaType(e.name, e.pkg, e.container, byQName, byName, imps[e.file])

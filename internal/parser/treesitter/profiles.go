@@ -27,6 +27,10 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:python:v8", EmitsCallEdges: true}
 }
 
+// Java v9 marks an unqualified construction in a class that, with every
+// class enclosing it, spells no supertype (graph.JavaNoInheritedTypeEvidence),
+// so a member type declared elsewhere no longer blocks the package or import
+// type of that name.
 // Java v8 records the column each edge starts at, so the store credits an
 // edge to the method whose body holds it when several methods share a line.
 // v7 marks a construction of a member type the calling class declares
@@ -61,7 +65,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyLineOnly {
 		return parser.Profile{ID: "treesitter:java:v7", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:java:v8", EmitsCallEdges: true}
+	if a.legacyNoInherited {
+		return parser.Profile{ID: "treesitter:java:v8", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v9", EmitsCallEdges: true}
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.
