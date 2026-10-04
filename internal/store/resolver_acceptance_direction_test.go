@@ -66,8 +66,8 @@ func (f *parityFixture) referenceIdentity(t *testing.T, ref int64) (symbol, cont
 // visible as callee of its caller and caller of its target, a refusal is
 // visible from neither side, and the call-site reference carries the edge's
 // destination and context -- or nothing for a refusal. Reference identities
-// are derived by the indexer's paths and paths+names entrypoints and by the
-// full resolve; the names-only entrypoint is not used by the indexer and does
+// are derived by the full resolve and by the paths and paths+names
+// entrypoints (the indexer calls only the latter); the names-only entrypoint is not used by the indexer and does
 // not reconcile references, so it is asserted for direction only.
 func TestResolverGateRuleBindingsHaveDirectionAndReferenceIdentity(t *testing.T) {
 	for _, sc := range allFactParityScenarios() {
@@ -82,10 +82,9 @@ func TestResolverGateRuleBindingsHaveDirectionAndReferenceIdentity(t *testing.T)
 					refs[i] = f.addCallReference(t, p.edge)
 				}
 				f.resolveVia(t, entry, sc.paths, sc.names)
-				boundTargets := map[int64]bool{}
-				for _, p := range probes {
-					if _, d, _, did := f.edgeSides(t, p.edge); d != "" {
-						boundTargets[did] = true
+				for i, p := range probes {
+					if got := f.binding(t, p.edge); got != p.want {
+						t.Errorf("%s: probe %d bound %q, want %q", entry, i, got, p.want)
 					}
 				}
 				for i, p := range probes {
@@ -98,25 +97,17 @@ func TestResolverGateRuleBindingsHaveDirectionAndReferenceIdentity(t *testing.T)
 						if callers := f.neighbours(t, dstID, true); !slices.Contains(callers, src) {
 							t.Errorf("%s: probe %d bound %s but FindCallers(%s) = %v", entry, i, dst, dst, callers)
 						}
-					} else {
-						// A refused edge shows no relationship to any declared symbol, except
-						// a symbol another probe of the scenario legitimately binds.
-						rows, err := f.store.db.QueryContext(f.ctx, `SELECT id FROM symbols WHERE repo_id = ?`, f.repoID)
-						if err != nil {
-							t.Fatal(err)
+					}
+					// The caller's callees are exactly the destinations its probes
+					// bound: a refused probe contributes none.
+					var want []string
+					for _, q := range probes {
+						if qs, qd, _, _ := f.edgeSides(t, q.edge); qs == src && qd != "" {
+							want = append(want, qd)
 						}
-						var ids []int64
-						for rows.Next() {
-							var id int64
-							_ = rows.Scan(&id)
-							ids = append(ids, id)
-						}
-						rows.Close()
-						for _, id := range ids {
-							if id != srcID && !boundTargets[id] && slices.Contains(f.neighbours(t, id, true), src) {
-								t.Errorf("%s: probe %d is unresolved yet %s lists %s as a caller", entry, i, f.qualifiedOf(t, id), src)
-							}
-						}
+					}
+					if !slices.Equal(slices.Sorted(slices.Values(callees)), slices.Sorted(slices.Values(want))) {
+						t.Errorf("%s: probe %d: FindCallees(%s) = %v, want exactly %v", entry, i, src, callees, want)
 					}
 					if entry == "names" {
 						continue
@@ -160,7 +151,7 @@ var batchBlocks = []batchBlock{
 			lib := f.file(t, "lib1.py", "python")
 			f.symbol(t, lib, "claimed", "lib1.claimed", "function", "python")
 			other := f.file(t, "py1/other.py", "python")
-			f.symbol(t, other, "claimedElsewhere", "other1.claimedElsewhere", "function", "python")
+			f.symbol(t, other, "claimed", "other1.claimed", "function", "python")
 			main := f.file(t, "py1/main.py", "python")
 			caller := f.symbol(t, main, "run", "main1.run", "function", "python")
 			f.namedImport(t, main, "python", "lib1", "claimed")
@@ -309,7 +300,7 @@ func TestResolverGateMixedBatchIsIndependentOfInsertionOrder(t *testing.T) {
 // package evidence and unit-level declaration removal.
 var moreLifecycleCases = []lifecycleCase{
 	{
-		rule: "typescript_scope_ownership", paths: []string{"app/main.ts"}, names: []string{"helper"},
+		rule: "typescript_scope_ownership", paths: []string{"app/main.ts"}, names: []string{"helper"}, declChange: true, declPaths: []string{"app/util.ts"},
 		want: map[string]string{"public": "app/util.helper|typescript_module_scope|high", "private": "<unresolved>"},
 		seed: func(t *testing.T, f *parityFixture) (int64, func(string)) {
 			lib := f.file(t, "app/util.ts", "typescript")
@@ -335,17 +326,19 @@ var moreLifecycleCases = []lifecycleCase{
 			f.namedImport(t, main, "python", "lib", "helper")
 			edge := f.edge(t, main, caller, "helper")
 			return edge, func(state string) {
+				name := "helper"
 				if state == "renamed" {
-					f.exec(t, `UPDATE symbols SET name='helper2', qualified_name='lib.helper2' WHERE id=?`, helper)
-				} else {
-					f.exec(t, `UPDATE symbols SET name='helper', qualified_name='lib.helper' WHERE id=?`, helper)
+					name = "helper2"
 				}
+				qualified := "lib." + name
+				f.exec(t, `UPDATE symbols SET name=?, qualified_name=?, stable_key=?, qualified_suffix=?, dot_tail2=?, dot_tail3=? WHERE id=?`,
+					name, qualified, qualified+"|python", qualifiedSuffix(qualified), dotTail2(qualified), dotTail3(qualified), helper)
 			}
 		},
 	},
 	{
 		// The imported package's declaration moves to another directory.
-		rule: "own_module_import", paths: []string{"cmd/main.go"}, names: []string{"Open"}, declChange: true, declPaths: []string{"pkg/open.go"},
+		rule: "own_module_import", paths: []string{"cmd/main.go"}, names: []string{"Open"}, declChange: true, declPaths: []string{"pkg/open.go", "elsewhere/open.go"},
 		want: map[string]string{"in-package": "pkg.Open|module_import|high", "moved": "<unresolved>"},
 		seed: func(t *testing.T, f *parityFixture) (int64, func(string)) {
 			decl := f.file(t, "pkg/open.go", "go")
@@ -409,7 +402,7 @@ var moreLifecycleCases = []lifecycleCase{
 			f.exec(t, `UPDATE symbols SET visibility='public', is_static=0 WHERE id=?`, caller)
 			edge := f.edge(t, main, caller, "Helper")
 			return edge, func(state string) {
-				f.exec(t, `DELETE FROM symbols WHERE name='Helper'`)
+				f.exec(t, `DELETE FROM symbols WHERE file_id=? AND name='Helper'`, main)
 				if state == "declared" {
 					helper := f.symbolIn(t, main, "Helper", "App.Main.Helper", "function", "Main", "csharp")
 					f.exec(t, `UPDATE symbols SET visibility='public', is_static=0 WHERE id=?`, helper)
