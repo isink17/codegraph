@@ -333,8 +333,11 @@ func TestLocalBindingsCompoundAndGlobal(t *testing.T) {
 		{"inline else body", "def run(flag):\n    if flag:\n        pass\n    else: h = 1\n", []string{"flag", "h"}},
 		{"inline for body", "def run(xs):\n    for x in xs: seen = x\n", []string{"xs", "x", "seen"}},
 		{"inline with body", "def run(p):\n    with open(p) as fh: data = fh\n", []string{"p", "fh", "data"}},
-		{"global binds nothing here", "def run():\n    global h\n", nil},
-		{"nonlocal binds nothing here", "def run():\n    nonlocal h\n", nil},
+		{"global names are withheld file-wide", "def run():\n    global h\n", []string{"h"}},
+		{"global with an assignment escapes", "def run():\n    global h\n    h = 1\n", []string{"h"}},
+		{"del binds the name", "def run():\n    del h\n", []string{"h"}},
+		{"nonlocal names are withheld file-wide", "def run():\n    nonlocal h\n", []string{"h"}},
+		{"semicolon global", "def run():\n    global h; h = 1\n", []string{"h"}},
 		{"a dict literal is not a compound body", "def run():\n    m = {\"k\": 1}\n", []string{"m"}},
 	}
 	for _, tc := range tests {
@@ -478,5 +481,31 @@ func TestImportBindingsReadUnicodeNames(t *testing.T) {
 		if strings.Join(got, " ") != tc.want {
 			t.Errorf("ImportBindings(%q) = %q, want %q", tc.stmt, strings.Join(got, " "), tc.want)
 		}
+	}
+}
+
+func TestAttrAssignTargets(t *testing.T) {
+	tests := []struct {
+		name, src string
+		want      []string
+	}{
+		{"plain", "C.full = 3\n", []string{"C.full"}},
+		{"annotated", "C.full: int = 3\n", []string{"C.full"}},
+		{"augmented", "C.full += 3\n", []string{"C.full"}},
+		{"chained", "o.x = C.full = 3\n", []string{"o.x", "C.full"}},
+		{"semicolon", "pass; C.full = 3\n", []string{"C.full"}},
+		{"inline body", "if k: C.full = 3\n", []string{"C.full"}},
+		{"comparison is not assignment", "ok = C.full == 3\n", nil},
+		{"keyword argument is not assignment", "f(C.full, x=C.full)\n", nil},
+		{"string is masked", "s = \"C.full = 3\"\n", nil},
+		{"subscript target", "C.full[0] = 3\n", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := AttrAssignTargets(tc.src)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("AttrAssignTargets() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

@@ -160,13 +160,14 @@ const (
 	// ResolutionStrategyPythonModuleScope: the call is a bare name that the
 	// calling Python file itself declares exactly once at module level, and no
 	// import in that file binds the name.
-	ResolutionStrategyPythonModuleScope   = "python_module_scope"
-	ResolutionStrategyCSharpSameType      = "csharp_same_type"
-	ResolutionStrategyCSharpThisScope     = "csharp_this_scope"
-	ResolutionStrategyCSharpTypeScope     = "csharp_type_scope"
-	ResolutionStrategyCSharpAliasScope    = "csharp_alias_scope"
-	ResolutionStrategyCSharpStaticUsing   = "csharp_static_using"
-	ResolutionStrategyCSharpTypedReceiver = "csharp_typed_receiver"
+	ResolutionStrategyPythonModuleScope     = "python_module_scope"
+	ResolutionStrategyPythonLocalClassScope = "python_local_class_scope"
+	ResolutionStrategyCSharpSameType        = "csharp_same_type"
+	ResolutionStrategyCSharpThisScope       = "csharp_this_scope"
+	ResolutionStrategyCSharpTypeScope       = "csharp_type_scope"
+	ResolutionStrategyCSharpAliasScope      = "csharp_alias_scope"
+	ResolutionStrategyCSharpStaticUsing     = "csharp_static_using"
+	ResolutionStrategyCSharpTypedReceiver   = "csharp_typed_receiver"
 
 	// PHP scoped static calls (P22.44, php_scope.go). The type is proven by one
 	// syntactic evidence level, the method is the unique syntax-proven static
@@ -297,6 +298,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	// either identity is discarded to reach the match.
 	ResolutionStrategyPythonImportScope:                                          ResolutionConfidenceHigh,
 	ResolutionStrategyPythonModuleScope:                                          ResolutionConfidenceHigh,
+	ResolutionStrategyPythonLocalClassScope:                                      ResolutionConfidenceHigh,
 	ResolutionStrategyCSharpSameType:                                             ResolutionConfidenceHigh,
 	ResolutionStrategyCSharpThisScope:                                            ResolutionConfidenceHigh,
 	ResolutionStrategyCSharpTypeScope:                                            ResolutionConfidenceHigh,
@@ -393,6 +395,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyKotlinImportScope,
 	ResolutionStrategyPythonImportScope,
 	ResolutionStrategyPythonModuleScope,
+	ResolutionStrategyPythonLocalClassScope,
 	ResolutionStrategyGoReceiverScope,
 	ResolutionStrategyCSharpSameType,
 	ResolutionStrategyCSharpThisScope,

@@ -2,6 +2,7 @@ package python
 
 import (
 	"regexp/syntax"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -249,6 +250,28 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 	lines := maskPythonLines(strings.Split(src, "\n"))
 	var out []LocalBinding
 	seen := map[string]struct{}{}
+	escaped := map[string]bool{}
+	var escapedOrder []string
+	var noteEscapes func(stmt string)
+	noteEscapes = func(line string) {
+		for _, stmt := range splitTopLevel(line, ';') {
+			stmt = strings.TrimSpace(stmt)
+			for _, keyword := range []string{"global ", "nonlocal "} {
+				if rest, ok := strings.CutPrefix(stmt, keyword); ok {
+					for _, name := range splitTopLevel(rest, ',') {
+						if name = NormalizeIdentifier(strings.TrimSpace(name)); validIdentifier(name) && !escaped[name] {
+							escaped[name] = true
+							escapedOrder = append(escapedOrder, name)
+						}
+					}
+				}
+			}
+			if rest, ok := pythonInlineBody(stmt); ok {
+				noteEscapes(rest)
+			}
+		}
+	}
+	decorated := false
 	add := func(name string) { addBinding(&out, seen, LocalBinding{Name: name}) }
 
 	logical, starts := pythonLogicalLines(lines)
@@ -266,6 +289,12 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 			}
 			skipUntil = -1
 		}
+		if strings.HasPrefix(trimmed, "@") {
+			decorated = true
+			continue
+		}
+		wasDecorated := decorated
+		decorated = false
 		header := strings.TrimPrefix(trimmed, "async ")
 		isDecl := strings.HasPrefix(header, "def ") || strings.HasPrefix(header, "class ")
 		if strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "from ") {
@@ -304,6 +333,7 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 				if colon == len(header) {
 					continue
 				}
+				noteEscapes(header[colon+1:])
 				for _, stmt := range splitTopLevel(header[colon+1:], ';') {
 					stmt = strings.TrimSpace(stmt)
 					if strings.HasPrefix(stmt, "import ") || strings.HasPrefix(stmt, "from ") {
@@ -332,11 +362,27 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 				// after the call. At module scope the same name is a symbol
 				// this graph already holds, and reporting it here would make a
 				// module-level `def` shadow every call to itself.
-				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: true})
+				// A decorator rebinds the name to whatever it returns, so a
+				// decorated class, or a decorated member of a class body
+				// (`@property`), is not provably what it declares.
+				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: !(wasDecorated && (classBody || strings.HasPrefix(header, "class ")))})
 			}
 			continue
 		}
+		noteEscapes(trimmed)
 		addPythonAssignedNames(trimmed, add)
+	}
+	// A `global`/`nonlocal` name is rebindable from here by any statement form
+	// (assignment, import, def, class, del), so every call to it in the file is
+	// withheld: the owning scope is not known, the module sees it.
+	if !classBody {
+		for _, name := range escapedOrder {
+			if i := slices.IndexFunc(out, func(b LocalBinding) bool { return b.Name == name }); i >= 0 {
+				out[i].Declaration, out[i].Escapes = false, true
+				continue
+			}
+			out = append(out, LocalBinding{Name: name, Escapes: true})
+		}
 	}
 	return out
 }
@@ -380,6 +426,9 @@ func defHeader(src string) (string, int) {
 type LocalBinding struct {
 	Name        string
 	Declaration bool
+	// Escapes marks a `global`/`nonlocal` name: the scope that owns it is not
+	// known here, so it is recorded at module level where every call sees it.
+	Escapes bool
 }
 
 func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
@@ -391,6 +440,15 @@ func addBinding(out *[]LocalBinding, seen map[string]struct{}, b LocalBinding) {
 		return
 	}
 	if _, ok := seen[b.Name]; ok {
+		if !b.Declaration {
+			// A plain rebinding of a declared name (`C = make()` after
+			// `class C`) makes the name something other than the declaration.
+			for i := range *out {
+				if (*out)[i].Name == b.Name {
+					(*out)[i].Declaration = false
+				}
+			}
+		}
 		return
 	}
 	seen[b.Name] = struct{}{}
@@ -491,6 +549,16 @@ func addPythonAssignedNames(stmt string, add func(string)) {
 		if strings.HasPrefix(stmt, keyword) {
 			return
 		}
+	}
+	// `del x` makes x local to the scope for its whole body.
+	if rest, ok := strings.CutPrefix(stmt, "del "); ok {
+		for _, target := range splitTopLevel(rest, ',') {
+			target = strings.TrimSpace(strings.Trim(strings.TrimSpace(target), "()"))
+			if !strings.ContainsAny(target, ".[") {
+				add(target)
+			}
+		}
+		return
 	}
 	// A compound header carrying its body on one line (`if flag: h = 1`) binds
 	// what the body binds. Without this the scan would read `if flag` as the
@@ -740,4 +808,66 @@ func pythonInlineBody(stmt string) (string, bool) {
 		return strings.TrimSpace(rest), true
 	}
 	return "", false
+}
+
+// Owner is the lexical scope this binding is recorded under: the scope that
+// wrote it, or the module for a `global`/`nonlocal` name.
+func (b LocalBinding) Owner(written string) string {
+	if b.Escapes {
+		return ""
+	}
+	return written
+}
+
+// AttrAssignTargets reports the `name.attr` targets src assigns to, in the
+// forms `a.x = v`, `a.x: T = v`, `a.x += v` and chained `a.x = b.y = v`. A
+// target inside a tuple, loop or `with` is not read. The receiver is whatever
+// name the text spells: the caller decides which receivers it cares about.
+func AttrAssignTargets(src string) []string {
+	var out []string
+	logical, _ := pythonLogicalLines(maskPythonLines(strings.Split(src, "\n")))
+	var scan func(stmt string)
+	scan = func(line string) {
+		for _, stmt := range splitTopLevel(line, ';') {
+			stmt = strings.TrimSpace(stmt)
+			if rest, ok := pythonInlineBody(stmt); ok {
+				scan(rest)
+				continue
+			}
+			depth, last := 0, 0
+			var segments []string
+			for i := 0; i < len(stmt); i++ {
+				switch stmt[i] {
+				case '(', '[', '{':
+					depth++
+				case ')', ']', '}':
+					depth--
+				case '=':
+					if depth != 0 || i+1 < len(stmt) && stmt[i+1] == '=' || i > 0 && strings.IndexByte("=!<>:", stmt[i-1]) >= 0 {
+						continue
+					}
+					seg := stmt[last:i]
+					if n := len(seg); n > 0 && strings.IndexByte("+-*/%&|^@", seg[n-1]) >= 0 {
+						seg = strings.TrimRight(seg, "+-*/%&|^@<>")
+					}
+					segments = append(segments, seg)
+					last = i + 1
+				}
+			}
+			for _, seg := range segments {
+				if cut := topLevelIndex(seg, ':'); cut >= 0 {
+					seg = seg[:cut]
+				}
+				recv, attr, ok := strings.Cut(strings.TrimSpace(seg), ".")
+				recv, attr = strings.TrimSpace(recv), strings.TrimSpace(attr)
+				if ok && validIdentifier(recv) && validIdentifier(attr) {
+					out = append(out, NormalizeIdentifier(recv)+"."+NormalizeIdentifier(attr))
+				}
+			}
+		}
+	}
+	for _, line := range logical {
+		scan(strings.TrimSpace(line))
+	}
+	return out
 }

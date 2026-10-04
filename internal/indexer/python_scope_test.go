@@ -325,6 +325,49 @@ func TestPythonImportScopeLifecycle(t *testing.T) {
 	}
 }
 
+func TestPythonDottedLocalClassDoesNotBindCrossModule(t *testing.T) {
+	files := map[string]string{
+		"a.py": "def run():\n    class C:\n        def full(self): return 'a'\n",
+		"b.py": "def run():\n    class C:\n        full = lambda: 'b'\n    return C.full()\n",
+	}
+	r := newPyRepo(t, parser.NewRegistry(pyparser.New()), files)
+	assert := func() {
+		t.Helper()
+		got := strings.Join(r.projection(t), "\n")
+		if !strings.Contains(got, `edge b.py "C.full" => <unresolved>`) {
+			syms, _ := r.store.ExportSymbolsPage(r.ctx, r.repoID, 100000, 0)
+			t.Fatalf("cross-module local class edge was not refused:\n%s\nsymbols: %+v", got, syms)
+		}
+	}
+	assert()
+	positive := newPyRepo(t, parser.NewRegistry(pyparser.New()), map[string]string{
+		"positive.py": "def run():\n    class C:\n        def full(self): return 'local'\n    return C.full()\n",
+	})
+	positiveAssert := func(want string) {
+		t.Helper()
+		got := strings.Join(positive.projection(t), "\n")
+		if !strings.Contains(got, want) {
+			t.Fatalf("same-scope class control: want %q in\n%s", want, got)
+		}
+	}
+	positiveAssert(`edge positive.py "C.full" => positive.py:positive.run.C.full [python_local_class_scope]`)
+	positive.write(t, "positive.py", "def run():\n    class C:\n        full = lambda: 'local'\n    return C.full()\n")
+	positive.update(t)
+	positiveAssert(`edge positive.py "C.full" => <unresolved>`)
+	fresh := newPyRepo(t, parser.NewRegistry(pyparser.New()), map[string]string{
+		"positive.py": "def run():\n    class C:\n        full = lambda: 'local'\n    return C.full()\n",
+	})
+	if got, want := strings.Join(positive.projection(t), "\n"), strings.Join(fresh.projection(t), "\n"); got != want {
+		t.Fatalf("changed incremental graph differs from fresh:\nfresh:\n%s\nupdate:\n%s", want, got)
+	}
+	r.update(t)
+	assert()
+	freshOriginal := newPyRepo(t, parser.NewRegistry(pyparser.New()), files)
+	if got, want := strings.Join(freshOriginal.projection(t), "\n"), strings.Join(r.projection(t), "\n"); got != want {
+		t.Fatalf("fresh/update graph differs:\nfresh:\n%s\nupdate:\n%s", got, want)
+	}
+}
+
 // Every step above is also checked for parity against a fresh index of the same
 // final tree, which is the only guarantee that an incremental answer is not
 // merely stale.
@@ -434,4 +477,124 @@ func (r *pyRepo) callEdgeTargets(t *testing.T, srcPath string) map[string]string
 		out[e.SrcQualifiedName] = dst + " [" + e.ResolutionStrategy + "]"
 	}
 	return out
+}
+
+// runPythonLocalClassCases pins which class a dotted `C.member()` call may
+// bind to. Each case is a CPython 3.14.5 fact (recovery/a/cg86_oracle.py).
+func runPythonLocalClassCases(t *testing.T, reg func() *parser.Registry) {
+	const bound = `python_local_class_scope`
+	cases := []struct {
+		name    string
+		files   map[string]string
+		src     string
+		want    string // substring of the edge state
+		notWant string
+	}{
+		{"enclosing function class is visible to a nested function",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    def inner():\n        return C.full(None)\n    return inner()\n"},
+			"m.py", "m.py:m.run.C.full [" + bound + "]", ""},
+		{"sibling functions bind their own class",
+			map[string]string{"m.py": "def a():\n    class C:\n        def full(self): return 1\n    return C.full(None)\n\n\ndef b():\n    class C:\n        def full(self): return 2\n    return C.full(None)\n"},
+			"m.py", "m.py:m.a.C.full [" + bound + "]", ""},
+		{"method does not see a class declared in its own class body",
+			map[string]string{"m.py": "class Outer:\n    class C:\n        def full(self): return 1\n\n    def method(self):\n        return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"rebound name is not the class",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    C = make()\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"import of the same name is not the local class",
+			map[string]string{"x.py": "class C:\n    def full(self): return 0\n", "m.py": "from x import C\n\n\ndef run():\n    class C:\n        def full(self): return 1\n    return C.full(None)\n"},
+			"m.py", "", "x.py:"},
+		{"F1 nearer def of the same name is not the module class",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef run():\n    def C(): pass\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"F1 module def after the class wins",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef C(): pass\n\n\ndef run():\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"F2 wildcard import may rebind the class",
+			map[string]string{"pkg/__init__.py": "", "pkg/star.py": "class C:\n    def full(self): return 0\n", "m.py": "class C:\n    def full(self): return 1\n\n\nfrom pkg.star import *\n\n\ndef run():\n    return C.full()\n"},
+			"m.py", "", "m.py:m.C.full"},
+		{"F3 del makes the name local",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef run():\n    del C\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"F4 nonlocal rebinding from a sibling closure",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    def inner():\n        return C.full(None)\n    def other():\n        nonlocal C\n        C = 2\n    return inner\n"},
+			"m.py", "<unresolved>", bound},
+		{"F4 global rebinding of a module class",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef swap():\n    global C\n    C = 2\n\n\ndef run():\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"module class is left to the other strategies",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef run():\n    return C.full()\n"},
+			"m.py", "m.py:m.C.full", bound},
+		{"B2 global declares a class",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    return C.full(None)\n\n\ndef swap():\n    global C\n    class C: pass\n"},
+			"m.py", "<unresolved>", bound},
+		{"B2 global declares a def",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef swap():\n    global C\n    def C(): pass\n\n\ndef run():\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"B2 global imports the name",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef swap():\n    global C\n    import fastimpl as C\n\n\ndef run():\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"B2 global and assignment on one line",
+			map[string]string{"m.py": "class C:\n    def full(self): return 1\n\n\ndef swap():\n    global C; C = 2\n\n\ndef run():\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"B2 nonlocal declares a class in a sibling closure",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    def inner():\n        return C.full(None)\n    def other():\n        nonlocal C\n        class C: pass\n    return inner\n"},
+			"m.py", "<unresolved>", bound},
+		{"B3 class body rebinds the member",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n        full = 3\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"B3 class body rebinds the member by import",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n        from os import getcwd as full\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"B4 decorated class",
+			map[string]string{"m.py": "def deco(cls): return 7\n\n\ndef run():\n    @deco\n    class C:\n        def full(self): return 1\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"B4 multi-line decorator",
+			map[string]string{"m.py": "def deco(a): return lambda cls: 7\n\n\ndef run():\n    @deco(\n        1,\n    )\n    class C:\n        def full(self): return 1\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"decorated member (@property) is not provably the def",
+			map[string]string{"m.py": "def run():\n    class C:\n        @property\n        def full(self): return 1\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"decorated member (@staticmethod) is refused conservatively",
+			map[string]string{"m.py": "def run():\n    class C:\n        @staticmethod\n        def full(): return 1\n    return C.full()\n"},
+			"m.py", "<unresolved>", bound},
+		{"literal attribute assignment replaces the member",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    C.full = 3\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"annotated attribute assignment replaces the member",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    C.full: int = 3\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"chained attribute assignment replaces the member",
+			map[string]string{"m.py": "def run(o):\n    class C:\n        def full(self): return 1\n    o.x = C.full = 3\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"attribute assignment from a nested function replaces the member",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n    def patch():\n        C.full = 3\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+		{"assigning another attribute or another receiver does not withhold",
+			map[string]string{"m.py": "def run(o):\n    class C:\n        def full(self): return 1\n    C.other = 3\n    o.full = 3\n    return C.full(None)\n"},
+			"m.py", "m.py:m.run.C.full [" + bound + "]", ""},
+		{"undecorated sibling after a decorated class still binds",
+			map[string]string{"m.py": "def deco(cls): return 7\n\n\ndef run():\n    @deco\n    class D:\n        pass\n    class C:\n        def full(self): return 1\n    return C.full(None)\n"},
+			"m.py", "m.py:m.run.C.full [" + bound + "]", ""},
+		{"global without a rebinding of another name does not withhold",
+			map[string]string{"m.py": "counter = 0\n\n\ndef bump():\n    global counter\n    counter += 1\n\n\ndef run():\n    class C:\n        def full(self): return 1\n    return C.full(None)\n"},
+			"m.py", "m.py:m.run.C.full [" + bound + "]", ""},
+		{"member defined twice is undecidable",
+			map[string]string{"m.py": "def run():\n    class C:\n        def full(self): return 1\n        def full(self, x): return 2\n    return C.full(None)\n"},
+			"m.py", "<unresolved>", bound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPyRepo(t, reg(), tc.files)
+			got := r.edgeState(t, tc.src, "C.full")
+			if !strings.Contains(got, tc.want) || (tc.notWant != "" && strings.Contains(got, tc.notWant)) {
+				t.Fatalf("C.full => %q; want contains %q, not %q\n%s", got, tc.want, tc.notWant, strings.Join(r.projection(t), "\n"))
+			}
+		})
+	}
+}
+
+func TestPythonLocalClassScopeCases(t *testing.T) {
+	runPythonLocalClassCases(t, func() *parser.Registry { return parser.NewRegistry(pyparser.New()) })
 }

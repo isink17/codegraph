@@ -126,7 +126,7 @@ func pyExtractLocalBindings(root *sitter.Node, module string, content []byte, pf
 			pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
 				LocalName:   binding.Name,
 				Kind:        kind,
-				OwnerModule: owner,
+				OwnerModule: binding.Owner(owner),
 			})
 		}
 	}

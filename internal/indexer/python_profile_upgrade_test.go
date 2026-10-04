@@ -854,3 +854,119 @@ func TestPythonRegexProfileNFKCHeaderBindingsConverge(t *testing.T) {
 	runPythonNFKCHeaderProfileConvergence(t,
 		pythonHeaderBindingsV6Adapter{Adapter: pyparser.New(), id: "python-regex:python:v6"}, pyparser.New(), false)
 }
+
+// pythonLocalClassSource is a program CPython runs: every `.full(None)` call
+// below reaches something other than the class it names (a decorator's return
+// value, a rebound member, a name a `global` statement reassigns).
+const pythonLocalClassSource = `def deco(cls): return 7
+
+
+def run():
+    @deco
+    class C:
+        def full(self): return 1
+    return C.full(None)
+
+
+def run2():
+    class Q:
+        def full(self): return 1
+    return Q.full(None)
+
+
+def swap():
+    global Q
+    Q = 2
+
+
+def run3():
+    class R:
+        @property
+        def full(self): return 1
+    R.full = 3
+    return R.full(None)
+`
+
+// pythonLocalClassV7Adapter reproduces what both Python adapters persisted for
+// pythonLocalClassSource before v8: no `global`/`nonlocal` name row, and a
+// decorated class recorded as a plain declaration.
+type pythonLocalClassV7Adapter struct {
+	parser.Adapter
+	id string
+}
+
+func (a pythonLocalClassV7Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: a.id, EmitsCallEdges: true}
+}
+
+func (a pythonLocalClassV7Adapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	pf, err := a.Adapter.Parse(ctx, path, content)
+	if err != nil || filepath.Base(path) != "mod.py" {
+		return pf, err
+	}
+	kept := pf.Scope.Imports[:0]
+	for _, b := range pf.Scope.Imports {
+		if b.Kind == graph.ScopeImportLocalBinding && (b.OwnerModule == "" || strings.Contains(b.LocalName, ".")) {
+			continue
+		}
+		if b.Kind == graph.ScopeImportClassBodyBinding {
+			// Before v8 a decorated member was as much a declaration as any.
+			b.ImportedName = "decl"
+		}
+		if b.Kind == graph.ScopeImportLocalBinding && b.LocalName == "C" {
+			b.Kind = graph.ScopeImportNestedDeclaration
+		}
+		kept = append(kept, b)
+	}
+	pf.Scope.Imports = kept
+	return pf, nil
+}
+
+// The v8 evidence (escaped names, decorated classes, rebound members) is not
+// derivable from the unchanged file's persisted rows, so the bump must reparse
+// it: the upgraded graph, and the graph after an unrelated file changes, must
+// each equal a from-scratch index, and the stale wrong edges must be gone.
+func runPythonLocalClassProfileConvergence(t *testing.T, old pythonLocalClassV7Adapter, current parser.Adapter) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "mod.py"), pythonLocalClassSource)
+	currentID := current.(parser.ProfileProvider).Profile().ID
+
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(old), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old index: %v", err)
+	}
+	stale := pythonGraph(t, s)
+	requireRows(t, stale, "old graph", "call|C.full@8->mod.run.C.full", "call|Q.full@14->mod.run2.Q.full", "call|R.full@27->mod.run3.R.full")
+
+	upgraded := New(s.Store, parser.NewRegistry(current), nil)
+	summary, err := upgraded.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if summary.FilesChanged != 1 || strings.Join(summary.ParserProfileLanguages, ",") != "python" {
+		t.Fatalf("profile bump did not reparse the unchanged file: changed=%d languages=%v",
+			summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	got := pythonGraph(t, s)
+	requireRows(t, got, "upgraded graph", "prov|mod.py="+currentID+":1", "call|C.full@8->", "call|Q.full@14->", "call|R.full@27->")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+
+	writeProfileFile(t, filepath.Join(root, "other.py"), "def unrelated(): pass\n")
+	if _, err := upgraded.Update(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+	got = pythonGraph(t, s)
+	requireRows(t, got, "graph after unrelated update", "call|C.full@8->", "call|Q.full@14->", "call|R.full@27->")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("graph after unrelated update:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+}
+
+func TestPythonRegexProfileLocalClassEvidenceConverges(t *testing.T) {
+	runPythonLocalClassProfileConvergence(t,
+		pythonLocalClassV7Adapter{Adapter: pyparser.New(), id: "python-regex:python:v7"}, pyparser.New())
+}
