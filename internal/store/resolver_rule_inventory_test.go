@@ -24,7 +24,7 @@ func TestResolverGateSQLMatchesHandComposedGate(t *testing.T) {
 		AND ` + rubyScopeVetoSQL + `
 		AND NOT ` + resolverJVMScopeVetoSQL + `
 		AND NOT EXISTS (SELECT 1 FROM ` + csharpScopeVeto + ` csv WHERE csv.edge_id = edges.id)` + `
-		AND NOT EXISTS (SELECT 1 FROM ` + tsScopeVeto + ` tsv WHERE tsv.edge_id = edges.id)` + `
+		AND NOT (f.language = 'typescript')
 		AND NOT EXISTS (SELECT 1 FROM ` + pyScopeVeto + ` psv WHERE psv.edge_id = edges.id)` + `
 		AND ` + phpScopeVetoSQL + `
 		AND ` + swiftScopeVetoSQL
@@ -59,7 +59,7 @@ var resolverRuleParity = map[resolverRuleID]string{
 	"ruby_ownership":             "TestResolverOwnershipRulesMatchGoTwins, TestRubyScopeVetoSQLMatchesGoTwin",
 	"jvm_scope_ownership":        "TestResolverGateRuleFactParity",
 	"csharp_scope_ownership":     "TestResolverGateRuleFactParity",
-	"typescript_scope_ownership": "TestResolverGateRuleFactParity",
+	"typescript_scope_ownership": "TestResolverOwnershipRulesMatchGoTwins, TestResolverGateRuleFactParity",
 	"python_scope_claims":        "TestResolverGateRuleFactParity, TestPythonScopeClaimsSurviveIntoTheWeakStrategy",
 	"php_ownership":              "TestResolverOwnershipRulesMatchGoTwins",
 	"swift_ownership":            "TestResolverOwnershipRulesMatchGoTwins",
@@ -116,7 +116,7 @@ func TestResolverGateRuleInventory(t *testing.T) {
 func TestResolverOwnershipRulesMatchGoTwins(t *testing.T) {
 	ctx := context.Background()
 	s, repo := openBudgetStore(t)
-	languages := []string{"", "cpp", "go", "php", "python", "ruby", "rust", "swift"}
+	languages := []string{"", "cpp", "go", "php", "python", "ruby", "rust", "swift", "typescript"}
 	files := map[string]int64{}
 	for i, language := range languages {
 		id, err := insertTestFileLang(ctx, s, repo.ID, "src"+string(rune('a'+i)), language)

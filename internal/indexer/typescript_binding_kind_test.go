@@ -163,6 +163,16 @@ func TestTypeScriptCallBindsOnlyNameableDeclarations(t *testing.T) {
 			others: tree{"other.ts": "export function unrelated() {}\n"},
 			dst:    "run", want: "main.ts:main.run(function)",
 		},
+		{
+			// The module's dotted file name makes the spelling a suffix of the
+			// member's qualified name. TypeScript scope does not decide the
+			// call, and an update must not hand it to the dotted-suffix
+			// strategies a fresh index keeps it from.
+			name:   "namespace import member of a dotted module file",
+			caller: "main.ts", src: "import * as service from \"./user.service\";\nexport function caller() { service.UserService.create(); }\n",
+			others: tree{"user.service.ts": "export class UserService {\n  static create(): number { return 1; }\n}\n"},
+			dst:    "service.UserService.create",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
