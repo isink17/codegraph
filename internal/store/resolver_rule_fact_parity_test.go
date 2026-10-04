@@ -12,20 +12,24 @@ type factProbe struct {
 	want string
 }
 
+// factScenario is one repository state with the bindings every entrypoint must
+// produce. dim is the acceptance-matrix dimension the scenario covers.
+type factScenario struct {
+	rule, name, dim string
+	paths           []string
+	names           []string
+	seed            func(t *testing.T, f *parityFixture) []factProbe
+}
+
 // factParityScenarios seed a repository state that exercises one rule of the
 // bind gate whose Go-side decision reads loaded facts rather than the edge
 // alone. Each scenario is resolved once per entrypoint in a fresh store: the
 // full resolve answers through the composed SQL gate, the path- and
 // name-scoped resolves through the Go binder, and every answer must be the
 // same.
-var factParityScenarios = []struct {
-	rule, name string
-	paths      []string
-	names      []string
-	seed       func(t *testing.T, f *parityFixture) []factProbe
-}{
+var factParityScenarios = []factScenario{
 	{
-		rule: "language_gate", name: "same-language candidate binds",
+		rule: "language_gate", name: "same-language candidate binds", dim: "positive",
 		paths: []string{"app/main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "app/util.py", "python")
@@ -36,7 +40,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "language_gate", name: "other-language candidate refused",
+		rule: "language_gate", name: "other-language candidate refused", dim: "negative",
 		paths: []string{"app/main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "pkg/util.go", "go")
@@ -47,7 +51,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "language_gate", name: "unknown caller language refused",
+		rule: "language_gate", name: "unknown caller language refused", dim: "missing_fact",
 		paths: []string{"app/main.x"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "app/util.py", "python")
@@ -58,7 +62,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "language_gate", name: "another repository's candidate is invisible",
+		rule: "language_gate", name: "another repository's candidate is invisible", dim: "repo_isolation",
 		paths: []string{"app/main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			other, err := f.store.UpsertRepo(f.ctx, t.TempDir())
@@ -78,7 +82,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "caller_kind_candidate", name: "production caller refuses a test-only candidate",
+		rule: "caller_kind_candidate", name: "production caller refuses a test-only candidate", dim: "negative",
 		paths: []string{"app/main.py", "app/test_main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			tests := f.file(t, "app/test_util.py", "python")
@@ -94,7 +98,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "caller_kind_candidate", name: "production candidate beats a test shadow",
+		rule: "caller_kind_candidate", name: "production candidate beats a test shadow", dim: "test_shadow",
 		paths: []string{"app/main.py", "app/test_main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "app/util.py", "python")
@@ -112,7 +116,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "broad_ambiguity", name: "two same-language candidates refuse the bare name",
+		rule: "broad_ambiguity", name: "two same-language candidates refuse the bare name", dim: "ambiguity",
 		paths: []string{"app/main.py"}, names: []string{"helper", "util.helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			a := f.file(t, "app/util.py", "python")
@@ -131,7 +135,7 @@ var factParityScenarios = []struct {
 		// The receiver strategy sees only the container-bearing candidate, so
 		// without the broad-level veto it would resurrect a name the bare-name
 		// level already found undecidable.
-		rule: "broad_ambiguity", name: "a narrower strategy cannot resurrect an ambiguous bare name",
+		rule: "broad_ambiguity", name: "a narrower strategy cannot resurrect an ambiguous bare name", dim: "ambiguity",
 		paths: []string{"app/main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			a := f.file(t, "app/util.py", "python")
@@ -147,7 +151,7 @@ var factParityScenarios = []struct {
 		// The import maps into the module's own pkg directory, which declares
 		// no Open; the claim keeps a same-named package elsewhere from
 		// answering through a suffix.
-		rule: "own_module_import", name: "a claimed import does not fall back to another directory",
+		rule: "own_module_import", name: "a claimed import does not fall back to another directory", dim: "negative",
 		paths: []string{"cmd/main.go"}, names: []string{"Open"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			pkg := f.file(t, "pkg/close.go", "go")
@@ -161,7 +165,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "own_module_import", name: "module path without an import fact fails closed",
+		rule: "own_module_import", name: "module path without an import fact fails closed", dim: "missing_fact",
 		paths: []string{"cmd/main.go"}, names: []string{"Open"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			pkg := f.file(t, "pkg/open.go", "go")
@@ -172,7 +176,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "own_module_import", name: "import fact binds the module package",
+		rule: "own_module_import", name: "import fact binds the module package", dim: "positive",
 		paths: []string{"cmd/main.go"}, names: []string{"Open"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			pkg := f.file(t, "pkg/open.go", "go")
@@ -184,7 +188,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "typescript_scope_ownership", name: "an unimported cross-file candidate is not the generic strategies' to bind",
+		rule: "typescript_scope_ownership", name: "an unimported cross-file candidate is not the generic strategies' to bind", dim: "missing_fact",
 		paths: []string{"app/main.ts"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "app/util.ts", "typescript")
@@ -195,7 +199,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "csharp_scope_ownership", name: "an unproven C# call is not the generic strategies' to bind",
+		rule: "csharp_scope_ownership", name: "an unproven C# call is not the generic strategies' to bind", dim: "missing_fact",
 		paths: []string{"App/Main.cs"}, names: []string{"Helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "App/Util.cs", "csharp")
@@ -212,7 +216,7 @@ var factParityScenarios = []struct {
 		// Repository-wide uniqueness is not scope evidence for a class name:
 		// a bare call to a class the caller neither declares nor imports
 		// stays unresolved.
-		rule: "bare_type_scope", name: "an unimported class is not in scope",
+		rule: "bare_type_scope", name: "an unimported class is not in scope", dim: "missing_fact",
 		paths: []string{"app/main.py"}, names: []string{"Widget"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "app/widgets.py", "python")
@@ -226,7 +230,7 @@ var factParityScenarios = []struct {
 		// The caller imports helper from a module that does not declare it:
 		// Python claims the call and refuses it, so a unique helper elsewhere
 		// is not the generic strategies' to bind.
-		rule: "python_scope_claims", name: "a claimed import refusal does not fall back",
+		rule: "python_scope_claims", name: "a claimed import refusal does not fall back", dim: "negative",
 		paths: []string{"app/main.py"}, names: []string{"helper"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			f.file(t, "lib.py", "python")
@@ -243,7 +247,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "jvm_scope_ownership", name: "a Java file with scope evidence owns its refused calls",
+		rule: "jvm_scope_ownership", name: "a Java file with scope evidence owns its refused calls", dim: "negative",
 		paths: []string{"app/Main.java"}, names: []string{"x", "Other.x"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "lib/Other.java", "java")
@@ -257,7 +261,7 @@ var factParityScenarios = []struct {
 		},
 	},
 	{
-		rule: "jvm_scope_ownership", name: "a Java file without scope evidence is not owned",
+		rule: "jvm_scope_ownership", name: "a Java file without scope evidence is not owned", dim: "missing_fact",
 		paths: []string{"app/Main.java"}, names: []string{"x", "Other.x"},
 		seed: func(t *testing.T, f *parityFixture) []factProbe {
 			lib := f.file(t, "lib/Other.java", "java")
@@ -274,7 +278,7 @@ func TestResolverGateRuleFactParity(t *testing.T) {
 	for _, rule := range resolverBindGateRules {
 		known[rule.id] = true
 	}
-	for _, sc := range factParityScenarios {
+	for _, sc := range allFactParityScenarios() {
 		if !known[resolverRuleID(sc.rule)] {
 			t.Fatalf("scenario %q names unknown rule %q", sc.name, sc.rule)
 		}
