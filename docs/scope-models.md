@@ -6,6 +6,10 @@ Missing, conflicting, unsupported and ambiguous facts leave an edge unresolved. 
 
 Every resolution entrypoint applies the same model: full indexing, path-scoped updates, name-targeted updates and their combination. The repository-wide resolver enforces each rule in SQL and the incremental binder enforces it in Go. Where an ownership rule depends only on the edge itself, its SQL and Go forms are tested against each other. Fresh and incremental indexing of the same tree are tested to produce the same bindings.
 
+Call-site references follow their edges. A reference carries the syntax fact and the caller as its context; the edge carries the resolver's decision, and a reference's target is derived from the edge. Full indexing, path-scoped updates and their combination reconcile references after they resolve, so a binding that becomes a refusal leaves the reference with no target rather than the previous one, and a rebind gives it the new target. A refused edge keeps its caller as the reference's context. The context is cleared only when no edge coherently matches the reference: the edge is gone, or the matching edges disagree on their source. The name-targeted entrypoint alone (`ResolveEdgesForNames`) re-decides edges without reconciling references; a caller using it alone must run `ReconcileReferenceIdentities` afterwards, and the indexer never calls it alone.
+
+Queries read the persisted relationship. For a known symbol, callers and callees follow the stored destination identity, so a stale ID returns nothing and a refused edge is never reconstructed from spelling. Only a name no symbol carries may return unresolved-spelling hints, which are hints and not relationships.
+
 Release archives are built with CGO and include the tree-sitter parsers. In an explicit `CGO_ENABLED=0` build, Go (via `go/ast`) and Python (via the pure fallback parser) still produce call edges. The other languages keep heuristic symbol and import navigation but produce no call edges, so none of the call-resolution behaviour below applies to them in that build. CodeGraph will not update a tree-sitter graph using one of those heuristic parsers, because the update would delete its call edges.
 
 ## Go
@@ -129,12 +133,15 @@ The tree-sitter Java parser records:
 
 Every Java file gets a persisted scope record. The Java resolver owns every call and `new` expression in such a file. A call it refuses stays unresolved; generic matching never fills it in.
 
-A dotted qualifier must match exactly one fully qualified type. For a simple type name, a matching single-type import decides on its own. Otherwise, same-package types, member types of the caller's class and on-demand imports compete, and two visible candidates leave the call unresolved. That includes a same-package type that collides with an on-demand-imported type.
+A dotted qualifier must match exactly one fully qualified type. For a simple type name, the resolver first checks for a member type that could hide it. Supertypes are not recorded, so the name stays unresolved when any enclosing class of the caller declares a member type of that name, or when any non-private member type of that name exists in the project (it may be inherited). A member type that the file's single-type import names is exempt from the second check. This costs recall: a top-level class whose simple name some accessible member type also uses is not bound by its simple name. If nothing hides the name, a matching single-type import decides on its own. Otherwise same-package types and on-demand imports compete, and two visible candidates leave the call unresolved. That includes a same-package type that collides with an on-demand-imported type.
+
+One exception binds a member type: an unqualified `new Box(...)`, where the calling class declares `Box` itself, binds that member (a declared member type hides every inherited, enclosing, imported and package type of its name). The parser marks such a construction only when it sits directly in a method, constructor or lambda body of that class and no other method or constructor declaration shares its line, since edges carry a line but no column. Constructions in anonymous, local or enum-constant class bodies, field initializers, initializer blocks, enum members, and member types of an enclosing class are not bound by this exception.
 
 Calls bind as follows:
 - An unqualified or `this.` call binds a unique method of that name declared in the caller's own class. A method of that name declared in the caller's class or an enclosing class shadows static imports; when no unique own method is chosen, the call stays unresolved.
 - `Type.m()` binds only a unique, visible static method. Overloads are not chosen between.
 - `new T(...)` binds the unique Java constructor whose syntactic parameter count admits the call's syntactic argument count. A trailing varargs parameter admits any number of extra arguments. Argument types are not modelled, so constructors that admit the same count compete and the call stays unresolved. An implicit default constructor is not a target.
+- A generic construction (`new Box<>(x)`, `new Box<String>(x)`, `new a.b.Box<>()`) is looked up by its raw class name and chooses its constructor by argument count like a raw one. Type arguments are not modelled and never choose between constructors or classes.
 - An unqualified call that no method of the caller's or an enclosing class shadows can bind through a static import.
 
 Visibility is checked as follows:
@@ -148,7 +155,8 @@ The following stay unresolved:
 - `super.` calls.
 - Variable, field and expression receivers.
 - Inheritance and interface dispatch.
-- Generic type arguments.
+- Qualified creations (`outer.new Inner()`, `this.new Inner()`), and generic creations with type arguments on an outer segment or on a qualified creation (`outer.new Inner<>()`).
+- A construction or qualified call whose class is named by a local class, interface, enum or record declared in an enclosing method, constructor, initializer or lambda body, or in an anonymous or local class body. A local type in a sibling method or a non-enclosing block hides nothing.
 
 Java reaches Kotlin only through the JVM shapes listed under Kotlin. Incremental updates apply the same rules when declarations, imports or peer files change.
 
@@ -266,6 +274,7 @@ Lookup works as follows:
 - The nearest visible import wins, and within one scope the longest matching spelling wins.
 - Two different imports at the same distance leave the call unresolved.
 - A local binding at least as near as the import shadows it, and the call stays unresolved.
+- One exception to a local binding: a dotted call `C.member()` whose receiver `C` is a class declared in a function (a nested local class) binds to that class's own member (`python_local_class_scope`, high) when the nearest scope declaring `C` holds exactly one class and the file has no wildcard import. It stays unresolved when `C` is `global`/`nonlocal`/`del`eted, the class is decorated, the class body rebinds the member, or the nearest declaration is not exactly one class. A module-level class receiver is left to the other strategies, and a class body's names are not visible from its methods.
 - A function-local import never binds a call; it only blocks other bindings.
 - A module-level import binds when the target module declares the name exactly once at module level.
 - For `from pkg import helpers` followed by `helpers.load()`, the `pkg.helpers` submodule is tried unless `pkg/__init__.py` binds `helpers` itself or has a module-level `from … import *`.
