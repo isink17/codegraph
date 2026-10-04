@@ -22,6 +22,19 @@ func (f *parityFixture) edgeSides(t *testing.T, edge int64) (src, dst string, sr
 	return src, d.String, srcID, did.Int64
 }
 
+// destinationFile is the path of the file declaring an edge's destination, ""
+// while the edge is unresolved.
+func (f *parityFixture) destinationFile(t *testing.T, edge int64) string {
+	t.Helper()
+	var path sql.NullString
+	if err := f.store.db.QueryRowContext(f.ctx, `
+		SELECT fl.path FROM edges e JOIN symbols d ON d.id = e.dst_symbol_id JOIN files fl ON fl.id = d.file_id
+		WHERE e.id = ?`, edge).Scan(&path); err != nil && err != sql.ErrNoRows {
+		t.Fatal(err)
+	}
+	return path.String
+}
+
 func (f *parityFixture) neighbours(t *testing.T, id int64, callers bool) []string {
 	t.Helper()
 	find := f.store.FindCallees
@@ -133,6 +146,10 @@ type batchBlock struct {
 	paths []string
 	names []string
 	seed  func(t *testing.T, f *parityFixture, rev bool) []factProbe
+	// files are the path of the declaring file of each probe's expected
+	// destination, "" for a refused probe. The qualified name alone cannot tell
+	// same-named declarations apart.
+	files []string
 }
 
 func twoDecls(t *testing.T, rev bool, a, b func()) {
@@ -146,7 +163,7 @@ func twoDecls(t *testing.T, rev bool, a, b func()) {
 
 var batchBlocks = []batchBlock{
 	{
-		name: "python import claim", paths: []string{"py1/main.py"}, names: []string{"claimed"},
+		files: []string{"lib1.py"}, name: "python import claim", paths: []string{"py1/main.py"}, names: []string{"claimed"},
 		seed: func(t *testing.T, f *parityFixture, rev bool) []factProbe {
 			lib := f.file(t, "lib1.py", "python")
 			f.symbol(t, lib, "claimed", "lib1.claimed", "function", "python")
@@ -159,7 +176,7 @@ var batchBlocks = []batchBlock{
 		},
 	},
 	{
-		name: "python ambiguity", paths: []string{"py2/main.py"}, names: []string{"twin"},
+		files: []string{""}, name: "python ambiguity", paths: []string{"py2/main.py"}, names: []string{"twin"},
 		seed: func(t *testing.T, f *parityFixture, rev bool) []factProbe {
 			a := f.file(t, "py2/a.py", "python")
 			b := f.file(t, "py2/b.py", "python")
@@ -172,7 +189,7 @@ var batchBlocks = []batchBlock{
 		},
 	},
 	{
-		name: "python test shadow", paths: []string{"py3/main.py", "py3/test_main.py"}, names: []string{"shadowed"},
+		files: []string{"py3/util.py", ""}, name: "python test shadow", paths: []string{"py3/main.py", "py3/test_main.py"}, names: []string{"shadowed"},
 		seed: func(t *testing.T, f *parityFixture, rev bool) []factProbe {
 			lib := f.file(t, "py3/util.py", "python")
 			tests := f.file(t, "py3/test_util.py", "python")
@@ -190,7 +207,7 @@ var batchBlocks = []batchBlock{
 		},
 	},
 	{
-		name: "typescript import", paths: []string{"ts1/main.ts"}, names: []string{"tsHelper"},
+		files: []string{"ts1/util.ts", ""}, name: "typescript import", paths: []string{"ts1/main.ts"}, names: []string{"tsHelper"},
 		seed: func(t *testing.T, f *parityFixture, rev bool) []factProbe {
 			lib := f.file(t, "ts1/util.ts", "typescript")
 			h := f.symbol(t, lib, "tsHelper", "ts1/util.tsHelper", "function", "typescript")
@@ -207,7 +224,7 @@ var batchBlocks = []batchBlock{
 		},
 	},
 	{
-		name: "go own module", paths: []string{"cmd/main.go"}, names: []string{"OpenBatch"},
+		files: []string{"pkgb/open.go"}, name: "go own module", paths: []string{"cmd/main.go"}, names: []string{"OpenBatch"},
 		seed: func(t *testing.T, f *parityFixture, rev bool) []factProbe {
 			pkg := f.file(t, "pkgb/open.go", "go")
 			third := f.file(t, "third/pkgb/open.go", "go")
@@ -221,7 +238,7 @@ var batchBlocks = []batchBlock{
 		},
 	},
 	{
-		name: "java same class", paths: []string{"app/Main.java"}, names: []string{"javaHelper"},
+		files: []string{"app/Main.java"}, name: "java same class", paths: []string{"app/Main.java"}, names: []string{"javaHelper"},
 		seed: func(t *testing.T, f *parityFixture, rev bool) []factProbe {
 			main := f.file(t, "app/Main.java", "java")
 			f.symbolIn(t, main, "javaHelper", "app.Main.javaHelper", "function", "Main", "java")
@@ -231,7 +248,7 @@ var batchBlocks = []batchBlock{
 		},
 	},
 	{
-		name: "csharp unproven call", paths: []string{"App/Main.cs"}, names: []string{"CsHelper"},
+		files: []string{""}, name: "csharp unproven call", paths: []string{"App/Main.cs"}, names: []string{"CsHelper"},
 		seed: func(t *testing.T, f *parityFixture, rev bool) []factProbe {
 			lib := f.file(t, "App/Util.cs", "csharp")
 			f.symbol(t, lib, "CsHelper", "App.Util.CsHelper", "method", "csharp")
@@ -251,6 +268,7 @@ func TestResolverGateMixedBatchIsIndependentOfInsertionOrder(t *testing.T) {
 	type located struct {
 		probe factProbe
 		key   string
+		file  string
 	}
 	for rot := 0; rot < len(batchBlocks); rot++ {
 		for _, rev := range []bool{false, true} {
@@ -279,14 +297,21 @@ func TestResolverGateMixedBatchIsIndependentOfInsertionOrder(t *testing.T) {
 					f := newParityFixture(t, "module example.com/project\n")
 					var all []located
 					for _, b := range rotate(batchBlocks, rot) {
-						for i, p := range b.seed(t, f, rev) {
-							all = append(all, located{p, fmt.Sprintf("%s#%d", b.name, i)})
+						probes := b.seed(t, f, rev)
+						if len(probes) != len(b.files) {
+							t.Fatalf("block %s: %d probes, %d expected files", b.name, len(probes), len(b.files))
+						}
+						for i, p := range probes {
+							all = append(all, located{p, fmt.Sprintf("%s#%d", b.name, i), b.files[i]})
 						}
 					}
 					v.run(t, f)
 					for _, l := range all {
 						if got := f.binding(t, l.probe.edge); got != l.probe.want {
 							t.Errorf("%s bound %q, want %q", l.key, got, l.probe.want)
+						}
+						if gotFile := f.destinationFile(t, l.probe.edge); gotFile != l.file {
+							t.Errorf("%s bound in file %q, want %q", l.key, gotFile, l.file)
 						}
 					}
 				})
