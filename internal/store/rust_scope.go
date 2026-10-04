@@ -39,6 +39,10 @@ type rustScopeModule struct {
 type rustValueItems struct {
 	decl  map[rustValueKey]bool // owner scope and declared name
 	macro map[rustValueKey]bool // owner scope; name is always ""
+	// unproven holds declarations an unknown attribute macro may have
+	// rewritten or dropped: owner scope and qualified name, or a prefix of the
+	// qualified names below it.
+	unproven map[rustValueKey]bool
 }
 type rustValueKey struct {
 	file        int64
@@ -596,7 +600,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}); err != nil {
 		return nil, err
 	}
-	valueItems := rustValueItems{decl: map[rustValueKey]bool{}, macro: map[rustValueKey]bool{}}
+	valueItems := rustValueItems{decl: map[rustValueKey]bool{}, macro: map[rustValueKey]bool{}, unproven: map[rustValueKey]bool{}}
 	if err := sqliteBatchedQuery(ctx, tx,
 		`SELECT v.file_id,v.owner_module,v.name,v.kind FROM rust_value_item_evidence v JOIN files f ON f.id=v.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE v.repo_id=?`,
 		scopeClause, []any{repoID}, scopedFiles, filtered,
@@ -608,6 +612,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			}
 			if kind == graph.RustValueItemMacro {
 				valueItems.macro[rustValueKey{file: file, owner: owner}] = true
+			} else if kind == graph.RustValueItemUnproven {
+				valueItems.unproven[rustValueKey{file: file, name: name}] = true
 			} else {
 				valueItems.decl[rustValueKey{file: file, owner: owner, name: name}] = true
 			}
@@ -691,7 +697,26 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		return module
 	}
 	byQ = map[string][]rustScopeSymbol{}
+	// unprovenSymbol reports whether an unknown attribute macro sits on the
+	// symbol or on an item holding it in its own file, and may have renamed or
+	// dropped it. Such a symbol answers no call.
+	unprovenSymbol := func(c rustScopeSymbol) bool {
+		for q := c.qualified; q != ""; {
+			if valueItems.unproven[rustValueKey{file: c.file, name: q}] {
+				return true
+			}
+			i := strings.LastIndex(q, "::")
+			if i < 0 {
+				break
+			}
+			q = q[:i]
+		}
+		return false
+	}
 	for _, original := range symbols {
+		if unprovenSymbol(original) {
+			continue
+		}
 		added := false
 		// A file module's view carries each symbol at the same place below
 		// the file as the parser put it: a top-level item directly in the

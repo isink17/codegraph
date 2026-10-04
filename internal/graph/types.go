@@ -282,6 +282,10 @@ type RustValueItem struct {
 const (
 	RustValueItemDecl  = "decl"
 	RustValueItemMacro = "macro"
+	// RustValueItemUnproven names (by persisted qualified name, or a prefix of
+	// it) a declaration an unknown attribute macro may have rewritten or
+	// dropped: it binds no call.
+	RustValueItemUnproven = "unproven"
 )
 
 type RustModule struct {

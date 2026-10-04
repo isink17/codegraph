@@ -6,6 +6,8 @@ import (
 	"context"
 	"runtime"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 // rustExternalModules parses src as the file at path and returns the
@@ -120,6 +122,50 @@ mod n { const I: u8 = 1; mk!(j); }
 	for _, w := range want {
 		if !got[w] {
 			t.Fatalf("value items = %v, missing %q", got, w)
+		}
+	}
+}
+
+// TestRustAttributeEvidence pins which attributes leave an item proven: only
+// the built-in, non-generative ones, and a derive only when every entry is a
+// built-in derive no import, macro or glob could shadow.
+func TestRustAttributeEvidence(t *testing.T) {
+	cases := []struct {
+		name, src string
+		want      []string
+	}{
+		{"builtin only", "#[derive(Debug, Clone)]\n#[allow(dead_code)]\n/// doc\nstruct S;\n#[inline]\n#[cfg(unix)]\nfn f() {}\n", nil},
+		{"custom derive", "#[derive(Debug, procgen::Gen)]\nstruct S;\n", []string{"crate macro "}},
+		{"attribute macro on a fn", "#[tokio::main]\nasync fn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
+		{"attribute macro on a method", "struct S;\nimpl S {\n    #[rename]\n    fn m() {}\n}\n", []string{"crate unproven crate::S::m"}},
+		{"attribute macro on an impl", "struct S;\n#[x]\nimpl S {\n    fn m() {}\n}\n", []string{"crate macro ", "crate unproven crate::S"}},
+		{"attribute macro on a module", "#[x]\nmod n {\n    pub fn f() {}\n}\n", []string{"crate macro ", "crate unproven crate::n"}},
+		{"cfg_attr", "#[cfg_attr(a, derive(Debug))]\nstruct S;\n", []string{"crate macro ", "crate unproven crate::S"}},
+		{"derive alias", "use p::Gen as Clone;\n#[derive(Clone)]\nstruct S;\n", []string{"crate macro "}},
+		{"std import of a builtin name", "use std::fmt::Debug;\n#[derive(Debug)]\nstruct S;\n", nil},
+		{"glob is not counted", "use crate::a::*;\n#[derive(Debug)]\nstruct S;\n", nil},
+		{"macro_use", "#[macro_use]\nextern crate p;\n#[inline]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
+		{"macro named like a builtin", "macro_rules! inline { () => {} }\n#[inline]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
+		{"block item is the block scope's concern", "fn f() {\n    #[derive(p::G)]\n    struct S;\n}\n", nil},
+	}
+	for _, tc := range cases {
+		pf, err := NewRust().Parse(context.Background(), "src/lib.rs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, item := range pf.Scope.RustValueItems {
+			if item.Kind != graph.RustValueItemDecl {
+				got[item.OwnerModule+" "+item.Kind+" "+item.Name] = true
+			}
+		}
+		for _, w := range tc.want {
+			if !got[w] {
+				t.Errorf("%s: missing %q in %v", tc.name, w, got)
+			}
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: value items = %v, want exactly %v", tc.name, got, tc.want)
 		}
 	}
 }
