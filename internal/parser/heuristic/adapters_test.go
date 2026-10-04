@@ -106,7 +106,7 @@ func TestCSharpHeuristicV2KeepsNamespaceIdentity(t *testing.T) {
 	if p.Scope.Package != "App.Core" || p.Symbols[len(p.Symbols)-1].QualifiedName != "App.Core.Outer.Inner.Run" {
 		t.Fatalf("C# heuristic facts = package %q symbols %+v", p.Scope.Package, p.Symbols)
 	}
-	if NewCSharp().Profile().ID != "heuristic:csharp:v4" || NewCSharp().Profile().EmitsCallEdges {
+	if NewCSharp().Profile().ID != "heuristic:csharp:v5" || NewCSharp().Profile().EmitsCallEdges {
 		t.Fatalf("C# heuristic profile = %+v", NewCSharp().Profile())
 	}
 }
@@ -258,6 +258,29 @@ func TestScopeEvidenceIgnoresRawAndVerbatimStrings(t *testing.T) {
 			if strings.Contains(imp.SourceSpecifier, "Fake") {
 				t.Fatalf("C# string leaked import from %q: %+v", tc.src, pf.Scope.Imports)
 			}
+		}
+	}
+}
+
+// `static` is a keyword only when whitespace follows it: `using staticns;`
+// names the namespace staticns, and `using static<TAB>ns.Util;` is a static
+// using. (Heuristic C# v5; v4 kept the tab spelling as one raw name.)
+func TestCSharpHeuristicUsingStaticKeyword(t *testing.T) {
+	for _, c := range []struct {
+		src, source string
+		static      bool
+	}{
+		{"using staticns;", "staticns", false},
+		{"using static ns.Util;", "ns.Util", true},
+		{"using static\tns.Util;", "ns.Util", true},
+		{"using  static   ns.Util;", "ns.Util", true},
+	} {
+		pf, err := NewCSharp().Parse(context.Background(), "A.cs", []byte(c.src+"\nclass A {}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pf.Scope.Imports) != 1 || pf.Scope.Imports[0].SourceSpecifier != c.source || pf.Scope.Imports[0].Static != c.static {
+			t.Errorf("%q: imports = %+v, want %q static %v", c.src, pf.Scope.Imports, c.source, c.static)
 		}
 	}
 }
