@@ -25,6 +25,9 @@ import (
 //	Nest$In.make     new Bag()                 app/Bag
 //	Imp.make         new Bag()                 other/Holder$Bag (single-type import)
 //	SImp.make        new Bag()                 other/Holder$Bag (single-static-import)
+//	SSpace.make      new Bag()                 other/Holder$Bag (`import static other.Holder. Bag;`)
+//	TSpace.make      new Bag()                 other/Holder$Bag (`import other.Holder /*c*/ .Bag;`)
+//	SWild.make       new Bag()                 app/Bag (static on-demand import never shadows)
 //	Sub.make         new Bag()                 app/Base$Bag (inherited member)
 //	Impl$In.make     new Bag()                 app/Bag (Impl implements Runnable)
 //	Encl$In.make     new Bag()                 app/Encl$Bag (enclosing member)
@@ -32,9 +35,10 @@ import (
 //	Local.make       new Bag() after local class Bag  app/Local$1Bag
 //	Field.bag        field initializer new Bag()      app/Bag
 //
-// SImp, Impl$In and Field stay unresolved: a static import is not resolved
-// to a type, an implements clause is not followed, and a field initializer is
-// not marked.
+// SImp, SSpace, TSpace, Impl$In and Field stay unresolved: a static import
+// is not resolved to a type, an import spelled with inner spaces or comments
+// has no usable name, an implements clause is not followed, and a field
+// initializer is not marked.
 var javaNoInheritedTypeTree = tree{
 	"app/Bag.java":      `package app; public class Bag { public Bag() {} }`,
 	"app/Base.java":     `package app; public class Base { public static class Bag { public Bag() {} } }`,
@@ -44,6 +48,9 @@ var javaNoInheritedTypeTree = tree{
 	"app/Nest.java":     "package app;\npublic class Nest {\n    static class In {\n        void make() {\n            new Bag();\n        }\n    }\n}\n",
 	"app/Imp.java":      "package app;\nimport other.Holder.Bag;\npublic class Imp {\n    void make() {\n        new Bag();\n    }\n}\n",
 	"app/SImp.java":     "package app;\nimport static other.Holder.Bag;\npublic class SImp {\n    void make() {\n        new Bag();\n    }\n}\n",
+	"app/SSpace.java":   "package app;\nimport static other.Holder. Bag;\npublic class SSpace {\n    void make() {\n        new Bag();\n    }\n}\n",
+	"app/TSpace.java":   "package app;\nimport other.Holder /*c*/ .Bag;\npublic class TSpace {\n    void make() {\n        new Bag();\n    }\n}\n",
+	"app/SWild.java":    "package app;\nimport static other.Holder.*;\npublic class SWild {\n    void make() {\n        new Bag();\n    }\n}\n",
 	"app/Sub.java":      "package app;\npublic class Sub extends Base {\n    void make() {\n        new Bag();\n    }\n}\n",
 	"app/Impl.java":     "package app;\npublic class Impl implements Runnable {\n    public void run() {}\n    static class In {\n        void make() {\n            new Bag();\n        }\n    }\n}\n",
 	"app/Encl.java":     "package app;\npublic class Encl {\n    static class Bag { Bag() {} }\n    static class In {\n        void make() {\n            new Bag();\n        }\n    }\n}\n",
@@ -62,6 +69,9 @@ func assertJavaNoInheritedTypeTargets(t *testing.T, r *lifecycleRepo, step strin
 		"app.Nest.In.make|Bag": "app.Bag.Bag",
 		"app.Imp.make|Bag":     "other.Holder.Bag.Bag",
 		"app.SImp.make|Bag":    "",
+		"app.SSpace.make|Bag":  "",
+		"app.TSpace.make|Bag":  "",
+		"app.SWild.make|Bag":   "app.Bag.Bag",
 		"app.Sub.make|Bag":     "",
 		"app.Impl.In.make|Bag": "",
 		"app.Encl.In.make|Bag": "",

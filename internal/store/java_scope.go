@@ -375,8 +375,14 @@ func javaTypeInScope(eName, pkg, container string, byQName map[string][]javaScop
 	// shadows every package and on-demand type of that name (JLS 6.4.1,
 	// 7.5.3); a static import is not resolved to a type here, so the name
 	// stays unresolved.
+	// The import evidence keeps a declaration's spelling, so a single import
+	// written with spaces or comments inside its name (`import a.B. Box;`)
+	// carries no usable local name; it may name this one, so it refuses.
 	imported := ""
 	for _, i := range imps {
+		if !i.wildcard && !javaDottedName(i.source) {
+			return javaScopeSymbol{}, false, ""
+		}
 		if i.static && !i.wildcard && i.local == name {
 			return javaScopeSymbol{}, false, ""
 		}
@@ -420,6 +426,22 @@ func javaTypeInScope(eName, pkg, container string, byQName map[string][]javaScop
 		}
 	}
 	return javaUniqueVisible(c, pkg, "java_package_scope")
+}
+
+// javaDottedName reports whether s is Java identifiers joined by dots, with
+// nothing else between them.
+func javaDottedName(s string) bool {
+	for _, seg := range strings.Split(s, ".") {
+		if seg == "" {
+			return false
+		}
+		for k, r := range seg {
+			if r != '_' && r != '$' && !unicode.IsLetter(r) && (k == 0 || !unicode.IsDigit(r)) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func javaUniqueVisible(c []javaScopeSymbol, pkg, strategy string) (javaScopeSymbol, bool, string) {
