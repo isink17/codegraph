@@ -325,13 +325,16 @@ var rustPrivateVisibilityCases = []struct {
 		"a/y.rs": "pub use super::x::*;\npub fn caller() {\n    crate::a::y::id();\n}\n",
 	}, "a/y.rs", "crate::a::y::id", "a/x.rs:crate::a::x::id", true},
 	// Every hop of a re-export chain is judged from its own module: a passes
-	// id on, but e is outside a, so std::process::id answers (rustc).
+	// id on, but e is outside a, so e's glob does not import it and
+	// std::process::id answers (rustc), although the caller inside a could
+	// see crate::a::x::id.
 	{"pub(super) item behind a chained glob re-export from outside its parent", tree{
 		"lib.rs": "mod a; mod e;",
-		"a.rs":   "pub mod x;\npub use x::*;\n",
+		"a.rs":   "pub mod x; pub mod y;\npub use x::*;\n",
 		"a/x.rs": "pub(super) fn id() -> u32 { 7 }",
-		"e.rs":   "pub use crate::a::*;\npub use std::process::*;\npub fn outside() {\n    crate::e::id();\n}\n",
-	}, "e.rs", "crate::e::id", "", false},
+		"a/y.rs": "pub fn caller() {\n    crate::e::id();\n}\n",
+		"e.rs":   "pub use crate::a::*;\npub use std::process::*;\n",
+	}, "a/y.rs", "crate::e::id", "", false},
 	// A glob re-export never passes on a private item: `exit` is std's.
 	{"private item behind a glob re-export", tree{
 		"lib.rs": "mod a; mod c;",
