@@ -102,7 +102,19 @@ func (i *Indexer) symbolHistory(ctx context.Context, repoID int64, root string, 
 	for _, p := range changes {
 		delete(want, p)
 	}
-	update := store.GitSymbolUpdate{All: !reuse}
+	candidates := make([]string, 0, len(want))
+	for p := range want {
+		candidates = append(candidates, p)
+	}
+	slices.Sort(candidates)
+	filtered, err := githistory.Filtered(ctx, root, candidates)
+	if err != nil {
+		return store.GitSymbolUpdate{}, err
+	}
+	for _, p := range filtered {
+		delete(want, p)
+	}
+	update := store.GitSymbolUpdate{All: !reuse, Filtered: filtered}
 	var blame []string
 	if reuse {
 		have, err := i.store.StoredGitSymbolRanges(ctx, repoID)
@@ -130,7 +142,10 @@ func (i *Indexer) symbolHistory(ctx context.Context, repoID int64, root string, 
 		return update, nil
 	}
 	slices.Sort(blame)
-	boundary := githistory.WindowBoundary(ctx, root, state.Watermark)
+	boundary, err := githistory.WindowBoundary(ctx, root, state.Watermark, state.WindowCommits)
+	if err != nil {
+		return store.GitSymbolUpdate{}, err
+	}
 	shallow := state.Status == githistory.StatusTruncated
 	results := make([][]githistory.SymbolStats, len(blame))
 	errs := make([]error, len(blame))

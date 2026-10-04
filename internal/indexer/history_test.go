@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/githistory/gittest"
+	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
 	"github.com/isink17/codegraph/internal/parser/heuristic"
@@ -202,6 +204,24 @@ func TestHistoryFreshIncrementalAndRewriteParity(t *testing.T) {
 		return st
 	}
 
+	// No-op update: nothing changes.
+	initial := historyDump(t, inc)
+	if strings.Contains(initial, "git_symbol_history rows=0") {
+		t.Fatalf("no symbol history:\n%s", initial)
+	}
+	index(t, inc, r.Dir, true, false)
+	if again := historyDump(t, inc); again != initial {
+		t.Fatalf("no-op update changed history:\n%s\n---\n%s", initial, again)
+	}
+
+	// Upgrade from a file-level-only database: the old algorithm id forces a
+	// recompute that fills symbol history.
+	if _, err := inc.raw(t).Exec(`UPDATE git_history_state SET algorithm = 'file-v1'; DELETE FROM git_symbol_history`); err != nil {
+		t.Fatal(err)
+	}
+	index(t, inc, r.Dir, true, false)
+	assertParity("upgrade")
+
 	// Descendant commits.
 	r.Write("c.go", "package h\n\nfunc D() {}\n")
 	r.Commit("carol@example.com", "three")
@@ -357,11 +377,9 @@ func symbolLines(t *testing.T, s *profileStore, paths ...string) []string {
 	for _, f := range got.Files {
 		out = append(out, f.Path+" "+f.SymbolHistory)
 		for _, sym := range f.Symbols {
-			last := "before_window"
+			last := sym.State
 			if sym.LastCommit != nil {
 				last = sym.LastCommit.SHA[:7] + " " + sym.LastAuthor
-			} else if !sym.BeforeWindow {
-				last = "missing"
 			}
 			out = append(out, fmt.Sprintf("  %s %d-%d %s", sym.QualifiedName, sym.StartLine, sym.EndLine, last))
 		}
@@ -404,5 +422,109 @@ func TestSymbolHistoryLastTouched(t *testing.T) {
 	}
 	if _, err := s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Symbols: true}); err == nil {
 		t.Fatal("symbols on a listing accepted")
+	}
+}
+
+// Git diff trusts assume-unchanged and skip-worktree, so an edit under either
+// flag is found by hashing; a `filter` attribute (here a real line-adding
+// smudge) withholds symbols because blame reads clean blob lines. File-level
+// history is kept in every case.
+func TestSymbolHistoryHiddenEditsAndFilters(t *testing.T) {
+	r := gittest.Init(t)
+	r.Write("a.go", "package h\n\nfunc A() {}\n")
+	r.Write("b.go", "package h\n\nfunc B() {}\n")
+	r.Write("c.go", "package h\n\nfunc C() {}\n")
+	r.Write("same.go", "package h\n\nfunc S() {}\n")
+	r.Write("f.go", "package h\n\nfunc F() {}\n")
+	r.Write(".gitattributes", "f.go filter=addline\n")
+	r.Git("config", "filter.addline.clean", "awk 'NR>1 || $0 != \"// generated\"'")
+	r.Git("config", "filter.addline.smudge", "awk 'NR==1{print \"// generated\"}1'")
+	r.Commit("", "one")
+	if err := os.Remove(filepath.Join(r.Dir, "f.go")); err != nil {
+		t.Fatal(err)
+	}
+	r.Git("checkout", "--", "f.go") // smudged: one more line than the blob
+	r.Git("update-index", "--assume-unchanged", "a.go", "same.go")
+	r.Git("update-index", "--skip-worktree", "b.go")
+	r.Write("a.go", "package h\n\n\n\nfunc A() {}\n")
+	r.Write("b.go", "package h\n\n\n\nfunc B() {}\n")
+	if out := r.Git("status", "--porcelain"); out != "" {
+		t.Fatalf("fixture: git status should hide the edits, got %q", out)
+	}
+
+	s := newProfileStore(t)
+	index(t, s, r.Dir, false, false)
+	got := symbolLines(t, s, "a.go", "b.go", "c.go", "same.go", "f.go")
+	head := r.Git("rev-parse", "--short=7", "HEAD")
+	want := []string{
+		"a.go worktree_differs",
+		"b.go worktree_differs",
+		"c.go ok", "  h.C 3-3 " + head + " alice@example.com",
+		"same.go ok", "  h.S 3-3 " + head + " alice@example.com",
+		"f.go filtered_content",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("symbols:\n got %q\nwant %q", got, want)
+	}
+	files, err := s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Paths: []string{"f.go"}})
+	if err != nil || len(files.Files) != 1 || files.Files[0].CommitCount != 1 || files.Files[0].WorktreeDiffers {
+		t.Fatalf("file-level f.go = %+v, %v", files, err)
+	}
+	fresh := newProfileStore(t)
+	index(t, fresh, r.Dir, false, false)
+	index(t, s, r.Dir, true, false)
+	if a, b := historyDump(t, s), historyDump(t, fresh); a != b {
+		t.Fatalf("update differs from fresh:\n%s\n---\n%s", a, b)
+	}
+}
+
+// A symbol without a usable range and a range with no stored blame are
+// reported as such, never as an attributed symbol without data. One response
+// returns at most limits.MaxPage symbols, in order, with each file's total.
+func TestSymbolHistoryStatesAndBound(t *testing.T) {
+	r := gittest.Init(t)
+	var b strings.Builder
+	b.WriteString("package h\n")
+	for k := 0; k < 300; k++ {
+		fmt.Fprintf(&b, "\nfunc F%03d() {}\n", k)
+	}
+	r.Write("one.go", b.String())
+	r.Write("two.go", strings.ReplaceAll(b.String(), "func F", "func G"))
+	r.Commit("", "one")
+	s := newProfileStore(t)
+	index(t, s, r.Dir, false, false)
+
+	got, err := s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Paths: []string{"one.go", "two.go"}, Symbols: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, two := got.Files[0], got.Files[1]
+	if !got.SymbolsTruncated || one.SymbolCount != 300 || len(one.Symbols) != 300 || two.SymbolCount != 300 ||
+		len(two.Symbols) != limits.MaxPage-300 || two.Symbols[0].Name != "G000" || two.Symbols[len(two.Symbols)-1].Name != "G199" {
+		t.Fatalf("bound: truncated=%v one=%d/%d two=%d/%d", got.SymbolsTruncated, len(one.Symbols), one.SymbolCount, len(two.Symbols), two.SymbolCount)
+	}
+	for k, sym := range one.Symbols {
+		if sym.Name != fmt.Sprintf("F%03d", k) || sym.State != store.SymbolStateLastCommit {
+			t.Fatalf("one.go symbol %d = %+v", k, sym)
+		}
+	}
+	if _, err := s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Paths: make([]string, limits.MaxBatchItems+1), Symbols: true}); err == nil {
+		t.Fatal("unbounded file batch accepted")
+	}
+
+	db := s.raw(t)
+	if _, err := db.Exec(`UPDATE symbols SET end_line = 0 WHERE name = 'F000'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM git_symbol_history WHERE path = 'one.go' AND start_line = (SELECT start_line FROM symbols WHERE name = 'F001')`); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GitHistory(context.Background(), 1, store.GitHistoryQuery{Paths: []string{"one.go"}, Symbols: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := got.Files[0].Symbols[0], got.Files[0].Symbols[1]; a.State != store.SymbolStateNoRange || a.LastCommit != nil ||
+		b.State != store.SymbolStateNotComputed || b.LastCommit != nil || b.LastAuthor != "" {
+		t.Fatalf("states: %+v %+v", a, b)
 	}
 }

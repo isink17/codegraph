@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/isink17/codegraph/internal/githistory"
+	"github.com/isink17/codegraph/internal/limits"
 )
 
 // GitHistoryState returns the stored repository-level history state. A
@@ -36,6 +38,8 @@ type GitSymbolUpdate struct {
 	All   bool
 	Paths []string
 	Rows  []githistory.SymbolStats
+	// Filtered replaces the paths whose `filter` attribute withholds them.
+	Filtered []string
 }
 
 // ReplaceGitHistory stores one history evaluation atomically. files == nil
@@ -88,6 +92,14 @@ func (s *Store) ReplaceGitHistory(ctx context.Context, repoID int64, state githi
 	}
 	if symbols.All {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM git_symbol_history WHERE repo_id=?`, repoID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM git_filtered_paths WHERE repo_id=?`, repoID); err != nil {
+		return err
+	}
+	for _, p := range symbols.Filtered {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO git_filtered_paths(repo_id, path) VALUES(?, ?)`, repoID, p); err != nil {
 			return err
 		}
 	}
@@ -176,6 +188,9 @@ type GitFileHistory struct {
 	// file's symbols, or why symbol-level history is withheld.
 	SymbolHistory string             `json:"symbol_history,omitempty"`
 	Symbols       []GitSymbolHistory `json:"symbols,omitempty"`
+	// SymbolCount is the file's symbol total; Symbols holds fewer when the
+	// response reached its symbol bound (GitHistoryResult.SymbolsTruncated).
+	SymbolCount int `json:"symbol_count,omitempty"`
 }
 
 // Reasons symbol-level history is withheld for a file.
@@ -184,12 +199,20 @@ const (
 	SymbolHistoryNotIndexed      = "not_indexed"
 	SymbolHistoryWorktreeDiffers = "worktree_differs"
 	SymbolHistoryUntrustedRanges = "untrusted_ranges"
+	SymbolHistoryFilteredContent = "filtered_content"
+)
+
+// Per-symbol states.
+const (
+	SymbolStateLastCommit   = "last_commit"   // LastCommit and LastAuthor are set
+	SymbolStateBeforeWindow = "before_window" // every line was last touched before the window
+	SymbolStateNoRange      = "no_range"      // the parser recorded no usable line range
+	SymbolStateNotComputed  = "not_computed"  // no stored blame for this range (graph changed since the scan)
 )
 
 // GitSymbolHistory is the window commit git blame last attributes to any line
 // of one symbol's range at the watermark. It is not a count of changes to the
-// symbol. LastCommit is absent and BeforeWindow true when every line was last
-// touched before the window.
+// symbol.
 type GitSymbolHistory struct {
 	ID            int64         `json:"id"`
 	Kind          string        `json:"kind"`
@@ -197,9 +220,9 @@ type GitSymbolHistory struct {
 	QualifiedName string        `json:"qualified_name"`
 	StartLine     int           `json:"start_line"`
 	EndLine       int           `json:"end_line"`
+	State         string        `json:"state"`
 	LastCommit    *GitCommitRef `json:"last_commit,omitempty"`
 	LastAuthor    string        `json:"last_author,omitempty"`
-	BeforeWindow  bool          `json:"before_window,omitempty"`
 }
 
 // GitHistoryQuery selects rows: explicit Paths, or a page of every path with
@@ -222,6 +245,9 @@ type GitHistoryResult struct {
 	Total  int `json:"total"`
 	Limit  int `json:"limit,omitempty"`
 	Offset int `json:"offset,omitempty"`
+	// SymbolsTruncated reports that rows hold fewer symbols than their
+	// symbol_count: one response returns at most limits.MaxPage symbols.
+	SymbolsTruncated bool `json:"symbols_truncated,omitempty"`
 }
 
 const gitFileHistorySelect = `
@@ -248,11 +274,15 @@ func (s *Store) GitHistory(ctx context.Context, repoID int64, q GitHistoryQuery)
 	if q.Symbols && len(q.Paths) == 0 {
 		return GitHistoryResult{}, errors.New("symbols requires explicit files")
 	}
+	if len(q.Paths) > limits.MaxBatchItems {
+		return GitHistoryResult{}, fmt.Errorf("at most %d files, got %d", limits.MaxBatchItems, len(q.Paths))
+	}
 	out := GitHistoryResult{History: state, Files: []GitFileHistory{}}
 	if state.Status == githistory.StatusAbsent {
 		return out, nil
 	}
 	if len(q.Paths) > 0 {
+		symbolsReturned := 0
 		for _, p := range q.Paths {
 			rows, err := s.db.QueryContext(ctx, `WITH paths(path) AS (SELECT ?2)`+gitFileHistorySelect, repoID, CanonicalRelPath(p))
 			if err != nil {
@@ -264,8 +294,13 @@ func (s *Store) GitHistory(ctx context.Context, repoID int64, q GitHistoryQuery)
 			}
 			if q.Symbols {
 				for k := range got {
-					if err := s.gitSymbolHistory(ctx, repoID, &got[k]); err != nil {
+					budget := limits.MaxPage - symbolsReturned
+					if err := s.gitSymbolHistory(ctx, repoID, &got[k], budget); err != nil {
 						return GitHistoryResult{}, err
+					}
+					symbolsReturned += len(got[k].Symbols)
+					if len(got[k].Symbols) < got[k].SymbolCount {
+						out.SymbolsTruncated = true
 					}
 				}
 			}
@@ -317,7 +352,8 @@ func scanGitFileHistory(rows *sql.Rows) ([]GitFileHistory, error) {
 
 // gitSymbolHistory fills one file's symbol-level history, or the reason it is
 // withheld. The same rules decide which files the indexer blames.
-func (s *Store) gitSymbolHistory(ctx context.Context, repoID int64, f *GitFileHistory) error {
+// At most budget symbols are returned, in order; SymbolCount has the total.
+func (s *Store) gitSymbolHistory(ctx context.Context, repoID int64, f *GitFileHistory, budget int) error {
 	switch {
 	case !f.Indexed:
 		f.SymbolHistory = SymbolHistoryNotIndexed
@@ -327,11 +363,18 @@ func (s *Store) gitSymbolHistory(ctx context.Context, repoID int64, f *GitFileHi
 		return nil
 	}
 	var profile string
-	if err := s.db.QueryRowContext(ctx, `SELECT parser_profile FROM files WHERE repo_id=? AND path=? AND is_deleted=0`,
-		repoID, f.Path).Scan(&profile); err != nil {
+	var filtered bool
+	if err := s.db.QueryRowContext(ctx, `SELECT parser_profile,
+		EXISTS(SELECT 1 FROM git_filtered_paths g WHERE g.repo_id=f.repo_id AND g.path=f.path)
+		FROM files f WHERE f.repo_id=? AND f.path=? AND f.is_deleted=0`,
+		repoID, f.Path).Scan(&profile, &filtered); err != nil {
 		return err
 	}
-	if !githistory.TrustedRanges(profile) {
+	switch {
+	case filtered:
+		f.SymbolHistory = SymbolHistoryFilteredContent
+		return nil
+	case !githistory.TrustedRanges(profile):
 		f.SymbolHistory = SymbolHistoryUntrustedRanges
 		return nil
 	}
@@ -350,6 +393,10 @@ func (s *Store) gitSymbolHistory(ctx context.Context, repoID int64, f *GitFileHi
 	f.SymbolHistory = SymbolHistoryOK
 	f.Symbols = []GitSymbolHistory{}
 	for rows.Next() {
+		f.SymbolCount++
+		if len(f.Symbols) >= budget {
+			continue
+		}
 		var sym GitSymbolHistory
 		var sha sql.NullString
 		var ref GitCommitRef
@@ -357,12 +404,17 @@ func (s *Store) gitSymbolHistory(ctx context.Context, repoID int64, f *GitFileHi
 			&sha, &ref.CommitterTime, &sym.LastAuthor); err != nil {
 			return err
 		}
+		// The same range rule GitSymbolRanges applies before blaming.
 		switch {
-		case sha.Valid && sha.String != "":
+		case sym.StartLine <= 0 || sym.EndLine < sym.StartLine:
+			sym.State, sym.LastAuthor = SymbolStateNoRange, ""
+		case !sha.Valid:
+			sym.State = SymbolStateNotComputed
+		case sha.String == "":
+			sym.State = SymbolStateBeforeWindow
+		default:
 			ref.SHA = sha.String
-			sym.LastCommit = &ref
-		case sha.Valid:
-			sym.BeforeWindow = true
+			sym.State, sym.LastCommit = SymbolStateLastCommit, &ref
 		}
 		f.Symbols = append(f.Symbols, sym)
 	}

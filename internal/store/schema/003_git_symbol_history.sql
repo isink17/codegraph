@@ -13,3 +13,11 @@ CREATE TABLE git_symbol_history (
     last_author TEXT NOT NULL,
     PRIMARY KEY (repo_id, path, start_line, end_line)
 );
+
+-- Paths with a Git `filter` attribute (LFS, smudge/clean): their working-tree
+-- lines need not be the blob lines blame reads, so they get no symbol rows.
+CREATE TABLE git_filtered_paths (
+    repo_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY (repo_id, path)
+);

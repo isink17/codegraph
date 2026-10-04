@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -90,6 +91,9 @@ type FileStats struct {
 type Error struct {
 	Reason string
 	Err    error
+	// quietMiss marks exit status 1 with nothing on stderr: what
+	// `rev-parse -q --verify` reports for a name that does not resolve.
+	quietMiss bool
 }
 
 func (e *Error) Error() string { return e.Reason + ": " + e.Err.Error() }
@@ -140,6 +144,11 @@ func gitEnv() []string {
 }
 
 func run(ctx context.Context, root string, args ...string) ([]byte, error) {
+	return runInput(ctx, root, "", args...)
+}
+
+// runInput runs Git with input on stdin.
+func runInput(ctx context.Context, root, input string, args ...string) ([]byte, error) {
 	path, err := exec.LookPath(gitBinary)
 	if err != nil {
 		return nil, &Error{Reason: ReasonGitUnavailable, Err: err}
@@ -150,6 +159,9 @@ func run(ctx context.Context, root string, args ...string) ([]byte, error) {
 	cmd.Env = gitEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	err = cmd.Run()
 	if err == nil {
 		return stdout.Bytes(), nil
@@ -159,6 +171,10 @@ func run(ctx context.Context, root string, args ...string) ([]byte, error) {
 	}
 	msg := strings.TrimSpace(stderr.String())
 	full := fmt.Errorf("git %s: %w: %s", args[0], err, msg)
+	var exitErr *exec.ExitError
+	if msg == "" && errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return nil, &Error{Reason: ReasonGitFailed, Err: full, quietMiss: true}
+	}
 	switch {
 	case strings.Contains(msg, "dubious ownership"):
 		return nil, &Error{Reason: ReasonUnsafeDirectory, Err: full}
@@ -217,14 +233,23 @@ func WorktreeChanges(ctx context.Context, root, watermark string, indexed []stri
 	if err != nil {
 		return nil, err
 	}
-	listed, err := run(ctx, root, "-c", "core.fsmonitor=false", "ls-files", "-z", "--cached")
+	// -v tags each entry: lowercase for assume-unchanged, S for skip-worktree.
+	// Git diff trusts both flags and skips the file, so an edit to it is
+	// invisible above; its content is hashed below instead.
+	listed, err := run(ctx, root, "-c", "core.fsmonitor=false", "ls-files", "-z", "-v", "--cached")
 	if err != nil {
 		return nil, err
 	}
 	known := map[string]bool{}
-	for _, p := range strings.Split(string(listed), "\x00") {
-		if p != "" {
-			known[p] = true
+	var hidden []string
+	for _, entry := range strings.Split(string(listed), "\x00") {
+		if len(entry) < 3 {
+			continue
+		}
+		tag, p := entry[0], entry[2:]
+		known[p] = true
+		if tag == 'S' || (tag >= 'a' && tag <= 'z') {
+			hidden = append(hidden, p)
 		}
 	}
 	seen := map[string]bool{}
@@ -233,10 +258,20 @@ func WorktreeChanges(ctx context.Context, root, watermark string, indexed []stri
 			seen[p] = true
 		}
 	}
+	isIndexed := map[string]bool{}
 	for _, p := range indexed {
+		isIndexed[p] = true
 		if !known[p] {
 			seen[p] = true
 		}
+	}
+	hidden = slices.DeleteFunc(hidden, func(p string) bool { return seen[p] || !isIndexed[p] })
+	differ, err := contentDiffers(ctx, root, watermark, hidden)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range differ {
+		seen[p] = true
 	}
 	paths := make([]string, 0, len(seen))
 	for p := range seen {
@@ -244,6 +279,61 @@ func WorktreeChanges(ctx context.Context, root, watermark string, indexed []stri
 	}
 	sort.Strings(paths)
 	return paths, nil
+}
+
+// contentDiffers returns the paths whose working-tree file, cleaned by the
+// same filters `git add` applies, hashes to another blob than the watermark's.
+func contentDiffers(ctx context.Context, root, watermark string, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	hashes, err := runInput(ctx, root, strings.Join(paths, "\n")+"\n", "hash-object", "--stdin-paths")
+	if err != nil {
+		return nil, err
+	}
+	got := strings.Fields(string(hashes))
+	if len(got) != len(paths) {
+		return nil, &Error{Reason: ReasonGitFailed, Err: fmt.Errorf("hash-object returned %d hashes for %d paths", len(got), len(paths))}
+	}
+	tree, err := run(ctx, root, append([]string{"ls-tree", "-z", watermark, "--"}, paths...)...)
+	if err != nil {
+		return nil, err
+	}
+	blob := map[string]string{}
+	for _, entry := range strings.Split(string(tree), "\x00") {
+		meta, p, ok := strings.Cut(entry, "\t")
+		if fields := strings.Fields(meta); ok && len(fields) == 3 {
+			blob[p] = fields[2]
+		}
+	}
+	var out []string
+	for k, p := range paths {
+		if blob[p] != got[k] {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// Filtered returns the paths with a `filter` attribute (Git LFS, a custom
+// smudge/clean pair). Their working-tree lines need not be the blob's lines
+// blame reads, so symbol ranges cannot be matched to them.
+func Filtered(ctx context.Context, root string, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	out, err := runInput(ctx, root, strings.Join(paths, "\x00")+"\x00", "check-attr", "-z", "--stdin", "filter")
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Split(string(out), "\x00")
+	var filtered []string
+	for k := 0; k+2 < len(fields); k += 3 {
+		if v := fields[k+2]; v != "unspecified" && v != "unset" {
+			filtered = append(filtered, fields[k])
+		}
+	}
+	return filtered, nil
 }
 
 // revertSubject and revertTrailer are the two markers Git itself writes for
@@ -468,14 +558,24 @@ func TrustedRanges(profile string) bool {
 	return false
 }
 
-// WindowBoundary returns the first-parent commit just outside the window, or
-// "" when the window reaches the root (or a shallow graft) of the history.
-func WindowBoundary(ctx context.Context, root, watermark string) string {
-	out, err := run(ctx, root, "rev-parse", "-q", "--verify", watermark+"~"+strconv.Itoa(WindowLimit)+"^{commit}")
-	if err != nil {
-		return ""
+// WindowBoundary returns the first-parent commit just outside a window of
+// windowCommits commits, or "" when the window reaches the root (or a shallow
+// graft) of the history: a window shorter than WindowLimit, or a full one whose
+// oldest commit has no first parent. Any other failure is returned, so a blame
+// is never run without its bound.
+func WindowBoundary(ctx context.Context, root, watermark string, windowCommits int) (string, error) {
+	if windowCommits < WindowLimit {
+		return "", nil
 	}
-	return strings.TrimSpace(string(out))
+	out, err := run(ctx, root, "rev-parse", "-q", "--verify", watermark+"~"+strconv.Itoa(WindowLimit)+"^{commit}")
+	var gerr *Error
+	if errors.As(err, &gerr) && gerr.quietMiss {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // Blame attributes each range of path to the newest window commit among its

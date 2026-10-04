@@ -443,8 +443,8 @@ func TestBlameAttributesRangesToTheNewestWindowCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b := WindowBoundary(ctx, r.Dir, state.Watermark); b != "" {
-		t.Fatalf("boundary of a 9-commit history = %q", b)
+	if b, err := WindowBoundary(ctx, r.Dir, state.Watermark, 9); b != "" || err != nil {
+		t.Fatalf("boundary of a 9-commit history = %q, %v", b, err)
 	}
 	for _, tc := range []struct {
 		path   string
@@ -488,9 +488,9 @@ func TestBlameStopsAtTheWindowBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	boundary := WindowBoundary(ctx, r.Dir, state.Watermark)
-	if want := r.Git("rev-parse", "HEAD~250"); boundary != want {
-		t.Fatalf("boundary = %s, want commit 10 %s", boundary, want)
+	boundary, err := WindowBoundary(ctx, r.Dir, state.Watermark, WindowLimit)
+	if want := r.Git("rev-parse", "HEAD~250"); boundary != want || err != nil {
+		t.Fatalf("boundary = %s, %v, want commit 10 %s", boundary, err, want)
 	}
 	for path, want := range map[string]string{
 		"hot.txt":  state.Watermark,
@@ -561,7 +561,11 @@ func TestBlameInShallowCloneStopsAtTheCut(t *testing.T) {
 		t.Fatalf("state = %+v, %v", state, err)
 	}
 	// b.go: b1 from c1 (cut away), b3 from c7 (the shallow root).
-	got, err := Blame(ctx, clone.Dir, state.Watermark, WindowBoundary(ctx, clone.Dir, state.Watermark), "b.go", true, []Range{{1, 1}, {2, 2}})
+	boundary, err := WindowBoundary(ctx, clone.Dir, state.Watermark, 2)
+	if err != nil || boundary != "" {
+		t.Fatalf("shallow boundary = %q, %v", boundary, err)
+	}
+	got, err := Blame(ctx, clone.Dir, state.Watermark, boundary, "b.go", true, []Range{{1, 1}, {2, 2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,5 +578,29 @@ func TestBlameInShallowCloneStopsAtTheCut(t *testing.T) {
 	got, err = Blame(ctx, clone.Dir, head, "", "b.go", true, []Range{{1, 3}})
 	if err != nil || got[0].LastSHA != head {
 		t.Fatalf("after a commit in the clone = %+v, %v", got, err)
+	}
+}
+
+// Only a genuinely missing ancestor means "no boundary": a full window whose
+// oldest commit is the root. A Git failure is an error, never an unbounded
+// blame.
+func TestWindowBoundaryMissIsQuietFailureIsNot(t *testing.T) {
+	r := gittest.Init(t)
+	fastImport(t, r, WindowLimit)
+	ctx := context.Background()
+	head := r.Git("rev-parse", "HEAD")
+	if b, err := WindowBoundary(ctx, r.Dir, head, WindowLimit); b != "" || err != nil {
+		t.Fatalf("root-reaching full window = %q, %v", b, err)
+	}
+	fastImport(t, r, WindowLimit+1)
+	head = r.Git("rev-parse", "HEAD")
+	defer func(d time.Duration) { Timeout = d }(Timeout)
+	Timeout = time.Nanosecond
+	b, err := WindowBoundary(ctx, r.Dir, head, WindowLimit)
+	if err == nil || b != "" || ReasonOf(err) != ReasonTimeout {
+		t.Fatalf("timed-out boundary = %q, %v", b, err)
+	}
+	if b, err := WindowBoundary(ctx, filepath.Join(r.Dir, ".git", "nope"), head, WindowLimit); err == nil || b != "" {
+		t.Fatalf("failed boundary = %q, %v", b, err)
 	}
 }
