@@ -288,7 +288,7 @@ func TestJavaNestedClassScopeProfileConvergence(t *testing.T) {
 	if strings.Join(summary.ParserProfileLanguages, ",") != "java" {
 		t.Fatalf("update = %+v, want a java profile reparse", summary)
 	}
-	if got := fileParserProfile(t, s.raw(t), repo, "app/Caller.java"); got != "treesitter:java:v9" {
+	if got := fileParserProfile(t, s.raw(t), repo, "app/Caller.java"); got != "treesitter:java:v10" {
 		t.Fatalf("updated profile = %q", got)
 	}
 	bound := 0

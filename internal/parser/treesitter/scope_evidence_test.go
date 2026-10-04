@@ -205,3 +205,45 @@ func TestRustUseTreeUnsupportedAndMalformedFailClosed(t *testing.T) {
 		})
 	}
 }
+
+// Java import evidence comes from the declaration's tokens: `static` is a
+// keyword token, never a prefix of the package name, and whitespace and
+// comments between tokens are not part of the name. A declaration with a
+// syntax error keeps its raw spelling, which the store refuses.
+func TestJavaImportEvidenceFromSyntax(t *testing.T) {
+	for _, c := range []struct {
+		decl, source, local string
+		static, wildcard    bool
+	}{
+		{"import staticpkg.Bag;", "staticpkg.Bag", "Bag", false, false},
+		{"import staticpkg.*;", "staticpkg", "", false, true},
+		{"import static staticpkg.Util.run;", "staticpkg.Util.run", "run", true, false},
+		{"import static\ta.B.Bag;", "a.B.Bag", "Bag", true, false},
+		{"import static\na.B.*;", "a.B", "", true, true},
+		{"import /*c*/ static /*d*/ a . B /*e*/ .*;", "a.B", "", true, true},
+		{"import a.B. Box;", "a.B.Box", "Box", false, false},
+		{"import a.B /*c*/ .Box;", "a.B.Box", "Box", false, false},
+		{"import Top;", "Top", "Top", false, false},
+		{"import a.;", "import a.;", "", false, false},
+	} {
+		p, err := NewJava().Parse(context.Background(), "C.java", []byte("package p;\n"+c.decl+"\nclass C {}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Scope.Imports) != 1 {
+			t.Fatalf("%s: imports = %+v", c.decl, p.Scope.Imports)
+		}
+		got := p.Scope.Imports[0]
+		if got.SourceSpecifier != c.source || got.LocalName != c.local || got.ImportedName != c.local || got.Static != c.static || got.Wildcard != c.wildcard {
+			t.Errorf("%s: import = %+v, want source %q local %q static %v wildcard %v", c.decl, got, c.source, c.local, c.static, c.wildcard)
+		}
+	}
+	// The v9 text rule is reproduced only by the legacy adapter.
+	p, err := NewJavaV9().Parse(context.Background(), "C.java", []byte("package p;\nimport staticpkg.Bag;\nclass C {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Scope.Imports) != 1 || p.Scope.Imports[0].SourceSpecifier != "pkg.Bag" {
+		t.Fatalf("v9 imports = %+v, want the legacy pkg.Bag", p.Scope.Imports)
+	}
+}

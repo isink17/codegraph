@@ -35,10 +35,10 @@ import (
 //	Local.make       new Bag() after local class Bag  app/Local$1Bag
 //	Field.bag        field initializer new Bag()      app/Bag
 //
-// SImp, SSpace, TSpace, Impl$In and Field stay unresolved: a static import
-// is not resolved to a type, an import spelled with inner spaces or comments
-// has no usable name, an implements clause is not followed, and a field
-// initializer is not marked.
+// SImp, SSpace, Impl$In and Field stay unresolved: a static import is not
+// resolved to a type, an implements clause is not followed, and a field
+// initializer is not marked. TSpace's comment is not part of the imported
+// name, so it binds like Imp.
 var javaNoInheritedTypeTree = tree{
 	"app/Bag.java":      `package app; public class Bag { public Bag() {} }`,
 	"app/Base.java":     `package app; public class Base { public static class Bag { public Bag() {} } }`,
@@ -70,7 +70,7 @@ func assertJavaNoInheritedTypeTargets(t *testing.T, r *lifecycleRepo, step strin
 		"app.Imp.make|Bag":     "other.Holder.Bag.Bag",
 		"app.SImp.make|Bag":    "",
 		"app.SSpace.make|Bag":  "",
-		"app.TSpace.make|Bag":  "",
+		"app.TSpace.make|Bag":  "other.Holder.Bag.Bag",
 		"app.SWild.make|Bag":   "app.Bag.Bag",
 		"app.Sub.make|Bag":     "",
 		"app.Impl.In.make|Bag": "",
