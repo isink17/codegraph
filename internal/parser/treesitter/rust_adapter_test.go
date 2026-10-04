@@ -134,7 +134,8 @@ func TestRustAttributeEvidence(t *testing.T) {
 		name, src string
 		want      []string
 	}{
-		{"builtin attributes", "#[allow(dead_code)]\n/// doc\nstruct S;\n#[inline]\n#[cfg(unix)]\nfn f() {}\n", nil},
+		{"builtin attributes", "#[allow(dead_code)]\n/// doc\nstruct S;\n#[inline]\n#[doc = \"x\"]\nfn f() {}\n", nil},
+		{"cfg is unproven, never neutral", "#[cfg(any())]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
 		{"builtin derives", "#[derive(Debug, Clone)]\nstruct S;\n", []string{"crate macro "}},
 		{"custom derive", "#[derive(Debug, procgen::Gen)]\nstruct S;\n", []string{"crate macro "}},
 		{"attribute macro on a fn", "#[tokio::main]\nasync fn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},

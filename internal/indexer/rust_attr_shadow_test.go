@@ -132,7 +132,7 @@ var rustAttrShadowCases = []struct {
 	// -- negative controls: builtin, non-generative attributes keep what is proven
 	{"builtin attributes, own fn", tree{
 		"lib.rs": "mod m;",
-		"m.rs":   "#[derive(Debug, Clone, PartialEq)]\n#[allow(dead_code)]\n/// doc\nstruct Marker;\n#[inline]\n#[cfg(unix)]\n#[doc = \"x\"]\nfn g() {}\nfn f() {}\npub fn c() {\n    f();\n}\n",
+		"m.rs":   "#[derive(Debug, Clone, PartialEq)]\n#[allow(dead_code)]\n/// doc\nstruct Marker;\n#[inline]\n#[doc = \"x\"]\nfn g() {}\nfn f() {}\npub fn c() {\n    f();\n}\n",
 	}, "", "", "m.rs:crate::m::f"},
 	{"builtin derive in a function block, own fn", tree{
 		"lib.rs": "mod m;",
@@ -192,7 +192,43 @@ var rustAttrShadowCases = []struct {
 		"lib.rs": "#[cfg(unix)]\nmod n;\nmod m;",
 		"n.rs":   "pub fn f() {}",
 		"m.rs":   "pub fn c() {\n    crate::n::f();\n}\n",
-	}, "", "crate::n::f", "n.rs:crate::n::f"},
+	}, "", "crate::n::f", ""},
+	// -- cfg may remove an item, and no configuration is evaluated, so it is
+	// unproven (rustc oracle: #[cfg(any())] fn f beside `use provider::*;`
+	// leaves the glob's f, not the disabled declaration, as the callee)
+	{"cfg(any()) own fn beside a glob", tree{
+		"lib.rs":      "mod provider; mod m;",
+		"provider.rs": "pub fn f() {}",
+		"m.rs":        "use crate::provider::*;\n#[cfg(any())]\nfn f() {}\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"cfg(feature) own fn beside a glob", tree{
+		"lib.rs":      "mod provider; mod m;",
+		"provider.rs": "pub fn f() {}",
+		"m.rs":        "use crate::provider::*;\n#[cfg(feature = \"x\")]\nfn f() {}\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"cfg(all()) own fn, over-refused", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "#[cfg(all())]\nfn f() {}\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"cfg on the caller", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "fn f() {}\n#[cfg(unix)]\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"cfg const beside a glob", tree{
+		"lib.rs":      "mod provider; mod m;",
+		"provider.rs": "pub fn f() {}",
+		"m.rs":        "use crate::provider::*;\n#[cfg(any())]\nconst f: u8 = 0;\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"cfg on an explicit import", tree{
+		"lib.rs":      "mod provider; mod m;",
+		"provider.rs": "pub fn f() {}",
+		"m.rs":        "#[cfg(unix)]\nuse crate::provider::f;\npub fn c() {\n    f();\n}\n",
+	}, "", "", ""},
+	{"unconditional own fn beside a glob", tree{
+		"lib.rs":      "mod provider; mod m;",
+		"provider.rs": "pub fn f() {}",
+		"m.rs":        "use crate::provider::*;\nfn f() {}\npub fn c() {\n    f();\n}\n",
+	}, "", "", "m.rs:crate::m::f"},
 	// -- an attribute macro on an enclosing item may rewrite its whole body
 	// (rustc 1.98.1 oracle: #[inject] fn caller() { g(); other::h(); } runs
 	// the injected g and other::h), so no original call inside it binds

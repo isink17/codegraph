@@ -175,11 +175,13 @@ var rustGlobShadowCases = []struct {
 		"m.rs":   "pub use crate::k::f;\n",
 		"k.rs":   "pub struct f(u8);\n",
 	}, "k.rs:crate::k::f", "", "m::f"},
-	// One import spelled under two cfg arms is still one import.
+	// One import spelled under two cfg arms is one import only if the arms are
+	// complementary; proving that needs a cfg evaluator (rustc agrees here, but
+	// cfg(a) / cfg(b) arms may both be off), so every cfg import is unproven.
 	{"cfg-duplicated explicit use", tree{
 		"lib.rs": "mod b;\n#[cfg(unix)]\nuse b::f;\n#[cfg(not(unix))]\nuse b::f;\npub fn caller() {\n    f();\n}\n",
 		"b.rs":   "pub fn f() {}",
-	}, "b.rs:crate::b::f", "", ""},
+	}, "", "", ""},
 	// An inline module holds only its own items: the file module's `f` is
 	// not `m::x::f`, so x's re-export answers the call.
 	{"inline module re-export beside a file item", tree{
