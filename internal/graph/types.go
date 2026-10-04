@@ -177,6 +177,7 @@ type ScopeEvidence struct {
 	ModulePath           string
 	Imports              []ScopeImport
 	Modules              []RustModule
+	RustValueItems       []RustValueItem
 	GoLocals             []GoLocalBinding
 	SwiftLexicalBindings []SwiftLexicalBinding
 	JVMFacade            JVMFileFacade
@@ -265,6 +266,27 @@ type ScopeImport struct {
 	TypeOnly        bool
 	OwnerModule     string
 }
+
+// RustValueItem is a module-level declaration the parser records no symbol
+// for, yet which can answer a bare call: a const, a static or an extern-block
+// function or static (Kind RustValueItemDecl, Name spelled), or an item-level
+// macro invocation whose expansion is not read and so may declare any item
+// (Kind RustValueItemMacro, Name the macro as written). OwnerModule is the
+// module whose scope holds it, spelled as the owner of an import.
+type RustValueItem struct {
+	OwnerModule string
+	Name        string
+	Kind        string
+}
+
+const (
+	RustValueItemDecl  = "decl"
+	RustValueItemMacro = "macro"
+	// RustValueItemUnproven names (by persisted qualified name, or a prefix of
+	// it) a declaration an unknown attribute macro may have rewritten or
+	// dropped: it binds no call.
+	RustValueItemUnproven = "unproven"
+)
 
 type RustModule struct {
 	Name        string

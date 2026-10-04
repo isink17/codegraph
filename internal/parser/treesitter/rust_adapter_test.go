@@ -6,6 +6,8 @@ import (
 	"context"
 	"runtime"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 // rustExternalModules parses src as the file at path and returns the
@@ -80,5 +82,146 @@ func TestRustModuleEvidenceKeepsBackslashFileNameAsData(t *testing.T) {
 	got := rustExternalModules(t, `/home/a/repo/src/x\y.rs`, "mod foo;\n")
 	if got["foo"] != `x\y/foo` {
 		t.Fatalf("external_path(foo) = %q, want %q", got["foo"], `x\y/foo`)
+	}
+}
+
+// TestRustValueItemEvidence pins which module-level syntax is recorded as a
+// value item: const, static and extern-block items by name, any item-level
+// macro invocation (statement or braced form, in an extern block too) and an
+// unparsable span as an unread expansion. Impl bodies, function bodies and
+// macro definitions record nothing, and an inline module's items carry the
+// inline module's own owner.
+func TestRustValueItemEvidence(t *testing.T) {
+	src := `const A: u8 = 1;
+static mut B: u8 = 2;
+extern "C" { fn c(); static D: u8; mk!(); }
+mk!(e);
+thread_local! { static F: u8 = 0; }
+macro_rules! mk { () => {} }
+struct S;
+impl S { const G: u8 = 1; mk!(); }
+fn body() { const H: u8 = 1; mk!(); }
+mod n { const I: u8 = 1; mk!(j); }
+`
+	pf, err := NewRust().Parse(context.Background(), "src/lib.rs", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, item := range pf.Scope.RustValueItems {
+		got[item.OwnerModule+" "+item.Kind+" "+item.Name] = true
+	}
+	want := []string{
+		"crate decl A", "crate decl B", "crate decl c", "crate decl D",
+		"crate macro mk", "crate macro thread_local",
+		"crate::n decl I", "crate::n macro mk",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("value items = %v, want exactly %v", got, want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("value items = %v, missing %q", got, w)
+		}
+	}
+}
+
+// TestRustAttributeEvidence pins which attributes leave an item proven: only
+// the built-in, non-generative ones. A derive is never proven: a macro_use in
+// another file may make any derive name a procedural one.
+func TestRustAttributeEvidence(t *testing.T) {
+	cases := []struct {
+		name, src string
+		want      []string
+	}{
+		{"builtin attributes", "#[allow(dead_code)]\n/// doc\nstruct S;\n#[inline]\n#[doc = \"x\"]\nfn f() {}\n", nil},
+		{"cfg is unproven, never neutral", "#[cfg(any())]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
+		{"builtin derives", "#[derive(Debug, Clone)]\nstruct S;\n", []string{"crate macro "}},
+		{"custom derive", "#[derive(Debug, procgen::Gen)]\nstruct S;\n", []string{"crate macro "}},
+		{"attribute macro on a fn", "#[tokio::main]\nasync fn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
+		{"attribute macro on a method", "struct S;\nimpl S {\n    #[rename]\n    fn m() {}\n}\n", []string{"crate unproven crate::S::m"}},
+		{"attribute macro on an impl", "struct S;\n#[x]\nimpl S {\n    fn m() {}\n}\n", []string{"crate macro ", "crate unproven crate::S"}},
+		{"attribute macro on a module", "#[x]\nmod n {\n    pub fn f() {}\n}\n", []string{"crate macro ", "crate unproven crate::n"}},
+		{"cfg_attr", "#[cfg_attr(a, derive(Debug))]\nstruct S;\n", []string{"crate macro ", "crate unproven crate::S"}},
+		{"derive alias", "use p::Gen as Clone;\n#[derive(Clone)]\nstruct S;\n", []string{"crate macro "}},
+		{"std import of a derive name", "use std::fmt::Debug;\n#[derive(Debug)]\nstruct S;\n", []string{"crate macro "}},
+		{"derive beside a glob", "use crate::a::*;\n#[derive(Debug)]\nstruct S;\n", []string{"crate macro "}},
+		{"glob does not refuse a builtin attribute", "use crate::a::*;\n#[inline]\nfn f() {}\n", nil},
+		{"macro_use", "#[macro_use]\nextern crate p;\n#[inline]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
+		{"macro named like a builtin", "macro_rules! inline { () => {} }\n#[inline]\nfn f() {}\n", []string{"crate macro ", "crate unproven crate::f"}},
+		{"block item is the block scope's concern", "fn f() {\n    #[derive(p::G)]\n    struct S;\n}\n", nil},
+	}
+	for _, tc := range cases {
+		pf, err := NewRust().Parse(context.Background(), "src/lib.rs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, item := range pf.Scope.RustValueItems {
+			if item.Kind != graph.RustValueItemDecl {
+				got[item.OwnerModule+" "+item.Kind+" "+item.Name] = true
+			}
+		}
+		for _, w := range tc.want {
+			if !got[w] {
+				t.Errorf("%s: missing %q in %v", tc.name, w, got)
+			}
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: value items = %v, want exactly %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRustCallsInRewrittenItemAreUnproven pins that every call whose enclosing
+// fn, impl, trait or inline mod carries an attribute the parser cannot expand
+// is marked unproven, `crate::` paths included; builtin attributes, derives
+// and attributes on siblings leave the calls as written.
+func TestRustCallsInRewrittenItemAreUnproven(t *testing.T) {
+	cases := []struct {
+		name, src string
+		refused   bool
+	}{
+		{"fn", "#[x::inject]\nfn c() { g(); crate::g(); other::h(); }\n", true},
+		{"fn, self path", "#[x::inject]\nfn c() { self::g(); }\n", true},
+		{"nested closure", "#[x::inject]\nfn c() { let _f = || { g(); }; }\n", true},
+		{"nested fn", "#[x::inject]\nfn c() { fn d() { g(); } }\n", true},
+		{"impl", "#[x::inject]\nimpl S { fn c(&self) { g(); crate::g(); } }\n", true},
+		{"trait", "#[x::inject]\ntrait T { fn c(&self) { g(); crate::g(); } }\n", true},
+		{"inline mod", "#[x::inject]\nmod n { fn c() { g(); crate::g(); } }\n", true},
+		{"builtin attribute", "#[inline]\n#[allow(dead_code)]\nfn c() { g(); crate::g(); }\n", false},
+		{"builtin attribute on impl", "#[allow(dead_code)]\nimpl S { fn c(&self) { crate::g(); } }\n", false},
+		{"plain", "fn c() { g(); crate::g(); }\n", false},
+		{"unknown attribute on a sibling", "#[x::inject]\nfn o() {}\nfn c() { g(); crate::g(); }\n", false},
+		{"derive on a sibling", "#[derive(Clone)]\nstruct S;\nfn c() { g(); crate::g(); }\n", false},
+	}
+	for _, tc := range cases {
+		pf, err := NewRust().Parse(context.Background(), "src/lib.rs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		for _, e := range pf.Edges {
+			if e.Kind != "calls" {
+				continue
+			}
+			calls++
+			if got := e.Evidence == graph.RustCallBlockScopeEvidence; got != tc.refused {
+				t.Errorf("%s: call %q refused=%v, want %v", tc.name, e.DstName, got, tc.refused)
+			}
+		}
+		if calls == 0 {
+			t.Errorf("%s: no call edges", tc.name)
+		}
+	}
+}
+
+func TestRustPathAttributeDeclaresNoDefaultModule(t *testing.T) {
+	got := rustExternalModules(t, "src/lib.rs", "#[path = \"real.rs\"]\nmod child;\nmod plain;\n")
+	if _, ok := got["child"]; ok {
+		t.Errorf("path-attributed mod recorded a default ExternalPath: %v", got)
+	}
+	if got["plain"] != "plain" {
+		t.Errorf("plain mod lost its default path: %v", got)
 	}
 }

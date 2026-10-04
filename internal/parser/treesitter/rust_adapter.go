@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -38,19 +39,22 @@ func (a *RustAdapter) Parse(ctx context.Context, path string, content []byte) (g
 		FileTokens: computeFileTokens(content),
 	}
 
-	rustExtractImports(root, module, content, &pf)
-	rustExtractSymbols(root, module, "", path, content, &pf)
-	rustExtractCalls(root, content, &pf)
+	attrs := rustAttrScope(root, content)
+	rustExtractImports(root, module, content, attrs, &pf)
+	rustExtractSymbols(root, module, "", path, content, attrs, &pf)
+	rustExtractCalls(root, content, attrs, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:rust:" + testTargetModule(module, "_test") + ":" + target
 	})
 	return pf, nil
 }
 
-func rustExtractImports(root *sitter.Node, module string, content []byte, pf *graph.ParsedFile) {
+func rustExtractImports(root *sitter.Node, module string, content []byte, attrs rustAttrs, pf *graph.ParsedFile) {
 	for i := range int(root.ChildCount()) {
 		child := root.Child(i)
-		if child.Type() == "use_declaration" && !child.HasError() {
+		// An attribute macro may rewrite or drop a `use`: its import is not
+		// proven, and rustExtractSymbols records the module's unknown expansion.
+		if child.Type() == "use_declaration" && !child.HasError() && rustItemAttrKind(child, content, attrs) == rustAttrNeutral {
 			if arg := childByFieldName(child, "argument"); arg != nil {
 				pf.Imports = append(pf.Imports, nodeText(arg, content))
 				rustUseTree(arg, "", rustVisibility(child, content) == "public", module, content, &pf.Scope.Imports)
@@ -59,7 +63,7 @@ func rustExtractImports(root *sitter.Node, module string, content []byte, pf *gr
 		if child.Type() == "mod_item" {
 			if name := childByFieldName(child, "name"); name != nil {
 				if body := childByFieldName(child, "body"); body != nil {
-					rustExtractImports(body, module+"::"+nodeText(name, content), content, pf)
+					rustExtractImports(body, module+"::"+nodeText(name, content), content, attrs, pf)
 				}
 			}
 		}
@@ -193,9 +197,10 @@ func rustModulePath(path string) string {
 	return "crate::" + strings.Join(parts, "::")
 }
 
-func rustExtractSymbols(node *sitter.Node, module, container, path string, content []byte, pf *graph.ParsedFile) {
+func rustExtractSymbols(node *sitter.Node, module, container, path string, content []byte, attrs rustAttrs, pf *graph.ParsedFile) {
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
+		rustAddAttrEvidence(child, module, container, content, attrs, pf)
 		switch child.Type() {
 		case "function_item":
 			rustAddFunction(child, module, container, content, pf)
@@ -206,7 +211,13 @@ func rustExtractSymbols(node *sitter.Node, module, container, path string, conte
 		case "trait_item":
 			rustAddType(child, module, "trait", content, pf)
 		case "impl_item":
-			rustExtractImpl(child, module, path, content, pf)
+			rustExtractImpl(child, module, path, content, attrs, pf)
+		case "const_item", "static_item", "function_signature_item", "foreign_mod_item", "macro_invocation", "expression_statement", "ERROR":
+			// An impl body is walked with its type as container; its consts
+			// and macros are the type's, not the module's.
+			if container == "" {
+				rustAddValueItems(child, module, content, attrs, pf)
+			}
 		case "mod_item":
 			nameNode := childByFieldName(child, "name")
 			body := childByFieldName(child, "body")
@@ -219,12 +230,57 @@ func rustExtractSymbols(node *sitter.Node, module, container, path string, conte
 						m.ExternalPath = base + "/" + name
 					}
 				}
-				pf.Scope.Modules = append(pf.Scope.Modules, m)
+				// An attribute macro may drop or rename the module: its
+				// declaration is not proven.
+				if rustItemAttrKind(child, content, attrs) != rustAttrRewrite {
+					pf.Scope.Modules = append(pf.Scope.Modules, m)
+				}
 				if body != nil {
-					rustExtractSymbols(body, module+"::"+name, "", path, content, pf)
+					rustExtractSymbols(body, module+"::"+name, "", path, content, attrs, pf)
 				}
 			}
 		}
+	}
+}
+
+// rustAddValueItems records what a module-level node declares in the value
+// namespace without a symbol: a const, a static or an extern-block function or
+// static, by name. A macro invocation, in the module or in an extern block, is
+// recorded as an unknown expansion: its output is never read, so it may declare
+// any item, a function of any name included. So is a node the grammar could
+// not parse, which may hide a declaration. Invocations inside a function
+// block are the block scope's concern (rustItemMacro), not the module's.
+func rustAddValueItems(node *sitter.Node, module string, content []byte, attrs rustAttrs, pf *graph.ParsedFile) {
+	add := func(name, kind string) {
+		item := graph.RustValueItem{OwnerModule: module, Name: name, Kind: kind}
+		if !slices.Contains(pf.Scope.RustValueItems, item) {
+			pf.Scope.RustValueItems = append(pf.Scope.RustValueItems, item)
+		}
+	}
+	switch node.Type() {
+	case "const_item", "static_item", "function_signature_item":
+		if name := childByFieldName(node, "name"); name != nil {
+			add(nodeText(name, content), graph.RustValueItemDecl)
+		}
+	case "foreign_mod_item":
+		if body := childByFieldName(node, "body"); body != nil {
+			for i := range int(body.ChildCount()) {
+				rustAddAttrEvidence(body.Child(i), module, "", content, attrs, pf)
+				rustAddValueItems(body.Child(i), module, content, attrs, pf)
+			}
+		}
+	case "expression_statement":
+		if node.NamedChildCount() > 0 && node.NamedChild(0).Type() == "macro_invocation" {
+			rustAddValueItems(node.NamedChild(0), module, content, attrs, pf)
+		}
+	case "macro_invocation":
+		name := ""
+		if macro := childByFieldName(node, "macro"); macro != nil {
+			name = nodeText(macro, content)
+		}
+		add(name, graph.RustValueItemMacro)
+	case "ERROR":
+		add("", graph.RustValueItemMacro)
 	}
 }
 
@@ -281,7 +337,7 @@ func rustAddType(node *sitter.Node, module, kind string, content []byte, pf *gra
 	})
 }
 
-func rustExtractImpl(node *sitter.Node, module, path string, content []byte, pf *graph.ParsedFile) {
+func rustExtractImpl(node *sitter.Node, module, path string, content []byte, attrs rustAttrs, pf *graph.ParsedFile) {
 	typeNode := childByFieldName(node, "type")
 	if typeNode == nil {
 		return
@@ -290,7 +346,7 @@ func rustExtractImpl(node *sitter.Node, module, path string, content []byte, pf 
 	body := childByFieldName(node, "body")
 	if body != nil {
 		first := len(pf.Symbols)
-		rustExtractSymbols(body, module, typeName, path, content, pf)
+		rustExtractSymbols(body, module, typeName, path, content, attrs, pf)
 		// A trait impl's items have the trait's visibility, not their own,
 		// and the parser does not know the trait's.
 		if childByFieldName(node, "trait") != nil {
@@ -329,7 +385,7 @@ func rustVisibility(node *sitter.Node, content []byte) string {
 	return "private"
 }
 
-func rustExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+func rustExtractCalls(root *sitter.Node, content []byte, attrs rustAttrs, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
 		fnNode := childByFieldName(call, "function")
 		if fnNode == nil {
@@ -341,7 +397,7 @@ func rustExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if rustCallShadowed(call, name, content) {
+		if rustCallShadowed(call, name, content, attrs) {
 			evidence = graph.RustCallBlockScopeEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
@@ -385,12 +441,23 @@ func rustPathHead(name string) string {
 // declare it; or, for a bare name, a parameter or pattern binding of an
 // enclosing function, closure, `let`, `for`, `match` arm or `if let` /
 // `while let` names it. Each shadows the module's item of that name.
+// An enclosing function, impl, trait or mod an unknown attribute macro may
+// rewrite makes every call inside it unproven, whatever its path.
 // Over-approximating scopes only leaves more calls unresolved.
-func rustCallShadowed(call *sitter.Node, name string, content []byte) bool {
+func rustCallShadowed(call *sitter.Node, name string, content []byte, attrs rustAttrs) bool {
 	head := rustPathHead(name)
 	bare := head != "" && !strings.Contains(name, "::")
 	inMod := false
 	for node := call.Parent(); node != nil; node = node.Parent() {
+		switch node.Type() {
+		case "function_item", "impl_item", "trait_item", "mod_item":
+			// An attribute macro on an enclosing item may rewrite the whole
+			// body, `crate::` paths included, so none of its original calls is
+			// proven to bind what it names.
+			if rustItemAttrKind(node, content, attrs) == rustAttrRewrite {
+				return true
+			}
+		}
 		switch node.Type() {
 		case "mod_item":
 			inMod = true
@@ -404,7 +471,7 @@ func rustCallShadowed(call *sitter.Node, name string, content []byte) bool {
 			}
 			for i := range int(node.ChildCount()) {
 				child := node.Child(i)
-				if rustDeclares(child, head, content) || rustItemMacro(child, content) {
+				if rustDeclares(child, head, content) || rustItemMacro(child, content) || (!isComment(child) && rustItemAttrKind(child, content, attrs) != rustAttrNeutral) {
 					return true
 				}
 				if bare && child.Type() == "let_declaration" && rustPatternBinds(childByFieldName(child, "pattern"), head, content) {

@@ -31,6 +31,24 @@ type rustScopeModule struct {
 	inline                            bool
 }
 
+// rustValueItems is what the parser recorded in module scopes that binds no
+// symbol: declared value names (const, static, extern-block items) and
+// modules holding an item macro invocation, whose expansion is unread and so
+// may declare anything. Both are keyed by the persisted owner spelling, the
+// one an import uses, and by the file that holds them.
+type rustValueItems struct {
+	decl  map[rustValueKey]bool // owner scope and declared name
+	macro map[rustValueKey]bool // owner scope; name is always ""
+	// unproven holds declarations an unknown attribute macro may have
+	// rewritten or dropped: owner scope and qualified name, or a prefix of the
+	// qualified names below it.
+	unproven map[rustValueKey]bool
+}
+type rustValueKey struct {
+	file        int64
+	owner, name string
+}
+
 // RustResolutionStats is bounded-work evidence for one Rust resolver batch.
 // It is intentionally not a runtime counter or a public product setting.
 type RustResolutionStats struct {
@@ -582,6 +600,27 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}); err != nil {
 		return nil, err
 	}
+	valueItems := rustValueItems{decl: map[rustValueKey]bool{}, macro: map[rustValueKey]bool{}, unproven: map[rustValueKey]bool{}}
+	if err := sqliteBatchedQuery(ctx, tx,
+		`SELECT v.file_id,v.owner_module,v.name,v.kind FROM rust_value_item_evidence v JOIN files f ON f.id=v.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE v.repo_id=?`,
+		scopeClause, []any{repoID}, scopedFiles, filtered,
+		func(rows *sql.Rows) error {
+			var file int64
+			var owner, name, kind string
+			if err := rows.Scan(&file, &owner, &name, &kind); err != nil {
+				return err
+			}
+			if kind == graph.RustValueItemMacro {
+				valueItems.macro[rustValueKey{file: file, owner: owner}] = true
+			} else if kind == graph.RustValueItemUnproven {
+				valueItems.unproven[rustValueKey{file: file, name: name}] = true
+			} else {
+				valueItems.decl[rustValueKey{file: file, owner: owner, name: name}] = true
+			}
+			return nil
+		}); err != nil {
+		return nil, err
+	}
 	for changed := true; changed; {
 		changed = false
 		for _, m := range decls {
@@ -658,7 +697,26 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		return module
 	}
 	byQ = map[string][]rustScopeSymbol{}
+	// unprovenSymbol reports whether an unknown attribute macro sits on the
+	// symbol or on an item holding it in its own file, and may have renamed or
+	// dropped it. Such a symbol answers no call.
+	unprovenSymbol := func(c rustScopeSymbol) bool {
+		for q := c.qualified; q != ""; {
+			if valueItems.unproven[rustValueKey{file: c.file, name: q}] {
+				return true
+			}
+			i := strings.LastIndex(q, "::")
+			if i < 0 {
+				break
+			}
+			q = q[:i]
+		}
+		return false
+	}
 	for _, original := range symbols {
+		if unprovenSymbol(original) {
+			continue
+		}
 		added := false
 		// A file module's view carries each symbol at the same place below
 		// the file as the parser put it: a top-level item directly in the
@@ -688,6 +746,40 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		if !added {
 			byQ[original.qualified] = append(byQ[original.qualified], original)
 		}
+	}
+	// A module's value items, seen from a module path the way byQ sees its
+	// symbols: a file module's own scope and each inline module below it,
+	// under every module the declaration graph proves the file holds. The
+	// persisted owner spelling is kept as well, which only adds refusals.
+	type rustModuleView struct {
+		root, module, name string
+	}
+	viewDecl, viewMacro := map[rustModuleView]bool{}, map[rustModuleView]bool{}
+	addView := func(file int64, owner, name string, into map[rustModuleView]bool) {
+		if root := rootOfFile[file]; root != "" {
+			into[rustModuleView{root, owner, name}] = true
+		}
+		below, inFile := strings.CutPrefix(owner, files[file].module)
+		if !inFile || (below != "" && !strings.HasPrefix(below, "::")) {
+			return
+		}
+		for key, members := range moduleFiles {
+			if sep := strings.IndexByte(key, 0); sep >= 0 && len(members) == 1 && members[0] == file && !inlineModules[key] {
+				into[rustModuleView{key[:sep], key[sep+1:] + below, name}] = true
+			}
+		}
+	}
+	for k := range valueItems.decl {
+		addView(k.file, k.owner, k.name, viewDecl)
+	}
+	for k := range valueItems.macro {
+		addView(k.file, k.owner, "", viewMacro)
+	}
+	// shadowsGlobs reports whether module, in crate root, declares name in the
+	// value namespace without a symbol, or holds an item macro that may: either
+	// hides every glob import of that name there, whatever its visibility.
+	shadowsGlobs := func(root, module, name string) bool {
+		return viewDecl[rustModuleView{root, module, name}] || viewMacro[rustModuleView{root, module, ""}]
 	}
 	moduleMember := func(module string, id int64, caller int64) bool {
 		root := rootOfFile[caller]
@@ -836,6 +928,7 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		for _, im := range imports {
 			own = own || (im.owner == module && !im.glob && im.local == name && rootOfFile[im.file] == root)
 		}
+		own = own || shadowsGlobs(root, module, name)
 		for _, im := range imports {
 			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {
 				continue
@@ -1043,6 +1136,13 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 					}
 				}
 				if ownStruct && !own {
+					continue
+				}
+				// A const, static or extern-block item of that name hides the
+				// glob's function too, and an item macro may declare one, or
+				// a module or type shadowing a qualified call's first segment;
+				// none is a symbol, so the call is refused, not bound.
+				if !own && (valueItems.macro[rustValueKey{file: file, owner: owner}] || (!qualified && valueItems.decl[rustValueKey{file: file, owner: owner, name: dst}])) {
 					continue
 				}
 				if own {
