@@ -136,6 +136,9 @@ type pyScopeLocal struct {
 	// class is written in. It reaches only calls attributed to that function
 	// itself: a method or nested function skips the class's scope.
 	classBody bool
+	// memberDecl marks a class-body name the body declares with `def`/`class`,
+	// as opposed to one it rebinds by assignment, import or loop.
+	memberDecl bool
 	// headerEnd, when set, marks a class-body name recorded under one of the
 	// class's direct methods: it reaches only the calls attributed to that
 	// method on its `def` header, which ends on this line.
@@ -374,7 +377,7 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 	if err != nil {
 		return answers, err
 	}
-	nestedClasses, localClassTargets, err := pythonNestedClassTargets(ctx, q, repoID, edges, callerPaths, scopes, imports)
+	nestedClasses, localClassTargets, err := pythonNestedClassTargets(ctx, q, repoID, edges, callerPaths, scopes, imports, locals)
 	if err != nil {
 		return answers, err
 	}
@@ -602,7 +605,7 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 
 // pythonNestedClassTargets uses class declaration identity and the caller's
 // lexical scope to bind a dotted receiver only to its own class member.
-func pythonNestedClassTargets(ctx context.Context, q execQuerier, repoID int64, edges []pyScopeEdge, paths map[int64]string, scopes map[int64]string, imports map[int64][]pyScopeImport) (map[int64]bool, map[int64]int64, error) {
+func pythonNestedClassTargets(ctx context.Context, q execQuerier, repoID int64, edges []pyScopeEdge, paths map[int64]string, scopes map[int64]string, imports map[int64][]pyScopeImport, locals map[int64][]pyScopeLocal) (map[int64]bool, map[int64]int64, error) {
 	classNames, memberNames := map[string]struct{}{}, map[string]struct{}{}
 	for _, edge := range edges {
 		if strings.Contains(edge.name, ".") {
@@ -718,6 +721,17 @@ func pythonNestedClassTargets(ctx context.Context, q execQuerier, repoID int64, 
 			if len(kinds) != 1 || kinds[0] != "class" || wildcard[edge.file] {
 				ambiguous = true
 				break
+			}
+			if owner == "" {
+				// A module-level class carries no class-body evidence, so its
+				// members cannot be shown unrebound: leave the call to the
+				// other strategies.
+				break
+			}
+			for _, l := range locals[edge.file] {
+				if l.classBody && !l.memberDecl && l.owner == owner && l.name == pythonLeadingSegment(member) {
+					ambiguous = true
+				}
 			}
 			for _, c := range classes {
 				if c.file == paths[edge.file] && c.qualified == qname {
@@ -1038,6 +1052,7 @@ func pythonScopeImports(ctx context.Context, q execQuerier, repoID int64, ids []
 					name:        imp.local,
 					declaration: imp.kind == graph.ScopeImportNestedDeclaration,
 					classBody:   imp.kind == graph.ScopeImportClassBodyBinding,
+					memberDecl:  imp.kind == graph.ScopeImportClassBodyBinding && imp.imported == "decl",
 					headerEnd:   headerEnd,
 				})
 			}

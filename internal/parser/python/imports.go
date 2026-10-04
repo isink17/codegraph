@@ -2,6 +2,7 @@ package python
 
 import (
 	"regexp/syntax"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -250,6 +251,27 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 	var out []LocalBinding
 	seen := map[string]struct{}{}
 	escaped := map[string]bool{}
+	var escapedOrder []string
+	var noteEscapes func(stmt string)
+	noteEscapes = func(line string) {
+		for _, stmt := range splitTopLevel(line, ';') {
+			stmt = strings.TrimSpace(stmt)
+			for _, keyword := range []string{"global ", "nonlocal "} {
+				if rest, ok := strings.CutPrefix(stmt, keyword); ok {
+					for _, name := range splitTopLevel(rest, ',') {
+						if name = NormalizeIdentifier(strings.TrimSpace(name)); validIdentifier(name) && !escaped[name] {
+							escaped[name] = true
+							escapedOrder = append(escapedOrder, name)
+						}
+					}
+				}
+			}
+			if rest, ok := pythonInlineBody(stmt); ok {
+				noteEscapes(rest)
+			}
+		}
+	}
+	decorated := false
 	add := func(name string) { addBinding(&out, seen, LocalBinding{Name: name}) }
 
 	logical, starts := pythonLogicalLines(lines)
@@ -267,6 +289,12 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 			}
 			skipUntil = -1
 		}
+		if strings.HasPrefix(trimmed, "@") {
+			decorated = true
+			continue
+		}
+		wasDecorated := decorated
+		decorated = false
 		header := strings.TrimPrefix(trimmed, "async ")
 		isDecl := strings.HasPrefix(header, "def ") || strings.HasPrefix(header, "class ")
 		if strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "from ") {
@@ -305,6 +333,7 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 				if colon == len(header) {
 					continue
 				}
+				noteEscapes(header[colon+1:])
 				for _, stmt := range splitTopLevel(header[colon+1:], ';') {
 					stmt = strings.TrimSpace(stmt)
 					if strings.HasPrefix(stmt, "import ") || strings.HasPrefix(stmt, "from ") {
@@ -333,28 +362,26 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 				// after the call. At module scope the same name is a symbol
 				// this graph already holds, and reporting it here would make a
 				// module-level `def` shadow every call to itself.
-				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: true})
+				// A decorator rebinds the name to whatever it returns, so a
+				// decorated class is not provably the class it declares.
+				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: !(wasDecorated && strings.HasPrefix(header, "class "))})
 			}
 			continue
 		}
-		if !classBody {
-			for _, stmt := range splitTopLevel(trimmed, ';') {
-				stmt = strings.TrimSpace(stmt)
-				for _, keyword := range []string{"global ", "nonlocal "} {
-					if rest, ok := strings.CutPrefix(stmt, keyword); ok {
-						for _, name := range splitTopLevel(rest, ',') {
-							escaped[NormalizeIdentifier(strings.TrimSpace(name))] = true
-						}
-					}
-				}
-			}
-		}
+		noteEscapes(trimmed)
 		addPythonAssignedNames(trimmed, add)
 	}
-	// A `global`/`nonlocal` name the scope also assigns rebinds a name of an
-	// outer scope that no call below that scope can be shown to still see.
-	for i := range out {
-		out[i].Escapes = escaped[out[i].Name] && !out[i].Declaration
+	// A `global`/`nonlocal` name is rebindable from here by any statement form
+	// (assignment, import, def, class, del), so every call to it in the file is
+	// withheld: the owning scope is not known, the module sees it.
+	if !classBody {
+		for _, name := range escapedOrder {
+			if i := slices.IndexFunc(out, func(b LocalBinding) bool { return b.Name == name }); i >= 0 {
+				out[i].Declaration, out[i].Escapes = false, true
+				continue
+			}
+			out = append(out, LocalBinding{Name: name, Escapes: true})
+		}
 	}
 	return out
 }

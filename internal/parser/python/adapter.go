@@ -317,10 +317,17 @@ func AddClassScopeBindings(module string, lines []string, pf *graph.ParsedFile) 
 			}
 			owner = strings.TrimPrefix(owner, module+".")
 			for _, binding := range classes[sym.QualifiedName] {
+				imported := ""
+				if binding.Declaration {
+					// A `def`/`class` the body declares; any other row is a
+					// rebinding of the name.
+					imported = "decl"
+				}
 				pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{
-					LocalName:   binding.Name,
-					Kind:        graph.ScopeImportClassBodyBinding,
-					OwnerModule: owner,
+					LocalName:    binding.Name,
+					ImportedName: imported,
+					Kind:         graph.ScopeImportClassBodyBinding,
+					OwnerModule:  owner,
 				})
 			}
 		case "method":
@@ -569,7 +576,7 @@ func isPythonKeyword(name string) bool {
 // every name in its NFKC form, the name CPython binds (PEP 3131). v5 records
 // lambda parameters and match-case captures as local bindings. v6 records
 // lambdas in a def header's defaults, bodies on a header line and class-body
-// bindings. v7 matches a method header's names by their NFKC form.
+// bindings. v7 matches a method header's names by their NFKC form.  v8 records global/nonlocal names, `del` targets, rebound and decorated class-body names.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.Profile{ID: "python-regex:python:v7", EmitsCallEdges: true}
+	return parser.Profile{ID: "python-regex:python:v8", EmitsCallEdges: true}
 }
