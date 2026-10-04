@@ -3428,6 +3428,7 @@ func (c srcSymbolChooser) attribute(line, col int) sourceAttribution {
 // innermost span is the one that starts last (ties: ends first). Identical
 // ranges owned by different symbols are still ambiguous.
 func (c srcSymbolChooser) attributeAt(line, col int) sourceAttribution {
+	// ponytail: linear scan of every span per edge, so a file with very many methods costs O(spans) per edge; index spans by start position if profiling shows it.
 	before := func(l1, c1, l2, c2 int) bool { return l1 < l2 || (l1 == l2 && c1 <= c2) }
 	var best *funcSpan
 	ambiguous := false
