@@ -1,4 +1,4 @@
-# File-level Git history
+# Git history
 
 Every `codegraph index` and `codegraph update` (and the MCP `index_repo` and
 `update_graph` tools) also records a small, bounded summary of the Git history of
@@ -61,6 +61,60 @@ Rules:
   `watermark` until the next scan; compare it with `git rev-parse HEAD` when that
   matters.
 
+## Symbol last-touched
+
+For each indexed symbol, the newest window commit that `git blame` attributes
+to any line of the symbol's range at the watermark: `last_commit` (`sha`,
+`committer_time`) and `last_author` (`%aE` after `.mailmap`). It answers "which
+commit last touched this symbol's current lines", nothing more. It is not a
+count of changes to the symbol, and deleted lines leave no trace in it.
+
+- **Blame:** `git blame --porcelain --first-parent` at the watermark, stopped at
+  the window boundary (the first-parent commit just outside the 250). If that
+  boundary cannot be resolved because Git failed, history is `absent` with the
+  failure's reason; blame never runs without its bound. Commits compare by
+  committer time, then SHA. Blame follows whole-file renames; it does not follow
+  lines moved or copied between files (no `-M`/`-C` line detection). A merge
+  owns the lines it brought in, as in the file-level history.
+  `blame.ignoreRevsFile`, user mailmap settings, `diff.algorithm` and textconv
+  are overridden, as for file history.
+- **Per-symbol `state`:**
+
+  | State | Meaning |
+  |---|---|
+  | `last_commit` | `last_commit` and `last_author` are set |
+  | `before_window` | every line of the range was last touched before the window |
+  | `no_range` | the parser recorded no usable line range for the symbol |
+  | `not_computed` | no stored blame for this range: the graph changed after the last scan |
+
+- **Withheld** (`symbol_history` on the file row; file-level history is kept):
+  - `worktree_differs`: the file is modified, staged, untracked or ignored but
+    indexed. Symbol ranges come from the working tree and blame from the
+    watermark, so their lines would not correspond. Files flagged
+    `assume-unchanged` or `skip-worktree`, which `git diff` does not inspect,
+    are hashed with the filters `git add` would apply and compared with the
+    watermark blob; they count as changed only when they differ, and that
+    also sets the file row's `worktree_differs`.
+  - `filtered_content`: the path has a Git `filter` attribute (Git LFS, a
+    custom smudge/clean filter). The working-tree lines need not be the blob
+    lines blame reads, so they are not matched.
+  - `untrusted_ranges`: the file was parsed by a heuristic adapter, whose symbol
+    ranges cover the declaration line only.
+  - `not_indexed`: the path is not a live file of the graph.
+- **Shallow clones:** the oldest available commit is a boundary too, so lines
+  older than the cut read as `before_window` instead of being credited to it.
+- **Bounds:** symbols need explicit `files` (at most 500, the shared batch
+  bound). One response returns at most 500 symbols in file order, then symbol
+  order; each row's `symbol_count` is the file's total, and
+  `symbols_truncated: true` says rows hold fewer. Ask for fewer files to see
+  the rest.
+- **Updates:** rows are keyed by path and line range and reused while the
+  watermark, window, algorithm and `.mailmap` are unchanged; only a file whose
+  range set changed, or that became clean again, is blamed again. Any other
+  change recomputes every file, so stored values always equal a fresh index.
+  Algorithm version: `file-v1+blame-v1`; a database from before symbol history
+  recomputes on its next scan.
+
 ## Repository state
 
 `history.status` is `ok`, `truncated` (a shallow clone: values are published but
@@ -84,7 +138,7 @@ variables, so history always describes the repository that contains the root.
 ## Updates
 
 The state stores the watermark, the window size, the algorithm version
-(`file-v1`) and a fingerprint of the repository's `.mailmap`, which Git reads
+(`file-v1+blame-v1`) and a fingerprint of the repository's `.mailmap`, which Git reads
 from the working tree. When all of them are unchanged and the clone is not
 shallow, an update only re-reads the worktree change set. A shallow clone is
 always recomputed, because deepening it grows the window without moving `HEAD`. Otherwise the window is recomputed
@@ -105,13 +159,21 @@ a listing with `path_filter`, `limit` and `offset`. A listing orders by
  "params":{"name":"file_history","arguments":{"files":["internal/store/store.go"]}}}
 ```
 
+`include_symbols: true` (CLI `--symbols`) adds `symbol_history`,
+`symbol_count` and `symbols` to each row; it needs explicit `files`. Symbols
+are ordered by start line, end line, kind, qualified name and id.
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call",
+ "params":{"name":"file_history","arguments":{"files":["internal/store/store.go"],"include_symbols":true}}}
+```
+
 CLI, same document:
 
 ```sh
 codegraph file_history .                                   # files with the most commits first
 codegraph file_history . --file internal/store/store.go    # one or more files
+codegraph file_history . --file internal/store/store.go --symbols
 codegraph file_history . --path-filter internal/ --limit 50
 codegraph index . --no-history                             # skip it (recorded as disabled)
 ```
-
-Symbol-level history is not provided.

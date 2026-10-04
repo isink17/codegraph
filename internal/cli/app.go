@@ -316,6 +316,7 @@ func runFileHistory(ctx context.Context, cfg config.Config, stdout io.Writer, ar
 	fs.StringVar(&q.PathPrefix, "path-filter", "", "path prefix")
 	fs.IntVar(&q.Limit, "limit", 0, "page size")
 	fs.IntVar(&q.Offset, "offset", 0, "page offset")
+	fs.BoolVar(&q.Symbols, "symbols", false, "add symbol-level last-touched history to each --file")
 	repoRootCandidate, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, "")
 	if err != nil {
 		return err

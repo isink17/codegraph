@@ -426,3 +426,181 @@ func TestUserConfigDoesNotChangeAggregates(t *testing.T) {
 		t.Fatalf("with user config:\n got %+v\nwant %+v", got, want)
 	}
 }
+
+// logL is the oracle: the newest first-parent commit `git log -L` reports for
+// a line range. It walks history by a different algorithm than blame.
+func logL(t *testing.T, r *gittest.Repo, path string, rg Range) string {
+	t.Helper()
+	out := r.Git("log", "--first-parent", "-1", "--format=%H", "-L", fmt.Sprintf("%d,%d:%s", rg.Start, rg.End, path), "HEAD")
+	first, _, _ := strings.Cut(out, "\n") // -L always prints the patch
+	return first
+}
+
+func TestBlameAttributesRangesToTheNewestWindowCommit(t *testing.T) {
+	r, sha := historyRepo(t)
+	ctx := context.Background()
+	state, err := Probe(ctx, r.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := WindowBoundary(ctx, r.Dir, state.Watermark, 9); b != "" || err != nil {
+		t.Fatalf("boundary of a 9-commit history = %q, %v", b, err)
+	}
+	for _, tc := range []struct {
+		path   string
+		rg     Range
+		want   string
+		author string
+	}{
+		{"pkg/a2.go", Range{1, 1}, "c1", "alice@example.com"}, // made on a.go: rename followed
+		{"pkg/a2.go", Range{2, 2}, "c2", "alice@example.com"}, // alice@old.example, mailmapped
+		{"pkg/a2.go", Range{1, 3}, "c3", "alice@example.com"},
+		{"pkg/a2.go", Range{2, 9}, "c3", "alice@example.com"}, // clipped to the file
+		{"e.go", Range{1, 2}, "m1", "alice@example.com"},      // first parent: the merge, not carol
+		{"b.go", Range{1, 1}, "c1", "alice@example.com"},
+		{"b.go", Range{2, 2}, "c7", "alice@example.com"},
+	} {
+		got, err := Blame(ctx, r.Dir, state.Watermark, "", tc.path, false, []Range{tc.rg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].LastSHA != sha[tc.want] || got[0].LastAuthor != tc.author || got[0].Range != tc.rg || got[0].LastTime == 0 {
+			t.Fatalf("%s %v = %+v, want %s (%s)", tc.path, tc.rg, got, tc.want, sha[tc.want])
+		}
+		if tc.rg.End <= 3 {
+			if oracle := logL(t, r, tc.path, tc.rg); oracle != got[0].LastSHA {
+				t.Fatalf("%s %v: blame %s, git log -L %s", tc.path, tc.rg, got[0].LastSHA, oracle)
+			}
+		}
+	}
+	// A range wholly past the end has no line to attribute.
+	got, err := Blame(ctx, r.Dir, state.Watermark, "", "pkg/a2.go", false, []Range{{5, 9}})
+	if err != nil || len(got) != 1 || got[0].LastSHA != "" {
+		t.Fatalf("past end = %+v, %v", got, err)
+	}
+}
+
+func TestBlameStopsAtTheWindowBoundary(t *testing.T) {
+	r := gittest.Init(t)
+	fastImport(t, r, 260)
+	ctx := context.Background()
+	state, err := Probe(ctx, r.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary, err := WindowBoundary(ctx, r.Dir, state.Watermark, WindowLimit)
+	if want := r.Git("rev-parse", "HEAD~250"); boundary != want || err != nil {
+		t.Fatalf("boundary = %s, %v, want commit 10 %s", boundary, err, want)
+	}
+	for path, want := range map[string]string{
+		"hot.txt":  state.Watermark,
+		"edge.txt": r.Git("rev-parse", "HEAD~249"), // commit 11, the oldest window commit
+		"cold.txt": "",                             // last touched by commit 5
+	} {
+		got, err := Blame(ctx, r.Dir, state.Watermark, boundary, path, false, []Range{{1, 1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got[0].LastSHA != want {
+			t.Fatalf("%s = %+v, want %q", path, got[0], want)
+		}
+	}
+}
+
+// Blame configuration that would change attribution without moving HEAD is
+// overridden.
+func TestUserConfigDoesNotChangeBlame(t *testing.T) {
+	r, _ := historyRepo(t)
+	ctx := context.Background()
+	state, err := Probe(ctx, r.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranges := []Range{{1, 1}, {2, 2}, {3, 3}}
+	want, err := Blame(ctx, r.Dir, state.Watermark, "", "pkg/a2.go", false, ranges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Write("ignore-revs", r.Git("rev-parse", "HEAD~6")+"\n") // c3
+	r.Write("other.mailmap", "Zed <zed@example.com> <alice@example.com>\n")
+	for _, kv := range [][2]string{
+		{"blame.ignoreRevsFile", filepath.Join(r.Dir, "ignore-revs")}, {"blame.showRoot", "false"},
+		{"mailmap.file", filepath.Join(r.Dir, "other.mailmap")}, {"diff.algorithm", "patience"},
+	} {
+		r.Git("config", kv[0], kv[1])
+	}
+	got, err := Blame(ctx, r.Dir, state.Watermark, "", "pkg/a2.go", false, ranges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("with user config:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestTrustedRanges(t *testing.T) {
+	for profile, want := range map[string]bool{
+		"treesitter:java:v8": true, "go-ast:go:v1": true, "python-regex:python:v8": true,
+		"heuristic:java:v1": false, "": false,
+	} {
+		if TrustedRanges(profile) != want {
+			t.Errorf("TrustedRanges(%q) = %v", profile, !want)
+		}
+	}
+}
+
+// A shallow clone's oldest commit is a boundary, not the author of every
+// line older than the cut.
+func TestBlameInShallowCloneStopsAtTheCut(t *testing.T) {
+	r, sha := historyRepo(t)
+	clone := &gittest.Repo{T: t, Dir: filepath.Join(t.TempDir(), "clone")}
+	r.Git("clone", "-q", "--depth", "2", "file://"+filepath.ToSlash(r.Dir), clone.Dir)
+	ctx := context.Background()
+	state, err := Probe(ctx, clone.Dir)
+	if err != nil || state.Status != StatusTruncated {
+		t.Fatalf("state = %+v, %v", state, err)
+	}
+	// b.go: b1 from c1 (cut away), b3 from c7 (the shallow root).
+	boundary, err := WindowBoundary(ctx, clone.Dir, state.Watermark, 2)
+	if err != nil || boundary != "" {
+		t.Fatalf("shallow boundary = %q, %v", boundary, err)
+	}
+	got, err := Blame(ctx, clone.Dir, state.Watermark, boundary, "b.go", true, []Range{{1, 1}, {2, 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].LastSHA != "" || got[1].LastSHA != "" {
+		t.Fatalf("shallow b.go = %+v (c7 %s)", got, sha["c7"])
+	}
+	r.Write("b.go", "b1\nb3\nb4\n")
+	clone.Write("b.go", "b1\nb3\nb4\n")
+	head := clone.Commit("", "c9")
+	got, err = Blame(ctx, clone.Dir, head, "", "b.go", true, []Range{{1, 3}})
+	if err != nil || got[0].LastSHA != head {
+		t.Fatalf("after a commit in the clone = %+v, %v", got, err)
+	}
+}
+
+// Only a genuinely missing ancestor means "no boundary": a full window whose
+// oldest commit is the root. A Git failure is an error, never an unbounded
+// blame.
+func TestWindowBoundaryMissIsQuietFailureIsNot(t *testing.T) {
+	r := gittest.Init(t)
+	fastImport(t, r, WindowLimit)
+	ctx := context.Background()
+	head := r.Git("rev-parse", "HEAD")
+	if b, err := WindowBoundary(ctx, r.Dir, head, WindowLimit); b != "" || err != nil {
+		t.Fatalf("root-reaching full window = %q, %v", b, err)
+	}
+	fastImport(t, r, WindowLimit+1)
+	head = r.Git("rev-parse", "HEAD")
+	defer func(d time.Duration) { Timeout = d }(Timeout)
+	Timeout = time.Nanosecond
+	b, err := WindowBoundary(ctx, r.Dir, head, WindowLimit)
+	if err == nil || b != "" || ReasonOf(err) != ReasonTimeout {
+		t.Fatalf("timed-out boundary = %q, %v", b, err)
+	}
+	if b, err := WindowBoundary(ctx, filepath.Join(r.Dir, ".git", "nope"), head, WindowLimit); err == nil || b != "" {
+		t.Fatalf("failed boundary = %q, %v", b, err)
+	}
+}
