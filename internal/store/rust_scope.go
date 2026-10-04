@@ -762,6 +762,21 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}
 		return false
 	}
+	// reexportVisible reports whether module, in crate root, sees c, and so
+	// whether a re-export from module may pass c on.
+	reexportVisible := func(c rustScopeSymbol, module, root string) bool {
+		switch c.visibility {
+		case "public":
+			return true
+		case "restricted:crate":
+			return rootOfFile[c.file] == root
+		case "restricted:super":
+			declared := candidateModule(c)
+			parent := declared[:max(0, strings.LastIndex(declared, "::"))]
+			return parent != "" && (module == parent || strings.HasPrefix(module, parent+"::"))
+		}
+		return false
+	}
 	resolvePath := func(raw, owner string) string {
 		p := strings.Split(strings.TrimPrefix(raw, "::"), "::")
 		if len(p) == 0 || p[0] == "" {
@@ -825,8 +840,6 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {
 				continue
 			}
-			// Rust never re-exports a private item, so nothing private is
-			// reached through a re-export step.
 			var reached []rustScopeSymbol
 			if im.glob {
 				if own {
@@ -840,8 +853,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 					reached = exportCandidates(strings.Join(parts[:len(parts)-1], "::"), parts[len(parts)-1], root, seen)
 				}
 			}
+			// Rust never re-exports a private item, and a re-export passes on
+			// only what the re-exporting module itself can see: a `pub(super)`
+			// item reached from outside its parent module is not imported, so
+			// another item of that name answers (rustc: the glob is unused).
 			for _, c := range reached {
-				if c.visibility != "private" && c.visibility != "restricted:self" {
+				if reexportVisible(c, module, root) {
 					out = append(out, c)
 				}
 			}

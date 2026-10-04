@@ -297,6 +297,41 @@ var rustPrivateVisibilityCases = []struct {
 		"lib.rs": "mod m;",
 		"m.rs":   "mod x {\n    pub struct String;\n    impl String {\n        fn new() {}\n    }\n}\npub fn caller() {\n    String::new();\n}\n",
 	}, "m.rs", "String::new", "", false},
+	// A re-export passes on only what the re-exporting module sees. c is
+	// outside a, so its glob does not import a::x's pub(super) id and
+	// std::process::id answers (rustc: the glob is unused, a::x::id never
+	// used), although the caller itself could see a::x::id.
+	{"pub(super) item behind a glob re-export from outside its parent", tree{
+		"lib.rs": "mod a; mod c;",
+		"a.rs":   "pub mod x; pub mod y;",
+		"a/x.rs": "pub(super) fn id() -> u32 { 7 }",
+		"a/y.rs": "pub fn caller() {\n    crate::c::id();\n}\n",
+		"c.rs":   "pub use crate::a::x::*;\npub use std::process::*;\n",
+	}, "a/y.rs", "crate::c::id", "", false},
+	// a itself sees a::x's pub(super) id, so its glob re-export passes it on
+	// to a's children (rustc: crate::a::x::id).
+	{"pub(super) item behind a glob re-export from its parent", tree{
+		"lib.rs": "mod a;",
+		"a.rs":   "pub mod x; pub mod y;\npub use x::*;\n",
+		"a/x.rs": "pub(super) fn id() -> u32 { 7 }",
+		"a/y.rs": "pub fn caller() {\n    crate::a::id();\n}\n",
+	}, "a/y.rs", "crate::a::id", "a/x.rs:crate::a::x::id", true},
+	// A descendant of a sees a::x's pub(super) id too, so its glob
+	// re-export passes it on (rustc: crate::a::x::id).
+	{"pub(super) item behind a descendant's glob re-export", tree{
+		"lib.rs": "mod a;",
+		"a.rs":   "pub mod x; pub mod y;",
+		"a/x.rs": "pub(super) fn id() -> u32 { 7 }",
+		"a/y.rs": "pub use super::x::*;\npub fn caller() {\n    crate::a::y::id();\n}\n",
+	}, "a/y.rs", "crate::a::y::id", "a/x.rs:crate::a::x::id", true},
+	// Every hop of a re-export chain is judged from its own module: a passes
+	// id on, but e is outside a, so std::process::id answers (rustc).
+	{"pub(super) item behind a chained glob re-export from outside its parent", tree{
+		"lib.rs": "mod a; mod e;",
+		"a.rs":   "pub mod x;\npub use x::*;\n",
+		"a/x.rs": "pub(super) fn id() -> u32 { 7 }",
+		"e.rs":   "pub use crate::a::*;\npub use std::process::*;\npub fn outside() {\n    crate::e::id();\n}\n",
+	}, "e.rs", "crate::e::id", "", false},
 	// A glob re-export never passes on a private item: `exit` is std's.
 	{"private item behind a glob re-export", tree{
 		"lib.rs": "mod a; mod c;",
