@@ -392,8 +392,8 @@ var resolverBindableCandidateRules = []resolverGateRule{
 		languages: []string{"java", "kotlin"}, sql: `NOT ` + resolverJVMScopeVetoSQL},
 	{id: "csharp_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"csharp"}, sql: `NOT EXISTS (SELECT 1 FROM ` + csharpScopeVeto + ` csv WHERE csv.edge_id = edges.id)`},
-	{id: "typescript_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
-		languages: []string{"typescript"}, sql: `NOT EXISTS (SELECT 1 FROM ` + tsScopeVeto + ` tsv WHERE tsv.edge_id = edges.id)`},
+	{id: ruleTypeScriptOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"typescript"}, sql: typescriptScopeVetoSQL, owns: typescriptScopeOwned},
 	{id: "python_scope_claims", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"python"}, sql: `NOT EXISTS (SELECT 1 FROM ` + pyScopeVeto + ` psv WHERE psv.edge_id = edges.id)`},
 	{id: rulePHPOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
@@ -424,6 +424,7 @@ const (
 	ruleRubyOwnership        resolverRuleID = "ruby_ownership"
 	rulePHPOwnership         resolverRuleID = "php_ownership"
 	ruleSwiftOwnership       resolverRuleID = "swift_ownership"
+	ruleTypeScriptOwnership  resolverRuleID = "typescript_scope_ownership"
 )
 
 // The rules whose Go twin reads facts the binder loads for the batch.
@@ -446,14 +447,16 @@ var binderOwnershipRoutes = map[resolverRuleID]func(edgeTarget) bool{
 	ruleRubyOwnership:        resolverRuleOwns(ruleRubyOwnership),
 	rulePHPOwnership:         resolverRuleOwns(rulePHPOwnership),
 	ruleSwiftOwnership:       resolverRuleOwns(ruleSwiftOwnership),
+	ruleTypeScriptOwnership:  resolverRuleOwns(ruleTypeScriptOwnership),
 }
 
 var (
-	binderOwnsCpp    = binderOwnershipRoutes[ruleCppEvidenceOwnership]
-	binderOwnsGoBare = binderOwnershipRoutes[ruleGoBarePackageScope]
-	binderOwnsRuby   = binderOwnershipRoutes[ruleRubyOwnership]
-	binderOwnsPHP    = binderOwnershipRoutes[rulePHPOwnership]
-	binderOwnsSwift  = binderOwnershipRoutes[ruleSwiftOwnership]
+	binderOwnsCpp        = binderOwnershipRoutes[ruleCppEvidenceOwnership]
+	binderOwnsGoBare     = binderOwnershipRoutes[ruleGoBarePackageScope]
+	binderOwnsRuby       = binderOwnershipRoutes[ruleRubyOwnership]
+	binderOwnsPHP        = binderOwnershipRoutes[rulePHPOwnership]
+	binderOwnsSwift      = binderOwnershipRoutes[ruleSwiftOwnership]
+	binderOwnsTypeScript = binderOwnershipRoutes[ruleTypeScriptOwnership]
 )
 
 // binderFactRoutes are the fact-decided twins the binder applies, keyed by

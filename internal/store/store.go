@@ -3428,6 +3428,7 @@ func (c srcSymbolChooser) attribute(line, col int) sourceAttribution {
 // innermost span is the one that starts last (ties: ends first). Identical
 // ranges owned by different symbols are still ambiguous.
 func (c srcSymbolChooser) attributeAt(line, col int) sourceAttribution {
+	// ponytail: linear scan of every span per edge, so a file with very many methods costs O(spans) per edge; index spans by start position if profiling shows it.
 	before := func(l1, c1, l2, c2 int) bool { return l1 < l2 || (l1 == l2 && c1 <= c2) }
 	var best *funcSpan
 	ambiguous := false
@@ -3936,9 +3937,6 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeVeto); err != nil {
 		return err
 	}
@@ -3969,9 +3967,6 @@ func (s *Store) prepareResolverTables(ctx context.Context, tx *sql.Tx, repoID in
 	// runs anyway reads them as "no test files, no vetoed names, no imports"
 	// rather than failing.
 	if err := ensureResolverAmbiguousNamesTable(ctx, tx); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+tsScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+pyScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
@@ -4220,7 +4215,6 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64) (int, er
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+resolverImportScopeTable)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_java_scope_veto`)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_veto`)
-		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+tsScopeVeto)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeVeto)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+pyScopeResolution)
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.tmp_kotlin_scope_resolution`)
@@ -6145,7 +6139,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	}
 	tsIDs := make(map[int64]struct{})
 	for _, target := range targets {
-		if target.srcLanguage == "typescript" {
+		if binderOwnsTypeScript(target) {
 			tsIDs[target.edgeID] = struct{}{}
 		}
 	}
@@ -6157,7 +6151,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		outcome.resolved += n
 		remaining = targets[:0]
 		for _, target := range targets {
-			if target.srcLanguage != "typescript" {
+			if !binderOwnsTypeScript(target) {
 				remaining = append(remaining, target)
 			}
 		}

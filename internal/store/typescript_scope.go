@@ -10,8 +10,18 @@ import (
 	"strings"
 )
 
+// TypeScript scope owns every TypeScript (and JavaScript) edge: the pass binds
+// what module evidence proves and the rest stays unresolved, so no edge of the
+// language reaches a name-based resolver. The rule reads the edge alone, so a
+// transaction that runs a generic strategy without the pass refuses the same
+// edges as one that runs it.
+const typescriptScopeVetoSQL = `NOT (f.language = 'typescript')`
+
+func typescriptScopeOwned(t edgeTarget) bool {
+	return t.srcLanguage == "typescript"
+}
+
 const (
-	tsScopeVeto       = "tmp_typescript_scope_veto"
 	tsScopeResolution = "tmp_typescript_scope_resolution"
 	tsScopeStrategy   = "typescript_module_scope"
 )
@@ -105,15 +115,10 @@ func typescriptRuntimeSpellings(p string) []string {
 }
 
 // resolveTypeScriptScope is the sole TS/JS implicit resolver. It loads all
-// syntax evidence once, but applies only the requested edge set. Unsupported
-// or ambiguous module decisions are vetoed before generic name strategies.
+// syntax evidence once, but applies only the requested edge set. What it does
+// not bind stays unresolved: the typescript_scope_ownership gate rule keeps
+// every TypeScript edge from the generic name strategies.
 func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, only map[int64]struct{}) (int, error) {
-	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+tsScopeVeto+`(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
-		return 0, err
-	}
-	if _, err := q.ExecContext(ctx, `DELETE FROM `+tsScopeVeto); err != nil {
-		return 0, err
-	}
 	type edge struct {
 		id, file int64
 		name     string
@@ -134,13 +139,6 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 	}
 	if len(edges) == 0 {
 		return 0, nil
-	}
-	vetoRows := make([][]any, 0, len(edges))
-	for _, e := range edges {
-		vetoRows = append(vetoRows, []any{e.id})
-	}
-	if err := sqliteBatchedValuesExec(ctx, q, `INSERT OR IGNORE INTO `+tsScopeVeto+`(edge_id) VALUES `, "(?)", nil, vetoRows); err != nil {
-		return 0, err
 	}
 
 	files := map[int64]tsScopeFile{}
