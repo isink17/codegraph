@@ -26,6 +26,12 @@ import (
 //	Obj.run      toString(1)  compile error  Object.toString shadows
 //	Plain.run    foo()        Util.foo       no supertype: the import applies
 //	KtCall.run   hello()      lib.hello      Kotlin facade, no supertype
+//	Anon         foo()        Base.foo       anonymous class body extends Base (no call edge today)
+//	Loc.m        foo()        Base.foo       local class extends Base
+//	En           foo()        Util.foo       enum constant body (no call edge today)
+//	Rec.run      foo()        Util.foo       record (refused: not a plain class)
+//	Lam.run      foo()        Util.foo       lambda in a class with no supertype
+//	Nest.S.run   foo()        Base.foo       static nested class of a class extending Base
 //
 // Every call but Plain's stays unresolved: supertypes are not recorded.
 var javaStaticImportInheritedTree = map[string]string{
@@ -46,6 +52,12 @@ var javaStaticImportInheritedTree = map[string]string{
 	"app/Obj.java":    "package app;\nimport static app.Util.toString;\npublic class Obj { void run() { toString(1); } }\n",
 	"lib/Util.kt":     "package lib\nfun hello() {}\n",
 	"app/KtCall.java": "package app;\nimport static lib.UtilKt.hello;\npublic class KtCall { void run() { hello(); } }\n",
+	"app/Anon.java":   "package app;\nimport static app.Util.foo;\npublic class Anon { Object o = new Base() {\nvoid r() { foo(); }\n}; }\n",
+	"app/Loc.java":    "package app;\nimport static app.Util.foo;\npublic class Loc { void m() { class L extends Base {\nvoid r() { foo(); }\n} } }\n",
+	"app/En.java":     "package app;\nimport static app.Util.foo;\npublic enum En { A {\nvoid r() { foo(); }\n} }\n",
+	"app/Rec.java":    "package app;\nimport static app.Util.foo;\npublic record Rec(int x) {\nvoid run() { foo(); }\n}\n",
+	"app/Lam.java":    "package app;\nimport static app.Util.foo;\npublic class Lam {\nvoid run() { Runnable q = () -> foo(); }\n}\n",
+	"app/Nest.java":   "package app;\nimport static app.Util.foo;\npublic class Nest extends Base {\nstatic class S {\nvoid run() { foo(); }\n}\n}\n",
 	"app/Plain.java":  "package app;\nimport static app.Util.foo;\npublic class Plain { void run() { foo(); } }\n",
 }
 
@@ -62,6 +74,11 @@ func assertJavaStaticImportInheritedTargets(t *testing.T, r *lifecycleRepo, step
 		"app.Outer.In.run|foo": "",
 		"app.Obj.run|toString": "",
 		"app.Plain.run|foo":    "app.Util.foo",
+		"app.KtCall.run|hello": "lib.hello",
+		"app.Lam.run|foo":      "app.Util.foo",
+		"app.Rec.run|foo":      "",
+		"app.Nest.S.run|foo":   "",
+		"app.Loc.m|foo":        "",
 	} {
 		if g := calls[key]; len(g) != 1 || g[0] != want {
 			t.Errorf("%s: %s bound %q, want [%q]", step, key, g, want)

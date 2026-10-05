@@ -31,6 +31,7 @@ func (a *PythonAdapter) Profile() parser.Profile {
 // spells no supertype (graph.JavaNoSupertypeCallEvidence); only such a call
 // may bind a static import, since an inherited method of that name would
 // shadow it.
+//
 // Java v10 reads imports from their syntax nodes: a package whose name begins
 // with "static" keeps it (v9 recorded `import staticpkg.Bag;` as pkg.Bag), and
 // `static` followed by a tab, newline or comment, or comments and whitespace
