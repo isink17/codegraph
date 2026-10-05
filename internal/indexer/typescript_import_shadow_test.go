@@ -200,3 +200,20 @@ func TestTypeScriptImportShadowingProfileUpgradeConverges(t *testing.T) {
 		t.Fatal("second update mutated the graph")
 	}
 }
+
+// A dotted call can bind a declaration of its own file by qualified name
+// (module.name); a parameter named like the module shadows it.
+func TestTypeScriptModuleQualifiedCallShadowedByParameter(t *testing.T) {
+	for body, want := range map[string]string{
+		"export function k(){}\nexport function c(b){ b.k(); }\n": "",
+		"export function k(){}\nexport function c(){ b.k(); }\n":  "b.ts:b.k(",
+	} {
+		r := newLifecycleRepo(t, tree{"b.ts": body})
+		got := r.edgeState(t, "b.ts", "b.k")
+		if want == "" && !strings.Contains(got, ":: [/") {
+			t.Errorf("%q: want unresolved, got %s", body, got)
+		} else if want != "" && !strings.Contains(got, want) {
+			t.Errorf("%q: want %s, got %s", body, want, got)
+		}
+	}
+}

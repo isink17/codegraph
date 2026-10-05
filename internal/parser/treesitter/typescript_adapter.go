@@ -66,6 +66,10 @@ func (a *TypeScriptAdapter) Parse(ctx context.Context, logicalPath string, conte
 	bindable := maps.Clone(imported)
 	for _, sym := range pf.Symbols {
 		bindable[sym.Name] = true
+		// A dotted call can name a declaration of this file by its qualified
+		// name, whose first segment is the module.
+		head, _, _ := strings.Cut(sym.QualifiedName, ".")
+		bindable[head] = true
 	}
 	tsExtractCalls(root, content, imported, bindable, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
