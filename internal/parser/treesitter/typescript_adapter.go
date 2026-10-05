@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"maps"
 	"path"
 	"path/filepath"
 	"strings"
@@ -54,7 +55,23 @@ func (a *TypeScriptAdapter) Parse(ctx context.Context, logicalPath string, conte
 
 	tsExtractImports(root, content, &pf)
 	tsExtractSymbols(root, module, "", content, &pf)
-	tsExtractCalls(root, content, &pf)
+	imported := map[string]bool{}
+	for _, imp := range pf.Scope.Imports {
+		if !imp.ReExport {
+			imported[imp.LocalName] = true
+		}
+	}
+	// A call can only bind through an import or a declaration of this file, so
+	// only those names need the scope walk that proves a nearer binding.
+	bindable := maps.Clone(imported)
+	for _, sym := range pf.Symbols {
+		bindable[sym.Name] = true
+		// A dotted call can name a declaration of this file by its qualified
+		// name, whose first segment is the module.
+		head, _, _ := strings.Cut(sym.QualifiedName, ".")
+		bindable[head] = true
+	}
+	tsExtractCalls(root, content, imported, bindable, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:typescript:" + testTargetModule(module, ".test", ".spec") + ":" + target
 	})
@@ -327,7 +344,7 @@ var tsKeywords = map[string]bool{
 	"require": true,
 }
 
-func tsExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+func tsExtractCalls(root *sitter.Node, content []byte, imported, bindable map[string]bool, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
 		fnNode := childByFieldName(call, "function")
 		if fnNode == nil {
@@ -345,11 +362,15 @@ func tsExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		evidence := name
+		if head, _, _ := strings.Cut(name, "."); bindable[head] && tsCallShadowed(call, name, content, imported) {
+			evidence = graph.TypeScriptCallLocalBindingEvidence
+		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
 			DstName:     name,
 			Kind:        "calls",
-			Evidence:    name,
+			Evidence:    evidence,
 			Line:        line,
 		})
 		pf.References = append(pf.References, graph.Reference{
@@ -387,4 +408,136 @@ func tsCalleeName(node *sitter.Node, content []byte) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// tsCallShadowed reports whether a scope between the call and the module
+// binds the call's first name itself, so no import or module declaration of
+// that name is proven to be the callee. It over-approximates: a scope binds a
+// name wherever in it the declaration sits (let, const and class are in their
+// temporal dead zone before it, var and function declarations are hoisted),
+// and a var or function declaration anywhere in a function body counts for the
+// whole function. A module-level declaration of an imported name is a
+// redeclaration error, so it shadows too.
+func tsCallShadowed(call *sitter.Node, name string, content []byte, imported map[string]bool) bool {
+	head, _, _ := strings.Cut(name, ".")
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		switch node.Type() {
+		case "program":
+			return imported[head] && tsScopeDeclares(node, head, content, true, true)
+		case "statement_block", "switch_body":
+			if tsScopeDeclares(node, head, content, false, true) {
+				return true
+			}
+		case "for_statement", "for_in_statement":
+			if tsPatternBinds(childByFieldName(node, "initializer"), head, content) || tsPatternBinds(childByFieldName(node, "left"), head, content) {
+				return true
+			}
+		case "catch_clause":
+			if tsPatternBinds(childByFieldName(node, "parameter"), head, content) {
+				return true
+			}
+		case "class", "function", "function_expression", "generator_function":
+			// A named class or function expression binds its own name inside.
+			if nodeText(childByFieldName(node, "name"), content) == head {
+				return true
+			}
+			fallthrough
+		case "function_declaration", "generator_function_declaration", "arrow_function", "method_definition":
+			if tsPatternBinds(childByFieldName(node, "parameters"), head, content) || tsPatternBinds(childByFieldName(node, "parameter"), head, content) {
+				return true
+			}
+			if body := childByFieldName(node, "body"); body != nil && tsScopeDeclares(body, head, content, true, false) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// tsScopeDeclares reports whether node declares name. lexical covers the let,
+// const, class and function declarations directly in node; hoisted covers var
+// and function declarations anywhere below node outside nested functions.
+func tsScopeDeclares(node *sitter.Node, name string, content []byte, hoisted, lexical bool) bool {
+	var walk func(n *sitter.Node, top bool) bool
+	walk = func(n *sitter.Node, top bool) bool {
+		for i := range int(n.NamedChildCount()) {
+			child := n.NamedChild(i)
+			switch child.Type() {
+			case "export_statement":
+				if walk(child, top) {
+					return true
+				}
+				continue
+			case "lexical_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
+				if top && lexical && tsDeclarationBinds(child, name, content) {
+					return true
+				}
+				continue
+			case "function_declaration", "generator_function_declaration":
+				if (top || hoisted) && nodeText(childByFieldName(child, "name"), content) == name {
+					return true
+				}
+				continue
+			case "variable_declaration":
+				if hoisted && tsDeclarationBinds(child, name, content) {
+					return true
+				}
+				continue
+			case "switch_case", "switch_default":
+				// A case clause's declarations belong to the switch body's scope.
+				if walk(child, top) {
+					return true
+				}
+				continue
+			case "function", "function_expression", "arrow_function", "generator_function", "class", "class_body", "method_definition":
+				continue
+			}
+			if hoisted && walk(child, false) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(node, true)
+}
+
+func tsDeclarationBinds(decl *sitter.Node, name string, content []byte) bool {
+	if n := childByFieldName(decl, "name"); n != nil && decl.Type() != "lexical_declaration" && decl.Type() != "variable_declaration" {
+		return nodeText(n, content) == name
+	}
+	for i := range int(decl.NamedChildCount()) {
+		if d := decl.NamedChild(i); d.Type() == "variable_declarator" && tsPatternBinds(childByFieldName(d, "name"), name, content) {
+			return true
+		}
+	}
+	return false
+}
+
+// tsPatternBinds reports whether a binding pattern or parameter list binds
+// name. Default values and type annotations bind nothing, so they are skipped.
+func tsPatternBinds(node *sitter.Node, name string, content []byte) bool {
+	if node == nil {
+		return false
+	}
+	switch node.Type() {
+	case "identifier", "shorthand_property_identifier_pattern":
+		return nodeText(node, content) == name
+	case "assignment_pattern", "object_assignment_pattern":
+		return tsPatternBinds(childByFieldName(node, "left"), name, content)
+	case "required_parameter", "optional_parameter":
+		return tsPatternBinds(childByFieldName(node, "pattern"), name, content)
+	case "pair_pattern":
+		return tsPatternBinds(childByFieldName(node, "value"), name, content)
+	case "type_annotation", "lexical_declaration", "variable_declaration":
+		if node.Type() != "type_annotation" {
+			return tsDeclarationBinds(node, name, content)
+		}
+		return false
+	}
+	for i := range int(node.NamedChildCount()) {
+		if tsPatternBinds(node.NamedChild(i), name, content) {
+			return true
+		}
+	}
+	return false
 }

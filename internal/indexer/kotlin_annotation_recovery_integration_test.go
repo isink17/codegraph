@@ -256,7 +256,7 @@ func TestKotlinV6ToV7DetachedAnnotationRecoveryConvergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
 		t.Fatalf("v6-to-v7 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v11", "Synth.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v10", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"} {
+	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v11", "Synth.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v10", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v2"} {
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}
