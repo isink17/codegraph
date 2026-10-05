@@ -50,6 +50,9 @@ var tsImportShadowCases = []struct {
 	{"for of binding", "export function c(){ for (const k of []) k(); }", "", "", false},
 	{"named function expression", "export const c = function k(){ k(); };", "", "", false},
 	{"module redeclaration", "function k(){}\nexport function c(){ k(); }", "", "", false},
+	{"switch case const", "export function c(x){ switch (x) { case 1: const k = () => 1; k(); } }", "", "", false},
+	{"switch case let in earlier case", "export function c(x){ switch (x) { case 1: let k = () => 1; break; default: k(); } }", "", "", false},
+	{"switch case class", "export function c(x){ switch (x) { default: class k {} k(); } }", "", "", false},
 	{"namespace head parameter", "export function c(ns){ ns.k(); }", "ns.k", "", false},
 	{"namespace head local", "export function c(){ const ns = { k(){} }; ns.k(); }", "ns.k", "", false},
 	// -- controls: nothing shadows, the import answers

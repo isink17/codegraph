@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"maps"
 	"path"
 	"path/filepath"
 	"strings"
@@ -60,7 +61,13 @@ func (a *TypeScriptAdapter) Parse(ctx context.Context, logicalPath string, conte
 			imported[imp.LocalName] = true
 		}
 	}
-	tsExtractCalls(root, content, imported, &pf)
+	// A call can only bind through an import or a declaration of this file, so
+	// only those names need the scope walk that proves a nearer binding.
+	bindable := maps.Clone(imported)
+	for _, sym := range pf.Symbols {
+		bindable[sym.Name] = true
+	}
+	tsExtractCalls(root, content, imported, bindable, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:typescript:" + testTargetModule(module, ".test", ".spec") + ":" + target
 	})
@@ -333,7 +340,7 @@ var tsKeywords = map[string]bool{
 	"require": true,
 }
 
-func tsExtractCalls(root *sitter.Node, content []byte, imported map[string]bool, pf *graph.ParsedFile) {
+func tsExtractCalls(root *sitter.Node, content []byte, imported, bindable map[string]bool, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
 		fnNode := childByFieldName(call, "function")
 		if fnNode == nil {
@@ -352,7 +359,7 @@ func tsExtractCalls(root *sitter.Node, content []byte, imported map[string]bool,
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if tsCallShadowed(call, name, content, imported) {
+		if head, _, _ := strings.Cut(name, "."); bindable[head] && tsCallShadowed(call, name, content, imported) {
 			evidence = graph.TypeScriptCallLocalBindingEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
@@ -469,6 +476,12 @@ func tsScopeDeclares(node *sitter.Node, name string, content []byte, hoisted, le
 				continue
 			case "variable_declaration":
 				if hoisted && tsDeclarationBinds(child, name, content) {
+					return true
+				}
+				continue
+			case "switch_case", "switch_default":
+				// A case clause's declarations belong to the switch body's scope.
+				if walk(child, top) {
 					return true
 				}
 				continue
