@@ -167,11 +167,11 @@ func TestResolverPolicyMixedSourceChangeAndStaleMarker(t *testing.T) {
 }
 
 // A development build stamped C# 1 before the namespace policy shipped. The
-// shipped registry is at epoch 3, so that graph is decided again on unchanged
+// shipped registry is at epoch 4, so that graph is decided again on unchanged
 // source, without parsing, and a newer marker is refused with nothing written.
 func TestResolverPolicyShippedCSharpEpochRepairsDevelopmentStamp(t *testing.T) {
 	r := newRegisteredPolicyRepo(t, rustStaleTree())
-	if !strings.Contains(r.markers(t), r.markerKey("csharp")+"=3") {
+	if !strings.Contains(r.markers(t), r.markerKey("csharp")+"=4") {
 		t.Fatalf("fresh index markers = %q", r.markers(t))
 	}
 	want := r.projection(t)
@@ -200,14 +200,14 @@ func TestResolverPolicyShippedCSharpEpochRepairsDevelopmentStamp(t *testing.T) {
 	if diff := projectionDiff(want, r.projection(t)); diff != "" {
 		t.Fatalf("upgrade diverges from the fresh graph:\n%s", diff)
 	}
-	if !strings.Contains(r.markers(t), r.markerKey("csharp")+"=3") {
+	if !strings.Contains(r.markers(t), r.markerKey("csharp")+"=4") {
 		t.Fatalf("markers = %q", r.markers(t))
 	}
 	if again := r.update(t); again.ResolveMode != "none" || len(again.ResolverPolicyLanguages) != 0 {
 		t.Fatalf("second update: mode=%q languages=%v", again.ResolveMode, again.ResolverPolicyLanguages)
 	}
 
-	r.exec(t, `UPDATE settings SET value='4' WHERE key=?`, r.markerKey("csharp"))
+	r.exec(t, `UPDATE settings SET value='5' WHERE key=?`, r.markerKey("csharp"))
 	before := r.state(t)
 	_, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update"})
 	var pe *store.ResolverPolicyError

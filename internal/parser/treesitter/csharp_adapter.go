@@ -19,6 +19,9 @@ type CSharpAdapter struct {
 	// legacyImportText reproduces treesitter:csharp:v4, which read using
 	// directives from raw text (csLegacyUsing).
 	legacyImportText bool
+	// legacyNoBaseList reproduces treesitter:csharp:v5 and earlier, which
+	// recorded no base list on type symbols.
+	legacyNoBaseList bool
 }
 
 func NewCSharp() *CSharpAdapter { return &CSharpAdapter{} }
@@ -26,7 +29,14 @@ func NewCSharp() *CSharpAdapter { return &CSharpAdapter{} }
 // NewCSharpV4 returns a parser that reports treesitter:csharp:v4 and reads
 // using directives from raw text, so `using staticns;` names ns. It exists
 // only to reproduce v4 databases in profile-transition tests.
-func NewCSharpV4() *CSharpAdapter { return &CSharpAdapter{legacyImportText: true} }
+func NewCSharpV4() *CSharpAdapter {
+	return &CSharpAdapter{legacyImportText: true, legacyNoBaseList: true}
+}
+
+// NewCSharpV5 returns a parser that reports treesitter:csharp:v5 and records no
+// base list on type symbols. It exists only to reproduce v5 databases in
+// profile-transition tests.
+func NewCSharpV5() *CSharpAdapter { return &CSharpAdapter{legacyNoBaseList: true} }
 
 func (a *CSharpAdapter) Language() string     { return "csharp" }
 func (a *CSharpAdapter) Extensions() []string { return []string{".cs"} }
@@ -49,6 +59,13 @@ func (a *CSharpAdapter) Parse(ctx context.Context, path string, content []byte) 
 
 	csExtractImports(root, "", content, &pf, a.legacyImportText)
 	csExtractSymbols(root, "", "", content, &pf)
+	if a.legacyNoBaseList {
+		for i := range pf.Symbols {
+			if pf.Symbols[i].Kind == "type" {
+				pf.Symbols[i].Signature = ""
+			}
+		}
+	}
 	if namespaces := csNamespaces(root, content); len(namespaces) == 1 && csTruthfulFileNamespace(pf.Symbols, namespaces[0]) {
 		pf.Scope.Package = namespaces[0]
 	}
@@ -327,6 +344,9 @@ func csAddType(node *sitter.Node, module, parent string, content []byte, pf *gra
 		Range:         nodeRange(node),
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "type:csharp:" + qualified,
+		// The base list (`: Base, IFoo`) is the type's signature. The resolver
+		// reads it as evidence that inherited members can preempt using static.
+		Signature: csBaseList(node, content),
 	}
 	pf.Symbols = append(pf.Symbols, pfsym)
 
@@ -335,6 +355,15 @@ func csAddType(node *sitter.Node, module, parent string, content []byte, pf *gra
 		csCollectMemberBindings(body, qualified, content, pf)
 		csExtractSymbols(body, module, qualified, content, pf)
 	}
+}
+
+func csBaseList(node *sitter.Node, content []byte) string {
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		if child := node.NamedChild(i); child != nil && child.Type() == "base_list" {
+			return strings.Join(strings.Fields(nodeText(child, content)), " ")
+		}
+	}
+	return ""
 }
 
 func csAddMethod(node *sitter.Node, module, container string, content []byte, pf *graph.ParsedFile) {

@@ -327,7 +327,9 @@ Receivers follow these rules:
 - A local name that shadows the call, an untyped receiver, or competing overloads leave the call unresolved.
 - Arity is the last filter. When the call's argument count is known and any candidate's arity is unknown, nothing binds.
 
-Another type's method, and every type enclosing it, must be `public`. Internal and protected access is not modelled. Global usings are ignored.
+Another type's method, and every type enclosing it, must be `public`. Internal and protected access is not modelled. A `global using` directive is ambiguity evidence only, because compilation membership is not recorded: when one could change a call's target, the call is left unresolved.
+
+A bare call bound through `using static` yields to members that simple-name lookup finds first. If the caller's type or any enclosing type has a base list (`: Base`, an interface included), or an enclosing type declares a member of that name, the call stays unresolved: inherited and enclosing-type members are not bound, and an external or interface base cannot be inspected.
 
 Not modelled:
 - inheritance

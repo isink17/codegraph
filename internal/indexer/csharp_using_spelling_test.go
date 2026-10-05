@@ -150,7 +150,7 @@ func TestCSharpUsingSpellingProfileConvergence(t *testing.T) {
 	if strings.Join(summary.ParserProfileLanguages, ",") != "csharp" {
 		t.Fatalf("update = %+v, want a csharp profile reparse", summary)
 	}
-	if got := fileParserProfile(t, s.raw(t), repo, "Prefix.cs"); got != "treesitter:csharp:v5" {
+	if got := fileParserProfile(t, s.raw(t), repo, "Prefix.cs"); got != "treesitter:csharp:v6" {
 		t.Fatalf("updated profile = %q", got)
 	}
 	assertCSharpUsingTargets(t, s.Store, root, "update")

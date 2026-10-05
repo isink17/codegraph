@@ -119,11 +119,16 @@ func (a *KotlinAdapter) Profile() parser.Profile {
 // C# v5 reads using directives from their syntax tokens: a namespace whose
 // name begins with "static" keeps it (v4 recorded `using staticns;` as ns),
 // and `static` followed by a tab, newline or comment is a static using.
+// C# v6 records a type's base list as its signature, so the resolver can tell
+// when an inherited member may preempt a using static directive.
 func (a *CSharpAdapter) Profile() parser.Profile {
 	if a.legacyImportText {
 		return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:csharp:v5", EmitsCallEdges: true}
+	if a.legacyNoBaseList {
+		return parser.Profile{ID: "treesitter:csharp:v5", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:csharp:v6", EmitsCallEdges: true}
 }
 
 // TypeScript v2 marks a call whose first name a parameter, local, catch
