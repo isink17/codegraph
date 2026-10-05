@@ -45,8 +45,11 @@ var resolverPolicyRegistry = map[string]int{
 	// graph, and every graph with no marker, converge on the same decision.
 	// C#'s 3 refuses cross-file global-using-dependent bindings until compilation
 	// membership is persisted; epoch 2 may contain a wrong namespace-import edge.
+	// C#'s 4 lets a member of an enclosing type, or any base list on the
+	// caller's type or an enclosing type, preempt a using static binding of a
+	// bare call; epoch 3 may bind the using static target instead.
 	"cpp":        1,
-	"csharp":     3,
+	"csharp":     4,
 	"go":         1,
 	"java":       1,
 	"kotlin":     1,

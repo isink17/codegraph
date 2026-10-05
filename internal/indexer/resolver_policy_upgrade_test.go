@@ -362,7 +362,7 @@ func TestResolverPolicyCSharpEpochTwoGlobalAliasWrongEdgeUpgrade(t *testing.T) {
 	if n := r.touched(t); n != 0 {
 		t.Fatalf("%d Go edge/reference rows changed during C# upgrade", n)
 	}
-	wantMarkers := strings.Replace(markersBefore, r.markerKey("csharp")+"=2", r.markerKey("csharp")+"=3", 1)
+	wantMarkers := strings.Replace(markersBefore, r.markerKey("csharp")+"=2", r.markerKey("csharp")+"=4", 1)
 	if got := r.markers(t); got != wantMarkers {
 		t.Fatalf("policy markers = %q", got)
 	}
@@ -398,7 +398,7 @@ func csharpEpochTwoPolicies() map[string]int {
 func TestResolverPolicyCSharpNewerRefusalAndRollbackAreAtomic(t *testing.T) {
 	t.Run("newer marker refuses without mutation", func(t *testing.T) {
 		r := newRegisteredPolicyRepo(t, csharpGlobalAliasTree())
-		r.exec(t, `UPDATE settings SET value='4' WHERE key=?`, r.markerKey("csharp"))
+		r.exec(t, `UPDATE settings SET value='5' WHERE key=?`, r.markerKey("csharp"))
 		before := r.state(t)
 		_, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update"})
 		var policyError *store.ResolverPolicyError
@@ -430,8 +430,8 @@ func TestResolverPolicyCSharpNewerRefusalAndRollbackAreAtomic(t *testing.T) {
 		if got := r.refTarget(t, "cs/Caller.cs", "Util.Run"); got != "" {
 			t.Fatalf("retry left wrong reference identity %q", got)
 		}
-		if !strings.Contains(r.markers(t), r.markerKey("csharp")+"=3") {
-			t.Fatalf("retry did not stamp epoch 3: %q", r.markers(t))
+		if !strings.Contains(r.markers(t), r.markerKey("csharp")+"=4") {
+			t.Fatalf("retry did not stamp epoch 4: %q", r.markers(t))
 		}
 	})
 }

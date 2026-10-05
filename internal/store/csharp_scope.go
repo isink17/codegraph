@@ -338,6 +338,9 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 			}
 			return csharpScopeSymbol{}, "", false
 		}
+		if csharpEnclosingTypeMayDeclare(e.srcContainer, method, byName, byQName) {
+			return csharpScopeSymbol{}, "", false
+		}
 		for _, i := range globalImports {
 			if i.kind != "global_static" {
 				continue
@@ -718,4 +721,54 @@ func csharpTypeAccessibleByQName(qname, sourceContainer string, byQName map[stri
 		current = typeSymbol.container
 	}
 	return true
+}
+
+// csharpEnclosingTypeMayDeclare reports whether simple-name lookup could find
+// name in the caller's type or an enclosing type before it reaches a using
+// static directive (C# spec §12.8.4, member lookup §12.5): a member of that
+// name declared by an enclosing type, or any base list on the caller's type
+// or an enclosing type. A base type (an interface too, through default
+// members) may declare the name, and an external base cannot be inspected, so
+// a base list alone preempts the using static binding.
+func csharpEnclosingTypeMayDeclare(container, name string, byName, byQName map[string][]csharpScopeSymbol) bool {
+	// Every type inherits System.Object, so its members are found in the
+	// caller's type before any using directive.
+	if csharpObjectMembers[name] {
+		return true
+	}
+	for _, s := range byName[name] {
+		if s.container != "" && (s.container == container || strings.HasPrefix(container, s.container+".")) {
+			if _, isType := csharpTypeSymbol(s.container, byQName); isType {
+				return true
+			}
+		}
+	}
+	for t := container; ; {
+		parent, isType := csharpTypeSymbol(t, byQName)
+		if !isType {
+			return false
+		}
+		for _, s := range byQName[t] {
+			if s.kind == "type" && s.signature != "" {
+				return true
+			}
+		}
+		t = parent
+	}
+}
+
+var csharpObjectMembers = map[string]bool{
+	"Equals": true, "Finalize": true, "GetHashCode": true, "GetType": true,
+	"MemberwiseClone": true, "ReferenceEquals": true, "ToString": true,
+}
+
+// csharpTypeSymbol returns the container of the type named qname, if one is
+// indexed.
+func csharpTypeSymbol(qname string, byQName map[string][]csharpScopeSymbol) (string, bool) {
+	for _, s := range byQName[qname] {
+		if s.kind == "type" {
+			return s.container, true
+		}
+	}
+	return "", false
 }
