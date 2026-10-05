@@ -184,6 +184,43 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 	return len(res), err
 }
 
+// csharpGlobalImportCanRetarget reports whether a global using directive from
+// any indexed file could change what the type-or-namespace spelling q names.
+// Compilation membership is unknown, so such a directive is ambiguity
+// evidence: only a type declared in the caller's own or an enclosing namespace
+// is proven to win over it. A namespace-level alias does not: stored evidence
+// keeps only its owner namespace, not the namespace body it was written in.
+func csharpGlobalImportCanRetarget(q, srcNamespace string, globalImports []csharpScopeImport, byQName map[string][]csharpScopeSymbol) bool {
+	head, _, _ := strings.Cut(q, ".")
+	if head == q {
+		for level := srcNamespace; level != ""; {
+			if csharpHasTypeAtNamespace(level, q, byQName) {
+				return false
+			}
+			if dot := strings.LastIndexByte(level, '.'); dot >= 0 {
+				level = level[:dot]
+			} else {
+				level = ""
+			}
+		}
+	}
+	for _, i := range globalImports {
+		switch i.kind {
+		case "global_alias":
+			if head == i.local {
+				return true
+			}
+		case "global_namespace":
+			for _, candidate := range byQName[i.source+"."+q] {
+				if candidate.kind == "type" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol, byQName map[string][]csharpScopeSymbol, imports, globalImports []csharpScopeImport, bindings csharpScopeBindings) (csharpScopeSymbol, string, bool) {
 	name := e.name
 	if name == "" || strings.HasPrefix(name, "base.") {
@@ -192,47 +229,8 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 	parts := strings.Split(name, ".")
 	method := parts[len(parts)-1]
 	qualifier := strings.Join(parts[:len(parts)-1], ".")
-	if qualifier != "" {
-		head, _, _ := strings.Cut(qualifier, ".")
-		globalTypeImportCanChangeLookup := true
-		if head == qualifier {
-			for level := e.srcNamespace; level != ""; {
-				if csharpHasTypeAtNamespace(level, qualifier, byQName) {
-					globalTypeImportCanChangeLookup = false
-					break
-				}
-				for _, i := range imports {
-					if i.kind == "alias" && i.owner == level && i.local == qualifier {
-						globalTypeImportCanChangeLookup = false
-						break
-					}
-				}
-				if !globalTypeImportCanChangeLookup {
-					break
-				}
-				if dot := strings.LastIndexByte(level, '.'); dot >= 0 {
-					level = level[:dot]
-				} else {
-					level = ""
-				}
-			}
-		}
-		for _, i := range globalImports {
-			switch i.kind {
-			case "global_alias":
-				if globalTypeImportCanChangeLookup && head == i.local {
-					return csharpScopeSymbol{}, "", false
-				}
-			case "global_namespace":
-				if globalTypeImportCanChangeLookup {
-					for _, candidate := range byQName[i.source+"."+qualifier] {
-						if candidate.kind == "type" {
-							return csharpScopeSymbol{}, "", false
-						}
-					}
-				}
-			}
-		}
+	if qualifier != "" && csharpGlobalImportCanRetarget(qualifier, e.srcNamespace, globalImports, byQName) {
+		return csharpScopeSymbol{}, "", false
 	}
 	shadowed := func(n string) bool {
 		_, local := bindings.unknown[e.srcStable][n]
@@ -398,6 +396,9 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 			}
 			global := strings.HasPrefix(typeSpelling, "global::")
 			typeQ := strings.TrimPrefix(typeSpelling, "global::")
+			if !global && csharpGlobalImportCanRetarget(typeQ, e.srcNamespace, globalImports, byQName) {
+				return csharpScopeSymbol{}, "", false
+			}
 			qname, _, ok := csharpResolveTypeIdentity(typeQ, e.srcNamespace, imports, byQName, e.srcContainer, global)
 			if !ok {
 				return csharpScopeSymbol{}, "", false
@@ -421,6 +422,9 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 		}
 		global := strings.HasPrefix(typeSpelling, "global::")
 		typeQ := strings.TrimPrefix(typeSpelling, "global::")
+		if !global && csharpGlobalImportCanRetarget(typeQ, e.srcNamespace, globalImports, byQName) {
+			return csharpScopeSymbol{}, "", false
+		}
 		qname, _, ok := csharpResolveTypeIdentity(typeQ, e.srcNamespace, imports, byQName, e.srcContainer, global)
 		if !ok {
 			return csharpScopeSymbol{}, "", false

@@ -145,7 +145,8 @@ func TestCSharpGlobalAliasInOtherFileDoesNotBindCompetingImport(t *testing.T) {
 		"Global.cs":    `global using Util = A.Util;`,
 		"Caller.cs":    `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
 		"Qualified.cs": `namespace X; public class Qualified { public void N() { global::B.Util.Run(); } }`,
-		"Types.cs":     `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
+		"Typed.cs":     `using B; namespace X { public class Typed { Util f; public void M(Util u) { u.Go(); f.Go(); this.f.Go(); } } }`,
+		"Types.cs":     `namespace A { public class Util { public static void Run() {} public void Go() {} } } namespace B { public class Util { public static void Run() {} public void Go() {} } }`,
 	}
 	for path, content := range files {
 		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
@@ -165,6 +166,11 @@ func TestCSharpGlobalAliasInOtherFileDoesNotBindCompetingImport(t *testing.T) {
 	}
 	if got := csharpTarget(t, s, root, "Qualified.cs", "global::B.Util.Run"); got != "B.Util.Run" {
 		t.Fatalf("global-qualified reference resolved to %q, want B.Util.Run", got)
+	}
+	for _, call := range []string{"u.Go", "f.Go", "this.f.Go"} {
+		if got := csharpTarget(t, s, root, "Typed.cs", call); got != "" {
+			t.Fatalf("typed receiver %s resolved competing import to %q; want fail-closed", call, got)
+		}
 	}
 	repo, err := s.UpsertRepo(context.Background(), root)
 	if err != nil {
@@ -253,18 +259,18 @@ func TestCSharpGlobalUsingAmbiguityAndLocalPrecedence(t *testing.T) {
 			want:      "X.Util.Run",
 		},
 		{
-			name:   "namespace-local alias precedes cross-file global alias",
+			// Stored alias evidence keeps only the owner namespace, so it
+			// cannot prove the alias is in the body that holds the call.
+			name:   "namespace-local alias does not prove precedence over global alias",
 			global: `global using Util = A.Util;`,
 			caller: `namespace X { using Util = B.Util; public class Caller { public void M() { Util.Run(); } } }`,
 			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
-			want:   "B.Util.Run",
 		},
 		{
-			name:   "namespace-local alias precedes global alias",
+			name:   "alias in another body of the same namespace does not hide global alias",
 			global: `global using Util = A.Util;`,
-			caller: `namespace X { using Util = B.Util; public class Caller { public void M() { Util.Run(); } } }`,
+			caller: `namespace X { using Util = B.Util; } namespace X { public class Caller { public void M() { Util.Run(); } } }`,
 			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
-			want:   "B.Util.Run",
 		},
 		{
 			name:   "untrusted global alias does not veto local import",
