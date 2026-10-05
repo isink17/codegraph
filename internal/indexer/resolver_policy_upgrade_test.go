@@ -335,6 +335,107 @@ func TestResolverPolicyRepresentativeJavaAndCSharpUpgrades(t *testing.T) {
 	}
 }
 
+func TestResolverPolicyCSharpEpochTwoGlobalAliasWrongEdgeUpgrade(t *testing.T) {
+	r := newPolicyRepo(t, csharpGlobalAliasTree(), csharpEpochTwoPolicies())
+	// Model the stored epoch-2 graph exactly: its C# edge chose the ordinary
+	// namespace import while the separate global alias was not visible.
+	r.bind(t, "cs/Caller.cs", "Util.Run", "B.Util.Run")
+	if got := r.refTarget(t, "cs/Caller.cs", "Util.Run"); got != "B.Util.Run" {
+		t.Fatalf("setup reference identity = %q", got)
+	}
+	r.store.SetResolverPolicies(nil)
+	markersBefore := r.markers(t)
+	r.watchLanguages(t, "go", "java")
+	summary := r.update(t)
+	if summary.FilesChanged != 0 || summary.FilesIndexed != 0 || summary.ParseMS != 0 {
+		t.Fatalf("resolver policy upgrade parsed source: %+v", summary)
+	}
+	if got := strings.Join(summary.ResolverPolicyLanguages, ","); got != "csharp" || summary.ResolveMode != "resolver_policy" {
+		t.Fatalf("upgraded languages=%q mode=%q", got, summary.ResolveMode)
+	}
+	if got := r.edgeState(t, "cs/Caller.cs", "Util.Run"); strings.Contains(got, "B.Util.Run(") {
+		t.Fatalf("wrong target survived epoch 3: %s", got)
+	}
+	if got := r.refTarget(t, "cs/Caller.cs", "Util.Run"); got != "" {
+		t.Fatalf("wrong reference identity survived epoch 3: %q", got)
+	}
+	if n := r.touched(t); n != 0 {
+		t.Fatalf("%d Go edge/reference rows changed during C# upgrade", n)
+	}
+	wantMarkers := strings.Replace(markersBefore, r.markerKey("csharp")+"=2", r.markerKey("csharp")+"=3", 1)
+	if got := r.markers(t); got != wantMarkers {
+		t.Fatalf("policy markers = %q", got)
+	}
+	r.assertPolicyParity(t, "after C# epoch 2 to 3 upgrade")
+	edges, refs := r.edgeAndRefState(t)
+	markers := r.markers(t)
+	second := r.update(t)
+	if second.ResolveMode != "none" || len(second.ResolverPolicyLanguages) != 0 || second.ResolverPolicyMS != 0 {
+		t.Fatalf("second update was not a no-op: %+v", second)
+	}
+	if e, f := r.edgeAndRefState(t); e != edges || f != refs || r.markers(t) != markers {
+		t.Fatal("second update changed edges, references, or policy marker")
+	}
+}
+
+func csharpGlobalAliasTree() tree {
+	return tree{
+		"cs/Global.cs": `global using Util = A.Util;`,
+		"cs/Caller.cs": `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+		"cs/Types.cs":  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
+		"tool/main.go": "package main\nfunc main() {}\n",
+		"jv/A.java":    "package jv; class A { void f() { g(); } void g() {} }\n",
+	}
+}
+
+func csharpEpochTwoPolicies() map[string]int {
+	return map[string]int{
+		"cpp": 1, "csharp": 2, "go": 1, "java": 1, "kotlin": 1,
+		"php": 1, "python": 1, "ruby": 1, "rust": 1, "swift": 1, "typescript": 1,
+	}
+}
+
+func TestResolverPolicyCSharpNewerRefusalAndRollbackAreAtomic(t *testing.T) {
+	t.Run("newer marker refuses without mutation", func(t *testing.T) {
+		r := newRegisteredPolicyRepo(t, csharpGlobalAliasTree())
+		r.exec(t, `UPDATE settings SET value='4' WHERE key=?`, r.markerKey("csharp"))
+		before := r.state(t)
+		_, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update"})
+		var policyError *store.ResolverPolicyError
+		if !errors.As(err, &policyError) || policyError.Language != "csharp" || !errors.Is(err, store.ErrResolverPolicyNewer) {
+			t.Fatalf("error = %v, want newer C# policy refusal", err)
+		}
+		if after := r.state(t); after != before {
+			t.Fatal("newer-policy refusal mutated the database")
+		}
+	})
+
+	t.Run("reference failure rolls back C# edge and marker", func(t *testing.T) {
+		r := newPolicyRepo(t, csharpGlobalAliasTree(), csharpEpochTwoPolicies())
+		r.bind(t, "cs/Caller.cs", "Util.Run", "B.Util.Run")
+		r.exec(t, `CREATE TRIGGER fail_csharp_refs BEFORE UPDATE ON references_tbl BEGIN SELECT RAISE(ABORT, 'injected C# reference failure'); END`)
+		beforeEdges, beforeRefs := r.edgeAndRefState(t)
+		beforeMarkers := r.markers(t)
+		r.store.SetResolverPolicies(nil)
+		_, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update"})
+		if err == nil || !strings.Contains(err.Error(), "injected C# reference failure") {
+			t.Fatalf("update error = %v", err)
+		}
+		afterEdges, afterRefs := r.edgeAndRefState(t)
+		if afterEdges != beforeEdges || afterRefs != beforeRefs || r.markers(t) != beforeMarkers {
+			t.Fatal("failed C# upgrade partially changed edges, references, or marker")
+		}
+		r.exec(t, `DROP TRIGGER fail_csharp_refs`)
+		r.update(t)
+		if got := r.refTarget(t, "cs/Caller.cs", "Util.Run"); got != "" {
+			t.Fatalf("retry left wrong reference identity %q", got)
+		}
+		if !strings.Contains(r.markers(t), r.markerKey("csharp")+"=3") {
+			t.Fatalf("retry did not stamp epoch 3: %q", r.markers(t))
+		}
+	})
+}
+
 func TestResolverPolicyUnsupportedMarkerRefusesWithZeroMutation(t *testing.T) {
 	for _, tc := range []struct {
 		name, key, value string

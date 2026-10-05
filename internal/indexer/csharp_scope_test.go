@@ -139,6 +139,217 @@ func TestCSharpGlobalUsingFailsClosedWithoutProjectScope(t *testing.T) {
 	}
 }
 
+func TestCSharpGlobalAliasInOtherFileDoesNotBindCompetingImport(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"Global.cs":    `global using Util = A.Util;`,
+		"Caller.cs":    `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+		"Qualified.cs": `namespace X; public class Qualified { public void N() { global::B.Util.Run(); } }`,
+		"Typed.cs":     `using B; namespace X { public class Typed { Util f; public void M(Util u) { u.Go(); f.Go(); this.f.Go(); } } }`,
+		"Types.cs":     `namespace A { public class Util { public static void Run() {} public void Go() {} } } namespace B { public class Util { public static void Run() {} public void Go() {} } }`,
+	}
+	for path, content := range files {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := csharpTarget(t, s, root, "Caller.cs", "Util.Run"); got != "" {
+		t.Fatalf("cross-file global alias resolved competing import to %q; want fail-closed", got)
+	}
+	if got := csharpTarget(t, s, root, "Qualified.cs", "global::B.Util.Run"); got != "B.Util.Run" {
+		t.Fatalf("global-qualified reference resolved to %q, want B.Util.Run", got)
+	}
+	for _, call := range []string{"u.Go", "f.Go", "this.f.Go"} {
+		if got := csharpTarget(t, s, root, "Typed.cs", call); got != "" {
+			t.Fatalf("typed receiver %s resolved competing import to %q; want fail-closed", call, got)
+		}
+	}
+	repo, err := s.UpsertRepo(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveEdges(context.Background(), repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := csharpTarget(t, s, root, "Caller.cs", "Util.Run"); got != "" {
+		t.Fatalf("direct repo-wide resolve bound competing import to %q", got)
+	}
+}
+
+func TestCSharpGlobalAliasChangesRedecideUnchangedCallers(t *testing.T) {
+	root := t.TempDir()
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Global.cs", "namespace G; public class Marker {}")
+	write("Caller.cs", `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`)
+	write("Types.cs", `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`)
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	idx := New(s, parser.NewRegistry(ts.NewCSharp()), nil)
+	if _, err := idx.Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	assert := func(want string) {
+		t.Helper()
+		if got := csharpTarget(t, s, root, "Caller.cs", "Util.Run"); got != want {
+			t.Fatalf("Caller.cs Util.Run target=%q want %q", got, want)
+		}
+	}
+	assert("B.Util.Run")
+
+	write("Global.cs", `global using Util = A.Util;`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"Global.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assert("")
+	assertCSharpFreshParity(t, s, root)
+
+	write("Global.cs", `global using Renamed = A.Util;`)
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"Global.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assert("B.Util.Run")
+	assertCSharpFreshParity(t, s, root)
+
+	write("Global.cs", "namespace G; public class Marker {}")
+	if _, err := idx.Update(context.Background(), Options{RepoRoot: root, ScanKind: "update", Paths: []string{"Global.cs"}}); err != nil {
+		t.Fatal(err)
+	}
+	assert("B.Util.Run")
+	assertCSharpFreshParity(t, s, root)
+}
+
+func TestCSharpGlobalUsingAmbiguityAndLocalPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name, global, caller, types, localType, want string
+	}{
+		{
+			name:   "same-file global alias competes with root namespace import",
+			global: `namespace G; public class Marker {}`,
+			caller: `global using Util = A.Util; using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
+		},
+		{
+			name:   "global namespace competes with local namespace import",
+			global: `global using A;`,
+			caller: `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
+		},
+		{
+			name:      "local namespace type precedes global alias",
+			global:    `global using Util = A.Util;`,
+			caller:    `namespace X; public class Caller { public void M() { Util.Run(); } }`,
+			types:     `namespace A { public static class Util { public static void Run() {} } }`,
+			localType: `namespace X; public static class Util { public static void Run() {} }`,
+			want:      "X.Util.Run",
+		},
+		{
+			// Stored alias evidence keeps only the owner namespace, so it
+			// cannot prove the alias is in the body that holds the call.
+			name:   "namespace-local alias does not prove precedence over global alias",
+			global: `global using Util = A.Util;`,
+			caller: `namespace X { using Util = B.Util; public class Caller { public void M() { Util.Run(); } } }`,
+			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
+		},
+		{
+			name:   "alias in another body of the same namespace does not hide global alias",
+			global: `global using Util = A.Util;`,
+			caller: `namespace X { using Util = B.Util; } namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
+		},
+		{
+			name:   "untrusted global alias does not veto local import",
+			global: `global using Util = A.;`,
+			caller: `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } }`,
+			want:   "B.Util.Run",
+		},
+		{
+			name:   "conflicting global aliases",
+			global: `global using Util = A.Util;`,
+			caller: `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+			types:  `namespace A { public static class Util { public static void Run() {} } } namespace B { public static class Util { public static void Run() {} } } namespace C { public static class Util { public static void Run() {} } }`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			files := map[string]string{
+				"GlobalA.cs": tc.global,
+				"Caller.cs":  tc.caller,
+				"Types.cs":   tc.types,
+			}
+			if tc.localType != "" {
+				files["Local.cs"] = tc.localType
+			}
+			if tc.name == "conflicting global aliases" {
+				files["GlobalB.cs"] = `global using Util = C.Util;`
+			}
+			for path, content := range files {
+				if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+				t.Fatal(err)
+			}
+			if got := csharpTarget(t, s, root, "Caller.cs", "Util.Run"); got != tc.want {
+				t.Fatalf("target=%q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCSharpGlobalAliasAcrossUnmodeledProjectsFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"ProjectA/ProjectA.csproj": `<Project />`,
+		"ProjectA/Global.cs":       `global using Util = A.Util;`,
+		"ProjectA/Types.cs":        `namespace A { public static class Util { public static void Run() {} } }`,
+		"ProjectB/ProjectB.csproj": `<Project />`,
+		"ProjectB/Caller.cs":       `using B; namespace X { public class Caller { public void M() { Util.Run(); } } }`,
+		"ProjectB/Types.cs":        `namespace B { public static class Util { public static void Run() {} } }`,
+	}
+	for path, content := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, path)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := New(s, parser.NewRegistry(ts.NewCSharp()), nil).Index(context.Background(), Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := csharpTarget(t, s, root, "ProjectB/Caller.cs", "Util.Run"); got != "" {
+		t.Fatalf("unknown cross-project compilation membership bound %q", got)
+	}
+}
+
 func TestCSharpBareArityRespectsStaticCaller(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "C.cs"), []byte(`class C {
