@@ -646,6 +646,14 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		}
 		rel = rel[:dot]
 	}
+	// A method of that name the calling class or an enclosing class inherits
+	// is in scope too and shadows every static import, whatever its arity
+	// (JLS 6.4.1, 15.12.1). Supertypes are not recorded, so a static import
+	// binds only a call whose classes spell no supertype clause and so
+	// inherit only java.lang.Object, and only a name no Object method uses.
+	if e.evidence != graph.JavaNoSupertypeCallEvidence || javaObjectMethodName(name) {
+		return javaScopeSymbol{}, ""
+	}
 	explicitStaticOwners := map[string]struct{}{}
 	for _, i := range imps[e.file] {
 		if i.static && !i.wildcard && i.local == name {
@@ -682,6 +690,16 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		return staticCandidates[0], "java_static_import"
 	}
 	return javaScopeSymbol{}, ""
+}
+
+// javaObjectMethodName reports whether name is a method java.lang.Object
+// declares, which every class and interface has in scope (JLS 4.3.2, 9.2).
+func javaObjectMethodName(name string) bool {
+	switch name {
+	case "clone", "equals", "finalize", "getClass", "hashCode", "notify", "notifyAll", "toString", "wait":
+		return true
+	}
+	return false
 }
 
 // javaStaticImportMember follows an explicit import's exact JVM owner. In
@@ -741,7 +759,7 @@ func kotlinCompanionStaticMember(outer javaScopeSymbol, name string, e javaScope
 }
 
 func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	if kotlinNoArgCall(e.evidence) && !kotlinNeedsJVMEvidenceClassification(byQName[companion.qname+"."+name]) {
+	if javaNoArgCall(e) && !kotlinNeedsJVMEvidenceClassification(byQName[companion.qname+"."+name]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[companion.qname+"."+name] {
@@ -784,7 +802,7 @@ func kotlinCompanionMember(companion javaScopeSymbol, name string, e javaScopeEd
 }
 
 func kotlinObjectMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQName map[string][]javaScopeSymbol, strategy string, requireJvmStatic bool) (javaScopeSymbol, string) {
-	if kotlinNoArgCall(e.evidence) && !kotlinNeedsJVMEvidenceClassification(byQName[owner.qname+"."+name]) {
+	if javaNoArgCall(e) && !kotlinNeedsJVMEvidenceClassification(byQName[owner.qname+"."+name]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[owner.qname+"."+name] {
@@ -847,7 +865,7 @@ func kotlinFacadeMember(owner javaScopeSymbol, name string, e javaScopeEdge, byQ
 		}
 		files[part.file] = struct{}{}
 	}
-	if kotlinNoArgCall(e.evidence) && !kotlinNeedsJVMEvidenceClassification(byQName[kotlinJoin(owner.pkg, name)]) {
+	if javaNoArgCall(e) && !kotlinNeedsJVMEvidenceClassification(byQName[kotlinJoin(owner.pkg, name)]) {
 		var out javaScopeSymbol
 		n := 0
 		for _, s := range byQName[kotlinJoin(owner.pkg, name)] {
@@ -1140,6 +1158,16 @@ func kotlinCallableShape(name, signature string) bool {
 		}
 	}
 	return true
+}
+
+// javaNoArgCall reports whether e passes no arguments. A call marked
+// graph.JavaNoSupertypeCallEvidence keeps no call text, so its recorded
+// argument count decides.
+func javaNoArgCall(e javaScopeEdge) bool {
+	if e.evidence == graph.JavaNoSupertypeCallEvidence {
+		return e.callArity.Valid && e.callArity.Int64 == 0
+	}
+	return kotlinNoArgCall(e.evidence)
 }
 
 func kotlinNoArgCall(evidence string) bool {

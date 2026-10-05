@@ -27,6 +27,10 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.Profile{ID: "treesitter:python:v8", EmitsCallEdges: true}
 }
 
+// Java v11 marks a bare call in a class that, with every class enclosing it,
+// spells no supertype (graph.JavaNoSupertypeCallEvidence); only such a call
+// may bind a static import, since an inherited method of that name would
+// shadow it.
 // Java v10 reads imports from their syntax nodes: a package whose name begins
 // with "static" keeps it (v9 recorded `import staticpkg.Bag;` as pkg.Bag), and
 // `static` followed by a tab, newline or comment, or comments and whitespace
@@ -75,7 +79,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyImportText {
 		return parser.Profile{ID: "treesitter:java:v9", EmitsCallEdges: true}
 	}
-	return parser.Profile{ID: "treesitter:java:v10", EmitsCallEdges: true}
+	if a.legacyCallSupertype {
+		return parser.Profile{ID: "treesitter:java:v10", EmitsCallEdges: true}
+	}
+	return parser.Profile{ID: "treesitter:java:v11", EmitsCallEdges: true}
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.
