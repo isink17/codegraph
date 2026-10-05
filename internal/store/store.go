@@ -4878,6 +4878,20 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	if len(paths) == 0 && len(names) == 0 {
 		return ResolveEdgesForNamesStats{}, nil
 	}
+	for _, changedPath := range paths {
+		if !strings.EqualFold(filepath.Ext(changedPath), ".cs") {
+			continue
+		}
+		// ponytail: every C# path edit re-decides C# edges repo-wide so a
+		// removed global using cannot leave unchanged callers stale; narrow this
+		// when the store tracks old and new compilation-level directives.
+		if _, err := s.resolveEdgesRepoWide(ctx, repoID, []string{"csharp"}, func(tx *sql.Tx) error {
+			return reconcileReferenceIdentitiesForLanguages(ctx, tx, repoID, []string{"csharp"})
+		}); err != nil {
+			return ResolveEdgesForNamesStats{}, err
+		}
+		break
+	}
 	rubyChanged, err := s.rubyPathsChanged(ctx, repoID, paths)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err

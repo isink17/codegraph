@@ -12,7 +12,7 @@ func TestCSharpBareCallUnknownSourceStaticnessKeepsOnlyStaticCandidates(t *testi
 	instance := csharpScopeSymbol{name: "Run", qname: "C.Run", container: "C", kind: "function", visibility: "public", static: zero, arityMin: zero, arityMax: zero}
 	staticRun := csharpScopeSymbol{id: 2, name: "Run", qname: "C.Run", container: "C", kind: "function", visibility: "public", static: static, arityMin: zero, arityMax: zero}
 
-	got, strategy, ok := csharpResolveEdge(unknownSource, map[string][]csharpScopeSymbol{"Run": {instance, staticRun}}, nil, nil, csharpScopeBindings{unknown: map[string]map[string]struct{}{}, typed: map[string]map[string]map[string]struct{}{}})
+	got, strategy, ok := csharpResolveEdge(unknownSource, map[string][]csharpScopeSymbol{"Run": {instance, staticRun}}, nil, nil, nil, csharpScopeBindings{unknown: map[string]map[string]struct{}{}, typed: map[string]map[string]map[string]struct{}{}})
 	if !ok || got.id != 2 || strategy != "csharp_same_type" {
 		t.Fatalf("got id=%d strategy=%q ok=%v, want static candidate", got.id, strategy, ok)
 	}

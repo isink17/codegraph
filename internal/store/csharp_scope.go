@@ -27,6 +27,7 @@ type csharpScopeEdge struct {
 }
 
 type csharpScopeImport struct {
+	file                                 int64
 	source, imported, local, kind, owner string
 	static                               bool
 }
@@ -98,10 +99,28 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 		if err := scan(&f, &i.source, &i.imported, &i.local, &i.kind, &i.owner, &st); err != nil {
 			return err
 		}
+		i.file = f
 		i.static = st != 0
 		imports[f] = append(imports[f], i)
 		return nil
 	}); err != nil {
+		return 0, err
+	}
+	// The index has no C# project or compilation membership fact. Keep global
+	// using rows from other files as ambiguity evidence only; never import them
+	// repo-wide as if every indexed source file shared one compilation.
+	var globalImports []csharpScopeImport
+	if err := sqliteBatchedQuery(ctx, q, `SELECT file_id,source_specifier,imported_name,local_name,import_kind,owner_module,is_static FROM scope_import_evidence WHERE repo_id=? AND language='csharp' AND import_kind IN ('global_alias','global_namespace','global_static')`, "", []any{repoID}, nil, false,
+		func(rows *sql.Rows) error {
+			var i csharpScopeImport
+			var st int
+			if err := rows.Scan(&i.file, &i.source, &i.imported, &i.local, &i.kind, &i.owner, &st); err != nil {
+				return err
+			}
+			i.static = st != 0
+			globalImports = append(globalImports, i)
+			return nil
+		}); err != nil {
 		return 0, err
 	}
 	bindings := map[int64]csharpScopeBindings{}
@@ -132,7 +151,7 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 		strategy string
 	}{}
 	for _, e := range edges {
-		if dst, strategy, ok := csharpResolveEdge(e, byName, byQName, imports[e.file], bindings[e.file]); ok {
+		if dst, strategy, ok := csharpResolveEdge(e, byName, byQName, imports[e.file], globalImports, bindings[e.file]); ok {
 			res[e.id] = struct {
 				dst      int64
 				strategy string
@@ -165,7 +184,7 @@ FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.repo_id=? AND f.language='
 	return len(res), err
 }
 
-func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol, byQName map[string][]csharpScopeSymbol, imports []csharpScopeImport, bindings csharpScopeBindings) (csharpScopeSymbol, string, bool) {
+func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol, byQName map[string][]csharpScopeSymbol, imports, globalImports []csharpScopeImport, bindings csharpScopeBindings) (csharpScopeSymbol, string, bool) {
 	name := e.name
 	if name == "" || strings.HasPrefix(name, "base.") {
 		return csharpScopeSymbol{}, "", false
@@ -173,6 +192,48 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 	parts := strings.Split(name, ".")
 	method := parts[len(parts)-1]
 	qualifier := strings.Join(parts[:len(parts)-1], ".")
+	if qualifier != "" {
+		head, _, _ := strings.Cut(qualifier, ".")
+		globalTypeImportCanChangeLookup := true
+		if head == qualifier {
+			for level := e.srcNamespace; level != ""; {
+				if csharpHasTypeAtNamespace(level, qualifier, byQName) {
+					globalTypeImportCanChangeLookup = false
+					break
+				}
+				for _, i := range imports {
+					if i.kind == "alias" && i.owner == level && i.local == qualifier {
+						globalTypeImportCanChangeLookup = false
+						break
+					}
+				}
+				if !globalTypeImportCanChangeLookup {
+					break
+				}
+				if dot := strings.LastIndexByte(level, '.'); dot >= 0 {
+					level = level[:dot]
+				} else {
+					level = ""
+				}
+			}
+		}
+		for _, i := range globalImports {
+			switch i.kind {
+			case "global_alias":
+				if globalTypeImportCanChangeLookup && head == i.local {
+					return csharpScopeSymbol{}, "", false
+				}
+			case "global_namespace":
+				if globalTypeImportCanChangeLookup {
+					for _, candidate := range byQName[i.source+"."+qualifier] {
+						if candidate.kind == "type" {
+							return csharpScopeSymbol{}, "", false
+						}
+					}
+				}
+			}
+		}
+	}
 	shadowed := func(n string) bool {
 		_, local := bindings.unknown[e.srcStable][n]
 		_, typed := bindings.typed[e.srcStable][n]
@@ -278,6 +339,16 @@ func csharpResolveEdge(e csharpScopeEdge, byName map[string][]csharpScopeSymbol,
 				return out, "csharp_same_type", true
 			}
 			return csharpScopeSymbol{}, "", false
+		}
+		for _, i := range globalImports {
+			if i.kind != "global_static" {
+				continue
+			}
+			for _, candidate := range byQName[i.source+"."+method] {
+				if candidate.kind == "function" && candidate.static.Valid && candidate.static.Int64 != 0 {
+					return csharpScopeSymbol{}, "", false
+				}
+			}
 		}
 		var c2 []csharpScopeSymbol
 		seen := map[string]struct{}{}
@@ -445,6 +516,15 @@ func csharpNamespaceForType(qname string, byQName map[string][]csharpScopeSymbol
 		}
 	}
 	return first
+}
+
+func csharpHasTypeAtNamespace(namespace, name string, byQName map[string][]csharpScopeSymbol) bool {
+	for _, s := range byQName[namespace+"."+name] {
+		if s.kind == "type" {
+			return true
+		}
+	}
+	return false
 }
 
 func csharpResolveTypeIdentity(qualifier, namespace string, imports []csharpScopeImport, byQName map[string][]csharpScopeSymbol, sourceContainer string, global bool) (string, bool, bool) {
