@@ -731,6 +731,11 @@ func csharpTypeAccessibleByQName(qname, sourceContainer string, byQName map[stri
 // members) may declare the name, and an external base cannot be inspected, so
 // a base list alone preempts the using static binding.
 func csharpEnclosingTypeMayDeclare(container, name string, byName, byQName map[string][]csharpScopeSymbol) bool {
+	// Every type inherits System.Object, so its members are found in the
+	// caller's type before any using directive.
+	if csharpObjectMembers[name] {
+		return true
+	}
 	for _, s := range byName[name] {
 		if s.container != "" && (s.container == container || strings.HasPrefix(container, s.container+".")) {
 			if _, isType := csharpTypeSymbol(s.container, byQName); isType {
@@ -750,6 +755,11 @@ func csharpEnclosingTypeMayDeclare(container, name string, byName, byQName map[s
 		}
 		t = parent
 	}
+}
+
+var csharpObjectMembers = map[string]bool{
+	"Equals": true, "Finalize": true, "GetHashCode": true, "GetType": true,
+	"MemberwiseClone": true, "ReferenceEquals": true, "ToString": true,
 }
 
 // csharpTypeSymbol returns the container of the type named qname, if one is

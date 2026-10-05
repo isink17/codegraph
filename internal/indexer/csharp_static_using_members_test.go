@@ -39,9 +39,13 @@ import (
 //	Plain.One         Only() App.Util2.Only         App.Util2.Only
 //	Reopened.Run      Foo()  App.Util.Foo           App.Util.Foo (namespace reopened)
 //	Typed.Run         h.Hi() App.Helper.Hi          App.Helper.Hi (typed receiver)
+//	ObjCall.Run       ToString(1)  object.ToString (lookup stops there; CS1501)  unresolved
+//	SObj.Run          GetType(1)   object.GetType (static class too)            unresolved
+//	GenOuter.Inner.Go Foo()  App.Base.Foo           unresolved (generic outer with a base)
+//	Part.Run          Foo()  App.Base.Foo           unresolved (base list on another partial part)
 var csharpStaticUsingMembersTree = map[string]string{
 	"Util.cs": `namespace App {
-  public static class Util { public static void Foo() {} public static void Bar() {} public static void Baz() {} public static void Sfoo() {} public static void Qux() {} }
+  public static class Util { public static void Foo() {} public static void Bar() {} public static void Baz() {} public static void Sfoo() {} public static void Qux() {} public static void ToString(int x) {} public static void GetType(int x) {} }
   public static class Util2 { public static void Qux() {} public static void Only() {} }
   public class Helper { public void Hi() {} }
 }
@@ -53,6 +57,7 @@ var csharpStaticUsingMembersTree = map[string]string{
   public class Base2 { public static void Baz() {} }
   public class PBase { private void Foo() {} }
   public interface IThing { void Foo() {} }
+  public partial class Part : Base {}
 }
 `,
 	"A.cs": `using static App.Util;
@@ -79,6 +84,20 @@ namespace App {
     public void Two() { Qux(); }
     public void One() { Only(); }
   }
+  public class ObjCall {
+    public void Run() { ToString(1); }
+  }
+  public static class SObj {
+    public static void Run() { GetType(1); }
+  }
+  public class GenOuter<T> : Base {
+    public class Inner {
+      public void Go() { Foo(); }
+    }
+  }
+  public partial class Part {
+    public void Run() { Foo(); }
+  }
   public class Typed : Base { public void Run() { Helper h = new Helper(); h.Hi(); } }
 }
 `,
@@ -88,21 +107,25 @@ namespace App { public class Reopened { public void Run() { Foo(); } } }
 }
 
 var csharpStaticUsingMembersWant = map[string]string{
-	"App.Derived.Run|Foo":     "",
-	"App.DerivedS.Run|Sfoo":   "",
-	"App.Outer.Inner.Go|Bar":  "",
-	"App.Outer2.Inner.Go|Baz": "",
-	"App.Impl.Run|Foo":        "",
-	"App.Arity.Run|Foo":       "",
-	"App.StaticCtx.Run|Foo":   "",
-	"App.Priv.Run|Foo":        "",
-	"App.Self.Run|Foo":        "App.Self.Foo",
-	"App.Local.Run|Foo":       "",
-	"App.Plain.Run|Foo":       "App.Util.Foo",
-	"App.Plain.Two|Qux":       "",
-	"App.Plain.One|Only":      "App.Util2.Only",
-	"App.Reopened.Run|Foo":    "App.Util.Foo",
-	"App.Typed.Run|h.Hi":      "App.Helper.Hi",
+	"App.Derived.Run|Foo":       "",
+	"App.DerivedS.Run|Sfoo":     "",
+	"App.Outer.Inner.Go|Bar":    "",
+	"App.Outer2.Inner.Go|Baz":   "",
+	"App.Impl.Run|Foo":          "",
+	"App.Arity.Run|Foo":         "",
+	"App.StaticCtx.Run|Foo":     "",
+	"App.Priv.Run|Foo":          "",
+	"App.Self.Run|Foo":          "App.Self.Foo",
+	"App.Local.Run|Foo":         "",
+	"App.Plain.Run|Foo":         "App.Util.Foo",
+	"App.Plain.Two|Qux":         "",
+	"App.Plain.One|Only":        "App.Util2.Only",
+	"App.Reopened.Run|Foo":      "App.Util.Foo",
+	"App.Typed.Run|h.Hi":        "App.Helper.Hi",
+	"App.ObjCall.Run|ToString":  "",
+	"App.SObj.Run|GetType":      "",
+	"App.GenOuter.Inner.Go|Foo": "",
+	"App.Part.Run|Foo":          "",
 }
 
 func writeCSharpStaticUsingMembersTree(t *testing.T, extra map[string]string) string {
