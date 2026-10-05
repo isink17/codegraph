@@ -41,6 +41,9 @@ type JavaAdapter struct {
 	// legacyImportText reproduces treesitter:java:v9, which read imports from
 	// raw text (legacyJavaScope).
 	legacyImportText bool
+	// legacyCallSupertype reproduces treesitter:java:v10, which did not mark
+	// bare calls in classes that spell no supertype.
+	legacyCallSupertype bool
 }
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
@@ -49,53 +52,60 @@ func NewJava() *JavaAdapter { return &JavaAdapter{} }
 // constructor arity facts v4 records. It exists only to reproduce v3
 // databases in profile-transition tests.
 func NewJavaV3() *JavaAdapter {
-	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true}
+	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true}
 }
 
 // NewJavaV4 returns a parser that reports treesitter:java:v4 and does not mark
 // calls inside nested class bodies. It exists only to reproduce v4 databases
 // in profile-transition tests.
 func NewJavaV4() *JavaAdapter {
-	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true}
+	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true}
 }
 
 // NewJavaV5 returns a parser that reports treesitter:java:v5 and spells a
 // generic construction's class with its type arguments. It exists only to
 // reproduce v5 databases in profile-transition tests.
 func NewJavaV5() *JavaAdapter {
-	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true}
+	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true}
 }
 
 // NewJavaV6 returns a parser that reports treesitter:java:v6 and does not mark
 // constructions of a member type the calling class declares. It exists only
 // to reproduce v6 databases in profile-transition tests.
 func NewJavaV6() *JavaAdapter {
-	return &JavaAdapter{legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true}
+	return &JavaAdapter{legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true}
 }
 
 // NewJavaV7 returns a parser that reports treesitter:java:v7 and records no
 // column on edges. It exists only to reproduce v7 databases in
 // profile-transition tests.
 func NewJavaV7() *JavaAdapter {
-	return &JavaAdapter{legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true}
+	return &JavaAdapter{legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true}
 }
 
 // NewJavaV8 returns a parser that reports treesitter:java:v8 and does not mark
 // constructions in classes that spell no supertype. It exists only to
 // reproduce v8 databases in profile-transition tests.
-func NewJavaV8() *JavaAdapter { return &JavaAdapter{legacyNoInherited: true, legacyImportText: true} }
+func NewJavaV8() *JavaAdapter {
+	return &JavaAdapter{legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true}
+}
 
 // NewJavaV9 returns a parser that reports treesitter:java:v9 and reads
 // imports from raw text, so `import staticpkg.Bag;` names pkg.Bag. It exists
 // only to reproduce v9 databases in profile-transition tests.
-func NewJavaV9() *JavaAdapter { return &JavaAdapter{legacyImportText: true} }
+func NewJavaV9() *JavaAdapter { return &JavaAdapter{legacyImportText: true, legacyCallSupertype: true} }
+
+// NewJavaV10 returns a parser that reports treesitter:java:v10 and does not
+// mark bare calls in classes that spell no supertype. It exists only to
+// reproduce v10 databases in profile-transition tests.
+func NewJavaV10() *JavaAdapter { return &JavaAdapter{legacyCallSupertype: true} }
 
 // NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
 // first `package x;` spelled anywhere in the file, comments and strings
 // included, as its package. It exists only to reproduce v2 databases in
 // profile-transition tests.
 func NewJavaV2() *JavaAdapter {
-	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true}
+	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true}
 }
 
 func (a *JavaAdapter) Language() string     { return "java" }
@@ -122,7 +132,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 
 	javaExtractImports(root, content, &pf, a.legacyImportText)
 	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
-	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember, !a.legacyLineOnly, !a.legacyNoInherited)
+	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember, !a.legacyLineOnly, !a.legacyNoInherited, !a.legacyCallSupertype)
 	if a.legacyArity {
 		for i := range pf.Edges {
 			if pf.Edges[i].Kind == "constructs" {
@@ -364,7 +374,7 @@ func javaVisibility(node *sitter.Node, content []byte) string {
 	return "package"
 }
 
-func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember, markColumn, markNoInherited bool) {
+func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember, markColumn, markNoInherited, markNoSupertype bool) {
 	for _, creation := range findDescendants(root, "object_creation_expression") {
 		typeNode := childByFieldName(creation, "type")
 		if typeNode == nil {
@@ -403,6 +413,8 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 			evidence = graph.JavaCallNestedClassScopeEvidence
 		} else if obj != nil && rawConstruction && javaLocalTypeShadows(call, fullName, content) {
 			evidence = graph.JavaLocalTypeScopeEvidence
+		} else if obj == nil && markNoSupertype && javaCallNoSupertype(call) {
+			evidence = graph.JavaNoSupertypeCallEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
@@ -566,6 +578,47 @@ func javaNoInheritedTypeCreation(root, creation *sitter.Node, name string, conte
 		switch decl.Type() {
 		case "class_declaration", "interface_declaration", "record_declaration":
 		default:
+			return false
+		}
+		for i := range int(decl.NamedChildCount()) {
+			switch decl.NamedChild(i).Type() {
+			case "superclass", "super_interfaces", "extends_interfaces":
+				return false
+			}
+		}
+		switch outer := decl.Parent(); {
+		case outer == nil:
+			return false
+		case outer.Type() == "program":
+			return true
+		case outer.Type() == "class_body" || outer.Type() == "interface_body":
+			body = outer
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// javaCallNoSupertype reports whether call sits in a class or interface body
+// whose declaration, with every class or interface enclosing it, spells no
+// extends, implements or interface-extends clause, up to the compilation unit
+// (graph.JavaNoSupertypeCallEvidence). Enum, record and annotation bodies,
+// and declarations nested in anything but a class or interface body, mark
+// nothing: their implicit supertypes or members are not modelled.
+func javaCallNoSupertype(call *sitter.Node) bool {
+	var body *sitter.Node
+	for n := call.Parent(); n != nil && body == nil; n = n.Parent() {
+		switch n.Type() {
+		case "class_body", "interface_body":
+			body = n
+		case "program", "enum_body", "enum_body_declarations", "annotation_type_body":
+			return false
+		}
+	}
+	for body != nil {
+		decl := body.Parent()
+		if decl == nil || decl.Type() != "class_declaration" && decl.Type() != "interface_declaration" {
 			return false
 		}
 		for i := range int(decl.NamedChildCount()) {

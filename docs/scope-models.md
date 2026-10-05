@@ -144,7 +144,7 @@ Calls bind as follows:
 - `Type.m()` binds only a unique, visible static method. Overloads are not chosen between.
 - `new T(...)` binds the unique Java constructor whose syntactic parameter count admits the call's syntactic argument count. A trailing varargs parameter admits any number of extra arguments. Argument types are not modelled, so constructors that admit the same count compete and the call stays unresolved. An implicit default constructor is not a target.
 - A generic construction (`new Box<>(x)`, `new Box<String>(x)`, `new a.b.Box<>()`) is looked up by its raw class name and chooses its constructor by argument count like a raw one. Type arguments are not modelled and never choose between constructors or classes.
-- An unqualified call that no method of the caller's or an enclosing class shadows can bind through a static import.
+- An unqualified call that no method of the caller's or an enclosing class shadows can bind through a static import only when the caller's class and every class enclosing it are class or interface declarations that spell no `extends`, `implements` or interface `extends` clause, and the name is not a `java.lang.Object` method. Supertypes are not recorded, so an inherited method of that name, which shadows the import whatever its arity, cannot be ruled out otherwise; such a call stays unresolved, even where javac would pick the import because the inherited method is private or an interface static method.
 
 Visibility is checked as follows:
 - Private targets are visible only from their owner.

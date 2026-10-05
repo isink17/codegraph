@@ -98,6 +98,14 @@ const JavaOwnMemberTypeEvidence = "java:own_member_type"
 // (JLS 6.4.1, 8.1.4, 8.5).
 const JavaNoInheritedTypeEvidence = "java:no_inherited_member_types"
 
+// JavaNoSupertypeCallEvidence marks an unqualified Java method call in a
+// class or interface body whose declaration, with every class or interface
+// enclosing it, spells no extends, implements or interface-extends clause.
+// Such a class inherits methods only from java.lang.Object, so no other
+// inherited method can shadow a static import of that name (JLS 6.4.1,
+// 15.12.1). A call without it may have an inherited method in scope.
+const JavaNoSupertypeCallEvidence = "java:no_supertype_clause"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,
