@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 // TypeScript scope owns every TypeScript (and JavaScript) edge: the pass binds
@@ -122,16 +124,19 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 	type edge struct {
 		id, file int64
 		name     string
+		shadowed bool
 	}
 	var edges []edge
 	if err := sqliteBatchedQuery(ctx, q,
-		`SELECT e.id,e.file_id,e.dst_name FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='typescript' AND e.dst_symbol_id IS NULL`,
+		`SELECT e.id,e.file_id,e.dst_name,e.evidence FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.language='typescript' AND e.dst_symbol_id IS NULL`,
 		` AND e.id IN (%s)`, []any{repoID}, tsScopeIDArgs(only), len(only) > 0,
 		func(rows *sql.Rows) error {
 			var e edge
-			if err := rows.Scan(&e.id, &e.file, &e.name); err != nil {
+			var evidence sql.NullString
+			if err := rows.Scan(&e.id, &e.file, &e.name, &evidence); err != nil {
 				return err
 			}
+			e.shadowed = evidence.String == graph.TypeScriptCallLocalBindingEvidence
 			edges = append(edges, e)
 			return nil
 		}); err != nil {
@@ -414,6 +419,11 @@ func resolveTypeScriptScope(ctx context.Context, q execQuerier, repoID int64, on
 	}
 	results := map[int64]int64{}
 	for _, e := range edges {
+		if e.shadowed {
+			// A scope around the call binds its first name, so neither an
+			// import nor a module declaration of that name is its callee.
+			continue
+		}
 		var target tsScopeExport
 		parts := strings.Split(e.name, ".")
 		if len(parts) > 1 {

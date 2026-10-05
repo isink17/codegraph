@@ -117,7 +117,14 @@ func (a *CSharpAdapter) Profile() parser.Profile {
 	}
 	return parser.Profile{ID: "treesitter:csharp:v5", EmitsCallEdges: true}
 }
-func (a *TypeScriptAdapter) Profile() parser.Profile { return tsProfile("typescript") }
+
+// TypeScript v2 marks a call whose first name a parameter, local, catch
+// parameter or nested declaration binds (graph.TypeScriptCallLocalBindingEvidence);
+// unchanged bytes persist a different edge evidence, so every TypeScript file
+// has to reach the parser again.
+func (a *TypeScriptAdapter) Profile() parser.Profile {
+	return parser.Profile{ID: "treesitter:typescript:v2", EmitsCallEdges: true}
+}
 
 // Rust v5 records module-level const, static, extern-block items and item
 // macro invocations (graph.RustValueItem), which can shadow a glob-imported

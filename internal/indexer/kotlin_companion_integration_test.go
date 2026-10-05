@@ -396,7 +396,7 @@ func TestKotlinV4ToV5JvmCallableEvidenceConvergence(t *testing.T) {
 	}
 	for _, path := range []string{"Caller.java", "main.go", "caller.ts"} {
 		got := fileParserProfile(t, s.raw(t), repo, path)
-		want := map[string]string{"Caller.java": "treesitter:java:v10", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
+		want := map[string]string{"Caller.java": "treesitter:java:v10", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v2"}[path]
 		if got != want {
 			t.Fatalf("unrelated %s profile=%q want %q", path, got, want)
 		}
@@ -463,7 +463,7 @@ func TestJavaKotlinArityProfileConvergence(t *testing.T) {
 		}
 	}
 	for _, path := range []string{"main.go", "caller.ts"} {
-		want := map[string]string{"main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v1"}[path]
+		want := map[string]string{"main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v2"}[path]
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("unrelated %s profile=%q", path, got)
 		}

@@ -105,6 +105,13 @@ const JavaNoInheritedTypeEvidence = "java:no_inherited_member_types"
 // may answer it.
 const RustCallBlockScopeEvidence = "rust:block_scope_item"
 
+// TypeScriptCallLocalBindingEvidence marks a TypeScript or JavaScript call
+// whose first name a scope between it and the module binds itself (a
+// parameter, a local, a catch parameter, a nested declaration), or which a
+// module-level declaration rebinds against an import. No import and no module
+// declaration is proven to be its callee.
+const TypeScriptCallLocalBindingEvidence = "typescript:local_binding"
+
 // RustTraitImplVisibility is the visibility recorded for an item of a trait
 // impl (`impl Trait for T`). Such an item is as visible as the trait, which
 // the parser does not know, so it is neither private nor public.
