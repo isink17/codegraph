@@ -64,6 +64,15 @@ var javaStaticImportInheritedTree = map[string]string{
 func assertJavaStaticImportInheritedTargets(t *testing.T, r *lifecycleRepo, step string) {
 	t.Helper()
 	calls := javaEdgesByCallee(t, r, "calls")
+	// Anonymous-class and enum-constant bodies emit no call edge today; if one
+	// ever does, it must not bind the import over the supertype's method.
+	for key, g := range calls {
+		if strings.HasPrefix(key, "app.Anon.") || strings.HasPrefix(key, "app.En.") {
+			if len(g) != 1 || g[0] != "" {
+				t.Errorf("%s: %s bound %q, want unresolved", step, key, g)
+			}
+		}
+	}
 	for key, want := range map[string]string{
 		"app.Inst.run|foo":     "",
 		"app.Stat.run|foo":     "",
