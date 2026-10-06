@@ -13,7 +13,18 @@ const execFile = promisify(require('node:child_process').execFile);
 const { assetFor, install, PLATFORMS } = require('../lib/installer');
 
 const version = require('../package.json').version;
-const fixture = process.env.CODEGRAPH_TEST_BINARY || path.join(__dirname, 'native-fixture');
+const ownsFixture = !process.env.CODEGRAPH_TEST_BINARY;
+const fixtureDir = ownsFixture ? fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-native fixture ')) : undefined;
+const fixture = process.env.CODEGRAPH_TEST_BINARY || path.join(fixtureDir, `native-fixture${process.platform === 'win32' ? '.exe' : ''}`);
+process.env.CODEGRAPH_TEST_VERSION ||= version;
+if (ownsFixture) {
+  const built = spawnSync('go', ['build', '-o', fixture, './npm/test/native-fixture.go'], {
+    cwd: path.resolve(__dirname, '../..'),
+    env: process.env,
+    encoding: 'utf8',
+  });
+  if (built.status !== 0) throw new Error(`building native test fixture failed: ${built.stderr || built.error}`);
+}
 const binaryBytes = fs.readFileSync(fixture);
 let mode = 'ok';
 let requests = [];
@@ -42,7 +53,10 @@ const base = async () => {
   await listen;
   return `http://127.0.0.1:${server.address().port}`;
 };
-after(() => server.close());
+after(async () => {
+  await new Promise(resolve => server.close(resolve));
+  if (ownsFixture) fs.rmSync(fixtureDir, { recursive: true, force: true });
+});
 
 function tempPackage() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph npm fixture '));

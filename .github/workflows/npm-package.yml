@@ -32,13 +32,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Build local native fixture
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = Windows ]; then fixture="$RUNNER_TEMP/codegraph-fixture.exe"; else fixture="$RUNNER_TEMP/codegraph-fixture"; fi
-          go build -o "$fixture" npm/test/native-fixture.go
-          echo "CODEGRAPH_TEST_BINARY=$fixture" >> "$GITHUB_ENV"
-          echo 'CODEGRAPH_TEST_VERSION=0.0.0-dev' >> "$GITHUB_ENV"
       - name: Test packed installation
         working-directory: npm
         run: |
