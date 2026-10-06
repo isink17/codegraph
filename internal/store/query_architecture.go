@@ -33,7 +33,7 @@ func (s *Store) topDegreeSymbols(ctx context.Context, repoID int64, degreeCol, c
 		oppositeVisible = "e.dst_symbol_id IS NULL OR osf.id IS NOT NULL"
 	}
 	out := []map[string]any{}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		WITH degrees AS (
 			SELECT e.`+degreeCol+` AS sid, COUNT(1) AS degree
 			FROM edges e
@@ -108,7 +108,7 @@ func (s *Store) fillZeroDegree(ctx context.Context, repoID int64, degreeCol, cou
 		otherCol = "dst_symbol_id"
 		oppositeVisible = "e.dst_symbol_id IS NULL OR osf.id IS NOT NULL"
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT s.qualified_name, s.kind, f.path
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0

@@ -168,7 +168,7 @@ func (s *Store) importsForFiles(ctx context.Context, repoID int64, fileIDs []int
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT file_id, import_path
 			FROM file_imports
 			WHERE repo_id = ? AND file_id IN (`+placeholders+`)
@@ -243,7 +243,7 @@ func (s *Store) languageNamesDefinedInProject(ctx context.Context, repoID int64,
 		for _, language := range orderedLanguages {
 			args = append(args, language)
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT DISTINCT s.language, s.name
 			FROM symbols s
 			WHERE s.repo_id = ? AND s.name IN (`+placeholders+`)
