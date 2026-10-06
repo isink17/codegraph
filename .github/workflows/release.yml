@@ -88,46 +88,7 @@ jobs:
 
       - name: Build archive
         shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME}"
-          dist="dist"
-          binary="codegraph"
-          binary_name="${binary}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            binary_name="${binary}.exe"
-          fi
-          archive_base="${binary}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
-          mkdir -p "${dist}/${archive_base}"
-          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=1 go build -v -x -ldflags "-X github.com/isink17/codegraph/internal/version.Version=${version}" -o "${dist}/${archive_base}/${binary_name}" ./cmd/codegraph
-          actual="$("${dist}/${archive_base}/${binary_name}" --version)"
-          expected="codegraph ${version}"
-          if [ "${actual}" != "${expected}" ]; then
-            echo "version mismatch: got ${actual}, want ${expected}"
-            exit 1
-          fi
-          cp README.md "${dist}/${archive_base}/README.md"
-          cp LICENSE "${dist}/${archive_base}/LICENSE"
-          native_asset="codegraph-${version}-${{ matrix.goos }}_${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then native_asset="${native_asset}.exe"; fi
-          cp "${dist}/${archive_base}/${binary_name}" "${dist}/${native_asset}"
-          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            (
-              cd "${dist}/${archive_base}"
-              zip -q -r "../${archive_base}.zip" .
-            )
-            if [ "${RUNNER_OS}" = "macOS" ]; then checksum="shasum -a 256"; else checksum="sha256sum"; fi
-            ${checksum} "${dist}/${archive_base}.zip" > "${dist}/${archive_base}.zip.sha256"
-          else
-            tar -C "${dist}" -czf "${dist}/${archive_base}.tar.gz" "${archive_base}"
-            if [ "${RUNNER_OS}" = "macOS" ]; then checksum="shasum -a 256"; else checksum="sha256sum"; fi
-            ${checksum} "${dist}/${archive_base}.tar.gz" > "${dist}/${archive_base}.tar.gz.sha256"
-          fi
-          if [ "${RUNNER_OS}" = "macOS" ]; then
-            shasum -a 256 "${dist}/${native_asset}" | awk '{print $1}' > "${dist}/${native_asset}.sha256"
-          else
-            sha256sum "${dist}/${native_asset}" | awk '{print $1}' > "${dist}/${native_asset}.sha256"
-          fi
+        run: bash .github/scripts/build-release-asset.sh "${GITHUB_REF_NAME}" "${{ matrix.goos }}" "${{ matrix.goarch }}" "${{ matrix.archive_ext }}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

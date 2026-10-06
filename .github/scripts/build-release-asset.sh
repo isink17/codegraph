@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+version=${1:?usage: build-release-asset.sh TAG GOOS GOARCH ARCHIVE_EXT [DIST]}
+goos=${2:?usage: build-release-asset.sh TAG GOOS GOARCH ARCHIVE_EXT [DIST]}
+goarch=${3:?usage: build-release-asset.sh TAG GOOS GOARCH ARCHIVE_EXT [DIST]}
+archive_ext=${4:?usage: build-release-asset.sh TAG GOOS GOARCH ARCHIVE_EXT [DIST]}
+dist=${5:-dist}
+
+[[ "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+case "$goos/$goarch/$archive_ext" in
+  linux/amd64/tar.gz|linux/arm64/tar.gz|darwin/amd64/tar.gz|darwin/arm64/tar.gz|windows/amd64/zip|windows/arm64/zip) ;;
+  *) echo "unsupported release target: $goos/$goarch/$archive_ext" >&2; exit 1 ;;
+esac
+
+binary=codegraph
+binary_name=codegraph
+[[ "$goos" == windows ]] && binary_name=codegraph.exe
+archive_base="codegraph_${version}_${goos}_${goarch}"
+mkdir -p "$dist/$archive_base"
+GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=1 go build -v -x \
+  -ldflags "-X github.com/isink17/codegraph/internal/version.Version=$version" \
+  -o "$dist/$archive_base/$binary_name" ./cmd/codegraph
+
+actual=$("$dist/$archive_base/$binary_name" --version)
+expected="codegraph $version"
+if [[ "$actual" != "$expected" ]]; then
+  echo "version mismatch: got $actual, want $expected" >&2
+  exit 1
+fi
+cp README.md LICENSE "$dist/$archive_base/"
+
+native_asset="codegraph-${version}-${goos}_${goarch}"
+[[ "$goos" == windows ]] && native_asset+=".exe"
+cp "$dist/$archive_base/$binary_name" "$dist/$native_asset"
+
+case "$archive_ext" in
+  zip)
+    (cd "$dist/$archive_base" && zip -q -r "../$archive_base.zip" .)
+    archive="$dist/$archive_base.zip"
+    ;;
+  tar.gz)
+    tar -C "$dist" -czf "$dist/$archive_base.tar.gz" "$archive_base"
+    archive="$dist/$archive_base.tar.gz"
+    ;;
+esac
+
+checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+}
+checksum "$archive" >"$archive.sha256"
+checksum "$dist/$native_asset" | awk '{print $1}' >"$dist/$native_asset.sha256"
+[[ -s "$archive" && -s "$archive.sha256" && -s "$dist/$native_asset" && -s "$dist/$native_asset.sha256" ]]
