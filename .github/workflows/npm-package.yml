@@ -2,15 +2,25 @@ name: npm package
 
 on:
   push:
-    branches: [v2.0]
+    branches: [v2.0, 'ci/release-matrix-*']
     paths:
       - 'npm/**'
+      - '.github/scripts/build-release-asset.sh'
+      - '.github/scripts/setup-windows-arm64-cgo.ps1'
+      - '.github/scripts/smoke-windows-arm64-release.ps1'
+      - '.github/scripts/verify-release-assets.sh'
+      - '.github/scripts/verify-release-assets_test.sh'
       - '.github/workflows/npm-package.yml'
       - '.github/workflows/release.yml'
   pull_request:
     branches: [v2.0]
     paths:
       - 'npm/**'
+      - '.github/scripts/build-release-asset.sh'
+      - '.github/scripts/setup-windows-arm64-cgo.ps1'
+      - '.github/scripts/smoke-windows-arm64-release.ps1'
+      - '.github/scripts/verify-release-assets.sh'
+      - '.github/scripts/verify-release-assets_test.sh'
       - '.github/workflows/npm-package.yml'
       - '.github/workflows/release.yml'
 
@@ -18,6 +28,119 @@ permissions:
   contents: read
 
 jobs:
+  release-shaped:
+    if: ${{ (github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[release-dry-run]')) || (github.event_name == 'push' && startsWith(github.ref_name, 'ci/release-matrix-')) }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            goos: linux
+            goarch: amd64
+            archive_ext: tar.gz
+          - runner: ubuntu-22.04-arm
+            goos: linux
+            goarch: arm64
+            archive_ext: tar.gz
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            archive_ext: tar.gz
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+            archive_ext: tar.gz
+          - runner: windows-2025
+            goos: windows
+            goarch: amd64
+            archive_ext: zip
+          - runner: windows-11-arm
+            goos: windows
+            goarch: arm64
+            archive_ext: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Diagnose native Windows ARM64 toolchain
+        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }}
+        shell: pwsh
+        run: |
+          go version
+          go env GOHOSTOS GOHOSTARCH GOOS GOARCH CGO_ENABLED CC CXX
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,OSArchitecture
+          $env:PROCESSOR_ARCHITECTURE
+          where.exe gcc
+          where.exe clang
+          $gcc = (Get-Command gcc).Source
+          $clang = (Get-Command clang).Source
+          & $gcc --version
+          & $gcc -dumpmachine
+          & $clang --version
+          & $clang --target=aarch64-w64-windows-gnu -print-target-triple
+      - name: Install pinned llvm-mingw and prove native cgo
+        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }}
+        shell: pwsh
+        run: ./\.github\scripts\setup-windows-arm64-cgo.ps1
+      - name: Build release-shaped assets
+        shell: bash
+        run: bash .github/scripts/build-release-asset.sh v2.0.0 ${{ matrix.goos }} ${{ matrix.goarch }} ${{ matrix.archive_ext }}
+      - name: Smoke-test Windows ARM64 release binary
+        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }}
+        shell: pwsh
+        run: ./.github/scripts/smoke-windows-arm64-release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/codegraph-v*
+          retention-days: 1
+
+  release-shape-check:
+    if: ${{ (github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[release-dry-run]')) || (github.event_name == 'push' && startsWith(github.ref_name, 'ci/release-matrix-')) }}
+    needs: release-shaped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Stage npm version and verify complete artifact set
+        working-directory: npm
+        run: |
+          npm version 2.0.0 --no-git-tag-version --ignore-scripts
+          bash ../.github/scripts/verify-release-assets.sh package.json v2.0.0 ../dist
+          bash ../.github/scripts/verify-release-assets_test.sh
+      - name: Verify archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz; do
+            base=$(basename "$archive" .tar.gz)
+            expected=$(printf '%s\n' "$base/LICENSE" "$base/README.md" "$base/codegraph" | sort)
+            actual=$(tar -tzf "$archive" | grep -v '/$' | sort)
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual")
+          done
+          for archive in dist/*.zip; do
+            expected=$(printf '%s\n' 'LICENSE' 'README.md' 'codegraph.exe' | sort)
+            actual=$(unzip -Z1 "$archive" | sed '/\/$/d' | sort)
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual")
+          done
+
   packed-install:
     runs-on: ${{ matrix.os }}
     strategy:
