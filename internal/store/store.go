@@ -1831,21 +1831,27 @@ func (s *Store) BeginScan(ctx context.Context, repoID int64, kind string) (int64
 }
 
 func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSummary, started time.Time, status string, errText string) error {
-	finished := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	if err := completeScanTx(ctx, tx, scanID, summary, started, status, errText); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func completeScanTx(ctx context.Context, tx *sql.Tx, scanID int64, summary ScanSummary, started time.Time, status string, errText string) error {
+	finished := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE scans
 		SET finished_at = ?, status = ?, files_seen = ?, files_changed = ?, files_deleted = ?, error_text = ?
 		WHERE id = ?
 	`, finished.Format(time.RFC3339), status, summary.FilesSeen, summary.FilesChanged, summary.FilesDeleted, errText, scanID); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM scan_language_coverage WHERE scan_id = ?`, scanID); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	if len(summary.LanguageCoverage) > 0 {
@@ -1854,18 +1860,16 @@ func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSumm
 			VALUES(?, ?, ?, ?, ?, ?)
 		`)
 		if err != nil {
-			_ = tx.Rollback()
 			return err
 		}
 		defer stmt.Close()
 		for lang, cov := range summary.LanguageCoverage {
 			if _, err := stmt.ExecContext(ctx, scanID, lang, cov.Seen, cov.Indexed, cov.Skipped, cov.ParseFailed); err != nil {
-				_ = tx.Rollback()
 				return err
 			}
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) MarkFilesSeenBatch(ctx context.Context, repoID, scanID int64, paths []string) error {
@@ -7407,6 +7411,9 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 // traversal from a hub symbol reaches most of a repository. Callers that need
 // the whole closure rather than a tool-sized answer use impactClosure directly.
 func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth, limit, offset int) (map[string]any, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	symbolList, fileList, presence, unresolvedEdges, unresolvedNames, err := s.impactClosureWithPresence(ctx, repoID, symbols, files, depth)
 	if err != nil {
 		return nil, err
@@ -7730,6 +7737,9 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 }
 
 func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]RelatedTest, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
 		return nil, err
 	}
@@ -7978,6 +7988,9 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 }
 
 func (s *Store) GraphSnapshot(ctx context.Context, repoID int64, focusSymbol string, depth int) ([]graph.Symbol, []ExportEdge, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, nil, err
+	}
 	if strings.TrimSpace(focusSymbol) == "" {
 		symbols, err := s.loadSymbolsForExport(ctx, repoID, nil)
 		if err != nil {
@@ -8069,6 +8082,9 @@ func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit,
 }
 
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+exportEdgeColumnsSQL+`
 		FROM edges e `+activeEdgeJoinsSQL+`
@@ -8910,6 +8926,9 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 // It returns one page of the traversal plus the total number of nodes reached,
 // so a caller can report a bounded page without implying it is the whole chain.
 func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, 0, err
+	}
 	result, err := s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 	return result.Dependencies, result.Total, err
 }
@@ -9143,6 +9162,9 @@ func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
 // iteration order reaches the scores, without the whole-graph identity load a
 // graph-ordered float sum would need.
 func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	limit = safeLimit(limit)
 
 	// Step 1: load all resolved edges.
@@ -9408,6 +9430,9 @@ func (s *Store) symbolIdentities(ctx context.Context, ids []int64) (map[int64]sy
 
 // CouplingMetrics computes file-level coupling based on cross-file edge counts.
 func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	limit = safeLimit(limit)
 
 	cRows, err := s.db.QueryContext(ctx, `
@@ -9464,6 +9489,9 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 // DetectCycles finds circular dependencies at the file level using DFS with
 // white/gray/black coloring.
 func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	limit = safeLimit(limit)
 
 	// Build file-level dependency graph.
@@ -9658,6 +9686,9 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 
 // FindDeadCode returns symbols with no incoming edges and no references — likely dead code.
 func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT s.id, s.qualified_name, s.kind, s.name, f.path, f.language,
 		       s.start_line, s.start_col, s.end_line, s.end_col
@@ -10115,6 +10146,9 @@ func appendUnique(slice []string, val string) []string {
 // including language breakdown, top-level directories, symbol/edge kind
 // breakdowns, key entry points, and hub symbols.
 func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[string]any, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	// Deriving the totals from the breakdowns (below) removed the Stats call
 	// that used to front this function, and with it the only thing that failed
 	// for a repository id that does not exist. Without this probe an unknown id

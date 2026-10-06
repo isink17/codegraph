@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser"
 )
 
 func TestPlanParserSemanticEpochs(t *testing.T) {
@@ -50,6 +52,41 @@ func TestPlanParserSemanticEpochs(t *testing.T) {
 	}
 	if _, err := s.PlanParserSemanticEpochs(ctx, 1, current, func(lang string) bool { return lang == "python" }); err != nil {
 		t.Fatalf("unaffected malformed Java marker blocked Python-only operation: %v", err)
+	}
+}
+
+func TestParserSemanticPendingIsResumableButFutureStateRefuses(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	current := map[string]int{"java": parser.SemanticEpochs()["java"]}
+	all := func(string) bool { return true }
+	if err := s.BeginParserSemanticTransitions(ctx, 9, current, []string{"java"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.PlanParserSemanticEpochs(ctx, 9, current, all); err != nil || len(got) != 1 || got[0] != "java" {
+		t.Fatalf("pending plan=%v, %v", got, err)
+	}
+	if err := s.CheckParserSemanticGraph(ctx, 9); !errors.Is(err, ErrParserSemanticIncomplete) {
+		t.Fatalf("graph check=%v, want incomplete", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value=? WHERE key=?`, fmt.Sprintf("v1:0:%d", current["java"]+1), parserSemanticPendingKey(9, "java")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PlanParserSemanticEpochs(ctx, 9, current, all); !errors.Is(err, ErrParserSemanticNewer) {
+		t.Fatalf("future pending plan=%v, want newer", err)
+	}
+	if err := s.CheckParserSemanticGraph(ctx, 9); !errors.Is(err, ErrParserSemanticNewer) {
+		t.Fatalf("future pending query=%v, want newer", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value=? WHERE key=?`, "broken", parserSemanticPendingKey(9, "java")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckParserSemanticGraph(ctx, 9); !errors.Is(err, ErrParserSemanticMalformed) {
+		t.Fatalf("malformed pending query=%v, want malformed", err)
 	}
 }
 

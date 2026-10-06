@@ -4,13 +4,17 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
 	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 // Every Kotlin file below ends in a declaration after the annotated one: that
@@ -285,5 +289,80 @@ func TestKotlinV6ToV7DetachedAnnotationRecoveryConvergence(t *testing.T) {
 	again, err := r.idx.Update(ctx, Options{RepoRoot: root})
 	if err != nil || again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 || again.ResolveMode != "none" {
 		t.Fatalf("second update=%+v, %v; want no-op", again, err)
+	}
+}
+
+func TestKotlinSemanticTransitionFailureIsPendingAndRetryConverges(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "Caller.java"), "package app; import lib.FacadeKt; class Caller { void call() { FacadeKt.run(); } }\n")
+	writeProfileFile(t, filepath.Join(root, "Facade.kt"), "package lib\n@JvmName(\"run\")\nfun oldName() {}\n")
+	s := newProfileStore(t)
+	legacy := New(s.Store, parser.NewRegistry(tsparser.NewJava(), tsparser.NewKotlinV6()), nil)
+	if _, err := legacy.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	semanticKey := fmt.Sprintf("parser.semantic.%d.kotlin", repo)
+	var oldMarker string
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, semanticKey).Scan(&oldMarker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `CREATE TRIGGER fail_transition_resolve BEFORE UPDATE OF dst_symbol_id ON edges WHEN NEW.dst_symbol_id IS NOT OLD.dst_symbol_id BEGIN SELECT RAISE(FAIL, 'injected transition resolver failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	current := New(s.Store, lifecycleRegistry(), nil)
+	if _, err := current.Update(ctx, Options{RepoRoot: root}); err == nil || !strings.Contains(err.Error(), "injected transition resolver failure") {
+		t.Fatalf("transition error=%v, want injected resolver failure", err)
+	}
+	var scanStatus, scanError string
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT status,error_text FROM scans WHERE repo_id=? ORDER BY id DESC LIMIT 1`, repo).Scan(&scanStatus, &scanError); err != nil || scanStatus != "failed" || !strings.Contains(scanError, "injected transition resolver failure") {
+		t.Fatalf("failed transition scan status=%q error=%q queryErr=%v", scanStatus, scanError, err)
+	}
+	var gotMarker string
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, semanticKey).Scan(&gotMarker); err != nil {
+		t.Fatal(err)
+	}
+	if gotMarker != oldMarker {
+		t.Fatalf("converged Kotlin marker=%q, want unchanged %q", gotMarker, oldMarker)
+	}
+	var pending string
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, fmt.Sprintf("parser.semantic.pending.%d.kotlin", repo)).Scan(&pending); err != nil {
+		t.Fatalf("pending marker: %v", err)
+	}
+	wantPending := fmt.Sprintf("v1:%s:%d", oldMarker, parser.SemanticEpochForProfile("treesitter:kotlin:v11"))
+	if pending != wantPending {
+		t.Fatalf("pending marker=%q, want %q", pending, wantPending)
+	}
+	if _, err := s.Store.FindCallers(ctx, repo, "lib.oldName", 0, 10, 0); !errors.Is(err, store.ErrParserSemanticIncomplete) {
+		t.Fatalf("relationship query error=%v, want incomplete refusal", err)
+	}
+	if _, err := s.Store.ConstraintEdges(ctx, repo); !errors.Is(err, store.ErrParserSemanticIncomplete) {
+		t.Fatalf("constraint graph query error=%v, want incomplete refusal", err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `DROP TRIGGER fail_transition_resolve`); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FilesIndexed == 0 || summary.ResolveMode != "repo" {
+		t.Fatalf("retry summary=%+v, want parser and repo reconciliation", summary)
+	}
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, semanticKey).Scan(&gotMarker); err != nil {
+		t.Fatal(err)
+	}
+	if gotMarker != strconv.Itoa(parser.SemanticEpochForProfile("treesitter:kotlin:v11")) {
+		t.Fatalf("converged marker=%q", gotMarker)
+	}
+	if err := s.Store.CheckParserSemanticGraph(ctx, repo); err != nil {
+		t.Fatalf("pending state after retry: %v", err)
+	}
+	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: s.path, store: s.Store, idx: current, repoID: repo}
+	r.assertFreshParity(t, "failed Kotlin semantic transition retry")
+	second, err := current.Update(ctx, Options{RepoRoot: root})
+	if err != nil || second.FilesChanged != 0 || second.FilesIndexed != 0 || second.ResolveMode != "none" {
+		t.Fatalf("second update=%+v, %v; want no-op", second, err)
 	}
 }

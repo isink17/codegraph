@@ -298,6 +298,9 @@ func (s *Store) symbolPage(ctx context.Context, target execQuerier, repoID int64
 //     unknownTargetHints). No target exists, so no target language, package,
 //     file or class is invented to scope those hints.
 func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	var targetIDs []int64
 	var err error
 	if symbolID != 0 {
@@ -479,6 +482,9 @@ func (s *Store) unresolvedDstNamesExtending(ctx context.Context, repoID int64, q
 // destination identities are semantic relationships; unresolved destinations
 // remain evidence and are not promoted by query-time name lookup.
 func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	srcIDs, err := s.lookupQuerySymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {
 		return nil, err

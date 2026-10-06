@@ -142,6 +142,9 @@ func explainNotEvaluated() []string {
 // pair rows from one graph state with facts from another. Edges are ordered by
 // file, line, destination name, kind and id.
 func (s *Store) ExplainEdges(ctx context.Context, repoID int64, sel EdgeSelector) (ExplainResult, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return ExplainResult{}, err
+	}
 	if err := sel.Validate(); err != nil {
 		return ExplainResult{}, err
 	}

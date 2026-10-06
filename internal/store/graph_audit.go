@@ -448,6 +448,9 @@ func edgeAuditPredicate(check EdgeAuditCheck, caps GraphAuditCapabilities) (pred
 // It returns ErrAuditCheckUnsupported when this database's schema cannot answer
 // the check.
 func (s *Store) RunEdgeAuditCheck(ctx context.Context, repoID int64, check EdgeAuditCheck, caps GraphAuditCapabilities, exampleLimit int) (EdgeAuditResult, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return EdgeAuditResult{}, err
+	}
 	predicate, detailExpr, needsJoins, err := edgeAuditPredicate(check, caps)
 	if err != nil {
 		return EdgeAuditResult{}, err
@@ -497,6 +500,9 @@ func (s *Store) RunEdgeAuditCheck(ctx context.Context, repoID int64, check EdgeA
 // one and is enforced by SQLite. A NULL reference is not dangling -- it is the
 // documented result of the unbind paths -- so every clause requires NOT NULL.
 func (s *Store) RunDanglingTestLinkCheck(ctx context.Context, repoID int64, exampleLimit int) (TestLinkAuditResult, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return TestLinkAuditResult{}, err
+	}
 	const from = `
 		FROM test_links tl
 		LEFT JOIN files tf ON tf.id = tl.test_file_id
@@ -548,6 +554,9 @@ func (s *Store) RunDanglingTestLinkCheck(ctx context.Context, repoID int64, exam
 
 // GraphAuditSummaryFor returns the size of the graph in one pass per table.
 func (s *Store) GraphAuditSummaryFor(ctx context.Context, repoID int64) (GraphAuditSummary, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return GraphAuditSummary{}, err
+	}
 	var out GraphAuditSummary
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(is_deleted), 0)
@@ -582,6 +591,9 @@ func (s *Store) GraphAuditSummaryFor(ctx context.Context, repoID int64) (GraphAu
 // Both return ErrAuditCheckUnsupported on a pre-019 schema, where the columns
 // do not exist.
 func (s *Store) ResolutionStrategyDistribution(ctx context.Context, repoID int64, caps GraphAuditCapabilities) (map[string]int64, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	if !caps.HasResolutionMetadata {
 		return nil, ErrAuditCheckUnsupported
 	}
@@ -590,6 +602,9 @@ func (s *Store) ResolutionStrategyDistribution(ctx context.Context, repoID int64
 
 // ResolutionConfidenceDistribution counts resolved edges per confidence tier.
 func (s *Store) ResolutionConfidenceDistribution(ctx context.Context, repoID int64, caps GraphAuditCapabilities) (map[string]int64, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	if !caps.HasResolutionMetadata {
 		return nil, ErrAuditCheckUnsupported
 	}
@@ -671,6 +686,9 @@ const auditClassificationPageSize = 1000
 // idx_edges_repo_dst as a (repo_id, dst_symbol_id, rowid>?) range scan, with no
 // temporary b-tree for the ORDER BY.
 func (s *Store) UnresolvedTargetClassificationCounts(ctx context.Context, repoID int64, caps GraphAuditCapabilities) (map[string]int64, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	counts := map[string]int64{}
 	var afterID int64
 	for {

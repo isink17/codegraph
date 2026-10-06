@@ -143,6 +143,9 @@ func (s *Store) likeSymbolsMatched(ctx context.Context, repoID int64, query stri
 }
 
 func (s *Store) FindCallersResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (NeighborResult, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return NeighborResult{}, err
+	}
 	var ids []int64
 	if symbolID != 0 {
 		identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, symbolID)
@@ -175,6 +178,9 @@ func (s *Store) FindCallersResult(ctx context.Context, repoID int64, symbol stri
 }
 
 func (s *Store) FindCalleesResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (NeighborResult, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return NeighborResult{}, err
+	}
 	var ids []int64
 	if symbolID != 0 {
 		identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, symbolID)
@@ -201,6 +207,9 @@ func (s *Store) FindCalleesResult(ctx context.Context, repoID int64, symbol stri
 }
 
 func (s *Store) RelatedTestsResult(ctx context.Context, repoID int64, symbol, file string, limit, offset int) (RelatedTestsResult, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return RelatedTestsResult{}, err
+	}
 	if symbol != "" {
 		targetID, err := s.lookupSymbolID(ctx, repoID, symbol, 0)
 		found := err == nil
@@ -294,5 +303,8 @@ func (s *Store) filePresent(ctx context.Context, repoID int64, file string) (boo
 }
 
 func (s *Store) TraceDependenciesResult(ctx context.Context, repoID int64, symbol, direction string, maxDepth, limit, offset int) (TraceResult, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return TraceResult{}, err
+	}
 	return s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 }

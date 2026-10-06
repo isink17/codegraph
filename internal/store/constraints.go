@@ -83,6 +83,9 @@ func (s *Store) ConstraintFiles(ctx context.Context, repoID int64) ([]Constraint
 // missing symbol is dropped rather than reported as unresolved, because it is
 // neither a trustworthy dependency nor a blind spot of the parser.
 func (s *Store) ConstraintEdges(ctx context.Context, repoID int64) ([]ConstraintEdge, error) {
+	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT srcf.path, e.line, e.edge_kind, src.qualified_name, src.start_line, src.stable_key,
 		       e.dst_symbol_id IS NOT NULL,

@@ -246,6 +246,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	pendingTransition, err := i.store.HasParserSemanticTransitionPending(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
 	if !pathScoped && (scanKind != "update" || !xlangCurrent) {
 		for _, language := range semanticStale {
 			if !affectedLanguage(language) {
@@ -268,7 +272,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// The resulting repo-wide resolver must therefore preflight every indexed
 	// language's semantic marker before the first scan write, including markers
 	// outside a path-scoped request.
-	semanticTransition := len(profilePlan.reparseLanguages) > 0
+	semanticTransition := pendingTransition || len(profilePlan.reparseLanguages) > 0
 	if semanticTransition {
 		allIndexed := func(language string) bool {
 			_, ok := indexedLanguages[language]
@@ -317,6 +321,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	// Every refusal is behind us: only now may a known repository row, or the
 	// canonical-path marker of an empty one, be written.
+	if semanticTransition {
+		if err := i.store.BeginParserSemanticTransitions(ctx, repo.ID, semanticEpochs, profilePlan.languages()); err != nil {
+			return store.ScanSummary{}, err
+		}
+	}
 	if repoKnown {
 		if repo, err = i.store.UpsertRepo(ctx, opts.RepoRoot); err != nil {
 			return store.ScanSummary{}, err
@@ -1040,7 +1049,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	resolveStart := time.Now()
 	repoWideResolve := false
 
-	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
+	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 && !semanticTransition {
 		summary.ResolveMS = 0
 		summary.ResolveMode = "none"
 	} else if incrementalResolve && !semanticTransition {
@@ -1209,23 +1218,44 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if summary.FilesTotal > 0 {
 		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100
 	}
-	if err := i.store.StampParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticLanguages); err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
-	}
-	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
-		return summary, err
-	}
-	if composerChanged {
-		if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+	if semanticTransition {
+		if composerChanged {
+			if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+		}
+		if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
-		if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+		if err := i.store.CompleteScanWithParserSemanticEpochs(ctx, scanID, summary, started, repo.ID, semanticEpochs, semanticLanguages); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
-	}
-	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
-		return summary, err
+	} else {
+		if err := i.store.StampParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticLanguages); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
+			return summary, err
+		}
+		if composerChanged {
+			if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+				return summary, err
+			}
+			if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+				return summary, err
+			}
+		}
+		if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
+			return summary, err
+		}
 	}
 	return summary, nil
 }
