@@ -3,6 +3,9 @@
   "version": "0.0.0-dev",
   "description": "Verified installer for the native CodeGraph binary",
   "license": "SEE LICENSE IN LICENSE",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/isink17/codegraph.git",
