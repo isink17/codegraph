@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script="$(dirname "$0")/verify-release-assets.sh"
+script="$(cd "$(dirname "$0")" && pwd)/verify-release-assets.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/assets"
@@ -21,6 +21,10 @@ for target in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 wi
 done
 
 bash "$script" "$tmp/package.json" v2.0.0 "$tmp/assets"
+(
+  cd "$tmp"
+  bash "$script" package.json v2.0.0 assets
+)
 
 rejects() {
   if bash "$script" "$@" >/dev/null 2>&1; then

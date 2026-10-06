@@ -10,7 +10,7 @@ if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   exit 1
 fi
 
-version=$(node -e 'process.stdout.write(require(process.argv[1]).version)' "$package_json")
+version=$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).version)' "$package_json")
 tag_version=${tag#v}
 if [[ "$version" != "$tag_version" ]]; then
   echo "package version $version does not match tag $tag" >&2
