@@ -37,3 +37,4 @@ jobs:
         run: |
           npm test
           npm pack --dry-run
+          bash ../.github/scripts/verify-release-assets_test.sh

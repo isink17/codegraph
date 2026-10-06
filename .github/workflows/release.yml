@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -14,6 +14,14 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -55,9 +63,14 @@ jobs:
             goarch: arm64
             archive_ext: zip
 
+    # All jobs on a release tag build the same immutable tag; never rerun a
+    # completed publication workflow to replace assets under an existing tag.
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -136,6 +149,14 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -170,7 +191,15 @@ jobs:
 
           tail -n +2 release-notes-full.md > release-notes.md
 
-      - name: Create or update GitHub release
+      - name: Verify complete native asset set and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-dist
+          find dist -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" -o -name "*.zip" -o -name "*.zip.sha256" -o -name "codegraph-v*" \) -exec cp {} release-dist/ \;
+          bash .github/scripts/verify-release-assets.sh npm/package.json "${GITHUB_REF_NAME}" release-dist
+
+      - name: Create draft GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -178,14 +207,13 @@ jobs:
           set -euo pipefail
 
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release edit "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
-              --notes-file release-notes.md
-          else
-            gh release create "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
-              --notes-file release-notes.md
+            echo "Release ${GITHUB_REF_NAME} already exists; refusing to overwrite or reuse it." >&2
+            exit 1
           fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            --draft
 
       - name: Upload release assets
         env:
@@ -193,4 +221,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" release-dist/* --clobber
+          gh release upload "${GITHUB_REF_NAME}" release-dist/*
+
+      - name: Verify uploaded release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uploaded=$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name' | sort)
+          expected=$(for f in release-dist/*; do basename "$f"; done | sort)
+          diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$uploaded")
+
+      - name: Publish verified GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false
