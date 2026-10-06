@@ -124,6 +124,7 @@ jobs:
         run: |
           npm version 2.0.0 --no-git-tag-version --ignore-scripts
           bash ../.github/scripts/verify-release-assets.sh package.json v2.0.0 ../dist
+          bash ../.github/scripts/verify-release-assets_test.sh
       - name: Verify archive contents
         shell: bash
         run: |

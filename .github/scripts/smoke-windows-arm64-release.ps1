@@ -19,25 +19,25 @@ $stats = & $binary stats $fixture --json | Out-String
 if ($LASTEXITCODE -ne 0 -or $stats -notmatch 'typescript') { throw "Tree-sitter capability smoke failed: $stats" }
 
 $env:CODEGRAPH_NPM_TEST_MODE = '1'
-$listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add('http://localhost:18743/')
-$listener.Start()
-$serve = Start-Job -ArgumentList $listener, (Join-Path $PWD 'dist') -ScriptBlock {
-  param($http, $assets)
-  while ($http.IsListening) {
-    try {
-      $context = $http.GetContext()
-      $name = [System.IO.Path]::GetFileName([Uri]::UnescapeDataString($context.Request.Url.AbsolutePath))
-      $file = Join-Path $assets $name
-      if (Test-Path $file) {
-        $bytes = [IO.File]::ReadAllBytes($file); $context.Response.StatusCode = 200
-        $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-      } else { $context.Response.StatusCode = 404 }
-      $context.Response.Close()
-    } catch { break }
-  }
-}
+$ready = Join-Path $env:RUNNER_TEMP 'release-fixture-ready'
+$serverScript = Join-Path $env:RUNNER_TEMP 'release-fixture-server.js'
+@'
+const fs = require('node:fs'), http = require('node:http'), path = require('node:path');
+const assets = process.argv[2], ready = path.join(process.env.RUNNER_TEMP, 'release-fixture-ready');
+http.createServer((req, res) => {
+  const name = path.basename(decodeURIComponent(new URL(req.url, 'http://localhost').pathname));
+  const file = path.join(assets, name);
+  if (!fs.existsSync(file)) { res.writeHead(404).end(); return; }
+  res.writeHead(200).end(fs.readFileSync(file));
+}).listen(18743, '127.0.0.1', () => fs.writeFileSync(ready, 'ready'));
+'@ | Set-Content -Encoding utf8 $serverScript
+$server = Start-Process -FilePath node -ArgumentList @($serverScript, (Join-Path $PWD 'dist')) -PassThru -NoNewWindow
 try {
+  for ($i = 0; $i -lt 100 -and !(Test-Path $ready); $i++) {
+    if ($server.HasExited) { throw "Asset fixture server exited with code $($server.ExitCode)." }
+    Start-Sleep -Milliseconds 100
+  }
+  if (!(Test-Path $ready)) { throw 'Asset fixture server did not become ready.' }
   $env:CODEGRAPH_NPM_TEST_RELEASE_BASE_URL = 'http://localhost:18743'
   Push-Location npm
   try {
@@ -54,8 +54,6 @@ try {
   & $installed doctor
   if ($LASTEXITCODE -ne 0) { throw 'Installed npm doctor failed.' }
 } finally {
-  Stop-Job $serve -ErrorAction SilentlyContinue
-  Remove-Job $serve -Force -ErrorAction SilentlyContinue
-  $listener.Stop(); $listener.Close()
+  Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
 }
 Write-Host 'Windows ARM64 PE, version, doctor, TypeScript cgo parsing, and npm checksum install passed.'

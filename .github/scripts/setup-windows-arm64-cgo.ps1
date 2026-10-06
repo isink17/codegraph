@@ -9,6 +9,7 @@ $zip = Join-Path $env:RUNNER_TEMP $archive
 $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive"
 Invoke-WebRequest -Uri $url -OutFile $zip
 $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+Write-Host "llvm-mingw $version archive SHA-256=$actual"
 if ($actual -ne $sha256) { throw "llvm-mingw SHA-256 mismatch: $actual" }
 Expand-Archive -Path $zip -DestinationPath $root -Force
 $clang = Get-ChildItem $root -Recurse -Filter aarch64-w64-mingw32-clang.exe | Select-Object -First 1 -ExpandProperty FullName
