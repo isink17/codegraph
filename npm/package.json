@@ -1,0 +1,32 @@
+{
+  "name": "@isink17/codegraph",
+  "version": "0.0.0-dev",
+  "description": "Verified installer for the native CodeGraph binary",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/isink17/codegraph.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/isink17/codegraph",
+  "bugs": {
+    "url": "https://github.com/isink17/codegraph/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "codegraph": "bin/codegraph.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js",
+    "test": "node --test test/*.test.js",
+    "pack:check": "npm pack --dry-run"
+  },
+  "files": [
+    "bin/codegraph.js",
+    "install.js",
+    "lib/installer.js",
+    "LICENSE"
+  ]
+}

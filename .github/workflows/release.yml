@@ -95,6 +95,9 @@ jobs:
           fi
           cp README.md "${dist}/${archive_base}/README.md"
           cp LICENSE "${dist}/${archive_base}/LICENSE"
+          native_asset="codegraph-${version}-${{ matrix.goos }}_${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then native_asset="${native_asset}.exe"; fi
+          cp "${dist}/${archive_base}/${binary_name}" "${dist}/${native_asset}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             (
               cd "${dist}/${archive_base}"
@@ -107,6 +110,11 @@ jobs:
             if [ "${RUNNER_OS}" = "macOS" ]; then checksum="shasum -a 256"; else checksum="sha256sum"; fi
             ${checksum} "${dist}/${archive_base}.tar.gz" > "${dist}/${archive_base}.tar.gz.sha256"
           fi
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            shasum -a 256 "${dist}/${native_asset}" | awk '{print $1}' > "${dist}/${native_asset}.sha256"
+          else
+            sha256sum "${dist}/${native_asset}" | awk '{print $1}' > "${dist}/${native_asset}.sha256"
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -117,6 +125,7 @@ jobs:
             dist/*.tar.gz.sha256
             dist/*.zip
             dist/*.zip.sha256
+            dist/codegraph-v*
 
   release:
     needs: build
@@ -138,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-dist
-          find dist -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" -o -name "*.zip" -o -name "*.zip.sha256" \) -exec cp {} release-dist/ \;
+          find dist -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" -o -name "*.zip" -o -name "*.zip.sha256" -o -name "codegraph-v*" \) -exec cp {} release-dist/ \;
 
       - name: Extract release notes from CHANGELOG.md
         shell: bash

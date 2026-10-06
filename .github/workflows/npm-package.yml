@@ -1,0 +1,46 @@
+name: npm package
+
+on:
+  push:
+    branches: [v2.0]
+    paths:
+      - 'npm/**'
+      - '.github/workflows/npm-package.yml'
+      - '.github/workflows/release.yml'
+  pull_request:
+    branches: [v2.0]
+    paths:
+      - 'npm/**'
+      - '.github/workflows/npm-package.yml'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  packed-install:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build local native fixture
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then fixture="$RUNNER_TEMP/codegraph-fixture.exe"; else fixture="$RUNNER_TEMP/codegraph-fixture"; fi
+          go build -o "$fixture" npm/test/native-fixture.go
+          echo "CODEGRAPH_TEST_BINARY=$fixture" >> "$GITHUB_ENV"
+          echo 'CODEGRAPH_TEST_VERSION=0.0.0-dev' >> "$GITHUB_ENV"
+      - name: Test packed installation
+        working-directory: npm
+        run: |
+          npm test
+          npm pack --dry-run
