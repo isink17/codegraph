@@ -19,7 +19,9 @@ fun call() { Service.run() }`
 	assertJVMUnresolved(t, r, "Caller.kt", "Service.run")
 
 	r.write(t, "Service.java", java)
-	r.update(t, "Service.java")
+	if summary := r.update(t, "Service.java"); summary.ResolveMode != "paths+names" {
+		t.Fatalf("ordinary Java update resolve mode=%q, want paths+names", summary.ResolveMode)
+	}
 	assertJVMResolved(t, r, "Caller.kt", "Service.run", "Service.java", "kotlin_import_scope")
 	assertJVMReference(t, r, "Caller.kt", "Service.run", true)
 	r.assertFreshParity(t, "peer add")

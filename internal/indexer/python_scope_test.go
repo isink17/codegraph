@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ import (
 type pyRepo struct {
 	ctx    context.Context
 	root   string
+	dbPath string
 	store  *store.Store
 	idx    *Indexer
 	repoID int64
@@ -26,12 +28,13 @@ type pyRepo struct {
 func newPyRepo(t *testing.T, reg *parser.Registry, files map[string]string) *pyRepo {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(filepath.Join(t.TempDir(), "codegraph.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "codegraph.sqlite")
+	s, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	r := &pyRepo{ctx: ctx, root: t.TempDir(), store: s, idx: New(s, reg, nil)}
+	r := &pyRepo{ctx: ctx, root: t.TempDir(), dbPath: dbPath, store: s, idx: New(s, reg, nil)}
 	for rel, content := range files {
 		r.write(t, rel, content)
 	}
@@ -44,6 +47,16 @@ func newPyRepo(t *testing.T, reg *parser.Registry, files map[string]string) *pyR
 	}
 	r.repoID = repo.ID
 	return r
+}
+
+func (r *pyRepo) raw(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }
 
 func (r *pyRepo) write(t *testing.T, rel, content string) {
@@ -227,6 +240,208 @@ func runPythonScopeCases(t *testing.T, reg *parser.Registry) {
 
 func TestPythonImportScopeRegexAdapter(t *testing.T) {
 	runPythonScopeCases(t, parser.NewRegistry(pyparser.New()))
+}
+
+func runPythonUnstableBindingCases(t *testing.T, reg *parser.Registry) {
+	t.Helper()
+	r := newPyRepo(t, reg, map[string]string{
+		"pkg/__init__.py":               "",
+		"pkg/decorators.py":             "def plain(fn):\n    return replacement\n\ndef factory():\n    return plain\n\ndef replacement():\n    return 0\n",
+		"pkg/decorated.py":              "from pkg.decorators import plain, factory\n\n@plain\ndef f():\n    return 1\n\n@factory()\ndef g():\n    return 1\n\n@plain\n@factory\ndef h():\n    return 1\n\n@plain\ndef unrelated():\n    return 1\n\ndef stable():\n    return 1\n\ndef call_f():\n    return f()\ndef call_g():\n    return g()\ndef call_h():\n    return h()\ndef call_unrelated():\n    return unrelated()\ndef call_stable():\n    return stable()\n",
+		"pkg/globals_case.py":           "def f():\n    return 1\ndef g():\n    return 2\nglobals()[\"f\"] = g\ndef call_f():\n    return f()\ndef call_g():\n    return g()\n",
+		"pkg/computed_globals.py":       "def f():\n    return 1\nkey = \"f\"\nglobals()[key] = lambda: 2\ndef call_f():\n    return f()\n",
+		"pkg/lib.py":                    "def helper():\n    return 1\ndef other():\n    return 2\ndef target():\n    return 3\n",
+		"pkg/patch_setattr.py":          "from pkg import lib\ndef replacement():\n    return 0\nsetattr(lib, \"helper\", replacement)\ndef call_helper():\n    return lib.helper()\ndef call_other():\n    return lib.other()\n",
+		"pkg/patch_shadowed_setattr.py": "from pkg import lib\ndef setattr(obj, name, value):\n    return None\ndef fake():\n    return 0\nsetattr(lib, \"helper\", fake)\ndef call_helper():\n    return lib.helper()\n",
+		"pkg/custom_setter.py":          "def setattr(obj, name, value):\n    return None\n",
+		"pkg/patch_imported_setattr.py": "from pkg import lib\nfrom pkg.custom_setter import setattr\ndef fake():\n    return 0\nsetattr(lib, \"helper\", fake)\ndef call_helper():\n    return lib.helper()\n",
+		"pkg/patch_setter_after.py":     "from pkg import lib\nsetattr(lib, \"helper\", fake)\ndef setattr(obj, name, value):\n    return None\ndef fake():\n    return 0\ndef call_helper():\n    return lib.helper()\n",
+		"pkg/patch_assigned_setattr.py": "from pkg import lib\ndef custom(obj, name, value):\n    return None\nsetattr = custom\ndef fake():\n    return 0\nsetattr(lib, \"helper\", fake)\ndef call_helper():\n    return lib.helper()\n",
+		"pkg/patch_class_setattr.py":    "from pkg import lib\nclass setattr:\n    def __init__(self, obj, name, value):\n        pass\ndef fake():\n    return 0\nsetattr(lib, \"helper\", fake)\ndef call_helper():\n    return lib.helper()\n",
+		"pkg/patch_direct.py":           "from pkg import lib\ndef replacement():\n    return 0\nlib.other = replacement\ndef call_other():\n    return lib.other()\ndef call_helper():\n    return lib.helper()\n",
+		"pkg/patch_receiver.py":         "from pkg import lib, decorators\ndef replacement():\n    return 0\nsetattr(decorators, \"helper\", replacement)\ndef call_helper():\n    return lib.helper()\n",
+		"pkg/patch_computed.py":         "from pkg import lib\ndef replacement():\n    return 0\nname = \"helper\"\nsetattr(lib, name, replacement)\ndef call_helper():\n    return lib.helper()\n",
+	})
+	for _, tc := range []struct{ file, name, want string }{
+		{"pkg/decorated.py", "f", "<unresolved>"},
+		{"pkg/decorated.py", "g", "<unresolved>"},
+		{"pkg/decorated.py", "h", "<unresolved>"},
+		{"pkg/decorated.py", "unrelated", "<unresolved>"},
+		{"pkg/decorated.py", "stable", "pkg/decorated.py:decorated.stable [python_module_scope]"},
+		{"pkg/globals_case.py", "f", "<unresolved>"},
+		{"pkg/globals_case.py", "g", "pkg/globals_case.py:globals_case.g [python_module_scope]"},
+		{"pkg/computed_globals.py", "f", "pkg/computed_globals.py:computed_globals.f [python_module_scope]"},
+		{"pkg/patch_setattr.py", "lib.helper", "<unresolved>"},
+		{"pkg/patch_shadowed_setattr.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]"},
+		{"pkg/patch_imported_setattr.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]"},
+		{"pkg/patch_setter_after.py", "lib.helper", "<unresolved>"},
+		{"pkg/patch_assigned_setattr.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]"},
+		{"pkg/patch_class_setattr.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]"},
+		{"pkg/patch_setattr.py", "lib.other", "pkg/lib.py:lib.other [python_import_scope]"},
+		{"pkg/patch_direct.py", "lib.other", "<unresolved>"},
+		{"pkg/patch_direct.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]"},
+		{"pkg/patch_receiver.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]"},
+		{"pkg/patch_computed.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]"},
+	} {
+		if got := r.edgeState(t, tc.file, tc.name); !strings.Contains(got, tc.want) {
+			t.Errorf("%s %s: got %s; want %s", tc.file, tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestPythonUnstableModuleBindingsRegex(t *testing.T) {
+	runPythonUnstableBindingCases(t, parser.NewRegistry(pyparser.New()))
+}
+
+func TestPythonUnstableBindingLifecycle(t *testing.T) {
+	reg := parser.NewRegistry(pyparser.New())
+	base := map[string]string{
+		"pkg/__init__.py":     "",
+		"pkg/decorators.py":   "def plain(fn):\n    return replacement\n\ndef factory():\n    return plain\n\ndef replacement():\n    return 0\n",
+		"pkg/decorated.py":    "def f():\n    return 1\ndef g():\n    return 2\ndef stable():\n    return 3\ndef call_f():\n    return f()\ndef call_g():\n    return g()\ndef call_stable():\n    return stable()\n",
+		"pkg/globals_case.py": "def f():\n    return 1\ndef g():\n    return 2\ndef call_f():\n    return f()\ndef call_g():\n    return g()\n",
+		"pkg/lib.py":          "def helper():\n    return 1\ndef other():\n    return 2\ndef target():\n    return 3\n",
+		"pkg/patch.py":        "from pkg import lib\ndef replacement():\n    return 0\ndef call_helper():\n    return lib.helper()\ndef call_other():\n    return lib.other()\ndef call_target():\n    return lib.target()\n",
+	}
+	r := newPyRepo(t, reg, base)
+	assertFresh := func(step string) {
+		t.Helper()
+		want := newPyRepo(t, reg, readTree(t, r.root)).projection(t)
+		if diff := pythonProjectionDiff(want, r.projection(t)); diff != "" {
+			t.Fatalf("%s: update differs from fresh index:\n%s", step, diff)
+		}
+	}
+	assertTarget := func(file, name, want string) {
+		t.Helper()
+		if got := r.edgeState(t, file, name); !strings.Contains(got, want) {
+			t.Fatalf("%s %s: got %s; want %s", file, name, got, want)
+		}
+	}
+	assertTarget("pkg/decorated.py", "f", "pkg/decorated.py:decorated.f [python_module_scope]")
+	assertTarget("pkg/globals_case.py", "f", "pkg/globals_case.py:globals_case.f [python_module_scope]")
+	assertTarget("pkg/patch.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]")
+
+	// Seed the prior high-confidence edges and reference identities as if this
+	// source had been indexed before the mutation semantics were understood.
+	for _, stale := range []struct{ file, name, target string }{
+		{"pkg/decorated.py", "f", "decorated.f"},
+		{"pkg/globals_case.py", "f", "globals_case.f"},
+		{"pkg/patch.py", "lib.helper", "lib.helper"},
+	} {
+		var id int64
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT id FROM symbols WHERE repo_id=? AND qualified_name=?`, r.repoID, stale.target).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.raw(t).ExecContext(r.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy='python_module_scope',resolution_confidence='high' WHERE repo_id=? AND dst_name=? AND file_id=(SELECT id FROM files WHERE repo_id=? AND path=?)`, id, r.repoID, stale.name, r.repoID, stale.file); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.raw(t).ExecContext(r.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=? AND ref_kind='call' AND name=? AND file_id=(SELECT id FROM files WHERE repo_id=? AND path=?)`, id, r.repoID, stale.name, r.repoID, stale.file); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r.write(t, "pkg/decorated.py", "from pkg.decorators import plain, factory\n@plain\ndef f():\n    return 1\n@factory()\ndef g():\n    return 2\ndef stable():\n    return 3\ndef call_f():\n    return f()\ndef call_g():\n    return g()\ndef call_stable():\n    return stable()\n")
+	r.write(t, "pkg/globals_case.py", "def f():\n    return 1\ndef g():\n    return 2\nglobals()[\"f\"] = g\ndef call_f():\n    return f()\ndef call_g():\n    return g()\n")
+	r.write(t, "pkg/patch.py", "from pkg import lib\ndef replacement():\n    return 0\nsetattr(lib, \"helper\", replacement)\nlib.other = replacement\ndef call_helper():\n    return lib.helper()\ndef call_other():\n    return lib.other()\ndef call_target():\n    return lib.target()\n")
+	r.update(t)
+	for _, unresolved := range []struct{ file, name string }{{"pkg/decorated.py", "f"}, {"pkg/decorated.py", "g"}, {"pkg/globals_case.py", "f"}, {"pkg/patch.py", "lib.helper"}, {"pkg/patch.py", "lib.other"}} {
+		assertTarget(unresolved.file, unresolved.name, "<unresolved>")
+		var edge, ref sql.NullInt64
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT e.dst_symbol_id,r.symbol_id FROM edges e JOIN files f ON f.id=e.file_id JOIN references_tbl r ON r.file_id=e.file_id AND r.ref_kind='call' AND r.name=e.dst_name WHERE e.repo_id=? AND f.path=? AND e.dst_name=?`, r.repoID, unresolved.file, unresolved.name).Scan(&edge, &ref); err != nil {
+			t.Fatalf("read cleared identities for %s %s: %v", unresolved.file, unresolved.name, err)
+		}
+		if edge.Valid || ref.Valid {
+			t.Fatalf("%s %s retained edge/reference identities: %v / %v", unresolved.file, unresolved.name, edge, ref)
+		}
+	}
+	assertTarget("pkg/decorated.py", "stable", "pkg/decorated.py:decorated.stable [python_module_scope]")
+	assertTarget("pkg/globals_case.py", "g", "pkg/globals_case.py:globals_case.g [python_module_scope]")
+	assertTarget("pkg/patch.py", "lib.target", "pkg/lib.py:lib.target [python_import_scope]")
+	assertFresh("add mutations")
+
+	// Recreate the v2.0 profile/evidence shape of an existing graph, including
+	// its old high-confidence targets, then let ordinary update reparse it.
+	legacy := newPyRepo(t, reg, readTree(t, r.root))
+	for _, stale := range []struct{ file, name, target string }{
+		{"pkg/decorated.py", "f", "decorated.f"},
+		{"pkg/decorated.py", "g", "decorated.g"},
+		{"pkg/globals_case.py", "f", "globals_case.f"},
+		{"pkg/patch.py", "lib.helper", "lib.helper"},
+		{"pkg/patch.py", "lib.other", "lib.other"},
+	} {
+		var id int64
+		if err := legacy.raw(t).QueryRowContext(legacy.ctx, `SELECT id FROM symbols WHERE repo_id=? AND qualified_name=?`, legacy.repoID, stale.target).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := legacy.raw(t).ExecContext(legacy.ctx, `UPDATE edges SET dst_symbol_id=?,resolution_strategy='python_module_scope',resolution_confidence='high' WHERE repo_id=? AND dst_name=? AND file_id=(SELECT id FROM files WHERE repo_id=? AND path=?)`, id, legacy.repoID, stale.name, legacy.repoID, stale.file); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := legacy.raw(t).ExecContext(legacy.ctx, `UPDATE references_tbl SET symbol_id=? WHERE repo_id=? AND ref_kind='call' AND name=? AND file_id=(SELECT id FROM files WHERE repo_id=? AND path=?)`, id, legacy.repoID, stale.name, legacy.repoID, stale.file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, evidence := range []struct{ file, name string }{
+		{"pkg/decorated.py", "f"}, {"pkg/decorated.py", "g"},
+		{"pkg/globals_case.py", "f"}, {"pkg/patch.py", "lib.helper"}, {"pkg/patch.py", "lib.other"},
+	} {
+		if _, err := legacy.raw(t).ExecContext(legacy.ctx, `DELETE FROM scope_import_evidence WHERE repo_id=? AND language='python' AND import_kind='local_binding' AND local_name=? AND owner_module='' AND file_id=(SELECT id FROM files WHERE repo_id=? AND path=?)`, legacy.repoID, evidence.name, legacy.repoID, evidence.file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := legacy.raw(t).ExecContext(legacy.ctx, `UPDATE files SET parser_profile='python-regex:python:v8' WHERE repo_id=? AND language='python'`, legacy.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.idx.Update(legacy.ctx, Options{RepoRoot: legacy.root, ScanKind: "update"}); err != nil {
+		t.Fatalf("ordinary update of legacy v8 graph: %v", err)
+	}
+	for _, unresolved := range []struct{ file, name string }{
+		{"pkg/decorated.py", "f"}, {"pkg/decorated.py", "g"}, {"pkg/globals_case.py", "f"}, {"pkg/patch.py", "lib.helper"}, {"pkg/patch.py", "lib.other"},
+	} {
+		if got := legacy.edgeState(t, unresolved.file, unresolved.name); !strings.Contains(got, "<unresolved>") {
+			t.Fatalf("legacy upgrade %s %s: %s", unresolved.file, unresolved.name, got)
+		}
+		var edge, ref sql.NullInt64
+		if err := legacy.raw(t).QueryRowContext(legacy.ctx, `SELECT e.dst_symbol_id,r.symbol_id FROM edges e JOIN files f ON f.id=e.file_id JOIN references_tbl r ON r.file_id=e.file_id AND r.ref_kind='call' AND r.name=e.dst_name WHERE e.repo_id=? AND f.path=? AND e.dst_name=?`, legacy.repoID, unresolved.file, unresolved.name).Scan(&edge, &ref); err != nil {
+			t.Fatal(err)
+		}
+		if edge.Valid || ref.Valid {
+			t.Fatalf("legacy upgrade retained %s %s identities: %v / %v", unresolved.file, unresolved.name, edge, ref)
+		}
+	}
+	wantLegacy := newPyRepo(t, reg, readTree(t, legacy.root)).projection(t)
+	if diff := pythonProjectionDiff(wantLegacy, legacy.projection(t)); diff != "" {
+		t.Fatalf("legacy upgrade differs from fresh index:\n%s", diff)
+	}
+
+	// Change only the literal mutation names: calls to the old names recover,
+	// and the new names become unresolved.
+	r.write(t, "pkg/globals_case.py", "def f():\n    return 1\ndef g():\n    return 2\nglobals()[\"g\"] = f\ndef call_f():\n    return f()\ndef call_g():\n    return g()\n")
+	r.write(t, "pkg/patch.py", "from pkg import lib\ndef replacement():\n    return 0\nsetattr(lib, \"target\", replacement)\nlib.helper = replacement\ndef call_helper():\n    return lib.helper()\ndef call_other():\n    return lib.other()\ndef call_target():\n    return lib.target()\n")
+	r.update(t)
+	assertTarget("pkg/globals_case.py", "f", "pkg/globals_case.py:globals_case.f [python_module_scope]")
+	assertTarget("pkg/globals_case.py", "g", "<unresolved>")
+	assertTarget("pkg/patch.py", "lib.helper", "<unresolved>")
+	assertTarget("pkg/patch.py", "lib.target", "<unresolved>")
+	assertTarget("pkg/patch.py", "lib.other", "pkg/lib.py:lib.other [python_import_scope]")
+	assertFresh("change mutation names")
+
+	// Removing the mutations and decorators restores the original bindings.
+	for path, content := range base {
+		r.write(t, path, content)
+	}
+	r.update(t)
+	assertTarget("pkg/decorated.py", "f", "pkg/decorated.py:decorated.f [python_module_scope]")
+	assertTarget("pkg/globals_case.py", "g", "pkg/globals_case.py:globals_case.g [python_module_scope]")
+	assertTarget("pkg/patch.py", "lib.helper", "pkg/lib.py:lib.helper [python_import_scope]")
+	assertFresh("remove mutations")
+	before := strings.Join(r.projection(t), "\n")
+	summary, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FilesChanged != 0 || summary.FilesIndexed != 0 || strings.Join(r.projection(t), "\n") != before {
+		t.Fatalf("second update was not a no-op: summary=%+v", summary)
+	}
 }
 
 // The wildcard form is deliberately not supported: `from x import *` publishes

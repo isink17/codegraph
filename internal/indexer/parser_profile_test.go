@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -438,6 +439,225 @@ func TestParserProfileDowngradeRefusedWithZeroMutation(t *testing.T) {
 	}
 }
 
+func TestFutureParserSemanticEpochRefusedBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "A.java"), "class A {}\n")
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\n")
+	s := newProfileStore(t)
+	current := parser.SemanticEpochForProfile("treesitter:java:v11")
+	idx := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "treesitter:java:v11"), callCapable("go", ".go", "go-ast:go:v1")), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `UPDATE settings SET value=? WHERE key=?`, fmt.Sprint(current+1), fmt.Sprintf("parser.semantic.%d.java", repoID(t, s, root))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: root, Paths: []string{"main.go"}}); err != nil {
+		t.Fatalf("Go-only path update was blocked by future Java state: %v", err)
+	}
+	before := graphSnapshot(t, s)
+	for _, run := range []struct {
+		name string
+		fn   func() (store.ScanSummary, error)
+	}{
+		{"update", func() (store.ScanSummary, error) { return idx.Update(ctx, Options{RepoRoot: root}) }},
+		{"index", func() (store.ScanSummary, error) { return idx.Index(ctx, Options{RepoRoot: root}) }},
+		{"path-scoped", func() (store.ScanSummary, error) {
+			return idx.Update(ctx, Options{RepoRoot: root, Paths: []string{"A.java"}})
+		}},
+	} {
+		_, err := run.fn()
+		if !errors.Is(err, store.ErrParserSemanticNewer) {
+			t.Fatalf("%s error = %v, want future parser semantic refusal", run.name, err)
+		}
+		if after := graphSnapshot(t, s); after != before {
+			t.Fatalf("%s mutated graph on refusal:\nbefore=%+v\nafter=%+v", run.name, before, after)
+		}
+	}
+}
+
+func TestTransitionPreflightsFutureUnselectedLanguageBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "A.java"), "class A {}\n")
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\n")
+	s := newProfileStore(t)
+	initial := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "java:v1"), callCapable("go", ".go", "go:v1")), nil)
+	if _, err := initial.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	if _, err := s.raw(t).ExecContext(ctx, `UPDATE settings SET value=? WHERE key=?`, "2", fmt.Sprintf("parser.semantic.%d.java", repo)); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\nfunc Added() {}\n")
+	before := graphSnapshot(t, s)
+	transition := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "java:v1"), callCapable("go", ".go", "go:v2")), nil)
+	_, err := transition.Update(ctx, Options{RepoRoot: root, Paths: []string{"main.go"}})
+	if !errors.Is(err, store.ErrParserSemanticNewer) {
+		t.Fatalf("transition error=%v, want future Java semantic refusal", err)
+	}
+	if after := graphSnapshot(t, s); after != before {
+		t.Fatalf("transition mutated graph before future-state refusal:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+func TestMissingParserSemanticMarkerUpgradesOnOrdinaryUpdate(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "A.java"), "class A {}\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "treesitter:java:v11")), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `DELETE FROM settings WHERE key=?`, fmt.Sprintf("parser.semantic.%d.java", repoID(t, s, root))); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("ordinary update of legacy graph: %v", err)
+	}
+	if upgraded.FilesIndexed == 0 || upgraded.ResolveMode != "repo" {
+		t.Fatalf("ordinary update did not reparse and reconcile legacy parser semantics: %+v", upgraded)
+	}
+	second, err := idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.FilesIndexed != 0 || second.FilesChanged != 0 {
+		t.Fatalf("second update was not a no-op: %+v", second)
+	}
+}
+
+func TestPendingParserSemanticTransitionRecoversAfterLastFileRetired(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	file := filepath.Join(root, "Only.kt")
+	writeProfileFile(t, file, "class Only {}\n")
+	s := newProfileStore(t)
+	current := parser.SemanticEpochForProfile("treesitter:kotlin:v11")
+	idx := New(s.Store, parser.NewRegistry(callCapable("kotlin", ".kt", "treesitter:kotlin:v11")), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	if err := s.Store.BeginParserSemanticTransitions(ctx, repo, map[string]int{"kotlin": current}, []string{"kotlin"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `UPDATE files SET is_deleted=1 WHERE repo_id=? AND language='kotlin'`, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `DELETE FROM settings WHERE key=?`, "derived.cross_language_links_current.v2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("ordinary update could not resume transition after last file retired: %v", err)
+	}
+	if updated.ResolveMode != "repo" {
+		t.Fatalf("retry resolve mode = %q, want repo", updated.ResolveMode)
+	}
+	if pending, err := s.Store.HasParserSemanticTransitionPending(ctx, repo); err != nil || pending {
+		t.Fatalf("pending state after recovery = %v, %v; want false", pending, err)
+	}
+	var marker string
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, fmt.Sprintf("parser.semantic.%d.kotlin", repo)).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if marker != fmt.Sprint(current) {
+		t.Fatalf("certified Kotlin generation = %q, want %d", marker, current)
+	}
+}
+
+func TestFilteredFullIndexRefusesUnselectedStaleParserLanguage(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "A.java"), "class A {}\n")
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "treesitter:java:v11"), callCapable("go", ".go", "go-ast:go:v1")), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	if _, err := s.raw(t).ExecContext(ctx, `DELETE FROM settings WHERE key=?`, fmt.Sprintf("parser.semantic.%d.java", repo)); err != nil {
+		t.Fatal(err)
+	}
+	before := graphSnapshot(t, s)
+	_, err := idx.Index(ctx, Options{RepoRoot: root, Languages: []string{"go"}})
+	if !errors.Is(err, store.ErrParserSemanticUpgradeRequired) {
+		t.Fatalf("filtered full index err=%v, want unselected stale parser refusal", err)
+	}
+	if after := graphSnapshot(t, s); after != before {
+		t.Fatalf("filtered refusal mutated graph:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+func TestFilteredFullIndexFutureUnselectedLanguageRefusesBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "A.java"), "class A {}\n")
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "treesitter:java:v11"), callCapable("go", ".go", "go-ast:go:v1")), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	if _, err := s.raw(t).ExecContext(ctx, `UPDATE settings SET value=? WHERE key=?`, fmt.Sprint(parser.SemanticEpochForProfile("treesitter:java:v11")+1), fmt.Sprintf("parser.semantic.%d.java", repo)); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\nfunc Added() {}\n")
+	before := graphSnapshot(t, s)
+	_, err := idx.Index(ctx, Options{RepoRoot: root, Languages: []string{"go"}})
+	if !errors.Is(err, store.ErrParserSemanticNewer) {
+		t.Fatalf("filtered full index err=%v, want future Java semantic refusal", err)
+	}
+	if after := graphSnapshot(t, s); after != before {
+		t.Fatalf("future-state refusal mutated graph:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+func TestGoPathUpdateDoesNotRebindFutureJavaDottedEdge(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "caller.java"), "class caller {}\n")
+	writeProfileFile(t, filepath.Join(root, "callee.java"), "class callee {}\n")
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\n")
+	s := newProfileStore(t)
+	idx := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "treesitter:java:v11"), callCapable("go", ".go", "go-ast:go:v1")), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	db := s.raw(t)
+	if _, err := db.ExecContext(ctx, `UPDATE symbols SET qualified_name='pkg.callee',qualified_suffix='callee',dot_tail2='pkg.callee' WHERE repo_id=? AND name='callee'`, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE edges SET dst_name='pkg.callee',dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE repo_id=? AND file_id=(SELECT id FROM files WHERE repo_id=? AND path='caller.java')`, repo, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE settings SET value=? WHERE key=?`, fmt.Sprint(parser.SemanticEpochForProfile("treesitter:java:v11")+1), fmt.Sprintf("parser.semantic.%d.java", repo)); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\nfunc Added() {}\n")
+	if _, err := idx.Update(ctx, Options{RepoRoot: root, Paths: []string{"main.go"}}); err != nil {
+		t.Fatalf("Go-only path update: %v", err)
+	}
+	var dst sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges e JOIN files f ON f.id=e.file_id WHERE f.repo_id=? AND f.path='caller.java'`, repo).Scan(&dst); err != nil {
+		t.Fatal(err)
+	}
+	if dst.Valid {
+		t.Fatalf("Go-only path update rebound future Java dotted edge to %d", dst.Int64)
+	}
+}
+
 func TestParserProfilePathScopedTransitionExpandsSelectedLanguage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -699,7 +919,8 @@ type snapshot struct {
 	// a refused transition left such a file untouched.
 	ScopeImports, ModuleCandidates int
 	SwiftLexicalBindings           int
-	Provenance                     string
+	Provenance, Markers, FileState string
+	ScanState                      string
 }
 
 func graphSnapshot(t *testing.T, s *profileStore) snapshot {
@@ -718,11 +939,14 @@ func graphSnapshot(t *testing.T, s *profileStore) snapshot {
 		       (SELECT COUNT(*) FROM scope_module_candidate_evidence),
 		       (SELECT COUNT(*) FROM swift_lexical_binding_evidence),
 		       (SELECT COALESCE(GROUP_CONCAT(path || '=' || parser_profile || ':' || parser_call_edges), '')
-		          FROM (SELECT path, parser_profile, parser_call_edges FROM files ORDER BY path))
+		          FROM (SELECT path, parser_profile, parser_call_edges FROM files ORDER BY path)),
+	       (SELECT COALESCE(GROUP_CONCAT(key || '=' || value, ','), '') FROM (SELECT key,value FROM settings WHERE key LIKE 'parser.semantic.%' OR key LIKE 'resolver.policy.%' ORDER BY key)),
+		       (SELECT COALESCE(GROUP_CONCAT(path || '=' || language || ':' || size_bytes || ':' || mtime_unix_ns || ':' || content_sha256 || ':' || parse_state || ':' || is_deleted || ':' || last_scan_id || ':' || indexed_at || ':' || parser_semantic_epoch, ','), '') FROM (SELECT path,language,size_bytes,mtime_unix_ns,content_sha256,parse_state,is_deleted,last_scan_id,indexed_at,parser_semantic_epoch FROM files ORDER BY path)),
+	       (SELECT COALESCE(GROUP_CONCAT(id || '=' || scan_kind || ':' || started_at || ':' || COALESCE(finished_at,'') || ':' || status || ':' || files_seen || ':' || files_changed || ':' || files_deleted || ':' || COALESCE(error_text,''), ','), '') FROM (SELECT id,scan_kind,started_at,finished_at,status,files_seen,files_changed,files_deleted,error_text FROM scans ORDER BY id))
 	`)
 	if err := row.Scan(&out.Files, &out.Symbols, &out.Edges, &out.Refs, &out.Imports,
 		&out.ScopeEvidence, &out.TestLinks, &out.Scans,
-		&out.ScopeImports, &out.ModuleCandidates, &out.SwiftLexicalBindings, &out.Provenance); err != nil {
+		&out.ScopeImports, &out.ModuleCandidates, &out.SwiftLexicalBindings, &out.Provenance, &out.Markers, &out.FileState, &out.ScanState); err != nil {
 		t.Fatalf("snapshot error = %v", err)
 	}
 	return out

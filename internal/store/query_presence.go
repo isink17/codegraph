@@ -23,7 +23,7 @@ func (s *Store) SearchSymbolsResult(ctx context.Context, repoID int64, query str
 // row keeps presence available even when the requested page is empty.
 func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, query string, limit, offset int) (SymbolSearchResult, error) {
 	search := func(sqlText string, args ...any) (SymbolSearchResult, error) {
-		rows, err := s.db.QueryContext(ctx, sqlText, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, sqlText, args...)
 		if err != nil {
 			return SymbolSearchResult{}, err
 		}
@@ -113,7 +113,7 @@ func (s *Store) FindSymbolExactResult(ctx context.Context, repoID int64, query s
 		return SymbolSearchResult{}, err
 	}
 	var found int
-	err = s.db.QueryRowContext(ctx, `SELECT EXISTS(
+	err = s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM symbols s
 		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND (s.name = ? OR s.qualified_name = ?))`, repoID, query, query).Scan(&found)
@@ -122,7 +122,7 @@ func (s *Store) FindSymbolExactResult(ctx context.Context, repoID int64, query s
 
 func (s *Store) searchSymbolsMatched(ctx context.Context, repoID int64, query string) (bool, error) {
 	var matched int
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM symbol_fts fts JOIN symbols s ON s.id = fts.symbol_id
 		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND symbol_fts MATCH ?
@@ -135,7 +135,7 @@ func (s *Store) searchSymbolsMatched(ctx context.Context, repoID int64, query st
 
 func (s *Store) likeSymbolsMatched(ctx context.Context, repoID int64, query string) (bool, error) {
 	var matched int
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM symbols s
 		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 		WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?))`, repoID, "%"+query+"%", "%"+query+"%").Scan(&matched)
@@ -143,6 +143,13 @@ func (s *Store) likeSymbolsMatched(ctx context.Context, repoID int64, query stri
 }
 
 func (s *Store) FindCallersResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (NeighborResult, error) {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
+		return NeighborResult{}, err
+	}
+	if tx != nil {
+		defer tx.Rollback()
+	}
 	var ids []int64
 	if symbolID != 0 {
 		identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, symbolID)
@@ -175,6 +182,13 @@ func (s *Store) FindCallersResult(ctx context.Context, repoID int64, symbol stri
 }
 
 func (s *Store) FindCalleesResult(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) (NeighborResult, error) {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
+		return NeighborResult{}, err
+	}
+	if tx != nil {
+		defer tx.Rollback()
+	}
 	var ids []int64
 	if symbolID != 0 {
 		identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, symbolID)
@@ -201,6 +215,13 @@ func (s *Store) FindCalleesResult(ctx context.Context, repoID int64, symbol stri
 }
 
 func (s *Store) RelatedTestsResult(ctx context.Context, repoID int64, symbol, file string, limit, offset int) (RelatedTestsResult, error) {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
+		return RelatedTestsResult{}, err
+	}
+	if tx != nil {
+		defer tx.Rollback()
+	}
 	if symbol != "" {
 		targetID, err := s.lookupSymbolID(ctx, repoID, symbol, 0)
 		found := err == nil
@@ -286,7 +307,7 @@ func (s *Store) filePresent(ctx context.Context, repoID int64, file string) (boo
 		return false, nil
 	}
 	var id sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0 LIMIT 1`, repoID, canonical).Scan(&id)
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0 LIMIT 1`, repoID, canonical).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -294,5 +315,12 @@ func (s *Store) filePresent(ctx context.Context, repoID int64, file string) (boo
 }
 
 func (s *Store) TraceDependenciesResult(ctx context.Context, repoID int64, symbol, direction string, maxDepth, limit, offset int) (TraceResult, error) {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
+		return TraceResult{}, err
+	}
+	if tx != nil {
+		defer tx.Rollback()
+	}
 	return s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 }

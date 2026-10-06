@@ -170,6 +170,8 @@ This affects v2 databases only; legacy v1 databases are never imported or upgrad
 
 Normal `codegraph update .` upgrades supported parser profiles and versioned resolver policies. A resolver-only policy change re-evaluates existing edges and call references once without reparsing unchanged source; later updates are no-ops. A newer or unreadable policy marker refuses the affected scan before graph writes. Full or forced indexing checks every language policy, even when a language filter limits parsing. Parser-fact changes still require a parser profile upgrade.
 
+Parser profile IDs identify the implementation and semantics that determine whether unchanged files need reparsing. A separate parser-family generation records directional compatibility per repository and language, including CGO and no-CGO Python. Ordinary updates upgrade missing or older generations and reparse as needed; a newer or malformed generation refuses affected work before scan writes. Bump a family's language generation when its persisted parser semantics change; implementations share a value only while they implement the same safety generation.
+
 Use `codegraph clean .` for database maintenance tasks like WAL checkpointing, VACUUM, FTS optimize, ANALYZE, and incremental vacuum.
 
 ### Version

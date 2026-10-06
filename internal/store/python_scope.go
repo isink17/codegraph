@@ -417,6 +417,12 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			answers.claimed[e.id] = struct{}{}
 			continue
 		}
+		if claimed && member != "" && pythonMemberWasMutated(locals[e.file], at, e.name) {
+			// A literal member write through this visible imported receiver makes
+			// the imported declaration unstable in this module.
+			answers.claimed[e.id] = struct{}{}
+			continue
+		}
 		if !claimed {
 			if nestedClasses[e.id] {
 				answers.claimed[e.id] = struct{}{}
@@ -543,7 +549,7 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			targetFiles[id] = struct{}{}
 		}
 	}
-	targetImports, _, err := pythonScopeImports(ctx, q, repoID, sortedIDs(targetFiles))
+	targetImports, targetLocals, err := pythonScopeImports(ctx, q, repoID, sortedIDs(targetFiles))
 	if err != nil {
 		return answers, err
 	}
@@ -593,7 +599,7 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 			pythonPackageRebindsName(pkgPaths[pkg], pkgImports[pkg], pkgBindings[pkg], pkgLocals[pkg], topLevel[pkg], d.pkgName, d.paths) {
 			continue
 		}
-		if pythonModuleImportsName(targetImports[file], d.want) {
+		if pythonModuleImportsName(targetImports[file], d.want) || pythonModuleRebindsName(targetLocals[file], d.want) {
 			continue
 		}
 		if g := topLevel[file][d.want]; g != nil && g.declarations == 1 && len(g.topLevel) == 1 {
@@ -601,6 +607,24 @@ func pythonScopeDecide(ctx context.Context, q execQuerier, repoID int64, only ma
 		}
 	}
 	return answers, nil
+}
+
+func pythonMemberWasMutated(locals []pyScopeLocal, at, name string) bool {
+	for _, local := range locals {
+		if local.owner == "" && local.name == name && pythonScopeVisible(local.owner, at) {
+			return true
+		}
+	}
+	return false
+}
+
+func pythonModuleRebindsName(locals []pyScopeLocal, name string) bool {
+	for _, local := range locals {
+		if local.owner == "" && local.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // pythonNestedClassTargets uses class declaration identity and the caller's

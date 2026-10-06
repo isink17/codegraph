@@ -64,6 +64,82 @@ func TestResolveEdgesOwnModuleImportUsesPackageEvidence(t *testing.T) {
 	}
 }
 
+func TestJavaPathResolutionLeavesFutureGoOwnModuleEvidenceUntouched(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/project\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	repo, err := s.UpsertRepo(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetFile, err := insertTestFileLang(ctx, s, repo.ID, "pkg/target.go", "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := insertTestSymbolKind(ctx, s, repo.ID, targetFile, "Target", "pkg.Target", "function", "pkg", "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerFile, err := insertTestFileLang(ctx, s, repo.ID, "cmd/main.go", "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller, err := insertTestSymbolKind(ctx, s, repo.ID, callerFile, "main", "main", "function", "", "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO file_imports(repo_id,file_id,import_path) VALUES(?,?,?)`, repo.ID, callerFile, "example.com/project/pkg"); err != nil {
+		t.Fatal(err)
+	}
+	edge, err := insertTestEdge(ctx, s, repo.ID, callerFile, caller, "example.com/project/pkg.Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO references_tbl(repo_id,file_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col) VALUES(?,?,'call','Target','example.com/project/pkg.Target',1,1,1,10)`, repo.ID, callerFile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveEdges(ctx, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	var bound sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges WHERE id=?`, edge).Scan(&bound); err != nil || !bound.Valid || bound.Int64 != target {
+		t.Fatalf("fixture edge=%v err=%v, want target %d", bound, err, target)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=NULL,resolution_strategy='',resolution_confidence='' WHERE id=?`, edge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE references_tbl SET symbol_id=NULL,context_symbol_id=NULL WHERE repo_id=?`, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?, '2')`, parserSemanticKey(repo.ID, "go")); err != nil {
+		t.Fatal(err)
+	}
+	javaFile, err := insertTestFileLang(ctx, s, repo.ID, "Main.java", "java")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertTestSymbolKind(ctx, s, repo.ID, javaFile, "Main", "Main", "class", "", "java"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveEdgesForPathsAndNames(ctx, repo.ID, []string{"Main.java"}, nil); err != nil {
+		t.Fatalf("Java path resolution blocked by future Go state or failed: %v", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id FROM edges WHERE id=?`, edge).Scan(&bound); err != nil || bound.Valid {
+		t.Fatalf("Java path update changed Go edge to %v (err=%v)", bound, err)
+	}
+	var refSymbol sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=? AND file_id=?`, repo.ID, callerFile).Scan(&refSymbol); err != nil || refSymbol.Valid {
+		t.Fatalf("Java path update changed Go reference identity to %v (err=%v)", refSymbol, err)
+	}
+}
+
 func TestResolveEdgesOwnModuleImportUsesCanonicalStoredPaths(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {

@@ -27,6 +27,7 @@ import (
 	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
+	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
@@ -100,7 +101,7 @@ const (
 func (s *Store) canonicalRepositoryPathsState(ctx context.Context, repoID int64) (canonicalRepositoryPathsState, error) {
 	var marker sql.NullString
 	var files, dirtyFiles int
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT
 			(SELECT value FROM settings WHERE key=?),
 			(SELECT COUNT(*) FROM files WHERE repo_id=?),
@@ -211,11 +212,12 @@ type FileRecord struct {
 }
 
 type FileMetadataUpdate struct {
-	Path        string
-	Language    string
-	SizeBytes   int64
-	MtimeUnixNS int64
-	ContentHash string
+	Path                string
+	Language            string
+	SizeBytes           int64
+	MtimeUnixNS         int64
+	ContentHash         string
+	ParserSemanticEpoch int
 }
 
 type ScanSummary struct {
@@ -503,8 +505,9 @@ type ReplaceFileGraphInput struct {
 	// are only ever written together with the graph they describe: no other
 	// metadata path (mark-seen, touch, parse-failed) touches these columns, so a
 	// file can never claim a provenance its rows do not have.
-	ParserProfile   string
-	ParserCallEdges bool
+	ParserProfile       string
+	ParserCallEdges     bool
+	ParserSemanticEpoch int
 }
 
 func Open(path string) (*Store, error) {
@@ -1388,7 +1391,7 @@ func (s *Store) UpsertRepo(ctx context.Context, rootPath string) (graph.Repo, er
 		return graph.Repo{}, err
 	}
 	var repo graph.Repo
-	if err := s.db.QueryRowContext(ctx, `SELECT id, root_path, canonical_path FROM repos WHERE canonical_path = ?`, canonical).Scan(&repo.ID, &repo.RootPath, &repo.CanonicalPath); err != nil {
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT id, root_path, canonical_path FROM repos WHERE canonical_path = ?`, canonical).Scan(&repo.ID, &repo.RootPath, &repo.CanonicalPath); err != nil {
 		return graph.Repo{}, err
 	}
 	return repo, nil
@@ -1396,7 +1399,7 @@ func (s *Store) UpsertRepo(ctx context.Context, rootPath string) (graph.Repo, er
 
 func (s *Store) PrimaryRepo(ctx context.Context) (graph.Repo, bool, error) {
 	var repo graph.Repo
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT id, root_path, canonical_path
 		FROM repos
 		ORDER BY id ASC
@@ -1412,7 +1415,7 @@ func (s *Store) PrimaryRepo(ctx context.Context) (graph.Repo, bool, error) {
 }
 
 func (s *Store) ListRepos(ctx context.Context, limit, offset int) ([]graph.Repo, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT id, root_path, canonical_path
 		FROM repos
 		ORDER BY id ASC
@@ -1435,7 +1438,7 @@ func (s *Store) ListRepos(ctx context.Context, limit, offset int) ([]graph.Repo,
 }
 
 func (s *Store) ListScans(ctx context.Context, repoID int64, limit, offset int) ([]ScanRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT id, repo_id, scan_kind, started_at, COALESCE(finished_at, ''), status, files_seen, files_changed, files_deleted, error_text
 		FROM scans
 		WHERE repo_id = ?
@@ -1458,7 +1461,7 @@ func (s *Store) ListScans(ctx context.Context, repoID int64, limit, offset int) 
 }
 
 func (s *Store) LatestScanErrors(ctx context.Context, repoID int64, limit, offset int) ([]ScanRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT id, repo_id, scan_kind, started_at, COALESCE(finished_at, ''), status, files_seen, files_changed, files_deleted, error_text
 		FROM scans
 		WHERE repo_id = ? AND status = 'failed' AND error_text <> ''
@@ -1508,7 +1511,7 @@ func (s *Store) Analyze(ctx context.Context) (time.Duration, error) {
 func (s *Store) WalCheckpointTruncate(ctx context.Context) (WalCheckpointResult, error) {
 	start := time.Now()
 	var busy, logFrames, ckptFrames int64
-	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &ckptFrames); err != nil {
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &ckptFrames); err != nil {
 		return WalCheckpointResult{}, err
 	}
 	return WalCheckpointResult{
@@ -1657,7 +1660,7 @@ type ExistingFileMeta struct {
 // content hash is fetched on demand via `LookupFileContentHash` only
 // when (size, mtime) differs from disk.
 func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]ExistingFileMeta, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT path, size_bytes, mtime_unix_ns, parse_state
 		FROM files
 		WHERE repo_id = ? AND is_deleted = 0
@@ -1694,7 +1697,7 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		for _, path := range chunk {
 			args = append(args, path)
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -1712,7 +1715,7 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 // `ExistingFiles` map free of per-row hex strings.
 func (s *Store) LookupFileContentHash(ctx context.Context, repoID int64, path string) (string, bool, error) {
 	var hash string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT content_sha256
 		FROM files
 		WHERE repo_id = ? AND is_deleted = 0 AND path = ?
@@ -1786,7 +1789,7 @@ func (s *Store) attachScanLanguageCoverage(ctx context.Context, scans []ScanReco
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -1828,21 +1831,27 @@ func (s *Store) BeginScan(ctx context.Context, repoID int64, kind string) (int64
 }
 
 func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSummary, started time.Time, status string, errText string) error {
-	finished := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	if err := completeScanTx(ctx, tx, scanID, summary, started, status, errText); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func completeScanTx(ctx context.Context, tx *sql.Tx, scanID int64, summary ScanSummary, started time.Time, status string, errText string) error {
+	finished := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE scans
 		SET finished_at = ?, status = ?, files_seen = ?, files_changed = ?, files_deleted = ?, error_text = ?
 		WHERE id = ?
 	`, finished.Format(time.RFC3339), status, summary.FilesSeen, summary.FilesChanged, summary.FilesDeleted, errText, scanID); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM scan_language_coverage WHERE scan_id = ?`, scanID); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	if len(summary.LanguageCoverage) > 0 {
@@ -1851,18 +1860,16 @@ func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSumm
 			VALUES(?, ?, ?, ?, ?, ?)
 		`)
 		if err != nil {
-			_ = tx.Rollback()
 			return err
 		}
 		defer stmt.Close()
 		for lang, cov := range summary.LanguageCoverage {
 			if _, err := stmt.ExecContext(ctx, scanID, lang, cov.Seen, cov.Indexed, cov.Skipped, cov.ParseFailed); err != nil {
-				_ = tx.Rollback()
 				return err
 			}
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) MarkFilesSeenBatch(ctx context.Context, repoID, scanID int64, paths []string) error {
@@ -1925,6 +1932,10 @@ func (s *Store) TouchFilesMetadataBatch(ctx context.Context, repoID, scanID int6
 	defer stmt.Close()
 	indexedAt := time.Now().UTC().Format(time.RFC3339)
 	for _, update := range updates {
+		if err := CheckParserSemanticWrite(ctx, tx, repoID, update.Language, update.ParserSemanticEpoch); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		if _, err := stmt.ExecContext(
 			ctx,
 			repoID,
@@ -1999,8 +2010,8 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 		return 0, err
 	}
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0)
+		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges, parser_semantic_epoch)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0, ?)
 		ON CONFLICT(repo_id, path)
 		DO UPDATE SET
 			language = excluded.language,
@@ -2012,7 +2023,8 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0,
 			parser_profile = '',
-			parser_call_edges = 0
+			parser_call_edges = 0,
+			parser_semantic_epoch = excluded.parser_semantic_epoch
 		RETURNING id
 	`)
 	if err != nil {
@@ -2024,6 +2036,10 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 	fileIDs := make([]int64, 0, len(updates))
 	xlangFileEvidenceChanged := false
 	for _, update := range updates {
+		if err := CheckParserSemanticWrite(ctx, tx, repoID, update.Language, update.ParserSemanticEpoch); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
 		var oldLanguage string
 		var oldDeleted int
 		err := tx.QueryRowContext(ctx, `
@@ -2050,6 +2066,7 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 			parseState,
 			scanID,
 			indexedAt,
+			update.ParserSemanticEpoch,
 		).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
 			return 0, err
@@ -2200,8 +2217,8 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	}
 
 	upsertFileStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges)
-		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0, ?, ?)
+		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges, parser_semantic_epoch)
+		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0, ?, ?, ?)
 		ON CONFLICT(repo_id, path)
 		DO UPDATE SET
 			language = excluded.language,
@@ -2213,7 +2230,8 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0,
 			parser_profile = excluded.parser_profile,
-			parser_call_edges = excluded.parser_call_edges
+			parser_call_edges = excluded.parser_call_edges,
+			parser_semantic_epoch = excluded.parser_semantic_epoch
 		RETURNING id
 	`)
 	if err != nil {
@@ -2225,12 +2243,16 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	now := time.Now().UTC().Format(time.RFC3339)
 	fileIDs := make([]int64, 0, len(inputs))
 	for _, input := range inputs {
+		if err := CheckParserSemanticWrite(ctx, tx, repoID, input.Language, input.ParserSemanticEpoch); err != nil {
+			_ = tx.Rollback()
+			return result, err
+		}
 		var fileID int64
 		callEdges := 0
 		if input.ParserCallEdges {
 			callEdges = 1
 		}
-		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now, input.ParserProfile, callEdges).Scan(&fileID); err != nil {
+		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now, input.ParserProfile, callEdges, input.ParserSemanticEpoch).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
 			return result, err
 		}
@@ -3548,7 +3570,7 @@ func (s *Store) PreviousSymbolNamesForPaths(ctx context.Context, repoID int64, p
 		// makes SQLite scan the repository's whole symbol table before joining,
 		// which turns a one-file save into a full-table read. The subquery form
 		// takes idx_files_repo_path and then idx_symbols_file_start.
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT name FROM (
 			SELECT DISTINCT s.name AS name
 			FROM symbols s
@@ -3605,7 +3627,7 @@ const jvmFacadeNamesSelect = `SELECT DISTINCT fs.jvm_facade_class AS name
 // Callers must read this before PurgeDeletedFileGraphsForScan, which removes
 // the rows.
 func (s *Store) DeletedPathsInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT path FROM files
 		WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
 	`, repoID, scanID)
@@ -3627,7 +3649,7 @@ func (s *Store) DeletedPathsInScan(ctx context.Context, repoID, scanID int64) ([
 }
 
 func (s *Store) PreviousSymbolNamesForDeletedInScan(ctx context.Context, repoID, scanID int64) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT name FROM (
 		SELECT DISTINCT s.name AS name
 		FROM symbols s
@@ -3726,7 +3748,7 @@ func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64,
 // files (for example edges.dst_symbol_id), so that future resolve passes can
 // re-resolve them if the file returns.
 func (s *Store) PurgeDeletedFileGraphsForScan(ctx context.Context, repoID, scanID int64) (int, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT id
 		FROM files
 		WHERE repo_id = ? AND is_deleted = 1 AND last_scan_id = ?
@@ -4096,6 +4118,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 // state that did not commit with it.
 func (s *Store) ResolveEdgesRecordingPolicies(ctx context.Context, repoID int64, languages []string) (int, error) {
 	return s.resolveEdgesRepoWide(ctx, repoID, nil, func(tx *sql.Tx) error {
+		if err := checkParserSemanticMarkers(ctx, tx, repoID, parser.SemanticEpochs(), nil); err != nil {
+			return err
+		}
 		// An unscoped resolve writes every language's edges, so every marker
 		// must be one this binary can honour; the error rolls the writes back.
 		if _, err := s.storedResolverPolicies(ctx, tx, repoID, func(string) bool { return true }); err != nil {
@@ -4128,6 +4153,9 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	defer func() {
 		_ = tx.Rollback()
 	}()
+	if err := CheckParserSemanticResolve(ctx, tx, repoID, parser.SemanticEpochs(), languages); err != nil {
+		return 0, err
+	}
 
 	// A repo-wide resolve decides every edge, not only the unbound ones: a
 	// re-index skips unchanged files and keeps their edges, and a binding one
@@ -4818,6 +4846,13 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if len(paths) == 0 {
 		return nil
 	}
+	langs, err := s.languagesForPaths(ctx, repoID, paths)
+	if err != nil {
+		return err
+	}
+	if err := s.checkParserSemanticLanguages(ctx, repoID, sortedKeys(langs)); err != nil {
+		return err
+	}
 	if changed, err := s.swiftPathsChanged(ctx, repoID, paths); err != nil {
 		return err
 	} else if changed {
@@ -4837,7 +4872,7 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil); err != nil {
 		return err
 	}
-	return s.ReconcileReferenceIdentities(ctx, repoID)
+	return reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, sortedKeys(langs))
 }
 
 func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []string) (bool, error) {
@@ -4877,6 +4912,23 @@ func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []stri
 func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, paths, names []string) (ResolveEdgesForNamesStats, error) {
 	if len(paths) == 0 && len(names) == 0 {
 		return ResolveEdgesForNamesStats{}, nil
+	}
+	languageScope, err := s.languagesForPaths(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	// Java and Kotlin share JVM callable ABI. A declaration or ABI change in
+	// either language can invalidate unresolved or previously unbound callers
+	// in the other, so incremental resolution covers this pair while remaining
+	// scoped away from every unrelated language.
+	if _, java := languageScope["java"]; java {
+		languageScope["kotlin"] = struct{}{}
+	}
+	if _, kotlin := languageScope["kotlin"]; kotlin {
+		languageScope["java"] = struct{}{}
+	}
+	if err := s.checkParserSemanticLanguages(ctx, repoID, sortedKeys(languageScope)); err != nil {
+		return ResolveEdgesForNamesStats{}, err
 	}
 	for _, changedPath := range paths {
 		if !strings.EqualFold(filepath.Ext(changedPath), ".cs") {
@@ -4965,28 +5017,50 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	}
 
 	invalidateStarted := time.Now()
-	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles, rubyChanged)
+	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles, rubyChanged, languageScope)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
 	invalidateMS := time.Since(invalidateStarted).Milliseconds()
-	moduleVeto, err := s.resolveOwnModuleImportsStandalone(ctx, repoID, nil)
+	moduleScope := &ownModuleScope{}
+	if len(paths) > 0 {
+		moduleScope.paths = make(map[string]struct{}, len(paths))
+		for _, path := range paths {
+			if path != "" {
+				moduleScope.paths[path] = struct{}{}
+			}
+		}
+	}
+	if len(names) > 0 {
+		moduleScope.names = map[string]struct{}{}
+		for _, name := range names {
+			moduleScope.names[name] = struct{}{}
+			if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
+				moduleScope.names[name[dot+1:]] = struct{}{}
+			}
+		}
+	}
+	moduleVeto, err := s.resolveOwnModuleImportsStandalone(ctx, repoID, moduleScope)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, moduleVeto, scopes); err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
-	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto, scopes)
+	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto, scopes, languageScope)
 	if err == nil && (len(paths) > 0 || len(names) > 0) {
 		var n int
-		n, err = s.resolveDotSuffixIncrementally(ctx, repoID)
+		n, err = s.resolveDotSuffixIncrementally(ctx, repoID, sortedKeys(languageScope))
 		stats.TargetsResolved += n
 	}
 	stats.InvalidateMS += invalidateMS
 	stats.InvalidatedBindings += invalidated
 	if err == nil {
-		err = s.ReconcileReferenceIdentities(ctx, repoID)
+		if len(languageScope) == 0 {
+			err = s.ReconcileReferenceIdentities(ctx, repoID)
+		} else {
+			err = reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, sortedKeys(languageScope))
+		}
 	}
 	return stats, err
 }
@@ -5019,7 +5093,7 @@ func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []str
 		if len(terms) == 0 {
 			continue
 		}
-		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT e.dst_name FROM edges e JOIN files f ON f.id=e.file_id
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `SELECT DISTINCT e.dst_name FROM edges e JOIN files f ON f.id=e.file_id
 			WHERE e.repo_id=? AND f.language IN ('java','kotlin') AND (`+strings.Join(terms, " OR ")+`)`, args...)
 		if err != nil {
 			return nil, err
@@ -5073,16 +5147,20 @@ func (s *Store) jvmScopeEdgeNamesForPaths(ctx context.Context, repoID int64, pat
 // unresolved dotted edges; stronger strategies have already had first refusal.
 // The transaction-local resolver tables keep the full and incremental SQL
 // predicates identical, while no repo-wide resolver pass is repeated.
-func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64) (int, error) {
+func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64, languages []string) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := CheckParserSemanticResolve(ctx, tx, repoID, parser.SemanticEpochs(), languages); err != nil {
+		return 0, err
+	}
+	scope := newResolverScope(languages)
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
-	csharpResolved, err := resolveCSharpScope(ctx, tx, repoID, nil)
+	csharpResolved, err := resolveCSharpScope(ctx, tx, repoID, scope.only("csharp"))
 	if err != nil {
 		return 0, err
 	}
@@ -5090,7 +5168,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	// changed path or name selected: a type identity can become unique again
 	// through a removal that names nothing the `::` spelling carries (see
 	// phpStaleScopeBindings).
-	phpResolved, err := resolvePHPScope(ctx, tx, repoID, nil)
+	phpResolved, err := resolvePHPScope(ctx, tx, repoID, scope.only("php"))
 	if err != nil {
 		return 0, err
 	}
@@ -5099,7 +5177,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	// reopening that held `private_class_method :run`, a deleted duplicate
 	// declaration, a deleted shadowing constant. Nothing else reconsiders an
 	// unresolved Ruby call after a pure delete.
-	rubyResolved, err := resolveRubyScope(ctx, tx, repoID, nil)
+	rubyResolved, err := resolveRubyScope(ctx, tx, repoID, scope.only("ruby"))
 	if err != nil {
 		return 0, err
 	}
@@ -5113,7 +5191,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err := recordPythonScopeClaims(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
-	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, nil)
+	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -5183,7 +5261,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 //     can therefore still go stale in the way described above; that is the
 //     pre-existing behaviour, and narrowing it is a separate decision from
 //     this one.
-func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string, rustScope map[int64]struct{}, rubyChanged bool) (int, error) {
+func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string, rustScope map[int64]struct{}, rubyChanged bool, languageScope map[string]struct{}) (int, error) {
 	wanted := make(map[string]struct{}, len(names))
 	unique := make([]string, 0, len(names))
 	for _, name := range names {
@@ -5292,7 +5370,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		for _, name := range chunk {
 			args = append(args, name)
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT id FROM edges
 			WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
 			  AND edge_kind != '`+EdgeKindCrossLanguageRef+`'
@@ -5307,7 +5385,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 		}
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT id, dst_name FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
 		  AND edge_kind != '`+EdgeKindCrossLanguageRef+`'
@@ -5343,7 +5421,7 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	// predicate with an OR would disable the index for every language on every
 	// incremental update; this second selection stays bounded to Ruby files
 	// instead, and to the spellings the dot scan cannot already see.
-	rows, err = s.db.QueryContext(ctx, `
+	rows, err = s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT e.id, e.dst_name FROM edges e JOIN files f ON f.id = e.file_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NOT NULL AND f.language = 'ruby'
 		  AND e.resolution_strategy IN `+sqlQuotedList(rubyScopeStrategies)+`
@@ -5379,6 +5457,28 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	// answer cannot have changed.
 	if rustScope != nil && len(stale) > 0 {
 		if err := s.dropRustEdgesOutsideScope(ctx, repoID, rustScope, stale); err != nil {
+			return 0, err
+		}
+	}
+	if len(stale) == 0 {
+		return 0, nil
+	}
+	if len(languageScope) > 0 {
+		ids := make([]int64, 0, len(stale))
+		for id := range stale {
+			ids = append(ids, id)
+		}
+		if err := sqliteBatchedIDQuery(ctx, s.db, ids, `SELECT e.id,f.language FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND e.id IN (`, []any{repoID}, func(scan func(...any) error) error {
+			var id int64
+			var language string
+			if err := scan(&id, &language); err != nil {
+				return err
+			}
+			if _, ok := languageScope[language]; !ok {
+				delete(stale, id)
+			}
+			return nil
+		}); err != nil {
 			return 0, err
 		}
 	}
@@ -5432,7 +5532,7 @@ func (s *Store) namesWithSeveralDeclarations(ctx context.Context, repoID int64, 
 		for _, name := range chunk {
 			args = append(args, name)
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT name FROM symbols
 			WHERE repo_id = ? AND name IN (`+strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")+`)
 			GROUP BY name
@@ -5530,7 +5630,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		for _, storedPath := range chunk {
 			args = append(args, storedPath)
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -5572,7 +5672,7 @@ func (s *Store) resolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -5605,13 +5705,18 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 }
 
 func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string) (ResolveEdgesForNamesStats, error) {
-	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, nil, nil)
+	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, nil, nil, nil)
 }
 
-func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string, moduleVeto map[int64]struct{}, scopes *importScopeCache) (ResolveEdgesForNamesStats, error) {
+func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string, moduleVeto map[int64]struct{}, scopes *importScopeCache, languageScope map[string]struct{}) (ResolveEdgesForNamesStats, error) {
 	var stats ResolveEdgesForNamesStats
 	if len(names) == 0 {
 		return stats, nil
+	}
+	if moduleVeto == nil {
+		if err := s.checkParserSemanticAll(ctx, repoID); err != nil {
+			return stats, err
+		}
 	}
 	stats.NamesInput = len(names)
 	seen := make(map[string]struct{}, len(names))
@@ -5659,7 +5764,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		// one owns it. It must precede the module pass below for the ordering
 		// reason ResolveEdgesForPathsAndNames documents.
 		invalidateStarted := time.Now()
-		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique, nil, false)
+		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique, nil, false, nil)
 		if err != nil {
 			return stats, err
 		}
@@ -5723,7 +5828,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			args[i+1] = name
 		}
 
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return stats, err
 		}
@@ -5739,6 +5844,11 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			}
 			if outOfRustScope(srcLanguage, srcFileID) {
 				continue
+			}
+			if len(languageScope) > 0 {
+				if _, ok := languageScope[srcLanguage]; !ok {
+					continue
+				}
 			}
 			targetByID[id] = edgeTarget{
 				edgeID:      id,
@@ -5767,7 +5877,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 	// `::` rather than `.`, so its final component must join the same update
 	// batch when a declaration arrives after its caller.
 	suffixStarted := time.Now()
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT e.id, e.dst_name, f.language, e.file_id, e.evidence, e.edge_kind
 		FROM edges e
 		JOIN files f ON f.id = e.file_id
@@ -5787,6 +5897,11 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		}
 		if outOfRustScope(srcLanguage, srcFileID) {
 			continue
+		}
+		if len(languageScope) > 0 {
+			if _, ok := languageScope[srcLanguage]; !ok {
+				continue
+			}
 		}
 		stats.QualifiedScanned++
 		if _, ok := targetByID[id]; ok {
@@ -5868,7 +5983,7 @@ func scanEdgeTargets(rows *sql.Rows, languageByFileID map[int64]string) ([]edgeT
 
 func (s *Store) CountUnresolvedEdgesByDstName(ctx context.Context, repoID int64, dstName string) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NULL AND dst_name = ?
@@ -5882,7 +5997,7 @@ func (s *Store) CountUnresolvedEdgesByDstName(ctx context.Context, repoID int64,
 // zero after any indexing, re-indexing, or purge run.
 func (s *Store) CountDanglingEdgeTargets(ctx context.Context, repoID int64) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM edges e
 		WHERE e.repo_id = ?
@@ -7168,7 +7283,7 @@ func resolveSymbolsByStableKeysQuery(ctx context.Context, q queryContexter, repo
 func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 	var stats graph.Stats
 	stats.RepoID = repoID
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT
 			r.root_path,
 			(SELECT COUNT(1) FROM files f WHERE f.repo_id = r.id AND f.is_deleted = 0) AS files_count,
@@ -7196,14 +7311,14 @@ func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 		return graph.Stats{}, err
 	}
 	var indexedAt sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT indexed_at FROM files WHERE repo_id = ? AND indexed_at <> '' ORDER BY indexed_at DESC LIMIT 1`, repoID).Scan(&indexedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT indexed_at FROM files WHERE repo_id = ? AND indexed_at <> '' ORDER BY indexed_at DESC LIMIT 1`, repoID).Scan(&indexedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return graph.Stats{}, err
 	}
 	if indexedAt.Valid {
 		stats.LastIndexedAt = indexedAt.String
 	}
 	stats.Languages = map[string]int{}
-	rows, err := s.db.QueryContext(ctx, `SELECT language, COUNT(1) FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY language`, repoID)
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `SELECT language, COUNT(1) FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY language`, repoID)
 	if err != nil {
 		return graph.Stats{}, err
 	}
@@ -7221,7 +7336,7 @@ func (s *Store) Stats(ctx context.Context, repoID int64) (graph.Stats, error) {
 
 func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
 	// The page is selected in a subquery so only matching identities are sorted.
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		WITH page AS (
 			SELECT s.id AS id
 			FROM symbol_fts fts
@@ -7249,7 +7364,7 @@ func (s *Store) SearchSymbols(ctx context.Context, repoID int64, query string, l
 		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 	`, repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset))
 	if err != nil {
-		rows, err = s.db.QueryContext(ctx, `
+		rows, err = s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s
@@ -7272,7 +7387,7 @@ func (s *Store) FindSymbol(ctx context.Context, repoID int64, query string, limi
 }
 
 func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string, limit, offset int) ([]graph.Symbol, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM symbols s
@@ -7296,6 +7411,13 @@ func (s *Store) FindSymbolExact(ctx context.Context, repoID int64, query string,
 // traversal from a hub symbol reaches most of a repository. Callers that need
 // the whole closure rather than a tool-sized answer use impactClosure directly.
 func (s *Store) ImpactRadius(ctx context.Context, repoID int64, symbols []string, files []string, depth, limit, offset int) (map[string]any, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	symbolList, fileList, presence, unresolvedEdges, unresolvedNames, err := s.impactClosureWithPresence(ctx, repoID, symbols, files, depth)
 	if err != nil {
 		return nil, err
@@ -7397,7 +7519,7 @@ func (s *Store) impactClosureWithPresence(ctx context.Context, repoID int64, sym
 			presence.Missing = append(presence.Missing, file)
 			continue
 		}
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
@@ -7531,7 +7653,7 @@ func (s *Store) impactUnresolvedEvidence(ctx context.Context, repoID int64, symb
 	for _, chunk := range chunkInt64s(ids, sqliteInClauseBatchSize) {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		args := append([]any{repoID}, int64SliceToAny(chunk)...)
-		rows, err := s.db.QueryContext(ctx, `SELECT e.dst_name, COUNT(*)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `SELECT e.dst_name, COUNT(*)
 			FROM edges e
 			JOIN files ef ON ef.id = e.file_id AND ef.repo_id = e.repo_id AND ef.is_deleted = 0
 			WHERE e.repo_id = ? AND e.src_symbol_id IN (`+placeholders+`)
@@ -7605,7 +7727,7 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -7619,6 +7741,13 @@ func (s *Store) impactNeighbors(ctx context.Context, repoID int64, frontier []in
 }
 
 func (s *Store) RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]RelatedTest, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	if err := s.RequireCanonicalRepositoryPaths(ctx, repoID); err != nil {
 		return nil, err
 	}
@@ -7637,7 +7766,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 	var err error
 	if file != "" {
 		var targetFileID int64
-		lookupRows, err := s.db.QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0 ORDER BY id`, repoID, file)
+		lookupRows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0 ORDER BY id`, repoID, file)
 		if err != nil {
 			return nil, err
 		}
@@ -7678,7 +7807,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 		// way. The call-evidence arm excludes tests declared by the seed file
 		// itself: a test file's own tests calling its own helpers are not
 		// "related tests" of that file.
-		rows, err = s.db.QueryContext(ctx, `
+		rows, err = s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT path, symbol, reason, score FROM (
 				SELECT path, symbol, reason, score,
 					MAX(CAST(ROUND(score * 1000) AS INTEGER) * 4 + reason_rank) AS pick
@@ -7725,7 +7854,7 @@ func (s *Store) relatedTests(ctx context.Context, repoID int64, symbol, file str
 		// Same two evidence classes as the file branch, seeded by one symbol:
 		// rows name-bound to it, plus linked test functions that call it. Same
 		// deterministic `pick` rule as the file branch.
-		rows, err = s.db.QueryContext(ctx, `
+		rows, err = s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT path, symbol, reason, score FROM (
 				SELECT path, symbol, reason, score,
 					MAX(CAST(ROUND(score * 1000) AS INTEGER) * 4 + reason_rank) AS pick
@@ -7837,7 +7966,7 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	}
 	args = append(args, limitVal)
 	args = append(args, offsetVal)
-	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -7867,6 +7996,13 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 }
 
 func (s *Store) GraphSnapshot(ctx context.Context, repoID int64, focusSymbol string, depth int) ([]graph.Symbol, []ExportEdge, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	if strings.TrimSpace(focusSymbol) == "" {
 		symbols, err := s.loadSymbolsForExport(ctx, repoID, nil)
 		if err != nil {
@@ -7906,7 +8042,7 @@ func (s *Store) GraphSnapshot(ctx context.Context, repoID int64, focusSymbol str
 }
 
 func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offset int) ([]graph.Symbol, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM symbols s
@@ -7930,7 +8066,7 @@ func (s *Store) ExportSymbolsPage(ctx context.Context, repoID int64, limit, offs
 // in plain strings).
 func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit, offset int) ([]string, error) {
 	pageSize := exportLimit(limit)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT DISTINCT s.qualified_name
 		FROM symbols s
 		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
@@ -7958,7 +8094,14 @@ func (s *Store) ExportDOTNodeNamesPage(ctx context.Context, repoID int64, limit,
 }
 
 func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset int) ([]ExportEdge, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT `+exportEdgeColumnsSQL+`
 		FROM edges e `+activeEdgeJoinsSQL+`
 		WHERE e.repo_id = ? AND (`+visibleEdgeDestinationSQL+`)
@@ -7981,7 +8124,7 @@ func (s *Store) ExportEdgesPage(ctx context.Context, repoID int64, limit, offset
 
 func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]graph.Symbol, error) {
 	if len(symbolIDs) == 0 {
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 			       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 			FROM symbols s
@@ -8008,7 +8151,7 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -8023,7 +8166,7 @@ func (s *Store) loadSymbolsForExport(ctx context.Context, repoID int64, symbolID
 
 func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs []int64) ([]ExportEdge, error) {
 	if len(symbolIDs) == 0 {
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT `+exportEdgeColumnsSQL+`
 			FROM edges e `+activeEdgeJoinsSQL+`
 			WHERE e.repo_id = ? AND (`+visibleEdgeDestinationSQL+`)
@@ -8057,7 +8200,7 @@ func (s *Store) loadEdgesForExport(ctx context.Context, repoID int64, symbolIDs 
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -8198,7 +8341,7 @@ func (s *Store) HasDirtyFiles(ctx context.Context, repoID int64) (bool, error) {
 		return false, err
 	}
 	var exists int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM dirty_files WHERE repo_id = ? LIMIT 1`, repoID).Scan(&exists)
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT 1 FROM dirty_files WHERE repo_id = ? LIMIT 1`, repoID).Scan(&exists)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -8522,7 +8665,7 @@ func (s *Store) lookupImpactSymbolSeeds(ctx context.Context, repoID int64, symbo
 			args = append(args, i, name, lookupSymbolShortName(name))
 		}
 		args = append(args, repoID)
-		rows, err := s.db.QueryContext(ctx, `WITH requested(ord, name, short) AS (VALUES `+values.String()+`), candidates AS (
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `WITH requested(ord, name, short) AS (VALUES `+values.String()+`), candidates AS (
 			SELECT req.ord, s.id,
 			       CASE
 			         WHEN s.qualified_name = req.name THEN 0
@@ -8665,7 +8808,7 @@ func (s *Store) lookupSymbolIDs(ctx context.Context, repoID int64, symbol string
 }
 
 func (s *Store) lookupSymbolIDsByQuery(ctx context.Context, query string, args ...any) ([]int64, error) {
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -8711,7 +8854,7 @@ func (s *Store) symbolsByIDs(ctx context.Context, repoID int64, ids []int64, lim
 		return []graph.Symbol{}, nil
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT DISTINCT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
 		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
 		FROM symbols s
@@ -8750,7 +8893,7 @@ func (s *Store) queryUnresolvedDstNamesBySrcIDs(ctx context.Context, repoID int6
 	bySrc := map[int64][]string{}
 	for _, chunk := range chunkInt64s(srcIDs, sqliteInClauseBatchSize) {
 		ph := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
-		rows, err := s.db.QueryContext(ctx,
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 			`SELECT DISTINCT e.src_symbol_id, e.dst_name FROM edges e
 			 WHERE e.repo_id = ? AND e.src_symbol_id IN (`+ph+`) AND e.dst_symbol_id IS NULL AND e.dst_name != ''
 			 ORDER BY e.src_symbol_id ASC, e.dst_name ASC`,
@@ -8799,6 +8942,13 @@ func scanSymbol(scanner interface{ Scan(dest ...any) error }) (graph.Symbol, err
 // It returns one page of the traversal plus the total number of nodes reached,
 // so a caller can report a bounded page without implying it is the whole chain.
 func (s *Store) TraceDependencies(ctx context.Context, repoID int64, symbol string, direction string, maxDepth, limit, offset int) ([]map[string]any, int, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, 0, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	result, err := s.traceDependencies(ctx, repoID, symbol, direction, maxDepth, limit, offset)
 	return result.Dependencies, result.Total, err
 }
@@ -8888,7 +9038,7 @@ func (s *Store) traceDependencies(ctx context.Context, repoID int64, symbol stri
 			if entry.depth >= maxDepth {
 				continue
 			}
-			rows, err := s.db.QueryContext(ctx, query, repoID, entry.id)
+			rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, repoID, entry.id)
 			if err != nil {
 				return fmt.Errorf("trace_dependencies bfs query: %w", err)
 			}
@@ -9032,6 +9182,13 @@ func scanSymbols(rows *sql.Rows) ([]graph.Symbol, error) {
 // iteration order reaches the scores, without the whole-graph identity load a
 // graph-ordered float sum would need.
 func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	limit = safeLimit(limit)
 
 	// Step 1: load all resolved edges.
@@ -9044,7 +9201,7 @@ func (s *Store) PageRank(ctx context.Context, repoID int64, limit int) ([]map[st
 	// changes n, the damping base, every source's outgoing share and therefore
 	// the score of every active symbol. The graph PageRank runs on is the
 	// active resolved graph or it is not the graph the user can see.
-	rows2, err := s.db.QueryContext(ctx,
+	rows2, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 		`SELECT e.src_symbol_id, e.dst_symbol_id FROM edges e
 		 JOIN symbols src ON src.id = e.src_symbol_id
 		 JOIN files srcf ON srcf.id = src.file_id AND srcf.is_deleted = 0
@@ -9211,7 +9368,7 @@ type symbolIdentity struct {
 // and returns the persisted identity used by exact-id query semantics.
 func (s *Store) lookupSymbolIdentity(ctx context.Context, repoID, symbolID int64) (symbolIdentity, bool, error) {
 	var identity symbolIdentity
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT s.id, s.repo_id, s.name, s.qualified_name, s.language,
 		       s.kind, COALESCE(f.path, ''), s.start_line, s.start_col
 		FROM symbols s
@@ -9266,7 +9423,7 @@ func (s *Store) symbolIdentities(ctx context.Context, ids []int64) (map[int64]sy
 		// cross-repository dst_symbol_id, which the schema does not forbid. That
 		// row used to appear in the page with its real name; dropping it here
 		// would silently retitle the change as a bug fix.
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT s.id, s.qualified_name, s.kind, COALESCE(f.path, ''), s.start_line, s.start_col
 			FROM symbols s
 			LEFT JOIN files f ON f.id = s.file_id
@@ -9297,9 +9454,16 @@ func (s *Store) symbolIdentities(ctx context.Context, ids []int64) (map[int64]sy
 
 // CouplingMetrics computes file-level coupling based on cross-file edge counts.
 func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	limit = safeLimit(limit)
 
-	cRows, err := s.db.QueryContext(ctx, `
+	cRows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT f1.path as file_a, f2.path as file_b, COUNT(*) as edge_count
 		FROM edges e
 		JOIN symbols s1 ON s1.id = e.src_symbol_id AND s1.repo_id = e.repo_id
@@ -9353,10 +9517,17 @@ func (s *Store) CouplingMetrics(ctx context.Context, repoID int64, limit int) ([
 // DetectCycles finds circular dependencies at the file level using DFS with
 // white/gray/black coloring.
 func (s *Store) DetectCycles(ctx context.Context, repoID int64, limit int) ([]map[string]any, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	limit = safeLimit(limit)
 
 	// Build file-level dependency graph.
-	dRows, err := s.db.QueryContext(ctx, `
+	dRows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT DISTINCT f1.path, f2.path
 		FROM edges e
 		JOIN symbols s1 ON s1.id = e.src_symbol_id AND s1.repo_id = e.repo_id
@@ -9501,7 +9672,7 @@ func quoteFTS(query string) string {
 // FileIDByPath returns the file ID for a given repo and relative path.
 func (s *Store) FileIDByPath(ctx context.Context, repoID int64, path string) (int64, error) {
 	var id int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repoID, path).Scan(&id)
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repoID, path).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -9523,7 +9694,7 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
 	args = append(args, safeLimit(limit), safeOffset(offset))
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -9547,7 +9718,14 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 
 // FindDeadCode returns symbols with no incoming edges and no references — likely dead code.
 func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT s.id, s.qualified_name, s.kind, s.name, f.path, f.language,
 		       s.start_line, s.start_col, s.end_line, s.end_col
 		FROM symbols s
@@ -9711,9 +9889,9 @@ func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float
 	// takes the capped path, whose LIMIT is now spent on active candidates, so
 	// the answer is the same either way -- and a single indexed count is much
 	// cheaper than joining two tables on every vector query to choose a branch.
-	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&embCount)
+	_ = s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&embCount)
 	if embCount > int64(scanCap) {
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT se.symbol_id, se.embedding, se.dimensions,
 				   s.qualified_name, s.kind, s.signature, s.doc_summary, s.stable_key,
 				   s.start_line, s.start_col, s.end_line, s.end_col, f.path
@@ -9735,7 +9913,7 @@ func (s *Store) vectorSearch(ctx context.Context, repoID int64, queryVec []float
 		return s.scanAndRankVectors(rows, queryVec, limitVal, offsetVal)
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT se.symbol_id, se.embedding, se.dimensions,
 			   s.qualified_name, s.kind, s.signature, s.doc_summary, s.stable_key,
 			   s.start_line, s.start_col, s.end_line, s.end_col, f.path
@@ -9950,7 +10128,7 @@ func (s *Store) HybridSearch(ctx context.Context, repoID int64, query string, qu
 // HasEmbeddings checks whether the repo has any stored embeddings.
 func (s *Store) HasEmbeddings(ctx context.Context, repoID int64) (bool, error) {
 	var count int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&count)
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT COUNT(*) FROM symbol_embeddings WHERE repo_id = ?`, repoID).Scan(&count)
 	if err != nil {
 		// Table may not exist yet in older databases.
 		return false, nil
@@ -10004,12 +10182,19 @@ func appendUnique(slice []string, val string) []string {
 // including language breakdown, top-level directories, symbol/edge kind
 // breakdowns, key entry points, and hub symbols.
 func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[string]any, error) {
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 	// Deriving the totals from the breakdowns (below) removed the Stats call
 	// that used to front this function, and with it the only thing that failed
 	// for a repository id that does not exist. Without this probe an unknown id
 	// would return a well-formed document full of zeroes instead of an error.
 	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM repos WHERE id = ?`, repoID).Scan(&exists); err != nil {
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT 1 FROM repos WHERE id = ?`, repoID).Scan(&exists); err != nil {
 		// This error is returned straight to an MCP client, so an absent repo
 		// row is reported in CodeGraph's vocabulary rather than the driver's.
 		// A genuine database failure keeps its own wording.
@@ -10022,7 +10207,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	// Language breakdown
 	languages := []map[string]any{}
 	{
-		rows, err := s.db.QueryContext(ctx,
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 			`SELECT language, COUNT(*) as file_count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY language ORDER BY file_count DESC, language ASC`,
 			repoID)
 		if err != nil {
@@ -10045,7 +10230,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	// Top-level directories
 	topDirs := []map[string]any{}
 	{
-		rows, err := s.db.QueryContext(ctx,
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 			`SELECT SUBSTR(path, 1, INSTR(path || '/', '/') - 1) AS dir, COUNT(*) as count FROM files WHERE repo_id = ? AND is_deleted = 0 GROUP BY dir ORDER BY count DESC, dir ASC LIMIT 20`,
 			repoID)
 		if err != nil {
@@ -10068,7 +10253,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	// Symbol kind breakdown
 	symbolKinds := []map[string]any{}
 	{
-		rows, err := s.db.QueryContext(ctx,
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 			`SELECT s.kind, COUNT(*) as count FROM symbols s
 			 JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			 WHERE s.repo_id = ? GROUP BY s.kind ORDER BY count DESC, s.kind ASC`,
@@ -10093,7 +10278,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	// Edge kind breakdown
 	edgeKinds := []map[string]any{}
 	{
-		rows, err := s.db.QueryContext(ctx,
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 			`SELECT e.edge_kind, COUNT(*) as count FROM edges e `+activeEdgeJoinsSQL+`
 			 WHERE e.repo_id = ? AND (`+visibleEdgeDestinationSQL+`) GROUP BY e.edge_kind ORDER BY count DESC, e.edge_kind ASC`,
 			repoID)
@@ -10132,7 +10317,7 @@ func (s *Store) ArchitectureOverview(ctx context.Context, repoID int64) (map[str
 	// edges (plus a repeated language GROUP BY) for numbers already in hand.
 	// Only the reference count has no breakdown to sum.
 	var references int64
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 		`SELECT COUNT(1) FROM references_tbl rt
 		 JOIN files rf ON rf.id = rt.file_id AND rf.repo_id = rt.repo_id AND rf.is_deleted = 0
 		 WHERE rt.repo_id = ?`, repoID).Scan(&references); err != nil {
@@ -10168,7 +10353,7 @@ func sumCountField(rows []map[string]any, field string) int64 {
 
 // AllImports returns a map of file path to list of import paths for the given repo.
 func (s *Store) AllImports(ctx context.Context, repoID int64) (map[string][]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT f.path, fi.import_path
 		FROM file_imports fi
 		JOIN files f ON f.id = fi.file_id
@@ -10195,7 +10380,7 @@ func (s *Store) AllImports(ctx context.Context, repoID int64) (map[string][]stri
 
 // AllFilePaths returns all non-deleted file paths for the given repo.
 func (s *Store) AllFilePaths(ctx context.Context, repoID int64) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT path FROM files
 		WHERE repo_id = ? AND is_deleted = 0
 		ORDER BY path`, repoID)
@@ -10224,7 +10409,7 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 	// Step 1: total repo file stats.
 	var fileCount int64
 	var totalBytes int64
-	err := s.db.QueryRowContext(ctx,
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 		`SELECT COUNT(*) AS file_count, COALESCE(SUM(size_bytes),0) AS total_bytes FROM files WHERE repo_id = ? AND is_deleted = 0`,
 		repoID,
 	).Scan(&fileCount, &totalBytes)
@@ -10254,7 +10439,7 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 			for _, p := range paths {
 				args = append(args, p)
 			}
-			rows, err := s.db.QueryContext(ctx,
+			rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 				`SELECT path, size_bytes FROM files WHERE repo_id = ? AND is_deleted = 0 AND path IN (`+placeholders+`)`,
 				args...,
 			)
@@ -10286,7 +10471,7 @@ func (s *Store) BenchmarkTokens(ctx context.Context, repoID int64, task string) 
 	} else {
 		// No task provided: estimate based on average file size * 10 files.
 		var avgSize float64
-		err := s.db.QueryRowContext(ctx,
+		err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 			`SELECT COALESCE(AVG(size_bytes),0) FROM files WHERE repo_id = ? AND is_deleted = 0`,
 			repoID,
 		).Scan(&avgSize)
@@ -10377,7 +10562,7 @@ func (s *Store) SessionGetHistory(ctx context.Context, repoID int64, sessionID s
 	query += ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -10407,7 +10592,7 @@ func (s *Store) SessionGetHotFiles(ctx context.Context, repoID int64, sessionID 
 		limit = 20
 	}
 	limit = min(limit, limits.StoreMaxRows)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT key AS file, COUNT(*) AS access_count, MAX(created_at) AS last_accessed
 		FROM session_events
 		WHERE repo_id = ? AND event_type IN ('read', 'edit')

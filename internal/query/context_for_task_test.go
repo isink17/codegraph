@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/store"
 	"github.com/isink17/codegraph/internal/tokenest"
 )
@@ -124,6 +125,18 @@ func TestContextForTaskReturnsIdentityForDrillDown(t *testing.T) {
 		if sym.QualifiedName == "" {
 			t.Fatalf("symbol %q carries no qualified_name", sym.Name)
 		}
+	}
+}
+
+func TestContextForTaskRefusesPendingParserSemanticTransition(t *testing.T) {
+	fx := newContextFixture(t)
+	current := parser.SemanticEpochs()
+	if err := fx.store.BeginParserSemanticTransitions(context.Background(), fx.repoID, current, []string{"go"}); err != nil {
+		t.Fatalf("begin pending parser transition: %v", err)
+	}
+	_, err := fx.svc.ContextForTask(context.Background(), fx.repoID, taskPayment, fullOpts())
+	if !errors.Is(err, store.ErrParserSemanticIncomplete) {
+		t.Fatalf("ContextForTask error=%v, want incomplete-transition refusal", err)
 	}
 }
 

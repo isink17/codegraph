@@ -35,6 +35,13 @@ type QueryBenchTargets struct {
 // QueryBenchTargets selects deterministic representative targets for a query
 // benchmark. It is read-only and safe on a database opened with OpenReadOnly.
 func (s *Store) QueryBenchTargets(ctx context.Context, repoID int64) (QueryBenchTargets, error) {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
+		return QueryBenchTargets{}, err
+	}
+	if tx != nil {
+		defer tx.Rollback()
+	}
 	var out QueryBenchTargets
 
 	caller, err := s.extremeDegreeSymbol(ctx, repoID, "dst_symbol_id")
@@ -74,7 +81,7 @@ func (s *Store) extremeDegreeSymbol(ctx context.Context, repoID int64, degreeCol
 		return "", errors.New("store: unsupported degree column")
 	}
 	var maxDegree sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT MAX(degree) FROM (
 			SELECT COUNT(1) AS degree
 			FROM edges
@@ -92,7 +99,7 @@ func (s *Store) extremeDegreeSymbol(ctx context.Context, repoID int64, degreeCol
 	}
 
 	var qname string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT s.qualified_name
 		FROM (
 			SELECT `+degreeCol+` AS sid, COUNT(1) AS degree
@@ -119,7 +126,7 @@ func (s *Store) extremeDegreeSymbol(ctx context.Context, repoID int64, degreeCol
 // test links pointing at it, ties broken by path.
 func (s *Store) mostTestLinkedFile(ctx context.Context, repoID int64) (string, error) {
 	var path string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT f.path
 		FROM test_links t
 		JOIN files f ON f.id = t.target_file_id

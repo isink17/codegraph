@@ -1,6 +1,7 @@
 package python
 
 import (
+	"regexp"
 	"regexp/syntax"
 	"slices"
 	"sort"
@@ -10,6 +11,12 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/isink17/codegraph/internal/graph"
+)
+
+var (
+	globalNameWriteRE = regexp.MustCompile(`^\s*globals\s*\(\s*\)\s*\[\s*(?:"([^"\\]*)"|'([^'\\]*)')\s*\]\s*=`)
+	setattrWriteRE    = regexp.MustCompile(`^\s*setattr\s*\(\s*([^\s(),]+)\s*,\s*(?:"([^"\\]*)"|'([^'\\]*)')\s*,`)
+	memberWriteRE     = regexp.MustCompile(`^\s*([^\s.=]+)\.([^\s.=]+)\s*=([^=]|$)`)
 )
 
 // identStart and identContinue are the rune classes of a Python name (PEP 3131):
@@ -248,8 +255,10 @@ func ClassBodyBindings(src string) []LocalBinding {
 
 func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 	lines := maskPythonLines(strings.Split(src, "\n"))
+	rawLines := strings.Split(src, "\n")
 	var out []LocalBinding
 	seen := map[string]struct{}{}
+	moduleSetattrBound := false
 	escaped := map[string]bool{}
 	var escapedOrder []string
 	var noteEscapes func(stmt string)
@@ -272,7 +281,12 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 		}
 	}
 	decorated := false
-	add := func(name string) { addBinding(&out, seen, LocalBinding{Name: name}) }
+	add := func(name string) {
+		addBinding(&out, seen, LocalBinding{Name: name})
+		if !isFunctionScope && !classBody && name == "setattr" {
+			moduleSetattrBound = true
+		}
+	}
 
 	logical, starts := pythonLogicalLines(lines)
 	base := -1
@@ -308,6 +322,13 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 			if classBody {
 				for _, b := range ImportBindings(trimmed) {
 					add(b.LocalName)
+				}
+			}
+			if !isFunctionScope && !classBody {
+				for _, binding := range ImportBindings(trimmed) {
+					if binding.LocalName == "setattr" {
+						moduleSetattrBound = true
+					}
 				}
 			}
 			continue
@@ -352,6 +373,9 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 			}
 		}
 		if isDecl {
+			if !isFunctionScope && !classBody && (strings.HasPrefix(header, "def ") || strings.HasPrefix(header, "class ")) && declaredName(header) == "setattr" {
+				moduleSetattrBound = true
+			}
 			// A nested declaration owns everything indented below it, and its
 			// body is not part of this scope.
 			skipUntil = indent
@@ -366,8 +390,17 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 				// decorated class, or a decorated member of a class body
 				// (`@property`), is not provably what it declares.
 				addBinding(&out, seen, LocalBinding{Name: declaredName(header), Declaration: !(wasDecorated && (classBody || strings.HasPrefix(header, "class ")))})
+			} else if wasDecorated && strings.HasPrefix(header, "def ") {
+				// A module decorator binds its result, not necessarily this def.
+				add(declaredName(header))
 			}
 			continue
+		}
+		if !isFunctionScope && !classBody && starts[i] < len(rawLines) {
+			stmt := rawLines[starts[i]]
+			if name := moduleMutationBinding(stmt, !moduleSetattrBound); name != "" {
+				addMutationBinding(&out, seen, name)
+			}
 		}
 		noteEscapes(trimmed)
 		addPythonAssignedNames(trimmed, add)
@@ -385,6 +418,49 @@ func scopeBindings(src string, isFunctionScope, classBody bool) []LocalBinding {
 		}
 	}
 	return out
+}
+
+// moduleMutationBinding returns statically named module/member writes. Dotted
+// receivers are only acted on after the store matches them to visible imports.
+func moduleMutationBinding(stmt string, builtinSetattr bool) string {
+	if match := globalNameWriteRE.FindStringSubmatch(stmt); len(match) == 3 {
+		name := match[1]
+		if name == "" {
+			name = match[2]
+		}
+		if validIdentifier(name) {
+			return NormalizeIdentifier(name)
+		}
+	}
+	var receiver, member string
+	if match := setattrWriteRE.FindStringSubmatch(stmt); len(match) == 4 && builtinSetattr {
+		receiver, member = match[1], match[2]
+		if member == "" {
+			member = match[3]
+		}
+	} else if match := memberWriteRE.FindStringSubmatch(stmt); len(match) == 4 {
+		receiver, member = match[1], match[2]
+	}
+	if validIdentifier(receiver) && validIdentifier(member) {
+		return NormalizeIdentifier(receiver) + "." + NormalizeIdentifier(member)
+	}
+	return ""
+}
+
+func addMutationBinding(out *[]LocalBinding, seen map[string]struct{}, name string) {
+	parts := strings.Split(name, ".")
+	for i, part := range parts {
+		if !validIdentifier(part) {
+			return
+		}
+		parts[i] = NormalizeIdentifier(part)
+	}
+	name = strings.Join(parts, ".")
+	if _, ok := seen[name]; ok {
+		return
+	}
+	seen[name] = struct{}{}
+	*out = append(*out, LocalBinding{Name: name})
 }
 
 // DefHeaderEnd returns how many lines after its first the `def` header that

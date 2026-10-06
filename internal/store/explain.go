@@ -157,6 +157,14 @@ func (s *Store) ExplainEdges(ctx context.Context, repoID int64, sel EdgeSelector
 		return res, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	ctx = context.WithValue(ctx, parserSemanticGraphQueryerKey{}, parserSemanticGraphQueryer(tx))
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return res, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
+	}
 
 	where := `e.repo_id = ? AND e.id = ?`
 	args := []any{repoID, sel.EdgeID}

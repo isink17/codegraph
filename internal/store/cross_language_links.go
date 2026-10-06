@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/parser"
 )
 
 // Cross-language linking.
@@ -102,6 +104,33 @@ func (s *Store) CrossLanguageLinksCurrent(ctx context.Context, repoID int64) (bo
 	return value == "1", nil
 }
 
+// CrossLanguageLinksAffectedByPaths conservatively checks whether changed
+// files can be a bridge importer or destination. Basename matching may cause
+// extra rebuilds, but avoids reopening a future parser generation on an
+// unrelated path.
+func (s *Store) CrossLanguageLinksAffectedByPaths(ctx context.Context, repoID int64, paths []string) (bool, error) {
+	if len(paths) == 0 {
+		return false, nil
+	}
+	for _, p := range paths {
+		var found int
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files f JOIN file_imports i ON i.file_id=f.id WHERE f.repo_id=? AND f.path=?)`, repoID, p).Scan(&found); err != nil {
+			return false, err
+		}
+		if found != 0 {
+			return true, nil
+		}
+		base := path.Base(strings.TrimSuffix(p, path.Ext(p)))
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files f JOIN file_imports i ON i.file_id=f.id WHERE f.repo_id=? AND (i.import_path=? OR i.import_path LIKE ? OR i.import_path LIKE ? OR i.import_path LIKE ?))`, repoID, p, "%/"+base, "%"+base, "%"+base+".%").Scan(&found); err != nil {
+			return false, err
+		}
+		if found != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func clearCrossLanguageLinksCurrentTx(ctx context.Context, tx *sql.Tx, repoID int64) error {
 	_, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, crossLanguageLinksCurrentKey(repoID))
 	return err
@@ -157,6 +186,10 @@ type xlangLink struct {
 func (s *Store) ResolveCrossLanguageLinks(ctx context.Context, repoID int64) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return 0, err
+	}
+	if err := CheckParserSemanticResolve(ctx, tx, repoID, parser.SemanticEpochs(), nil); err != nil {
+		_ = tx.Rollback()
 		return 0, err
 	}
 	// Candidates are computed inside the same transaction that writes them, so
@@ -583,12 +616,14 @@ func applyCrossLanguageLinksTx(ctx context.Context, tx *sql.Tx, repoID int64, li
 		confidence string
 		fileID     int64
 	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, src_symbol_id, dst_symbol_id, dst_name, evidence, resolution_strategy, resolution_confidence, file_id
-		FROM edges
-		WHERE repo_id = ? AND edge_kind = ?
-		ORDER BY id
-	`, repoID, EdgeKindCrossLanguageRef)
+	query := `
+		SELECT e.id, e.src_symbol_id, e.dst_symbol_id, e.dst_name, e.evidence, e.resolution_strategy, e.resolution_confidence, e.file_id
+		FROM edges e
+		WHERE e.repo_id = ? AND e.edge_kind = ?
+		ORDER BY e.id
+	`
+	args := []any{repoID, EdgeKindCrossLanguageRef}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("cross-language existing query: %w", err)
 	}
@@ -675,21 +710,21 @@ func applyCrossLanguageLinksTx(ctx context.Context, tx *sql.Tx, repoID int64, li
 
 	const columns = "repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line," +
 		" resolution_strategy, resolution_confidence"
-	args := make([]any, 0, crossLangEdgeValuesBatchRows*10)
+	insertArgs := make([]any, 0, crossLangEdgeValuesBatchRows*10)
 	flush := func() error {
-		if len(args) == 0 {
+		if len(insertArgs) == 0 {
 			return nil
 		}
-		if err := execBatchInsert(ctx, tx, "edges", columns, 10, args, nil); err != nil {
+		if err := execBatchInsert(ctx, tx, "edges", columns, 10, insertArgs, nil); err != nil {
 			return fmt.Errorf("cross-language insert: %w", err)
 		}
-		args = args[:0]
+		insertArgs = insertArgs[:0]
 		return nil
 	}
 	for _, l := range insert {
-		args = append(args, repoID, l.srcSymbolID, l.dstSymbolID, l.dstName, EdgeKindCrossLanguageRef,
+		insertArgs = append(insertArgs, repoID, l.srcSymbolID, l.dstSymbolID, l.dstName, EdgeKindCrossLanguageRef,
 			l.evidence, l.srcFileID, 0, l.strategy, l.confidence)
-		if len(args) == crossLangEdgeValuesBatchRows*10 {
+		if len(insertArgs) == crossLangEdgeValuesBatchRows*10 {
 			if err := flush(); err != nil {
 				return 0, err
 			}

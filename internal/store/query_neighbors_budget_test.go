@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser"
 )
 
 // neighborBudgetFixture is a repository whose neighbour candidate order is
@@ -130,6 +132,65 @@ func TestFindCalleesResolvedStaysInVariableBudget(t *testing.T) {
 	}
 	if len(guard.statements) > wantInserts+8 {
 		t.Fatalf("neighbour statements = %d, want O(batches)", len(guard.statements))
+	}
+}
+
+type pausingNeighborQuerier struct {
+	inner   execQuerier
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (q *pausingNeighborQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if strings.Contains(query, "WITH candidates") {
+		q.once.Do(func() {
+			close(q.entered)
+			<-q.release
+		})
+	}
+	return q.inner.QueryContext(ctx, query, args...)
+}
+
+func (q *pausingNeighborQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.inner.ExecContext(ctx, query, args...)
+}
+
+func TestFindCallersUsesSnapshotAcrossParserTransition(t *testing.T) {
+	ctx := context.Background()
+	s, repo := openBudgetStore(t)
+	fx := buildNeighborBudgetFixture(t, s, repo.ID, 1)
+	pause := &pausingNeighborQuerier{entered: make(chan struct{}), release: make(chan struct{})}
+	s.neighborStatementWrap = func(target execQuerier) execQuerier {
+		pause.inner = target
+		return pause
+	}
+	type result struct {
+		callers []graph.Symbol
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		callers, err := s.FindCallers(ctx, repo.ID, fx.dstNames[0], 0, 20, 0)
+		done <- result{callers: callers, err: err}
+	}()
+	<-pause.entered
+	if err := s.BeginParserSemanticTransitions(ctx, repo.ID, parser.SemanticEpochs(), []string{"go"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=NULL WHERE repo_id=? AND dst_symbol_id=?`, repo.ID, fx.dstIDs[0]); err != nil {
+		t.Fatal(err)
+	}
+	close(pause.release)
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if names := qualifiedNames(got.callers); !slices.Equal(names, []string{fx.srcNames[0]}) {
+		t.Fatalf("snapshot callers = %v, want certified pre-transition caller %q", names, fx.srcNames[0])
+	}
+	if _, err := s.FindCallers(ctx, repo.ID, fx.dstNames[0], 0, 20, 0); !errors.Is(err, ErrParserSemanticIncomplete) {
+		t.Fatalf("query after transition began = %v, want incomplete refusal", err)
 	}
 }
 

@@ -210,6 +210,84 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	semanticEpochs := parser.SemanticEpochs()
+	pendingLanguages, err := i.store.ParserSemanticTransitionLanguages(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	pendingTransition := len(pendingLanguages) > 0
+	// A custom/test registry may omit production languages. Keep those
+	// repository-wide generations for resolver preflights, but do not treat
+	// their absent adapter as an upgrade requirement unless files of that
+	// language are actually part of this operation.
+	semanticLanguages := make([]string, 0, len(currentProfiles))
+	for language, profile := range currentProfiles {
+		semanticEpochs[language] = profile.SemanticEpoch
+		if affectedLanguage(language) {
+			semanticLanguages = append(semanticLanguages, language)
+		}
+	}
+	slices.Sort(semanticLanguages)
+	semanticCompatibilityAffected := affectedLanguage
+	xlangCurrent, err := i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	if !pathScoped && (scanKind != "update" || !xlangCurrent) {
+		indexedLanguages, err := i.store.IndexedLanguages(ctx, repo.ID)
+		if err != nil {
+			return store.ScanSummary{}, err
+		}
+		semanticCompatibilityAffected = func(language string) bool {
+			_, exists := indexedLanguages[language]
+			_, pending := pendingLanguages[language]
+			return exists || pending
+		}
+	}
+	indexedLanguages, err := i.store.IndexedLanguages(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	semanticStale, err := i.store.PlanParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticCompatibilityAffected)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	if !pathScoped && (scanKind != "update" || !xlangCurrent) {
+		for _, language := range semanticStale {
+			if !affectedLanguage(language) {
+				return store.ScanSummary{}, &store.ParserSemanticError{Reason: store.ErrParserSemanticUpgradeRequired, Language: language, Current: semanticEpochs[language]}
+			}
+		}
+	}
+	for _, language := range semanticStale {
+		if _, indexed := indexedLanguages[language]; !indexed {
+			if _, pending := pendingLanguages[language]; pending && affectedLanguage(language) {
+				profilePlan.reparseLanguages[language] = struct{}{}
+			}
+			continue
+		}
+		if _, supported := currentProfiles[language]; !supported && affectedLanguage(language) {
+			return store.ScanSummary{}, &store.ParserSemanticError{Reason: store.ErrParserSemanticUpgradeRequired, Language: language, Current: semanticEpochs[language]}
+		}
+		if affectedLanguage(language) {
+			profilePlan.reparseLanguages[language] = struct{}{}
+		}
+	}
+	// A parser/profile transition can invalidate edges owned by any language.
+	// The resulting repo-wide resolver must therefore preflight every indexed
+	// language's semantic marker before the first scan write, including markers
+	// outside a path-scoped request.
+	semanticTransition := pendingTransition || len(profilePlan.reparseLanguages) > 0
+	if semanticTransition {
+		allIndexed := func(language string) bool {
+			_, ok := indexedLanguages[language]
+			_, pending := pendingLanguages[language]
+			return ok || pending
+		}
+		if _, err := i.store.PlanParserSemanticEpochs(ctx, repo.ID, semanticEpochs, allIndexed); err != nil {
+			return store.ScanSummary{}, err
+		}
+	}
 	if pathScoped && len(profilePlan.reparseLanguages) > 0 {
 		// A parser profile belongs to a language, not one selected file. Expand a
 		// path-scoped request to every live file in each selected stale language
@@ -240,7 +318,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// Its policy coverage is therefore every language, so a newer or unreadable
 	// marker of an unselected language refuses it too.
 	policyAffected := affectedLanguage
-	if !pathScoped && scanKind != "update" {
+	if semanticTransition || (!pathScoped && scanKind != "update") {
 		policyAffected = func(string) bool { return true }
 	}
 	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, policyAffected)
@@ -249,6 +327,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	// Every refusal is behind us: only now may a known repository row, or the
 	// canonical-path marker of an empty one, be written.
+	if semanticTransition {
+		if err := i.store.BeginParserSemanticTransitions(ctx, repo.ID, semanticEpochs, profilePlan.languages()); err != nil {
+			return store.ScanSummary{}, err
+		}
+	}
 	if repoKnown {
 		if repo, err = i.store.UpsertRepo(ctx, opts.RepoRoot); err != nil {
 			return store.ScanSummary{}, err
@@ -702,8 +785,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				// to record. Empty is the truthful answer and, unlike the
 				// previous content's hash, it cannot later be mistaken for
 				// proof that the persisted graph matches what is on disk.
-				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
-				ContentHash: "",
+				MtimeUnixNS:         res.task.info.ModTime().UnixNano(),
+				ContentHash:         "",
+				ParserSemanticEpoch: currentProfiles[res.task.language].SemanticEpoch,
 			})
 			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
 			if len(oversizeBatch) >= metadataBatchSize {
@@ -717,11 +801,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		case "touch":
 			writeStart := time.Now()
 			touchBatch = append(touchBatch, store.FileMetadataUpdate{
-				Path:        res.task.rel,
-				Language:    res.task.language,
-				SizeBytes:   res.task.info.Size(),
-				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
-				ContentHash: res.hash,
+				Path:                res.task.rel,
+				Language:            res.task.language,
+				SizeBytes:           res.task.info.Size(),
+				MtimeUnixNS:         res.task.info.ModTime().UnixNano(),
+				ContentHash:         res.hash,
+				ParserSemanticEpoch: currentProfiles[res.task.language].SemanticEpoch,
 			})
 			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
 			if len(touchBatch) < metadataBatchSize {
@@ -744,14 +829,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			// than claiming a conversion that did not happen.
 			replaceProfile := currentProfiles[res.task.language]
 			replaceBatch = append(replaceBatch, store.ReplaceFileGraphInput{
-				Path:            res.task.rel,
-				Language:        res.parsed.Language,
-				SizeBytes:       res.task.info.Size(),
-				MtimeUnixNS:     res.task.info.ModTime().UnixNano(),
-				ContentHash:     res.hash,
-				Parsed:          res.parsed,
-				ParserProfile:   replaceProfile.ID,
-				ParserCallEdges: replaceProfile.EmitsCallEdges,
+				Path:                res.task.rel,
+				Language:            res.parsed.Language,
+				SizeBytes:           res.task.info.Size(),
+				MtimeUnixNS:         res.task.info.ModTime().UnixNano(),
+				ContentHash:         res.hash,
+				Parsed:              res.parsed,
+				ParserProfile:       replaceProfile.ID,
+				ParserCallEdges:     replaceProfile.EmitsCallEdges,
+				ParserSemanticEpoch: replaceProfile.SemanticEpoch,
 			})
 			changedPathSet[res.task.rel] = struct{}{}
 			for _, sym := range res.parsed.Symbols {
@@ -791,11 +877,12 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		case "parse_failed":
 			writeStart := time.Now()
 			parseFailedBatch = append(parseFailedBatch, store.FileMetadataUpdate{
-				Path:        res.task.rel,
-				Language:    res.task.language,
-				SizeBytes:   res.task.info.Size(),
-				MtimeUnixNS: res.task.info.ModTime().UnixNano(),
-				ContentHash: res.hash,
+				Path:                res.task.rel,
+				Language:            res.task.language,
+				SizeBytes:           res.task.info.Size(),
+				MtimeUnixNS:         res.task.info.ModTime().UnixNano(),
+				ContentHash:         res.hash,
+				ParserSemanticEpoch: currentProfiles[res.task.language].SemanticEpoch,
 			})
 			summary.ParseErrors++
 			summary.ParseSamples = addParseSample(summary.ParseSamples, fmt.Sprintf("%s: %s", res.task.rel, res.parseErr))
@@ -968,10 +1055,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	resolveStart := time.Now()
 	repoWideResolve := false
 
-	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
+	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 && !semanticTransition {
 		summary.ResolveMS = 0
 		summary.ResolveMode = "none"
-	} else if incrementalResolve {
+	} else if incrementalResolve && !semanticTransition {
 		// For path-scoped updates (Options.Paths) and incremental update runs, limit edge
 		// resolution to the changed files. Full index runs still do repo-wide resolution.
 		changedPaths := make([]string, 0, len(changedPathSet))
@@ -1048,7 +1135,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 		summary.ResolverPolicyLanguages = policyStale
 	}
-	xlangCurrent, err := i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
+	xlangCurrent, err = i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
 	if err != nil {
 		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 		return summary, err
@@ -1057,10 +1144,19 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// replacement, retirement, or deletion clears the durable currentness marker
 	// in the same store transaction; an absent marker also covers pre-P22.37
 	// databases and incomplete prior scans.
-	if !xlangCurrent || len(changedPathSet) > 0 {
-		if _, err := i.store.ResolveCrossLanguageLinks(ctx, repo.ID); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+	if !xlangCurrent || len(changedPathSet) > 0 || pathScoped {
+		var resolveErr error
+		shouldResolve := scanKind != "update" || !pathScoped
+		if !shouldResolve && len(candidatePaths) > 0 {
+			paths := candidatePaths
+			shouldResolve, resolveErr = i.store.CrossLanguageLinksAffectedByPaths(ctx, repo.ID, paths)
+		}
+		if resolveErr == nil && shouldResolve {
+			_, resolveErr = i.store.ResolveCrossLanguageLinks(ctx, repo.ID)
+		}
+		if resolveErr != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
+			return summary, resolveErr
 		}
 	}
 	// Test links: one canonical repo-wide pass (P22.2). Unlike edge resolution
@@ -1128,19 +1224,44 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if summary.FilesTotal > 0 {
 		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100
 	}
-	if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
-		return summary, err
-	}
-	if composerChanged {
-		if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+	if semanticTransition {
+		if composerChanged {
+			if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+			if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+				return summary, err
+			}
+		}
+		if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
-		if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+		if err := i.store.CompleteScanWithParserSemanticEpochs(ctx, scanID, summary, started, repo.ID, semanticEpochs, semanticLanguages); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
 			return summary, err
 		}
-	}
-	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
-		return summary, err
+	} else {
+		if err := i.store.StampParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticLanguages); err != nil {
+			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+			return summary, err
+		}
+		if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
+			return summary, err
+		}
+		if composerChanged {
+			if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+				return summary, err
+			}
+			if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+				return summary, err
+			}
+		}
+		if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
+			return summary, err
+		}
 	}
 	return summary, nil
 }

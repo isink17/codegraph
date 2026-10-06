@@ -1,5 +1,7 @@
 package parser
 
+import "strings"
+
 // Profile is the semantic identity of the adapter that produced a file's
 // persisted graph. It answers one question the filesystem cannot: "would this
 // binary's parser have written the same facts as the one that indexed this
@@ -50,6 +52,58 @@ type Profile struct {
 	// heuristic adapter replacing a tree-sitter graph deletes every call edge
 	// for the language without saying so.
 	EmitsCallEdges bool
+
+	// SemanticEpoch orders parser-owned graph semantics across implementation
+	// families. Unlike ID, it is language-wide: tree-sitter and fallback
+	// adapters that implement the same safety generation share an epoch.
+	SemanticEpoch int
+}
+
+// SemanticEpochForProfile is the directional compatibility contract for one
+// parser family. Bump its language entry whenever that family changes
+// persisted semantics. Different families share a value only while they
+// implement the same safety generation.
+func SemanticEpochForProfile(id string) int {
+	parts := strings.SplitN(id, ":", 3)
+	if len(parts) < 2 {
+		return 0
+	}
+	return parserSemanticEpochs[parts[0]+":"+parts[1]]
+}
+
+// SemanticEpochs returns a copy of the language-level compatibility contract.
+func SemanticEpochs() map[string]int {
+	out := make(map[string]int)
+	for familyLanguage, epoch := range parserSemanticEpochs {
+		language := familyLanguage[strings.IndexByte(familyLanguage, ':')+1:]
+		if epoch > out[language] {
+			out[language] = epoch
+		}
+	}
+	return out
+}
+
+var parserSemanticEpochs = map[string]int{
+	"treesitter:cpp": 1, "treesitter:csharp": 1, "treesitter:go": 1,
+	"treesitter:java": 1, "treesitter:kotlin": 1, "treesitter:php": 1,
+	"treesitter:python": 2, "treesitter:ruby": 1, "treesitter:rust": 1,
+	"treesitter:swift": 1, "treesitter:typescript": 1,
+	"python-regex:python": 2,
+	"heuristic:cpp":       1, "heuristic:csharp": 1, "heuristic:go": 1,
+	"heuristic:java": 1, "heuristic:kotlin": 1, "heuristic:php": 1,
+	"heuristic:python": 1, "heuristic:ruby": 1, "heuristic:rust": 1,
+	"heuristic:swift": 1, "heuristic:typescript": 1,
+	"go-ast:go": 1,
+}
+
+// NewProfile constructs a production profile with the current family/language
+// semantic epoch. Profile ID changes still control which files are reparsed.
+func NewProfile(language, id string, emitsCallEdges bool) Profile {
+	parts := strings.SplitN(id, ":", 3)
+	if len(parts) < 2 || parts[1] != language {
+		return Profile{ID: id, EmitsCallEdges: emitsCallEdges}
+	}
+	return Profile{ID: id, EmitsCallEdges: emitsCallEdges, SemanticEpoch: SemanticEpochForProfile(id)}
 }
 
 // Known reports whether the profile identifies an adapter at all.

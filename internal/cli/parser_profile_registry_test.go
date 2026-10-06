@@ -18,6 +18,10 @@ func TestDefaultRegistryDeclaresAProfileForEveryLanguage(t *testing.T) {
 	}
 	seen := map[string]string{}
 	for _, lang := range registry.SupportedLanguages() {
+		profile, ok := registry.ProfileForLanguage(lang.Language)
+		if !ok || profile.SemanticEpoch < 1 {
+			t.Fatalf("production language %q has no parser semantic epoch: %+v", lang.Language, profile)
+		}
 		if lang.ParserProfile == "" {
 			t.Fatalf("language %q has no parser profile", lang.Language)
 		}

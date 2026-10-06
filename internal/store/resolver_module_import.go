@@ -103,15 +103,16 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		// symbols during a later path/name pass.
 		seenEdges[id] = struct{}{}
 		if scope != nil {
-			if len(scope.paths) > 0 {
-				if _, ok := scope.paths[sourcePath]; !ok {
-					continue
-				}
+			_, pathMatch := scope.paths[sourcePath]
+			_, nameMatch := scope.names[dst[dot+1:]]
+			if len(scope.paths) > 0 && len(scope.names) > 0 && !pathMatch && !nameMatch {
+				continue
 			}
-			if len(scope.names) > 0 {
-				if _, ok := scope.names[dst[dot+1:]]; !ok {
-					continue
-				}
+			if len(scope.paths) > 0 && len(scope.names) == 0 && !pathMatch {
+				continue
+			}
+			if len(scope.names) > 0 && len(scope.paths) == 0 && !nameMatch {
+				continue
 			}
 		}
 		fact := edgeFact{id: id, dir: dir, name: dst[dot+1:]}

@@ -75,6 +75,16 @@ func NewRegistry(adapters ...Adapter) *Registry {
 		if provider, ok := adapter.(ProfileProvider); ok {
 			profile = provider.Profile()
 		}
+		// Older synthetic adapters used in tests may omit the new contract;
+		// bind them to the current language generation just like the legacy
+		// unknown-provenance upgrade path. Production defaults are checked
+		// directly by the profile registry tests.
+		if profile.Known() && profile.SemanticEpoch == 0 {
+			profile.SemanticEpoch = SemanticEpochForProfile(profile.ID)
+			if profile.SemanticEpoch == 0 && !isProductionProfileFamily(profile.ID) {
+				profile.SemanticEpoch = 1
+			}
+		}
 		if !profile.Known() {
 			delete(byLang, language)
 			missingSet[language] = struct{}{}
@@ -84,7 +94,7 @@ func NewRegistry(adapters ...Adapter) *Registry {
 			continue
 		}
 		if existing, seen := byLang[language]; seen {
-			if existing.ID != profile.ID {
+			if existing.ID != profile.ID || (existing.SemanticEpoch > 0 && profile.SemanticEpoch > 0 && existing.SemanticEpoch != profile.SemanticEpoch) {
 				delete(byLang, language)
 				missingSet[language] = struct{}{}
 			}
@@ -106,6 +116,18 @@ func NewRegistry(adapters ...Adapter) *Registry {
 	}
 }
 
+func isProductionProfileFamily(id string) bool {
+	parts := strings.SplitN(id, ":", 2)
+	if len(parts) < 2 {
+		return false
+	}
+	switch parts[0] {
+	case "treesitter", "heuristic", "python-regex":
+		return true
+	}
+	return false
+}
+
 // ProfileForLanguage returns the profile of the adapter serving `language` in
 // this registry. The second result is false when no adapter serves the
 // language or when its adapter declares no profile.
@@ -120,6 +142,15 @@ func (r *Registry) LanguageProfiles() map[string]Profile {
 	out := make(map[string]Profile, len(r.profileByLang))
 	for language, profile := range r.profileByLang {
 		out[language] = profile
+	}
+	return out
+}
+
+// SemanticEpochs returns the language-level generations served by this registry.
+func (r *Registry) SemanticEpochs() map[string]int {
+	out := make(map[string]int, len(r.profileByLang))
+	for language, profile := range r.profileByLang {
+		out[language] = profile.SemanticEpoch
 	}
 	return out
 }

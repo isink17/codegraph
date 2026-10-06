@@ -19,7 +19,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:java:v11"
 		}
 		if lang.Language == "python" {
-			want = "treesitter:python:v8"
+			want = "treesitter:python:v9"
 		}
 		if lang.Language == "php" {
 			want = "treesitter:php:v4"
