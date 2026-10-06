@@ -16,6 +16,12 @@ CodeGraph is a local-first code context engine and MCP server. It indexes a repo
 
 Use it when an assistant needs repository structure, callers and callees, related tests, or task-focused context without rebuilding that map from files for every question. CodeGraph helps navigate the code; verify proposed changes against source and the language limits below.
 
+## Contents
+
+**Getting started:** [Install](#install) · [First run](#first-run) · [AI client support](#ai-client-support) · [Why CodeGraph?](#why-codegraph) · [Core capabilities](#core-capabilities) · [Supported languages](#supported-languages) · [Agent Skill](#agent-skill)
+
+**Reference:** [MCP Tools](#mcp-tools-30) · [Index and database behavior](#index-and-database-behavior) · [Result Limits](#result-limits) · [Usage / Token Meter](#usage--token-meter) · [CLI Reference](#cli-reference) · [Optional: Embeddings & Agentic Mode](#optional-embeddings--agentic-mode) · [Configuration](#configuration) · [Architecture](#architecture) · [Building from Source](#building-from-source) · [License](#license)
+
 ## Install
 
 The current v2.0 branch is not released. To install this branch, clone it and install the command:
@@ -133,24 +139,11 @@ npx skills add isink17/codegraph --skill codegraph
 
 This installs the Agent Skill from the repository, not the CodeGraph binary. The skill supports clients that accept Agent Skills and documents both MCP modes and the CLI fallback.
 
-## Detailed reference
-
-- [MCP tool reference](#mcp-tools-30)
-- [Progressive symbol detail](#progressive-disclosure-detail)
-- [Compact output](#compact-output-format)
-- [Graph capability and limitations](#graph-capability-and-limitations)
-- [Gateway MCP mode](#gateway-mcp-mode---tool-mode)
-- [Result limits and query behavior](#result-limits)
-- [Usage and token meter](#usage--token-meter)
-- [CLI reference](#cli-reference)
-- [Embeddings and agentic mode](#optional-embeddings--agentic-mode)
-- [Configuration](#configuration)
-- [Architecture](#architecture)
-- [Build from source](#building-from-source)
-- [Index and database behavior](#index-and-database-behavior)
-- [Version](#version)
-
 ## MCP Tools (30)
+
+**Tool categories:** [Code Intelligence](#code-intelligence) · [Architecture & Analysis](#architecture--analysis) · [Repository Management](#repository-management) · [Session Memory](#session-memory) · [Agentic](#agentic)
+
+**Details:** [Tools not listed in `tools/list`](#tools-not-listed-in-toolslist) · [Progressive disclosure (`detail`)](#progressive-disclosure-detail) · [Compact output (`format`)](#compact-output-format) · [Query contract](#query-contract) · [Graph capability and `limitations`](#graph-capability-and-limitations) · [Token budget and continuation (`context_for_task`)](#token-budget-and-continuation-context_for_task) · [Gateway MCP mode (`--tool-mode`)](#gateway-mcp-mode---tool-mode)
 
 ### Code Intelligence
 
@@ -501,6 +494,8 @@ tool does and what it accepts.
 
 The mode is chosen at startup and fixed for the life of the server; no tool can
 change it. Restart with the other mode to switch.
+
+[Back to Contents](#contents)
 
 ---
 
