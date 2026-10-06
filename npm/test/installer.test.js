@@ -83,6 +83,10 @@ test('maps only the six supported native targets', () => {
   assert.throws(() => assetFor('linux', 'ia32', version), /does not support linux\/ia32/);
 });
 
+test('declares public scoped-package publication access', () => {
+  assert.equal(require('../package.json').publishConfig.access, 'public');
+});
+
 test('packs, globally installs and invokes the tarball wrapper', async t => {
   const work = tempPackage();
   t.after(() => fs.rmSync(work, { recursive: true, force: true }));
