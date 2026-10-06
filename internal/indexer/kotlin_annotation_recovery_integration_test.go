@@ -136,7 +136,9 @@ func TestKotlinDetachedAnnotationLayoutLifecycle(t *testing.T) {
 	for i, content := range []string{sameLine, ownLine, sameLine} {
 		if i > 0 {
 			r.write(t, "lib/Actions.kt", content)
-			r.update(t, "lib/Actions.kt")
+			if summary := r.update(t, "lib/Actions.kt"); summary.ResolveMode != "paths+names" {
+				t.Fatalf("ordinary Kotlin update resolve mode=%q, want paths+names", summary.ResolveMode)
+			}
 		}
 		step := []string{"same-line", "own-line", "same-line again"}[i]
 		assertKotlinFacade(t, r.dbPath, r.repoID, "lib/Actions.kt", "lib.ActionsKt|explicit=0|multifile=0")
@@ -253,7 +255,7 @@ func TestKotlinV6ToV7DetachedAnnotationRecoveryConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" {
+	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" || summary.ResolveMode != "repo" {
 		t.Fatalf("v6-to-v7 update=%+v", summary)
 	}
 	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v11", "Synth.kt": "treesitter:kotlin:v11", "Other.kt": "treesitter:kotlin:v11", "Caller.java": "treesitter:java:v11", "main.go": "go-ast:go:v1", "caller.ts": "treesitter:typescript:v2"} {
@@ -281,7 +283,7 @@ func TestKotlinV6ToV7DetachedAnnotationRecoveryConvergence(t *testing.T) {
 	}
 	r.assertFreshParity(t, "Kotlin v6-to-v7 annotation recovery convergence")
 	again, err := r.idx.Update(ctx, Options{RepoRoot: root})
-	if err != nil || again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 {
+	if err != nil || again.FilesChanged != 0 || again.FilesIndexed != 0 || len(again.ParserProfileLanguages) != 0 || again.ResolveMode != "none" {
 		t.Fatalf("second update=%+v, %v; want no-op", again, err)
 	}
 }

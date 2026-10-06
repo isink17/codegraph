@@ -4913,6 +4913,16 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
+	// Java and Kotlin share JVM callable ABI. A declaration or ABI change in
+	// either language can invalidate unresolved or previously unbound callers
+	// in the other, so incremental resolution covers this pair while remaining
+	// scoped away from every unrelated language.
+	if _, java := languageScope["java"]; java {
+		languageScope["kotlin"] = struct{}{}
+	}
+	if _, kotlin := languageScope["kotlin"]; kotlin {
+		languageScope["java"] = struct{}{}
+	}
 	if err := s.checkParserSemanticLanguages(ctx, repoID, sortedKeys(languageScope)); err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}

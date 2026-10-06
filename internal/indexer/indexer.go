@@ -238,11 +238,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return exists
 		}
 	}
-	semanticStale, err := i.store.PlanParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticCompatibilityAffected)
+	indexedLanguages, err := i.store.IndexedLanguages(ctx, repo.ID)
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
-	indexedLanguages, err := i.store.IndexedLanguages(ctx, repo.ID)
+	semanticStale, err := i.store.PlanParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticCompatibilityAffected)
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
@@ -262,6 +262,20 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 		if affectedLanguage(language) {
 			profilePlan.reparseLanguages[language] = struct{}{}
+		}
+	}
+	// A parser/profile transition can invalidate edges owned by any language.
+	// The resulting repo-wide resolver must therefore preflight every indexed
+	// language's semantic marker before the first scan write, including markers
+	// outside a path-scoped request.
+	semanticTransition := len(profilePlan.reparseLanguages) > 0
+	if semanticTransition {
+		allIndexed := func(language string) bool {
+			_, ok := indexedLanguages[language]
+			return ok
+		}
+		if _, err := i.store.PlanParserSemanticEpochs(ctx, repo.ID, semanticEpochs, allIndexed); err != nil {
+			return store.ScanSummary{}, err
 		}
 	}
 	if pathScoped && len(profilePlan.reparseLanguages) > 0 {
@@ -294,7 +308,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// Its policy coverage is therefore every language, so a newer or unreadable
 	// marker of an unselected language refuses it too.
 	policyAffected := affectedLanguage
-	if !pathScoped && scanKind != "update" {
+	if semanticTransition || (!pathScoped && scanKind != "update") {
 		policyAffected = func(string) bool { return true }
 	}
 	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, policyAffected)
@@ -1029,7 +1043,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
 		summary.ResolveMS = 0
 		summary.ResolveMode = "none"
-	} else if incrementalResolve {
+	} else if incrementalResolve && !semanticTransition {
 		// For path-scoped updates (Options.Paths) and incremental update runs, limit edge
 		// resolution to the changed files. Full index runs still do repo-wide resolution.
 		changedPaths := make([]string, 0, len(changedPathSet))

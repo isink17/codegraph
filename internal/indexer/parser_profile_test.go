@@ -477,6 +477,32 @@ func TestFutureParserSemanticEpochRefusedBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestTransitionPreflightsFutureUnselectedLanguageBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "A.java"), "class A {}\n")
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\n")
+	s := newProfileStore(t)
+	initial := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "java:v1"), callCapable("go", ".go", "go:v1")), nil)
+	if _, err := initial.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	if _, err := s.raw(t).ExecContext(ctx, `UPDATE settings SET value=? WHERE key=?`, "2", fmt.Sprintf("parser.semantic.%d.java", repo)); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileFile(t, filepath.Join(root, "main.go"), "package main\nfunc Added() {}\n")
+	before := graphSnapshot(t, s)
+	transition := New(s.Store, parser.NewRegistry(callCapable("java", ".java", "java:v1"), callCapable("go", ".go", "go:v2")), nil)
+	_, err := transition.Update(ctx, Options{RepoRoot: root, Paths: []string{"main.go"}})
+	if !errors.Is(err, store.ErrParserSemanticNewer) {
+		t.Fatalf("transition error=%v, want future Java semantic refusal", err)
+	}
+	if after := graphSnapshot(t, s); after != before {
+		t.Fatalf("transition mutated graph before future-state refusal:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
 func TestMissingParserSemanticMarkerUpgradesOnOrdinaryUpdate(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -493,8 +519,8 @@ func TestMissingParserSemanticMarkerUpgradesOnOrdinaryUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ordinary update of legacy graph: %v", err)
 	}
-	if upgraded.FilesIndexed == 0 {
-		t.Fatalf("ordinary update did not reparse legacy parser semantics: %+v", upgraded)
+	if upgraded.FilesIndexed == 0 || upgraded.ResolveMode != "repo" {
+		t.Fatalf("ordinary update did not reparse and reconcile legacy parser semantics: %+v", upgraded)
 	}
 	second, err := idx.Update(ctx, Options{RepoRoot: root})
 	if err != nil {
