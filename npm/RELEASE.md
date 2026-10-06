@@ -15,7 +15,14 @@ cd npm
 npm version --no-git-tag-version "$version"
 npm pack --dry-run
 npm test
+bash ../.github/scripts/verify-release-assets.sh package.json "$tag" ../release-dist
 ```
+
+`verify-release-assets.sh` is the publication parity gate: it requires a valid
+`vX.Y.Z` tag equal to the staged package version and all six exact native asset
+names plus matching, valid SHA-256 sidecars. Run it against downloaded GitHub
+assets before `npm publish`; it exits nonzero for missing input, version
+mismatch, missing/empty asset or sidecar, or checksum mismatch.
 
 The tag's release must contain both the existing human-download archive and
 these npm assets for each target:
@@ -27,7 +34,8 @@ these npm assets for each target:
 - `codegraph-vX.Y.Z-windows_amd64.exe` and its `.sha256` sidecar
 - `codegraph-vX.Y.Z-windows_arm64.exe` and its `.sha256` sidecar
 
-Publish only after release asset upload succeeds. The installer requests only
+Run the guard against the downloaded release assets before packing. Publish
+only after release asset upload succeeds. The installer requests only
 tag `vX.Y.Z` and validates the selected asset against its SHA-256 sidecar before
 installing it. If an asset or sidecar is absent, install fails with the package
 version, platform and expected tag/asset; it never falls back to another
@@ -42,6 +50,22 @@ npm version in a clean temporary prefix and run `codegraph --version`.
 Package ownership for the `@isink17` scope and either an authorized npm token
 or configured npm trusted publisher remain release prerequisites. No credential
 or trusted publisher is configured by this implementation.
+
+Prefer npm trusted publishing for an eventual GitHub Actions publisher. The
+owner must first establish package ownership, then configure the package's
+Trusted Publisher in npm settings for `isink17/codegraph` and the exact future
+publishing workflow filename. npm currently requires a GitHub-hosted runner,
+Node 22.14.0 or later, npm 11.5.1 or later, and `id-token: write`; this project
+does not add those permissions or a publishing workflow until publication is
+explicitly approved. A scoped automation token is the fallback if the owner
+cannot use trusted publishing.
+
+If GitHub Release creation or upload fails, the workflow leaves an unpublished
+draft that blocks automatic reruns. The owner must inspect the draft and
+downloaded artifacts, confirm it was never public, then delete the incomplete
+draft before rerunning. Never replace bytes in a published Release. The workflow
+refuses every existing Release and never uses `--clobber`. An incomplete asset
+set blocks npm publication through the guard.
 
 If `npm publish` reports failure, first check
 `npm view @isink17/codegraph@X.Y.Z version`. If the exact version exists,
