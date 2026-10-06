@@ -36,7 +36,11 @@ cp "$dist/$archive_base/$binary_name" "$dist/$native_asset"
 
 case "$archive_ext" in
   zip)
-    (cd "$dist/$archive_base" && zip -q -r "../$archive_base.zip" .)
+    if [[ "$goos" == windows ]]; then
+      powershell.exe -NoProfile -NonInteractive -Command "Compress-Archive -Path '$dist/$archive_base/*' -DestinationPath '$dist/$archive_base.zip' -Force"
+    else
+      (cd "$dist/$archive_base" && zip -q -r "../$archive_base.zip" .)
+    fi
     archive="$dist/$archive_base.zip"
     ;;
   tar.gz)
