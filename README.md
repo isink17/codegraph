@@ -10,95 +10,99 @@
   <img src="https://img.shields.io/badge/MCP%20tools-30-00ff88?style=flat-square" alt="MCP Tools"/>
 </p>
 
-<br/>
+# CodeGraph
 
-`codegraph` is a **local-first code context engine and MCP server** that builds a persistent knowledge graph of your source repositories in SQLite. It gives AI coding assistants deep structural awareness — symbols, call graphs, dependencies, and semantic search — with a local SQLite graph and no hosted CodeGraph backend.
+CodeGraph is a local-first code context engine and MCP server. It indexes a repository into a SQLite graph of symbols and source-supported relationships, then makes that context available to compatible AI coding clients without a hosted CodeGraph backend.
 
-**Single binary. Zero config. No external databases. No API keys.**
+Use it when an assistant needs repository structure, callers and callees, related tests, or task-focused context without rebuilding that map from files for every question. CodeGraph helps navigate the code; verify proposed changes against source and the language limits below.
 
----
+## Install
 
-## Why codegraph?
+The current v2.0 branch is not released. To install this branch, clone it and install the command:
 
-AI coding assistants are powerful, but they spend most of their token budget *discovering* what to change — grepping files, reading code, reconstructing call graphs from partial evidence.
+~~~bash
+git clone --depth 1 --branch v2.0 https://github.com/isink17/codegraph.git
+cd codegraph
+go install ./cmd/codegraph
+~~~
 
-**codegraph shifts that cost.** One call to `context_for_task` returns the exact files, symbols, and relationships an agent needs. One call to `agentic_query` gets a synthesized answer backed by graph traversal and semantic search.
+This requires Go 1.26.0 or newer and a C compiler for the tree-sitter CGO bindings. The Go bin directory must be on PATH.
 
-```
-❌ Without codegraph
-   AI reads files one by one → greps for patterns → burns tokens on context-gathering
+For a no-toolchain install, [GitHub Releases](https://github.com/isink17/codegraph/releases/latest) provides native Linux, macOS, and Windows archives with SHA-256 sidecar files. Choose the archive matching your OS and architecture: `darwin_amd64` or `darwin_arm64`, `linux_amd64` or `linux_arm64`, `windows_amd64` or `windows_arm64`. Windows archives are ZIP files; the others are tar.gz. Verify the archive with its adjacent `.sha256` file before extracting it and placing the binary on `PATH`.
 
-✅ With codegraph
-   AI calls context_for_task("add retry logic to HTTP client")
-   → instantly gets relevant files, functions, callers, callees, and tests
-```
+Compare the digest from the sidecar with the downloaded file's hash: use `shasum -a 256 <archive>` on macOS, `sha256sum <archive>` on Linux, or `(Get-FileHash <archive> -Algorithm SHA256).Hash` in PowerShell. Replace `<archive>` with the downloaded filename.
 
----
+The latest published release is v1.2.0; those binaries predate the current v2.0 branch and do not provide this branch's capabilities. There is no v2.0 binary release yet.
 
-## How It Works
+## First run
 
-```
-Your Code ──▶ tree-sitter AST ──▶ SQLite Graph ──▶ MCP Tools ──▶ AI Assistant
-                    │                   │                │
-               12 languages       symbols, edges      30 tools
-               framework detect   embeddings          agentic reasoning
-               import resolution  session memory      hybrid search
-```
+From the repository you want to work on:
 
-`codegraph index .` walks your repo, parses every file, resolves relationships with evidence-based, language-aware declaration, import/module, lexical-scope, ownership, and receiver/type facts, and writes a symbol graph into a local v2 database (`.codegraph/codegraph.v2.sqlite`). Ambiguous evidence remains unresolved. Legacy v1 `codegraph.sqlite` data is not automatically migrated; first v2 index may require rebuilding repository data. v1 and v2 databases can coexist safely. The MCP server then exposes that graph to any compatible AI assistant via 30 structured tools — no hosted CodeGraph backend, no Docker, no API keys.
+~~~bash
+codegraph install
+codegraph index .
+codegraph doctor
+~~~
 
----
+`codegraph install` creates local defaults and attempts to add CodeGraph to supported clients with existing config files; it leaves existing CodeGraph entries untouched. Restart the client after configuration and ask: “Trace the request flow for this feature, then list callers and related tests.” `codegraph doctor` reports local setup and graph capability; omit it from routine indexing.
 
-## Features
+> **Database compatibility:** before v2.0.0, the v2 database is a regenerable development cache. Older v2 development indexes may be refused and need `codegraph index . --rebuild`; stop other CodeGraph processes first because rebuild needs exclusive database access. Legacy v1 databases are not imported or upgraded, and can coexist with v2 data.
 
-### 🔍 Parsing & Indexing
+Normal commands may check GitHub Releases once per 24 hours. Set `DO_NOT_TRACK` or `CODEGRAPH_NO_UPDATE_CHECK` to a non-empty value other than `0` or `false` to disable that check and prevent creation or update of the local version-check state file.
 
-- **Native tree-sitter parsing** for all 12 supported languages — robust AST extraction
-- **Evidence-based relationship resolution** — language-aware facts resolve only supported, unambiguous links
-- **Cross-language linking** — connects symbols across language boundaries
-- **Incremental updates** — only re-indexes changed files; fast on large repos
-- **Framework detection** — recognizes 20+ frameworks (Express, Django, gin, React, Spring, Laravel, …)
+## AI client support
 
-### 🔎 Search & Query
+The default full mode advertises 30 tools. Gateway advertises four core tools plus tool_search and tool_call; agents can discover and invoke the rest on demand.
 
-- **Hybrid search** — vector similarity (Ollama embeddings) + FTS5, fused with Reciprocal Rank Fusion
-- **Semantic search** — find code by meaning, not just text
-- **Call graph traversal** — callers, callees, transitive dependency chains
-- **Impact analysis** — know what breaks before you change it
-- **Dead code detection** — find symbols with zero references
-- **Architecture overview** — language breakdown, entry points, hub symbols, coupling metrics
+~~~bash
+codegraph serve --tool-mode gateway
+codegraph install --tool-mode gateway
+~~~
 
-### 🤖 AI Integration
+`codegraph install` auto-configures Claude Code, Cursor, Windsurf, and Gemini CLI. Codex and other MCP clients need manual configuration; install prints snippets but does not edit Codex config. A common JSON client entry is:
 
-- **30 MCP tools** — comprehensive API for AI coding assistants
-- **Agentic reasoning** — ReAct loop over a local Ollama LLM that chains tools and synthesizes answers
-- **Context building** — one tool call returns everything an agent needs for a task
-- **Session memory** — persist reads, edits, decisions, and facts across sessions
-- **Token benchmarking** — measure savings vs. naive file reading
+~~~json
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve"]
+    }
+  }
+}
+~~~
 
-### 📊 Graph Analytics
+For Codex, use the printed TOML snippet in its MCP configuration:
 
-- **PageRank** — find the most important symbols in your codebase
-- **Coupling metrics** — identify tightly coupled file pairs
-- **Cycle detection** — find circular dependencies at the file level
-- **Interactive visualization** — D3.js force-directed graph with search and zoom
+~~~toml
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["serve"]
+startup_timeout_sec = 60
+~~~
 
-### 🛠 Developer Experience
 
-- **Single Go binary** — no runtime dependencies, cross-platform
-- **Zero-config SQLite** — no Docker, no external databases
-- **`codegraph install`** — auto-detects and configures Claude Code, Cursor, Windsurf, Gemini CLI
-- **File watching** — automatic re-indexing on changes
-- **Local-first** — repository graph and index data stays in local SQLite; no hosted CodeGraph backend
+## Why CodeGraph?
 
-Normal commands may perform a GitHub Releases update check, cached on a 24-hour
-interval. Optional Ollama features use the configured Ollama endpoint.
+| Without an indexed graph | With CodeGraph |
+|---|---|
+| The assistant searches files and infers repository structure as it goes. | The assistant can query indexed symbols, supported relationships, and related tests through MCP. |
+| It repeats discovery across questions and sessions. | A local SQLite graph persists between runs and supports focused context queries. |
 
----
+The graph is evidence-based and intentionally partial: ambiguous or unsupported relationships remain unresolved. Parser capability and static language models affect relationship results; the source remains the authority.
 
-## Supported Languages
+## Core capabilities
 
-Native CGO and release builds use tree-sitter for all 12 supported languages:
+- Index and incrementally update source repositories in a local SQLite database.
+- Search symbols with full-text search and optional Ollama-backed vector embeddings.
+- Query callers, callees, dependency impact, related tests, and task-focused context.
+- Detect frameworks and cross-language import links; inspect graph structure, dead code, coupling, cycles, and dependencies.
+- Watch files for changes, audit indexed data, and visualize the graph.
+- Connect over MCP in full mode or an opt-in gateway mode; optional Ollama support adds embeddings and agentic queries.
+
+## Supported languages
+
+Native CGO builds of this v2.0 branch use tree-sitter parsers for all 12 supported languages:
 
 | Language | Extensions |
 |---|---|
@@ -115,178 +119,36 @@ Native CGO and release builds use tree-sitter for all 12 supported languages:
 | PHP | `.php` |
 | C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc` |
 
-Release archives use native CGO builds, so shipped binaries include the tree-sitter
-parsers and relationship/call-edge support. Explicit `CGO_ENABLED=0` builds retain
-Go (`go/ast`) and Python (pure fallback) call edges; Java, Kotlin, C#, TypeScript,
-JavaScript, Rust, Ruby, Swift, PHP, and C/C++ retain heuristic symbol/import
-navigation without call edges. They are not release-equivalent: symbols, imports
-and search are not complete for any language in such a build, and the Python
-fallback misses some call sites. Relationship tools disclose this through
-`limitations` (see [Graph capability](#graph-capability-and-limitations)).
+Explicit `CGO_ENABLED=0` builds are not equivalent: Go and Python retain call edges, while the other languages provide heuristic symbol/import navigation without call edges. Symbols, imports, and search are incomplete in those fallback parsers. Python's fallback also misses some call sites. Relationship queries and `codegraph doctor` report graph capability.
 
-Every language with call resolution uses a partial static scope model. [Language scope models](docs/scope-models.md) describes, for each language, the facts it proves, which calls it owns, lookup precedence, visibility, interop, unsupported forms and incremental behaviour.
-
-Ruby uses a partial static scope model. See [Ruby scope and limitations](docs/ruby-scope.md) for supported receivers, visibility, constant hazards, and why `require` and Rails/Zeitwerk conventions do not grant resolution evidence.
-
-> Node.js repos are supported; full tree-sitter node support is still in progress.
-
----
-
-## Quick Start
-
-### 1. Install
-
-```bash
-go install github.com/isink17/codegraph/cmd/codegraph@latest
-```
-
-Requires Go 1.26.0 or newer and a C compiler (for tree-sitter CGo bindings).
-
-### Build from source
-
-```bash
-git clone https://github.com/isink17/codegraph
-cd codegraph
-go build ./cmd/codegraph
-go test ./...
-```
-
-Requires Go 1.26.0 or newer and a C compiler (for tree-sitter CGo bindings).
-
-#### Clean rebuild
-
-```bash
-cd your-project
-codegraph index . --rebuild
-```
-
-Use this after parser or indexer changes when you need a true full reindex from scratch.
-`codegraph index . --rebuild` needs exclusive access to the repo database.
-If rebuild fails because the DB is in use, stop `codegraph serve` or other `codegraph` processes and retry.
-Before `v2.0.0`, the v2 database is a regenerable development cache. The clean
-baseline replaces historical development migrations; older v2 development indexes
-are refused before mutation. Rebuild them with `codegraph index . --rebuild`.
-This affects v2 databases only; legacy v1 databases are never imported or upgraded. Normal forward migration compatibility begins at `v2.0.0`.
-
-Normal `codegraph update .` upgrades supported parser profiles and versioned resolver policies. A resolver-only policy change re-evaluates existing edges and call references once without reparsing unchanged source; later updates are no-ops. A newer or unreadable policy marker refuses the affected scan before graph writes. Full or forced indexing checks every language policy, even when a language filter limits parsing. Parser-fact changes still require a parser profile upgrade.
-
-Parser profile IDs identify the implementation and semantics that determine whether unchanged files need reparsing. A separate parser-family generation records directional compatibility per repository and language, including CGO and no-CGO Python. Ordinary updates upgrade missing or older generations and reparse as needed; a newer or malformed generation refuses affected work before scan writes. Bump a family's language generation when its persisted parser semantics change; implementations share a value only while they implement the same safety generation.
-
-Use `codegraph clean .` for database maintenance tasks like WAL checkpointing, VACUUM, FTS optimize, ANALYZE, and incremental vacuum.
-
-### Version
-
-```bash
-codegraph --version
-codegraph version
-```
-
-Prints the installed local version only. It does not contact GitHub.
-
-Normal commands check GitHub Releases at most once every 24 hours. Set
-`DO_NOT_TRACK` or `CODEGRAPH_NO_UPDATE_CHECK` to a non-empty value other than
-`0` or `false` to disable the check. This also prevents creation or update of
-the local version-check state file.
-
-### 2. Auto-configure your AI tool
-
-```bash
-codegraph install
-```
-
-Detects Claude Code, Cursor, Windsurf, and Gemini CLI and writes the MCP config automatically.
-
-### 3. Index your project
-
-```bash
-cd your-project
-codegraph index .
-```
-
-### 4. Start the MCP server
-
-```bash
-codegraph serve
-```
-
-Repo root is auto-detected from git (or falls back to your current working directory).
-
-That's it. Your AI assistant now has deep structural code understanding.
-
----
-
-## MCP Setup
-
-### Auto-configure (recommended)
-
-```bash
-codegraph install
-```
-
-### Manual Setup
-
-<details>
-<summary><strong>Claude Code</strong> — add to <code>.mcp.json</code></summary>
-
-```json
-{
-  "mcpServers": {
-    "codegraph": {
-      "command": "codegraph",
-      "args": ["serve"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><strong>Cursor / Windsurf</strong> — add to <code>mcp.json</code></summary>
-
-```json
-{
-  "mcpServers": {
-    "codegraph": {
-      "command": "codegraph",
-      "args": ["serve"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><strong>Codex</strong> — add to <code>config.toml</code></summary>
-
-```toml
-[mcp_servers.codegraph]
-command = "codegraph"
-args = ["serve"]
-startup_timeout_sec = 60
-```
-</details>
-
-See the [`examples/`](examples/) directory for more configuration samples.
-
----
+All call resolution uses partial static models, not language runtimes. Node.js repositories are supported, but full tree-sitter node support is still in progress. Python models only selected source-visible mutation forms; Ruby does not infer runtime load order or Rails/Zeitwerk mappings. C# may leave `using static` calls unresolved when inheritance or enclosing members could change the target. See [language scope models](docs/scope-models.md) and [Ruby scope and limitations](docs/ruby-scope.md).
 
 ## Agent Skill
 
-[`skills/codegraph`](skills/codegraph/SKILL.md) is an [Agent Skills](https://agentskills.io)–compatible
-skill that teaches coding agents the efficient CodeGraph workflow: narrow graph
-context first, targeted drill-down, caller/callee and impact reasoning, source
-verification. Install it with the [`skills` CLI](https://github.com/vercel-labs/skills):
+[skills/codegraph](skills/codegraph/SKILL.md) teaches coding agents to start with focused graph context, drill into source, and use callers, callees, and impact queries. Install it with the [Skills CLI](https://github.com/vercel-labs/skills):
 
-```bash
-npx skills add isink17/codegraph --skill codegraph                       # pick agents interactively
-npx skills add isink17/codegraph --skill codegraph -a claude-code -a codex
-npx skills add isink17/codegraph --skill codegraph -g                    # global instead of per-project
-```
+~~~bash
+npx skills add isink17/codegraph --skill codegraph
+~~~
 
-It works with any client that supports Agent Skills; the skill itself covers
-both MCP modes (`full` and `gateway`) and the CLI fallback.
+This installs the Agent Skill from the repository, not the CodeGraph binary. The skill supports clients that accept Agent Skills and documents both MCP modes and the CLI fallback.
 
----
+## Detailed reference
+
+- [MCP tool reference](#mcp-tools-30)
+- [Progressive symbol detail](#progressive-disclosure-detail)
+- [Compact output](#compact-output-format)
+- [Graph capability and limitations](#graph-capability-and-limitations)
+- [Gateway MCP mode](#gateway-mcp-mode---tool-mode)
+- [Result limits and query behavior](#result-limits)
+- [Usage and token meter](#usage--token-meter)
+- [CLI reference](#cli-reference)
+- [Embeddings and agentic mode](#optional-embeddings--agentic-mode)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Build from source](#building-from-source)
+- [Index and database behavior](#index-and-database-behavior)
+- [Version](#version)
 
 ## MCP Tools (30)
 
@@ -329,8 +191,6 @@ both MCP modes (`full` and `gateway`) and the CLI fallback.
 | `latest_scan_errors` | List indexer errors from the last scan |
 | `audit` | Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only). Optional `examples` integer caps examples per finding; `0` means counts only |
 | `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; see [docs/constraints.md](docs/constraints.md) |
-| `file_history` | File-level Git history from the last index, and per-symbol last-touching commit with `include_symbols` (not in `tools/list`; call by name or find with `tool_search`). See [docs/git-history.md](docs/git-history.md) |
-| `explain_edge` | Explain why an edge is resolved (persisted strategy and confidence) or unresolved (the resolver rules that provably refuse it, or `unknown`) in the current graph (read-only; not in `tools/list`; call by name or find with `tool_search`). Select by `edge_id`, or `file` + `line` (+ `name`); `limit`/`offset` page; see [docs/explain.md](docs/explain.md) |
 
 ### Session Memory
 
@@ -346,6 +206,10 @@ both MCP modes (`full` and `gateway`) and the CLI fallback.
 | Tool | Description |
 |---|---|
 | `agentic_query` | Ask a question answered by a local AI agent that reasons over the code graph (requires Ollama) |
+
+### Tools not listed in `tools/list`
+
+`file_history`, `explain_edge`, and `usage_stats` are callable by exact name but are not advertised in either tool mode. Gateway clients can find them with `tool_search`; full-mode clients need to call the documented name directly. See [file history](docs/git-history.md), [edge explanations](docs/explain.md), and [usage / token meter](#usage--token-meter).
 
 ### Progressive disclosure (`detail`)
 
@@ -639,6 +503,26 @@ The mode is chosen at startup and fixed for the life of the server; no tool can
 change it. Restart with the other mode to switch.
 
 ---
+
+## Index and database behavior
+
+`codegraph index . --rebuild` performs a full reindex and replaces the v2 database; use it after parser or indexer changes when stale rows must be cleared. It requires exclusive database access.
+
+Normal `codegraph update .` upgrades supported parser profiles and versioned resolver policies. Resolver-only policy changes re-evaluate existing edges without reparsing unchanged source; later updates are no-ops. Newer or unreadable policy markers refuse affected work before graph writes. Parser-fact changes still require a parser profile upgrade.
+
+Parser profile IDs identify the implementation and semantics used to decide whether unchanged files need reparsing. A separate parser-family generation records directional compatibility per repository and language, including CGO and no-CGO Python. Updates upgrade missing or older generations and reparse as needed; newer or malformed generations refuse affected work before scan writes. Full or forced indexing checks every language policy, even when a language filter limits parsing. A parser family shares a generation only while its implementations have the same persisted semantics.
+
+Use `codegraph clean .` for database maintenance such as WAL checkpointing, VACUUM, FTS optimize, ANALYZE, and incremental vacuum.
+
+## Version
+
+~~~bash
+codegraph --version
+codegraph version
+~~~
+
+These commands print the installed local version without contacting GitHub.
+
 
 ## Result Limits
 
