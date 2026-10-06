@@ -423,7 +423,7 @@ func TestPythonScopeClaimsSurviveIntoTheWeakStrategy(t *testing.T) {
 	if _, err := s.ResolveEdges(ctx, repo.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.resolveDotSuffixIncrementally(ctx, repo.ID); err != nil {
+	if _, err := s.resolveDotSuffixIncrementally(ctx, repo.ID, nil); err != nil {
 		t.Fatal(err)
 	}
 	var got sql.NullInt64

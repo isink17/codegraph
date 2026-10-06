@@ -263,6 +263,8 @@ Both Python parsers, tree-sitter and the pure fallback, read PEP 3131 Unicode id
 - `import` / `from … import` statements, with the scope they were written in
 - what each scope binds locally: parameters; assignment, loop, `with`/`except` and walrus targets; and nested `def`/`class` names inside functions
 
+Module-level decorated functions and source-visible literal writes such as `globals()["name"] = value`, `setattr(imported_module, "member", value)`, and `imported_module.member = value` are treated as unstable bindings. Calls to those declarations or exact imported members stay unresolved. The receiver must match an import the resolver can identify. Computed names, unknown receivers, external mutations, and other runtime mutation are not generally modeled; when source proves one of the supported forms, resolution fails closed.
+
 Imports written inside a class body are not recorded.
 
 Python resolution claims only calls whose leading name the calling scope already gives a meaning, through a visible import or a local binding. A claimed call binds or stays unresolved; the generic strategies cannot override it. A bare call with no such evidence goes to the generic strategies. Those strategies bind a class in another file only when the caller declares it or imports the declaring file.

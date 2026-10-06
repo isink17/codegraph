@@ -17,6 +17,10 @@ func TestPythonImportScopeTreeSitterAdapter(t *testing.T) {
 	runPythonScopeCases(t, parser.NewRegistry(tsparser.NewPython()))
 }
 
+func TestPythonUnstableModuleBindingsTreeSitter(t *testing.T) {
+	runPythonUnstableBindingCases(t, parser.NewRegistry(tsparser.NewPython()))
+}
+
 func TestPythonDottedLocalClassTreeSitterAdapter(t *testing.T) {
 	files := map[string]string{
 		"a.py": "def run():\n    class C:\n        def full(self): return 'a'\n",

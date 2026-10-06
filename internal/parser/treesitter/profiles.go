@@ -9,7 +9,7 @@ import "github.com/isink17/codegraph/internal/parser"
 // languages. See parser.Profile for when to bump a version suffix.
 
 func tsProfile(language string) parser.Profile {
-	return parser.Profile{ID: "treesitter:" + language + ":v1", EmitsCallEdges: true}
+	return parser.NewProfile(language, "treesitter:"+language+":v1", true)
 }
 
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
@@ -22,9 +22,9 @@ func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 // records every name in its NFKC form, the name CPython binds (PEP 3131). v5
 // records lambda parameters and match-case captures as local bindings. v6
 // records lambdas in a def header's defaults, bodies on a header line and
-// class-body bindings. v7 matches a method header's names by their NFKC form.  v8 records global/nonlocal names, `del` targets, rebound and decorated class-body names.
+// class-body bindings. v7 matches a method header's names by their NFKC form. v8 records global/nonlocal names, `del` targets, rebound and decorated class-body names. v9 records decorated module functions and literal module/member writes as negative binding evidence.
 func (a *PythonAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:python:v8", EmitsCallEdges: true}
+	return parser.NewProfile("python", "treesitter:python:v9", true)
 }
 
 // Java v11 marks a bare call in a class that, with every class enclosing it,
@@ -57,33 +57,33 @@ func (a *PythonAdapter) Profile() parser.Profile {
 // key. v2 persists direct AST argument counts on method-invocation edges.
 func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyPackage {
-		return parser.Profile{ID: "treesitter:java:v2", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v2", true)
 	}
 	if a.legacyArity {
-		return parser.Profile{ID: "treesitter:java:v3", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v3", true)
 	}
 	if a.legacyNestedScope {
-		return parser.Profile{ID: "treesitter:java:v4", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v4", true)
 	}
 	if a.legacyGenericConstruction {
-		return parser.Profile{ID: "treesitter:java:v5", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v5", true)
 	}
 	if a.legacyOwnMember {
-		return parser.Profile{ID: "treesitter:java:v6", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v6", true)
 	}
 	if a.legacyLineOnly {
-		return parser.Profile{ID: "treesitter:java:v7", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v7", true)
 	}
 	if a.legacyNoInherited {
-		return parser.Profile{ID: "treesitter:java:v8", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v8", true)
 	}
 	if a.legacyImportText {
-		return parser.Profile{ID: "treesitter:java:v9", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v9", true)
 	}
 	if a.legacyCallSupertype {
-		return parser.Profile{ID: "treesitter:java:v10", EmitsCallEdges: true}
+		return parser.NewProfile("java", "treesitter:java:v10", true)
 	}
-	return parser.Profile{ID: "treesitter:java:v11", EmitsCallEdges: true}
+	return parser.NewProfile("java", "treesitter:java:v11", true)
 }
 
 // Kotlin v11 refuses duplicate package headers recovered as expressions.
@@ -107,13 +107,13 @@ func (a *JavaAdapter) Profile() parser.Profile {
 func (a *KotlinAdapter) Profile() parser.Profile {
 	switch a.legacy {
 	case 6:
-		return parser.Profile{ID: "treesitter:kotlin:v6", EmitsCallEdges: true}
+		return parser.NewProfile("kotlin", "treesitter:kotlin:v6", true)
 	case 8:
-		return parser.Profile{ID: "treesitter:kotlin:v8", EmitsCallEdges: true}
+		return parser.NewProfile("kotlin", "treesitter:kotlin:v8", true)
 	case 9:
-		return parser.Profile{ID: "treesitter:kotlin:v9", EmitsCallEdges: true}
+		return parser.NewProfile("kotlin", "treesitter:kotlin:v9", true)
 	}
-	return parser.Profile{ID: "treesitter:kotlin:v11", EmitsCallEdges: true}
+	return parser.NewProfile("kotlin", "treesitter:kotlin:v11", true)
 }
 
 // C# v5 reads using directives from their syntax tokens: a namespace whose
@@ -123,12 +123,12 @@ func (a *KotlinAdapter) Profile() parser.Profile {
 // when an inherited member may preempt a using static directive.
 func (a *CSharpAdapter) Profile() parser.Profile {
 	if a.legacyImportText {
-		return parser.Profile{ID: "treesitter:csharp:v4", EmitsCallEdges: true}
+		return parser.NewProfile("csharp", "treesitter:csharp:v4", true)
 	}
 	if a.legacyNoBaseList {
-		return parser.Profile{ID: "treesitter:csharp:v5", EmitsCallEdges: true}
+		return parser.NewProfile("csharp", "treesitter:csharp:v5", true)
 	}
-	return parser.Profile{ID: "treesitter:csharp:v6", EmitsCallEdges: true}
+	return parser.NewProfile("csharp", "treesitter:csharp:v6", true)
 }
 
 // TypeScript v2 marks a call whose first name a parameter, local, catch
@@ -136,7 +136,7 @@ func (a *CSharpAdapter) Profile() parser.Profile {
 // unchanged bytes persist a different edge evidence, so every TypeScript file
 // has to reach the parser again.
 func (a *TypeScriptAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:typescript:v2", EmitsCallEdges: true}
+	return parser.NewProfile("typescript", "treesitter:typescript:v2", true)
 }
 
 // Rust v5 records module-level const, static, extern-block items and item
@@ -153,7 +153,7 @@ func (a *TypeScriptAdapter) Profile() parser.Profile {
 // directory. Unchanged bytes persist a different row, and the resolver joins
 // the new spelling exactly, so every Rust file has to reach the parser again.
 func (a *RustAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:rust:v5", EmitsCallEdges: true}
+	return parser.NewProfile("rust", "treesitter:rust:v5", true)
 }
 
 // Ruby v6 records a `def` passed as the only argument of a visibility modifier
@@ -182,12 +182,12 @@ func (a *RustAdapter) Profile() parser.Profile {
 // otherwise a repository indexed under v2 would keep edges this parser refuses
 // to emit and never reparse.
 func (a *RubyAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:ruby:v6", EmitsCallEdges: true}
+	return parser.NewProfile("ruby", "treesitter:ruby:v6", true)
 }
 func (a *SwiftAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:swift:v7", EmitsCallEdges: true}
+	return parser.NewProfile("swift", "treesitter:swift:v7", true)
 }
 func (a *PHPAdapter) Profile() parser.Profile {
-	return parser.Profile{ID: "treesitter:php:v4", EmitsCallEdges: true}
+	return parser.NewProfile("php", "treesitter:php:v4", true)
 }
 func (a *CppAdapter) Profile() parser.Profile { return tsProfile("cpp") }

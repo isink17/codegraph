@@ -1,0 +1,1 @@
+ALTER TABLE files ADD COLUMN parser_semantic_epoch INTEGER NOT NULL DEFAULT 0;

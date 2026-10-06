@@ -300,9 +300,9 @@ func TestV2DatabaseIdentityAndCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The product generation marker is independent of the schema epoch:
-	// migrations 2 to 4 (Git history, Rust value items) did not change user_version.
-	if ceiling != 4 {
-		t.Fatalf("migration ceiling = %d, want 4", ceiling)
+	// Schema migrations do not change user_version, which identifies the product generation.
+	if ceiling != 5 {
+		t.Fatalf("migration ceiling = %d, want 5", ceiling)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)

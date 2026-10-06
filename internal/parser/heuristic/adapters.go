@@ -638,7 +638,7 @@ func (a *Adapter) Profile() parser.Profile {
 	if a.language == "csharp" {
 		version = "v5"
 	}
-	return parser.Profile{ID: "heuristic:" + a.language + ":" + version, EmitsCallEdges: false}
+	return parser.NewProfile(a.language, "heuristic:"+a.language+":"+version, false)
 }
 
 func heuristicCSharpImport(value string) graph.ScopeImport {

@@ -27,6 +27,7 @@ import (
 	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
+	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
@@ -211,11 +212,12 @@ type FileRecord struct {
 }
 
 type FileMetadataUpdate struct {
-	Path        string
-	Language    string
-	SizeBytes   int64
-	MtimeUnixNS int64
-	ContentHash string
+	Path                string
+	Language            string
+	SizeBytes           int64
+	MtimeUnixNS         int64
+	ContentHash         string
+	ParserSemanticEpoch int
 }
 
 type ScanSummary struct {
@@ -503,8 +505,9 @@ type ReplaceFileGraphInput struct {
 	// are only ever written together with the graph they describe: no other
 	// metadata path (mark-seen, touch, parse-failed) touches these columns, so a
 	// file can never claim a provenance its rows do not have.
-	ParserProfile   string
-	ParserCallEdges bool
+	ParserProfile       string
+	ParserCallEdges     bool
+	ParserSemanticEpoch int
 }
 
 func Open(path string) (*Store, error) {
@@ -1925,6 +1928,10 @@ func (s *Store) TouchFilesMetadataBatch(ctx context.Context, repoID, scanID int6
 	defer stmt.Close()
 	indexedAt := time.Now().UTC().Format(time.RFC3339)
 	for _, update := range updates {
+		if err := CheckParserSemanticWrite(ctx, tx, repoID, update.Language, update.ParserSemanticEpoch); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		if _, err := stmt.ExecContext(
 			ctx,
 			repoID,
@@ -1999,8 +2006,8 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 		return 0, err
 	}
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0)
+		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges, parser_semantic_epoch)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0, ?)
 		ON CONFLICT(repo_id, path)
 		DO UPDATE SET
 			language = excluded.language,
@@ -2012,7 +2019,8 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0,
 			parser_profile = '',
-			parser_call_edges = 0
+			parser_call_edges = 0,
+			parser_semantic_epoch = excluded.parser_semantic_epoch
 		RETURNING id
 	`)
 	if err != nil {
@@ -2024,6 +2032,10 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 	fileIDs := make([]int64, 0, len(updates))
 	xlangFileEvidenceChanged := false
 	for _, update := range updates {
+		if err := CheckParserSemanticWrite(ctx, tx, repoID, update.Language, update.ParserSemanticEpoch); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
 		var oldLanguage string
 		var oldDeleted int
 		err := tx.QueryRowContext(ctx, `
@@ -2050,6 +2062,7 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 			parseState,
 			scanID,
 			indexedAt,
+			update.ParserSemanticEpoch,
 		).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
 			return 0, err
@@ -2200,8 +2213,8 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	}
 
 	upsertFileStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges)
-		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0, ?, ?)
+		INSERT INTO files(repo_id, path, language, size_bytes, mtime_unix_ns, content_sha256, parse_state, last_scan_id, indexed_at, is_deleted, parser_profile, parser_call_edges, parser_semantic_epoch)
+		VALUES(?, ?, ?, ?, ?, ?, 'indexed', ?, ?, 0, ?, ?, ?)
 		ON CONFLICT(repo_id, path)
 		DO UPDATE SET
 			language = excluded.language,
@@ -2213,7 +2226,8 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			indexed_at = excluded.indexed_at,
 			is_deleted = 0,
 			parser_profile = excluded.parser_profile,
-			parser_call_edges = excluded.parser_call_edges
+			parser_call_edges = excluded.parser_call_edges,
+			parser_semantic_epoch = excluded.parser_semantic_epoch
 		RETURNING id
 	`)
 	if err != nil {
@@ -2225,12 +2239,16 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 	now := time.Now().UTC().Format(time.RFC3339)
 	fileIDs := make([]int64, 0, len(inputs))
 	for _, input := range inputs {
+		if err := CheckParserSemanticWrite(ctx, tx, repoID, input.Language, input.ParserSemanticEpoch); err != nil {
+			_ = tx.Rollback()
+			return result, err
+		}
 		var fileID int64
 		callEdges := 0
 		if input.ParserCallEdges {
 			callEdges = 1
 		}
-		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now, input.ParserProfile, callEdges).Scan(&fileID); err != nil {
+		if err := upsertFileStmt.QueryRowContext(ctx, repoID, input.Path, input.Language, input.SizeBytes, input.MtimeUnixNS, input.ContentHash, scanID, now, input.ParserProfile, callEdges, input.ParserSemanticEpoch).Scan(&fileID); err != nil {
 			_ = tx.Rollback()
 			return result, err
 		}
@@ -4096,6 +4114,9 @@ func (s *Store) ResolveEdges(ctx context.Context, repoID int64) (int, error) {
 // state that did not commit with it.
 func (s *Store) ResolveEdgesRecordingPolicies(ctx context.Context, repoID int64, languages []string) (int, error) {
 	return s.resolveEdgesRepoWide(ctx, repoID, nil, func(tx *sql.Tx) error {
+		if err := checkParserSemanticMarkers(ctx, tx, repoID, parser.SemanticEpochs(), nil); err != nil {
+			return err
+		}
 		// An unscoped resolve writes every language's edges, so every marker
 		// must be one this binary can honour; the error rolls the writes back.
 		if _, err := s.storedResolverPolicies(ctx, tx, repoID, func(string) bool { return true }); err != nil {
@@ -4128,6 +4149,9 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	defer func() {
 		_ = tx.Rollback()
 	}()
+	if err := CheckParserSemanticResolve(ctx, tx, repoID, parser.SemanticEpochs(), languages); err != nil {
+		return 0, err
+	}
 
 	// A repo-wide resolve decides every edge, not only the unbound ones: a
 	// re-index skips unchanged files and keeps their edges, and a binding one
@@ -4818,6 +4842,13 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if len(paths) == 0 {
 		return nil
 	}
+	langs, err := s.languagesForPaths(ctx, repoID, paths)
+	if err != nil {
+		return err
+	}
+	if err := s.checkParserSemanticLanguages(ctx, repoID, sortedKeys(langs)); err != nil {
+		return err
+	}
 	if changed, err := s.swiftPathsChanged(ctx, repoID, paths); err != nil {
 		return err
 	} else if changed {
@@ -4837,7 +4868,7 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil); err != nil {
 		return err
 	}
-	return s.ReconcileReferenceIdentities(ctx, repoID)
+	return reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, sortedKeys(langs))
 }
 
 func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []string) (bool, error) {
@@ -4877,6 +4908,13 @@ func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []stri
 func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, paths, names []string) (ResolveEdgesForNamesStats, error) {
 	if len(paths) == 0 && len(names) == 0 {
 		return ResolveEdgesForNamesStats{}, nil
+	}
+	languageScope, err := s.languagesForPaths(ctx, repoID, paths)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	if err := s.checkParserSemanticLanguages(ctx, repoID, sortedKeys(languageScope)); err != nil {
+		return ResolveEdgesForNamesStats{}, err
 	}
 	for _, changedPath := range paths {
 		if !strings.EqualFold(filepath.Ext(changedPath), ".cs") {
@@ -4965,28 +5003,50 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	}
 
 	invalidateStarted := time.Now()
-	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles, rubyChanged)
+	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles, rubyChanged, languageScope)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
 	invalidateMS := time.Since(invalidateStarted).Milliseconds()
-	moduleVeto, err := s.resolveOwnModuleImportsStandalone(ctx, repoID, nil)
+	moduleScope := &ownModuleScope{}
+	if len(paths) > 0 {
+		moduleScope.paths = make(map[string]struct{}, len(paths))
+		for _, path := range paths {
+			if path != "" {
+				moduleScope.paths[path] = struct{}{}
+			}
+		}
+	}
+	if len(names) > 0 {
+		moduleScope.names = map[string]struct{}{}
+		for _, name := range names {
+			moduleScope.names[name] = struct{}{}
+			if dot := strings.LastIndexByte(name, '.'); dot >= 0 && dot+1 < len(name) {
+				moduleScope.names[name[dot+1:]] = struct{}{}
+			}
+		}
+	}
+	moduleVeto, err := s.resolveOwnModuleImportsStandalone(ctx, repoID, moduleScope)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, moduleVeto, scopes); err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
-	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto, scopes)
+	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto, scopes, languageScope)
 	if err == nil && (len(paths) > 0 || len(names) > 0) {
 		var n int
-		n, err = s.resolveDotSuffixIncrementally(ctx, repoID)
+		n, err = s.resolveDotSuffixIncrementally(ctx, repoID, sortedKeys(languageScope))
 		stats.TargetsResolved += n
 	}
 	stats.InvalidateMS += invalidateMS
 	stats.InvalidatedBindings += invalidated
 	if err == nil {
-		err = s.ReconcileReferenceIdentities(ctx, repoID)
+		if len(languageScope) == 0 {
+			err = s.ReconcileReferenceIdentities(ctx, repoID)
+		} else {
+			err = reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, sortedKeys(languageScope))
+		}
 	}
 	return stats, err
 }
@@ -5073,16 +5133,20 @@ func (s *Store) jvmScopeEdgeNamesForPaths(ctx context.Context, repoID int64, pat
 // unresolved dotted edges; stronger strategies have already had first refusal.
 // The transaction-local resolver tables keep the full and incremental SQL
 // predicates identical, while no repo-wide resolver pass is repeated.
-func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64) (int, error) {
+func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64, languages []string) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := CheckParserSemanticResolve(ctx, tx, repoID, parser.SemanticEpochs(), languages); err != nil {
+		return 0, err
+	}
+	scope := newResolverScope(languages)
 	if err := s.prepareResolverTables(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
-	csharpResolved, err := resolveCSharpScope(ctx, tx, repoID, nil)
+	csharpResolved, err := resolveCSharpScope(ctx, tx, repoID, scope.only("csharp"))
 	if err != nil {
 		return 0, err
 	}
@@ -5090,7 +5154,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	// changed path or name selected: a type identity can become unique again
 	// through a removal that names nothing the `::` spelling carries (see
 	// phpStaleScopeBindings).
-	phpResolved, err := resolvePHPScope(ctx, tx, repoID, nil)
+	phpResolved, err := resolvePHPScope(ctx, tx, repoID, scope.only("php"))
 	if err != nil {
 		return 0, err
 	}
@@ -5099,7 +5163,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	// reopening that held `private_class_method :run`, a deleted duplicate
 	// declaration, a deleted shadowing constant. Nothing else reconsiders an
 	// unresolved Ruby call after a pure delete.
-	rubyResolved, err := resolveRubyScope(ctx, tx, repoID, nil)
+	rubyResolved, err := resolveRubyScope(ctx, tx, repoID, scope.only("ruby"))
 	if err != nil {
 		return 0, err
 	}
@@ -5113,7 +5177,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 	if err := recordPythonScopeClaims(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
-	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, nil)
+	n, err := s.resolveEdgesByDotSuffix(ctx, tx, repoID, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -5183,7 +5247,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64)
 //     can therefore still go stale in the way described above; that is the
 //     pre-existing behaviour, and narrowing it is a separate decision from
 //     this one.
-func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string, rustScope map[int64]struct{}, rubyChanged bool) (int, error) {
+func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64, names []string, rustScope map[int64]struct{}, rubyChanged bool, languageScope map[string]struct{}) (int, error) {
 	wanted := make(map[string]struct{}, len(names))
 	unique := make([]string, 0, len(names))
 	for _, name := range names {
@@ -5379,6 +5443,28 @@ func (s *Store) invalidateNameEvidenceBindings(ctx context.Context, repoID int64
 	// answer cannot have changed.
 	if rustScope != nil && len(stale) > 0 {
 		if err := s.dropRustEdgesOutsideScope(ctx, repoID, rustScope, stale); err != nil {
+			return 0, err
+		}
+	}
+	if len(stale) == 0 {
+		return 0, nil
+	}
+	if len(languageScope) > 0 {
+		ids := make([]int64, 0, len(stale))
+		for id := range stale {
+			ids = append(ids, id)
+		}
+		if err := sqliteBatchedIDQuery(ctx, s.db, ids, `SELECT e.id,f.language FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND e.id IN (`, []any{repoID}, func(scan func(...any) error) error {
+			var id int64
+			var language string
+			if err := scan(&id, &language); err != nil {
+				return err
+			}
+			if _, ok := languageScope[language]; !ok {
+				delete(stale, id)
+			}
+			return nil
+		}); err != nil {
 			return 0, err
 		}
 	}
@@ -5605,13 +5691,18 @@ func (s *Store) ResolveEdgesForNames(ctx context.Context, repoID int64, names []
 }
 
 func (s *Store) ResolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string) (ResolveEdgesForNamesStats, error) {
-	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, nil, nil)
+	return s.resolveEdgesForNamesWithStats(ctx, repoID, names, nil, nil, nil)
 }
 
-func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string, moduleVeto map[int64]struct{}, scopes *importScopeCache) (ResolveEdgesForNamesStats, error) {
+func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64, names []string, moduleVeto map[int64]struct{}, scopes *importScopeCache, languageScope map[string]struct{}) (ResolveEdgesForNamesStats, error) {
 	var stats ResolveEdgesForNamesStats
 	if len(names) == 0 {
 		return stats, nil
+	}
+	if moduleVeto == nil {
+		if err := s.checkParserSemanticAll(ctx, repoID); err != nil {
+			return stats, err
+		}
 	}
 	stats.NamesInput = len(names)
 	seen := make(map[string]struct{}, len(names))
@@ -5659,7 +5750,7 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		// one owns it. It must precede the module pass below for the ordering
 		// reason ResolveEdgesForPathsAndNames documents.
 		invalidateStarted := time.Now()
-		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique, nil, false)
+		invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, unique, nil, false, nil)
 		if err != nil {
 			return stats, err
 		}
@@ -5740,6 +5831,11 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 			if outOfRustScope(srcLanguage, srcFileID) {
 				continue
 			}
+			if len(languageScope) > 0 {
+				if _, ok := languageScope[srcLanguage]; !ok {
+					continue
+				}
+			}
 			targetByID[id] = edgeTarget{
 				edgeID:      id,
 				dstName:     dstName,
@@ -5787,6 +5883,11 @@ func (s *Store) resolveEdgesForNamesWithStats(ctx context.Context, repoID int64,
 		}
 		if outOfRustScope(srcLanguage, srcFileID) {
 			continue
+		}
+		if len(languageScope) > 0 {
+			if _, ok := languageScope[srcLanguage]; !ok {
+				continue
+			}
 		}
 		stats.QualifiedScanned++
 		if _, ok := targetByID[id]; ok {

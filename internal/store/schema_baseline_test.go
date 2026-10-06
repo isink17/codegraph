@@ -63,7 +63,7 @@ func TestV2BaselineIncludesCurrentParserAndScopeFacts(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 	for _, query := range []string{
-		`SELECT parser_profile, parser_call_edges, parse_state FROM files LIMIT 0`,
+		`SELECT parser_profile, parser_call_edges, parser_semantic_epoch, parse_state FROM files LIMIT 0`,
 		`SELECT resolution_strategy, resolution_confidence FROM edges LIMIT 0`,
 		`SELECT target_stable_key FROM test_links LIMIT 0`,
 		`SELECT * FROM kotlin_jvm_callable_evidence LIMIT 0`,
