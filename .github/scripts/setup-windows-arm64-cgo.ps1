@@ -1,3 +1,4 @@
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 # The hosted runner's default gcc is x86_64 MinGW and cannot assemble Go's AArch64 runtime/cgo files.
 $version = '20260922'
@@ -30,6 +31,7 @@ $env:CGO_ENABLED = '1'
 go env CC CXX
 where.exe (Split-Path $clang -Leaf)
 & $clang --version
+$probe = Join-Path $env:RUNNER_TEMP 'cgo-probe.go'
 @'
 package main
 /*

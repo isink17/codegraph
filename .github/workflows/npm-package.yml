@@ -88,7 +88,6 @@ jobs:
         run: ./\.github\scripts\setup-windows-arm64-cgo.ps1
       - name: Build release-shaped assets
         shell: bash
-        env:
         run: bash .github/scripts/build-release-asset.sh v2.0.0 ${{ matrix.goos }} ${{ matrix.goarch }} ${{ matrix.archive_ext }}
       - name: Smoke-test Windows ARM64 release binary
         if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }}
