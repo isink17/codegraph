@@ -54,6 +54,24 @@ func (s *Store) HasParserSemanticTransitionPending(ctx context.Context, repoID i
 	return exists, err
 }
 
+func (s *Store) ParserSemanticTransitionLanguages(ctx context.Context, repoID int64) (map[string]struct{}, error) {
+	prefix := "parser.semantic.pending." + strconv.FormatInt(repoID, 10) + "."
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM settings WHERE key LIKE ?`, prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	languages := make(map[string]struct{})
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		languages[strings.TrimPrefix(key, prefix)] = struct{}{}
+	}
+	return languages, rows.Err()
+}
+
 func parseParserSemanticPending(raw string) (from, to int, err error) {
 	parts := strings.Split(raw, ":")
 	if len(parts) != 3 || parts[0] != "v1" {
@@ -418,7 +436,7 @@ func (s *Store) checkParserSemanticAll(ctx context.Context, repoID int64) error 
 // CheckParserSemanticGraph rejects relationship answers while any transition
 // is pending. The settings lookup is constant-size and shared by graph APIs.
 func (s *Store) CheckParserSemanticGraph(ctx context.Context, repoID int64) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT key,value FROM settings WHERE key LIKE ?`, "parser.semantic.pending."+strconv.FormatInt(repoID, 10)+".%")
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `SELECT key,value FROM settings WHERE key LIKE ?`, "parser.semantic.pending."+strconv.FormatInt(repoID, 10)+".%")
 	if err != nil {
 		return err
 	}
@@ -441,6 +459,43 @@ func (s *Store) CheckParserSemanticGraph(ctx context.Context, repoID int64) erro
 		return &ParserSemanticError{Reason: ErrParserSemanticIncomplete, Language: language, Stored: raw, Current: want}
 	}
 	return rows.Err()
+}
+
+type parserSemanticGraphQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+type parserSemanticGraphQueryerKey struct{}
+
+func (s *Store) parserSemanticQueryer(ctx context.Context) parserSemanticGraphQueryer {
+	if q, ok := ctx.Value(parserSemanticGraphQueryerKey{}).(parserSemanticGraphQueryer); ok {
+		return q
+	}
+	return s.db
+}
+
+// beginParserSemanticGraphRead pins the validity check and every relationship
+// read that follows to one SQLite snapshot. A transition committed after the
+// first read cannot make later statements observe its partially replaced graph.
+func (s *Store) beginParserSemanticGraphRead(ctx context.Context, repoID int64) (context.Context, *sql.Tx, error) {
+	if _, ok := ctx.Value(parserSemanticGraphQueryerKey{}).(parserSemanticGraphQueryer); ok {
+		if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+			return ctx, nil, err
+		}
+		return ctx, nil, nil
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ctx, nil, err
+	}
+	readCtx := context.WithValue(ctx, parserSemanticGraphQueryerKey{}, parserSemanticGraphQueryer(tx))
+	if err := s.CheckParserSemanticGraph(readCtx, repoID); err != nil {
+		_ = tx.Rollback()
+		return ctx, nil, err
+	}
+	return readCtx, tx, nil
 }
 
 func (s *Store) checkParserSemanticLanguages(ctx context.Context, repoID int64, languages []string) error {

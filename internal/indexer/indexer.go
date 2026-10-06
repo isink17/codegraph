@@ -211,6 +211,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return store.ScanSummary{}, err
 	}
 	semanticEpochs := parser.SemanticEpochs()
+	pendingLanguages, err := i.store.ParserSemanticTransitionLanguages(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	pendingTransition := len(pendingLanguages) > 0
 	// A custom/test registry may omit production languages. Keep those
 	// repository-wide generations for resolver preflights, but do not treat
 	// their absent adapter as an upgrade requirement unless files of that
@@ -235,7 +240,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 		semanticCompatibilityAffected = func(language string) bool {
 			_, exists := indexedLanguages[language]
-			return exists
+			_, pending := pendingLanguages[language]
+			return exists || pending
 		}
 	}
 	indexedLanguages, err := i.store.IndexedLanguages(ctx, repo.ID)
@@ -243,10 +249,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return store.ScanSummary{}, err
 	}
 	semanticStale, err := i.store.PlanParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticCompatibilityAffected)
-	if err != nil {
-		return store.ScanSummary{}, err
-	}
-	pendingTransition, err := i.store.HasParserSemanticTransitionPending(ctx, repo.ID)
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
@@ -259,6 +261,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	for _, language := range semanticStale {
 		if _, indexed := indexedLanguages[language]; !indexed {
+			if _, pending := pendingLanguages[language]; pending && affectedLanguage(language) {
+				profilePlan.reparseLanguages[language] = struct{}{}
+			}
 			continue
 		}
 		if _, supported := currentProfiles[language]; !supported && affectedLanguage(language) {
@@ -276,7 +281,8 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if semanticTransition {
 		allIndexed := func(language string) bool {
 			_, ok := indexedLanguages[language]
-			return ok
+			_, pending := pendingLanguages[language]
+			return ok || pending
 		}
 		if _, err := i.store.PlanParserSemanticEpochs(ctx, repo.ID, semanticEpochs, allIndexed); err != nil {
 			return store.ScanSummary{}, err

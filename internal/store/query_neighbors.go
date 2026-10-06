@@ -215,7 +215,7 @@ func edgeIDBranch(selectCol, matchCol, setSQL, extra string) string {
 // connection, so the two transports cannot disagree about semantics: they
 // differ only in how a value set is spelled.
 func (s *Store) neighborPage(ctx context.Context, repoID int64, limit, offset int, build neighborCandidateBuilder) ([]graph.Symbol, error) {
-	inline := &neighborSets{target: s.neighborTarget(s.db)}
+	inline := &neighborSets{target: s.neighborTarget(s.parserSemanticQueryer(ctx))}
 	cte, args, err := build(ctx, inline)
 	if err != nil {
 		return nil, err
@@ -231,12 +231,17 @@ func (s *Store) neighborPage(ctx context.Context, repoID int64, limit, offset in
 	// them -- must run on one physical connection, because a TEMP table belongs
 	// to the connection that created it. Taking it from the pool per statement
 	// would silently query an empty table on a different connection.
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, err
+	var target execQuerier
+	if q, ok := ctx.Value(parserSemanticGraphQueryerKey{}).(parserSemanticGraphQueryer); ok {
+		target = s.neighborTarget(q)
+	} else {
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		target = s.neighborTarget(conn)
 	}
-	defer conn.Close()
-	target := s.neighborTarget(conn)
 	if _, err := target.ExecContext(ctx, createNeighborKeysSQL); err != nil {
 		return nil, err
 	}
@@ -298,11 +303,14 @@ func (s *Store) symbolPage(ctx context.Context, target execQuerier, repoID int64
 //     unknownTargetHints). No target exists, so no target language, package,
 //     file or class is invented to scope those hints.
 func (s *Store) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
 		return nil, err
 	}
+	if tx != nil {
+		defer tx.Rollback()
+	}
 	var targetIDs []int64
-	var err error
 	if symbolID != 0 {
 		identity, ok, lookupErr := s.lookupSymbolIdentity(ctx, repoID, symbolID)
 		if lookupErr != nil {
@@ -482,8 +490,12 @@ func (s *Store) unresolvedDstNamesExtending(ctx context.Context, repoID int64, q
 // destination identities are semantic relationships; unresolved destinations
 // remain evidence and are not promoted by query-time name lookup.
 func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
 		return nil, err
+	}
+	if tx != nil {
+		defer tx.Rollback()
 	}
 	srcIDs, err := s.lookupQuerySymbolIDs(ctx, repoID, symbol, symbolID)
 	if err != nil {

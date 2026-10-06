@@ -126,9 +126,9 @@ func (s *Store) GraphAuditCapabilitiesFor(ctx context.Context) (GraphAuditCapabi
 	// A database with no schema_migrations row is possible in principle; treat
 	// the version as 0 rather than failing, since the column probe below is
 	// what actually decides behaviour.
-	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&caps.SchemaVersion)
+	_ = s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&caps.SchemaVersion)
 
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(edges)`)
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `PRAGMA table_info(edges)`)
 	if err != nil {
 		return GraphAuditCapabilities{}, err
 	}
@@ -448,8 +448,12 @@ func edgeAuditPredicate(check EdgeAuditCheck, caps GraphAuditCapabilities) (pred
 // It returns ErrAuditCheckUnsupported when this database's schema cannot answer
 // the check.
 func (s *Store) RunEdgeAuditCheck(ctx context.Context, repoID int64, check EdgeAuditCheck, caps GraphAuditCapabilities, exampleLimit int) (EdgeAuditResult, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
-		return EdgeAuditResult{}, err
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return EdgeAuditResult{}, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
 	}
 	predicate, detailExpr, needsJoins, err := edgeAuditPredicate(check, caps)
 	if err != nil {
@@ -463,7 +467,7 @@ func (s *Store) RunEdgeAuditCheck(ctx context.Context, repoID int64, check EdgeA
 		countFrom = auditEdgeFromSQL
 	}
 	var result EdgeAuditResult
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 		`SELECT COUNT(*)`+countFrom+`WHERE e.repo_id = ? AND (`+predicate+`)`,
 		repoID,
 	).Scan(&result.Count); err != nil {
@@ -473,7 +477,7 @@ func (s *Store) RunEdgeAuditCheck(ctx context.Context, repoID int64, check EdgeA
 		return result, nil
 	}
 
-	exampleRows, err := s.db.QueryContext(ctx,
+	exampleRows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 		`SELECT `+auditEdgeExampleColumnsFor(caps)+`, `+detailExpr+auditEdgeFromSQL+
 			`WHERE e.repo_id = ? AND (`+predicate+`) ORDER BY e.id ASC LIMIT ?`,
 		repoID, exampleLimit,
@@ -500,8 +504,12 @@ func (s *Store) RunEdgeAuditCheck(ctx context.Context, repoID int64, check EdgeA
 // one and is enforced by SQLite. A NULL reference is not dangling -- it is the
 // documented result of the unbind paths -- so every clause requires NOT NULL.
 func (s *Store) RunDanglingTestLinkCheck(ctx context.Context, repoID int64, exampleLimit int) (TestLinkAuditResult, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
-		return TestLinkAuditResult{}, err
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return TestLinkAuditResult{}, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
 	}
 	const from = `
 		FROM test_links tl
@@ -521,7 +529,7 @@ func (s *Store) RunDanglingTestLinkCheck(ctx context.Context, repoID int64, exam
 		" ELSE '' END"
 
 	var result TestLinkAuditResult
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 		`SELECT COUNT(*)`+from+`WHERE tl.repo_id = ? AND (`+predicate+`)`,
 		repoID,
 	).Scan(&result.Count); err != nil {
@@ -531,7 +539,7 @@ func (s *Store) RunDanglingTestLinkCheck(ctx context.Context, repoID int64, exam
 		return result, nil
 	}
 
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx,
 		`SELECT tl.id, COALESCE(tf.path, ''), COALESCE(tl.test_symbol_id, 0), `+
 			`COALESCE(tl.target_file_id, 0), COALESCE(tl.target_symbol_id, 0), `+detailExpr+from+
 			`WHERE tl.repo_id = ? AND (`+predicate+`) ORDER BY tl.id ASC LIMIT ?`,
@@ -554,21 +562,25 @@ func (s *Store) RunDanglingTestLinkCheck(ctx context.Context, repoID int64, exam
 
 // GraphAuditSummaryFor returns the size of the graph in one pass per table.
 func (s *Store) GraphAuditSummaryFor(ctx context.Context, repoID int64) (GraphAuditSummary, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
-		return GraphAuditSummary{}, err
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return GraphAuditSummary{}, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
 	}
 	var out GraphAuditSummary
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(is_deleted), 0)
 		FROM files WHERE repo_id = ?
 	`, repoID).Scan(&out.Files, &out.DeletedFiles); err != nil {
 		return GraphAuditSummary{}, err
 	}
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM symbols WHERE repo_id = ?`, repoID).Scan(&out.Symbols); err != nil {
 		return GraphAuditSummary{}, err
 	}
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT COUNT(*),
 		       COALESCE(SUM(CASE WHEN dst_symbol_id IS NOT NULL THEN 1 ELSE 0 END), 0)
 		FROM edges WHERE repo_id = ?
@@ -576,7 +588,7 @@ func (s *Store) GraphAuditSummaryFor(ctx context.Context, repoID int64) (GraphAu
 		return GraphAuditSummary{}, err
 	}
 	out.UnresolvedEdges = out.Edges - out.ResolvedEdges
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM test_links WHERE repo_id = ?`, repoID).Scan(&out.TestLinks); err != nil {
 		return GraphAuditSummary{}, err
 	}
@@ -591,8 +603,12 @@ func (s *Store) GraphAuditSummaryFor(ctx context.Context, repoID int64) (GraphAu
 // Both return ErrAuditCheckUnsupported on a pre-019 schema, where the columns
 // do not exist.
 func (s *Store) ResolutionStrategyDistribution(ctx context.Context, repoID int64, caps GraphAuditCapabilities) (map[string]int64, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
-		return nil, err
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
 	}
 	if !caps.HasResolutionMetadata {
 		return nil, ErrAuditCheckUnsupported
@@ -602,8 +618,12 @@ func (s *Store) ResolutionStrategyDistribution(ctx context.Context, repoID int64
 
 // ResolutionConfidenceDistribution counts resolved edges per confidence tier.
 func (s *Store) ResolutionConfidenceDistribution(ctx context.Context, repoID int64, caps GraphAuditCapabilities) (map[string]int64, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
-		return nil, err
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
 	}
 	if !caps.HasResolutionMetadata {
 		return nil, ErrAuditCheckUnsupported
@@ -630,7 +650,7 @@ const DistributionUnregisteredKey = "<unregistered>"
 // The column name and the allowed value set are chosen by this package, never
 // by a caller.
 func (s *Store) resolvedEdgeDistribution(ctx context.Context, repoID int64, column string, allowed []string) (map[string]int64, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT `+column+`, COUNT(*)
 		FROM edges
 		WHERE repo_id = ? AND dst_symbol_id IS NOT NULL
@@ -686,13 +706,17 @@ const auditClassificationPageSize = 1000
 // idx_edges_repo_dst as a (repo_id, dst_symbol_id, rowid>?) range scan, with no
 // temporary b-tree for the ORDER BY.
 func (s *Store) UnresolvedTargetClassificationCounts(ctx context.Context, repoID int64, caps GraphAuditCapabilities) (map[string]int64, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
-		return nil, err
+	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
+	if graphErr != nil {
+		return nil, graphErr
+	}
+	if graphTx != nil {
+		defer graphTx.Rollback()
 	}
 	counts := map[string]int64{}
 	var afterID int64
 	for {
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 			SELECT `+unresolvedClassificationColumnsFor(caps)+`
 			FROM edges e
 			LEFT JOIN symbols src ON src.id = e.src_symbol_id

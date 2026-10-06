@@ -531,6 +531,49 @@ func TestMissingParserSemanticMarkerUpgradesOnOrdinaryUpdate(t *testing.T) {
 	}
 }
 
+func TestPendingParserSemanticTransitionRecoversAfterLastFileRetired(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	file := filepath.Join(root, "Only.kt")
+	writeProfileFile(t, file, "class Only {}\n")
+	s := newProfileStore(t)
+	current := parser.SemanticEpochForProfile("treesitter:kotlin:v11")
+	idx := New(s.Store, parser.NewRegistry(callCapable("kotlin", ".kt", "treesitter:kotlin:v11")), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoID(t, s, root)
+	if err := s.Store.BeginParserSemanticTransitions(ctx, repo, map[string]int{"kotlin": current}, []string{"kotlin"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `UPDATE files SET is_deleted=1 WHERE repo_id=? AND language='kotlin'`, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.raw(t).ExecContext(ctx, `DELETE FROM settings WHERE key=?`, "derived.cross_language_links_current.v2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := idx.Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("ordinary update could not resume transition after last file retired: %v", err)
+	}
+	if updated.ResolveMode != "repo" {
+		t.Fatalf("retry resolve mode = %q, want repo", updated.ResolveMode)
+	}
+	if pending, err := s.Store.HasParserSemanticTransitionPending(ctx, repo); err != nil || pending {
+		t.Fatalf("pending state after recovery = %v, %v; want false", pending, err)
+	}
+	var marker string
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, fmt.Sprintf("parser.semantic.%d.kotlin", repo)).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if marker != fmt.Sprint(current) {
+		t.Fatalf("certified Kotlin generation = %q, want %d", marker, current)
+	}
+}
+
 func TestFilteredFullIndexRefusesUnselectedStaleParserLanguage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

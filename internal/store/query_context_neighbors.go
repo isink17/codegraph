@@ -57,7 +57,7 @@ const (
 // goes through it, including the shared name cascade.
 func (s *Store) neighborQuery(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	s.neighborStmts.Add(1)
-	return s.db.QueryContext(ctx, query, args...)
+	return s.parserSemanticQueryer(ctx).QueryContext(ctx, query, args...)
 }
 
 // neighborQuerier adapts neighborQuery to the queryContexter the shared
@@ -108,8 +108,13 @@ func LookupSymbolShortName(name string) string { return lookupSymbolShortName(na
 // including for a seed with no id and for a seed with no neighbours.
 func (s *Store) FindContextNeighbors(ctx context.Context, repoID int64, seeds []ContextSeed, fanout int) ([]ContextNeighbors, error) {
 	if len(seeds) > 0 {
-		if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+		readCtx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+		if err != nil {
 			return nil, err
+		}
+		ctx = readCtx
+		if tx != nil {
+			defer tx.Rollback()
 		}
 	}
 	out := make([]ContextNeighbors, len(seeds))

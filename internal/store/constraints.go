@@ -45,7 +45,7 @@ type ConstraintIndexInfo struct {
 // watcher's dirty-file count for one repository.
 func (s *Store) ConstraintIndexInfo(ctx context.Context, repoID int64) (ConstraintIndexInfo, error) {
 	var info ConstraintIndexInfo
-	err := s.db.QueryRowContext(ctx, `
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT
 			(SELECT COALESCE(MAX(id), 0) FROM scans WHERE repo_id = ?),
 			(SELECT COUNT(1) FROM dirty_files WHERE repo_id = ?),
@@ -56,7 +56,7 @@ func (s *Store) ConstraintIndexInfo(ctx context.Context, repoID int64) (Constrai
 
 // ConstraintFiles lists the repository's live files ordered by path.
 func (s *Store) ConstraintFiles(ctx context.Context, repoID int64) ([]ConstraintFile, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT path, language, parser_profile, parser_call_edges
 		FROM files WHERE repo_id = ? AND is_deleted = 0
 		ORDER BY path`, repoID)
@@ -83,10 +83,14 @@ func (s *Store) ConstraintFiles(ctx context.Context, repoID int64) ([]Constraint
 // missing symbol is dropped rather than reported as unresolved, because it is
 // neither a trustworthy dependency nor a blind spot of the parser.
 func (s *Store) ConstraintEdges(ctx context.Context, repoID int64) ([]ConstraintEdge, error) {
-	if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+	ctx, tx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	if tx != nil {
+		defer tx.Rollback()
+	}
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT srcf.path, e.line, e.edge_kind, src.qualified_name, src.start_line, src.stable_key,
 		       e.dst_symbol_id IS NOT NULL,
 		       COALESCE(dstf.path, ''), COALESCE(dst.qualified_name, ''), COALESCE(dst.start_line, 0), COALESCE(dst.stable_key, ''),
