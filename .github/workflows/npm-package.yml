@@ -6,6 +6,8 @@ on:
     paths:
       - 'npm/**'
       - '.github/scripts/build-release-asset.sh'
+      - '.github/scripts/setup-windows-arm64-cgo.ps1'
+      - '.github/scripts/smoke-windows-arm64-release.ps1'
       - '.github/scripts/verify-release-assets.sh'
       - '.github/scripts/verify-release-assets_test.sh'
       - '.github/workflows/npm-package.yml'
@@ -15,6 +17,8 @@ on:
     paths:
       - 'npm/**'
       - '.github/scripts/build-release-asset.sh'
+      - '.github/scripts/setup-windows-arm64-cgo.ps1'
+      - '.github/scripts/smoke-windows-arm64-release.ps1'
       - '.github/scripts/verify-release-assets.sh'
       - '.github/scripts/verify-release-assets_test.sh'
       - '.github/workflows/npm-package.yml'
