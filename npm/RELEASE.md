@@ -51,6 +51,15 @@ Package ownership for the `@isink17` scope and either an authorized npm token
 or configured npm trusted publisher remain release prerequisites. No credential
 or trusted publisher is configured by this implementation.
 
+Prefer npm trusted publishing for an eventual GitHub Actions publisher. The
+owner must first establish package ownership, then configure the package's
+Trusted Publisher in npm settings for `isink17/codegraph` and the exact future
+publishing workflow filename. npm currently requires a GitHub-hosted runner,
+Node 22.14.0 or later, npm 11.5.1 or later, and `id-token: write`; this project
+does not add those permissions or a publishing workflow until publication is
+explicitly approved. A scoped automation token is the fallback if the owner
+cannot use trusted publishing.
+
 If GitHub Release creation or upload fails, the workflow leaves an unpublished
 draft that blocks automatic reruns. The owner must inspect the draft and
 downloaded artifacts, confirm it was never public, then delete the incomplete
