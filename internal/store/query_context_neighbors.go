@@ -107,6 +107,11 @@ func LookupSymbolShortName(name string) string { return lookupSymbolShortName(na
 // callees. The returned slice is parallel to seeds: index i is seed i, always,
 // including for a seed with no id and for a seed with no neighbours.
 func (s *Store) FindContextNeighbors(ctx context.Context, repoID int64, seeds []ContextSeed, fanout int) ([]ContextNeighbors, error) {
+	if len(seeds) > 0 {
+		if err := s.CheckParserSemanticGraph(ctx, repoID); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]ContextNeighbors, len(seeds))
 	for i := range out {
 		out[i] = ContextNeighbors{Callers: []graph.Symbol{}, Callees: []graph.Symbol{}}
