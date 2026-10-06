@@ -4,6 +4,9 @@ set -euo pipefail
 package_json=${1:?usage: verify-release-assets.sh PACKAGE_JSON TAG ASSET_DIR}
 tag=${2-}
 asset_dir=${3:?usage: verify-release-assets.sh PACKAGE_JSON TAG ASSET_DIR}
+sha256() {
+  node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"
+}
 
 if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   echo "invalid or missing release tag: $tag" >&2
@@ -43,7 +46,7 @@ for sidecar in "$asset_dir"/*.tar.gz.sha256 "$asset_dir"/*.zip.sha256; do
   [[ -e "$sidecar" ]] || continue
   archive=${sidecar%.sha256}
   expected=$(awk 'NR==1 {print $1}' "$sidecar")
-  actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+  actual=$(sha256 "$archive")
   if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ || "$expected" != "$actual" ]]; then
     echo "invalid SHA-256 sidecar for $(basename "$archive")" >&2
     exit 1
@@ -60,7 +63,7 @@ for target in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 wi
     fi
   done
   expected=$(awk 'NR==1 {print $1}' "$asset_dir/$asset.sha256")
-  actual=$(shasum -a 256 "$asset_dir/$asset" | awk '{print $1}')
+  actual=$(sha256 "$asset_dir/$asset")
   if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ || "$expected" != "$actual" ]]; then
     echo "invalid SHA-256 sidecar for $asset" >&2
     exit 1
