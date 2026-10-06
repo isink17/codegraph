@@ -20,7 +20,7 @@ if ($LASTEXITCODE -ne 0 -or $stats -notmatch 'typescript') { throw "Tree-sitter 
 
 $env:CODEGRAPH_NPM_TEST_MODE = '1'
 $listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add('http://127.0.0.1:18743/')
+$listener.Prefixes.Add('http://localhost:18743/')
 $listener.Start()
 $serve = Start-Job -ArgumentList $listener, (Join-Path $PWD 'dist') -ScriptBlock {
   param($http, $assets)
@@ -38,7 +38,7 @@ $serve = Start-Job -ArgumentList $listener, (Join-Path $PWD 'dist') -ScriptBlock
   }
 }
 try {
-  $env:CODEGRAPH_NPM_TEST_RELEASE_BASE_URL = 'http://127.0.0.1:18743'
+  $env:CODEGRAPH_NPM_TEST_RELEASE_BASE_URL = 'http://localhost:18743'
   Push-Location npm
   try {
     & npm version 2.0.0 --no-git-tag-version --ignore-scripts
