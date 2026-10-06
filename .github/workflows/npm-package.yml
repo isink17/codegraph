@@ -14,6 +14,9 @@ on:
     branches: [v2.0]
     paths:
       - 'npm/**'
+      - '.github/scripts/build-release-asset.sh'
+      - '.github/scripts/verify-release-assets.sh'
+      - '.github/scripts/verify-release-assets_test.sh'
       - '.github/workflows/npm-package.yml'
       - '.github/workflows/release.yml'
 

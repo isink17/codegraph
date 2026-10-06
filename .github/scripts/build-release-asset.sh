@@ -45,9 +45,9 @@ case "$archive_ext" in
     ;;
 esac
 
-checksum() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+sha256() {
+  node -e 'const p=process.argv[1]; const d=require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(p)).digest("hex"); process.stdout.write(`${d}  ${p}\n`)' "$1"
 }
-checksum "$archive" >"$archive.sha256"
-checksum "$dist/$native_asset" | awk '{print $1}' >"$dist/$native_asset.sha256"
+sha256 "$archive" >"$archive.sha256"
+sha256 "$dist/$native_asset" | awk '{print $1}' >"$dist/$native_asset.sha256"
 [[ -s "$archive" && -s "$archive.sha256" && -s "$dist/$native_asset" && -s "$dist/$native_asset.sha256" ]]
