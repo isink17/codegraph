@@ -62,9 +62,34 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Diagnose native Windows ARM64 toolchain
+        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }}
+        shell: pwsh
+        run: |
+          go version
+          go env GOHOSTOS GOHOSTARCH GOOS GOARCH CGO_ENABLED CC CXX
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,OSArchitecture
+          $env:PROCESSOR_ARCHITECTURE
+          where.exe gcc
+          where.exe clang
+          $gcc = (Get-Command gcc).Source
+          $clang = (Get-Command clang).Source
+          & $gcc --version
+          & $gcc -dumpmachine
+          & $clang --version
+          & $clang --target=aarch64-w64-windows-gnu -print-target-triple
+      - name: Install pinned llvm-mingw and prove native cgo
+        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }}
+        shell: pwsh
+        run: ./\.github\scripts\setup-windows-arm64-cgo.ps1
       - name: Build release-shaped assets
         shell: bash
+        env:
         run: bash .github/scripts/build-release-asset.sh v2.0.0 ${{ matrix.goos }} ${{ matrix.goarch }} ${{ matrix.archive_ext }}
+      - name: Smoke-test Windows ARM64 release binary
+        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }}
+        shell: pwsh
+        run: ./.github/scripts/smoke-windows-arm64-release.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.goos }}-${{ matrix.goarch }}

@@ -13,6 +13,12 @@ case "$goos/$goarch/$archive_ext" in
   *) echo "unsupported release target: $goos/$goarch/$archive_ext" >&2; exit 1 ;;
 esac
 
+if [[ "$goos/$goarch" == windows/arm64 ]]; then
+  [[ "$(go env CGO_ENABLED)" == 1 ]] || { echo "Windows ARM64 release requires CGO_ENABLED=1" >&2; exit 1; }
+  [[ "$(go env CC)" == *aarch64-w64-mingw32-clang* ]] || { echo "Windows ARM64 release requires the verified llvm-mingw CC" >&2; exit 1; }
+  [[ "$(go env CXX)" == *aarch64-w64-mingw32-clang++* ]] || { echo "Windows ARM64 release requires the verified llvm-mingw CXX" >&2; exit 1; }
+fi
+
 binary=codegraph
 binary_name=codegraph
 [[ "$goos" == windows ]] && binary_name=codegraph.exe
@@ -22,9 +28,12 @@ GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=1 go build -v -x \
   -ldflags "-X github.com/isink17/codegraph/internal/version.Version=$version" \
   -o "$dist/$archive_base/$binary_name" ./cmd/codegraph
 
-actual=$("$dist/$archive_base/$binary_name" --version)
+actual=""
+if [[ "$goos/$goarch" == "$(go env GOOS)/$(go env GOARCH)" ]]; then
+  actual=$("$dist/$archive_base/$binary_name" --version)
+fi
 expected="codegraph $version"
-if [[ "$actual" != "$expected" ]]; then
+if [[ -n "$actual" && "$actual" != "$expected" ]]; then
   echo "version mismatch: got $actual, want $expected" >&2
   exit 1
 fi
