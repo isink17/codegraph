@@ -31,5 +31,6 @@
     "install.js",
     "lib/installer.js",
     "LICENSE"
-  ]
+  ],
+  "mcpName": "io.github.isink17/codegraph"
 }
