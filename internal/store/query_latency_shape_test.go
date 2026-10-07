@@ -26,6 +26,9 @@ func TestBigGraphFixtureShape(t *testing.T) {
 	ctx := context.Background()
 	f := bigGraph(t)
 	t.Logf("fixture: %s", f.Describe())
+	if err := f.store.RequireCanonicalRepositoryPaths(ctx, f.repoID); err != nil {
+		t.Fatalf("fixture repository path marker: %v", err)
+	}
 
 	if f.Symbols < 95_000 || f.Symbols > 115_000 {
 		t.Fatalf("Symbols = %d, want ~100k", f.Symbols)

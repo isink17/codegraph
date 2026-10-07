@@ -231,6 +231,9 @@ func buildBigGraph() (*bigGraphFixture, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.EnsureCanonicalRepositoryPaths(ctx, repo.ID, true); err != nil {
+		return nil, err
+	}
 	f := &bigGraphFixture{
 		store:  s,
 		repoID: repo.ID,
