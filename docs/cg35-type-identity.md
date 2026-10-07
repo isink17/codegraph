@@ -88,7 +88,7 @@ cost and evidence contract; CG-36 must not silently implement it.
 | --- | --- | --- |
 | Provider declaration or alias changes | Matching consumers are invalidated and recomputed | `TestJVMTypeDependenciesFailClosedAndConverge`, `TestJVMTypeAliasDependencyMutationAndDeletion` |
 | Consumer imports change | The consumer's stored syntax is re-evaluated | `TestJVMTypeDependenciesImportOnlyChangeRedecidesConsumer` |
-| Provider or consumer is deleted/retired | Dependent observations are invalidated; removed paths do not remain usable | `TestJVMTypeDependencyRetirementLeavesRetryableInvalidation` |
+| Provider is deleted/retired | Dependent observations are invalidated; retired provider paths do not remain usable | `TestJVMTypeDependencyRetirementLeavesRetryableInvalidation`, `TestJVMTypeAliasDependencyMutationAndDeletion` |
 | Language transition | Old-provider dependencies are invalidated | `TestJVMTypeDependencyLanguageTransitionInvalidatesOldProvider` |
 | Rebuild failure | Dirty state remains for retry | `TestJVMTypeDependencyRecomputeFailureLeavesDirtyStateForRetry` |
 | Fresh versus incremental | Tested final observations converge across add/change/delete/ambiguity transitions | `TestJVMTypeDependencyConvergenceMatrix`, `internal/indexer/jvm_type_dependency_lifecycle_test.go` |
