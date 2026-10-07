@@ -31,7 +31,8 @@ prior state and declared change. No-op runs prove that the declared input is
 unchanged. Results from different modes are not interchangeable. Refuse stale
 results whenever the CodeGraph SHA, fixture identity/SHA, root marker,
 configuration, or required environment identity differs. Dirty results remain
-incomparable until the artifact also fingerprints the working-tree diff.
+incomparable in v1. A future schema may permit comparison only after defining
+and validating a deterministic working-tree diff fingerprint.
 
 Timing records preserve raw samples, warmup count, measurement count, units,
 and aggregation policy. Build/index setup time is separate from query latency.
