@@ -98,33 +98,53 @@ func addJavaScope(imp *sitter.Node, content []byte, out *[]graph.ScopeImport) {
 	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: local, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard, Static: static})
 }
 
-func addKotlinScope(text string, out *[]graph.ScopeImport) {
-	text = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), "import"))
-	parts := strings.Fields(text)
-	if len(parts) == 0 {
+func addKotlinScopeNode(imp *sitter.Node, content []byte, out *[]graph.ScopeImport) {
+	if imp == nil || imp.HasError() {
+		*out = append(*out, graph.ScopeImport{SourceSpecifier: nodeText(imp, content), Kind: graph.ScopeImportNamed})
 		return
 	}
-	path := parts[0]
-	wildcard := strings.HasSuffix(path, ".*")
-	name := strings.TrimSuffix(path, ".*")
-	local := name
-	if i := strings.LastIndexByte(name, '.'); i >= 0 {
-		local = name[i+1:]
+	ident := childByFieldName(imp, "identifier")
+	if ident == nil {
+		ident = firstChild(imp, "identifier")
 	}
-	if len(parts) >= 3 && parts[1] == "as" {
-		local = parts[2]
+	var parts []string
+	if ident != nil {
+		for _, part := range findDescendants(ident, "simple_identifier") {
+			parts = append(parts, nodeText(part, content))
+		}
+	}
+	if len(parts) == 0 {
+		*out = append(*out, graph.ScopeImport{SourceSpecifier: nodeText(imp, content), Kind: graph.ScopeImportNamed})
+		return
+	}
+	name := strings.Join(parts, ".")
+	wildcard := len(findDescendants(imp, "wildcard_import")) > 0
+	local, imported := parts[len(parts)-1], parts[len(parts)-1]
+	if alias := firstChild(imp, "import_alias"); alias != nil {
+		if n := firstChild(alias, "type_identifier"); n != nil && !n.HasError() {
+			local = nodeText(n, content)
+		} else {
+			local = ""
+		}
 	}
 	if wildcard {
-		local = ""
-	}
-	imported := local
-	if i := strings.LastIndexByte(name, '.'); i >= 0 {
-		imported = name[i+1:]
-	}
-	if wildcard {
-		imported = ""
+		local, imported = "", ""
 	}
 	*out = append(*out, graph.ScopeImport{SourceSpecifier: name, ImportedName: imported, LocalName: local, Kind: graph.ScopeImportNamed, Wildcard: wildcard})
+}
+
+func jvmImportConflict(imports []graph.ScopeImport) bool {
+	seen := make(map[string]string, len(imports))
+	for _, imp := range imports {
+		if imp.Wildcard || imp.LocalName == "" {
+			continue
+		}
+		if prior, ok := seen[imp.LocalName]; ok && prior != imp.SourceSpecifier {
+			return true
+		}
+		seen[imp.LocalName] = imp.SourceSpecifier
+	}
+	return false
 }
 
 func addTypeScriptImport(text string, out *[]graph.ScopeImport) {

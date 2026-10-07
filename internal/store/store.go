@@ -1394,6 +1394,9 @@ func (s *Store) UpsertRepo(ctx context.Context, rootPath string) (graph.Repo, er
 	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `SELECT id, root_path, canonical_path FROM repos WHERE canonical_path = ?`, canonical).Scan(&repo.ID, &repo.RootPath, &repo.CanonicalPath); err != nil {
 		return graph.Repo{}, err
 	}
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO jvm_compilation_scope_evidence(repo_id,evidence_domain,evidence_version,state,provenance) VALUES(?,'jvm-type-identity',1,'unknown','store:default-no-compilation-scope-evidence')`, repo.ID); err != nil {
+		return graph.Repo{}, err
+	}
 	return repo, nil
 }
 
@@ -2384,6 +2387,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM kotlin_jvm_name_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM jvm_type_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM go_local_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2545,6 +2551,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM kotlin_jvm_name_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM jvm_type_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM swift_extension_memberships WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2875,6 +2884,52 @@ func insertParsedFileGraph(
 		}
 		if err := execBatchInsert(ctx, tx, "kotlin_jvm_name_evidence", "repo_id, file_id, symbol_id, is_known, jvm_name", 5, args, stats); err != nil {
 			return nil, err
+		}
+	}
+	if len(parsed.JVMTypeEvidence) > 0 {
+		for _, fact := range parsed.JVMTypeEvidence {
+			if fact.Provenance == "" || fact.SyntaxState == "" || fact.SymbolIndex < -1 || fact.SymbolIndex >= len(symbolIDs) {
+				return nil, fmt.Errorf("invalid JVM type evidence symbol index %d", fact.SymbolIndex)
+			}
+			var symbolID any
+			language := parsed.Language
+			evidenceKey := fact.EvidenceKey
+			if fact.SymbolIndex >= 0 {
+				symbolID = symbolIDs[fact.SymbolIndex]
+				language = parsed.Symbols[fact.SymbolIndex].Language
+				symbol := parsed.Symbols[fact.SymbolIndex]
+				evidenceKey = fmt.Sprintf("%s#%s:%d:%d", filePath, symbol.StableKey, symbol.Range.StartLine, symbol.Range.StartCol)
+			}
+			if fact.SymbolIndex < 0 && evidenceKey != "" {
+				evidenceKey = filePath + "#" + evidenceKey
+			}
+			if language != "java" && language != "kotlin" {
+				return nil, fmt.Errorf("invalid JVM type evidence language %q", language)
+			}
+			if evidenceKey == "" {
+				return nil, fmt.Errorf("empty JVM type evidence key")
+			}
+			underlyingState := fact.UnderlyingState
+			if underlyingState == "" {
+				underlyingState = "unknown"
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO jvm_type_evidence(repo_id,file_id,symbol_id,evidence_key,owner_name,source_language,declaration_kind,modifiers,has_type_parameters,underlying_type,underlying_state,alias_target,syntax_state,provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, repoID, fileID, symbolID, evidenceKey, fact.OwnerName, language, fact.Kind, fact.Modifiers, boolInt(fact.TypeParams), fact.UnderlyingType, underlyingState, fact.AliasTarget, fact.SyntaxState, fact.Provenance); err != nil {
+				return nil, err
+			}
+			ordinals := map[string]int{}
+			for _, typ := range fact.Params {
+				if (typ.Position != "parameter" && typ.Position != "result") || typ.SyntaxState == "" {
+					return nil, fmt.Errorf("invalid JVM callable type evidence for symbol index %d", fact.SymbolIndex)
+				}
+				ordinal := ordinals[typ.Position]
+				if symbolID == nil {
+					return nil, fmt.Errorf("callable JVM type syntax without symbol")
+				}
+				if _, err := tx.ExecContext(ctx, `INSERT INTO jvm_callable_type_evidence(repo_id,symbol_id,position,ordinal,syntax,syntax_state) VALUES(?,?,?,?,?,?)`, repoID, symbolIDs[fact.SymbolIndex], typ.Position, ordinal, typ.Syntax, typ.SyntaxState); err != nil {
+					return nil, err
+				}
+				ordinals[typ.Position] = ordinal + 1
+			}
 		}
 	}
 	if len(parsed.SwiftExtensionMemberships) > 0 {

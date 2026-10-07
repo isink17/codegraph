@@ -140,6 +140,32 @@ type ParsedFile struct {
 	SwiftExtensionMemberships []SwiftExtensionMembership
 	KotlinJVMCallableEvidence []KotlinJVMCallableEvidence
 	KotlinJVMNameEvidence     []KotlinJVMNameEvidence
+	JVMTypeEvidence           []JVMTypeEvidence
+}
+
+// JVMTypeEvidence is source syntax only. It never claims a canonical JVM type
+// or compiler lowering result.
+type JVMTypeEvidence struct {
+	SymbolIndex     int
+	EvidenceKey     string
+	OwnerName       string
+	FilePath        string
+	SourceLanguage  string
+	Kind            string
+	Modifiers       string
+	TypeParams      bool
+	UnderlyingType  string
+	UnderlyingState string
+	AliasTarget     string
+	SyntaxState     string
+	Provenance      string
+	Params          []JVMCallableTypeEvidence
+}
+
+type JVMCallableTypeEvidence struct {
+	Position    string
+	Syntax      string
+	SyntaxState string
 }
 
 // KotlinJVMCallableEvidence describes Java-visible value-parameter arities

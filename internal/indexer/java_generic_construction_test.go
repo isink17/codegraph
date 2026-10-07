@@ -118,7 +118,7 @@ func TestJavaGenericConstructionProfileConvergence(t *testing.T) {
 	if strings.Join(summary.ParserProfileLanguages, ",") != "java" {
 		t.Fatalf("update = %+v, want a java profile reparse", summary)
 	}
-	if got := fileParserProfile(t, s.raw(t), repo, "app/Caller.java"); got != "treesitter:java:v11" {
+	if got := fileParserProfile(t, s.raw(t), repo, "app/Caller.java"); got != "treesitter:java:v12" {
 		t.Fatalf("updated profile = %q", got)
 	}
 	assertJavaGenericTargets(t, r, "update")

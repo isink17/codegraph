@@ -64,6 +64,101 @@ func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 	}
 }
 
+func TestKotlinJVMTypeSyntaxEvidence(t *testing.T) {
+	source := `package api
+import dep.Token as Alias
+import dep.*
+typealias Local = Alias
+@JvmInline value class Value<T>(val value: T)
+class Ordinary
+fun use(value: Alias): Ordinary = Ordinary()`
+	parsed, err := NewKotlin().Parse(context.Background(), "Types.kt", []byte(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Scope.Imports) != 2 || parsed.Scope.Imports[0].LocalName != "Alias" || !parsed.Scope.Imports[1].Wildcard {
+		t.Fatalf("imports = %+v", parsed.Scope.Imports)
+	}
+	if len(parsed.JVMTypeEvidence) < 4 || parsed.JVMTypeEvidence[0].Kind != "typealias" || parsed.JVMTypeEvidence[0].AliasTarget != "Alias" || parsed.JVMTypeEvidence[0].SyntaxState != "unknown" {
+		t.Fatalf("typealias source evidence = %+v", parsed.JVMTypeEvidence)
+	}
+	var valueUnderlying string
+	for _, fact := range parsed.JVMTypeEvidence {
+		if fact.Kind == "class" && strings.Contains(fact.Modifiers, "value") {
+			if fact.TypeParams && fact.UnderlyingState == "known" {
+				valueUnderlying = fact.UnderlyingType
+			}
+		}
+	}
+	if valueUnderlying != "T" {
+		t.Fatalf("value class underlying source syntax = %q; facts=%+v", valueUnderlying, parsed.JVMTypeEvidence)
+	}
+	aliases, err := NewKotlin().Parse(context.Background(), "Aliases.kt", []byte("typealias A = B\ntypealias B = A\ntypealias MissingTarget = Unknown\n"))
+	if err != nil || len(aliases.JVMTypeEvidence) != 3 {
+		t.Fatalf("cyclic/unknown aliases = %+v err=%v", aliases.JVMTypeEvidence, err)
+	}
+	for _, fact := range aliases.JVMTypeEvidence {
+		if fact.SyntaxState != "unknown" || fact.AliasTarget == "" {
+			t.Fatalf("alias target was treated as resolved: %+v", fact)
+		}
+	}
+	for _, sym := range parsed.Symbols {
+		if sym.Kind != "function" {
+			continue
+		}
+		var fact *graph.JVMTypeEvidence
+		for i := range parsed.JVMTypeEvidence {
+			if parsed.JVMTypeEvidence[i].SymbolIndex >= 0 && parsed.Symbols[parsed.JVMTypeEvidence[i].SymbolIndex].StableKey == sym.StableKey {
+				fact = &parsed.JVMTypeEvidence[i]
+			}
+		}
+		if fact == nil || len(fact.Params) != 2 || fact.Params[0].Syntax != "Alias" || fact.Params[0].SyntaxState != "known" || fact.Params[1].Position != "result" {
+			t.Fatalf("function type evidence = %+v", fact)
+		}
+	}
+	bad, err := NewKotlin().Parse(context.Background(), "Bad.kt", []byte("fun broken(value: List<Alias>) {}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad.JVMTypeEvidence) != 1 || bad.JVMTypeEvidence[0].Params[0].SyntaxState != "incomplete" {
+		t.Fatalf("unsupported nested type evidence = %+v", bad.JVMTypeEvidence)
+	}
+	malformed, err := NewKotlin().Parse(context.Background(), "Bad.kt", []byte("fun broken(value: List<) {}"))
+	if err != nil || len(malformed.JVMTypeEvidence) != 0 {
+		t.Fatalf("malformed type evidence = %+v, err=%v", malformed.JVMTypeEvidence, err)
+	}
+	conflict, err := NewKotlin().Parse(context.Background(), "Conflict.kt", []byte("import a.Token as Same\nimport b.Token as Same\nfun use(x: Same) {}"))
+	if err != nil || len(conflict.Scope.Imports) != 2 || len(conflict.JVMTypeEvidence) != 1 || conflict.JVMTypeEvidence[0].SyntaxState != "unknown" {
+		t.Fatalf("conflicting import evidence = %+v imports=%+v err=%v", conflict.JVMTypeEvidence, conflict.Scope.Imports, err)
+	}
+}
+
+func TestJavaJVMTypeSyntaxEvidence(t *testing.T) {
+	parsed, err := NewJava().Parse(context.Background(), "Types.java", []byte(`package api;
+import dep.Token;
+import dep.*;
+class Box<T> { Token run(Token input) { return input; } }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Scope.Imports) != 2 || !parsed.Scope.Imports[1].Wildcard {
+		t.Fatalf("imports = %+v", parsed.Scope.Imports)
+	}
+	var generic, method bool
+	for _, fact := range parsed.JVMTypeEvidence {
+		sym := parsed.Symbols[fact.SymbolIndex]
+		if sym.Kind == "type" && fact.TypeParams {
+			generic = true
+		}
+		if sym.Name == "run" && len(fact.Params) == 2 && fact.Params[0].Syntax == "Token" && fact.Params[1].Position == "result" {
+			method = true
+		}
+	}
+	if !generic || !method {
+		t.Fatalf("JVM type evidence = %+v symbols=%+v", parsed.JVMTypeEvidence, parsed.Symbols)
+	}
+}
+
 func TestKotlinCompanionSourceSymbols(t *testing.T) {
 	tests := []struct {
 		name string

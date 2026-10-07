@@ -27,10 +27,11 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.NewProfile("python", "treesitter:python:v9", true)
 }
 
-// Java v11 marks a bare call in a class that, with every class enclosing it,
-// spells no supertype (graph.JavaNoSupertypeCallEvidence); only such a call
-// may bind a static import, since an inherited method of that name would
-// shadow it.
+// Java v12 adds source-only JVM declaration and callable type syntax evidence;
+// it does not change edge resolution. Java v11 marks a bare call in a class
+// that, with every class enclosing it, spells no supertype
+// (graph.JavaNoSupertypeCallEvidence); only such a call may bind a static
+// import, since an inherited method of that name would shadow it.
 //
 // Java v10 reads imports from their syntax nodes: a package whose name begins
 // with "static" keeps it (v9 recorded `import staticpkg.Bag;` as pkg.Bag), and
@@ -83,10 +84,12 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyCallSupertype {
 		return parser.NewProfile("java", "treesitter:java:v10", true)
 	}
-	return parser.NewProfile("java", "treesitter:java:v11", true)
+	return parser.NewProfile("java", "treesitter:java:v12", true)
 }
 
-// Kotlin v11 refuses duplicate package headers recovered as expressions.
+// Kotlin v12 persists source-only JVM type declarations, aliases and callable
+// type syntax; it does not change edge resolution. Kotlin v11 refuses duplicate
+// package headers recovered as expressions.
 // v10 reads the package from the package_header node instead of the
 // first raw-text line starting with `package x`, so a comment or a multi-line
 // string can no longer name it; the package prefixes every qualified name and
@@ -113,7 +116,7 @@ func (a *KotlinAdapter) Profile() parser.Profile {
 	case 9:
 		return parser.NewProfile("kotlin", "treesitter:kotlin:v9", true)
 	}
-	return parser.NewProfile("kotlin", "treesitter:kotlin:v11", true)
+	return parser.NewProfile("kotlin", "treesitter:kotlin:v12", true)
 }
 
 // C# v5 reads using directives from their syntax tokens: a namespace whose

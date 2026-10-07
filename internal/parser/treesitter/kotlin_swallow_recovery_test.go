@@ -274,7 +274,7 @@ func TestKotlinSwallowedPrivateFunctionFacts(t *testing.T) {
 		calls = append(calls, e.DstName)
 	}
 	sort.Strings(calls)
-	if NewKotlinV8().Profile().ID != "treesitter:kotlin:v8" || NewKotlin().Profile().ID != "treesitter:kotlin:v11" || len(old.Symbols) != 2 || !reflect.DeepEqual(calls, []string{"run", "run()", "target"}) {
+	if NewKotlinV8().Profile().ID != "treesitter:kotlin:v8" || NewKotlin().Profile().ID != "treesitter:kotlin:v12" || len(old.Symbols) != 2 || !reflect.DeepEqual(calls, []string{"run", "run()", "target"}) {
 		t.Fatalf("v8 symbols = %+v calls = %v", old.Symbols, calls)
 	}
 }
