@@ -25,11 +25,13 @@ not secrets or local path spellings.
 
 ## Measurements
 
-Store raw timing samples per named scenario, in a declared unit, with warmup
-count, sample count, and aggregation policy. Fresh-index setup, incremental
-update, no-op update, and warm query timings are separate populations. The
-existing `BenchmarkQueryLatency100k` fixture and `codegraph bench-queries`
-measure different workloads and must have distinct fixture/scenario identities.
+Store raw timing samples per named scenario in nanoseconds, with warmup count,
+sample count, operations per sample, and aggregation policy. v1 records each
+scenario's policy as `benchstat`; public-mode output emits each raw sample as a
+Go benchmark `ns/op` row for benchstat. Fresh-index setup, incremental update,
+no-op update, and warm query timings are separate populations. The existing
+`BenchmarkQueryLatency100k` fixture and `codegraph bench-queries` measure
+different workloads and must have distinct fixture/scenario identities.
 
 Every metric names its denominator and units. Missing or zero denominators
 produce an absent metric and a refusal reason, never a fabricated zero or
