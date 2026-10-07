@@ -56,27 +56,84 @@ This is one CG-35-owned prerequisite, not several speculative implementation
 projects. Schedule compilation-scope identity work separately after reviewing its
 cost and evidence contract; CG-36 must not silently implement it.
 
-## Source evidence foundation (first implementation slice)
+## Current implementation audit
 
-Migration 006 persists source-only JVM declaration and callable type facts,
-including owner, structured import aliases/wildcards (in the existing import
-evidence), raw parameter/result and value-class underlying type syntax,
-generic/value modifiers, parser provenance and explicit syntax state. Kotlin typealiases are stored as file-scoped facts and
-do not create graph symbols. Java and Kotlin parsers emit these facts under
-profile v12; resolver semantic generations and resolver policy are unchanged.
-Historical and newly indexed repositories receive compilation-scope state
-`unknown` for the `jvm-type-identity` domain, evidence version 1. No repository
-completeness or classpath completeness is inferred.
+### IMPLEMENTED
 
-The classifier remains disabled. Facts have no dependencies on declarations or
-negative lookup results, and the indexer does not invalidate unchanged callers
-when a type or alias changes. The next slice must establish an independently
-verified compilation-scope input (selected/generated/excluded sources,
-dependency alias/class metadata and compiler identity), add positive and
-negative type dependencies, and prove invalidation on import, declaration,
-alias and ambiguity changes before any callable identity can be consumed by the
-resolver. Until then, source facts are available for inspection only and must
-not change call edges.
+- Migration 006 stores Java/Kotlin type declarations and callable parameter and
+  result positions, syntax state, modifiers, generic/value-class syntax,
+  alias-target spelling, and parser provenance. Kotlin typealiases are
+  file-scoped source facts and do not create graph symbols. The facts describe
+  source syntax, not canonical JVM identity.
+- Java and Kotlin adapters emit those facts in their current parser profiles.
+  Profile-upgrade coverage reparses stored files; resolver semantic generations
+  and resolver policy remain unchanged.
+- Migration 007 adds independent `source`, `generated`, `excluded`,
+  `dependency`, `external_metadata`, and `compiler_identity` scope dimensions.
+  Each dimension is `complete`, `incomplete`, or `unknown`, with existing
+  repositories initialized to `unknown`.
+- `internal/store/jvm_type_dependencies.go` stores positive and negative
+  observations only when scope is complete. Duplicate/conflicting candidates
+  become ambiguous; absent or insufficient evidence stays unknown. These are
+  invalidation observations, not callable-identity proof.
+- The indexer rebuilds dependencies after changed-file persistence and before
+  resolver pass 2. Provider and consumer changes mark affected observations
+  dirty before recomputation, so a failed rebuild remains unusable and can be
+  retried. Fresh indexing and incremental updates converge in the tested
+  mutation matrix.
+
+### LIFECYCLE AUDIT
+
+| Change | Current behavior | Evidence |
+| --- | --- | --- |
+| Provider declaration or alias changes | Matching consumers are invalidated and recomputed | `TestJVMTypeDependenciesFailClosedAndConverge`, `TestJVMTypeAliasDependencyMutationAndDeletion` |
+| Consumer imports change | The consumer's stored syntax is re-evaluated | `TestJVMTypeDependenciesImportOnlyChangeRedecidesConsumer` |
+| Provider or consumer is deleted/retired | Dependent observations are invalidated; removed paths do not remain usable | `TestJVMTypeDependencyRetirementLeavesRetryableInvalidation` |
+| Language transition | Old-provider dependencies are invalidated | `TestJVMTypeDependencyLanguageTransitionInvalidatesOldProvider` |
+| Rebuild failure | Dirty state remains for retry | `TestJVMTypeDependencyRecomputeFailureLeavesDirtyStateForRetry` |
+| Fresh versus incremental | Tested final observations converge across add/change/delete/ambiguity transitions | `TestJVMTypeDependencyConvergenceMatrix`, `internal/indexer/jvm_type_dependency_lifecycle_test.go` |
+| Scope not supplied | Every completeness dimension remains unknown; no positive or negative completeness claim is made | `TestJVMCompilationScopeMigrationDefaultsExistingReposUnknown` |
+
+### NOT IMPLEMENTED
+
+- No build-evidence exporter or artifact importer supplies selected
+  compilation, source-set, classpath, generated/excluded-source, dependency
+  metadata, or compiler identity evidence.
+- No classifier consumes these source/dependency observations to upgrade an
+  unresolved call. The ordinary classifier remains limited to unresolved
+  target categories and does not prove JVM callable identity.
+- No compiler-backed canonical JVM owner/name/descriptor resolution is
+  enabled. The 24 `Internal.parseCookie` calls remain unresolved.
+
+### UNKNOWN
+
+Without trusted build evidence, actual selected sources, generated and excluded
+inputs, dependency aliases/classes, external metadata, Kotlin compiler/plugin
+identity, and effective JVM ABI are unknown. An observed repository absence is
+not proof of a builtin or dependency absence. No scope dimension may be
+promoted from unknown based on parser success or dependency observation alone.
+
+### TRUST BOUNDARY
+
+Source parsers may report syntax facts and provenance. Only an explicitly
+invoked, validated producer/import path may report build facts. Completeness is
+per dimension and requires evidence for that dimension; exporter success alone
+does not make any dimension complete. Stale or mismatched build fingerprints
+make affected evidence unusable/unknown. Ordinary `index`, `update`, `watch`,
+`serve` startup/autosync, and MCP index/update paths do not invoke Gradle,
+Gradle wrappers, Maven, Maven wrappers, or project build scripts. Source audit
+found process execution only for Git, Go tooling, and OS URL openers.
+
+### FUTURE EXPORTER BOUNDARY
+
+The authorized first producer target is one explicitly selected Kotlin Gradle
+compilation. Its versioned artifact must identify the repository/build root,
+selected Gradle project and compilation, observable Gradle/Kotlin/JDK identity,
+input fingerprint, and per-dimension evidence with provenance. It must not
+persist arbitrary environment variables or credentials. Until an artifact is
+validated and its fingerprint matches current inputs, imported evidence is
+unusable. This contract does not authorize automatic build execution from an
+ordinary indexing path or generalize the producer to Maven.
 
 ## Failure modes and acceptance oracles
 
