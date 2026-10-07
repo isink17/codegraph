@@ -135,3 +135,12 @@ func TestCompareArtifactsRefusesStaleAndEnvironmentMismatch(t *testing.T) {
 		t.Fatalf("scenario mismatch = %+v", got)
 	}
 }
+
+func TestCompareArtifactsUsesStableInvalidReasons(t *testing.T) {
+	base, candidate := artifact(), artifact()
+	candidate.Identity.FixtureSHA = "invalid"
+	got := CompareArtifacts(base, candidate)
+	if got.Comparability.Comparable || len(got.Comparability.Reasons) != 1 || got.Comparability.Reasons[0] != "candidate_invalid" {
+		t.Fatalf("invalid artifact reasons = %+v", got.Comparability.Reasons)
+	}
+}

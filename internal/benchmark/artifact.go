@@ -190,10 +190,10 @@ func CompareArtifacts(baseline, candidate Artifact) ComparisonArtifact {
 	candidateBytes, candidateErr := candidate.Marshal()
 	reasons := []string{}
 	if baseErr != nil {
-		reasons = append(reasons, "baseline_invalid:"+baseErr.Error())
+		reasons = append(reasons, "baseline_invalid")
 	}
 	if candidateErr != nil {
-		reasons = append(reasons, "candidate_invalid:"+candidateErr.Error())
+		reasons = append(reasons, "candidate_invalid")
 	}
 	if len(reasons) == 0 {
 		reasons = append(reasons, Compare(baseline.Identity, candidate.Identity).Reasons...)
