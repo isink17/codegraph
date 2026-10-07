@@ -47,6 +47,18 @@ func TestEditSafetyRequiresCompleteVerifiedBoundariesForSafe(t *testing.T) {
 	}
 }
 
+func TestEditSafetyAmbiguousSemanticChangeRemainsUnknown(t *testing.T) {
+	e := EditSafetyEvidence{
+		SemanticChanges:    []Change{{Kind: "declaration_changed", Identity: "pkg.A", Ambiguous: true}},
+		ResolvedImpact:     []ImpactEvidence{{Symbol: "pkg.B", File: "b.go"}},
+		RequiredBoundaries: []string{"graph"},
+		Evidence:           []SafetyEvidence{{Boundary: "graph", Source: "index", Detail: "complete graph", State: EvidenceSatisfied, Confidence: ConfidenceVerified}},
+	}
+	if got := NewEditSafetyEvidence(e).OverallState; got != EditSafetyUnknown {
+		t.Fatalf("ambiguous change state = %q, want unknown", got)
+	}
+}
+
 func TestEditSafetyUnsafeRequiresExplicitEvidence(t *testing.T) {
 	e := NewEditSafetyEvidence(EditSafetyEvidence{Evidence: []SafetyEvidence{{State: EvidenceUnsafe}}})
 	if e.OverallState != EditSafetyUnknown {
@@ -84,5 +96,27 @@ func TestEditSafetyEvidenceOrderingIsDeterministic(t *testing.T) {
 	ordered := NewEditSafetyEvidence(e)
 	if ordered.SemanticChanges[0].Kind != "a" || ordered.ResolvedImpact[0].Symbol != "a" || ordered.Evidence[0].Boundary != "a" || ordered.RequiredBoundaries[0] != "a" {
 		t.Fatalf("evidence not sorted: %+v", ordered)
+	}
+}
+
+func TestEditSafetyOrderingUsesTieBreakFields(t *testing.T) {
+	changeA := Change{Kind: "changed", Identity: "pkg.A", Before: json.RawMessage(`{"x":1}`)}
+	changeB := Change{Kind: "changed", Identity: "pkg.A", Before: json.RawMessage(`{"x":2}`)}
+	evidenceA := SafetyEvidence{Boundary: "graph", Source: "index", Detail: "same", State: EvidenceIncomplete, Confidence: ConfidenceUnknown}
+	evidenceB := SafetyEvidence{Boundary: "graph", Source: "index", Detail: "same", State: EvidenceSatisfied, Confidence: ConfidenceVerified}
+	a, err := json.Marshal(NewEditSafetyEvidence(EditSafetyEvidence{
+		SemanticChanges: []Change{changeB, changeA}, Evidence: []SafetyEvidence{evidenceB, evidenceA},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(NewEditSafetyEvidence(EditSafetyEvidence{
+		SemanticChanges: []Change{changeA, changeB}, Evidence: []SafetyEvidence{evidenceA, evidenceB},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("tie ordering differs:\n%s\n%s", a, b)
 	}
 }

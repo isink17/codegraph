@@ -1,6 +1,9 @@
 package diff
 
-import "sort"
+import (
+	"bytes"
+	"sort"
+)
 
 const EditSafetySchema = "codegraph.edit_safety/v1"
 
@@ -91,7 +94,16 @@ func NewEditSafetyEvidence(e EditSafetyEvidence) EditSafetyEvidence {
 		if e.SemanticChanges[i].Kind != e.SemanticChanges[j].Kind {
 			return e.SemanticChanges[i].Kind < e.SemanticChanges[j].Kind
 		}
-		return e.SemanticChanges[i].Identity < e.SemanticChanges[j].Identity
+		if e.SemanticChanges[i].Identity != e.SemanticChanges[j].Identity {
+			return e.SemanticChanges[i].Identity < e.SemanticChanges[j].Identity
+		}
+		if e.SemanticChanges[i].Ambiguous != e.SemanticChanges[j].Ambiguous {
+			return !e.SemanticChanges[i].Ambiguous
+		}
+		if order := bytes.Compare(e.SemanticChanges[i].Before, e.SemanticChanges[j].Before); order != 0 {
+			return order < 0
+		}
+		return bytes.Compare(e.SemanticChanges[i].After, e.SemanticChanges[j].After) < 0
 	})
 	sort.Slice(e.ResolvedImpact, func(i, j int) bool {
 		if e.ResolvedImpact[i].Symbol != e.ResolvedImpact[j].Symbol {
@@ -118,7 +130,13 @@ func NewEditSafetyEvidence(e EditSafetyEvidence) EditSafetyEvidence {
 		if a.Source != b.Source {
 			return a.Source < b.Source
 		}
-		return a.Detail < b.Detail
+		if a.Detail != b.Detail {
+			return a.Detail < b.Detail
+		}
+		if a.State != b.State {
+			return a.State < b.State
+		}
+		return a.Confidence < b.Confidence
 	})
 	e.OverallState = deriveEditSafetyState(e)
 	return e
@@ -128,6 +146,11 @@ func deriveEditSafetyState(e EditSafetyEvidence) EditSafetyState {
 	for _, evidence := range e.Evidence {
 		if evidence.State == EvidenceUnsafe && evidence.Source != "" && evidence.Detail != "" && evidence.Confidence != ConfidenceUnknown {
 			return EditSafetyUnsafe
+		}
+	}
+	for _, change := range e.SemanticChanges {
+		if change.Ambiguous {
+			return EditSafetyUnknown
 		}
 	}
 	if len(e.SemanticChanges) == 0 || len(e.ResolvedImpact) == 0 || len(e.RequiredBoundaries) == 0 || len(e.UnresolvedBoundaries) > 0 || len(e.UnsupportedBoundaries) > 0 {
@@ -143,7 +166,15 @@ func deriveEditSafetyState(e EditSafetyEvidence) EditSafetyState {
 		}
 		evidenceByBoundary[evidence.Boundary] = evidence
 	}
+	required := make(map[string]struct{}, len(e.RequiredBoundaries))
 	for _, boundary := range e.RequiredBoundaries {
+		if boundary == "" {
+			return EditSafetyUnknown
+		}
+		if _, duplicate := required[boundary]; duplicate {
+			return EditSafetyUnknown
+		}
+		required[boundary] = struct{}{}
 		evidence, ok := evidenceByBoundary[boundary]
 		if !ok || evidence.State != EvidenceSatisfied || evidence.Confidence != ConfidenceVerified {
 			return EditSafetyUnknown
