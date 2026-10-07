@@ -191,6 +191,10 @@ func TestSnapshotCancellationCleansScratch(t *testing.T) {
 	rev := r.Commit("", "one")
 	ctx, cancel := context.WithCancel(t.Context())
 	reg := parser.NewRegistry(cancelAdapter{cancel})
+	scratch := t.TempDir()
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, scratch)
+	}
 	before := diffScratchDirs(t)
 	_, err := snapshot(ctx, r.Dir, rev, reg)
 	if err == nil {
