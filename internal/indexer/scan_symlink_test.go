@@ -290,6 +290,40 @@ func TestIndexNonIndexableEntriesAreSkippedNotFatal(t *testing.T) {
 	}
 }
 
+func TestUpdatePathScopedDirectoryWithSourceSuffixIsSkipped(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repoRoot, "not-a-file.go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	if _, err := idx.Update(ctx, Options{RepoRoot: repoRoot, Paths: []string{"not-a-file.go"}}); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatalf("UpsertRepo() error = %v", err)
+	}
+	files, err := s.ExistingFiles(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("ExistingFiles() error = %v", err)
+	}
+	if _, indexed := files["not-a-file.go"]; indexed {
+		t.Fatalf("directory with source suffix was indexed: %v", files)
+	}
+}
+
 func withWalkDir(t *testing.T, walk func(string, fs.WalkDirFunc) error) {
 	t.Helper()
 	prev := walkDir
