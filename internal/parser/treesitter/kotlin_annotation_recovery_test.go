@@ -305,7 +305,7 @@ func TestKotlinV6ParserKeepsDetachedAnnotationFailClosed(t *testing.T) {
 	if got := NewKotlinV6().Profile().ID; got != "treesitter:kotlin:v6" {
 		t.Fatalf("v6 profile = %q", got)
 	}
-	if got := NewKotlin().Profile().ID; got != "treesitter:kotlin:v11" {
+	if got := NewKotlin().Profile().ID; got != "treesitter:kotlin:v12" {
 		t.Fatalf("current profile = %q", got)
 	}
 	old := kotlinParseFacts(t, NewKotlinV6(), src, "run")

@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -68,6 +69,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	}
 
 	kotlinExtractImports(root, content, &pf)
+	kotlinExtractTypeAliases(root, content, &pf)
 	// Scripts may legally hold top-level expressions, so the split and
 	// swallowed shapes are only proven, and only recovered, in .kt files.
 	kt := filepath.Ext(path) == ".kt"
@@ -80,7 +82,31 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
 	})
+	if jvmImportConflict(pf.Scope.Imports) {
+		for i := range pf.JVMTypeEvidence {
+			pf.JVMTypeEvidence[i].SyntaxState = "unknown"
+		}
+	}
 	return pf, nil
+}
+
+func kotlinExtractTypeAliases(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+	for _, node := range findDescendants(root, "type_alias") {
+		name := childByFieldName(node, "name")
+		if name == nil {
+			name = firstChild(node, "type_identifier")
+		}
+		target := childByFieldName(node, "type")
+		if target == nil {
+			target = firstChild(node, "user_type")
+		}
+		_, syntax := kotlinTypeSyntax(target, content)
+		fact := graph.JVMTypeEvidence{SymbolIndex: -1, Kind: "typealias", SyntaxState: "unknown", AliasTarget: syntax, OwnerName: pf.Scope.Package, Provenance: "kotlin:tree-sitter:type-alias", EvidenceKey: fmt.Sprintf("typealias:%d:%s", node.StartPoint().Row+1, nodeText(name, content))}
+		if node.HasError() || name == nil || name.HasError() {
+			fact.SyntaxState = "unknown"
+		}
+		pf.JVMTypeEvidence = append(pf.JVMTypeEvidence, fact)
+	}
 }
 
 // kotlinPackage reads the package from the file's package_header, a direct
@@ -130,7 +156,7 @@ func kotlinExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFil
 		if ident != nil {
 			pf.Imports = append(pf.Imports, nodeText(ident, content))
 		}
-		addKotlinScope(nodeText(imp, content), &pf.Scope.Imports)
+		addKotlinScopeNode(imp, content, &pf.Scope.Imports)
 	}
 }
 
@@ -757,6 +783,33 @@ func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, cont
 		DocSummary:    prevCommentText(view.first, content),
 		StableKey:     "type:kotlin:" + qualified,
 	})
+	modifiers := ""
+	if mods := firstChild(node, "modifiers"); mods != nil {
+		modifiers = nodeText(mods, content)
+	}
+	typeParams := firstChild(node, "type_parameters") != nil
+	state := "known"
+	if node.HasError() || nameNode.HasError() {
+		state = "unknown"
+	}
+	fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: "class", Modifiers: modifiers, TypeParams: typeParams, OwnerName: container, SyntaxState: state, Provenance: "kotlin:tree-sitter:class-declaration"}
+	if strings.Contains(modifiers, "value") || strings.Contains(modifiers, "inline") {
+		fact.UnderlyingState = "unknown"
+		if ctor := firstChild(node, "primary_constructor"); ctor != nil {
+			params := findDescendants(ctor, "class_parameter")
+			if len(params) == 1 {
+				var typ *sitter.Node
+				for i := range int(params[0].ChildCount()) {
+					child := params[0].Child(i)
+					if child.Type() == "user_type" || child.Type() == "nullable_type" || child.Type() == "type_identifier" {
+						typ = child
+					}
+				}
+				fact.UnderlyingState, fact.UnderlyingType = kotlinTypeSyntax(typ, content)
+			}
+		}
+	}
+	pf.JVMTypeEvidence = append(pf.JVMTypeEvidence, fact)
 
 	body := childByFieldName(node, "body")
 	if body == nil {
@@ -808,6 +861,34 @@ func kotlinAddFunction(view kotlinDeclarationView, module, container string, con
 		DocSummary:    prevCommentText(view.first, content),
 		StableKey:     "func:kotlin:" + qualified,
 	})
+	if parts.params != nil {
+		fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: "function", OwnerName: effectiveContainer, SyntaxState: "known", Provenance: "kotlin:tree-sitter:function-signature"}
+		if len(parts.between) > 0 {
+			fact.SyntaxState = "incomplete"
+		}
+		fact.TypeParams = parts.typeParameters
+		for i := range int(parts.params.NamedChildCount()) {
+			param := parts.params.NamedChild(i)
+			if param.Type() != "parameter" {
+				continue
+			}
+			var typ *sitter.Node
+			for j := range int(param.ChildCount()) {
+				if param.Child(j).Type() == "type" || param.Child(j).Type() == "user_type" || param.Child(j).Type() == "nullable_type" {
+					typ = param.Child(j)
+				}
+			}
+			state, syntax := kotlinTypeSyntax(typ, content)
+			fact.Params = append(fact.Params, graph.JVMCallableTypeEvidence{Position: "parameter", Syntax: syntax, SyntaxState: state})
+		}
+		if parts.explicitResult {
+			state, syntax := kotlinTypeSyntax(parts.result, content)
+			fact.Params = append(fact.Params, graph.JVMCallableTypeEvidence{Position: "result", Syntax: syntax, SyntaxState: state})
+		} else {
+			fact.Params = append(fact.Params, graph.JVMCallableTypeEvidence{Position: "result", SyntaxState: "unknown"})
+		}
+		pf.JVMTypeEvidence = append(pf.JVMTypeEvidence, fact)
+	}
 	if fact, ok := kotlinJVMCallableEvidence(view, parts, content, imports, len(pf.Symbols)-1, unknownRename); ok {
 		pf.KotlinJVMCallableEvidence = append(pf.KotlinJVMCallableEvidence, fact)
 	}
@@ -1123,6 +1204,23 @@ func kotlinFunctionReturnType(node *sitter.Node) (*sitter.Node, bool) {
 		}
 	}
 	return nil, false
+}
+
+func kotlinTypeSyntax(node *sitter.Node, content []byte) (string, string) {
+	if node == nil || node.HasError() {
+		return "unknown", ""
+	}
+	syntax := strings.Join(strings.Fields(nodeText(node, content)), " ")
+	if syntax == "" {
+		return "unknown", ""
+	}
+	if node.Type() != "user_type" && node.Type() != "nullable_type" && node.Type() != "type_identifier" {
+		return "incomplete", syntax
+	}
+	if strings.Contains(syntax, ".") || len(findDescendants(node, "type_arguments")) > 0 || len(findDescendants(node, "function_type")) > 0 {
+		return "incomplete", syntax
+	}
+	return "known", syntax
 }
 
 func kotlinPlainJavaType(node *sitter.Node, content []byte) bool {

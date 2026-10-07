@@ -56,6 +56,28 @@ This is one CG-35-owned prerequisite, not several speculative implementation
 projects. Schedule compilation-scope identity work separately after reviewing its
 cost and evidence contract; CG-36 must not silently implement it.
 
+## Source evidence foundation (first implementation slice)
+
+Migration 006 persists source-only JVM declaration and callable type facts,
+including owner, structured import aliases/wildcards (in the existing import
+evidence), raw parameter/result and value-class underlying type syntax,
+generic/value modifiers, parser provenance and explicit syntax state. Kotlin typealiases are stored as file-scoped facts and
+do not create graph symbols. Java and Kotlin parsers emit these facts under
+profile v12; resolver semantic generations and resolver policy are unchanged.
+Historical and newly indexed repositories receive compilation-scope state
+`unknown` for the `jvm-type-identity` domain, evidence version 1. No repository
+completeness or classpath completeness is inferred.
+
+The classifier remains disabled. Facts have no dependencies on declarations or
+negative lookup results, and the indexer does not invalidate unchanged callers
+when a type or alias changes. The next slice must establish an independently
+verified compilation-scope input (selected/generated/excluded sources,
+dependency alias/class metadata and compiler identity), add positive and
+negative type dependencies, and prove invalidation on import, declaration,
+alias and ambiguity changes before any callable identity can be consumed by the
+resolver. Until then, source facts are available for inspection only and must
+not change call edges.
+
 ## Failure modes and acceptance oracles
 
 - Compiler plus `javap` on pinned compiler/stdlib/classpath is the ABI oracle;

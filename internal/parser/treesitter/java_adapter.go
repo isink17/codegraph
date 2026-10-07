@@ -148,6 +148,11 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	linkTestsGeneric(pf.Scope.Package, &pf, func(target string) string {
 		return "func:java:" + testTargetModule(pf.Scope.Package, "Test", "Tests") + ":" + target
 	})
+	if jvmImportConflict(pf.Scope.Imports) {
+		for i := range pf.JVMTypeEvidence {
+			pf.JVMTypeEvidence[i].SyntaxState = "unknown"
+		}
+	}
 	return pf, nil
 }
 
@@ -246,6 +251,12 @@ func javaAddType(node *sitter.Node, module, parent string, content []byte, pf *g
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     "type:java:" + javaStablePrefix(module) + strings.TrimPrefix(qualified, javaPrefix(module)),
 	})
+	mods := firstChild(node, "modifiers")
+	modText := ""
+	if mods != nil {
+		modText = nodeText(mods, content)
+	}
+	pf.JVMTypeEvidence = append(pf.JVMTypeEvidence, graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: node.Type(), Modifiers: modText, TypeParams: firstChild(node, "type_parameters") != nil, OwnerName: container, SyntaxState: "known", Provenance: "java:tree-sitter:type-declaration"})
 
 	// Recurse into the body with this type as container.
 	body := childByFieldName(node, "body")
@@ -300,6 +311,42 @@ func javaAddMethod(node *sitter.Node, module, container string, content []byte, 
 		DocSummary:    prevCommentText(node, content),
 		StableKey:     stableKey,
 	})
+	fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: kind, TypeParams: firstChild(node, "type_parameters") != nil, OwnerName: effectiveContainer, SyntaxState: "known", Provenance: "java:tree-sitter:method-signature"}
+	if params := firstChild(node, "formal_parameters"); params != nil {
+		for i := range int(params.NamedChildCount()) {
+			param := params.NamedChild(i)
+			if param.Type() != "formal_parameter" && param.Type() != "spread_parameter" && param.Type() != "receiver_parameter" {
+				continue
+			}
+			typ := childByFieldName(param, "type")
+			if typ == nil {
+				typ = firstChild(param, "type")
+			}
+			state, syntax := javaTypeSyntax(typ, content)
+			fact.Params = append(fact.Params, graph.JVMCallableTypeEvidence{Position: "parameter", Syntax: syntax, SyntaxState: state})
+		}
+	}
+	if kind == "function" {
+		if result := childByFieldName(node, "type"); result != nil {
+			state, syntax := javaTypeSyntax(result, content)
+			fact.Params = append(fact.Params, graph.JVMCallableTypeEvidence{Position: "result", Syntax: syntax, SyntaxState: state})
+		}
+	}
+	pf.JVMTypeEvidence = append(pf.JVMTypeEvidence, fact)
+}
+
+func javaTypeSyntax(node *sitter.Node, content []byte) (string, string) {
+	if node == nil || node.HasError() {
+		return "unknown", ""
+	}
+	syntax := strings.Join(strings.Fields(nodeText(node, content)), " ")
+	if syntax == "" {
+		return "unknown", ""
+	}
+	if strings.Contains(syntax, ".") || len(findDescendants(node, "generic_type")) > 0 || len(findDescendants(node, "type_arguments")) > 0 || node.Type() == "array_type" {
+		return "incomplete", syntax
+	}
+	return "known", syntax
 }
 
 func javaPrefix(pkg string) string {
