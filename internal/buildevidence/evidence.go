@@ -174,6 +174,21 @@ func (a Artifact) Validate() error {
 	if a.Evidence.Dimensions.CompilerIdentity.State == Complete && (a.Tools.GradleVersion == "" || a.Tools.KotlinPluginVersion == "" || a.Tools.KotlinCompilerVersion == "") {
 		return fmt.Errorf("complete compiler identity requires Gradle, Kotlin plugin, and Kotlin compiler versions")
 	}
+	if a.Evidence.Dimensions.Source.State == Complete && a.Evidence.SourceRoots == nil {
+		return fmt.Errorf("complete source evidence requires an explicit source_roots list")
+	}
+	if a.Evidence.Dimensions.Generated.State == Complete && a.Evidence.GeneratedRoots == nil {
+		return fmt.Errorf("complete generated evidence requires an explicit generated_roots list")
+	}
+	if a.Evidence.Dimensions.Excluded.State == Complete && a.Evidence.ExcludedRoots == nil {
+		return fmt.Errorf("complete excluded evidence requires an explicit excluded_roots list")
+	}
+	if a.Evidence.Dimensions.Dependency.State == Complete && a.Evidence.Dependencies == nil {
+		return fmt.Errorf("complete dependency evidence requires an explicit dependencies list")
+	}
+	if a.Evidence.Dimensions.ExternalMetadata.State == Complete && a.Evidence.ExternalMetadata == nil {
+		return fmt.Errorf("complete external metadata evidence requires an explicit external_metadata list")
+	}
 	for _, roots := range [][]string{a.Evidence.SourceRoots, a.Evidence.GeneratedRoots, a.Evidence.ExcludedRoots} {
 		for _, root := range roots {
 			if err := validateRepoPath(root); err != nil {
@@ -189,6 +204,9 @@ func (a Artifact) Validate() error {
 		case "positive", "negative", "unknown", "ambiguous":
 		default:
 			return fmt.Errorf("unsupported dependency state %q", dep.State)
+		}
+		if dep.State == "negative" && a.Evidence.Dimensions.Dependency.State != Complete {
+			return fmt.Errorf("negative dependency evidence requires complete dependency scope")
 		}
 	}
 	for _, metadata := range a.Evidence.ExternalMetadata {

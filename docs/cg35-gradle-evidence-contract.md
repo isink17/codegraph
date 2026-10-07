@@ -38,9 +38,11 @@ The six evidence dimensions are independent: `source`, `generated`, `excluded`,
 `complete`, `incomplete`, or `unknown` plus provenance. Producer execution does
 not promote a dimension. Complete source/generated/excluded evidence means the
 selected compilation's roots were enumerated, including a proven empty set.
+Complete dimensions must carry their corresponding payload explicitly; an
+empty set is encoded as `[]`, while missing or `null` payloads are refused.
 Excluded roots are emitted only when the build model proves them. Dependency
 observations use `positive`, `negative`, `unknown`, or `ambiguous`; an
-incomplete scope cannot support a negative fact. Missing dimensions normalize
+incomplete or unknown dependency scope cannot support a negative fact. Missing dimensions normalize
 to explicit `unknown` with `dimension omitted from artifact` provenance.
 
 Roots use normalized repository-relative slash paths. Dependency and external
@@ -59,6 +61,9 @@ credentials, or build logs. Tool identity is an allowlisted set of version
 strings. Repository identity must be opaque and must not embed credentials.
 Build root and source roots are relative to the repository identity. Exporters
 must not serialize environment values merely because Gradle can expose them.
+Free-form producer, identity, and provenance fields must use controlled
+non-secret values; the schema has no field for credentials or environment
+values.
 
 Evidence is usable only when schema, repository/build/compilation identity, and
 current input fingerprint match. Otherwise the artifact is rejected or all

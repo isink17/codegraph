@@ -20,6 +20,8 @@ func testArtifact() Artifact {
 		Evidence: Evidence{
 			Dimensions:       Dimensions{Source: dimension(), Generated: dimension(), Excluded: dimension(), Dependency: dimension(), ExternalMetadata: dimension(), CompilerIdentity: dimension()},
 			SourceRoots:      []string{"app/src/main/kotlin"},
+			GeneratedRoots:   []string{},
+			ExcludedRoots:    []string{},
 			Dependencies:     []Dependency{{Coordinate: "org.example:lib:1.0", State: "positive", Provenance: "resolved compile classpath"}},
 			ExternalMetadata: []Metadata{{Identity: "org.example:lib:1.0", SHA256: sha, Provenance: "artifact metadata"}},
 		},
@@ -129,6 +131,37 @@ func TestCompleteCompilerIdentityRequiresToolVersions(t *testing.T) {
 	a := testArtifact()
 	a.Tools.KotlinCompilerVersion = ""
 	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "compiler versions") {
+		t.Fatalf("Validate() = %v", err)
+	}
+}
+
+func TestCompleteDimensionsRequireExplicitPayloads(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Artifact)
+	}{
+		{name: "source roots", mutate: func(a *Artifact) { a.Evidence.SourceRoots = nil }},
+		{name: "generated roots", mutate: func(a *Artifact) { a.Evidence.GeneratedRoots = nil }},
+		{name: "excluded roots", mutate: func(a *Artifact) { a.Evidence.ExcludedRoots = nil }},
+		{name: "dependencies", mutate: func(a *Artifact) { a.Evidence.Dependencies = nil }},
+		{name: "external metadata", mutate: func(a *Artifact) { a.Evidence.ExternalMetadata = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := testArtifact()
+			test.mutate(&a)
+			if err := a.Validate(); err == nil {
+				t.Fatal("complete dimension accepted omitted payload")
+			}
+		})
+	}
+}
+
+func TestNegativeDependencyRequiresCompleteScope(t *testing.T) {
+	a := testArtifact()
+	a.Evidence.Dimensions.Dependency = Dimension{State: Incomplete, Provenance: []string{"partial classpath"}}
+	a.Evidence.Dependencies = []Dependency{{Coordinate: "org.example:missing:1.0", State: "negative", Provenance: "partial classpath"}}
+	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "requires complete") {
 		t.Fatalf("Validate() = %v", err)
 	}
 }
