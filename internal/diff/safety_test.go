@@ -26,6 +26,16 @@ func TestEditSafetyRequiresCompleteVerifiedBoundariesForSafe(t *testing.T) {
 	if got := NewEditSafetyEvidence(base).OverallState; got != EditSafetySafe {
 		t.Fatalf("complete evidence state = %q, want safe", got)
 	}
+	base.SemanticChanges[0].Identity = ""
+	if got := NewEditSafetyEvidence(base).OverallState; got != EditSafetyUnknown {
+		t.Fatalf("missing change identity state = %q, want unknown", got)
+	}
+	base.SemanticChanges[0].Identity = "pkg.A"
+	base.ResolvedImpact[0].File = " "
+	if got := NewEditSafetyEvidence(base).OverallState; got != EditSafetyUnknown {
+		t.Fatalf("missing impact evidence state = %q, want unknown", got)
+	}
+	base.ResolvedImpact[0].File = "b.go"
 	base.Evidence[0].Confidence = ConfidenceDerived
 	if got := NewEditSafetyEvidence(base).OverallState; got != EditSafetyUnknown {
 		t.Fatalf("derived evidence state = %q, want unknown", got)

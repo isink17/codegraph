@@ -3,6 +3,7 @@ package diff
 import (
 	"bytes"
 	"sort"
+	"strings"
 )
 
 const EditSafetySchema = "codegraph.edit_safety/v1"
@@ -144,12 +145,17 @@ func NewEditSafetyEvidence(e EditSafetyEvidence) EditSafetyEvidence {
 
 func deriveEditSafetyState(e EditSafetyEvidence) EditSafetyState {
 	for _, evidence := range e.Evidence {
-		if evidence.State == EvidenceUnsafe && evidence.Source != "" && evidence.Detail != "" && evidence.Confidence != ConfidenceUnknown {
+		if evidence.State == EvidenceUnsafe && evidence.Source != "" && evidence.Detail != "" && (evidence.Confidence == ConfidenceVerified || evidence.Confidence == ConfidenceDerived) {
 			return EditSafetyUnsafe
 		}
 	}
 	for _, change := range e.SemanticChanges {
-		if change.Ambiguous {
+		if change.Ambiguous || change.Kind == "" || change.Identity == "" {
+			return EditSafetyUnknown
+		}
+	}
+	for _, impact := range e.ResolvedImpact {
+		if strings.TrimSpace(impact.Symbol) == "" || strings.TrimSpace(impact.File) == "" {
 			return EditSafetyUnknown
 		}
 	}
