@@ -75,6 +75,10 @@ func New(s *store.Store, registry *parser.Registry, embedder embedding.Embedder)
 	return &Indexer{store: s, registry: registry, embedder: embedder}
 }
 
+// Registry exposes the immutable parser set so read-only snapshot operations
+// can build isolated indexes with exactly the same parser capabilities.
+func (i *Indexer) Registry() *parser.Registry { return i.registry }
+
 func (i *Indexer) SupportedLanguages() []parser.LanguageSupport {
 	return i.registry.SupportedLanguages()
 }

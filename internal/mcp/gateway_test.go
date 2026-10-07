@@ -28,7 +28,7 @@ var preGatewayToolNames = []string{
 	"get_impact_radius", "find_related_tests", "search_symbols", "search_semantic",
 	"graph_stats", "supported_languages", "list_repos", "list_scans",
 	"latest_scan_errors", "context_for_task", "find_dead_code", "list_files",
-	"architecture_overview", "trace_dependencies", "detect_frameworks",
+	"architecture_overview", "diff", "trace_dependencies", "detect_frameworks",
 	"benchmark_tokens", "cross_language_links", "session_log", "session_history",
 	"session_hot_files", "session_context", "graph_analytics", "agentic_query",
 	"audit", "check_constraints",
@@ -311,11 +311,11 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // (+141 bytes, +35 estimated tokens); gateway definitions stay unchanged.
 //
 // check_constraints is listed in full mode: 12676 -> 12974 bytes (+298 bytes,
-// +75 estimated tokens). It is not gateway core, so the gateway payload is
-// unchanged and the tool is reached through tool_search.
+// +75 estimated tokens). diff adds 347 bytes (+87 estimated tokens) to the full
+// surface; it is not gateway core, so the gateway payload is unchanged.
 const (
-	fullToolsListBytes  = 12974
-	fullToolsListTokens = 3244
+	fullToolsListBytes  = 13321
+	fullToolsListTokens = 3331
 	// The gateway payload is pinned for the same reason, and became load-bearing
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name

@@ -216,6 +216,12 @@ var toolRegistry = []toolDescriptor{
 		handler:  (*Server).handleArchitectureOverview,
 	},
 	{
+		name: "diff", description: "Compare two local commits using deterministic semantic graph changes",
+		properties: []string{"base", "head", "limit", "offset"},
+		required:   []string{"base", "head"},
+		category:   "graph", handler: (*Server).handleDiff,
+	},
+	{
 		name: "trace_dependencies", description: "Trace resolved dependency edges from one symbol (upstream callers or downstream callees); exact qualified identity takes precedence; ambiguous names fail closed",
 		properties: []string{"symbol", "direction", "depth", "limit", "offset", "format"},
 		required:   []string{"symbol"},
