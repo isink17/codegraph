@@ -167,6 +167,10 @@ func deriveEditSafetyState(e EditSafetyEvidence) EditSafetyState {
 		if strings.TrimSpace(evidence.Boundary) == "" || strings.TrimSpace(evidence.Source) == "" || strings.TrimSpace(evidence.Detail) == "" {
 			return EditSafetyUnknown
 		}
+		if (evidence.State != EvidenceSatisfied && evidence.State != EvidenceUnsafe && evidence.State != EvidenceIncomplete) ||
+			(evidence.Confidence != ConfidenceVerified && evidence.Confidence != ConfidenceDerived && evidence.Confidence != ConfidenceUnknown) {
+			return EditSafetyUnknown
+		}
 		if _, duplicate := evidenceByBoundary[evidence.Boundary]; duplicate {
 			return EditSafetyUnknown
 		}

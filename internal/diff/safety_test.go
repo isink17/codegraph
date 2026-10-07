@@ -98,6 +98,28 @@ func TestEditSafetyUnsafeRequiresExplicitEvidence(t *testing.T) {
 	}
 }
 
+func TestEditSafetyInvalidExtraEvidenceRemainsUnknown(t *testing.T) {
+	for name, extra := range map[string]SafetyEvidence{
+		"state":      {Boundary: "extra", Source: "index", Detail: "unknown", State: "future", Confidence: ConfidenceVerified},
+		"confidence": {Boundary: "extra", Source: "index", Detail: "unknown", State: EvidenceIncomplete, Confidence: "future"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := EditSafetyEvidence{
+				SemanticChanges:    []Change{{Kind: "declaration_changed", Identity: "pkg.A"}},
+				ResolvedImpact:     []ImpactEvidence{{Symbol: "pkg.B", File: "b.go"}},
+				RequiredBoundaries: []string{"graph"},
+				Evidence: []SafetyEvidence{
+					{Boundary: "graph", Source: "index", Detail: "complete graph", State: EvidenceSatisfied, Confidence: ConfidenceVerified},
+					extra,
+				},
+			}
+			if got := NewEditSafetyEvidence(e).OverallState; got != EditSafetyUnknown {
+				t.Fatalf("invalid extra evidence state = %q, want unknown", got)
+			}
+		})
+	}
+}
+
 func TestEditSafetyEvidenceOrderingIsDeterministic(t *testing.T) {
 	e := EditSafetyEvidence{
 		SemanticChanges: []Change{{Kind: "z", Identity: "z"}, {Kind: "a", Identity: "a"}},
