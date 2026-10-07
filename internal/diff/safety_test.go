@@ -36,6 +36,16 @@ func TestEditSafetyRequiresCompleteVerifiedBoundariesForSafe(t *testing.T) {
 		t.Fatalf("missing impact evidence state = %q, want unknown", got)
 	}
 	base.ResolvedImpact[0].File = "b.go"
+	base.SemanticChanges[0].Kind = " "
+	if got := NewEditSafetyEvidence(base).OverallState; got != EditSafetyUnknown {
+		t.Fatalf("blank-looking change kind state = %q, want unknown", got)
+	}
+	base.SemanticChanges[0].Kind = "declaration_changed"
+	base.Evidence[0].Source = " \t"
+	if got := NewEditSafetyEvidence(base).OverallState; got != EditSafetyUnknown {
+		t.Fatalf("blank-looking evidence source state = %q, want unknown", got)
+	}
+	base.Evidence[0].Source = "index"
 	base.Evidence[0].Confidence = ConfidenceDerived
 	if got := NewEditSafetyEvidence(base).OverallState; got != EditSafetyUnknown {
 		t.Fatalf("derived evidence state = %q, want unknown", got)
@@ -79,6 +89,12 @@ func TestEditSafetyUnsafeRequiresExplicitEvidence(t *testing.T) {
 	}}})
 	if e.OverallState != EditSafetyUnsafe {
 		t.Fatalf("explicit unsafe evidence state = %q, want unsafe", e.OverallState)
+	}
+	e = NewEditSafetyEvidence(EditSafetyEvidence{Evidence: []SafetyEvidence{{
+		Source: " ", Detail: "forbidden dependency", State: EvidenceUnsafe, Confidence: ConfidenceVerified,
+	}}})
+	if e.OverallState != EditSafetyUnknown {
+		t.Fatalf("blank unsafe source state = %q, want unknown", e.OverallState)
 	}
 }
 

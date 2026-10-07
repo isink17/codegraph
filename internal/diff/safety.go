@@ -145,12 +145,12 @@ func NewEditSafetyEvidence(e EditSafetyEvidence) EditSafetyEvidence {
 
 func deriveEditSafetyState(e EditSafetyEvidence) EditSafetyState {
 	for _, evidence := range e.Evidence {
-		if evidence.State == EvidenceUnsafe && evidence.Source != "" && evidence.Detail != "" && (evidence.Confidence == ConfidenceVerified || evidence.Confidence == ConfidenceDerived) {
+		if evidence.State == EvidenceUnsafe && strings.TrimSpace(evidence.Source) != "" && strings.TrimSpace(evidence.Detail) != "" && (evidence.Confidence == ConfidenceVerified || evidence.Confidence == ConfidenceDerived) {
 			return EditSafetyUnsafe
 		}
 	}
 	for _, change := range e.SemanticChanges {
-		if change.Ambiguous || change.Kind == "" || change.Identity == "" {
+		if change.Ambiguous || strings.TrimSpace(change.Kind) == "" || strings.TrimSpace(change.Identity) == "" {
 			return EditSafetyUnknown
 		}
 	}
@@ -164,7 +164,7 @@ func deriveEditSafetyState(e EditSafetyEvidence) EditSafetyState {
 	}
 	evidenceByBoundary := make(map[string]SafetyEvidence, len(e.Evidence))
 	for _, evidence := range e.Evidence {
-		if evidence.Boundary == "" || evidence.Source == "" || evidence.Detail == "" {
+		if strings.TrimSpace(evidence.Boundary) == "" || strings.TrimSpace(evidence.Source) == "" || strings.TrimSpace(evidence.Detail) == "" {
 			return EditSafetyUnknown
 		}
 		if _, duplicate := evidenceByBoundary[evidence.Boundary]; duplicate {
@@ -174,7 +174,7 @@ func deriveEditSafetyState(e EditSafetyEvidence) EditSafetyState {
 	}
 	required := make(map[string]struct{}, len(e.RequiredBoundaries))
 	for _, boundary := range e.RequiredBoundaries {
-		if boundary == "" {
+		if strings.TrimSpace(boundary) == "" {
 			return EditSafetyUnknown
 		}
 		if _, duplicate := required[boundary]; duplicate {
