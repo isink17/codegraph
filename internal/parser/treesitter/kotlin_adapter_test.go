@@ -123,6 +123,10 @@ fun use(value: Alias): Ordinary = Ordinary()`
 	if len(bad.JVMTypeEvidence) != 1 || bad.JVMTypeEvidence[0].Params[0].SyntaxState != "incomplete" {
 		t.Fatalf("unsupported nested type evidence = %+v", bad.JVMTypeEvidence)
 	}
+	extension, err := NewKotlin().Parse(context.Background(), "Extension.kt", []byte("fun Token.extend(value: Alias): Token = this"))
+	if err != nil || len(extension.JVMTypeEvidence) != 1 || extension.JVMTypeEvidence[0].SyntaxState != "incomplete" {
+		t.Fatalf("extension receiver evidence = %+v, err=%v", extension.JVMTypeEvidence, err)
+	}
 	malformed, err := NewKotlin().Parse(context.Background(), "Bad.kt", []byte("fun broken(value: List<) {}"))
 	if err != nil || len(malformed.JVMTypeEvidence) != 0 {
 		t.Fatalf("malformed type evidence = %+v, err=%v", malformed.JVMTypeEvidence, err)

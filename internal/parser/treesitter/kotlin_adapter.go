@@ -863,6 +863,9 @@ func kotlinAddFunction(view kotlinDeclarationView, module, container string, con
 	})
 	if parts.params != nil {
 		fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: "function", OwnerName: effectiveContainer, SyntaxState: "known", Provenance: "kotlin:tree-sitter:function-signature"}
+		if len(parts.between) > 0 {
+			fact.SyntaxState = "incomplete"
+		}
 		fact.TypeParams = parts.typeParameters
 		for i := range int(parts.params.NamedChildCount()) {
 			param := parts.params.NamedChild(i)
