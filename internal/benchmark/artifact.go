@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -29,11 +30,16 @@ type Artifact struct {
 }
 
 type ScenarioMeasurement struct {
-	Name         string        `json:"name"`
-	RawSamplesNS []int64       `json:"raw_samples_ns"`
-	WarmupCount  int           `json:"warmup_count"`
-	Denominators []Denominator `json:"denominators"`
+	Name                string        `json:"name"`
+	RawSamplesNS        []int64       `json:"raw_samples_ns"`
+	SampleCount         int           `json:"sample_count"`
+	WarmupCount         int           `json:"warmup_count"`
+	OperationsPerSample int64         `json:"operations_per_sample"`
+	AggregationPolicy   string        `json:"aggregation_policy"`
+	Denominators        []Denominator `json:"denominators"`
 }
+
+const BenchstatAggregation = "benchstat"
 
 // A denominator with no positive value must explain why its metric is absent.
 type Denominator struct {
@@ -75,6 +81,9 @@ func (a Artifact) Validate() error {
 	if !validGitSHA(a.Identity.CodeGraphSHA) || !isSHA256(a.Identity.FixtureSHA) || !isSHA256(a.Identity.EnvironmentFingerprint) || !isSHA256(a.Identity.ConfigFingerprint) {
 		return fmt.Errorf("codegraph SHA must be a Git object ID and fixture, environment, and config fingerprints must be SHA-256")
 	}
+	if a.Identity.PriorStateSHA != "" && !validGitSHA(a.Identity.PriorStateSHA) || a.Identity.ChangeSetSHA != "" && !isSHA256(a.Identity.ChangeSetSHA) {
+		return fmt.Errorf("prior state must be a Git object ID and change set must be SHA-256")
+	}
 	if len(a.Scenarios) == 0 {
 		return fmt.Errorf("benchmark artifact requires scenarios")
 	}
@@ -86,12 +95,12 @@ func (a Artifact) Validate() error {
 	}
 	seenScenarios := map[string]bool{}
 	for _, s := range a.Scenarios {
-		if s.Name == "" || seenScenarios[s.Name] {
+		if !validBenchmarkName(s.Name) || seenScenarios[s.Name] {
 			return fmt.Errorf("scenario names must be non-empty and unique")
 		}
 		seenScenarios[s.Name] = true
-		if s.WarmupCount < 0 || len(s.RawSamplesNS) == 0 {
-			return fmt.Errorf("scenario %q requires raw samples and non-negative warmup", s.Name)
+		if s.WarmupCount < 0 || len(s.RawSamplesNS) == 0 || s.SampleCount != len(s.RawSamplesNS) || s.OperationsPerSample <= 0 || s.AggregationPolicy != BenchstatAggregation {
+			return fmt.Errorf("scenario %q requires matching sample count, positive operations per sample, benchstat aggregation, and non-negative warmup", s.Name)
 		}
 		if a.PublicMode && len(s.RawSamplesNS) < 10 {
 			return fmt.Errorf("public scenario %q requires at least 10 raw samples", s.Name)
@@ -227,8 +236,27 @@ func scenarioMismatchReasons(a, b []ScenarioMeasurement) []string {
 				return []string{"denominator_definition_mismatch:" + s.Name + ":" + d.Name}
 			}
 		}
+		baseDenominators := map[string]Denominator{}
+		for _, d := range base.Denominators {
+			baseDenominators[d.Name] = d
+		}
+		for _, d := range s.Denominators {
+			if !sameDenominatorResult(baseDenominators[d.Name], d) {
+				return []string{"denominator_value_mismatch:" + s.Name + ":" + d.Name}
+			}
+		}
+		if base.OperationsPerSample != s.OperationsPerSample || base.AggregationPolicy != s.AggregationPolicy {
+			return []string{"sample_policy_mismatch:" + s.Name}
+		}
 	}
 	return nil
+}
+
+func sameDenominatorResult(a, b Denominator) bool {
+	if a.Value == nil || b.Value == nil {
+		return a.Value == nil && b.Value == nil && a.MissingReason == b.MissingReason
+	}
+	return *a.Value == *b.Value
 }
 
 func digest(data []byte) string {
@@ -269,6 +297,37 @@ func (a Artifact) RenderMarkdown() (string, error) {
 		fmt.Fprintf(&b, "\nQuality (separate result; task set `%s`, rubric `%s`): correct %d, partial %d, incorrect %d, failed %d.\n", q.TaskSetSHA, q.RubricSHA, q.Correct, q.Partial, q.Incorrect, q.Failed)
 	}
 	return b.String(), nil
+}
+
+// RenderBenchstat emits one Go benchmark sample per raw timing sample.
+func (a Artifact) RenderBenchstat() (string, error) {
+	a = a.canonicalize()
+	if err := a.Validate(); err != nil {
+		return "", err
+	}
+	if !a.PublicMode {
+		return "", fmt.Errorf("benchstat output requires public mode")
+	}
+	var b strings.Builder
+	for _, s := range a.Scenarios {
+		for _, sample := range s.RawSamplesNS {
+			nsPerOperation := float64(sample) / float64(s.OperationsPerSample)
+			fmt.Fprintf(&b, "Benchmark%s-1\t1\t%s ns/op\n", s.Name, strconv.FormatFloat(nsPerOperation, 'f', -1, 64))
+		}
+	}
+	return b.String(), nil
+}
+
+func validBenchmarkName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func validGitSHA(value string) bool {

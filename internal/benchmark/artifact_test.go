@@ -17,7 +17,7 @@ func artifact() Artifact {
 	id.ConfigFingerprint = strings.Repeat("f", 64)
 	return Artifact{
 		Schema: ArtifactSchema, Identity: id,
-		Scenarios: []ScenarioMeasurement{{Name: "symbol_lookup", RawSamplesNS: []int64{10, 11}, WarmupCount: 2, Denominators: []Denominator{{Name: "results", Unit: "symbols", Value: &value}}}},
+		Scenarios: []ScenarioMeasurement{{Name: "symbol_lookup", RawSamplesNS: []int64{10, 11}, SampleCount: 2, WarmupCount: 2, OperationsPerSample: 1, AggregationPolicy: BenchstatAggregation, Denominators: []Denominator{{Name: "results", Unit: "symbols", Value: &value}}}},
 		Output:    OutputAccounting{SerializedBytes: 9, EstimatedTokens: 3, ProviderTokens: &provider},
 		Quality:   &QualityResult{TaskSetSHA: strings.Repeat("a", 64), RubricSHA: strings.Repeat("b", 64), Correct: 1},
 	}
@@ -38,7 +38,7 @@ func TestRenderMarkdownUsesOnlyStoredRawFields(t *testing.T) {
 
 func TestArtifactRoundTripDeterministic(t *testing.T) {
 	a := artifact()
-	a.Scenarios = append(a.Scenarios, ScenarioMeasurement{Name: "callers", RawSamplesNS: []int64{20}, Denominators: []Denominator{{Name: "rows", Unit: "rows", Value: func() *int64 { v := int64(2); return &v }()}}})
+	a.Scenarios = append(a.Scenarios, ScenarioMeasurement{Name: "callers", RawSamplesNS: []int64{20}, SampleCount: 1, OperationsPerSample: 1, AggregationPolicy: BenchstatAggregation, Denominators: []Denominator{{Name: "rows", Unit: "rows", Value: func() *int64 { v := int64(2); return &v }()}}})
 	first, err := a.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -73,6 +73,8 @@ func TestArtifactRequiresSamplesDenominatorsAndValidAccounting(t *testing.T) {
 		{"missing denominator without reason", func(a *Artifact) { a.Scenarios[0].Denominators[0].Value = nil }},
 		{"token accounting mismatch", func(a *Artifact) { a.Output.EstimatedTokens = 2 }},
 		{"no samples", func(a *Artifact) { a.Scenarios[0].RawSamplesNS = nil }},
+		{"sample count mismatch", func(a *Artifact) { a.Scenarios[0].SampleCount++ }},
+		{"missing aggregation policy", func(a *Artifact) { a.Scenarios[0].AggregationPolicy = "" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -85,6 +87,16 @@ func TestArtifactRequiresSamplesDenominatorsAndValidAccounting(t *testing.T) {
 	}
 }
 
+func TestArtifactRejectsMalformedLifecycleFingerprints(t *testing.T) {
+	a := artifact()
+	a.Identity.Lifecycle = LifecycleIncremental
+	a.Identity.PriorStateSHA = "not-a-git-sha"
+	a.Identity.ChangeSetSHA = strings.Repeat("a", 64)
+	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "prior state") {
+		t.Fatalf("Validate() = %v", err)
+	}
+}
+
 func TestArtifactPublicModeNeedsTenSamples(t *testing.T) {
 	a := artifact()
 	a.PublicMode = true
@@ -94,8 +106,26 @@ func TestArtifactPublicModeNeedsTenSamples(t *testing.T) {
 	for len(a.Scenarios[0].RawSamplesNS) < 10 {
 		a.Scenarios[0].RawSamplesNS = append(a.Scenarios[0].RawSamplesNS, 1)
 	}
+	a.Scenarios[0].SampleCount = len(a.Scenarios[0].RawSamplesNS)
 	if err := a.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	benchstat, err := a.RenderBenchstat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(benchstat, "Benchmarksymbol_lookup-1"); got != 10 {
+		t.Fatalf("benchstat has %d samples, want 10: %s", got, benchstat)
+	}
+}
+
+func TestCompareArtifactsRefusesDifferentDenominatorValues(t *testing.T) {
+	base, candidate := artifact(), artifact()
+	value := int64(101)
+	candidate.Scenarios[0].Denominators[0].Value = &value
+	got := CompareArtifacts(base, candidate)
+	if got.Comparability.Comparable || !contains(got.Comparability.Reasons, "denominator_value_mismatch:symbol_lookup:results") {
+		t.Fatalf("denominator mismatch = %+v", got.Comparability)
 	}
 }
 
