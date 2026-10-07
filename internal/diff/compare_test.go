@@ -2,6 +2,7 @@ package diff
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/store"
@@ -128,6 +129,29 @@ func TestLanguageChangeIsReportedForSameSourceBytes(t *testing.T) {
 	}
 	if len(got.Diff.Files.Modified) != 1 || got.Diff.Files.Modified[0].Identity != "a.go" {
 		t.Fatalf("language change was not reported: %+v", got.Diff.Files)
+	}
+}
+
+func TestUnsupportedFilesLimitSemanticComparison(t *testing.T) {
+	base := Revision{GraphData: store.SemanticGraph{
+		Files: []store.SemanticFile{{Path: "future.lang", ContentHash: "same", ParseState: store.ParseStateIndexed}},
+	}}
+	head := Revision{GraphData: store.SemanticGraph{
+		Files:        []store.SemanticFile{{Path: "future.lang", ContentHash: "same", ParseState: store.ParseStateIndexed}},
+		Declarations: []store.SemanticDeclaration{{Path: "future.lang", StableKey: "new"}},
+	}}
+	got, err := Compare(base, head, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Comparison.Status != "limited" {
+		t.Fatalf("unsupported file scope status = %q, want limited: %+v", got.Comparison.Status, got.Comparison)
+	}
+	if !strings.Contains(strings.Join(got.Comparison.Limitations, ";"), "semantic coverage is incomplete") {
+		t.Fatalf("missing unsupported-file limitation: %+v", got.Comparison)
+	}
+	if len(got.Diff.Symbols.Added) != 1 {
+		t.Fatalf("known semantic delta was not retained: %+v", got.Diff.Symbols)
 	}
 }
 

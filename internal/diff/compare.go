@@ -171,6 +171,14 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 func semanticCompatible(a, b Revision) bool {
 	return a.GraphData.SchemaVersion == b.GraphData.SchemaVersion && sameJSON(a.IndexPolicy, b.IndexPolicy) && sameJSON(a.GraphData.State.ResolverPolicies, b.GraphData.State.ResolverPolicies) && sameJSON(a.GraphData.State.ParserSemantics, b.GraphData.State.ParserSemantics) && sameJSON(a.GraphData.State.Capability, b.GraphData.State.Capability) && sameJSON(a.GraphData.State.JVMScope, b.GraphData.State.JVMScope) && sameFileParserSemantics(a.GraphData.Files, b.GraphData.Files) && a.GraphData.State.Pending == "" && b.GraphData.State.Pending == "" && a.GraphData.State.DirtyFiles == 0 && b.GraphData.State.DirtyFiles == 0
 }
+func hasUnknownLanguageFiles(files []store.SemanticFile) bool {
+	for _, f := range files {
+		if f.Language == "" {
+			return true
+		}
+	}
+	return false
+}
 func sameFileParserSemantics(a, b []store.SemanticFile) bool {
 	am, bm := map[string]store.SemanticFile{}, map[string]store.SemanticFile{}
 	for _, f := range a {
@@ -322,6 +330,9 @@ func limitations(a, b store.SemanticGraph) []string {
 		}
 	}
 	for side, g := range map[string]store.SemanticGraph{"base": a, "head": b} {
+		if hasUnknownLanguageFiles(g.Files) {
+			add(side + ": semantic coverage is incomplete for files without a recognized language")
+		}
 		if g.State.Pending != "" {
 			add(side + ": " + g.State.Pending)
 		}
