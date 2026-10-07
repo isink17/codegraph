@@ -40,6 +40,22 @@ Publishing for later releases.
 
 Do not perform these release steps as part of metadata preparation.
 
+### Owner preflight
+
+Before staging, run these checks as the release operator:
+
+```sh
+node --version
+npm --version
+npm whoami
+npm profile get
+npm stage --help
+```
+
+Confirm the username is exactly `isink17`, account-level 2FA is enabled, the
+`stage` command is available, and npm is using the intended public registry.
+Do not print or request authentication tokens or other secrets.
+
 ### Pre-publication checks
 
 Run from a clean checkout of the exact tag. Confirm the tag and stage the
@@ -82,11 +98,23 @@ not a publisher signature.
 
 ### Staged publishing and owner approval
 
-`npm stage publish` creates the package if it does not yet exist and reserves
-the staged package version in the registry. It is not publicly installable.
-Approval publishes it and requires 2FA. Staged and published versions share a
-unique version index. Package versions are immutable: never overwrite a version,
-reuse it for different bytes, or retry blindly with changed bytes.
+For staged publishing, the release operator needs Node `>=22.14.0` and npm
+`>=11.15.0`. For future Trusted Publishing, the workflow needs Node `>=22.14.0`
+and npm `>=11.5.1`. These npm CLI versions are release-operator/workflow
+requirements only; they are not runtime requirements for CodeGraph users.
+For the owner-operated v2.0.0 first release, pin a known staged-publishing-
+capable npm 11 release, currently npm `11.21.0`, rather than installing
+`npm@latest` blindly immediately before release. Keep `npm stage --help` as the
+final capability check before release.
+
+When `npm stage publish` creates a package that does not yet exist, npm creates
+the package and publishes a public `0.0.0-stage` placeholder. The intended
+staged `2.0.0` version and its contents remain unavailable to normal public
+installation until the owner approves it. Seeing `0.0.0-stage` before approval
+is expected and does not mean that `2.0.0` was accidentally released. Approval
+with 2FA publishes the intended version. Staged and published versions share a
+unique version index. Package versions are immutable: never overwrite a
+version, reuse it for different bytes, or retry blindly with changed bytes.
 
 Discover the stage ID from the package's list; do not copy a memorized ID:
 
@@ -104,9 +132,8 @@ The owner must review the stage and approve it with 2FA. Reject also requires
 2FA. Do not approve before confirming that all matching GitHub Release assets
 are public, complete, and verified.
 
-Use an npm CLI version that implements staged publishing. Confirm
-`npm stage --help` works before release preparation; an older CLI may report
-`Unknown command: "stage"`.
+An older CLI may report `Unknown command: "stage"`; use the minimum above and
+keep `npm stage --help` as the final capability check before release.
 
 ### Post-approval checks
 
@@ -172,7 +199,7 @@ After `@isink17/codegraph` exists, configure an npm Trusted Publisher for:
   configuring the publisher
 
 Prefer GitHub-hosted Actions with OIDC. npm Trusted Publishing requires Node
-`>=22.14`, npm `>=11.5.1`, a GitHub-hosted runner, and workflow permission
+`>=22.14.0`, npm `>=11.5.1`, a GitHub-hosted runner, and workflow permission
 `id-token: write`. No `NPM_TOKEN` is needed. Do not add a publishing workflow
 or configure npm settings in this preparation wave.
 
