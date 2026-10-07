@@ -49,8 +49,9 @@ Artifacts use versioned JSON and reject malformed fields, unknown versions,
 missing denominators, invalid lifecycle combinations, stale identities, and
 incomparable environment/configuration/fixture inputs. Comparability is an
 explicit boolean plus stable refusal reasons. Serialization is deterministic
-for the same artifact data. The identity contract is defined in
-`docs/cg14-benchmark-methodology.md` and implemented by `internal/benchmark`.
+for the same artifact data. CG-14 must merge before this contract is
+implemented; its methodology authority will define the reusable identity and
+comparability rules, and this document specifies the CG-22/23 artifact fields.
 
 ## Current fixture notes
 
