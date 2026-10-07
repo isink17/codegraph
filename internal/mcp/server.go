@@ -14,6 +14,7 @@ import (
 	"github.com/isink17/codegraph/internal/compactfmt"
 	"github.com/isink17/codegraph/internal/constraints"
 	"github.com/isink17/codegraph/internal/detail"
+	"github.com/isink17/codegraph/internal/diff"
 	"github.com/isink17/codegraph/internal/framework"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/graphaudit"
@@ -1478,6 +1479,26 @@ func (s *Server) handleExplainEdge(ctx context.Context, raw json.RawMessage) (ma
 	res, err := s.store.ExplainEdges(ctx, s.repoID, store.EdgeSelector{
 		EdgeID: req.EdgeID, File: req.File, Line: req.Line, Name: req.Name, Limit: req.Limit, Offset: req.Offset,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": res}, nil
+}
+
+func (s *Server) handleDiff(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Base   string `json:"base"`
+		Head   string `json:"head"`
+		Limit  int    `json:"limit"`
+		Offset int    `json:"offset"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	if s.indexer == nil {
+		return nil, fmt.Errorf("diff requires the active parser registry")
+	}
+	res, err := diff.CompareCommits(ctx, s.repoRoot, req.Base, req.Head, s.indexer.Registry(), req.Offset, req.Limit)
 	if err != nil {
 		return nil, err
 	}

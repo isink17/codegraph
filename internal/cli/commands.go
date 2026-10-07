@@ -201,6 +201,20 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			name:        "diff",
+			description: "compare two local commits by their indexed semantic graphs",
+			usageLines:  []string{"  diff <base> <head> [--repo-root PATH] [--limit N --offset N]"},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root (defaults to current repository)"},
+				{name: "--limit N", description: "changes per page (default 20, max 500)"},
+				{name: "--offset N", description: "offset into the change list"},
+			},
+			examples: []string{"codegraph diff main~1 main", "codegraph diff --repo-root . main~1 main"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runDiff(ctx, stdout, args)
+			},
+		},
+		{
 			name:        "find_symbol",
 			aliases:     []string{"find-symbol"},
 			description: "find symbols by name (substring match by default)",
