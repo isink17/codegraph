@@ -85,7 +85,7 @@ func TestGitSymbolHistoryMigrationUpgradeAndNewerRefusal(t *testing.T) {
 		t.Fatalf("after upgrade: tables=%d migration3=%d %v", tables, applied, err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (7, '2026-10-04T00:00:00Z')`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (8, '2026-10-04T00:00:00Z')`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {

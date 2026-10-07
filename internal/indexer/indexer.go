@@ -1036,6 +1036,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return summary, err
 		}
 	}
+	dependencyPaths := make([]string, 0, len(changedPathSet))
+	for path := range changedPathSet {
+		dependencyPaths = append(dependencyPaths, path)
+	}
+	if _, err := i.store.RebuildJVMTypeDependencies(ctx, repo.ID, dependencyPaths); err != nil {
+		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
+		return summary, err
+	}
 
 	// ---------------------------------------------------------------------
 	// PASS 2 -- relationship resolution.

@@ -2057,6 +2057,12 @@ func (s *Store) RetireFileGraphsBatch(ctx context.Context, repoID, scanID int64,
 		case oldDeleted != 0 || oldLanguage != update.Language:
 			xlangFileEvidenceChanged = true
 		}
+		if oldLanguage == "java" || oldLanguage == "kotlin" || update.Language == "java" || update.Language == "kotlin" {
+			if err := markJVMDependencyPathDirtyTx(ctx, tx, repoID, update.Path); err != nil {
+				_ = tx.Rollback()
+				return 0, err
+			}
+		}
 		var fileID int64
 		if err := stmt.QueryRowContext(
 			ctx,
@@ -2250,6 +2256,17 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			_ = tx.Rollback()
 			return result, err
 		}
+		var oldLanguage string
+		if err := tx.QueryRowContext(ctx, `SELECT language FROM files WHERE repo_id=? AND path=? AND is_deleted=0`, repoID, input.Path).Scan(&oldLanguage); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			_ = tx.Rollback()
+			return result, err
+		}
+		if oldLanguage == "java" || oldLanguage == "kotlin" || input.Language == "java" || input.Language == "kotlin" {
+			if err := markJVMDependencyPathDirtyTx(ctx, tx, repoID, input.Path); err != nil {
+				_ = tx.Rollback()
+				return result, err
+			}
+		}
 		var fileID int64
 		callEdges := 0
 		if input.ParserCallEdges {
@@ -2284,6 +2301,12 @@ func (s *Store) replaceFileGraphsBatchWithStats(ctx context.Context, repoID, sca
 			return result, err
 		}
 		symbolIDs[idx] = ids
+		if input.Language == "java" || input.Language == "kotlin" {
+			if err := markJVMDependencyParsedKeysDirtyTx(ctx, tx, repoID, input.Path, input.Parsed); err != nil {
+				_ = tx.Rollback()
+				return result, err
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -3567,6 +3590,31 @@ func (s *Store) MarkMissingDeleted(ctx context.Context, repoID, scanID int64) (i
 		return 0, err
 	}
 	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT path FROM files WHERE repo_id=? AND is_deleted=0 AND last_scan_id<>? AND language IN ('java','kotlin') ORDER BY path`, repoID, scanID)
+	if err != nil {
+		return 0, err
+	}
+	var jvmPaths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		jvmPaths = append(jvmPaths, path)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	for _, path := range jvmPaths {
+		if err := markJVMDependencyPathDirtyTx(ctx, tx, repoID, path); err != nil {
+			return 0, err
+		}
+	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE files
 		SET is_deleted = 1, parse_state = 'deleted', last_scan_id = ?
@@ -3770,6 +3818,42 @@ func (s *Store) MarkFilesDeletedBatch(ctx context.Context, repoID, scanID int64,
 		if err != nil {
 			return int(total), err
 		}
+		jvmQuery := `SELECT path FROM files WHERE repo_id=? AND is_deleted=0 AND language IN ('java','kotlin') AND path IN (` + placeholders + `) ORDER BY path`
+		jvmArgs := make([]any, 0, len(chunk)+1)
+		jvmArgs = append(jvmArgs, repoID)
+		for _, path := range chunk {
+			jvmArgs = append(jvmArgs, path)
+		}
+		rows, err := tx.QueryContext(ctx, jvmQuery, jvmArgs...)
+		if err != nil {
+			_ = tx.Rollback()
+			return int(total), err
+		}
+		var jvmPaths []string
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				rows.Close()
+				_ = tx.Rollback()
+				return int(total), err
+			}
+			jvmPaths = append(jvmPaths, path)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			_ = tx.Rollback()
+			return int(total), err
+		}
+		if err := rows.Close(); err != nil {
+			_ = tx.Rollback()
+			return int(total), err
+		}
+		for _, path := range jvmPaths {
+			if err := markJVMDependencyPathDirtyTx(ctx, tx, repoID, path); err != nil {
+				_ = tx.Rollback()
+				return int(total), err
+			}
+		}
 		res, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
 			_ = tx.Rollback()
@@ -3842,6 +3926,17 @@ func (s *Store) PurgeDeletedFileGraphsForScan(ctx context.Context, repoID, scanI
 		}
 		_ = tx.Rollback()
 	}()
+	for _, fileID := range fileIDs {
+		var path, language string
+		if err := tx.QueryRowContext(ctx, `SELECT path,language FROM files WHERE repo_id=? AND id=?`, repoID, fileID).Scan(&path, &language); err != nil {
+			return 0, err
+		}
+		if language == "java" || language == "kotlin" {
+			if err := markJVMDependencyPathDirtyTx(ctx, tx, repoID, path); err != nil {
+				return 0, err
+			}
+		}
+	}
 
 	if len(fileIDs) > sqliteInClauseBatchSize {
 		if err := prepareTmpDeleteFileIDs(ctx, tx, fileIDs, nil); err != nil {

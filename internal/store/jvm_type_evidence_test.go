@@ -79,7 +79,7 @@ func TestJVMCompilationScopeMigrationDefaultsExistingReposUnknown(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DROP TABLE jvm_compilation_scope_evidence; DROP TABLE jvm_callable_type_evidence; DROP TABLE jvm_type_evidence; DELETE FROM schema_migrations WHERE version=6`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE jvm_type_dependency_pending_paths; DROP TABLE jvm_type_dependency_index_state; DROP TABLE jvm_type_dependencies; DROP TABLE jvm_type_declarations; DELETE FROM schema_migrations WHERE version=7; DROP TABLE jvm_compilation_scope_evidence; DROP TABLE jvm_callable_type_evidence; DROP TABLE jvm_type_evidence; DELETE FROM schema_migrations WHERE version=6`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
