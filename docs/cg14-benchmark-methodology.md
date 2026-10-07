@@ -22,6 +22,11 @@ The fixture SHA covers the versioned fixture definition and its canonical
 inputs. The root marker identifies the logical path convention used by the
 fixture. The configuration fingerprint is a deterministic digest of the
 effective benchmark configuration, excluding secrets and machine-local paths.
+The environment fingerprint is a deterministic digest of relevant runtime and
+toolchain inputs beyond the explicit OS, architecture, Go version, and CGO
+fields. It must not include hostnames, absolute paths, arbitrary environment
+values, credentials, timestamps, or other volatile machine identity; its
+versioned input list must be recorded alongside any benchmark artifact.
 
 ## Run lifecycle and result rules
 
