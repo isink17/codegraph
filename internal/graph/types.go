@@ -69,6 +69,12 @@ const LuaLocalFunctionEvidence = "lua:local_function:"
 // is that def's 1-based start line and column.
 const ScalaLocalFunctionEvidence = "scala:local_function:"
 
+// DartLexicalFunctionEvidence prefixes the evidence of a call edge whose bare
+// callee Dart's lexical scoping binds to one local or top-level function of
+// the same file. The suffix is that declaration's 1-based start line and
+// column.
+const DartLexicalFunctionEvidence = "dart:lexical_function:"
+
 // HCLTerraformReferenceEvidence marks a Terraform `references` edge whose
 // destination is a static module address (var.X, local.X, module.M, data.T.N,
 // T.N). It binds only to the one declaration of that address in the same

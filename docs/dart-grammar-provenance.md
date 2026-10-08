@@ -13,7 +13,7 @@ upstream `LICENSE` verbatim. `PROVENANCE.md` there records the file hashes,
 why this commit and not a later one, and the refresh steps. Its MIT notice
 ships in `THIRD_PARTY_NOTICES` with every release archive and the npm package.
 
-The adapter (profile `treesitter:dart:v2`) records:
+The adapter (profile `treesitter:dart:v3`) records:
 
 - `import`, `export`, `part` and `part of` URIs as written (a `part of`
   library name is not a URI and is not recorded), including the
@@ -27,16 +27,34 @@ The adapter (profile `treesitter:dart:v2`) records:
   getters, setters and variables, and members: methods, operators, getters,
   setters, fields and constructors. Constructors are `Class.Class` (unnamed,
   also `Class.new`) or `Class.name` (named, factory and redirecting factory).
-  A setter's stable key ends in `=`.
+  A setter's stable key ends in `=`. Local functions of a file without a
+  parse error, keyed `func:dart:local:name:line:col`.
 - Call references: `f()`, `a.b.f()`, member calls named by the member alone
   when the receiver is not a plain dotted path, cascade sections, and
   `new`/`const` constructions.
 
-It builds no call graph in any build (`codegraph doctor` lists Dart as
-degraded): what a Dart call runs depends on the receiver's static type
-(extension methods, cascades), mixin linearization, implicit `this`, library
-privacy across `part` files and package resolution. Unnamed extensions,
-local declarations and destructuring patterns are not recorded. In a file
+Call edges exist only for a bare call `f(...)` that lexical scoping provably
+binds to a function of the same file (strategy `dart_lexical_function`):
+
+- a local function, when every other token `f` in the enclosing top-level
+  declaration is a bare call and the call follows the declaration inside its
+  block;
+- a top-level function, when the file has no `part`/`part of` directive (the
+  library is this one file), it is the only top-level declaration named `f`,
+  `f` appears in no directive, top-level variable, typedef or type header, and
+  every other token `f` in the enclosing top-level declaration is a bare call.
+  Library declarations shadow imports, and an inherited member never shadows a
+  lexical name, so neither can change the target.
+
+Every other call stays an unresolved reference: what a qualified Dart call runs
+depends on the receiver's static type (extension methods, cascades), mixin
+linearization, implicit `this`, library privacy across `part` files and
+package resolution. The proof is by spelling, so a name that is also a
+parameter, variable, pattern, member, member access, named argument or
+`show`/`hide` name anywhere in the caller's top-level declaration refuses even
+where Dart would bind it. A call to `_` is never proven, since a local `_` is a
+wildcard (Dart 3.7) that binds nothing. A file with a parse error builds no call edge. Unnamed
+extensions, local variables and destructuring patterns are not recorded. In a file
 with a parse error only the declarations that end before the first error (or
 missing token) are recorded: text before it parsed without recovery, while
 recovery after it may close a body early, swallow later declarations into an

@@ -89,7 +89,7 @@ const (
 )
 
 // localFunctionSQL matches a function local to a block or chunk (Lua `local
-// function`, Scala local def): not addressable from another file, so never a
+// function`, Scala local def, Dart local function): not addressable from another file, so never a
 // cross-language link end, and never dead merely because no call to it was
 // proven. It names each language's exact key prefix together with the file's
 // language, since another language's key may also contain ":local:" (a Rust
@@ -101,7 +101,7 @@ func localFunctionSQL(qual string) string {
 		return fmt.Sprintf("(substr(%s, 1, %d) = '%s' AND %sfile_id IN (SELECT id FROM files WHERE language = '%s'))",
 			key, len(prefix), prefix, qual, lang)
 	}
-	return "(" + inLang("func:lua:local:", "lua") + " OR " + inLang("func:scala:local:", "scala") + ")"
+	return "(" + inLang("func:lua:local:", "lua") + " OR " + inLang("func:scala:local:", "scala") + " OR " + inLang("func:dart:local:", "dart") + ")"
 }
 
 // v2 excludes Ruby importer rows. A v1-current database may still hold a link

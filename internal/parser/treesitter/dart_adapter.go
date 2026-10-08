@@ -4,7 +4,10 @@ package treesitter
 
 import (
 	"context"
+	"maps"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -14,11 +17,12 @@ import (
 )
 
 // DartAdapter extracts declarations, directives and call references from Dart
-// sources. It builds no call graph: what a Dart call runs depends on the
-// receiver's static type (extension methods, cascades), on mixin
-// linearization, on implicit `this`, on `package:` resolution through
-// package_config.json and on dynamic dispatch, none of which syntax alone
-// proves. Every call stays an unresolved reference.
+// sources. What a qualified Dart call runs depends on the receiver's static
+// type (extension methods, cascades), on mixin linearization, on `package:`
+// resolution through package_config.json and on dynamic dispatch, none of
+// which syntax alone proves, so those calls stay unresolved references. Only a
+// bare call that Dart's lexical scoping provably binds to a function of the
+// same file becomes a call edge; see dartLexicalCalls.
 //
 // Declarations are recorded at the top level and in the bodies of classes,
 // mixins, named extensions, extension types and enums. In a file with a parse
@@ -56,6 +60,9 @@ func (a *DartAdapter) Parse(ctx context.Context, path string, content []byte) (g
 		limit = 0
 	}
 	dartMembers(root, "", limit, content, &pf)
+	if !broken {
+		pf.Edges = dartLexicalCalls(root, content, &pf)
+	}
 	var walk func(n *sitter.Node)
 	walk = func(n *sitter.Node) {
 		if ref, ok := dartCallReference(n, content); ok && (!broken || !dartInError(n)) {
@@ -231,10 +238,7 @@ func dartExcessCloseBrace(root *sitter.Node) bool {
 func dartMembers(parent *sitter.Node, owner string, limit uint32, content []byte, pf *graph.ParsedFile) {
 	for i := 0; i < int(parent.ChildCount()); i++ {
 		child := parent.Child(i)
-		var body *sitter.Node
-		if next := child.NextSibling(); next != nil && next.Type() == "function_body" {
-			body = next
-		}
+		body := dartBodyAfter(child)
 		end := child
 		if body != nil {
 			end = body
@@ -663,4 +667,241 @@ func dartInError(node *sitter.Node) bool {
 		}
 	}
 	return false
+}
+
+// dartUnit is one program-level declaration: a top-level function, getter or
+// setter is its signature and the function_body that follows it.
+type dartUnit struct {
+	nodes []*sitter.Node
+	// name is the declared name of a top-level function, getter or setter;
+	// function is set for a function with a body, the only kind a bare call
+	// runs directly (a getter's call invokes the value it returns).
+	name     *sitter.Node
+	function bool
+	// body is a type's member list. Its leaves, like everything in a
+	// function unit but its name, are scoped to the unit; a type's header
+	// (name, type parameters) and every other unit are library-level.
+	body *sitter.Node
+}
+
+// dartLeaf is one occurrence of a name inside a unit.
+type dartLeaf struct {
+	node   *sitter.Node
+	unit   int
+	inBody bool
+	callee bool
+}
+
+// dartLexicalCalls returns a call edge for each bare `name(...)` call Dart's
+// lexical scoping provably binds to a function declared in this file, and
+// records each local function declaration as a symbol so such a call has a
+// target. Lexical lookup runs from the innermost block out through the
+// enclosing class body (declared members only: an inherited member never
+// shadows a lexical name), the library and then the imports, which the
+// library's own declarations shadow.
+//
+// The proof is by spelling: every declaration spells its name as a token, so
+// a name whose only tokens are one declaration and bare calls has no other
+// binding to shadow it. A call binds
+//
+//   - to a local function, when every other token of the name in the enclosing
+//     program-level declaration is a bare call, the call lies in the block that
+//     declares the function and follows its declaration;
+//   - to a top-level function, when the file has no part directives (so the
+//     library is this file), it is the file's only top-level declaration of the
+//     name, the name appears in no directive, top-level variable, typedef or
+//     type header, and every other token of the name in the enclosing
+//     program-level declaration is a bare call.
+//
+// Anything else stays unresolved: a method, field or accessor of the same
+// name, a parameter, variable or pattern of that name, a closure held in a
+// variable, an import prefix, and every qualified, cascade, conditional or
+// constructor call. A file with a parse error proves nothing; the caller does
+// not call this for one.
+func dartLexicalCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) []graph.Edge {
+	var units []dartUnit
+	parts, orphan := false, false
+	for i := 0; i < int(root.ChildCount()); i++ {
+		child := root.Child(i)
+		u := dartUnit{nodes: []*sitter.Node{child}}
+		switch child.Type() {
+		case "part_directive", "part_of_directive":
+			parts = true
+		case "function_signature", "getter_signature", "setter_signature":
+			u.name = childByFieldName(child, "name")
+			if body := dartBodyAfter(child); body != nil {
+				// The comments between them belong to the unit too.
+				for i+1 < int(root.ChildCount()) {
+					i++
+					next := root.Child(i)
+					u.nodes = append(u.nodes, next)
+					if next.Type() == "function_body" {
+						break
+					}
+				}
+				u.function = child.Type() == "function_signature"
+			}
+		case "function_body":
+			// Every body follows its signature; one that does not means the
+			// units are not the ones the source spells.
+			orphan = true
+		case "class_definition", "mixin_declaration", "extension_declaration", "extension_type_declaration", "enum_declaration":
+			u.body = childByFieldName(child, "body")
+			if u.body == nil {
+				u.body = firstChild(child, "class_body")
+			}
+		}
+		units = append(units, u)
+	}
+	leaves := map[string][]dartLeaf{}
+	for ui, u := range units {
+		var walk func(n *sitter.Node, inBody bool)
+		walk = func(n *sitter.Node, inBody bool) {
+			inBody = inBody || u.name != nil || u.body != nil && n.StartByte() == u.body.StartByte() && n.EndByte() == u.body.EndByte() && n.Type() == u.body.Type()
+			if n.ChildCount() == 0 {
+				if text := nodeText(n, content); dartNameLike(text) {
+					next := n.NextSibling()
+					callee := n.Type() == "identifier" && next != nil && next.Type() == "selector" &&
+						next.NamedChild(0) != nil && next.NamedChild(0).Type() == "argument_part"
+					leaves[text] = append(leaves[text], dartLeaf{node: n, unit: ui, inBody: inBody, callee: callee})
+				}
+				return
+			}
+			for i := range int(n.ChildCount()) {
+				walk(n.Child(i), inBody)
+			}
+		}
+		for _, n := range u.nodes {
+			walk(n, false)
+		}
+	}
+	// Local functions are declarations of this file; record them all so a
+	// proven call has a symbol to bind to.
+	locals := map[uint32]*sitter.Node{} // name token start -> declaration
+	for _, decl := range findDescendants(root, "local_function_declaration") {
+		lambda := firstChild(decl, "lambda_expression")
+		if lambda == nil {
+			continue
+		}
+		sig := childByFieldName(lambda, "parameters")
+		if sig == nil || sig.Type() != "function_signature" {
+			continue
+		}
+		name := childByFieldName(sig, "name")
+		if name == nil {
+			continue
+		}
+		locals[name.StartByte()] = decl
+		text := nodeText(name, content)
+		rng := nodeRange(decl)
+		pf.Symbols = append(pf.Symbols, graph.Symbol{
+			Language:      "dart",
+			Kind:          "function",
+			Name:          text,
+			QualifiedName: text,
+			Signature:     strings.Join(strings.Fields(nodeText(sig, content)), " "),
+			Visibility:    dartVisibility(text),
+			Range:         rng,
+			StableKey:     "func:dart:local:" + text + ":" + strconv.Itoa(rng.StartLine) + ":" + strconv.Itoa(rng.StartCol),
+		})
+	}
+	if orphan {
+		return nil
+	}
+	same := func(a, b *sitter.Node) bool {
+		return a != nil && b != nil && a.StartByte() == b.StartByte() && a.EndByte() == b.EndByte()
+	}
+	var edges []graph.Edge
+	edge := func(call *sitter.Node, name string, target graph.Position) {
+		at := nodeRange(call)
+		edges = append(edges, graph.Edge{
+			DstName:  name,
+			Kind:     "calls",
+			Evidence: graph.DartLexicalFunctionEvidence + strconv.Itoa(target.StartLine) + ":" + strconv.Itoa(target.StartCol),
+			Line:     at.StartLine,
+			Col:      at.StartCol,
+		})
+	}
+	for _, name := range slices.Sorted(maps.Keys(leaves)) {
+		// Since Dart 3.7 a local `_` is a wildcard that binds nothing, so a
+		// call `_()` may reach a library `_` past a local one; `_` is never
+		// proven.
+		if name == "_" {
+			continue
+		}
+		occ := leaves[name]
+		// The top-level target and whether anything library-level besides it
+		// declares or mentions the name.
+		top, libraryClash := -1, parts
+		for _, l := range occ {
+			u := units[l.unit]
+			switch {
+			case l.callee:
+			case u.name != nil && same(l.node, u.name):
+				if u.function && top == -1 {
+					top = l.unit
+				} else {
+					libraryClash = true
+				}
+			case !l.inBody:
+				libraryClash = true
+			}
+		}
+		for _, call := range occ {
+			if !call.callee {
+				continue
+			}
+			var own []dartLeaf
+			for _, l := range occ {
+				if l.unit != call.unit || l.callee || top == l.unit && same(l.node, units[top].name) {
+					continue
+				}
+				own = append(own, l)
+			}
+			switch {
+			case len(own) == 0 && top != -1 && !libraryClash:
+				edge(call.node, name, nodeRange(units[top].nodes[0]))
+			case len(own) == 1:
+				// A block is the declaration's whole scope, and Dart rejects a
+				// reference that precedes the declaration.
+				decl := locals[own[0].node.StartByte()]
+				if decl == nil {
+					continue
+				}
+				if block := decl.Parent(); block != nil && block.Type() == "block" && dartWithin(call.node, block) && call.node.StartByte() > decl.StartByte() {
+					edge(call.node, name, nodeRange(decl))
+				}
+			}
+		}
+	}
+	return edges
+}
+
+// dartBodyAfter is the function_body that follows a signature, past any
+// comments between them, or nil.
+func dartBodyAfter(sig *sitter.Node) *sitter.Node {
+	for next := sig.NextSibling(); next != nil; next = next.NextSibling() {
+		switch next.Type() {
+		case "comment", "documentation_comment":
+			continue
+		case "function_body":
+			return next
+		}
+		return nil
+	}
+	return nil
+}
+
+func dartWithin(n, outer *sitter.Node) bool {
+	return n.StartByte() >= outer.StartByte() && n.EndByte() <= outer.EndByte()
+}
+
+// dartNameLike reports text that can spell an identifier or a built-in
+// identifier used as a name.
+func dartNameLike(text string) bool {
+	if text == "" {
+		return false
+	}
+	c := text[0]
+	return c == '_' || c == '$' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80
 }
