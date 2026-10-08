@@ -328,3 +328,41 @@ func TestLuaPathWithoutFileRowSchedulesTheLuaPass(t *testing.T) {
 		t.Fatalf("bound %d; want the Lua pass to run and bind one", bound())
 	}
 }
+
+// Half-written resolutions are cleared too: in an unproven repository every
+// Lua call ends with no destination, strategy or confidence, whichever of the
+// three a row held.
+func TestResolveLuaScopeClearsHalfWrittenResolutions(t *testing.T) {
+	ctx := context.Background()
+	s, repoID, _ := luaOneProvenCall(t)
+	if _, err := insertTestFileLang(ctx, s, repoID, "other.lua", "lua"); err != nil {
+		t.Fatal(err)
+	}
+	var file, sym int64
+	if err := s.db.QueryRowContext(ctx, `SELECT file_id, src_symbol_id FROM edges LIMIT 1`).Scan(&file, &sym); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		dst                  any
+		strategy, confidence string
+	}{
+		{nil, ResolutionStrategyLuaLocalFunction, ""},
+		{sym, "", ""},
+		{nil, "", ResolutionConfidenceHigh},
+	} {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line, start_col, resolution_strategy, resolution_confidence) VALUES(?, ?, ?, 'f', 'calls', ?, ?, 3, 1, ?, ?)`,
+			repoID, sym, row.dst, graph.LuaLocalFunctionEvidence+"1:1", file, row.strategy, row.confidence); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := resolveLuaScope(ctx, s.db, repoID); err != nil {
+		t.Fatal(err)
+	}
+	var dirty int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges WHERE dst_symbol_id IS NOT NULL OR resolution_strategy <> '' OR resolution_confidence <> ''`).Scan(&dirty); err != nil {
+		t.Fatal(err)
+	}
+	if dirty != 0 {
+		t.Fatalf("%d Lua call rows keep part of a resolution; want all cleared", dirty)
+	}
+}
