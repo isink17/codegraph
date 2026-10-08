@@ -293,7 +293,7 @@ var toolRegistry = []toolDescriptor{
 	},
 	{
 		name: "check_constraints", description: "Check architectural dependency constraints between declared path groups (read-only)",
-		properties: []string{"limit", "offset"},
+		properties: []string{"limit", "offset", "strict_freshness"},
 		category:   "audit",
 		handler:    (*Server).handleCheckConstraints,
 	},
@@ -473,7 +473,7 @@ func argType(prop string) string {
 	switch prop {
 	case "limit", "offset", "edge_id", "line", "symbol_id", "depth", "max_files", "max_symbols", "max_steps", "examples", "max_tokens":
 		return "integer"
-	case "force", "include_tests", "include_callers", "include_schema", "reset", "include_symbols":
+	case "force", "include_tests", "include_callers", "include_schema", "reset", "include_symbols", "strict_freshness":
 		return "boolean"
 	case "paths", "symbols", "files":
 		return "array"

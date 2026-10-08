@@ -396,15 +396,19 @@ func newCommandList() []*command {
 				"  check_constraints [PATH]",
 				"    reads .codegraph-constraints.json at the repository root",
 				"    exits 0 ok, 1 violations, 2 stale, not indexed, not configured or invalid config",
+				"    with --strict-freshness, 0 and 1 also require full coverage at HEAD; otherwise",
+				"    3 known stale, 4 freshness unknown, 5 insufficient whole-repository coverage",
 			},
 			flags: []commandFlag{
 				{name: "--repo-root PATH", description: "repository root to check (defaults to the git repo root)"},
 				{name: "--config FILE", description: "constraints document to use instead of the repo-root file"},
 				{name: "--limit N", description: "findings per page and cycle cap (default 20, max 500)"},
 				{name: "--offset N", description: "offset into the findings"},
+				{name: "--strict-freshness", description: "add a freshness verdict; exit 3, 4 or 5 unless a full scan at the current HEAD is proven"},
 			},
 			examples: []string{
 				"codegraph index . && codegraph check_constraints .",
+				"codegraph check_constraints . --strict-freshness",
 				"codegraph check-constraints . --limit 100",
 			},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {

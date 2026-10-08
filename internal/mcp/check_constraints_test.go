@@ -110,6 +110,22 @@ func TestCheckConstraintsToolDoesNotWrite(t *testing.T) {
 	if data := call()["data"].(map[string]any); data["status"] != constraints.StatusStale {
 		t.Fatalf("status after a queued change = %v, want stale", data["status"])
 	}
+	if _, ok := payload["data"].(map[string]any)["freshness"]; ok {
+		t.Fatal("default call returned a freshness block")
+	}
+	strictDV, strictChanges := probe()
+	res, err := server.handleCheckConstraints(ctx, json.RawMessage(`{"strict_freshness":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv, changes := probe(); dv != strictDV || changes != strictChanges {
+		t.Fatal("strict check_constraints wrote")
+	}
+	strict := res["data"].(constraints.Result)
+	if strict.Status != constraints.StatusStale || strict.Freshness == nil ||
+		strict.Freshness.Verdict != constraints.VerdictKnownStale || strict.Freshness.ExitCode != constraints.ExitKnownStale {
+		t.Fatalf("strict data = %+v", strict.Freshness)
+	}
 }
 
 // TestCheckConstraintsToolArguments: limit and offset are validated, never
@@ -122,5 +138,11 @@ func TestCheckConstraintsToolArguments(t *testing.T) {
 	}
 	if err := validateToolArguments("check_constraints", json.RawMessage(`{"limit":5,"offset":2}`)); err != nil {
 		t.Errorf("valid arguments rejected: %v", err)
+	}
+	if err := validateToolArguments("check_constraints", json.RawMessage(`{"strict_freshness":true}`)); err != nil {
+		t.Errorf("strict_freshness rejected: %v", err)
+	}
+	if err := validateToolArguments("check_constraints", json.RawMessage(`{"strict_freshness":"yes"}`)); err == nil {
+		t.Error("a non-boolean strict_freshness was accepted")
 	}
 }

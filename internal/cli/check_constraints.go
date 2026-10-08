@@ -40,6 +40,7 @@ func runCheckConstraints(ctx context.Context, cfg config.Config, stdout io.Write
 	configFlag := fs.String("config", "", "constraints document (optional)")
 	limit := fs.Int("limit", 0, "findings per page")
 	offset := fs.Int("offset", 0, "offset into the findings")
+	strict := fs.Bool("strict-freshness", false, "fail unless whole-repository coverage at the current HEAD is proven")
 
 	repoRootCandidate, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, "")
 	if err != nil {
@@ -64,6 +65,8 @@ func runCheckConstraints(ctx context.Context, cfg config.Config, stdout io.Write
 		ConfigPath: *configFlag,
 		Limit:      *limit,
 		Offset:     *offset,
+
+		StrictFreshness: *strict,
 	}, func(ctx context.Context) (*store.Store, int64, error) {
 		r, err := openIndexedRepoReadOnly(ctx, cfg, repoRoot)
 		if err != nil {
@@ -83,7 +86,10 @@ func runCheckConstraints(ctx context.Context, cfg config.Config, stdout io.Write
 	if err := enc.Encode(res); err != nil {
 		return err
 	}
-	if code := constraints.ExitCode(res.Status); code != 0 {
+	if code := constraints.ResultExitCode(res); code != 0 {
+		if res.Freshness != nil && res.Freshness.Verdict != constraints.VerdictFullCoverageAtHead {
+			return &ExitError{Code: code, Err: fmt.Errorf("check_constraints: status %s, freshness %s", res.Status, res.Freshness.Verdict)}
+		}
 		return &ExitError{Code: code, Err: fmt.Errorf("check_constraints: status %s", res.Status)}
 	}
 	return nil

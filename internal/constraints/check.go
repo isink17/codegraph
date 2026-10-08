@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/store"
 )
@@ -52,6 +53,42 @@ func ExitCode(status string) int {
 	}
 }
 
+// Strict freshness verdicts. None of them means "fresh": uncommitted edits
+// and watcher events that were never queued are never checked.
+const (
+	// VerdictKnownStale: a recorded fact says the graph is behind (a failed
+	// or running latest scan, a non-empty dirty queue, a moved HEAD).
+	VerdictKnownStale = "known_stale"
+	// VerdictUnknown: the evidence needed to decide was not recorded or could
+	// not be read (no completed scan, a database from before coverage
+	// recording, an unreadable HEAD, a full scan that overlapped another
+	// writer, or scan activity during the check itself).
+	VerdictUnknown = "unknown"
+	// VerdictInsufficientCoverage: no known staleness, but the recorded scans
+	// do not prove the whole repository was walked at the current HEAD.
+	VerdictInsufficientCoverage = "insufficient_coverage"
+	// VerdictFullCoverageAtHead: no known staleness, and the newest completed
+	// full scan started and finished at the current HEAD, overlapped no other
+	// scan, and no scan has failed since.
+	VerdictFullCoverageAtHead = "full_coverage_at_head"
+)
+
+// Strict exit codes, beyond 0, 1 and 2. Used only with Options.StrictFreshness.
+const (
+	ExitKnownStale           = 3
+	ExitFreshnessUnknown     = 4
+	ExitInsufficientCoverage = 5
+)
+
+// ResultExitCode is the process exit code for res: ExitCode(res.Status), or
+// the strict verdict's code when strict freshness was evaluated.
+func ResultExitCode(res Result) int {
+	if res.Freshness != nil {
+		return res.Freshness.ExitCode
+	}
+	return ExitCode(res.Status)
+}
+
 // ValidatePage checks paging arguments. limit 0 selects the default page;
 // out-of-range values are errors, never clamped.
 func ValidatePage(limit, offset int) error {
@@ -73,6 +110,9 @@ type Options struct {
 	ConfigPath string
 	Limit      int
 	Offset     int
+	// StrictFreshness adds the freshness block to an evaluated result and
+	// moves its exit code to the strict contract (see ResultExitCode).
+	StrictFreshness bool
 }
 
 // Opener opens the index. An error wrapping store.ErrRepoNotIndexed becomes
@@ -179,6 +219,25 @@ type Result struct {
 	FindingsTruncated bool       `json:"findings_truncated"`
 	Cycles            []Cycle    `json:"cycles"`
 	CyclesTruncated   bool       `json:"cycles_truncated"`
+	// Freshness is present only in strict mode, and only once the index was
+	// opened (status stale, violations or ok). Like index, it is history
+	// metadata and outside the same-bytes-for-the-same-tree guarantee.
+	Freshness *StrictFreshness `json:"freshness,omitempty"`
+}
+
+// StrictFreshness is the strict-mode verdict and the evidence behind it. It
+// holds no host path.
+type StrictFreshness struct {
+	Verdict string `json:"verdict"`
+	// Reasons explain the verdict; empty for full_coverage_at_head.
+	Reasons []string `json:"reasons"`
+	// State and StateReasons are the graph_stats freshness state and reasons
+	// (never "fresh"; no_known_staleness at best).
+	State        string               `json:"state"`
+	StateReasons []string             `json:"state_reasons"`
+	HeadNow      string               `json:"head_now"`
+	LastFullScan *graph.FreshnessScan `json:"last_full_scan"`
+	ExitCode     int                  `json:"exit_code"`
 }
 
 func newResult() Result {
@@ -352,6 +411,12 @@ func Check(ctx context.Context, opts Options, open Opener) (Result, error) {
 
 	// 4. Staleness. Findings are still computed under stale.
 	stale := info.DirtyFiles > 0
+	var before graph.Freshness
+	if opts.StrictFreshness {
+		if before, err = st.FreshnessStatus(ctx, repoID); err != nil {
+			return Result{}, err
+		}
+	}
 
 	// 5. Evaluate.
 	edges, err := st.ConstraintEdges(ctx, repoID)
@@ -442,7 +507,91 @@ func Check(ctx context.Context, opts Options, open Opener) (Result, error) {
 	default:
 		res.Status = StatusOK
 	}
+	if opts.StrictFreshness {
+		// Read again after the evaluation: a scan that started, finished or
+		// failed meanwhile may have changed the rows the findings rest on.
+		after, err := st.FreshnessStatus(ctx, repoID)
+		if err != nil {
+			return Result{}, err
+		}
+		res.Freshness = strictFreshness(res.Status, before, after)
+	}
 	return res, nil
+}
+
+// strictFreshness decides the strict verdict from the freshness read before
+// and after the evaluation. A proven gap (insufficient_coverage) outranks a
+// missing fact (unknown); known_stale outranks both.
+func strictFreshness(status string, before, after graph.Freshness) *StrictFreshness {
+	out := &StrictFreshness{
+		State:        before.State,
+		StateReasons: before.Reasons,
+		HeadNow:      before.Worktree.HeadNow,
+		LastFullScan: before.Coverage.LastFullScan,
+	}
+	var unknown, insufficient []string
+	switch {
+	case status == StatusStale || before.State == graph.FreshnessKnownStale:
+		out.Verdict = VerdictKnownStale
+		out.Reasons = append([]string{}, before.Reasons...)
+		if len(out.Reasons) == 0 {
+			out.Reasons = []string{"dirty_queue_nonempty"}
+		}
+		out.ExitCode = ExitKnownStale
+		return out
+	case before.State != graph.FreshnessNoKnownStaleness:
+		unknown = append(unknown, before.Reasons...)
+	case !before.Coverage.Recorded:
+		unknown = append(unknown, "coverage_not_recorded")
+	case before.Coverage.LastFullScan == nil:
+		insufficient = append(insufficient, "no_recorded_full_scan")
+	default:
+		full := before.Coverage.LastFullScan
+		if before.Coverage.FailedAfterLastFull > 0 {
+			insufficient = append(insufficient, "scan_failed_after_full_scan")
+		}
+		if full.Overlap != "none" {
+			unknown = append(unknown, "full_scan_overlapped_another_scan")
+		}
+		switch {
+		case full.HeadAtStart == "" || full.HeadAtFinish == "":
+			unknown = append(unknown, "full_scan_head_not_recorded")
+		case full.HeadAtStart != full.HeadAtFinish:
+			insufficient = append(insufficient, "head_moved_during_full_scan")
+		case before.Worktree.HeadNow == "unknown":
+			unknown = append(unknown, "head_now_unknown")
+		case full.HeadAtFinish != before.Worktree.HeadNow:
+			insufficient = append(insufficient, "head_moved_since_full_scan")
+		}
+	}
+	if !sameScanState(before, after) {
+		unknown = append(unknown, "scan_activity_during_check")
+	}
+	switch {
+	case len(insufficient) > 0:
+		out.Verdict, out.ExitCode = VerdictInsufficientCoverage, ExitInsufficientCoverage
+	case len(unknown) > 0:
+		out.Verdict, out.ExitCode = VerdictUnknown, ExitFreshnessUnknown
+	default:
+		out.Verdict, out.ExitCode = VerdictFullCoverageAtHead, ExitCode(status)
+	}
+	out.Reasons = append(append([]string{}, insufficient...), unknown...)
+	return out
+}
+
+// sameScanState reports whether no scan began, closed or queued work between
+// two freshness reads, and HEAD did not move.
+func sameScanState(a, b graph.Freshness) bool {
+	scan := func(sc *graph.FreshnessScan) string {
+		if sc == nil {
+			return ""
+		}
+		return fmt.Sprintf("%d/%s", sc.ID, sc.Status)
+	}
+	return scan(a.LatestScan) == scan(b.LatestScan) &&
+		a.RunningScans.Count == b.RunningScans.Count &&
+		a.DirtyQueue == b.DirtyQueue &&
+		a.Worktree.HeadNow == b.Worktree.HeadNow
 }
 
 // logicalConfigPath returns the config's repository-relative logical path, or

@@ -175,6 +175,40 @@ func TestCheckConstraintsCLIStatusesAndExitCodes(t *testing.T) {
 	})
 }
 
+// --strict-freshness adds the freshness block and moves only the exit code:
+// the other keys match the default output byte for byte.
+func TestCheckConstraintsCLIStrictFreshness(t *testing.T) {
+	root := constraintsRepo(t, true)
+	// Not a Git repository: no HEAD is ever recorded or readable.
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
+	if _, _, err := runCLI(t, "index", root); err != nil {
+		t.Fatal(err)
+	}
+	defOut, def, defCode := checkCLI(t, "check_constraints", root)
+	if def.Freshness != nil || strings.Contains(defOut, `"freshness"`) || defCode != 1 {
+		t.Fatalf("default output changed: exit %d\n%s", defCode, defOut)
+	}
+	out, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictUnknown ||
+		code != constraints.ExitFreshnessUnknown || res.Freshness.ExitCode != code {
+		t.Fatalf("strict: status %s exit %d\n%s", res.Status, code, out)
+	}
+	if strings.Contains(out, root) {
+		t.Fatalf("strict result leaks the host repo root:\n%s", out)
+	}
+	res.Freshness = nil
+	stripped, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stripped)+"\n" != defOut {
+		t.Fatalf("strict mode changed the default keys:\n%s\n%s", defOut, stripped)
+	}
+	if _, _, code := checkCLI(t, "check_constraints", root, "--strict-freshness=bogus"); code != 2 {
+		t.Fatalf("invalid flag value exit %d, want 2", code)
+	}
+}
+
 func loadTestConfig(t *testing.T) config.Config {
 	t.Helper()
 	cfg, err := config.Load()
