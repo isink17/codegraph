@@ -185,6 +185,11 @@ local function g()
   for f in f() do f() end
 end
 `, []string{"f@3:12->1:1"}},
+		{"numeric for bounds are outside the loop scope", `local function f() end
+local function g()
+  for f = f(), f() do f() end
+end
+`, []string{"f@3:11->1:1", "f@3:16->1:1"}},
 		{"calls in assignment targets are walked", `local function f() end
 local function g(t)
   t[f()] = 1

@@ -123,8 +123,8 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 	}
 	var sites []luaCallSite
 	var walk func(n *sitter.Node, scope *luaScope)
-	walkChildren := func(n *sitter.Node, scope *luaScope, from int) {
-		for i := from; i < int(n.ChildCount()); i++ {
+	walkChildren := func(n *sitter.Node, scope *luaScope) {
+		for i := 0; i < int(n.ChildCount()); i++ {
 			walk(n.Child(i), scope)
 		}
 	}
@@ -246,7 +246,7 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 			// A repeat body's locals are visible in its until condition.
 			inner := &luaScope{parent: scope}
 			if body := childByFieldName(n, "body"); body != nil {
-				walkChildren(body, inner, 0)
+				walkChildren(body, inner)
 			}
 			if cond := childByFieldName(n, "condition"); cond != nil {
 				walk(cond, inner)
@@ -255,14 +255,14 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 		case "block":
 			// Every other block (do, while, if/elseif/else, loop and function
 			// bodies) is its own scope.
-			walkChildren(n, &luaScope{parent: scope}, 0)
+			walkChildren(n, &luaScope{parent: scope})
 			return
 		case "function_call":
 			if name := childByFieldName(n, "name"); name != nil && name.Type() == "identifier" {
 				sites = append(sites, luaCallSite{call: n, name: text(name), binding: scope.lookup(text(name))})
 			}
 		}
-		walkChildren(n, scope, 0)
+		walkChildren(n, scope)
 	}
 	walk(root, &luaScope{})
 	var edges []graph.Edge
