@@ -121,6 +121,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyPHPComposerPSR4,
 		ResolutionStrategyRubyImplicitSelf,
 		ResolutionStrategyRubyExplicitSelf,
+		ResolutionStrategyLuaLocalFunction,
 		ResolutionStrategyRubyLexicalConstant,
 		ResolutionStrategyRubyConstantPath,
 		ResolutionStrategySwiftSelfScope,

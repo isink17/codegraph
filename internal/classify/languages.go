@@ -276,6 +276,8 @@ var conservativeGaps = map[string]string{
 		"the call site never appears in the import path and cannot be linked",
 	"kotlin": "stdlib members (`println`) are auto-imported, so the calls that " +
 		"would be classifiable carry no import evidence at all",
+	"lua": "`require(\"socket.http\")` names a LuaRocks module and a project file " +
+		"the same way; package.path is a run-time value and is never read",
 	"php": "`use App\\Models\\User` and a vendor namespace are the same shape; " +
 		"no composer autoload map is indexed",
 	"ruby": "the `require` vs `require_relative` distinction is not persisted, " +
