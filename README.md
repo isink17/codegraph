@@ -108,7 +108,7 @@ The graph is evidence-based and intentionally partial: ambiguous or unsupported 
 
 ## Supported languages
 
-Native CGO builds of this v2.0 branch use tree-sitter parsers for all 12 supported languages:
+Native CGO builds of this v2.0 branch use tree-sitter parsers for the 11 registered languages:
 
 | Language | Extensions |
 |---|---|

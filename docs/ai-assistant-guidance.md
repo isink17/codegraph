@@ -5,7 +5,7 @@ This repository ships `codegraph`, a local-first code context engine and MCP ser
 ## Recommended Workflow
 
 - Run `codegraph install` once to set up local configuration and optional editor/tool integration.
-- Run `codegraph index <repo>` to build the initial graph.
+- Run `codegraph init <repo>` to create local state and build the initial graph.
 - Use `codegraph serve` for stdio MCP integration (repo root auto-detected).
 - Prefer MCP tools for repository context instead of repeated shelling out.
 
@@ -21,4 +21,3 @@ This repository ships `codegraph`, a local-first code context engine and MCP ser
 - Keep the core engine client-agnostic.
 - Do not assume assistant-specific features beyond the MCP protocol.
 - Tool results should remain concise and JSON-oriented to support planning and follow-up actions.
-
