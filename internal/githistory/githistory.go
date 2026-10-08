@@ -222,6 +222,15 @@ func Probe(ctx context.Context, root string) (State, error) {
 	return State{Status: status, Watermark: sha, WatermarkTime: ct, WindowLimit: WindowLimit, Algorithm: Algorithm, Mailmap: mailmap}, nil
 }
 
+// Head returns the HEAD commit of root with a single git call.
+func Head(ctx context.Context, root string) (string, error) {
+	out, err := run(ctx, root, "rev-parse", "-q", "--verify", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // WorktreeChanges lists root-relative paths whose working-tree content
 // differs from the watermark commit: tracked files modified, staged or
 // deleted, plus every indexed path Git does not track. An indexed path is

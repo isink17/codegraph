@@ -1399,6 +1399,11 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if err != nil {
 		return err
 	}
+	freshness, err := app.Store.FreshnessStatus(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	stats.Freshness = &freshness
 	return writeJSON(stdout, stats)
 }
 
