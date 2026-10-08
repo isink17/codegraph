@@ -538,9 +538,11 @@ type FreshnessCoverage struct {
 	// LastFullScan is the newest completed scan whose recorded scope is full.
 	// Rows written before scope recording never qualify.
 	LastFullScan *FreshnessScan `json:"last_full_scan"`
-	// FailedAfterLastFull counts failed scans of any scope newer than
-	// LastFullScan (every failed scan when there is none): each may have left
-	// partial writes that no full scan has covered since.
+	// FailedAfterLastFull counts failed scans of any scope that started after
+	// LastFullScan or finished no earlier than it did (every failed scan when
+	// there is none): each may have left partial writes that no full scan has
+	// covered since. Finish times have one-second resolution, so a failure
+	// closing in the same second as the full scan counts too.
 	FailedAfterLastFull int64 `json:"failed_after_last_full"`
 }
 

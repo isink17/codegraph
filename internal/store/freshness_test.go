@@ -353,3 +353,30 @@ func TestFreshnessCoveragePreMigrationDatabase(t *testing.T) {
 		t.Fatalf("first recorded full scan after upgrade: %+v", got)
 	}
 }
+
+// A failed scan that started before the last full scan but closed after it
+// may have written after it: it counts. One that closed before it began does
+// not.
+func TestFreshnessCoverageFailedScanClosingAfterFullScan(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := freshnessStore(t, t.TempDir())
+	early, earlyStarted := scopedScan(t, s, repoID, ScanScopePaths, "h1")
+	full, fullStarted := scopedScan(t, s, repoID, ScanScopeFull, "h1")
+	completeScan(t, s, full, fullStarted, "completed", "h1")
+	completeScan(t, s, early, earlyStarted, "failed", "")
+	set := func(id int64, started, finished string) {
+		t.Helper()
+		if _, err := s.db.ExecContext(ctx, `UPDATE scans SET started_at = ?, finished_at = ? WHERE id = ?`, started, finished, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set(full, "2026-01-01T00:00:10Z", "2026-01-01T00:00:20Z")
+	set(early, "2026-01-01T00:00:05Z", "2026-01-01T00:00:30Z")
+	if got := freshness(t, s, repoID).Coverage; got.LastFullScan.ID != full || got.FailedAfterLastFull != 1 {
+		t.Fatalf("failure closing after the full scan: %+v", got)
+	}
+	set(early, "2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z")
+	if got := freshness(t, s, repoID).Coverage; got.FailedAfterLastFull != 0 {
+		t.Fatalf("failure closed before the full scan began: %+v", got)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/githistory/gittest"
@@ -215,5 +216,75 @@ func TestScanCoverageWorktreeDivergence(t *testing.T) {
 	}
 	if side.Coverage.LastFullScan.HeadAtFinish != sideHead || side.Worktree.HeadNow != sideHead {
 		t.Fatalf("linked worktree = %+v / %+v", side.Coverage.LastFullScan, side.Worktree)
+	}
+}
+
+// committingGoAdapter commits once from inside a parse: HEAD moves while the
+// scan is reading the tree.
+type committingGoAdapter struct {
+	*goparser.Adapter
+	once   *sync.Once
+	commit func()
+}
+
+func (a committingGoAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	a.once.Do(a.commit)
+	return a.Adapter.Parse(ctx, path, content)
+}
+
+// HEAD moving during one scan is recorded as two different heads.
+func TestScanCoverageHeadMovesDuringScan(t *testing.T) {
+	ctx := context.Background()
+	r, first, s, _ := coverageFixture(t)
+	var second string
+	adapter := committingGoAdapter{Adapter: goparser.New(), once: &sync.Once{}, commit: func() {
+		second = r.Commit("", "during")
+	}}
+	idx := New(s, parser.NewRegistry(adapter), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: r.Dir}); err != nil {
+		t.Fatal(err)
+	}
+	full := coverageOf(t, s, r.Dir).Coverage.LastFullScan
+	if second == "" || second == first || full == nil || full.HeadAtStart != first || full.HeadAtFinish != second {
+		t.Fatalf("heads = %+v; want start %s finish %s", full, first, second)
+	}
+}
+
+// head_at_start is read before the repository configuration and manifests:
+// a commit made right after that read, before any other read of the tree,
+// is not the recorded start HEAD.
+func TestScanCoverageStartHeadPrecedesTreeReads(t *testing.T) {
+	ctx := context.Background()
+	r, first, s, _ := coverageFixture(t)
+	var second string
+	scanStartHook = func() {
+		r.Write(".codegraph/config.json", `{"languages": ["go"]}`)
+		second = r.Commit("", "before walk")
+	}
+	t.Cleanup(func() { scanStartHook = nil })
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: r.Dir, Languages: []string{"go"}}); err != nil {
+		t.Fatal(err)
+	}
+	scanStartHook = nil
+	latest := coverageOf(t, s, r.Dir).LatestScan
+	// The config written after the HEAD read was read by the scan: the
+	// override equals it, so the scan is full.
+	if latest.Scope != store.ScanScopeFull || latest.HeadAtStart != first || latest.HeadAtFinish != second {
+		t.Fatalf("latest = %+v; want full, start %s, finish %s", latest, first, second)
+	}
+}
+
+// A refused run reads HEAD and nothing else changes: the database holds no
+// repository and no scan.
+func TestScanCoverageRefusedRunWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	r, _, s, _ := coverageFixture(t)
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: r.Dir, Paths: []string{"../outside.go"}}); err == nil {
+		t.Fatal("escaping path accepted")
+	}
+	if _, found, err := s.FindRepo(ctx, r.Dir); err != nil || found {
+		t.Fatalf("refused run created a repository: %v %v", found, err)
 	}
 }

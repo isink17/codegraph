@@ -117,6 +117,14 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	// HEAD is read before the first read of the tree (repository config,
+	// manifests, the walk), so head_at_start bounds everything the scan saw.
+	// A Git read writes nothing, so a refused run still leaves the database
+	// untouched.
+	headAtStart := scanHead(ctx, opts.RepoRoot)
+	if scanStartHook != nil {
+		scanStartHook()
+	}
 	repoCfg, err := config.LoadRepo(opts.RepoRoot)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -365,7 +373,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	} else if filtered {
 		scope = store.ScanScopeFiltered
 	}
-	scanID, started, err := i.store.BeginScanWithScope(ctx, repo.ID, scanKind, scope, scanHead(ctx, opts.RepoRoot))
+	scanID, started, err := i.store.BeginScanWithScope(ctx, repo.ID, scanKind, scope, headAtStart)
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
@@ -1281,6 +1289,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	return summary, nil
 }
+
+// scanStartHook, when set by a test, runs right after head_at_start is read
+// and before any other read of the tree.
+var scanStartHook func()
 
 // scanHeadTimeout bounds each HEAD read recorded on a scan row.
 const scanHeadTimeout = 2 * time.Second
