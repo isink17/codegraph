@@ -16,8 +16,9 @@ codegraph index . && codegraph check_constraints .
 | CLI | `check-constraints` | alias; same command, same output, same exit code |
 | MCP | `check_constraints` | listed in `full` mode; in `gateway` mode, find it with `tool_search` and run it with `tool_call` |
 
-CLI flags: `[PATH]` or `--repo-root PATH`, `--config FILE`, `--limit N`, `--offset N`.
-MCP arguments: `limit`, `offset`. The MCP tool takes no config path, so a tool call
+CLI flags: `[PATH]` or `--repo-root PATH`, `--config FILE`, `--limit N`, `--offset N`,
+`--strict-freshness`.
+MCP arguments: `limit`, `offset`, `strict_freshness`. The MCP tool takes no config path, so a tool call
 cannot make the server read an arbitrary file. It reads only the repo-root file.
 
 ## Config file
@@ -193,6 +194,37 @@ Checks happen in this order: the config is read and validated first, without the
 index; then the index is opened read-only; then group overlap is checked; then
 staleness. Without a watcher, `stale` never fires. In CI, freshness is the
 caller's job: run `codegraph index` (or `update`) first.
+
+### Strict freshness (`--strict-freshness`, MCP `strict_freshness: true`)
+
+Opt-in. Without it the result and the exit code are exactly as above. With it, a
+result whose index was opened (`stale`, `violations`, `ok`) gains a `freshness`
+object, and the exit code also requires proof that the whole repository was
+walked at the current HEAD. `config_error`, `not_configured` and `not_indexed`
+are unchanged (exit 2, no `freshness`).
+
+| `freshness.verdict` | meaning | CLI exit |
+|---|---|---|
+| `full_coverage_at_head` | no known staleness, and the newest completed full scan started and finished at the current HEAD, overlapped no other scan, and no scan has failed since | 0 (`ok`) or 1 (`violations`) |
+| `known_stale` | `status` is `stale`, or graph_stats freshness is `known_stale` (failed or running latest scan, dirty queue, HEAD moved past the history watermark) | 3 |
+| `unknown` | the deciding fact was not recorded or not readable: no completed scan, a database from before coverage recording (read-only, unmigrated), a full scan without recorded HEADs, HEAD unreadable now, a full scan that overlapped another scan, any scan row still `running` (a live writer or one a crashed process abandoned; it yields 4 until the row is removed), or scan activity between the freshness read that precedes every graph read and the one after the evaluation | 4 |
+| `insufficient_coverage` | no known staleness, but no recorded full scan, or a scan failed after it, or HEAD moved during it or since it (a path-scoped `update` or watch flush never counts as full, even when it advanced the history watermark) | 5 |
+
+A proven gap (`insufficient_coverage`) outranks `unknown`. `freshness` also carries
+`reasons`, the graph_stats `state` and `state_reasons` (never "fresh";
+`no_known_staleness` at best), `head_now`, `last_full_scan` and `exit_code`.
+A full scan is `index`, or `update` without paths, under the repository's own
+configuration; language, include or exclude overrides passed by an internal caller
+that differ from it make a `filtered` scan, which does not count (no CLI or MCP
+surface sets them). A failed scan counts against coverage when it started after the
+full scan or closed no earlier than it started.
+
+`full_coverage_at_head` is not "fresh": uncommitted edits, watcher events that
+were never queued, a changed repository configuration and a HEAD that moved away
+and back during the scan are not detected. A database read that fails with an error (unlike an
+unrecorded fact or an unreadable HEAD, which give `unknown`) is not a verdict: the CLI exits 2 and MCP returns a
+tool error, as in default mode. Like `index`, `freshness` is history
+metadata outside the same-bytes guarantee; CLI and MCP still agree byte for byte.
 
 ### Config error codes
 

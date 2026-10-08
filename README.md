@@ -189,7 +189,7 @@ This installs the Agent Skill from the repository, not the CodeGraph binary. The
 | `list_scans` | List recent scans |
 | `latest_scan_errors` | List indexer errors from the last scan |
 | `audit` | Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only). Optional `examples` integer caps examples per finding; `0` means counts only |
-| `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; see [docs/constraints.md](docs/constraints.md) |
+| `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; `strict_freshness` adds a coverage verdict; see [docs/constraints.md](docs/constraints.md) |
 
 ### Session Memory
 
@@ -696,6 +696,7 @@ codegraph audit <path> --fail-on error    # Exit non-zero when the graph has err
 # Architectural constraints (see docs/constraints.md)
 codegraph index . && codegraph check_constraints .   # Exit 0 ok, 1 violations, 2 cannot evaluate
 codegraph check-constraints . --config rules.json    # Alias; evaluate another constraints document
+codegraph check_constraints . --strict-freshness     # Also exit 3 stale, 4 unknown, 5 no full scan at HEAD
 
 # Git history (see docs/git-history.md)
 codegraph file_history <path>             # Files with the most recent-window commits first

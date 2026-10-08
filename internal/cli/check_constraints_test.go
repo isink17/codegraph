@@ -12,6 +12,8 @@ import (
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/constraints"
+	"github.com/isink17/codegraph/internal/githistory/gittest"
+	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -173,6 +175,123 @@ func TestCheckConstraintsCLIStatusesAndExitCodes(t *testing.T) {
 			t.Fatalf("external config reported as %+v\n%s", res.Config, out)
 		}
 	})
+}
+
+// --strict-freshness adds the freshness block and moves only the exit code:
+// the other keys match the default output byte for byte.
+func TestCheckConstraintsCLIStrictFreshness(t *testing.T) {
+	root := constraintsRepo(t, true)
+	// Not a Git repository: no HEAD is ever recorded or readable.
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
+	if _, _, err := runCLI(t, "index", root); err != nil {
+		t.Fatal(err)
+	}
+	defOut, def, defCode := checkCLI(t, "check_constraints", root)
+	if def.Freshness != nil || strings.Contains(defOut, `"freshness"`) || defCode != 1 {
+		t.Fatalf("default output changed: exit %d\n%s", defCode, defOut)
+	}
+	out, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictUnknown ||
+		code != constraints.ExitFreshnessUnknown || res.Freshness.ExitCode != code {
+		t.Fatalf("strict: status %s exit %d\n%s", res.Status, code, out)
+	}
+	if strings.Contains(out, root) {
+		t.Fatalf("strict result leaks the host repo root:\n%s", out)
+	}
+	res.Freshness = nil
+	stripped, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stripped)+"\n" != defOut {
+		t.Fatalf("strict mode changed the default keys:\n%s\n%s", defOut, stripped)
+	}
+	if _, _, code := checkCLI(t, "check_constraints", root, "--strict-freshness=bogus"); code != 2 {
+		t.Fatalf("invalid flag value exit %d, want 2", code)
+	}
+}
+
+// Strict exit codes through the CLI on a real Git repository: a proven full
+// scan keeps exit 0, a queued change moves stale from exit 2 to 3, and a
+// path-scoped-only commit exits 5, a full update with violations exits 1, and a
+// config error stays exit 2 with no freshness block.
+func TestCheckConstraintsCLIStrictExitCodes(t *testing.T) {
+	root := constraintsRepo(t, true)
+	if err := os.WriteFile(filepath.Join(root, "internal/domain/a.go"), []byte("package domain\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gittest.Require(t)
+	repo := &gittest.Repo{T: t, Dir: root}
+	repo.Git("init", "-q", "-b", "main")
+	repo.Write(".gitignore", ".codegraph/\n")
+	repo.Commit("", "one")
+	if _, _, err := runCLI(t, "index", root); err != nil {
+		t.Fatal(err)
+	}
+	out, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusOK || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictFullCoverageAtHead || code != 0 {
+		t.Fatalf("proven: status %s exit %d\n%s", res.Status, code, out)
+	}
+
+	opened, err := openIndexedRepoReadOnly(context.Background(), loadTestConfig(t), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath, repoID := opened.DBPath, opened.Repo.ID
+	opened.Close()
+
+	// A new commit indexed only path-scoped: the history watermark follows
+	// HEAD, but no full scan covers it, so strict exits 5.
+	repo.Write("internal/domain/a.go", "package domain\n\nimport \"example.com/m/internal/infra\"\n\nfunc A() { infra.B() }\n")
+	repo.Commit("", "two")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := indexer.New(st, newDefaultRegistry(), nil).Update(context.Background(), indexer.Options{RepoRoot: root, Paths: []string{"internal/domain/a.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	out, res, code = checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictInsufficientCoverage || code != constraints.ExitInsufficientCoverage {
+		t.Fatalf("path-scoped only: status %s exit %d\n%s", res.Status, code, out)
+	}
+	if _, _, code := checkCLI(t, "check_constraints", root); code != 1 {
+		t.Fatalf("default exit %d, want 1", code)
+	}
+	// A full update proves coverage again: violations exit 1.
+	if _, _, err := runCLI(t, "update", root); err != nil {
+		t.Fatal(err)
+	}
+	out, res, code = checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictFullCoverageAtHead || code != 1 {
+		t.Fatalf("full update: status %s exit %d\n%s", res.Status, code, out)
+	}
+
+	st, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.QueueDirtyFiles(context.Background(), repoID, []string{"internal/domain/a.go"}, "modified"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if _, res, code := checkCLI(t, "check_constraints", root); res.Status != constraints.StatusStale || res.Freshness != nil || code != 2 {
+		t.Fatalf("default stale: status %s exit %d", res.Status, code)
+	}
+	if _, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness"); res.Status != constraints.StatusStale ||
+		res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictKnownStale || code != constraints.ExitKnownStale {
+		t.Fatalf("strict stale: status %s freshness %+v exit %d", res.Status, res.Freshness, code)
+	}
+
+	overlap := `{"schema_version":1,"groups":{"a":{"include":["internal/**"]},"b":{"include":["internal/domain/**"]}},"rules":[]}`
+	if err := os.WriteFile(filepath.Join(root, constraints.ConfigFileName), []byte(overlap), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness"); res.Status != constraints.StatusConfigError ||
+		res.Errors[0].Code != constraints.CodeGroupOverlap || res.Freshness != nil || code != 2 {
+		t.Fatalf("strict group overlap: status %s errors %+v freshness %+v exit %d", res.Status, res.Errors, res.Freshness, code)
+	}
 }
 
 func loadTestConfig(t *testing.T) config.Config {
