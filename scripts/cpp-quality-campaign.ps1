@@ -169,6 +169,21 @@ function Remove-OwnedProbeDirectory([string] $Path, [string] $Parent) {
     }
 }
 
+function Protect-OwnedProbeDirectory([string] $Path) {
+    if ($env:OS -eq "Windows_NT") {
+        $acl = Get-Acl -LiteralPath $Path
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRuleSpecific($rule) }
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+        $null = $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    } else {
+        $mode = [System.IO.UnixFileMode]::UserRead -bor [System.IO.UnixFileMode]::UserWrite -bor [System.IO.UnixFileMode]::UserExecute
+        [System.IO.File]::SetUnixFileMode($Path, $mode)
+    }
+}
+
 function Get-ContentFingerprint($Files, [string] $Root, [switch] $AllFiles) {
     $sourceExtensions = @(".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp", ".tpp")
     $selected = if ($AllFiles) { $Files } else { $Files | Where-Object { $sourceExtensions -contains $_.Extension.ToLowerInvariant() } }
@@ -284,6 +299,7 @@ if ($MutationProbe) {
     try {
         $null = New-Item -ItemType Directory -Path $probeRoot -ErrorAction Stop
         $probeOwned = $true
+        Protect-OwnedProbeDirectory $probeRoot
         $probeRoot = Get-AbsolutePath $probeRoot
         $null = New-Item -ItemType Directory -Path $probeDB -Force
         $null = New-Item -ItemType Directory -Path (Join-Path $probeHome "config") -Force
