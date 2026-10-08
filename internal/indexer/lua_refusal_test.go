@@ -69,6 +69,8 @@ var luaRefusalCases = []struct {
 	{name: "_G required into a local", files: tree{"m.lua": luaProven + "local G = require '_G'\nG.debug.setlocal(1, 1, nil)\n"}},
 	{name: "_G required inside a literal chunk", files: tree{"m.lua": luaProven + "load(\"return require'_G'\")().debug.setlocal(1, 1, nil)\n"}},
 	{name: "LuaJIT ffi required", files: tree{"m.lua": luaProven + "local ffi = require(\"ffi\")\n"}},
+	{name: "LuaJIT ffi through package.loaded", files: tree{"m.lua": luaProven + "local x = package.loaded.ffi\n"}},
+	{name: "LuaJIT ffi through _G", files: tree{"m.lua": luaProven + "local x = _G[\"ffi\"]\n"}},
 	// A computed name can spell debug, so every computed loader argument or
 	// global-table key is a hazard.
 	{name: "debug through a computed name", files: tree{"m.lua": luaProven + "_G[\"de\" .. \"bug\"].setupvalue(g, 1, nil)\n"}},

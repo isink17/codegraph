@@ -134,9 +134,9 @@ func luaLocalFunctionCalls(ctx context.Context, root *sitter.Node, content []byt
 // luaHazardNames are the globals through which a chunk can reach the debug
 // library, whose setlocal/setupvalue/upvaluejoin/sethook rewrite locals at run
 // time: the library itself, the global tables that hold it, and the loaders
-// that return it or run code that can name it.
+// that return it or run code that can name it. LuaJIT's ffi reaches the C API.
 var luaHazardNames = map[string]bool{
-	"debug": true, "_G": true, "_ENV": true, "package": true, "getfenv": true,
+	"debug": true, "ffi": true, "_G": true, "_ENV": true, "package": true, "getfenv": true,
 	"require": true, "load": true, "loadstring": true, "dofile": true, "loadfile": true,
 }
 
@@ -363,10 +363,9 @@ func luaScan(ctx context.Context, root *sitter.Node, content []byte) ([]graph.Ed
 			switch free(name, scope) {
 			case "require", "dofile", "loadfile":
 				// package.loaded preloads "_G" and "package", which hold
-				// the debug library, so a literal naming any hazard is one;
-				// LuaJIT's "ffi" reaches the C API.
+				// the debug library, so a literal naming any hazard is one.
 				if len(args) == 1 {
-					if s, ok := luaLiteral(args[0], content); ok && !luaHazardNames[s] && s != "ffi" {
+					if s, ok := luaLiteral(args[0], content); ok && !luaHazardNames[s] {
 						return
 					}
 				}

@@ -28,7 +28,7 @@ dispatch, metatables and receiver identity remain unresolved. A file with any
 parse error, or whose own code can reach the `debug` library (whose
 `setlocal`, `setupvalue`, `upvaluejoin` and `sethook` rewrite locals at run
 time), produces no call edges. Reaching it means a free (not lexically bound)
-reference to `debug`, `_G`, `_ENV`, `package`, `getfenv`, `require`, `load`,
+reference to `debug`, `ffi`, `_G`, `_ENV`, `package`, `getfenv`, `require`, `load`,
 `loadstring`, `dofile` or `loadfile`, except: `debug.traceback` and
 `debug.getinfo` (they read the stack, never rebind it); `_G.x`, `_G["x"]`,
 `rawget`/`rawset(_G, "x", ...)`, the same through `_ENV`, and
