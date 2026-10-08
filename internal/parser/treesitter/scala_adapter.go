@@ -22,9 +22,9 @@ import (
 // Declarations are recorded only where they are members: the top level, a
 // package body, and the bodies of classes, objects, traits and enums. Local
 // definitions inside a method or block are not addressable and are skipped.
-// A declaration whose subtree holds a parse error is skipped with everything
-// inside it, because tree-sitter's recovery can nest the declarations that
-// follow it under the wrong owner.
+// In a file with a parse error only the declarations that end before the
+// first error are recorded, and none when an opening brace is missing; see
+// scalaMembers and scalaExcessCloseBrace.
 type ScalaAdapter struct{}
 
 func NewScala() *ScalaAdapter            { return &ScalaAdapter{} }
@@ -43,11 +43,22 @@ func (a *ScalaAdapter) Parse(ctx context.Context, path string, content []byte) (
 		return graph.ParsedFile{}, err
 	}
 	pf := graph.ParsedFile{Language: "scala", FileTokens: computeFileTokens(content)}
-	scalaMembers(root, "", nil, content, &pf)
 	// Parent walks cost a cgo call per level; a clean tree needs none.
 	broken := root.HasError()
+	errAt, limit := ^uint32(0), ^uint32(0)
+	if broken {
+		errAt = scalaFirstErrorByte(root)
+		limit = errAt
+		if scalaExcessCloseBrace(root) {
+			limit = 0
+		}
+	}
+	scalaMembers(root, "", nil, limit, content, &pf)
+	// Imports are file-scoped, so a stray brace cannot misplace one, but an
+	// import running into an error may have lost a path segment or selector:
+	// only imports ended by a newline or `;` before the first error count.
 	for _, imp := range findDescendants(root, "import_declaration") {
-		if !broken || !scalaInError(imp) {
+		if !broken || imp.EndByte() < errAt && strings.ContainsAny(string(content[imp.EndByte():errAt]), "\n;") {
 			scalaImports(imp, content, &pf)
 		}
 	}
@@ -87,17 +98,59 @@ func scalaPath(pkg string, owners []scalaOwner, name string, keyed bool) string 
 	return strings.Join(append(parts, name), ".")
 }
 
+// scalaFirstErrorByte is where the first ERROR or MISSING node starts.
+func scalaFirstErrorByte(n *sitter.Node) uint32 {
+	if n.Type() == "ERROR" || n.IsMissing() {
+		return n.StartByte()
+	}
+	for i := range int(n.ChildCount()) {
+		if child := n.Child(i); child.HasError() {
+			return scalaFirstErrorByte(child)
+		}
+	}
+	return n.EndByte()
+}
+
+// scalaExcessCloseBrace reports more `}` than `{` tokens, which means an
+// opening brace is missing. Recovery then closes a body at an earlier `}`
+// and moves the members after it out to the enclosing scope, all before the
+// first error, which is only the excess `}` at the end. Where the missing
+// brace was is unknown, so no declaration's owner is.
+func scalaExcessCloseBrace(root *sitter.Node) bool {
+	depth := 0
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n.ChildCount() == 0 && !n.IsMissing() {
+			switch n.Type() {
+			case "{":
+				depth++
+			case "}":
+				depth--
+			}
+			return
+		}
+		for i := range int(n.ChildCount()) {
+			walk(n.Child(i))
+		}
+	}
+	walk(root)
+	return depth < 0
+}
+
 // scalaMembers records the member declarations directly under parent. A
 // bodyless package clause (`package a.b`) applies to every following sibling
 // and chains with earlier ones; a package with a body applies to the body.
-func scalaMembers(parent *sitter.Node, pkg string, owners []scalaOwner, content []byte, pf *graph.ParsedFile) {
+//
+// Only declarations that end before limit, the first parse error, are
+// recorded. After the error, recovery may have closed a body early, left a
+// later declaration inside an unclosed one, or dropped a package clause, so
+// owners there are guesses. A container that does not end before the error
+// is skipped with all of its members, since its extent is no longer known.
+func scalaMembers(parent *sitter.Node, pkg string, owners []scalaOwner, limit uint32, content []byte, pf *graph.ParsedFile) {
 	for i := range int(parent.ChildCount()) {
 		child := parent.Child(i)
-		if child.HasError() {
-			if child.Type() == "package_clause" {
-				return // every following declaration's package is unknown
-			}
-			continue
+		if child.EndByte() >= limit {
+			return
 		}
 		switch child.Type() {
 		case "package_clause":
@@ -110,25 +163,25 @@ func scalaMembers(parent *sitter.Node, pkg string, owners []scalaOwner, content 
 				full = pkg + "." + name
 			}
 			if body := childByFieldName(child, "body"); body != nil {
-				scalaMembers(body, full, owners, content, pf)
+				scalaMembers(body, full, owners, limit, content, pf)
 			} else {
 				pkg = full
 			}
 		case "class_definition":
-			scalaType(child, "class", pkg, owners, content, pf)
+			scalaType(child, "class", pkg, owners, limit, content, pf)
 		case "object_definition":
-			scalaType(child, "object", pkg, owners, content, pf)
+			scalaType(child, "object", pkg, owners, limit, content, pf)
 		case "trait_definition":
-			scalaType(child, "trait", pkg, owners, content, pf)
+			scalaType(child, "trait", pkg, owners, limit, content, pf)
 		case "enum_definition":
-			scalaType(child, "enum", pkg, owners, content, pf)
+			scalaType(child, "enum", pkg, owners, limit, content, pf)
 		case "function_definition", "function_declaration":
 			scalaFunction(child, pkg, owners, content, pf)
 		case "extension_definition":
 			// Extension methods are members of the enclosing scope; the
 			// receiver they extend is not modelled. Each method is its own
 			// `body` child, in both the indented and the braced form.
-			scalaMembers(child, pkg, owners, content, pf)
+			scalaMembers(child, pkg, owners, limit, content, pf)
 		case "val_definition", "var_definition":
 			pattern := childByFieldName(child, "pattern")
 			switch {
@@ -154,7 +207,7 @@ func scalaMembers(parent *sitter.Node, pkg string, owners []scalaOwner, content 
 	}
 }
 
-func scalaType(node *sitter.Node, kind, pkg string, owners []scalaOwner, content []byte, pf *graph.ParsedFile) {
+func scalaType(node *sitter.Node, kind, pkg string, owners []scalaOwner, limit uint32, content []byte, pf *graph.ParsedFile) {
 	nameNode := childByFieldName(node, "name")
 	if nameNode == nil {
 		return
@@ -167,7 +220,7 @@ func scalaType(node *sitter.Node, kind, pkg string, owners []scalaOwner, content
 	scalaSymbol(node, kind, name, prefix, pkg, owners, content, pf)
 	if body := childByFieldName(node, "body"); body != nil {
 		inner := append(owners[:len(owners):len(owners)], scalaOwner{name: name, object: kind == "object"})
-		scalaMembers(body, pkg, inner, content, pf)
+		scalaMembers(body, pkg, inner, limit, content, pf)
 	}
 }
 
