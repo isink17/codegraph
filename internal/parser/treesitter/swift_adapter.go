@@ -347,12 +347,15 @@ func swiftNominalCallProven(name string, call *sitter.Node, pf *graph.ParsedFile
 }
 
 func swiftAppendCall(call *sitter.Node, name, evidence string, content []byte, pf *graph.ParsedFile) {
-	edge := graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1}
+	column := int(call.StartPoint().Column) + 1
+	edge := graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1, Col: column}
 	if arity := swiftCallArity(call); arity != nil {
 		edge.CallArity = arity
 	}
 	pf.Edges = append(pf.Edges, edge)
-	pf.References = append(pf.References, graph.Reference{Kind: "call", Name: swiftCallBaseName(name), QualifiedName: name, Range: nodeRange(call)})
+	rng := nodeRange(call)
+	rng.StartCol = column
+	pf.References = append(pf.References, graph.Reference{Kind: "call", Name: swiftCallBaseName(name), QualifiedName: name, Range: rng})
 }
 
 func swiftCallEvidence(fn *sitter.Node, name string) string {

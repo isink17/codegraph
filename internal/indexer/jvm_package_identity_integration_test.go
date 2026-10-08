@@ -99,14 +99,18 @@ func TestJVMRawTextPackageProfileConvergence(t *testing.T) {
 			t.Fatalf("legacy %s profile = %q, want %q", path, got, want)
 		}
 	}
-	// The reproduction: the comment is the package and the edges bind.
+	// The comment is the package. Legacy parser edges have no persisted source
+	// column, so reference identity must remain unknown until the current parser
+	// reparses these files.
 	if got := commentPackageSymbols(t, r); got != "docs.Caller|type:java:docs:Caller,docs.Caller.run|func:java:docs:Caller:run,docs.caller|func:kotlin:docs.caller" {
 		t.Fatalf("legacy caller symbols = %q", got)
 	}
-	for caller, target := range map[string]string{"docs.Caller.run": "docs.Helper.go", "docs.caller": "docs.helper", "docs.User.use": "docs.Caller.run", "docs.user": "docs.caller"} {
-		if got, _ := jvmNameCall(t, r, caller); !strings.HasPrefix(got, target+"|") {
-			t.Fatalf("legacy %s -> %q, want %s", caller, got, target)
-		}
+	var boundJavaReferences, boundKotlinReferences int
+	if err := s.raw(t).QueryRowContext(ctx, `SELECT
+		SUM(CASE WHEN f.path LIKE '%.java' AND r.symbol_id IS NOT NULL THEN 1 ELSE 0 END),
+		SUM(CASE WHEN f.path LIKE '%.kt' AND r.symbol_id IS NOT NULL THEN 1 ELSE 0 END)
+		FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND r.ref_kind='call'`, repo).Scan(&boundJavaReferences, &boundKotlinReferences); err != nil || boundJavaReferences != 0 || boundKotlinReferences == 0 {
+		t.Fatalf("legacy bound references: Java=%d Kotlin=%d, want Java=0 and Kotlin>0 (%v)", boundJavaReferences, boundKotlinReferences, err)
 	}
 
 	// A path-scoped update reconverges only its paths' language, Kotlin; a

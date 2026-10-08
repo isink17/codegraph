@@ -68,7 +68,7 @@ func TestSwiftV3GenericVetoFullAndIncremental(t *testing.T) {
 }
 
 func insertSwiftVetoEdge(ctx context.Context, s *Store, repoID, fileID, srcID int64, name, evidence string) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line) VALUES(?, ?, NULL, ?, 'calls', ?, ?, 1)`, repoID, srcID, name, evidence, fileID)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line, start_col) VALUES(?, ?, NULL, ?, 'calls', ?, ?, 1, 1)`, repoID, srcID, name, evidence, fileID)
 	if err != nil {
 		return 0, err
 	}

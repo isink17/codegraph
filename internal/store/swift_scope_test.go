@@ -74,8 +74,8 @@ func (f *swiftScopeFixture) arity(symbol int64, min, max int64) {
 
 func (f *swiftScopeFixture) call(file, source int64, dst, evidence string, arity, line int) int64 {
 	f.t.Helper()
-	res, err := f.store.db.ExecContext(f.ctx, `INSERT INTO edges(repo_id,src_symbol_id,dst_name,edge_kind,evidence,file_id,line,call_arity)
-		VALUES(?,?,?,'calls',?,?,?,?)`, f.repoID, source, dst, evidence, file, line, arity)
+	res, err := f.store.db.ExecContext(f.ctx, `INSERT INTO edges(repo_id,src_symbol_id,dst_name,edge_kind,evidence,file_id,line,call_arity,start_col)
+		VALUES(?,?,?,'calls',?,?,?, ?,1)`, f.repoID, source, dst, evidence, file, line, arity)
 	if err != nil {
 		f.t.Fatal(err)
 	}

@@ -75,3 +75,35 @@ func run() {
 		t.Fatalf("call destinations = %q, want [helper Pair helper factory]", calls)
 	}
 }
+
+func TestCallOccurrenceColumnsCoverUnicodeCRLFAndNestedCalls(t *testing.T) {
+	src := "package p\r\nfunc caller() { café(); target(target()); target() }\r\n"
+	pf, err := New().Parse(context.Background(), "pkg.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.Split(src, "\r\n")[1]
+	firstTarget := strings.Index(line, "target")
+	secondTarget := firstTarget + len("target") + strings.Index(line[firstTarget+len("target"):], "target")
+	wants := []struct {
+		name string
+		col  int
+	}{
+		{"café", strings.Index(line, "café") + 1},
+		{"target", firstTarget + 1},
+		{"target", secondTarget + 1},
+		{"target", strings.LastIndex(line, "target") + 1},
+	}
+	if len(pf.Edges) != len(wants) || len(pf.References) != len(wants) {
+		t.Fatalf("calls: edges=%d refs=%d, want %d", len(pf.Edges), len(pf.References), len(wants))
+	}
+	for i, want := range wants {
+		edge, ref := pf.Edges[i], pf.References[i]
+		if edge.DstName != want.name || edge.Line != 2 || edge.Col != want.col {
+			t.Errorf("edge %d = (%q,%d,%d), want (%q,2,%d)", i, edge.DstName, edge.Line, edge.Col, want.name, want.col)
+		}
+		if ref.Name != want.name || ref.Range.StartLine != 2 || ref.Range.StartCol != want.col {
+			t.Errorf("reference %d = (%q,%d,%d), want (%q,2,%d)", i, ref.Name, ref.Range.StartLine, ref.Range.StartCol, want.name, want.col)
+		}
+	}
+}

@@ -53,9 +53,8 @@ type Edge struct {
 	Evidence    string `json:"evidence,omitempty"`
 	FileID      int64  `json:"file_id"`
 	Line        int    `json:"line"`
-	// Col is the 1-based column the edge's expression starts at, or 0 when
-	// the parser does not report one. It only places the edge inside a
-	// source symbol's range when several share its line; it is not persisted.
+	// Col is the 1-based source column at which the call occurrence starts, or
+	// 0 when the parser cannot identify it. Persisted edges keep NULL for 0.
 	Col       int  `json:"-"`
 	CallArity *int `json:"call_arity,omitempty"`
 }

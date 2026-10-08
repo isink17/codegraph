@@ -212,6 +212,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				Kind:        "calls",
 				Evidence:    strings.TrimSpace(line),
 				Line:        lineNo,
+				Col:         loc[2] + 1,
 			})
 			pf.References = append(pf.References, graph.Reference{
 				Kind:          "call",
@@ -219,7 +220,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 				QualifiedName: name,
 				Range: graph.Position{
 					StartLine: lineNo,
-					StartCol:  indent + 1,
+					StartCol:  loc[2] + 1,
 					EndLine:   lineNo,
 					EndCol:    len(line) + 1,
 				},

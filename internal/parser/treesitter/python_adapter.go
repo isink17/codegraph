@@ -333,12 +333,15 @@ func pyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Kind:        "calls",
 			Evidence:    name,
 			Line:        line,
+			Col:         int(fnNode.StartPoint().Column) + 1,
 		})
+		rng := nodeRange(call)
+		rng.StartCol = int(fnNode.StartPoint().Column) + 1
 		pf.References = append(pf.References, graph.Reference{
 			Kind:          "call",
 			Name:          name,
 			QualifiedName: name,
-			Range:         nodeRange(call),
+			Range:         rng,
 		})
 	}
 }

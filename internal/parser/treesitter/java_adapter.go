@@ -469,14 +469,16 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 			Kind:        "calls",
 			Evidence:    evidence,
 			Line:        line,
-			Col:         javaEdgeCol(call, markColumn),
+			Col:         javaEdgeCol(nameNode, markColumn),
 			CallArity:   javaMethodCallArity(call),
 		})
+		rng := nodeRange(call)
+		rng.StartCol = javaEdgeCol(nameNode, markColumn)
 		pf.References = append(pf.References, graph.Reference{
 			Kind:          "call",
 			Name:          fullName,
 			QualifiedName: fullName,
-			Range:         nodeRange(call),
+			Range:         rng,
 		})
 	}
 }

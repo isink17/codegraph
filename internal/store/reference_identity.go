@@ -26,6 +26,7 @@ WITH matched AS (
 			  ON e.repo_id = r.repo_id
 			 AND e.file_id = r.file_id
 			 AND e.line = r.start_line
+			 AND e.start_col = r.start_col
 			 AND e.edge_kind = 'calls'
 			JOIN files f ON f.id = e.file_id
 			 AND (
@@ -40,6 +41,7 @@ WITH matched AS (
 				)
 			 )
 			WHERE r.repo_id = ? AND r.ref_kind = 'call'
+			  AND e.start_col IS NOT NULL
 		), derived AS (
 			SELECT r.id,
 				CASE
