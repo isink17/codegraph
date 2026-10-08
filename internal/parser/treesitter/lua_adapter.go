@@ -3,14 +3,13 @@
 package treesitter
 
 import (
-	"bytes"
 	"context"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/isink17/codegraph/internal/parser/treesitter/luagrammar"
 	sitter "github.com/smacker/go-tree-sitter"
-	luagrammar "github.com/smacker/go-tree-sitter/lua"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
@@ -28,59 +27,48 @@ func (a *LuaAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 		return graph.ParsedFile{}, err
 	}
 	pf := graph.ParsedFile{Language: "lua", FileTokens: computeFileTokens(content)}
-	for _, fn := range findDescendants(root, "function_statement") {
+	for _, fn := range findDescendants(root, "function_declaration") {
 		name := childByFieldName(fn, "name")
-		if name == nil {
+		raw := luaDottedName(name, content)
+		if raw == "" {
 			continue
 		}
-		raw := strings.TrimSpace(nodeText(name, content))
 		qname := strings.ReplaceAll(raw, ":", ".")
-		last := qname
+		last, container := qname, ""
 		if i := strings.LastIndexByte(qname, '.'); i >= 0 {
-			last = qname[i+1:]
-		}
-		container := ""
-		if i := strings.LastIndexByte(qname, '.'); i >= 0 {
-			container = qname[:i]
+			last, container = qname[i+1:], qname[:i]
 		}
 		prefix := "global"
 		if firstChild(fn, "local") != nil {
 			prefix = "local"
 		}
 		kind := "function"
-		if strings.Contains(raw, ":") {
+		if name.Type() == "method_index_expression" {
 			kind = "method"
 		}
-		rng := luaRange(fn, content)
+		rng := nodeRange(fn)
 		// Repeated local names in nested lexical scopes are distinct declarations.
 		stableKey := "func:lua:" + prefix + ":" + qname + ":" + strconv.Itoa(rng.StartLine) + ":" + strconv.Itoa(rng.StartCol)
 		pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "lua", Kind: kind, Name: last, QualifiedName: qname, ContainerName: container, Range: rng, StableKey: stableKey})
-	}
-	for _, call := range findDescendants(root, "function_call") {
-		prefix := childByFieldName(call, "prefix")
-		if prefix == nil || prefix.Type() != "identifier" || strings.TrimSpace(nodeText(prefix, content)) != "require" {
-			continue
-		}
-		args := firstChild(call, "function_arguments")
-		if args == nil || args.NamedChildCount() != 1 {
-			continue
-		}
-		arg := args.NamedChild(0)
-		if arg.Type() != "string" {
-			continue
-		}
-		specifier := strings.Trim(nodeText(arg, content), "\"'")
-		if specifier != "" {
-			pf.Imports = append(pf.Imports, specifier)
-		}
 	}
 	for _, call := range findDescendants(root, "function_call") {
 		name := luaCallName(call, content)
 		if name == "" {
 			continue
 		}
-		rng := luaRange(call, content)
-		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: rng})
+		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
+		if name != "require" {
+			continue
+		}
+		// Only a single literal string argument names a module: require("m"),
+		// require "m" or require [[m]].
+		args := childByFieldName(call, "arguments")
+		if args == nil || args.NamedChildCount() != 1 || args.NamedChild(0).Type() != "string" {
+			continue
+		}
+		if specifier := nodeText(childByFieldName(args.NamedChild(0), "content"), content); specifier != "" {
+			pf.Imports = append(pf.Imports, specifier)
+		}
 	}
 	pf.Edges = luaLocalFunctionCalls(root, content)
 	return pf, nil
@@ -135,12 +123,12 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 	}
 	var sites []luaCallSite
 	var walk func(n *sitter.Node, scope *luaScope)
-	walkChildren := func(n *sitter.Node, scope *luaScope, from int) {
-		for i := from; i < int(n.ChildCount()); i++ {
+	walkChildren := func(n *sitter.Node, scope *luaScope) {
+		for i := 0; i < int(n.ChildCount()); i++ {
 			walk(n.Child(i), scope)
 		}
 	}
-	text := func(n *sitter.Node) string { return strings.TrimSpace(nodeText(n, content)) }
+	text := func(n *sitter.Node) string { return nodeText(n, content) }
 	assign := func(target *sitter.Node, scope *luaScope) {
 		if target != nil && target.Type() == "identifier" {
 			if b := scope.lookup(text(target)); b != nil {
@@ -148,30 +136,42 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 			}
 		}
 	}
+	// names returns the identifiers a variable_list declares or assigns, and
+	// walks every other target (`t[f()]`, `g().x`) as an expression.
+	names := func(list *sitter.Node, scope *luaScope) []*sitter.Node {
+		var out []*sitter.Node
+		for i := 0; i < int(list.ChildCount()); i++ {
+			if list.FieldNameForChild(i) != "name" {
+				continue
+			}
+			if c := list.Child(i); c.Type() == "identifier" {
+				out = append(out, c)
+			} else {
+				walk(c, scope)
+			}
+		}
+		return out
+	}
 	// function walks a function's parameters and body in a fresh scope.
 	function := func(n *sitter.Node, scope *luaScope, method bool) {
 		inner := &luaScope{parent: scope}
 		if method {
 			inner.declare("self", &luaBinding{})
 		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if c := n.Child(i); c.Type() == "parameter_list" {
-				for j := 0; j < int(c.NamedChildCount()); j++ {
-					if p := c.NamedChild(j); p.Type() == "identifier" {
-						inner.declare(text(p), &luaBinding{})
-					}
+		if params := childByFieldName(n, "parameters"); params != nil {
+			for i := 0; i < int(params.NamedChildCount()); i++ {
+				if p := params.NamedChild(i); p.Type() == "identifier" {
+					inner.declare(text(p), &luaBinding{})
 				}
 			}
 		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if c := n.Child(i); c.Type() == "function_body" {
-				walkChildren(c, &luaScope{parent: inner}, 0)
-			}
+		if body := childByFieldName(n, "body"); body != nil {
+			walk(body, inner)
 		}
 	}
 	walk = func(n *sitter.Node, scope *luaScope) {
 		switch n.Type() {
-		case "function_statement":
+		case "function_declaration":
 			name := childByFieldName(n, "name")
 			if firstChild(n, "local") != nil {
 				// `local function f` binds f before its body, so f is visible
@@ -181,90 +181,88 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 				return
 			}
 			// `function f()` assigns f; `function M.f()` / `M:f()` assign a field.
-			if name != nil && name.NamedChildCount() == 1 {
-				assign(name.NamedChild(0), scope)
-			}
-			function(n, scope, name != nil && strings.Contains(text(name), ":"))
+			assign(name, scope)
+			function(n, scope, name != nil && name.Type() == "method_index_expression")
 			return
-		case "function":
+		case "function_definition":
 			function(n, scope, false)
 			return
 		case "variable_declaration":
-			local := firstChild(n, "local") != nil
-			var declared []string
-			for i := 0; i < int(n.ChildCount()); i++ {
-				c := n.Child(i)
-				if c.Type() != "variable_declarator" {
-					walk(c, scope)
-					continue
-				}
-				if c.NamedChildCount() == 1 && c.NamedChild(0).Type() == "identifier" {
-					if local {
-						declared = append(declared, text(c.NamedChild(0)))
-					} else {
-						assign(c.NamedChild(0), scope)
-					}
-					continue
-				}
-				walk(c, scope)
+			// `local x` or `local x, y <const> = ...`: the initialiser runs
+			// before the locals are in scope.
+			list, values := firstChild(n, "variable_list"), (*sitter.Node)(nil)
+			if a := firstChild(n, "assignment_statement"); a != nil {
+				list, values = firstChild(a, "variable_list"), firstChild(a, "expression_list")
 			}
-			// A local's initialiser runs before the local is in scope.
-			for _, name := range declared {
-				scope.declare(name, &luaBinding{})
+			if values != nil {
+				walk(values, scope)
+			}
+			if list != nil {
+				for _, id := range names(list, scope) {
+					scope.declare(text(id), &luaBinding{})
+				}
+			}
+			return
+		case "assignment_statement":
+			if list := firstChild(n, "variable_list"); list != nil {
+				for _, id := range names(list, scope) {
+					assign(id, scope)
+				}
+			}
+			if values := firstChild(n, "expression_list"); values != nil {
+				walk(values, scope)
 			}
 			return
 		case "for_statement":
+			// The loop header is evaluated outside the loop variables' scope.
 			inner := &luaScope{parent: scope}
-			for i := 0; i < int(n.ChildCount()); i++ {
-				c := n.Child(i)
-				switch c.Type() {
-				case "for_numeric":
-					// The bounds are evaluated outside the loop variable's scope.
-					v := childByFieldName(c, "var")
-					for j := 0; j < int(c.ChildCount()); j++ {
-						if v == nil || c.Child(j).StartByte() != v.StartByte() {
-							walk(c.Child(j), scope)
+			if clause := childByFieldName(n, "clause"); clause != nil {
+				switch clause.Type() {
+				case "for_numeric_clause":
+					for _, field := range []string{"start", "end", "step"} {
+						if e := childByFieldName(clause, field); e != nil {
+							walk(e, scope)
 						}
 					}
-					if v != nil {
+					if v := childByFieldName(clause, "name"); v != nil {
 						inner.declare(text(v), &luaBinding{})
 					}
-				case "for_generic":
-					if e := childByFieldName(c, "expression_list"); e != nil {
+				case "for_generic_clause":
+					if e := firstChild(clause, "expression_list"); e != nil {
 						walk(e, scope)
 					}
-					if ids := childByFieldName(c, "identifier_list"); ids != nil {
-						for j := 0; j < int(ids.NamedChildCount()); j++ {
-							inner.declare(text(ids.NamedChild(j)), &luaBinding{})
+					if list := firstChild(clause, "variable_list"); list != nil {
+						for _, id := range names(list, scope) {
+							inner.declare(text(id), &luaBinding{})
 						}
 					}
-				default:
-					walk(c, inner)
 				}
 			}
+			if body := childByFieldName(n, "body"); body != nil {
+				walk(body, inner)
+			}
 			return
-		case "do_statement", "while_statement", "repeat_statement":
+		case "repeat_statement":
 			// A repeat body's locals are visible in its until condition.
-			walkChildren(n, &luaScope{parent: scope}, 0)
-			return
-		case "if_statement":
 			inner := &luaScope{parent: scope}
-			for i := 0; i < int(n.ChildCount()); i++ {
-				c := n.Child(i)
-				if c.Type() == "if_elseif" || c.Type() == "if_else" {
-					inner = &luaScope{parent: scope}
-				}
-				walk(c, inner)
+			if body := childByFieldName(n, "body"); body != nil {
+				walkChildren(body, inner)
 			}
+			if cond := childByFieldName(n, "condition"); cond != nil {
+				walk(cond, inner)
+			}
+			return
+		case "block":
+			// Every other block (do, while, if/elseif/else, loop and function
+			// bodies) is its own scope.
+			walkChildren(n, &luaScope{parent: scope})
 			return
 		case "function_call":
-			if prefix := childByFieldName(n, "prefix"); prefix != nil && prefix.Type() == "identifier" {
-				if name := luaCallName(n, content); name == text(prefix) {
-					sites = append(sites, luaCallSite{call: n, name: name, binding: scope.lookup(name)})
-				}
+			if name := childByFieldName(n, "name"); name != nil && name.Type() == "identifier" {
+				sites = append(sites, luaCallSite{call: n, name: text(name), binding: scope.lookup(text(name))})
 			}
 		}
-		walkChildren(n, scope, 0)
+		walkChildren(n, scope)
 	}
 	walk(root, &luaScope{})
 	var edges []graph.Edge
@@ -272,8 +270,8 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 		if site.binding == nil || site.binding.fn == nil || site.binding.reassigned {
 			continue
 		}
-		decl := luaRange(site.binding.fn, content)
-		at := luaRange(site.call, content)
+		decl := nodeRange(site.binding.fn)
+		at := nodeRange(site.call)
 		edges = append(edges, graph.Edge{
 			DstName:  site.name,
 			Kind:     "calls",
@@ -297,54 +295,29 @@ func luaNamesDebug(root *sitter.Node, content []byte) bool {
 	return false
 }
 
-func luaCallName(node *sitter.Node, content []byte) string {
-	if node == nil || node.Type() != "function_call" {
-		return ""
-	}
-	var parts []string
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		if child.Type() == "table_dot" || child.Type() == "." {
-			parts = append(parts, ".")
-			continue
-		}
-		if !child.IsNamed() {
-			continue
-		}
-		switch child.Type() {
-		case "identifier":
-			if i > 0 && node.Child(i-1).Type() == "table_dot" {
-				parts = append(parts, ".")
-			}
-			parts = append(parts, strings.TrimSpace(nodeText(child, content)))
-		case "self_call_colon":
-			parts = append(parts, ":")
-		case "function_call_paren":
-		case "function_arguments", "table_argument", "string_argument":
-			// Arguments follow the callee; they are not part of its name.
-			return strings.Join(parts, "")
-		default:
-			return ""
-		}
-	}
-	return strings.Join(parts, "")
+// luaCallName spells a call's callee as a dotted path: `f`, `a.b.c`, `a.b:m`.
+// Any other callee (`(g)()`, `h()()`, `t[1]()`) has no name.
+func luaCallName(call *sitter.Node, content []byte) string {
+	return luaDottedName(childByFieldName(call, "name"), content)
 }
 
-// luaRange is nodeRange starting at the node's first non-space byte. The pinned
-// grammar folds the newline before a statement that starts at column zero into
-// that statement's first token, which would otherwise place the statement,
-// and a call that opens it, at the end of the previous line.
-func luaRange(n *sitter.Node, content []byte) graph.Position {
-	rng := nodeRange(n)
-	start := int(n.StartByte())
-	end := int(n.EndByte())
-	for start < end && strings.IndexByte(" \t\r\n\f\v", content[start]) >= 0 {
-		start++
+func luaDottedName(n *sitter.Node, content []byte) string {
+	if n == nil {
+		return ""
 	}
-	line := 1 + bytes.Count(content[:start], []byte{'\n'})
-	if line != rng.StartLine || start != int(n.StartByte()) {
-		rng.StartLine = line
-		rng.StartCol = start - (bytes.LastIndexByte(content[:start], '\n') + 1) + 1
+	switch n.Type() {
+	case "identifier":
+		return nodeText(n, content)
+	case "dot_index_expression", "method_index_expression":
+		sep, member := ".", childByFieldName(n, "field")
+		if n.Type() == "method_index_expression" {
+			sep, member = ":", childByFieldName(n, "method")
+		}
+		table := luaDottedName(childByFieldName(n, "table"), content)
+		if table == "" || member == nil || member.Type() != "identifier" {
+			return ""
+		}
+		return table + sep + nodeText(member, content)
 	}
-	return rng
+	return ""
 }

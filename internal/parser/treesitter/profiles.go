@@ -14,8 +14,11 @@ func tsProfile(language string) parser.Profile {
 
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
+// Lua v2 parses with the vendored tree-sitter-grammars v0.3.0 grammar: goto,
+// labels and <const>/<close> locals parse, so such files can bind calls, and
+// bracket callees (`t[k]()`) no longer get a concatenated name.
 func (a *LuaAdapter) Profile() parser.Profile {
-	return tsProfile("lua")
+	return parser.NewProfile("lua", "treesitter:lua:v2", true)
 }
 
 // Scala v1 records declarations, imports and call references but no call

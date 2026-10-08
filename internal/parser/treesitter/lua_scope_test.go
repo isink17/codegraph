@@ -155,10 +155,77 @@ local d = require("debug")
 `, []string{}},
 		{"parse error refuses the file", `local function f() end
 local function g() f() end
-goto skip
-::skip::
-local x <const> = 1
+local x = = 1
 `, []string{}},
+		{"goto labels and attributes bind no name", `local function f() end
+local function g()
+  local limit <const> = 1
+  local r <close> = nil
+  for i = 1, limit do
+    if i then goto continue end
+    f()
+    ::continue::
+  end
+end
+`, []string{"f@7:5->1:1"}},
+		{"attributed local shadows the function", `local function f() end
+local function g()
+  local f <const> = 1
+  f()
+end
+`, []string{}},
+		{"repeat condition sees the body's locals", `local function r() end
+local function g()
+  repeat local r = 1 until r()
+  r()
+end
+`, []string{"r@4:3->1:1"}},
+		{"generic for header is outside the loop scope", `local function f() end
+local function g()
+  for f in f() do f() end
+end
+`, []string{"f@3:12->1:1"}},
+		{"numeric for bounds are outside the loop scope", `local function f() end
+local function g()
+  for f = f(), f() do f() end
+end
+`, []string{"f@3:11->1:1", "f@3:16->1:1"}},
+		{"calls in assignment targets are walked", `local function f() end
+local function g(t)
+  t[f()] = 1
+end
+`, []string{"f@3:5->1:1"}},
+		{"multiple assignment reassigns every name", `local function f() end
+local function g() f() end
+local a
+a, f = 1, 2
+`, []string{}},
+		{"string and table call forms are bare calls", `local function f() end
+local function g()
+  f "x"
+  f { 1 }
+  f
+  (
+    1
+  )
+end
+`, []string{"f@3:3->1:1", "f@4:3->1:1", "f@5:3->1:1"}},
+		{"parenthesized indexed and chained callees stay unresolved", `local function f() return f end
+local t = { f = f }
+local function g()
+  (f)()
+  t.f()
+  t["f"]()
+  f()()
+end
+`, []string{"f@7:3->1:1"}},
+		{"self in a method is a parameter", `local function self() end
+local M = {}
+function M:m() self() end
+function M.n() self() end
+`, []string{"self@4:16->1:1"}},
+		{"columns count UTF-8 bytes", "local function f() end\nlocal s = \"\u00fc\U0001F600\" local function g() f() end\n",
+			[]string{"f@2:39->1:1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			parsed, err := NewLua().Parse(context.Background(), "calls.lua", []byte(tc.source))
