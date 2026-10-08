@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`codegraph licenses` prints CodeGraph's license and `THIRD_PARTY_NOTICES` from copies embedded in the binary, with no network access, config or adjacent files. `THIRD_PARTY_NOTICES` gains the ICU (Unicode, Inc.) license for the `utf8.h`, `utf16.h` and `umachine.h` headers the Tree-sitter runtime compiles in.
+
 Scala: damaged Scala 3 indentation syntax that the grammar parses without an error no longer moves members to another owner. In a `:` body, a member indented off the body's column or not deeper than its owner's line; at the top level, a member indented under a `:`-bodied type, or a non-type member under a bodyless type (a deleted body `:`); a top-level expression (a misspelt `package`); or an `end X` marker that does not directly follow and align with X bounds the recorded declarations like a parse error. Braced code and annotations on their own line are not column-checked, so valid, consistently indented Scala 2 and Scala 3 code records the same declarations as before. A line shifted by a whole indentation step can still form another valid program and is recorded as parsed, and a deleted `:` before a nested type on a top-level type is not detected. Profile `treesitter:scala:v3`, so existing indexes reparse Scala files.
 
 Scala: a file with a parse error no longer records declarations under a guessed owner. Only declarations and imports that end before the first error are recorded, and a type or package body that does not end before it is skipped with its members; when the file has more `}` than `{`, a missing opening brace has moved members out of their type before any error shows, so no declaration is recorded. Broken files lose recall until fixed. Profile `treesitter:scala:v2`, so existing indexes reparse Scala files.

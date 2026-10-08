@@ -144,6 +144,15 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			name:        "licenses",
+			description: "print CodeGraph's license and the third-party notices embedded in the binary",
+			usageLines:  []string{"  licenses"},
+			examples:    []string{"codegraph licenses"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runLicenses(stdout)
+			},
+		},
+		{
 			name:        "index",
 			description: "index a repository",
 			usageLines:  []string{"  index <repo-path>"},

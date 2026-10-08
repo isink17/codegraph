@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	codegraph "github.com/isink17/codegraph"
 	"github.com/isink17/codegraph/internal/appname"
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/detail"
@@ -63,16 +64,18 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if isRootVersionFlag(args[0]) {
 		return runVersion(stdout)
 	}
-	if args[0] == "version" {
+	// version and licenses run before the release check and config load: they
+	// must work offline and without a config file.
+	if args[0] == "version" || args[0] == "licenses" {
+		cmd, ok := lookupCommand(args[0])
+		if !ok {
+			return fmt.Errorf("unknown command %q", args[0])
+		}
 		if hasHelpFlag(args[1:]) {
-			cmd, ok := lookupCommand("version")
-			if !ok {
-				return fmt.Errorf("unknown command %q", args[0])
-			}
 			printCommandHelp(stdout, cmd, args[0])
 			return nil
 		}
-		return runVersion(stdout)
+		return cmd.run(ctx, config.Config{}, stdout, stderr, args[0], args[1:])
 	}
 
 	startupVersionCheck(ctx, stderr)
@@ -131,6 +134,13 @@ func hasHelpFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+// runLicenses prints CodeGraph's license and the third-party notices embedded
+// in the binary, so they are available without the release archive's files.
+func runLicenses(stdout io.Writer) error {
+	_, err := io.WriteString(stdout, codegraph.License+"\n"+codegraph.ThirdPartyNotices)
+	return err
 }
 
 func runVersion(stdout io.Writer) error {
