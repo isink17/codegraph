@@ -299,3 +299,100 @@ locals {
 		t.Fatalf("edges = %v\nwant %v", got, want)
 	}
 }
+
+// Indexed and computed addresses name at most the declaring block: a literal
+// index or key keeps the block's address, a computed index or splat marks the
+// reference dynamic, and nothing ever names an instance. data.T.N and T.N are
+// distinct namespaces.
+func TestHCLTerraformIndexedAndComputedAddresses(t *testing.T) {
+	pf := parseHCL(t, "/r/main.tf", `resource "aws_instance" "web" {
+  by_key     = aws_instance.peer["blue"].id
+  by_legacy  = aws_instance.peer.0.id
+  mod_index  = module.net[0].subnet_id
+  mod_key    = module.net["eu"].subnet_id
+  mod_each   = module.net[each.key].subnet_id
+  mod_splat  = module.net[*].subnet_id
+  mod_local  = module.net[local.zone].subnet_id
+  computed   = aws_instance.peer[var.i + 1].id
+  templated  = aws_instance.peer["${var.k}"].id
+  data_ami   = data.aws_ami.base.id
+  data_idx   = data.aws_ami.base[0].id
+  managed    = aws_ami.base.id
+  short_data = data.aws_ami
+  parens     = (var.obj).field
+  cond       = var.on ? aws_s3_bucket.a.id : aws_s3_bucket.b.id
+  tried      = try(aws_s3_bucket.c[0].arn, null)
+  key_expr   = { (local.key) = 1 }
+  nested     = local.cfg.inner[0].leaf
+}
+`)
+	want := []string{
+		"aws_ami.base",
+		"aws_instance.peer",
+		"aws_instance.peer",
+		"aws_instance.peer dynamic",
+		"aws_instance.peer dynamic",
+		"aws_s3_bucket.a",
+		"aws_s3_bucket.b",
+		"aws_s3_bucket.c",
+		"data.aws_ami.base",
+		"data.aws_ami.base",
+		"local.cfg",
+		"local.key",
+		"local.zone",
+		"module.net",
+		"module.net",
+		"module.net dynamic",
+		"module.net dynamic",
+		"module.net dynamic",
+		"var.i",
+		"var.k",
+		"var.obj",
+		"var.on",
+	}
+	if got := hclEdges(pf); !slices.Equal(got, want) {
+		t.Fatalf("edges = %v\nwant %v", got, want)
+	}
+}
+
+// The grammar splits an operand's attributes and indices away from it inside
+// an operation; every operand traversal still names its own address, and
+// builtins and loop variables stay out.
+func TestHCLTerraformReferencesInOperations(t *testing.T) {
+	pf := parseHCL(t, "/r/main.tf", `resource "aws_instance" "web" {
+  count   = var.create && local.flags[0].on ? 1 : 0
+  negated = !var.disabled.value
+  minus   = -var.offset
+  chain   = var.a + var.b * local.c.d
+  mixed   = var.n.m - module.net[0].count
+  splat   = 1 + aws_instance.peer[*].cpu
+  keyed   = var.base + aws_instance.peer[var.k].cpu
+  paren   = (var.p + 1) * local.q
+  builtin = count.index + each.value.n + path.module
+  loop    = [for s in var.list : s.id if s.size > local.min]
+  partial = 1 + data.aws_ami
+}
+`)
+	want := []string{
+		"aws_instance.peer dynamic",
+		"aws_instance.peer dynamic",
+		"local.c",
+		"local.flags",
+		"local.min",
+		"local.q",
+		"module.net",
+		"var.a",
+		"var.b",
+		"var.base",
+		"var.create",
+		"var.disabled",
+		"var.k",
+		"var.list",
+		"var.n",
+		"var.offset",
+		"var.p",
+	}
+	if got := hclEdges(pf); !slices.Equal(got, want) {
+		t.Fatalf("edges = %v\nwant %v", got, want)
+	}
+}

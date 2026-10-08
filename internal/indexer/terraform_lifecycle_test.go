@@ -311,3 +311,104 @@ func TestTerraformNewUnparseableFileUnbindsItsDirectory(t *testing.T) {
 		t.Fatalf("update diverges from a fresh index:\n%s", diff)
 	}
 }
+
+// Address namespaces and indexed forms: data.T.N and T.N never answer for each
+// other, a literal index binds the declaring block (never an instance), a
+// computed one stays unresolved, a module reference binds the module block in
+// the caller's directory and never a declaration inside the child, and
+// sibling directories with identical names stay apart through rename and
+// delete.
+func TestTerraformAddressNamespacesAndIndexedForms(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"live/main.tf": `data "aws_ami" "base" {}
+
+resource "aws_ami" "base" {}
+
+module "net" {
+  source   = "../modules/net"
+  for_each = var.zones
+}
+
+resource "aws_instance" "app" {
+  count     = var.enabled && local.size > 0 ? 1 : 0
+  ami       = data.aws_ami.base.id
+  copy      = aws_ami.base.id
+  subnet    = module.net["eu"].subnet_id
+  any       = module.net[each.key].subnet_id
+  peer      = aws_instance.peer[0].id
+  missing   = aws_instance.ghost.id
+  only_data = data.aws_ami.other.id
+}
+
+resource "aws_instance" "peer" {
+  count = 2
+}
+`,
+		"live/vars.tf": `variable "zones" {}
+variable "enabled" {}
+locals {
+  size = 3
+}
+`,
+		"modules/net/main.tf": `variable "zones" {}
+variable "enabled" {}
+data "aws_ami" "other" {}
+output "subnet_id" { value = var.enabled ? data.aws_ami.other.id : "" }
+`,
+	})
+	bound := func(path, qname, kind string) string {
+		return ` => ` + path + `:` + qname + `(` + kind + `) [terraform_module_scope/high]`
+	}
+	expect := func(step string, cases map[[2]string]string) {
+		t.Helper()
+		for k, want := range cases {
+			if got := r.hclRefs(t, k[0], k[1]); got != want {
+				t.Fatalf("%s: %s -> %s = %q, want %q", step, k[0], k[1], got, want)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	module := bound("live/main.tf", "module.net", "terraform_module")
+	enabled := bound("live/vars.tf", "var.enabled", "terraform_variable")
+	expect("fresh", map[[2]string]string{
+		{"live/main.tf", "data.aws_ami.base"}:  bound("live/main.tf", "data.aws_ami.base", "terraform_data"),
+		{"live/main.tf", "aws_ami.base"}:       bound("live/main.tf", "aws_ami.base", "terraform_resource"),
+		{"live/main.tf", "module.net"}:         unresolvedRef + " | " + module, // each.key, then the literal key
+		{"live/main.tf", "aws_instance.peer"}:  bound("live/main.tf", "aws_instance.peer", "terraform_resource"),
+		{"live/main.tf", "aws_instance.ghost"}: unresolvedRef,
+		// Declared only inside the child module: not visible to the caller.
+		{"live/main.tf", "data.aws_ami.other"}:        unresolvedRef,
+		{"live/main.tf", "var.enabled"}:               enabled,
+		{"live/main.tf", "local.size"}:                bound("live/vars.tf", "local.size", "terraform_local"),
+		{"modules/net/main.tf", "var.enabled"}:        bound("modules/net/main.tf", "var.enabled", "terraform_variable"),
+		{"modules/net/main.tf", "data.aws_ami.other"}: bound("modules/net/main.tf", "data.aws_ami.other", "terraform_data"),
+	})
+
+	// Deleting the managed twin leaves the data reference bound and the
+	// managed one unresolved; the data declaration never stands in.
+	main := r.currentTree(t)["live/main.tf"]
+	r.write(t, "live/main.tf", strings.Replace(main, "resource \"aws_ami\" \"base\" {}\n", "", 1))
+	r.update(t, "live/main.tf")
+	expect("managed twin deleted", map[[2]string]string{
+		{"live/main.tf", "data.aws_ami.base"}: bound("live/main.tf", "data.aws_ami.base", "terraform_data"),
+		{"live/main.tf", "aws_ami.base"}:      unresolvedRef,
+	})
+	r.write(t, "live/main.tf", main)
+	r.update(t, "live/main.tf")
+
+	// Moving the caller's variables away leaves its references unresolved
+	// even though the child module still declares the same names.
+	vars := r.currentTree(t)["live/vars.tf"]
+	r.remove(t, "live/vars.tf")
+	r.write(t, "live/moved/vars.tf", vars)
+	r.update(t, "live/vars.tf", "live/moved/vars.tf")
+	expect("variables moved to another directory", map[[2]string]string{
+		{"live/main.tf", "var.enabled"}:        unresolvedRef,
+		{"live/main.tf", "local.size"}:         unresolvedRef,
+		{"modules/net/main.tf", "var.enabled"}: bound("modules/net/main.tf", "var.enabled", "terraform_variable"),
+	})
+	r.remove(t, "live/moved/vars.tf")
+	r.write(t, "live/vars.tf", vars)
+	r.update(t, "live/vars.tf", "live/moved/vars.tf")
+	expect("variables restored", map[[2]string]string{{"live/main.tf", "var.enabled"}: enabled})
+}

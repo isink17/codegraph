@@ -310,8 +310,23 @@ func (r *hclRefs) walk(n *sitter.Node, shadow map[string]bool) {
 			return
 		}
 	case "expression":
-		if n.NamedChildCount() > 0 && n.NamedChild(0).Type() == "variable_expr" {
-			r.traversal(n, shadow)
+		if n.NamedChildCount() > 0 {
+			switch n.NamedChild(0).Type() {
+			case "variable_expr":
+				r.traversal(hclChildren(n), shadow)
+			case "operation":
+				// The grammar leaves an operand's attributes and indices as
+				// siblings of the next operand, and hoists the last operand's
+				// out of the operation entirely; in source order each
+				// traversal is a variable_expr and the postfixes after it.
+				tokens := hclOperationTokens(n.NamedChild(0), nil)
+				tokens = append(tokens, hclChildren(n)[1:]...)
+				for i, tok := range tokens {
+					if tok.Type() == "variable_expr" {
+						r.traversal(tokens[i:], shadow)
+					}
+				}
+			}
 		}
 	}
 	for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -319,11 +334,26 @@ func (r *hclRefs) walk(n *sitter.Node, shadow map[string]bool) {
 	}
 }
 
-// traversal reads the address an expression's leading traversal names. An
-// index or splat before the address is complete names nothing; a splat or a
+// hclOperationTokens flattens an operation's operands in source order. A
+// nested expression (a parenthesized operand) stays one token: walk reads it
+// on its own.
+func hclOperationTokens(n *sitter.Node, out []*sitter.Node) []*sitter.Node {
+	switch n.Type() {
+	case "operation", "binary_operation", "unary_operation":
+		for _, c := range hclChildren(n) {
+			out = hclOperationTokens(c, out)
+		}
+		return out
+	}
+	return append(out, n)
+}
+
+// traversal reads the address the traversal at the head of nodes names: a
+// variable_expr and the attributes, indices and splats after it. An index or
+// splat before the address is complete names nothing; a splat or a
 // non-literal index after it makes the reference dynamic.
-func (r *hclRefs) traversal(expr *sitter.Node, shadow map[string]bool) {
-	head := expr.NamedChild(0)
+func (r *hclRefs) traversal(nodes []*sitter.Node, shadow map[string]bool) {
+	head := nodes[0]
 	root := nodeText(firstChild(head, "identifier"), r.content)
 	if root == "" || shadow[root] || hclBuiltinRoots[root] {
 		return
@@ -335,8 +365,7 @@ func (r *hclRefs) traversal(expr *sitter.Node, shadow map[string]bool) {
 	parts := []string{root}
 	dynamic := false
 postfix:
-	for i := 1; i < int(expr.NamedChildCount()); i++ {
-		c := expr.NamedChild(i)
+	for _, c := range nodes[1:] {
 		complete := len(parts) > need
 		switch c.Type() {
 		case "get_attr":
