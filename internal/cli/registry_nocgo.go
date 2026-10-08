@@ -10,7 +10,7 @@ import (
 )
 
 func newDefaultRegistry() *parser.Registry {
-	return parser.NewRegistry(
+	r := parser.NewRegistry(
 		goparser.New(),
 		pyparser.New(),
 		heuristicparser.NewJava(),
@@ -23,4 +23,6 @@ func newDefaultRegistry() *parser.Registry {
 		heuristicparser.NewPHP(),
 		heuristicparser.NewCAndCpp(),
 	)
+	r.SetNoCGOCapabilities(noCGOCapabilities())
+	return r
 }
