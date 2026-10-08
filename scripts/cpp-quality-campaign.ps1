@@ -362,6 +362,7 @@ if ($MutationProbe) {
             }
         }
     }
+    if ($null -ne $mutation) { $mutation | Add-Member -NotePropertyName cleanup_succeeded -NotePropertyValue $true }
 }
 
 $git = Get-GitIdentity $repo
