@@ -116,4 +116,8 @@ func TestLanguageCapabilitiesAreSortedAndExplicit(t *testing.T) {
 	if got[0].CallResolution != nil || got[0].TypeResolution != nil {
 		t.Fatalf("unknown resolver dimensions must stay unknown: %+v", got[0])
 	}
+	*got[0].Calls = false
+	if again := registry.Capabilities(); again[0].Calls == nil || !*again[0].Calls {
+		t.Fatalf("Capabilities() exposed mutable registry state: %+v", again)
+	}
 }

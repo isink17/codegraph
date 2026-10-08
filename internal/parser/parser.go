@@ -298,10 +298,25 @@ func (r *Registry) Capabilities() []LanguageCapability {
 	out := make([]LanguageCapability, 0, len(r.capabilities))
 	for _, capability := range r.capabilities {
 		capability.Extensions = slices.Clone(capability.Extensions)
+		capability.NoCGOParser = cloneBool(capability.NoCGOParser)
+		capability.NoCGOCallGraph = cloneBool(capability.NoCGOCallGraph)
+		capability.Symbols = cloneBool(capability.Symbols)
+		capability.Calls = cloneBool(capability.Calls)
+		capability.CallResolution = cloneBool(capability.CallResolution)
+		capability.ImportResolution = cloneBool(capability.ImportResolution)
+		capability.TypeResolution = cloneBool(capability.TypeResolution)
 		out = append(out, capability)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // SetNoCGOCapabilities completes build-independent availability metadata.
