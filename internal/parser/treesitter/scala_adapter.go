@@ -24,7 +24,8 @@ import (
 // definitions inside a method or block are not addressable and are skipped.
 // In a file with a parse error only the declarations that end before the
 // first error are recorded, and none when an opening brace is missing; see
-// scalaMembers and scalaExcessCloseBrace.
+// scalaMembers and scalaExcessCloseBrace. Damaged indentation syntax that
+// parses without an error is bounded the same way; see scalaLayoutErrorByte.
 type ScalaAdapter struct{}
 
 func NewScala() *ScalaAdapter            { return &ScalaAdapter{} }
@@ -52,6 +53,13 @@ func (a *ScalaAdapter) Parse(ctx context.Context, path string, content []byte) (
 		if scalaExcessCloseBrace(root) {
 			limit = 0
 		}
+	}
+	// Damaged indentation syntax can parse without an error. The first
+	// member laid out as no clean source lays it out bounds what is recorded
+	// like an error, except that a body ending right where that member
+	// starts, as an indented body does, is complete and kept.
+	if at := scalaLayoutErrorByte(root, true, false, -1, content); at != ^uint32(0) {
+		limit = min(limit, at+1)
 	}
 	scalaMembers(root, "", nil, limit, content, &pf)
 	// Imports are file-scoped, so a stray brace cannot misplace one, but an
@@ -135,6 +143,187 @@ func scalaExcessCloseBrace(root *sitter.Node) bool {
 	}
 	walk(root)
 	return depth < 0
+}
+
+// scalaPackageLevel lists what may appear at the top level or in a package
+// body. Anything else there, such as an expression, means the source is
+// damaged: a misspelt `package` keyword parses as one and leaves every
+// declaration after it without the package prefix.
+var scalaPackageLevel = map[string]bool{
+	"package_clause": true, "package_object": true, "import_declaration": true, "export_declaration": true,
+	"class_definition": true, "object_definition": true, "trait_definition": true, "enum_definition": true,
+	"function_definition": true, "function_declaration": true, "val_definition": true, "val_declaration": true,
+	"var_definition": true, "var_declaration": true, "given_definition": true, "type_definition": true,
+	"extension_definition": true, "comment": true, "block_comment": true,
+}
+
+// scalaLayoutErrorByte is where the first member starts that clean,
+// consistently indented source does not produce, or ^0 when there is none;
+// Parse treats it as the first parse error. The grammar parses some damaged
+// indentation syntax without an error: without the `:` that opens a body, or
+// with the body's first member indented deeper than the rest, the later
+// members move out to the enclosing scope. So in an indented scope (a `:`
+// body, an unbraced extension) every member that starts a line must start
+// at the column of the first one, deeper than the line its owner starts on;
+// the top level has a narrower rule, below. Columns are taken from
+// scalaAnchor. A member sharing its line with code before it is not
+// checked, nor is a braced body: braces delimit it. End markers are checked
+// in every scope, see scalaEndMarkerError.
+func scalaLayoutErrorByte(parent *sitter.Node, pkgLevel, indented bool, ownerIndent int, content []byte) uint32 {
+	errAt := ^uint32(0)
+	first := -1
+	var seen []*sitter.Node
+	prevCol, prevType, prevBody, prevColon := -1, false, false, false
+	for i := range int(parent.ChildCount()) {
+		child := parent.Child(i)
+		typ := child.Type()
+		if typ == "end" && !child.IsNamed() {
+			var ident *sitter.Node
+			if i+1 < int(parent.ChildCount()) {
+				ident = parent.Child(i + 1)
+			}
+			errAt = min(errAt, scalaEndMarkerError(seen, child, ident, content))
+			continue
+		}
+		if !child.IsNamed() || typ == "comment" || typ == "block_comment" {
+			continue
+		}
+		if pkgLevel && !scalaPackageLevel[typ] {
+			return min(errAt, child.StartByte())
+		}
+		seen = append(seen, child)
+		var body *sitter.Node
+		switch typ {
+		case "class_definition", "object_definition", "trait_definition", "enum_definition", "package_clause":
+			body = childByFieldName(child, "body")
+		case "extension_definition":
+			body = child
+		case "function_definition", "function_declaration", "val_definition", "val_declaration",
+			"var_definition", "var_declaration", "given_definition", "type_definition":
+		default:
+			continue
+		}
+		isType := typ == "class_definition" || typ == "object_definition" || typ == "trait_definition" || typ == "enum_definition"
+		colon := false
+		if body != nil {
+			colon = firstChild(body, "{") == nil
+			if typ != "extension_definition" && body.ChildCount() > 0 {
+				colon = body.Child(0).Type() == ":"
+			}
+		}
+		anchor := scalaAnchor(child)
+		col, ok := scalaLineColumn(anchor, content)
+		if ok && indented {
+			if first < 0 {
+				first = col
+			}
+			if col != first || col <= ownerIndent {
+				errAt = min(errAt, child.StartByte())
+			}
+		}
+		// At the top level only a member indented under the type before it
+		// is checked: under one with a `:` body it would have been a member
+		// of that body, and a def or value under a bodyless type is that
+		// type's body without its `:`. Braced code may indent freely there.
+		if ok && ownerIndent < 0 && prevCol >= 0 && col > prevCol && (prevColon || prevType && !prevBody && !isType) {
+			errAt = min(errAt, child.StartByte())
+		}
+		if ownerIndent < 0 && typ != "package_clause" {
+			prevCol, prevType, prevBody, prevColon = -1, isType, body != nil, colon
+			if ok {
+				prevCol = col
+			}
+		}
+		if body == nil {
+			continue
+		}
+		errAt = min(errAt, scalaLayoutErrorByte(body, typ == "package_clause", colon, scalaLineIndent(anchor, content), content))
+	}
+	return errAt
+}
+
+// scalaEndMarkerError checks the end marker `end X` after the members seen
+// so far in a scope, returning where the damage starts or ^0. The grammar
+// attaches the marker to the scope holding X, right after X, and clean
+// source aligns it with the line X starts on. Following other members, the
+// marker shows they moved out of the body it closes, as a dedented line
+// does, so the first of them is suspect; misaligned, X itself moved.
+// Keyword markers (`end extension`, `end given`) name nothing and pass.
+func scalaEndMarkerError(seen []*sitter.Node, end, ident *sitter.Node, content []byte) uint32 {
+	if ident == nil || ident.Type() != "_end_ident" {
+		return ^uint32(0)
+	}
+	want := scalaName(ident, content)
+	for j := len(seen) - 1; j >= 0; j-- {
+		def := seen[j]
+		name := childByFieldName(def, "name")
+		if name == nil {
+			name = childByFieldName(def, "pattern")
+		}
+		got := ""
+		switch {
+		case name == nil:
+		case def.Type() == "package_clause":
+			// `package a.b:` closes with `end b`.
+			got = scalaPackageName(name, content)
+			got = got[strings.LastIndexByte(got, '.')+1:]
+		default:
+			got = scalaName(name, content)
+		}
+		if got != want {
+			continue
+		}
+		if j < len(seen)-1 {
+			return seen[j+1].StartByte()
+		}
+		if col, ok := scalaLineColumn(end.StartByte(), content); !ok || col != scalaLineIndent(scalaAnchor(def), content) {
+			return def.StartByte()
+		}
+		return ^uint32(0)
+	}
+	if len(seen) > 0 {
+		return seen[0].StartByte()
+	}
+	return end.StartByte()
+}
+
+// scalaAnchor is where a definition starts once annotations before it are
+// skipped: an annotation may sit on its own line at any column.
+func scalaAnchor(def *sitter.Node) uint32 {
+	for i := range int(def.ChildCount()) {
+		if c := def.Child(i); c.Type() != "annotation" && c.Type() != "comment" && c.Type() != "block_comment" {
+			return c.StartByte()
+		}
+	}
+	return def.StartByte()
+}
+
+// scalaLineColumn is the column of the byte at, when only spaces and tabs
+// precede it on its line.
+func scalaLineColumn(at uint32, content []byte) (int, bool) {
+	for i := int(at) - 1; i >= 0; i-- {
+		switch content[i] {
+		case '\n':
+			return int(at) - 1 - i, true
+		case ' ', '\t':
+		default:
+			return 0, false
+		}
+	}
+	return int(at), true
+}
+
+// scalaLineIndent is the indentation of the line holding the byte at.
+func scalaLineIndent(at uint32, content []byte) int {
+	start := int(at)
+	for start > 0 && content[start-1] != '\n' {
+		start--
+	}
+	end := start
+	for end < len(content) && (content[end] == ' ' || content[end] == '\t') {
+		end++
+	}
+	return end - start
 }
 
 // scalaMembers records the member declarations directly under parent. A

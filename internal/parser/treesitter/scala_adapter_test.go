@@ -419,8 +419,7 @@ func TestScalaAdapterUnbracedRenameImport(t *testing.T) {
 // the intact file declares, symbols with the same kind and owner. Edits are
 // single-byte deletions and insertions of a brace, a parenthesis, a newline
 // or `class `. Edits that only rename an identifier (inside one, or joining
-// two) are skipped, as is any edit the grammar parses without an error: those
-// are recorded as parsed and are out of scope here.
+// two) are skipped.
 func TestScalaAdapterDamageNeverMisattributes(t *testing.T) {
 	const src = `package com.acme
 package billing
@@ -464,6 +463,322 @@ object Indented:
   def b = 3
 end Indented
 `
+	ident := func(b byte) bool {
+		return b == '_' || b == '$' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+	}
+	var edits []scalaEdit
+	for i := range len(src) {
+		if !ident(src[i]) && !(i > 0 && i+1 < len(src) && ident(src[i-1]) && ident(src[i+1])) {
+			edits = append(edits, scalaEdit{fmt.Sprintf("deleting byte %d (%q)", i, src[i]), src[:i] + src[i+1:]})
+		}
+		if i > 0 && ident(src[i-1]) && ident(src[i]) {
+			continue // an insertion inside an identifier only splits it
+		}
+		for _, ins := range []string{"{", "}", "(", ")", "\n", "class "} {
+			if ins == "class " && (i > 0 && ident(src[i-1]) || strings.HasPrefix(strings.TrimLeft(src[i:], " \n"), "extension")) {
+				// "class" would extend the identifier before it, or declare
+				// a valid class named by the soft keyword `extension`.
+				continue
+			}
+			edits = append(edits, scalaEdit{fmt.Sprintf("inserting %q at %d", ins, i), src[:i] + ins + src[i:]})
+		}
+	}
+	scalaDamageNeverMisattributes(t, src, edits)
+}
+
+// TestScalaAdapterIndentationDamageNeverMisattributes damages Scala 3
+// indentation syntax, which the grammar mostly parses without an error: a
+// deleted body-opening `:`, a line indented one or two columns deeper or
+// shallower, a newline or an `end` marker inserted at a line start, and a
+// misspelt first keyword on a line.
+func TestScalaAdapterIndentationDamageNeverMisattributes(t *testing.T) {
+	const src = `package com.acme
+
+import scala.util.Try
+
+object Outer:
+  def f = 1
+  object Inner:
+    val v = 1
+    class Deep:
+      def d = 2
+    end Deep
+    def after = 3
+  end Inner
+  enum Color:
+    case Red, Green
+    def paint = 1
+  extension (s: String)
+    def twice = s + s
+    def thrice = s * 3
+  given ord: Ordering[Int] = Ordering.Int
+  trait T:
+    def abs: Int
+  def last = 4
+end Outer
+
+class C:
+  def m = 1
+  def n = 2
+
+def top = 5
+val tv = 6
+`
+	// Shifting a whole line by one indentation step can produce another valid
+	// program, with that member in a different owner; nothing in the source
+	// shows the damage then.
+	valid := map[string]bool{
+		"dedenting two columns: `    def paint = 1`": true, // a member of Outer
+		"indenting two columns: `  def last = 4`":    true, // a member of T
+		"dedenting two columns: `  def n = 2`":       true, // top level
+		"indenting two columns: `def top = 5`":       true, // a member of C
+	}
+	var edits []scalaEdit
+	add := func(at, cut int, ins, what string) {
+		line := src[strings.LastIndexByte(src[:at], '\n')+1:]
+		line = line[:strings.IndexByte(line, '\n')]
+		if what = fmt.Sprintf("%s: `%s`", what, line); valid[what] {
+			return
+		}
+		edits = append(edits, scalaEdit{what + fmt.Sprintf(" at %d", at), src[:at] + ins + src[at+cut:]})
+	}
+	for i := range len(src) {
+		if src[i] == ':' && i+1 < len(src) && src[i+1] == '\n' {
+			add(i, 1, "", "deleting body colon")
+		}
+		if i > 0 && src[i-1] != '\n' {
+			continue
+		}
+		indent := i
+		for indent < len(src) && src[indent] == ' ' {
+			indent++
+		}
+		add(i, 0, " ", "indenting one column")
+		add(i, 0, "  ", "indenting two columns")
+		add(i, 0, "\n", "inserting a newline")
+		if indent > i {
+			add(i, 1, "", "dedenting one column")
+			add(i, min(2, indent-i), "", "dedenting two columns")
+		}
+		if indent < len(src) && src[indent] != '\n' {
+			add(indent, 1, "", "deleting the first byte of the line")
+		}
+		for _, owner := range []string{"Outer", "Inner", "Deep", "Color", "T", "C"} {
+			add(i, 0, "end "+owner+"\n", "inserting end "+owner)
+			add(indent, 0, "end "+owner+"\n"+src[i:indent], "inserting indented end "+owner)
+		}
+	}
+	scalaDamageNeverMisattributes(t, src, edits)
+}
+
+// TestScalaAdapterLayoutRulesKeepCleanSource runs the layout rules over clean,
+// consistently formatted Scala 2 and Scala 3 sources. None may report an
+// error position: the rules only narrow what an already damaged file records.
+func TestScalaAdapterLayoutRulesKeepCleanSource(t *testing.T) {
+	scala3 := `package com.acme.app
+
+import scala.util.Try
+import scala.concurrent.{Future, ExecutionContext as EC}
+
+// a comment at column 0
+   /* a block comment at an odd column */
+object Outer:
+  /** Doc. */
+  def sum(x: Int,
+          y: Int): Int =
+    x + y
+       // an odd comment inside the body
+  @deprecated("old")
+  inline def old = 1
+  object Inner:
+    val v = 1
+    class Deep(
+      a: Int,
+    ) extends Base
+        with Mixin:
+      def d = a
+    end Deep
+     // between members
+    def after = 3
+  end Inner
+  enum Color(val rgb: Int):
+    case Red extends Color(1)
+    case Green extends Color(2)
+    def paint = rgb
+  end Color
+  given ord: Ordering[Int] = Ordering.Int
+  given Ordering[String] with
+    def compare(x: String, y: String) = 0
+  end given
+  extension (s: String)
+    def twice = s + s
+    def thrice = s * 3
+  end extension
+  extension (i: Int) def neg = -i
+  extension (b: Boolean) {
+    def flip = !b
+  }
+  trait T:
+    def abs: Int
+  opaque type Id = Int
+  private[app] var w = 2
+  val xs = List(
+    1,
+    2,
+  )
+  def a = 1; def b = 2
+  def long =
+    val local = 1
+    local
+  end long
+end Outer
+
+case class Point(x: Int, y: Int):
+  def norm = x * x + y * y
+
+class C(x: Int)
+    extends Base:
+  def m = 1
+
+  def n = 2
+
+trait Tr:
+  def t: Int
+
+def top(x: Int): Int =
+  x
+
+val tv = 1
+@main def run(): Unit = println(top(1))
+`
+	scala2 := `package com.acme
+package legacy
+
+import scala.collection.mutable
+
+/** Docs. */
+abstract class Repo[T] extends AnyRef { self: Logging =>
+  def find(id: String): Option[T]
+  protected val cache = mutable.Map.empty[String, T]
+  object Keys { val prefix = "k" }
+  class Weird { def w = 1
+      def w2 = 2 }
+  def a = 1; def b = 2
+}
+
+object Repo {
+  implicit val ord: Ordering[String] = Ordering.String
+  def apply(): Repo[String] = new Repo[String] {
+    def find(id: String) = None
+  }
+}
+
+trait Logging {
+  def log(msg: String): Unit = println(msg)
+}
+
+package inner {
+  class Nested { def deep = 1 }
+  object Single {
+      def odd = 1
+  }
+}
+
+sealed trait State
+case object Draft extends State
+`
+	packageBlock := `package a:
+  class P:
+    def p = 1
+  object Q
+end a
+`
+	tabs := "package t\n\nobject O:\n\tdef f = 1\n\tclass I:\n\t\tdef g = 2\n\tend I\nend O\n"
+	crlf := strings.ReplaceAll(scala3, "\n", "\r\n")
+	sources := map[string]string{"Scala3": scala3, "Scala2": scala2, "PackageBlock": packageBlock, "Tabs": tabs, "CRLF": crlf,
+		// `package a.b:` closes with its last segment.
+		"QualifiedPackageBlock":  "package a.b:\n  class X:\n    def m = 1\n  object Y\nend b\n",
+		"QualifiedPackageBlock3": "package com.acme.app:\n  object Z:\n    def z = 1\n  end Z\nend app\n",
+		// Braces delimit bodies, so top-level columns are free.
+		"BracedIndentedTop":    "package p\n\n  class Indented {\n    def a = 1\n  }\n\nclass Flush {\n  def b = 2\n}\n",
+		"BracedDeeperSibling":  "object A {\n  def a = 1\n}\n  object B {\n    def b = 2\n  }\n",
+		"BracedCaseUnderTrait": "sealed trait Color\n  case object Red extends Color\n  case object Blue extends Color\n",
+		// An annotation on its own line is not where the definition starts;
+		// at the top level it may sit at any column. (In a `:` body the
+		// first token, annotation or not, sets the body's indentation.)
+		"AnnotationTop":   "  @SerialVersionUID(1L)\nclass A {\n  def x = 1\n}\n    @main def run() = 1\nobject O:\n  @deprecated(\"x\")\n  private def f = 1\n  def g = 2\nend O\n",
+		"AnnotationOwner": "object O:\n  @deprecated(\"x\")\n  object I:\n    def f = 1\n  end I\nend O\n",
+	}
+	for name, src := range sources {
+		root, err := parse(context.Background(), scalagrammar.GetLanguage(), []byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if root.HasError() {
+			t.Fatalf("%s: clean corpus does not parse: %s", name, root.String())
+		}
+		if at := scalaLayoutErrorByte(root, true, false, -1, []byte(src)); at != ^uint32(0) {
+			t.Errorf("%s: layout error reported at %q", name, src[at:min(len(src), int(at)+30)])
+		}
+	}
+	// Spot-check that the clean Scala 3 corpus keeps every owner.
+	keys := scalaKeys(parseScala(t, "Clean.scala", scala3))
+	for _, want := range []string{
+		"function func:scala:com.acme.app.Outer$.Inner$.Deep.d",
+		"function func:scala:com.acme.app.Outer$.Inner$.after",
+		"function func:scala:com.acme.app.Outer$.Color.paint",
+		"function func:scala:com.acme.app.Outer$.thrice",
+		"function func:scala:com.acme.app.Outer$.flip",
+		"function func:scala:com.acme.app.Outer$.b",
+		"function func:scala:com.acme.app.Outer$.long",
+		"function func:scala:com.acme.app.C.n",
+		"function func:scala:com.acme.app.run",
+		"value value:scala:com.acme.app.tv",
+	} {
+		if !slices.Contains(keys, want) {
+			t.Errorf("clean Scala 3 corpus lacks %q; got %q", want, keys)
+		}
+	}
+	if keys := scalaKeys(parseScala(t, "Qualified.scala", sources["QualifiedPackageBlock"])); !reflect.DeepEqual(keys, []string{"class type:scala:a.b.X", "function func:scala:a.b.X.m", "object object:scala:a.b.Y"}) {
+		t.Errorf("qualified package block = %q", keys)
+	}
+	if keys := scalaKeys(parseScala(t, "Pkg.scala", packageBlock)); !reflect.DeepEqual(keys, []string{"class type:scala:a.P", "function func:scala:a.P.p", "object object:scala:a.Q"}) {
+		t.Errorf("package block = %q", keys)
+	}
+}
+
+// TestScalaAdapterCleanlyParsedDamageDropsMovedMembers covers damage the
+// grammar parses without an error: a missing body `:`, a first member
+// indented deeper than the rest, a misspelt `package`, a top-level block and
+// a dedented member before an end marker. What follows the damage is dropped.
+func TestScalaAdapterCleanlyParsedDamageDropsMovedMembers(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		want []string
+	}{
+		{"package a\nobject A\n  def f = 1\n  class In:\n    def g = 2\n", []string{"object object:scala:a.A"}},
+		{"package a\nclass B\n  def m = 4\n  def n = 5\n", []string{"class type:scala:a.B"}},
+		{"package a\nobject A:\n   def f = 1\n  class In:\n    def g = 2\n", []string{"function func:scala:a.A$.f", "object object:scala:a.A"}},
+		{"package a\nobject O:\n  object A\n    def f = 1\n  def g = 2\n", nil}, // O holds the damage
+		{"ackage a\nobject A:\n  def f = 1\n", nil},
+		{"package a\n{ class X }\ndef f = 1\n", nil},
+		{"object A:\n  def f = 1\ndef g = 2\nend A\n", []string{"function func:scala:A$.f", "object object:scala:A"}},
+		{"object A:\n  def f = 1\n  end A\n", nil},
+	} {
+		if got := scalaKeys(parseScala(t, "Damaged.scala", tc.src)); !reflect.DeepEqual(got, tc.want) && !(len(got) == 0 && len(tc.want) == 0) {
+			t.Errorf("%q: symbols = %q, want %q", tc.src, got, tc.want)
+		}
+	}
+}
+
+type scalaEdit struct{ what, src string }
+
+// scalaDamageNeverMisattributes parses every damaged variant of src and fails
+// for any declaration or import the clean parse does not have, under the
+// same kind, stable key and container. Damage may cost recall, never
+// attribution.
+func scalaDamageNeverMisattributes(t *testing.T, src string, edits []scalaEdit) {
+	t.Helper()
 	key := func(s graph.Symbol) string { return s.Kind + " " + s.StableKey + " @" + s.ContainerName }
 	imp := func(i graph.ScopeImport) string {
 		return fmt.Sprintf("import %s %s as %s %s %v", i.SourceSpecifier, i.ImportedName, i.LocalName, i.Kind, i.Wildcard)
@@ -476,26 +791,9 @@ end Indented
 	for _, i := range cleanPF.Scope.Imports {
 		clean[imp(i)] = true
 	}
-	ident := func(b byte) bool {
-		return b == '_' || b == '$' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
-	}
-	type edit struct{ what, src string }
-	var edits []edit
-	for i := range len(src) {
-		if !ident(src[i]) && !(i > 0 && i+1 < len(src) && ident(src[i-1]) && ident(src[i+1])) {
-			edits = append(edits, edit{fmt.Sprintf("deleting byte %d (%q)", i, src[i]), src[:i] + src[i+1:]})
-		}
-		if i > 0 && ident(src[i-1]) && ident(src[i]) {
-			continue // an insertion inside an identifier only splits it
-		}
-		for _, ins := range []string{"{", "}", "(", ")", "\n", "class "} {
-			if ins == "class " && i > 0 && ident(src[i-1]) {
-				continue // "class" would extend the identifier before it
-			}
-			edits = append(edits, edit{fmt.Sprintf("inserting %q at %d", ins, i), src[:i] + ins + src[i:]})
-		}
-	}
-	check := func(e edit) {
+	var mu sync.Mutex
+	failures := 0
+	check := func(e scalaEdit) {
 		pf, err := NewScala().Parse(context.Background(), "Damaged.scala", []byte(e.src))
 		if err != nil {
 			t.Error(err)
@@ -512,13 +810,12 @@ end Indented
 				wrong = append(wrong, k)
 			}
 		}
-		if len(wrong) == 0 {
-			return
+		if len(wrong) != 0 {
+			mu.Lock()
+			failures++
+			mu.Unlock()
+			t.Errorf("%s yields %q", e.what, wrong)
 		}
-		if root, err := parse(context.Background(), scalagrammar.GetLanguage(), []byte(e.src)); err == nil && !root.HasError() {
-			return // parsed cleanly: out of scope
-		}
-		t.Errorf("%s yields %q", e.what, wrong)
 	}
 	// Each parse is independent; spreading them keeps the test under a second.
 	var wg sync.WaitGroup
@@ -531,4 +828,7 @@ end Indented
 		})
 	}
 	wg.Wait()
+	if failures != 0 {
+		t.Logf("%d of %d edits misattribute", failures, len(edits))
+	}
 }

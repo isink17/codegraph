@@ -71,15 +71,48 @@ when the file has more `}` than `{` (a missing opening brace moves members
 out of their type before any error shows). Packages nested inside a package body are not parsed by this grammar
 revision; declarations under them are dropped rather than misplaced.
 
-These rules only apply when the grammar reports an error. Broken source the
-grammar parses cleanly is recorded as parsed: in Scala 3 indentation syntax a
-deleted `:` that opens a body, or a first member indented deeper than the
-rest, moves the following members to package level, and a misspelt `package`
-keyword drops the package prefix.
+Damaged Scala 3 indentation syntax often parses without an error, so the
+same bound applies at the first member that clean, consistently indented
+source never lays out that way:
+
+- in a `:` body or an unbraced extension, a member starting a line at a
+  column other than the body's first member, or no deeper than the line its
+  owner starts on (a first member indented deeper than the rest, a deleted
+  `:` on a nested type);
+- at the top level, a member indented deeper than the type before it when
+  that type has a `:` body, or when it has no body and the member is not a
+  type (a deleted `:` on a top-level type);
+- at the top level or in a package body, anything that is not a package
+  clause, import, export, definition or comment (a misspelt `package`, a
+  stray block);
+- an `end X` marker that does not directly follow X in its scope, or is not
+  aligned with the line X starts on (a member dedented out of the body the
+  marker closes); `package a.b:` closes with `end b`.
+
+A body that ends where the offending member starts is kept. Columns are
+measured from a definition's modifiers or keyword, not from an annotation on
+a line of its own. Braced bodies, members sharing a line with earlier code,
+top-level members under a braced type, and type members under a bodyless
+type (`sealed trait C` followed by indented `case object`s) are not checked,
+so source that the grammar parses without an error and that is valid,
+consistently indented Scala keeps every declaration. A top-level `def` or
+`val` indented under a bodyless type (`case class P(x: Int)` then
+`  def helper = 1`) is treated as a deleted `:`, and it and everything after
+it are dropped; Scala 2 rejects that layout and Scala 3 reports it as
+indented too far. Inconsistent indentation inside a `:` body
+(mixed tabs and spaces, a member one column off) is treated as damage.
+
+What remains: shifting a whole line by one full indentation step can
+produce another valid program (a member dedented into the enclosing body,
+or indented into the preceding `:` body, with no end marker to contradict
+it), and nothing in the source then shows the damage; that member is
+recorded under its new owner. A deleted `:` on a top-level type whose
+members are themselves types (`class A\n  class B`) is not detected,
+since braced Scala 2 may indent a type under a bodyless one.
 
 ## Call resolution
 
-None. The profile `treesitter:scala:v2` declares no call edges: implicit and
+None. The profile `treesitter:scala:v3` declares no call edges: implicit and
 given scope, extension methods, inheritance, overload resolution and
 `apply`/`unapply` desugaring decide what a Scala call runs, and source syntax
 alone does not prove any of them. Every call stays an unresolved reference.
