@@ -212,3 +212,144 @@ func TestFreshnessUnknownRepo(t *testing.T) {
 		t.Fatal("unknown repo returned no error")
 	}
 }
+
+func scopedScan(t *testing.T, s *Store, repoID int64, scope, head string) (int64, time.Time) {
+	t.Helper()
+	id, started, err := s.BeginScanWithScope(context.Background(), repoID, "index", scope, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id, started
+}
+
+func completeScan(t *testing.T, s *Store, id int64, started time.Time, status, head string) {
+	t.Helper()
+	if err := s.CompleteScan(context.Background(), id, ScanSummary{HeadAtFinish: head}, started, status, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two writers interleave: each sees the other and neither reads as an
+// uncontested full scan. A scan started after both closed sees none.
+func TestFreshnessCoverageOverlappingWriters(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	full, fullStarted := scopedScan(t, s, repoID, ScanScopeFull, "h1")
+	paths, pathsStarted := scopedScan(t, s, repoID, ScanScopePaths, "h1")
+	completeScan(t, s, paths, pathsStarted, "completed", "h1")
+	completeScan(t, s, full, fullStarted, "completed", "h1")
+	f := freshness(t, s, repoID)
+	if f.Coverage.LastFullScan == nil || f.Coverage.LastFullScan.ID != full || f.Coverage.LastFullScan.Overlap != "yes" {
+		t.Fatalf("full scan overlapped by a path scan: %+v", f.Coverage.LastFullScan)
+	}
+	if f.LatestScan.ID != paths || f.LatestScan.Overlap != "yes" {
+		t.Fatalf("latest = %+v", f.LatestScan)
+	}
+
+	// The path scan started first and finished after a full scan began.
+	paths2, paths2Started := scopedScan(t, s, repoID, ScanScopePaths, "h1")
+	full2, full2Started := scopedScan(t, s, repoID, ScanScopeFull, "h1")
+	completeScan(t, s, paths2, paths2Started, "completed", "h1")
+	completeScan(t, s, full2, full2Started, "completed", "h1")
+	if got := freshness(t, s, repoID).Coverage.LastFullScan; got.ID != full2 || got.Overlap != "yes" {
+		t.Fatalf("full scan started during a path scan: %+v", got)
+	}
+
+	full3, full3Started := scopedScan(t, s, repoID, ScanScopeFull, "h1")
+	if got := freshness(t, s, repoID).LatestScan; got.ID != full3 || got.Overlap != "unknown" {
+		t.Fatalf("running scan overlap must stay unknown: %+v", got)
+	}
+	completeScan(t, s, full3, full3Started, "completed", "h1")
+	if got := freshness(t, s, repoID).Coverage.LastFullScan; got.ID != full3 || got.Overlap != "none" {
+		t.Fatalf("sequential full scan: %+v", got)
+	}
+}
+
+// A row a crashed process left running cannot be told from a live writer, so
+// every later scan reads as overlapped.
+func TestFreshnessCoverageAbandonedRunningRowOverlaps(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scopedScan(t, s, repoID, ScanScopeFull, "h1")
+	full, started := scopedScan(t, s, repoID, ScanScopeFull, "h1")
+	completeScan(t, s, full, started, "completed", "h1")
+	if got := freshness(t, s, repoID).Coverage.LastFullScan; got.ID != full || got.Overlap != "yes" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// Rows written through BeginScan, as before scope recording, never qualify as
+// a full scan; failures after the last full scan are counted.
+func TestFreshnessCoverageUnrecordedRows(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	f := freshness(t, s, repoID)
+	if !f.Coverage.Recorded || f.Coverage.LastFullScan != nil || f.LastCompletedScan.Scope != "unknown" || f.LastCompletedScan.HeadAtStart != "" {
+		t.Fatalf("unrecorded row: %+v / %+v", f.Coverage, f.LastCompletedScan)
+	}
+	full, started := scopedScan(t, s, repoID, ScanScopeFull, "h1")
+	completeScan(t, s, full, started, "completed", "h1")
+	scan(t, s, repoID, "update", "failed", "boom")
+	paths, pathsStarted := scopedScan(t, s, repoID, ScanScopePaths, "h1")
+	completeScan(t, s, paths, pathsStarted, "failed", "")
+	f = freshness(t, s, repoID)
+	if f.Coverage.LastFullScan.ID != full || f.Coverage.FailedAfterLastFull != 2 {
+		t.Fatalf("coverage = %+v", f.Coverage)
+	}
+}
+
+// A database from before scope recording: a read-only handle (which never
+// migrates) reports coverage as unrecorded and keeps the legacy scope rule;
+// a writable open adds the columns and keeps the old rows unrecorded.
+func TestFreshnessCoveragePreMigrationDatabase(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan(t, s, repo.ID, "watch_config", "completed", "")
+	scan(t, s, repo.ID, "index", "completed", "")
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE scans DROP COLUMN scope; ALTER TABLE scans DROP COLUMN head_at_start;
+		ALTER TABLE scans DROP COLUMN head_at_finish; ALTER TABLE scans DROP COLUMN overlapping_scans;
+		DELETE FROM schema_migrations WHERE version = 9`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ro, err := OpenReadOnly(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := ro.FreshnessStatus(ctx, repo.ID)
+	_ = ro.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Coverage.Recorded || f.Coverage.LastFullScan != nil || f.LastCompletedScan.Scope != "unknown" || f.LastCompletedScan.Overlap != "unknown" {
+		t.Fatalf("pre-migration read: %+v / %+v", f.Coverage, f.LastCompletedScan)
+	}
+	if f.State != graph.FreshnessNoKnownStaleness {
+		t.Fatalf("pre-migration state changed: %s %v", f.State, f.Reasons)
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	f = freshness(t, s, repo.ID)
+	if !f.Coverage.Recorded || f.Coverage.LastFullScan != nil || f.LastCompletedScan.Scope != "unknown" || f.LastCompletedScan.Overlap != "unknown" {
+		t.Fatalf("after upgrade: %+v / %+v", f.Coverage, f.LastCompletedScan)
+	}
+	full, started := scopedScan(t, s, repo.ID, ScanScopeFull, "h1")
+	completeScan(t, s, full, started, "completed", "h1")
+	if got := freshness(t, s, repo.ID).Coverage.LastFullScan; got == nil || got.ID != full || got.Overlap != "none" {
+		t.Fatalf("first recorded full scan after upgrade: %+v", got)
+	}
+}

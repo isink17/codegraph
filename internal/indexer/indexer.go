@@ -19,6 +19,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/embedding"
+	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/parser"
 	"github.com/isink17/codegraph/internal/platform"
@@ -120,6 +121,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	// An override equal to the repository's own configuration walks the same
+	// files; any other override narrows or widens what a full walk covers.
+	filtered := (len(opts.Include) > 0 && !slices.Equal(opts.Include, repoCfg.Include)) ||
+		(len(opts.Exclude) > 0 && !slices.Equal(opts.Exclude, repoCfg.Exclude)) ||
+		(len(opts.Languages) > 0 && !slices.Equal(opts.Languages, repoCfg.Languages))
 	if len(opts.Include) == 0 {
 		opts.Include = repoCfg.Include
 	}
@@ -353,7 +359,13 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		return store.ScanSummary{}, err
 	}
 
-	scanID, started, err := i.store.BeginScan(ctx, repo.ID, scanKind)
+	scope := store.ScanScopeFull
+	if pathScoped {
+		scope = store.ScanScopePaths
+	} else if filtered {
+		scope = store.ScanScopeFiltered
+	}
+	scanID, started, err := i.store.BeginScanWithScope(ctx, repo.ID, scanKind, scope, scanHead(ctx, opts.RepoRoot))
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
@@ -1254,6 +1266,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
 		return summary, i.failScan(ctx, scanID, summary, started, err)
 	}
+	summary.HeadAtFinish = scanHead(ctx, opts.RepoRoot)
 	if semanticTransition {
 		if err := i.store.CompleteScanWithParserSemanticEpochs(ctx, scanID, summary, started, repo.ID, semanticEpochs, semanticLanguages); err != nil {
 			return summary, i.failScan(ctx, scanID, summary, started, err)
@@ -1269,6 +1282,21 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	return summary, nil
 }
 
+// scanHeadTimeout bounds each HEAD read recorded on a scan row.
+const scanHeadTimeout = 2 * time.Second
+
+// scanHead reads HEAD for scan coverage evidence. Any failure (no Git, not a
+// repository, no commit yet, timeout) records "", which reads as unknown.
+func scanHead(ctx context.Context, root string) string {
+	ctx, cancel := context.WithTimeout(ctx, scanHeadTimeout)
+	defer cancel()
+	head, err := githistory.Head(ctx, root)
+	if err != nil {
+		return ""
+	}
+	return head
+}
+
 // scanCloseTimeout bounds recording a failed scan, which runs after the
 // scan's own context may already be cancelled.
 const scanCloseTimeout = 10 * time.Second
@@ -1280,6 +1308,7 @@ const scanCloseTimeout = 10 * time.Second
 func (i *Indexer) failScan(ctx context.Context, scanID int64, summary store.ScanSummary, started time.Time, cause error) error {
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanCloseTimeout)
 	defer cancel()
+	summary.HeadAtFinish = "" // recorded for completed scans only
 	if err := i.store.CompleteScan(closeCtx, scanID, summary, started, "failed", cause.Error()); err != nil {
 		return errors.Join(cause, fmt.Errorf("record failed scan %d: %w", scanID, err))
 	}
