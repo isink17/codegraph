@@ -127,6 +127,39 @@ function Copy-RepositoryForProbe([string] $Source, [string] $Destination) {
     }
 }
 
+function Remove-OwnedProbeDirectory([string] $Path, [string] $Parent) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $fullParent = [System.IO.Path]::GetFullPath($Parent).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $fullPath.StartsWith($fullParent, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [System.IO.Path]::GetDirectoryName($fullPath) -ne $Parent) {
+        throw "Refusing to remove probe directory outside its owned temporary parent: $Path"
+    }
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to remove probe directory that is not an ordinary directory: $Path"
+    }
+    $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+    $pending.Push([System.IO.DirectoryInfo]::new($fullPath))
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Peek()
+        $children = @($directory.EnumerateFileSystemInfos())
+        if ($children.Count -gt 0) {
+            foreach ($child in $children) {
+                if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    $child.Delete()
+                } elseif (($child.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                    $pending.Push([System.IO.DirectoryInfo]::new($child.FullName))
+                } else {
+                    $child.Delete()
+                }
+            }
+        } else {
+            $pending.Pop() | Out-Null
+            $directory.Delete()
+        }
+    }
+}
+
 function Get-ContentFingerprint($Files, [string] $Root) {
     $sourceExtensions = @(".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp", ".tpp")
     $entries = foreach ($file in ($Files | Where-Object { $sourceExtensions -contains $_.Extension.ToLowerInvariant() } | Sort-Object FullName)) {
@@ -233,37 +266,68 @@ foreach ($symbol in $CalleesOf) {
 
 $mutation = $null
 if ($MutationProbe) {
-    $probeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codegraph-cpp-mutation-" + [guid]::NewGuid().ToString("N"))
+    $tempParent = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $probeRoot = Join-Path $tempParent ("codegraph-cpp-mutation-" + [guid]::NewGuid().ToString("N"))
     $probeHome = Join-Path $out "mutation-codegraph-home"
     $probeDB = Join-Path $out "mutation-database"
-    $null = New-Item -ItemType Directory -Path $probeRoot -Force
-    $null = New-Item -ItemType Directory -Path $probeDB -Force
-    $null = New-Item -ItemType Directory -Path (Join-Path $probeHome "config") -Force
-    $probeConfig = @{ db_dir = $probeDB } | ConvertTo-Json -Compress
-    [System.IO.File]::WriteAllText((Join-Path $probeHome "config/config.json"), $probeConfig, $utf8WithoutBOM)
-    Copy-RepositoryForProbe $repo $probeRoot
-    $probeIndex = Invoke-CodeGraph "mutation_initial_index" @("index", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
-    $probeFile = Join-Path $probeRoot "codegraph-campaign-probe.cpp"
-    [System.IO.File]::WriteAllText($probeFile, "int codegraph_campaign_probe() { return 7; }`n", $utf8WithoutBOM)
-    $probeAdd = Invoke-CodeGraph "mutation_add_update" @("update_graph", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
-    $addSummary = Get-IndexSummary $probeAdd
-    Remove-Item -LiteralPath $probeFile -Force
-    $probeDelete = Invoke-CodeGraph "mutation_delete_update" @("update_graph", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
-    $deleteSummary = Get-IndexSummary $probeDelete
-    if ($probeIndex.exit_code -ne 0 -or $probeAdd.exit_code -ne 0 -or $probeDelete.exit_code -ne 0 -or $null -eq $addSummary -or $addSummary.files_changed -lt 1 -or $null -eq $deleteSummary -or $deleteSummary.files_deleted -lt 1) {
+    try {
+        $null = New-Item -ItemType Directory -Path $probeRoot -ErrorAction Stop
+        $probeRoot = Get-AbsolutePath $probeRoot
+        $null = New-Item -ItemType Directory -Path $probeDB -Force
+        $null = New-Item -ItemType Directory -Path (Join-Path $probeHome "config") -Force
+        $probeConfig = @{ db_dir = $probeDB } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path $probeHome "config/config.json"), $probeConfig, $utf8WithoutBOM)
+        Copy-RepositoryForProbe $repo $probeRoot
+        $originalSourceFingerprint = Get-ContentFingerprint $sourceFiles $repo
+        $probeIndex = Invoke-CodeGraph "mutation_initial_index" @("index", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
+        if ($probeIndex.exit_code -ne 0) { throw "Temporary checkout indexing failed." }
+        $eligible = @($sourceFiles | Where-Object { $_.Extension.ToLowerInvariant() -in @(".c", ".cc", ".cpp", ".cxx") } | Sort-Object { Get-RelativePath $repo $_.FullName })
+        if ($eligible.Count -eq 0) { throw "Mutation probe cannot modify existing file: repository has no eligible C/C++ source file." }
+        $selectedRelative = Get-RelativePath $repo $eligible[0].FullName
+        $probeExistingFile = Join-Path $probeRoot ($selectedRelative.Replace('/', [System.IO.Path]::DirectorySeparatorChar))
+        $originalBytes = [System.IO.File]::ReadAllBytes($probeExistingFile)
+        $modifiedBytes = [System.Text.Encoding]::UTF8.GetBytes(([System.Text.Encoding]::UTF8.GetString($originalBytes) + "`n// codegraph campaign mutation probe`n"))
+        [System.IO.File]::WriteAllBytes($probeExistingFile, $modifiedBytes)
+        $probeModify = Invoke-CodeGraph "mutation_existing_file_update" @("update_graph", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
+        $modifySummary = Get-IndexSummary $probeModify
+        if ($probeModify.exit_code -ne 0 -or $null -eq $modifySummary -or $modifySummary.files_changed -lt 1) { throw "Existing-file modification was not reindexed." }
+        $probeFile = Join-Path $probeRoot "codegraph-campaign-probe.cpp"
+        [System.IO.File]::WriteAllText($probeFile, "int codegraph_campaign_probe() { return 7; }`n", $utf8WithoutBOM)
+        $probeAdd = Invoke-CodeGraph "mutation_add_update" @("update_graph", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
+        $addSummary = Get-IndexSummary $probeAdd
+        Remove-Item -LiteralPath $probeFile -Force
+        $probeDelete = Invoke-CodeGraph "mutation_delete_update" @("update_graph", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
+        $deleteSummary = Get-IndexSummary $probeDelete
+        if ($probeAdd.exit_code -ne 0 -or $probeDelete.exit_code -ne 0 -or $null -eq $addSummary -or $addSummary.files_changed -lt 1 -or $null -eq $deleteSummary -or $deleteSummary.files_deleted -lt 1) {
+            throw "Add/delete mutation probe failed."
+        }
+        if ((Get-ContentFingerprint $sourceFiles $repo) -ne $originalSourceFingerprint) { throw "Original C/C++ source files changed during mutation probe." }
+        $mutation = [pscustomobject]@{
+            existing_file = $selectedRelative
+            existing_file_update_exit_code = $probeModify.exit_code
+            existing_file_update_summary = $modifySummary
+            original_source_preserved = $true
+            add_update_exit_code = $probeAdd.exit_code
+            delete_update_exit_code = $probeDelete.exit_code
+            add_update_summary = $addSummary
+            delete_update_summary = $deleteSummary
+            probe_file = "codegraph-campaign-probe.cpp"
+            temporary_copy_policy = "recursive content copy excluding .git, .codegraph, and reparse points; all mutations occur in runner-owned temporary checkout"
+        }
+    } catch {
         $failedCommands = $commands | ConvertTo-Json -Depth 100
         [System.IO.File]::WriteAllText((Join-Path $out "failed-mutation-commands.json"), $failedCommands + [Environment]::NewLine, $utf8WithoutBOM)
-        throw "Mutation probe failed; raw command outputs are in $out/failed-mutation-commands.json."
-    }
-    $mutation = [pscustomobject]@{
-        temporary_repository = $probeRoot
-        initial_index_exit_code = $probeIndex.exit_code
-        add_update_exit_code = $probeAdd.exit_code
-        delete_update_exit_code = $probeDelete.exit_code
-        add_update_summary = $addSummary
-        delete_update_summary = $deleteSummary
-        probe_file = "codegraph-campaign-probe.cpp"
-        temporary_copy_policy = "recursive content copy excluding .git, .codegraph, and reparse points; probe file is created and deleted only in this copy"
+        throw "Mutation probe failed; command evidence saved to $out/failed-mutation-commands.json. $($_.Exception.Message)"
+    } finally {
+        if (Test-Path -LiteralPath $probeRoot) {
+            try {
+                Remove-OwnedProbeDirectory $probeRoot $tempParent
+            } catch {
+                $cleanupFailure = [pscustomobject]@{ temporary_repository = $probeRoot; cleanup_error = $_.Exception.Message; commands = @($commands) } | ConvertTo-Json -Depth 100
+                [System.IO.File]::WriteAllText((Join-Path $out "mutation-cleanup-failure.json"), $cleanupFailure + [Environment]::NewLine, $utf8WithoutBOM)
+                throw "Mutation probe cleanup failed; evidence saved to $out/mutation-cleanup-failure.json. $($_.Exception.Message)"
+            }
+        }
     }
 }
 
