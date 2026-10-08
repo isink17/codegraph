@@ -752,10 +752,10 @@ Notes: package.json declares ISC; the LICENSE file governs. See docs/hcl-grammar
 Component: Tree-sitter Dart grammar (vendored)
 Go package: github.com/isink17/codegraph/internal/parser/treesitter/dartgrammar
 Upstream: https://github.com/UserNobody14/tree-sitter-dart
-Revision: c8e7cbbd1589cc2ee1f9b5befa604dc7e953b0af
+Revision: 8bd7e003770e2599ccf6b83a6a2a650ec71d73c2
 License: MIT
 Copyright: Copyright (c) 2020-2023 UserNobody14 and others
-Notes: Vendored unmodified; package.json declares ISC, the LICENSE file governs. See internal/parser/treesitter/dartgrammar/PROVENANCE.md.
+Notes: parser.c generated at ABI 14 from the unmodified upstream grammar; scanner, headers and LICENSE vendored unmodified; package.json declares ISC, the LICENSE file governs. See internal/parser/treesitter/dartgrammar/PROVENANCE.md.
 
 Copyright (c) 2020-2023 UserNobody14 and others
 

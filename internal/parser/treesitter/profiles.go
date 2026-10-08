@@ -35,10 +35,10 @@ func (a *ScalaAdapter) Profile() parser.Profile {
 	return parser.NewProfile("scala", "treesitter:scala:v3", false)
 }
 
-// Dart v1 records declarations, directives and call references but no call
+// Dart v2 records declarations, directives and call references but no call
 // edges; see DartAdapter.
 func (a *DartAdapter) Profile() parser.Profile {
-	return parser.NewProfile("dart", "treesitter:dart:v1", false)
+	return parser.NewProfile("dart", "treesitter:dart:v2", false)
 }
 
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding
