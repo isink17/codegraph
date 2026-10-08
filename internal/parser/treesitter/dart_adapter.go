@@ -21,10 +21,9 @@ import (
 // proves. Every call stays an unresolved reference.
 //
 // Declarations are recorded at the top level and in the bodies of classes,
-// mixins, named extensions, extension types and enums. A declaration whose
-// subtree holds a parse error is skipped with everything inside it, because
-// tree-sitter's recovery can swallow the declarations that follow it into the
-// broken one.
+// mixins, named extensions, extension types and enums. In a file with a parse
+// error only the declarations that end before the first error are recorded;
+// see dartMembers.
 //
 // Qualified names are `Owner.member`; a library has no name prefix because a
 // Dart library is its file. Constructors are named the way Dart spells their
@@ -48,8 +47,12 @@ func (a *DartAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	}
 	pf := graph.ParsedFile{Language: "dart", FileTokens: computeFileTokens(content)}
 	dartDirectives(root, content, &pf)
-	dartMembers(root, "", content, &pf)
 	broken := root.HasError()
+	limit := ^uint32(0)
+	if broken {
+		limit = dartFirstErrorByte(root)
+	}
+	dartMembers(root, "", limit, content, &pf)
 	var walk func(n *sitter.Node)
 	walk = func(n *sitter.Node) {
 		if ref, ok := dartCallReference(n, content); ok && (!broken || !dartInError(n)) {
@@ -84,10 +87,8 @@ func dartDirectives(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 				if s := dartURI(uri, content); s != "" {
 					pf.Imports = append(pf.Imports, s)
 				}
-			} else if name := firstChild(child, "dotted_identifier_list"); name != nil {
-				// `part of a.b;` names the owning library, not a file.
-				pf.Imports = append(pf.Imports, nodeText(name, content))
 			}
+			// `part of a.b;` names the owning library, not a URI: not recorded.
 		}
 	}
 }
@@ -167,38 +168,64 @@ func dartURI(uri *sitter.Node, content []byte) string {
 	return ""
 }
 
+// dartFirstErrorByte is the start of the first ERROR or MISSING node in
+// document order.
+func dartFirstErrorByte(n *sitter.Node) uint32 {
+	if n.Type() == "ERROR" || n.IsMissing() {
+		return n.StartByte()
+	}
+	for i := range int(n.ChildCount()) {
+		if child := n.Child(i); child.HasError() {
+			return dartFirstErrorByte(child)
+		}
+	}
+	return n.EndByte()
+}
+
 // dartMembers records the declarations directly under parent: the program,
 // or a class, mixin, extension, extension type or enum body. A function or
 // method is a signature node followed by its function_body sibling.
-func dartMembers(parent *sitter.Node, owner string, content []byte, pf *graph.ParsedFile) {
+//
+// Only declarations that end before limit, the first parse error, are
+// recorded. Text before the first error parsed without recovery, so its
+// declarations and owners are the ones the source spells; after it,
+// recovery may have closed a body early, swallowed a later declaration into
+// an unclosed one, or turned a misspelt keyword into a different
+// declaration. A type that does not end before the error is dropped with all
+// of its members, since its extent is no longer known.
+func dartMembers(parent *sitter.Node, owner string, limit uint32, content []byte, pf *graph.ParsedFile) {
 	for i := 0; i < int(parent.ChildCount()); i++ {
 		child := parent.Child(i)
 		var body *sitter.Node
 		if next := child.NextSibling(); next != nil && next.Type() == "function_body" {
 			body = next
 		}
-		if (child.HasError() && !dartContainedError(child)) || (body != nil && body.HasError()) {
-			continue
+		end := child
+		if body != nil {
+			end = body
+		}
+		if end.EndByte() >= limit {
+			return
 		}
 		switch child.Type() {
 		case "class_definition":
-			dartType(child, "class", childByFieldName(child, "name"), childByFieldName(child, "body"), content, pf)
+			dartType(child, "class", childByFieldName(child, "name"), childByFieldName(child, "body"), limit, content, pf)
 		case "mixin_declaration":
-			dartType(child, "mixin", firstChild(child, "identifier"), firstChild(child, "class_body"), content, pf)
+			dartType(child, "mixin", firstChild(child, "identifier"), firstChild(child, "class_body"), limit, content, pf)
 		case "extension_declaration":
 			// An unnamed extension cannot be named anywhere; its members are
 			// not recorded.
-			dartType(child, "extension", childByFieldName(child, "name"), childByFieldName(child, "body"), content, pf)
+			dartType(child, "extension", childByFieldName(child, "name"), childByFieldName(child, "body"), limit, content, pf)
 		case "extension_type_declaration":
 			name := childByFieldName(child, "name")
-			dartType(child, "extension_type", name, childByFieldName(child, "body"), content, pf)
+			dartType(child, "extension_type", name, childByFieldName(child, "body"), limit, content, pf)
 			if rep := childByFieldName(child, "representation"); rep != nil && name != nil {
 				if field := childByFieldName(rep, "name"); field != nil {
 					dartSymbol(rep, rep, "field", "value", nodeText(name, content), nodeText(field, content), "", content, pf)
 				}
 			}
 		case "enum_declaration":
-			dartType(child, "enum", childByFieldName(child, "name"), childByFieldName(child, "body"), content, pf)
+			dartType(child, "enum", childByFieldName(child, "name"), childByFieldName(child, "body"), limit, content, pf)
 		case "type_alias":
 			if owner == "" {
 				dartSymbol(child, child, "typedef", "type", "", dartTypedefName(child, content), "", content, pf)
@@ -228,14 +255,14 @@ func dartMembers(parent *sitter.Node, owner string, content []byte, pf *graph.Pa
 	}
 }
 
-func dartType(node *sitter.Node, kind string, nameNode, body *sitter.Node, content []byte, pf *graph.ParsedFile) {
+func dartType(node *sitter.Node, kind string, nameNode, body *sitter.Node, limit uint32, content []byte, pf *graph.ParsedFile) {
 	if nameNode == nil {
 		return
 	}
 	name := nodeText(nameNode, content)
 	dartSymbol(node, node, kind, "type", "", name, dartHeader(node, body, content), content, pf)
 	if body != nil {
-		dartMembers(body, name, content, pf)
+		dartMembers(body, name, limit, content, pf)
 	}
 }
 
@@ -364,36 +391,6 @@ func dartTypedefName(node *sitter.Node, content []byte) string {
 		}
 	}
 	return ""
-}
-
-// dartContainedError reports a type declaration whose parse error stays
-// inside one of its members: the header is clean and the body is closed by a
-// real `}`. Its members are then read one by one and only the broken ones
-// are skipped; an unclosed body may have swallowed what follows it, so any
-// other error drops the whole declaration.
-func dartContainedError(node *sitter.Node) bool {
-	switch node.Type() {
-	case "class_definition", "mixin_declaration", "extension_declaration", "extension_type_declaration", "enum_declaration":
-	default:
-		return false
-	}
-	var body *sitter.Node
-	for i := range int(node.ChildCount()) {
-		child := node.Child(i)
-		switch child.Type() {
-		case "class_body", "extension_body", "enum_body":
-			body = child
-		default:
-			if child.HasError() {
-				return false
-			}
-		}
-	}
-	if body == nil || body.ChildCount() == 0 {
-		return false
-	}
-	last := body.Child(int(body.ChildCount()) - 1)
-	return last.Type() == "}" && !last.IsMissing()
 }
 
 // dartTopLevelVariableStart is the first modifier or type node of a top-level

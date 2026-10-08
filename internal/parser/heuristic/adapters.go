@@ -135,7 +135,8 @@ func NewDart() *Adapter {
 		language: "dart",
 		exts:     extSet(".dart"),
 		imports: []importPattern{
-			{re: regexp.MustCompile(`^\s*(?:import|export|part\s+of|part)\s+r?['"]([^'"$]+)['"]`), nameGroup: 1},
+			{re: regexp.MustCompile(`^\s*(?:import|export|part\s+of|part)\s+r?'([^'$]+)'`), nameGroup: 1},
+			{re: regexp.MustCompile(`^\s*(?:import|export|part\s+of|part)\s+r?"([^"$]+)"`), nameGroup: 1},
 		},
 		rawImports: true,
 		symbols: []symbolPattern{

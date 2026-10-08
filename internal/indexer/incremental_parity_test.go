@@ -104,7 +104,8 @@ func TestDartCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	symbols("provider renamed", map[string]int{"type:dart:Caller": 1, "func:dart:Caller.run": 1, "func:dart:Caller.local": 1, "func:dart:renamed": 1})
 	r.write(t, "lib/caller.dart", strings.Replace(caller, "void local() {}", "void local() { var x = ; }", 1))
 	r.update(t, "lib/caller.dart")
-	symbols("member broken", map[string]int{"type:dart:Caller": 1, "func:dart:Caller.run": 1, "func:dart:renamed": 1})
+	// A parse error drops every declaration that does not end before it.
+	symbols("member broken", map[string]int{"func:dart:renamed": 1})
 	r.write(t, "lib/caller.dart", caller)
 	r.remove(t, "lib/provider.dart")
 	r.update(t, "lib/caller.dart", "lib/provider.dart")

@@ -14,7 +14,8 @@ MIT notice in that `LICENSE`.
 
 The adapter (profile `treesitter:dart:v1`) records:
 
-- `import`, `export`, `part` and `part of` URIs as written, including the
+- `import`, `export`, `part` and `part of` URIs as written (a `part of`
+  library name is not a URI and is not recorded), including the
   alternatives of a conditional import, with `as` prefixes, `show` names,
   `hide` names and `deferred` as import evidence. No URI is mapped to a file:
   `package:` URIs need `pubspec.yaml` and `package_config.json`, which are not
@@ -34,11 +35,18 @@ It builds no call graph in any build (`codegraph doctor` lists Dart as
 degraded): what a Dart call runs depends on the receiver's static type
 (extension methods, cascades), mixin linearization, implicit `this`, library
 privacy across `part` files and package resolution. Unnamed extensions,
-local declarations and destructuring patterns are not recorded. A declaration
-whose subtree holds a parse error is skipped with everything inside it; a type
-whose error stays inside one member keeps its other members. The grammar does
+local declarations and destructuring patterns are not recorded. In a file
+with a parse error only the declarations that end before the first error (or
+missing token) are recorded: text before it parsed without recovery, while
+recovery after it may close a body early, swallow later declarations into an
+unclosed one or read a misspelt keyword as another declaration. A type that
+does not end before the error is dropped with all its members. Call
+references are kept unless they sit inside an error node. The grammar does
 not parse null-aware elements (`[?x]`, Dart 3.8) or dot shorthands (Dart 3.10),
-so a declaration using them drops out.
+so a file using them keeps only the declarations before the first use.
 
 Non-CGO builds use `heuristic:dart:v1`: type declarations, typed function
 headers and directive URIs from regular expressions, without call references.
+Its comment stripper does not nest block comments (Dart's `/* /* */ */`
+does), and it can misread multi-line `'''` strings, so text there may yield
+spurious symbols.

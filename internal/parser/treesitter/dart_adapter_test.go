@@ -239,8 +239,9 @@ part 'app.g.dart';
 	if !reflect.DeepEqual(part.Imports, []string{"app.dart"}) || len(part.Scope.Imports) != 0 {
 		t.Fatalf("part of = %q %+v", part.Imports, part.Scope.Imports)
 	}
+	// A library name is not a URI.
 	named := parseDart(t, "part of app.models;\n")
-	if !reflect.DeepEqual(named.Imports, []string{"app.models"}) {
+	if len(named.Imports) != 0 {
 		t.Fatalf("part of library name = %q", named.Imports)
 	}
 }
@@ -304,25 +305,28 @@ void tail() {}
 		}
 	}
 
-	contained := parseDart(t, `class A {
-  void ok() { first(); }
+	// Only declarations that end before the first error are recorded, even
+	// when the error looks contained: recovery after it is not trusted.
+	contained := parseDart(t, `void before() { first(); }
+class A {
+  void ok() {}
   void broken() { var x = ; }
-  void after() { second(); }
+  void after() {}
 }
 void tail() { third(); }
 `)
-	assertDartKeys(t, contained, []string{"class type:dart:A", "method func:dart:A.ok", "method func:dart:A.after", "function func:dart:tail"})
-	if got := dartRefs(contained); !reflect.DeepEqual(got, []string{"first", "second", "third"}) {
+	assertDartKeys(t, contained, []string{"function func:dart:before"})
+	if got := dartRefs(contained); !reflect.DeepEqual(got, []string{"first", "third"}) {
 		t.Fatalf("references = %q", got)
 	}
 
 	// Words error recovery leaves behind are not top-level variables.
-	stray := parseDart(t, "part of 'lib.dart';\nimport 'a.dart' show X, Y hide Z;\nconst kept = 1;\n")
-	assertDartKeys(t, stray, []string{"variable value:dart:kept"})
+	stray := parseDart(t, "part of 'lib.dart';\nimport 'a.dart' show X, Y hide Z;\nconst after = 1;\n")
+	assertDartKeys(t, stray, []string{})
 
 	// The pinned grammar predates null-aware elements (Dart 3.8): the
-	// function holding one is not recorded, the rest of the file is.
-	nullAware := parseDart(t, "List<int> f(int? x) => [?x];\nvoid g() {}\n")
+	// function holding one and everything after it are not recorded.
+	nullAware := parseDart(t, "void g() {}\nList<int> f(int? x) => [?x];\nvoid h() {}\n")
 	assertDartKeys(t, nullAware, []string{"function func:dart:g"})
 }
 
@@ -416,5 +420,66 @@ func TestDartAdapterProfileIsSymbolsOnly(t *testing.T) {
 	}
 	if !a.Supports("lib/main.dart") || !a.Supports("A.DART") || a.Supports("main.dart.js") {
 		t.Fatal("Supports mismatch")
+	}
+}
+
+// Deleting any one byte must never give a declaration a different owner or
+// invent a name: every symbol a damaged file yields is one the intact file
+// declares, with the same kind and owner. Deletions that only rename an
+// identifier (a byte inside one, or the separator between two) are skipped.
+func TestDartAdapterByteDeletionNeverMisattributes(t *testing.T) {
+	const src = `library app;
+import 'package:a/a.dart' as a show B;
+
+/// Docs.
+abstract class Shape<T> extends Base with Mix implements I {
+  final int x, y;
+  static const k = 1;
+  Shape(this.x, this.y);
+  Shape.origin() : this(0, 0);
+  factory Shape.make(int v) => Shape(v, v);
+  int get area => x * y;
+  set area(int v) {}
+  int operator +(Shape o) => 0;
+  void draw() { helper(x); }
+}
+mixin Mix on Base {
+  void mixed() {}
+}
+enum Color { red, green; void paint() {} }
+extension Ext on String {
+  int twice() => 2;
+}
+extension type Id(int v) {
+  bool get ok => v > 0;
+}
+typedef Fn = int Function(int);
+int top = 1;
+int get total => top;
+void helper(int n) {
+  final list = [for (var i = 0; i < n; i++) i];
+  print(list);
+}
+class Last {
+  void end() {}
+}
+`
+	clean := map[string]bool{}
+	for _, s := range parseDart(t, src).Symbols {
+		clean[s.Kind+" "+s.StableKey+" @"+s.ContainerName] = true
+	}
+	ident := func(b byte) bool {
+		return b == '_' || b == '$' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+	}
+	for i := range len(src) {
+		if ident(src[i]) || (i > 0 && i+1 < len(src) && ident(src[i-1]) && ident(src[i+1])) {
+			continue
+		}
+		damaged := src[:i] + src[i+1:]
+		for _, s := range parseDart(t, damaged).Symbols {
+			if key := s.Kind + " " + s.StableKey + " @" + s.ContainerName; !clean[key] {
+				t.Errorf("deleting byte %d (%q) yields %s", i, src[i], key)
+			}
+		}
 	}
 }

@@ -357,6 +357,10 @@ void main() {}
 	if len(pf.Edges) != 0 || strings.Join(pf.Imports, ",") != "package:flutter/material.dart,src/model.dart,app.g.dart" {
 		t.Fatalf("edges = %v imports = %v", pf.Edges, pf.Imports)
 	}
+	pf, err = NewDart().Parse(context.Background(), "lib/q.dart", []byte("import 'a.dart\";\nimport \"b.dart';\n"))
+	if err != nil || len(pf.Imports) != 0 {
+		t.Fatalf("mismatched quotes = %q, %v", pf.Imports, err)
+	}
 	if p := NewDart().Profile(); p.ID != "heuristic:dart:v1" || p.EmitsCallEdges {
 		t.Fatalf("profile = %+v", p)
 	}
