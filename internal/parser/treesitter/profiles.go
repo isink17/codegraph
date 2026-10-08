@@ -18,6 +18,12 @@ func (a *LuaAdapter) Profile() parser.Profile {
 	return tsProfile("lua")
 }
 
+// Scala v1 records declarations, imports and call references but no call
+// edges; see ScalaAdapter.
+func (a *ScalaAdapter) Profile() parser.Profile {
+	return parser.NewProfile("scala", "treesitter:scala:v1", false)
+}
+
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding
 // evidence it shares with the non-cgo adapter: Unicode imports now bind, Unicode
 // locals now shadow, and a nested `def café` no longer binds the fragment `caf`.

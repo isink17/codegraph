@@ -2,10 +2,13 @@
 
 package cli
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // The cgo build parses every supported language with tree-sitter, and all of
-// those adapters build a call graph.
+// those adapters except Scala build a call graph.
 func TestCgoRegistryProfiles(t *testing.T) {
 	for _, lang := range newDefaultRegistry().SupportedLanguages() {
 		want := "treesitter:" + lang.Language + ":v1"
@@ -39,12 +42,12 @@ func TestCgoRegistryProfiles(t *testing.T) {
 		if lang.ParserProfile != want {
 			t.Fatalf("%s: parser profile = %q, want %q", lang.Language, lang.ParserProfile, want)
 		}
-		if !lang.CallEdges {
-			t.Fatalf("%s: CallEdges = false, want true for a tree-sitter adapter", lang.Language)
+		if lang.CallEdges == (lang.Language == "scala") {
+			t.Fatalf("%s: CallEdges = %v; only Scala is symbols-only under tree-sitter", lang.Language, lang.CallEdges)
 		}
 	}
-	if degraded := newDefaultRegistry().DegradedLanguages(); len(degraded) != 0 {
-		t.Fatalf("DegradedLanguages() = %v, want none in the cgo build", degraded)
+	if degraded := strings.Join(newDefaultRegistry().DegradedLanguages(), ","); degraded != "scala" {
+		t.Fatalf("DegradedLanguages() = %v, want only scala in the cgo build", degraded)
 	}
 	for _, capability := range newDefaultRegistry().Capabilities() {
 		if capability.NoCGOParser == nil || !*capability.NoCGOParser {

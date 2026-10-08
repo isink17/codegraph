@@ -235,7 +235,7 @@ var nodeCoreModules = map[string]bool{
 // coverage table; internal/cli tests compare that table with the live registry.
 var canonicalLanguages = []string{
 	"cpp", "csharp", "go", "java", "kotlin", "lua", "php", "python", "ruby",
-	"rust", "swift", "typescript",
+	"rust", "scala", "swift", "typescript",
 }
 
 // shadowingGap documents the one asymmetry in how project evidence is used.
@@ -282,6 +282,8 @@ var conservativeGaps = map[string]string{
 		"no composer autoload map is indexed",
 	"ruby": "the `require` vs `require_relative` distinction is not persisted, " +
 		"so a gem and a project file are the same bare string",
+	"scala": "`import scala.util.Try` and a first-party `com.acme.Util` are the same " +
+		"dotted shape, no build definition is indexed, and no Scala call edge exists",
 	"swift": "`import Foundation` and `import MyFramework` are the same " +
 		"single-identifier form; no SDK or package manifest is indexed",
 	"go": "external is unprovable: a dependency path and this repository's own " +

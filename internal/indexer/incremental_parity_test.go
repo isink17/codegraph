@@ -54,7 +54,52 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua())
+	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala())
+}
+
+// Scala builds no call graph: a call whose only candidate is a same-named
+// method elsewhere, or an overload in the same object, stays edgeless on every
+// path, and overloads and a companion keep their symbols across updates.
+func TestScalaCallsStayEdgelessAndLifecycleParity(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Caller.scala":   "package app\nobject Caller { def run(): Int = Provider.target(1) + local(1)\n  def local(x: Int): Int = x\n  def local(x: String): Int = 0 }\n",
+		"Provider.scala": "package app\nclass Provider\nobject Provider { def target(x: Int): Int = x }\n",
+	})
+	for _, name := range []string{"Provider.target", "local"} {
+		if got := r.edgeState(t, "Caller.scala", name); got != "<no edge>" {
+			t.Fatalf("Scala call %s produced an edge = %s", name, got)
+		}
+	}
+	symbols := func(step string, want map[string]int) {
+		t.Helper()
+		got := map[string]int{}
+		page, err := r.store.ExportSymbolsPage(r.ctx, r.repoID, 1000, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range page {
+			got[s.StableKey]++
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: symbols = %v, want %v", step, got, want)
+		}
+	}
+	callerSymbols := map[string]int{"object:scala:app.Caller": 1, "func:scala:app.Caller$.run": 1, "func:scala:app.Caller$.local": 2}
+	symbols("fresh", map[string]int{"object:scala:app.Caller": 1, "func:scala:app.Caller$.run": 1, "func:scala:app.Caller$.local": 2,
+		"type:scala:app.Provider": 1, "object:scala:app.Provider": 1, "func:scala:app.Provider$.target": 1})
+	r.assertFreshParity(t, "fresh")
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	r.write(t, "Provider.scala", "package app\nobject Provider { def renamed(x: Int): Int = x }\n")
+	r.update(t, "Provider.scala")
+	symbols("provider renamed", map[string]int{"object:scala:app.Caller": 1, "func:scala:app.Caller$.run": 1, "func:scala:app.Caller$.local": 2,
+		"object:scala:app.Provider": 1, "func:scala:app.Provider$.renamed": 1})
+	r.assertFreshParity(t, "provider renamed")
+	r.remove(t, "Provider.scala")
+	r.update(t, "Provider.scala")
+	symbols("provider deleted", callerSymbols)
+	r.assertFreshParity(t, "provider deleted")
 }
 
 func TestLuaGlobalCallRemainsUnresolvedAndLifecycleParity(t *testing.T) {
