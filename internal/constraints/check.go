@@ -318,6 +318,18 @@ func Check(ctx context.Context, opts Options, open Opener) (Result, error) {
 		}
 		return Result{}, err
 	}
+	// Strict mode reads freshness before any graph row, so a scan that lands
+	// between this read and the last one is seen as activity during the
+	// check rather than mixing older files with newer edges unnoticed.
+	var before graph.Freshness
+	if opts.StrictFreshness {
+		if before, err = st.FreshnessStatus(ctx, repoID); err != nil {
+			return Result{}, err
+		}
+		if strictBeforeHook != nil {
+			strictBeforeHook()
+		}
+	}
 	info, err := st.ConstraintIndexInfo(ctx, repoID)
 	if err != nil {
 		return Result{}, err
@@ -411,12 +423,6 @@ func Check(ctx context.Context, opts Options, open Opener) (Result, error) {
 
 	// 4. Staleness. Findings are still computed under stale.
 	stale := info.DirtyFiles > 0
-	var before graph.Freshness
-	if opts.StrictFreshness {
-		if before, err = st.FreshnessStatus(ctx, repoID); err != nil {
-			return Result{}, err
-		}
-	}
 
 	// 5. Evaluate.
 	edges, err := st.ConstraintEdges(ctx, repoID)
@@ -514,15 +520,20 @@ func Check(ctx context.Context, opts Options, open Opener) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		res.Freshness = strictFreshness(res.Status, before, after)
+		res.Freshness = strictFreshness(res.Status, info.LastScanID, before, after)
 	}
 	return res, nil
 }
 
+// strictBeforeHook, when set by a test, runs right after the strict
+// freshness read that precedes every graph read.
+var strictBeforeHook func()
+
 // strictFreshness decides the strict verdict from the freshness read before
-// and after the evaluation. A proven gap (insufficient_coverage) outranks a
+// every graph read and after the evaluation; lastScanID is the newest scan id
+// the graph reads saw, which must be before's latest scan. A proven gap (insufficient_coverage) outranks a
 // missing fact (unknown); known_stale outranks both.
-func strictFreshness(status string, before, after graph.Freshness) *StrictFreshness {
+func strictFreshness(status string, lastScanID int64, before, after graph.Freshness) *StrictFreshness {
 	out := &StrictFreshness{
 		State:        before.State,
 		StateReasons: before.Reasons,
@@ -550,8 +561,12 @@ func strictFreshness(status string, before, after graph.Freshness) *StrictFreshn
 		if before.Coverage.FailedAfterLastFull > 0 {
 			insufficient = append(insufficient, "scan_failed_after_full_scan")
 		}
-		if full.Overlap != "none" {
+		switch full.Overlap {
+		case "none":
+		case "yes":
 			unknown = append(unknown, "full_scan_overlapped_another_scan")
+		default:
+			unknown = append(unknown, "full_scan_overlap_not_recorded")
 		}
 		switch {
 		case full.HeadAtStart == "" || full.HeadAtFinish == "":
@@ -564,7 +579,7 @@ func strictFreshness(status string, before, after graph.Freshness) *StrictFreshn
 			insufficient = append(insufficient, "head_moved_since_full_scan")
 		}
 	}
-	if !sameScanState(before, after) {
+	if !sameScanState(before, after) || before.LatestScan == nil || before.LatestScan.ID != lastScanID {
 		unknown = append(unknown, "scan_activity_during_check")
 	}
 	switch {

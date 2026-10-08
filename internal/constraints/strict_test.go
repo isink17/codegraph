@@ -18,10 +18,11 @@ import (
 
 func freshnessAt(head string, full *graph.FreshnessScan) graph.Freshness {
 	return graph.Freshness{
-		State:    graph.FreshnessNoKnownStaleness,
-		Reasons:  []string{},
-		Worktree: graph.FreshnessWorktree{HeadNow: head},
-		Coverage: graph.FreshnessCoverage{Recorded: true, LastFullScan: full},
+		State:      graph.FreshnessNoKnownStaleness,
+		Reasons:    []string{},
+		LatestScan: &graph.FreshnessScan{ID: 7, Status: "completed"},
+		Worktree:   graph.FreshnessWorktree{HeadNow: head},
+		Coverage:   graph.FreshnessCoverage{Recorded: true, LastFullScan: full},
 	}
 }
 
@@ -59,7 +60,7 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 		{"no full scan", StatusOK, freshnessAt("h1", nil), VerdictInsufficientCoverage, ExitInsufficientCoverage, []string{"no_recorded_full_scan"}},
 		{"failed after full", StatusViolations, failedAfter, VerdictInsufficientCoverage, ExitInsufficientCoverage, []string{"scan_failed_after_full_scan"}},
 		{"overlapped writer", StatusOK, freshnessAt("h1", fullScan("h1", "h1", "yes")), VerdictUnknown, ExitFreshnessUnknown, []string{"full_scan_overlapped_another_scan"}},
-		{"overlap unrecorded", StatusOK, freshnessAt("h1", fullScan("h1", "h1", "unknown")), VerdictUnknown, ExitFreshnessUnknown, []string{"full_scan_overlapped_another_scan"}},
+		{"overlap unrecorded", StatusOK, freshnessAt("h1", fullScan("h1", "h1", "unknown")), VerdictUnknown, ExitFreshnessUnknown, []string{"full_scan_overlap_not_recorded"}},
 		{"head not recorded", StatusOK, freshnessAt("h1", fullScan("", "h1", "none")), VerdictUnknown, ExitFreshnessUnknown, []string{"full_scan_head_not_recorded"}},
 		{"head moved during scan", StatusOK, freshnessAt("h2", fullScan("h1", "h2", "none")), VerdictInsufficientCoverage, ExitInsufficientCoverage, []string{"head_moved_during_full_scan"}},
 		{"head now unknown", StatusOK, freshnessAt("unknown", fullScan("h1", "h1", "none")), VerdictUnknown, ExitFreshnessUnknown, []string{"head_now_unknown"}},
@@ -68,7 +69,7 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := strictFreshness(tc.status, tc.f, tc.f)
+			got := strictFreshness(tc.status, 7, tc.f, tc.f)
 			if got.Verdict != tc.verdict || got.ExitCode != tc.code || !slices.Equal(got.Reasons, tc.reasons) {
 				t.Fatalf("got %s exit %d reasons %v; want %s exit %d reasons %v", got.Verdict, got.ExitCode, got.Reasons, tc.verdict, tc.code, tc.reasons)
 			}
@@ -84,7 +85,9 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 	// A scan that starts, closes or queues work during the check, or a HEAD
 	// that moves during it, makes an otherwise proven verdict unknown.
 	proven := freshnessAt("h1", fullScan("h1", "h1", "none"))
-	proven.LatestScan = &graph.FreshnessScan{ID: 7, Status: "completed"}
+	if got := strictFreshness(StatusOK, 8, proven, proven); got.Verdict != VerdictUnknown || !slices.Equal(got.Reasons, []string{"scan_activity_during_check"}) {
+		t.Fatalf("graph read a newer scan than freshness: %+v", got)
+	}
 	for name, mutate := range map[string]func(*graph.Freshness){
 		"new scan":    func(f *graph.Freshness) { f.LatestScan = &graph.FreshnessScan{ID: 8, Status: "running"} },
 		"scan closed": func(f *graph.Freshness) { f.LatestScan = &graph.FreshnessScan{ID: 7, Status: "failed"} },
@@ -93,7 +96,7 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 	} {
 		after := proven
 		mutate(&after)
-		got := strictFreshness(StatusOK, proven, after)
+		got := strictFreshness(StatusOK, 7, proven, after)
 		if got.Verdict != VerdictUnknown || got.ExitCode != ExitFreshnessUnknown || !slices.Equal(got.Reasons, []string{"scan_activity_during_check"}) {
 			t.Fatalf("%s: got %+v", name, got)
 		}
@@ -191,7 +194,30 @@ func TestStrictFreshnessTransitions(t *testing.T) {
 	if err := s.st.QueueDirtyFiles(context.Background(), s.id, []string{"internal/domain/a.go"}, "modified"); err != nil {
 		t.Fatal(err)
 	}
-	s.expect(t, StatusStale, VerdictKnownStale, ExitKnownStale)
+	res = s.expect(t, StatusStale, VerdictKnownStale, ExitKnownStale)
+	// The reason comes from the freshness read itself, not the fallback.
+	if !slices.Contains(res.Freshness.StateReasons, "dirty_queue_nonempty") || !slices.Equal(res.Freshness.Reasons, res.Freshness.StateReasons) {
+		t.Fatalf("stale reasons = %v / %v", res.Freshness.Reasons, res.Freshness.StateReasons)
+	}
+}
+
+// A scan completing after the strict freshness read but before the graph is
+// read leaves the findings resting on rows the verdict did not see: unknown.
+func TestStrictFreshnessScanDuringCheck(t *testing.T) {
+	s := newStrictRepo(t)
+	s.run(t, indexer.Options{})
+	s.expect(t, StatusOK, VerdictFullCoverageAtHead, 0)
+	strictBeforeHook = func() {
+		strictBeforeHook = nil
+		s.run(t, indexer.Options{})
+	}
+	t.Cleanup(func() { strictBeforeHook = nil })
+	res := s.expect(t, StatusOK, VerdictUnknown, ExitFreshnessUnknown)
+	if !slices.Equal(res.Freshness.Reasons, []string{"scan_activity_during_check"}) {
+		t.Fatalf("reasons = %v", res.Freshness.Reasons)
+	}
+	// Once nothing runs during the check, the same graph is proven again.
+	s.expect(t, StatusOK, VerdictFullCoverageAtHead, 0)
 }
 
 // Without strict mode the result has no freshness key and the exit code is

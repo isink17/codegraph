@@ -40,7 +40,7 @@ func runCheckConstraints(ctx context.Context, cfg config.Config, stdout io.Write
 	configFlag := fs.String("config", "", "constraints document (optional)")
 	limit := fs.Int("limit", 0, "findings per page")
 	offset := fs.Int("offset", 0, "offset into the findings")
-	strict := fs.Bool("strict-freshness", false, "fail unless whole-repository coverage at the current HEAD is proven")
+	strict := fs.Bool("strict-freshness", false, "fail unless whole-repository coverage at the current HEAD is proven; uncommitted edits are not checked")
 
 	repoRootCandidate, err := parseOptionalRepoRootArg(fs, args, repoRootFlag, "")
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/constraints"
+	"github.com/isink17/codegraph/internal/githistory/gittest"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -206,6 +207,59 @@ func TestCheckConstraintsCLIStrictFreshness(t *testing.T) {
 	}
 	if _, _, code := checkCLI(t, "check_constraints", root, "--strict-freshness=bogus"); code != 2 {
 		t.Fatalf("invalid flag value exit %d, want 2", code)
+	}
+}
+
+// Strict exit codes through the CLI on a real Git repository: a proven full
+// scan keeps exit 0, a queued change moves stale from exit 2 to 3, and a
+// config error stays exit 2 with no freshness block.
+func TestCheckConstraintsCLIStrictExitCodes(t *testing.T) {
+	root := constraintsRepo(t, true)
+	if err := os.WriteFile(filepath.Join(root, "internal/domain/a.go"), []byte("package domain\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gittest.Require(t)
+	repo := &gittest.Repo{T: t, Dir: root}
+	repo.Git("init", "-q", "-b", "main")
+	repo.Write(".gitignore", ".codegraph/\n")
+	repo.Commit("", "one")
+	if _, _, err := runCLI(t, "index", root); err != nil {
+		t.Fatal(err)
+	}
+	out, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusOK || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictFullCoverageAtHead || code != 0 {
+		t.Fatalf("proven: status %s exit %d\n%s", res.Status, code, out)
+	}
+
+	opened, err := openIndexedRepoReadOnly(context.Background(), loadTestConfig(t), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath, repoID := opened.DBPath, opened.Repo.ID
+	opened.Close()
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.QueueDirtyFiles(context.Background(), repoID, []string{"internal/domain/a.go"}, "modified"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if _, res, code := checkCLI(t, "check_constraints", root); res.Status != constraints.StatusStale || res.Freshness != nil || code != 2 {
+		t.Fatalf("default stale: status %s exit %d", res.Status, code)
+	}
+	if _, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness"); res.Status != constraints.StatusStale ||
+		res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictKnownStale || code != constraints.ExitKnownStale {
+		t.Fatalf("strict stale: status %s freshness %+v exit %d", res.Status, res.Freshness, code)
+	}
+
+	overlap := `{"schema_version":1,"groups":{"a":{"include":["internal/**"]},"b":{"include":["internal/domain/**"]}},"rules":[]}`
+	if err := os.WriteFile(filepath.Join(root, constraints.ConfigFileName), []byte(overlap), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness"); res.Status != constraints.StatusConfigError ||
+		res.Errors[0].Code != constraints.CodeGroupOverlap || res.Freshness != nil || code != 2 {
+		t.Fatalf("strict group overlap: status %s errors %+v freshness %+v exit %d", res.Status, res.Errors, res.Freshness, code)
 	}
 }
 

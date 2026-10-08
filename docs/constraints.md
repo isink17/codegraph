@@ -207,7 +207,7 @@ are unchanged (exit 2, no `freshness`).
 |---|---|---|
 | `full_coverage_at_head` | no known staleness, and the newest completed full scan started and finished at the current HEAD, overlapped no other scan, and no scan has failed since | 0 (`ok`) or 1 (`violations`) |
 | `known_stale` | `status` is `stale`, or graph_stats freshness is `known_stale` (failed or running latest scan, dirty queue, HEAD moved past the history watermark) | 3 |
-| `unknown` | the deciding fact was not recorded or not readable: no completed scan, a database from before coverage recording (read-only, unmigrated), a full scan without recorded HEADs, HEAD unreadable now, a full scan that overlapped another scan (including a row a crashed scan left `running`), or scan activity between the start and end of the check | 4 |
+| `unknown` | the deciding fact was not recorded or not readable: no completed scan, a database from before coverage recording (read-only, unmigrated), a full scan without recorded HEADs, HEAD unreadable now, a full scan that overlapped another scan (including a row a crashed scan left `running`), or scan activity between the freshness read that precedes every graph read and the one after the evaluation | 4 |
 | `insufficient_coverage` | no known staleness, but no recorded full scan, or a scan failed after it, or HEAD moved during it or since it (a path-scoped `update` or watch flush never counts as full, even when it advanced the history watermark) | 5 |
 
 A proven gap (`insufficient_coverage`) outranks `unknown`. `freshness` also carries
@@ -221,7 +221,9 @@ full scan or closed no earlier than it started.
 
 `full_coverage_at_head` is not "fresh": uncommitted edits, watcher events that
 were never queued, a changed repository configuration and a HEAD that moved away
-and back during the scan are not detected. Like `index`, `freshness` is history
+and back during the scan are not detected. A database read that fails with an error (unlike an
+unrecorded fact or an unreadable HEAD, which give `unknown`) is not a verdict: the CLI exits 2 and MCP returns a
+tool error, as in default mode. Like `index`, `freshness` is history
 metadata outside the same-bytes guarantee; CLI and MCP still agree byte for byte.
 
 ### Config error codes
