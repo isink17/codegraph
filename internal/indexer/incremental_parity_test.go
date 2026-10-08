@@ -154,6 +154,170 @@ func TestScalaCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	r.assertFreshParity(t, "provider deleted")
 }
 
+// A bare Scala call bound by lexical scope to a local def of the same file is
+// resolved on every path and follows renames, shadowing, damage and deletes;
+// a member call, a call on an object and a same-named member elsewhere never
+// answer it.
+func TestScalaLocalFunctionCallLifecycleParity(t *testing.T) {
+	const caller = `package app
+object Caller {
+  def run(): Int = {
+    def helper(x: Int): Int = x + 1
+    helper(1) + local(1) + Provider.target(1)
+  }
+  def local(x: Int): Int = x
+}
+`
+	r := newLifecycleRepo(t, tree{
+		"Caller.scala":   caller,
+		"Provider.scala": "package app\nobject Provider { def target(x: Int): Int = x }\n",
+	})
+	assertState := func(step, wantHelper string) {
+		t.Helper()
+		if got := r.edgeState(t, "Caller.scala", "helper"); got != wantHelper {
+			t.Fatalf("%s: helper edge = %q, want %q", step, got, wantHelper)
+		}
+		for _, name := range []string{"local", "Provider.target"} {
+			if got := r.edgeState(t, "Caller.scala", name); got != "<no edge>" {
+				t.Fatalf("%s: unproven call %s gained an edge = %s", step, name, got)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	bound := ` => Caller.scala:app.Caller.run.helper(function) [scala_local_function/high]`
+	assertState("fresh", bound)
+	if got := r.refTarget(t, "Caller.scala", "helper"); got != "app.Caller.run.helper" {
+		t.Fatalf("fresh: helper reference bound to %q", got)
+	}
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	assertState("no-op", bound)
+
+	// A same-named member elsewhere neither steals nor drops the binding.
+	r.write(t, "Provider.scala", "package app\nobject Provider { def target(x: Int): Int = x; def helper(x: Int): Int = 0 }\n")
+	r.update(t, "Provider.scala")
+	assertState("member helper added elsewhere", bound)
+
+	edit := func(step, old, replacement, want string) {
+		t.Helper()
+		r.write(t, "Caller.scala", strings.Replace(caller, old, replacement, 1))
+		r.update(t, "Caller.scala")
+		assertState(step, want)
+		r.write(t, "Caller.scala", caller)
+		r.update(t, "Caller.scala")
+		assertState(step+" restored", bound)
+	}
+	edit("local def renamed", "def helper(x: Int)", "def renamed(x: Int)", "<no edge>")
+	edit("local def shifted down", "    def helper", "    val pad = 0\n\n    def helper", bound)
+	edit("shadowed by a val", "    helper(1) +", "    val helper = (x: Int) => x\n    helper(1) +", "<no edge>")
+	edit("wildcard import in scope", "    def helper", "    import Provider._\n    def helper", "<no edge>")
+	edit("parse error", "  def local(x: Int): Int = x\n", "  def local(x: Int): Int = \n  val = 1\n", "<no edge>")
+	edit("local def deleted", "    def helper(x: Int): Int = x + 1\n", "", "<no edge>")
+
+	r.remove(t, "Provider.scala")
+	r.update(t, "Provider.scala")
+	assertState("provider deleted", bound)
+	r.remove(t, "Caller.scala")
+	r.update(t, "Caller.scala")
+	r.assertFreshParity(t, "caller deleted")
+}
+
+// A call in a case guard never binds a def declared in that case's body, in
+// braced, indented and catch forms, on every path.
+func TestScalaCaseGuardLifecycleParity(t *testing.T) {
+	const src = `object G {
+  def f(y: Int): Boolean = y > 0
+  def a(x: Int): Int = x match {
+    case n if f(n) =>
+      def f(y: Int): Boolean = false
+      if (f(n)) 1 else 2
+    case _ => 0
+  }
+  def c(x: Int): Int = try 1 catch {
+    case e: Exception if f(x) =>
+      def f(y: Int): Boolean = false
+      if (f(x)) 1 else 2
+  }
+}
+object H:
+  def f(y: Int): Boolean = y > 0
+  def b(x: Int): Int =
+    x match
+      case n if f(n) =>
+        def f(y: Int): Boolean = false
+        if f(n) then 1 else 2
+      case _ => 0
+`
+	r := newLifecycleRepo(t, tree{"G.scala": src})
+	calls := func(step string, want []string) {
+		t.Helper()
+		var got []string
+		for _, line := range r.projection(t) {
+			if strings.Contains(line, `-calls-> "f"`) {
+				got = append(got, line)
+			}
+		}
+		if !reflect.DeepEqual(got, want) && (len(got) != 0 || len(want) != 0) {
+			t.Fatalf("%s: f calls = %q, want %q", step, got, want)
+		}
+		r.assertFreshParity(t, step)
+	}
+	bodyOnly := []string{
+		`edge G.scala:G.a -calls-> "f" => G.scala:G.a.f(function) [scala_local_function/high]`,
+		`edge G.scala:G.c -calls-> "f" => G.scala:G.c.f(function) [scala_local_function/high]`,
+		`edge G.scala:H.b -calls-> "f" => G.scala:H.b.f(function) [scala_local_function/high]`,
+	}
+	calls("fresh", bodyOnly)
+	// With the body calls gone only guard calls remain, and none binds.
+	r.write(t, "G.scala", strings.NewReplacer("if (f(n)) 1 else 2", "1", "if (f(x)) 1 else 2", "1", "if f(n) then 1 else 2", "1").Replace(src))
+	r.update(t, "G.scala")
+	calls("body calls removed", nil)
+	r.write(t, "G.scala", src)
+	r.update(t, "G.scala")
+	calls("restored", bodyOnly)
+}
+
+// A Lua local function or a Scala local def is not addressable from another
+// file, so it is never a cross-language link end, even when a TypeScript file
+// imports its file and exports a function of the same name.
+func TestLocalFunctionsAreNeverCrossLanguageTargets(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Caller.scala": "object Caller {\n  def run(): Int = {\n    def helper(): Int = 1\n    helper()\n  }\n}\n",
+		"m.lua":        "local function helper() end\nhelper()\n",
+		"scala.ts":     "import { helper } from \"./Caller.scala\";\nexport function helper() {}\n",
+		"lua.ts":       "import { helper } from \"./m.lua\";\nexport function helper() {}\n",
+		// Control: a Rust module named local is an ordinary link target even
+		// though its keys contain ":local:".
+		"src/local.rs": "pub fn shared() {}\n",
+		"rs.ts":        "import { shared } from \"./src/local.rs\";\nexport function shared() {}\n",
+	})
+	intoLocals := func(step string) {
+		t.Helper()
+		var control int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id JOIN files f ON f.id = s.file_id WHERE e.repo_id = ? AND e.edge_kind = ? AND f.path = 'src/local.rs' AND s.name = 'shared'`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&control); err != nil {
+			t.Fatal(err)
+		}
+		if control == 0 {
+			t.Fatalf("%s: the Rust crate::local function is no longer a cross-language target", step)
+		}
+		var n int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND (s.stable_key GLOB 'func:lua:local:*' OR s.stable_key GLOB 'func:scala:local:*')`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("%s: %d cross-language edges into local functions", step, n)
+		}
+		r.assertFreshParity(t, step)
+	}
+	intoLocals("fresh")
+	r.write(t, "scala.ts", "import { helper } from \"./Caller.scala\";\nexport function helper() { return 1; }\n")
+	r.update(t, "scala.ts")
+	intoLocals("updated")
+}
+
 func TestLuaGlobalCallRemainsUnresolvedAndLifecycleParity(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"caller.lua":   `function caller() target() end`,
