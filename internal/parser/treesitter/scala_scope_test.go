@@ -89,6 +89,59 @@ class R extends Base {
 	}
 }
 
+// A case clause's defs are in scope in its body only: a call in its guard
+// binds further out (here, to a member, so nowhere), while the same call in
+// the body binds the clause's def.
+func TestScalaCaseGuardDoesNotSeeBodyDefs(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+		want      []string
+	}{
+		{"braced match", `object G {
+  def f(y: Int): Boolean = y > 0
+  def run(x: Int): Int = x match {
+    case n if f(n) =>
+      def f(y: Int): Boolean = false
+      if (f(n)) 1 else 2
+    case _ => 0
+  }
+}
+`, []string{"f@6:11->5:7"}},
+		{"indented match", `object G:
+  def f(y: Int): Boolean = y > 0
+  def run(x: Int): Int =
+    x match
+      case n if f(n) =>
+        def f(y: Int): Boolean = false
+        if f(n) then 1 else 2
+      case _ => 0
+`, []string{"f@7:12->6:9"}},
+		{"catch", `object G {
+  def f(y: Int): Boolean = y > 0
+  def run(x: Int): Int = try 1 catch {
+    case e: Exception if f(x) =>
+      def f(y: Int): Boolean = false
+      if (f(x)) 1 else 2
+  }
+}
+`, []string{"f@6:11->5:7"}},
+		{"guard only", `object G {
+  def f(y: Int): Boolean = y > 0
+  def run(x: Int): Int = x match {
+    case n if f(n) => def f(y: Int): Boolean = false; 1
+    case _ => 0
+  }
+}
+`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scalaEdges(parseScala(t, "Guard.scala", tc.src)); !slices.Equal(got, tc.want) {
+				t.Fatalf("edges = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // Each fixture's only candidate is a local def that a hazard in its scope
 // may not be the binding of.
 func TestScalaLocalFunctionCallsRefuse(t *testing.T) {
@@ -119,6 +172,12 @@ func TestScalaLocalFunctionCallsRefuse(t *testing.T) {
 		{"named argument", "object O { def m = { def f(i: Int) = i; h(f = 1); f(1) } }\n"},
 		{"interpolated", "object O { def m = { def f(i: Int) = i; s\"$f\"; f(1) } }\n"},
 		{"type arguments", "object O { def m = { def f[T](t: T) = t; f[Int](1) } }\n"},
+		// A def is not in scope in a header outside the block declaring it.
+		{"default argument of the enclosing def", "object O { def h(p: Int = f()) = { def f() = 1; p } }\n"},
+		{"for generator", "object O { def m = for (x <- f()) yield { def f() = List(1); x } }\n"},
+		{"while condition", "object O { def m = while (f()) { def f() = false } }\n"},
+		{"if condition", "object O { def m = if (f()) { def f() = true; 1 } else 0 }\n"},
+		{"match scrutinee", "object O { def m = f() match { case _ => def f() = 1; 0 } }\n"},
 		{"quoted", "object O { def m(using Quotes) = { def f() = 1; '{ f() } } }\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

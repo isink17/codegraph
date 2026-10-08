@@ -82,6 +82,12 @@ const (
 	// connect, unchanged from the original pass.
 	crossLangEligibleKinds = `('function', 'method', 'class', 'type', 'struct', 'interface')`
 
+	// localSymbolKeySQL matches a function local to a block or chunk (Lua
+	// `local function`, Scala local def): not addressable from another file,
+	// so never a cross-language link end, and never dead merely because no
+	// call to it was proven.
+	localSymbolKeySQL = `COALESCE(stable_key, '') GLOB 'func:*:local:*'`
+
 	// crossLangEdgeValuesBatchRows controls multi-row inserts into edges where
 	// each cross-language row uses 10 parameters. 98*10=980 variables, staying
 	// under sqliteDefaultMaxVariables.
@@ -564,7 +570,8 @@ func crossLanguageSymbols(ctx context.Context, q xlangQueryer, repoID int64, fil
 			SELECT id, file_id, name, qualified_name, kind, start_line, start_col, stable_key
 			FROM symbols
 			WHERE repo_id = ? AND file_id IN (` + sqlitePlaceholders(len(batch)) + `)
-			AND kind IN ` + crossLangEligibleKinds
+			AND kind IN ` + crossLangEligibleKinds + `
+			AND NOT ` + localSymbolKeySQL
 		rows, err := q.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, fmt.Errorf("cross-language symbols query: %w", err)

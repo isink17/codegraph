@@ -130,6 +130,9 @@ declaring a def `f` declares exactly one, when:
   and any value use (`map(f)`, `f _`, `s"$f"`, a named argument `f = 1`,
   `f[T](...)`) refuses every call in the scope;
 - the scope holds no `import` or `export`, wherever it is;
+- a case clause counts as the scope only for a call in its body: its
+  defs are not in scope in its pattern or guard (`case n if f(n) => def f...`
+  looks for `f` further out);
 - no class, object, trait, enum, extension, given, anonymous class
   (`new T { ... }`), quote or splice lies between the call and the scope,
   since a member or inherited member there could shadow the def.
@@ -142,6 +145,12 @@ conversions or extension-method lookup. The resolver
 (`scala_local_function`, high) binds the edge to the local symbol at the
 recorded position or leaves it unresolved; no repository-wide strategy
 answers a Scala call.
+
+A local def's stable key carries its line and column, as a Lua local
+function's does, so editing lines above it changes its key: graph diffs and
+symbol history show it as removed and added, while its call edges follow.
+Local defs are never cross-language link ends and are never reported by
+dead-code queries, since a call to one may simply not have been proven.
 
 Only files that parse with no error, no layout damage (above) and no
 expression-level damage get local defs or edges. Expression-level damage is

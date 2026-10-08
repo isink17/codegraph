@@ -727,14 +727,17 @@ var scalaOpaqueScopes = map[string]bool{
 // scalaLocalBinding finds the innermost local scope around call that declares
 // a def named name as one of its own statements, and that def. It gives up
 // at a type, template or other scope that may hold a shadowing member, and
-// when the scope declares the name more than once.
+// when the scope declares the name more than once. A case clause's statements
+// are in scope only in its body: a call in its pattern or guard looks
+// further out.
 func scalaLocalBinding(call *sitter.Node, name string, content []byte) (*sitter.Node, *sitter.Node) {
-	for n := call.Parent(); n != nil; n = n.Parent() {
+	child := call
+	for n := call.Parent(); n != nil; child, n = n, n.Parent() {
 		typ := n.Type()
 		if scalaMemberScopes[typ] || scalaOpaqueScopes[typ] {
 			return nil, nil
 		}
-		if !scalaLocalScopes[typ] {
+		if !scalaLocalScopes[typ] || typ == "case_clause" && !scalaClauseBody(n, child) {
 			continue
 		}
 		var def *sitter.Node
@@ -755,6 +758,17 @@ func scalaLocalBinding(call *sitter.Node, name string, content []byte) (*sitter.
 		return nil, nil
 	}
 	return nil, nil
+}
+
+// scalaClauseBody reports whether child, a child of case clause n, is one of
+// its body statements rather than its pattern or guard.
+func scalaClauseBody(n, child *sitter.Node) bool {
+	for i := range int(n.ChildCount()) {
+		if scalaSameNode(n.Child(i), child) {
+			return n.FieldNameForChild(i) == "body"
+		}
+	}
+	return false
 }
 
 // scalaSoleSpelling reports whether name occurs in scope only as def's name,

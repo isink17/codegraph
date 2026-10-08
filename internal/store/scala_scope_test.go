@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -134,5 +136,39 @@ func TestScalaOwnershipAllEntrypoints(t *testing.T) {
 				t.Fatalf("bindings = %s, want %s", got, want)
 			}
 		})
+	}
+}
+
+// A Lua or Scala local function whose calls were not proven is not dead code:
+// FindDeadCode lists the unreferenced member and neither local.
+func TestFindDeadCodeSkipsLocalFunctions(t *testing.T) {
+	ctx := context.Background()
+	s, repo := openBudgetStore(t)
+	for _, seed := range []struct{ path, language, name, key string }{
+		{"M.scala", "scala", "member", "func:scala:O$.member"},
+		{"M.scala", "scala", "helper", "func:scala:local:O.m.helper:3:5"},
+		{"m.lua", "lua", "helper", "func:lua:local:helper:1:1"},
+	} {
+		var fileID int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repo.ID, seed.path).Scan(&fileID); err != nil {
+			if fileID, err = insertTestFileLang(ctx, s, repo.ID, seed.path, seed.language); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, ?, 'function', ?, ?, 1, 1, 2, 2, ?)`,
+			repo.ID, fileID, seed.language, seed.name, seed.name, seed.key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dead, err := s.FindDeadCode(ctx, repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, d := range dead {
+		names = append(names, fmt.Sprint(d["name"]))
+	}
+	if strings.Join(names, ",") != "member" {
+		t.Fatalf("dead code = %v, want only the member", names)
 	}
 }

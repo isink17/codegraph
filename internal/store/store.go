@@ -10085,6 +10085,9 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		-- s.start_line) ordering come out of the indexes rather than a sort.
 		WHERE s.repo_id = ? AND f.repo_id = ?
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
+		  -- A Lua or Scala local function is not dead merely because no call
+		  -- to it was proven (localSymbolKeySQL).
+		  AND COALESCE(s.stable_key, '') NOT GLOB 'func:*:local:*'
 		  -- Classification, not just the page, runs on the active graph: a use
 		  -- recorded in a soft-deleted file is not a use the reader can see, so
 		  -- counting it would keep an orphaned symbol out of the answer.
