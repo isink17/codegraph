@@ -951,6 +951,48 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	return writeJSON(stdout, map[string]any{"summary": summary, "stats": stats})
 }
 
+// runInit performs one explicit index pass and reports its resulting graph.
+func runInit(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	if len(args) > 1 {
+		return fmt.Errorf("init accepts at most one repo path")
+	}
+	repoRootCandidate := ""
+	if len(args) == 1 {
+		repoRootCandidate = args[0]
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
+	}
+	canonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		return err
+	}
+	app, repo, repoID, err := openApp(ctx, cfg, canonical)
+	if err != nil {
+		return err
+	}
+	defer app.Close()
+	summary, err := app.Indexer.Index(ctx, indexer.Options{RepoRoot: repo.RootPath, ScanKind: "index"})
+	if err != nil {
+		return err
+	}
+	stats, err := app.Query.Stats(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	capability, err := app.Store.GraphCapability(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	return writeJSON(stdout, map[string]any{
+		"repo_root":  repo.RootPath,
+		"summary":    summary,
+		"stats":      stats,
+		"capability": capability,
+	})
+}
+
 type indexSmokeRun struct {
 	Run      int            `json:"run"`
 	ScanKind string         `json:"scan_kind"`
