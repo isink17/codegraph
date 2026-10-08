@@ -985,17 +985,20 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if (runErr == nil || errors.Is(runErr, context.Canceled)) && loadErr != nil {
 		runErr = loadErr
 	}
+	// A caller cancellation can drain the walk without any worker reporting
+	// it; the scan must not go on to mark unseen files deleted.
+	if runErr == nil {
+		runErr = ctx.Err()
+	}
 	if runErr != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", runErr.Error())
-		return summary, runErr
+		return summary, i.failScan(ctx, scanID, summary, started, runErr)
 	}
 
 	if !pathScoped {
 		missingStarted := time.Now()
 		deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
 		if err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 		summary.MarkMissingMS = time.Since(missingStarted).Milliseconds()
 		summary.FilesDeleted = deleted
@@ -1003,8 +1006,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if len(missingCandidatePaths) > 0 {
 		deleted, err := i.store.MarkFilesDeletedBatch(ctx, repo.ID, scanID, missingCandidatePaths)
 		if err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 		summary.FilesDeleted += deleted
 	}
@@ -1021,8 +1023,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		// entirely -- on a full index as well as on an update.
 		removed, err := i.store.PreviousSymbolNamesForDeletedInScan(ctx, repo.ID, scanID)
 		if err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 		for _, name := range removed {
 			removedSymbolNameSet[name] = struct{}{}
@@ -1031,15 +1032,13 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		// no name to be found by. See store.DeletedPathsInScan.
 		removedPaths, err := i.store.DeletedPathsInScan(ctx, repo.ID, scanID)
 		if err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 		for _, path := range removedPaths {
 			changedPathSet[path] = struct{}{}
 		}
 		if _, err := i.store.PurgeDeletedFileGraphsForScan(ctx, repo.ID, scanID); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 	}
 
@@ -1052,8 +1051,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// saves. See store/resolver_type_scope.go.
 	if summary.FilesDeleted > 0 || retiredFiles > 0 {
 		if err := i.store.RevalidateTypeScopeAfterDeletion(ctx, repo.ID); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 	}
 	dependencyPaths := make([]string, 0, len(changedPathSet))
@@ -1061,8 +1059,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		dependencyPaths = append(dependencyPaths, path)
 	}
 	if _, err := i.store.RebuildJVMTypeDependencies(ctx, repo.ID, dependencyPaths); err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
+		return summary, i.failScan(ctx, scanID, summary, started, err)
 	}
 
 	// ---------------------------------------------------------------------
@@ -1114,15 +1111,13 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			crossStart := time.Now()
 			stats, err = i.store.ResolveEdgesForPathsAndNames(ctx, repo.ID, changedPaths, names)
 			if err != nil {
-				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-				return summary, err
+				return summary, i.failScan(ctx, scanID, summary, started, err)
 			}
 			summary.ResolveMode = "paths+names"
 			summary.ResolveCrossFileMS = time.Since(crossStart).Milliseconds()
 		} else {
 			if _, err := i.store.ResolveEdgesForPathsAndNames(ctx, repo.ID, changedPaths, nil); err != nil {
-				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-				return summary, err
+				return summary, i.failScan(ctx, scanID, summary, started, err)
 			}
 			summary.ResolveMode = "paths"
 		}
@@ -1134,8 +1129,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		// The policy markers of the stale languages commit with the edges they
 		// certify.
 		if _, resolveErr := i.store.ResolveEdgesRecordingPolicies(ctx, repo.ID, policyStale); resolveErr != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
-			return summary, resolveErr
+			return summary, i.failScan(ctx, scanID, summary, started, resolveErr)
 		}
 		summary.ResolveMode = "repo"
 		repoWideResolve = true
@@ -1155,8 +1149,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 				summary.ResolveMode += "+resolver_policy"
 			}
 			if err != nil {
-				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-				return summary, err
+				return summary, i.failScan(ctx, scanID, summary, started, err)
 			}
 			summary.ResolverPolicyMS = time.Since(policyStart).Milliseconds()
 			summary.ResolveMS = time.Since(resolveStart).Milliseconds()
@@ -1165,8 +1158,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	xlangCurrent, err = i.store.CrossLanguageLinksCurrent(ctx, repo.ID)
 	if err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
+		return summary, i.failScan(ctx, scanID, summary, started, err)
 	}
 	// Cross-language edges are a complete derived set. Any parser graph
 	// replacement, retirement, or deletion clears the durable currentness marker
@@ -1183,8 +1175,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			_, resolveErr = i.store.ResolveCrossLanguageLinks(ctx, repo.ID)
 		}
 		if resolveErr != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
-			return summary, resolveErr
+			return summary, i.failScan(ctx, scanID, summary, started, resolveErr)
 		}
 	}
 	// Test links: one canonical repo-wide pass (P22.2). Unlike edge resolution
@@ -1200,8 +1191,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		testLinkStart := time.Now()
 		testLinkStats, resolveErr := i.store.ResolveTestLinks(ctx, repo.ID)
 		if resolveErr != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", resolveErr.Error())
-			return summary, resolveErr
+			return summary, i.failScan(ctx, scanID, summary, started, resolveErr)
 		}
 		summary.ResolveTestLinksBound = testLinkStats.SymbolsBound
 		summary.ResolveTestLinksFileBound = testLinkStats.FilesBound
@@ -1223,8 +1213,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// Git history runs after the semantic graph is final and reads none of it.
 	history, historyMS, err := i.refreshHistory(ctx, repo.ID, opts.RepoRoot, opts.NoHistory)
 	if err != nil {
-		_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-		return summary, err
+		return summary, i.failScan(ctx, scanID, summary, started, err)
 	}
 	summary.History = &history
 	summary.HistoryMS = historyMS
@@ -1252,46 +1241,48 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if summary.FilesTotal > 0 {
 		summary.FilesDeletedPct = (float64(summary.FilesDeleted) / float64(summary.FilesTotal)) * 100
 	}
+	// Every write the scan owns lands before the row is closed: a scan is
+	// recorded completed only once nothing after it can still fail.
+	if composerChanged {
+		if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
+			return summary, i.failScan(ctx, scanID, summary, started, err)
+		}
+		if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
+			return summary, i.failScan(ctx, scanID, summary, started, err)
+		}
+	}
+	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
+		return summary, i.failScan(ctx, scanID, summary, started, err)
+	}
 	if semanticTransition {
-		if composerChanged {
-			if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
-				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-				return summary, err
-			}
-			if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
-				_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-				return summary, err
-			}
-		}
-		if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
-		}
 		if err := i.store.CompleteScanWithParserSemanticEpochs(ctx, scanID, summary, started, repo.ID, semanticEpochs, semanticLanguages); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 	} else {
 		if err := i.store.StampParserSemanticEpochs(ctx, repo.ID, semanticEpochs, semanticLanguages); err != nil {
-			_ = i.store.CompleteScan(ctx, scanID, summary, started, "failed", err.Error())
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 		if err := i.store.CompleteScan(ctx, scanID, summary, started, "completed", ""); err != nil {
-			return summary, err
-		}
-		if composerChanged {
-			if err := i.store.ReconcilePHPComposerPSR4(ctx, repo.ID, phpComposerStoreMappings(composer.Mappings)); err != nil {
-				return summary, err
-			}
-			if err := i.store.SetPHPComposerPSR4Fingerprint(ctx, repo.ID, composer.Fingerprint); err != nil {
-				return summary, err
-			}
-		}
-		if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
-			return summary, err
+			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
 	}
 	return summary, nil
+}
+
+// scanCloseTimeout bounds recording a failed scan, which runs after the
+// scan's own context may already be cancelled.
+const scanCloseTimeout = 10 * time.Second
+
+// failScan records scan scanID as failed with cause's text and returns cause,
+// joined with any error from recording it. Closing uses a context detached
+// from ctx's cancellation, so a cancelled scan still leaves `running`.
+func (i *Indexer) failScan(ctx context.Context, scanID int64, summary store.ScanSummary, started time.Time, cause error) error {
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanCloseTimeout)
+	defer cancel()
+	if err := i.store.CompleteScan(closeCtx, scanID, summary, started, "failed", cause.Error()); err != nil {
+		return errors.Join(cause, fmt.Errorf("record failed scan %d: %w", scanID, err))
+	}
+	return cause
 }
 
 func addParseSample(samples []string, sample string) []string {
