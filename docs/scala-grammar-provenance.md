@@ -28,8 +28,10 @@ tree-sitter grammars.
 
 ## What the adapter extracts (V1)
 
-`.scala` and `.sc` (Scala and scala-cli/Ammonite scripts; the grammar parses
-top-level statements) are parsed for:
+Only `.scala` is detected. `.sc` (scala-cli/Ammonite scripts) is
+intentionally not detected yet because SuperCollider uses the same extension,
+although the grammar parses top-level statements. A `.scala` file is parsed
+for:
 
 - package clauses, chained (`package a.b` then `package c`) and with bodies
   (`package a { ... }`);

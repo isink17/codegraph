@@ -120,7 +120,7 @@ Native CGO builds of this v2.0 branch register 14 user-facing language categorie
 | Kotlin | `.kt`, `.kts` |
 | Lua | `.lua` |
 | Rust | `.rs` |
-| Scala | `.scala`, `.sc` |
+| Scala | `.scala` |
 | C# | `.cs` |
 | Ruby | `.rb` |
 | Swift | `.swift` |

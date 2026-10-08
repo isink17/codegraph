@@ -304,7 +304,7 @@ func TestScalaHeuristicSymbolsOnly(t *testing.T) {
 	if p := NewScala().Profile(); p.ID != "heuristic:scala:v1" || p.EmitsCallEdges {
 		t.Fatalf("profile = %+v", p)
 	}
-	if !NewScala().Supports("build.sc") {
-		t.Fatal("scala heuristic does not claim .sc")
+	if NewScala().Supports("build.sc") {
+		t.Fatal("scala heuristic claims .sc, which SuperCollider shares")
 	}
 }

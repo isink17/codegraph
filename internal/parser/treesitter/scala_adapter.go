@@ -27,12 +27,14 @@ import (
 // follow it under the wrong owner.
 type ScalaAdapter struct{}
 
-func NewScala() *ScalaAdapter                { return &ScalaAdapter{} }
-func (a *ScalaAdapter) Language() string     { return "scala" }
-func (a *ScalaAdapter) Extensions() []string { return []string{".scala", ".sc"} }
+func NewScala() *ScalaAdapter            { return &ScalaAdapter{} }
+func (a *ScalaAdapter) Language() string { return "scala" }
+
+// `.sc` (scala-cli/Ammonite scripts) is not claimed: SuperCollider uses the
+// same extension.
+func (a *ScalaAdapter) Extensions() []string { return []string{".scala"} }
 func (a *ScalaAdapter) Supports(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	return ext == ".scala" || ext == ".sc"
+	return strings.EqualFold(filepath.Ext(path), ".scala")
 }
 
 func (a *ScalaAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {

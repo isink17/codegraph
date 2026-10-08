@@ -269,14 +269,14 @@ object After { def fine() = 2 }
 	}
 }
 
-func TestScalaAdapterScriptsAndExtensions(t *testing.T) {
+func TestScalaAdapterTopLevelStatementsAndExtensions(t *testing.T) {
 	a := NewScala()
-	for path, want := range map[string]bool{"A.scala": true, "build.sc": true, "B.SCALA": true, "a.sbt": false, "a.kt": false} {
+	for path, want := range map[string]bool{"A.scala": true, "build.sc": false, "B.SCALA": true, "a.sbt": false, "a.kt": false} {
 		if a.Supports(path) != want {
 			t.Errorf("Supports(%q) = %v", path, !want)
 		}
 	}
-	pf := parseScala(t, "count.sc", `import scala.io.Source
+	pf := parseScala(t, "Count.scala", `import scala.io.Source
 val lines = Source.fromFile("x").getLines().toList
 def count(xs: List[String]) = xs.size
 println(count(lines))
