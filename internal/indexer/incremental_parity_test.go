@@ -287,11 +287,23 @@ func TestLocalFunctionsAreNeverCrossLanguageTargets(t *testing.T) {
 		"m.lua":        "local function helper() end\nhelper()\n",
 		"scala.ts":     "import { helper } from \"./Caller.scala\";\nexport function helper() {}\n",
 		"lua.ts":       "import { helper } from \"./m.lua\";\nexport function helper() {}\n",
+		// Control: a Rust module named local is an ordinary link target even
+		// though its keys contain ":local:".
+		"src/local.rs": "pub fn shared() {}\n",
+		"rs.ts":        "import { shared } from \"./src/local.rs\";\nexport function shared() {}\n",
 	})
 	intoLocals := func(step string) {
 		t.Helper()
+		var control int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id JOIN files f ON f.id = s.file_id WHERE e.repo_id = ? AND e.edge_kind = ? AND f.path = 'src/local.rs' AND s.name = 'shared'`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&control); err != nil {
+			t.Fatal(err)
+		}
+		if control == 0 {
+			t.Fatalf("%s: the Rust crate::local function is no longer a cross-language target", step)
+		}
 		var n int
-		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND s.stable_key GLOB 'func:*:local:*'`,
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND (s.stable_key GLOB 'func:lua:local:*' OR s.stable_key GLOB 'func:scala:local:*')`,
 			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
