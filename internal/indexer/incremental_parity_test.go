@@ -54,7 +54,30 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust())
+	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua())
+}
+
+func TestLuaGlobalCallRemainsUnresolvedAndLifecycleParity(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"caller.lua":   `function caller() target() end`,
+		"provider.lua": `function target() end`,
+	})
+	if got := r.edgeState(t, "caller.lua", "target"); got != "<no edge>" {
+		t.Fatalf("unproven Lua global call resolved = %s", got)
+	}
+	r.assertFreshParity(t, "fresh")
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	r.write(t, "provider.lua", `function renamedTarget() end`)
+	r.update(t, "provider.lua")
+	if got := r.edgeState(t, "caller.lua", "target"); got != "<no edge>" {
+		t.Fatalf("renamed global call gained an edge = %s", got)
+	}
+	r.assertFreshParity(t, "provider renamed")
+	r.remove(t, "provider.lua")
+	r.update(t, "provider.lua")
+	r.assertFreshParity(t, "provider deleted")
 }
 
 func TestCrossLanguageLinksFollowIncrementalLifecycle(t *testing.T) {

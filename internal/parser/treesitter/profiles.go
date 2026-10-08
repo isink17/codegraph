@@ -14,6 +14,10 @@ func tsProfile(language string) parser.Profile {
 
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
+func (a *LuaAdapter) Profile() parser.Profile {
+	return parser.NewProfile("lua", "treesitter:lua:v1", false)
+}
+
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding
 // evidence it shares with the non-cgo adapter: Unicode imports now bind, Unicode
 // locals now shadow, and a nested `def café` no longer binds the fragment `caf`.

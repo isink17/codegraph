@@ -108,7 +108,7 @@ The graph is evidence-based and intentionally partial: ambiguous or unsupported 
 
 ## Supported languages
 
-Native CGO builds of this v2.0 branch use tree-sitter parsers for the 11 registered languages:
+Native CGO builds of this v2.0 branch register 12 user-facing language categories through 11 adapters; JavaScript and TypeScript share the `typescript` adapter.
 
 | Language | Extensions |
 |---|---|
@@ -118,6 +118,7 @@ Native CGO builds of this v2.0 branch use tree-sitter parsers for the 11 registe
 | JavaScript | `.js`, `.jsx`, `.mjs` |
 | Java | `.java` |
 | Kotlin | `.kt`, `.kts` |
+| Lua | `.lua` |
 | Rust | `.rs` |
 | C# | `.cs` |
 | Ruby | `.rb` |
@@ -127,7 +128,7 @@ Native CGO builds of this v2.0 branch use tree-sitter parsers for the 11 registe
 
 Explicit `CGO_ENABLED=0` builds are not equivalent: Go and Python retain call edges, while the other languages provide heuristic symbol/import navigation without call edges. Symbols, imports, and search are incomplete in those fallback parsers. Python's fallback also misses some call sites. Relationship queries and `codegraph doctor` report graph capability.
 
-All call resolution uses partial static models, not language runtimes. Node.js repositories are supported, but full tree-sitter node support is still in progress. Python models only selected source-visible mutation forms; Ruby does not infer runtime load order or Rails/Zeitwerk mappings. C# may leave `using static` calls unresolved when inheritance or enclosing members could change the target. See [language scope models](docs/scope-models.md) and [Ruby scope and limitations](docs/ruby-scope.md).
+All call resolution uses partial static models, not language runtimes. Lua currently extracts declarations, literal `require` imports, and call references; Lua call edges remain unresolved. Node.js repositories are supported, but full tree-sitter node support is still in progress. Python models only selected source-visible mutation forms; Ruby does not infer runtime load order or Rails/Zeitwerk mappings. C# may leave `using static` calls unresolved when inheritance or enclosing members could change the target. See [language scope models](docs/scope-models.md), [Lua grammar provenance](docs/lua-grammar-provenance.md), and [Ruby scope and limitations](docs/ruby-scope.md).
 
 ## Agent Skill
 
