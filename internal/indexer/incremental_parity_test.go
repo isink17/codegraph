@@ -713,14 +713,18 @@ func TestTypeScriptModuleAcceptanceLifecycle(t *testing.T) {
 
 func TestMixedScopedLanguagesDoNotCrossBind(t *testing.T) {
 	files := tree{
-		"rust/lib.rs":      "mod helper; fn run() { crate::helper::run(); }\n",
-		"rust/helper.rs":   "pub fn run() {}\n",
-		"java/a/Foo.java":  "package a; public class Foo { public static void run() {} }\n",
-		"java/b/Call.java": "package b; import a.Foo; class Call { void run() { Foo.run(); } }\n",
-		"kotlin/a.kt":      "package a\nfun helper() {}\n",
-		"kotlin/b.kt":      "package b\nimport a.helper\nfun run() { helper() }\n",
-		"ts/a.ts":          "export function helper() {}\n",
-		"ts/b.ts":          "import { helper } from \"./a\"\nfunction run() { helper() }\n",
+		"rust/lib.rs":        "mod helper; fn run() { crate::helper::run(); }\n",
+		"rust/helper.rs":     "pub fn run() {}\n",
+		"java/a/Foo.java":    "package a; public class Foo { public static void run() {} }\n",
+		"java/b/Call.java":   "package b; import a.Foo; class Call { void run() { Foo.run(); } }\n",
+		"kotlin/a.kt":        "package a\nfun helper() {}\n",
+		"kotlin/b.kt":        "package b\nimport a.helper\nfun run() { helper() }\n",
+		"ts/a.ts":            "export function helper() {}\n",
+		"ts/b.ts":            "import { helper } from \"./a\"\nfunction run() { helper() }\n",
+		"lua/caller.lua":     "local function helper() end\nlocal function run() helper() end\nreturn {run = run}\n",
+		"lua/util.lua":       "local M = {}\nfunction M.helper() end\nreturn M\n",
+		"scala/Caller.scala": "package app\nobject Caller { def run(): Int = { def helper(): Int = 1; helper() } }\n",
+		"dart/caller.dart":   "void helper() {}\nvoid main() { helper(); }\n",
 	}
 	r := newLifecycleRepo(t, files)
 	other := newLifecycleRepo(t, files)
@@ -744,6 +748,35 @@ func TestMixedScopedLanguagesDoNotCrossBind(t *testing.T) {
 		t.Fatalf("second repository changed after first repository update: got %v want %v", got, wantOther)
 	}
 	r.assertFreshParity(t, "mixed scoped languages")
+
+	// The Lua debug hazard withdraws Lua edges repository-wide and nothing
+	// else: the Scala and Dart lexical edges stay bound through it.
+	luaBound := ` => lua/caller.lua:helper(function) [lua_local_function/high]`
+	scalaBound := ` => scala/Caller.scala:app.Caller.run.helper(function) [scala_local_function/high]`
+	dartBound := ` => dart/caller.dart:helper(function) [dart_lexical_function/high]`
+	assertLexical := func(step, wantLua string) {
+		t.Helper()
+		for _, c := range []struct{ path, want string }{
+			{"lua/caller.lua", wantLua},
+			{"scala/Caller.scala", scalaBound},
+			{"dart/caller.dart", dartBound},
+		} {
+			got := r.edgeState(t, c.path, "helper")
+			if got != c.want {
+				t.Fatalf("%s: %s helper edge = %q, want %q", step, c.path, got, c.want)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	assertLexical("lexical edges bound", luaBound)
+
+	r.write(t, "lua/util.lua", "local M = {}\nfunction M.helper() end\ndebug.sethook(function() end, \"c\")\nreturn M\n")
+	r.update(t, "lua/util.lua")
+	assertLexical("lua debug hazard added", ` => :: [/]`)
+
+	r.write(t, "lua/util.lua", files["lua/util.lua"])
+	r.update(t, "lua/util.lua")
+	assertLexical("lua debug hazard removed", luaBound)
 }
 
 func TestTypeScriptNamespaceAndReExportParity(t *testing.T) {
