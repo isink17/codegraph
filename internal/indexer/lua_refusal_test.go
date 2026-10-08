@@ -20,7 +20,7 @@ const luaProven = "local function f() end\nlocal function g() f() end\n"
 //
 // overBroad marks a case whose empty answer is a deliberate conservative
 // refusal, not a semantic necessity: the binding is sound, but the current
-// file-level rule cannot tell. A precision change is expected to flip exactly
+// rule cannot tell or has no declaration symbol to bind to. A precision change is expected to flip exactly
 // these cases, and must do so on purpose. knownGap marks the opposite: a
 // binding the current rule keeps although a run-time path it does not see can
 // rewrite the local; a soundness fix is expected to flip those.
@@ -66,7 +66,9 @@ var luaRefusalCases = []struct {
 	{name: "_G field assignment", files: tree{"m.lua": luaProven + "_G.f = nil\n"}, want: []string{"2->1"}},
 
 	// -- parse errors
-	{name: "parse error in an independent region", files: tree{"m.lua": luaProven + "local function h()\n  local x = = 1\nend\n"}, overBroad: true},
+	// A chunk with any syntax error never loads, so there is no run-time
+	// binding to prove; withholding the edge is the honest answer.
+	{name: "parse error in an independent region", files: tree{"m.lua": luaProven + "local function h()\n  local x = = 1\nend\n"}},
 	{name: "parse error in the call region", files: tree{"m.lua": "local function f() end\nlocal function g() f( end\n"}},
 	{name: "parse error that may hide a reassignment", files: tree{"m.lua": luaProven + "f = = nil\n"}},
 	{name: "parse error in another file", files: tree{"m.lua": luaProven, "bad.lua": "local x = = 1\n"}, want: []string{"2->1"}},
@@ -82,7 +84,7 @@ var luaRefusalCases = []struct {
 	{name: "recursion through local function", files: tree{"m.lua": "local function fact(n)\n  if n <= 1 then return 1 end\n  return n * fact(n - 1)\nend\n"}, want: []string{"3->1"}},
 	{name: "forward reference is a global", files: tree{"m.lua": "local function a() b() end\nlocal function b() a() end\n"}, want: []string{"2->1"}},
 	{name: "local declared then assigned a function", files: tree{"m.lua": "local f\nf = function() end\nlocal function g() f() end\n"}},
-	{name: "local initialised with a function expression", files: tree{"m.lua": "local f = function() end\nlocal function g() f() end\n"}},
+	{name: "local initialised with a function expression", files: tree{"m.lua": "local f = function() end\nlocal function g() f() end\n"}, overBroad: true},
 	{name: "local function later reassigned", files: tree{"m.lua": luaProven + "f = function() end\n"}},
 
 	// -- calls that no lexical proof reaches
@@ -119,7 +121,7 @@ func TestLuaRefusalPrecision(t *testing.T) {
 }
 
 // luaBoundCalls renders every call edge of path as "callLine->declLine", and
-// fails on any Lua call bound by a strategy other than the lexical one or to a
+// fails on any call bound by a strategy other than the lexical one or to a
 // declaration in another file.
 func luaBoundCalls(t *testing.T, r *lifecycleRepo, path string) []string {
 	t.Helper()
