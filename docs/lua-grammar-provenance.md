@@ -8,7 +8,9 @@ and headers are vendored unmodified in `internal/parser/treesitter/luagrammar`
 with the upstream `LICENSE.md` verbatim; `PROVENANCE.md` there records the
 file hashes and the refresh steps. The parser is ABI 14 and links against the
 `github.com/smacker/go-tree-sitter` runtime like that module's own grammars.
-Binary distributions must carry the MIT notice in `LICENSE.md`.
+Binary distributions must carry the MIT notice in `LICENSE.md`; it is
+reproduced in `THIRD_PARTY_NOTICES`, which ships in every release archive and
+in the npm package.
 
 The earlier pin, the `lua` package of `github.com/smacker/go-tree-sitter`
 (`tjdevries/tree-sitter-lua` revision `acb3f366`, no license file), is no

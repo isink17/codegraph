@@ -885,7 +885,7 @@ internal/
   logging/              slog logger construction
   mcp/                  MCP stdio server (30 tools)
   parser/               Parser interface and adapters
-    treesitter/         Tree-sitter adapters (12 languages; CGO builds)
+    treesitter/         Tree-sitter adapters (CGO builds)
     golang/             Go go/ast parser (CGO_ENABLED=0 builds)
     python/             Pure-Go Python parser (CGO_ENABLED=0 builds; binding helpers reused by tree-sitter)
     heuristic/          Regex symbol/import parsers for the other languages (CGO_ENABLED=0 builds)
