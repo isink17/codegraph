@@ -130,6 +130,21 @@ final run = () { void go() {} go(); };
 		{"dot shorthand calls", "class C { static C make() => C(); C(); }\nC make() => C();\nC a() => .make();\nC b() { const C x = .new(); return .make(); }\nvoid c(C v) { switch (v) { case .make: break; } }\n", []string{}},
 		{"dot shorthand elsewhere leaves a bare call bound", "class C { static C make() => C(); }\nC make() => C();\nC a() => .make();\nC b() => make();\n",
 			[]string{"make@4:10->2:1"}},
+		// A comment between a signature and its body must not split them: the
+		// parameters still shadow the top-level function.
+		{"block comment before the body", "void g() {}\nvoid f(void Function() g) /* c */ { g(); }\n", []string{}},
+		{"line comment before the body", "void g() {}\nvoid f(void Function() g) // ignore: x\n{ g(); }\n", []string{}},
+		{"doc comment before the body", "void g() {}\nvoid f(void Function() g)\n/// doc\n{ g(); }\n", []string{}},
+		{"comment before an arrow body", "void g() {}\nvoid f(void Function() g) /* c */ => g();\n", []string{}},
+		{"comment after a shadowing type parameter", "void g() {}\nvoid f<g>() /* c */ { g(); }\n", []string{}},
+		{"comment before a method body", "void g() {}\nclass C { void m(void Function() g) /* c */ { g(); } }\n", []string{}},
+		{"comment before a setter body", "void g() {}\nset x(void Function() g) /* c */ { g(); }\n", []string{}},
+		{"comment before a getter body, nothing shadows", "void g() {}\nint get x /* c */ { g(); return 1; }\n", []string{"g@2:21->1:1"}},
+		{"comment before a local function body", "void g() {}\nvoid main() { void h(void Function() g) /* c */ { g(); } }\n", []string{}},
+		{"comment before the body, nothing shadows", "void g() {}\nvoid f() /* c */ { g(); }\nvoid k()\n/// doc\n=> g();\n",
+			[]string{"g@2:20->1:1", "g@5:4->1:1"}},
+		{"comment before a local function body, nothing shadows", "void main() { void h() /* c */ { } h(); }\n",
+			[]string{"h@1:36->1:15"}},
 		{"anonymous closures", "void main() { (() {})(); (() => 1)(); }\n", []string{}},
 		{"call of a call result and an index", "int Function() f() => () => 1;\nvoid main(List xs) { f()(); xs[0](); }\n", []string{"f@2:22->1:1"}},
 		{"local declared after the call", "void main() {\n  g();\n  void g() {}\n}\n", []string{}},
@@ -215,5 +230,17 @@ void main() {
 				}
 			}
 		}
+	}
+}
+
+// A comment between a signature and its body leaves the body in the
+// declaration's range, top-level and member alike.
+func TestDartSymbolRangeSpansCommentAndBody(t *testing.T) {
+	pf := parseDart(t, "void f() /* c */ {\n}\nclass C {\n  void m() // c\n  {\n  }\n}\n")
+	if f := dartSymbolByKey(t, pf, "func:dart:f"); f.Range.EndLine != 2 {
+		t.Fatalf("f range = %+v", f.Range)
+	}
+	if m := dartSymbolByKey(t, pf, "func:dart:C.m"); m.Range.EndLine != 6 {
+		t.Fatalf("C.m range = %+v", m.Range)
 	}
 }

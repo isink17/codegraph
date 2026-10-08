@@ -238,10 +238,7 @@ func dartExcessCloseBrace(root *sitter.Node) bool {
 func dartMembers(parent *sitter.Node, owner string, limit uint32, content []byte, pf *graph.ParsedFile) {
 	for i := 0; i < int(parent.ChildCount()); i++ {
 		child := parent.Child(i)
-		var body *sitter.Node
-		if next := child.NextSibling(); next != nil && next.Type() == "function_body" {
-			body = next
-		}
+		body := dartBodyAfter(child)
 		end := child
 		if body != nil {
 			end = body
@@ -723,7 +720,7 @@ type dartLeaf struct {
 // not call this for one.
 func dartLexicalCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) []graph.Edge {
 	var units []dartUnit
-	parts := false
+	parts, orphan := false, false
 	for i := 0; i < int(root.ChildCount()); i++ {
 		child := root.Child(i)
 		u := dartUnit{nodes: []*sitter.Node{child}}
@@ -732,11 +729,22 @@ func dartLexicalCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) [
 			parts = true
 		case "function_signature", "getter_signature", "setter_signature":
 			u.name = childByFieldName(child, "name")
-			if next := child.NextSibling(); next != nil && next.Type() == "function_body" {
-				u.nodes = append(u.nodes, next)
+			if body := dartBodyAfter(child); body != nil {
+				// The comments between them belong to the unit too.
+				for i+1 < int(root.ChildCount()) {
+					i++
+					next := root.Child(i)
+					u.nodes = append(u.nodes, next)
+					if next.Type() == "function_body" {
+						break
+					}
+				}
 				u.function = child.Type() == "function_signature"
-				i++
 			}
+		case "function_body":
+			// Every body follows its signature; one that does not means the
+			// units are not the ones the source spells.
+			orphan = true
 		case "class_definition", "mixin_declaration", "extension_declaration", "extension_type_declaration", "enum_declaration":
 			u.body = childByFieldName(child, "body")
 			if u.body == nil {
@@ -796,6 +804,9 @@ func dartLexicalCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) [
 			Range:         rng,
 			StableKey:     "func:dart:local:" + text + ":" + strconv.Itoa(rng.StartLine) + ":" + strconv.Itoa(rng.StartCol),
 		})
+	}
+	if orphan {
+		return nil
 	}
 	same := func(a, b *sitter.Node) bool {
 		return a != nil && b != nil && a.StartByte() == b.StartByte() && a.EndByte() == b.EndByte()
@@ -858,6 +869,21 @@ func dartLexicalCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) [
 		}
 	}
 	return edges
+}
+
+// dartBodyAfter is the function_body that follows a signature, past any
+// comments between them, or nil.
+func dartBodyAfter(sig *sitter.Node) *sitter.Node {
+	for next := sig.NextSibling(); next != nil; next = next.NextSibling() {
+		switch next.Type() {
+		case "comment", "documentation_comment":
+			continue
+		case "function_body":
+			return next
+		}
+		return nil
+	}
+	return nil
 }
 
 func dartWithin(n, outer *sitter.Node) bool {
