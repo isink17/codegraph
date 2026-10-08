@@ -29,10 +29,10 @@ func (a *LuaAdapter) Profile() parser.Profile {
 	return parser.NewProfile("lua", "treesitter:lua:v3", true)
 }
 
-// Scala v2 records declarations, imports and call references but no call
+// Scala v3 records declarations, imports and call references but no call
 // edges; see ScalaAdapter.
 func (a *ScalaAdapter) Profile() parser.Profile {
-	return parser.NewProfile("scala", "treesitter:scala:v2", false)
+	return parser.NewProfile("scala", "treesitter:scala:v3", false)
 }
 
 // Dart v1 records declarations, directives and call references but no call

@@ -71,15 +71,33 @@ when the file has more `}` than `{` (a missing opening brace moves members
 out of their type before any error shows). Packages nested inside a package body are not parsed by this grammar
 revision; declarations under them are dropped rather than misplaced.
 
-These rules only apply when the grammar reports an error. Broken source the
-grammar parses cleanly is recorded as parsed: in Scala 3 indentation syntax a
-deleted `:` that opens a body, or a first member indented deeper than the
-rest, moves the following members to package level, and a misspelt `package`
-keyword drops the package prefix.
+Damaged Scala 3 indentation syntax often parses without an error, so the
+same bound applies at the first member that clean, consistently indented
+source never lays out that way:
+
+- in an indented scope (a `:` body, an unbraced extension, the top level), a
+  member starting a line at a column other than the scope's first member,
+  or, in a `:` body, no deeper than the line its owner starts on (a deleted
+  body `:`, a first member indented deeper than the rest);
+- at the top level or in a package body, anything that is not a package
+  clause, import, export, definition or comment (a misspelt `package`, a
+  stray block);
+- an `end X` marker that does not directly follow X in its scope, or is not
+  aligned with the line X starts on (a member dedented out of the body the
+  marker closes).
+
+A body that ends where the offending member starts is kept. Braced bodies
+and members sharing a line with earlier code are not checked, so none of
+this costs recall on clean source in either style. What remains: shifting
+a whole line by one full indentation step can produce another valid
+program (a member dedented into the enclosing body, or indented into the
+preceding colon body, with no end marker to contradict it), and nothing in
+the source then shows the damage; that member is recorded under its new
+owner.
 
 ## Call resolution
 
-None. The profile `treesitter:scala:v2` declares no call edges: implicit and
+None. The profile `treesitter:scala:v3` declares no call edges: implicit and
 given scope, extension methods, inheritance, overload resolution and
 `apply`/`unapply` desugaring decide what a Scala call runs, and source syntax
 alone does not prove any of them. Every call stays an unresolved reference.
