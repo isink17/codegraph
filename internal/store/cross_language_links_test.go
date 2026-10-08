@@ -872,6 +872,32 @@ func TestCrossLanguageLinksAbstainOnFanIn(t *testing.T) {
 	}
 }
 
+// TestCrossLanguageLinksIgnoreDartImports: a Dart URI only ever loads a Dart
+// library, so a `.dart` import answered by a foreign file of the same stem is
+// a Dart file the tree lacks (a generated part, say), never a bridge. The same
+// specifier from TypeScript still bridges.
+func TestCrossLanguageLinksIgnoreDartImports(t *testing.T) {
+	spec := func(importer, language string) crossLangSpec {
+		return crossLangSpec{
+			files: []crossLangFile{
+				{path: importer, language: language, symbols: []crossLangSymbol{{name: "Encode", qualified: "Encode"}}},
+				{path: "src/shared/model.py", language: "python", symbols: []crossLangSymbol{{name: "Encode", qualified: "model.Encode"}}},
+			},
+			imports: []crossLangImport{{fromPath: importer, path: "src/shared/model.dart"}},
+		}
+	}
+	f := newGateFixture(t)
+	spec("src/app/client.dart", "dart").build(t, f, 1)
+	if created := f.resolveCrossLanguage(t); created != 0 {
+		t.Fatalf("a Dart import created %d cross-language links, want 0", created)
+	}
+	f = newGateFixture(t)
+	spec("src/app/client.ts", "typescript").build(t, f, 1)
+	if created := f.resolveCrossLanguage(t); created != 1 {
+		t.Fatalf("the same TypeScript import created %d links, want 1", created)
+	}
+}
+
 // TestCrossLanguageLinksReconcileDuplicatePair: a database written before this
 // pass became a rebuild can hold the same pair twice. The reconciliation must
 // retire the copy, or every rerun would report a change forever.

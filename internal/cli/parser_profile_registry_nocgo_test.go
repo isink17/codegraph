@@ -22,6 +22,7 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		"lua":        {"heuristic:lua:v1", false},
 		"scala":      {"heuristic:scala:v1", false},
 		"hcl":        {"heuristic:hcl:v1", false},
+		"dart":       {"heuristic:dart:v1", false},
 		"kotlin":     {"heuristic:kotlin:v4", false},
 		"csharp":     {"heuristic:csharp:v5", false},
 		"typescript": {"heuristic:typescript:v1", false},
@@ -46,7 +47,7 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		}
 	}
 	degraded := strings.Join(newDefaultRegistry().DegradedLanguages(), ",")
-	if degraded != "cpp,csharp,hcl,java,kotlin,lua,php,ruby,rust,scala,swift,typescript" {
+	if degraded != "cpp,csharp,dart,hcl,java,kotlin,lua,php,ruby,rust,scala,swift,typescript" {
 		t.Fatalf("DegradedLanguages() = %q", degraded)
 	}
 	for _, capability := range newDefaultRegistry().Capabilities() {

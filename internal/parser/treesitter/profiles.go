@@ -35,6 +35,12 @@ func (a *ScalaAdapter) Profile() parser.Profile {
 	return parser.NewProfile("scala", "treesitter:scala:v2", false)
 }
 
+// Dart v1 records declarations, directives and call references but no call
+// edges; see DartAdapter.
+func (a *DartAdapter) Profile() parser.Profile {
+	return parser.NewProfile("dart", "treesitter:dart:v1", false)
+}
+
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding
 // evidence it shares with the non-cgo adapter: Unicode imports now bind, Unicode
 // locals now shadow, and a nested `def café` no longer binds the fragment `caf`.

@@ -54,12 +54,63 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala(), tsparser.NewHCL())
+	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala(), tsparser.NewHCL(), tsparser.NewDart())
 }
 
 // Scala builds no call graph: a call whose only candidate is a same-named
 // method elsewhere, or an overload in the same object, stays edgeless on every
 // path, and overloads and a companion keep their symbols across updates.
+// Dart builds no call graph: a bare call whose only candidate is a top-level
+// function elsewhere, a same-class method call and a named constructor call
+// stay edgeless and their references unbound on every path, while the
+// declarations follow edits, renames and deletes.
+func TestDartCallsStayEdgelessAndLifecycleParity(t *testing.T) {
+	const caller = "import 'provider.dart';\nclass Caller {\n  void run() { target(); local(); Provider.make(); }\n  void local() {}\n}\n"
+	r := newLifecycleRepo(t, tree{
+		"lib/caller.dart":   caller,
+		"lib/provider.dart": "void target() {}\nclass Provider {\n  Provider.make();\n}\n",
+	})
+	symbols := func(step string, want map[string]int) {
+		t.Helper()
+		got := map[string]int{}
+		page, err := r.store.ExportSymbolsPage(r.ctx, r.repoID, 1000, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range page {
+			got[s.StableKey]++
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: symbols = %v, want %v", step, got, want)
+		}
+		for _, name := range []string{"target", "local", "Provider.make"} {
+			if got := r.edgeState(t, "lib/caller.dart", name); got != "<no edge>" {
+				t.Fatalf("%s: Dart call %s produced an edge = %s", step, name, got)
+			}
+			if got := r.refTarget(t, "lib/caller.dart", name); got != "" {
+				t.Fatalf("%s: Dart reference %s bound to %q", step, name, got)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	callerSymbols := map[string]int{"type:dart:Caller": 1, "func:dart:Caller.run": 1, "func:dart:Caller.local": 1}
+	symbols("fresh", map[string]int{"type:dart:Caller": 1, "func:dart:Caller.run": 1, "func:dart:Caller.local": 1,
+		"func:dart:target": 1, "type:dart:Provider": 1, "func:dart:Provider.make": 1})
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	r.write(t, "lib/provider.dart", "void renamed() {}\n")
+	r.update(t, "lib/provider.dart")
+	symbols("provider renamed", map[string]int{"type:dart:Caller": 1, "func:dart:Caller.run": 1, "func:dart:Caller.local": 1, "func:dart:renamed": 1})
+	r.write(t, "lib/caller.dart", strings.Replace(caller, "void local() {}", "void local() { var x = ; }", 1))
+	r.update(t, "lib/caller.dart")
+	symbols("member broken", map[string]int{"type:dart:Caller": 1, "func:dart:Caller.run": 1, "func:dart:renamed": 1})
+	r.write(t, "lib/caller.dart", caller)
+	r.remove(t, "lib/provider.dart")
+	r.update(t, "lib/caller.dart", "lib/provider.dart")
+	symbols("provider deleted", callerSymbols)
+}
+
 func TestScalaCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Caller.scala":   "package app\nobject Caller { def run(): Int = Provider.target(1) + local(1)\n  def local(x: Int): Int = x\n  def local(x: String): Int = 0 }\n",

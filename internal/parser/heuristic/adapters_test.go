@@ -312,3 +312,52 @@ func TestScalaHeuristicSymbolsOnly(t *testing.T) {
 		t.Fatal("scala heuristic claims .sc, which SuperCollider shares")
 	}
 }
+
+func TestDartHeuristicSymbolsOnly(t *testing.T) {
+	src := `import 'package:flutter/material.dart' as m;
+export "src/model.dart" show Model;
+part 'app.g.dart';
+// class Commented {}
+const doc = '''
+import 'not/real.dart';
+class InString {}
+''';
+abstract mixin class Logger {}
+sealed class Shape {}
+mixin Walker on Shape {}
+enum Color { red }
+extension type UserId(int v) {}
+extension StringX on String {}
+typedef IntList = List<int>;
+class Page extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    setState(() {
+      run();
+    });
+    return Text('x');
+  }
+  Future<void> load() async {}
+  static int count(String s) => 1;
+}
+void main() {}
+`
+	pf, err := NewDart().Parse(context.Background(), "lib/app.dart", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, s := range pf.Symbols {
+		names = append(names, s.Kind+":"+s.Name)
+	}
+	want := "type:Logger,type:Shape,type:Walker,type:Color,type:UserId,type:StringX,type:IntList,type:Page,function:build,function:load,function:count,function:main"
+	if strings.Join(names, ",") != want {
+		t.Fatalf("symbols = %v", names)
+	}
+	if len(pf.Edges) != 0 || strings.Join(pf.Imports, ",") != "package:flutter/material.dart,src/model.dart,app.g.dart" {
+		t.Fatalf("edges = %v imports = %v", pf.Edges, pf.Imports)
+	}
+	if p := NewDart().Profile(); p.ID != "heuristic:dart:v1" || p.EmitsCallEdges {
+		t.Fatalf("profile = %+v", p)
+	}
+}

@@ -234,7 +234,7 @@ var nodeCoreModules = map[string]bool{
 // default parser registries. Capabilities() exposes it as a deterministic
 // coverage table; internal/cli tests compare that table with the live registry.
 var canonicalLanguages = []string{
-	"cpp", "csharp", "go", "hcl", "java", "kotlin", "lua", "php", "python", "ruby",
+	"cpp", "csharp", "dart", "go", "hcl", "java", "kotlin", "lua", "php", "python", "ruby",
 	"rust", "scala", "swift", "typescript",
 }
 
@@ -274,6 +274,9 @@ var conservativeGaps = map[string]string{
 		"and a project header are the same string",
 	"csharp": "`using` imports a namespace, not a type, so the identifier at " +
 		"the call site never appears in the import path and cannot be linked",
+	"dart": "`dart:` libraries are SDK by spelling, but `package:x/y.dart` names a " +
+		"pub dependency and this package's own lib/ the same way; pubspec.yaml and " +
+		"package_config.json are never read, and no Dart call edge exists",
 	"kotlin": "stdlib members (`println`) are auto-imported, so the calls that " +
 		"would be classifiable carry no import evidence at all",
 	"hcl": "a module `source` is recorded as written; registry, VCS and archive " +

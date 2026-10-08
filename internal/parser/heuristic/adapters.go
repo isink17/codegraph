@@ -35,6 +35,10 @@ type Adapter struct {
 	skipFuncSet map[string]struct{}
 	cStyle      bool
 	hashStyle   bool
+	// rawImports matches the import patterns against the line as written,
+	// because the stripped line has lost its string literals; only a line
+	// that does not start inside a string or comment is read.
+	rawImports bool
 }
 
 func NewJava() *Adapter {
@@ -118,6 +122,30 @@ func NewScala() *Adapter {
 		symbols: []symbolPattern{
 			{kind: "type", re: regexp.MustCompile(`\b(class|trait|object|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
 			{kind: "function", re: regexp.MustCompile(`^\s*(?:(?:private|protected|override|final|implicit|inline|transparent|abstract|sealed)(?:\[[^\]]*\])?\s+)*def\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 1},
+		},
+		cStyle: true,
+	}
+}
+
+// NewDart is the non-CGO Dart fallback: classes, mixins, enums, extensions,
+// typedefs and typed function or method headers, plus directive URIs. It
+// builds no call graph, like the CGO Dart adapter.
+func NewDart() *Adapter {
+	return &Adapter{
+		language: "dart",
+		exts:     extSet(".dart"),
+		imports: []importPattern{
+			{re: regexp.MustCompile(`^\s*(?:import|export|part\s+of|part)\s+r?['"]([^'"$]+)['"]`), nameGroup: 1},
+		},
+		rawImports: true,
+		symbols: []symbolPattern{
+			{kind: "type", re: regexp.MustCompile(`^\s*(?:(?:abstract|sealed|base|interface|final|mixin)\s+)*(?:class|mixin|enum)\s+([A-Za-z_$][\w$]*)`), nameGroup: 1},
+			{kind: "type", re: regexp.MustCompile(`^\s*extension\s+type\s+(?:const\s+)?([A-Za-z_$][\w$]*)`), nameGroup: 1},
+			{kind: "type", re: regexp.MustCompile(`^\s*extension\s+([A-Za-z_$][\w$]*)(?:\s*<[^>]*>)?\s+on\b`), nameGroup: 1},
+			{kind: "type", re: regexp.MustCompile(`^\s*typedef\s+([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*=`), nameGroup: 1},
+			// A header needs a return type (void, a builtin, or a capitalised
+			// type), so a call such as `setState(() {` is not a declaration.
+			{kind: "function", re: regexp.MustCompile(`^\s*(?:(?:static|external|abstract)\s+)*(?:void|int|double|num|bool|dynamic|[A-Z][\w$]*(?:<[^()=]*>)?\??)\s+([A-Za-z_$][\w$]*)\s*(?:<[^()]*>)?\s*\([^;]*\)\s*(?:async\*?\s*|sync\*\s*)?(?:\{|=>)`), nameGroup: 1},
 		},
 		cStyle: true,
 	}
@@ -263,6 +291,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	for i, line := range lines {
 		lineNo := i + 1
 		line = strings.TrimSuffix(line, "\r")
+		lineStartsInCode := !state.inString && !state.inBlockComment && state.heredocTerm == ""
 		normalized, nextState := stripForHeuristic(line, state, a.cStyle, a.hashStyle)
 		state = nextState
 		trimmed := strings.TrimSpace(normalized)
@@ -278,7 +307,14 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			addHeuristicKotlinScope(trimmed, &pf.Scope.Imports)
 		}
 		for _, imp := range a.imports {
-			if m := imp.re.FindStringSubmatch(normalized); len(m) > imp.nameGroup {
+			importSource := normalized
+			if a.rawImports {
+				if !lineStartsInCode {
+					continue
+				}
+				importSource = line
+			}
+			if m := imp.re.FindStringSubmatch(importSource); len(m) > imp.nameGroup {
 				val := strings.TrimSpace(m[imp.nameGroup])
 				if val != "" {
 					pf.Imports = append(pf.Imports, val)

@@ -61,6 +61,7 @@ var callFixtures = map[string]struct {
 	"cpp":        {"cg_probe.cpp", "void cg_probe_callee() {}\nvoid cg_probe_caller() { cg_probe_callee(); }\n"},
 	"typescript": {"cg_probe.ts", "function callee(): void {}\nfunction caller(): void { callee(); }\n"},
 	"scala":      {"CgProbe.scala", "object CgProbe {\n  def callee(): Unit = ()\n  def caller(): Unit = callee()\n}\n"},
+	"dart":       {"cg_probe.dart", "void callee() {}\nvoid caller() { callee(); }\n"},
 	"lua":        {"cg_probe.lua", "local function callee() end\nfunction caller() callee() end\n"},
 }
 
