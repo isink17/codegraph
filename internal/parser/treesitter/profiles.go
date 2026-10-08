@@ -29,10 +29,10 @@ func (a *LuaAdapter) Profile() parser.Profile {
 	return parser.NewProfile("lua", "treesitter:lua:v3", true)
 }
 
-// Scala v1 records declarations, imports and call references but no call
+// Scala v2 records declarations, imports and call references but no call
 // edges; see ScalaAdapter.
 func (a *ScalaAdapter) Profile() parser.Profile {
-	return parser.NewProfile("scala", "treesitter:scala:v1", false)
+	return parser.NewProfile("scala", "treesitter:scala:v2", false)
 }
 
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding

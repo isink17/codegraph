@@ -65,13 +65,21 @@ apart.
 
 Not recorded: local definitions inside methods and blocks, destructuring
 vals, enum cases, auxiliary constructors, anonymous givens, infix and
-parameterless member calls, and every declaration inside a tree-sitter error
-node. Packages nested inside a package body are not parsed by this grammar
+parameterless member calls. In a file with a parse error, only declarations
+and imports that end before the first error are recorded, and none at all
+when the file has more `}` than `{` (a missing opening brace moves members
+out of their type before any error shows). Packages nested inside a package body are not parsed by this grammar
 revision; declarations under them are dropped rather than misplaced.
+
+These rules only apply when the grammar reports an error. Broken source the
+grammar parses cleanly is recorded as parsed: in Scala 3 indentation syntax a
+deleted `:` that opens a body, or a first member indented deeper than the
+rest, moves the following members to package level, and a misspelt `package`
+keyword drops the package prefix.
 
 ## Call resolution
 
-None. The profile `treesitter:scala:v1` declares no call edges: implicit and
+None. The profile `treesitter:scala:v2` declares no call edges: implicit and
 given scope, extension methods, inheritance, overload resolution and
 `apply`/`unapply` desugaring decide what a Scala call runs, and source syntax
 alone does not prove any of them. Every call stays an unresolved reference.

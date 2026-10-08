@@ -4,11 +4,16 @@ package treesitter
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+
+	scalagrammar "github.com/smacker/go-tree-sitter/scala"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
@@ -253,19 +258,31 @@ func TestScalaAdapterUncertainCallsStayReferences(t *testing.T) {
 }
 
 func TestScalaAdapterSyntaxErrorDropsRecoveredDeclarations(t *testing.T) {
-	const src = `object Before { def ok() = 1 }
+	const src = `import a.b.C
+object Before { def ok() = 1 }
 class Broken( { def inside() = 1
+import x.y.Z
 object After { def fine() = 2 }
 `
 	pf := parseScala(t, "Broken.scala", src)
-	// The recovered tree keeps a bodyless `class Broken` and puts the rest in
-	// an ERROR node; nothing inside the error is recorded under any owner.
-	want := []string{"class type:scala:Broken", "function func:scala:Before$.ok", "object object:scala:Before"}
+	// Only what ends before the first error is recorded: Broken's extent is
+	// unknown, and everything after it, imports included, is dropped.
+	want := []string{"function func:scala:Before$.ok", "object object:scala:Before"}
 	if got := scalaKeys(pf); !reflect.DeepEqual(got, want) {
 		t.Fatalf("symbols = %q, want only the clean declarations %q", got, want)
 	}
+	if !reflect.DeepEqual(pf.Imports, []string{"a.b.C"}) {
+		t.Fatalf("imports = %q, want only the one before the error", pf.Imports)
+	}
 	if bad := parseScala(t, "Pkg.scala", "package a.b.\nclass X\n"); len(bad.Symbols) != 0 {
 		t.Fatalf("declarations under a broken package clause = %q", scalaKeys(bad))
+	}
+	// A missing `{` lets the next `}` close Circle early, so area and k would
+	// land at the top level before the only error, the excess `}`. No owner
+	// is known then; nothing is recorded, though file-scoped imports are.
+	stray := parseScala(t, "Stray.scala", "import a.b.C\nobject Ok { def fine() = 1 }\nclass Circle(r: Double)\n  def area = r * r\n  val k = 1\n}\nclass Last\n")
+	if len(stray.Symbols) != 0 || !reflect.DeepEqual(stray.Imports, []string{"a.b.C"}) {
+		t.Fatalf("missing brace: symbols = %q, imports = %q", scalaKeys(stray), stray.Imports)
 	}
 }
 
@@ -395,4 +412,123 @@ func TestScalaAdapterUnbracedRenameImport(t *testing.T) {
 	if !reflect.DeepEqual(pf.Scope.Imports, want) {
 		t.Fatalf("scope imports = %+v", pf.Scope.Imports)
 	}
+}
+
+// Damaging a file by one byte must never give a declaration a different owner
+// or invent a name: every symbol and import the damaged file yields is one
+// the intact file declares, symbols with the same kind and owner. Edits are
+// single-byte deletions and insertions of a brace, a parenthesis, a newline
+// or `class `. Edits that only rename an identifier (inside one, or joining
+// two) are skipped, as is any edit the grammar parses without an error: those
+// are recorded as parsed and are out of scope here.
+func TestScalaAdapterDamageNeverMisattributes(t *testing.T) {
+	const src = `package com.acme
+package billing
+
+import scala.util.{Try, Success => Ok}
+
+/** Docs. */
+sealed trait Shape { def area: Double }
+case class Circle(r: Double) extends Shape {
+  def area: Double = r * r
+  val k, m = 1
+}
+object Circle {
+  def unit(): Circle = Circle(1)
+  type Id = Int
+}
+class Box[T](x: T) {
+  import scala.collection.mutable.Buffer
+  private def get(): T = { helper(x); x }
+  def this() = this(null)
+}
+enum Color { case Red, Green; def paint() = 1 }
+object Ext {
+  extension (s: String) {
+    def twice: String = s + s
+    def thrice: String = s * 3
+  }
+  given ord: Ordering[Int] = Ordering.Int
+}
+package inner {
+  class Nested { def deep() = 1 }
+}
+def helper(n: Any): Unit = println(n)
+val top = 1
+class Last { def end() = 2 }
+import java.time.{Clock as C, _}
+object Indented:
+  def a = 1
+  class Deep:
+    def d = 2
+  def b = 3
+end Indented
+`
+	key := func(s graph.Symbol) string { return s.Kind + " " + s.StableKey + " @" + s.ContainerName }
+	imp := func(i graph.ScopeImport) string {
+		return fmt.Sprintf("import %s %s as %s %s %v", i.SourceSpecifier, i.ImportedName, i.LocalName, i.Kind, i.Wildcard)
+	}
+	clean := map[string]bool{}
+	cleanPF := parseScala(t, "Clean.scala", src)
+	for _, s := range cleanPF.Symbols {
+		clean[key(s)] = true
+	}
+	for _, i := range cleanPF.Scope.Imports {
+		clean[imp(i)] = true
+	}
+	ident := func(b byte) bool {
+		return b == '_' || b == '$' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+	}
+	type edit struct{ what, src string }
+	var edits []edit
+	for i := range len(src) {
+		if !ident(src[i]) && !(i > 0 && i+1 < len(src) && ident(src[i-1]) && ident(src[i+1])) {
+			edits = append(edits, edit{fmt.Sprintf("deleting byte %d (%q)", i, src[i]), src[:i] + src[i+1:]})
+		}
+		if i > 0 && ident(src[i-1]) && ident(src[i]) {
+			continue // an insertion inside an identifier only splits it
+		}
+		for _, ins := range []string{"{", "}", "(", ")", "\n", "class "} {
+			if ins == "class " && i > 0 && ident(src[i-1]) {
+				continue // "class" would extend the identifier before it
+			}
+			edits = append(edits, edit{fmt.Sprintf("inserting %q at %d", ins, i), src[:i] + ins + src[i:]})
+		}
+	}
+	check := func(e edit) {
+		pf, err := NewScala().Parse(context.Background(), "Damaged.scala", []byte(e.src))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var wrong []string
+		for _, s := range pf.Symbols {
+			if k := key(s); !clean[k] {
+				wrong = append(wrong, k)
+			}
+		}
+		for _, i := range pf.Scope.Imports {
+			if k := imp(i); !clean[k] {
+				wrong = append(wrong, k)
+			}
+		}
+		if len(wrong) == 0 {
+			return
+		}
+		if root, err := parse(context.Background(), scalagrammar.GetLanguage(), []byte(e.src)); err == nil && !root.HasError() {
+			return // parsed cleanly: out of scope
+		}
+		t.Errorf("%s yields %q", e.what, wrong)
+	}
+	// Each parse is independent; spreading them keeps the test under a second.
+	var wg sync.WaitGroup
+	workers := runtime.GOMAXPROCS(0)
+	for w := range workers {
+		wg.Go(func() {
+			for j := w; j < len(edits); j += workers {
+				check(edits[j])
+			}
+		})
+	}
+	wg.Wait()
 }
