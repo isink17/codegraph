@@ -58,7 +58,7 @@ func (a *ScalaAdapter) Parse(ctx context.Context, path string, content []byte) (
 	// member laid out as no clean source lays it out bounds what is recorded
 	// like an error, except that a body ending right where that member
 	// starts, as an indented body does, is complete and kept.
-	if at := scalaLayoutErrorByte(root, true, true, -1, content); at != ^uint32(0) {
+	if at := scalaLayoutErrorByte(root, true, false, -1, content); at != ^uint32(0) {
 		limit = min(limit, at+1)
 	}
 	scalaMembers(root, "", nil, limit, content, &pf)
@@ -163,15 +163,17 @@ var scalaPackageLevel = map[string]bool{
 // indentation syntax without an error: without the `:` that opens a body, or
 // with the body's first member indented deeper than the rest, the later
 // members move out to the enclosing scope. So in an indented scope (a `:`
-// body, an unbraced extension, the top level) every member that starts a
-// line must start at the column of the first one, and in a `:` body deeper
-// than the line its owner starts on. A member sharing its line with code
-// before it is not checked, nor is a braced body: braces delimit it. End
-// markers are checked in every scope, see scalaEndMarkerError.
+// body, an unbraced extension) every member that starts a line must start
+// at the column of the first one, deeper than the line its owner starts on;
+// the top level has a narrower rule, below. Columns are taken from
+// scalaAnchor. A member sharing its line with code before it is not
+// checked, nor is a braced body: braces delimit it. End markers are checked
+// in every scope, see scalaEndMarkerError.
 func scalaLayoutErrorByte(parent *sitter.Node, pkgLevel, indented bool, ownerIndent int, content []byte) uint32 {
 	errAt := ^uint32(0)
 	first := -1
 	var seen []*sitter.Node
+	prevCol, prevType, prevBody, prevColon := -1, false, false, false
 	for i := range int(parent.ChildCount()) {
 		child := parent.Child(i)
 		typ := child.Type()
@@ -201,7 +203,17 @@ func scalaLayoutErrorByte(parent *sitter.Node, pkgLevel, indented bool, ownerInd
 		default:
 			continue
 		}
-		if col, ok := scalaLineColumn(child.StartByte(), content); ok && indented {
+		isType := typ == "class_definition" || typ == "object_definition" || typ == "trait_definition" || typ == "enum_definition"
+		colon := false
+		if body != nil {
+			colon = firstChild(body, "{") == nil
+			if typ != "extension_definition" && body.ChildCount() > 0 {
+				colon = body.Child(0).Type() == ":"
+			}
+		}
+		anchor := scalaAnchor(child)
+		col, ok := scalaLineColumn(anchor, content)
+		if ok && indented {
 			if first < 0 {
 				first = col
 			}
@@ -209,14 +221,23 @@ func scalaLayoutErrorByte(parent *sitter.Node, pkgLevel, indented bool, ownerInd
 				errAt = min(errAt, child.StartByte())
 			}
 		}
+		// At the top level only a member indented under the type before it
+		// is checked: under one with a `:` body it would have been a member
+		// of that body, and a def or value under a bodyless type is that
+		// type's body without its `:`. Braced code may indent freely there.
+		if ok && ownerIndent < 0 && prevCol >= 0 && col > prevCol && (prevColon || prevType && !prevBody && !isType) {
+			errAt = min(errAt, child.StartByte())
+		}
+		if ownerIndent < 0 && typ != "package_clause" {
+			prevCol, prevType, prevBody, prevColon = -1, isType, body != nil, colon
+			if ok {
+				prevCol = col
+			}
+		}
 		if body == nil {
 			continue
 		}
-		colon := firstChild(body, "{") == nil
-		if typ != "extension_definition" && body.ChildCount() > 0 {
-			colon = body.Child(0).Type() == ":"
-		}
-		errAt = min(errAt, scalaLayoutErrorByte(body, typ == "package_clause", colon, scalaLineIndent(child.StartByte(), content), content))
+		errAt = min(errAt, scalaLayoutErrorByte(body, typ == "package_clause", colon, scalaLineIndent(anchor, content), content))
 	}
 	return errAt
 }
@@ -243,7 +264,9 @@ func scalaEndMarkerError(seen []*sitter.Node, end, ident *sitter.Node, content [
 		switch {
 		case name == nil:
 		case def.Type() == "package_clause":
+			// `package a.b:` closes with `end b`.
 			got = scalaPackageName(name, content)
+			got = got[strings.LastIndexByte(got, '.')+1:]
 		default:
 			got = scalaName(name, content)
 		}
@@ -253,7 +276,7 @@ func scalaEndMarkerError(seen []*sitter.Node, end, ident *sitter.Node, content [
 		if j < len(seen)-1 {
 			return seen[j+1].StartByte()
 		}
-		if col, ok := scalaLineColumn(end.StartByte(), content); !ok || col != scalaLineIndent(def.StartByte(), content) {
+		if col, ok := scalaLineColumn(end.StartByte(), content); !ok || col != scalaLineIndent(scalaAnchor(def), content) {
 			return def.StartByte()
 		}
 		return ^uint32(0)
@@ -262,6 +285,17 @@ func scalaEndMarkerError(seen []*sitter.Node, end, ident *sitter.Node, content [
 		return seen[0].StartByte()
 	}
 	return end.StartByte()
+}
+
+// scalaAnchor is where a definition starts once annotations before it are
+// skipped: an annotation may sit on its own line at any column.
+func scalaAnchor(def *sitter.Node) uint32 {
+	for i := range int(def.ChildCount()) {
+		if c := def.Child(i); c.Type() != "annotation" && c.Type() != "comment" && c.Type() != "block_comment" {
+			return c.StartByte()
+		}
+	}
+	return def.StartByte()
 }
 
 // scalaLineColumn is the column of the byte at, when only spaces and tabs

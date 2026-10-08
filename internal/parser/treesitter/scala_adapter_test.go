@@ -695,7 +695,21 @@ end a
 `
 	tabs := "package t\n\nobject O:\n\tdef f = 1\n\tclass I:\n\t\tdef g = 2\n\tend I\nend O\n"
 	crlf := strings.ReplaceAll(scala3, "\n", "\r\n")
-	for name, src := range map[string]string{"Scala3": scala3, "Scala2": scala2, "PackageBlock": packageBlock, "Tabs": tabs, "CRLF": crlf} {
+	sources := map[string]string{"Scala3": scala3, "Scala2": scala2, "PackageBlock": packageBlock, "Tabs": tabs, "CRLF": crlf,
+		// `package a.b:` closes with its last segment.
+		"QualifiedPackageBlock":  "package a.b:\n  class X:\n    def m = 1\n  object Y\nend b\n",
+		"QualifiedPackageBlock3": "package com.acme.app:\n  object Z:\n    def z = 1\n  end Z\nend app\n",
+		// Braces delimit bodies, so top-level columns are free.
+		"BracedIndentedTop":    "package p\n\n  class Indented {\n    def a = 1\n  }\n\nclass Flush {\n  def b = 2\n}\n",
+		"BracedDeeperSibling":  "object A {\n  def a = 1\n}\n  object B {\n    def b = 2\n  }\n",
+		"BracedCaseUnderTrait": "sealed trait Color\n  case object Red extends Color\n  case object Blue extends Color\n",
+		// An annotation on its own line is not where the definition starts;
+		// at the top level it may sit at any column. (In a `:` body the
+		// first token, annotation or not, sets the body's indentation.)
+		"AnnotationTop":   "  @SerialVersionUID(1L)\nclass A {\n  def x = 1\n}\n    @main def run() = 1\nobject O:\n  @deprecated(\"x\")\n  private def f = 1\n  def g = 2\nend O\n",
+		"AnnotationOwner": "object O:\n  @deprecated(\"x\")\n  object I:\n    def f = 1\n  end I\nend O\n",
+	}
+	for name, src := range sources {
 		root, err := parse(context.Background(), scalagrammar.GetLanguage(), []byte(src))
 		if err != nil {
 			t.Fatal(err)
@@ -703,7 +717,7 @@ end a
 		if root.HasError() {
 			t.Fatalf("%s: clean corpus does not parse: %s", name, root.String())
 		}
-		if at := scalaLayoutErrorByte(root, true, true, -1, []byte(src)); at != ^uint32(0) {
+		if at := scalaLayoutErrorByte(root, true, false, -1, []byte(src)); at != ^uint32(0) {
 			t.Errorf("%s: layout error reported at %q", name, src[at:min(len(src), int(at)+30)])
 		}
 	}
@@ -724,6 +738,9 @@ end a
 		if !slices.Contains(keys, want) {
 			t.Errorf("clean Scala 3 corpus lacks %q; got %q", want, keys)
 		}
+	}
+	if keys := scalaKeys(parseScala(t, "Qualified.scala", sources["QualifiedPackageBlock"])); !reflect.DeepEqual(keys, []string{"class type:scala:a.b.X", "function func:scala:a.b.X.m", "object object:scala:a.b.Y"}) {
+		t.Errorf("qualified package block = %q", keys)
 	}
 	if keys := scalaKeys(parseScala(t, "Pkg.scala", packageBlock)); !reflect.DeepEqual(keys, []string{"class type:scala:a.P", "function func:scala:a.P.p", "object object:scala:a.Q"}) {
 		t.Errorf("package block = %q", keys)

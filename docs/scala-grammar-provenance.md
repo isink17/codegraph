@@ -75,25 +75,36 @@ Damaged Scala 3 indentation syntax often parses without an error, so the
 same bound applies at the first member that clean, consistently indented
 source never lays out that way:
 
-- in an indented scope (a `:` body, an unbraced extension, the top level), a
-  member starting a line at a column other than the scope's first member,
-  or, in a `:` body, no deeper than the line its owner starts on (a deleted
-  body `:`, a first member indented deeper than the rest);
+- in a `:` body or an unbraced extension, a member starting a line at a
+  column other than the body's first member, or no deeper than the line its
+  owner starts on (a first member indented deeper than the rest, a deleted
+  `:` on a nested type);
+- at the top level, a member indented deeper than the type before it when
+  that type has a `:` body, or when it has no body and the member is not a
+  type (a deleted `:` on a top-level type);
 - at the top level or in a package body, anything that is not a package
   clause, import, export, definition or comment (a misspelt `package`, a
   stray block);
 - an `end X` marker that does not directly follow X in its scope, or is not
   aligned with the line X starts on (a member dedented out of the body the
-  marker closes).
+  marker closes); `package a.b:` closes with `end b`.
 
-A body that ends where the offending member starts is kept. Braced bodies
-and members sharing a line with earlier code are not checked, so none of
-this costs recall on clean source in either style. What remains: shifting
-a whole line by one full indentation step can produce another valid
-program (a member dedented into the enclosing body, or indented into the
-preceding colon body, with no end marker to contradict it), and nothing in
-the source then shows the damage; that member is recorded under its new
-owner.
+A body that ends where the offending member starts is kept. Columns are
+measured from a definition's modifiers or keyword, not from an annotation on
+a line of its own. Braced bodies, members sharing a line with earlier code,
+and top-level members under a braced or bodyless type (`sealed trait C`
+followed by indented `case object`s) are not checked, so source that the
+grammar parses without an error and that is valid, consistently indented
+Scala keeps every declaration. Inconsistent indentation inside a `:` body
+(mixed tabs and spaces, a member one column off) is treated as damage.
+
+What remains: shifting a whole line by one full indentation step can
+produce another valid program (a member dedented into the enclosing body,
+or indented into the preceding `:` body, with no end marker to contradict
+it), and nothing in the source then shows the damage; that member is
+recorded under its new owner. A deleted `:` on a top-level type whose
+members are themselves types (`class A\n  class B`) is not detected,
+since braced Scala 2 may indent a type under a bodyless one.
 
 ## Call resolution
 
