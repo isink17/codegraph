@@ -538,7 +538,10 @@ type FreshnessRunningScans struct {
 	// scan; older ones were superseded.
 	AfterLastCompleted int64 `json:"after_last_completed"`
 	// Liveness is always "unknown": scans hold no lease, so a running row
-	// cannot be told apart from one whose process died.
+	// cannot be told apart from one whose process died. A scan that fails or
+	// is cancelled closes its own row as failed; only a process that dies
+	// mid-scan, or a failure that could not itself be recorded, leaves one
+	// running.
 	Liveness string `json:"liveness"`
 }
 
