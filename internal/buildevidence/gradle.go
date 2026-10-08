@@ -70,6 +70,15 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if err != nil {
 		return Artifact{}, err
 	}
+	outputParent, err := filepath.EvalSymlinks(filepath.Dir(output))
+	if err != nil {
+		return Artifact{}, fmt.Errorf("resolve evidence output parent (it must exist): %w", err)
+	}
+	parentInfo, err := os.Stat(outputParent)
+	if err != nil || !parentInfo.IsDir() {
+		return Artifact{}, errors.New("evidence output parent must be an existing directory")
+	}
+	output = filepath.Join(outputParent, filepath.Base(output))
 	if _, inside := relativeWithin(root, output); inside {
 		return Artifact{}, errors.New("artifact output must be outside the repository")
 	}

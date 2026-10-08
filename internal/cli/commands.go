@@ -91,7 +91,7 @@ func newCommandList() []*command {
 				{name: "--gradle PATH", description: "explicit Gradle executable to run"},
 				{name: "--project PATH", description: "selected Gradle project path, such as :app"},
 				{name: "--compilation NAME", description: "selected Kotlin/JVM compilation"},
-				{name: "--output FILE", description: "new artifact path outside the repository"},
+				{name: "--output FILE", description: "new artifact path outside the repository (parent directory must exist)"},
 			},
 			examples: []string{"codegraph export-gradle-evidence --repo-root . --gradle /opt/gradle/bin/gradle --project :app --compilation main --output /tmp/kotlin-evidence.json"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {

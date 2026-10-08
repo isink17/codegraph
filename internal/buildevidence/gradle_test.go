@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -83,6 +84,41 @@ func TestCanonicalRepoRootsRefusesSymlinkEscape(t *testing.T) {
 	missingThroughLink := filepath.Join(link, "not-created-yet")
 	if _, err := canonicalRepoRoots(root, []string{missingThroughLink}); err == nil || !strings.Contains(err.Error(), "escapes") {
 		t.Fatalf("missing source root under escaping symlink accepted: %v", err)
+	}
+}
+
+func TestExportGradleRejectsSymlinkedOutputParentBeforeInvocation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinked output-parent test is platform-specific")
+	}
+	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(t.TempDir(), "repo-alias")
+	if err := os.Symlink(root, aliasParent); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "gradle-invoked")
+	gradle := filepath.Join(bin, "gradle")
+	if err := os.WriteFile(gradle, []byte("#!/bin/sh\nprintf invoked > \"$CODEGRAPH_GRADLE_MARKER\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEGRAPH_GRADLE_MARKER", marker)
+	_, err = ExportGradle(context.Background(), GradleRequest{
+		RepositoryRoot: root,
+		GradleCommand:  gradle,
+		Project:        ":app",
+		Compilation:    "main",
+		OutputPath:     filepath.Join(aliasParent, "evidence.json"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "outside the repository") {
+		t.Fatalf("symlinked in-repository output accepted: %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Gradle ran before output containment refusal: %v", err)
 	}
 }
 

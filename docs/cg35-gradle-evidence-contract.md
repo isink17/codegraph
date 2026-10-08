@@ -96,6 +96,8 @@ paths, and escaping symlinks fail closed. The output must be outside the
 repository and is never overwritten. Ordinary index/update/watch/serve/MCP
 paths do not call the producer.
 Directory symlinks in the scanned repository currently refuse fingerprinting.
+The output parent must already exist; its canonical path is checked before
+Gradle starts, including symlinked parents.
 
 `internal/buildevidence.Decode` validates bounded JSON and normalizes omitted
 dimensions to unknown. `Artifact.ValidateCurrent` refuses a changed fingerprint;
