@@ -214,8 +214,10 @@ A proven gap (`insufficient_coverage`) outranks `unknown`. `freshness` also carr
 `reasons`, the graph_stats `state` and `state_reasons` (never "fresh";
 `no_known_staleness` at best), `head_now`, `last_full_scan` and `exit_code`.
 A full scan is `index`, or `update` without paths, under the repository's own
-configuration; `--languages` or include/exclude overrides that differ from it make
-a `filtered` scan, which does not count.
+configuration; language, include or exclude overrides passed by an internal caller
+that differ from it make a `filtered` scan, which does not count (no CLI or MCP
+surface sets them). A failed scan counts against coverage when it started after the
+full scan or closed no earlier than it started.
 
 `full_coverage_at_head` is not "fresh": uncommitted edits, watcher events that
 were never queued, a changed repository configuration and a HEAD that moved away
