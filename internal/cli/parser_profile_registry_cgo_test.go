@@ -42,7 +42,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:typescript:v2"
 		}
 		if lang.Language == "lua" {
-			want = "treesitter:lua:v3"
+			want = "treesitter:lua:v4"
 		}
 		if lang.Language == "scala" {
 			want = "treesitter:scala:v3"
