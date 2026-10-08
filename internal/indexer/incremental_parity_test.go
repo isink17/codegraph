@@ -154,6 +154,75 @@ func TestScalaCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	r.assertFreshParity(t, "provider deleted")
 }
 
+// A bare Scala call bound by lexical scope to a local def of the same file is
+// resolved on every path and follows renames, shadowing, damage and deletes;
+// a member call, a call on an object and a same-named member elsewhere never
+// answer it.
+func TestScalaLocalFunctionCallLifecycleParity(t *testing.T) {
+	const caller = `package app
+object Caller {
+  def run(): Int = {
+    def helper(x: Int): Int = x + 1
+    helper(1) + local(1) + Provider.target(1)
+  }
+  def local(x: Int): Int = x
+}
+`
+	r := newLifecycleRepo(t, tree{
+		"Caller.scala":   caller,
+		"Provider.scala": "package app\nobject Provider { def target(x: Int): Int = x }\n",
+	})
+	assertState := func(step, wantHelper string) {
+		t.Helper()
+		if got := r.edgeState(t, "Caller.scala", "helper"); got != wantHelper {
+			t.Fatalf("%s: helper edge = %q, want %q", step, got, wantHelper)
+		}
+		for _, name := range []string{"local", "Provider.target"} {
+			if got := r.edgeState(t, "Caller.scala", name); got != "<no edge>" {
+				t.Fatalf("%s: unproven call %s gained an edge = %s", step, name, got)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	bound := ` => Caller.scala:app.Caller.run.helper(function) [scala_local_function/high]`
+	assertState("fresh", bound)
+	if got := r.refTarget(t, "Caller.scala", "helper"); got != "app.Caller.run.helper" {
+		t.Fatalf("fresh: helper reference bound to %q", got)
+	}
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	assertState("no-op", bound)
+
+	// A same-named member elsewhere neither steals nor drops the binding.
+	r.write(t, "Provider.scala", "package app\nobject Provider { def target(x: Int): Int = x; def helper(x: Int): Int = 0 }\n")
+	r.update(t, "Provider.scala")
+	assertState("member helper added elsewhere", bound)
+
+	edit := func(step, old, replacement, want string) {
+		t.Helper()
+		r.write(t, "Caller.scala", strings.Replace(caller, old, replacement, 1))
+		r.update(t, "Caller.scala")
+		assertState(step, want)
+		r.write(t, "Caller.scala", caller)
+		r.update(t, "Caller.scala")
+		assertState(step+" restored", bound)
+	}
+	edit("local def renamed", "def helper(x: Int)", "def renamed(x: Int)", "<no edge>")
+	edit("local def shifted down", "    def helper", "    val pad = 0\n\n    def helper", bound)
+	edit("shadowed by a val", "    helper(1) +", "    val helper = (x: Int) => x\n    helper(1) +", "<no edge>")
+	edit("wildcard import in scope", "    def helper", "    import Provider._\n    def helper", "<no edge>")
+	edit("parse error", "  def local(x: Int): Int = x\n", "  def local(x: Int): Int = \n  val = 1\n", "<no edge>")
+	edit("local def deleted", "    def helper(x: Int): Int = x + 1\n", "", "<no edge>")
+
+	r.remove(t, "Provider.scala")
+	r.update(t, "Provider.scala")
+	assertState("provider deleted", bound)
+	r.remove(t, "Caller.scala")
+	r.update(t, "Caller.scala")
+	r.assertFreshParity(t, "caller deleted")
+}
+
 func TestLuaGlobalCallRemainsUnresolvedAndLifecycleParity(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"caller.lua":   `function caller() target() end`,

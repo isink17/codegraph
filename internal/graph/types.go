@@ -64,6 +64,11 @@ type Edge struct {
 // same file. The suffix is that statement's 1-based start line and column.
 const LuaLocalFunctionEvidence = "lua:local_function:"
 
+// ScalaLocalFunctionEvidence prefixes the evidence of a call edge whose bare
+// callee Scala's scoping binds to one local def of the same file. The suffix
+// is that def's 1-based start line and column.
+const ScalaLocalFunctionEvidence = "scala:local_function:"
+
 // HCLTerraformReferenceEvidence marks a Terraform `references` edge whose
 // destination is a static module address (var.X, local.X, module.M, data.T.N,
 // T.N). It binds only to the one declaration of that address in the same

@@ -4437,6 +4437,12 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 			totalResolved += n
 		}
 	}
+	// Scala calls: the same, for local defs; see scala_scope.go.
+	if n, err := resolveScalaScope(ctx, tx, repoID, scope.only("scala")); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	// Terraform references: bound within their module directory or left
 	// unresolved; hclScopeVetoSQL keeps every strategy below off them. See
 	// hcl_scope.go.
@@ -5430,6 +5436,10 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 			return 0, err
 		}
 	}
+	scalaResolved, err := resolveScalaScope(ctx, tx, repoID, scope.only("scala"))
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
@@ -5444,7 +5454,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
-	n += csharpResolved + phpResolved + rubyResolved + luaResolved
+	n += csharpResolved + phpResolved + rubyResolved + luaResolved + scalaResolved
 	for _, table := range []string{
 		resolverAmbiguousNamesTable, resolverTestFilesTable,
 		resolverImportScopeTable, resolverCppNamespaceScopesTable,
@@ -6766,6 +6776,34 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		remaining = targets[:0]
 		for _, target := range targets {
 			if _, owned := luaIDs[target.edgeID]; owned {
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		targets = remaining
+	}
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	// Scala owns every call outright too. This is the Go-side twin of
+	// scalaScopeVetoSQL. Its proof is per file, so its pass decides only these
+	// edges.
+	scalaIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if binderOwnsScala(target) {
+			scalaIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(scalaIDs) > 0 {
+		n, err := s.resolveScalaScopeStandalone(ctx, repoID, scalaIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		outcome.unresolved += len(scalaIDs) - n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, owned := scalaIDs[target.edgeID]; owned {
 				continue
 			}
 			remaining = append(remaining, target)

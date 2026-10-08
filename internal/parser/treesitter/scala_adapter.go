@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -14,14 +15,15 @@ import (
 )
 
 // ScalaAdapter extracts declarations, imports and call references from Scala 2
-// and Scala 3 sources. It builds no call graph: which declaration a Scala call
-// runs depends on implicit and given scope, extension methods, inheritance,
-// overload resolution and apply/unapply desugaring, none of which source
-// syntax alone proves. Every call stays an unresolved reference.
+// and Scala 3 sources. Which declaration a Scala call runs generally depends
+// on implicit and given scope, extension methods, inheritance, overload
+// resolution and apply/unapply desugaring, none of which source syntax alone
+// proves, so calls stay unresolved references. The one exception is a bare
+// call to a local def of the same file; see scalaLocalFunctions.
 //
-// Declarations are recorded only where they are members: the top level, a
-// package body, and the bodies of classes, objects, traits and enums. Local
-// definitions inside a method or block are not addressable and are skipped.
+// Members are recorded where they are declared: the top level, a package
+// body, and the bodies of classes, objects, traits and enums. Local defs are
+// recorded only in clean files; see scalaLocalFunctions.
 // In a file with a parse error only the declarations that end before the
 // first error are recorded, and none when an opening brace is missing; see
 // scalaMembers and scalaExcessCloseBrace. Damaged indentation syntax that
@@ -58,10 +60,16 @@ func (a *ScalaAdapter) Parse(ctx context.Context, path string, content []byte) (
 	// member laid out as no clean source lays it out bounds what is recorded
 	// like an error, except that a body ending right where that member
 	// starts, as an indented body does, is complete and kept.
-	if at := scalaLayoutErrorByte(root, true, false, -1, content); at != ^uint32(0) {
-		limit = min(limit, at+1)
+	layoutErr := scalaLayoutErrorByte(root, true, false, -1, content)
+	if layoutErr != ^uint32(0) {
+		limit = min(limit, layoutErr+1)
 	}
 	scalaMembers(root, "", nil, limit, content, &pf)
+	// Local defs and the calls proven to reach them come from clean files
+	// only: in a damaged one no scope's extent is known.
+	if !broken && layoutErr == ^uint32(0) && !scalaLocalDamage(root, content) {
+		scalaLocalFunctions(root, content, &pf)
+	}
 	// Imports are file-scoped, so a stray brace cannot misplace one, but an
 	// import running into an error may have lost a path segment or selector:
 	// only imports ended by a newline or `;` before the first error count.
@@ -621,4 +629,282 @@ func scalaInError(node *sitter.Node) bool {
 		}
 	}
 	return false
+}
+
+// scalaLocalFunctions records the local defs of a clean file (a `def`
+// statement in a block, an indented block or a case clause, outside any local
+// type) and returns, in pf.Edges, a call edge for every bare `f(...)` that
+// Scala's scoping provably binds to one of them. A local def is a binding of
+// the highest precedence in the innermost scope declaring it, so it shadows
+// every member, inherited member, import and package binding of an enclosing
+// scope (SLS 2; Scala 3 keeps the rule); it cannot be overridden, and a bare
+// call is not subject to implicit conversion or extension-method lookup,
+// which apply to selections. What remains is shadowing between the call and
+// the def, which is refused wholesale: the call binds only when, in the
+// whole declaring scope, f is spelled nowhere but as that def's name, as a
+// bare callee or as a selected member (`x.f`), and the scope holds no import
+// or export. Any parameter, val, var, pattern, generator, given, nested def,
+// type or other use of the name refuses every call in the scope. A call
+// inside a type, template, given, extension, quote or splice between it and
+// the def also stays unresolved, since a member there may shadow the def.
+func scalaLocalFunctions(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+	recorded := map[uint32]bool{} // start bytes of the recorded local defs
+	var calls []*sitter.Node
+	var walk func(n *sitter.Node, inExpr bool)
+	walk = func(n *sitter.Node, inExpr bool) {
+		typ := n.Type()
+		if scalaOpaqueScopes[typ] || inExpr && scalaMemberScopes[typ] {
+			return
+		}
+		switch typ {
+		case "function_definition":
+			if inExpr && scalaLocalScopes[n.Parent().Type()] {
+				if scalaLocalSymbol(n, content, pf) {
+					recorded[n.StartByte()] = true
+				}
+			}
+		case "call_expression":
+			calls = append(calls, n)
+		}
+		inner := inExpr || !scalaMemberScopes[typ]
+		for i := range int(n.NamedChildCount()) {
+			walk(n.NamedChild(i), inner)
+		}
+	}
+	walk(root, false)
+	proven := map[[2]uint32]bool{} // (scope start, def start) pairs that passed
+	refused := map[[2]uint32]bool{}
+	for _, call := range calls {
+		callee := childByFieldName(call, "function")
+		if callee == nil || callee.Type() != "identifier" {
+			continue
+		}
+		name := scalaName(callee, content)
+		scope, def := scalaLocalBinding(call, name, content)
+		if def == nil || !recorded[def.StartByte()] {
+			continue
+		}
+		key := [2]uint32{scope.StartByte(), def.StartByte()}
+		if !proven[key] && !refused[key] {
+			if scalaSoleSpelling(scope, def, name, content) {
+				proven[key] = true
+			} else {
+				refused[key] = true
+			}
+		}
+		if !proven[key] {
+			continue
+		}
+		decl, at := nodeRange(def), nodeRange(call)
+		pf.Edges = append(pf.Edges, graph.Edge{
+			DstName:  name,
+			Kind:     "calls",
+			Evidence: graph.ScalaLocalFunctionEvidence + strconv.Itoa(decl.StartLine) + ":" + strconv.Itoa(decl.StartCol),
+			Line:     at.StartLine,
+			Col:      at.StartCol,
+		})
+	}
+}
+
+// scalaLocalScopes are the scopes whose statements may be local defs.
+var scalaLocalScopes = map[string]bool{"block": true, "indented_block": true, "case_clause": true}
+
+// scalaMemberScopes hold members, not statements. Met inside an expression
+// they are a local type, whose members may shadow anything outside it.
+var scalaMemberScopes = map[string]bool{
+	"compilation_unit": true, "package_clause": true, "package_object": true,
+	"class_definition": true, "object_definition": true, "trait_definition": true, "enum_definition": true,
+	"template_body": true, "enum_body": true, "extension_definition": true,
+}
+
+// scalaOpaqueScopes are never searched: a given or anonymous class template
+// has members of its own, and quoted code is not run where it is written.
+var scalaOpaqueScopes = map[string]bool{
+	"given_definition": true, "instance_expression": true, "with_template_body": true,
+	"quote_expression": true, "splice_expression": true, "macro_body": true,
+}
+
+// scalaLocalBinding finds the innermost local scope around call that declares
+// a def named name as one of its own statements, and that def. It gives up
+// at a type, template or other scope that may hold a shadowing member, and
+// when the scope declares the name more than once.
+func scalaLocalBinding(call *sitter.Node, name string, content []byte) (*sitter.Node, *sitter.Node) {
+	for n := call.Parent(); n != nil; n = n.Parent() {
+		typ := n.Type()
+		if scalaMemberScopes[typ] || scalaOpaqueScopes[typ] {
+			return nil, nil
+		}
+		if !scalaLocalScopes[typ] {
+			continue
+		}
+		var def *sitter.Node
+		count := 0
+		for i := range int(n.NamedChildCount()) {
+			c := n.NamedChild(i)
+			if c.Type() == "function_definition" && scalaName(childByFieldName(c, "name"), content) == name {
+				def = c
+				count++
+			}
+		}
+		switch count {
+		case 0:
+			continue
+		case 1:
+			return n, def
+		}
+		return nil, nil
+	}
+	return nil, nil
+}
+
+// scalaSoleSpelling reports whether name occurs in scope only as def's name,
+// as a bare callee `name(...)` or as a selected member `x.name`, and the
+// scope holds no import or export.
+func scalaSoleSpelling(scope, def *sitter.Node, name string, content []byte) bool {
+	defName := childByFieldName(def, "name")
+	ok := true
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if !ok {
+			return
+		}
+		switch n.Type() {
+		case "import_declaration", "export_declaration":
+			ok = false
+			return
+		case "identifier", "type_identifier", "operator_identifier":
+			if scalaName(n, content) != name || scalaSameNode(n, defName) {
+				return
+			}
+			parent := n.Parent()
+			switch parent.Type() {
+			case "call_expression":
+				ok = scalaSameNode(childByFieldName(parent, "function"), n)
+			case "field_expression":
+				ok = scalaSameNode(childByFieldName(parent, "field"), n)
+			default:
+				ok = false
+			}
+			return
+		}
+		for i := range int(n.NamedChildCount()) {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(scope)
+	return ok
+}
+
+func scalaSameNode(a, b *sitter.Node) bool {
+	return a != nil && b != nil && a.StartByte() == b.StartByte() && a.EndByte() == b.EndByte() && a.Type() == b.Type()
+}
+
+// scalaLocalSymbol records a local def under the innermost symbol enclosing
+// it. Its stable key carries its position: local defs of one name in
+// different blocks are distinct declarations.
+func scalaLocalSymbol(def *sitter.Node, content []byte, pf *graph.ParsedFile) bool {
+	nameNode := childByFieldName(def, "name")
+	if nameNode == nil {
+		return false
+	}
+	name := scalaName(nameNode, content)
+	if name == "" {
+		return false
+	}
+	rng := nodeRange(def)
+	container := ""
+	var best graph.Position
+	for _, s := range pf.Symbols {
+		r := s.Range
+		if scalaBefore(r.StartLine, r.StartCol, rng.StartLine, rng.StartCol) && scalaBefore(rng.EndLine, rng.EndCol, r.EndLine, r.EndCol) &&
+			(container == "" || scalaBefore(best.StartLine, best.StartCol, r.StartLine, r.StartCol)) {
+			container, best = s.QualifiedName, r
+		}
+	}
+	qname := name
+	if container != "" {
+		qname = container + "." + name
+	}
+	pf.Symbols = append(pf.Symbols, graph.Symbol{
+		Language:      "scala",
+		Kind:          "function",
+		Name:          name,
+		QualifiedName: qname,
+		ContainerName: container,
+		Signature:     scalaSignature(def, content),
+		Range:         rng,
+		DocSummary:    prevCommentText(def, content),
+		StableKey:     "func:scala:local:" + qname + ":" + strconv.Itoa(rng.StartLine) + ":" + strconv.Itoa(rng.StartCol),
+	})
+	return true
+}
+
+// scalaBefore reports whether (l1, c1) is at or before (l2, c2).
+func scalaBefore(l1, c1, l2, c2 int) bool { return l1 < l2 || l1 == l2 && c1 <= c2 }
+
+// scalaHardKeywords are reserved in Scala 2 and Scala 3 alike. The grammar
+// accepts some of them as identifiers, which only damaged source spells:
+// `def a = 1  class Deep:` parses cleanly as an infix call of `class`.
+var scalaHardKeywords = map[string]bool{
+	"abstract": true, "case": true, "catch": true, "class": true, "def": true, "do": true, "else": true,
+	"extends": true, "final": true, "finally": true, "for": true, "if": true, "implicit": true, "import": true,
+	"lazy": true, "match": true, "new": true, "object": true, "override": true, "package": true,
+	"private": true, "protected": true, "return": true, "sealed": true, "throw": true, "trait": true,
+	"try": true, "type": true, "val": true, "var": true, "while": true, "with": true, "yield": true,
+}
+
+// scalaLocalDamage reports layout that clean source does not produce inside
+// expressions, where scalaLayoutErrorByte does not look: a hard keyword
+// parsed as an identifier, or an indented block whose statements starting a
+// line are not all at one column deeper than the line its owner starts on,
+// or a def or value whose body starts a line no deeper than the definition.
+// Each can move a statement into or out of a block without a parse error.
+// The grammar also produces them for some valid code, such as a multi-line
+// `||` chain parsed as postfix statements; that tree is wrong too.
+func scalaLocalDamage(root *sitter.Node, content []byte) bool {
+	damaged := false
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if damaged {
+			return
+		}
+		switch n.Type() {
+		case "identifier":
+			damaged = scalaHardKeywords[nodeText(n, content)]
+			return
+		case "function_definition", "val_definition", "var_definition":
+			body := childByFieldName(n, "body")
+			if body == nil {
+				body = childByFieldName(n, "value")
+			}
+			if body != nil {
+				if col, ok := scalaLineColumn(body.StartByte(), content); ok && col <= scalaLineIndent(scalaAnchor(n), content) {
+					damaged = true
+					return
+				}
+			}
+		case "indented_block":
+			owner := scalaLineIndent(n.Parent().StartByte(), content)
+			first := -1
+			for i := range int(n.NamedChildCount()) {
+				c := n.NamedChild(i)
+				col, ok := scalaLineColumn(scalaAnchor(c), content)
+				if !ok || c.Type() == "comment" || c.Type() == "block_comment" {
+					continue
+				}
+				if first < 0 {
+					first = col
+				}
+				if col != first || col <= owner {
+					damaged = true
+					return
+				}
+			}
+		}
+		for i := range int(n.NamedChildCount()) {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(root)
+	return damaged
 }

@@ -10,7 +10,7 @@ import (
 
 // symbolsOnlyCgoLanguages are the tree-sitter adapters that deliberately build
 // no call graph; every other cgo adapter does.
-var symbolsOnlyCgoLanguages = map[string]bool{"dart": true, "scala": true}
+var symbolsOnlyCgoLanguages = map[string]bool{"dart": true}
 
 // The cgo build parses every supported language with tree-sitter, and all of
 // those adapters except symbolsOnlyCgoLanguages build a call graph.
@@ -48,7 +48,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:lua:v4"
 		}
 		if lang.Language == "scala" {
-			want = "treesitter:scala:v3"
+			want = "treesitter:scala:v4"
 		}
 		if lang.Language == "swift" {
 			want = "treesitter:swift:v7"

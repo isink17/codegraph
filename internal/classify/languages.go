@@ -288,7 +288,8 @@ var conservativeGaps = map[string]string{
 	"ruby": "the `require` vs `require_relative` distinction is not persisted, " +
 		"so a gem and a project file are the same bare string",
 	"scala": "`import scala.util.Try` and a first-party `com.acme.Util` are the same " +
-		"dotted shape, no build definition is indexed, and no Scala call edge exists",
+		"dotted shape, no build definition is indexed, and only calls to a local def " +
+		"of the same file are ever resolved",
 	"swift": "`import Foundation` and `import MyFramework` are the same " +
 		"single-identifier form; no SDK or package manifest is indexed",
 	"go": "external is unprovable: a dependency path and this repository's own " +

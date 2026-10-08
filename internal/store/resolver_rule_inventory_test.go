@@ -23,6 +23,7 @@ func TestResolverGateSQLMatchesHandComposedGate(t *testing.T) {
 		AND ` + resolverCppBareMemberScopeSQL + `
 		AND ` + rubyScopeVetoSQL + `
 		AND ` + luaScopeVetoSQL + `
+		AND ` + scalaScopeVetoSQL + `
 		AND ` + hclScopeVetoSQL + `
 		AND NOT ` + resolverJVMScopeVetoSQL + `
 		AND NOT EXISTS (SELECT 1 FROM ` + csharpScopeVeto + ` csv WHERE csv.edge_id = edges.id)` + `
@@ -60,6 +61,7 @@ var resolverRuleParity = map[resolverRuleID]string{
 	"cpp_bare_member_scope":      "TestResolverCandidateRestrictionsMatchGoTwins (predicate only: bare C++ edges reach no generic strategy on either path, cpp_evidence_ownership); TestCppBareMemberScope_AllEntrypoints, kind list in TestCppClassMemberKindsSQLMatchesGoTwin",
 	"ruby_ownership":             "TestResolverOwnershipRulesMatchGoTwins, TestRubyScopeVetoSQLMatchesGoTwin",
 	"lua_ownership":              "TestResolverOwnershipRulesMatchGoTwins, TestLuaScopeVetoSQLMatchesGoTwin",
+	"scala_ownership":            "TestResolverOwnershipRulesMatchGoTwins, TestScalaScopeVetoSQLMatchesGoTwin",
 	"hcl_ownership":              "TestResolverOwnershipRulesMatchGoTwins, TestHCLScopeVetoSQLMatchesGoTwin",
 	"jvm_scope_ownership":        "TestResolverGateRuleFactParity",
 	"csharp_scope_ownership":     "TestResolverGateRuleFactParity",
@@ -120,7 +122,7 @@ func TestResolverGateRuleInventory(t *testing.T) {
 func TestResolverOwnershipRulesMatchGoTwins(t *testing.T) {
 	ctx := context.Background()
 	s, repo := openBudgetStore(t)
-	languages := []string{"", "cpp", "go", "hcl", "lua", "php", "python", "ruby", "rust", "swift", "typescript"}
+	languages := []string{"", "cpp", "go", "hcl", "lua", "php", "python", "ruby", "rust", "scala", "swift", "typescript"}
 	files := map[string]int64{}
 	for i, language := range languages {
 		id, err := insertTestFileLang(ctx, s, repo.ID, "src"+string(rune('a'+i)), language)

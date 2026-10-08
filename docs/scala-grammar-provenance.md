@@ -112,8 +112,44 @@ since braced Scala 2 may indent a type under a bodyless one.
 
 ## Call resolution
 
-None. The profile `treesitter:scala:v3` declares no call edges: implicit and
-given scope, extension methods, inheritance, overload resolution and
-`apply`/`unapply` desugaring decide what a Scala call runs, and source syntax
-alone does not prove any of them. Every call stays an unresolved reference.
-Non-CGO builds use the symbols-only `heuristic:scala:v1`.
+Only same-file local defs. Implicit and given scope, extension methods,
+inheritance, overload resolution and `apply`/`unapply` desugaring decide what
+any other Scala call runs, and source syntax alone does not prove them, so
+those calls stay unresolved references with no edge.
+
+The profile `treesitter:scala:v4` records local defs (a `def` statement in a
+block, an indented block or a case clause, outside any local class, object,
+trait, given or anonymous class) as `func:scala:local:<owner>.<name>:<line>:<col>`
+and emits a call edge for a bare `f(...)` whose innermost local scope
+declaring a def `f` declares exactly one, when:
+
+- nothing in that whole scope spells `f` except the def's name, bare callees
+  `f(...)` and selected members `x.f`; any parameter, lambda parameter,
+  val, var, pattern or extractor binding, `for` generator, given, implicit,
+  nested def, extension method, local object, class or type of that name,
+  and any value use (`map(f)`, `f _`, `s"$f"`, a named argument `f = 1`,
+  `f[T](...)`) refuses every call in the scope;
+- the scope holds no `import` or `export`, wherever it is;
+- no class, object, trait, enum, extension, given, anonymous class
+  (`new T { ... }`), quote or splice lies between the call and the scope,
+  since a member or inherited member there could shadow the def.
+
+A local def is the highest-precedence binding of the innermost scope that
+declares it, so it shadows members, inherited members, explicit and wildcard
+imports and package members of every enclosing scope in Scala 2 and Scala 3;
+it cannot be overridden, and bare calls are not subject to implicit
+conversions or extension-method lookup. The resolver
+(`scala_local_function`, high) binds the edge to the local symbol at the
+recorded position or leaves it unresolved; no repository-wide strategy
+answers a Scala call.
+
+Only files that parse with no error, no layout damage (above) and no
+expression-level damage get local defs or edges. Expression-level damage is
+a hard keyword parsed as an identifier, an indented block whose line-leading
+statements do not share one column deeper than their owner, or a def or val
+body starting a line no deeper than its definition. The grammar also
+produces these for some valid code (a multi-line `||` chain parsed as
+postfix statements, `with` or `match` after a multi-line expression), whose
+tree is wrong; those files lose local edges. Macros that rewrite a block
+(`utest`'s `Tests { ... }`) are taken as written. Non-CGO builds use the
+symbols-only `heuristic:scala:v1`.
