@@ -57,7 +57,7 @@ func lifecycleRegistry() *parser.Registry {
 	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala(), tsparser.NewHCL(), tsparser.NewDart())
 }
 
-// Scala builds no call graph: a call whose only candidate is a same-named
+// Scala builds no cross-file call graph: a call whose only candidate is a same-named
 // method elsewhere, or an overload in the same object, stays edgeless on every
 // path, and overloads and a companion keep their symbols across updates.
 // Dart builds no cross-file call graph: a bare call whose only candidate is a

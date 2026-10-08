@@ -10119,7 +10119,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		-- s.start_line) ordering come out of the indexes rather than a sort.
 		WHERE s.repo_id = ? AND f.repo_id = ?
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
-		  -- A Lua or Scala local function is not dead merely because no call
+		  -- A Lua, Scala or Dart local function is not dead merely because no call
 		  -- to it was proven (localFunctionSQL).
 		  AND NOT `+localFunctionSQL("s.")+`
 		  -- Classification, not just the page, runs on the active graph: a use
