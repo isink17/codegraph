@@ -4443,6 +4443,13 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	} else {
 		totalResolved += n
 	}
+	// Dart calls: the same, for local and top-level functions; see
+	// dart_scope.go.
+	if n, err := resolveDartScope(ctx, tx, repoID, scope.only("dart")); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	// Terraform references: bound within their module directory or left
 	// unresolved; hclScopeVetoSQL keeps every strategy below off them. See
 	// hcl_scope.go.
@@ -5440,6 +5447,10 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
+	dartResolved, err := resolveDartScope(ctx, tx, repoID, scope.only("dart"))
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
@@ -5454,7 +5465,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
-	n += csharpResolved + phpResolved + rubyResolved + luaResolved + scalaResolved
+	n += csharpResolved + phpResolved + rubyResolved + luaResolved + scalaResolved + dartResolved
 	for _, table := range []string{
 		resolverAmbiguousNamesTable, resolverTestFilesTable,
 		resolverImportScopeTable, resolverCppNamespaceScopesTable,
@@ -6804,6 +6815,29 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		remaining = targets[:0]
 		for _, target := range targets {
 			if _, owned := scalaIDs[target.edgeID]; owned {
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		targets = remaining
+	}
+	// Dart likewise; the Go-side twin of dartScopeVetoSQL.
+	dartIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if binderOwnsDart(target) {
+			dartIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(dartIDs) > 0 {
+		n, err := s.resolveDartScopeStandalone(ctx, repoID, dartIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		outcome.unresolved += len(dartIDs) - n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, owned := dartIDs[target.edgeID]; owned {
 				continue
 			}
 			remaining = append(remaining, target)

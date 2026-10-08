@@ -392,6 +392,8 @@ var resolverBindableCandidateRules = []resolverGateRule{
 		languages: []string{"lua"}, sql: luaScopeVetoSQL, owns: luaScopeOwned},
 	{id: ruleScalaOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"scala"}, sql: scalaScopeVetoSQL, owns: scalaScopeOwned},
+	{id: ruleDartOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
+		languages: []string{"dart"}, sql: dartScopeVetoSQL, owns: dartScopeOwned},
 	{id: ruleHCLOwnership, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"hcl"}, sql: hclScopeVetoSQL, owns: hclScopeOwned},
 	{id: "jvm_scope_ownership", stage: resolverStageOwnership, disposition: resolverDispositionOwned,
@@ -430,6 +432,7 @@ const (
 	ruleRubyOwnership        resolverRuleID = "ruby_ownership"
 	ruleLuaOwnership         resolverRuleID = "lua_ownership"
 	ruleScalaOwnership       resolverRuleID = "scala_ownership"
+	ruleDartOwnership        resolverRuleID = "dart_ownership"
 	ruleHCLOwnership         resolverRuleID = "hcl_ownership"
 	rulePHPOwnership         resolverRuleID = "php_ownership"
 	ruleSwiftOwnership       resolverRuleID = "swift_ownership"
@@ -456,6 +459,7 @@ var binderOwnershipRoutes = map[resolverRuleID]func(edgeTarget) bool{
 	ruleRubyOwnership:        resolverRuleOwns(ruleRubyOwnership),
 	ruleLuaOwnership:         resolverRuleOwns(ruleLuaOwnership),
 	ruleScalaOwnership:       resolverRuleOwns(ruleScalaOwnership),
+	ruleDartOwnership:        resolverRuleOwns(ruleDartOwnership),
 	ruleHCLOwnership:         resolverRuleOwns(ruleHCLOwnership),
 	rulePHPOwnership:         resolverRuleOwns(rulePHPOwnership),
 	ruleSwiftOwnership:       resolverRuleOwns(ruleSwiftOwnership),
@@ -468,6 +472,7 @@ var (
 	binderOwnsRuby       = binderOwnershipRoutes[ruleRubyOwnership]
 	binderOwnsLua        = binderOwnershipRoutes[ruleLuaOwnership]
 	binderOwnsScala      = binderOwnershipRoutes[ruleScalaOwnership]
+	binderOwnsDart       = binderOwnershipRoutes[ruleDartOwnership]
 	binderOwnsHCL        = binderOwnershipRoutes[ruleHCLOwnership]
 	binderOwnsPHP        = binderOwnershipRoutes[rulePHPOwnership]
 	binderOwnsSwift      = binderOwnershipRoutes[ruleSwiftOwnership]

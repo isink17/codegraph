@@ -60,10 +60,10 @@ func lifecycleRegistry() *parser.Registry {
 // Scala builds no call graph: a call whose only candidate is a same-named
 // method elsewhere, or an overload in the same object, stays edgeless on every
 // path, and overloads and a companion keep their symbols across updates.
-// Dart builds no call graph: a bare call whose only candidate is a top-level
-// function elsewhere, a same-class method call and a named constructor call
-// stay edgeless and their references unbound on every path, while the
-// declarations follow edits, renames and deletes.
+// Dart builds no cross-file call graph: a bare call whose only candidate is a
+// top-level function elsewhere, a same-class method call and a named
+// constructor call stay edgeless and their references unbound on every path,
+// while the declarations follow edits, renames and deletes.
 func TestDartCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	const caller = "import 'provider.dart';\nclass Caller {\n  void run() { target(); local(); Provider.make(); }\n  void local() {}\n}\n"
 	r := newLifecycleRepo(t, tree{
@@ -110,6 +110,75 @@ func TestDartCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	r.remove(t, "lib/provider.dart")
 	r.update(t, "lib/caller.dart", "lib/provider.dart")
 	symbols("provider deleted", callerSymbols)
+}
+
+// A Dart call proven by lexical scope binds to its own file's declaration on
+// every path, and loses the binding when the declaration is renamed, a part
+// directive makes the library span files, or the file stops parsing.
+func TestDartLexicalCallLifecycleParity(t *testing.T) {
+	const caller = `void helper() {}
+void run() {
+  int sq(int n) => n * n;
+  sq(2);
+  helper();
+  missing();
+}
+`
+	r := newLifecycleRepo(t, tree{
+		"lib/caller.dart": caller,
+		"lib/other.dart":  "void helper() {}\nvoid missing() {}\nvoid sq(int n) {}\n",
+	})
+	assertState := func(step, wantHelper, wantSq string) {
+		t.Helper()
+		if got := r.edgeState(t, "lib/caller.dart", "helper"); got != wantHelper {
+			t.Fatalf("%s: helper edge = %q, want %q", step, got, wantHelper)
+		}
+		if got := r.edgeState(t, "lib/caller.dart", "sq"); got != wantSq {
+			t.Fatalf("%s: sq edge = %q, want %q", step, got, wantSq)
+		}
+		if got := r.edgeState(t, "lib/caller.dart", "missing"); got != "<no edge>" {
+			t.Fatalf("%s: unproven call gained an edge = %s", step, got)
+		}
+		if got := r.refTarget(t, "lib/caller.dart", "missing"); got != "" {
+			t.Fatalf("%s: unproven reference bound to %q", step, got)
+		}
+		r.assertFreshParity(t, step)
+	}
+	helper := ` => lib/caller.dart:helper(function) [dart_lexical_function/high]`
+	sq := ` => lib/caller.dart:sq(function) [dart_lexical_function/high]`
+	assertState("fresh", helper, sq)
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	assertState("no-op", helper, sq)
+
+	r.write(t, "lib/other.dart", "void helper() {}\nvoid helper2() {}\n")
+	r.update(t, "lib/other.dart")
+	assertState("other edited", helper, sq)
+
+	r.write(t, "lib/caller.dart", strings.Replace(caller, "void helper() {}", "void renamed() {}", 1))
+	r.update(t, "lib/caller.dart")
+	assertState("top-level renamed", "<no edge>", sq)
+
+	r.write(t, "lib/caller.dart", strings.Replace(caller, "int sq(", "int square(", 1))
+	r.update(t, "lib/caller.dart")
+	assertState("local renamed", helper, "<no edge>")
+
+	r.write(t, "lib/caller.dart", "part 'more.dart';\n"+caller)
+	r.update(t, "lib/caller.dart")
+	assertState("part added", "<no edge>", " => lib/caller.dart:sq(function) [dart_lexical_function/high]")
+
+	r.write(t, "lib/caller.dart", caller+"class {\n")
+	r.update(t, "lib/caller.dart")
+	assertState("parse error", "<no edge>", "<no edge>")
+
+	r.write(t, "lib/caller.dart", caller)
+	r.remove(t, "lib/other.dart")
+	r.update(t, "lib/caller.dart", "lib/other.dart")
+	assertState("other deleted", helper, sq)
+	r.remove(t, "lib/caller.dart")
+	r.update(t, "lib/caller.dart")
+	r.assertFreshParity(t, "caller deleted")
 }
 
 func TestScalaCallsStayEdgelessAndLifecycleParity(t *testing.T) {

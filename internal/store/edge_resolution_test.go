@@ -123,6 +123,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyRubyExplicitSelf,
 		ResolutionStrategyLuaLocalFunction,
 		ResolutionStrategyScalaLocalFunction,
+		ResolutionStrategyDartLexicalFunction,
 		ResolutionStrategyTerraformModuleScope,
 		ResolutionStrategyRubyLexicalConstant,
 		ResolutionStrategyRubyConstantPath,

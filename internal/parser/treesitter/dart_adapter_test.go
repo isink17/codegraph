@@ -22,9 +22,6 @@ func parseDart(t *testing.T, src string) graph.ParsedFile {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pf.Edges) != 0 {
-		t.Fatalf("Dart produced call edges: %+v", pf.Edges)
-	}
 	return pf
 }
 
@@ -481,9 +478,9 @@ class _CounterPageState extends State<CounterPage> {
 	}
 }
 
-func TestDartAdapterProfileIsSymbolsOnly(t *testing.T) {
+func TestDartAdapterProfile(t *testing.T) {
 	a := NewDart()
-	if p := a.Profile(); p.ID != "treesitter:dart:v2" || p.EmitsCallEdges {
+	if p := a.Profile(); p.ID != "treesitter:dart:v3" || !p.EmitsCallEdges {
 		t.Fatalf("profile = %+v", p)
 	}
 	if !a.Supports("lib/main.dart") || !a.Supports("A.DART") || a.Supports("main.dart.js") {

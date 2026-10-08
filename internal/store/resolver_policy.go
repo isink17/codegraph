@@ -50,6 +50,7 @@ var resolverPolicyRegistry = map[string]int{
 	// bare call; epoch 3 may bind the using static target instead.
 	"cpp":        1,
 	"csharp":     4,
+	"dart":       1,
 	"go":         1,
 	"java":       1,
 	"kotlin":     1,
