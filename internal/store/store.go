@@ -2796,7 +2796,7 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" || parsed.Scope.TerraformComplete {
+	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" || parsed.Scope.TerraformComplete || parsed.Scope.LuaDebugFree {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path, jvm_facade_class, jvm_facade_explicit, jvm_multifile) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath, parsed.Scope.JVMFacade.Class, boolInt(parsed.Scope.JVMFacade.Explicit), boolInt(parsed.Scope.JVMFacade.Multifile)); err != nil {
 			return nil, err
 		}
@@ -4396,10 +4396,12 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	// Lua calls: bound to the local function the parser proved or left
 	// unresolved; luaScopeVetoSQL keeps every strategy below off them. See
 	// lua_scope.go.
-	if n, err := resolveLuaScope(ctx, tx, repoID, scope.only("lua")); err != nil {
-		return 0, err
-	} else {
-		totalResolved += n
+	if scope.has("lua") {
+		if n, err := resolveLuaScope(ctx, tx, repoID); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
 	}
 	// Terraform references: bound within their module directory or left
 	// unresolved; hclScopeVetoSQL keeps every strategy below off them. See
@@ -5381,9 +5383,13 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
-	luaResolved, err := resolveLuaScope(ctx, tx, repoID, scope.only("lua"))
-	if err != nil {
-		return 0, err
+	// Lua decides every call repo-wide: a changed or deleted file can make
+	// the debug library reachable, or unreachable, for all of them.
+	luaResolved := 0
+	if scope.has("lua") {
+		if luaResolved, err = resolveLuaScope(ctx, tx, repoID); err != nil {
+			return 0, err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
@@ -6701,7 +6707,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, nil
 	}
 	// Lua owns every call outright, like Ruby above. This is the Go-side twin
-	// of luaScopeVetoSQL.
+	// of luaScopeVetoSQL. Its pass re-decides the whole repository, like HCL's.
 	luaIDs := make(map[int64]struct{})
 	for _, target := range targets {
 		if binderOwnsLua(target) {
@@ -6709,7 +6715,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 	}
 	if len(luaIDs) > 0 {
-		n, err := s.resolveLuaScopeStandalone(ctx, repoID, luaIDs)
+		if _, err := s.resolveLuaScopeStandalone(ctx, repoID); err != nil {
+			return outcome, err
+		}
+		n, err := s.boundEdgeCount(ctx, repoID, sortedIDs(luaIDs))
 		if err != nil {
 			return outcome, err
 		}

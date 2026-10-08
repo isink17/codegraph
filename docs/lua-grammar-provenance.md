@@ -43,11 +43,21 @@ any of those names passed as a value (`pcall(require, m)`, `local env = _G`)
 count as reaching it. Field and method names, table-constructor keys, labels,
 parameters and locals named `debug`, and plain string data do not.
 
-The proof covers this file's code only. Another module that obtains a
-function this file exports and calls `debug.setupvalue` on it, or C code using
-`lua_setupvalue`, can rebind an upvalue the edge relies on; that is not
-detected. Nor is a literal `require` of another module that itself returns
-the debug library: what a module returns is outside this file. A literal
-`require` of a hazard name (`"_G"` and `"package"` are preloaded and hold
+The debug library acts on the whole Lua state, not on the file that loads
+it: `debug.setupvalue` or `debug.upvaluejoin` on a closure another module
+exports, or `debug.setlocal` from a hook or a callback, rebinds a local of
+any file. So the proof also covers every other indexed `.lua` file: while any
+of them can reach the library by the rule above, or was not scanned (an
+oversize or failed parse, a non-CGO build), every Lua call in the repository
+stays unresolved. A file with a parse error counts only if it spells one of
+the names above anywhere, because a dialect the grammar rejects may still
+run. The decision is repository-wide and re-made on every update that touches
+a `.lua` path, so fresh and incremental indexing agree. Assigning to an
+exported field (`M.f = other` from another module) changes `M.f()` calls,
+which are never resolved, and not calls to the `local function f`, so it is
+not a hazard. Not detected: code outside the index (installed modules, the
+host application, a module loaded from a path the index does not cover) and
+C code using `lua_setupvalue`. A literal `require` of another module that
+returns the debug library is covered only when that module is indexed. A literal `require` of a hazard name (`"_G"` and `"package"` are preloaded and hold
 the library) or of LuaJIT's `"ffi"` does count as reaching it. Calls at file top level
 have no source symbol and are not persisted as edges.

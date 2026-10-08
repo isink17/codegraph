@@ -26,7 +26,7 @@ func (a *HCLAdapter) Profile() parser.Profile {
 // labels and <const>/<close> locals parse, so such files can bind calls, and
 // bracket callees (`t[k]()`) no longer get a concatenated name.
 func (a *LuaAdapter) Profile() parser.Profile {
-	return parser.NewProfile("lua", "treesitter:lua:v3", true)
+	return parser.NewProfile("lua", "treesitter:lua:v4", true)
 }
 
 // Scala v3 records declarations, imports and call references but no call

@@ -43,6 +43,15 @@ func TestLuaScopeVetoSQLMatchesGoTwin(t *testing.T) {
 	}
 }
 
+// markLuaDebugFree records the parser's evidence that a Lua file cannot reach
+// the debug library; without it no Lua call in the repository binds.
+func markLuaDebugFree(t *testing.T, s *Store, repoID, fileID int64) {
+	t.Helper()
+	if _, err := s.db.Exec(`INSERT INTO file_scope_evidence(repo_id, file_id, language) VALUES(?, ?, 'lua')`, repoID, fileID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The pass binds only the symbol at the evidence position: a same-named local
 // at another position, a global function, or a missing declaration leaves the
 // edge unresolved.
@@ -53,6 +62,7 @@ func TestResolveLuaScopeBindsOnlyTheDeclarationAtTheEvidencePosition(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	markLuaDebugFree(t, s, repo.ID, file)
 	symbol := func(key string, line int) int64 {
 		res, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, 'lua', 'function', 'f', 'f', ?, 1, ?, 9, ?)`,
 			repo.ID, file, line, line, key)
@@ -78,7 +88,7 @@ func TestResolveLuaScopeBindsOnlyTheDeclarationAtTheEvidencePosition(t *testing.
 	global := edge(graph.LuaLocalFunctionEvidence + "3:1")
 	missing := edge(graph.LuaLocalFunctionEvidence + "4:1")
 	plain := edge("")
-	n, err := resolveLuaScope(ctx, s.db, repo.ID, nil)
+	n, err := resolveLuaScope(ctx, s.db, repo.ID)
 	if err != nil || n != 1 {
 		t.Fatalf("bound %d, err %v; want exactly one", n, err)
 	}
@@ -131,6 +141,8 @@ func TestLuaOwnershipAllEntrypoints(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			markLuaDebugFree(t, s, repo.ID, file)
+			markLuaDebugFree(t, s, repo.ID, other)
 			symbol := func(fileID int64, name, key string) int64 {
 				res, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, 'lua', 'function', ?, ?, 1, 1, 3, 4, ?)`,
 					repo.ID, fileID, name, name, key)
@@ -175,5 +187,58 @@ func TestLuaOwnershipAllEntrypoints(t *testing.T) {
 				t.Fatalf("bindings = %s", got)
 			}
 		})
+	}
+}
+
+// One Lua file without debug-free evidence withdraws every binding in the
+// repository, including bindings the pass made before; restoring the evidence
+// restores them.
+func TestResolveLuaScopeWithdrawnByAnyFileWithoutDebugEvidence(t *testing.T) {
+	ctx := context.Background()
+	s, repo := openBudgetStore(t)
+	file, err := insertTestFileLang(ctx, s, repo.ID, "m.lua", "lua")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := insertTestFileLang(ctx, s, repo.ID, "other.lua", "lua")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markLuaDebugFree(t, s, repo.ID, file)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, 'lua', 'function', 'f', 'f', 1, 1, 1, 9, 'func:lua:local:f:1:1')`, repo.ID, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := res.LastInsertId()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line, start_col) VALUES(?, ?, 'f', 'calls', ?, ?, 2, 1)`,
+		repo.ID, f, graph.LuaLocalFunctionEvidence+"1:1", file); err != nil {
+		t.Fatal(err)
+	}
+	bound := func() int {
+		var n int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges WHERE dst_symbol_id IS NOT NULL`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n, err := resolveLuaScope(ctx, s.db, repo.ID); err != nil || n != 0 || bound() != 0 {
+		t.Fatalf("other.lua unproven: bound %d (stored %d), err %v; want none", n, bound(), err)
+	}
+	markLuaDebugFree(t, s, repo.ID, other)
+	if n, err := resolveLuaScope(ctx, s.db, repo.ID); err != nil || n != 1 || bound() != 1 {
+		t.Fatalf("all proven: bound %d (stored %d), err %v; want one", n, bound(), err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM file_scope_evidence WHERE file_id = ?`, other); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := resolveLuaScope(ctx, s.db, repo.ID); err != nil || n != 0 || bound() != 0 {
+		t.Fatalf("evidence withdrawn: bound %d (stored %d), err %v; want the earlier binding cleared", n, bound(), err)
+	}
+	// A deleted file's tombstone proves nothing either way.
+	if _, err := s.db.ExecContext(ctx, `UPDATE files SET is_deleted = 1 WHERE id = ?`, other); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := resolveLuaScope(ctx, s.db, repo.ID); err != nil || n != 1 {
+		t.Fatalf("unproven file deleted: bound %d, err %v; want one", n, err)
 	}
 }

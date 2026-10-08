@@ -242,6 +242,12 @@ type ScopeEvidence struct {
 	// without one (a parse error, a failed or oversize parse, the non-cgo
 	// fallback) proves nothing about its directory.
 	TerraformComplete bool
+	// LuaDebugFree reports that the Lua adapter proved this file's code
+	// cannot reach the debug library. It is persisted as the file's
+	// file_scope_evidence row; a Lua file without one may rewrite the locals
+	// and upvalues of any other file, so no Lua lexical binding in the
+	// repository is proven while it is indexed.
+	LuaDebugFree bool
 }
 
 // JVMFileFacade is the JVM class a Kotlin source file compiles its top-level

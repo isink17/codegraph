@@ -70,7 +70,7 @@ func (a *LuaAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 			pf.Imports = append(pf.Imports, specifier)
 		}
 	}
-	pf.Edges = luaLocalFunctionCalls(ctx, root, content)
+	pf.Edges, pf.Scope.LuaDebugFree = luaLocalFunctionCalls(ctx, root, content)
 	return pf, nil
 }
 
@@ -117,18 +117,47 @@ type luaCallSite struct {
 // closures included. A file with any parse error, or whose own code can reach
 // the debug library (see luaScan), proves nothing.
 //
-// The proof assumes no code outside this file mutates its locals or upvalues
-// through the debug library or the C API: another module calling
-// debug.setupvalue on a function this file exports is not visible here.
-func luaLocalFunctionCalls(ctx context.Context, root *sitter.Node, content []byte) []graph.Edge {
+// It also reports whether this file's code provably cannot reach the debug
+// library. The debug library rewrites locals and upvalues of any function in
+// the Lua state, so another indexed file reaching it withdraws every proof in
+// the repository; the store makes that decision (see lua_scope.go). A file
+// with a parse error is debug-free only if it never spells a hazard name:
+// a dialect the grammar rejects may still load and run. Code outside the
+// index (installed modules, the host application, the C API) is not visible.
+func luaLocalFunctionCalls(ctx context.Context, root *sitter.Node, content []byte) ([]graph.Edge, bool) {
 	if root.HasError() {
-		return nil
+		return nil, !luaSpellsHazard(content)
 	}
 	edges, hazard := luaScan(ctx, root, content)
 	if hazard {
-		return nil
+		return nil, false
 	}
-	return edges
+	return edges, true
+}
+
+// luaSpellsHazard reports whether any identifier-shaped run of content, in
+// code, comments or strings alike, is one of luaHazardNames. Every route to
+// the debug library spells one of them, so a false answer is a proof that
+// needs no parse tree.
+func luaSpellsHazard(content []byte) bool {
+	word := func(c byte) bool {
+		return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	}
+	for i := 0; i < len(content); {
+		if !word(content[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(content) && word(content[j]) {
+			j++
+		}
+		if luaHazardNames[string(content[i:j])] {
+			return true
+		}
+		i = j
+	}
+	return false
 }
 
 // luaHazardNames are the globals through which a chunk can reach the debug
