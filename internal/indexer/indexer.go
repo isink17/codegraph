@@ -83,6 +83,14 @@ func (i *Indexer) SupportedLanguages() []parser.LanguageSupport {
 	return i.registry.SupportedLanguages()
 }
 
+func (i *Indexer) LanguageCapabilities() []parser.LanguageCapability {
+	return i.registry.Capabilities()
+}
+
+func (i *Indexer) LanguageExtensionCollisions() []parser.ExtensionCollision {
+	return i.registry.ExtensionCollisions()
+}
+
 func languageAllowed(allowed []string, language string) bool {
 	return len(allowed) == 0 || slices.Contains(allowed, language)
 }

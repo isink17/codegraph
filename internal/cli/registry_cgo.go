@@ -8,7 +8,7 @@ import (
 )
 
 func newDefaultRegistry() *parser.Registry {
-	return parser.NewRegistry(
+	r := parser.NewRegistry(
 		tsparser.NewGo(),
 		tsparser.NewPython(),
 		tsparser.NewJava(),
@@ -21,4 +21,6 @@ func newDefaultRegistry() *parser.Registry {
 		tsparser.NewPHP(),
 		tsparser.NewCpp(),
 	)
+	r.SetNoCGOCapabilities(noCGOCapabilities())
+	return r
 }

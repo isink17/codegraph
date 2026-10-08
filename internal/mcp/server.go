@@ -409,7 +409,11 @@ func (s *Server) handleGraphStats(ctx context.Context, _ json.RawMessage) (map[s
 }
 
 func (s *Server) handleSupportedLanguages(ctx context.Context, _ json.RawMessage) (map[string]any, error) {
-	data := map[string]any{"languages": s.indexer.SupportedLanguages()}
+	data := map[string]any{
+		"languages":            s.indexer.SupportedLanguages(),
+		"capabilities":         s.indexer.LanguageCapabilities(),
+		"extension_collisions": s.indexer.LanguageExtensionCollisions(),
+	}
 	// The languages above are what THIS binary parses; graph_capability is what
 	// the persisted graph can answer, which a different build may have written.
 	capability, err := s.store.GraphCapability(ctx, s.repoID)

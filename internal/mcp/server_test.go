@@ -134,6 +134,13 @@ func TestSupportedLanguagesTool(t *testing.T) {
 		t.Fatalf("json.Unmarshal(content text) error = %v", err)
 	}
 	langData := parsed["data"].(map[string]any)
+	capabilities := langData["capabilities"].([]any)
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %v, want the registry's one language", capabilities)
+	}
+	if collisions, ok := langData["extension_collisions"].([]any); !ok || len(collisions) != 0 {
+		t.Fatalf("extension_collisions = %v, want an empty registry collision report", langData["extension_collisions"])
+	}
 	languages := langData["languages"].([]any)
 	if len(languages) == 0 {
 		t.Fatalf("languages = %v, want non-empty", languages)

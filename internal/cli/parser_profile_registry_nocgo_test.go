@@ -46,4 +46,13 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 	if degraded != "cpp,csharp,java,kotlin,php,ruby,rust,swift,typescript" {
 		t.Fatalf("DegradedLanguages() = %q", degraded)
 	}
+	for _, capability := range newDefaultRegistry().Capabilities() {
+		if capability.NoCGOParser == nil || !*capability.NoCGOParser {
+			t.Errorf("%s no_cgo_parser = %v, want true", capability.ID, capability.NoCGOParser)
+		}
+		wantCallGraph := capability.ID == "go" || capability.ID == "python"
+		if capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph != wantCallGraph {
+			t.Errorf("%s no_cgo_call_graph = %v, want %v", capability.ID, capability.NoCGOCallGraph, wantCallGraph)
+		}
+	}
 }
