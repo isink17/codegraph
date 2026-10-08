@@ -235,7 +235,9 @@ func dartMembers(parent *sitter.Node, owner string, limit uint32, content []byte
 				dartSymbol(child, child, "enum_value", "value", owner, nodeText(name, content), "", content, pf)
 			}
 		case "function_signature", "getter_signature", "setter_signature":
-			if owner == "" {
+			// A top-level signature is a declaration only with its body or,
+			// for `external`, its `;`; recovery leaves bare signatures behind.
+			if owner == "" && (body != nil || dartTerminated(child, limit)) {
 				dartCallable(child, child, body, owner, content, pf)
 			}
 		case "method_signature", "declaration":
@@ -248,7 +250,7 @@ func dartMembers(parent *sitter.Node, owner string, limit uint32, content []byte
 				dartVariables(child, child, "field", owner, content, pf)
 			}
 		case "initialized_identifier_list", "static_final_declaration_list":
-			if start := dartTopLevelVariableStart(child); owner == "" && start != nil {
+			if start := dartTopLevelVariableStart(child); owner == "" && start != nil && dartTerminated(child, limit) {
 				dartVariables(child, start, "variable", "", content, pf)
 			}
 		}
@@ -391,6 +393,13 @@ func dartTypedefName(node *sitter.Node, content []byte) string {
 		}
 	}
 	return ""
+}
+
+// dartTerminated reports a loose top-level node followed by a real `;` that
+// ends before limit.
+func dartTerminated(n *sitter.Node, limit uint32) bool {
+	next := n.NextSibling()
+	return next != nil && next.Type() == ";" && !next.IsMissing() && next.EndByte() < limit
 }
 
 // dartTopLevelVariableStart is the first modifier or type node of a top-level

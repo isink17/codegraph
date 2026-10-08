@@ -320,6 +320,24 @@ void tail() { third(); }
 		t.Fatalf("references = %q", got)
 	}
 
+	// Recovery leaves declarations without their closing part; none of them
+	// is recorded, nor anything swallowed by an unclosed or misspelt type.
+	for _, broken := range []string{
+		"int get class X {\n  void m() {}\n}\n",
+		"int top  1;\nvoid after() {}\n",
+		"lclass ibrary app;\n",
+		"void helper(int n) {\n  if (n > 0 {\n}\n",
+		"clas A {\n  void m1() {}\n}\n",
+		"class A {\n  void a() {}\n\nvoid top() {}\nmixin M on B {\n  void mm() {}\n}\n",
+		"enum E { one, two; void em() {}\nclass C {\n  void cm() {}\n}\n",
+	} {
+		if got := dartKeys(parseDart(t, broken)); len(got) != 0 {
+			t.Errorf("%q recorded %q", broken, got)
+		}
+	}
+	external := parseDart(t, "external void ext();\nint total = 1;\nint get g => 1;\n")
+	assertDartKeys(t, external, []string{"function func:dart:ext", "variable value:dart:total", "function func:dart:g"})
+
 	// Words error recovery leaves behind are not top-level variables.
 	stray := parseDart(t, "part of 'lib.dart';\nimport 'a.dart' show X, Y hide Z;\nconst after = 1;\n")
 	assertDartKeys(t, stray, []string{})
