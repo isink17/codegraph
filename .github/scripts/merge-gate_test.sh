@@ -19,7 +19,10 @@ case "$1 $2" in
 "pr view")
 	if [[ "$*" == *mergeCommit* ]]; then echo "${STUB_AFTER:-MERGED fedcba}"; else echo "$STUB_PR"; fi ;;
 "pr merge") echo "$*" >>"$STUB_LOG" ;;
-"api repos/{owner}/{repo}/compare/"*) echo "$STUB_BEHIND" ;;
+"api repos/{owner}/{repo}/compare/"*)
+	# The compare must be against the base the gate was asked for.
+	[[ "$2" == "repos/{owner}/{repo}/compare/${STUB_WANT_BASE:-v2.0}...$STUB_SHA" ]] || { echo "unexpected compare $2" >&2; exit 1; }
+	echo "$STUB_BEHIND" ;;
 "api --paginate") printf '%b' "$STUB_CHECKS" ;;
 "api repos/{owner}/{repo}/commits/"*) echo "$STUB_STATUS" ;;
 *) echo "unexpected gh $*" >&2; exit 1 ;;
@@ -41,6 +44,7 @@ case_() {
 		STUB_PR="${PR_JSON:-OPEN false v2.0 $sha MERGEABLE}" \
 		STUB_BEHIND="${BEHIND:-0}" STUB_CHECKS="${CHECKS-$green}" \
 		STUB_STATUS="${STATUS:-0 pending}" STUB_AFTER="${AFTER:-}" \
+		STUB_WANT_BASE="${WANT_BASE:-v2.0}" STUB_SHA="$sha" \
 		bash "$script" "$@" >/dev/null 2>&1; then got=pass; else got=block; fi
 	if [ "$got" != "$want" ]; then
 		echo "FAIL $name: want $want, got $got"
@@ -102,6 +106,31 @@ case_ merge-blocked-no-call block 42 "$sha" "$work/r3.md" --merge
 case_ merge-ok pass 42 "$sha" "$r" --merge
 grep -qx "pr merge 42 --squash --match-head-commit $sha" "$work/merge.log" ||
 	{ echo "FAIL merge-ok: merge call was: $(cat "$work/merge.log")"; failures=$((failures + 1)); }
+
+# Base selection: v2.0 by default, the listed integration branch only when
+# asked for explicitly, and never master or an unlisted branch.
+ib=integration/v2.0-wave-20261008
+case_ default-base-is-v2 pass 42 "$sha" "$r"
+PR_JSON="OPEN false $ib $sha MERGEABLE" case_ integration-pr-default-base block 42 "$sha" "$r"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib case_ integration-ok pass --base "$ib" 42 "$sha" "$r"
+WANT_BASE=$ib case_ v2-pr-claims-integration block --base "$ib" 42 "$sha" "$r"
+PR_JSON="OPEN false master $sha MERGEABLE" WANT_BASE=master case_ base-master-refused block --base master 42 "$sha" "$r"
+PR_JSON="OPEN false integration/v2.0-wave-20990101 $sha MERGEABLE" WANT_BASE=integration/v2.0-wave-20990101 \
+	case_ base-unlisted-integration block --base integration/v2.0-wave-20990101 42 "$sha" "$r"
+PR_JSON="OPEN false integration/v2.0 $sha MERGEABLE" WANT_BASE=integration/v2.0 case_ base-prefix-refused block --base integration/v2.0 42 "$sha" "$r"
+case_ base-missing-value block --base
+PR_JSON="OPEN false $ib $other MERGEABLE" WANT_BASE=$ib case_ integration-stale-head block --base "$ib" 42 "$sha" "$r"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib BEHIND=2 case_ integration-behind block --base "$ib" 42 "$sha" "$r"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib case_ integration-missing-review block --base "$ib" 42 "$sha" "$work/none.md"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib case_ integration-review-other-head block --base "$ib" 42 "$sha" "$work/r1.md"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib CHECKS='' case_ integration-no-ci block --base "$ib" 42 "$sha" "$r"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib CHECKS='ci\tcompleted\tfailure\tgithub-actions\n' \
+	case_ integration-ci-failed block --base "$ib" 42 "$sha" "$r"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib case_ integration-short-sha block --base "$ib" 42 1234567 "$r"
+: >"$work/merge.log"
+PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib case_ integration-merge pass --base "$ib" 42 "$sha" "$r" --merge
+grep -qx "pr merge 42 --squash --match-head-commit $sha" "$work/merge.log" ||
+	{ echo "FAIL integration-merge: merge call was: $(cat "$work/merge.log")"; failures=$((failures + 1)); }
 
 # The merge is read back: a PR still open afterwards fails the gate.
 AFTER='OPEN ' case_ merge-not-read-back block 42 "$sha" "$r" --merge
