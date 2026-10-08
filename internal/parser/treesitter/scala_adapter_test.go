@@ -419,8 +419,8 @@ func TestScalaAdapterUnbracedRenameImport(t *testing.T) {
 // the intact file declares, symbols with the same kind and owner. Edits are
 // single-byte deletions and insertions of a brace, a parenthesis, a newline
 // or `class `. Edits that only rename an identifier (inside one, or joining
-// two) are skipped, as is any edit that leaves a valid program, which
-// declares what it spells.
+// two) are skipped, as is any edit the grammar parses without an error: those
+// are recorded as parsed and are out of scope here.
 func TestScalaAdapterDamageNeverMisattributes(t *testing.T) {
 	const src = `package com.acme
 package billing
@@ -516,7 +516,7 @@ end Indented
 			return
 		}
 		if root, err := parse(context.Background(), scalagrammar.GetLanguage(), []byte(e.src)); err == nil && !root.HasError() {
-			return // a valid program declares what it spells
+			return // parsed cleanly: out of scope
 		}
 		t.Errorf("%s yields %q", e.what, wrong)
 	}

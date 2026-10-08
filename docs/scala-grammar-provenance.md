@@ -71,6 +71,12 @@ when the file has more `}` than `{` (a missing opening brace moves members
 out of their type before any error shows). Packages nested inside a package body are not parsed by this grammar
 revision; declarations under them are dropped rather than misplaced.
 
+These rules only apply when the grammar reports an error. Broken source the
+grammar parses cleanly is recorded as parsed: in Scala 3 indentation syntax a
+deleted `:` that opens a body, or a first member indented deeper than the
+rest, moves the following members to package level, and a misspelt `package`
+keyword drops the package prefix. The compiler rejects such files.
+
 ## Call resolution
 
 None. The profile `treesitter:scala:v2` declares no call edges: implicit and
