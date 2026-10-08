@@ -21,6 +21,7 @@ func newDefaultRegistry() *parser.Registry {
 		tsparser.NewPHP(),
 		tsparser.NewCpp(),
 		tsparser.NewLua(),
+		tsparser.NewScala(),
 	)
 	r.SetNoCGOCapabilities(noCGOCapabilities())
 	return r

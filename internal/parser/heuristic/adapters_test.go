@@ -284,3 +284,27 @@ func TestCSharpHeuristicUsingStaticKeyword(t *testing.T) {
 		}
 	}
 }
+
+func TestScalaHeuristicSymbolsOnly(t *testing.T) {
+	src := "package app\nimport scala.util.Try\n// class Commented\nobject Main {\n  private[app] def run(): Unit = helper()\n  def helper() = 1\n}\ntrait Shape\n"
+	pf, err := NewScala().Parse(context.Background(), "Main.scala", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, s := range pf.Symbols {
+		names = append(names, s.Kind+":"+s.Name)
+	}
+	if strings.Join(names, ",") != "type:Main,function:run,function:helper,type:Shape" {
+		t.Fatalf("symbols = %v", names)
+	}
+	if len(pf.Edges) != 0 || len(pf.Imports) != 1 || pf.Imports[0] != "scala.util.Try" {
+		t.Fatalf("edges = %v imports = %v", pf.Edges, pf.Imports)
+	}
+	if p := NewScala().Profile(); p.ID != "heuristic:scala:v1" || p.EmitsCallEdges {
+		t.Fatalf("profile = %+v", p)
+	}
+	if !NewScala().Supports("build.sc") {
+		t.Fatal("scala heuristic does not claim .sc")
+	}
+}

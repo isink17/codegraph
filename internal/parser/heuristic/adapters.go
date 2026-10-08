@@ -110,6 +110,19 @@ func NewLua() *Adapter {
 	}
 }
 
+func NewScala() *Adapter {
+	return &Adapter{
+		language: "scala",
+		exts:     extSet(".scala", ".sc"),
+		imports:  []importPattern{{re: regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`), nameGroup: 1}},
+		symbols: []symbolPattern{
+			{kind: "type", re: regexp.MustCompile(`\b(class|trait|object|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 2},
+			{kind: "function", re: regexp.MustCompile(`^\s*(?:(?:private|protected|override|final|implicit|inline|transparent|abstract|sealed)(?:\[[^\]]*\])?\s+)*def\s+([A-Za-z_][A-Za-z0-9_]*)`), nameGroup: 1},
+		},
+		cStyle: true,
+	}
+}
+
 func NewRust() *Adapter {
 	return &Adapter{
 		language: "rust",
