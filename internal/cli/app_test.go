@@ -51,6 +51,99 @@ func TestRunInstallCreatesConfigAndPrintsSnippets(t *testing.T) {
 	}
 }
 
+func TestRunInitIndexesAndReportsCapabilityIdempotently(t *testing.T) {
+	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "codegraph-home"))
+	repoRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte("package main\nfunc Main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() { startupVersionCheck = prev })
+
+	for run := 0; run < 2; run++ {
+		var out bytes.Buffer
+		if err := Run(context.Background(), []string{"init", repoRoot}, &out, io.Discard); err != nil {
+			t.Fatalf("Run(init) error = %v", err)
+		}
+		var result map[string]json.RawMessage
+		if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+			t.Fatalf("decode init result: %v", err)
+		}
+		for _, key := range []string{"repo_root", "summary", "stats", "capability"} {
+			if _, ok := result[key]; !ok {
+				t.Fatalf("init result missing %q: %s", key, out.String())
+			}
+		}
+		var summary store.ScanSummary
+		if err := json.Unmarshal(result["summary"], &summary); err != nil {
+			t.Fatal(err)
+		}
+		if summary.FilesSeen != 1 || summary.FilesTotal != 1 {
+			t.Fatalf("first init did not scan the source file: %+v", summary)
+		}
+		if run == 0 {
+			var capability store.GraphCapability
+			if err := json.Unmarshal(result["capability"], &capability); err != nil {
+				t.Fatalf("decode capability: %v", err)
+			}
+			if capability.State == "" || len(capability.Languages) != 1 || capability.Languages[0].Language != "go" {
+				t.Fatalf("unexpected graph capability: %+v", capability)
+			}
+			continue
+		}
+		var second store.ScanSummary
+		if err := json.Unmarshal(result["summary"], &second); err != nil {
+			t.Fatal(err)
+		}
+		if second.FilesChanged != 0 || second.FilesSeen != 1 {
+			t.Fatalf("repeated init summary = %+v", second)
+		}
+	}
+}
+
+func TestRunInitUsesCurrentDirectoryByDefault(t *testing.T) {
+	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "codegraph-home"))
+	repoRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte("package main\nfunc Main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(repoRoot)
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() { startupVersionCheck = prev })
+
+	var out bytes.Buffer
+	if err := Run(context.Background(), []string{"init"}, &out, io.Discard); err != nil {
+		t.Fatalf("Run(init) error = %v", err)
+	}
+	var result struct {
+		RepoRoot string `json:"repo_root"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("decode init result: %v", err)
+	}
+	canonicalRoot, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RepoRoot != canonicalRoot {
+		t.Fatalf("repo_root = %q, want canonical current directory %q", result.RepoRoot, canonicalRoot)
+	}
+}
+
+func TestRunInitRejectsMultipleRepoPaths(t *testing.T) {
+	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "codegraph-home"))
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() { startupVersionCheck = prev })
+
+	err := Run(context.Background(), []string{"init", "first", "second"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "init accepts at most one repo path") {
+		t.Fatalf("Run(init with multiple paths) error = %v", err)
+	}
+}
+
 func TestRunFindSymbolQueryCommand(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
 	t.Setenv("CODEGRAPH_HOME", home)

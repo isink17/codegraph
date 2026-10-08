@@ -147,6 +147,15 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			name:        "init",
+			description: "initialize and index the current repository",
+			usageLines:  []string{"  init [repo-path]"},
+			examples:    []string{"codegraph init", "codegraph init /path/to/repo"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runInit(ctx, cfg, stdout, args)
+			},
+		},
+		{
 			name:        "update_graph",
 			aliases:     []string{"update"},
 			description: "update only changed files",
