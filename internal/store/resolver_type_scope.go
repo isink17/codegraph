@@ -1122,6 +1122,10 @@ type importScopeCache struct {
 	// statement has to re-bind the crate-root fan-out.
 	rustFiles map[int64]struct{}
 	loaded    bool
+	// hclDefer makes the binder withhold HCL edges into hclWithheld instead
+	// of running the repository-wide HCL pass per batch; the caller runs it.
+	hclDefer    bool
+	hclWithheld []int64
 }
 
 // newImportScopeCache returns a cache for one repo's resolve.

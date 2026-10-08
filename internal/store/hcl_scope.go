@@ -16,7 +16,7 @@ import (
 // namespace, and no other directory's declarations are visible. An HCL edge
 // binds only to the single declaration of its exact address in its own
 // file's directory; a duplicate, a missing declaration, a dynamic traversal,
-// or a directory holding a Terraform file the grammar could not parse leaves
+// or a directory holding a .tf file not parsed completely leaves
 // it unresolved. No repo-wide strategy may answer an HCL edge: a name lookup
 // would cross module directories.
 //
@@ -51,9 +51,31 @@ func resolveHCLScope(ctx context.Context, q execQuerier, repoID int64) (int, err
 		WHERE repo_id = ? AND file_id IN (SELECT id FROM files WHERE repo_id = ? AND language = 'hcl')`, repoID, repoID); err != nil {
 		return 0, err
 	}
-	declarations := map[hclScopeKey][]int64{}
+	// A directory is unproven when one of its .tf files has no completeness
+	// row: a syntax error, a failed or oversize parse, or the non-cgo
+	// fallback may have left a declaration unrecorded.
 	broken := map[string]bool{}
-	rows, err := q.QueryContext(ctx, `SELECT s.id, s.kind, s.qualified_name, f.path
+	rows, err := q.QueryContext(ctx, `SELECT f.path FROM files f
+		WHERE f.repo_id = ? AND f.language = 'hcl' AND f.is_deleted = 0
+		  AND NOT EXISTS (SELECT 1 FROM file_scope_evidence fs WHERE fs.repo_id = f.repo_id AND fs.file_id = f.id)`, repoID)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var filePath string
+		if err := rows.Scan(&filePath); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if strings.EqualFold(filepath.Ext(filePath), ".tf") {
+			broken[path.Dir(filePath)] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	declarations := map[hclScopeKey][]int64{}
+	rows, err = q.QueryContext(ctx, `SELECT s.id, s.kind, s.qualified_name, f.path
 		FROM symbols s JOIN files f ON f.id = s.file_id
 		WHERE s.repo_id = ? AND f.language = 'hcl' AND f.is_deleted = 0`, repoID)
 	if err != nil {
@@ -69,12 +91,8 @@ func resolveHCLScope(ctx context.Context, q execQuerier, repoID int64) (int, err
 		if !terraform.IsTerraformPath(filePath) {
 			continue
 		}
-		dir := path.Dir(filePath)
-		switch {
-		case kind == terraform.KindSyntaxError:
-			broken[dir] = true
-		case hclTerraformDeclarationKinds[kind]:
-			key := hclScopeKey{dir, qname}
+		if hclTerraformDeclarationKinds[kind] {
+			key := hclScopeKey{path.Dir(filePath), qname}
 			declarations[key] = append(declarations[key], id)
 		}
 	}
@@ -134,4 +152,16 @@ func (s *Store) resolveHCLScopeStandalone(ctx context.Context, repoID int64) (in
 		return 0, err
 	}
 	return n, tx.Commit()
+}
+
+// boundEdgeCount counts the listed edges that have a destination.
+func (s *Store) boundEdgeCount(ctx context.Context, repoID int64, ids []int64) (int, error) {
+	n := 0
+	err := sqliteBatchedIDQuery(ctx, s.db, ids, `SELECT id FROM edges WHERE repo_id = ? AND dst_symbol_id IS NOT NULL AND id IN (`, []any{repoID},
+		func(scan func(...any) error) error {
+			var id int64
+			n++
+			return scan(&id)
+		})
+	return n, err
 }

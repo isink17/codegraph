@@ -1000,3 +1000,24 @@ func TestCrossLanguageLinksKeepStoredPathIdentity(t *testing.T) {
 		}
 	}
 }
+
+// HCL files are neither bridge sources nor bridge destinations: a Terraform
+// module source names a directory, and no other language loads HCL as code.
+func TestCrossLanguageLinksIgnoreHCLFiles(t *testing.T) {
+	f := newGateFixture(t)
+	spec := crossLangSpec{
+		files: []crossLangFile{
+			{path: "src/client.ts", language: "typescript", symbols: []crossLangSymbol{{name: "Encode", qualified: "client.Encode"}}},
+			{path: "infra/model.tf", language: "hcl", symbols: []crossLangSymbol{{name: "Encode", qualified: "Encode"}}},
+			{path: "src/shared/model.py", language: "python", symbols: []crossLangSymbol{{name: "Encode", qualified: "model.Encode"}}},
+		},
+		imports: []crossLangImport{
+			{fromPath: "src/client.ts", path: "infra/model"},
+			{fromPath: "infra/model.tf", path: "src/shared/model"},
+		},
+	}
+	spec.build(t, f, 1)
+	if created := f.resolveCrossLanguage(t); created != 0 {
+		t.Fatalf("HCL bridge created %d links: %v", created, crossLangLinks(t, f))
+	}
+}

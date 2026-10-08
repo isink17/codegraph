@@ -14,9 +14,12 @@ func tsProfile(language string) parser.Profile {
 
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
-// HCL emits Terraform reference edges and no call edges.
+// HCL's relationship graph is its Terraform `references` edges; it emits no
+// `calls`. It still declares a graph, so a repository with Terraform files is
+// not reported as symbols-only and a non-cgo reindex, which records no
+// references, is refused as the downgrade it is.
 func (a *HCLAdapter) Profile() parser.Profile {
-	return parser.NewProfile("hcl", "treesitter:hcl:v1", false)
+	return parser.NewProfile("hcl", "treesitter:hcl:v1", true)
 }
 
 // Lua v2 parses with the vendored tree-sitter-grammars v0.3.0 grammar: goto,

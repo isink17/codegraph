@@ -3,9 +3,17 @@
 package indexer
 
 import (
+	"context"
+	"errors"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/parser"
+	heuristicparser "github.com/isink17/codegraph/internal/parser/heuristic"
+	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 // A small, original two-module Terraform configuration with a tfvars file, a
@@ -199,4 +207,24 @@ func TestTerraformReferencesBindWithinTheirModuleDirectory(t *testing.T) {
 	r.write(t, "infra/storage.tf", "resource \"aws_eip\" \"app\" {}\n")
 	r.update(t, "infra/storage.tf")
 	expect("duplicate resource", map[[2]string]string{{"infra/outputs.tf", "aws_eip.app"}: unresolvedRef})
+}
+
+// The non-cgo fallback records no references, so replacing a tree-sitter HCL
+// graph with it is refused like any other call-graph downgrade.
+func TestTerraformFallbackReindexIsRefusedAsDowngrade(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "main.tf"), "variable \"region\" {}\noutput \"r\" { value = var.region }\n")
+	s, err := store.Open(filepath.Join(t.TempDir(), "codegraph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if _, err := New(s, parser.NewRegistry(tsparser.NewHCL()), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	fallback := New(s, parser.NewRegistry(heuristicparser.NewHCL()), nil)
+	if _, err := fallback.Update(ctx, Options{RepoRoot: root}); !errors.Is(err, ErrParserDowngradeRefused) {
+		t.Fatalf("fallback update err = %v, want ErrParserDowngradeRefused", err)
+	}
 }

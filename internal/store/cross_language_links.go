@@ -31,7 +31,9 @@ import (
 // gives them meaning (`require "./x"` resolves against the working directory,
 // `require_relative "./x"` against the caller), and neither form ever loads a
 // `.py` or `.ts` file. HCL rows are Terraform module sources, which name a
-// directory of Terraform files, never a file of another language. A Ruby file may still be a bridge DESTINATION when
+// directory of Terraform files, never a file of another language, and no
+// other language's import loads an HCL file as code, so HCL files are neither
+// bridge sources nor bridge destinations. A Ruby file may still be a bridge DESTINATION when
 // another language's own import names it.
 //
 // So one rule covers every link:
@@ -368,7 +370,7 @@ func crossLanguageTarget(src xlangSymbol, srcEligible int, dstSymbols []xlangSym
 func crossLanguageFiles(ctx context.Context, q xlangQueryer, repoID int64) ([]xlangFile, map[string][]xlangFile, map[string][]xlangFile, error) {
 	rows, err := q.QueryContext(ctx, `
 		SELECT id, path, language FROM files
-		WHERE repo_id = ? AND is_deleted = 0
+		WHERE repo_id = ? AND is_deleted = 0 AND language <> 'hcl'
 		ORDER BY path, id
 	`, repoID)
 	if err != nil {

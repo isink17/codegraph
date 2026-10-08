@@ -55,18 +55,33 @@ or resolved to a directory.
 A traversal rooted at `var`, `local`, `module`, `data` or any other name (a
 resource type) becomes a `references` edge to its address (`var.N`,
 `local.N`, `module.N`, `data.T.N`, `T.N`); a `.tfvars` assignment references
-`var.N`. Roots `count`, `each`, `self`, `path` and `terraform`, and names bound
-by a `for` expression or a `dynamic` block (its label or `iterator`), are not
-references. A splat or non-literal index after the address marks the edge
-dynamic; it never binds.
+`var.N`. These are not references: roots `count`, `each`, `self`, `path`,
+`terraform` and `ephemeral`; names bound by a `for` expression, a template
+`%{ for }` directive or a `dynamic` block (its label or `iterator`); and the
+`provider` and `providers` meta-arguments and lifecycle `ignore_changes`. A
+splat or non-literal index after the address (`aws_instance.web[*]`,
+`aws_instance.web[count.index]`, `local.m[var.k]`) marks the edge dynamic, and
+a dynamic edge never binds: the instance a `count` or `for_each` index selects
+is a plan-time value. A literal index (`aws_instance.web[0]`) binds.
 
 A Terraform module is a directory. A reference binds only to the one
 declaration of its address among the `.tf` files of its own directory. A
 duplicate (including `override.tf` merges), a missing declaration, a
-declaration in another directory, and every reference in a directory holding a
-`.tf` file with a parse error stay unresolved; a malformed file records no
-references and a `terraform_syntax_error` marker. Hidden directories such as
-`.terraform/` are not scanned. Nothing evaluates expressions or plans.
+declaration in another directory, and every reference in a directory one of
+whose `.tf` files was not parsed completely stay unresolved. A cleanly parsed
+Terraform file is recorded as complete in `file_scope_evidence`; a file with a
+syntax error records no references and no completeness row, and neither does
+a failed or oversize parse or the non-CGO fallback. `module.M.out` binds to
+the `module "M"` block of the same directory, never to the child module's
+output. Hidden directories such as `.terraform/` are not scanned. Nothing
+evaluates expressions or plans.
+
+Terraform symbol names are short (`main`, `this`, `region`), so a bare-name
+lookup can be ambiguous; query by address (`aws_vpc.main`, `var.region`).
+`find_callers` on a declaration lists the blocks that reference it.
 
 The non-CGO fallback (`heuristic:hcl:v1`) records only top-level declarations
-of `.tf` files, under the same names, and no references or imports.
+of `.tf` files, under the same names, and no references or imports. The CGO
+profile declares a relationship graph (its `references` edges), so an index
+with Terraform files is not reported as symbols-only, and replacing it with
+the fallback is refused as a downgrade.

@@ -236,6 +236,12 @@ type ScopeEvidence struct {
 	GoLocals             []GoLocalBinding
 	SwiftLexicalBindings []SwiftLexicalBinding
 	JVMFacade            JVMFileFacade
+	// TerraformComplete reports that the HCL adapter parsed this Terraform
+	// file without a syntax error, so every declaration it holds is recorded.
+	// It is persisted as the file's file_scope_evidence row; a Terraform file
+	// without one (a parse error, a failed or oversize parse, the non-cgo
+	// fallback) proves nothing about its directory.
+	TerraformComplete bool
 }
 
 // JVMFileFacade is the JVM class a Kotlin source file compiles its top-level

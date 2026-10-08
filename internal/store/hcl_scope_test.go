@@ -48,9 +48,18 @@ func TestHCLScopeVetoSQLMatchesGoTwin(t *testing.T) {
 func TestResolveHCLScopeBindsOnlyAUniqueSameDirectoryDeclaration(t *testing.T) {
 	ctx := context.Background()
 	s, repo := openBudgetStore(t)
-	file := func(path string) int64 {
+	// file inserts a completely parsed file; partial inserts one without
+	// its completeness row.
+	partial := func(path string) int64 {
 		id, err := insertTestFileLang(ctx, s, repo.ID, path, "hcl")
 		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	file := func(path string) int64 {
+		id := partial(path)
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language) VALUES(?, ?, 'hcl')`, repo.ID, id); err != nil {
 			t.Fatal(err)
 		}
 		return id
@@ -93,7 +102,9 @@ func TestResolveHCLScopeBindsOnlyAUniqueSameDirectoryDeclaration(t *testing.T) {
 	cMain := file("c/main.tf")
 	cVar := symbol(cMain, terraform.KindVariable, "var.region")
 	brokenDir := edge(cMain, cVar, "var.region", ref)
-	symbol(file("c/broken.tf"), terraform.KindSyntaxError, terraform.KindSyntaxError)
+	partial("c/broken.tf")
+	// An incomplete tfvars file declares nothing and proves nothing away.
+	partial("a/prod.tfvars")
 
 	n, err := resolveHCLScope(ctx, s.db, repo.ID)
 	if err != nil {
@@ -111,5 +122,38 @@ func TestResolveHCLScopeBindsOnlyAUniqueSameDirectoryDeclaration(t *testing.T) {
 		if want == 0 && got != nil || want != 0 && (got == nil || *got != want || strategy != ResolutionStrategyTerraformModuleScope) {
 			t.Fatalf("edge %d: dst=%v strategy=%q, want %d", id, got, strategy, want)
 		}
+	}
+}
+
+// The Go-side binder routes HCL edges to the HCL pass and counts the ones the
+// pass bound as resolved, not as unresolved.
+func TestResolveEdgesForNamesCountsBoundHCLEdges(t *testing.T) {
+	ctx := context.Background()
+	s, repo := openBudgetStore(t)
+	file, err := insertTestFileLang(ctx, s, repo.ID, "a/main.tf", "hcl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language) VALUES(?, ?, 'hcl')`, repo.ID, file); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, 'hcl', ?, 'region', 'var.region', 1, 1, 9, 1, 'tf:terraform_variable:var.region')`,
+		repo.ID, file, terraform.KindVariable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, _ := res.LastInsertId()
+	for _, dst := range []string{"var.region", "var.missing"} {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line, start_col) VALUES(?, ?, ?, 'references', ?, ?, 2, 1)`,
+			repo.ID, src, dst, graph.HCLTerraformReferenceEvidence, file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := s.ResolveEdgesForNamesWithStats(ctx, repo.ID, []string{"var.region", "var.missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TargetsResolved != 1 || stats.TargetsUnresolved != 1 {
+		t.Fatalf("stats = %+v, want 1 resolved, 1 unresolved", stats)
 	}
 }

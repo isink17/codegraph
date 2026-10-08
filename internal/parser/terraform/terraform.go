@@ -21,10 +21,6 @@ const (
 	KindOutput        = "terraform_output"
 	KindModule        = "terraform_module"
 	KindVariableValue = "terraform_variable_value"
-	// KindSyntaxError marks a Terraform file the grammar could not parse
-	// cleanly. A declaration it holds may be missing, so nothing in its
-	// directory is proven unique.
-	KindSyntaxError = "terraform_syntax_error"
 
 	KindHCLBlock     = "hcl_block"
 	KindHCLAttribute = "hcl_attribute"

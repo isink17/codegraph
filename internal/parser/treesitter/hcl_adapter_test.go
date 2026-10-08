@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
-	"github.com/isink17/codegraph/internal/parser/terraform"
 )
 
 func parseHCL(t *testing.T, path, src string) graph.ParsedFile {
@@ -102,6 +101,9 @@ moved {
 	}
 	if got := hclSymbols(pf); !slices.Equal(got, want) {
 		t.Fatalf("symbols = %v\nwant %v", got, want)
+	}
+	if !pf.Scope.TerraformComplete {
+		t.Fatal("clean file does not claim completeness")
 	}
 	if got := strings.Join(pf.Imports, ","); got != "./modules/vpc,terraform-aws-modules/vpc/aws" {
 		t.Fatalf("imports = %q", got)
@@ -233,7 +235,8 @@ datacenters = ["dc1"]
 }
 
 // A malformed Terraform file keeps the declarations it can name, records no
-// references, and carries the marker that keeps its directory unbound.
+// references, and does not claim completeness, which keeps its directory
+// unbound.
 func TestHCLMalformedTerraformFile(t *testing.T) {
 	pf := parseHCL(t, "/r/broken.tf", `variable "region" {}
 
@@ -245,10 +248,54 @@ resource "aws_instance" "web" {
 	if len(pf.Edges) != 0 || len(pf.References) != 0 {
 		t.Fatalf("malformed file produced edges %v", hclEdges(pf))
 	}
-	if !slices.Contains(hclSymbols(pf), terraform.KindSyntaxError+" "+terraform.KindSyntaxError) {
-		t.Fatalf("symbols = %v, want a syntax error marker", hclSymbols(pf))
+	if pf.Scope.TerraformComplete {
+		t.Fatal("malformed file claims completeness")
 	}
 	if !slices.Contains(hclSymbols(pf), "terraform_variable var.region") {
 		t.Fatalf("symbols = %v, want var.region kept", hclSymbols(pf))
+	}
+}
+
+// Names a template `for` directive binds are loop variables in its body, not
+// resources; meta-arguments naming providers or the block's own arguments,
+// and ephemeral resources, are not references.
+func TestHCLTerraformNonReferences(t *testing.T) {
+	pf := parseHCL(t, "/r/main.tf", `resource "aws_instance" "web" {
+  provider  = aws.west
+  user_data = "%{ for server in aws_instance.peer }${server.ip}%{ endfor }"
+  shadow    = "%{ for aws_s3_bucket in var.names }${aws_s3_bucket.web}%{ endfor }"
+  script    = <<EOT
+%{ for k, v in local.env ~}
+${k}=${v.value} ${var.suffix}
+%{ endfor ~}
+EOT
+  secret    = ephemeral.random_password.db.result
+  lifecycle {
+    ignore_changes       = [tags, ami]
+    replace_triggered_by = [aws_s3_bucket.logs]
+  }
+  depends_on = [aws_s3_bucket.logs]
+}
+
+module "child" {
+  source    = "./child"
+  providers = { aws = aws.west }
+}
+
+locals {
+  providers = var.provider_names
+}
+`)
+	want := []string{
+		"aws_instance.peer",
+		"aws_s3_bucket.logs",
+		"aws_s3_bucket.logs",
+		"local.env",
+		"var.names",
+		"var.provider_names",
+		"var.suffix",
+	}
+	if got := hclEdges(pf); !slices.Equal(got, want) {
+		t.Fatalf("edges = %v\nwant %v", got, want)
 	}
 }

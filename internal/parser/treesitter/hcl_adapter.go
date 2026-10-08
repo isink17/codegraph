@@ -43,15 +43,10 @@ func (a *HCLAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 		return pf, nil
 	}
 	// A parse error may hide a declaration, so the file proves nothing: it
-	// records no references, and its marker keeps its directory unbound.
+	// records no references and does not claim completeness, which keeps its
+	// directory unbound.
 	broken := root.HasError()
-	if broken {
-		pf.Symbols = append(pf.Symbols, graph.Symbol{
-			Language: "hcl", Kind: terraform.KindSyntaxError, Name: filepath.Base(path),
-			QualifiedName: terraform.KindSyntaxError, Range: nodeRange(hclFirstError(root)),
-			StableKey: "tf:" + terraform.KindSyntaxError,
-		})
-	}
+	pf.Scope.TerraformComplete = !broken
 	refs := &hclRefs{content: content, pf: &pf}
 	add := func(d terraform.Declaration, n *sitter.Node, signature string) {
 		pf.Symbols = append(pf.Symbols, graph.Symbol{
@@ -90,7 +85,9 @@ func (a *HCLAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 				if d, ok := terraform.LocalDeclaration(nodeText(firstChild(attr, "identifier"), content)); ok {
 					add(d, attr, "")
 					if !broken {
-						refs.walk(attr, nil)
+						// The value only: a local may be named like a
+						// non-reference argument (`providers`).
+						refs.walk(firstChild(attr, "expression"), nil)
 					}
 				}
 			}
@@ -224,21 +221,16 @@ func hclLiteralAttribute(body *sitter.Node, name string, content []byte) (string
 	return "", false
 }
 
-func hclFirstError(n *sitter.Node) *sitter.Node {
-	if n.IsError() || n.IsMissing() {
-		return n
-	}
-	for i := 0; i < int(n.ChildCount()); i++ {
-		if c := n.Child(i); c.HasError() || c.IsMissing() {
-			return hclFirstError(c)
-		}
-	}
-	return n
-}
-
 // hclBuiltinRoots name objects that are not declarations of the module:
 // count.index, each.key, self.x, path.module, terraform.workspace.
-var hclBuiltinRoots = map[string]bool{"count": true, "each": true, "self": true, "path": true, "terraform": true}
+// ephemeral.T.N names an ephemeral resource, which no declaration kind records.
+var hclBuiltinRoots = map[string]bool{"count": true, "each": true, "self": true, "path": true, "terraform": true, "ephemeral": true}
+
+// hclNonReferenceAttributes hold traversals that are not references to module
+// objects: `provider = aws.west` and a module's `providers` map name provider
+// configurations, and lifecycle `ignore_changes` names the block's own
+// arguments.
+var hclNonReferenceAttributes = map[string]bool{"provider": true, "providers": true, "ignore_changes": true}
 
 type hclRefs struct {
 	content []byte
@@ -264,6 +256,28 @@ func (r *hclRefs) walk(n *sitter.Node, shadow map[string]bool) {
 		return
 	}
 	switch n.Type() {
+	case "attribute":
+		if hclNonReferenceAttributes[nodeText(firstChild(n, "identifier"), r.content)] {
+			return
+		}
+	case "template_for":
+		// `%{ for x in coll }...%{ endfor }`: x is bound in the directive's
+		// body; the collection is evaluated outside it.
+		start := firstChild(n, "template_for_start")
+		inner := hclShadow(shadow)
+		for _, c := range hclChildren(start) {
+			if c.Type() == "identifier" {
+				inner[nodeText(c, r.content)] = true
+			} else {
+				r.walk(c, shadow)
+			}
+		}
+		for _, c := range hclChildren(n) {
+			if c.Type() != "template_for_start" {
+				r.walk(c, inner)
+			}
+		}
+		return
 	case "for_tuple_expr", "for_object_expr":
 		intro := firstChild(n, "for_intro")
 		inner := hclShadow(shadow)
