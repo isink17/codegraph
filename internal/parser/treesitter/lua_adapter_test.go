@@ -43,7 +43,16 @@ require(moduleName)
 			t.Errorf("no symbol with declaration identity for %q and kind %q", key, kind)
 		}
 	}
-	if len(p.Edges) != 1 || p.Edges[0].DstName != "localFn" || p.Edges[0].Evidence != graph.LuaLocalFunctionEvidence+"1:1" || p.Edges[0].Line != 2 || p.Edges[0].Col != 21 {
+	// A computed require can load the debug library, so this file proves no
+	// call; the same file without it proves exactly the localFn call.
+	if len(p.Edges) != 0 {
+		t.Fatalf("edges = %+v, want none beside a computed require", p.Edges)
+	}
+	static, err := NewLua().Parse(context.Background(), "main.lua", []byte(strings.Replace(src, "require(moduleName)\n", "", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := static; len(p.Edges) != 1 || p.Edges[0].DstName != "localFn" || p.Edges[0].Evidence != graph.LuaLocalFunctionEvidence+"1:1" || p.Edges[0].Line != 2 || p.Edges[0].Col != 21 {
 		t.Fatalf("edges = %+v, want only the proven localFn call", p.Edges)
 	}
 	references := map[string]bool{}

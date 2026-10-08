@@ -70,7 +70,7 @@ func (a *LuaAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 			pf.Imports = append(pf.Imports, specifier)
 		}
 	}
-	pf.Edges = luaLocalFunctionCalls(root, content)
+	pf.Edges = luaLocalFunctionCalls(ctx, root, content)
 	return pf, nil
 }
 
@@ -114,13 +114,49 @@ type luaCallSite struct {
 // never assigned to. Every other call stays unresolved: globals, fields,
 // methods, parameters, other locals, and any binding with a plain assignment
 // or a non-local `function name()` statement against it anywhere in its scope,
-// closures included. A file with any parse error, or that names `debug` as an
-// identifier or string (whose setlocal/setupvalue rewrite locals at run time),
-// proves nothing.
-func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
-	if root.HasError() || luaNamesDebug(root, content) {
+// closures included. A file with any parse error, or whose own code can reach
+// the debug library (see luaScan), proves nothing.
+//
+// The proof assumes no code outside this file mutates its locals or upvalues
+// through the debug library or the C API: another module calling
+// debug.setupvalue on a function this file exports is not visible here.
+func luaLocalFunctionCalls(ctx context.Context, root *sitter.Node, content []byte) []graph.Edge {
+	if root.HasError() {
 		return nil
 	}
+	edges, hazard := luaScan(ctx, root, content)
+	if hazard {
+		return nil
+	}
+	return edges
+}
+
+// luaHazardNames are the globals through which a chunk can reach the debug
+// library, whose setlocal/setupvalue/upvaluejoin/sethook rewrite locals at run
+// time: the library itself, the global tables that hold it, and the loaders
+// that return it or run code that can name it. LuaJIT's ffi reaches the C API.
+var luaHazardNames = map[string]bool{
+	"debug": true, "ffi": true, "_G": true, "_ENV": true, "package": true, "getfenv": true,
+	"require": true, "load": true, "loadstring": true, "dofile": true, "loadfile": true,
+}
+
+// luaScan walks a chunk once, resolving bare calls by lexical scope and
+// reporting whether the chunk can reach the debug library. A hazard is a free
+// (not lexically bound) reference to one of luaHazardNames, except:
+//   - debug.traceback and debug.getinfo, which read the stack but cannot
+//     rebind a local or upvalue;
+//   - _G.x, _ENV.x, _G["x"], _ENV["x"], rawget/rawset(_G, "x", ...) and
+//     package.loaded.x / package.loaded["x"], for a literal x outside
+//     luaHazardNames;
+//   - package.path, package.cpath and package.config;
+//   - require, dofile and loadfile of a literal other than "debug" (other
+//     files are outside this proof, as above);
+//   - load and loadstring of a literal chunk that is itself hazard-free.
+//
+// Field and method names, table-constructor keys, labels and string data are
+// never references. A computed key or module name is a hazard.
+func luaScan(ctx context.Context, root *sitter.Node, content []byte) ([]graph.Edge, bool) {
+	hazard := false
 	var sites []luaCallSite
 	var walk func(n *sitter.Node, scope *luaScope)
 	walkChildren := func(n *sitter.Node, scope *luaScope) {
@@ -152,6 +188,26 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 		}
 		return out
 	}
+	free := func(n *sitter.Node, scope *luaScope) string {
+		if n != nil && n.Type() == "identifier" && scope.lookup(text(n)) == nil {
+			return text(n)
+		}
+		return ""
+	}
+	// safeKey reports whether n is a literal naming none of luaHazardNames.
+	safeKey := func(n *sitter.Node) bool {
+		s, ok := luaLiteral(n, content)
+		return ok && !luaHazardNames[s]
+	}
+	// globalTable reports whether n is a free _G or _ENV, or package.loaded.
+	globalTable := func(n *sitter.Node, scope *luaScope) bool {
+		switch free(n, scope) {
+		case "_G", "_ENV":
+			return true
+		}
+		return n != nil && n.Type() == "dot_index_expression" &&
+			free(childByFieldName(n, "table"), scope) == "package" && text(childByFieldName(n, "field")) == "loaded"
+	}
 	// function walks a function's parameters and body in a fresh scope.
 	function := func(n *sitter.Node, scope *luaScope, method bool) {
 		inner := &luaScope{parent: scope}
@@ -182,6 +238,9 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 			}
 			// `function f()` assigns f; `function M.f()` / `M:f()` assign a field.
 			assign(name, scope)
+			if name != nil && name.Type() != "identifier" {
+				walk(name, scope)
+			}
 			function(n, scope, name != nil && name.Type() == "method_index_expression")
 			return
 		case "function_definition":
@@ -257,9 +316,80 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 			// bodies) is its own scope.
 			walkChildren(n, &luaScope{parent: scope})
 			return
+		case "identifier":
+			if luaHazardNames[free(n, scope)] {
+				hazard = true
+			}
+			return
+		case "goto_statement", "label_statement":
+			return
+		case "field":
+			// `{k = v}` names a key; `{[k] = v}` evaluates one.
+			if firstChild(n, "[") == nil {
+				if v := childByFieldName(n, "value"); v != nil {
+					walk(v, scope)
+				}
+				return
+			}
+		case "method_index_expression":
+			walk(childByFieldName(n, "table"), scope)
+			return
+		case "dot_index_expression":
+			table, field := childByFieldName(n, "table"), text(childByFieldName(n, "field"))
+			switch {
+			case free(table, scope) == "debug":
+				// traceback and getinfo read the stack; neither rebinds anything.
+				hazard = hazard || (field != "traceback" && field != "getinfo")
+				return
+			case free(table, scope) == "package" && (field == "path" || field == "cpath" || field == "config"):
+				return
+			case globalTable(table, scope):
+				hazard = hazard || luaHazardNames[field]
+				return
+			}
+			walk(table, scope)
+			return
+		case "bracket_index_expression":
+			if globalTable(childByFieldName(n, "table"), scope) {
+				hazard = hazard || !safeKey(childByFieldName(n, "field"))
+				return
+			}
 		case "function_call":
-			if name := childByFieldName(n, "name"); name != nil && name.Type() == "identifier" {
+			name := childByFieldName(n, "name")
+			if name != nil && name.Type() == "identifier" {
 				sites = append(sites, luaCallSite{call: n, name: text(name), binding: scope.lookup(text(name))})
+			}
+			args := luaArgs(childByFieldName(n, "arguments"))
+			switch free(name, scope) {
+			case "require", "dofile", "loadfile":
+				// package.loaded preloads "_G" and "package", which hold
+				// the debug library, so a literal naming any hazard is one.
+				if len(args) == 1 {
+					if s, ok := luaLiteral(args[0], content); ok && !luaHazardNames[s] {
+						return
+					}
+				}
+				hazard = true
+				return
+			case "load", "loadstring":
+				if len(args) > 0 {
+					if s, ok := luaLiteral(args[0], content); ok && !luaChunkHazard(ctx, s) {
+						for _, a := range args[1:] {
+							walk(a, scope)
+						}
+						return
+					}
+				}
+				hazard = true
+				return
+			case "rawget", "rawset":
+				if len(args) >= 2 && globalTable(args[0], scope) {
+					hazard = hazard || !safeKey(args[1])
+					for _, a := range args[2:] {
+						walk(a, scope)
+					}
+					return
+				}
 			}
 		}
 		walkChildren(n, scope)
@@ -280,19 +410,48 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 			Col:      at.StartCol,
 		})
 	}
-	return edges
+	return edges, hazard
 }
 
-func luaNamesDebug(root *sitter.Node, content []byte) bool {
-	// The string form catches require("debug") and _G["debug"].
-	for _, kind := range []string{"identifier", "string_content"} {
-		for _, n := range findDescendants(root, kind) {
-			if strings.TrimSpace(nodeText(n, content)) == "debug" {
-				return true
-			}
+// luaChunkHazard reports whether a literal chunk handed to load can reach the
+// debug library; a chunk that does not parse is treated as one that can.
+func luaChunkHazard(ctx context.Context, chunk string) bool {
+	root, err := parse(ctx, luagrammar.GetLanguage(), []byte(chunk))
+	if err != nil || root.HasError() {
+		return true
+	}
+	_, hazard := luaScan(ctx, root, []byte(chunk))
+	return hazard
+}
+
+// luaArgs returns a call's argument expressions.
+func luaArgs(args *sitter.Node) []*sitter.Node {
+	var out []*sitter.Node
+	for i := 0; args != nil && i < int(args.NamedChildCount()); i++ {
+		if c := args.NamedChild(i); c.Type() != "comment" {
+			out = append(out, c)
 		}
 	}
-	return false
+	return out
+}
+
+// luaLiteral returns the value of a string literal without escapes. A string
+// with a backslash is not read: its value need not equal its spelling.
+func luaLiteral(n *sitter.Node, content []byte) (string, bool) {
+	if n == nil || n.Type() != "string" {
+		return "", false
+	}
+	s := nodeText(childByFieldName(n, "content"), content)
+	if strings.ContainsRune(s, '\\') {
+		return "", false
+	}
+	// A long string drops the line break that opens it.
+	for _, nl := range []string{"\r\n", "\n\r", "\n", "\r"} {
+		if strings.HasPrefix(s, nl) {
+			return s[len(nl):], true
+		}
+	}
+	return s, true
 }
 
 // luaCallName spells a call's callee as a dotted path: `f`, `a.b.c`, `a.b:m`.

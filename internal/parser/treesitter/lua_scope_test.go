@@ -38,7 +38,16 @@ callback()
 	if len(parsed.Symbols) != 7 {
 		t.Fatalf("symbols = %d, want seven named declarations", len(parsed.Symbols))
 	}
-	if got := luaEdgeTargets(parsed.Edges); !slices.Equal(got, []string{"shadowed@3:37->3:6", "inner@4:3->2:3"}) {
+	// A computed require can load the debug library, so this file proves no
+	// call; the same file without it proves exactly the two local calls.
+	if len(parsed.Edges) != 0 {
+		t.Fatalf("edges = %v, want none beside a computed require", luaEdgeTargets(parsed.Edges))
+	}
+	static, err := NewLua().Parse(context.Background(), "scope.lua", []byte(strings.Replace(source, "require(moduleName)\n", "", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := luaEdgeTargets(static.Edges); !slices.Equal(got, []string{"shadowed@3:37->3:6", "inner@4:3->2:3"}) {
 		t.Fatalf("edges = %v, want only the two local function calls", got)
 	}
 	if len(parsed.Imports) != 1 || parsed.Imports[0] != "pkg.static" {
