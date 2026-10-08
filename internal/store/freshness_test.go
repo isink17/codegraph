@@ -383,4 +383,26 @@ func TestFreshnessCoverageFailedScanClosingAfterFullScan(t *testing.T) {
 	if got := freshness(t, s, repoID).Coverage; got.FailedAfterLastFull != 0 {
 		t.Fatalf("failure closed before the full scan began: %+v", got)
 	}
+	// Closing in the same second the full scan started still counts.
+	set(early, "2026-01-01T00:00:05Z", "2026-01-01T00:00:10Z")
+	if got := freshness(t, s, repoID).Coverage; got.FailedAfterLastFull != 1 {
+		t.Fatalf("failure closing in the second the full scan began: %+v", got)
+	}
+}
+
+// With no full scan on record every failed scan counts, including one whose
+// finish time was never written.
+func TestFreshnessCoverageFailedScansWithoutFullScan(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := freshnessStore(t, t.TempDir())
+	paths, started := scopedScan(t, s, repoID, ScanScopePaths, "h1")
+	completeScan(t, s, paths, started, "failed", "")
+	scan(t, s, repoID, "update", "failed", "boom")
+	open, _ := scopedScan(t, s, repoID, ScanScopePaths, "h1")
+	if _, err := s.db.ExecContext(ctx, `UPDATE scans SET status = 'failed', finished_at = NULL WHERE id = ?`, open); err != nil {
+		t.Fatal(err)
+	}
+	if got := freshness(t, s, repoID).Coverage; got.LastFullScan != nil || got.FailedAfterLastFull != 3 {
+		t.Fatalf("failed scans without a full scan: %+v", got)
+	}
 }
