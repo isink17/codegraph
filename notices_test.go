@@ -2,6 +2,7 @@ package codegraph
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +16,11 @@ func TestEmbeddedNoticesMatchRootFiles(t *testing.T) {
 		}
 		if embedded == "" || string(disk) != embedded {
 			t.Errorf("embedded %s differs from the file on disk", name)
+		}
+		// .gitattributes pins LF, so every platform's binary prints the
+		// same bytes even from a Windows checkout with autocrlf.
+		if strings.Contains(embedded, "\r") {
+			t.Errorf("embedded %s contains CR line endings", name)
 		}
 	}
 }

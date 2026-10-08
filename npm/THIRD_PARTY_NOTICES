@@ -59,7 +59,7 @@ Go package: github.com/smacker/go-tree-sitter
 Upstream: https://github.com/unicode-org/icu (icu4c/source/common/unicode)
 Revision: 552b01f61127d30d6589aa4bf99468224979b661 (lib/src/unicode/ICU_SHA in tree-sitter v0.22.5)
 License: Unicode license for ICU 58 and later (full text below)
-Copyright: Copyright © 1991-2019 Unicode, Inc. All rights reserved.
+Copyright: Copyright © 1991-2019 Unicode, Inc. All rights reserved.; header notices: Copyright (C) 1999-2015 (utf16.h: 1999-2012), International Business Machines Corporation and others
 Notes: utf8.h, utf16.h and umachine.h are compiled into the runtime through unicode.h; go-tree-sitter vendors them flattened (only the #include paths differ from tree-sitter v0.22.5 lib/src/unicode). License text is tree-sitter's lib/src/unicode/LICENSE at that tag, which reproduces ICU's icu4c LICENSE.
 
 COPYRIGHT AND PERMISSION NOTICE (ICU 58 and later)
