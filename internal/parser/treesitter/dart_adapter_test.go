@@ -4,12 +4,16 @@ package treesitter
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser/treesitter/dartgrammar"
 )
 
 func parseDart(t *testing.T, src string) graph.ParsedFile {
@@ -441,13 +445,16 @@ func TestDartAdapterProfileIsSymbolsOnly(t *testing.T) {
 	}
 }
 
-// Deleting any one byte must never give a declaration a different owner or
-// invent a name: every symbol a damaged file yields is one the intact file
-// declares, with the same kind and owner. Deletions that only rename an
-// identifier (a byte inside one, or the separator between two) are skipped.
-func TestDartAdapterByteDeletionNeverMisattributes(t *testing.T) {
+// Damaging a file by one edit -- deleting any byte, or inserting a brace,
+// parenthesis, newline or `class ` -- must never give a declaration a
+// different owner, invent a name or truncate an import: every symbol and
+// scope import a damaged file yields is one the intact file has, with the
+// same kind and owner. Edits that only rename an identifier are skipped, and
+// so is an edit that leaves a valid program, which declares what it spells.
+func TestDartAdapterDamageNeverMisattributes(t *testing.T) {
 	const src = `library app;
-import 'package:a/a.dart' as a show B;
+import 'package:a/a.dart' as a show B, C hide D;
+export 'src/b.dart' show E;
 
 /// Docs.
 abstract class Shape<T> extends Base with Mix implements I {
@@ -476,28 +483,78 @@ int top = 1;
 int get total => top;
 void helper(int n) {
   final list = [for (var i = 0; i < n; i++) i];
+  print('n=${n} {}');
   print(list);
 }
 class Last {
   void end() {}
 }
 `
+	key := func(sym graph.Symbol) string { return sym.Kind + " " + sym.StableKey + " @" + sym.ContainerName }
+	imp := func(i graph.ScopeImport) string {
+		return fmt.Sprintf("import %s %s as %s %s %v %v", i.SourceSpecifier, i.ImportedName, i.LocalName, i.Kind, i.Wildcard, i.ReExport)
+	}
 	clean := map[string]bool{}
-	for _, s := range parseDart(t, src).Symbols {
-		clean[s.Kind+" "+s.StableKey+" @"+s.ContainerName] = true
+	cleanPF := parseDart(t, src)
+	for _, sym := range cleanPF.Symbols {
+		clean[key(sym)] = true
+	}
+	for _, i := range cleanPF.Scope.Imports {
+		clean[imp(i)] = true
 	}
 	ident := func(b byte) bool {
 		return b == '_' || b == '$' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
 	}
+	type edit struct{ what, src string }
+	var edits []edit
 	for i := range len(src) {
-		if ident(src[i]) || (i > 0 && i+1 < len(src) && ident(src[i-1]) && ident(src[i+1])) {
-			continue
+		if !ident(src[i]) && !(i > 0 && i+1 < len(src) && ident(src[i-1]) && ident(src[i+1])) {
+			edits = append(edits, edit{fmt.Sprintf("deleting byte %d (%q)", i, src[i]), src[:i] + src[i+1:]})
 		}
-		damaged := src[:i] + src[i+1:]
-		for _, s := range parseDart(t, damaged).Symbols {
-			if key := s.Kind + " " + s.StableKey + " @" + s.ContainerName; !clean[key] {
-				t.Errorf("deleting byte %d (%q) yields %s", i, src[i], key)
+		if i > 0 && ident(src[i-1]) && ident(src[i]) {
+			continue // an insertion inside an identifier only splits it
+		}
+		for _, ins := range []string{"{", "}", "(", ")", "\n", "class "} {
+			if ins == "class " && i > 0 && ident(src[i-1]) {
+				continue // "class" would extend the identifier before it
 			}
+			edits = append(edits, edit{fmt.Sprintf("inserting %q at %d", ins, i), src[:i] + ins + src[i:]})
 		}
 	}
+	check := func(e edit) {
+		pf, err := NewDart().Parse(context.Background(), "damaged.dart", []byte(e.src))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var wrong []string
+		for _, sym := range pf.Symbols {
+			if k := key(sym); !clean[k] {
+				wrong = append(wrong, k)
+			}
+		}
+		for _, i := range pf.Scope.Imports {
+			if k := imp(i); !clean[k] {
+				wrong = append(wrong, k)
+			}
+		}
+		if len(wrong) == 0 {
+			return
+		}
+		if root, err := parse(context.Background(), dartgrammar.GetLanguage(), []byte(e.src)); err == nil && !root.HasError() {
+			return // a valid program declares what it spells
+		}
+		t.Errorf("%s yields %q", e.what, wrong)
+	}
+	// Each parse is independent; spreading them keeps the test short.
+	var wg sync.WaitGroup
+	workers := runtime.GOMAXPROCS(0)
+	for w := range workers {
+		wg.Go(func() {
+			for j := w; j < len(edits); j += workers {
+				check(edits[j])
+			}
+		})
+	}
+	wg.Wait()
 }

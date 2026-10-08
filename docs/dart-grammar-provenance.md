@@ -40,7 +40,10 @@ with a parse error only the declarations that end before the first error (or
 missing token) are recorded: text before it parsed without recovery, while
 recovery after it may close a body early, swallow later declarations into an
 unclosed one or read a misspelt keyword as another declaration. A type that
-does not end before the error is dropped with all its members. Call
+does not end before the error is dropped with all its members, and directives
+follow the same rule. A broken file with more `}` than `{` tokens records no
+declarations at all: recovery closes a body at an earlier `}` and moves the
+members after it out to the top level before it reports the excess brace. Call
 references are kept unless they sit inside an error node. The grammar does
 not parse null-aware elements (`[?x]`, Dart 3.8) or dot shorthands (Dart 3.10),
 so a file using them keeps only the declarations before the first use.

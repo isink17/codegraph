@@ -46,11 +46,14 @@ func (a *DartAdapter) Parse(ctx context.Context, path string, content []byte) (g
 		return graph.ParsedFile{}, err
 	}
 	pf := graph.ParsedFile{Language: "dart", FileTokens: computeFileTokens(content)}
-	dartDirectives(root, content, &pf)
 	broken := root.HasError()
 	limit := ^uint32(0)
 	if broken {
 		limit = dartFirstErrorByte(root)
+	}
+	dartDirectives(root, limit, content, &pf)
+	if broken && dartExcessCloseBrace(root) {
+		limit = 0
 	}
 	dartMembers(root, "", limit, content, &pf)
 	var walk func(n *sitter.Node)
@@ -69,11 +72,14 @@ func (a *DartAdapter) Parse(ctx context.Context, path string, content []byte) (g
 // dartDirectives records library-level directives. Every URI is recorded as
 // written; a `package:` URI is never mapped to a file, since that needs
 // pubspec.yaml and package_config.json.
-func dartDirectives(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
+//
+// Like declarations, only directives that end before limit, the first parse
+// error, are read, so none is cut short by recovery.
+func dartDirectives(root *sitter.Node, limit uint32, content []byte, pf *graph.ParsedFile) {
 	for i := range int(root.ChildCount()) {
 		child := root.Child(i)
-		if child.HasError() {
-			continue
+		if child.EndByte() >= limit {
+			return
 		}
 		switch child.Type() {
 		case "import_or_export":
@@ -180,6 +186,35 @@ func dartFirstErrorByte(n *sitter.Node) uint32 {
 		}
 	}
 	return n.EndByte()
+}
+
+// dartExcessCloseBrace reports more `}` than `{` tokens, which means an
+// opening brace is missing. Recovery then closes a body at an earlier `}` and
+// moves the members after it out to the enclosing scope, all before the first
+// error, which is only the excess `}` at the end. Where the missing brace was
+// is unknown, so no declaration's owner is. Tokens are counted, so braces in
+// strings and comments do not; an interpolation `${` is a `$` and a `{`.
+func dartExcessCloseBrace(root *sitter.Node) bool {
+	depth := 0
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n.ChildCount() == 0 {
+			if !n.IsMissing() {
+				switch n.Type() {
+				case "{":
+					depth++
+				case "}":
+					depth--
+				}
+			}
+			return
+		}
+		for i := range int(n.ChildCount()) {
+			walk(n.Child(i))
+		}
+	}
+	walk(root)
+	return depth < 0
 }
 
 // dartMembers records the declarations directly under parent: the program,
