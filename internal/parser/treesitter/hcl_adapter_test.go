@@ -378,8 +378,8 @@ func TestHCLTerraformReferencesInOperations(t *testing.T) {
   call_attr  = foo(var.q).r + local.s.t
   paren_idx  = (var.ia + var.ib)[0] + var.ic
   short_lhs  = data.t + aws_k.n
-  # Splicing .n onto the bare aws_k/aws_j would complete an address.
-  spliced    = (var.v + aws_k).n
+  # Splicing .n onto the bare aws_m/aws_j would complete an address.
+  spliced    = (var.v + aws_m).n
   bare_paren = 1 + (aws_j).n
 }
 `)
