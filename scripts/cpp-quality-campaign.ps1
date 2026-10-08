@@ -131,7 +131,7 @@ function Remove-OwnedProbeDirectory([string] $Path, [string] $Parent) {
     $fullPath = [System.IO.Path]::GetFullPath($Path)
     $fullParent = [System.IO.Path]::GetFullPath($Parent).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
     if (-not $fullPath.StartsWith($fullParent, [System.StringComparison]::OrdinalIgnoreCase) -or
-        [System.IO.Path]::GetDirectoryName($fullPath) -ne $Parent) {
+        [System.IO.Path]::GetDirectoryName($fullPath) -ne $fullParent.TrimEnd([System.IO.Path]::DirectorySeparatorChar)) {
         throw "Refusing to remove probe directory outside its owned temporary parent: $Path"
     }
     $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
@@ -142,12 +142,21 @@ function Remove-OwnedProbeDirectory([string] $Path, [string] $Parent) {
     $pending.Push([System.IO.DirectoryInfo]::new($fullPath))
     while ($pending.Count -gt 0) {
         $directory = $pending.Peek()
+        $current = Get-Item -LiteralPath $directory.FullName -Force -ErrorAction Stop
+        $withinOwnedRoot = $directory.FullName.Equals($fullPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $directory.FullName.StartsWith($fullPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+        if (($current.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $withinOwnedRoot) {
+            throw "Refusing to traverse replaced or redirected cleanup directory: $($directory.FullName)"
+        }
         $children = @($directory.EnumerateFileSystemInfos())
         if ($children.Count -gt 0) {
             foreach ($child in $children) {
                 if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
                     $child.Delete()
                 } elseif (($child.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                    if (-not $child.FullName.StartsWith($fullPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw "Refusing to remove path outside owned probe directory: $($child.FullName)"
+                    }
                     $pending.Push([System.IO.DirectoryInfo]::new($child.FullName))
                 } else {
                     $child.Delete()
@@ -160,9 +169,10 @@ function Remove-OwnedProbeDirectory([string] $Path, [string] $Parent) {
     }
 }
 
-function Get-ContentFingerprint($Files, [string] $Root) {
+function Get-ContentFingerprint($Files, [string] $Root, [switch] $AllFiles) {
     $sourceExtensions = @(".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp", ".tpp")
-    $entries = foreach ($file in ($Files | Where-Object { $sourceExtensions -contains $_.Extension.ToLowerInvariant() } | Sort-Object FullName)) {
+    $selected = if ($AllFiles) { $Files } else { $Files | Where-Object { $sourceExtensions -contains $_.Extension.ToLowerInvariant() } }
+    $entries = foreach ($file in ($selected | Sort-Object FullName)) {
         $relative = Get-RelativePath $Root $file.FullName
         $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
         $hash = Get-Sha256 $bytes
@@ -266,19 +276,21 @@ foreach ($symbol in $CalleesOf) {
 
 $mutation = $null
 if ($MutationProbe) {
-    $tempParent = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $tempParent = (Get-AbsolutePath ([System.IO.Path]::GetTempPath())).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
     $probeRoot = Join-Path $tempParent ("codegraph-cpp-mutation-" + [guid]::NewGuid().ToString("N"))
     $probeHome = Join-Path $out "mutation-codegraph-home"
     $probeDB = Join-Path $out "mutation-database"
+    $probeOwned = $false
     try {
         $null = New-Item -ItemType Directory -Path $probeRoot -ErrorAction Stop
+        $probeOwned = $true
         $probeRoot = Get-AbsolutePath $probeRoot
         $null = New-Item -ItemType Directory -Path $probeDB -Force
         $null = New-Item -ItemType Directory -Path (Join-Path $probeHome "config") -Force
         $probeConfig = @{ db_dir = $probeDB } | ConvertTo-Json -Compress
         [System.IO.File]::WriteAllText((Join-Path $probeHome "config/config.json"), $probeConfig, $utf8WithoutBOM)
         Copy-RepositoryForProbe $repo $probeRoot
-        $originalSourceFingerprint = Get-ContentFingerprint $sourceFiles $repo
+        $originalSourceFingerprint = Get-ContentFingerprint $files $repo -AllFiles
         $probeIndex = Invoke-CodeGraph "mutation_initial_index" @("index", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
         if ($probeIndex.exit_code -ne 0) { throw "Temporary checkout indexing failed." }
         $eligible = @($sourceFiles | Where-Object { $_.Extension.ToLowerInvariant() -in @(".c", ".cc", ".cpp", ".cxx") } | Sort-Object { Get-RelativePath $repo $_.FullName })
@@ -286,7 +298,10 @@ if ($MutationProbe) {
         $selectedRelative = Get-RelativePath $repo $eligible[0].FullName
         $probeExistingFile = Join-Path $probeRoot ($selectedRelative.Replace('/', [System.IO.Path]::DirectorySeparatorChar))
         $originalBytes = [System.IO.File]::ReadAllBytes($probeExistingFile)
-        $modifiedBytes = [System.Text.Encoding]::UTF8.GetBytes(([System.Text.Encoding]::UTF8.GetString($originalBytes) + "`n// codegraph campaign mutation probe`n"))
+        $markerBytes = [System.Text.Encoding]::ASCII.GetBytes("`n// codegraph campaign mutation probe`n")
+        $modifiedBytes = [byte[]]::new($originalBytes.Length + $markerBytes.Length)
+        [System.Buffer]::BlockCopy($originalBytes, 0, $modifiedBytes, 0, $originalBytes.Length)
+        [System.Buffer]::BlockCopy($markerBytes, 0, $modifiedBytes, $originalBytes.Length, $markerBytes.Length)
         [System.IO.File]::WriteAllBytes($probeExistingFile, $modifiedBytes)
         $probeModify = Invoke-CodeGraph "mutation_existing_file_update" @("update_graph", $probeRoot, "--jsonl", "--no-history") $probeRoot $probeHome $commands
         $modifySummary = Get-IndexSummary $probeModify
@@ -301,7 +316,7 @@ if ($MutationProbe) {
         if ($probeAdd.exit_code -ne 0 -or $probeDelete.exit_code -ne 0 -or $null -eq $addSummary -or $addSummary.files_changed -lt 1 -or $null -eq $deleteSummary -or $deleteSummary.files_deleted -lt 1) {
             throw "Add/delete mutation probe failed."
         }
-        if ((Get-ContentFingerprint $sourceFiles $repo) -ne $originalSourceFingerprint) { throw "Original C/C++ source files changed during mutation probe." }
+        if ((Get-ContentFingerprint $files $repo -AllFiles) -ne $originalSourceFingerprint) { throw "Original checkout files changed during mutation probe." }
         $mutation = [pscustomobject]@{
             existing_file = $selectedRelative
             existing_file_update_exit_code = $probeModify.exit_code
@@ -319,7 +334,9 @@ if ($MutationProbe) {
         [System.IO.File]::WriteAllText((Join-Path $out "failed-mutation-commands.json"), $failedCommands + [Environment]::NewLine, $utf8WithoutBOM)
         throw "Mutation probe failed; command evidence saved to $out/failed-mutation-commands.json. $($_.Exception.Message)"
     } finally {
-        if (Test-Path -LiteralPath $probeRoot) {
+        $mutationCommands = $commands | ConvertTo-Json -Depth 100
+        [System.IO.File]::WriteAllText((Join-Path $out "mutation-commands.json"), $mutationCommands + [Environment]::NewLine, $utf8WithoutBOM)
+        if ($probeOwned -and (Test-Path -LiteralPath $probeRoot)) {
             try {
                 Remove-OwnedProbeDirectory $probeRoot $tempParent
             } catch {
