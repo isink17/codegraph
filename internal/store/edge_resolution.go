@@ -190,6 +190,10 @@ const (
 	// lua_local_function: a bare Lua call the parser bound, by lexical scope,
 	// to one never-reassigned `local function` statement of the same file.
 	ResolutionStrategyLuaLocalFunction = "lua_local_function"
+	// terraform_module_scope: a Terraform reference whose static address is
+	// declared exactly once in the referring file's directory (its module),
+	// in a directory with no unparsed Terraform file.
+	ResolutionStrategyTerraformModuleScope = "terraform_module_scope"
 
 	// ruby_lexical_constant: `Service.run` / `Service::run` where `Service` is
 	// exactly one constant token, the caller's own file proves the lexical
@@ -317,6 +321,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyRubyImplicitSelf:                                           ResolutionConfidenceHigh,
 	ResolutionStrategyRubyExplicitSelf:                                           ResolutionConfidenceHigh,
 	ResolutionStrategyLuaLocalFunction:                                           ResolutionConfidenceHigh,
+	ResolutionStrategyTerraformModuleScope:                                       ResolutionConfidenceHigh,
 	ResolutionStrategyRubyLexicalConstant:                                        ResolutionConfidenceHigh,
 	ResolutionStrategyRubyConstantPath:                                           ResolutionConfidenceHigh,
 	ResolutionStrategySwiftSelfScope:                                             ResolutionConfidenceHigh,

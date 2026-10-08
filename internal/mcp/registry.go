@@ -126,13 +126,13 @@ var toolRegistry = []toolDescriptor{
 		handler: (*Server).handleFindSymbol,
 	},
 	{
-		name: "find_callers", description: "Find resolved callers of an indexed symbol; unknown names may return unresolved hints separately",
+		name: "find_callers", description: "Find resolved callers of an indexed symbol; unknown names may return unresolved hints separately. Terraform: the blocks that reference it",
 		properties: []string{"symbol", "symbol_id", "limit", "offset", "detail", "format"},
 		category:   "graph", gatewayCore: true,
 		handler: (*Server).handleFindCallers,
 	},
 	{
-		name: "find_callees", description: "Find resolved callees of an indexed symbol",
+		name: "find_callees", description: "Find resolved callees of an indexed symbol. Terraform: the declarations a block references",
 		properties: []string{"symbol", "symbol_id", "limit", "offset", "detail", "format"},
 		category:   "graph", gatewayCore: true,
 		handler: (*Server).handleFindCallees,

@@ -54,7 +54,7 @@ type lifecycleRepo struct {
 // Python and C++ fixtures below need the adapters that actually emit call
 // edges, the same reason cpp_callgraph_test.go carries the tag.
 func lifecycleRegistry() *parser.Registry {
-	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala())
+	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala(), tsparser.NewHCL())
 }
 
 // Scala builds no call graph: a call whose only candidate is a same-named

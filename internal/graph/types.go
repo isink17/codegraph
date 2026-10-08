@@ -64,6 +64,16 @@ type Edge struct {
 // same file. The suffix is that statement's 1-based start line and column.
 const LuaLocalFunctionEvidence = "lua:local_function:"
 
+// HCLTerraformReferenceEvidence marks a Terraform `references` edge whose
+// destination is a static module address (var.X, local.X, module.M, data.T.N,
+// T.N). It binds only to the one declaration of that address in the same
+// directory.
+const HCLTerraformReferenceEvidence = "hcl:terraform_reference"
+
+// HCLTerraformDynamicEvidence marks a Terraform `references` edge whose
+// traversal continues through a splat or a non-literal index. It never binds.
+const HCLTerraformDynamicEvidence = "hcl:terraform_dynamic"
+
 // PHPMemberCallNestedScopeEvidence marks a PHP $this member call lexically
 // inside an executable scope P22.45 does not model as a source symbol.
 const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"
@@ -226,6 +236,12 @@ type ScopeEvidence struct {
 	GoLocals             []GoLocalBinding
 	SwiftLexicalBindings []SwiftLexicalBinding
 	JVMFacade            JVMFileFacade
+	// TerraformComplete reports that the HCL adapter parsed this Terraform
+	// file without a syntax error, so every declaration it holds is recorded.
+	// It is persisted as the file's file_scope_evidence row; a Terraform file
+	// without one (a parse error, a failed or oversize parse, the non-cgo
+	// fallback) proves nothing about its directory.
+	TerraformComplete bool
 }
 
 // JVMFileFacade is the JVM class a Kotlin source file compiles its top-level

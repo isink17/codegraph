@@ -24,6 +24,7 @@ func newDefaultRegistry() *parser.Registry {
 		heuristicparser.NewCAndCpp(),
 		heuristicparser.NewLua(),
 		heuristicparser.NewScala(),
+		heuristicparser.NewHCL(),
 	)
 	r.SetNoCGOCapabilities(noCGOCapabilities())
 	return r

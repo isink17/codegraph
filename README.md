@@ -108,7 +108,7 @@ The graph is evidence-based and intentionally partial: ambiguous or unsupported 
 
 ## Supported languages
 
-Native CGO builds of this v2.0 branch register 14 user-facing language categories through 13 adapters; JavaScript and TypeScript share the `typescript` adapter.
+Native CGO builds of this v2.0 branch register 15 user-facing language categories through 14 adapters; JavaScript and TypeScript share the `typescript` adapter.
 
 | Language | Extensions |
 |---|---|
@@ -119,6 +119,7 @@ Native CGO builds of this v2.0 branch register 14 user-facing language categorie
 | Java | `.java` |
 | Kotlin | `.kt`, `.kts` |
 | Lua | `.lua` |
+| HCL / Terraform | `.tf`, `.tfvars`, `.hcl` |
 | Rust | `.rs` |
 | Scala | `.scala` |
 | C# | `.cs` |
@@ -127,9 +128,11 @@ Native CGO builds of this v2.0 branch register 14 user-facing language categorie
 | PHP | `.php` |
 | C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc` |
 
+For HCL, "call edges" in capability and `doctor` output means Terraform `references` edges; Terraform has no calls.
+
 Explicit `CGO_ENABLED=0` builds are not equivalent: Go and Python retain call edges, while the other languages provide heuristic symbol/import navigation without call edges. Symbols, imports, and search are incomplete in those fallback parsers. Python's fallback also misses some call sites. Relationship queries and `codegraph doctor` report graph capability.
 
-All call resolution uses partial static models, not language runtimes. Lua extracts declarations, literal `require` imports, and call references, and resolves only a bare call whose innermost lexical binding is a never-reassigned `local function` of the same file; globals, fields, methods, modules, and any file with a parse error or that names `debug` (identifier or string) stay unresolved (CGO builds only). Scala (V1) extracts packages, imports with renames and wildcards, classes, objects, traits, enums, defs, vals, type aliases, givens and extension methods, plus call references; it builds no call edges in any build, because implicit/given scope, extension methods, inheritance and overloads decide what a Scala call runs. Node.js repositories are supported, but full tree-sitter node support is still in progress. Python models only selected source-visible mutation forms; Ruby does not infer runtime load order or Rails/Zeitwerk mappings. C# may leave `using static` calls unresolved when inheritance or enclosing members could change the target. See [language scope models](docs/scope-models.md), [Lua grammar provenance](docs/lua-grammar-provenance.md), [Scala grammar provenance](docs/scala-grammar-provenance.md), and [Ruby scope and limitations](docs/ruby-scope.md).
+All call resolution uses partial static models, not language runtimes. Lua extracts declarations, literal `require` imports, and call references, and resolves only a bare call whose innermost lexical binding is a never-reassigned `local function` of the same file; globals, fields, methods, modules, and any file with a parse error or that names `debug` (identifier or string) stay unresolved (CGO builds only). Scala (V1) extracts packages, imports with renames and wildcards, classes, objects, traits, enums, defs, vals, type aliases, givens and extension methods, plus call references; it builds no call edges in any build, because implicit/given scope, extension methods, inheritance and overloads decide what a Scala call runs. Terraform/OpenTofu (`.tf`, `.tfvars`) records providers, resources, data sources, variables, locals, outputs and module calls under their Terraform addresses (`aws_instance.web`, `data.aws_ami.base`, `var.region`, `local.tags`, `module.vpc`) and `var.`/`local.`/`module.`/`data.`/resource traversals as `references` edges, never calls; a reference binds only to the single declaration of its address in the same directory (module), and duplicates, missing declarations, splats, non-literal indexes, cross-module addresses and any directory holding an unparsable `.tf` file stay unresolved. Module `source` strings are recorded as written and never fetched. Terraform names are short, so query by address (`var.region`, not `region`). Other `.hcl` files (Packer, Nomad, Terragrunt) get only top-level blocks and attributes. CodeGraph does not evaluate Terraform plans or expressions. Node.js repositories are supported, but full tree-sitter node support is still in progress. Python models only selected source-visible mutation forms; Ruby does not infer runtime load order or Rails/Zeitwerk mappings. C# may leave `using static` calls unresolved when inheritance or enclosing members could change the target. See [language scope models](docs/scope-models.md), [Lua grammar provenance](docs/lua-grammar-provenance.md), [Scala grammar provenance](docs/scala-grammar-provenance.md), [HCL grammar provenance](docs/hcl-grammar-provenance.md), and [Ruby scope and limitations](docs/ruby-scope.md).
 
 ## Agent Skill
 

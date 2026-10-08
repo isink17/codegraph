@@ -28,6 +28,7 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/parser"
+	"github.com/isink17/codegraph/internal/parser/terraform"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
@@ -2795,7 +2796,7 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" {
+	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" || parsed.Scope.TerraformComplete {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path, jvm_facade_class, jvm_facade_explicit, jvm_multifile) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath, parsed.Scope.JVMFacade.Class, boolInt(parsed.Scope.JVMFacade.Explicit), boolInt(parsed.Scope.JVMFacade.Multifile)); err != nil {
 			return nil, err
 		}
@@ -3394,10 +3395,23 @@ func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *Write
 // "protocol", "actor", "object", "value") is a container or a declaration with
 // no body of its own, and must never absorb a call made inside a member.
 //
+// Terraform has no functions: its references live in the expressions of
+// resource, data, module, provider, variable and output blocks, locals
+// entries and tfvars assignments, so those kinds own them. The terraform
+// settings block and generic HCL blocks hold no references.
+//
 // This is deliberately narrower than a general "is callable" test: it answers
 // only "can a reference at this line belong to this symbol's body?".
 func ownsSourceEdges(kind string) bool {
-	return kind == "function" || kind == "method" || kind == "constructor"
+	switch kind {
+	case "function", "method", "constructor":
+		return true
+	// Terraform blocks and entries whose expressions hold references.
+	case terraform.KindProvider, terraform.KindResource, terraform.KindData, terraform.KindVariable,
+		terraform.KindLocal, terraform.KindOutput, terraform.KindModule, terraform.KindVariableValue:
+		return true
+	}
+	return false
 }
 
 type funcSpan struct {
@@ -4387,6 +4401,16 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	} else {
 		totalResolved += n
 	}
+	// Terraform references: bound within their module directory or left
+	// unresolved; hclScopeVetoSQL keeps every strategy below off them. See
+	// hcl_scope.go.
+	if scope.has("hcl") {
+		if n, err := resolveHCLScope(ctx, tx, repoID); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
+	}
 	if n, err := resolveJavaScope(ctx, tx, repoID, scope.only("java")); err != nil {
 		return 0, err
 	} else {
@@ -5119,6 +5143,7 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	// whose visibility those edits could have flipped join the batch before
 	// anything is invalidated. See typeScopeNamesForChangedPaths.
 	scopes := newImportScopeCache(s, repoID)
+	scopes.hclDefer = true
 	scopes.rustRoots, err = s.rustRootsForPaths(ctx, repoID, paths)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
@@ -5209,11 +5234,24 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, moduleVeto, scopes); err != nil {
 		return ResolveEdgesForNamesStats{}, err
 	}
+	// Only the name pass's outcome reaches stats; the path pass's is discarded.
+	countedHCL := len(scopes.hclWithheld)
 	stats, err := s.resolveEdgesForNamesWithStats(ctx, repoID, names, moduleVeto, scopes, languageScope)
 	if err == nil && (len(paths) > 0 || len(names) > 0) {
 		var n int
 		n, err = s.resolveDotSuffixIncrementally(ctx, repoID, sortedKeys(languageScope))
 		stats.TargetsResolved += n
+	}
+	// A Terraform edge's answer depends on every file of its directory, and a
+	// deleted path is no longer in files, so the extension decides. The pass
+	// runs once, for the changed paths and the binder's withheld edges alike.
+	if err == nil && (slices.ContainsFunc(paths, isHCLPath) || len(scopes.hclWithheld) > 0) {
+		if _, err = s.resolveHCLScopeStandalone(ctx, repoID); err == nil {
+			var bound int
+			bound, err = s.boundEdgeCount(ctx, repoID, scopes.hclWithheld[countedHCL:])
+			stats.TargetsResolved += bound
+			stats.TargetsUnresolved -= bound
+		}
 	}
 	stats.InvalidateMS += invalidateMS
 	stats.InvalidatedBindings += invalidated
@@ -6626,6 +6664,38 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			remaining = append(remaining, target)
 		}
 		targets = remaining
+	}
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	// HCL owns every edge outright. Its pass re-decides the whole repository,
+	// because an edge's answer depends on every file of its directory. This
+	// is the Go-side twin of hclScopeVetoSQL.
+	var hclIDs []int64
+	remaining = targets[:0]
+	for _, target := range targets {
+		if binderOwnsHCL(target) {
+			hclIDs = append(hclIDs, target.edgeID)
+			continue
+		}
+		remaining = append(remaining, target)
+	}
+	targets = remaining
+	if len(hclIDs) > 0 && scopes != nil && scopes.hclDefer {
+		// ResolveEdgesForPathsAndNames runs the pass once, after every
+		// binder batch, and accounts for these edges there.
+		scopes.hclWithheld = append(scopes.hclWithheld, hclIDs...)
+		outcome.unresolved += len(hclIDs)
+	} else if len(hclIDs) > 0 {
+		if _, err := s.resolveHCLScopeStandalone(ctx, repoID); err != nil {
+			return outcome, err
+		}
+		bound, err := s.boundEdgeCount(ctx, repoID, hclIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += bound
+		outcome.unresolved += len(hclIDs) - bound
 	}
 	if len(targets) == 0 {
 		return outcome, nil

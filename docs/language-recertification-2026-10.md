@@ -7,16 +7,19 @@ The detailed resolver contracts and limitations remain in
 
 ## Capability evidence
 
-The registry has 11 IDs: `cpp`, `csharp`, `go`, `java`, `kotlin`, `php`,
-`python`, `ruby`, `rust`, `swift`, and `typescript`. It reports parser profile
+At the recorded SHA the registry had 11 IDs: `cpp`, `csharp`, `go`, `java`,
+`kotlin`, `php`, `python`, `ruby`, `rust`, `swift`, and `typescript`. `lua` and
+`hcl` were registered after this snapshot and are not recertified here; see
+the CHANGELOG, [`lua-grammar-provenance.md`](lua-grammar-provenance.md) and
+[`hcl-grammar-provenance.md`](hcl-grammar-provenance.md). It reports parser profile
 and call-edge availability separately. Call-resolution and type-resolution
 capabilities remain unknown; parser registration does not prove those
 capabilities. Extension collisions fail closed.
 
 In CGO builds the registered adapters use tree-sitter profiles and report call
-edges. In `CGO_ENABLED=0` builds, Go uses `go/ast` and Python uses its regex
-fallback; these retain call edges. The other nine languages use heuristic
-symbols-only adapters. The indexer refuses to update a tree-sitter graph with
+edges (for `hcl`, its Terraform `references` edges). In `CGO_ENABLED=0` builds,
+Go uses `go/ast` and Python uses its regex fallback; these retain call edges.
+Every other language uses a heuristic symbols-only adapter. The indexer refuses to update a tree-sitter graph with
 those degraded adapters, since that would discard call edges.
 
 ## Priority languages

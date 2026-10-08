@@ -419,3 +419,28 @@ A Swift call never binds a symbol in another language. A change to any Swift fil
 ## Ruby
 
 See [Ruby scope and limitations](ruby-scope.md).
+
+## HCL and Terraform
+
+`.tf` and `.tfvars` files are Terraform/OpenTofu; any other `.hcl` file
+(Packer, Nomad, Terragrunt) records only top-level blocks and attributes and
+no relationships.
+
+- **Scope unit.** A Terraform module is a directory: the `.tf` files of one
+  directory share one namespace, and no other directory's declarations are
+  visible. Declarations are recorded under their addresses (`T.N`,
+  `data.T.N`, `var.N`, `local.N`, `module.N`, `output.N`, `provider.P`).
+- **Edges.** A traversal rooted at `var`, `local`, `module`, `data` or a
+  resource type is a `references` edge (never `calls`) to its address; a
+  `.tfvars` assignment references `var.N`. `module.M.out` names `module.M`.
+- **Binding.** The HCL pass owns every HCL edge and binds it
+  (`terraform_module_scope`) only when exactly one declaration of the address
+  exists in the referring file's directory and every `.tf` file there parsed
+  completely. It re-decides all HCL edges whenever an HCL path changes.
+- **Not references.** `count`, `each`, `self`, `path`, `terraform` and
+  `ephemeral` roots; `for`-expression, template `%{ for }` and `dynamic`
+  iterators; `provider`/`providers` meta-arguments; `ignore_changes`.
+- **Unresolved by design.** Duplicates (including `override.tf` merges),
+  missing declarations, other directories, splats and non-literal indexes:
+  the instance `count.index` or `each.key` selects is a plan-time value.
+  Module sources are recorded as written and never resolved to a directory.
