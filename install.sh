@@ -5,7 +5,6 @@ version=${CODEGRAPH_VERSION:-${1:-}}
 if [ -z "$version" ]; then
   version=$(curl -fsSL https://api.github.com/repos/isink17/codegraph/releases/latest | sed -n 's/.*"tag_name": "\(v[0-9][0-9.]*\)".*/\1/p')
 fi
-version_num=${version#v}
 printf '%s\n' "$version" | awk '!/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {exit 1}' || { echo "invalid version: $version (expected vX.Y.Z)" >&2; exit 1; }
 
 os=$(uname -s); arch=$(uname -m)
@@ -23,7 +22,14 @@ curl -fsSL "$base/$version/$asset.sha256" -o "$tmp/checksum"
 expected=$(awk 'NR == 1 {print $1}' "$tmp/checksum")
 case "$expected" in *[!0-9a-fA-F]*|'') echo "invalid SHA-256 sidecar" >&2; exit 1;; esac
 [ "${#expected}" -eq 64 ] || { echo "invalid SHA-256 sidecar" >&2; exit 1; }
-actual=$(sha256sum "$tmp/codegraph" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$tmp/codegraph" | awk '{print $1}')
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$tmp/codegraph" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  actual=$(shasum -a 256 "$tmp/codegraph" | awk '{print $1}')
+else
+  echo "no SHA-256 utility found (need sha256sum or shasum)" >&2
+  exit 1
+fi
 [ "$expected" = "$actual" ] || { echo "SHA-256 mismatch; refusing installation" >&2; exit 1; }
 mkdir -p "$dest"
 [ -d "$dest" ] && [ -w "$dest" ] || { echo "installation directory is not writable: $dest" >&2; exit 1; }
