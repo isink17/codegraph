@@ -87,6 +87,25 @@ func main() {}
 	if got := int(data["files"].(float64)); got != 1 {
 		t.Fatalf("files = %d, want 1", got)
 	}
+	// freshness is additive: every pre-existing key is still there.
+	for _, key := range []string{"repo_root", "repo_id", "files", "symbols", "references", "edges", "dirty_files", "last_scan_id", "last_indexed_at", "languages"} {
+		if _, ok := data[key]; !ok {
+			t.Fatalf("graph_stats lost key %q: %v", key, data)
+		}
+	}
+	freshness, ok := data["freshness"].(map[string]any)
+	if !ok {
+		t.Fatalf("graph_stats has no freshness object: %v", data)
+	}
+	// A completed scan, no queue, no Git anchor: nothing known stale, and
+	// never "fresh".
+	if freshness["state"] != "no_known_staleness" || freshness["watcher"] != "not_in_this_process" || freshness["filesystem"] != "not_checked" {
+		t.Fatalf("freshness = %v", freshness)
+	}
+	worktree := freshness["worktree"].(map[string]any)
+	if worktree["head_at_index"] != "unknown" || worktree["head_changed"] != "unknown" {
+		t.Fatalf("worktree = %v", worktree)
+	}
 }
 
 func TestSupportedLanguagesTool(t *testing.T) {

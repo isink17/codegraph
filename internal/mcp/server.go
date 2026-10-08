@@ -405,6 +405,11 @@ func (s *Server) handleGraphStats(ctx context.Context, _ json.RawMessage) (map[s
 	if err != nil {
 		return nil, err
 	}
+	freshness, err := s.store.FreshnessStatus(ctx, s.repoID)
+	if err != nil {
+		return nil, err
+	}
+	stats.Freshness = &freshness
 	return map[string]any{"ok": true, "data": stats}, nil
 }
 

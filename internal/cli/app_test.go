@@ -462,6 +462,10 @@ func TestRunIndexWithRepoDBDirSkipsRepoDatabaseFiles(t *testing.T) {
 	if got := int(stats["files"].(float64)); got != 1 {
 		t.Fatalf("stats files = %d, want 1; output=%s", got, out.String())
 	}
+	freshness, ok := stats["freshness"].(map[string]any)
+	if !ok || freshness["state"] != "no_known_staleness" || freshness["watcher"] != "not_in_this_process" {
+		t.Fatalf("stats freshness = %v; output=%s", stats["freshness"], out.String())
+	}
 }
 
 func TestRunIndexRebuildDropsStaleRows(t *testing.T) {

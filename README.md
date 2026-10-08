@@ -179,7 +179,7 @@ This installs the Agent Skill from the repository, not the CodeGraph binary. The
 | `index_repo` | Index a repository into the local code graph |
 | `update_graph` | Update only changed files |
 | `list_files` | List indexed files with optional path filter |
-| `graph_stats` | Repository graph statistics |
+| `graph_stats` | Repository graph statistics, plus a read-only `freshness` status (never "fresh") |
 | `supported_languages` | List supported languages and extensions |
 | `list_repos` | List known repositories |
 | `list_scans` | List recent scans |

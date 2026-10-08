@@ -461,6 +461,75 @@ type Stats struct {
 	LastScanID    int64          `json:"last_scan_id"`
 	LastIndexedAt string         `json:"last_indexed_at,omitempty"`
 	Languages     map[string]int `json:"languages"`
+	// Freshness is set only by graph_stats and the stats command; other
+	// callers that embed Stats leave it nil and the key absent.
+	Freshness *Freshness `json:"freshness,omitempty"`
+}
+
+// Freshness states. None of them means "fresh": codegraph cannot prove the
+// graph matches the working tree without rescanning it.
+const (
+	FreshnessKnownStale       = "known_stale"
+	FreshnessNoKnownStaleness = "no_known_staleness"
+	FreshnessUnknown          = "unknown"
+)
+
+// Freshness is a read-only account of what the stored graph can say about its
+// own staleness. Every field has an explicit unknown; nothing claims "fresh".
+type Freshness struct {
+	State             string                `json:"state"`
+	Reasons           []string              `json:"reasons"`
+	LastCompletedScan *FreshnessScan        `json:"last_completed_scan"`
+	LatestScan        *FreshnessScan        `json:"latest_scan"`
+	RunningScans      FreshnessRunningScans `json:"running_scans"`
+	DirtyQueue        FreshnessDirtyQueue   `json:"dirty_queue"`
+	// Watcher is "not_in_this_process": the processes that answer graph_stats
+	// and stats never run a watcher, and no watcher liveness is persisted.
+	Watcher    string            `json:"watcher"`
+	Worktree   FreshnessWorktree `json:"worktree"`
+	Filesystem string            `json:"filesystem"`
+}
+
+type FreshnessScan struct {
+	ID         int64  `json:"id"`
+	Kind       string `json:"kind"`
+	Status     string `json:"status"`
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	// Scope is "full" only for a scan kind that never takes paths; index and
+	// update share one kind with and without paths, so they read "unknown".
+	Scope     string `json:"scope"`
+	ErrorText string `json:"error_text,omitempty"`
+}
+
+type FreshnessRunningScans struct {
+	Count int64 `json:"count"`
+	// AfterLastCompleted counts running rows newer than the last completed
+	// scan; older ones were superseded.
+	AfterLastCompleted int64 `json:"after_last_completed"`
+	// Liveness is always "unknown": scans hold no lease, so a running row
+	// cannot be told apart from one whose process died.
+	Liveness string `json:"liveness"`
+}
+
+type FreshnessDirtyQueue struct {
+	Queued   int64 `json:"queued"`
+	InFlight int64 `json:"inflight"`
+	// OldestQueuedAt covers queued rows only; claiming a row rewrites its time.
+	OldestQueuedAt string `json:"oldest_queued_at,omitempty"`
+}
+
+type FreshnessWorktree struct {
+	RepoRoot      string `json:"repo_root"`
+	CanonicalPath string `json:"canonical_path"`
+	// HeadAtIndex is git_history_state.watermark_sha: HEAD as probed by the
+	// most recent scan that reached its history phase. That scan may have
+	// failed afterwards. "unknown" when history is absent or disabled.
+	HeadAtIndex       string `json:"head_at_index"`
+	HeadAtIndexSource string `json:"head_at_index_source"`
+	HeadNow           string `json:"head_now"`
+	// HeadChanged is "yes", "no" or "unknown" (unknown unless both heads are).
+	HeadChanged string `json:"head_changed"`
 }
 
 type TaskContext struct {
