@@ -1,12 +1,16 @@
 name: CI
 
 on:
+  # integration/v2.0-wave-* branches stage one wave of reviewed feature PRs
+  # before a single PR carries them into v2.0; they get the same full gate.
   push:
     branches:
       - v2.0
+      - 'integration/v2.0-wave-*'
   pull_request:
     branches:
       - v2.0
+      - 'integration/v2.0-wave-*'
     # Adding windows-stress to an open PR triggers the deep Windows gate.
     # Release-candidate checks use a PR targeting v2.0 with this label; no
     # workflow_dispatch or schedule can accidentally run against master.
