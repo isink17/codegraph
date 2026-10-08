@@ -15,7 +15,7 @@ func tsProfile(language string) parser.Profile {
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
 func (a *LuaAdapter) Profile() parser.Profile {
-	return parser.NewProfile("lua", "treesitter:lua:v1", false)
+	return tsProfile("lua")
 }
 
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding

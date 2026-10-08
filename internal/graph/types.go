@@ -59,6 +59,11 @@ type Edge struct {
 	CallArity *int `json:"call_arity,omitempty"`
 }
 
+// LuaLocalFunctionEvidence prefixes the evidence of a call edge whose bare
+// callee Lua's lexical scoping binds to one `local function` statement of the
+// same file. The suffix is that statement's 1-based start line and column.
+const LuaLocalFunctionEvidence = "lua:local_function:"
+
 // PHPMemberCallNestedScopeEvidence marks a PHP $this member call lexically
 // inside an executable scope P22.45 does not model as a source symbol.
 const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"

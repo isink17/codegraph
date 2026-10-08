@@ -6,6 +6,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 func TestLuaAdapterDeclarationsImportsAndCallReferences(t *testing.T) {
@@ -41,14 +43,14 @@ require(moduleName)
 			t.Errorf("no symbol with declaration identity for %q and kind %q", key, kind)
 		}
 	}
-	if len(p.Edges) != 0 {
-		t.Fatalf("unproven calls produced edges: %+v", p.Edges)
+	if len(p.Edges) != 1 || p.Edges[0].DstName != "localFn" || p.Edges[0].Evidence != graph.LuaLocalFunctionEvidence+"1:1" || p.Edges[0].Line != 2 || p.Edges[0].Col != 21 {
+		t.Fatalf("edges = %+v, want only the proven localFn call", p.Edges)
 	}
 	references := map[string]bool{}
 	for _, r := range p.References {
 		references[r.Name] = true
 	}
-	for _, name := range []string{"localFn", "module.run", "obj:method", "unknown"} {
+	for _, name := range []string{"localFn", "module.run", "obj:method", "unknown", "require"} {
 		if !references[name] {
 			t.Errorf("missing call reference %q", name)
 		}

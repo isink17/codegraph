@@ -333,6 +333,7 @@ var resolverAcceptanceMatrix = map[resolverRuleID]map[string]string{
 	"cpp_evidence_ownership":   edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestCppScopeVetoSQLMatchesGoTwin,TestCppEvidenceOwnershipAllEntrypoints"),
 	"go_bare_package_scope":    edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestGoPackageScopeSQLMatchesGo"),
 	"ruby_ownership":           edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestRubyScopeVetoSQLMatchesGoTwin"),
+	"lua_ownership":            edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestLuaScopeVetoSQLMatchesGoTwin"),
 	"php_ownership":            edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins"),
 	"swift_ownership":          edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins"),
 	"cpp_bare_namespace_scope": predicateOnlyCells("TestResolverCandidateRestrictionsMatchGoTwins"),

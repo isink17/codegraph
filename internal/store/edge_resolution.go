@@ -187,6 +187,9 @@ const (
 	ResolutionStrategyPHPComposerPSR4  = "php_composer_psr4"
 	ResolutionStrategyRubyImplicitSelf = "ruby_implicit_self"
 	ResolutionStrategyRubyExplicitSelf = "ruby_explicit_self"
+	// lua_local_function: a bare Lua call the parser bound, by lexical scope,
+	// to one never-reassigned `local function` statement of the same file.
+	ResolutionStrategyLuaLocalFunction = "lua_local_function"
 
 	// ruby_lexical_constant: `Service.run` / `Service::run` where `Service` is
 	// exactly one constant token, the caller's own file proves the lexical
@@ -313,6 +316,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyPHPComposerPSR4:                                            ResolutionConfidenceHigh,
 	ResolutionStrategyRubyImplicitSelf:                                           ResolutionConfidenceHigh,
 	ResolutionStrategyRubyExplicitSelf:                                           ResolutionConfidenceHigh,
+	ResolutionStrategyLuaLocalFunction:                                           ResolutionConfidenceHigh,
 	ResolutionStrategyRubyLexicalConstant:                                        ResolutionConfidenceHigh,
 	ResolutionStrategyRubyConstantPath:                                           ResolutionConfidenceHigh,
 	ResolutionStrategySwiftSelfScope:                                             ResolutionConfidenceHigh,

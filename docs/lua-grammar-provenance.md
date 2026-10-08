@@ -25,14 +25,26 @@ The ISC declaration is the upstream package metadata; this note does not infer
 an author or add a fabricated copyright notice. The grammar is standard Lua,
 not the distinct Luau grammar.
 
-The adapter currently extracts function declarations, literal `require`
-specifier strings, and call references. Calls are not resolved to edges because
-this grammar and the current persisted evidence model do not prove lexical
-ownership, runtime global state, or reassignment. Dynamic requires, table
-dispatch, metatables, and receiver identity remain unresolved.
+The adapter extracts function declarations, literal `require` specifier
+strings, and call references. It emits a call edge only for a bare `name(...)`
+call whose innermost lexical binding is a `local function` statement of the
+same file that is never assigned to anywhere in its scope, closures included;
+the edge's evidence names that declaration's position, and the resolver binds
+the symbol at exactly that position or nothing. Parameters, loop variables,
+other locals, globals, fields, methods, modules, dynamic requires, table
+dispatch, metatables and receiver identity remain unresolved. A file with any
+parse error (the pinned grammar does not parse `goto`, labels, or `<const>` /
+`<close>` attributes) or that names `debug` (whose `setlocal`/`setupvalue`
+rewrite locals at run time) produces no call edges. Calls at file top level
+have no source symbol and are not persisted as edges.
+
+The pinned grammar folds the newline before a statement that starts at column
+zero into that statement's first token; the adapter reports positions and
+names from the first non-space byte.
 
 A local smoke sample was parsed from `lua/lua` commit
 `0b29f408433e92953cc72b1d3e06c7ac8139e439`: `testes/all.lua`,
 `main.lua`, `closure.lua`, `calls.lua`, and `locals.lua` produced 14 symbols,
-51 call references, and zero call edges. Those upstream files are not copied
+51 call references, and zero call edges before local call resolution existed;
+that count was not re-measured for this change. Those upstream files are not copied
 into this repository because the checkout has no standalone license file.

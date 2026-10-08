@@ -4379,6 +4379,14 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	} else {
 		totalResolved += n
 	}
+	// Lua calls: bound to the local function the parser proved or left
+	// unresolved; luaScopeVetoSQL keeps every strategy below off them. See
+	// lua_scope.go.
+	if n, err := resolveLuaScope(ctx, tx, repoID, scope.only("lua")); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
 	if n, err := resolveJavaScope(ctx, tx, repoID, scope.only("java")); err != nil {
 		return 0, err
 	} else {
@@ -5335,6 +5343,10 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
+	luaResolved, err := resolveLuaScope(ctx, tx, repoID, scope.only("lua"))
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
 		return 0, err
 	}
@@ -5349,7 +5361,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
-	n += csharpResolved + phpResolved + rubyResolved
+	n += csharpResolved + phpResolved + rubyResolved + luaResolved
 	for _, table := range []string{
 		resolverAmbiguousNamesTable, resolverTestFilesTable,
 		resolverImportScopeTable, resolverCppNamespaceScopesTable,
@@ -6609,6 +6621,33 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		remaining = targets[:0]
 		for _, target := range targets {
 			if _, owned := rubyIDs[target.edgeID]; owned {
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		targets = remaining
+	}
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	// Lua owns every call outright, like Ruby above. This is the Go-side twin
+	// of luaScopeVetoSQL.
+	luaIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if binderOwnsLua(target) {
+			luaIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(luaIDs) > 0 {
+		n, err := s.resolveLuaScopeStandalone(ctx, repoID, luaIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		outcome.unresolved += len(luaIDs) - n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, owned := luaIDs[target.edgeID]; owned {
 				continue
 			}
 			remaining = append(remaining, target)

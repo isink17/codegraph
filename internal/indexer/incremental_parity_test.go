@@ -80,6 +80,69 @@ func TestLuaGlobalCallRemainsUnresolvedAndLifecycleParity(t *testing.T) {
 	r.assertFreshParity(t, "provider deleted")
 }
 
+// A bare call bound by lexical scope to a local function of the same file is
+// resolved on every path; any other call in the same file stays unresolved, and
+// a same-named global elsewhere never answers it.
+func TestLuaLocalFunctionCallLifecycleParity(t *testing.T) {
+	const caller = `local function helper() end
+local function run() helper() missing() end
+`
+	r := newLifecycleRepo(t, tree{
+		"caller.lua": caller,
+		"other.lua":  "function helper() end\nfunction missing() end\n",
+	})
+	assertState := func(step, wantHelper string) {
+		t.Helper()
+		if got := r.edgeState(t, "caller.lua", "helper"); got != wantHelper {
+			t.Fatalf("%s: helper edge = %q, want %q", step, got, wantHelper)
+		}
+		if got := r.edgeState(t, "caller.lua", "missing"); got != "<no edge>" {
+			t.Fatalf("%s: unproven call gained an edge = %s", step, got)
+		}
+		if got := r.refTarget(t, "caller.lua", "missing"); got != "" {
+			t.Fatalf("%s: unproven reference bound to %q", step, got)
+		}
+		r.assertFreshParity(t, step)
+	}
+	bound := ` => caller.lua:helper(function) [lua_local_function/high]`
+	assertState("fresh", bound)
+	if got := r.refTarget(t, "caller.lua", "helper"); got != "helper" {
+		t.Fatalf("fresh: helper reference bound to %q", got)
+	}
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	assertState("no-op", bound)
+
+	// Unrelated edits elsewhere neither steal nor drop the binding.
+	r.write(t, "other.lua", "function helper() end\nfunction helper2() end\n")
+	r.update(t, "other.lua")
+	assertState("other edited", bound)
+
+	// Renaming the declaration leaves the call with nothing to bind to.
+	r.write(t, "caller.lua", strings.Replace(caller, "local function helper()", "local function renamed()", 1))
+	r.update(t, "caller.lua")
+	assertState("declaration renamed", "<no edge>")
+
+	r.write(t, "caller.lua", caller)
+	r.update(t, "caller.lua")
+	assertState("declaration restored", bound)
+
+	// Reassignment anywhere in scope withdraws the proof.
+	r.write(t, "caller.lua", caller+"helper = nil\n")
+	r.update(t, "caller.lua")
+	assertState("reassigned", "<no edge>")
+
+	r.remove(t, "other.lua")
+	r.update(t, "other.lua")
+	r.write(t, "caller.lua", caller)
+	r.update(t, "caller.lua")
+	assertState("other deleted", bound)
+	r.remove(t, "caller.lua")
+	r.update(t, "caller.lua")
+	r.assertFreshParity(t, "caller deleted")
+}
+
 func TestCrossLanguageLinksFollowIncrementalLifecycle(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"src.ts":    "import { RenderReport } from \"./target.py\";\nexport function RenderReport() {}\n",
