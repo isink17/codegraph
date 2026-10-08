@@ -26,6 +26,16 @@ func TestCurrentFingerprintChangesWithRepositoryInputs(t *testing.T) {
 	if err := os.WriteFile(buildFile, []byte("plugins { kotlin(\"jvm\") }\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	buildDirInput := filepath.Join(root, "app", "build", "settings.properties")
+	gradleDirInput := filepath.Join(root, "app", ".gradle", "settings.properties")
+	for _, path := range []string{buildDirInput, gradleDirInput} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("setting=one\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	source := filepath.Join(root, "app", "src", "main", "kotlin", "Hello.kt")
 	if err := os.WriteFile(source, []byte("class Hello\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -62,6 +72,28 @@ func TestCurrentFingerprintChangesWithRepositoryInputs(t *testing.T) {
 	}
 	if err := a.ValidateCurrentInRepository(root); err == nil {
 		t.Fatal("artifact remained current after build input edit")
+	}
+	current, err := CurrentFingerprint(root, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.InputFingerprint = current
+	if err := os.WriteFile(buildDirInput, []byte("setting=two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateCurrentInRepository(root); err == nil {
+		t.Fatal("artifact remained current after nested build-directory input edit")
+	}
+	current, err = CurrentFingerprint(root, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.InputFingerprint = current
+	if err := os.WriteFile(gradleDirInput, []byte("setting=two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateCurrentInRepository(root); err == nil {
+		t.Fatal("artifact remained current after nested .gradle input edit")
 	}
 	if err := os.WriteFile(source, []byte("class Changed\n"), 0o600); err != nil {
 		t.Fatal(err)

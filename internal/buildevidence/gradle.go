@@ -102,7 +102,7 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	}
 	modelPath := filepath.Join(tmpDir, "model.json")
 	args := []string{
-		"--no-daemon", "--init-script", initPath,
+		"--no-daemon", "--project-cache-dir", filepath.Join(tmpDir, "gradle-project-cache"), "--init-script", initPath,
 		"-Pcg35.project=" + req.Project,
 		"-Pcg35.compilation=" + req.Compilation,
 		"-Pcg35.output=" + modelPath,
@@ -386,8 +386,8 @@ func canonicalRepoPath(root, abs string) (string, error) {
 	return filepath.ToSlash(filepath.Clean(rel)), nil
 }
 
-// ponytail: hashes the full non-generated tree in O(repository bytes); use a
-// Gradle-proven input manifest if explicit freshness checks become costly.
+// ponytail: hashes the full tree in O(repository bytes); use a Gradle-proven
+// input manifest if explicit freshness checks become costly.
 func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 	h := sha256.New()
 	write := func(name string, data []byte) {
@@ -421,15 +421,6 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
-		}
-		if entry.IsDir() {
-			switch entry.Name() {
-			case ".git", ".gradle", "build", ".codegraph":
-				if name != root {
-					return filepath.SkipDir
-				}
-			}
-			return nil
 		}
 		var info fs.FileInfo
 		var err error
