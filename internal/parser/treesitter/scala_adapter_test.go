@@ -358,3 +358,41 @@ class OrderService(repo: OrderRepository, clock: Clock)(implicit ec: ExecutionCo
 		}
 	}
 }
+
+func TestScalaAdapterMultiMethodExtensions(t *testing.T) {
+	const src = `object Ext {
+  extension (s: String)
+    def shout: String = s.toUpperCase
+    def whisper: String = s.toLowerCase
+
+  extension (n: Int) {
+    def double: Int = n * 2
+    def half: Int = n / 2
+  }
+}
+`
+	want := []string{
+		"function func:scala:Ext$.double",
+		"function func:scala:Ext$.half",
+		"function func:scala:Ext$.shout",
+		"function func:scala:Ext$.whisper",
+		"object object:scala:Ext",
+	}
+	if got := scalaKeys(parseScala(t, "Ext.scala", src)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("symbols = %q, want %q", got, want)
+	}
+}
+
+func TestScalaAdapterUnbracedRenameImport(t *testing.T) {
+	pf := parseScala(t, "Rename.scala", "import p.q as r\nimport a.b.c as d\nimport x.y as _\n")
+	if !reflect.DeepEqual(pf.Imports, []string{"p.q", "a.b.c"}) {
+		t.Fatalf("imports = %q", pf.Imports)
+	}
+	want := []graph.ScopeImport{
+		{SourceSpecifier: "p", ImportedName: "q", LocalName: "r", Kind: graph.ScopeImportNamed},
+		{SourceSpecifier: "a.b", ImportedName: "c", LocalName: "d", Kind: graph.ScopeImportNamed},
+	}
+	if !reflect.DeepEqual(pf.Scope.Imports, want) {
+		t.Fatalf("scope imports = %+v", pf.Scope.Imports)
+	}
+}

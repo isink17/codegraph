@@ -126,14 +126,9 @@ func scalaMembers(parent *sitter.Node, pkg string, owners []scalaOwner, content 
 			scalaFunction(child, pkg, owners, content, pf)
 		case "extension_definition":
 			// Extension methods are members of the enclosing scope; the
-			// receiver they extend is not modelled.
-			if body := childByFieldName(child, "body"); body != nil {
-				if body.Type() == "function_definition" || body.Type() == "function_declaration" {
-					scalaFunction(body, pkg, owners, content, pf)
-				} else {
-					scalaMembers(body, pkg, owners, content, pf)
-				}
-			}
+			// receiver they extend is not modelled. Each method is its own
+			// `body` child, in both the indented and the braced form.
+			scalaMembers(child, pkg, owners, content, pf)
 		case "val_definition", "var_definition":
 			pattern := childByFieldName(child, "pattern")
 			switch {
@@ -278,6 +273,16 @@ func scalaImports(node *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		}
 		path = nil
 	}
+	// renamed records `q => r` or `q as r` under base; `q => _` hides q.
+	renamed := func(sel *sitter.Node, base string) {
+		name, alias := childByFieldName(sel, "name"), childByFieldName(sel, "alias")
+		if base == "" || name == nil || alias == nil || alias.Type() != "identifier" {
+			return
+		}
+		imported := scalaName(name, content)
+		pf.Imports = append(pf.Imports, base+"."+imported)
+		pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{SourceSpecifier: base, ImportedName: imported, LocalName: scalaName(alias, content), Kind: graph.ScopeImportNamed})
+	}
 	for i := range int(node.ChildCount()) {
 		child := node.Child(i)
 		base := strings.Join(path, ".")
@@ -288,6 +293,9 @@ func scalaImports(node *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			flush()
 		case "namespace_wildcard":
 			scalaWildcard(base, nodeText(child, content), pf)
+			path = nil
+		case "arrow_renamed_identifier", "as_renamed_identifier":
+			renamed(child, base) // Scala 3 unbraced `import p.q as r`
 			path = nil
 		case "namespace_selectors":
 			for j := range int(child.NamedChildCount()) {
@@ -300,13 +308,7 @@ func scalaImports(node *sitter.Node, content []byte, pf *graph.ParsedFile) {
 				case "namespace_wildcard":
 					scalaWildcard(base, nodeText(sel, content), pf)
 				case "arrow_renamed_identifier", "as_renamed_identifier":
-					name, alias := childByFieldName(sel, "name"), childByFieldName(sel, "alias")
-					if name == nil || alias == nil || alias.Type() != "identifier" {
-						continue
-					}
-					imported := scalaName(name, content)
-					pf.Imports = append(pf.Imports, base+"."+imported)
-					pf.Scope.Imports = append(pf.Scope.Imports, graph.ScopeImport{SourceSpecifier: base, ImportedName: imported, LocalName: scalaName(alias, content), Kind: graph.ScopeImportNamed})
+					renamed(sel, base)
 				}
 			}
 			path = nil

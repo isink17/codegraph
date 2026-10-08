@@ -8,17 +8,29 @@ added. That dependency's `_automation/grammars.json` records the source as
 tag `v0.22.5`, revision `d9017869dda79cefe2dc9d23c6125eda0a2d5d22` (tagged
 2024-08-08). The tag object resolves to that exact commit.
 
-At that revision the repository carries a standalone `LICENSE` file (MIT,
-"Copyright (c) 2018 Max Brunsfeld and GitHub") and `package.json` declares
-`"license": "MIT"`. The generated `parser.c` reports `LANGUAGE_VERSION 14`.
+Two different license files apply, and they cover different code:
+
+- **The grammar.** `LICENSE` at the root of `tree-sitter/tree-sitter-scala`
+  at revision `d9017869dda79cefe2dc9d23c6125eda0a2d5d22` is the MIT License,
+  "Copyright (c) 2018 Max Brunsfeld and GitHub" (git blob
+  `bd0a4d6c7d625591c54e1f023b93af2a4650271a`, sha256
+  `1f95ed26e1f4074074c9c7083e61c0a9e4c3b9f435745044995f3beb4ed28575`), and
+  that revision's `package.json` declares `"license": "MIT"`. This covers the
+  generated `parser.c` and `scanner.c`.
+- **The Go module.** `LICENSE` at the root of the `smacker/go-tree-sitter`
+  module is the MIT License, "Copyright (c) 2019 Maxim Sukharev". It covers
+  the module's Go bindings and updater, not the grammar. The module's `scala/`
+  directory ships no license file of its own, so the grammar's notice is not
+  present anywhere in the dependency as distributed.
+
+The generated `parser.c` reports `LANGUAGE_VERSION 14`.
 
 The distributed `parser.c` and `scanner.c` are byte-identical to the upstream
 `src/parser.c` and `src/scanner.c` at that revision except for header include
 paths (`tree_sitter/parser.h` -> `parser.h`, `tree_sitter/alloc.h` and
 `tree_sitter/array.h` -> `../alloc.h`, `../array.h`), which the dependency's
 updater rewrites for every grammar. CodeGraph imports the dependency package
-and does not copy or modify those sources. The Go module's own MIT license
-names Maxim Sukharev and covers the bindings, not the grammar.
+and does not copy or modify those sources.
 
 MIT requires the grammar's copyright and permission notice to accompany
 copies of the software. A CodeGraph binary links the generated parser, so the
