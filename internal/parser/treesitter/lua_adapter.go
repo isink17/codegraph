@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -49,7 +50,10 @@ func (a *LuaAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 		if strings.Contains(raw, ":") {
 			kind = "method"
 		}
-		pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "lua", Kind: kind, Name: last, QualifiedName: qname, ContainerName: container, Range: nodeRange(fn), StableKey: "func:lua:" + prefix + ":" + qname})
+		rng := nodeRange(fn)
+		// Repeated local names in nested lexical scopes are distinct declarations.
+		stableKey := "func:lua:" + prefix + ":" + qname + ":" + strconv.Itoa(rng.StartLine) + ":" + strconv.Itoa(rng.StartCol)
+		pf.Symbols = append(pf.Symbols, graph.Symbol{Language: "lua", Kind: kind, Name: last, QualifiedName: qname, ContainerName: container, Range: rng, StableKey: stableKey})
 	}
 	for _, call := range findDescendants(root, "function_call") {
 		prefix := childByFieldName(call, "prefix")

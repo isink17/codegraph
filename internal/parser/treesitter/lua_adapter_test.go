@@ -4,6 +4,7 @@ package treesitter
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -29,8 +30,15 @@ require(moduleName)
 		"func:lua:global:M.tableFn": "function",
 		"func:lua:global:M.method":  "method",
 	} {
-		if got[key] != kind {
-			t.Errorf("symbol %q = %q", key, got[key])
+		found := false
+		for gotKey, gotKind := range got {
+			if gotKind == kind && strings.HasPrefix(gotKey, key+":") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no symbol with declaration identity for %q and kind %q", key, kind)
 		}
 	}
 	if len(p.Edges) != 0 {

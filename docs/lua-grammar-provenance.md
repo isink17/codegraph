@@ -8,11 +8,18 @@ revision `acb3f3666383bd8cba9c9d9dde00ec4b16b055d6` (2024-03-14).
 
 At that exact revision, `package.json` declares `"license": "ISC"`. The
 revision has no standalone license file, no `tree-sitter.json`, and no
-copyright holder declaration. The generated `parser.c` reports
-`LANGUAGE_VERSION 14`; generated `parser.c` and `scanner.c` are distributed by
-the Go dependency with dependency-side changes, including a parser-header
-include rewrite. CodeGraph imports the dependency package and does not copy or
-modify those generated C sources.
+copyright holder declaration. The scanner's history credits earlier
+Azganoth and MunifTanjim tree-sitter-lua sources, so the package metadata alone
+does not settle the scanner's full provenance. The pinned package identifies
+the generated parser/scanner paths, and the parser reports `LANGUAGE_VERSION
+14`; byte-level provenance and generation-history differences have not been
+fully reconciled. The Go module's own MIT license names Maxim Sukharev, but
+does not establish the grammar's holder or grant.
+
+CodeGraph imports the dependency package and does not copy or modify those
+generated C sources. This evidence is not final redistribution clearance. The
+grammar notice/provenance obligation must be closed, or a compatible grammar
+with a clear license selected, before public v2.0 redistribution.
 
 The ISC declaration is the upstream package metadata; this note does not infer
 an author or add a fabricated copyright notice. The grammar is standard Lua,

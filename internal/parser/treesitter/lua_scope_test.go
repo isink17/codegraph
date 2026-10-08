@@ -43,3 +43,26 @@ callback()
 		t.Fatalf("call references = %d, want six", len(parsed.References))
 	}
 }
+
+func TestLuaDeclarationIdentitySeparatesLexicalDuplicates(t *testing.T) {
+	const source = `local function same() end
+local function outer()
+  local function same() end
+  do local function same() end end
+end
+`
+	parsed, err := NewLua().Parse(context.Background(), "same.lua", []byte(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Symbols) != 4 {
+		t.Fatalf("symbols = %d, want outer and three same declarations", len(parsed.Symbols))
+	}
+	keys := map[string]bool{}
+	for _, sym := range parsed.Symbols {
+		if keys[sym.StableKey] {
+			t.Errorf("duplicate declaration identity %q", sym.StableKey)
+		}
+		keys[sym.StableKey] = true
+	}
+}
