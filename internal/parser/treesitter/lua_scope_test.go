@@ -149,6 +149,10 @@ end
 local function g() f() end
 debug.setlocal(1, 1, nil)
 `, []string{}},
+		{"debug through require refuses the file", `local function f() end
+local function g() f() end
+local d = require("debug")
+`, []string{}},
 		{"parse error refuses the file", `local function f() end
 local function g() f() end
 goto skip

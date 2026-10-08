@@ -101,3 +101,79 @@ func TestResolveLuaScopeBindsOnlyTheDeclarationAtTheEvidencePosition(t *testing.
 		t.Fatalf("bindings = %v", got)
 	}
 }
+
+// Every resolver entry point leaves a Lua call to the Lua pass: a same-named
+// global in another file never answers it, on any path.
+func TestLuaOwnershipAllEntrypoints(t *testing.T) {
+	ctx := context.Background()
+	for _, entry := range []struct {
+		name string
+		run  func(*Store, int64) error
+	}{
+		{"repo-wide", func(s *Store, repo int64) error { _, err := s.ResolveEdges(ctx, repo); return err }},
+		{"names", func(s *Store, repo int64) error {
+			_, err := s.ResolveEdgesForNames(ctx, repo, []string{"f", "g"})
+			return err
+		}},
+		{"paths", func(s *Store, repo int64) error { return s.ResolveEdgesForPaths(ctx, repo, []string{"m.lua"}) }},
+		{"paths-and-names", func(s *Store, repo int64) error {
+			_, err := s.ResolveEdgesForPathsAndNames(ctx, repo, []string{"m.lua"}, []string{"f", "g"})
+			return err
+		}},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			s, repo := openBudgetStore(t)
+			file, err := insertTestFileLang(ctx, s, repo.ID, "m.lua", "lua")
+			if err != nil {
+				t.Fatal(err)
+			}
+			other, err := insertTestFileLang(ctx, s, repo.ID, "other.lua", "lua")
+			if err != nil {
+				t.Fatal(err)
+			}
+			symbol := func(fileID int64, name, key string) int64 {
+				res, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, 'lua', 'function', ?, ?, 1, 1, 3, 4, ?)`,
+					repo.ID, fileID, name, name, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				id, _ := res.LastInsertId()
+				return id
+			}
+			local := symbol(file, "f", "func:lua:local:f:1:1")
+			symbol(other, "f", "func:lua:global:f:1:1")
+			symbol(other, "g", "func:lua:global:g:1:1")
+			edge := func(name, evidence string) int64 {
+				res, err := s.db.ExecContext(ctx, `INSERT INTO edges(repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line, start_col) VALUES(?, ?, ?, 'calls', ?, ?, 2, 1)`,
+					repo.ID, local, name, evidence, file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				id, _ := res.LastInsertId()
+				return id
+			}
+			proven := edge("f", graph.LuaLocalFunctionEvidence+"1:1")
+			unproven := edge("g", "")
+			if err := entry.run(s, repo.ID); err != nil {
+				t.Fatal(err)
+			}
+			state := func(id int64) string {
+				var dst *int64
+				var strategy string
+				if err := s.db.QueryRowContext(ctx, `SELECT dst_symbol_id, resolution_strategy FROM edges WHERE id = ?`, id).Scan(&dst, &strategy); err != nil {
+					t.Fatal(err)
+				}
+				if dst == nil {
+					return "-"
+				}
+				if *dst == local {
+					return "local:" + strategy
+				}
+				return "other:" + strategy
+			}
+			if got := state(proven) + "," + state(unproven); got != "local:"+ResolutionStrategyLuaLocalFunction+",-" {
+				t.Fatalf("bindings = %s", got)
+			}
+		})
+	}
+}

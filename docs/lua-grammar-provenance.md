@@ -34,8 +34,9 @@ the symbol at exactly that position or nothing. Parameters, loop variables,
 other locals, globals, fields, methods, modules, dynamic requires, table
 dispatch, metatables and receiver identity remain unresolved. A file with any
 parse error (the pinned grammar does not parse `goto`, labels, or `<const>` /
-`<close>` attributes) or that names `debug` (whose `setlocal`/`setupvalue`
-rewrite locals at run time) produces no call edges. Calls at file top level
+`<close>` attributes) or that names `debug` as an identifier or string
+(whose `setlocal`/`setupvalue` rewrite locals at run time) produces no call
+edges. `debug` reached without spelling it (`_G["de".."bug"]`) is not detected. Calls at file top level
 have no source symbol and are not persisted as edges.
 
 The pinned grammar folds the newline before a statement that starts at column

@@ -126,8 +126,9 @@ type luaCallSite struct {
 // never assigned to. Every other call stays unresolved: globals, fields,
 // methods, parameters, other locals, and any binding with a plain assignment
 // or a non-local `function name()` statement against it anywhere in its scope,
-// closures included. A file with any parse error, or that names `debug` (whose
-// setlocal/setupvalue rewrite locals at run time), proves nothing.
+// closures included. A file with any parse error, or that names `debug` as an
+// identifier or string (whose setlocal/setupvalue rewrite locals at run time),
+// proves nothing.
 func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 	if root.HasError() || luaNamesDebug(root, content) {
 		return nil
@@ -285,9 +286,12 @@ func luaLocalFunctionCalls(root *sitter.Node, content []byte) []graph.Edge {
 }
 
 func luaNamesDebug(root *sitter.Node, content []byte) bool {
-	for _, id := range findDescendants(root, "identifier") {
-		if strings.TrimSpace(nodeText(id, content)) == "debug" {
-			return true
+	// The string form catches require("debug") and _G["debug"].
+	for _, kind := range []string{"identifier", "string_content"} {
+		for _, n := range findDescendants(root, kind) {
+			if strings.TrimSpace(nodeText(n, content)) == "debug" {
+				return true
+			}
 		}
 	}
 	return false
