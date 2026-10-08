@@ -2,17 +2,18 @@
 
 The CGO Dart adapter parses with
 [`UserNobody14/tree-sitter-dart`](https://github.com/UserNobody14/tree-sitter-dart)
-commit `c8e7cbbd1589cc2ee1f9b5befa604dc7e953b0af`, MIT licensed ("Copyright
+commit `8bd7e003770e2599ccf6b83a6a2a650ec71d73c2`, MIT licensed ("Copyright
 (c) 2020-2023 UserNobody14 and others"; upstream `package.json` says ISC, which
-contradicts the license file). The generated `parser.c` (about 5.8 MiB),
-`scanner.c` and headers are vendored unmodified in
-`internal/parser/treesitter/dartgrammar` with the upstream `LICENSE` verbatim;
-`PROVENANCE.md` there records the file hashes and the refresh steps. The
-parser is ABI 14, the last ABI the `github.com/smacker/go-tree-sitter` runtime
-loads; later upstream commits are ABI 15. Its MIT notice ships in
-`THIRD_PARTY_NOTICES` with every release archive and the npm package.
+contradicts the license file). Upstream publishes that commit's parser as
+ABI 15, which the `github.com/smacker/go-tree-sitter` runtime cannot load, so
+`parser.c` (about 6.8 MiB) is generated from the unmodified upstream grammar
+with tree-sitter CLI v0.25.10 at ABI 14; `scanner.c` and the headers are
+vendored unmodified in `internal/parser/treesitter/dartgrammar` with the
+upstream `LICENSE` verbatim. `PROVENANCE.md` there records the file hashes,
+why this commit and not a later one, and the refresh steps. Its MIT notice
+ships in `THIRD_PARTY_NOTICES` with every release archive and the npm package.
 
-The adapter (profile `treesitter:dart:v1`) records:
+The adapter (profile `treesitter:dart:v2`) records:
 
 - `import`, `export`, `part` and `part of` URIs as written (a `part of`
   library name is not a URI and is not recorded), including the
@@ -44,9 +45,13 @@ does not end before the error is dropped with all its members, and directives
 follow the same rule. A broken file with more `}` than `{` tokens records no
 declarations at all: recovery closes a body at an earlier `}` and moves the
 members after it out to the top level before it reports the excess brace. Call
-references are kept unless they sit inside an error node. The grammar does
-not parse null-aware elements (`[?x]`, Dart 3.8) or dot shorthands (Dart 3.10),
-so a file using them keeps only the declarations before the first use.
+references are kept unless they sit inside an error node. Null-aware
+elements (`[?x]`, `{?k: ?v}`, Dart 3.8), dot shorthands (`.red`, `.new()`,
+`case .red:`, Dart 3.10), `get`/`set` as identifiers and labeled statements
+parse. A dot shorthand names no type, so a shorthand call (`.make()`,
+`.new()`, `const .new()`) yields no call reference. A generic call with one
+type argument (`f<int>(x)`) is sometimes parsed as a comparison and then
+yields no call reference.
 
 Non-CGO builds use `heuristic:dart:v1`: type declarations, typed function
 headers and directive URIs from regular expressions, without call references.
