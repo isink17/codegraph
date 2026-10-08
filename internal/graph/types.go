@@ -64,6 +64,16 @@ type Edge struct {
 // same file. The suffix is that statement's 1-based start line and column.
 const LuaLocalFunctionEvidence = "lua:local_function:"
 
+// HCLTerraformReferenceEvidence marks a Terraform `references` edge whose
+// destination is a static module address (var.X, local.X, module.M, data.T.N,
+// T.N). It binds only to the one declaration of that address in the same
+// directory.
+const HCLTerraformReferenceEvidence = "hcl:terraform_reference"
+
+// HCLTerraformDynamicEvidence marks a Terraform `references` edge whose
+// traversal continues through a splat or a non-literal index. It never binds.
+const HCLTerraformDynamicEvidence = "hcl:terraform_dynamic"
+
 // PHPMemberCallNestedScopeEvidence marks a PHP $this member call lexically
 // inside an executable scope P22.45 does not model as a source symbol.
 const PHPMemberCallNestedScopeEvidence = "php:nested_executable_scope"

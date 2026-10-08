@@ -63,6 +63,7 @@ type LanguageCapability struct {
 var languageNames = map[string]string{
 	"cpp": "C/C++", "csharp": "C#", "go": "Go", "java": "Java",
 	"kotlin": "Kotlin", "php": "PHP", "python": "Python", "ruby": "Ruby",
+	"hcl":  "HCL/Terraform",
 	"lua":  "Lua",
 	"rust": "Rust", "scala": "Scala", "swift": "Swift", "typescript": "TypeScript/JavaScript",
 }

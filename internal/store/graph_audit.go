@@ -43,6 +43,11 @@ const EdgeKindCrossLanguageRef = "cross_language_ref"
 // decides. It is not a cross-language reference.
 const EdgeKindCalls = "calls"
 
+// EdgeKindReferences is a Terraform reference to a declaration (var.X,
+// local.X, module.M, data.T.N, T.N). It is not a call; only the HCL pass
+// decides it.
+const EdgeKindReferences = "references"
+
 // EdgeAuditExample identifies one violating edge. It carries identity only --
 // the endpoints, the recorded target name, and the resolution provenance --
 // because examples exist to be looked up by a human or an agent, not to

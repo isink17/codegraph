@@ -14,6 +14,11 @@ func tsProfile(language string) parser.Profile {
 
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
+// HCL emits Terraform reference edges and no call edges.
+func (a *HCLAdapter) Profile() parser.Profile {
+	return parser.NewProfile("hcl", "treesitter:hcl:v1", false)
+}
+
 // Lua v2 parses with the vendored tree-sitter-grammars v0.3.0 grammar: goto,
 // labels and <const>/<close> locals parse, so such files can bind calls, and
 // bracket callees (`t[k]()`) no longer get a concatenated name.

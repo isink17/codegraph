@@ -28,6 +28,7 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/limits"
 	"github.com/isink17/codegraph/internal/parser"
+	"github.com/isink17/codegraph/internal/parser/terraform"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/texttoken"
 )
@@ -3394,10 +3395,23 @@ func execImportsInsert(ctx context.Context, tx *sql.Tx, args []any, stats *Write
 // "protocol", "actor", "object", "value") is a container or a declaration with
 // no body of its own, and must never absorb a call made inside a member.
 //
+// Terraform has no functions: its references live in the expressions of
+// resource, data, module, provider, variable and output blocks, locals
+// entries and tfvars assignments, so those kinds own them. The terraform
+// settings block and generic HCL blocks hold no references.
+//
 // This is deliberately narrower than a general "is callable" test: it answers
 // only "can a reference at this line belong to this symbol's body?".
 func ownsSourceEdges(kind string) bool {
-	return kind == "function" || kind == "method" || kind == "constructor"
+	switch kind {
+	case "function", "method", "constructor":
+		return true
+	// Terraform blocks and entries whose expressions hold references.
+	case terraform.KindProvider, terraform.KindResource, terraform.KindData, terraform.KindVariable,
+		terraform.KindLocal, terraform.KindOutput, terraform.KindModule, terraform.KindVariableValue:
+		return true
+	}
+	return false
 }
 
 type funcSpan struct {
@@ -4387,6 +4401,16 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	} else {
 		totalResolved += n
 	}
+	// Terraform references: bound within their module directory or left
+	// unresolved; hclScopeVetoSQL keeps every strategy below off them. See
+	// hcl_scope.go.
+	if scope.has("hcl") {
+		if n, err := resolveHCLScope(ctx, tx, repoID); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
+	}
 	if n, err := resolveJavaScope(ctx, tx, repoID, scope.only("java")); err != nil {
 		return 0, err
 	} else {
@@ -5109,6 +5133,13 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	rubyChanged, err := s.rubyPathsChanged(ctx, repoID, paths)
 	if err != nil {
 		return ResolveEdgesForNamesStats{}, err
+	}
+	// A Terraform edge's answer depends on every file of its directory, and a
+	// deleted path is no longer in files, so the extension decides.
+	if slices.ContainsFunc(paths, isHCLPath) {
+		if _, err := s.resolveHCLScopeStandalone(ctx, repoID); err != nil {
+			return ResolveEdgesForNamesStats{}, err
+		}
 	}
 	// Invalidate before anything re-binds: a binding this batch may have made
 	// ambiguous has to be reconsidered, not merely left alone. It runs first so
@@ -6626,6 +6657,30 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			remaining = append(remaining, target)
 		}
 		targets = remaining
+	}
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	// HCL owns every edge outright. Its pass re-decides the whole repository,
+	// because an edge's answer depends on every file of its directory. This
+	// is the Go-side twin of hclScopeVetoSQL.
+	hclIDs := 0
+	remaining = targets[:0]
+	for _, target := range targets {
+		if binderOwnsHCL(target) {
+			hclIDs++
+			continue
+		}
+		remaining = append(remaining, target)
+	}
+	targets = remaining
+	if hclIDs > 0 {
+		if _, err := s.resolveHCLScopeStandalone(ctx, repoID); err != nil {
+			return outcome, err
+		}
+		// ponytail: the repository-wide pass reports its own total, not this
+		// batch's share; every owned edge is counted as decided-unresolved.
+		outcome.unresolved += hclIDs
 	}
 	if len(targets) == 0 {
 		return outcome, nil

@@ -30,7 +30,8 @@ import (
 // `require_relative` strings with neither the call kind nor the load path that
 // gives them meaning (`require "./x"` resolves against the working directory,
 // `require_relative "./x"` against the caller), and neither form ever loads a
-// `.py` or `.ts` file. A Ruby file may still be a bridge DESTINATION when
+// `.py` or `.ts` file. HCL rows are Terraform module sources, which name a
+// directory of Terraform files, never a file of another language. A Ruby file may still be a bridge DESTINATION when
 // another language's own import names it.
 //
 // So one rule covers every link:
@@ -409,7 +410,7 @@ func crossLanguageBridges(
 		SELECT f.id, f.path, f.language, fi.import_path
 		FROM file_imports fi
 		JOIN files f ON f.id = fi.file_id
-		WHERE f.repo_id = ? AND f.is_deleted = 0 AND f.language <> 'ruby'
+		WHERE f.repo_id = ? AND f.is_deleted = 0 AND f.language NOT IN ('ruby', 'hcl')
 		ORDER BY f.path, fi.import_path, f.id
 	`, repoID)
 	if err != nil {
