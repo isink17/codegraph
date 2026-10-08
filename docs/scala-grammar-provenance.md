@@ -92,10 +92,14 @@ source never lays out that way:
 A body that ends where the offending member starts is kept. Columns are
 measured from a definition's modifiers or keyword, not from an annotation on
 a line of its own. Braced bodies, members sharing a line with earlier code,
-and top-level members under a braced or bodyless type (`sealed trait C`
-followed by indented `case object`s) are not checked, so source that the
-grammar parses without an error and that is valid, consistently indented
-Scala keeps every declaration. Inconsistent indentation inside a `:` body
+top-level members under a braced type, and type members under a bodyless
+type (`sealed trait C` followed by indented `case object`s) are not checked,
+so source that the grammar parses without an error and that is valid,
+consistently indented Scala keeps every declaration. A top-level `def` or
+`val` indented under a bodyless type (`case class P(x: Int)` then
+`  def helper = 1`) is treated as a deleted `:`, and it and everything after
+it are dropped; Scala 2 rejects that layout and Scala 3 reports it as
+indented too far. Inconsistent indentation inside a `:` body
 (mixed tabs and spaces, a member one column off) is treated as damage.
 
 What remains: shifting a whole line by one full indentation step can
