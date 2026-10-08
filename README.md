@@ -524,6 +524,10 @@ codegraph version
 
 These commands print the installed local version without contacting GitHub.
 
+`codegraph licenses` prints CodeGraph's license and the third-party notices
+(`THIRD_PARTY_NOTICES`) embedded in the binary, offline and without the
+release archive's files.
+
 
 ## Result Limits
 
@@ -671,6 +675,7 @@ codegraph doctor                          # Check installation health
 codegraph config show                     # Show current config
 codegraph --version                       # Print current version
 codegraph version                          # Print current version
+codegraph licenses                        # Print embedded license and third-party notices
 
 # Indexing
 codegraph index <path>                    # Full index
