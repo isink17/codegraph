@@ -25,7 +25,24 @@ the edge's evidence names that declaration's position, and the resolver binds
 the symbol at exactly that position or nothing. Parameters, loop variables,
 other locals, globals, fields, methods, modules, dynamic requires, table
 dispatch, metatables and receiver identity remain unresolved. A file with any
-parse error, or that names `debug` as an identifier or string
-(whose `setlocal`/`setupvalue` rewrite locals at run time), produces no call
-edges. `debug` reached without spelling it (`_G["de".."bug"]`) is not detected. Calls at file top level
+parse error, or whose own code can reach the `debug` library (whose
+`setlocal`, `setupvalue`, `upvaluejoin` and `sethook` rewrite locals at run
+time), produces no call edges. Reaching it means a free (not lexically bound)
+reference to `debug`, `_G`, `_ENV`, `package`, `getfenv`, `require`, `load`,
+`loadstring`, `dofile` or `loadfile`, except: `debug.traceback` and
+`debug.getinfo` (they read the stack, never rebind it); `_G.x`, `_G["x"]`,
+`rawget`/`rawset(_G, "x", ...)`, the same through `_ENV`, and
+`package.loaded.x` for a literal `x` that is none of those names;
+`package.path`, `package.cpath` and `package.config`; `require`, `dofile` and
+`loadfile` of a literal other than `"debug"`; and `load`/`loadstring` of a
+literal chunk that passes the same check. A computed key or module name
+(`_G["de".."bug"]`, `_G[k]`, `require(name)`), a string with an escape, and
+any of those names passed as a value (`pcall(require, m)`, `local env = _G`)
+count as reaching it. Field and method names, table-constructor keys, labels,
+parameters and locals named `debug`, and plain string data do not.
+
+The proof covers this file's code only. Another module that obtains a
+function this file exports and calls `debug.setupvalue` on it, or C code using
+`lua_setupvalue`, can rebind an upvalue the edge relies on; that is not
+detected. Calls at file top level
 have no source symbol and are not persisted as edges.
