@@ -1,5 +1,5 @@
 # Embedded into the binary by notices.go; LF on every platform keeps
 # `codegraph licenses` output byte-identical across release builds.
-LICENSE text eol=lf
-THIRD_PARTY_NOTICES text eol=lf
+/LICENSE text eol=lf
+/THIRD_PARTY_NOTICES text eol=lf
 npm/THIRD_PARTY_NOTICES text eol=lf
