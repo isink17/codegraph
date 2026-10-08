@@ -14,10 +14,11 @@ func tsProfile(language string) parser.Profile {
 
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
-// HCL v2 reads references inside operators. Its relationship graph is its Terraform `references` edges; it emits no
-// `calls`. It still declares a graph, so a repository with Terraform files is
-// not reported as symbols-only and a non-cgo reindex, which records no
-// references, is refused as the downgrade it is.
+// HCL v2 reads references inside operators. Its relationship graph is its
+// Terraform `references` edges; it emits no `calls`. It still declares a
+// graph, so a repository with Terraform files is not reported as symbols-only
+// and a non-cgo reindex, which records no references, is refused as the
+// downgrade it is.
 func (a *HCLAdapter) Profile() parser.Profile {
 	return parser.NewProfile("hcl", "treesitter:hcl:v2", true)
 }

@@ -371,26 +371,42 @@ func TestHCLTerraformReferencesInOperations(t *testing.T) {
   builtin = count.index + each.value.n + path.module
   loop    = [for s in var.list : s.id if s.size > local.min]
   partial = 1 + data.aws_ami
+  # A postfix after a parenthesized operand or a call belongs to that
+  # operand, never to a traversal before it.
+  paren_attr = 1 + (var.pa).b
+  paren_last = var.pl * (local.pb + 1).z
+  call_attr  = foo(var.q).r + local.s.t
+  paren_idx  = (var.ia + var.ib)[0] + var.ic
+  short_lhs  = data.t + aws_k.n
 }
 `)
 	want := []string{
 		"aws_instance.peer dynamic",
 		"aws_instance.peer dynamic",
+		"aws_k.n",
 		"local.c",
 		"local.flags",
 		"local.min",
+		"local.pb",
 		"local.q",
+		"local.s",
 		"module.net",
 		"var.a",
 		"var.b",
 		"var.base",
 		"var.create",
 		"var.disabled",
+		"var.ia",
+		"var.ib",
+		"var.ic",
 		"var.k",
 		"var.list",
 		"var.n",
 		"var.offset",
 		"var.p",
+		"var.pa",
+		"var.pl",
+		"var.q",
 	}
 	if got := hclEdges(pf); !slices.Equal(got, want) {
 		t.Fatalf("edges = %v\nwant %v", got, want)

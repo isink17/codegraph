@@ -4,6 +4,7 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sort"
@@ -411,4 +412,41 @@ output "subnet_id" { value = var.enabled ? data.aws_ami.other.id : "" }
 	r.write(t, "live/vars.tf", vars)
 	r.update(t, "live/vars.tf", "live/moved/vars.tf")
 	expect("variables restored", map[[2]string]string{{"live/main.tf", "var.enabled"}: enabled})
+}
+
+// An index written by the v1 profile, which dropped references inside
+// operators, is reparsed on update and gains them.
+func TestTerraformV1ProfileUpgradeRecordsOperatorReferences(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"m/main.tf": "variable \"enabled\" {}\nresource \"aws_eip\" \"x\" {\n  count = var.enabled && true ? 1 : 0\n}\n",
+	})
+	want := ` => m/main.tf:var.enabled(terraform_variable) [terraform_module_scope/high]`
+	if got := r.hclRefs(t, "m/main.tf", "var.enabled"); got != want {
+		t.Fatalf("fresh: var.enabled = %q, want %q", got, want)
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Stand in for the v1 graph: the profile and the missing edge.
+	if _, err := db.Exec(`DELETE FROM edges WHERE repo_id = ? AND dst_name = 'var.enabled'`, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE files SET parser_profile = 'treesitter:hcl:v1' WHERE repo_id = ? AND language = 'hcl'`, r.repoID); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.hclRefs(t, "m/main.tf", "var.enabled"); got != "<no edge>" {
+		t.Fatalf("v1 stand-in: var.enabled = %q", got)
+	}
+	if summary := r.update(t); strings.Join(summary.ParserProfileLanguages, ",") != "hcl" {
+		t.Fatalf("update = %+v, want an hcl profile reparse", summary)
+	}
+	if got := fileParserProfile(t, db, r.repoID, "m/main.tf"); got != "treesitter:hcl:v2" {
+		t.Fatalf("updated profile = %q", got)
+	}
+	if got := r.hclRefs(t, "m/main.tf", "var.enabled"); got != want {
+		t.Fatalf("upgraded: var.enabled = %q, want %q", got, want)
+	}
+	r.assertFreshParity(t, "v1 profile upgrade")
 }
