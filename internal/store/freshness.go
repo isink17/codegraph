@@ -143,20 +143,22 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (graph.Freshnes
 		if f.Coverage.LastFullScan, err = readScan(` AND status = 'completed' AND scope = 'full'`); err != nil {
 			return graph.Freshness{}, err
 		}
-		// A failed scan counts when it started after the last full scan or
-		// finished at or after it did: either way its partial writes may have
-		// landed after the full scan's. Timestamps have one-second resolution,
-		// so a same-second failure counts too.
+		// A failed scan counts when it started after the last full scan began
+		// or closed at or after the moment it began: either way it was running
+		// while the full scan read the tree, or after it, so its partial writes
+		// may postdate what the full scan saw. Timestamps have one-second
+		// resolution, so a failure closing in the second the full scan began
+		// counts too.
 		var lastFullID int64
-		lastFullFinished := ""
+		lastFullStarted := ""
 		if f.Coverage.LastFullScan != nil {
 			lastFullID = f.Coverage.LastFullScan.ID
-			lastFullFinished = f.Coverage.LastFullScan.FinishedAt
+			lastFullStarted = f.Coverage.LastFullScan.StartedAt
 		}
 		if err := tx.QueryRowContext(ctx, `
 			SELECT COUNT(1) FROM scans
 			WHERE repo_id = ? AND status = 'failed' AND (id > ? OR (? <> '' AND COALESCE(finished_at, '') >= ?))`,
-			repoID, lastFullID, lastFullFinished, lastFullFinished).Scan(&f.Coverage.FailedAfterLastFull); err != nil {
+			repoID, lastFullID, lastFullStarted, lastFullStarted).Scan(&f.Coverage.FailedAfterLastFull); err != nil {
 			return graph.Freshness{}, err
 		}
 	}

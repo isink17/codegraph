@@ -275,16 +275,43 @@ func TestScanCoverageStartHeadPrecedesTreeReads(t *testing.T) {
 	}
 }
 
-// A refused run reads HEAD and nothing else changes: the database holds no
-// repository and no scan.
+// A run refused before the HEAD read (an escaping path) and one refused
+// after it (an unreadable repository config) both leave the database
+// untouched: no repository row, no scan row.
 func TestScanCoverageRefusedRunWritesNothing(t *testing.T) {
 	ctx := context.Background()
-	r, _, s, _ := coverageFixture(t)
+	r, _, s, dbPath := coverageFixture(t)
+	headRead := false
+	scanStartHook = func() { headRead = true }
+	t.Cleanup(func() { scanStartHook = nil })
 	idx := New(s, parser.NewRegistry(goparser.New()), nil)
 	if _, err := idx.Index(ctx, Options{RepoRoot: r.Dir, Paths: []string{"../outside.go"}}); err == nil {
 		t.Fatal("escaping path accepted")
 	}
+	if headRead {
+		t.Fatal("escaping path refused after the HEAD read")
+	}
+	r.Write(".codegraph/config.json", "{not json")
+	if _, err := idx.Index(ctx, Options{RepoRoot: r.Dir}); err == nil {
+		t.Fatal("invalid repository config accepted")
+	}
+	if !headRead {
+		t.Fatal("config refusal did not happen after the HEAD read")
+	}
 	if _, found, err := s.FindRepo(ctx, r.Dir); err != nil || found {
 		t.Fatalf("refused run created a repository: %v %v", found, err)
+	}
+	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open(store.SQLiteDriverName(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var repos, scans int
+	if err := raw.QueryRow(`SELECT (SELECT COUNT(*) FROM repos), (SELECT COUNT(*) FROM scans)`).Scan(&repos, &scans); err != nil || repos != 0 || scans != 0 {
+		t.Fatalf("refused runs wrote rows: repos=%d scans=%d %v", repos, scans, err)
 	}
 }

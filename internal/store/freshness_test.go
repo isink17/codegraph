@@ -354,8 +354,8 @@ func TestFreshnessCoveragePreMigrationDatabase(t *testing.T) {
 	}
 }
 
-// A failed scan that started before the last full scan but closed after it
-// may have written after it: it counts. One that closed before it began does
+// A failed scan that started before the last full scan counts when it closed
+// while the full scan ran or after it; one that closed before it began does
 // not.
 func TestFreshnessCoverageFailedScanClosingAfterFullScan(t *testing.T) {
 	ctx := context.Background()
@@ -374,6 +374,10 @@ func TestFreshnessCoverageFailedScanClosingAfterFullScan(t *testing.T) {
 	set(early, "2026-01-01T00:00:05Z", "2026-01-01T00:00:30Z")
 	if got := freshness(t, s, repoID).Coverage; got.LastFullScan.ID != full || got.FailedAfterLastFull != 1 {
 		t.Fatalf("failure closing after the full scan: %+v", got)
+	}
+	set(early, "2026-01-01T00:00:05Z", "2026-01-01T00:00:15Z")
+	if got := freshness(t, s, repoID).Coverage; got.FailedAfterLastFull != 1 {
+		t.Fatalf("failure closing while the full scan ran: %+v", got)
 	}
 	set(early, "2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z")
 	if got := freshness(t, s, repoID).Coverage; got.FailedAfterLastFull != 0 {
