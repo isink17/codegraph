@@ -102,6 +102,48 @@ func TestRunInitIndexesAndReportsCapabilityIdempotently(t *testing.T) {
 	}
 }
 
+func TestRunInitUsesCurrentDirectoryByDefault(t *testing.T) {
+	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "codegraph-home"))
+	repoRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte("package main\nfunc Main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(repoRoot)
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() { startupVersionCheck = prev })
+
+	var out bytes.Buffer
+	if err := Run(context.Background(), []string{"init"}, &out, io.Discard); err != nil {
+		t.Fatalf("Run(init) error = %v", err)
+	}
+	var result struct {
+		RepoRoot string `json:"repo_root"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("decode init result: %v", err)
+	}
+	canonicalRoot, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RepoRoot != canonicalRoot {
+		t.Fatalf("repo_root = %q, want canonical current directory %q", result.RepoRoot, canonicalRoot)
+	}
+}
+
+func TestRunInitRejectsMultipleRepoPaths(t *testing.T) {
+	t.Setenv("CODEGRAPH_HOME", filepath.Join(t.TempDir(), "codegraph-home"))
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() { startupVersionCheck = prev })
+
+	err := Run(context.Background(), []string{"init", "first", "second"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "init accepts at most one repo path") {
+		t.Fatalf("Run(init with multiple paths) error = %v", err)
+	}
+}
+
 func TestRunFindSymbolQueryCommand(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codegraph-home")
 	t.Setenv("CODEGRAPH_HOME", home)
