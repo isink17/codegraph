@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/parser"
 	heuristicparser "github.com/isink17/codegraph/internal/parser/heuristic"
 	tsparser "github.com/isink17/codegraph/internal/parser/treesitter"
@@ -226,5 +227,87 @@ func TestTerraformFallbackReindexIsRefusedAsDowngrade(t *testing.T) {
 	fallback := New(s, parser.NewRegistry(heuristicparser.NewHCL()), nil)
 	if _, err := fallback.Update(ctx, Options{RepoRoot: root}); !errors.Is(err, ErrParserDowngradeRefused) {
 		t.Fatalf("fallback update err = %v, want ErrParserDowngradeRefused", err)
+	}
+}
+
+const terraformRegionModule = "output \"o\" {\n  value = var.region\n}\n"
+
+// A new .tf file the scan retires without parsing owned nothing, yet it may
+// declare anything: its directory must become unbound on update as on a fresh
+// index.
+func TestTerraformNewOversizeFileUnbindsItsDirectory(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		".codegraph/config.json": `{"max_file_size_bytes": 4096}`,
+		"b/main.tf":              terraformRegionModule,
+		"b/vars.tf":              "variable \"region\" {}\n",
+	})
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got == unresolvedRef {
+		t.Fatalf("fresh: var.region unresolved")
+	}
+	r.write(t, "b/big.tf", "variable \"region\" {}\n"+strings.Repeat("# padding\n", 1000))
+	r.update(t)
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got != unresolvedRef {
+		t.Fatalf("oversize added: var.region = %q, want unresolved", got)
+	}
+	r.assertFreshParity(t, "oversize added")
+	r.remove(t, "b/big.tf")
+	r.update(t)
+	r.assertFreshParity(t, "oversize removed")
+}
+
+// failingTerraform refuses to parse bad.tf, standing in for a parse failure
+// under best_effort, which the tree-sitter grammar itself never reports.
+type failingTerraform struct{ *tsparser.HCLAdapter }
+
+func (a failingTerraform) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	if filepath.Base(path) == "bad.tf" {
+		return graph.ParsedFile{}, errors.New("unparseable")
+	}
+	return a.HCLAdapter.Parse(ctx, path, content)
+}
+
+func newFailingTerraformRepo(t *testing.T, root string) *lifecycleRepo {
+	t.Helper()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codegraph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	r := &lifecycleRepo{ctx: ctx, root: root, dbPath: dbPath, store: s,
+		idx: New(s, parser.NewRegistry(failingTerraform{tsparser.NewHCL()}), nil)}
+	if _, err := r.idx.Index(ctx, Options{RepoRoot: root, ScanKind: "index"}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	repo, err := s.UpsertRepo(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.repoID = repo.ID
+	return r
+}
+
+func TestTerraformNewUnparseableFileUnbindsItsDirectory(t *testing.T) {
+	root := t.TempDir()
+	r := &lifecycleRepo{root: root}
+	r.write(t, ".codegraph/config.json", `{"parse_error_policy": "best_effort"}`)
+	r.write(t, "b/main.tf", terraformRegionModule)
+	r.write(t, "b/vars.tf", "variable \"region\" {}\n")
+	r = newFailingTerraformRepo(t, root)
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got == unresolvedRef {
+		t.Fatalf("fresh: var.region unresolved")
+	}
+	r.write(t, "b/bad.tf", "variable \"region\" {}\n")
+	r.update(t)
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got != unresolvedRef {
+		t.Fatalf("unparseable added: var.region = %q, want unresolved", got)
+	}
+	fresh := t.TempDir()
+	for rel, content := range r.currentTree(t) {
+		(&lifecycleRepo{root: fresh}).write(t, rel, content)
+	}
+	if diff := projectionDiff(newFailingTerraformRepo(t, fresh).projection(t), r.projection(t)); diff != "" {
+		t.Fatalf("update diverges from a fresh index:\n%s", diff)
 	}
 }

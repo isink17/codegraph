@@ -670,18 +670,26 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return err
 		}
 		writeMetadataDur += time.Since(started)
-		// Only a batch that actually removed something changed the graph.
-		// Re-retiring a file that already owned nothing -- a file that fails to
-		// parse on every update, an oversize log whose mtime keeps moving --
-		// gives Pass 2 nothing to re-decide, and dispatching it anyway would
-		// turn every watcher event in such a repository into a repo-wide
-		// resolve and test-link pass.
-		if retired > 0 {
-			for _, path := range paths {
+		// Only a batch that actually removed something, or a file entering
+		// the index retired, changed the graph. Re-retiring a file that was
+		// already failed or oversize -- a file that fails to parse on every
+		// update, an oversize log whose mtime keeps moving -- gives Pass 2
+		// nothing to re-decide, and dispatching it anyway would turn every
+		// watcher event in such a repository into a repo-wide resolve and
+		// test-link pass. A file new to the index, though, owned nothing and
+		// still changes a decision: an unparsed .tf file may hide a
+		// declaration of its Terraform module directory. For the same reason a
+		// .tf file leaving a parsed state is dispatched even when it held no
+		// counted rows; other languages keep the row-count rule.
+		for _, path := range paths {
+			prev, had := existing[path]
+			entered := !had || strings.EqualFold(filepath.Ext(path), ".tf") &&
+				prev.ParseState != store.ParseStateFailed && prev.ParseState != store.ParseStateOversize
+			if retired > 0 || entered {
 				changedPathSet[path] = struct{}{}
 			}
-			retiredFiles += retired
 		}
+		retiredFiles += retired
 		*batch = (*batch)[:0]
 		return nil
 	}
