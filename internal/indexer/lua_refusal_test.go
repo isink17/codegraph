@@ -73,10 +73,12 @@ var luaRefusalCases = []struct {
 	{name: "parse error that may hide a reassignment", files: tree{"m.lua": luaProven + "f = = nil\n"}},
 	{name: "parse error in another file", files: tree{"m.lua": luaProven, "bad.lua": "local x = = 1\n"}, want: []string{"2->1"}},
 
-	// -- Lua 5.2+ goto and Lua 5.4 attributes
-	{name: "goto and label", files: tree{"m.lua": luaProven + "local function h()\n  goto done\n  ::done::\nend\n"}, overBroad: true},
-	{name: "const attribute elsewhere", files: tree{"m.lua": luaProven + "local limit <const> = 10\n"}, overBroad: true},
-	{name: "close attribute elsewhere", files: tree{"m.lua": luaProven + "local function h()\n  local r <close> = nil\nend\n"}, overBroad: true},
+	// -- Lua 5.2+ goto and Lua 5.4 attributes. The grammar parses them, and
+	// neither a label nor an attribute binds or rebinds a name, so they leave
+	// the proof intact.
+	{name: "goto and label", files: tree{"m.lua": luaProven + "local function h()\n  goto done\n  ::done::\nend\n"}, want: []string{"2->1"}},
+	{name: "const attribute elsewhere", files: tree{"m.lua": luaProven + "local limit <const> = 10\n"}, want: []string{"2->1"}},
+	{name: "close attribute elsewhere", files: tree{"m.lua": luaProven + "local function h()\n  local r <close> = nil\nend\n"}, want: []string{"2->1"}},
 	{name: "const local shadowing the function", files: tree{"m.lua": "local function f() end\nlocal f <const> = 1\nlocal function g() f() end\n"}},
 
 	// -- proven closure and local-call cases

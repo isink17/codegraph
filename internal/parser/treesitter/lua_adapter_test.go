@@ -75,3 +75,20 @@ func TestLuaAdapterSyntaxErrorDoesNotInventDeclarations(t *testing.T) {
 		t.Fatalf("syntax recovery invented graph facts: %+v", p)
 	}
 }
+
+func TestLuaAdapterLiteralRequireForms(t *testing.T) {
+	const src = `local a = require("paren")
+local b = require "bare"
+local c = require [[long]]
+local d = require("x" .. y)
+local e = require(name)
+local f = require()
+`
+	p, err := NewLua().Parse(context.Background(), "req.lua", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(p.Imports, ","); got != "paren,bare,long" {
+		t.Fatalf("imports = %s", got)
+	}
+}
