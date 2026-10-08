@@ -387,6 +387,47 @@ func TestLocalFunctionsAreNeverCrossLanguageTargets(t *testing.T) {
 	intoLocals("updated")
 }
 
+// A Dart local function is keyed func:dart:local:..., so it is never a
+// cross-language link end either, even when a TypeScript file imports its
+// file and exports a function of the same name.
+func TestDartLocalFunctionIsNeverCrossLanguageTarget(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib/m.dart": "void outer() {\n  void helper() {}\n  helper();\n}\n",
+		"dart.ts":    "import { helper } from \"./lib/m.dart\";\nexport function helper() {}\n",
+	})
+	check := func(step string) {
+		t.Helper()
+		var locals, into int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM symbols WHERE repo_id = ? AND stable_key GLOB 'func:dart:local:helper:*'`, r.repoID).Scan(&locals); err != nil {
+			t.Fatal(err)
+		}
+		if locals != 1 {
+			t.Fatalf("%s: %d Dart local helper symbols, want 1", step, locals)
+		}
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND s.stable_key GLOB 'func:*:local:*'`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&into); err != nil {
+			t.Fatal(err)
+		}
+		if into != 0 {
+			t.Fatalf("%s: %d cross-language edges into local functions", step, into)
+		}
+		// The bridge is live: the import still links, just not to the local.
+		var bridged int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND s.stable_key = 'func:dart:outer'`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&bridged); err != nil {
+			t.Fatal(err)
+		}
+		if bridged == 0 {
+			t.Fatalf("%s: no cross-language edge reached the Dart file", step)
+		}
+		r.assertFreshParity(t, step)
+	}
+	check("fresh")
+	r.write(t, "dart.ts", "import { helper } from \"./lib/m.dart\";\nexport function helper() { return 1; }\n")
+	r.update(t, "dart.ts")
+	check("updated")
+}
+
 func TestLuaGlobalCallRemainsUnresolvedAndLifecycleParity(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"caller.lua":   `function caller() target() end`,
