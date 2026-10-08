@@ -82,17 +82,27 @@ const (
 	// connect, unchanged from the original pass.
 	crossLangEligibleKinds = `('function', 'method', 'class', 'type', 'struct', 'interface')`
 
-	// localSymbolKeySQL matches a function local to a block or chunk (Lua
-	// `local function`, Scala local def): not addressable from another file,
-	// so never a cross-language link end, and never dead merely because no
-	// call to it was proven.
-	localSymbolKeySQL = `COALESCE(stable_key, '') GLOB 'func:*:local:*'`
-
 	// crossLangEdgeValuesBatchRows controls multi-row inserts into edges where
 	// each cross-language row uses 10 parameters. 98*10=980 variables, staying
 	// under sqliteDefaultMaxVariables.
 	crossLangEdgeValuesBatchRows = 98
 )
+
+// localFunctionSQL matches a function local to a block or chunk (Lua `local
+// function`, Scala local def): not addressable from another file, so never a
+// cross-language link end, and never dead merely because no call to it was
+// proven. It names each language's exact key prefix together with the file's
+// language, since another language's key may also contain ":local:" (a Rust
+// crate::local module, a Go package named lua). qual is the symbols table
+// qualifier, "" or "s.".
+func localFunctionSQL(qual string) string {
+	key := "COALESCE(" + qual + "stable_key, '')"
+	inLang := func(prefix, lang string) string {
+		return fmt.Sprintf("(substr(%s, 1, %d) = '%s' AND %sfile_id IN (SELECT id FROM files WHERE language = '%s'))",
+			key, len(prefix), prefix, qual, lang)
+	}
+	return "(" + inLang("func:lua:local:", "lua") + " OR " + inLang("func:scala:local:", "scala") + ")"
+}
 
 // v2 excludes Ruby importer rows. A v1-current database may still hold a link
 // bridged from a Ruby require string, so v1 is never read as current.
@@ -571,7 +581,7 @@ func crossLanguageSymbols(ctx context.Context, q xlangQueryer, repoID int64, fil
 			FROM symbols
 			WHERE repo_id = ? AND file_id IN (` + sqlitePlaceholders(len(batch)) + `)
 			AND kind IN ` + crossLangEligibleKinds + `
-			AND NOT ` + localSymbolKeySQL
+			AND NOT ` + localFunctionSQL("")
 		rows, err := q.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, fmt.Errorf("cross-language symbols query: %w", err)

@@ -140,7 +140,10 @@ func TestScalaOwnershipAllEntrypoints(t *testing.T) {
 }
 
 // A Lua or Scala local function whose calls were not proven is not dead code:
-// FindDeadCode lists the unreferenced member and neither local.
+// FindDeadCode lists the unreferenced member and neither local. Keys of other
+// languages that merely contain ":local:" (a Rust crate::local module, a Go
+// package named lua with a receiver type local, a TypeScript local.ts module)
+// are ordinary symbols and stay listed.
 func TestFindDeadCodeSkipsLocalFunctions(t *testing.T) {
 	ctx := context.Background()
 	s, repo := openBudgetStore(t)
@@ -148,6 +151,9 @@ func TestFindDeadCodeSkipsLocalFunctions(t *testing.T) {
 		{"M.scala", "scala", "member", "func:scala:O$.member"},
 		{"M.scala", "scala", "helper", "func:scala:local:O.m.helper:3:5"},
 		{"m.lua", "lua", "helper", "func:lua:local:helper:1:1"},
+		{"src/local.rs", "rust", "rhelper", "func:rust:crate::local:rhelper"},
+		{"go/lua.go", "go", "gofoo", "func:lua:local:gofoo"},
+		{"local.ts", "typescript", "tsfoo", "func:typescript:local:tsfoo"},
 	} {
 		var fileID int64
 		if err := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repo.ID, seed.path).Scan(&fileID); err != nil {
@@ -168,7 +174,7 @@ func TestFindDeadCodeSkipsLocalFunctions(t *testing.T) {
 	for _, d := range dead {
 		names = append(names, fmt.Sprint(d["name"]))
 	}
-	if strings.Join(names, ",") != "member" {
-		t.Fatalf("dead code = %v, want only the member", names)
+	if got, want := strings.Join(names, ","), "member,gofoo,tsfoo,rhelper"; got != want {
+		t.Fatalf("dead code = %s, want %s", got, want)
 	}
 }
