@@ -75,7 +75,7 @@ These rules only apply when the grammar reports an error. Broken source the
 grammar parses cleanly is recorded as parsed: in Scala 3 indentation syntax a
 deleted `:` that opens a body, or a first member indented deeper than the
 rest, moves the following members to package level, and a misspelt `package`
-keyword drops the package prefix. The compiler rejects such files.
+keyword drops the package prefix.
 
 ## Call resolution
 
