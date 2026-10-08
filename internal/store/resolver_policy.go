@@ -53,6 +53,7 @@ var resolverPolicyRegistry = map[string]int{
 	"go":         1,
 	"java":       1,
 	"kotlin":     1,
+	"lua":        1,
 	"php":        1,
 	"python":     1,
 	"ruby":       1,

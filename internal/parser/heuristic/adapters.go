@@ -101,6 +101,15 @@ func NewTypeScriptJavaScript() *Adapter {
 	}
 }
 
+func NewLua() *Adapter {
+	return &Adapter{
+		language: "lua",
+		exts:     extSet(".lua"),
+		imports:  []importPattern{{re: regexp.MustCompile(`require\s*\(\s*["']([^"']+)["']\s*\)`), nameGroup: 1}},
+		symbols:  []symbolPattern{{kind: "function", re: regexp.MustCompile(`(?m)^\s*(?:local\s+)?function\s+([A-Za-z_][A-Za-z0-9_.:]*)\s*\(`), nameGroup: 1}},
+	}
+}
+
 func NewRust() *Adapter {
 	return &Adapter{
 		language: "rust",
