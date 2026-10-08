@@ -83,6 +83,22 @@ func registerCommand(reg map[string]*command, c *command) {
 func newCommandList() []*command {
 	return []*command{
 		{
+			name:        "export-gradle-evidence",
+			description: "explicitly inspect one Kotlin/JVM Gradle compilation",
+			usageLines:  []string{"  export-gradle-evidence --repo-root PATH --gradle PATH --project :path --compilation main --output FILE"},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "Gradle repository root"},
+				{name: "--gradle PATH", description: "explicit Gradle executable to run"},
+				{name: "--project PATH", description: "selected Gradle project path, such as :app"},
+				{name: "--compilation NAME", description: "selected Kotlin/JVM compilation"},
+				{name: "--output FILE", description: "new artifact path outside the repository (parent directory must exist)"},
+			},
+			examples: []string{"codegraph export-gradle-evidence --repo-root . --gradle /opt/gradle/bin/gradle --project :app --compilation main --output /tmp/kotlin-evidence.json"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runExportGradleEvidence(ctx, stdout, stderr, args)
+			},
+		},
+		{
 			name:        "help",
 			description: "show help",
 			usageLines:  []string{"  help [command]"},

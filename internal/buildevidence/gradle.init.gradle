@@ -1,0 +1,54 @@
+import groovy.json.JsonOutput
+
+gradle.projectsEvaluated {
+    gradle.rootProject.tasks.register('codegraphExportEvidence') {
+        doLast {
+            def props = gradle.startParameter.projectProperties
+            def projectPath = props.get('cg35.project')
+            def compilationName = props.get('cg35.compilation')
+            def outputPath = props.get('cg35.output')
+            if (!projectPath || !compilationName || !outputPath) {
+                throw new GradleException('CodeGraph evidence selection is incomplete')
+            }
+
+            def project = gradle.rootProject.findProject(projectPath)
+            if (project == null) {
+                throw new GradleException("Selected Gradle project does not exist: ${projectPath}")
+            }
+            def kotlin = project.extensions.findByName('kotlin')
+            def target = kotlin?.target
+            if (target == null || !target.hasProperty('compilations')) {
+                throw new GradleException('This producer currently supports Kotlin/JVM projects only')
+            }
+            def compilation = target.compilations.findByName(compilationName)
+            if (compilation == null) {
+                throw new GradleException("Selected Kotlin/JVM compilation does not exist: ${compilationName}")
+            }
+
+            def sourceRoots = compilation.allKotlinSourceSets
+                .collectMany { it.kotlin.sourceDirectories.files }
+                .collect { it.absolutePath }
+                .unique()
+                .sort()
+            def classpath = project.configurations.getByName(compilation.compileDependencyConfigurationName)
+            def dependencies = classpath.resolvedConfiguration.resolvedArtifacts
+                .collect { it.moduleVersion.id.toString() }
+                .unique()
+                .sort()
+            def kotlinPlugin = project.plugins.find {
+                it.class.name == 'org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapper'
+            }
+            def model = [
+                gradle_version: gradle.gradleVersion,
+                kotlin_plugin_version: kotlinPlugin?.class?.package?.implementationVersion ?: '',
+                jdk_vendor: System.getProperty('java.vendor') ?: '',
+                jdk_version: System.getProperty('java.version') ?: '',
+                project: projectPath,
+                compilation: compilationName,
+                source_roots: sourceRoots,
+                dependencies: dependencies
+            ]
+            new File(outputPath).setText(JsonOutput.toJson(model), 'UTF-8')
+        }
+    }
+}
