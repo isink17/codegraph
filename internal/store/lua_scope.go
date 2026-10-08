@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"maps"
+	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
@@ -28,13 +30,16 @@ func luaScopeOwned(t edgeTarget) bool {
 	return t.srcLanguage == "lua" && t.edgeKind == EdgeKindCalls
 }
 
+// isLuaPath reports whether a changed path can change a Lua decision.
+func isLuaPath(p string) bool { return strings.EqualFold(filepath.Ext(p), ".lua") }
+
 // luaDebugReachableSQL reports whether any live Lua file of the repository
 // lacks the parser's debug-free evidence: one whose code can reach the debug
 // library, or that was not scanned (an oversize or failed parse, the non-cgo
 // fallback, an older profile).
 const luaDebugReachableSQL = `SELECT EXISTS(SELECT 1 FROM files f
 WHERE f.repo_id = ? AND f.language = 'lua' AND f.is_deleted = 0
-  AND NOT EXISTS (SELECT 1 FROM file_scope_evidence fs WHERE fs.repo_id = f.repo_id AND fs.file_id = f.id))`
+  AND NOT EXISTS (SELECT 1 FROM file_scope_evidence fs WHERE fs.repo_id = f.repo_id AND fs.file_id = f.id AND fs.language = 'lua'))`
 
 // resolveLuaScope re-decides every Lua call of the repository. The debug
 // library rewrites the locals and upvalues of any function in the Lua state
@@ -43,9 +48,13 @@ WHERE f.repo_id = ? AND f.language = 'lua' AND f.is_deleted = 0
 // proof, including those of files it never names. The decision depends on
 // every Lua file, so the pass clears and rebinds all of them each time it
 // runs, as the HCL pass does.
+//
+// ponytail: O(all Lua calls) writes per Lua-touching update, and an update
+// can run the pass up to three times (binder batch, suffix pass, repo-wide).
+// Upgrade path: rebind set-based in one UPDATE and decide once per update.
 func resolveLuaScope(ctx context.Context, q execQuerier, repoID int64) (int, error) {
 	if _, err := q.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
-		WHERE repo_id = ? AND edge_kind = '`+EdgeKindCalls+`' AND file_id IN (SELECT id FROM files WHERE repo_id = ? AND language = 'lua')`, repoID, repoID); err != nil {
+		WHERE repo_id = ? AND edge_kind = '`+EdgeKindCalls+`' AND (dst_symbol_id IS NOT NULL OR COALESCE(resolution_strategy, '') <> '' OR COALESCE(resolution_confidence, '') <> '') AND file_id IN (SELECT id FROM files WHERE repo_id = ? AND language = 'lua')`, repoID, repoID); err != nil {
 		return 0, err
 	}
 	var reachable bool

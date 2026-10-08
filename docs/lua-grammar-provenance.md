@@ -58,6 +58,7 @@ which are never resolved, and not calls to the `local function f`, so it is
 not a hazard. Not detected: code outside the index (installed modules, the
 host application, a module loaded from a path the index does not cover) and
 C code using `lua_setupvalue`. A literal `require` of another module that
-returns the debug library is covered only when that module is indexed. A literal `require` of a hazard name (`"_G"` and `"package"` are preloaded and hold
-the library) or of LuaJIT's `"ffi"` does count as reaching it. Calls at file top level
-have no source symbol and are not persisted as edges.
+returns the debug library is covered only when that module is indexed. A
+literal `require` of a hazard name (`"_G"` and `"package"` are preloaded and
+hold the library) or of LuaJIT's `"ffi"` does count as reaching it. Calls at
+file top level have no source symbol and are not persisted as edges.

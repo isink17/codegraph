@@ -2796,7 +2796,13 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" || parsed.Scope.TerraformComplete || parsed.Scope.LuaDebugFree {
+	scopeRow := parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" || parsed.Scope.TerraformComplete
+	if parsed.Language == "lua" {
+		// A Lua row means exactly one thing, the debug-free proof
+		// luaDebugReachableSQL reads; no other scope fact may create it.
+		scopeRow = parsed.Scope.LuaDebugFree
+	}
+	if scopeRow {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path, jvm_facade_class, jvm_facade_explicit, jvm_multifile) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath, parsed.Scope.JVMFacade.Class, boolInt(parsed.Scope.JVMFacade.Explicit), boolInt(parsed.Scope.JVMFacade.Multifile)); err != nil {
 			return nil, err
 		}
@@ -5109,6 +5115,11 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	// either language can invalidate unresolved or previously unbound callers
 	// in the other, so incremental resolution covers this pair while remaining
 	// scoped away from every unrelated language.
+	// A Lua file's debug evidence decides every Lua call of the repository,
+	// so any .lua path puts Lua in scope, even one without a file row left.
+	if len(languageScope) > 0 && slices.ContainsFunc(paths, isLuaPath) {
+		languageScope["lua"] = struct{}{}
+	}
 	if _, java := languageScope["java"]; java {
 		languageScope["kotlin"] = struct{}{}
 	}
