@@ -1275,7 +1275,8 @@ const scanCloseTimeout = 10 * time.Second
 
 // failScan records scan scanID as failed with cause's text and returns cause,
 // joined with any error from recording it. Closing uses a context detached
-// from ctx's cancellation, so a cancelled scan still leaves `running`.
+// from ctx's cancellation, so a cancelled scan is still closed as `failed`
+// instead of staying `running`.
 func (i *Indexer) failScan(ctx context.Context, scanID int64, summary store.ScanSummary, started time.Time, cause error) error {
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanCloseTimeout)
 	defer cancel()
