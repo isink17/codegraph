@@ -234,7 +234,7 @@ var nodeCoreModules = map[string]bool{
 // default parser registries. Capabilities() exposes it as a deterministic
 // coverage table; internal/cli tests compare that table with the live registry.
 var canonicalLanguages = []string{
-	"cpp", "csharp", "go", "java", "kotlin", "php", "python", "ruby",
+	"cpp", "csharp", "go", "java", "kotlin", "lua", "php", "python", "ruby",
 	"rust", "swift", "typescript",
 }
 

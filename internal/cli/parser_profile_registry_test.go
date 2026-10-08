@@ -60,6 +60,7 @@ var callFixtures = map[string]struct {
 	"java":       {"CgProbe.java", "class CgProbe {\n    void callee() {}\n    void caller() { this.callee(); }\n}\n"},
 	"cpp":        {"cg_probe.cpp", "void cg_probe_callee() {}\nvoid cg_probe_caller() { cg_probe_callee(); }\n"},
 	"typescript": {"cg_probe.ts", "function callee(): void {}\nfunction caller(): void { callee(); }\n"},
+	"lua":        {"cg_probe.lua", "function callee() end\nfunction caller() callee() end\n"},
 }
 
 func TestDefaultRegistryCallEdgeClaimsAreTruthful(t *testing.T) {
