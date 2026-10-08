@@ -145,6 +145,8 @@ final run = () { void go() {} go(); };
 			[]string{"g@2:20->1:1", "g@5:4->1:1"}},
 		{"comment before a local function body, nothing shadows", "void main() { void h() /* c */ { } h(); }\n",
 			[]string{"h@1:36->1:15"}},
+		{"wildcard local function", "void _() {}\nvoid main() { void _() {} _(); }\n", []string{}},
+		{"wildcard top-level function", "void _() {}\nvoid main() { _(); }\n", []string{}},
 		{"anonymous closures", "void main() { (() {})(); (() => 1)(); }\n", []string{}},
 		{"call of a call result and an index", "int Function() f() => () => 1;\nvoid main(List xs) { f()(); xs[0](); }\n", []string{"f@2:22->1:1"}},
 		{"local declared after the call", "void main() {\n  g();\n  void g() {}\n}\n", []string{}},

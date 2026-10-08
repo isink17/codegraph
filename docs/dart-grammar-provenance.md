@@ -52,7 +52,8 @@ linearization, implicit `this`, library privacy across `part` files and
 package resolution. The proof is by spelling, so a name that is also a
 parameter, variable, pattern, member, member access, named argument or
 `show`/`hide` name anywhere in the caller's top-level declaration refuses even
-where Dart would bind it. A file with a parse error builds no call edge. Unnamed
+where Dart would bind it. A call to `_` is never proven, since a local `_` is a
+wildcard (Dart 3.7) that binds nothing. A file with a parse error builds no call edge. Unnamed
 extensions, local variables and destructuring patterns are not recorded. In a file
 with a parse error only the declarations that end before the first error (or
 missing token) are recorded: text before it parsed without recovery, while

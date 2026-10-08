@@ -139,7 +139,7 @@ func TestScalaOwnershipAllEntrypoints(t *testing.T) {
 	}
 }
 
-// A Lua or Scala local function whose calls were not proven is not dead code:
+// A Lua, Scala or Dart local function whose calls were not proven is not dead code:
 // FindDeadCode lists the unreferenced member and neither local. Keys of other
 // languages that merely contain ":local:" (a Rust crate::local module, a Go
 // package named lua with a receiver type local, a TypeScript local.ts module)
@@ -151,6 +151,7 @@ func TestFindDeadCodeSkipsLocalFunctions(t *testing.T) {
 		{"M.scala", "scala", "member", "func:scala:O$.member"},
 		{"M.scala", "scala", "helper", "func:scala:local:O.m.helper:3:5"},
 		{"m.lua", "lua", "helper", "func:lua:local:helper:1:1"},
+		{"m.dart", "dart", "helper", "func:dart:local:helper:2:3"},
 		{"src/local.rs", "rust", "rhelper", "func:rust:crate::local:rhelper"},
 		{"go/lua.go", "go", "gofoo", "func:lua:local:gofoo"},
 		{"local.ts", "typescript", "tsfoo", "func:typescript:local:tsfoo"},

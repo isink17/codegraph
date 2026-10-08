@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -186,20 +187,27 @@ func TestDartOwnershipAllEntrypoints(t *testing.T) {
 }
 
 // A Dart local function whose calls were not proven is not dead code:
-// FindDeadCode lists the unreferenced top-level function and not the local.
+// FindDeadCode lists the unreferenced top-level function and not the local,
+// while a non-Dart file whose key happens to read func:dart:local: (a Go
+// package named dart) is still listed.
 func TestFindDeadCodeSkipsDartLocalFunctions(t *testing.T) {
 	ctx := context.Background()
 	s, repo := openBudgetStore(t)
-	file, err := insertTestFileLang(ctx, s, repo.ID, "m.dart", "dart")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, seed := range []struct{ name, key string }{
-		{"top", "func:dart:top"},
-		{"helper", "func:dart:local:helper:2:3"},
+	for _, seed := range []struct{ path, language, name, key string }{
+		{"m.dart", "dart", "top", "func:dart:top"},
+		{"m.dart", "dart", "helper", "func:dart:local:helper:2:3"},
+		{"dart/x.go", "go", "gofoo", "func:dart:local:gofoo"},
 	} {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, 'dart', 'function', ?, ?, 1, 1, 2, 2, ?)`,
-			repo.ID, file, seed.name, seed.name, seed.key); err != nil {
+		file, err := insertTestFileLang(ctx, s, repo.ID, seed.path, seed.language)
+		if err != nil {
+			var id int64
+			if qerr := s.db.QueryRowContext(ctx, `SELECT id FROM files WHERE repo_id = ? AND path = ?`, repo.ID, seed.path).Scan(&id); qerr != nil {
+				t.Fatal(err)
+			}
+			file = id
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO symbols(repo_id, file_id, language, kind, name, qualified_name, start_line, start_col, end_line, end_col, stable_key) VALUES(?, ?, ?, 'function', ?, ?, 1, 1, 2, 2, ?)`,
+			repo.ID, file, seed.language, seed.name, seed.name, seed.key); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -211,7 +219,8 @@ func TestFindDeadCodeSkipsDartLocalFunctions(t *testing.T) {
 	for _, d := range dead {
 		names = append(names, fmt.Sprint(d["name"]))
 	}
-	if strings.Join(names, ",") != "top" {
-		t.Fatalf("dead code = %v, want only top", names)
+	slices.Sort(names)
+	if strings.Join(names, ",") != "gofoo,top" {
+		t.Fatalf("dead code = %v, want gofoo and top", names)
 	}
 }

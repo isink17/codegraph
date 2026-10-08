@@ -823,6 +823,12 @@ func dartLexicalCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) [
 		})
 	}
 	for _, name := range slices.Sorted(maps.Keys(leaves)) {
+		// Since Dart 3.7 a local `_` is a wildcard that binds nothing, so a
+		// call `_()` may reach a library `_` past a local one; `_` is never
+		// proven.
+		if name == "_" {
+			continue
+		}
 		occ := leaves[name]
 		// The top-level target and whether anything library-level besides it
 		// declares or mentions the name.
