@@ -9,8 +9,8 @@ contradicts the license file). The generated `parser.c` (about 5.8 MiB),
 `internal/parser/treesitter/dartgrammar` with the upstream `LICENSE` verbatim;
 `PROVENANCE.md` there records the file hashes and the refresh steps. The
 parser is ABI 14, the last ABI the `github.com/smacker/go-tree-sitter` runtime
-loads; later upstream commits are ABI 15. Binary distributions must carry the
-MIT notice in that `LICENSE`.
+loads; later upstream commits are ABI 15. Its MIT notice ships in
+`THIRD_PARTY_NOTICES` with every release archive and the npm package.
 
 The adapter (profile `treesitter:dart:v1`) records:
 

@@ -131,12 +131,12 @@ jobs:
           set -euo pipefail
           for archive in dist/*.tar.gz; do
             base=$(basename "$archive" .tar.gz)
-            expected=$(printf '%s\n' "$base/LICENSE" "$base/README.md" "$base/codegraph" | sort)
+            expected=$(printf '%s\n' "$base/LICENSE" "$base/README.md" "$base/THIRD_PARTY_NOTICES" "$base/codegraph" | sort)
             actual=$(tar -tzf "$archive" | grep -v '/$' | sort)
             diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual")
           done
           for archive in dist/*.zip; do
-            expected=$(printf '%s\n' 'LICENSE' 'README.md' 'codegraph.exe' | sort)
+            expected=$(printf '%s\n' 'LICENSE' 'README.md' 'THIRD_PARTY_NOTICES' 'codegraph.exe' | sort)
             actual=$(unzip -Z1 "$archive" | sed '/\/$/d' | sort)
             diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual")
           done

@@ -30,7 +30,8 @@
     "bin/codegraph.js",
     "install.js",
     "lib/installer.js",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES"
   ],
   "mcpName": "io.github.isink17/codegraph"
 }

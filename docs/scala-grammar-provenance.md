@@ -34,9 +34,9 @@ and does not copy or modify those sources.
 
 MIT requires the grammar's copyright and permission notice to accompany
 copies of the software. A CodeGraph binary links the generated parser, so the
-notice must ship with binary distributions; the repository has no
-third-party notice file yet, an obligation shared with the other bundled
-tree-sitter grammars.
+notice must ship with binary distributions. It is reproduced, with the
+notices of the other bundled tree-sitter grammars, in `THIRD_PARTY_NOTICES`,
+which ships in every release archive and in the npm package.
 
 ## What the adapter extracts (V1)
 

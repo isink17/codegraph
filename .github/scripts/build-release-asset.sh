@@ -37,7 +37,7 @@ if [[ -n "$actual" && "$actual" != "$expected" ]]; then
   echo "version mismatch: got $actual, want $expected" >&2
   exit 1
 fi
-cp README.md LICENSE "$dist/$archive_base/"
+cp README.md LICENSE THIRD_PARTY_NOTICES "$dist/$archive_base/"
 
 native_asset="codegraph-${version}-${goos}_${goarch}"
 [[ "$goos" == windows ]] && native_asset+=".exe"

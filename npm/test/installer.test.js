@@ -95,6 +95,7 @@ test('packs, globally installs and invokes the tarball wrapper', async t => {
   const files = metadata.files.map(file => file.path);
   assert(files.includes('bin/codegraph.js'));
   assert(files.includes('lib/installer.js'));
+  assert(files.includes('THIRD_PARTY_NOTICES'));
   assert(!files.some(file => /(^|\/)(\.git|node_modules|\.npm|evidence|dist)(\/|$)/i.test(file)));
   assert(metadata.size < 100_000, `unexpected tarball size: ${metadata.size}`);
   const archive = path.join(work, metadata.filename);

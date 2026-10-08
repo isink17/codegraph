@@ -27,7 +27,8 @@ grammar.
 
 CodeGraph imports the dependency package and does not copy or modify those
 generated C sources. Redistributing a binary that links them carries the
-Apache-2.0 notice obligation (section 4), which release packaging must meet.
+Apache-2.0 notice obligation (section 4); the license text ships in
+`THIRD_PARTY_NOTICES` with every release archive and the npm package.
 
 ## What the adapter records
 
