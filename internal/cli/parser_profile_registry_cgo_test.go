@@ -3,12 +3,17 @@
 package cli
 
 import (
-	"strings"
+	"maps"
+	"slices"
 	"testing"
 )
 
+// symbolsOnlyCgoLanguages are the tree-sitter adapters that deliberately build
+// no call graph; every other cgo adapter does.
+var symbolsOnlyCgoLanguages = map[string]bool{"dart": true, "scala": true}
+
 // The cgo build parses every supported language with tree-sitter, and all of
-// those adapters except Scala build a call graph.
+// those adapters except symbolsOnlyCgoLanguages build a call graph.
 func TestCgoRegistryProfiles(t *testing.T) {
 	for _, lang := range newDefaultRegistry().SupportedLanguages() {
 		want := "treesitter:" + lang.Language + ":v1"
@@ -48,12 +53,13 @@ func TestCgoRegistryProfiles(t *testing.T) {
 		if lang.ParserProfile != want {
 			t.Fatalf("%s: parser profile = %q, want %q", lang.Language, lang.ParserProfile, want)
 		}
-		if lang.CallEdges == (lang.Language == "scala") {
-			t.Fatalf("%s: CallEdges = %v; only Scala is symbols-only under tree-sitter", lang.Language, lang.CallEdges)
+		if lang.CallEdges == symbolsOnlyCgoLanguages[lang.Language] {
+			t.Fatalf("%s: CallEdges = %v, want %v", lang.Language, lang.CallEdges, !symbolsOnlyCgoLanguages[lang.Language])
 		}
 	}
-	if degraded := strings.Join(newDefaultRegistry().DegradedLanguages(), ","); degraded != "scala" {
-		t.Fatalf("DegradedLanguages() = %v, want only scala in the cgo build", degraded)
+	want := slices.Sorted(maps.Keys(symbolsOnlyCgoLanguages))
+	if degraded := newDefaultRegistry().DegradedLanguages(); !slices.Equal(degraded, want) {
+		t.Fatalf("DegradedLanguages() = %v, want %v in the cgo build", degraded, want)
 	}
 	for _, capability := range newDefaultRegistry().Capabilities() {
 		if capability.NoCGOParser == nil || !*capability.NoCGOParser {

@@ -382,6 +382,13 @@ const (
 	ScopeImportTypedBinding  = "typed_binding"
 	ScopeImportPHPTraitScope = "php_trait_scope"
 
+	// ScopeImportDartDeferred is a Dart `deferred as p` import: a namespace
+	// row whose library loads only after p.loadLibrary(). ScopeImportDartHide
+	// is one name a Dart `hide` combinator removes from an import or export;
+	// ImportedName carries it. No resolver reads either yet.
+	ScopeImportDartDeferred = "dart_deferred"
+	ScopeImportDartHide     = "dart_hide"
+
 	// ScopeImportNestedDeclaration is a local binding a nested `def` or `class`
 	// makes in the function that encloses it. It shadows an import of the same
 	// name the way any other local does, but the name it binds is a symbol this

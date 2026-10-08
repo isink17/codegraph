@@ -33,8 +33,11 @@ import (
 // `.py` or `.ts` file. HCL rows are Terraform module sources, which name a
 // directory of Terraform files, never a file of another language, and no
 // other language's import loads an HCL file as code, so HCL files are neither
-// bridge sources nor bridge destinations. A Ruby file may still be a bridge DESTINATION when
-// another language's own import names it.
+// bridge sources nor bridge destinations. Dart rows are never bridge evidence
+// either: a Dart import, export or part URI only ever loads a Dart library, so
+// a `.dart` specifier answered by a foreign file of the same stem is a missing
+// Dart file, not a bridge. A Ruby or Dart file may still be a bridge
+// DESTINATION when another language's own import names it.
 //
 // So one rule covers every link:
 //
@@ -412,7 +415,7 @@ func crossLanguageBridges(
 		SELECT f.id, f.path, f.language, fi.import_path
 		FROM file_imports fi
 		JOIN files f ON f.id = fi.file_id
-		WHERE f.repo_id = ? AND f.is_deleted = 0 AND f.language NOT IN ('ruby', 'hcl')
+		WHERE f.repo_id = ? AND f.is_deleted = 0 AND f.language NOT IN ('ruby', 'dart', 'hcl')
 		ORDER BY f.path, fi.import_path, f.id
 	`, repoID)
 	if err != nil {
