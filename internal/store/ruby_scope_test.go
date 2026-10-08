@@ -72,8 +72,8 @@ func (f *rubyFixture) method(t *testing.T, fileID int64, qname string, static bo
 func (f *rubyFixture) call(t *testing.T, fileID int64, src sql.NullInt64, dst, evidence string, line int) int64 {
 	t.Helper()
 	res, err := f.store.db.ExecContext(f.ctx, `
-		INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-		VALUES(?, ?, NULL, ?, 'calls', ?, ?, ?)`, f.repoID, src, dst, evidence, fileID, line)
+		INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line, start_col)
+		VALUES(?, ?, NULL, ?, 'calls', ?, ?, ?, 1)`, f.repoID, src, dst, evidence, fileID, line)
 	if err != nil {
 		t.Fatalf("insert edge %s: %v", dst, err)
 	}

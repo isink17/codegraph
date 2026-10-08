@@ -715,12 +715,15 @@ func cppExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			Kind:        "calls",
 			Evidence:    evidence,
 			Line:        line,
+			Col:         int(fnNode.StartPoint().Column) + 1,
 		})
+		rng := nodeRange(call)
+		rng.StartCol = int(fnNode.StartPoint().Column) + 1
 		pf.References = append(pf.References, graph.Reference{
 			Kind:          "call",
 			Name:          callName,
 			QualifiedName: callName,
-			Range:         nodeRange(call),
+			Range:         rng,
 		})
 	}
 }

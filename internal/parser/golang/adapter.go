@@ -134,19 +134,22 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			if name == "" {
 				return true
 			}
-			pos := fset.Position(node.Lparen)
+			pos := fset.Position(node.Fun.Pos())
 			pf.Edges = append(pf.Edges, graph.Edge{
 				SrcSymbolID: 0,
 				DstName:     name,
 				Kind:        "calls",
 				Evidence:    renderNode(content, fset, node.Fun),
 				Line:        pos.Line,
+				Col:         pos.Column,
 			})
+			rng := toRange(fset, node.Pos(), node.End())
+			rng.StartCol = fset.Position(node.Fun.Pos()).Column
 			pf.References = append(pf.References, graph.Reference{
 				Kind:          "call",
 				Name:          name,
 				QualifiedName: name,
-				Range:         toRange(fset, node.Pos(), node.End()),
+				Range:         rng,
 			})
 		}
 		return true

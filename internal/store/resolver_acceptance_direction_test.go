@@ -58,7 +58,7 @@ func (f *parityFixture) addCallReference(t *testing.T, edge int64) int64 {
 	t.Helper()
 	res, err := f.store.db.ExecContext(f.ctx, `
 		INSERT INTO references_tbl(repo_id,file_id,ref_kind,name,qualified_name,start_line,start_col,end_line,end_col)
-		SELECT repo_id,file_id,'call',dst_name,'',line,1,line,1 FROM edges WHERE id = ?`, edge)
+		SELECT repo_id,file_id,'call',dst_name,'',line,COALESCE(start_col,1),line,1 FROM edges WHERE id = ?`, edge)
 	if err != nil {
 		t.Fatal(err)
 	}

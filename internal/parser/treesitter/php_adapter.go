@@ -350,8 +350,17 @@ func phpExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		if nested && strings.HasPrefix(name, "$this->") {
 			evidence = graph.PHPMemberCallNestedScopeEvidence
 		}
-		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1})
-		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
+		callee := call
+		if fn := childByFieldName(call, "function"); fn != nil {
+			callee = fn
+		} else if nameNode := childByFieldName(call, "name"); nameNode != nil {
+			callee = nameNode
+		}
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(callee.StartPoint().Row) + 1, Col: int(callee.StartPoint().Column) + 1})
+		rng := nodeRange(call)
+		rng.StartLine = int(callee.StartPoint().Row) + 1
+		rng.StartCol = int(callee.StartPoint().Column) + 1
+		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: rng})
 	}
 	var walk func(*sitter.Node, bool)
 	walk = func(node *sitter.Node, nested bool) {

@@ -1,0 +1,1 @@
+ALTER TABLE edges ADD COLUMN start_col INTEGER;

@@ -257,8 +257,8 @@ func insertTestSymbolKind(ctx context.Context, s *Store, repoID, fileID int64, n
 
 func insertTestEdge(ctx context.Context, s *Store, repoID, fileID, srcSymbolID int64, dstName string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line)
-		VALUES(?, ?, NULL, ?, 'call', '', ?, 1)
+		INSERT INTO edges(repo_id, src_symbol_id, dst_symbol_id, dst_name, edge_kind, evidence, file_id, line, start_col)
+		VALUES(?, ?, NULL, ?, 'call', '', ?, 1, 1)
 	`, repoID, srcSymbolID, dstName, fileID)
 	if err != nil {
 		return 0, err

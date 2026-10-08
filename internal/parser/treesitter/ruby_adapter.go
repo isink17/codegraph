@@ -553,12 +553,14 @@ func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		}
 		// The reference is a real occurrence either way; only the call edge
 		// needs a receiver the parser can vouch for.
-		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: nodeRange(call)})
+		rng := nodeRange(call)
+		rng.StartCol = int(call.StartPoint().Column) + 1
+		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: rng})
 		if rubyAssignmentTarget(call) || rubyBlockLocalDefinition(call) || rubyRebindsSelf(call, content) || rubyRecordedWrapper(call, recorded) {
 			continue
 		}
 		evidence := rubyCallEvidence(receiver, rubyCallOperator(receiver, methodNode, content))
-		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1})
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1, Col: int(call.StartPoint().Column) + 1})
 	}
 }
 

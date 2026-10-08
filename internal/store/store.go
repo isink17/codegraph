@@ -61,9 +61,9 @@ const (
 	// 90*11=990 variables, staying under sqliteDefaultMaxVariables.
 	sqliteReferenceValuesBatchRows = 90
 
-	// sqliteEdgeValuesBatchRows controls multi-row inserts into edges where each row uses 8 parameters.
-	// 124*8=992 variables, staying under sqliteDefaultMaxVariables.
-	sqliteEdgeValuesBatchRows = 124
+	// sqliteEdgeValuesBatchRows controls multi-row inserts into edges where each row uses 9 parameters.
+	// 110*9=990 variables, staying under sqliteDefaultMaxVariables.
+	sqliteEdgeValuesBatchRows = 110
 
 	// sqliteImportValuesBatchRows controls multi-row inserts into file_imports where each row uses 3 parameters.
 	// 300*3=900 variables, staying under sqliteDefaultMaxVariables.
@@ -2749,7 +2749,7 @@ func insertParsedFileGraph(
 
 	if len(parsed.Edges) > 0 {
 		srcChooser := newSrcSymbolChooser(symbolIDs, parsed.Symbols)
-		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*8)
+		edgeArgs := make([]any, 0, min(len(parsed.Edges), sqliteEdgeValuesBatchRows)*9)
 		for _, edge := range parsed.Edges {
 			attribution := srcChooser.attribute(edge.Line, edge.Col)
 			srcID := attribution.id
@@ -2759,8 +2759,12 @@ func insertParsedFileGraph(
 				}
 				continue
 			}
-			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line, edge.CallArity)
-			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*8 {
+			var startCol any
+			if edge.Col > 0 {
+				startCol = edge.Col
+			}
+			edgeArgs = append(edgeArgs, repoID, srcID, edge.DstName, edge.Kind, edge.Evidence, fileID, edge.Line, edge.CallArity, startCol)
+			if len(edgeArgs) >= sqliteEdgeValuesBatchRows*9 {
 				if err := execUnresolvedEdgesInsert(ctx, tx, edgeArgs, stats); err != nil {
 					return nil, err
 				}
@@ -3362,7 +3366,7 @@ func execReferencesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *Wr
 }
 
 func execUnresolvedEdgesInsert(ctx context.Context, tx *sql.Tx, args []any, stats *WriteStats) error {
-	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line, call_arity", 8, args, stats)
+	return execBatchInsert(ctx, tx, "edges", "repo_id, src_symbol_id, dst_name, edge_kind, evidence, file_id, line, call_arity, start_col", 9, args, stats)
 }
 
 // testLinkInsertCols is the arity of the test_links insert tuple. It includes
