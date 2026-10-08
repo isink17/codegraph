@@ -40,6 +40,10 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 	unrecorded.Coverage.Recorded = false
 	failedAfter := freshnessAt("h1", fullScan("h1", "h1", "none"))
 	failedAfter.Coverage.FailedAfterLastFull = 1
+	olderRunning := freshnessAt("h1", fullScan("h1", "h1", "none"))
+	olderRunning.RunningScans = graph.FreshnessRunningScans{Count: 1, AfterLastCompleted: 0, Liveness: "unknown"}
+	staleNoQueueReason := freshnessAt("h1", fullScan("h1", "h1", "none"))
+	staleNoQueueReason.State, staleNoQueueReason.Reasons = graph.FreshnessKnownStale, []string{"head_moved"}
 	both := freshnessAt("h1", fullScan("h1", "h1", "yes"))
 	both.Coverage.FailedAfterLastFull = 1
 
@@ -54,6 +58,8 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 		{"full coverage ok", StatusOK, freshnessAt("h1", fullScan("h1", "h1", "none")), VerdictFullCoverageAtHead, 0, []string{}},
 		{"full coverage violations", StatusViolations, freshnessAt("h1", fullScan("h1", "h1", "none")), VerdictFullCoverageAtHead, 1, []string{}},
 		{"dirty queue status", StatusStale, freshnessAt("h1", fullScan("h1", "h1", "none")), VerdictKnownStale, ExitKnownStale, []string{"dirty_queue_nonempty"}},
+		{"older scan still running", StatusOK, olderRunning, VerdictUnknown, ExitFreshnessUnknown, []string{"scan_running_or_abandoned"}},
+		{"stale status adds queue reason", StatusStale, staleNoQueueReason, VerdictKnownStale, ExitKnownStale, []string{"head_moved", "dirty_queue_nonempty"}},
 		{"known stale state", StatusOK, stale, VerdictKnownStale, ExitKnownStale, []string{"head_moved"}},
 		{"never completed", StatusOK, neverCompleted, VerdictUnknown, ExitFreshnessUnknown, []string{"never_completed"}},
 		{"pre-migration database", StatusOK, unrecorded, VerdictUnknown, ExitFreshnessUnknown, []string{"coverage_not_recorded"}},

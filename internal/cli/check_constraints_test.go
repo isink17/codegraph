@@ -13,6 +13,7 @@ import (
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/constraints"
 	"github.com/isink17/codegraph/internal/githistory/gittest"
+	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -212,6 +213,7 @@ func TestCheckConstraintsCLIStrictFreshness(t *testing.T) {
 
 // Strict exit codes through the CLI on a real Git repository: a proven full
 // scan keeps exit 0, a queued change moves stale from exit 2 to 3, and a
+// path-scoped-only commit exits 5, a full update with violations exits 1, and a
 // config error stays exit 2 with no freshness block.
 func TestCheckConstraintsCLIStrictExitCodes(t *testing.T) {
 	root := constraintsRepo(t, true)
@@ -237,7 +239,36 @@ func TestCheckConstraintsCLIStrictExitCodes(t *testing.T) {
 	}
 	dbPath, repoID := opened.DBPath, opened.Repo.ID
 	opened.Close()
+
+	// A new commit indexed only path-scoped: the history watermark follows
+	// HEAD, but no full scan covers it, so strict exits 5.
+	repo.Write("internal/domain/a.go", "package domain\n\nimport \"example.com/m/internal/infra\"\n\nfunc A() { infra.B() }\n")
+	repo.Commit("", "two")
 	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := indexer.New(st, newDefaultRegistry(), nil).Update(context.Background(), indexer.Options{RepoRoot: root, Paths: []string{"internal/domain/a.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	out, res, code = checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictInsufficientCoverage || code != constraints.ExitInsufficientCoverage {
+		t.Fatalf("path-scoped only: status %s exit %d\n%s", res.Status, code, out)
+	}
+	if _, _, code := checkCLI(t, "check_constraints", root); code != 1 {
+		t.Fatalf("default exit %d, want 1", code)
+	}
+	// A full update proves coverage again: violations exit 1.
+	if _, _, err := runCLI(t, "update", root); err != nil {
+		t.Fatal(err)
+	}
+	out, res, code = checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictFullCoverageAtHead || code != 1 {
+		t.Fatalf("full update: status %s exit %d\n%s", res.Status, code, out)
+	}
+
+	st, err = store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}

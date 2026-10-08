@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -545,8 +546,8 @@ func strictFreshness(status string, lastScanID int64, before, after graph.Freshn
 	case status == StatusStale || before.State == graph.FreshnessKnownStale:
 		out.Verdict = VerdictKnownStale
 		out.Reasons = append([]string{}, before.Reasons...)
-		if len(out.Reasons) == 0 {
-			out.Reasons = []string{"dirty_queue_nonempty"}
+		if status == StatusStale && !slices.Contains(out.Reasons, "dirty_queue_nonempty") {
+			out.Reasons = append(out.Reasons, "dirty_queue_nonempty")
 		}
 		out.ExitCode = ExitKnownStale
 		return out
@@ -578,6 +579,12 @@ func strictFreshness(status string, lastScanID int64, before, after graph.Freshn
 		case full.HeadAtFinish != before.Worktree.HeadNow:
 			insufficient = append(insufficient, "head_moved_since_full_scan")
 		}
+	}
+	// Any running row, even one older than the last completed scan, may be a
+	// live writer changing rows under the check; scans hold no lease, so an
+	// abandoned row cannot be told apart and also reads as unknown.
+	if (before.RunningScans.Count > 0 || after.RunningScans.Count > 0) && !slices.Contains(unknown, "scan_running_or_abandoned") {
+		unknown = append(unknown, "scan_running_or_abandoned")
 	}
 	if !sameScanState(before, after) || before.LatestScan == nil || before.LatestScan.ID != lastScanID {
 		unknown = append(unknown, "scan_activity_during_check")
