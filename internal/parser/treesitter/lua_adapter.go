@@ -362,8 +362,11 @@ func luaScan(ctx context.Context, root *sitter.Node, content []byte) ([]graph.Ed
 			args := luaArgs(childByFieldName(n, "arguments"))
 			switch free(name, scope) {
 			case "require", "dofile", "loadfile":
+				// package.loaded preloads "_G" and "package", which hold
+				// the debug library, so a literal naming any hazard is one;
+				// LuaJIT's "ffi" reaches the C API.
 				if len(args) == 1 {
-					if s, ok := luaLiteral(args[0], content); ok && s != "debug" {
+					if s, ok := luaLiteral(args[0], content); ok && !luaHazardNames[s] && s != "ffi" {
 						return
 					}
 				}

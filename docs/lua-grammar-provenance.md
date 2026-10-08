@@ -44,5 +44,8 @@ parameters and locals named `debug`, and plain string data do not.
 The proof covers this file's code only. Another module that obtains a
 function this file exports and calls `debug.setupvalue` on it, or C code using
 `lua_setupvalue`, can rebind an upvalue the edge relies on; that is not
-detected. Calls at file top level
+detected. Nor is a literal `require` of another module that itself returns
+the debug library: what a module returns is outside this file. A literal
+`require` of a hazard name (`"_G"` and `"package"` are preloaded and hold
+the library) or of LuaJIT's `"ffi"` does count as reaching it. Calls at file top level
 have no source symbol and are not persisted as edges.
