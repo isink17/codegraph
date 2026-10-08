@@ -476,6 +476,13 @@ const (
 
 // Freshness is a read-only account of what the stored graph can say about its
 // own staleness. Every field has an explicit unknown; nothing claims "fresh".
+//
+// State is unknown when no scan ever completed and no other reason fires,
+// known_stale when any reason other than never_completed fires, and
+// no_known_staleness otherwise. Scans record neither their HEAD nor their
+// scope, so a later completed path-scoped update or watch flush becomes the
+// latest scan and clears latest_scan_failed even when an earlier failed full
+// update left its work undone.
 type Freshness struct {
 	State             string                `json:"state"`
 	Reasons           []string              `json:"reasons"`
@@ -514,7 +521,7 @@ type FreshnessRunningScans struct {
 
 type FreshnessDirtyQueue struct {
 	Queued   int64 `json:"queued"`
-	InFlight int64 `json:"inflight"`
+	InFlight int64 `json:"in_flight"`
 	// OldestQueuedAt covers queued rows only; claiming a row rewrites its time.
 	OldestQueuedAt string `json:"oldest_queued_at,omitempty"`
 }
@@ -524,7 +531,9 @@ type FreshnessWorktree struct {
 	CanonicalPath string `json:"canonical_path"`
 	// HeadAtIndex is git_history_state.watermark_sha: HEAD as probed by the
 	// most recent scan that reached its history phase. That scan may have
-	// failed afterwards. "unknown" when history is absent or disabled.
+	// failed afterwards, and a path-scoped update or watch flush advances it
+	// too, so HeadChanged "no" does not mean the whole graph was rebuilt at
+	// that HEAD. "unknown" when history is absent or disabled.
 	HeadAtIndex       string `json:"head_at_index"`
 	HeadAtIndexSource string `json:"head_at_index_source"`
 	HeadNow           string `json:"head_now"`

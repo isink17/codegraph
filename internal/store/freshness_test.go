@@ -86,6 +86,15 @@ func TestFreshnessCompletedThenFailed(t *testing.T) {
 	}
 }
 
+func TestFreshnessNeverCompletedWithFailure(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "failed", "boom")
+	f := freshness(t, s, repoID)
+	if f.State != graph.FreshnessKnownStale || !slices.Equal(f.Reasons, []string{"never_completed", "latest_scan_failed"}) {
+		t.Fatalf("state=%s reasons=%v", f.State, f.Reasons)
+	}
+}
+
 func TestFreshnessCompletedOnlyHasNoKnownStaleness(t *testing.T) {
 	s, repoID := freshnessStore(t, t.TempDir())
 	scan(t, s, repoID, "watch_config", "completed", "")
@@ -141,7 +150,10 @@ func TestFreshnessDirtyQueue(t *testing.T) {
 
 func TestFreshnessHeadNotARepository(t *testing.T) {
 	gittest.Require(t)
-	s, repoID := freshnessStore(t, t.TempDir())
+	dir := t.TempDir()
+	// Keep git from finding an enclosing repository above the temp dir.
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+	s, repoID := freshnessStore(t, dir)
 	scan(t, s, repoID, "index", "completed", "")
 	f := freshness(t, s, repoID)
 	if f.Worktree.HeadNow != "unknown" || f.Worktree.HeadChanged != "unknown" || f.State != graph.FreshnessNoKnownStaleness {

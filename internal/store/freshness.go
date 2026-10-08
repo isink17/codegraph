@@ -57,10 +57,10 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 		f.Reasons = append(f.Reasons, "head_moved")
 	}
 	switch {
+	case len(f.Reasons) > 0 && (f.LastCompletedScan != nil || len(f.Reasons) > 1):
+		f.State = graph.FreshnessKnownStale
 	case f.LastCompletedScan == nil:
 		f.State = graph.FreshnessUnknown
-	case len(f.Reasons) > 0:
-		f.State = graph.FreshnessKnownStale
 	default:
 		f.State = graph.FreshnessNoKnownStaleness
 	}
