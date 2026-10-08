@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -141,6 +142,34 @@ func TestRunInitRejectsMultipleRepoPaths(t *testing.T) {
 	err := Run(context.Background(), []string{"init", "first", "second"}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "init accepts at most one repo path") {
 		t.Fatalf("Run(init with multiple paths) error = %v", err)
+	}
+}
+
+func TestOrdinaryIndexDoesNotInvokeGradle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake Gradle executable test uses a shell script")
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "gradle-invoked")
+	gradle := filepath.Join(bin, "gradle")
+	if err := os.WriteFile(gradle, []byte("#!/bin/sh\nprintf invoked > \"$CODEGRAPH_GRADLE_MARKER\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEGRAPH_GRADLE_MARKER", marker)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cfg := config.Config{DBDir: config.RepoDBDir, DBPerformanceProfile: "balanced"}
+	if err := runIndex(context.Background(), cfg, io.Discard, "index", []string{root, "--no-history"}, false); err != nil {
+		t.Fatalf("runIndex(): %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ordinary indexing invoked Gradle: stat marker error = %v", err)
 	}
 }
 

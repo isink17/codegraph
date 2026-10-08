@@ -71,10 +71,33 @@ affected dimensions remain unknown; timestamp-only acceptance is forbidden.
 Import validation is read-only and does not write scope evidence to SQLite in
 this first slice. The classifier remains disabled.
 
-## Initial validator slice
+## Initial producer slice
+
+`codegraph export-gradle-evidence` explicitly runs the executable supplied with
+`--gradle` for one selected Kotlin/JVM project and compilation. It resolves that
+compilation's Gradle classpath and records positive module coordinates plus the
+Kotlin source-set roots. It never discovers or launches a project wrapper
+implicitly. The integration fixture pins Kotlin Gradle Plugin 2.3.20 and asserts
+Gradle 9.3.1.
+
+This first producer deliberately reports source and dependency dimensions as
+`incomplete`; generated/excluded roots and external metadata as `unknown`; and
+compiler identity as `incomplete`. It observes the Gradle runtime JDK, not a
+selected Kotlin compiler toolchain. Classpath file dependencies and artifact
+content freshness are not proven. `CurrentFingerprint` covers the local
+repository file tree and reported source roots. It is not freshness evidence
+for external dependency artifacts or environment-driven Gradle model changes;
+those dimensions remain incomplete/unknown. The artifact is not imported into
+Store, and the classifier remains disabled.
+
+The artifact contains no arbitrary environment variables, credentials, build
+logs, or absolute machine paths. Source roots are canonical repository-relative
+paths, and escaping symlinks fail closed. The output must be outside the
+repository and is never overwritten. Ordinary index/update/watch/serve/MCP
+paths do not call the producer.
+Directory symlinks in the scanned repository currently refuse fingerprinting.
 
 `internal/buildevidence.Decode` validates bounded JSON and normalizes omitted
-dimensions to unknown. `Artifact.ValidateCurrent` refuses a changed input
-fingerprint. This boundary validates artifact claims; it does not attest that
-the producer actually observed a complete build model. The future producer
-must provide provenance that makes each completeness claim auditable.
+dimensions to unknown. `Artifact.ValidateCurrent` refuses a changed fingerprint;
+`CurrentFingerprint` recomputes the local file inputs above. These checks do not
+attest omitted Gradle inputs or promote incomplete evidence to complete.

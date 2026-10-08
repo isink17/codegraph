@@ -1,5 +1,5 @@
-// Package buildevidence validates explicitly generated Gradle/Kotlin build
-// evidence. It has no build execution or indexing side effects.
+// Package buildevidence produces and validates explicitly requested
+// Gradle/Kotlin build evidence. It has no indexing side effects.
 package buildevidence
 
 import (
