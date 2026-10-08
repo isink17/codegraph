@@ -117,7 +117,7 @@ WANT_BASE=$ib case_ v2-pr-claims-integration block --base "$ib" 42 "$sha" "$r"
 PR_JSON="OPEN false master $sha MERGEABLE" WANT_BASE=master case_ base-master-refused block --base master 42 "$sha" "$r"
 PR_JSON="OPEN false integration/v2.0-wave-20990101 $sha MERGEABLE" WANT_BASE=integration/v2.0-wave-20990101 \
 	case_ base-unlisted-integration block --base integration/v2.0-wave-20990101 42 "$sha" "$r"
-PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE="$ib" case_ base-prefix-refused block --base integration/v2.0 42 "$sha" "$r"
+PR_JSON="OPEN false integration/v2.0 $sha MERGEABLE" WANT_BASE=integration/v2.0 case_ base-prefix-refused block --base integration/v2.0 42 "$sha" "$r"
 case_ base-missing-value block --base
 PR_JSON="OPEN false $ib $other MERGEABLE" WANT_BASE=$ib case_ integration-stale-head block --base "$ib" 42 "$sha" "$r"
 PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib BEHIND=2 case_ integration-behind block --base "$ib" 42 "$sha" "$r"
