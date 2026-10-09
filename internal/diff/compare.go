@@ -104,6 +104,33 @@ const (
 	CoverageUnavailable = "unavailable"
 )
 
+// Risk is change-risk evidence derived from the changes above. It carries no
+// score: every entry cites the removed declaration and the base-side calls it
+// rests on, and Coverage says how far an empty list can be trusted.
+type Risk struct {
+	Coverage SectionCoverage `json:"coverage"`
+	// RemovedDeclarationCallers lists, for each declaration_removed change,
+	// the resolved calls to it in the base revision from a declaration that
+	// still exists in the head revision.
+	RemovedDeclarationCallers []RemovedDeclarationCallers `json:"removed_declaration_callers"`
+}
+
+type RemovedDeclarationCallers struct {
+	// Declaration is the identity of the declaration_removed change.
+	Declaration string     `json:"declaration"`
+	Calls       []RiskCall `json:"calls"`
+}
+
+// RiskCall is one base-side call into a removed declaration. Site is the
+// edge identity used by the edge sections. Head is the edge at the same site
+// in the head revision, absent when the call is gone or the site is ambiguous.
+type RiskCall struct {
+	Site          string              `json:"site"`
+	Base          store.SemanticEdge  `json:"base"`
+	Head          *store.SemanticEdge `json:"head,omitempty"`
+	HeadAmbiguous bool                `json:"head_ambiguous,omitempty"`
+}
+
 type DiffDocument struct {
 	Schema    string         `json:"schema"`
 	Coverage  Coverage       `json:"coverage"`
@@ -112,6 +139,7 @@ type DiffDocument struct {
 	Symbols   SymbolSection  `json:"symbols"`
 	Edges     EdgeSection    `json:"edges"`
 	TestLinks SymbolSection  `json:"test_links"`
+	Risk      Risk           `json:"risk"`
 	Total     int            `json:"total"`
 	Offset    int            `json:"offset"`
 	Limit     int            `json:"limit"`
@@ -133,8 +161,12 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 		compareDeclarations(&changes, base.GraphData, head.GraphData, incomplete)
 	}
 	compatible := relationshipCompatible(base, head)
+	// Edges of files without a current parse are dropped before anything,
+	// including the column decision, looks at them.
+	keepEdge := func(v store.SemanticEdge) bool { return !incomplete[v.Path] && !incomplete[v.Source.Path] }
+	baseEdges, headEdges := filter(base.GraphData.Edges, keepEdge), filter(head.GraphData.Edges, keepEdge)
 	if compatible {
-		compareEdges(&changes, base.GraphData.Edges, head.GraphData.Edges, incomplete)
+		compareEdges(&changes, baseEdges, headEdges)
 		compareTestLinks(&changes, base.GraphData.TestLinks, head.GraphData.TestLinks, incomplete)
 	}
 	sort.Slice(changes, func(i, j int) bool {
@@ -181,7 +213,8 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	for _, c := range all {
 		summary[summaryKey(c.Kind)]++
 	}
-	doc := DiffDocument{Schema: Schema, Coverage: sectionCoverage(base, head, semanticOK, compatible, len(incomplete)), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
+	coverage := sectionCoverage(base, head, baseEdges, headEdges, semanticOK, compatible, len(incomplete))
+	doc := DiffDocument{Schema: Schema, Coverage: coverage, Risk: removedDeclarationRisk(all, coverage, head.GraphData.Declarations, baseEdges, headEdges), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
 	for _, c := range changes {
 		addToSections(&doc, c)
 	}
@@ -190,7 +223,7 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	return Result{Schema: "codegraph.change/v1", From: base, To: head, Comparison: Comparison{Status: status, Limitations: lims}, Diff: doc}, nil
 }
 
-func sectionCoverage(base, head Revision, semanticOK, compatible bool, skippedFiles int) Coverage {
+func sectionCoverage(base, head Revision, baseEdges, headEdges []store.SemanticEdge, semanticOK, compatible bool, skippedFiles int) Coverage {
 	c := Coverage{Files: SectionCoverage{State: CoverageComplete}}
 	switch {
 	case !semanticOK:
@@ -216,7 +249,7 @@ func sectionCoverage(base, head Revision, semanticOK, compatible bool, skippedFi
 			c.TestLinks = SectionCoverage{State: CoveragePartial, Reason: c.Symbols.Reason + "; test links are heuristic relations"}
 		case len(base.GraphData.State.Capability.Limitations()) > 0 || len(head.GraphData.State.Capability.Limitations()) > 0:
 			c.Edges = SectionCoverage{State: CoveragePartial, Reason: "parser call capability is limited; a missing edge is not evidence of a removed call"}
-		case !useEdgeColumns(base.GraphData.Edges, head.GraphData.Edges) && anyEdgeColumn(base.GraphData.Edges, head.GraphData.Edges):
+		case !useEdgeColumns(baseEdges, headEdges) && anyEdgeColumn(baseEdges, headEdges):
 			c.Edges = SectionCoverage{State: CoveragePartial, Reason: "call column not recorded for some edges; same-line calls are matched by line only"}
 		}
 	}
@@ -512,11 +545,10 @@ func compareDeclarations(out *[]Change, a, b store.SemanticGraph, incomplete map
 	}
 }
 
-func compareEdges(out *[]Change, a, b []store.SemanticEdge, incomplete map[string]bool) {
+// compareEdges compares edges already restricted to files with a current parse.
+func compareEdges(out *[]Change, a, b []store.SemanticEdge) {
 	withColumn := useEdgeColumns(a, b)
 	site := func(v store.SemanticEdge) string { return edgeSite(v, withColumn) }
-	keep := func(v store.SemanticEdge) bool { return !incomplete[v.Path] && !incomplete[v.Source.Path] }
-	a, b = filter(a, keep), filter(b, keep)
 	if !withColumn {
 		// A column recorded on one side only is not a source change.
 		a, b = withoutColumns(a), withoutColumns(b)
@@ -580,10 +612,78 @@ func edgeSite(v store.SemanticEdge, withColumn bool) string {
 	return canonical([]any{src, v.Path, v.Line, v.Kind})
 }
 func withoutColumns(in []store.SemanticEdge) []store.SemanticEdge {
-	for i := range in {
-		in[i].Column = 0
+	out := append([]store.SemanticEdge(nil), in...)
+	for i := range out {
+		out[i].Column = 0
 	}
-	return in
+	return out
+}
+
+func endpointIdentity(v store.SemanticEndpoint) string {
+	return declIdentity(store.SemanticDeclaration{Path: v.Path, Language: v.Language, Kind: v.Kind, QualifiedName: v.QualifiedName, Signature: v.Signature, StableKey: v.StableKey})
+}
+
+// removedDeclarationRisk cites the base-side resolved calls into each removed
+// declaration from callers that survive into the head revision. Only resolved
+// calls are evidence, so the list is never complete: an unresolved, dynamic or
+// cross-language call can reach a removed declaration without appearing here.
+func removedDeclarationRisk(changes []Change, cov Coverage, headDecls []store.SemanticDeclaration, baseEdges, headEdges []store.SemanticEdge) Risk {
+	r := Risk{RemovedDeclarationCallers: []RemovedDeclarationCallers{}}
+	if cov.Symbols.State == CoverageUnavailable || cov.Edges.State == CoverageUnavailable {
+		r.Coverage = SectionCoverage{State: CoverageUnavailable, Reason: "removed declarations or edges were not compared"}
+		return r
+	}
+	reason := "only resolved calls are cited; an unresolved, dynamic or cross-language call can still reach a removed declaration"
+	if cov.Edges.State != CoverageComplete {
+		reason = cov.Edges.Reason + "; " + reason
+	}
+	r.Coverage = SectionCoverage{State: CoveragePartial, Reason: reason}
+	removed := map[string]bool{}
+	for _, c := range changes {
+		if c.Kind == "declaration_removed" {
+			removed[c.Identity] = true
+		}
+	}
+	if len(removed) == 0 {
+		return r
+	}
+	surviving := make(map[string]bool, len(headDecls))
+	for _, d := range headDecls {
+		surviving[declIdentity(d)] = true
+	}
+	withColumn := useEdgeColumns(baseEdges, headEdges)
+	if !withColumn {
+		baseEdges, headEdges = withoutColumns(baseEdges), withoutColumns(headEdges)
+	}
+	site := func(v store.SemanticEdge) string { return edgeSite(v, withColumn) }
+	heads := group(headEdges, site)
+	byDecl := map[string][]RiskCall{}
+	for _, e := range baseEdges {
+		target := endpointIdentity(e.Target)
+		if e.Target.State != "resolved" || !removed[target] || !surviving[endpointIdentity(e.Source)] {
+			continue
+		}
+		call := RiskCall{Site: site(e), Base: e}
+		switch h := heads[call.Site]; len(h) {
+		case 0:
+		case 1:
+			call.Head = &h[0]
+		default:
+			call.HeadAmbiguous = true
+		}
+		byDecl[target] = append(byDecl[target], call)
+	}
+	for _, decl := range union(byDecl, byDecl) {
+		calls := byDecl[decl]
+		sort.Slice(calls, func(i, j int) bool {
+			if calls[i].Site != calls[j].Site {
+				return calls[i].Site < calls[j].Site
+			}
+			return canonical(calls[i].Base) < canonical(calls[j].Base)
+		})
+		r.RemovedDeclarationCallers = append(r.RemovedDeclarationCallers, RemovedDeclarationCallers{Declaration: decl, Calls: calls})
+	}
+	return r
 }
 func filter[T any](in []T, keep func(T) bool) []T {
 	out := make([]T, 0, len(in))
