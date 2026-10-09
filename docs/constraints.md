@@ -206,7 +206,7 @@ are unchanged (exit 2, no `freshness`).
 | `freshness.verdict` | meaning | CLI exit |
 |---|---|---|
 | `full_coverage_at_head` | no known staleness, and the newest completed full scan started and finished at the current HEAD, overlapped no other scan, and no scan has failed since | 0 (`ok`) or 1 (`violations`) |
-| `known_stale` | `status` is `stale`, or graph_stats freshness is `known_stale` (failed or running latest scan, dirty queue, HEAD moved past the history watermark) | 3 |
+| `known_stale` | `status` is `stale`, or an independent stale fact: a failed latest scan (its committed batches belong to no completed scan), a non-empty dirty queue, or HEAD moved past the history watermark. A running scan newer than the last completed one is not such a fact here, although graph_stats reports `known_stale` for it: with no other stale fact it gives `unknown` (4); with one, 3 | 3 |
 | `unknown` | the deciding fact was not recorded or not readable: no completed scan, a database from before coverage recording (read-only, unmigrated), a full scan without recorded HEADs, HEAD unreadable now, a full scan that overlapped another scan, any scan row still `running` (a live writer or one a crashed process abandoned; it yields 4 until the row is removed: stop every codegraph process for the repository and run `codegraph index --rebuild`, which deletes the repository database and indexes from scratch), or scan activity between the freshness read that precedes every graph read and the one after the evaluation | 4 |
 | `insufficient_coverage` | no known staleness, but no recorded full scan, or a scan failed after it, or HEAD moved during it or since it (a path-scoped `update` or watch flush never counts as full, even when it advanced the history watermark) | 5 |
 

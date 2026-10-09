@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -291,6 +292,42 @@ func TestCheckConstraintsCLIStrictExitCodes(t *testing.T) {
 	if _, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness"); res.Status != constraints.StatusConfigError ||
 		res.Errors[0].Code != constraints.CodeGroupOverlap || res.Freshness != nil || code != 2 {
 		t.Fatalf("strict group overlap: status %s errors %+v freshness %+v exit %d", res.Status, res.Errors, res.Freshness, code)
+	}
+}
+
+// A completed full scan followed by a scan row left running: writer liveness
+// alone is unknown (exit 4), not known stale; default mode stays exit 1.
+func TestCheckConstraintsCLIStrictRunningScan(t *testing.T) {
+	root := constraintsRepo(t, true)
+	gittest.Require(t)
+	repo := &gittest.Repo{T: t, Dir: root}
+	repo.Git("init", "-q", "-b", "main")
+	repo.Write(".gitignore", ".codegraph/\n")
+	head := repo.Commit("", "one")
+	if _, _, err := runCLI(t, "index", root); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := openIndexedRepoReadOnly(context.Background(), loadTestConfig(t), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath, repoID := opened.DBPath, opened.Repo.ID
+	opened.Close()
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.BeginScanWithScope(context.Background(), repoID, "update", store.ScanScopePaths, head); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if _, res, code := checkCLI(t, "check_constraints", root); res.Freshness != nil || code != 1 {
+		t.Fatalf("default exit %d", code)
+	}
+	out, res, code := checkCLI(t, "check_constraints", root, "--strict-freshness")
+	if res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictUnknown || code != constraints.ExitFreshnessUnknown ||
+		!slices.Contains(res.Freshness.Reasons, "scan_running_or_abandoned") {
+		t.Fatalf("strict with a running scan: exit %d\n%s", code, out)
 	}
 }
 
