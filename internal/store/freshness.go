@@ -93,21 +93,43 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (graph.Freshnes
 		return graph.Freshness{}, err
 	}
 
-	scanQuery := `SELECT id, scan_kind, status, started_at, COALESCE(finished_at, ''), error_text FROM scans WHERE repo_id = ?`
+	// A read-only handle does not migrate, so a database from before scope
+	// recording has none of its columns; it reads as unrecorded.
+	var coverageColumns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('scans') WHERE name IN ('scope', 'head_at_start', 'head_at_finish', 'overlapping_scans')`).Scan(&coverageColumns); err != nil {
+		return graph.Freshness{}, err
+	}
+	f.Coverage.Recorded = coverageColumns == 4
+	scanQuery := `SELECT id, scan_kind, status, started_at, COALESCE(finished_at, ''), error_text, '', '', '', NULL FROM scans WHERE repo_id = ?`
+	if f.Coverage.Recorded {
+		scanQuery = `SELECT id, scan_kind, status, started_at, COALESCE(finished_at, ''), error_text, scope, head_at_start, head_at_finish, overlapping_scans FROM scans WHERE repo_id = ?`
+	}
 	readScan := func(where string) (*graph.FreshnessScan, error) {
 		var sc graph.FreshnessScan
+		var overlap sql.NullInt64
 		err := tx.QueryRowContext(ctx, scanQuery+where+` ORDER BY id DESC LIMIT 1`, repoID).
-			Scan(&sc.ID, &sc.Kind, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.ErrorText)
+			Scan(&sc.ID, &sc.Kind, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.ErrorText, &sc.Scope, &sc.HeadAtStart, &sc.HeadAtFinish, &overlap)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		// watch_config runs never take paths; every other kind may or may not.
-		sc.Scope = freshnessUnknown
-		if sc.Kind == "watch_config" {
-			sc.Scope = "full"
+		if sc.Scope == "" {
+			// Not recorded: watch_config runs never take paths; every other
+			// kind may or may not.
+			sc.Scope = freshnessUnknown
+			if sc.Kind == "watch_config" {
+				sc.Scope = "full"
+			}
+		}
+		// A running row's count is final only once it closes.
+		sc.Overlap = freshnessUnknown
+		if overlap.Valid && sc.Status != "running" {
+			sc.Overlap = "none"
+			if overlap.Int64 > 0 {
+				sc.Overlap = "yes"
+			}
 		}
 		return &sc, nil
 	}
@@ -116,6 +138,29 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (graph.Freshnes
 	}
 	if f.LatestScan, err = readScan(``); err != nil {
 		return graph.Freshness{}, err
+	}
+	if f.Coverage.Recorded {
+		if f.Coverage.LastFullScan, err = readScan(` AND status = 'completed' AND scope = 'full'`); err != nil {
+			return graph.Freshness{}, err
+		}
+		// A failed scan counts when it started after the last full scan began
+		// or closed at or after the moment it began: either way it was running
+		// while the full scan read the tree, or after it, so its partial writes
+		// may postdate what the full scan saw. Timestamps have one-second
+		// resolution, so a failure closing in the second the full scan began
+		// counts too.
+		var lastFullID int64
+		lastFullStarted := ""
+		if f.Coverage.LastFullScan != nil {
+			lastFullID = f.Coverage.LastFullScan.ID
+			lastFullStarted = f.Coverage.LastFullScan.StartedAt
+		}
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(1) FROM scans
+			WHERE repo_id = ? AND status = 'failed' AND (id > ? OR (? <> '' AND COALESCE(finished_at, '') >= ?))`,
+			repoID, lastFullID, lastFullStarted, lastFullStarted).Scan(&f.Coverage.FailedAfterLastFull); err != nil {
+			return graph.Freshness{}, err
+		}
 	}
 	var lastCompletedID int64
 	if f.LastCompletedScan != nil {

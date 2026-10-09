@@ -22,9 +22,6 @@ func parseDart(t *testing.T, src string) graph.ParsedFile {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pf.Edges) != 0 {
-		t.Fatalf("Dart produced call edges: %+v", pf.Edges)
-	}
 	return pf
 }
 
@@ -292,6 +289,28 @@ func TestDartAdapterCallReferences(t *testing.T) {
 	}
 }
 
+// In expression position the grammar reads a single-type-argument call
+// `f<int>(x)` as the comparison `(f < int) > (x)`. Dart relational operators
+// do not chain, so that shape is always a generic call. Generic constructor
+// calls (`Box<int>.named()`) parse as constructor_invocation.
+func TestDartAdapterGenericCallReferences(t *testing.T) {
+	const src = `void run(int x) {
+  final a = ident<int>(x);
+  final b = ident<List<int>>(x);
+  final c = Box<int>(1);
+  final d = Box<int>.named(2);
+  final e = List<int>.filled(3, 0);
+  final f = (p < q) > (r);
+  return ident<int>(x);
+}
+`
+	pf := parseDart(t, src)
+	want := []string{"Box", "Box.named", "List.filled", "ident", "ident", "ident"}
+	if got := dartRefs(pf); !reflect.DeepEqual(got, want) {
+		t.Fatalf("references:\n got %q\nwant %q", got, want)
+	}
+}
+
 // Error recovery can swallow later declarations into a broken one, so a
 // declaration with an error inside it is dropped with everything it holds;
 // a class whose error stays inside one closed member keeps its other members.
@@ -345,11 +364,57 @@ void tail() { third(); }
 	// Words error recovery leaves behind are not top-level variables.
 	stray := parseDart(t, "part of 'lib.dart';\nimport 'a.dart' show X, Y hide Z;\nconst after = 1;\n")
 	assertDartKeys(t, stray, []string{})
+}
 
-	// The pinned grammar predates null-aware elements (Dart 3.8): the
-	// function holding one and everything after it are not recorded.
-	nullAware := parseDart(t, "void g() {}\nList<int> f(int? x) => [?x];\nvoid h() {}\n")
-	assertDartKeys(t, nullAware, []string{"function func:dart:g"})
+// Dart 3.8 null-aware elements, Dart 3.10 dot shorthands, `get`/`set` used as
+// identifiers and labeled statements parse without an error, so declarations
+// after them are recorded. A dot shorthand names no type: a shorthand call
+// yields no reference rather than a guessed name.
+func TestDartAdapterRecentSyntax(t *testing.T) {
+	const src = `enum Color { red, green }
+class P {
+  P();
+  P.make();
+  int get get => 1;
+  set set(int v) {}
+  void m() { var get = 1; var set = 2; print(get + set); }
+}
+List<int> list(int? x, int? y) => [?x, 1, ?y];
+Set<int> set1(int? x) => {?x};
+Map<String, int> map(String? k, int? v) => {?k: 1, 'a': ?v, ?k: ?v};
+Color c() => .red;
+P p() => .new();
+P q() => .make();
+P r() => const .new();
+int w(Color c) => switch (c) { .red => 1, .green => 2 };
+void u(Color c) {
+  if (c == .green) {}
+  switch (c) { case .red: break; default: }
+  outer: for (var i = 0; i < 3; i++) { while (true) { break outer; } }
+  after();
+}
+var filled = List<int>.filled(3, 0);
+void tail() {}
+`
+	root, err := parse(context.Background(), dartgrammar.GetLanguage(), []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.HasError() {
+		t.Fatalf("parse error: %s", root.String())
+	}
+	pf := parseDart(t, src)
+	assertDartKeys(t, pf, []string{
+		"enum type:dart:Color", "enum_value value:dart:Color.red", "enum_value value:dart:Color.green",
+		"class type:dart:P", "constructor func:dart:P.P", "constructor func:dart:P.make",
+		"method func:dart:P.get", "method func:dart:P.set=", "method func:dart:P.m",
+		"function func:dart:list", "function func:dart:set1", "function func:dart:map",
+		"function func:dart:c", "function func:dart:p", "function func:dart:q", "function func:dart:r",
+		"function func:dart:w", "function func:dart:u", "variable value:dart:filled", "function func:dart:tail",
+	})
+	if got := dartRefs(pf); !reflect.DeepEqual(got, []string{"List.filled", "after", "print"}) {
+		t.Fatalf("references = %q", got)
+	}
 }
 
 func TestDartAdapterFlutterWidget(t *testing.T) {
@@ -435,9 +500,9 @@ class _CounterPageState extends State<CounterPage> {
 	}
 }
 
-func TestDartAdapterProfileIsSymbolsOnly(t *testing.T) {
+func TestDartAdapterProfile(t *testing.T) {
 	a := NewDart()
-	if p := a.Profile(); p.ID != "treesitter:dart:v1" || p.EmitsCallEdges {
+	if p := a.Profile(); p.ID != "treesitter:dart:v3" || !p.EmitsCallEdges {
 		t.Fatalf("profile = %+v", p)
 	}
 	if !a.Supports("lib/main.dart") || !a.Supports("A.DART") || a.Supports("main.dart.js") {

@@ -133,7 +133,7 @@ For HCL, "call edges" in capability and `doctor` output means Terraform `referen
 
 Explicit `CGO_ENABLED=0` builds are not equivalent: Go and Python retain call edges, while the other languages provide heuristic symbol/import navigation without call edges. Symbols, imports, and search are incomplete in those fallback parsers. Python's fallback also misses some call sites. Relationship queries and `codegraph doctor` report graph capability.
 
-All call resolution uses partial static models, not language runtimes. Lua extracts declarations, literal `require` imports, and call references, and resolves only a bare call whose innermost lexical binding is a never-reassigned `local function` of the same file; globals, fields, methods, modules, and any file with a parse error or whose own code can reach the `debug` library (a free `debug`, `_G`/`_ENV` or loader reference, or a computed module name or global-table key) stay unresolved (CGO builds only). Scala (V1) extracts packages, imports with renames and wildcards, classes, objects, traits, enums, defs, vals, type aliases, givens and extension methods, plus call references; it builds no call edges in any build, because implicit/given scope, extension methods, inheritance and overloads decide what a Scala call runs. Terraform/OpenTofu (`.tf`, `.tfvars`) records providers, resources, data sources, variables, locals, outputs and module calls under their Terraform addresses (`aws_instance.web`, `data.aws_ami.base`, `var.region`, `local.tags`, `module.vpc`) and `var.`/`local.`/`module.`/`data.`/resource traversals as `references` edges, never calls; a reference binds only to the single declaration of its address in the same directory (module), and duplicates, missing declarations, splats, non-literal indexes, cross-module addresses and any directory holding an unparsable `.tf` file stay unresolved. Module `source` strings are recorded as written and never fetched. Terraform names are short, so query by address (`var.region`, not `region`). Other `.hcl` files (Packer, Nomad, Terragrunt) get only top-level blocks and attributes. CodeGraph does not evaluate Terraform plans or expressions. Dart (V1) extracts directives, classes, mixins, extensions, extension types, enums, typedefs, functions, members, constructors and call references; it builds no call edges in any build, because extension methods, cascades, mixins and package resolution decide what a Dart call runs. Node.js repositories are supported, but full tree-sitter node support is still in progress. Python models only selected source-visible mutation forms; Ruby does not infer runtime load order or Rails/Zeitwerk mappings. C# may leave `using static` calls unresolved when inheritance or enclosing members could change the target. See [language scope models](docs/scope-models.md), [Lua grammar provenance](docs/lua-grammar-provenance.md), [Scala grammar provenance](docs/scala-grammar-provenance.md), [HCL grammar provenance](docs/hcl-grammar-provenance.md), [Dart grammar provenance](docs/dart-grammar-provenance.md), and [Ruby scope and limitations](docs/ruby-scope.md).
+All call resolution uses partial static models, not language runtimes. Lua extracts declarations, literal `require` imports, and call references, and resolves only a bare call whose innermost lexical binding is a never-reassigned `local function` of the same file; globals, fields, methods, modules, and any file with a parse error or whose own code can reach the `debug` library (a free `debug`, `_G`/`_ENV` or loader reference, or a computed module name or global-table key) stay unresolved, and every Lua call stays unresolved while any indexed Lua file can reach it (CGO builds only). Scala (V1) extracts packages, imports with renames and wildcards, classes, objects, traits, enums, defs, vals, type aliases, givens and extension methods, plus call references; CGO builds also record local defs and resolve only a bare call that Scala's scoping provably binds to a local def of the same file (no other spelling of the name, no import, and no type, template or given in between); every other call stays unresolved, because implicit/given scope, extension methods, inheritance and overloads decide what a Scala call runs. Terraform/OpenTofu (`.tf`, `.tfvars`) records providers, resources, data sources, variables, locals, outputs and module calls under their Terraform addresses (`aws_instance.web`, `data.aws_ami.base`, `var.region`, `local.tags`, `module.vpc`) and `var.`/`local.`/`module.`/`data.`/resource traversals as `references` edges, never calls; a reference binds only to the single declaration of its address in the same directory (module), and duplicates, missing declarations, splats, non-literal indexes, cross-module addresses and any directory holding an unparsable `.tf` file stay unresolved. Module `source` strings are recorded as written and never fetched. Terraform names are short, so query by address (`var.region`, not `region`). Other `.hcl` files (Packer, Nomad, Terragrunt) get only top-level blocks and attributes. CodeGraph does not evaluate Terraform plans or expressions. Dart (V1) extracts directives, classes, mixins, extensions, extension types, enums, typedefs, functions, members, constructors and call references; CGO builds resolve only a bare call that lexical scoping binds to a local function or, in a library without `part` files, a top-level function of the same file, and every qualified, cascade, constructor, extension, imported or shadowable call stays unresolved, because extension methods, cascades, mixins and package resolution decide what a Dart call runs. Node.js repositories are supported, but full tree-sitter node support is still in progress. Python models only selected source-visible mutation forms; Ruby does not infer runtime load order or Rails/Zeitwerk mappings. C# may leave `using static` calls unresolved when inheritance or enclosing members could change the target. See [language scope models](docs/scope-models.md), [Lua grammar provenance](docs/lua-grammar-provenance.md), [Scala grammar provenance](docs/scala-grammar-provenance.md), [HCL grammar provenance](docs/hcl-grammar-provenance.md), [Dart grammar provenance](docs/dart-grammar-provenance.md), and [Ruby scope and limitations](docs/ruby-scope.md).
 
 ## Agent Skill
 
@@ -189,7 +189,7 @@ This installs the Agent Skill from the repository, not the CodeGraph binary. The
 | `list_scans` | List recent scans |
 | `latest_scan_errors` | List indexer errors from the last scan |
 | `audit` | Audit the indexed graph for integrity, resolver-correctness, and trust issues (read-only). Optional `examples` integer caps examples per finding; `0` means counts only |
-| `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; see [docs/constraints.md](docs/constraints.md) |
+| `check_constraints` | Check architectural dependency rules between path groups declared in the repo-root `.codegraph-constraints.json` (read-only). `limit`/`offset` page the findings; `strict_freshness` adds a coverage verdict; see [docs/constraints.md](docs/constraints.md) |
 
 ### Session Memory
 
@@ -524,6 +524,10 @@ codegraph version
 
 These commands print the installed local version without contacting GitHub.
 
+`codegraph licenses` prints CodeGraph's license and the third-party notices
+(`THIRD_PARTY_NOTICES`) embedded in the binary, offline and without the
+release archive's files.
+
 
 ## Result Limits
 
@@ -671,6 +675,7 @@ codegraph doctor                          # Check installation health
 codegraph config show                     # Show current config
 codegraph --version                       # Print current version
 codegraph version                          # Print current version
+codegraph licenses                        # Print embedded license and third-party notices
 
 # Indexing
 codegraph index <path>                    # Full index
@@ -691,6 +696,7 @@ codegraph audit <path> --fail-on error    # Exit non-zero when the graph has err
 # Architectural constraints (see docs/constraints.md)
 codegraph index . && codegraph check_constraints .   # Exit 0 ok, 1 violations, 2 cannot evaluate
 codegraph check-constraints . --config rules.json    # Alias; evaluate another constraints document
+codegraph check_constraints . --strict-freshness     # Also exit 3 stale, 4 unknown, 5 no full scan at HEAD
 
 # Git history (see docs/git-history.md)
 codegraph file_history <path>             # Files with the most recent-window commits first

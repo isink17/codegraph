@@ -222,6 +222,9 @@ type FileMetadataUpdate struct {
 }
 
 type ScanSummary struct {
+	// HeadAtFinish is HEAD read just before a scan is recorded completed; ""
+	// when it could not be read. Persisted in scans.head_at_finish only.
+	HeadAtFinish   string   `json:"-"`
 	RepoID         int64    `json:"repo_id"`
 	ScanID         int64    `json:"scan_id"`
 	Rebuild        bool     `json:"rebuild,omitempty"`
@@ -1821,12 +1824,33 @@ func (s *Store) attachScanLanguageCoverage(ctx context.Context, scans []ScanReco
 	return nil
 }
 
+// Scan scopes recorded in scans.scope. "" means not recorded.
+const (
+	// ScanScopeFull walked the whole repository under its own configuration
+	// and reconciled deletions.
+	ScanScopeFull = "full"
+	// ScanScopePaths read only the listed paths.
+	ScanScopePaths = "paths"
+	// ScanScopeFiltered walked the repository under include, exclude or
+	// language overrides that differ from the repository's configuration.
+	ScanScopeFiltered = "filtered"
+)
+
 func (s *Store) BeginScan(ctx context.Context, repoID int64, kind string) (int64, time.Time, error) {
+	return s.BeginScanWithScope(ctx, repoID, kind, "", "")
+}
+
+// BeginScanWithScope opens a running scan row recording its scope and the HEAD
+// read before it started ("" when unreadable). overlapping_scans starts as the
+// number of this repository's scans already running; completing the scan adds
+// the ones still running or started since. Both counts are taken inside the
+// row's own write, which SQLite serializes against every other scan write.
+func (s *Store) BeginScanWithScope(ctx context.Context, repoID int64, kind, scope, head string) (int64, time.Time, error) {
 	started := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO scans(repo_id, scan_kind, started_at, status)
-		VALUES(?, ?, ?, 'running')
-	`, repoID, kind, started.Format(time.RFC3339))
+		INSERT INTO scans(repo_id, scan_kind, started_at, status, scope, head_at_start, overlapping_scans)
+		VALUES(?, ?, ?, 'running', ?, ?, (SELECT COUNT(1) FROM scans WHERE repo_id = ? AND status = 'running'))
+	`, repoID, kind, started.Format(time.RFC3339), scope, head, repoID)
 	if err != nil {
 		return 0, time.Time{}, err
 	}
@@ -1850,9 +1874,13 @@ func completeScanTx(ctx context.Context, tx *sql.Tx, scanID int64, summary ScanS
 	finished := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE scans
-		SET finished_at = ?, status = ?, files_seen = ?, files_changed = ?, files_deleted = ?, error_text = ?
+		SET finished_at = ?, status = ?, files_seen = ?, files_changed = ?, files_deleted = ?, error_text = ?,
+			head_at_finish = ?,
+			overlapping_scans = overlapping_scans + (
+				SELECT COUNT(1) FROM scans o
+				WHERE o.repo_id = scans.repo_id AND o.id <> scans.id AND (o.status = 'running' OR o.id > scans.id))
 		WHERE id = ?
-	`, finished.Format(time.RFC3339), status, summary.FilesSeen, summary.FilesChanged, summary.FilesDeleted, errText, scanID); err != nil {
+	`, finished.Format(time.RFC3339), status, summary.FilesSeen, summary.FilesChanged, summary.FilesDeleted, errText, summary.HeadAtFinish, scanID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM scan_language_coverage WHERE scan_id = ?`, scanID); err != nil {
@@ -2796,7 +2824,13 @@ func insertParsedFileGraph(
 			}
 		}
 	}
-	if parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" || parsed.Scope.TerraformComplete {
+	scopeRow := parsed.Language == "java" || parsed.Language == "kotlin" || parsed.Scope.Package != "" || parsed.Scope.ModulePath != "" || parsed.Scope.TerraformComplete
+	if parsed.Language == "lua" {
+		// A Lua row means exactly one thing, the debug-free proof
+		// luaDebugReachableSQL reads; no other scope fact may create it.
+		scopeRow = parsed.Scope.LuaDebugFree
+	}
+	if scopeRow {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO file_scope_evidence(repo_id, file_id, language, package_name, module_path, jvm_facade_class, jvm_facade_explicit, jvm_multifile) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, repoID, fileID, parsed.Language, parsed.Scope.Package, parsed.Scope.ModulePath, parsed.Scope.JVMFacade.Class, boolInt(parsed.Scope.JVMFacade.Explicit), boolInt(parsed.Scope.JVMFacade.Multifile)); err != nil {
 			return nil, err
 		}
@@ -4396,7 +4430,22 @@ func (s *Store) resolveEdgesRepoWide(ctx context.Context, repoID int64, language
 	// Lua calls: bound to the local function the parser proved or left
 	// unresolved; luaScopeVetoSQL keeps every strategy below off them. See
 	// lua_scope.go.
-	if n, err := resolveLuaScope(ctx, tx, repoID, scope.only("lua")); err != nil {
+	if scope.has("lua") {
+		if n, err := resolveLuaScope(ctx, tx, repoID); err != nil {
+			return 0, err
+		} else {
+			totalResolved += n
+		}
+	}
+	// Scala calls: the same, for local defs; see scala_scope.go.
+	if n, err := resolveScalaScope(ctx, tx, repoID, scope.only("scala")); err != nil {
+		return 0, err
+	} else {
+		totalResolved += n
+	}
+	// Dart calls: the same, for local and top-level functions; see
+	// dart_scope.go.
+	if n, err := resolveDartScope(ctx, tx, repoID, scope.only("dart")); err != nil {
 		return 0, err
 	} else {
 		totalResolved += n
@@ -5107,6 +5156,11 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 	// either language can invalidate unresolved or previously unbound callers
 	// in the other, so incremental resolution covers this pair while remaining
 	// scoped away from every unrelated language.
+	// A Lua file's debug evidence decides every Lua call of the repository,
+	// so any .lua path puts Lua in scope, even one without a file row left.
+	if len(languageScope) > 0 && slices.ContainsFunc(paths, isLuaPath) {
+		languageScope["lua"] = struct{}{}
+	}
 	if _, java := languageScope["java"]; java {
 		languageScope["kotlin"] = struct{}{}
 	}
@@ -5381,7 +5435,19 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
-	luaResolved, err := resolveLuaScope(ctx, tx, repoID, scope.only("lua"))
+	// Lua decides every call repo-wide: a changed or deleted file can make
+	// the debug library reachable, or unreachable, for all of them.
+	luaResolved := 0
+	if scope.has("lua") {
+		if luaResolved, err = resolveLuaScope(ctx, tx, repoID); err != nil {
+			return 0, err
+		}
+	}
+	scalaResolved, err := resolveScalaScope(ctx, tx, repoID, scope.only("scala"))
+	if err != nil {
+		return 0, err
+	}
+	dartResolved, err := resolveDartScope(ctx, tx, repoID, scope.only("dart"))
 	if err != nil {
 		return 0, err
 	}
@@ -5399,7 +5465,7 @@ func (s *Store) resolveDotSuffixIncrementally(ctx context.Context, repoID int64,
 	if err != nil {
 		return 0, err
 	}
-	n += csharpResolved + phpResolved + rubyResolved + luaResolved
+	n += csharpResolved + phpResolved + rubyResolved + luaResolved + scalaResolved + dartResolved
 	for _, table := range []string{
 		resolverAmbiguousNamesTable, resolverTestFilesTable,
 		resolverImportScopeTable, resolverCppNamespaceScopesTable,
@@ -6701,7 +6767,7 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, nil
 	}
 	// Lua owns every call outright, like Ruby above. This is the Go-side twin
-	// of luaScopeVetoSQL.
+	// of luaScopeVetoSQL. Its pass re-decides the whole repository, like HCL's.
 	luaIDs := make(map[int64]struct{})
 	for _, target := range targets {
 		if binderOwnsLua(target) {
@@ -6709,7 +6775,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		}
 	}
 	if len(luaIDs) > 0 {
-		n, err := s.resolveLuaScopeStandalone(ctx, repoID, luaIDs)
+		if _, err := s.resolveLuaScopeStandalone(ctx, repoID); err != nil {
+			return outcome, err
+		}
+		n, err := s.boundEdgeCount(ctx, repoID, sortedIDs(luaIDs))
 		if err != nil {
 			return outcome, err
 		}
@@ -6718,6 +6787,57 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		remaining = targets[:0]
 		for _, target := range targets {
 			if _, owned := luaIDs[target.edgeID]; owned {
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		targets = remaining
+	}
+	if len(targets) == 0 {
+		return outcome, nil
+	}
+	// Scala owns every call outright too. This is the Go-side twin of
+	// scalaScopeVetoSQL. Its proof is per file, so its pass decides only these
+	// edges.
+	scalaIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if binderOwnsScala(target) {
+			scalaIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(scalaIDs) > 0 {
+		n, err := s.resolveScalaScopeStandalone(ctx, repoID, scalaIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		outcome.unresolved += len(scalaIDs) - n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, owned := scalaIDs[target.edgeID]; owned {
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		targets = remaining
+	}
+	// Dart likewise; the Go-side twin of dartScopeVetoSQL.
+	dartIDs := make(map[int64]struct{})
+	for _, target := range targets {
+		if binderOwnsDart(target) {
+			dartIDs[target.edgeID] = struct{}{}
+		}
+	}
+	if len(dartIDs) > 0 {
+		n, err := s.resolveDartScopeStandalone(ctx, repoID, dartIDs)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.resolved += n
+		outcome.unresolved += len(dartIDs) - n
+		remaining = targets[:0]
+		for _, target := range targets {
+			if _, owned := dartIDs[target.edgeID]; owned {
 				continue
 			}
 			remaining = append(remaining, target)
@@ -9999,6 +10119,9 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		-- s.start_line) ordering come out of the indexes rather than a sort.
 		WHERE s.repo_id = ? AND f.repo_id = ?
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
+		  -- A Lua, Scala or Dart local function is not dead merely because no call
+		  -- to it was proven (localFunctionSQL).
+		  AND NOT `+localFunctionSQL("s.")+`
 		  -- Classification, not just the page, runs on the active graph: a use
 		  -- recorded in a soft-deleted file is not a use the reader can see, so
 		  -- counting it would keep an orphaned symbol out of the answer.

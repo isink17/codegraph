@@ -29,7 +29,7 @@ func (a *HCLAdapter) Supports(path string) bool {
 }
 
 func (a *HCLAdapter) Profile() parser.Profile {
-	return parser.NewProfile("hcl", "heuristic:hcl:v1", false)
+	return parser.NewProfile("hcl", "heuristic:hcl:v2", false)
 }
 
 var hclBlockHeadRE = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_-]*)((?:[ \t]+"[A-Za-z0-9_-]*")*)[ \t]*\{`)

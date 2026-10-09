@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/constraints"
@@ -110,6 +111,22 @@ func TestCheckConstraintsToolDoesNotWrite(t *testing.T) {
 	if data := call()["data"].(map[string]any); data["status"] != constraints.StatusStale {
 		t.Fatalf("status after a queued change = %v, want stale", data["status"])
 	}
+	if _, ok := payload["data"].(map[string]any)["freshness"]; ok {
+		t.Fatal("default call returned a freshness block")
+	}
+	strictDV, strictChanges := probe()
+	res, err := server.handleCheckConstraints(ctx, json.RawMessage(`{"strict_freshness":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv, changes := probe(); dv != strictDV || changes != strictChanges {
+		t.Fatal("strict check_constraints wrote")
+	}
+	strict := res["data"].(constraints.Result)
+	if strict.Status != constraints.StatusStale || strict.Freshness == nil ||
+		strict.Freshness.Verdict != constraints.VerdictKnownStale || strict.Freshness.ExitCode != constraints.ExitKnownStale {
+		t.Fatalf("strict data = %+v", strict.Freshness)
+	}
 }
 
 // TestCheckConstraintsToolArguments: limit and offset are validated, never
@@ -122,5 +139,51 @@ func TestCheckConstraintsToolArguments(t *testing.T) {
 	}
 	if err := validateToolArguments("check_constraints", json.RawMessage(`{"limit":5,"offset":2}`)); err != nil {
 		t.Errorf("valid arguments rejected: %v", err)
+	}
+	if err := validateToolArguments("check_constraints", json.RawMessage(`{"strict_freshness":true}`)); err != nil {
+		t.Errorf("strict_freshness rejected: %v", err)
+	}
+	if err := validateToolArguments("check_constraints", json.RawMessage(`{"strict_freshness":"yes"}`)); err == nil {
+		t.Error("a non-boolean strict_freshness was accepted")
+	}
+}
+
+// strict_freshness over MCP: a completed full scan followed by a scan row left
+// running is unknown (4), not known stale.
+func TestCheckConstraintsToolStrictRunningScan(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeRepoFile(t, repoRoot, "go.mod", "module example.com/m\n\ngo 1.22\n")
+	writeRepoFile(t, repoRoot, "internal/domain/a.go", "package domain\n\nfunc A() {}\n")
+	writeRepoFile(t, repoRoot, "internal/infra/b.go", "package infra\n\nfunc B() {}\n")
+	writeRepoFile(t, repoRoot, constraints.ConfigFileName, `{"schema_version":1,
+		"groups":{"domain":{"include":["internal/domain/**"]},"infra":{"include":["internal/infra/**"]}},
+		"rules":[{"id":"r","kind":"forbidden_dependency","from":["domain"],"to":["infra"]}]}`)
+	st, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	idx := indexer.New(st, parser.NewRegistry(goparser.New()), nil)
+	repo, err := st.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.BeginScanWithScope(ctx, repo.ID, "update", store.ScanScopePaths, ""); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(repoRoot, repo.ID, st, idx, query.New(st, nil), io.Discard)
+	res, err := server.handleCheckConstraints(ctx, json.RawMessage(`{"strict_freshness":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := res["data"].(constraints.Result)
+	got := data.Freshness
+	if data.Status != constraints.StatusOK || got == nil || got.Verdict != constraints.VerdictUnknown || got.ExitCode != constraints.ExitFreshnessUnknown ||
+		!slices.Contains(got.Reasons, "scan_running_or_abandoned") {
+		t.Fatalf("strict freshness = %+v", got)
 	}
 }

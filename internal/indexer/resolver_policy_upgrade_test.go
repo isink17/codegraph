@@ -390,7 +390,7 @@ func csharpGlobalAliasTree() tree {
 
 func csharpEpochTwoPolicies() map[string]int {
 	return map[string]int{
-		"cpp": 1, "csharp": 2, "go": 1, "hcl": 1, "java": 1, "kotlin": 1, "lua": 1,
+		"cpp": 1, "csharp": 2, "dart": 1, "go": 1, "hcl": 1, "java": 1, "kotlin": 1, "lua": 1, "scala": 1,
 		"php": 1, "python": 1, "ruby": 1, "rust": 1, "swift": 1, "typescript": 1,
 	}
 }

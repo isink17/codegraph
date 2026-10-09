@@ -14,31 +14,34 @@ func tsProfile(language string) parser.Profile {
 
 func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
-// HCL's relationship graph is its Terraform `references` edges; it emits no
-// `calls`. It still declares a graph, so a repository with Terraform files is
-// not reported as symbols-only and a non-cgo reindex, which records no
-// references, is refused as the downgrade it is.
+// HCL v2 reads references inside operators. Its relationship graph is its
+// Terraform `references` edges; it emits no `calls`. It still declares a
+// graph, so a repository with Terraform files is not reported as symbols-only
+// and a non-cgo reindex, which records no references, is refused as the
+// downgrade it is.
 func (a *HCLAdapter) Profile() parser.Profile {
-	return parser.NewProfile("hcl", "treesitter:hcl:v1", true)
+	return parser.NewProfile("hcl", "treesitter:hcl:v3", true)
 }
 
 // Lua v2 parses with the vendored tree-sitter-grammars v0.3.0 grammar: goto,
 // labels and <const>/<close> locals parse, so such files can bind calls, and
 // bracket callees (`t[k]()`) no longer get a concatenated name.
 func (a *LuaAdapter) Profile() parser.Profile {
-	return parser.NewProfile("lua", "treesitter:lua:v3", true)
+	return parser.NewProfile("lua", "treesitter:lua:v4", true)
 }
 
-// Scala v3 records declarations, imports and call references but no call
-// edges; see ScalaAdapter.
+// Scala v4 records declarations, imports and call references, and call edges
+// only for bare calls proven to reach a local def of the same file; see
+// ScalaAdapter.
 func (a *ScalaAdapter) Profile() parser.Profile {
-	return parser.NewProfile("scala", "treesitter:scala:v3", false)
+	return parser.NewProfile("scala", "treesitter:scala:v4", true)
 }
 
-// Dart v1 records declarations, directives and call references but no call
-// edges; see DartAdapter.
+// Dart v2 parses with the regenerated grammar. v3 adds local function
+// symbols and call edges for the bare calls lexical scoping proves; see
+// dartLexicalCalls.
 func (a *DartAdapter) Profile() parser.Profile {
-	return parser.NewProfile("dart", "treesitter:dart:v1", false)
+	return parser.NewProfile("dart", "treesitter:dart:v3", true)
 }
 
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding

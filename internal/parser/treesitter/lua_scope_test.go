@@ -256,3 +256,35 @@ function M.n() self() end
 		})
 	}
 }
+
+// LuaDebugFree is the file's half of the repository-wide debug proof: it holds
+// exactly when the file's own code cannot reach the debug library, and a file
+// with a parse error earns it only by never spelling a hazard name.
+func TestLuaDebugFreeEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, source string
+		want         bool
+	}{
+		{"plain module", "local function f() end\nlocal function g() f() end\nreturn {g = g}\n", true},
+		{"literal require and debug.traceback", "local j = require(\"json\")\nlocal t = debug.traceback\n", true},
+		{"debug as data", "log.debug(\"debug\")\nlocal t = {debug = true}\n", true},
+		{"debug.setupvalue", "debug.setupvalue(f, 1, nil)\n", false},
+		{"debug aliased", "local dbg = debug\n", false},
+		{"debug required", "local d = require(\"debug\")\n", false},
+		{"computed require", "local x = require(name)\n", false},
+		{"parse error without a hazard name", "local x = = 1\n", true},
+		{"parse error spelling debug in a comment", "local x = = 1 -- debug\n", false},
+		{"parse error spelling require", "local x = = require\n", false},
+		{"parse error with a longer identifier", "local x = = debugger + my_G\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed, err := NewLua().Parse(context.Background(), "m.lua", []byte(tc.source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if parsed.Scope.LuaDebugFree != tc.want {
+				t.Fatalf("LuaDebugFree = %v, want %v", parsed.Scope.LuaDebugFree, tc.want)
+			}
+		})
+	}
+}

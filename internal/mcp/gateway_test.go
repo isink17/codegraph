@@ -316,9 +316,12 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 //
 // The Terraform note on find_callers and find_callees adds 89 bytes (+22
 // estimated tokens) to both the full and the gateway surface.
+//
+// check_constraints' strict_freshness boolean adds 38 bytes (+9 estimated
+// tokens) to the full surface; check_constraints is not gateway core.
 const (
-	fullToolsListBytes  = 13410
-	fullToolsListTokens = 3353
+	fullToolsListBytes  = 13448
+	fullToolsListTokens = 3362
 	// The gateway payload is pinned for the same reason, and became load-bearing
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name

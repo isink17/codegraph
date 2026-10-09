@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Coordinator merge gate for pull requests into v2.0.
+# Coordinator merge gate for pull requests into v2.0 or an authorized
+# integration (staging) branch.
 #
-#   merge-gate.sh PR HEAD_SHA REVIEW_FILE [--merge]
+#   merge-gate.sh [--base BASE] PR HEAD_SHA REVIEW_FILE [--merge]
+#
+# BASE defaults to v2.0. Any other base must be listed exactly in
+# allowed_bases below; master and arbitrary branches are refused.
 #
 # Verifies, and with --merge squash-merges, only when all of these hold:
-#   - the PR is open, not a draft, and targets v2.0;
+#   - the PR is open, not a draft, and targets BASE;
 #   - its head is exactly HEAD_SHA (full 40-character SHA);
 #   - REVIEW_FILE is a completed independent review of that exact head:
 #     its first four lines are exactly "PR: #<PR>",
@@ -12,20 +16,34 @@
 #   - every check run on HEAD_SHA has completed as success, skipped or
 #     neutral, the aggregate "ci" check from GitHub Actions succeeded, and
 #     no legacy commit status is failing or pending;
-#   - the head contains the current v2.0 tip (CI ran against today's base)
+#   - the head contains the current BASE tip (CI ran against today's base)
 #     and GitHub reports no conflict.
 # The merge passes --match-head-commit, so GitHub refuses it if the head
 # moved after verification; the result is read back afterwards.
 set -euo pipefail
 
-base=v2.0
+# Integration branches are staging targets for one wave each. Add a branch
+# here only in the change that creates it; the list is reviewed like code.
+allowed_bases=(v2.0 integration/v2.0-wave-20261008 integration/v2.0-wave-20261009)
 
 fail() {
 	echo "merge-gate: BLOCKED: $*" >&2
 	exit 1
 }
 
-[ $# -ge 3 ] || { echo "usage: $0 PR HEAD_SHA REVIEW_FILE [--merge]" >&2; exit 2; }
+base=v2.0
+if [ "${1:-}" = --base ]; then
+	[ $# -ge 2 ] || fail "--base needs a branch name"
+	base=$2
+	shift 2
+fi
+base_ok=false
+for b in "${allowed_bases[@]}"; do
+	if [ "$base" = "$b" ]; then base_ok=true; fi
+done
+[ "$base_ok" = true ] || fail "base '$base' is not an authorized merge target"
+
+[ $# -ge 3 ] || { echo "usage: $0 [--base BASE] PR HEAD_SHA REVIEW_FILE [--merge]" >&2; exit 2; }
 pr=$1 sha=$2 review=$3 mode=${4:-verify}
 case "$mode" in verify | --merge) ;; *) fail "unknown mode $mode" ;; esac
 [[ "$pr" =~ ^[0-9]+$ ]] || fail "PR must be a number: $pr"

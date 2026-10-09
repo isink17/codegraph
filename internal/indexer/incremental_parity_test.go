@@ -57,13 +57,13 @@ func lifecycleRegistry() *parser.Registry {
 	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala(), tsparser.NewHCL(), tsparser.NewDart())
 }
 
-// Scala builds no call graph: a call whose only candidate is a same-named
+// Scala builds no cross-file call graph: a call whose only candidate is a same-named
 // method elsewhere, or an overload in the same object, stays edgeless on every
 // path, and overloads and a companion keep their symbols across updates.
-// Dart builds no call graph: a bare call whose only candidate is a top-level
-// function elsewhere, a same-class method call and a named constructor call
-// stay edgeless and their references unbound on every path, while the
-// declarations follow edits, renames and deletes.
+// Dart builds no cross-file call graph: a bare call whose only candidate is a
+// top-level function elsewhere, a same-class method call and a named
+// constructor call stay edgeless and their references unbound on every path,
+// while the declarations follow edits, renames and deletes.
 func TestDartCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	const caller = "import 'provider.dart';\nclass Caller {\n  void run() { target(); local(); Provider.make(); }\n  void local() {}\n}\n"
 	r := newLifecycleRepo(t, tree{
@@ -112,6 +112,75 @@ func TestDartCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	symbols("provider deleted", callerSymbols)
 }
 
+// A Dart call proven by lexical scope binds to its own file's declaration on
+// every path, and loses the binding when the declaration is renamed, a part
+// directive makes the library span files, or the file stops parsing.
+func TestDartLexicalCallLifecycleParity(t *testing.T) {
+	const caller = `void helper() {}
+void run() {
+  int sq(int n) => n * n;
+  sq(2);
+  helper();
+  missing();
+}
+`
+	r := newLifecycleRepo(t, tree{
+		"lib/caller.dart": caller,
+		"lib/other.dart":  "void helper() {}\nvoid missing() {}\nvoid sq(int n) {}\n",
+	})
+	assertState := func(step, wantHelper, wantSq string) {
+		t.Helper()
+		if got := r.edgeState(t, "lib/caller.dart", "helper"); got != wantHelper {
+			t.Fatalf("%s: helper edge = %q, want %q", step, got, wantHelper)
+		}
+		if got := r.edgeState(t, "lib/caller.dart", "sq"); got != wantSq {
+			t.Fatalf("%s: sq edge = %q, want %q", step, got, wantSq)
+		}
+		if got := r.edgeState(t, "lib/caller.dart", "missing"); got != "<no edge>" {
+			t.Fatalf("%s: unproven call gained an edge = %s", step, got)
+		}
+		if got := r.refTarget(t, "lib/caller.dart", "missing"); got != "" {
+			t.Fatalf("%s: unproven reference bound to %q", step, got)
+		}
+		r.assertFreshParity(t, step)
+	}
+	helper := ` => lib/caller.dart:helper(function) [dart_lexical_function/high]`
+	sq := ` => lib/caller.dart:sq(function) [dart_lexical_function/high]`
+	assertState("fresh", helper, sq)
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	assertState("no-op", helper, sq)
+
+	r.write(t, "lib/other.dart", "void helper() {}\nvoid helper2() {}\n")
+	r.update(t, "lib/other.dart")
+	assertState("other edited", helper, sq)
+
+	r.write(t, "lib/caller.dart", strings.Replace(caller, "void helper() {}", "void renamed() {}", 1))
+	r.update(t, "lib/caller.dart")
+	assertState("top-level renamed", "<no edge>", sq)
+
+	r.write(t, "lib/caller.dart", strings.Replace(caller, "int sq(", "int square(", 1))
+	r.update(t, "lib/caller.dart")
+	assertState("local renamed", helper, "<no edge>")
+
+	r.write(t, "lib/caller.dart", "part 'more.dart';\n"+caller)
+	r.update(t, "lib/caller.dart")
+	assertState("part added", "<no edge>", " => lib/caller.dart:sq(function) [dart_lexical_function/high]")
+
+	r.write(t, "lib/caller.dart", caller+"class {\n")
+	r.update(t, "lib/caller.dart")
+	assertState("parse error", "<no edge>", "<no edge>")
+
+	r.write(t, "lib/caller.dart", caller)
+	r.remove(t, "lib/other.dart")
+	r.update(t, "lib/caller.dart", "lib/other.dart")
+	assertState("other deleted", helper, sq)
+	r.remove(t, "lib/caller.dart")
+	r.update(t, "lib/caller.dart")
+	r.assertFreshParity(t, "caller deleted")
+}
+
 func TestScalaCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Caller.scala":   "package app\nobject Caller { def run(): Int = Provider.target(1) + local(1)\n  def local(x: Int): Int = x\n  def local(x: String): Int = 0 }\n",
@@ -152,6 +221,211 @@ func TestScalaCallsStayEdgelessAndLifecycleParity(t *testing.T) {
 	r.update(t, "Provider.scala")
 	symbols("provider deleted", callerSymbols)
 	r.assertFreshParity(t, "provider deleted")
+}
+
+// A bare Scala call bound by lexical scope to a local def of the same file is
+// resolved on every path and follows renames, shadowing, damage and deletes;
+// a member call, a call on an object and a same-named member elsewhere never
+// answer it.
+func TestScalaLocalFunctionCallLifecycleParity(t *testing.T) {
+	const caller = `package app
+object Caller {
+  def run(): Int = {
+    def helper(x: Int): Int = x + 1
+    helper(1) + local(1) + Provider.target(1)
+  }
+  def local(x: Int): Int = x
+}
+`
+	r := newLifecycleRepo(t, tree{
+		"Caller.scala":   caller,
+		"Provider.scala": "package app\nobject Provider { def target(x: Int): Int = x }\n",
+	})
+	assertState := func(step, wantHelper string) {
+		t.Helper()
+		if got := r.edgeState(t, "Caller.scala", "helper"); got != wantHelper {
+			t.Fatalf("%s: helper edge = %q, want %q", step, got, wantHelper)
+		}
+		for _, name := range []string{"local", "Provider.target"} {
+			if got := r.edgeState(t, "Caller.scala", name); got != "<no edge>" {
+				t.Fatalf("%s: unproven call %s gained an edge = %s", step, name, got)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	bound := ` => Caller.scala:app.Caller.run.helper(function) [scala_local_function/high]`
+	assertState("fresh", bound)
+	if got := r.refTarget(t, "Caller.scala", "helper"); got != "app.Caller.run.helper" {
+		t.Fatalf("fresh: helper reference bound to %q", got)
+	}
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	assertState("no-op", bound)
+
+	// A same-named member elsewhere neither steals nor drops the binding.
+	r.write(t, "Provider.scala", "package app\nobject Provider { def target(x: Int): Int = x; def helper(x: Int): Int = 0 }\n")
+	r.update(t, "Provider.scala")
+	assertState("member helper added elsewhere", bound)
+
+	edit := func(step, old, replacement, want string) {
+		t.Helper()
+		r.write(t, "Caller.scala", strings.Replace(caller, old, replacement, 1))
+		r.update(t, "Caller.scala")
+		assertState(step, want)
+		r.write(t, "Caller.scala", caller)
+		r.update(t, "Caller.scala")
+		assertState(step+" restored", bound)
+	}
+	edit("local def renamed", "def helper(x: Int)", "def renamed(x: Int)", "<no edge>")
+	edit("local def shifted down", "    def helper", "    val pad = 0\n\n    def helper", bound)
+	edit("shadowed by a val", "    helper(1) +", "    val helper = (x: Int) => x\n    helper(1) +", "<no edge>")
+	edit("wildcard import in scope", "    def helper", "    import Provider._\n    def helper", "<no edge>")
+	edit("parse error", "  def local(x: Int): Int = x\n", "  def local(x: Int): Int = \n  val = 1\n", "<no edge>")
+	edit("local def deleted", "    def helper(x: Int): Int = x + 1\n", "", "<no edge>")
+
+	r.remove(t, "Provider.scala")
+	r.update(t, "Provider.scala")
+	assertState("provider deleted", bound)
+	r.remove(t, "Caller.scala")
+	r.update(t, "Caller.scala")
+	r.assertFreshParity(t, "caller deleted")
+}
+
+// A call in a case guard never binds a def declared in that case's body, in
+// braced, indented and catch forms, on every path.
+func TestScalaCaseGuardLifecycleParity(t *testing.T) {
+	const src = `object G {
+  def f(y: Int): Boolean = y > 0
+  def a(x: Int): Int = x match {
+    case n if f(n) =>
+      def f(y: Int): Boolean = false
+      if (f(n)) 1 else 2
+    case _ => 0
+  }
+  def c(x: Int): Int = try 1 catch {
+    case e: Exception if f(x) =>
+      def f(y: Int): Boolean = false
+      if (f(x)) 1 else 2
+  }
+}
+object H:
+  def f(y: Int): Boolean = y > 0
+  def b(x: Int): Int =
+    x match
+      case n if f(n) =>
+        def f(y: Int): Boolean = false
+        if f(n) then 1 else 2
+      case _ => 0
+`
+	r := newLifecycleRepo(t, tree{"G.scala": src})
+	calls := func(step string, want []string) {
+		t.Helper()
+		var got []string
+		for _, line := range r.projection(t) {
+			if strings.Contains(line, `-calls-> "f"`) {
+				got = append(got, line)
+			}
+		}
+		if !reflect.DeepEqual(got, want) && (len(got) != 0 || len(want) != 0) {
+			t.Fatalf("%s: f calls = %q, want %q", step, got, want)
+		}
+		r.assertFreshParity(t, step)
+	}
+	bodyOnly := []string{
+		`edge G.scala:G.a -calls-> "f" => G.scala:G.a.f(function) [scala_local_function/high]`,
+		`edge G.scala:G.c -calls-> "f" => G.scala:G.c.f(function) [scala_local_function/high]`,
+		`edge G.scala:H.b -calls-> "f" => G.scala:H.b.f(function) [scala_local_function/high]`,
+	}
+	calls("fresh", bodyOnly)
+	// With the body calls gone only guard calls remain, and none binds.
+	r.write(t, "G.scala", strings.NewReplacer("if (f(n)) 1 else 2", "1", "if (f(x)) 1 else 2", "1", "if f(n) then 1 else 2", "1").Replace(src))
+	r.update(t, "G.scala")
+	calls("body calls removed", nil)
+	r.write(t, "G.scala", src)
+	r.update(t, "G.scala")
+	calls("restored", bodyOnly)
+}
+
+// A Lua local function or a Scala local def is not addressable from another
+// file, so it is never a cross-language link end, even when a TypeScript file
+// imports its file and exports a function of the same name.
+func TestLocalFunctionsAreNeverCrossLanguageTargets(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Caller.scala": "object Caller {\n  def run(): Int = {\n    def helper(): Int = 1\n    helper()\n  }\n}\n",
+		"m.lua":        "local function helper() end\nhelper()\n",
+		"scala.ts":     "import { helper } from \"./Caller.scala\";\nexport function helper() {}\n",
+		"lua.ts":       "import { helper } from \"./m.lua\";\nexport function helper() {}\n",
+		// Control: a Rust module named local is an ordinary link target even
+		// though its keys contain ":local:".
+		"src/local.rs": "pub fn shared() {}\n",
+		"rs.ts":        "import { shared } from \"./src/local.rs\";\nexport function shared() {}\n",
+	})
+	intoLocals := func(step string) {
+		t.Helper()
+		var control int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id JOIN files f ON f.id = s.file_id WHERE e.repo_id = ? AND e.edge_kind = ? AND f.path = 'src/local.rs' AND s.name = 'shared'`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&control); err != nil {
+			t.Fatal(err)
+		}
+		if control == 0 {
+			t.Fatalf("%s: the Rust crate::local function is no longer a cross-language target", step)
+		}
+		var n int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND (s.stable_key GLOB 'func:lua:local:*' OR s.stable_key GLOB 'func:scala:local:*')`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("%s: %d cross-language edges into local functions", step, n)
+		}
+		r.assertFreshParity(t, step)
+	}
+	intoLocals("fresh")
+	r.write(t, "scala.ts", "import { helper } from \"./Caller.scala\";\nexport function helper() { return 1; }\n")
+	r.update(t, "scala.ts")
+	intoLocals("updated")
+}
+
+// A Dart local function is keyed func:dart:local:..., so it is never a
+// cross-language link end either, even when a TypeScript file imports its
+// file and exports a function of the same name.
+func TestDartLocalFunctionIsNeverCrossLanguageTarget(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib/m.dart": "void outer() {\n  void helper() {}\n  helper();\n}\n",
+		"dart.ts":    "import { helper } from \"./lib/m.dart\";\nexport function helper() {}\n",
+	})
+	check := func(step string) {
+		t.Helper()
+		var locals, into int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM symbols WHERE repo_id = ? AND stable_key GLOB 'func:dart:local:helper:*'`, r.repoID).Scan(&locals); err != nil {
+			t.Fatal(err)
+		}
+		if locals != 1 {
+			t.Fatalf("%s: %d Dart local helper symbols, want 1", step, locals)
+		}
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND s.stable_key GLOB 'func:*:local:*'`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&into); err != nil {
+			t.Fatal(err)
+		}
+		if into != 0 {
+			t.Fatalf("%s: %d cross-language edges into local functions", step, into)
+		}
+		// The bridge is live: the import still links, just not to the local.
+		var bridged int
+		if err := r.raw(t).QueryRowContext(r.ctx, `SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id = e.dst_symbol_id WHERE e.repo_id = ? AND e.edge_kind = ? AND s.stable_key = 'func:dart:outer'`,
+			r.repoID, store.EdgeKindCrossLanguageRef).Scan(&bridged); err != nil {
+			t.Fatal(err)
+		}
+		if bridged == 0 {
+			t.Fatalf("%s: no cross-language edge reached the Dart file", step)
+		}
+		r.assertFreshParity(t, step)
+	}
+	check("fresh")
+	r.write(t, "dart.ts", "import { helper } from \"./lib/m.dart\";\nexport function helper() { return 1; }\n")
+	r.update(t, "dart.ts")
+	check("updated")
 }
 
 func TestLuaGlobalCallRemainsUnresolvedAndLifecycleParity(t *testing.T) {
@@ -439,14 +713,18 @@ func TestTypeScriptModuleAcceptanceLifecycle(t *testing.T) {
 
 func TestMixedScopedLanguagesDoNotCrossBind(t *testing.T) {
 	files := tree{
-		"rust/lib.rs":      "mod helper; fn run() { crate::helper::run(); }\n",
-		"rust/helper.rs":   "pub fn run() {}\n",
-		"java/a/Foo.java":  "package a; public class Foo { public static void run() {} }\n",
-		"java/b/Call.java": "package b; import a.Foo; class Call { void run() { Foo.run(); } }\n",
-		"kotlin/a.kt":      "package a\nfun helper() {}\n",
-		"kotlin/b.kt":      "package b\nimport a.helper\nfun run() { helper() }\n",
-		"ts/a.ts":          "export function helper() {}\n",
-		"ts/b.ts":          "import { helper } from \"./a\"\nfunction run() { helper() }\n",
+		"rust/lib.rs":        "mod helper; fn run() { crate::helper::run(); }\n",
+		"rust/helper.rs":     "pub fn run() {}\n",
+		"java/a/Foo.java":    "package a; public class Foo { public static void run() {} }\n",
+		"java/b/Call.java":   "package b; import a.Foo; class Call { void run() { Foo.run(); } }\n",
+		"kotlin/a.kt":        "package a\nfun helper() {}\n",
+		"kotlin/b.kt":        "package b\nimport a.helper\nfun run() { helper() }\n",
+		"ts/a.ts":            "export function helper() {}\n",
+		"ts/b.ts":            "import { helper } from \"./a\"\nfunction run() { helper() }\n",
+		"lua/caller.lua":     "local function helper() end\nlocal function run() helper() end\nreturn {run = run}\n",
+		"lua/util.lua":       "local M = {}\nfunction M.helper() end\nreturn M\n",
+		"scala/Caller.scala": "package app\nobject Caller { def run(): Int = { def helper(): Int = 1; helper() } }\n",
+		"dart/caller.dart":   "void helper() {}\nvoid main() { helper(); }\n",
 	}
 	r := newLifecycleRepo(t, files)
 	other := newLifecycleRepo(t, files)
@@ -470,6 +748,35 @@ func TestMixedScopedLanguagesDoNotCrossBind(t *testing.T) {
 		t.Fatalf("second repository changed after first repository update: got %v want %v", got, wantOther)
 	}
 	r.assertFreshParity(t, "mixed scoped languages")
+
+	// The Lua debug hazard withdraws Lua edges repository-wide and nothing
+	// else: the Scala and Dart lexical edges stay bound through it.
+	luaBound := ` => lua/caller.lua:helper(function) [lua_local_function/high]`
+	scalaBound := ` => scala/Caller.scala:app.Caller.run.helper(function) [scala_local_function/high]`
+	dartBound := ` => dart/caller.dart:helper(function) [dart_lexical_function/high]`
+	assertLexical := func(step, wantLua string) {
+		t.Helper()
+		for _, c := range []struct{ path, want string }{
+			{"lua/caller.lua", wantLua},
+			{"scala/Caller.scala", scalaBound},
+			{"dart/caller.dart", dartBound},
+		} {
+			got := r.edgeState(t, c.path, "helper")
+			if got != c.want {
+				t.Fatalf("%s: %s helper edge = %q, want %q", step, c.path, got, c.want)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	assertLexical("lexical edges bound", luaBound)
+
+	r.write(t, "lua/util.lua", "local M = {}\nfunction M.helper() end\ndebug.sethook(function() end, \"c\")\nreturn M\n")
+	r.update(t, "lua/util.lua")
+	assertLexical("lua debug hazard added", ` => :: [/]`)
+
+	r.write(t, "lua/util.lua", files["lua/util.lua"])
+	r.update(t, "lua/util.lua")
+	assertLexical("lua debug hazard removed", luaBound)
 }
 
 func TestTypeScriptNamespaceAndReExportParity(t *testing.T) {

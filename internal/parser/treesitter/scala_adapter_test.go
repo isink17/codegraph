@@ -24,9 +24,6 @@ func parseScala(t *testing.T, path, src string) graph.ParsedFile {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pf.Edges) != 0 {
-		t.Fatalf("Scala produced call edges: %+v", pf.Edges)
-	}
 	return pf
 }
 
@@ -144,10 +141,14 @@ class Top
 		"class type:scala:Top",
 		"class type:scala:d.Z",
 		"function func:scala:a.b.Y$.g",
+		"function func:scala:local:a.b.Y.g.local:3:17",
 		"object object:scala:a.b.Y",
 	}
 	if got := scalaKeys(pf); !reflect.DeepEqual(got, want) {
-		t.Fatalf("symbols = %q, want %q (local defs and vals are not members)", got, want)
+		t.Fatalf("symbols = %q, want %q (local vals are not recorded, local defs are keyed by position)", got, want)
+	}
+	if got := scalaEdges(pf); !slices.Equal(got, []string{"local@3:44->3:17"}) {
+		t.Fatalf("edges = %q", got)
 	}
 }
 
@@ -239,6 +240,10 @@ func TestScalaAdapterUncertainCallsStayReferences(t *testing.T) {
 }
 `
 	pf := parseScala(t, "Shadow.scala", src)
+	// Only the call the local def shadows every other helper for is an edge.
+	if got := scalaEdges(pf); !slices.Equal(got, []string{"helper@4:47->4:24"}) {
+		t.Fatalf("edges = %q", got)
+	}
 	want := []string{"List", "Shadow.helper", "foreach", "helper", "helper", "obj.member.call", "sorted", "xs.map"}
 	if got := scalaRefs(pf); !reflect.DeepEqual(got, want) {
 		t.Fatalf("references = %q, want %q", got, want)

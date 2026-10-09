@@ -17,7 +17,9 @@ import (
 // binds only to the single declaration of its exact address in its own
 // file's directory; a duplicate, a missing declaration, a dynamic traversal,
 // or a directory holding a .tf file not parsed completely leaves
-// it unresolved. No repo-wide strategy may answer an HCL edge: a name lookup
+// it unresolved. Blocks in override files (override.tf, *_override.tf) merge
+// into that ordinary declaration and are never a candidate: an address with
+// only override blocks, which Terraform rejects, stays unresolved. No repo-wide strategy may answer an HCL edge: a name lookup
 // would cross module directories.
 //
 // The decision for an edge depends on every file of its directory, so the
@@ -67,7 +69,7 @@ func resolveHCLScope(ctx context.Context, q execQuerier, repoID int64) (int, err
 			_ = rows.Close()
 			return 0, err
 		}
-		if strings.EqualFold(filepath.Ext(filePath), ".tf") {
+		if terraform.IsTerraformPath(filePath) && !terraform.IsTFVarsPath(filePath) {
 			broken[path.Dir(filePath)] = true
 		}
 	}
@@ -88,7 +90,7 @@ func resolveHCLScope(ctx context.Context, q execQuerier, repoID int64) (int, err
 			_ = rows.Close()
 			return 0, err
 		}
-		if !terraform.IsTerraformPath(filePath) {
+		if !terraform.IsTerraformPath(filePath) || terraform.IsOverridePath(filePath) {
 			continue
 		}
 		if hclTerraformDeclarationKinds[kind] {

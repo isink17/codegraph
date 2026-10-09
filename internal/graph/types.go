@@ -64,6 +64,17 @@ type Edge struct {
 // same file. The suffix is that statement's 1-based start line and column.
 const LuaLocalFunctionEvidence = "lua:local_function:"
 
+// ScalaLocalFunctionEvidence prefixes the evidence of a call edge whose bare
+// callee Scala's scoping binds to one local def of the same file. The suffix
+// is that def's 1-based start line and column.
+const ScalaLocalFunctionEvidence = "scala:local_function:"
+
+// DartLexicalFunctionEvidence prefixes the evidence of a call edge whose bare
+// callee Dart's lexical scoping binds to one local or top-level function of
+// the same file. The suffix is that declaration's 1-based start line and
+// column.
+const DartLexicalFunctionEvidence = "dart:lexical_function:"
+
 // HCLTerraformReferenceEvidence marks a Terraform `references` edge whose
 // destination is a static module address (var.X, local.X, module.M, data.T.N,
 // T.N). It binds only to the one declaration of that address in the same
@@ -242,6 +253,12 @@ type ScopeEvidence struct {
 	// without one (a parse error, a failed or oversize parse, the non-cgo
 	// fallback) proves nothing about its directory.
 	TerraformComplete bool
+	// LuaDebugFree reports that the Lua adapter proved this file's code
+	// cannot reach the debug library. It is persisted as the file's
+	// file_scope_evidence row; a Lua file without one may rewrite the locals
+	// and upvalues of any other file, so no Lua lexical binding in the
+	// repository is proven while it is indexed.
+	LuaDebugFree bool
 }
 
 // JVMFileFacade is the JVM class a Kotlin source file compiles its top-level
@@ -502,10 +519,10 @@ const (
 //
 // State is unknown when no scan ever completed and no other reason fires,
 // known_stale when any reason other than never_completed fires, and
-// no_known_staleness otherwise. Scans record neither their HEAD nor their
-// scope, so a later completed path-scoped update or watch flush becomes the
-// latest scan and clears latest_scan_failed even when an earlier failed full
-// update left its work undone.
+// no_known_staleness otherwise. State and Reasons look only at the latest
+// scan, so a later completed path-scoped update or watch flush clears
+// latest_scan_failed even when an earlier failed full update left its work
+// undone; Coverage is where whole-repository evidence lives.
 type Freshness struct {
 	State             string                `json:"state"`
 	Reasons           []string              `json:"reasons"`
@@ -518,6 +535,27 @@ type Freshness struct {
 	Watcher    string            `json:"watcher"`
 	Worktree   FreshnessWorktree `json:"worktree"`
 	Filesystem string            `json:"filesystem"`
+	Coverage   FreshnessCoverage `json:"coverage"`
+}
+
+// FreshnessCoverage is the recorded evidence of whole-repository coverage. It
+// proves which scan last walked the whole repository and at which HEAD; it
+// never proves the working tree still matches, since uncommitted edits and
+// watcher events that were never queued are not checked.
+type FreshnessCoverage struct {
+	// Recorded is false when the database predates scan scope recording (a
+	// read-only handle does not migrate); every other field is then empty.
+	Recorded bool `json:"recorded"`
+	// LastFullScan is the newest completed scan whose recorded scope is full.
+	// Rows written before scope recording never qualify.
+	LastFullScan *FreshnessScan `json:"last_full_scan"`
+	// FailedAfterLastFull counts failed scans of any scope that started after
+	// LastFullScan or closed no earlier than it started (every failed scan
+	// when there is none): each ran while or after the full scan read the
+	// tree and may have left partial writes no full scan has covered since.
+	// Times have one-second resolution, so a failure closing in the second
+	// the full scan started counts too.
+	FailedAfterLastFull int64 `json:"failed_after_last_full"`
 }
 
 type FreshnessScan struct {
@@ -526,10 +564,19 @@ type FreshnessScan struct {
 	Status     string `json:"status"`
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at,omitempty"`
-	// Scope is "full" only for a scan kind that never takes paths; index and
-	// update share one kind with and without paths, so they read "unknown".
+	// Scope is the recorded scope: "full", "paths" or "filtered". A row
+	// written before scope recording reads "full" for watch_config, a kind
+	// that never takes paths, and "unknown" otherwise.
 	Scope     string `json:"scope"`
 	ErrorText string `json:"error_text,omitempty"`
+	// HeadAtStart and HeadAtFinish are HEAD read before the scan began and
+	// before it was recorded completed; absent when not read or not recorded.
+	HeadAtStart  string `json:"head_at_start,omitempty"`
+	HeadAtFinish string `json:"head_at_finish,omitempty"`
+	// Overlap is "none" when no other scan of this repository was running at
+	// any point while this one ran, "yes" when one was (or a crashed scan's
+	// row still reads running), and "unknown" when not recorded.
+	Overlap string `json:"overlap"`
 }
 
 type FreshnessRunningScans struct {

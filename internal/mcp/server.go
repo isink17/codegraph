@@ -1524,8 +1524,9 @@ func (s *Server) handleDiff(ctx context.Context, raw json.RawMessage) (map[strin
 // evaluator issuing SELECT only, which the no-write test pins.
 func (s *Server) handleCheckConstraints(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
 	var req struct {
-		Limit  int `json:"limit"`
-		Offset int `json:"offset"`
+		Limit           int  `json:"limit"`
+		Offset          int  `json:"offset"`
+		StrictFreshness bool `json:"strict_freshness"`
 	}
 	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -1533,9 +1534,10 @@ func (s *Server) handleCheckConstraints(ctx context.Context, raw json.RawMessage
 		}
 	}
 	res, err := constraints.Check(ctx, constraints.Options{
-		RepoRoot: s.repoRoot,
-		Limit:    req.Limit,
-		Offset:   req.Offset,
+		RepoRoot:        s.repoRoot,
+		Limit:           req.Limit,
+		Offset:          req.Offset,
+		StrictFreshness: req.StrictFreshness,
 	}, func(context.Context) (*store.Store, int64, error) {
 		return s.store, s.repoID, nil
 	})

@@ -84,8 +84,29 @@ type EdgeSection struct {
 	ResolutionChanged []Change `json:"resolution_changed"`
 	EvidenceChanged   []Change `json:"evidence_changed"`
 }
+
+// SectionCoverage says how far an empty or short section can be trusted.
+// Only "complete" means an absent change is evidence of no change.
+type SectionCoverage struct {
+	State  string `json:"state"` // complete, partial, or unavailable
+	Reason string `json:"reason,omitempty"`
+}
+type Coverage struct {
+	Files     SectionCoverage `json:"files"`
+	Symbols   SectionCoverage `json:"symbols"`
+	Edges     SectionCoverage `json:"edges"`
+	TestLinks SectionCoverage `json:"test_links"`
+}
+
+const (
+	CoverageComplete    = "complete"
+	CoveragePartial     = "partial"
+	CoverageUnavailable = "unavailable"
+)
+
 type DiffDocument struct {
 	Schema    string         `json:"schema"`
+	Coverage  Coverage       `json:"coverage"`
 	Summary   map[string]int `json:"summary"`
 	Files     ChangeSection  `json:"files"`
 	Symbols   SymbolSection  `json:"symbols"`
@@ -107,13 +128,14 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	changes := make([]Change, 0)
 	compareFiles(&changes, revisionFiles(base), revisionFiles(head))
 	semanticOK := semanticCompatible(base, head)
+	incomplete := incompletePaths(base.GraphData, head.GraphData)
 	if semanticOK {
-		compareDeclarations(&changes, base.GraphData, head.GraphData)
+		compareDeclarations(&changes, base.GraphData, head.GraphData, incomplete)
 	}
 	compatible := relationshipCompatible(base, head)
 	if compatible {
-		compareEdges(&changes, base.GraphData.Edges, head.GraphData.Edges)
-		compareTestLinks(&changes, base.GraphData.TestLinks, head.GraphData.TestLinks)
+		compareEdges(&changes, base.GraphData.Edges, head.GraphData.Edges, incomplete)
+		compareTestLinks(&changes, base.GraphData.TestLinks, head.GraphData.TestLinks, incomplete)
 	}
 	sort.Slice(changes, func(i, j int) bool {
 		if changeOrder(changes[i].Kind) != changeOrder(changes[j].Kind) {
@@ -159,13 +181,46 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	for _, c := range all {
 		summary[summaryKey(c.Kind)]++
 	}
-	doc := DiffDocument{Schema: Schema, Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
+	doc := DiffDocument{Schema: Schema, Coverage: sectionCoverage(base, head, semanticOK, compatible, len(incomplete)), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
 	for _, c := range changes {
 		addToSections(&doc, c)
 	}
 	base.Graph = metadata(base.GraphData, base.IndexPolicy)
 	head.Graph = metadata(head.GraphData, head.IndexPolicy)
 	return Result{Schema: "codegraph.change/v1", From: base, To: head, Comparison: Comparison{Status: status, Limitations: lims}, Diff: doc}, nil
+}
+
+func sectionCoverage(base, head Revision, semanticOK, compatible bool, skippedFiles int) Coverage {
+	c := Coverage{Files: SectionCoverage{State: CoverageComplete}}
+	switch {
+	case !semanticOK:
+		c.Symbols = SectionCoverage{State: CoverageUnavailable, Reason: "indexing or graph semantics differ between revisions"}
+	case skippedFiles > 0:
+		c.Symbols = SectionCoverage{State: CoveragePartial, Reason: fmt.Sprintf("%d files without a current parse were not compared", skippedFiles)}
+	default:
+		c.Symbols = SectionCoverage{State: CoverageComplete}
+	}
+	switch {
+	case !semanticOK:
+		c.Edges = c.Symbols
+		c.TestLinks = c.Symbols
+	case !compatible:
+		c.Edges = SectionCoverage{State: CoverageUnavailable, Reason: "graph state is incomplete"}
+		c.TestLinks = c.Edges
+	default:
+		c.Edges = SectionCoverage{State: CoverageComplete}
+		c.TestLinks = SectionCoverage{State: CoverageComplete, Reason: "test links are heuristic relations, not proof of test coverage"}
+		switch {
+		case skippedFiles > 0:
+			c.Edges = SectionCoverage{State: CoveragePartial, Reason: c.Symbols.Reason}
+			c.TestLinks = SectionCoverage{State: CoveragePartial, Reason: c.Symbols.Reason + "; test links are heuristic relations"}
+		case len(base.GraphData.State.Capability.Limitations()) > 0 || len(head.GraphData.State.Capability.Limitations()) > 0:
+			c.Edges = SectionCoverage{State: CoveragePartial, Reason: "parser call capability is limited; a missing edge is not evidence of a removed call"}
+		case !useEdgeColumns(base.GraphData.Edges, head.GraphData.Edges) && anyEdgeColumn(base.GraphData.Edges, head.GraphData.Edges):
+			c.Edges = SectionCoverage{State: CoveragePartial, Reason: "call column not recorded for some edges; same-line calls are matched by line only"}
+		}
+	}
+	return c
 }
 
 func semanticCompatible(a, b Revision) bool {
@@ -394,8 +449,9 @@ func compareFiles(out *[]Change, a, b []SourceFile) {
 	}
 }
 
-func compareDeclarations(out *[]Change, a, b store.SemanticGraph) {
-	am, bm := group(a.Declarations, declIdentity), group(b.Declarations, declIdentity)
+// incompletePaths lists files whose graph rows do not describe the current
+// bytes on either side; their declarations, edges and test links are not compared.
+func incompletePaths(a, b store.SemanticGraph) map[string]bool {
 	incomplete := map[string]bool{}
 	for _, g := range []store.SemanticGraph{a, b} {
 		for _, f := range g.Files {
@@ -404,6 +460,36 @@ func compareDeclarations(out *[]Change, a, b store.SemanticGraph) {
 			}
 		}
 	}
+	return incomplete
+}
+
+// useEdgeColumns reports whether every edge on both sides has a recorded call
+// column. Columns join the site identity only then: an edge indexed before
+// columns were persisted must still pair with the same call on the other side.
+func useEdgeColumns(a, b []store.SemanticEdge) bool {
+	for _, side := range [][]store.SemanticEdge{a, b} {
+		for _, e := range side {
+			if e.Column <= 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func anyEdgeColumn(a, b []store.SemanticEdge) bool {
+	for _, side := range [][]store.SemanticEdge{a, b} {
+		for _, e := range side {
+			if e.Column > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func compareDeclarations(out *[]Change, a, b store.SemanticGraph, incomplete map[string]bool) {
+	am, bm := group(a.Declarations, declIdentity), group(b.Declarations, declIdentity)
 	for _, k := range union(am, bm) {
 		x, y := am[k], bm[k]
 		if len(x) > 0 && incomplete[x[0].Path] || len(y) > 0 && incomplete[y[0].Path] {
@@ -426,8 +512,16 @@ func compareDeclarations(out *[]Change, a, b store.SemanticGraph) {
 	}
 }
 
-func compareEdges(out *[]Change, a, b []store.SemanticEdge) {
-	am, bm := group(a, edgeSite), group(b, edgeSite)
+func compareEdges(out *[]Change, a, b []store.SemanticEdge, incomplete map[string]bool) {
+	withColumn := useEdgeColumns(a, b)
+	site := func(v store.SemanticEdge) string { return edgeSite(v, withColumn) }
+	keep := func(v store.SemanticEdge) bool { return !incomplete[v.Path] && !incomplete[v.Source.Path] }
+	a, b = filter(a, keep), filter(b, keep)
+	if !withColumn {
+		// A column recorded on one side only is not a source change.
+		a, b = withoutColumns(a), withoutColumns(b)
+	}
+	am, bm := group(a, site), group(b, site)
 	for _, k := range union(am, bm) {
 		x, y := am[k], bm[k]
 		if len(x) > 1 || len(y) > 1 {
@@ -453,8 +547,9 @@ func compareEdges(out *[]Change, a, b []store.SemanticEdge) {
 	}
 }
 
-func compareTestLinks(out *[]Change, a, b []store.SemanticTestLink) {
-	am, bm := group(a, testIdentity), group(b, testIdentity)
+func compareTestLinks(out *[]Change, a, b []store.SemanticTestLink, incomplete map[string]bool) {
+	keep := func(v store.SemanticTestLink) bool { return !incomplete[v.TestFile] && !incomplete[v.TargetFile] }
+	am, bm := group(filter(a, keep), testIdentity), group(filter(b, keep), testIdentity)
 	for _, k := range union(am, bm) {
 		x, y := am[k], bm[k]
 		if len(x) > 1 || len(y) > 1 {
@@ -477,8 +572,27 @@ func compareTestLinks(out *[]Change, a, b []store.SemanticTestLink) {
 func declIdentity(v store.SemanticDeclaration) string {
 	return canonical([]any{v.Path, v.Language, v.Kind, v.QualifiedName, v.Signature, v.StableKey})
 }
-func edgeSite(v store.SemanticEdge) string {
-	return canonical([]any{declIdentity(store.SemanticDeclaration{Path: v.Source.Path, Language: v.Source.Language, Kind: v.Source.Kind, QualifiedName: v.Source.QualifiedName, Signature: v.Source.Signature, StableKey: v.Source.StableKey}), v.Path, v.Line, v.Kind})
+func edgeSite(v store.SemanticEdge, withColumn bool) string {
+	src := declIdentity(store.SemanticDeclaration{Path: v.Source.Path, Language: v.Source.Language, Kind: v.Source.Kind, QualifiedName: v.Source.QualifiedName, Signature: v.Source.Signature, StableKey: v.Source.StableKey})
+	if withColumn {
+		return canonical([]any{src, v.Path, v.Line, v.Column, v.Kind})
+	}
+	return canonical([]any{src, v.Path, v.Line, v.Kind})
+}
+func withoutColumns(in []store.SemanticEdge) []store.SemanticEdge {
+	for i := range in {
+		in[i].Column = 0
+	}
+	return in
+}
+func filter[T any](in []T, keep func(T) bool) []T {
+	out := make([]T, 0, len(in))
+	for _, v := range in {
+		if keep(v) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 func testIdentity(v store.SemanticTestLink) string {
 	return canonical([]any{v.TestFile, v.Test, v.TargetFile, v.Target, v.Reason})

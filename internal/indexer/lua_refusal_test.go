@@ -5,6 +5,7 @@ package indexer
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/store"
@@ -104,10 +105,45 @@ var luaRefusalCases = []struct {
 	{name: "shadowed debug then free debug in another scope", files: tree{"m.lua": luaProven + "local function h()\n  local debug = {}\n  debug.x()\nend\nlocal function k() debug.setlocal(1, 1, nil) end\n"}},
 	{name: "local debug aliasing the library", files: tree{"m.lua": luaProven + "local debug = debug\n"}},
 	{name: "free debug before a later local debug", files: tree{"m.lua": luaProven + "local function h() debug.setlocal(1, 1, nil) end\nlocal debug = {}\n"}},
+
+	// -- other indexed files. The debug library acts on the whole Lua state:
+	// setupvalue and upvaluejoin on a closure m.lua exports, or setlocal from
+	// a hook or a callback, rebind m.lua's locals although m.lua never names
+	// debug. Any indexed file that can reach it withdraws every proof.
 	{name: "debug used on this file from another file", files: tree{
 		"m.lua":     luaProven + "return {g = g}\n",
 		"other.lua": "local m = require(\"m\")\ndebug.setupvalue(m.g, 1, nil)\n",
-	}, want: []string{"2->1"}, knownGap: true},
+	}},
+	{name: "debug.upvaluejoin from another file", files: tree{
+		"m.lua":     luaProven + "return {g = g}\n",
+		"other.lua": "local m = require(\"m\")\nlocal function evil() end\ndebug.upvaluejoin(m.g, 1, function() return evil end, 1)\n",
+	}},
+	{name: "debug.sethook in an unrelated file", files: tree{"m.lua": luaProven, "other.lua": "debug.sethook(function() debug.setlocal(2, 1, nil) end, \"c\")\n"}},
+	{name: "debug required in another file", files: tree{"m.lua": luaProven, "other.lua": "local d = require(\"debug\")\n"}},
+	{name: "debug aliased in another file", files: tree{"m.lua": luaProven, "other.lua": "local dbg = debug\n"}},
+	{name: "computed require in another file", files: tree{"m.lua": luaProven, "other.lua": "local name = ...\nlocal x = require(name)\n"}},
+	{name: "pcall require in another file", files: tree{"m.lua": luaProven, "other.lua": "local ok, x = pcall(require, \"json\")\n"}},
+	{name: "load of a computed chunk in another file", files: tree{"m.lua": luaProven, "other.lua": "local src = ...\nload(src)()\n"}},
+	{name: "dofile of a computed path in another file", files: tree{"m.lua": luaProven, "other.lua": "local p = ...\ndofile(p)\n"}},
+	{name: "_ENV indexed by a computed key in another file", files: tree{"m.lua": luaProven, "other.lua": "local k = ...\nlocal v = _ENV[k]\n"}},
+	{name: "LuaJIT ffi in another file", files: tree{"m.lua": luaProven, "other.lua": "local ffi = require(\"ffi\")\n"}},
+	{name: "parse error in another file spelling debug", files: tree{"m.lua": luaProven, "bad.lua": "local x = = debug\n"}},
+	{name: "hazard in a nested directory", files: tree{"m.lua": luaProven, "lib/deep/other.lua": "local d = debug\n"}},
+	// Neither table mutation nor the environment reaches a local: a call to
+	// the local function f does not read M.f, _G.f or the chunk environment.
+	{name: "exported field replaced from another file", files: tree{
+		"m.lua":     luaProven + "return {f = f, g = g}\n",
+		"other.lua": "local m = require(\"m\")\nm.f = function() end\nm.g = nil\n",
+	}, want: []string{"2->1"}},
+	{name: "global of the same name assigned in another file", files: tree{"m.lua": luaProven, "other.lua": "f = function() end\nfunction g() end\n"}, want: []string{"2->1"}},
+	{name: "setfenv in another file", files: tree{"m.lua": luaProven + "return {g = g}\n", "other.lua": "local m = require(\"m\")\nsetfenv(m.g, {})\n"}, want: []string{"2->1"}},
+	{name: "local _ENV in another file", files: tree{"m.lua": luaProven, "other.lua": "local _ENV = {}\n"}, want: []string{"2->1"}},
+	{name: "local closure escapes and is called from another file", files: tree{"m.lua": luaProven + "return g\n", "other.lua": "local g = require(\"m\")\ng()\n"}, want: []string{"2->1"}},
+	{name: "debug.traceback and getinfo in another file", files: tree{"m.lua": luaProven, "other.lua": "local function h() return debug.getinfo(1), debug.traceback() end\n"}, want: []string{"2->1"}},
+	{name: "debug as a field or string in another file", files: tree{"m.lua": luaProven, "other.lua": "log.debug(\"debug\")\nlocal t = {debug = true}\n"}, want: []string{"2->1"}},
+	// C code is outside the Lua proof: lua_setupvalue or lua_setlocal through
+	// the C API rebinds an upvalue as debug.setupvalue does, undetected.
+	{name: "C API lua_setupvalue in an indexed C++ file", files: tree{"m.lua": luaProven, "host.cpp": "struct lua_State;\nextern \"C\" const char *lua_setupvalue(lua_State *L, int f, int n);\nvoid rebind(lua_State *L) { lua_setupvalue(L, -2, 1); }\n"}, want: []string{"2->1"}, knownGap: true},
 
 	// -- environment and global-table hazards reach globals, never locals
 	{name: "local _ENV", files: tree{"m.lua": luaProven + "local _ENV = {}\n"}, want: []string{"2->1"}},
@@ -207,4 +243,70 @@ func luaBoundCalls(t *testing.T, r *lifecycleRepo, path string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// Another file's debug access withdraws m.lua's proof although m.lua never
+// changes, and restoring that file restores it: every update re-decides the
+// whole repository's Lua calls, so the incremental graph matches a fresh
+// index at every step, deletes and mixed-language updates included.
+func TestLuaCrossFileDebugHazardLifecycleParity(t *testing.T) {
+	const caller = "local function f() end\nlocal function g() f() end\nreturn {g = g}\n"
+	r := newLifecycleRepo(t, tree{
+		"m.lua":     caller,
+		"other.lua": "local m = require(\"m\")\n",
+		"main.go":   "package main\n\nfunc main() {}\n",
+	})
+	bound := ` => m.lua:f(function) [lua_local_function/high]`
+	step := func(name, want string) {
+		t.Helper()
+		if got := r.edgeState(t, "m.lua", "f"); (want == bound) != (got == bound) {
+			t.Fatalf("%s: f edge = %q, want bound=%v", name, got, want == bound)
+		}
+		r.assertFreshParity(t, name)
+	}
+	step("fresh", bound)
+
+	r.write(t, "other.lua", "local m = require(\"m\")\ndebug.setupvalue(m.g, 1, nil)\n")
+	r.update(t, "other.lua")
+	step("other reaches debug", "")
+
+	r.write(t, "other.lua", "local m = require(\"m\")\n")
+	r.update(t, "other.lua")
+	step("other stops reaching debug", bound)
+
+	r.write(t, "hook.lua", "debug.sethook(function() end, \"c\")\n")
+	r.update(t, "hook.lua")
+	step("hazard file added", "")
+
+	// A delete and an unrelated Go edit in one update: the deleted file's
+	// tombstone keeps Lua in the update's language scope.
+	r.remove(t, "hook.lua")
+	r.write(t, "main.go", "package main\n\nfunc main() { helper() }\n\nfunc helper() {}\n")
+	r.update(t, "hook.lua", "main.go")
+	step("hazard file deleted with a Go edit", bound)
+
+	r.write(t, "bad.lua", "local x = = debug\n")
+	r.update(t, "bad.lua")
+	step("parse error spelling debug", "")
+
+	r.write(t, "bad.lua", "local x = = 1\n")
+	r.update(t, "bad.lua")
+	step("parse error without a hazard name", bound)
+
+	// A Lua file the indexer never scans proves nothing about itself.
+	writeRepoConfig(t, r.root, 256, "")
+	r.write(t, "big.lua", "-- "+strings.Repeat("x", 300)+"\n")
+	r.update(t, "big.lua")
+	if got := r.edgeState(t, "m.lua", "f"); got == bound {
+		t.Fatalf("oversize Lua file: f edge = %q, want unbound", got)
+	}
+	r.remove(t, "big.lua")
+	r.update(t, "big.lua")
+	if got := r.edgeState(t, "m.lua", "f"); got != bound {
+		t.Fatalf("oversize Lua file removed: f edge = %q, want %q", got, bound)
+	}
+
+	r.remove(t, "m.lua")
+	r.update(t, "m.lua")
+	r.assertFreshParity(t, "caller deleted")
 }

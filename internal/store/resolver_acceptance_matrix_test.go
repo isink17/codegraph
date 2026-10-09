@@ -334,6 +334,8 @@ var resolverAcceptanceMatrix = map[resolverRuleID]map[string]string{
 	"go_bare_package_scope":    edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestGoPackageScopeSQLMatchesGo"),
 	"ruby_ownership":           edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestRubyScopeVetoSQLMatchesGoTwin"),
 	"lua_ownership":            edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestLuaScopeVetoSQLMatchesGoTwin"),
+	"scala_ownership":          edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestScalaScopeVetoSQLMatchesGoTwin"),
+	"dart_ownership":           edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestDartScopeVetoSQLMatchesGoTwin"),
 	"hcl_ownership":            edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins,TestHCLScopeVetoSQLMatchesGoTwin"),
 	"php_ownership":            edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins"),
 	"swift_ownership":          edgeLocalCells("TestResolverOwnershipRulesMatchGoTwins"),

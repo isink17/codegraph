@@ -1,0 +1,21 @@
+{
+  "description": "Every direct call site from a function declared in src/main.go to a function or method declared in src/main.go, deduplicated to distinct (caller, callee) pairs. Calls into the standard library (fmt.Println, append, len) are outside the universe.",
+  "complete_enumeration": true,
+  "labeling": "hand-labeled by reading src/main.go; all eligible pairs listed",
+  "callers": ["Add", "normalize", "trim", "main", "report", "Len"],
+  "targets": ["Add", "Len", "normalize", "trim", "main", "report"],
+  "pairs": [
+    {"caller": "Add", "callee": "normalize"},
+    {"caller": "normalize", "callee": "trim"},
+    {"caller": "main", "callee": "Add"},
+    {"caller": "main", "callee": "Len"},
+    {"caller": "main", "callee": "report"},
+    {"caller": "report", "callee": "normalize"},
+    {"caller": "report", "callee": "Len"}
+  ],
+  "tasks": [
+    {"id": "callers-of-normalize", "type": "find_callers", "symbol": "normalize", "prompt": "Which functions call normalize?", "expected_facts": ["Add", "report"]},
+    {"id": "callees-of-main", "type": "find_callees", "symbol": "main", "prompt": "Which local functions does main call?", "expected_facts": ["Add", "Len", "report"]},
+    {"id": "callers-of-trim", "type": "find_callers", "symbol": "trim", "prompt": "Which functions call trim?", "expected_facts": ["normalize"]}
+  ]
+}
