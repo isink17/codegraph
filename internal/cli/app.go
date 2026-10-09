@@ -1435,12 +1435,27 @@ func runRecoverScans(ctx context.Context, cfg config.Config, stdout io.Writer, a
 	if err != nil {
 		return err
 	}
-	app, _, _, err := openApp(ctx, cfg, repoRoot)
+	canonical, err := store.CanonicalRepoPath(repoRoot)
 	if err != nil {
 		return err
 	}
-	defer app.Close()
-	ids, err := app.Store.RecoverAbandonedScans(ctx)
+	dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		return err
+	}
+	// Never create a database just to find nothing in it.
+	if st, err := os.Stat(dbPath); err != nil || st.Size() == 0 {
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("repository %s is not indexed", repoRoot)
+		}
+		return err
+	}
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	ids, err := s.RecoverAbandonedScans(ctx)
 	if err != nil {
 		return err
 	}

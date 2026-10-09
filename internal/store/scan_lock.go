@@ -117,7 +117,9 @@ func (s *Store) releaseAllScanLocks() {
 // A recovered row is failed, never completed: it certifies nothing, and strict
 // freshness still requires a later completed full scan. Rows written by a
 // binary that predates the scan lock cannot be told from a live writer of such
-// a binary; stop those before recovering. The lock is advisory and local to
+// a binary; stop those before recovering. A scan whose finishing write failed keeps
+// its lock until its store is closed, so recovery refuses until that process
+// closes the store or exits. The lock is advisory and local to
 // the host: a writer on another machine sharing the database over a network
 // file system is not seen.
 func (s *Store) RecoverAbandonedScans(ctx context.Context) ([]int64, error) {
