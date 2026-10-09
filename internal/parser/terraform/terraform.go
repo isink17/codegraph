@@ -27,13 +27,11 @@ const (
 )
 
 // IsTerraformPath reports whether a file has Terraform semantics. .tf.json and
-// .tofu files are not indexed.
+// .tofu files are not indexed. The .tf suffix is matched case-sensitively, as
+// Terraform's module loader does: a file such as main.TF is never loaded by
+// Terraform, so it must not supply declarations.
 func IsTerraformPath(path string) bool {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".tf", ".tfvars":
-		return true
-	}
-	return false
+	return filepath.Ext(path) == ".tf" || IsTFVarsPath(path)
 }
 
 // IsOverridePath reports whether a .tf file is an override file: override.tf

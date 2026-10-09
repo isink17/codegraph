@@ -17,3 +17,20 @@ func TestIsOverridePath(t *testing.T) {
 		}
 	}
 }
+
+func TestIsTerraformPathMatchesTerraformLoader(t *testing.T) {
+	for path, want := range map[string]bool{
+		"main.tf":           true,
+		"infra/override.tf": true,
+		"terraform.tfvars":  true,
+		"main.TF":           false,
+		"vars.Tf":           false,
+		"override.TF":       false,
+		"main.tf.json":      false,
+		"main.tofu":         false,
+	} {
+		if got := IsTerraformPath(path); got != want {
+			t.Errorf("IsTerraformPath(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
