@@ -593,6 +593,33 @@ func dartCallReference(n *sitter.Node, content []byte) (graph.Reference, bool) {
 		}
 		callee, end = n, n
 		name = strings.Join(parts, ".")
+	case "constructor_invocation":
+		// `Box<int>.named()`: the type, its type arguments, the name.
+		var parts []string
+		for i := range int(n.NamedChildCount()) {
+			switch child := n.NamedChild(i); child.Type() {
+			case "type_identifier", "identifier":
+				parts = append(parts, nodeText(child, content))
+			}
+		}
+		callee, end = n, n
+		name = strings.Join(parts, ".")
+	case "relational_expression":
+		// The grammar reads `f<T>(x)` as `(f < T) > (x)`. Dart relational
+		// operators do not chain, so that shape is only ever a generic call.
+		inner := n.NamedChild(0)
+		if n.NamedChildCount() != 3 || inner == nil || inner.Type() != "relational_expression" ||
+			inner.NamedChildCount() != 3 || nodeText(inner.NamedChild(1), content) != "<" ||
+			nodeText(n.NamedChild(1), content) != ">" ||
+			n.NamedChild(2).Type() != "parenthesized_expression" {
+			return graph.Reference{}, false
+		}
+		if first, arg := inner.NamedChild(0), inner.NamedChild(2); first.Type() != "identifier" ||
+			(arg.Type() != "identifier" && arg.Type() != "type_identifier") {
+			return graph.Reference{}, false
+		}
+		callee, end = inner.NamedChild(0), n
+		name = nodeText(callee, content)
 	default:
 		return graph.Reference{}, false
 	}
