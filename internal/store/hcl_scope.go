@@ -69,7 +69,7 @@ func resolveHCLScope(ctx context.Context, q execQuerier, repoID int64) (int, err
 			_ = rows.Close()
 			return 0, err
 		}
-		if strings.EqualFold(filepath.Ext(filePath), ".tf") {
+		if terraform.IsTerraformPath(filePath) && !terraform.IsTFVarsPath(filePath) {
 			broken[path.Dir(filePath)] = true
 		}
 	}

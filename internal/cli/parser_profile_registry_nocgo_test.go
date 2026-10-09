@@ -21,7 +21,7 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		"java":       {"heuristic:java:v1", false},
 		"lua":        {"heuristic:lua:v1", false},
 		"scala":      {"heuristic:scala:v1", false},
-		"hcl":        {"heuristic:hcl:v1", false},
+		"hcl":        {"heuristic:hcl:v2", false},
 		"dart":       {"heuristic:dart:v1", false},
 		"kotlin":     {"heuristic:kotlin:v4", false},
 		"csharp":     {"heuristic:csharp:v5", false},
