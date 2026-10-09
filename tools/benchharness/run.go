@@ -21,6 +21,7 @@ type Truth struct {
 	CompleteEnumeration bool     `json:"complete_enumeration"`
 	Labeling            string   `json:"labeling"`
 	Callers             []string `json:"callers"`
+	Targets             []string `json:"targets"`
 	Pairs               []struct {
 		Caller string `json:"caller"`
 		Callee string `json:"callee"`
@@ -59,8 +60,12 @@ func Run(cfg RunConfig) (*Record, error) {
 	if err := json.Unmarshal(raw, &truth); err != nil {
 		return nil, fmt.Errorf("ground truth: %w", err)
 	}
-	if len(truth.Pairs) == 0 || truth.Description == "" {
-		return nil, fmt.Errorf("ground truth: empty universe or missing description")
+	if len(truth.Pairs) == 0 || truth.Description == "" || len(truth.Targets) == 0 {
+		return nil, fmt.Errorf("ground truth: empty universe, targets or missing description")
+	}
+	isTarget := map[string]bool{}
+	for _, t := range truth.Targets {
+		isTarget[t] = true
 	}
 	fixtureSHA, err := HashDir(cfg.FixtureDir)
 	if err != nil {
@@ -119,12 +124,21 @@ func Run(cfg RunConfig) (*Record, error) {
 		}
 		obs = append(obs, Observation{Kind: "pair", ID: key, Outcome: outcome})
 	}
-	unexpected := 0
+	// Edges to a labeled target that are not a labeled pair are wrong for
+	// this fixture; edges to anything else are outside the universe and are
+	// excluded from the precision denominator.
+	unexpected, outside := 0, 0
 	for _, c := range callers {
 		for n := range got[c] {
-			if key := c + "->" + n; !inTruth[key] {
+			key := c + "->" + n
+			switch {
+			case inTruth[key]:
+			case isTarget[n]:
 				unexpected++
 				obs = append(obs, Observation{Kind: "unexpected", ID: key, Outcome: "resolved_outside_truth"})
+			default:
+				outside++
+				obs = append(obs, Observation{Kind: "outside_universe", ID: key, Outcome: "resolved_outside_universe"})
 			}
 		}
 	}
@@ -167,6 +181,7 @@ func Run(cfg RunConfig) (*Record, error) {
 		count("resolved_to_truth_target", matched, scope),
 		count("not_resolved", n-matched, scope),
 		count("resolved_outside_truth", unexpected, scope),
+		count("resolved_outside_universe", outside, scope),
 	}
 	if truth.CompleteEnumeration {
 		metrics = append(metrics, ratio("coverage", matched, n,
@@ -174,7 +189,7 @@ func Run(cfg RunConfig) (*Record, error) {
 	}
 	if matched+unexpected > 0 {
 		metrics = append(metrics, ratio("audited_resolved_precision", matched, matched+unexpected,
-			"every resolved callee edge from the truth callers (full audit of this fixture, not a sample)",
+			"every resolved callee edge from the truth callers whose callee name-matches a labeled target (full audit of this fixture, not a sample); edges to unlabeled callees are excluded",
 			"audited resolved subset: "+scope))
 	}
 	for _, mode := range []string{modeBaseline, modeCLI} {
@@ -183,7 +198,7 @@ func Run(cfg RunConfig) (*Record, error) {
 			Metric{Name: "context_bytes_total/" + mode, Value: fp(float64(t[0])), Unit: "bytes", Scope: scope},
 			Metric{Name: "estimated_tokens_total/" + mode, Value: fp(float64(sumTokens(obs, mode))), Unit: "estimated_tokens", Scope: scope},
 			ratio("evidence_completeness/"+mode, t[1], t[2],
-				"expected facts over all tasks; a fact counts when its identifier appears as a whole word in the context", scope))
+				"expected facts over all tasks; a fact counts when it appears in the context delimited by non-identifier characters", scope))
 	}
 
 	env := map[string]string{"num_cpu": strconv.Itoa(runtime.NumCPU())}
@@ -281,7 +296,10 @@ func readAllSources(repo string) ([]byte, error) {
 func factsPresent(ctx []byte, facts []string) int {
 	n := 0
 	for _, f := range facts {
-		if regexp.MustCompile(`\b` + regexp.QuoteMeta(f) + `\b`).Match(ctx) {
+		// Explicit identifier boundaries; \b would misbehave for facts that
+		// start or end with a non-word character.
+		re := regexp.MustCompile(`(^|[^A-Za-z0-9_])` + regexp.QuoteMeta(f) + `($|[^A-Za-z0-9_])`)
+		if re.Match(ctx) {
 			n++
 		}
 	}

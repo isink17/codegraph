@@ -3,6 +3,7 @@
   "complete_enumeration": true,
   "labeling": "hand-labeled by reading src/main.go; all eligible pairs listed",
   "callers": ["Add", "normalize", "trim", "main", "report", "Len"],
+  "targets": ["Add", "Len", "normalize", "trim", "main", "report"],
   "pairs": [
     {"caller": "Add", "callee": "normalize"},
     {"caller": "normalize", "callee": "trim"},

@@ -97,6 +97,8 @@ type Observation struct {
 
 var shaRE = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 
+var allowedUnits = map[string]bool{"count": true, "bytes": true, "estimated_tokens": true, "ratio": true}
+
 // forbiddenMetricNames are claims this harness cannot support from its data.
 var forbiddenMetricNames = []string{"accuracy", "f1", "perfect"}
 
@@ -151,8 +153,14 @@ func Validate(r *Record) error {
 				bad("metric %q: unsupported claim %q", mt.Name, f)
 			}
 		}
-		if lower == "recall" && !m.CompleteEnumeration {
-			bad("metric recall requires complete_enumeration ground truth")
+		if strings.Contains(lower, "recall") && !m.CompleteEnumeration {
+			bad("metric %q: recall requires complete_enumeration ground truth", mt.Name)
+		}
+		if (strings.HasPrefix(lower, "coverage") || strings.HasPrefix(lower, "unresolved_share")) && !m.CompleteEnumeration && mt.Value != nil {
+			bad("metric %q: must be null without complete_enumeration ground truth", mt.Name)
+		}
+		if !allowedUnits[mt.Unit] {
+			bad("metric %q: unit %q not allowed", mt.Name, mt.Unit)
 		}
 		if mt.Scope == "" {
 			bad("metric %q: scope missing", mt.Name)
@@ -181,7 +189,7 @@ func CheckCurrent(r *Record, wantCodeGraphSHA, fixtureDir string) error {
 		if err != nil {
 			return err
 		}
-		if len(r.Fixtures) == 0 || r.Fixtures[0].SHA != got {
+		if len(r.Fixtures) != 1 || r.Fixtures[0].SHA != got {
 			return fmt.Errorf("stale record: fixture sha does not match %s (%s)", fixtureDir, got)
 		}
 	}

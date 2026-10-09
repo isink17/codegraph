@@ -25,16 +25,21 @@ binary.
   sorted paths and contents of the fixture directory.
 - Correctness: `codegraph find_callees` per truth caller; pairs are counted as
   resolved to the truth target or not resolved; resolved edges outside the
-  truth universe are counted separately. `coverage` is emitted only when the
+  truth universe are counted separately: edges to a labeled `targets` name that
+  are not a labeled pair are `resolved_outside_truth` (in the name-matched
+  precision denominator); edges to unlabeled callees are
+  `resolved_outside_universe` and excluded. `coverage` is emitted only when the
   truth enumerates the whole universe. No accuracy, recall or F1 is emitted.
 - Context: for each task, the exact bytes of (a) a fixed read-all-sources
   baseline and (b) the codegraph CLI query output. Estimated tokens are
   `ceil(bytes/4)` (`internal/tokenest`), not provider tokens. Evidence
-  completeness is whole-word presence of expected identifiers. Answer quality
+  completeness is presence of each expected fact delimited by
+  non-identifier characters (facts should be plain identifiers). Answer quality
   is not measured (no model is run) and is serialized as `null`.
 - Fewer bytes is never reported as better on its own.
 
 `validate` rejects records missing source SHA, fixture identity, methodology,
 ground truth, limitations, observations, or ratio numerators/denominators, and
-any accuracy/F1 claim or recall without complete ground truth. `--expect-sha`
+units outside count/bytes/estimated_tokens/ratio, any accuracy/F1 claim, and
+recall/coverage/unresolved_share values without complete ground truth. `--expect-sha`
 and `--fixture` reject stale records.

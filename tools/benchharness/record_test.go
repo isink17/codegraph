@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +57,17 @@ func TestValidateRejects(t *testing.T) {
 			r.Methodology.CompleteEnumeration = false
 			r.Metrics[1].Name = "recall"
 		},
+		"recall variant without full truth": func(r *Record) {
+			r.Methodology.CompleteEnumeration = false
+			r.Metrics[1].Name = "pair_recall"
+		},
+		"coverage without full truth": func(r *Record) { r.Methodology.CompleteEnumeration = false },
+		"unresolved_share without full truth": func(r *Record) {
+			r.Methodology.CompleteEnumeration = false
+			r.Metrics[0].Name = "unresolved_share"
+		},
+		"percent unit": func(r *Record) { r.Metrics[1].Unit = "percent" },
+		"empty unit":   func(r *Record) { r.Metrics[1].Unit = "" },
 		"wrong schema": func(r *Record) { r.Schema = "codegraph.benchmark/v0" },
 	}
 	for name, mut := range cases {
@@ -104,6 +116,10 @@ func TestCheckCurrentStale(t *testing.T) {
 	r.Fixtures[0].SHA = strings.Repeat("c", 64)
 	if CheckCurrent(r, "", dir) == nil {
 		t.Fatal("stale fixture sha accepted")
+	}
+	r.Fixtures = []Fixture{{Name: "x", SHA: sha}, {Name: "y", SHA: sha}}
+	if CheckCurrent(r, "", dir) == nil {
+		t.Fatal("multi-fixture record checked against one directory")
 	}
 }
 
@@ -193,9 +209,39 @@ func TestRunFixtureReproducible(t *testing.T) {
 		if err := Validate(rec); err != nil {
 			t.Fatal(err)
 		}
+		want := map[string]string{
+			"candidate_opportunities": "7", "resolved_to_truth_target": "7", "not_resolved": "0",
+			"resolved_outside_truth":                "0",
+			"evidence_completeness/" + modeBaseline: "6/6",
+			"evidence_completeness/" + modeCLI:      "6/6",
+		}
+		for _, m := range rec.Metrics {
+			w, ok := want[m.Name]
+			if !ok {
+				continue
+			}
+			got := fmtValue(m)
+			if m.Unit == "ratio" {
+				got = fmt.Sprintf("%d/%d", *m.Numerator, *m.Denominator)
+			}
+			if got != w {
+				t.Errorf("%s = %s, want %s", m.Name, got, w)
+			}
+			delete(want, m.Name)
+		}
+		if len(want) != 0 {
+			t.Errorf("missing metrics: %v", want)
+		}
 		outs[i], _ = Marshal(rec)
 	}
 	if !bytes.Equal(outs[0], outs[1]) {
 		t.Fatalf("runs differ:\n%s\n---\n%s", outs[0], outs[1])
+	}
+}
+
+func TestFactsPresentBoundaries(t *testing.T) {
+	ctx := []byte(`"name": "Add", "x": "Adder", op: a.b+`)
+	if got := factsPresent(ctx, []string{"Add", "Adde", "a.b+", "dd"}); got != 2 {
+		t.Fatalf("factsPresent = %d, want 2", got)
 	}
 }
