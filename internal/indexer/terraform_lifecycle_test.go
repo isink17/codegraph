@@ -450,3 +450,127 @@ func TestTerraformV1ProfileUpgradeRecordsOperatorReferences(t *testing.T) {
 	}
 	r.assertFreshParity(t, "v1 profile upgrade")
 }
+
+// Blocks in override.tf and *_override.tf merge into the one ordinary
+// declaration of their address, so they never compete with it and are never
+// a bind target themselves.
+func TestTerraformOverrideFilesMergeIntoTheirOriginal(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"infra/main.tf": `variable "region" {}
+
+locals {
+  tags = {}
+}
+
+module "net" {
+  source = "./net"
+}
+
+resource "aws_eip" "app" {}
+
+data "aws_eip" "app" {}
+
+resource "aws_instance" "web" {
+  a = var.region
+  b = local.tags
+  c = module.net.id
+  d = aws_eip.app.id
+  e = data.aws_eip.app.id
+  f = aws_eip.only_overridden.id
+}
+`,
+		"infra/override.tf": `variable "region" {
+  default = "eu"
+}
+
+locals {
+  tags = { a = 1 }
+}
+
+module "net" {
+  source = "./net2"
+}
+
+resource "aws_eip" "app" {
+  vpc = true
+}
+
+resource "aws_eip" "only_overridden" {}
+`,
+		"infra/dns_override.tf": `variable "region" {
+  default = "us"
+}
+
+data "aws_eip" "app" {
+  id = "x"
+}
+
+output "o" {
+  value = var.region
+}
+`,
+		"infra/sub/main.tf":     "output \"o\" {\n  value = var.region\n}\n",
+		"infra/sub/override.tf": "variable \"region\" {}\n",
+	})
+	bound := func(qname, kind string) string {
+		return ` => infra/main.tf:` + qname + `(` + kind + `) [terraform_module_scope/high]`
+	}
+	region := bound("var.region", "terraform_variable")
+	base := map[[2]string]string{
+		{"infra/main.tf", "var.region"}:              region, // base + 2 overrides
+		{"infra/main.tf", "local.tags"}:              bound("local.tags", "terraform_local"),
+		{"infra/main.tf", "module.net"}:              bound("module.net", "terraform_module"),
+		{"infra/main.tf", "aws_eip.app"}:             bound("aws_eip.app", "terraform_resource"),
+		{"infra/main.tf", "data.aws_eip.app"}:        bound("data.aws_eip.app", "terraform_data"),
+		{"infra/main.tf", "aws_eip.only_overridden"}: unresolvedRef, // no original: Terraform errors
+		{"infra/dns_override.tf", "var.region"}:      region,        // a reference inside an override file
+		{"infra/sub/main.tf", "var.region"}:          unresolvedRef, // only an override in its directory
+	}
+	expect := func(step string, cases map[[2]string]string) {
+		t.Helper()
+		for k, want := range cases {
+			if got := r.hclRefs(t, k[0], k[1]); got != want {
+				t.Fatalf("%s: %s -> %s = %q, want %q", step, k[0], k[1], got, want)
+			}
+		}
+		r.assertFreshParity(t, step)
+	}
+	expect("fresh", base)
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	expect("no-op", base)
+
+	// Editing an override keeps the original as the target.
+	r.write(t, "infra/override.tf", strings.Replace(r.currentTree(t)["infra/override.tf"], `"eu"`, `"ap"`, 1))
+	r.update(t, "infra/override.tf")
+	expect("override edited", base)
+
+	// Editing the original keeps it the target.
+	main := r.currentTree(t)["infra/main.tf"]
+	r.write(t, "infra/main.tf", "# edited\n"+main)
+	r.update(t, "infra/main.tf")
+	expect("base edited", base)
+
+	// A second ordinary declaration is still a Terraform error.
+	r.write(t, "infra/extra.tf", "variable \"region\" {}\n")
+	r.update(t, "infra/extra.tf")
+	expect("duplicate ordinary", map[[2]string]string{
+		{"infra/main.tf", "var.region"}:  unresolvedRef,
+		{"infra/main.tf", "aws_eip.app"}: bound("aws_eip.app", "terraform_resource"),
+	})
+	r.remove(t, "infra/extra.tf")
+	r.update(t, "infra/extra.tf")
+	expect("duplicate removed", base)
+
+	// Deleting the original leaves only overrides: nothing binds.
+	r.write(t, "infra/main.tf", strings.Replace(main, `variable "region" {}`, ``, 1))
+	r.update(t, "infra/main.tf")
+	expect("original deleted", map[[2]string]string{
+		{"infra/main.tf", "var.region"}:         unresolvedRef,
+		{"infra/dns_override.tf", "var.region"}: unresolvedRef,
+	})
+	r.write(t, "infra/main.tf", main)
+	r.update(t, "infra/main.tf")
+	expect("original restored", base)
+}

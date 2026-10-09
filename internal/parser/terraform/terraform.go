@@ -36,6 +36,18 @@ func IsTerraformPath(path string) bool {
 	return false
 }
 
+// IsOverridePath reports whether a .tf file is an override file: override.tf
+// or a name ending in _override.tf. Its top-level blocks merge into the
+// ordinary declaration of the same address instead of declaring one.
+func IsOverridePath(path string) bool {
+	base := filepath.Base(path)
+	if !strings.HasSuffix(base, ".tf") {
+		return false
+	}
+	stem := strings.TrimSuffix(base, ".tf")
+	return stem == "override" || strings.HasSuffix(stem, "_override")
+}
+
 // IsTFVarsPath reports whether a file is a variable definitions file.
 func IsTFVarsPath(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".tfvars")
