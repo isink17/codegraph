@@ -24,7 +24,7 @@ set -euo pipefail
 
 # Integration branches are staging targets for one wave each. Add a branch
 # here only in the change that creates it; the list is reviewed like code.
-allowed_bases=(v2.0 integration/v2.0-wave-20261008)
+allowed_bases=(v2.0 integration/v2.0-wave-20261008 integration/v2.0-wave-20261009)
 
 fail() {
 	echo "merge-gate: BLOCKED: $*" >&2
