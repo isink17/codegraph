@@ -45,12 +45,16 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 	staleNoQueueReason := freshnessAt("h1", fullScan("h1", "h1", "none"))
 	staleNoQueueReason.State, staleNoQueueReason.Reasons = graph.FreshnessKnownStale, []string{"head_moved"}
 	// The first index still running: never completed plus a running row is
-	// not a stale fact, so it is unknown; a failed earlier scan still is.
+	// not a stale fact, so it is unknown. A scan left running (or abandoned)
+	// and a later scan that failed before any completed is: the failed scan
+	// may have committed batches.
 	firstRunning := freshnessAt("h1", nil)
+	firstRunning.LatestScan = &graph.FreshnessScan{ID: 7, Status: "running"}
 	firstRunning.State, firstRunning.Reasons = graph.FreshnessKnownStale, []string{"never_completed", "scan_running_or_abandoned"}
 	firstRunning.RunningScans = graph.FreshnessRunningScans{Count: 1, AfterLastCompleted: 1, Liveness: "unknown"}
-	failedThenRunning := firstRunning
-	failedThenRunning.Reasons = []string{"never_completed", "latest_scan_failed", "scan_running_or_abandoned"}
+	runningThenFailed := firstRunning
+	runningThenFailed.LatestScan = &graph.FreshnessScan{ID: 7, Status: "failed"}
+	runningThenFailed.Reasons = []string{"never_completed", "latest_scan_failed", "scan_running_or_abandoned"}
 	both := freshnessAt("h1", fullScan("h1", "h1", "yes"))
 	both.Coverage.FailedAfterLastFull = 1
 
@@ -70,7 +74,7 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 		{"known stale state", StatusOK, stale, VerdictKnownStale, ExitKnownStale, []string{"head_moved"}},
 		{"never completed", StatusOK, neverCompleted, VerdictUnknown, ExitFreshnessUnknown, []string{"never_completed"}},
 		{"first index still running", StatusOK, firstRunning, VerdictUnknown, ExitFreshnessUnknown, []string{"never_completed", "scan_running_or_abandoned"}},
-		{"failed first scan then running", StatusOK, failedThenRunning, VerdictKnownStale, ExitKnownStale, []string{"never_completed", "latest_scan_failed", "scan_running_or_abandoned"}},
+		{"running scan then a later failed scan", StatusOK, runningThenFailed, VerdictKnownStale, ExitKnownStale, []string{"never_completed", "latest_scan_failed", "scan_running_or_abandoned"}},
 		{"pre-migration database", StatusOK, unrecorded, VerdictUnknown, ExitFreshnessUnknown, []string{"coverage_not_recorded"}},
 		{"no full scan", StatusOK, freshnessAt("h1", nil), VerdictInsufficientCoverage, ExitInsufficientCoverage, []string{"no_recorded_full_scan"}},
 		{"failed after full", StatusViolations, failedAfter, VerdictInsufficientCoverage, ExitInsufficientCoverage, []string{"scan_failed_after_full_scan"}},
