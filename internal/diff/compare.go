@@ -84,8 +84,29 @@ type EdgeSection struct {
 	ResolutionChanged []Change `json:"resolution_changed"`
 	EvidenceChanged   []Change `json:"evidence_changed"`
 }
+
+// SectionCoverage says how far an empty or short section can be trusted.
+// Only "complete" means an absent change is evidence of no change.
+type SectionCoverage struct {
+	State  string `json:"state"` // complete, partial, or unavailable
+	Reason string `json:"reason,omitempty"`
+}
+type Coverage struct {
+	Files     SectionCoverage `json:"files"`
+	Symbols   SectionCoverage `json:"symbols"`
+	Edges     SectionCoverage `json:"edges"`
+	TestLinks SectionCoverage `json:"test_links"`
+}
+
+const (
+	CoverageComplete    = "complete"
+	CoveragePartial     = "partial"
+	CoverageUnavailable = "unavailable"
+)
+
 type DiffDocument struct {
 	Schema    string         `json:"schema"`
+	Coverage  Coverage       `json:"coverage"`
 	Summary   map[string]int `json:"summary"`
 	Files     ChangeSection  `json:"files"`
 	Symbols   SymbolSection  `json:"symbols"`
@@ -107,8 +128,9 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	changes := make([]Change, 0)
 	compareFiles(&changes, revisionFiles(base), revisionFiles(head))
 	semanticOK := semanticCompatible(base, head)
+	skippedFiles := 0
 	if semanticOK {
-		compareDeclarations(&changes, base.GraphData, head.GraphData)
+		skippedFiles = compareDeclarations(&changes, base.GraphData, head.GraphData)
 	}
 	compatible := relationshipCompatible(base, head)
 	if compatible {
@@ -159,13 +181,40 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	for _, c := range all {
 		summary[summaryKey(c.Kind)]++
 	}
-	doc := DiffDocument{Schema: Schema, Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
+	doc := DiffDocument{Schema: Schema, Coverage: sectionCoverage(base, head, semanticOK, compatible, skippedFiles), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
 	for _, c := range changes {
 		addToSections(&doc, c)
 	}
 	base.Graph = metadata(base.GraphData, base.IndexPolicy)
 	head.Graph = metadata(head.GraphData, head.IndexPolicy)
 	return Result{Schema: "codegraph.change/v1", From: base, To: head, Comparison: Comparison{Status: status, Limitations: lims}, Diff: doc}, nil
+}
+
+func sectionCoverage(base, head Revision, semanticOK, compatible bool, skippedFiles int) Coverage {
+	c := Coverage{Files: SectionCoverage{State: CoverageComplete}}
+	switch {
+	case !semanticOK:
+		c.Symbols = SectionCoverage{State: CoverageUnavailable, Reason: "indexing or graph semantics differ between revisions"}
+	case skippedFiles > 0:
+		c.Symbols = SectionCoverage{State: CoveragePartial, Reason: fmt.Sprintf("%d files without a current parse were not compared", skippedFiles)}
+	default:
+		c.Symbols = SectionCoverage{State: CoverageComplete}
+	}
+	switch {
+	case !semanticOK:
+		c.Edges = c.Symbols
+		c.TestLinks = c.Symbols
+	case !compatible:
+		c.Edges = SectionCoverage{State: CoverageUnavailable, Reason: "graph state is incomplete"}
+		c.TestLinks = c.Edges
+	default:
+		c.Edges = SectionCoverage{State: CoverageComplete}
+		c.TestLinks = SectionCoverage{State: CoverageComplete, Reason: "test links are heuristic relations, not coverage proof"}
+		if len(base.GraphData.State.Capability.Limitations()) > 0 || len(head.GraphData.State.Capability.Limitations()) > 0 {
+			c.Edges = SectionCoverage{State: CoveragePartial, Reason: "parser call capability is limited; a missing edge is not evidence of a removed call"}
+		}
+	}
+	return c
 }
 
 func semanticCompatible(a, b Revision) bool {
@@ -394,7 +443,9 @@ func compareFiles(out *[]Change, a, b []SourceFile) {
 	}
 }
 
-func compareDeclarations(out *[]Change, a, b store.SemanticGraph) {
+// compareDeclarations returns how many paths were skipped because their
+// declarations do not describe the current bytes.
+func compareDeclarations(out *[]Change, a, b store.SemanticGraph) int {
 	am, bm := group(a.Declarations, declIdentity), group(b.Declarations, declIdentity)
 	incomplete := map[string]bool{}
 	for _, g := range []store.SemanticGraph{a, b} {
@@ -424,6 +475,7 @@ func compareDeclarations(out *[]Change, a, b store.SemanticGraph) {
 			appendChange(out, "declaration_changed", k, x[0], y[0])
 		}
 	}
+	return len(incomplete)
 }
 
 func compareEdges(out *[]Change, a, b []store.SemanticEdge) {
@@ -478,7 +530,7 @@ func declIdentity(v store.SemanticDeclaration) string {
 	return canonical([]any{v.Path, v.Language, v.Kind, v.QualifiedName, v.Signature, v.StableKey})
 }
 func edgeSite(v store.SemanticEdge) string {
-	return canonical([]any{declIdentity(store.SemanticDeclaration{Path: v.Source.Path, Language: v.Source.Language, Kind: v.Source.Kind, QualifiedName: v.Source.QualifiedName, Signature: v.Source.Signature, StableKey: v.Source.StableKey}), v.Path, v.Line, v.Kind})
+	return canonical([]any{declIdentity(store.SemanticDeclaration{Path: v.Source.Path, Language: v.Source.Language, Kind: v.Source.Kind, QualifiedName: v.Source.QualifiedName, Signature: v.Source.Signature, StableKey: v.Source.StableKey}), v.Path, v.Line, v.Column, v.Kind})
 }
 func testIdentity(v store.SemanticTestLink) string {
 	return canonical([]any{v.TestFile, v.Test, v.TargetFile, v.Target, v.Reason})
