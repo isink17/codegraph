@@ -322,7 +322,11 @@ func (s *Store) CompleteScanWithParserSemanticEpochs(ctx context.Context, scanID
 	if err := completeScanTx(ctx, tx, scanID, summary, started, "completed", ""); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.releaseScanLock(scanID)
+	return nil
 }
 
 // CheckParserSemanticWrite prevents a scan that began before a newer semantic

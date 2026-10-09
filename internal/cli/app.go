@@ -1417,6 +1417,54 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	return writeJSON(stdout, stats)
 }
 
+// runRecoverScans records as failed every scan row left running by a process
+// that no longer holds the scan lock. It refuses, changing nothing, while any
+// scan of the repository is still running.
+func runRecoverScans(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("recover-scans", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	if repoRootCandidate == "" && fs.NArg() > 0 {
+		repoRootCandidate = fs.Arg(0)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
+	}
+	canonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		return err
+	}
+	dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		return err
+	}
+	// Never create a database just to find nothing in it.
+	if st, err := os.Stat(dbPath); err != nil || st.Size() == 0 {
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("repository %s is not indexed", repoRoot)
+		}
+		return err
+	}
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	ids, err := s.RecoverAbandonedScans(ctx)
+	if err != nil {
+		return err
+	}
+	if ids == nil {
+		ids = []int64{}
+	}
+	return writeJSON(stdout, map[string]any{"recovered_scans": ids, "status": "failed"})
+}
+
 // cliProjection adapts the store to the rendering layer's contracts, the same
 // way the MCP server does. Both surfaces render through one projector, so a
 // level means the same thing whichever one asked for it.
