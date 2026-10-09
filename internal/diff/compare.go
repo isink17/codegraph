@@ -109,22 +109,22 @@ const (
 // rests on, and Coverage says how far an empty list can be trusted.
 type Risk struct {
 	Coverage SectionCoverage `json:"coverage"`
-	// RemovedDeclarationCallers lists, for each declaration_removed change,
-	// the resolved calls to it in the base revision from a declaration that
-	// still exists in the head revision.
-	RemovedDeclarationCallers []RemovedDeclarationCallers `json:"removed_declaration_callers"`
+	// RemovedDeclarationDependents lists, for each declaration_removed change,
+	// the resolved edges into it (calls or any other edge kind) in the base
+	// revision from a declaration that still exists in the head revision.
+	RemovedDeclarationDependents []RemovedDeclarationDependents `json:"removed_declaration_dependents"`
 }
 
-type RemovedDeclarationCallers struct {
+type RemovedDeclarationDependents struct {
 	// Declaration is the identity of the declaration_removed change.
 	Declaration string     `json:"declaration"`
-	Calls       []RiskCall `json:"calls"`
+	Edges       []RiskEdge `json:"edges"`
 }
 
-// RiskCall is one base-side call into a removed declaration. Site is the
+// RiskEdge is one base-side resolved edge into a removed declaration. Site is the
 // edge identity used by the edge sections. Head is the edge at the same site
 // in the head revision, absent when the call is gone or the site is ambiguous.
-type RiskCall struct {
+type RiskEdge struct {
 	Site          string              `json:"site"`
 	Base          store.SemanticEdge  `json:"base"`
 	Head          *store.SemanticEdge `json:"head,omitempty"`
@@ -623,17 +623,17 @@ func endpointIdentity(v store.SemanticEndpoint) string {
 	return declIdentity(store.SemanticDeclaration{Path: v.Path, Language: v.Language, Kind: v.Kind, QualifiedName: v.QualifiedName, Signature: v.Signature, StableKey: v.StableKey})
 }
 
-// removedDeclarationRisk cites the base-side resolved calls into each removed
-// declaration from callers that survive into the head revision. Only resolved
-// calls are evidence, so the list is never complete: an unresolved, dynamic or
+// removedDeclarationRisk cites the base-side resolved edges (calls and any
+// other edge kind) into each removed declaration from sources that survive
+// into the head revision. Only resolved edges are evidence, so the list is never complete: an unresolved, dynamic or
 // cross-language call can reach a removed declaration without appearing here.
 func removedDeclarationRisk(changes []Change, cov Coverage, headDecls []store.SemanticDeclaration, baseEdges, headEdges []store.SemanticEdge) Risk {
-	r := Risk{RemovedDeclarationCallers: []RemovedDeclarationCallers{}}
+	r := Risk{RemovedDeclarationDependents: []RemovedDeclarationDependents{}}
 	if cov.Symbols.State == CoverageUnavailable || cov.Edges.State == CoverageUnavailable {
 		r.Coverage = SectionCoverage{State: CoverageUnavailable, Reason: "removed declarations or edges were not compared"}
 		return r
 	}
-	reason := "only resolved calls are cited; an unresolved, dynamic or cross-language call can still reach a removed declaration"
+	reason := "only resolved edges are cited; an unresolved, dynamic or cross-language call can still reach a removed declaration"
 	if cov.Edges.State != CoverageComplete {
 		reason = cov.Edges.Reason + "; " + reason
 	}
@@ -657,13 +657,13 @@ func removedDeclarationRisk(changes []Change, cov Coverage, headDecls []store.Se
 	}
 	site := func(v store.SemanticEdge) string { return edgeSite(v, withColumn) }
 	heads := group(headEdges, site)
-	byDecl := map[string][]RiskCall{}
+	byDecl := map[string][]RiskEdge{}
 	for _, e := range baseEdges {
 		target := endpointIdentity(e.Target)
 		if e.Target.State != "resolved" || !removed[target] || !surviving[endpointIdentity(e.Source)] {
 			continue
 		}
-		call := RiskCall{Site: site(e), Base: e}
+		call := RiskEdge{Site: site(e), Base: e}
 		switch h := heads[call.Site]; len(h) {
 		case 0:
 		case 1:
@@ -681,7 +681,7 @@ func removedDeclarationRisk(changes []Change, cov Coverage, headDecls []store.Se
 			}
 			return canonical(calls[i].Base) < canonical(calls[j].Base)
 		})
-		r.RemovedDeclarationCallers = append(r.RemovedDeclarationCallers, RemovedDeclarationCallers{Declaration: decl, Calls: calls})
+		r.RemovedDeclarationDependents = append(r.RemovedDeclarationDependents, RemovedDeclarationDependents{Declaration: decl, Edges: calls})
 	}
 	return r
 }

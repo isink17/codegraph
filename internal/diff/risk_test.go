@@ -45,13 +45,13 @@ func TestRiskCitesCallersOfRemovedDeclaration(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := got.Diff.Risk
-	if r.Coverage.State != CoveragePartial || !strings.Contains(r.Coverage.Reason, "only resolved calls") {
+	if r.Coverage.State != CoveragePartial || !strings.Contains(r.Coverage.Reason, "only resolved edges") {
 		t.Fatalf("risk coverage = %+v", r.Coverage)
 	}
-	if len(r.RemovedDeclarationCallers) != 1 || r.RemovedDeclarationCallers[0].Declaration != declIdentity(gone) {
+	if len(r.RemovedDeclarationDependents) != 1 || r.RemovedDeclarationDependents[0].Declaration != declIdentity(gone) {
 		t.Fatalf("risk = %+v", r)
 	}
-	calls := r.RemovedDeclarationCallers[0].Calls
+	calls := r.RemovedDeclarationDependents[0].Edges
 	if len(calls) != 2 {
 		t.Fatalf("calls = %+v", calls)
 	}
@@ -101,7 +101,7 @@ func TestRiskSkipsRemovedCallersAndIncompleteFiles(t *testing.T) {
 	r := got.Diff.Risk
 	// Dead was removed with Gone, and A's call lies in a file without a
 	// current parse: no call is citable, so Gone gets no entry.
-	if len(r.RemovedDeclarationCallers) != 0 {
+	if len(r.RemovedDeclarationDependents) != 0 {
 		t.Fatalf("risk = %+v", r)
 	}
 	if got.Diff.Summary["symbols_removed"] != 2 {
@@ -121,7 +121,7 @@ func TestRiskUnavailableWhenEdgesNotCompared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := got.Diff.Risk; r.Coverage.State != CoverageUnavailable || len(r.RemovedDeclarationCallers) != 0 {
+	if r := got.Diff.Risk; r.Coverage.State != CoverageUnavailable || len(r.RemovedDeclarationDependents) != 0 {
 		t.Fatalf("risk = %+v", r)
 	}
 }
@@ -145,5 +145,19 @@ func TestIncompleteFileDoesNotDisableEdgeColumns(t *testing.T) {
 	}
 	if cov := got.Diff.Coverage.Edges; cov.State != CoveragePartial || strings.Contains(cov.Reason, "call column") {
 		t.Fatalf("edge coverage = %+v", cov)
+	}
+}
+
+func TestRiskMarksAmbiguousHeadSite(t *testing.T) {
+	gone, a, x, y := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A"), riskDecl("lib.go", "X"), riskDecl("lib.go", "Y")
+	base := riskRevision(indexed("a.go", "lib.go"), []store.SemanticDeclaration{gone, a, x, y}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
+	head := riskRevision(indexed("a.go", "lib.go"), []store.SemanticDeclaration{a, x, y}, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, y, 4, 2, "resolved")})
+	got, err := Compare(base, head, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := got.Diff.Risk.RemovedDeclarationDependents
+	if len(r) != 1 || len(r[0].Edges) != 1 || !r[0].Edges[0].HeadAmbiguous || r[0].Edges[0].Head != nil {
+		t.Fatalf("risk = %+v", r)
 	}
 }
