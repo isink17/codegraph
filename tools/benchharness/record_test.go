@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -207,6 +208,9 @@ func TestRunFixtureReproducible(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "codegraph")
+	if runtime.GOOS == "windows" {
+		bin += ".exe" // exec resolves explicit paths only with the executable suffix
+	}
 	if out, err := exec.Command("go", "build", "-o", bin, "../../cmd/codegraph").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
