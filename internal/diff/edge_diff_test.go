@@ -163,3 +163,57 @@ func TestSemanticGraphFreshAndIncrementalParity(t *testing.T) {
 		t.Fatalf("projection lost call columns: %s", fresh)
 	}
 }
+
+func coverageRevision(files []store.SemanticFile, edges []store.SemanticEdge, capability store.GraphCapability) Revision {
+	return Revision{GraphData: store.SemanticGraph{Files: files, Edges: edges, State: store.SemanticGraphState{Capability: capability, ResolverPolicies: map[string]string{}, ParserSemantics: map[string]string{}}}}
+}
+
+func coverageEdge(path string, column int, target string) store.SemanticEdge {
+	src := store.SemanticEndpoint{Path: path, Language: "go", Kind: "function", QualifiedName: "p.A", Signature: "func A()", StableKey: "func:p::A", State: "resolved"}
+	return store.SemanticEdge{Source: src, Path: path, Kind: "calls", Line: 3, Column: column, Target: store.SemanticEndpoint{QualifiedName: target, State: "unresolved"}}
+}
+
+func TestEdgeColumnRecordedOnOneSideOnlyIsNotAChange(t *testing.T) {
+	files := []store.SemanticFile{{Path: "a.go", Language: "go", ParseState: store.ParseStateIndexed}}
+	base := coverageRevision(files, []store.SemanticEdge{coverageEdge("a.go", 0, "B")}, store.GraphCapability{})
+	head := coverageRevision(files, []store.SemanticEdge{coverageEdge("a.go", 7, "B")}, store.GraphCapability{})
+	got, err := Compare(base, head, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Diff.Total != 0 {
+		t.Fatalf("column recorded on one side produced changes: %+v", got.Diff)
+	}
+	if got.Diff.Coverage.Edges.State != CoveragePartial || !strings.Contains(got.Diff.Coverage.Edges.Reason, "call column") {
+		t.Fatalf("edge coverage = %+v", got.Diff.Coverage.Edges)
+	}
+}
+
+func TestNonCurrentParseStateMakesEdgesPartial(t *testing.T) {
+	baseFiles := []store.SemanticFile{{Path: "a.go", Language: "go", ParseState: store.ParseStateIndexed}}
+	headFiles := []store.SemanticFile{{Path: "a.go", Language: "go", ParseState: store.ParseStatePending}}
+	base := coverageRevision(baseFiles, []store.SemanticEdge{coverageEdge("a.go", 5, "B")}, store.GraphCapability{})
+	head := coverageRevision(headFiles, nil, store.GraphCapability{})
+	got, err := Compare(base, head, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Diff.Edges.Removed) != 0 {
+		t.Fatalf("edge of a non-current file reported removed: %+v", got.Diff.Edges.Removed)
+	}
+	if c := got.Diff.Coverage; c.Edges.State != CoveragePartial || c.TestLinks.State != CoveragePartial || c.Symbols.State != CoveragePartial {
+		t.Fatalf("coverage = %+v", c)
+	}
+}
+
+func TestLimitedCallCapabilityMakesEdgesPartial(t *testing.T) {
+	files := []store.SemanticFile{{Path: "a.go", Language: "go", ParseState: store.ParseStateIndexed}}
+	limited := store.GraphCapability{State: store.GraphSymbolsOnly, Languages: []store.LanguageCapability{{Language: "go", Capability: store.GraphSymbolsOnly}}}
+	got, err := Compare(coverageRevision(files, nil, limited), coverageRevision(files, nil, limited), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := got.Diff.Coverage.Edges; c.State != CoveragePartial || !strings.Contains(c.Reason, "capability") {
+		t.Fatalf("edge coverage = %+v", c)
+	}
+}
