@@ -99,11 +99,13 @@ func TestRiskSkipsRemovedCallersAndIncompleteFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := got.Diff.Risk
-	if len(r.RemovedDeclarationCallers) != 1 || len(r.RemovedDeclarationCallers[0].Calls) != 0 {
-		// Gone has an entry only if a cited call survives; neither does here.
-		if len(r.RemovedDeclarationCallers) != 0 {
-			t.Fatalf("risk = %+v", r)
-		}
+	// Dead was removed with Gone, and A's call lies in a file without a
+	// current parse: no call is citable, so Gone gets no entry.
+	if len(r.RemovedDeclarationCallers) != 0 {
+		t.Fatalf("risk = %+v", r)
+	}
+	if got.Diff.Summary["symbols_removed"] != 2 {
+		t.Fatalf("summary = %v", got.Diff.Summary)
 	}
 	if r.Coverage.State != CoveragePartial || !strings.Contains(r.Coverage.Reason, "without a current parse") {
 		t.Fatalf("risk coverage = %+v", r.Coverage)
