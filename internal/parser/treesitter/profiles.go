@@ -20,7 +20,7 @@ func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 // and a non-cgo reindex, which records no references, is refused as the
 // downgrade it is.
 func (a *HCLAdapter) Profile() parser.Profile {
-	return parser.NewProfile("hcl", "treesitter:hcl:v2", true)
+	return parser.NewProfile("hcl", "treesitter:hcl:v3", true)
 }
 
 // Lua v2 parses with the vendored tree-sitter-grammars v0.3.0 grammar: goto,

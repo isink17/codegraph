@@ -442,7 +442,7 @@ func TestTerraformV1ProfileUpgradeRecordsOperatorReferences(t *testing.T) {
 	if summary := r.update(t); strings.Join(summary.ParserProfileLanguages, ",") != "hcl" {
 		t.Fatalf("update = %+v, want an hcl profile reparse", summary)
 	}
-	if got := fileParserProfile(t, db, r.repoID, "m/main.tf"); got != "treesitter:hcl:v2" {
+	if got := fileParserProfile(t, db, r.repoID, "m/main.tf"); got != "treesitter:hcl:v3" {
 		t.Fatalf("updated profile = %q", got)
 	}
 	if got := r.hclRefs(t, "m/main.tf", "var.enabled"); got != want {
@@ -573,4 +573,24 @@ output "o" {
 	r.write(t, "infra/main.tf", main)
 	r.update(t, "infra/main.tf")
 	expect("original restored", base)
+}
+
+// Terraform's loader matches the .tf suffix case-sensitively, so a declaration
+// in vars.TF is never loaded and must not become a reference target.
+func TestTerraformUppercaseExtensionDeclaresNothing(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"infra/main.tf": "output \"o\" {\n  value = var.x\n}\n",
+		"infra/vars.TF": "variable \"x\" {}\n",
+	})
+	if got := r.hclRefs(t, "infra/main.tf", "var.x"); got != unresolvedRef {
+		t.Fatalf("fresh: var.x = %q, want unresolved", got)
+	}
+	r.assertFreshParity(t, "fresh")
+
+	r.write(t, "infra/decl.tf", "variable \"x\" {}\n")
+	r.update(t, "infra/decl.tf")
+	if got, want := r.hclRefs(t, "infra/main.tf", "var.x"), ` => infra/decl.tf:var.x(terraform_variable) [terraform_module_scope/high]`; got != want {
+		t.Fatalf("lowercase added: var.x = %q, want %q", got, want)
+	}
+	r.assertFreshParity(t, "lowercase added")
 }
