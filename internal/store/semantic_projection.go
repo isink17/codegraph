@@ -64,7 +64,9 @@ type SemanticEdge struct {
 	Strategy   string           `json:"strategy"`
 	Confidence string           `json:"confidence"`
 	Line       int              `json:"line"`
-	CallArity  *int             `json:"call_arity,omitempty"`
+	// Column is the 1-based call column, or 0 when the parser did not record one.
+	Column    int  `json:"column,omitempty"`
+	CallArity *int `json:"call_arity,omitempty"`
 }
 
 type SemanticTestLink struct {
@@ -178,7 +180,7 @@ func (s *Store) SemanticGraph(ctx context.Context, repoID int64) (SemanticGraph,
 		}
 	}
 
-	rows, err = tx.QueryContext(ctx, `SELECT e.src_symbol_id,e.dst_symbol_id,e.dst_name,e.edge_kind,e.evidence,f.path,e.line,e.resolution_strategy,e.resolution_confidence,e.call_arity FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.is_deleted=0 ORDER BY f.path,e.line,e.edge_kind,e.dst_name,e.evidence,e.resolution_strategy,e.resolution_confidence`, repoID)
+	rows, err = tx.QueryContext(ctx, `SELECT e.src_symbol_id,e.dst_symbol_id,e.dst_name,e.edge_kind,e.evidence,f.path,e.line,COALESCE(e.start_col,0),e.resolution_strategy,e.resolution_confidence,e.call_arity FROM edges e JOIN files f ON f.id=e.file_id WHERE e.repo_id=? AND f.is_deleted=0 ORDER BY f.path,e.line,COALESCE(e.start_col,0),e.edge_kind,e.dst_name,e.evidence,e.resolution_strategy,e.resolution_confidence`, repoID)
 	if err != nil {
 		return out, err
 	}
@@ -186,9 +188,9 @@ func (s *Store) SemanticGraph(ctx context.Context, repoID int64) (SemanticGraph,
 		var src int64
 		var dst sql.NullInt64
 		var name, kind, evidence, path, strategy, confidence string
-		var line int
+		var line, column int
 		var arity sql.NullInt64
-		if err := rows.Scan(&src, &dst, &name, &kind, &evidence, &path, &line, &strategy, &confidence, &arity); err != nil {
+		if err := rows.Scan(&src, &dst, &name, &kind, &evidence, &path, &line, &column, &strategy, &confidence, &arity); err != nil {
 			rows.Close()
 			return out, err
 		}
@@ -204,7 +206,7 @@ func (s *Store) SemanticGraph(ctx context.Context, repoID int64) (SemanticGraph,
 				target.State = "missing"
 			}
 		}
-		edge := SemanticEdge{Source: source, Target: target, Path: path, Kind: kind, Evidence: evidence, Strategy: strategy, Confidence: confidence, Line: line}
+		edge := SemanticEdge{Source: source, Target: target, Path: path, Kind: kind, Evidence: evidence, Strategy: strategy, Confidence: confidence, Line: line, Column: column}
 		if arity.Valid {
 			v := int(arity.Int64)
 			edge.CallArity = &v
