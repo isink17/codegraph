@@ -541,9 +541,27 @@ func strictFreshness(status string, lastScanID int64, before, after graph.Freshn
 		HeadNow:      before.Worktree.HeadNow,
 		LastFullScan: before.Coverage.LastFullScan,
 	}
+	// graph_stats counts a running scan newer than the last completed one as
+	// a stale reason. Strict mode does not: whether that writer is live or
+	// abandoned is unknown, which is what the running check below reports.
+	// The state is recomputed without it, by the store's own rule, so only
+	// independent stale facts (moved HEAD, queued work, a failed latest scan,
+	// whose committed batches no completed scan accounts for) give exit 3.
+	state := before.State
+	remaining := slices.DeleteFunc(slices.Clone(before.Reasons), func(r string) bool { return r == "scan_running_or_abandoned" })
+	if len(remaining) != len(before.Reasons) {
+		switch {
+		case len(remaining) > 0 && (before.LastCompletedScan != nil || len(remaining) > 1):
+			state = graph.FreshnessKnownStale
+		case before.LastCompletedScan == nil:
+			state = graph.FreshnessUnknown
+		default:
+			state = graph.FreshnessNoKnownStaleness
+		}
+	}
 	var unknown, insufficient []string
 	switch {
-	case status == StatusStale || before.State == graph.FreshnessKnownStale:
+	case status == StatusStale || state == graph.FreshnessKnownStale:
 		out.Verdict = VerdictKnownStale
 		out.Reasons = append([]string{}, before.Reasons...)
 		if status == StatusStale && !slices.Contains(out.Reasons, "dirty_queue_nonempty") {
@@ -551,8 +569,8 @@ func strictFreshness(status string, lastScanID int64, before, after graph.Freshn
 		}
 		out.ExitCode = ExitKnownStale
 		return out
-	case before.State != graph.FreshnessNoKnownStaleness:
-		unknown = append(unknown, before.Reasons...)
+	case state != graph.FreshnessNoKnownStaleness:
+		unknown = append(unknown, remaining...)
 	case !before.Coverage.Recorded:
 		unknown = append(unknown, "coverage_not_recorded")
 	case before.Coverage.LastFullScan == nil:
