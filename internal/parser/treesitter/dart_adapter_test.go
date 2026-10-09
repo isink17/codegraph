@@ -289,6 +289,28 @@ func TestDartAdapterCallReferences(t *testing.T) {
 	}
 }
 
+// In expression position the grammar reads a single-type-argument call
+// `f<int>(x)` as the comparison `(f < int) > (x)`. Dart relational operators
+// do not chain, so that shape is always a generic call. Generic constructor
+// calls (`Box<int>.named()`) parse as constructor_invocation.
+func TestDartAdapterGenericCallReferences(t *testing.T) {
+	const src = `void run(int x) {
+  final a = ident<int>(x);
+  final b = ident<List<int>>(x);
+  final c = Box<int>(1);
+  final d = Box<int>.named(2);
+  final e = List<int>.filled(3, 0);
+  final f = (p < q) > (r);
+  return ident<int>(x);
+}
+`
+	pf := parseDart(t, src)
+	want := []string{"Box", "Box.named", "List.filled", "ident", "ident", "ident"}
+	if got := dartRefs(pf); !reflect.DeepEqual(got, want) {
+		t.Fatalf("references:\n got %q\nwant %q", got, want)
+	}
+}
+
 // Error recovery can swallow later declarations into a broken one, so a
 // declaration with an error inside it is dropped with everything it holds;
 // a class whose error stays inside one closed member keeps its other members.
@@ -390,7 +412,7 @@ void tail() {}
 		"function func:dart:c", "function func:dart:p", "function func:dart:q", "function func:dart:r",
 		"function func:dart:w", "function func:dart:u", "variable value:dart:filled", "function func:dart:tail",
 	})
-	if got := dartRefs(pf); !reflect.DeepEqual(got, []string{"after", "print"}) {
+	if got := dartRefs(pf); !reflect.DeepEqual(got, []string{"List.filled", "after", "print"}) {
 		t.Fatalf("references = %q", got)
 	}
 }
