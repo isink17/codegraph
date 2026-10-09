@@ -109,7 +109,8 @@ grep -qx "pr merge 42 --squash --match-head-commit $sha" "$work/merge.log" ||
 
 # Base selection: v2.0 by default, the listed integration branch only when
 # asked for explicitly, and never master or an unlisted branch.
-ib=integration/v2.0-wave-20261008
+ib=integration/v2.0-wave-20261009
+retired=integration/v2.0-wave-20261008
 case_ default-base-is-v2 pass 42 "$sha" "$r"
 PR_JSON="OPEN false $ib $sha MERGEABLE" case_ integration-pr-default-base block 42 "$sha" "$r"
 PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib case_ integration-ok pass --base "$ib" 42 "$sha" "$r"
@@ -119,11 +120,9 @@ PR_JSON="OPEN false integration/v2.0-wave-20990101 $sha MERGEABLE" WANT_BASE=int
 	case_ base-unlisted-integration block --base integration/v2.0-wave-20990101 42 "$sha" "$r"
 PR_JSON="OPEN false integration/v2.0 $sha MERGEABLE" WANT_BASE=integration/v2.0 case_ base-prefix-refused block --base integration/v2.0 42 "$sha" "$r"
 case_ base-missing-value block --base
-ib3=integration/v2.0-wave-20261009
-PR_JSON="OPEN false $ib3 $sha MERGEABLE" WANT_BASE=$ib3 case_ wave3-integration-ok pass --base "$ib3" 42 "$sha" "$r"
-PR_JSON="OPEN false $ib3 $sha MERGEABLE" case_ wave3-pr-default-base block 42 "$sha" "$r"
-PR_JSON="OPEN false $ib3 $sha MERGEABLE" WANT_BASE=$ib case_ wave3-pr-claims-wave2 block --base "$ib" 42 "$sha" "$r"
-PR_JSON="OPEN false integration/v2.0-wave-2026100 $sha MERGEABLE" WANT_BASE=integration/v2.0-wave-2026100 case_ wave3-prefix-refused block --base integration/v2.0-wave-2026100 42 "$sha" "$r"
+PR_JSON="OPEN false $retired $sha MERGEABLE" WANT_BASE=$retired case_ base-retired-wave-refused block --base "$retired" 42 "$sha" "$r"
+PR_JSON="OPEN false $retired $sha MERGEABLE" WANT_BASE=$ib case_ retired-pr-claims-live-wave block --base "$ib" 42 "$sha" "$r"
+PR_JSON="OPEN false integration/v2.0-wave-2026100 $sha MERGEABLE" WANT_BASE=integration/v2.0-wave-2026100 case_ base-wave-prefix-refused block --base integration/v2.0-wave-2026100 42 "$sha" "$r"
 PR_JSON="OPEN false $ib $other MERGEABLE" WANT_BASE=$ib case_ integration-stale-head block --base "$ib" 42 "$sha" "$r"
 PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib BEHIND=2 case_ integration-behind block --base "$ib" 42 "$sha" "$r"
 PR_JSON="OPEN false $ib $sha MERGEABLE" WANT_BASE=$ib case_ integration-missing-review block --base "$ib" 42 "$sha" "$work/none.md"

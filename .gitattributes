@@ -3,3 +3,6 @@
 /LICENSE text eol=lf
 /THIRD_PARTY_NOTICES text eol=lf
 npm/THIRD_PARTY_NOTICES text eol=lf
+
+# Benchmark fixtures are hashed byte-for-byte; keep them LF on every platform.
+tools/benchharness/testdata/** text eol=lf
