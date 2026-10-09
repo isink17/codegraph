@@ -235,6 +235,15 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			name:        "recover-scans",
+			description: "record scans left running by a dead process as failed",
+			usageLines:  []string{"  recover-scans [repo-path]"},
+			examples:    []string{"codegraph recover-scans ."},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runRecoverScans(ctx, cfg, stdout, args)
+			},
+		},
+		{
 			name:        "diff",
 			description: "compare two local commits by their indexed semantic graphs",
 			usageLines:  []string{"  diff <base> <head> [--repo-root PATH] [--limit N --offset N]"},

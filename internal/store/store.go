@@ -162,6 +162,14 @@ func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64
 
 type Store struct {
 	db *sql.DB
+	// path is the database file; scan locks live beside it. Empty for stores
+	// built in tests without a file, which take no scan lock.
+	path string
+	// scanLocks holds the shared scan lock of each scan this store began and
+	// has not yet recorded as finished.
+	scanLockMu      sync.Mutex
+	scanLocks       map[int64]*os.File
+	orphanScanLocks []*os.File
 	// resolverPolicies overrides resolverPolicyRegistry; nil outside tests.
 	resolverPolicies map[string]int
 	cleanup          func() error
@@ -553,7 +561,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, path: path}
 	if err := s.Migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -1247,6 +1255,7 @@ func applyPragmas(db *sql.DB, isNewDB bool, profile string) error {
 
 func (s *Store) Close() error {
 	err := s.db.Close()
+	s.releaseAllScanLocks()
 	if s.cleanup != nil {
 		s.cleanupOnce.Do(func() { s.cleanupErr = s.cleanup() })
 		err = errors.Join(err, s.cleanupErr)
@@ -1846,16 +1855,28 @@ func (s *Store) BeginScan(ctx context.Context, repoID int64, kind string) (int64
 // the ones still running or started since. Both counts are taken inside the
 // row's own write, which SQLite serializes against every other scan write.
 func (s *Store) BeginScanWithScope(ctx context.Context, repoID int64, kind, scope, head string) (int64, time.Time, error) {
+	lock, err := s.acquireScanLock(ctx)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
 	started := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO scans(repo_id, scan_kind, started_at, status, scope, head_at_start, overlapping_scans)
 		VALUES(?, ?, ?, 'running', ?, ?, (SELECT COUNT(1) FROM scans WHERE repo_id = ? AND status = 'running'))
 	`, repoID, kind, started.Format(time.RFC3339), scope, head, repoID)
 	if err != nil {
+		releaseScanLockFile(lock)
 		return 0, time.Time{}, err
 	}
 	id, err := res.LastInsertId()
-	return id, started, err
+	if err != nil {
+		// The row exists but its id is unknown, so it cannot be closed: keep
+		// the lock until Close so recovery cannot mistake it for abandoned.
+		s.holdScanLock(0, lock)
+		return 0, time.Time{}, err
+	}
+	s.holdScanLock(id, lock)
+	return id, started, nil
 }
 
 func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSummary, started time.Time, status string, errText string) error {
@@ -1867,7 +1888,11 @@ func (s *Store) CompleteScan(ctx context.Context, scanID int64, summary ScanSumm
 	if err := completeScanTx(ctx, tx, scanID, summary, started, status, errText); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.releaseScanLock(scanID)
+	return nil
 }
 
 func completeScanTx(ctx context.Context, tx *sql.Tx, scanID int64, summary ScanSummary, started time.Time, status string, errText string) error {

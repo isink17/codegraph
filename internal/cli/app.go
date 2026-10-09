@@ -1417,6 +1417,39 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	return writeJSON(stdout, stats)
 }
 
+// runRecoverScans records as failed every scan row left running by a process
+// that no longer holds the scan lock. It refuses, changing nothing, while any
+// scan of the repository is still running.
+func runRecoverScans(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("recover-scans", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	repoRootFlag := fs.String("repo-root", "", "repository root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	if repoRootCandidate == "" && fs.NArg() > 0 {
+		repoRootCandidate = fs.Arg(0)
+	}
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	if err != nil {
+		return err
+	}
+	app, _, _, err := openApp(ctx, cfg, repoRoot)
+	if err != nil {
+		return err
+	}
+	defer app.Close()
+	ids, err := app.Store.RecoverAbandonedScans(ctx)
+	if err != nil {
+		return err
+	}
+	if ids == nil {
+		ids = []int64{}
+	}
+	return writeJSON(stdout, map[string]any{"recovered_scans": ids, "status": "failed"})
+}
+
 // cliProjection adapts the store to the rendering layer's contracts, the same
 // way the MCP server does. Both surfaces render through one projector, so a
 // level means the same thing whichever one asked for it.
