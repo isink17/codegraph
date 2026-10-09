@@ -66,6 +66,17 @@ func TestValidateRejects(t *testing.T) {
 			r.Methodology.CompleteEnumeration = false
 			r.Metrics[0].Name = "unresolved_share"
 		},
+		"precision with unit count": func(r *Record) {
+			r.Metrics[1].Name = "audited_resolved_precision"
+		},
+		"coverage with unit count": func(r *Record) {
+			r.Metrics[1].Name = "coverage"
+			*r.Metrics[1].Value = 0.95
+		},
+		"pair_coverage without full truth": func(r *Record) {
+			r.Methodology.CompleteEnumeration = false
+			r.Metrics[0].Name = "pair_coverage"
+		},
 		"percent unit": func(r *Record) { r.Metrics[1].Unit = "percent" },
 		"empty unit":   func(r *Record) { r.Metrics[1].Unit = "" },
 		"wrong schema": func(r *Record) { r.Schema = "codegraph.benchmark/v0" },

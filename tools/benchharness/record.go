@@ -81,8 +81,10 @@ type Metric struct {
 }
 
 // Observation is one raw measured fact. Kind "pair" is a ground-truth call
-// pair; kind "unexpected" is a graph edge outside the truth universe; kind
-// "context" is one task/mode context measurement.
+// pair; kind "unexpected" is a resolved edge to a labeled target that is not
+// a labeled pair; kind "outside_universe" is a resolved edge to an unlabeled
+// callee (excluded from precision); kind "context" is one task/mode context
+// measurement.
 type Observation struct {
 	Kind          string  `json:"kind"`
 	ID            string  `json:"id"`
@@ -96,6 +98,8 @@ type Observation struct {
 }
 
 var shaRE = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
+
+var rateName = regexp.MustCompile(`precision|coverage|recall|share|completeness|rate`)
 
 var allowedUnits = map[string]bool{"count": true, "bytes": true, "estimated_tokens": true, "ratio": true}
 
@@ -156,7 +160,10 @@ func Validate(r *Record) error {
 		if strings.Contains(lower, "recall") && !m.CompleteEnumeration {
 			bad("metric %q: recall requires complete_enumeration ground truth", mt.Name)
 		}
-		if (strings.HasPrefix(lower, "coverage") || strings.HasPrefix(lower, "unresolved_share")) && !m.CompleteEnumeration && mt.Value != nil {
+		if rateName.MatchString(lower) && mt.Unit != "ratio" {
+			bad("metric %q: rate-like name requires unit ratio", mt.Name)
+		}
+		if (strings.Contains(lower, "coverage") || strings.Contains(lower, "unresolved_share")) && !m.CompleteEnumeration && mt.Value != nil {
 			bad("metric %q: must be null without complete_enumeration ground truth", mt.Name)
 		}
 		if !allowedUnits[mt.Unit] {
