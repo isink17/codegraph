@@ -144,6 +144,27 @@ func (s *Store) PlanResolverPolicies(ctx context.Context, repoID int64, affected
 	return stale, nil
 }
 
+// PendingResolverPolicies returns, sorted, the languages with live files whose
+// edges were not decided by the current policy: the next update re-decides
+// them, and until then their edges may be ones the current policy refuses.
+// It reads only, and refuses a marker this binary cannot honour.
+func (s *Store) PendingResolverPolicies(ctx context.Context, repoID int64) ([]string, error) {
+	all := make([]string, 0, len(s.policies()))
+	for language := range s.policies() {
+		all = append(all, language)
+	}
+	sort.Strings(all)
+	present, err := s.languagesWithLiveFiles(ctx, repoID, all)
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[string]bool, len(present))
+	for _, language := range present {
+		live[language] = true
+	}
+	return s.PlanResolverPolicies(ctx, repoID, func(language string) bool { return live[language] })
+}
+
 // parseResolverPolicyVersion accepts only the canonical decimal form this
 // package writes.
 func parseResolverPolicyVersion(raw string) (int, bool) {

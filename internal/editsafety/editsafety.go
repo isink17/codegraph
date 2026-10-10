@@ -47,6 +47,7 @@ const (
 	ReasonFreshnessUnknown         = "freshness_unknown"
 	ReasonInsufficientCoverage     = "insufficient_coverage"
 	ReasonParserSemanticUpgrade    = "parser_semantic_upgrade_required"
+	ReasonResolverPolicyPending    = "resolver_policy_redecide_required"
 	ReasonIsolationUnproven        = "isolation_unproven"
 	ReasonConstraintsIndeterminate = "constraints_indeterminate"
 )
@@ -236,6 +237,19 @@ func Assess(ctx context.Context, st *store.Store, repoID int64, opts Options) (R
 		return Result{}, err
 	}
 
+	// Edges decided by an older resolver policy may include ones the current
+	// policy refuses; they are not evidence until the next update re-decides
+	// them. A marker this binary cannot read is no better.
+	policyPending := false
+	if pending, err := st.PendingResolverPolicies(ctx, repoID); err != nil || len(pending) > 0 {
+		policyPending = true
+		if err != nil {
+			res.Limitations = append(res.Limitations, "resolver policy markers cannot be honoured by this binary: "+err.Error())
+		} else {
+			res.Limitations = append(res.Limitations, "edges of "+strings.Join(pending, ", ")+" were decided by an older resolver policy; run `codegraph update` to re-decide them")
+		}
+	}
+
 	limitations, err := st.GraphLimitations(ctx, repoID)
 	if err != nil {
 		return Result{}, err
@@ -277,7 +291,7 @@ func Assess(ctx context.Context, st *store.Store, repoID int64, opts Options) (R
 		LastFullScan: fresh.LastFullScan,
 	}
 
-	decide(&res, semanticBlocked, constraintOutcome, constraintDetail)
+	decide(&res, semanticBlocked, policyPending, constraintOutcome, constraintDetail)
 	return res, nil
 }
 
@@ -470,7 +484,7 @@ func evaluateConstraints(ctx context.Context, st *store.Store, repoID int64, opt
 // decide applies the evaluation order: freshness, then coverage, then the
 // verdict rules. Evidence is kept whatever the outcome, but only an adequate
 // graph produces a verdict.
-func decide(res *Result, semanticBlocked bool, constraintOutcome, constraintDetail string) {
+func decide(res *Result, semanticBlocked, policyPending bool, constraintOutcome, constraintDetail string) {
 	ev := res.Evidence
 	rule := func(id, outcome, detail string) {
 		res.Rules = append(res.Rules, Rule{ID: id, Outcome: outcome, Detail: detail})
@@ -534,6 +548,8 @@ func decide(res *Result, semanticBlocked bool, constraintOutcome, constraintDeta
 		unknown(ReasonFreshnessUnknown)
 	case semanticBlocked:
 		unknown(ReasonParserSemanticUpgrade)
+	case policyPending:
+		unknown(ReasonResolverPolicyPending)
 	case !res.Coverage.Sufficient:
 		unknown(ReasonInsufficientCoverage)
 	case constraintOutcome == OutcomeFired:
