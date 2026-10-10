@@ -156,6 +156,29 @@ PR_JSON="OPEN false $nb $sha MERGEABLE" WANT_BASE=$nb CHECKS='ci\tcompleted\tfai
 	case_ new-wave-ci-failed block --base "$nb" 42 "$sha" "$r"
 PR_JSON="OPEN true $nb $sha MERGEABLE" WANT_BASE=$nb case_ new-wave-draft block --base "$nb" 42 "$sha" "$r"
 
+# The cg19 wave branch is listed exactly; near names and prefixes are not.
+cb=integration/v2.0-wave-20261010-cg19
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$cb case_ cg19-wave-ok pass --base "$cb" 42 "$sha" "$r"
+PR_JSON="OPEN false $cb $sha MERGEABLE" case_ cg19-wave-pr-default-base block 42 "$sha" "$r"
+WANT_BASE=$cb case_ v2-pr-claims-cg19-wave block --base "$cb" 42 "$sha" "$r"
+PR_JSON="OPEN false $nb $sha MERGEABLE" WANT_BASE=$cb case_ wave-pr-claims-cg19-wave block --base "$cb" 42 "$sha" "$r"
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$nb case_ cg19-pr-claims-wave block --base "$nb" 42 "$sha" "$r"
+for fake in integration/v2.0-wave-20261010-cg1 integration/v2.0-wave-20261010-cg190 integration/v2.0-wave-20261010-cg19x \
+	integration/v2.0-wave-20261010-cg18 xintegration/v2.0-wave-20261010-cg19 integration/v2.0-wave-20261010-cg19/x \
+	integration/v2.0-wave-20261010- integration/v2.0-wave-20261010-CG19; do
+	PR_JSON="OPEN false $fake $sha MERGEABLE" WANT_BASE=$fake case_ "cg19-wave-near-name:$fake" block --base "$fake" 42 "$sha" "$r"
+done
+PR_JSON="OPEN false $cb $other MERGEABLE" WANT_BASE=$cb case_ cg19-wave-stale-head block --base "$cb" 42 "$sha" "$r"
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$cb BEHIND=1 case_ cg19-wave-behind block --base "$cb" 42 "$sha" "$r"
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$cb case_ cg19-wave-missing-review block --base "$cb" 42 "$sha" "$work/none.md"
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$cb case_ cg19-wave-review-other-head block --base "$cb" 42 "$sha" "$work/r1.md"
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$cb case_ cg19-wave-review-block block --base "$cb" 42 "$sha" "$work/r3.md"
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$cb CHECKS='ci\tin_progress\t\tgithub-actions\n' \
+	case_ cg19-wave-ci-pending block --base "$cb" 42 "$sha" "$r"
+PR_JSON="OPEN false $cb $sha MERGEABLE" WANT_BASE=$cb CHECKS='ci\tcompleted\tfailure\tgithub-actions\n' \
+	case_ cg19-wave-ci-failed block --base "$cb" 42 "$sha" "$r"
+PR_JSON="OPEN true $cb $sha MERGEABLE" WANT_BASE=$cb case_ cg19-wave-draft block --base "$cb" 42 "$sha" "$r"
+
 # The merge is read back: a PR still open afterwards fails the gate.
 AFTER='OPEN ' case_ merge-not-read-back block 42 "$sha" "$r" --merge
 
