@@ -297,6 +297,12 @@ var toolRegistry = []toolDescriptor{
 		category:   "audit",
 		handler:    (*Server).handleCheckConstraints,
 	},
+	{
+		name: "safe_to_edit", description: "Assess editing one exact symbol or file under named static rules; unknown when the graph cannot vouch (read-only)",
+		properties: []string{"symbol", "symbol_id", "file"},
+		category:   "audit",
+		handler:    (*Server).handleSafeToEdit,
+	},
 	// Hidden diagnostics. Callable and searchable, never advertised: the whole
 	// point of measuring context cost is not to add any.
 	{

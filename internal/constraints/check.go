@@ -769,3 +769,16 @@ func (a *agg) dependency() Dependency {
 		Occurrences:          a.count,
 	}
 }
+
+// StrictFreshnessVerdict is the strict verdict for a reader that is not a
+// constraints evaluation: dirtyFiles is the dirty-queue size and lastScanID
+// the newest scan id its graph reads saw, as for Check. A non-empty queue is
+// known stale. The returned ExitCode is the constraints contract; callers
+// with their own exit contract read Verdict.
+func StrictFreshnessVerdict(dirtyFiles int64, lastScanID int64, before, after graph.Freshness) *StrictFreshness {
+	status := StatusOK
+	if dirtyFiles > 0 {
+		status = StatusStale
+	}
+	return strictFreshness(status, lastScanID, before, after)
+}

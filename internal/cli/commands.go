@@ -426,6 +426,32 @@ func newCommandList() []*command {
 			},
 		},
 		{
+			// safe_to_edit's exit code is a contract like check_constraints':
+			// see editsafety.ExitCode.
+			name:        "safe_to_edit",
+			aliases:     []string{"safe-to-edit"},
+			description: "assess whether editing one exact symbol or file is safe under named static rules",
+			usageLines: []string{
+				"  safe_to_edit [PATH] (--symbol QUALIFIED_NAME | --symbol-id ID | --file FILE)",
+				"    prints a codegraph.safe_to_edit/v1 result; SAFE is never produced in this version",
+				"    exits 0 SAFE, 1 CAUTION or UNSAFE, 2 invalid input, missing or ambiguous target, not indexed,",
+				"    3 known stale, 4 unknown, 5 insufficient coverage",
+			},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root (defaults to the git repo root)"},
+				{name: "--symbol NAME", description: "exact qualified name; an ambiguous name is an error, never guessed"},
+				{name: "--symbol-id ID", description: "exact symbol id"},
+				{name: "--file FILE", description: "repository-relative path of an indexed file (directories are not supported)"},
+			},
+			examples: []string{
+				"codegraph safe_to_edit . --symbol pkg.Func",
+				"codegraph safe-to-edit . --file internal/pkg/file.go",
+			},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runSafeToEdit(ctx, cfg, stdout, args)
+			},
+		},
+		{
 			name:        "file_history",
 			aliases:     []string{"file-history"},
 			description: "show file-level Git history stored by the last index or update",

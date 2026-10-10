@@ -15,6 +15,7 @@ import (
 	"github.com/isink17/codegraph/internal/constraints"
 	"github.com/isink17/codegraph/internal/detail"
 	"github.com/isink17/codegraph/internal/diff"
+	"github.com/isink17/codegraph/internal/editsafety"
 	"github.com/isink17/codegraph/internal/framework"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/graphaudit"
@@ -1508,6 +1509,30 @@ func (s *Server) handleDiff(ctx context.Context, raw json.RawMessage) (map[strin
 		return nil, fmt.Errorf("diff requires the active parser registry")
 	}
 	res, err := diff.CompareCommits(ctx, s.repoRoot, req.Base, req.Head, s.indexer.Registry(), req.Offset, req.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "data": res}, nil
+}
+
+// handleSafeToEdit assesses one exact symbol or file and returns the same
+// result the CLI prints as `data`. Unknown assessments are data; invalid
+// arguments, a missing or ambiguous target, an unindexed repository and I/O
+// or SQL failures are tool errors. Like check_constraints it issues reads only.
+func (s *Server) handleSafeToEdit(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
+	var req struct {
+		Symbol   string `json:"symbol"`
+		SymbolID int64  `json:"symbol_id"`
+		File     string `json:"file"`
+	}
+	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	res, err := editsafety.Assess(ctx, s.store, s.repoID, editsafety.Options{
+		RepoRoot: s.repoRoot, Symbol: req.Symbol, SymbolID: req.SymbolID, File: req.File,
+	})
 	if err != nil {
 		return nil, err
 	}
