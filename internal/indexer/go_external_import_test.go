@@ -120,3 +120,25 @@ func TestGoExternalImportNeverBindsLocalPackage(t *testing.T) {
 	r.update(t)
 	assertGoExternalImportGraph(t, "no-op", edge)
 }
+
+// TestGoExternalImportVetoWithoutGoMod is the same corpus in a GOPATH-style
+// tree: pkg/errors v0.9.1 ships no go.mod. No import path can be mapped to a
+// directory of the repository, so none binds, and the standard library's
+// spelling still never reaches the local package.
+func TestGoExternalImportVetoWithoutGoMod(t *testing.T) {
+	files := goExternalImportTree()
+	delete(files, "go.mod")
+	r := newGoRepo(t, goNativeRegistry(), files)
+	for _, c := range []struct{ src, dst, want string }{
+		{"go113.go", "errors.Is", "<unresolved> [/]"},
+		{"go113.go", "errors.As", "<unresolved> [/]"},
+		{"go113.go", "errors.Unwrap", "<unresolved> [/]"},
+		{"wrap.go", "github.com/other/errors.Wrap", "<unresolved> [/]"},
+		{"wrap.go", "example.com/errors/sub.Helper", "<unresolved> [/]"},
+		{"wrap.go", "Is", "go113.go:errors.Is [go_package_scope/high]"},
+	} {
+		if got := r.edgeState(t, c.src, c.dst); got != c.want {
+			t.Errorf("%s %q => %s, want %s", c.src, c.dst, got, c.want)
+		}
+	}
+}

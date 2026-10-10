@@ -49,8 +49,11 @@ func (s *Store) resolveOwnModuleImportsStandalone(ctx context.Context, repoID in
 // reads module declarations from the repository, not from the Go toolchain.
 func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID int64, scope *ownModuleScope) (int, map[int64]struct{}, error) {
 	blocked := map[int64]struct{}{}
+	// A repository with no go.mod still gets the veto: there no import path
+	// maps to a directory of this repository, so none can be bound, and the
+	// spelling of a standard-library import must not reach a local package.
 	modules, err := repoGoModules(ctx, tx, repoID)
-	if err != nil || len(modules) == 0 {
+	if err != nil {
 		return 0, blocked, err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_resolver_own_module_veto(edge_id INTEGER PRIMARY KEY)`); err != nil {
@@ -78,7 +81,7 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		JOIN files sf ON sf.id = e.file_id AND sf.repo_id = e.repo_id
 		JOIN file_imports fi ON fi.file_id = sf.id AND fi.repo_id = e.repo_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
-		  AND sf.language = 'go'
+		  AND sf.language = 'go' AND instr(e.dst_name, '.') > 0
 		  AND substr(e.dst_name, 1, length(fi.import_path) + 1) = fi.import_path || '.'
 		  AND NOT EXISTS (
 			SELECT 1 FROM go_local_binding_evidence g
