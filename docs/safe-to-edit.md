@@ -65,8 +65,12 @@ whose recorded name equals a target symbol's name or qualified name or ends in
 1. **Freshness** (`ES-FRESHNESS`). Unless the verdict is
    `full_coverage_at_head`, the status is unknown: `known_stale`,
    `insufficient_coverage` or `freshness_unknown`.
-2. **Parser semantics.** A graph that needs a parser semantic upgrade is
-   unknown: `parser_semantic_upgrade_required`.
+2. **Parser semantics and resolver policy.** A graph that needs a parser
+   semantic upgrade is unknown: `parser_semantic_upgrade_required`. A graph
+   whose edges for some indexed language were decided by an older resolver
+   policy (the next `update` re-decides them) is unknown:
+   `resolver_policy_redecide_required`; a policy marker this binary cannot
+   honour counts the same.
 3. **Coverage** (`ES-COVERAGE`). The target's language must be call-capable
    through one complete parser profile (no symbols-only, mixed, unknown or
    approximate parser). Otherwise unknown: `insufficient_coverage`.

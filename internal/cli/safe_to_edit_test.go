@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -399,5 +400,45 @@ func TestSafeToEditCLIManyExactMatchesStayAmbiguous(t *testing.T) {
 	_, _, code, msg := safeToEdit(t, root, "--symbol", "util.Dup")
 	if code != editsafety.ExitInvalid || !strings.Contains(msg, "ambiguous") || !strings.HasSuffix(msg, ", ...") {
 		t.Fatalf("exit %d msg %q", code, msg)
+	}
+}
+
+// Edges decided by an older resolver policy are not evidence: the result is
+// unknown until an update re-decides them.
+func TestSafeToEditCLIPendingResolverPolicy(t *testing.T) {
+	root, _ := safeToEditRepo(t, nil)
+	opened, err := openIndexedRepoReadOnly(context.Background(), loadTestConfig(t), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath, repoID := opened.DBPath, opened.Repo.ID
+	opened.Close()
+	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := db.Exec(`UPDATE settings SET value = '1' WHERE key = ?`, "resolver.policy."+strconv.FormatInt(repoID, 10)+".go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("lowered %d go policy markers, want 1", n)
+	}
+	db.Close()
+
+	out, r, code, _ := safeToEdit(t, root, "--symbol", "infra.B")
+	if r.Status != editsafety.StatusUnknown || r.Verdict != nil || r.Reason != editsafety.ReasonResolverPolicyPending || code != editsafety.ExitUnknown ||
+		r.Evidence.DependentsTotal != 1 {
+		t.Fatalf("pending policy: %s %s %s exit %d\n%s", r.Status, verdictOf(r), r.Reason, code, out)
+	}
+	if _, _, err := runCLI(t, "update", root); err != nil {
+		t.Fatal(err)
+	}
+	if _, r, code, _ := safeToEdit(t, root, "--symbol", "infra.B"); verdictOf(r) != editsafety.VerdictCaution || code != 1 {
+		t.Fatalf("after update: %s %s exit %d", r.Status, verdictOf(r), code)
 	}
 }
