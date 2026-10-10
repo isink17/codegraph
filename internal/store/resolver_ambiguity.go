@@ -289,7 +289,8 @@ type binderCandidateFacts struct {
 	// cppCallerNamespaces map edge ids to the calling symbol's.
 	cppMemberTargets, cppCallerClasses       map[int64]string
 	cppNamespaceTargets, cppCallerNamespaces map[int64]string
-	// ownModuleVeto holds the edges an own-module import mapped, and
+	// ownModuleVeto holds the import-qualified Go calls resolveOwnModuleImports
+	// withholds from the generic strategies, and
 	// goLocalClaims the Go selector calls a locally bound qualifier claims.
 	ownModuleVeto, goLocalClaims map[int64]struct{}
 	// bareLevel is the bare-name level loaded for dotted fallback spellings,
@@ -307,8 +308,10 @@ func goLocalQualifierWithholds(t edgeTarget, f *binderCandidateFacts) bool {
 	return claimed
 }
 
-// ownModuleImportWithholds reads the edges resolveOwnModuleImports mapped to
-// an own-module package, the set it also writes to the SQL veto table.
+// ownModuleImportWithholds reads the set resolveOwnModuleImports writes to the
+// SQL veto table: every unresolved Go call qualified by an import binding that
+// no local variable shadows, whether or not the import maps to a package of
+// the repository's modules.
 func ownModuleImportWithholds(t edgeTarget, f *binderCandidateFacts) bool {
 	_, vetoed := f.ownModuleVeto[t.edgeID]
 	return vetoed

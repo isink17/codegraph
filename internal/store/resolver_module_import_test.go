@@ -242,6 +242,9 @@ func TestModulePackageDirUsesSegmentsAndNestedModuleBoundaries(t *testing.T) {
 		want       string
 		ok         bool
 	}{
+		{name: "root module own path", modules: []goModule{{path: "example.com/project", root: "."}}, importPath: "example.com/project", want: ".", ok: true},
+		{name: "nested module own path", modules: []goModule{{path: "example.com/root", root: "."}, {path: "example.com/tools/sub", root: "tools/sub"}}, importPath: "example.com/tools/sub", want: "tools/sub", ok: true},
+		{name: "root path prefix collision", modules: []goModule{{path: "example.com/project", root: "."}}, importPath: "example.com/projectx", ok: false},
 		{name: "versioned module", modules: []goModule{{path: "example.com/project/v2", root: "."}}, importPath: "example.com/project/v2/pkg", want: "pkg", ok: true},
 		{name: "prefix collision", modules: []goModule{{path: "example.com/project", root: "."}}, importPath: "example.com/projectx/pkg", ok: false},
 		{name: "nested module wins", modules: []goModule{{path: "example.com/root", root: "."}, {path: "example.com/tools/sub", root: "tools/sub"}}, importPath: "example.com/tools/sub/pkg", want: "tools/sub/pkg", ok: true},

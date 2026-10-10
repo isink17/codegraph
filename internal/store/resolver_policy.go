@@ -51,10 +51,12 @@ var resolverPolicyRegistry = map[string]int{
 	// Go's 2 withholds every call qualified by an import outside the
 	// repository's modules; epoch 1 may bind `stderrors.Is` to a local
 	// package's `errors.Is` through exact_qualified.
+	// Go's 3 maps an import of the repository-root module's own path to the
+	// root package; epoch 2 leaves those calls unresolved.
 	"cpp":        1,
 	"csharp":     4,
 	"dart":       1,
-	"go":         2,
+	"go":         3,
 	"java":       1,
 	"kotlin":     1,
 	"hcl":        1,
