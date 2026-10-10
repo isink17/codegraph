@@ -742,6 +742,9 @@ func javaReceiverMember(e javaScopeEdge, byQName, byName map[string][]javaScopeS
 		return javaScopeSymbol{}, ""
 	}
 	if owner.signature != "class" {
+		if !javaSupertypesInProject(owner, byQName, byName, 0) {
+			return javaScopeSymbol{}, ""
+		}
 		for _, s := range byName[member] {
 			if s.kind == "type" || s.kind == "constructor" || s.qname == out.qname {
 				continue
@@ -752,6 +755,59 @@ func javaReceiverMember(e javaScopeEdge, byQName, byName map[string][]javaScopeS
 		}
 	}
 	return out, ResolutionStrategyJavaReceiverScope
+}
+
+// javaSupertypesInProject reports whether every supertype owner's clause
+// names, transitively, is a project Java type or a member-less JDK marker
+// interface. Only then can the project-wide name check in javaReceiverMember
+// see every inherited overload: a library or JDK supertype may declare an
+// overload of the same name and argument count that the graph never records.
+// A supertype that does not resolve uniquely from the owner's package counts
+// as outside the project, and so does one whose symbol was not loaded: the
+// resolver loads only names its edges spell.
+// ponytail: refuses classes whose project supertypes are not edge names; load
+// supertype names transitively if the lost bindings matter.
+func javaSupertypesInProject(owner javaScopeSymbol, byQName, byName map[string][]javaScopeSymbol, depth int) bool {
+	if depth > 16 {
+		return false
+	}
+	clause := owner.signature
+	for {
+		i := strings.IndexByte(clause, '<')
+		if i < 0 {
+			break
+		}
+		j, open := i, 0
+		for ; j < len(clause); j++ {
+			if clause[j] == '<' {
+				open++
+			} else if clause[j] == '>' {
+				open--
+				if open == 0 {
+					break
+				}
+			}
+		}
+		if j >= len(clause) {
+			return false
+		}
+		clause = clause[:i] + clause[j+1:]
+	}
+	for _, f := range strings.FieldsFunc(clause, func(r rune) bool { return r == ' ' || r == ',' }) {
+		switch f {
+		case "permits":
+			// A permits list names subtypes, not supertypes; it ends the clause.
+			return true
+		case "class", "interface", "extends", "implements",
+			"Serializable", "java.io.Serializable", "Cloneable", "java.lang.Cloneable":
+			continue
+		}
+		super, ok, _ := javaType(f, owner.pkg, "", byQName, byName, nil)
+		if !ok || super.language != "java" || super.kind != "type" || !javaSupertypesInProject(super, byQName, byName, depth+1) {
+			return false
+		}
+	}
+	return true
 }
 
 func javaObjectMethodName(name string) bool {

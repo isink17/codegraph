@@ -23,6 +23,12 @@ var javaReceiverTree = map[string]string{
 	"app/Base.java":   "package app;\npublic class Base { public void inh(String s) {} }\n",
 	"app/Sub.java":    "package app;\npublic class Sub extends Base { public void inh(int i) {} public void solo() {} }\n",
 	"app/Helper.java": "package app;\npublic class Helper { public static String key() { return \"\"; } }\n",
+	// ArrayList declares remove(int) and remove(Object): javac binds
+	// e.remove(1) to ArrayList.remove(int), which the graph never records.
+	"app/Ext.java":  "package app;\npublic class Ext extends java.util.ArrayList<String> { public boolean remove(String s) { return false; } }\n",
+	"app/Ser.java":  "package app;\npublic class Ser implements java.io.Serializable { public void ping() {} }\n",
+	"app/Mid.java":  "package app;\npublic class Mid extends java.util.ArrayList<String> {}\n",
+	"app/Leaf.java": "package app;\npublic class Leaf extends Mid { public void leaf() {} }\n",
 	"app/Use.java": `package app;
 import java.util.List;
 public class Use {
@@ -44,6 +50,7 @@ public class Use {
   void shadow(Opt field) { field.key(); }
   void viaField() { field.solo(); }
   <T extends Opt> void generic(T t) { t.key(); }
+  void supers(Ext e, Ser s2, Leaf l) { e.remove(1); s2.ping(); l.leaf(); }
 }
 `,
 }
@@ -57,13 +64,16 @@ func assertJavaReceiverTargets(t *testing.T, r *lifecycleRepo, step string, keyT
 		"app.Use.params|p.dup":        {""},
 		"app.Use.params|sh.area":      {""},
 		"app.Use.params|s.inh":        {""},
-		"app.Use.params|s.solo":       {"app.Sub.solo"},
+		"app.Use.params|s.solo":       {""},
 		"app.Use.params|Helper.key":   {keyTarget},
 		"app.Use.params|v.key":        {""},
 		"app.Use.params|o.key":        {keyTarget},
 		"app.Use.shadow|field.key":    {keyTarget},
 		"app.Use.viaField|field.solo": {""},
 		"app.Use.generic|t.key":       {""},
+		"app.Use.supers|e.remove":     {""},
+		"app.Use.supers|s2.ping":      {"app.Ser.ping"},
+		"app.Use.supers|l.leaf":       {""},
 	} {
 		if strings.Join(calls[key], ",") != strings.Join(want, ",") {
 			t.Errorf("%s: %s bound %q, want %q", step, key, calls[key], want)
