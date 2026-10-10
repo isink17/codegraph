@@ -147,9 +147,17 @@ const (
 	ResolutionStrategyJavaImportScope        = "java_import_scope"
 	ResolutionStrategyJavaStaticImport       = "java_static_import"
 	ResolutionStrategyJavaConstructor        = "java_constructor"
-	ResolutionStrategyKotlinPackageScope     = "kotlin_package_scope"
-	ResolutionStrategyKotlinImportScope      = "kotlin_import_scope"
-	ResolutionStrategyTypeScriptModuleScope  = "typescript_module_scope"
+
+	// ResolutionStrategyJavaReceiverScope: the edge is a Java call `x.m(...)`
+	// whose receiver x is a local or parameter whose declaration states its
+	// class type, and that class is the one visible project class of that
+	// name and declares exactly one method of that name the argument count
+	// admits. See javaReceiverMember in java_scope.go.
+	ResolutionStrategyJavaReceiverScope = "java_receiver_scope"
+
+	ResolutionStrategyKotlinPackageScope    = "kotlin_package_scope"
+	ResolutionStrategyKotlinImportScope     = "kotlin_import_scope"
+	ResolutionStrategyTypeScriptModuleScope = "typescript_module_scope"
 
 	// ResolutionStrategyPythonImportScope: the call's leading name is bound by
 	// an import statement in the calling Python file, that import names exactly
@@ -303,6 +311,7 @@ var resolutionConfidenceByStrategy = map[string]string{
 	ResolutionStrategyJavaImportScope:        ResolutionConfidenceHigh,
 	ResolutionStrategyJavaStaticImport:       ResolutionConfidenceHigh,
 	ResolutionStrategyJavaConstructor:        ResolutionConfidenceHigh,
+	ResolutionStrategyJavaReceiverScope:      ResolutionConfidenceHigh,
 	ResolutionStrategyKotlinPackageScope:     ResolutionConfidenceHigh,
 	ResolutionStrategyKotlinImportScope:      ResolutionConfidenceHigh,
 	ResolutionStrategyTypeScriptModuleScope:  ResolutionConfidenceHigh,
@@ -409,6 +418,7 @@ var incrementallyRedecidableStrategies = append(
 	ResolutionStrategyJavaImportScope,
 	ResolutionStrategyJavaStaticImport,
 	ResolutionStrategyJavaConstructor,
+	ResolutionStrategyJavaReceiverScope,
 	ResolutionStrategyKotlinPackageScope,
 	ResolutionStrategyKotlinImportScope,
 	ResolutionStrategyPythonImportScope,

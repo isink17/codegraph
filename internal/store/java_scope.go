@@ -86,7 +86,8 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	importFiles := map[int64]struct{}{}
 	for _, e := range edges {
 		importFiles[e.file] = struct{}{}
-		for _, part := range strings.FieldsFunc(e.name, func(r rune) bool { return r == '.' || r == '$' }) {
+		_, receiverType, _ := strings.Cut(e.evidence, graph.JavaLocalReceiverEvidence+";")
+		for _, part := range strings.FieldsFunc(e.name+"."+receiverType, func(r rune) bool { return r == '.' || r == '$' }) {
 			if part != "" {
 				scopeNames[part] = struct{}{}
 			}
@@ -583,6 +584,10 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		// owner names a local type, which hides every recorded type.
 		return javaScopeSymbol{}, ""
 	}
+	if e.evidence == graph.JavaLocalReceiverEvidence || strings.HasPrefix(e.evidence, graph.JavaLocalReceiverEvidence+";") {
+		// The receiver is a local or parameter, never a type name (JLS 6.4.2).
+		return javaReceiverMember(e, byQName, byName, imps[e.file])
+	}
 	if strings.HasPrefix(name, "this.") {
 		name = strings.TrimPrefix(name, "this.")
 		s, _, strategy := javaMethods(javaEdgeOwner(e), name, e.pkg, javaEdgeOwner(e), byQName, "java_package_scope", false)
@@ -694,6 +699,61 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 
 // javaObjectMethodName reports whether name is a method java.lang.Object
 // declares, which every class and interface has in scope (JLS 4.3.2, 9.2).
+// javaReceiverMember binds a call on a local or parameter whose declaration
+// states its type (graph.JavaLocalReceiverEvidence). That declared type is
+// the receiver's compile-time type whatever the variable later holds. It
+// binds only when the type is one visible project Java class (not an
+// interface, enum or record, whose supertypes add members) declaring exactly
+// one method of that name whose parameter count admits the call's argument
+// count. A class with a supertype clause binds only when no other project
+// type declares a method of that name the argument count could reach, since
+// supertypes are not resolved and an inherited overload would compete. A
+// name java.lang.Object declares is refused: an inherited Object overload
+// may compete with the class's.
+func javaReceiverMember(e javaScopeEdge, byQName, byName map[string][]javaScopeSymbol, imps []javaScopeImport) (javaScopeSymbol, string) {
+	_, typeName, _ := strings.Cut(e.evidence, graph.JavaLocalReceiverEvidence+";")
+	dot := strings.IndexByte(e.name, '.')
+	if typeName == "" || dot < 0 || !e.callArity.Valid {
+		return javaScopeSymbol{}, ""
+	}
+	member := e.name[dot+1:]
+	if member == "" || strings.Contains(member, ".") || javaObjectMethodName(member) {
+		return javaScopeSymbol{}, ""
+	}
+	owner, ok, _ := javaType(typeName, e.pkg, e.container, byQName, byName, imps)
+	if !ok || owner.language != "java" || owner.kind != "type" || (owner.signature != "class" && !strings.HasPrefix(owner.signature, "class ")) {
+		return javaScopeSymbol{}, ""
+	}
+	var out javaScopeSymbol
+	n := 0
+	for _, s := range byQName[owner.qname+"."+member] {
+		if s.kind != "function" {
+			continue
+		}
+		if !s.arityMin.Valid {
+			return javaScopeSymbol{}, ""
+		}
+		if javaConstructorAccepts(s, e.callArity) {
+			out = s
+			n++
+		}
+	}
+	if n != 1 || !javaVisibleFrom(out, e.pkg, out.pkg, javaEdgeOwner(e) == owner.qname) {
+		return javaScopeSymbol{}, ""
+	}
+	if owner.signature != "class" {
+		for _, s := range byName[member] {
+			if s.kind == "type" || s.kind == "constructor" || s.qname == out.qname {
+				continue
+			}
+			if !s.arityMin.Valid || javaConstructorAccepts(s, e.callArity) {
+				return javaScopeSymbol{}, ""
+			}
+		}
+	}
+	return out, ResolutionStrategyJavaReceiverScope
+}
+
 func javaObjectMethodName(name string) bool {
 	switch name {
 	case "clone", "equals", "finalize", "getClass", "hashCode", "notify", "notifyAll", "toString", "wait":

@@ -131,6 +131,16 @@ const JavaNoInheritedTypeEvidence = "java:no_inherited_member_types"
 // 15.12.1). A call without it may have an inherited method in scope.
 const JavaNoSupertypeCallEvidence = "java:no_supertype_clause"
 
+// JavaLocalReceiverEvidence marks a Java call `x.m(...)` whose receiver x is
+// a local variable or parameter declared in the calling method, constructor
+// or lambda before the call. A variable obscures a type of the same name (JLS
+// 6.4.2), so x is never a type name. Followed by ";" and a type spelling, the
+// declaration states x's type explicitly as that class or interface name with
+// its type arguments dropped; alone, the type is not stated (`var`, an
+// untyped lambda parameter, a pattern binding), or it is a primitive, an array,
+// a union or a type variable, and the call binds nothing.
+const JavaLocalReceiverEvidence = "java:local_receiver"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,

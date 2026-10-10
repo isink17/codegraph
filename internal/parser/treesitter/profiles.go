@@ -57,6 +57,10 @@ func (a *PythonAdapter) Profile() parser.Profile {
 	return parser.NewProfile("python", "treesitter:python:v9", true)
 }
 
+// Java v13 marks a call whose receiver is a local variable or parameter
+// (graph.JavaLocalReceiverEvidence) with the receiver's explicitly declared
+// type, records parameter counts on method declarations, and records a type's
+// declaration keyword and supertype clauses as its signature.
 // Java v12 adds source-only JVM declaration and callable type syntax evidence;
 // it does not change edge resolution. Java v11 marks a bare call in a class
 // that, with every class enclosing it, spells no supertype
@@ -114,7 +118,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	if a.legacyCallSupertype {
 		return parser.NewProfile("java", "treesitter:java:v10", true)
 	}
-	return parser.NewProfile("java", "treesitter:java:v12", true)
+	if a.legacyReceiverType {
+		return parser.NewProfile("java", "treesitter:java:v12", true)
+	}
+	return parser.NewProfile("java", "treesitter:java:v13", true)
 }
 
 // Kotlin v12 persists source-only JVM type declarations, aliases and callable

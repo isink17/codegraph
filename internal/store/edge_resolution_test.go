@@ -101,6 +101,7 @@ func TestConfidenceMappingCoversEveryStrategy(t *testing.T) {
 		ResolutionStrategyJavaImportScope,
 		ResolutionStrategyJavaStaticImport,
 		ResolutionStrategyJavaConstructor,
+		ResolutionStrategyJavaReceiverScope,
 		ResolutionStrategyKotlinPackageScope,
 		ResolutionStrategyKotlinImportScope,
 		ResolutionStrategyTypeScriptModuleScope,
