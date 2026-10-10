@@ -23,6 +23,8 @@
   (`codegraph audit`, MCP `audit`); read-only, observational, never re-resolves
 - `internal/constraints`: architectural constraints over an indexed graph
   (`codegraph check_constraints`, MCP `check_constraints`); read-only
+- `internal/editsafety`: fail-closed edit-safety assessment of one symbol or
+  file (`codegraph safe_to_edit`, MCP `safe_to_edit`); read-only
 - `internal/query`: symbol, caller, callee, impact, and stats queries
 - `internal/search`: package doc only, no code; semantic search is implemented
   in `internal/store` and `internal/query` (token weights in `internal/texttoken`)

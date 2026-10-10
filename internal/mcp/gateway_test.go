@@ -31,7 +31,7 @@ var preGatewayToolNames = []string{
 	"architecture_overview", "diff", "trace_dependencies", "detect_frameworks",
 	"benchmark_tokens", "cross_language_links", "session_log", "session_history",
 	"session_hot_files", "session_context", "graph_analytics", "agentic_query",
-	"audit", "check_constraints",
+	"audit", "check_constraints", "safe_to_edit",
 }
 
 // wantGatewayToolNames is the gateway surface, in order: the core workflow tools
@@ -319,9 +319,13 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 //
 // check_constraints' strict_freshness boolean adds 38 bytes (+9 estimated
 // tokens) to the full surface; check_constraints is not gateway core.
+//
+// safe_to_edit is listed in full mode: 13448 -> 13761 bytes (+313 bytes, +79
+// estimated tokens). It is not gateway core, so the gateway payload is
+// unchanged; gateway clients reach it through tool_search and tool_call.
 const (
-	fullToolsListBytes  = 13448
-	fullToolsListTokens = 3362
+	fullToolsListBytes  = 13761
+	fullToolsListTokens = 3441
 	// The gateway payload is pinned for the same reason, and became load-bearing
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name
