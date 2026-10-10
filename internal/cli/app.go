@@ -1439,16 +1439,25 @@ func runRecoverScans(ctx context.Context, cfg config.Config, stdout io.Writer, a
 	if err != nil {
 		return err
 	}
-	dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+	// Look the database up without dbPathForRepo, which creates its parent
+	// directory: a refusal must leave the repository untouched.
+	paths, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
 	if err != nil {
 		return err
 	}
-	// Never create a database just to find nothing in it.
-	if st, err := os.Stat(dbPath); err != nil || st.Size() == 0 {
-		if err == nil || errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("repository %s is not indexed", repoRoot)
+	dbPath := ""
+	for _, path := range paths {
+		st, err := os.Stat(path)
+		if err == nil && st.Size() > 0 {
+			dbPath = path
+			break
 		}
-		return err
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if dbPath == "" {
+		return fmt.Errorf("repository %s is not indexed", repoRoot)
 	}
 	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
 	if err != nil {
