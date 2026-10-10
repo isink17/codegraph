@@ -140,10 +140,12 @@ type DiffDocument struct {
 	Edges     EdgeSection    `json:"edges"`
 	TestLinks SymbolSection  `json:"test_links"`
 	Risk      Risk           `json:"risk"`
-	Total     int            `json:"total"`
-	Offset    int            `json:"offset"`
-	Limit     int            `json:"limit"`
-	Truncated bool           `json:"truncated"`
+	// FileRenames is an annotation over Files; it changes no other section.
+	FileRenames FileRenames `json:"file_renames"`
+	Total       int         `json:"total"`
+	Offset      int         `json:"offset"`
+	Limit       int         `json:"limit"`
+	Truncated   bool        `json:"truncated"`
 }
 
 func Compare(base, head Revision, offset, limit int) (Result, error) {
@@ -214,7 +216,7 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 		summary[summaryKey(c.Kind)]++
 	}
 	coverage := sectionCoverage(base, head, baseEdges, headEdges, semanticOK, compatible, len(incomplete))
-	doc := DiffDocument{Schema: Schema, Coverage: coverage, Risk: removedDeclarationRisk(all, coverage, head.GraphData.Declarations, baseEdges, headEdges), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
+	doc := DiffDocument{Schema: Schema, Coverage: coverage, FileRenames: fileRenames(revisionFiles(base), revisionFiles(head), sameJSON(base.IndexPolicy, head.IndexPolicy)), Risk: removedDeclarationRisk(all, coverage, head.GraphData.Declarations, baseEdges, headEdges), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
 	for _, c := range changes {
 		addToSections(&doc, c)
 	}

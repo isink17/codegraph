@@ -20,8 +20,10 @@ import (
 func TestDiffCLIAndMCPReturnSameDocument(t *testing.T) {
 	r := gittest.Init(t)
 	r.Write("main.go", "package main\nfunc A() {}\n")
+	r.Write("util.go", "package main\nfunc U() {}\n")
 	base := r.Commit("", "base")
 	r.Write("main.go", "package main\nfunc A() { B() }\nfunc B() {}\n")
+	r.Git("mv", "util.go", "helpers.go")
 	head := r.Commit("", "head")
 
 	var cliOut, cliErr bytes.Buffer
@@ -81,6 +83,16 @@ func TestDiffCLIAndMCPReturnSameDocument(t *testing.T) {
 	}
 	if !viaMCP.OK {
 		t.Fatalf("MCP diff payload not ok: %s", response.Result.Content[0].Text)
+	}
+	var renames struct {
+		Diff struct {
+			FileRenames struct {
+				Exact []struct{ From, To string } `json:"exact"`
+			} `json:"file_renames"`
+		} `json:"diff"`
+	}
+	if err := json.Unmarshal(cliOut.Bytes(), &renames); err != nil || len(renames.Diff.FileRenames.Exact) != 1 || renames.Diff.FileRenames.Exact[0].From != "util.go" || renames.Diff.FileRenames.Exact[0].To != "helpers.go" {
+		t.Fatalf("CLI renames = %+v (%v)", renames.Diff.FileRenames, err)
 	}
 	cliJSON, _ := json.Marshal(viaCLI)
 	var mcpDocument any
