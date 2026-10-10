@@ -6980,6 +6980,10 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 	if err != nil {
 		return outcome, err
 	}
+	goBareLocal, err := goLocallyBoundBareEdges(ctx, s.db, repoID, goBareEdgeIDs)
+	if err != nil {
+		return outcome, err
+	}
 
 	shortSet := make(map[string]struct{}, len(targets))
 	bareLevelSet := make(map[string]struct{})
@@ -7145,7 +7149,8 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 			// identifier is entitled to.
 			var matchedGroup candidateGroup
 			var matched bool
-			if scope, known := goBareScopes[target.edgeID]; known && scope.key != goPackageScopeUnknown {
+			_, local := goBareLocal[target.edgeID]
+			if scope, known := goBareScopes[target.edgeID]; known && scope.key != goPackageScopeUnknown && !local {
 				matchedGroup, matched = goBareGroups[goScopeName{scope: scope.key, name: target.dstName}]
 			}
 			dstID, ok := int64(0), false
