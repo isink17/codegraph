@@ -41,7 +41,7 @@ func runSafeToEdit(ctx context.Context, cfg config.Config, stdout io.Writer, arg
 	if err != nil {
 		return &ExitError{Code: editsafety.ExitInvalid, Err: fmt.Errorf("safe_to_edit: %w", err)}
 	}
-	// Default HTML escaping keeps the bytes equal to the MCP tool's data.
+	// Default HTML escaping, as the MCP tool's data; only the indentation differs.
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(res); err != nil {

@@ -84,6 +84,9 @@ const (
 // reported.
 const maxDependents = 50
 
+// maxCandidates bounds the candidate ids an ambiguity error lists.
+const maxCandidates = 20
+
 // Errors that are not an assessment. Every one is invalid input or setup.
 var (
 	ErrInvalidTarget  = errors.New("invalid target")
@@ -311,15 +314,11 @@ func readTarget(ctx context.Context, st *store.Store, repoID int64, opts Options
 	default:
 		id := opts.SymbolID
 		if opts.Symbol != "" {
-			matches, err := st.FindSymbolExact(ctx, repoID, opts.Symbol, limits.MaxPage+1, 0)
+			// maxCandidates+1 rows tell a unique name from an ambiguous one
+			// and bound the candidate list in the error.
+			exact, err := st.SymbolsByQualifiedName(ctx, repoID, opts.Symbol, maxCandidates+1)
 			if err != nil {
 				return t, false, err
-			}
-			var exact []graph.Symbol
-			for _, m := range matches {
-				if m.QualifiedName == opts.Symbol {
-					exact = append(exact, m)
-				}
 			}
 			switch len(exact) {
 			case 0:
@@ -328,10 +327,14 @@ func readTarget(ctx context.Context, st *store.Store, repoID int64, opts Options
 				id = exact[0].ID
 			default:
 				ids := make([]string, 0, len(exact))
-				for _, m := range exact {
+				for _, m := range exact[:min(len(exact), maxCandidates)] {
 					ids = append(ids, fmt.Sprintf("%d (%s:%d)", m.ID, m.FilePath, m.Range.StartLine))
 				}
-				return t, false, fmt.Errorf("%w: %d symbols are named %q; pass symbol_id, one of %s", ErrAmbiguous, len(exact), opts.Symbol, strings.Join(ids, ", "))
+				more := ""
+				if len(exact) > maxCandidates {
+					more = ", ..."
+				}
+				return t, false, fmt.Errorf("%w: several symbols are named %q; pass symbol_id, one of %s%s", ErrAmbiguous, opts.Symbol, strings.Join(ids, ", "), more)
 			}
 		}
 		var ok bool
@@ -399,7 +402,11 @@ func semanticUpgrade(err error) bool {
 func evaluateConstraints(ctx context.Context, st *store.Store, repoID int64, opts Options, t store.EditSafetyTarget, res *Result) (string, string, error) {
 	keys := map[string]bool{}
 	for _, s := range t.Symbols {
-		keys[s.StableKey] = true
+		// An empty key identifies nothing; it must not match an endpoint
+		// that also lacks one.
+		if s.StableKey != "" {
+			keys[s.StableKey] = true
+		}
 	}
 	involves := func(d constraints.Dependency) bool {
 		if keys[d.Source.StableKey] || keys[d.Target.StableKey] {

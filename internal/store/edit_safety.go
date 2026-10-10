@@ -45,6 +45,25 @@ type EditSafetyDependent struct {
 	ResolutionConfidence string `json:"resolution_confidence"`
 }
 
+// SymbolsByQualifiedName returns up to limit live symbols whose qualified
+// name is exactly name, ordered by path and position. It never matches a
+// short name or suffix.
+func (s *Store) SymbolsByQualifiedName(ctx context.Context, repoID int64, name string, limit int) ([]graph.Symbol, error) {
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
+		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+		FROM symbols s
+		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
+		WHERE s.repo_id = ? AND s.qualified_name = ?
+		ORDER BY f.path ASC, s.start_line ASC, s.start_col ASC, s.kind ASC, s.stable_key ASC
+		LIMIT ?
+	`, repoID, name, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
+}
+
 // EditSafetySymbol reads the target state for one symbol id. ok is false when
 // no live symbol has that id.
 func (s *Store) EditSafetySymbol(ctx context.Context, repoID, symbolID int64) (EditSafetyTarget, bool, error) {
@@ -201,8 +220,17 @@ func (s *Store) editSafetyEdges(ctx context.Context, repoID int64, t *EditSafety
 			args = append(args, c.args...)
 		}
 		var n int
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges e WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND (`+
-			strings.Join(where, " OR ")+`)`, args...).Scan(&n); err != nil {
+		// Only edges from live files count; for a file target, not edges
+		// from the file itself.
+		self := ``
+		if sameFile {
+			self = ` AND src.file_id <> ?`
+			args = append(args, t.Symbols[0].FileID)
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges e
+			JOIN symbols src ON src.repo_id = e.repo_id AND src.id = e.src_symbol_id
+			JOIN files sf ON sf.repo_id = src.repo_id AND sf.id = src.file_id AND sf.is_deleted = 0
+			WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL AND (`+strings.Join(where, " OR ")+`)`+self, args...).Scan(&n); err != nil {
 			return err
 		}
 		t.UnresolvedCandidates += n
