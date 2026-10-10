@@ -22,6 +22,12 @@ func pairRevision(file store.SemanticFile, decls ...store.SemanticDeclaration) R
 	}
 }
 
+// withTree adds files, such as go.mod, to a revision's tree.
+func withTree(r Revision, files ...SourceFile) Revision {
+	r.TreeFiles = append(r.TreeFiles, files...)
+	return r
+}
+
 func goFile(path string) store.SemanticFile {
 	return store.SemanticFile{Path: path, Language: "go", ContentHash: "h1", ParseState: store.ParseStateIndexed, ParserProfile: "go", ParserCallEdges: true, ParserSemanticEpoch: 1}
 }
@@ -69,6 +75,13 @@ func TestDeclarationPairsProveContinuityOnlyInsideOneDirectory(t *testing.T) {
 		{name: "path-derived stable key", base: pairRevision(goFile("p/a.go"), fn), head: pairRevision(goFile("p/b.go"), store.SemanticDeclaration{Language: "go", Kind: "function", Name: "A", QualifiedName: "p.A", StableKey: "func:b::A", StartLine: 3, EndLine: 3}), refused: []string{refuseDeclarationUnmatched}},
 		{name: "parser profile differs", base: pairRevision(goFile("p/a.go"), fn), head: pairRevision(func() store.SemanticFile { f := goFile("p/b.go"); f.ParserProfile = "go2"; return f }(), fn), refused: []string{refuseParserSemanticsDiffer}},
 		{name: "renamed file not parsed", base: pairRevision(goFile("p/a.go"), fn), head: pairRevision(func() store.SemanticFile { f := goFile("p/b.go"); f.ParseState = store.ParseStateFailed; return f }()), refused: []string{refuseFileNotParsed}},
+		{name: "go.mod added in the directory", base: pairRevision(goFile("p/a.go"), fn), head: withTree(pairRevision(goFile("p/b.go"), fn), SourceFile{Path: "p/go.mod", ContentHash: "m"}), refused: []string{refuseModuleRootChanged}},
+		{name: "root go.mod changed", base: withTree(pairRevision(goFile("p/a.go"), fn), SourceFile{Path: "go.mod", ContentHash: "m1"}), head: withTree(pairRevision(goFile("p/b.go"), fn), SourceFile{Path: "go.mod", ContentHash: "m2"}), refused: []string{refuseModuleRootChanged}},
+		{name: "sibling go.mod changed", base: withTree(pairRevision(goFile("p/a.go"), fn), SourceFile{Path: "go.mod", ContentHash: "m"}, SourceFile{Path: "q/go.mod", ContentHash: "q1"}), head: withTree(pairRevision(goFile("p/b.go"), fn), SourceFile{Path: "go.mod", ContentHash: "m"}, SourceFile{Path: "q/go.mod", ContentHash: "q2"}), pairs: 1},
+		{name: "go.work added", base: pairRevision(goFile("p/a.go"), fn), head: withTree(pairRevision(goFile("p/b.go"), fn), SourceFile{Path: "go.work", ContentHash: "w"}), refused: []string{refuseModuleRootChanged}},
+		{name: "tree unknown", base: pairRevision(goFile("p/a.go"), fn), head: func() Revision { r := pairRevision(goFile("p/b.go"), fn); r.TreeFiles = nil; return r }(), refused: []string{refuseModuleEvidenceMissing}},
+		{name: "external test package within the test role", base: pairRevision(goFile("p/a_test.go"), goFunc("TestA")), head: pairRevision(goFile("p/b_test.go"), goFunc("TestA")), pairs: 1},
+		{name: "build-constrained content", base: pairRevision(func() store.SemanticFile { f := goFile("p/a.go"); f.ContentHash = "linux"; return f }(), fn), head: pairRevision(func() store.SemanticFile { f := goFile("p/b.go"); f.ContentHash = "linux"; return f }(), fn), pairs: 1},
 		{name: "graph capability differs", base: pairRevision(goFile("p/a.go"), fn), head: func() Revision {
 			r := pairRevision(goFile("p/b.go"), fn)
 			r.GraphData.State.Pending = "resolver"
@@ -140,6 +153,11 @@ func TestCompareCommitsDeclarationPairsLifecycle(t *testing.T) {
 	back := r.Commit("", "rename back")
 	r.Git("mv", "a.go", "a_test.go")
 	refused := r.Commit("", "into a test file")
+	r.Git("mv", "a_test.go", "a.go")
+	plain := r.Commit("", "out of the test file")
+	r.Git("mv", "a.go", "b.go")
+	r.Write("go.mod", "module example.com/m\n")
+	nested := r.Commit("", "rename with a new module")
 	status, currentHead := r.Git("status", "--porcelain", "--untracked-files=all"), r.Git("rev-parse", "HEAD")
 	reg := parser.NewRegistry(goparser.New())
 	diff := func(from, to string) DeclarationPairs {
@@ -165,6 +183,9 @@ func TestCompareCommitsDeclarationPairsLifecycle(t *testing.T) {
 	}
 	if role := diff(back, refused); len(role.Pairs) != 0 || !reflect.DeepEqual(reasons(role), []string{refuseBuildRoleChanged}) {
 		t.Fatalf("test-file rename = %+v", role)
+	}
+	if mod := diff(plain, nested); len(mod.Pairs) != 0 || !reflect.DeepEqual(reasons(mod), []string{refuseModuleRootChanged}) {
+		t.Fatalf("rename with a new go.mod = %+v", mod)
 	}
 	if got := r.Git("status", "--porcelain", "--untracked-files=all"); got != status {
 		t.Fatalf("worktree changed: %q => %q", status, got)

@@ -55,9 +55,11 @@ const (
 	refuseBuildRoleChanged      = "build_role_changed"
 	refuseDeclarationNotUnique  = "declaration_not_unique"
 	refuseDeclarationUnmatched  = "declaration_unmatched"
+	refuseModuleRootChanged     = "module_root_changed"
+	refuseModuleEvidenceMissing = "module_evidence_unavailable"
 )
 
-func declarationPairs(renames FileRenames, base, head store.SemanticGraph, semanticOK bool, incomplete map[string]bool) DeclarationPairs {
+func declarationPairs(renames FileRenames, base, head store.SemanticGraph, semanticOK bool, incomplete map[string]bool, baseTree, headTree []SourceFile) DeclarationPairs {
 	d := DeclarationPairs{Pairs: []DeclarationPair{}, Refused: []RefusedPairing{}}
 	if renames.Limitation != "" {
 		d.Limitation = "declarations not paired because file renames were not paired"
@@ -90,6 +92,12 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 			continue
 		case goBuildRole(r.From) != goBuildRole(r.To):
 			refuse(refuseBuildRoleChanged)
+			continue
+		case baseTree == nil || headTree == nil:
+			refuse(refuseModuleEvidenceMissing)
+			continue
+		case goModuleEvidence(baseTree, path.Dir(r.From)) != goModuleEvidence(headTree, path.Dir(r.To)):
+			refuse(refuseModuleRootChanged)
 			continue
 		}
 		before, after := groupByShape(baseDecls[r.From]), groupByShape(headDecls[r.To])
@@ -151,6 +159,29 @@ func declarationsByPath(decls []store.SemanticDeclaration) map[string][]store.Se
 		out[d.Path] = append(out[d.Path], d)
 	}
 	return out
+}
+
+// goModuleEvidence lists the path and content hash of every go.mod and
+// go.work in dir and each of its parents. A directory is its package's import
+// path only while the modules above it are unchanged.
+// ponytail: any go.mod or go.work byte change refuses, even a require edit;
+// reading the module directive would keep those pairs.
+func goModuleEvidence(tree []SourceFile, dir string) string {
+	ancestors := map[string]bool{}
+	for d := dir; ; d = path.Dir(d) {
+		ancestors[d] = true
+		if d == "." || d == "/" {
+			break
+		}
+	}
+	var out []string
+	for _, f := range tree {
+		if b := path.Base(f.Path); (b == "go.mod" || b == "go.work") && ancestors[path.Dir(f.Path)] {
+			out = append(out, f.Path+"="+f.ContentHash)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, "\n")
 }
 
 // goBuildRole is the part of a Go file name the toolchain reads: the _test
