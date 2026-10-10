@@ -355,6 +355,11 @@ func modulePackageDir(modules []goModule, importPath string) (string, bool) {
 			dir = path.Join(best.root, rel)
 		}
 	}
+	// The repository-root module's own path names the root directory, which
+	// path.Dir spells "." for the files stored there.
+	if dir == "" {
+		dir = "."
+	}
 	for _, module := range modules {
 		if !module.blocked || module.root == "" || module.root == "." {
 			continue

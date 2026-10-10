@@ -85,10 +85,9 @@ func assertGoExternalImportGraph(t *testing.T, step string, edge func(src, dst s
 		{"wrap.go", "Is", "go113.go:errors.Is [go_package_scope/high]"},
 		// A parameter shadowing the import is the local, not the package.
 		{"other/other.go", "errors.Is", "other/other.go:other.checker.Is [go_receiver_scope/high]"},
-		// External test package importing the module root: module_import does
-		// not map the root package (a known gap that predates this rule), and
-		// it must not fall through to a repo-wide guess either.
-		{"go113_test.go", "example.com/errors.Is", "<unresolved> [/]"},
+		// External test package importing the module root binds the root
+		// package, not the same-named Is of extra/ or the standard library.
+		{"go113_test.go", "example.com/errors.Is", "go113.go:errors.Is [module_import/high]"},
 	} {
 		if got := edge(c.src, c.dst); got != c.want {
 			t.Errorf("%s: %s %q => %s, want %s", step, c.src, c.dst, got, c.want)
