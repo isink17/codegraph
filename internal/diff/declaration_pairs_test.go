@@ -53,6 +53,17 @@ func TestDeclarationPairsProveContinuityOnlyInsideOneDirectory(t *testing.T) {
 		{name: "case-only directory", base: pairRevision(goFile("P/a.go"), fn), head: pairRevision(goFile("p/a.go"), fn), refused: []string{refuseModuleIdentityChanged}},
 		{name: "into a test file", base: pairRevision(goFile("p/a.go"), fn), head: pairRevision(goFile("p/a_test.go"), fn), refused: []string{refuseBuildRoleChanged}},
 		{name: "into a GOOS file", base: pairRevision(goFile("p/a.go"), fn), head: pairRevision(goFile("p/a_linux.go"), fn), refused: []string{refuseBuildRoleChanged}},
+		{name: "into an ignored file", base: pairRevision(goFile("p/a.go"), fn), head: pairRevision(goFile("p/_a.go"), fn), refused: []string{refuseBuildRoleChanged}},
+		{name: "suffix order", base: pairRevision(goFile("p/a_linux_amd64.go"), fn), head: pairRevision(goFile("p/b_linux_amd64.go"), fn), pairs: 1},
+		{name: "not Go", base: func() Revision {
+			f := goFile("p/a.lua")
+			f.Language = "lua"
+			return pairRevision(f, store.SemanticDeclaration{Language: "lua", Kind: "function", Name: "f", QualifiedName: "M.f", StableKey: "func:lua:M.f:1:1"})
+		}(), head: func() Revision {
+			f := goFile("p/b.lua")
+			f.Language = "lua"
+			return pairRevision(f, store.SemanticDeclaration{Language: "lua", Kind: "function", Name: "f", QualifiedName: "M.f", StableKey: "func:lua:M.f:1:1"})
+		}(), refused: []string{refuseLanguageNotProven}},
 		{name: "same GOOS", base: pairRevision(goFile("p/a_linux.go"), fn), head: pairRevision(goFile("p/b_linux.go"), fn), pairs: 1},
 		{name: "duplicate declarations", base: pairRevision(goFile("p/a.go"), goFunc("init"), goFunc("init"), fn), head: pairRevision(goFile("p/b.go"), goFunc("init"), goFunc("init"), fn), pairs: 1, refused: []string{refuseDeclarationNotUnique, refuseDeclarationNotUnique}},
 		{name: "path-derived stable key", base: pairRevision(goFile("p/a.go"), fn), head: pairRevision(goFile("p/b.go"), store.SemanticDeclaration{Language: "go", Kind: "function", Name: "A", QualifiedName: "p.A", StableKey: "func:b::A", StartLine: 3, EndLine: 3}), refused: []string{refuseDeclarationUnmatched}},

@@ -16,10 +16,12 @@ import (
 // risk still cites their dependents.
 //
 // Continuity is asserted only when the move cannot change what a declaration
-// means. Version 1 therefore pairs only renames inside one directory: for Go
-// the directory is the package's import path, and for the JVM languages the
-// compilation scope of a directory is not recorded, while languages that
-// derive a module from the path already show it as a different stable key.
+// means. Version 1 pairs only Go files renamed inside one directory: the
+// directory is the package's import path, and only the file name's build role
+// can change membership. Every other language is refused: callers reach Lua,
+// C/C++, Ruby and PHP declarations through the file path (require, include)
+// and Kotlin top-level functions through a class named after the file, while
+// their stable keys may not carry the path.
 type DeclarationPairs struct {
 	Pairs   []DeclarationPair `json:"pairs"`
 	Refused []RefusedPairing  `json:"refused"`
@@ -45,6 +47,7 @@ type RefusedPairing struct {
 }
 
 const (
+	refuseLanguageNotProven     = "language_not_proven"
 	refuseSemanticsIncompatible = "semantics_incompatible"
 	refuseFileNotParsed         = "file_not_parsed"
 	refuseParserSemanticsDiffer = "parser_semantics_differ"
@@ -72,6 +75,9 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 		case !semanticOK:
 			refuse(refuseSemanticsIncompatible)
 			continue
+		case r.Language != "go":
+			refuse(refuseLanguageNotProven)
+			continue
 		case !bok || !hok || incomplete[r.From] || incomplete[r.To]:
 			refuse(refuseFileNotParsed)
 			continue
@@ -82,7 +88,7 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 		case path.Dir(r.From) != path.Dir(r.To):
 			refuse(refuseModuleIdentityChanged)
 			continue
-		case bf.Language == "go" && goBuildRole(r.From) != goBuildRole(r.To):
+		case goBuildRole(r.From) != goBuildRole(r.To):
 			refuse(refuseBuildRoleChanged)
 			continue
 		}
@@ -148,12 +154,17 @@ func declarationsByPath(decls []store.SemanticDeclaration) map[string][]store.Se
 }
 
 // goBuildRole is the part of a Go file name the toolchain reads: the _test
-// suffix and any GOOS/GOARCH suffix. Two names with different roles can belong
+// suffix, any GOOS/GOARCH suffix, and a leading _ or . that makes the
+// toolchain ignore the file. Two names with different roles can belong
 // to different compilations of the same directory. go/build decides which
 // elements are constraints: under a GOOS and GOARCH nothing names, a name
 // ending in a known one does not match.
 func goBuildRole(p string) string {
-	name := strings.TrimSuffix(path.Base(p), ".go")
+	base := path.Base(p)
+	if strings.HasPrefix(base, "_") || strings.HasPrefix(base, ".") {
+		return "ignored"
+	}
+	name := strings.TrimSuffix(base, ".go")
 	stem := strings.TrimSuffix(name, "_test")
 	role := ""
 	if stem != name {
