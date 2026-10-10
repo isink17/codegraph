@@ -48,10 +48,13 @@ var resolverPolicyRegistry = map[string]int{
 	// C#'s 4 lets a member of an enclosing type, or any base list on the
 	// caller's type or an enclosing type, preempt a using static binding of a
 	// bare call; epoch 3 may bind the using static target instead.
+	// Go's 2 withholds every call qualified by an import outside the
+	// repository's modules; epoch 1 may bind `stderrors.Is` to a local
+	// package's `errors.Is` through exact_qualified.
 	"cpp":        1,
 	"csharp":     4,
 	"dart":       1,
-	"go":         1,
+	"go":         2,
 	"java":       1,
 	"kotlin":     1,
 	"hcl":        1,
