@@ -370,3 +370,34 @@ func TestSafeToEditExitCodes(t *testing.T) {
 		}
 	}
 }
+
+// An unresolved edge from inside a file target is not a candidate for it,
+// while the same edge still counts for a symbol target in that file. p.Ping()
+// names S.Ping, which the same file declares.
+func TestSafeToEditCLIUnresolvedCandidatesExcludeTheTargetFile(t *testing.T) {
+	root, _ := safeToEditRepo(t, map[string]string{
+		"internal/infra/self.go": "package infra\n\ntype S struct{}\n\nfunc (S) Ping() {}\n\nfunc useSelf(p interface{ Ping() }) { p.Ping() }\n",
+	})
+	_, sym, _, _ := safeToEdit(t, root, "--symbol", "infra.S.Ping")
+	if sym.Evidence.UnresolvedCandidates != 1 {
+		t.Fatalf("symbol target: unresolved candidates %d, want 1 (p.Ping in self.go)", sym.Evidence.UnresolvedCandidates)
+	}
+	_, file, _, _ := safeToEdit(t, root, "--file", "internal/infra/self.go")
+	if file.Evidence.UnresolvedCandidates != 0 {
+		t.Fatalf("file target: unresolved candidates %d, want 0 (its own edge)", file.Evidence.UnresolvedCandidates)
+	}
+}
+
+// Ambiguity is decided on exact qualified names alone and lists a bounded
+// set of candidates.
+func TestSafeToEditCLIManyExactMatchesStayAmbiguous(t *testing.T) {
+	extra := map[string]string{}
+	for i := 0; i < 25; i++ {
+		extra["internal/many/d"+strconv.Itoa(i)+"/x.go"] = "package util\n\nfunc Dup() {}\n"
+	}
+	root, _ := safeToEditRepo(t, extra)
+	_, _, code, msg := safeToEdit(t, root, "--symbol", "util.Dup")
+	if code != editsafety.ExitInvalid || !strings.Contains(msg, "ambiguous") || !strings.HasSuffix(msg, ", ...") {
+		t.Fatalf("exit %d msg %q", code, msg)
+	}
+}
