@@ -86,26 +86,30 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	importFiles := map[int64]struct{}{}
 	for _, e := range edges {
 		importFiles[e.file] = struct{}{}
-		for _, part := range strings.FieldsFunc(e.name, func(r rune) bool { return r == '.' || r == '$' }) {
+		_, receiverType, _ := strings.Cut(e.evidence, graph.JavaLocalReceiverEvidence+";")
+		for _, part := range strings.FieldsFunc(e.name+"."+receiverType, func(r rune) bool { return r == '.' || r == '$' }) {
 			if part != "" {
 				scopeNames[part] = struct{}{}
 			}
 		}
 	}
-	if err := sqliteBatchedIDQuery(ctx, q, sortedIDs(importFiles),
-		`SELECT file_id,source_specifier,local_name,wildcard,is_static FROM scope_import_evidence WHERE repo_id=? AND language='java' AND file_id IN (`,
-		[]any{repoID}, func(scan func(...any) error) error {
-			var file int64
-			var i javaScopeImport
-			var w, st int
-			if err := scan(&file, &i.source, &i.local, &w, &st); err != nil {
-				return err
-			}
-			i.wildcard = w != 0
-			i.static = st != 0
-			imports[file] = append(imports[file], i)
-			return nil
-		}); err != nil {
+	loadImports := func(files map[int64]struct{}) error {
+		return sqliteBatchedIDQuery(ctx, q, sortedIDs(files),
+			`SELECT file_id,source_specifier,local_name,wildcard,is_static FROM scope_import_evidence WHERE repo_id=? AND language='java' AND file_id IN (`,
+			[]any{repoID}, func(scan func(...any) error) error {
+				var file int64
+				var i javaScopeImport
+				var w, st int
+				if err := scan(&file, &i.source, &i.local, &w, &st); err != nil {
+					return err
+				}
+				i.wildcard = w != 0
+				i.static = st != 0
+				imports[file] = append(imports[file], i)
+				return nil
+			})
+	}
+	if err := loadImports(importFiles); err != nil {
 		return 0, err
 	}
 	for _, fileImports := range imports {
@@ -128,7 +132,8 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	byQName := map[string][]javaScopeSymbol{}
 	byName := map[string][]javaScopeSymbol{}
 	companions := map[string][]javaScopeSymbol{}
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,ke.symbol_id,ke.is_known,ke.jvm_arity_min,ke.jvm_arity_max,
+	loadSymbols := func(names []string) error {
+		return sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.signature,s.visibility,s.is_static,COALESCE(fs.package_name,''),f.language,s.arity_min,s.arity_max,ke.symbol_id,ke.is_known,ke.jvm_arity_min,ke.jvm_arity_max,
 		EXISTS(SELECT 1 FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmStatic' AND ki.local_name!='JvmStatic'),
 		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmName' AND ki.local_name!='JvmName' AND instr(s.signature,'@'||ki.local_name)>0),''),
 		COALESCE((SELECT group_concat(ki.local_name, ',') FROM scope_import_evidence ki WHERE ki.repo_id=s.repo_id AND ki.file_id=s.file_id AND ki.language='kotlin' AND ki.source_specifier='kotlin.jvm.JvmSynthetic' AND ki.local_name!='JvmSynthetic' AND instr(s.signature,'@'||ki.local_name)>0),''),
@@ -137,19 +142,61 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		LEFT JOIN kotlin_jvm_callable_evidence ke ON ke.repo_id=s.repo_id AND ke.symbol_id=s.id
 		LEFT JOIN kotlin_jvm_name_evidence kn ON kn.repo_id=s.repo_id AND kn.symbol_id=s.id
 		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0`, " AND s.name IN (%s)",
-		[]any{repoID}, stringSliceToAny(nameList), true,
-		func(rows *sql.Rows) error {
-			var s javaScopeSymbol
-			var alias int
-			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &s.jvmEvidence, &s.jvmKnown, &s.jvmArityMin, &s.jvmArityMax, &alias, &s.jvmNameAliases, &s.jvmSyntheticAliases, &s.jvmNameEvidence, &s.jvmNameKnown, &s.jvmName); err != nil {
-				return err
-			}
-			s.jvmStaticAlias = alias != 0
-			byQName[s.qname] = append(byQName[s.qname], s)
-			byName[s.name] = append(byName[s.name], s)
-			return nil
-		}); err != nil {
+			[]any{repoID}, stringSliceToAny(names), true,
+			func(rows *sql.Rows) error {
+				var s javaScopeSymbol
+				var alias int
+				if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.signature, &s.visibility, &s.static, &s.pkg, &s.language, &s.arityMin, &s.arityMax, &s.jvmEvidence, &s.jvmKnown, &s.jvmArityMin, &s.jvmArityMax, &alias, &s.jvmNameAliases, &s.jvmSyntheticAliases, &s.jvmNameEvidence, &s.jvmNameKnown, &s.jvmName); err != nil {
+					return err
+				}
+				s.jvmStaticAlias = alias != 0
+				byQName[s.qname] = append(byQName[s.qname], s)
+				byName[s.name] = append(byName[s.name], s)
+				return nil
+			})
+	}
+	if err := loadSymbols(nameList); err != nil {
 		return 0, err
+	}
+	// Receiver binding reads the supertype clauses of the types it binds
+	// through (javaSupertypesInProject). Load, transitively, the symbols those
+	// clauses name and the imports of the files declaring them, so a clause
+	// name is resolved as its own file resolves it. Each round adds only names
+	// no edge spells, which no other rule looks up.
+	for round := 0; round < 8; round++ {
+		var more []string
+		files := map[int64]struct{}{}
+		for _, candidates := range byName {
+			for _, c := range candidates {
+				if c.language != "java" || c.kind != "type" || !strings.Contains(c.signature, " ") {
+					continue
+				}
+				if _, ok := importFiles[c.file]; !ok {
+					importFiles[c.file] = struct{}{}
+					files[c.file] = struct{}{}
+				}
+				for _, f := range javaClauseNames(c.signature) {
+					for _, part := range strings.FieldsFunc(f, func(r rune) bool { return r == '.' || r == '$' }) {
+						if _, ok := scopeNames[part]; !ok && part != "" {
+							scopeNames[part] = struct{}{}
+							more = append(more, part)
+						}
+					}
+				}
+			}
+		}
+		if len(files) > 0 {
+			if err := loadImports(files); err != nil {
+				return 0, err
+			}
+		}
+		if len(more) == 0 {
+			break
+		}
+		sort.Strings(more)
+		if err := loadSymbols(more); err != nil {
+			return 0, err
+		}
 	}
 	// Companion rows are owner evidence, not Java types. Load only companions
 	// from Kotlin class files already selected by the edge's outer name. The
@@ -290,7 +337,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 		if e.kind == "constructs" {
 			dst, strategy = javaConstructor(e, byQName, byName, imports)
 		} else {
-			dst, strategy = javaMember(e, byQName, byName, imports, facades, companions)
+			dst, strategy = javaMember(e, byQName, byName, imports, importFiles, facades, companions)
 		}
 		if dst.id != 0 {
 			res[e.id] = struct {
@@ -572,7 +619,7 @@ func javaConstructor(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byNa
 	}
 	return out, "java_constructor"
 }
-func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport, facades map[string][]javaFacadePart, companions map[string][]javaScopeSymbol) (javaScopeSymbol, string) {
+func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName map[string][]javaScopeSymbol, imps map[int64][]javaScopeImport, importFiles map[int64]struct{}, facades map[string][]javaFacadePart, companions map[string][]javaScopeSymbol) (javaScopeSymbol, string) {
 	name := e.name
 	if name == "super." || strings.HasPrefix(name, "super.") {
 		return javaScopeSymbol{}, ""
@@ -582,6 +629,10 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		// members shadow every enclosing class and static import; or its
 		// owner names a local type, which hides every recorded type.
 		return javaScopeSymbol{}, ""
+	}
+	if e.evidence == graph.JavaLocalReceiverEvidence || strings.HasPrefix(e.evidence, graph.JavaLocalReceiverEvidence+";") {
+		// The receiver is a local or parameter, never a type name (JLS 6.4.2).
+		return javaReceiverMember(e, byQName, byName, imps, importFiles)
 	}
 	if strings.HasPrefix(name, "this.") {
 		name = strings.TrimPrefix(name, "this.")
@@ -694,6 +745,183 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 
 // javaObjectMethodName reports whether name is a method java.lang.Object
 // declares, which every class and interface has in scope (JLS 4.3.2, 9.2).
+// javaReceiverMember binds a call on a local or parameter whose declaration
+// states its type (graph.JavaLocalReceiverEvidence). That declared type is
+// the receiver's compile-time type whatever the variable later holds. It
+// binds only when the type is one visible project Java class (not an
+// interface, enum or record, whose supertypes add members) declaring exactly
+// one method of that name whose parameter count admits the call's argument
+// count. A class with a supertype clause binds only when no other project
+// type declares a method of that name the argument count could reach, since
+// supertypes are not resolved and an inherited overload would compete. A
+// name java.lang.Object declares is refused: an inherited Object overload
+// may compete with the class's.
+func javaReceiverMember(e javaScopeEdge, byQName, byName map[string][]javaScopeSymbol, imports map[int64][]javaScopeImport, importFiles map[int64]struct{}) (javaScopeSymbol, string) {
+	imps := imports[e.file]
+	_, typeName, _ := strings.Cut(e.evidence, graph.JavaLocalReceiverEvidence+";")
+	dot := strings.IndexByte(e.name, '.')
+	if typeName == "" || dot < 0 || !e.callArity.Valid {
+		return javaScopeSymbol{}, ""
+	}
+	member := e.name[dot+1:]
+	if member == "" || strings.Contains(member, ".") || javaObjectMethodName(member) {
+		return javaScopeSymbol{}, ""
+	}
+	owner, ok, _ := javaType(typeName, e.pkg, e.container, byQName, byName, imps)
+	if !ok || owner.language != "java" || owner.kind != "type" || (owner.signature != "class" && !strings.HasPrefix(owner.signature, "class ")) {
+		return javaScopeSymbol{}, ""
+	}
+	var out javaScopeSymbol
+	n := 0
+	for _, s := range byQName[owner.qname+"."+member] {
+		if s.kind != "function" {
+			continue
+		}
+		if !s.arityMin.Valid {
+			return javaScopeSymbol{}, ""
+		}
+		if javaConstructorAccepts(s, e.callArity) {
+			out = s
+			n++
+		}
+	}
+	if n != 1 || !javaVisibleFrom(out, e.pkg, out.pkg, javaEdgeOwner(e) == owner.qname) {
+		return javaScopeSymbol{}, ""
+	}
+	if owner.signature != "class" {
+		if !javaSupertypesInProject(owner, byQName, byName, imports, importFiles, 0) {
+			return javaScopeSymbol{}, ""
+		}
+		for _, s := range byName[member] {
+			if s.kind == "type" || s.kind == "constructor" || s.qname == out.qname {
+				continue
+			}
+			if !s.arityMin.Valid || javaConstructorAccepts(s, e.callArity) {
+				return javaScopeSymbol{}, ""
+			}
+		}
+	}
+	return out, ResolutionStrategyJavaReceiverScope
+}
+
+// javaSupertypesInProject reports whether every supertype owner's clause
+// names, transitively, is a project Java type or a member-less JDK marker
+// interface (Serializable, Cloneable). Only then can the project-wide name
+// check in javaReceiverMember see every inherited overload: a library or JDK
+// supertype may declare an overload of the same name and argument count that
+// the graph never records.
+//
+// A clause name is resolved as the declaring file resolves it, through that
+// file's imports (a single-type import shadows a same-package type, JLS
+// 6.4.1), so a file whose imports were not loaded refuses, and so do nested
+// owners, whose clause may name a sibling member type, and any name that does
+// not resolve to exactly one loaded project type.
+func javaSupertypesInProject(owner javaScopeSymbol, byQName, byName map[string][]javaScopeSymbol, imports map[int64][]javaScopeImport, importFiles map[int64]struct{}, depth int) bool {
+	if depth > 16 {
+		return false
+	}
+	names := javaClauseNames(owner.signature)
+	if len(names) == 0 {
+		return true
+	}
+	if _, ok := importFiles[owner.file]; !ok || owner.qname != owner.pkg+"."+owner.name && !(owner.pkg == "" && owner.qname == owner.name) {
+		return false
+	}
+	imps := imports[owner.file]
+	for _, f := range names {
+		if f == "" {
+			return false
+		}
+		if javaMarkerSupertype(f, imps, byName) {
+			continue
+		}
+		super, ok, _ := javaType(f, owner.pkg, "", byQName, byName, imps)
+		if !ok || super.language != "java" || super.kind != "type" || !javaSupertypesInProject(super, byQName, byName, imports, importFiles, depth+1) {
+			return false
+		}
+	}
+	return true
+}
+
+// javaClauseNames lists the type names a type signature's extends and
+// implements clauses spell, with type arguments removed. A permits list names
+// subtypes and is skipped. An unbalanced type argument list yields "", which
+// callers refuse.
+func javaClauseNames(signature string) []string {
+	clause := signature
+	for {
+		i := strings.IndexByte(clause, '<')
+		if i < 0 {
+			break
+		}
+		j, open := i, 0
+		for ; j < len(clause); j++ {
+			if clause[j] == '<' {
+				open++
+			} else if clause[j] == '>' {
+				open--
+				if open == 0 {
+					break
+				}
+			}
+		}
+		if j >= len(clause) {
+			return []string{""}
+		}
+		clause = clause[:i] + clause[j+1:]
+	}
+	var out []string
+	for _, f := range strings.FieldsFunc(clause, func(r rune) bool { return r == ' ' || r == ',' }) {
+		switch f {
+		case "permits":
+			return out
+		case "class", "interface", "extends", "implements":
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// javaMarkerSupertype reports whether a clause name is java.io.Serializable or
+// java.lang.Cloneable, which declare no members. A simple name counts only
+// when no project type of that name was loaded (the clause names are loaded,
+// so none exists) and the file's imports bind it to the JDK type: Cloneable
+// unless a single-type import names another, Serializable only through an
+// import of java.io.Serializable or java.io.*.
+func javaMarkerSupertype(f string, imps []javaScopeImport, byName map[string][]javaScopeSymbol) bool {
+	var want string
+	switch f {
+	case "java.io.Serializable", "java.lang.Cloneable":
+		return true
+	case "Serializable":
+		want = "java.io.Serializable"
+	case "Cloneable":
+		want = "java.lang.Cloneable"
+	default:
+		return false
+	}
+	for _, s := range byName[f] {
+		if javaTypeIdentityEligible(s) {
+			return false
+		}
+	}
+	for _, i := range imps {
+		if !i.static && !i.wildcard && i.local == f {
+			return i.source == want
+		}
+	}
+	if f == "Cloneable" {
+		return true
+	}
+	for _, i := range imps {
+		if !i.static && i.wildcard && i.source == "java.io" {
+			return true
+		}
+	}
+	return false
+}
+
 func javaObjectMethodName(name string) bool {
 	switch name {
 	case "clone", "equals", "finalize", "getClass", "hashCode", "notify", "notifyAll", "toString", "wait":

@@ -53,11 +53,14 @@ var resolverPolicyRegistry = map[string]int{
 	// package's `errors.Is` through exact_qualified.
 	// Go's 3 maps an import of the repository-root module's own path to the
 	// root package; epoch 2 leaves those calls unresolved.
+	// Java's 2 never reads a local or parameter receiver as a type name (JLS
+	// 6.4.2) and binds calls on explicitly typed ones; epoch 1 may bind such
+	// a receiver spelled like a type to that type's static method.
 	"cpp":        1,
 	"csharp":     4,
 	"dart":       1,
 	"go":         3,
-	"java":       1,
+	"java":       2,
 	"kotlin":     1,
 	"hcl":        1,
 	"lua":        1,
