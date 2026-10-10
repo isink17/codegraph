@@ -64,7 +64,7 @@ func assertJavaReceiverTargets(t *testing.T, r *lifecycleRepo, step string, keyT
 		"app.Use.params|p.dup":        {""},
 		"app.Use.params|sh.area":      {""},
 		"app.Use.params|s.inh":        {""},
-		"app.Use.params|s.solo":       {""},
+		"app.Use.params|s.solo":       {"app.Sub.solo"},
 		"app.Use.params|Helper.key":   {keyTarget},
 		"app.Use.params|v.key":        {""},
 		"app.Use.params|o.key":        {keyTarget},
@@ -187,4 +187,25 @@ func TestJavaTypedLocalReceiverProfileConvergence(t *testing.T) {
 	}
 	assertJavaReceiverTargets(t, r, "update", "app.Opt.key")
 	r.assertFreshParity(t, "receiver profile convergence")
+}
+
+// A single-type import shadows a same-package type of the same simple name
+// (JLS 6.4.1). C's supertype is the library's lib.Base, whose m(int) javac
+// picks for c.m(1); the unrelated project p.Base must not stand in for it.
+func TestJavaReceiverSupertypeThroughImport(t *testing.T) {
+	r := newLifecycleRepo(t, map[string]string{
+		"p/Base.java": "package p;\npublic class Base { }\n",
+		"p/C.java":    "package p;\nimport lib.Base;\npublic class C extends Base { public void m(String s) {} }\n",
+		"p/D.java":    "package p;\npublic class D extends Base { public void n(String s) {} }\n",
+		"p/Use.java":  "package p;\nclass Use {\n  void run() { Base b = new Base(); C c = new C(); c.m(1); D d = new D(); d.n(\"\"); }\n}\n",
+	})
+	calls := javaEdgesByCallee(t, r, "calls")
+	if got := strings.Join(calls["p.Use.run|c.m"], ","); got != "" {
+		t.Fatalf("c.m bound %q through an imported library supertype", got)
+	}
+	// Without the import the same-package Base is the supertype: d.n binds.
+	if got := strings.Join(calls["p.Use.run|d.n"], ","); got != "p.D.n" {
+		t.Fatalf("d.n bound %q, want p.D.n", got)
+	}
+	r.assertFreshParity(t, "import shadows package type")
 }
