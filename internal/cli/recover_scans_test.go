@@ -38,8 +38,11 @@ func TestRecoverScansCommand(t *testing.T) {
 		t.Fatalf("unindexed repo: err=%v", err)
 	}
 	dbPath := filepath.Join(repoRoot, ".codegraph", store.RepoDatabaseFileName)
-	if _, err := os.Stat(dbPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("recover-scans created a database: %v", err)
+	if _, err := os.Stat(filepath.Dir(dbPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recover-scans created the artifacts directory: %v", err)
+	}
+	if entries, err := os.ReadDir(repoRoot); err != nil || len(entries) != 1 {
+		t.Fatalf("refusal changed the repository root: entries=%v err=%v", entries, err)
 	}
 
 	if err := Run(ctx, []string{"index", repoRoot}, &out, &errOut); err != nil {
