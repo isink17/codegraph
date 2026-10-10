@@ -377,6 +377,14 @@ var resolverBindableCandidateRules = []resolverGateRule{
 		languages: []string{"go"}, sql: resolverGoBareScopeSQL, owns: goBareScopeOwned},
 	{id: ruleGoLocalQualifier, stage: resolverStageOwnership, disposition: resolverDispositionOwned,
 		languages: []string{"go"}, sql: resolverGoLocalQualifierSQL, withholds: goLocalQualifierWithholds},
+	// own_module_import binds exact_qualified too: an import-qualified spelling
+	// of a package outside this repository's modules can equal a local
+	// package's qualified name (`errors.Is`).
+	{id: ruleOwnModuleImport, stage: resolverStageOwnModule, disposition: resolverDispositionOwned,
+		languages: []string{"go"}, sql: `NOT EXISTS (
+			SELECT 1 FROM tmp_resolver_own_module_veto v
+			WHERE v.edge_id = edges.id
+		)`, withholds: ownModuleImportWithholds},
 	{id: "bare_type_scope", stage: resolverStageChosenCandidate, disposition: resolverDispositionIneligible,
 		languages: slices.Sorted(maps.Keys(typeScopeGatedLanguages)), sql: resolverBareNameTypeScopeSQL,
 		refuses: bareTypeScopeRefuses},
@@ -412,16 +420,11 @@ var resolverBindableCandidateRules = []resolverGateRule{
 
 // resolverBindGateRules is what every repo-wide strategy's UPDATE other than
 // exact-qualified must satisfy: the bindable-candidate rules plus the
-// broad-level ambiguity veto and the own-module veto. It is one list so a
+// broad-level ambiguity veto. It is one list so a
 // strategy cannot be added that applies one rule and forgets another.
 var resolverBindGateRules = append(slices.Clip(resolverBindableCandidateRules),
 	resolverGateRule{id: ruleBroadAmbiguity, stage: resolverStageBroadAmbiguity, disposition: resolverDispositionAmbiguous,
 		sql: resolverAmbiguousNamesSQL, withholds: broadDotTailAmbiguityWithholds},
-	resolverGateRule{id: ruleOwnModuleImport, stage: resolverStageOwnModule, disposition: resolverDispositionOwned,
-		languages: []string{"go"}, sql: `NOT EXISTS (
-			SELECT 1 FROM tmp_resolver_own_module_veto v
-			WHERE v.edge_id = edges.id
-		)`, withholds: ownModuleImportWithholds},
 )
 
 // The edge-local ownership rules: each carries the Go twin the binder uses to

@@ -18,6 +18,10 @@ func TestResolverGateSQLMatchesHandComposedGate(t *testing.T) {
 		AND NOT (f.language = 'cpp' AND (instr(edges.dst_name, '.') = 0 OR instr(edges.dst_name, '::') > 0))
 		AND ` + resolverGoBareScopeSQL + `
 		AND ` + resolverGoLocalQualifierSQL + `
+		AND NOT EXISTS (
+			SELECT 1 FROM tmp_resolver_own_module_veto v
+			WHERE v.edge_id = edges.id
+		)
 		AND ` + resolverBareNameTypeScopeSQL + `
 		AND ` + resolverCppBareNamespaceScopeSQL + `
 		AND ` + resolverCppBareMemberScopeSQL + `
@@ -33,11 +37,7 @@ func TestResolverGateSQLMatchesHandComposedGate(t *testing.T) {
 		AND ` + phpScopeVetoSQL + `
 		AND ` + swiftScopeVetoSQL
 	handGate := handBindable + `
-		AND ` + resolverAmbiguousNamesSQL + `
-		AND NOT EXISTS (
-			SELECT 1 FROM tmp_resolver_own_module_veto v
-			WHERE v.edge_id = edges.id
-		)`
+		AND ` + resolverAmbiguousNamesSQL
 	if resolverBindableCandidateSQL != handBindable {
 		t.Fatalf("resolverBindableCandidateSQL drifted:\n got: %q\nwant: %q", resolverBindableCandidateSQL, handBindable)
 	}

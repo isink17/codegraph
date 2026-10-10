@@ -78,7 +78,14 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		JOIN files sf ON sf.id = e.file_id AND sf.repo_id = e.repo_id
 		JOIN file_imports fi ON fi.file_id = sf.id AND fi.repo_id = e.repo_id
 		WHERE e.repo_id = ? AND e.dst_symbol_id IS NULL
-		  AND sf.language = 'go' AND instr(e.dst_name, '/') > 0
+		  AND sf.language = 'go'
+		  AND substr(e.dst_name, 1, length(fi.import_path) + 1) = fi.import_path || '.'
+		  AND NOT EXISTS (
+			SELECT 1 FROM go_local_binding_evidence g
+			WHERE g.repo_id = e.repo_id AND g.file_id = e.file_id
+			  AND g.name = substr(e.dst_name, 1, instr(e.dst_name, '.') - 1)
+			  AND e.line BETWEEN g.scope_start_line AND g.scope_end_line
+		  )
 	`, repoID)
 	if err != nil {
 		return 0, blocked, err
@@ -94,14 +101,20 @@ func (s *Store) resolveOwnModuleImports(ctx context.Context, tx *sql.Tx, repoID 
 		if dot <= 0 || dot == len(dst)-1 || dst[:dot] != imported {
 			continue
 		}
+		// The parser rewrites a qualifier only when it is the file's import
+		// binding, so the spelling proves the callee lives in package
+		// `imported`. Veto every such edge, even when scoped resolution will
+		// not bind it yet: deleted targets must not fall through to unrelated
+		// same-name symbols during a later path/name pass, and a package
+		// outside every module of this repository (the standard library, a
+		// third-party dependency) has no indexed target at all. Without the
+		// veto `stderrors.Is`, rewritten to `errors.Is`, matches the qualified
+		// name of a local package that is also called errors.
+		seenEdges[id] = struct{}{}
 		dir, ok := modulePackageDir(modules, imported)
 		if !ok {
 			continue
 		}
-		// Veto every mapped edge, even when scoped resolution will not bind it
-		// yet. Deleted targets must not fall through to unrelated same-name
-		// symbols during a later path/name pass.
-		seenEdges[id] = struct{}{}
 		if scope != nil {
 			_, pathMatch := scope.paths[sourcePath]
 			_, nameMatch := scope.names[dst[dot+1:]]
