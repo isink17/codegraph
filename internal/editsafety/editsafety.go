@@ -412,7 +412,8 @@ func semanticUpgrade(err error) bool {
 
 // evaluateConstraints reads the repo-root constraints document and reports
 // whether any violation involves the target: a finding or cycle hop whose
-// source or target is a target symbol or, for a file target, the file.
+// source or target is a target symbol, a declaration nested in its span or,
+// for a file target, the file.
 func evaluateConstraints(ctx context.Context, st *store.Store, repoID int64, opts Options, t store.EditSafetyTarget, res *Result) (string, string, error) {
 	// Stable keys are not unique: declarations in other files, or a second
 	// declaration in the same file, can share one. A symbol endpoint matches
@@ -424,7 +425,9 @@ func evaluateConstraints(ctx context.Context, st *store.Store, repoID int64, opt
 		key  string
 	}
 	decls := map[decl]bool{}
-	for _, s := range t.Symbols {
+	// A symbol target also covers the declarations nested in its span: a
+	// violation by a method is a violation by its class.
+	for _, s := range slices.Concat(t.Symbols, t.Members) {
 		// An empty key identifies nothing; it must not match an endpoint
 		// that also lacks one.
 		if s.StableKey != "" {

@@ -22,6 +22,11 @@ type EditSafetyTarget struct {
 	// Symbols are the target symbols: the one exact symbol, or every symbol
 	// the file declares, ordered by position.
 	Symbols []graph.Symbol
+	// Members are, for a symbol target, the other live declarations of its
+	// file whose source span lies inside the target's span (line and column),
+	// ordered by position: editing the target edits them. They are read for
+	// constraint matching only; they do not widen Dependents.
+	Members []graph.Symbol
 	// Dependents are the resolved edges into Symbols from outside the target,
 	// ordered by source path, line, source symbol and edge kind.
 	Dependents []EditSafetyDependent
@@ -83,6 +88,23 @@ func (s *Store) EditSafetySymbol(ctx context.Context, repoID, symbolID int64) (E
 		return EditSafetyTarget{}, false, nil
 	}
 	out := EditSafetyTarget{Symbols: []graph.Symbol{sym}}
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
+		SELECT s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+		FROM symbols s JOIN files f ON f.repo_id = s.repo_id AND f.id = s.file_id
+		WHERE s.repo_id = ? AND s.file_id = ? AND s.id <> ? AND f.is_deleted = 0
+		  AND (s.start_line > ? OR (s.start_line = ? AND s.start_col >= ?))
+		  AND (s.end_line < ? OR (s.end_line = ? AND s.end_col <= ?))
+		ORDER BY s.start_line, s.start_col, s.end_line, s.end_col, s.qualified_name, s.kind, s.stable_key, s.id
+	`, repoID, sym.FileID, sym.ID,
+		sym.Range.StartLine, sym.Range.StartLine, sym.Range.StartCol,
+		sym.Range.EndLine, sym.Range.EndLine, sym.Range.EndCol)
+	if err != nil {
+		return EditSafetyTarget{}, false, err
+	}
+	if out.Members, err = scanSymbols(rows); err != nil {
+		return EditSafetyTarget{}, false, err
+	}
 	if err := s.editSafetyEdges(ctx, repoID, &out, false); err != nil {
 		return EditSafetyTarget{}, false, err
 	}

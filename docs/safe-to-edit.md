@@ -60,6 +60,17 @@ for a file target. An unresolved candidate is an edge with no resolved target
 whose recorded name equals a target symbol's name or qualified name or ends in
 `.` plus its name.
 
+A symbol target covers, for constraint matching, every declaration of its file
+whose source span (line and column) lies inside the target's span: a class
+covers its methods and nested classes, because editing the class edits them.
+Each is matched by its exact declaration (file, start line, stable key), so a
+same-named member of another class or another file is not included.
+Declarations outside the span are not covered: a Go struct target does not
+cover its methods, which are declared outside the struct. Nested declarations
+do not widen the dependents: `dependents` still lists only edges into the
+target symbol itself, so a class's CAUTION evidence does not include callers
+of its methods.
+
 ## Evaluation order
 
 1. **Freshness** (`ES-FRESHNESS`). Unless the verdict is
@@ -78,7 +89,7 @@ whose recorded name equals a target symbol's name or qualified name or ends in
 
 | Rule | Fires when | Result |
 |---|---|---|
-| `ES-CONSTRAINT-VIOLATION` | a `check_constraints` finding or cycle hop of the repo-root constraints document has a target symbol (or, for a file, the file) as its source or target | `UNSAFE` |
+| `ES-CONSTRAINT-VIOLATION` | a `check_constraints` finding or cycle hop of the repo-root constraints document has a target symbol, a declaration nested in a symbol target's source span, or (for a file) the file as its source or target | `UNSAFE` |
 | (indeterminate constraints) | the constraints document is invalid, or its cycles were truncated | unknown: `constraints_indeterminate` |
 | `ES-UNTESTED-DEPENDENTS` | there are dependents and none is in a test file | `CAUTION` |
 | `ES-KNOWN-DEPENDENTS` | there are dependents | `CAUTION` |
