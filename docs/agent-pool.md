@@ -48,7 +48,8 @@ scripts/agent-pool/pool.sh release --slot <slot> --token <token>
   exact head SHA. Evidence goes to `~/Projekti/codegraph-evidence/<wave>/`,
   never only in the slot.
 - `release` needs the lease's token, no process with its cwd in the slot, a
-  clean tree, and a HEAD that is pushed or merged (detached or not). It then detaches the
+  clean tree, and a HEAD that is merged into `origin/v2.0` or contained in a
+  branch that still exists on `origin` (detached or not; fetched with `--prune`). It then detaches the
   slot at `origin/v2.0` and removes the lease. Any failure keeps the lease and
   the work. The task branch is kept.
 
@@ -74,7 +75,10 @@ process is running.
 ## Recovery
 
 - A stale-suspected lease is cleared only by an explicit
-  `pool.sh reclaim --slot <slot> --token <token> --reason <text>`. The lease
+  `pool.sh reclaim --slot <slot> --token <token> --reason <text>`, with the
+  token read from `token=` in `pool/<slot>.lease` (`status` hides it). The
+  token guards against reclaiming a lease that changed, not against a
+  deliberate reclaim. The lease
   is moved to `pool/archive/` and the action appended to `pool/archive/audit.log`;
   the slot's files are not touched.
 - Unfinished work in a slot is archived before the slot is recycled, to

@@ -87,6 +87,18 @@ wait
 wins=$(cat "$T"/rel? | grep -c ok || true)
 [[ $wins == 1 ]] || fail "concurrent release: $wins winners"
 
+# A detached HEAD whose remote branch was deleted is not treated as pushed.
+"$POOL" acquire --slot $A --task gone --agent x >/dev/null
+g -C "$CG_POOL_ROOT/$A" switch -q -c gone
+g -C "$CG_POOL_ROOT/$A" commit -q --allow-empty -m gone
+g -C "$CG_POOL_ROOT/$A" push -q origin gone 2>/dev/null
+g -C "$CG_POOL_ROOT/$A" switch -q --detach
+g -C "$T/origin.git" branch -q -D gone
+expect 1 "$POOL" release --slot $A --token "$(token $A)"
+g -C "$CG_POOL_ROOT/$A" switch -q --detach origin/v2.0
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+expect 2 "$POOL" acquire --slot $A --task t --agent
+
 # Dirty worker: release keeps the lease and the change.
 echo wip >"$CG_POOL_ROOT/$B/wip.txt"
 expect 1 "$POOL" release --slot $B --token "$(token $B)"

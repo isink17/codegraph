@@ -20,6 +20,7 @@ WORKERS=(codegraph-worker-a codegraph-worker-b)
 REVIEW=codegraph-review
 
 die() { echo "$1" >&2; exit "${2:-1}"; }
+need() { [[ $# -ge 2 ]] || die "$1 needs a value" 2; }
 lease_file() { echo "$LEASES/$1.lease"; }
 slot_path() { echo "$POOL_ROOT/$1"; }
 field() { sed -n "s/^$2=//p" "$1" | head -n 1; }
@@ -150,7 +151,7 @@ try_acquire_locked() {
 	problems=$(slot_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not idle: $problems" >&2; return 1; }
 	token=$(random_token)
-	tmp=$(mktemp "$LEASES/.$slot.XXXXXX")
+	tmp=$(mktemp "$LEASES/.$slot.XXXXXX") || return 1
 	{
 		echo "slot=$slot"
 		echo "task=$TASK"
@@ -161,7 +162,7 @@ try_acquire_locked() {
 		echo "pid=$LEASE_PID"
 		echo "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 		echo "token=$token"
-	} >"$tmp"
+	} >"$tmp" || { rm -f "$tmp"; return 1; }
 	if ln "$tmp" "$f" 2>/dev/null; then
 		rm -f "$tmp"
 		echo "leased $slot token=$token"
@@ -176,12 +177,12 @@ cmd_acquire() {
 	TASK="" AGENT="" PR="" OWNER="${USER:-}" LEASE_PID=""
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--slot) slot=$2; shift 2 ;;
-		--task) TASK=$2; shift 2 ;;
-		--agent) AGENT=$2; shift 2 ;;
-		--pr) PR=$2; shift 2 ;;
-		--owner) OWNER=$2; shift 2 ;;
-		--pid) LEASE_PID=$2; shift 2 ;;
+		--slot) need "$@"; slot=$2; shift 2 ;;
+		--task) need "$@"; TASK=$2; shift 2 ;;
+		--agent) need "$@"; AGENT=$2; shift 2 ;;
+		--pr) need "$@"; PR=$2; shift 2 ;;
+		--owner) need "$@"; OWNER=$2; shift 2 ;;
+		--pid) need "$@"; LEASE_PID=$2; shift 2 ;;
 		--review) review=1; shift ;;
 		*) die "unknown argument $1" 2 ;;
 		esac
@@ -216,8 +217,8 @@ cmd_release() {
 	local slot="" token="" p
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--slot) slot=$2; shift 2 ;;
-		--token) token=$2; shift 2 ;;
+		--slot) need "$@"; slot=$2; shift 2 ;;
+		--token) need "$@"; token=$2; shift 2 ;;
 		*) die "unknown argument $1" 2 ;;
 		esac
 	done
@@ -227,9 +228,9 @@ cmd_release() {
 	p=$(slot_path "$slot")
 	slot_in_use "$slot" && die "$slot is in use by a process; leave it first"
 	[[ -z $(git -C "$p" status --porcelain --untracked-files=all) ]] || die "$slot is dirty; commit or archive the work, lease kept"
-	git -C "$p" fetch -q "$REMOTE" || die "fetch failed; lease kept"
+	git -C "$p" fetch -q --prune "$REMOTE" || die "fetch failed; lease kept"
 	git -C "$p" merge-base --is-ancestor HEAD "$REMOTE/$BASE" ||
-		[[ -n $(git -C "$p" branch -r --contains HEAD) ]] ||
+		[[ -n $(git -C "$p" branch -r --contains HEAD --list "$REMOTE/*") ]] ||
 		die "$slot HEAD is neither pushed nor merged; lease kept"
 	git -C "$p" switch -q --detach "$REMOTE/$BASE" || die "could not return $slot to $REMOTE/$BASE; lease kept"
 	rm "$(lease_file "$slot")"
@@ -242,9 +243,9 @@ cmd_reclaim() {
 	local slot="" token="" reason="" archive
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--slot) slot=$2; shift 2 ;;
-		--token) token=$2; shift 2 ;;
-		--reason) reason=$2; shift 2 ;;
+		--slot) need "$@"; slot=$2; shift 2 ;;
+		--token) need "$@"; token=$2; shift 2 ;;
+		--reason) need "$@"; reason=$2; shift 2 ;;
 		*) die "unknown argument $1" 2 ;;
 		esac
 	done
