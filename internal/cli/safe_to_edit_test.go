@@ -15,6 +15,7 @@ import (
 	"github.com/isink17/codegraph/internal/constraints"
 	"github.com/isink17/codegraph/internal/editsafety"
 	"github.com/isink17/codegraph/internal/githistory/gittest"
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/store"
 )
@@ -440,5 +441,62 @@ func TestSafeToEditCLIPendingResolverPolicy(t *testing.T) {
 	}
 	if _, r, code, _ := safeToEdit(t, root, "--symbol", "infra.B"); verdictOf(r) != editsafety.VerdictCaution || code != 1 {
 		t.Fatalf("after update: %s %s exit %d", r.Status, verdictOf(r), code)
+	}
+}
+
+// Stable keys are not unique: two declarations, in different files or in one
+// file, can share one. A constraint violation through one of them must not
+// make the other UNSAFE, and must still make its own declaration UNSAFE.
+func TestSafeToEditCLIConstraintMatchesExactDeclaration(t *testing.T) {
+	const cfg = `{"schema_version":1,
+	"groups":{"u1":{"include":["internal/u1/**"]},"infra":{"include":["internal/infra/**"]}},
+	"rules":[{"id":"u1-no-infra","kind":"forbidden_dependency","from":["u1"],"to":["infra"]}]}`
+	root, _ := safeToEditRepo(t, map[string]string{
+		constraints.ConfigFileName: cfg,
+		"internal/u1/x.go":         "package util\n\nimport \"example.com/m/internal/infra\"\n\nfunc Dup() { infra.B() }\n",
+		"internal/u1/y.go":         "package util\n\nimport \"example.com/m/internal/infra\"\n\nfunc init() {}\n\nfunc init() { infra.C() }\n",
+	})
+	opened, err := openIndexedRepoReadOnly(context.Background(), loadTestConfig(t), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	find := func(name string) []graph.Symbol {
+		syms, err := opened.Store.FindSymbolExact(context.Background(), opened.Repo.ID, name, 10, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return syms
+	}
+	dups, inits := find("util.Dup"), find("util.init")
+	opened.Close()
+	if len(dups) != 2 || dups[0].StableKey == "" || dups[0].StableKey != dups[1].StableKey {
+		t.Fatalf("fixture needs two util.Dup sharing a stable key: %+v", dups)
+	}
+	if len(inits) != 2 || inits[0].FilePath != inits[1].FilePath || inits[0].StableKey != inits[1].StableKey {
+		t.Fatalf("fixture needs two init in one file sharing a stable key: %+v", inits)
+	}
+	byID := func(id int64) (editsafety.Result, int) {
+		_, res, code, _ := safeToEdit(t, root, "--symbol-id", strconv.FormatInt(id, 10))
+		return res, code
+	}
+	for _, pair := range [][]graph.Symbol{dups, inits} {
+		for _, s := range pair {
+			res, code := byID(s.ID)
+			violates := s.FilePath == "internal/u1/x.go" || (s.Name == "init" && s.Range.StartLine > 5)
+			got := ruleOutcome(res, editsafety.RuleConstraintViolation) == editsafety.OutcomeFired
+			if got != violates {
+				t.Fatalf("%s %s:%d constraint fired=%v want %v (exit %d)\n%+v", s.QualifiedName, s.FilePath, s.Range.StartLine, got, violates, code, res.Evidence)
+			}
+			if violates && (verdictOf(res) != editsafety.VerdictUnsafe || code != 1) {
+				t.Fatalf("%s %s:%d: %s exit %d", s.QualifiedName, s.FilePath, s.Range.StartLine, verdictOf(res), code)
+			}
+		}
+	}
+	// A file target matches by exact path only.
+	for file, want := range map[string]bool{"internal/u1/x.go": true, "internal/u2/x.go": false, "internal/u1/y.go": true} {
+		_, res, _, _ := safeToEdit(t, root, "--file", file)
+		if got := ruleOutcome(res, editsafety.RuleConstraintViolation) == editsafety.OutcomeFired; got != want {
+			t.Fatalf("file %s constraint fired=%v want %v", file, got, want)
+		}
 	}
 }

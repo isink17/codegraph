@@ -414,19 +414,29 @@ func semanticUpgrade(err error) bool {
 // whether any violation involves the target: a finding or cycle hop whose
 // source or target is a target symbol or, for a file target, the file.
 func evaluateConstraints(ctx context.Context, st *store.Store, repoID int64, opts Options, t store.EditSafetyTarget, res *Result) (string, string, error) {
-	keys := map[string]bool{}
+	// Stable keys are not unique: declarations in other files, or a second
+	// declaration in the same file, can share one. A symbol endpoint matches
+	// only by file, start line and stable key together; a file target matches
+	// by exact path.
+	type decl struct {
+		path string
+		line int64
+		key  string
+	}
+	decls := map[decl]bool{}
 	for _, s := range t.Symbols {
 		// An empty key identifies nothing; it must not match an endpoint
 		// that also lacks one.
 		if s.StableKey != "" {
-			keys[s.StableKey] = true
+			decls[decl{s.FilePath, int64(s.Range.StartLine), s.StableKey}] = true
 		}
 	}
 	involves := func(d constraints.Dependency) bool {
-		if keys[d.Source.StableKey] || keys[d.Target.StableKey] {
-			return true
+		if opts.File != "" {
+			return d.Source.Path == res.Target.File || d.Target.Path == res.Target.File
 		}
-		return opts.File != "" && (d.Source.Path == res.Target.File || d.Target.Path == res.Target.File)
+		return (d.Source.StableKey != "" && decls[decl{d.Source.Path, d.Source.SymbolStartLine, d.Source.StableKey}]) ||
+			(d.Target.StableKey != "" && decls[decl{d.Target.Path, d.Target.StartLine, d.Target.StableKey}])
 	}
 	open := func(context.Context) (*store.Store, int64, error) { return st, repoID, nil }
 	rules := map[string]bool{}
