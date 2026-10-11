@@ -138,6 +138,9 @@ end
 local function k() for f = 1, 2 do f() end end
 local function m() for _, f in ipairs(t) do f() end end
 `, []string{}},
+		{"declaration before a move", `local function f() end
+f()
+`, []string{"f@2:1->1:1"}},
 		{"moved declaration binds at its new position", `
 local function f() end
 f()
