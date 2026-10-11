@@ -14,11 +14,17 @@ expect() { # expect <exit code> <command...>
 	local want=$1 got=0
 	shift
 	"$@" >"$T/out" 2>&1 || got=$?
-	[[ $got == "$want" ]] || fail "$* exited $got, want $want: $(cat "$T/out")"
+	[[ $got == "$want" ]] || fail "line ${BASH_LINENO[0]}: $* exited $got, want $want: $(cat "$T/out")"
 }
 state() { "$POOL" status "$1" | sed -n 1p | sed 's/^[^:]*: //'; }
 token() { sed -n 's/^token=//p' "$CG_POOL_LEASES/$1.lease"; }
 g() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@"; }
+# Commits a new file <name>.txt in slot $1.
+change() {
+	echo "$2" >"$CG_POOL_ROOT/$1/$2.txt"
+	g -C "$CG_POOL_ROOT/$1" add "$2.txt"
+	g -C "$CG_POOL_ROOT/$1" commit -q -m "$2"
+}
 
 g init -q --bare "$T/origin.git"
 g clone -q "$T/origin.git" "$T/seed" 2>/dev/null
@@ -65,7 +71,7 @@ expect 0 "$POOL" release --slot $R --token "$(token $R)"
 
 # Release refuses an unpushed branch, accepts it once pushed.
 g -C "$CG_POOL_ROOT/$A" switch -q -c work
-g -C "$CG_POOL_ROOT/$A" commit -q --allow-empty -m work
+change $A work
 expect 1 "$POOL" release --slot $A --token "$(token $A)"
 g -C "$CG_POOL_ROOT/$A" push -q origin work 2>/dev/null
 expect 0 "$POOL" release --slot $A --token "$(token $A)"
@@ -90,7 +96,7 @@ wins=$(cat "$T"/rel? | grep -c ok || true)
 # A detached HEAD whose remote branch was deleted is not treated as pushed.
 "$POOL" acquire --slot $A --task gone --agent x >/dev/null
 g -C "$CG_POOL_ROOT/$A" switch -q -c gone
-g -C "$CG_POOL_ROOT/$A" commit -q --allow-empty -m gone
+change $A gone
 g -C "$CG_POOL_ROOT/$A" push -q origin gone 2>/dev/null
 g -C "$CG_POOL_ROOT/$A" switch -q --detach
 g -C "$T/origin.git" branch -q -D gone
@@ -198,6 +204,200 @@ for c in git sed awk cat date hostname od tr mktemp ln rm mv mkdir rmdir head ki
 done
 nolsof_state=$(env -u CG_POOL_CWD_FILE PATH="$T/nolsof" "$BASH" "$POOL" status $A | sed -n 's/^[^:]*: //p;q')
 [[ $nolsof_state == inconsistent ]] || fail "missing lsof state $nolsof_state"
+
+# Git that fails for one subcommand, for failure injection.
+mkdir "$T/failgit"
+cat >"$T/failgit/git" <<EOF
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "\$CG_FAIL_GIT" ] && { echo "injected \$a failure" >&2; exit 128; }; done
+exec $(command -v git) "\$@"
+EOF
+chmod +x "$T/failgit/git"
+failgit() { CG_FAIL_GIT=$1 PATH="$T/failgit:$PATH" "${@:2}"; }
+lease_exists() { [[ -e $CG_POOL_LEASES/$1.lease ]]; }
+head_of() { git -C "$CG_POOL_ROOT/$1" rev-parse HEAD; }
+base_of() { git -C "$T/seed" rev-parse origin/v2.0; }
+advance_base() {
+	g -C "$T/seed" fetch -q origin
+	g -C "$T/seed" switch -q --detach origin/v2.0
+	g -C "$T/seed" commit -q --allow-empty -m "${1:-advance}"
+	g -C "$T/seed" push -q origin HEAD:v2.0
+	g -C "$T/seed" fetch -q origin
+}
+# Squash-merges origin branch $1 into v2.0 the way GitHub does: one new
+# commit with the merged tree, then deletes the branch.
+squash_merge() {
+	local tree
+	g -C "$T/seed" fetch -q origin
+	tree=$(g -C "$T/seed" merge-tree --write-tree origin/v2.0 "origin/$1")
+	g -C "$T/seed" push -q origin "$(g -C "$T/seed" commit-tree "$tree" -p origin/v2.0 -m "squash $1"):refs/heads/v2.0"
+	g -C "$T/seed" push -q origin --delete "$1" 2>/dev/null
+	g -C "$T/seed" fetch -q --prune origin
+}
+# Leases worker $1 and leaves it on task branch $2 with one change, pushed.
+task_branch() {
+	"$POOL" acquire --slot "$1" --task "$2" --agent x >/dev/null
+	g -C "$CG_POOL_ROOT/$1" switch -q -c "$2" origin/v2.0
+	change "$1" "$2"
+	g -C "$CG_POOL_ROOT/$1" push -q origin "$2" 2>/dev/null
+}
+for s in $A $B $R; do
+	rm -f "${CG_POOL_LEASES:?}/${s:?}.lease"
+	g -C "$CG_POOL_ROOT/$s" switch -q --detach origin/v2.0
+done
+
+# A failed git status never counts as clean: release keeps lease and tree.
+"$POOL" acquire --slot $A --task st --agent x >/dev/null
+expect 1 failgit status "$POOL" release --slot $A --token "$(token $A)"
+grep -q 'git status failed' "$T/out" || fail "status failure not reported: $(cat "$T/out")"
+lease_exists $A || fail "lease lost on failed status"
+wtdir=$(g -C "$CG_POOL_ROOT/$A" rev-parse --absolute-git-dir)
+cp "$wtdir/index" "$T/index.bak"
+echo garbage >"$wtdir/index"
+expect 1 "$POOL" release --slot $A --token "$(token $A)"
+lease_exists $A || fail "lease lost on corrupt index"
+cp "$T/index.bak" "$wtdir/index"
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
+# The PR #418 case: a task branch carrying a merge of the base, squash-merged,
+# remote branch deleted. Release succeeds and keeps the local branch.
+task_branch $A sq
+advance_base other-work
+g -C "$CG_POOL_ROOT/$A" fetch -q origin
+g -C "$CG_POOL_ROOT/$A" merge -q --no-edit origin/v2.0
+g -C "$CG_POOL_ROOT/$A" push -q origin sq 2>/dev/null
+squash_merge sq
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+[[ $(head_of $A) == "$(base_of)" ]] || fail "squash release did not move to base"
+g -C "$CG_POOL_ROOT/$A" rev-parse -q --verify refs/heads/sq >/dev/null || fail "squash release lost the task branch"
+# Same, released detached on the task commit after the base moved on.
+task_branch $A sq2
+squash_merge sq2
+advance_base later
+g -C "$CG_POOL_ROOT/$A" switch -q --detach
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
+# Matching content but no local branch holding the commit: refused.
+task_branch $A sq3
+g -C "$CG_POOL_ROOT/$A" switch -q --detach
+g -C "$CG_POOL_ROOT/$A" branch -q -D sq3
+squash_merge sq3
+expect 1 "$POOL" release --slot $A --token "$(token $A)"
+lease_exists $A || fail "unpreserved detached commit released"
+g -C "$CG_POOL_ROOT/$A" branch -q sq3 HEAD
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
+# Remote branch deleted without merging, and a squash-merged branch that
+# gained unique work afterwards: both refused.
+task_branch $A unmerged
+g -C "$T/seed" push -q origin --delete unmerged 2>/dev/null
+expect 1 "$POOL" release --slot $A --token "$(token $A)"
+g -C "$CG_POOL_ROOT/$A" switch -q --detach origin/v2.0
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+task_branch $A diverged
+squash_merge diverged
+change $A more
+expect 1 "$POOL" release --slot $A --token "$(token $A)"
+grep -q 'neither pushed nor merged' "$T/out" || fail "diverged release reason: $(cat "$T/out")"
+
+# Failed fetch and missing baseline keep the lease.
+mv "$T/origin.git" "$T/origin.off"
+expect 1 "$POOL" release --slot $A --token "$(token $A)"
+mv "$T/origin.off" "$T/origin.git"
+expect 1 env CG_POOL_BASE=nope "$POOL" release --slot $A --token "$(token $A)"
+grep -q 'no valid origin/nope' "$T/out" || fail "missing base reason: $(cat "$T/out")"
+lease_exists $A || fail "lease lost on fetch or base failure"
+# A still-published branch releases normally.
+g -C "$CG_POOL_ROOT/$A" push -q origin diverged 2>/dev/null
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
+# prepare: idle slots left behind by a merge move forward; acquire then works.
+advance_base merged-pr
+expect 1 "$POOL" acquire --slot $B --task t --agent x
+expect 0 "$POOL" prepare --slot $B
+[[ $(head_of $B) == "$(base_of)" ]] || fail "prepare did not reach base"
+expect 0 "$POOL" prepare --slot $B
+grep -q 'already at' "$T/out" || fail "no-op prepare: $(cat "$T/out")"
+expect 0 "$POOL" acquire --slot $B --task t --agent x
+expect 0 "$POOL" release --slot $B --token "$(token $B)"
+
+# prepare refuses and changes nothing: leased, dirty, on a branch, unique
+# detached commit, process inside, process check unavailable, failed fetch,
+# failed status, missing base.
+advance_base again
+snap() { echo "$(head_of "$1") $(git -C "$CG_POOL_ROOT/$1" symbolic-ref -q HEAD || :) $(ls "$CG_POOL_LEASES")"; }
+refuse() { # refuse <slot> <reason> [env assignments...]
+	local before
+	before=$(snap "$1")
+	expect 1 env "${@:3}" "$POOL" prepare --slot "$1"
+	grep -q "$2" "$T/out" || fail "prepare $1 reason, want $2: $(cat "$T/out")"
+	[[ $(snap "$1") == "$before" ]] || fail "refused prepare changed $1"
+}
+"$POOL" prepare --slot $B >/dev/null
+"$POOL" acquire --slot $B --task leased --agent x >/dev/null
+advance_base leased
+refuse $B 'is leased'
+echo wip >"$CG_POOL_ROOT/$A/wip.txt"
+refuse $A dirty
+rm "$CG_POOL_ROOT/$A/wip.txt"
+g -C "$CG_POOL_ROOT/$A" switch -q -c attached
+refuse $A on-branch
+g -C "$CG_POOL_ROOT/$A" switch -q --detach
+g -C "$CG_POOL_ROOT/$A" commit -q --allow-empty -m unique
+refuse $A 'not an ancestor'
+g -C "$CG_POOL_ROOT/$A" switch -q --detach HEAD~1
+echo "$CG_POOL_ROOT/$A" >"$T/cwds"
+refuse $A process-cwd
+: >"$T/cwds"
+refuse $A 'process check unavailable' CG_POOL_CWD_FILE="$T/missing/cwds"
+mv "$T/origin.git" "$T/origin.off"
+refuse $A 'fetch of origin failed'
+mv "$T/origin.off" "$T/origin.git"
+refuse $A 'git status failed' CG_FAIL_GIT=status PATH="$T/failgit:$PATH"
+refuse $A 'no valid origin/nope' CG_POOL_BASE=nope
+# One worker prepared while the other is busy; --all reports every slot.
+expect 0 "$POOL" prepare --slot $A
+expect 1 "$POOL" prepare --all
+{ grep -q "prepared $R" "$T/out" && grep -q "$B is leased" "$T/out"; } || fail "--all output: $(cat "$T/out")"
+expect 0 "$POOL" release --slot $B --token "$(token $B)"
+
+# Concurrency: prepare against acquire, release, reclaim and other prepares.
+# Whatever interleaving wins, no lease appears or vanishes unexpectedly and a
+# leased slot is never moved by prepare.
+advance_base race
+for i in 1 2 3 4; do ("$POOL" prepare --slot $A >/dev/null 2>&1 || :) & done
+("$POOL" acquire --slot $A --task race --agent x >"$T/acq" 2>&1 && echo ok >>"$T/acq" || :) &
+wait
+if lease_exists $A; then
+	grep -q '^ok$' "$T/acq" || fail "lease without a winning acquire"
+	("$POOL" release --slot $A --token "$(token $A)" >"$T/rel" 2>&1 && echo ok >>"$T/rel" || :) &
+	("$POOL" prepare --slot $A >/dev/null 2>&1 || :) &
+	wait
+	grep -q '^ok$' "$T/rel" || lease_exists $A || fail "lease vanished without release"
+else
+	grep -q '^ok$' "$T/acq" && fail "winning acquire left no lease"
+	[[ $(head_of $A) == "$(base_of)" ]] || fail "concurrent prepares left $A behind"
+fi
+if lease_exists $A; then "$POOL" release --slot $A --token "$(token $A)" >/dev/null; fi
+"$POOL" prepare --slot $B >/dev/null
+"$POOL" acquire --slot $B --task stale --agent x >/dev/null
+TB=$(token $B)
+sed -i.bak "s/^pid=.*/pid=$dead/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$B.lease" && rm "$CG_POOL_LEASES/$B.lease.bak"
+advance_base reclaim
+bh=$(head_of $B)
+("$POOL" reclaim --slot $B --token "$TB" --reason race >/dev/null 2>&1 || :) &
+("$POOL" prepare --slot $B >/dev/null 2>&1 || :) &
+wait
+if lease_exists $B; then
+	[[ $(head_of $B) == "$bh" ]] || fail "prepare moved a leased slot"
+	expect 0 "$POOL" reclaim --slot $B --token "$TB" --reason race
+fi
+expect 0 "$POOL" prepare --all
+for s in $A $B $R; do
+	[[ $(head_of "$s") == "$(base_of)" ]] || fail "$s not at base after --all"
+	if lease_exists "$s"; then fail "$s leased after --all"; fi
+done
+[[ -z $(ls "$CG_POOL_LEASES") || $(ls "$CG_POOL_LEASES") == archive ]] || fail "leftover lease files: $(ls "$CG_POOL_LEASES")"
 
 if ((fails)); then
 	echo "$fails failure(s)"

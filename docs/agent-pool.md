@@ -28,6 +28,7 @@ Leases live in `~/Projekti/codegraph-evidence/pool/<slot>.lease`.
 scripts/agent-pool/pool.sh status
 scripts/agent-pool/pool.sh acquire --slot auto --task <branch> --agent <name> [--pr N] [--pid PID]
 scripts/agent-pool/pool.sh release --slot <slot> --token <token>
+scripts/agent-pool/pool.sh prepare --slot <slot> | --all
 ```
 
 - Every check fails closed: a failed fetch, a Git error, a slot that is not
@@ -38,8 +39,13 @@ scripts/agent-pool/pool.sh release --slot <slot> --token <token>
   lease exists). Exactly one of several concurrent callers wins; a lease is
   never overwritten. It prints the ownership token; keep it. `--slot auto`
   takes the first idle worker or exits 3 with `BLOCKED_POOL_BUSY`.
-- `--pid` records a long-lived process of the agent session. Without it the
-  lease is never reported stale.
+- `--pid` is optional. It records a long-lived process of the agent
+  session so `status` can report the lease `stale-suspected` once that
+  process is gone. Without a PID there is no automatic stale detection: the
+  lease stays busy until its owner releases it with the token, or an
+  administrator recovers it explicitly after verifying the owner is gone
+  (see Recovery). There is no time-based expiry, and a missing PID is never
+  permission to reclaim a slot.
 - The review slot is leased only with `--review`, and only for review:
   read-only commands and `git checkout --detach <reviewed-sha>`. No edits,
   commits, stashes or branches. Return it to `origin/v2.0` afterwards.
@@ -48,10 +54,30 @@ scripts/agent-pool/pool.sh release --slot <slot> --token <token>
   exact head SHA. Evidence goes to `~/Projekti/codegraph-evidence/<wave>/`,
   never only in the slot.
 - `release` needs the lease's token, no process with its cwd in the slot, a
-  clean tree, and a HEAD that is merged into `origin/v2.0` or contained in a
-  branch that still exists on `origin` (detached or not; fetched with `--prune`). It then detaches the
-  slot at `origin/v2.0` and removes the lease. Any failure keeps the lease and
-  the work. The task branch is kept.
+  clean tree (a failing `git status` is an error, never "clean"), a
+  successful `fetch --prune`, a valid `origin/v2.0`, and a HEAD that is
+  integrated by one of:
+  - an ancestor of `origin/v2.0`;
+  - contained in a branch that still exists on `origin`;
+  - contained in a local branch, and merging it into `origin/v2.0` (`git
+    merge-tree`) yields exactly the `origin/v2.0` tree. This is the
+    squash-merge case where GitHub deleted the PR branch: every change is in
+    the base, and the commits stay reachable from the local branch, which
+    release keeps. A detached commit that no local branch holds is never
+    released on content alone.
+
+  It then detaches the slot at `origin/v2.0` and removes the lease. Any
+  failure keeps the lease and the work. The task branch is kept.
+- `prepare` moves idle, unleased slots forward to a freshly fetched
+  `origin/v2.0` after merges, so they can be leased again. Under the slot
+  lock it requires: a valid worktree of the repository, no lease, no process
+  in the slot (and process inspection that works), a detached HEAD, a clean
+  tree, a successful fetch, a valid base, and a HEAD that is an ancestor of
+  the base. It then runs `git switch --detach <base>` and verifies the result.
+  A slot already at the base is left as is. Anything else is refused and the
+  slot is left unchanged. `--all` prepares each slot independently; it is
+  not all-or-nothing, and exits 1 if any slot was refused. A slot whose lock
+  is held by another `pool.sh` run is refused, not waited for.
 
 ## States
 
