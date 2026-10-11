@@ -14,6 +14,8 @@ POOL_ROOT=${CG_POOL_ROOT:-$HOME/Projekti}
 LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-evidence/pool}
 REMOTE=${CG_POOL_REMOTE:-origin}
 BASE=${CG_POOL_BASE:-v2.0}
+# Every slot must be a worktree of this repository.
+REPO=${CG_POOL_REPO:-$HOME/Projekti/codegraph}
 WORKERS=(codegraph-worker-a codegraph-worker-b)
 REVIEW=codegraph-review
 
@@ -29,19 +31,23 @@ known_slot() {
 }
 
 # Paths of every process cwd, one per line, read once per invocation.
-# Tests supply the list in a file.
+# Tests supply the list in a file. When the list cannot be read, every slot
+# counts as in use.
 CWDS=""
 CWDS_READ=0
-process_cwds() {
-	if ((CWDS_READ == 0)); then
-		if [[ -n ${CG_POOL_CWD_FILE:-} ]]; then
-			CWDS=$(cat "$CG_POOL_CWD_FILE")
-		else
-			CWDS=$(lsof -n -w -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
-		fi
-		CWDS_READ=1
+CWDS_FAILED=0
+read_cwds() {
+	local raw
+	((CWDS_READ == 0)) || return 0
+	CWDS_READ=1
+	if [[ -n ${CG_POOL_CWD_FILE:-} ]]; then
+		raw=$(cat "$CG_POOL_CWD_FILE" 2>/dev/null) || CWDS_FAILED=1
+		CWDS=$raw
+	elif raw=$(lsof -n -w -d cwd -Fn 2>/dev/null) && [[ -n $raw ]]; then
+		CWDS=$(printf '%s\n' "$raw" | sed -n 's/^n//p')
+	else
+		CWDS_FAILED=1
 	fi
-	printf '%s\n' "$CWDS"
 }
 
 # Every lease change of a slot happens under its lock. mkdir is atomic; a
@@ -57,20 +63,30 @@ unlock_slot() { rmdir "$LOCK"; LOCK=""; }
 slot_in_use() {
 	local p
 	p=$(cd "$(slot_path "$1")" 2>/dev/null && pwd -P) || return 1
-	process_cwds | awk -v p="$p" '$0 == p || index($0, p "/") == 1 { found = 1 } END { exit !found }'
+	read_cwds
+	((CWDS_FAILED == 0)) || return 0
+	printf '%s\n' "$CWDS" | awk -v p="$p" '$0 == p || index($0, p "/") == 1 { found = 1 } END { exit !found }'
 }
 
 # Prints why a slot is not an idle baseline; prints nothing when it is.
 slot_problems() {
-	local p head base
+	local p real top common repo changes head base
 	p=$(slot_path "$1")
-	[[ -d $p ]] || { echo "missing"; return; }
-	[[ -z $(git -C "$p" status --porcelain --untracked-files=all) ]] || echo "dirty"
-	git -C "$p" symbolic-ref -q HEAD >/dev/null && echo "on-branch $(git -C "$p" symbolic-ref --short HEAD)"
-	head=$(git -C "$p" rev-parse HEAD)
-	base=$(git -C "$p" rev-parse "$REMOTE/$BASE")
+	real=$(cd "$p" 2>/dev/null && pwd -P) || { echo "missing"; return 0; }
+	repo=$(cd "$REPO/.git" 2>/dev/null && pwd -P) || { echo "repository $REPO missing"; return 0; }
+	top=$(git -C "$real" rev-parse --show-toplevel 2>/dev/null) &&
+		common=$(cd "$real" && cd "$(git rev-parse --git-common-dir)" && pwd -P) &&
+		[[ $top == "$real" && $common == "$repo" ]] ||
+		{ echo "not a worktree of $REPO"; return 0; }
+	changes=$(git -C "$real" status --porcelain --untracked-files=all 2>&1) || { echo "git status failed"; return 0; }
+	[[ -z $changes ]] || echo "dirty"
+	git -C "$real" symbolic-ref -q HEAD >/dev/null && echo "on-branch $(git -C "$real" symbolic-ref --short HEAD)"
+	head=$(git -C "$real" rev-parse -q --verify 'HEAD^{commit}') || { echo "no valid HEAD"; return 0; }
+	base=$(git -C "$real" rev-parse -q --verify "$REMOTE/$BASE^{commit}") || { echo "no $REMOTE/$BASE"; return 0; }
 	[[ $head == "$base" ]] || echo "head ${head:0:12} != $REMOTE/$BASE ${base:0:12}"
-	slot_in_use "$1" && echo "process-cwd"
+	if slot_in_use "$1"; then
+		if ((CWDS_FAILED == 0)); then echo "process-cwd"; else echo "process check unavailable"; fi
+	fi
 	return 0
 }
 
@@ -130,7 +146,7 @@ try_acquire() {
 try_acquire_locked() {
 	local slot=$1 f tmp token problems
 	f=$(lease_file "$slot")
-	git -C "$(slot_path "$slot")" fetch -q "$REMOTE" "$BASE" 2>/dev/null || true
+	git -C "$(slot_path "$slot")" fetch -q "$REMOTE" 2>/dev/null || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }
 	problems=$(slot_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not idle: $problems" >&2; return 1; }
 	token=$(random_token)

@@ -16,7 +16,7 @@ The coordinator works in the primary checkout and is the only writer there.
 No other worktrees are created without owner approval; when both workers are
 busy, report `BLOCKED_POOL_BUSY` instead.
 
-A slot is **idle** when its tree is clean (`git status --porcelain
+A slot is **idle** when it is a worktree of the primary repository, its tree is clean (`git status --porcelain
 --untracked-files=all` is empty), its HEAD is detached and equal to a freshly
 fetched `origin/v2.0`, no process has its cwd inside it, and it has no lease.
 
@@ -30,7 +30,10 @@ scripts/agent-pool/pool.sh acquire --slot auto --task <branch> --agent <name> [-
 scripts/agent-pool/pool.sh release --slot <slot> --token <token>
 ```
 
-- `acquire` revalidates that the slot is idle, then creates the lease
+- Every check fails closed: a failed fetch, a Git error, a slot that is not
+  a worktree of this repository, or process inspection that cannot run
+  (`lsof` missing or failing) leaves the slot unleased and not free.
+- `acquire` fetches `origin`, revalidates that the slot is idle, then creates the lease
   atomically (written in full, then hard-linked into place; `link` fails if a
   lease exists). Exactly one of several concurrent callers wins; a lease is
   never overwritten. It prints the ownership token; keep it. `--slot auto`
