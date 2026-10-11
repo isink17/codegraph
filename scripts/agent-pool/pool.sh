@@ -5,6 +5,7 @@
 #   pool.sh acquire --slot <slot|auto> --task <task> --agent <agent> [--pr N] [--owner who] [--pid PID] [--review]
 #   pool.sh release --slot <slot> --token <token>
 #   pool.sh reclaim --slot <slot> --token <token> --reason <text>
+#   pool.sh prepare --slot <slot> | --all
 #
 # Exit codes: 0 ok, 1 refused, 2 usage, 3 BLOCKED_POOL_BUSY.
 set -euo pipefail
@@ -69,9 +70,10 @@ slot_in_use() {
 	printf '%s\n' "$CWDS" | awk -v p="$p" '$0 == p || index($0, p "/") == 1 { found = 1 } END { exit !found }'
 }
 
-# Prints why a slot is not an idle baseline; prints nothing when it is.
-slot_problems() {
-	local p real top common repo changes head base
+# Prints why a slot is not a clean, detached, unused worktree of the
+# repository; prints nothing when it is. Ignores where HEAD points.
+slot_shape_problems() {
+	local p real top common repo changes
 	p=$(slot_path "$1")
 	real=$(cd "$p" 2>/dev/null && pwd -P) || { echo "missing"; return 0; }
 	repo=$(cd "$REPO/.git" 2>/dev/null && pwd -P) || { echo "repository $REPO missing"; return 0; }
@@ -82,12 +84,22 @@ slot_problems() {
 	changes=$(git -C "$real" status --porcelain --untracked-files=all 2>&1) || { echo "git status failed"; return 0; }
 	[[ -z $changes ]] || echo "dirty"
 	git -C "$real" symbolic-ref -q HEAD >/dev/null && echo "on-branch $(git -C "$real" symbolic-ref --short HEAD)"
-	head=$(git -C "$real" rev-parse -q --verify 'HEAD^{commit}') || { echo "no valid HEAD"; return 0; }
-	base=$(git -C "$real" rev-parse -q --verify "$REMOTE/$BASE^{commit}") || { echo "no $REMOTE/$BASE"; return 0; }
-	[[ $head == "$base" ]] || echo "head ${head:0:12} != $REMOTE/$BASE ${base:0:12}"
+	git -C "$real" rev-parse -q --verify 'HEAD^{commit}' >/dev/null || echo "no valid HEAD"
 	if slot_in_use "$1"; then
 		if ((CWDS_FAILED == 0)); then echo "process-cwd"; else echo "process check unavailable"; fi
 	fi
+	return 0
+}
+
+# Prints why a slot is not an idle baseline; prints nothing when it is.
+slot_problems() {
+	local p head base problems
+	problems=$(slot_shape_problems "$1")
+	[[ -z $problems ]] || { echo "$problems"; return 0; }
+	p=$(slot_path "$1")
+	head=$(git -C "$p" rev-parse -q --verify 'HEAD^{commit}') || { echo "no valid HEAD"; return 0; }
+	base=$(git -C "$p" rev-parse -q --verify "$REMOTE/$BASE^{commit}") || { echo "no $REMOTE/$BASE"; return 0; }
+	[[ $head == "$base" ]] || echo "head ${head:0:12} != $REMOTE/$BASE ${base:0:12}"
 	return 0
 }
 
@@ -134,7 +146,7 @@ random_token() { od -An -tx1 -N16 /dev/urandom | tr -d ' \n'; }
 # into place. link(2) fails if the lease exists, so exactly one caller wins
 # and no reader ever sees a partial lease.
 try_acquire() {
-	local slot=$1 f tmp token problems
+	local slot=$1 f
 	f=$(lease_file "$slot")
 	[[ -e $f ]] && return 1
 	lock_slot "$slot" || { echo "$slot lock held: $LEASES/.$slot.lock" >&2; return 1; }
@@ -213,8 +225,27 @@ own_lease() {
 	[[ $(field "$f" token) == "$token" ]] || die "token does not match the $slot lease"
 }
 
+# True when releasing HEAD loses nothing:
+# - HEAD is an ancestor of base, or
+# - HEAD is in a branch that still exists on the remote, or
+# - HEAD is in a local branch (which release keeps) and merging it into base
+#   changes nothing: the squash-merge case, where GitHub deleted the PR branch.
+# A detached commit that no local branch holds is never released on content
+# alone. Any Git error counts as not integrated.
+head_integrated() {
+	local p=$1 head=$2 base=$3 remote held merged base_tree
+	git -C "$p" merge-base --is-ancestor "$head" "$base" && return 0
+	remote=$(git -C "$p" for-each-ref --contains "$head" --format='%(refname)' "refs/remotes/$REMOTE/") || return 1
+	[[ -n $remote ]] && return 0
+	held=$(git -C "$p" for-each-ref --contains "$head" --format='%(refname)' refs/heads/) || return 1
+	[[ -n $held ]] || return 1
+	merged=$(git -C "$p" merge-tree --write-tree "$base" "$head" 2>/dev/null) || return 1
+	base_tree=$(git -C "$p" rev-parse -q --verify "$base^{tree}") || return 1
+	[[ ${merged%%$'\n'*} == "$base_tree" ]]
+}
+
 cmd_release() {
-	local slot="" token="" p
+	local slot="" token="" p changes head base
 	while [[ $# -gt 0 ]]; do
 		case $1 in
 		--slot) need "$@"; slot=$2; shift 2 ;;
@@ -227,12 +258,13 @@ cmd_release() {
 	own_lease "$slot" "$token"
 	p=$(slot_path "$slot")
 	slot_in_use "$slot" && die "$slot is in use by a process; leave it first"
-	[[ -z $(git -C "$p" status --porcelain --untracked-files=all) ]] || die "$slot is dirty; commit or archive the work, lease kept"
+	changes=$(git -C "$p" status --porcelain --untracked-files=all) || die "git status failed in $slot; lease kept"
+	[[ -z $changes ]] || die "$slot is dirty; commit or archive the work, lease kept"
+	head=$(git -C "$p" rev-parse -q --verify 'HEAD^{commit}') || die "$slot has no valid HEAD; lease kept"
 	git -C "$p" fetch -q --prune "$REMOTE" || die "fetch failed; lease kept"
-	git -C "$p" merge-base --is-ancestor HEAD "$REMOTE/$BASE" ||
-		[[ -n $(git -C "$p" branch -r --contains HEAD --list "$REMOTE/*") ]] ||
-		die "$slot HEAD is neither pushed nor merged; lease kept"
-	git -C "$p" switch -q --detach "$REMOTE/$BASE" || die "could not return $slot to $REMOTE/$BASE; lease kept"
+	base=$(git -C "$p" rev-parse -q --verify "$REMOTE/$BASE^{commit}") || die "no valid $REMOTE/$BASE; lease kept"
+	head_integrated "$p" "$head" "$base" || die "$slot HEAD is neither pushed nor merged; lease kept"
+	git -C "$p" switch -q --detach "$base" || die "could not return $slot to $REMOTE/$BASE; lease kept"
 	rm "$(lease_file "$slot")"
 	echo "released $slot at $(git -C "$p" rev-parse --short HEAD)"
 }
@@ -261,10 +293,56 @@ cmd_reclaim() {
 	echo "reclaimed $slot; slot state now: $(slot_state "$slot" | sed -n 1p)"
 }
 
+# Moves an idle, unleased slot forward to the freshly fetched base. Only a
+# fast-forward of a clean detached HEAD; anything else is refused unchanged.
+prepare_locked() {
+	local slot=$1 p problems head base
+	p=$(slot_path "$slot")
+	[[ ! -e $(lease_file "$slot") ]] || { echo "$slot is leased; not prepared" >&2; return 1; }
+	problems=$(slot_shape_problems "$slot")
+	[[ -z $problems ]] || { echo "$slot not prepared: ${problems//$'\n'/; }" >&2; return 1; }
+	git -C "$p" fetch -q "$REMOTE" || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }
+	base=$(git -C "$p" rev-parse -q --verify "$REMOTE/$BASE^{commit}") || { echo "$slot: no valid $REMOTE/$BASE" >&2; return 1; }
+	head=$(git -C "$p" rev-parse -q --verify 'HEAD^{commit}') || { echo "$slot: no valid HEAD" >&2; return 1; }
+	if [[ $head == "$base" ]]; then
+		echo "$slot already at ${base:0:12}"
+		return 0
+	fi
+	git -C "$p" merge-base --is-ancestor "$head" "$base" ||
+		{ echo "$slot HEAD ${head:0:12} is not an ancestor of $REMOTE/$BASE; not prepared" >&2; return 1; }
+	git -C "$p" switch -q --detach "$base" || { echo "$slot: checkout of ${base:0:12} failed" >&2; return 1; }
+	problems=$(slot_problems "$slot")
+	[[ -z $problems ]] || { echo "$slot after prepare: ${problems//$'\n'/; }" >&2; return 1; }
+	echo "prepared $slot ${head:0:12} -> ${base:0:12}"
+}
+
+prepare_slot() {
+	local rc=0
+	lock_slot "$1" || { echo "$1 lock held: $LEASES/.$1.lock" >&2; return 1; }
+	prepare_locked "$1" || rc=$?
+	unlock_slot
+	return $rc
+}
+
+# Each slot is prepared on its own; --all is not all-or-nothing.
+cmd_prepare() {
+	local slots=() s rc=0
+	case ${1:-} in
+	--slot) need "$@"; slots=("$2"); [[ $# -eq 2 ]] || die "unknown argument $3" 2 ;;
+	--all) slots=("${WORKERS[@]}" "$REVIEW"); [[ $# -eq 1 ]] || die "unknown argument $2" 2 ;;
+	*) die "prepare needs --slot <slot> or --all" 2 ;;
+	esac
+	for s in "${slots[@]}"; do known_slot "$s" || die "unknown slot $s" 2; done
+	mkdir -p "$LEASES"
+	for s in "${slots[@]}"; do prepare_slot "$s" || rc=1; done
+	return $rc
+}
+
 case ${1:-} in
 status) shift; cmd_status "$@" ;;
 acquire) shift; cmd_acquire "$@" ;;
 release) shift; cmd_release "$@" ;;
 reclaim) shift; cmd_reclaim "$@" ;;
-*) die "usage: pool.sh status|acquire|release|reclaim (see header)" 2 ;;
+prepare) shift; cmd_prepare "$@" ;;
+*) die "usage: pool.sh status|acquire|release|reclaim|prepare (see header)" 2 ;;
 esac
