@@ -5,7 +5,7 @@ set -euo pipefail
 POOL=$(cd "$(dirname "$0")" && pwd)/pool.sh
 T=$(cd "$(mktemp -d)" && pwd -P)
 trap 'rm -rf "$T"' EXIT
-export CG_POOL_ROOT=$T/slots CG_POOL_LEASES=$T/leases CG_POOL_CWD_CMD="cat $T/cwds"
+export CG_POOL_ROOT=$T/slots CG_POOL_LEASES=$T/leases CG_POOL_CWD_FILE=$T/cwds
 : >"$T/cwds"
 fails=0
 
@@ -72,6 +72,22 @@ g -C "$CG_POOL_ROOT/$A" push -q origin work 2>/dev/null
 expect 0 "$POOL" release --slot $A --token "$(token $A)"
 [[ $(state $A) == free ]] || fail "pushed release state $(state $A)"
 
+# Detached commits that are not pushed are not discarded.
+"$POOL" acquire --slot $A --task d --agent x >/dev/null
+TA=$(token $A)
+g -C "$CG_POOL_ROOT/$A" switch -q --detach
+g -C "$CG_POOL_ROOT/$A" commit -q --allow-empty -m detached
+expect 1 "$POOL" release --slot $A --token "$TA"
+g -C "$CG_POOL_ROOT/$A" switch -q --detach origin/v2.0
+
+# Concurrent releases of one lease: exactly one succeeds.
+for i in 1 2 3 4; do
+	("$POOL" release --slot $A --token "$TA" >/dev/null 2>&1 && echo ok >"$T/rel$i" || : >"$T/rel$i") &
+done
+wait
+wins=$(cat "$T"/rel? | grep -c ok || true)
+[[ $wins == 1 ]] || fail "concurrent release: $wins winners"
+
 # Dirty worker: release keeps the lease and the change.
 echo wip >"$CG_POOL_ROOT/$B/wip.txt"
 expect 1 "$POOL" release --slot $B --token "$(token $B)"
@@ -80,7 +96,10 @@ expect 1 "$POOL" release --slot $B --token "$(token $B)"
 # Abandoned lease with a dead process: stale-suspected, never auto-freed;
 # reclaim archives the lease and leaves the dirty slot untouched.
 TB=$(token $B)
-sed -i.bak "s/^pid=.*/pid=999999/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$B.lease" && rm "$CG_POOL_LEASES/$B.lease.bak"
+sh -c 'exit 0' &
+dead=$!
+wait $dead || true
+sed -i.bak "s/^pid=.*/pid=$dead/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$B.lease" && rm "$CG_POOL_LEASES/$B.lease.bak"
 [[ $(state $B) == stale-suspected ]] || fail "dead-pid state $(state $B)"
 expect 1 "$POOL" acquire --slot $B --task steal --agent x
 expect 1 "$POOL" reclaim --slot $B --token wrong --reason test

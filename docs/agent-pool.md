@@ -45,7 +45,7 @@ scripts/agent-pool/pool.sh release --slot <slot> --token <token>
   exact head SHA. Evidence goes to `~/Projekti/codegraph-evidence/<wave>/`,
   never only in the slot.
 - `release` needs the lease's token, no process with its cwd in the slot, a
-  clean tree, and a branch that is pushed or merged. It then detaches the
+  clean tree, and a HEAD that is pushed or merged (detached or not). It then detaches the
   slot at `origin/v2.0` and removes the lease. Any failure keeps the lease and
   the work. The task branch is kept.
 
@@ -62,6 +62,11 @@ scripts/agent-pool/pool.sh release --slot <slot> --token <token>
   busy; its owner is the task named by its branch or open PR.
 
 There is no time-based expiry.
+
+Every lease change takes a per-slot lock (`pool/.<slot>.lock`, a directory
+created with `mkdir`). A lock left behind by a crashed run blocks the slot
+and is reported; remove it by hand only after checking that no `pool.sh`
+process is running.
 
 ## Recovery
 

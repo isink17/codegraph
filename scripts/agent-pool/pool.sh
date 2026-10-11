@@ -28,18 +28,35 @@ known_slot() {
 	return 1
 }
 
-# Paths of every process cwd, one per line. Tests replace the source.
+# Paths of every process cwd, one per line, read once per invocation.
+# Tests supply the list in a file.
+CWDS=""
+CWDS_READ=0
 process_cwds() {
-	if [[ -n ${CG_POOL_CWD_CMD:-} ]]; then
-		eval "$CG_POOL_CWD_CMD"
-	else
-		lsof -n -d cwd -F n 2>/dev/null | sed -n 's/^n//p' || true
+	if ((CWDS_READ == 0)); then
+		if [[ -n ${CG_POOL_CWD_FILE:-} ]]; then
+			CWDS=$(cat "$CG_POOL_CWD_FILE")
+		else
+			CWDS=$(lsof -n -w -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
+		fi
+		CWDS_READ=1
 	fi
+	printf '%s\n' "$CWDS"
 }
+
+# Every lease change of a slot happens under its lock. mkdir is atomic; a
+# lock left by a crashed run is reported, never broken automatically.
+LOCK=""
+trap '[[ -n $LOCK ]] && rmdir "$LOCK"' EXIT
+lock_slot() {
+	mkdir "$LEASES/.$1.lock" 2>/dev/null || return 1
+	LOCK="$LEASES/.$1.lock"
+}
+unlock_slot() { rmdir "$LOCK"; LOCK=""; }
 
 slot_in_use() {
 	local p
-	p=$(cd "$(slot_path "$1")" && pwd -P)
+	p=$(cd "$(slot_path "$1")" 2>/dev/null && pwd -P) || return 1
 	process_cwds | awk -v p="$p" '$0 == p || index($0, p "/") == 1 { found = 1 } END { exit !found }'
 }
 
@@ -103,6 +120,16 @@ try_acquire() {
 	local slot=$1 f tmp token problems
 	f=$(lease_file "$slot")
 	[[ -e $f ]] && return 1
+	lock_slot "$slot" || { echo "$slot lock held: $LEASES/.$slot.lock" >&2; return 1; }
+	try_acquire_locked "$slot"
+	local rc=$?
+	unlock_slot
+	return $rc
+}
+
+try_acquire_locked() {
+	local slot=$1 f tmp token problems
+	f=$(lease_file "$slot")
 	git -C "$(slot_path "$slot")" fetch -q "$REMOTE" "$BASE" 2>/dev/null || true
 	problems=$(slot_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not idle: $problems" >&2; return 1; }
@@ -160,26 +187,17 @@ cmd_acquire() {
 	try_acquire "$slot" || die "$slot not leased: $(slot_state "$slot" | sed -n 1p)"
 }
 
-# Moves the lease aside atomically so a concurrent release or reclaim of the
-# same lease cannot both succeed, then checks it was the lease we meant.
-take_lease() {
-	local slot=$1 token=$2 f held
+# Takes the slot lock and checks the caller owns the lease.
+own_lease() {
+	local slot=$1 token=$2 f
 	f=$(lease_file "$slot")
+	lock_slot "$slot" || die "$slot lock held: $LEASES/.$slot.lock"
 	[[ -e $f ]] || die "$slot has no lease"
 	[[ $(field "$f" token) == "$token" ]] || die "token does not match the $slot lease"
-	held="$LEASES/.$slot.$token.held"
-	mv "$f" "$held" 2>/dev/null || die "$slot lease changed concurrently"
-	if [[ $(field "$held" token) != "$token" ]]; then
-		ln "$held" "$f" 2>/dev/null && rm -f "$held"
-		die "$slot lease changed concurrently"
-	fi
-	echo "$held"
 }
 
-restore_lease() { ln "$1" "$(lease_file "$2")" && rm -f "$1"; }
-
 cmd_release() {
-	local slot="" token="" p held f
+	local slot="" token="" p
 	while [[ $# -gt 0 ]]; do
 		case $1 in
 		--slot) slot=$2; shift 2 ;;
@@ -189,31 +207,23 @@ cmd_release() {
 	done
 	[[ -n $slot && -n $token ]] || die "release needs --slot and --token" 2
 	known_slot "$slot" || die "unknown slot $slot" 2
-	f=$(lease_file "$slot")
-	[[ -e $f ]] || die "$slot has no lease"
-	[[ $(field "$f" token) == "$token" ]] || die "token does not match the $slot lease"
+	own_lease "$slot" "$token"
 	p=$(slot_path "$slot")
 	slot_in_use "$slot" && die "$slot is in use by a process; leave it first"
 	[[ -z $(git -C "$p" status --porcelain --untracked-files=all) ]] || die "$slot is dirty; commit or archive the work, lease kept"
 	git -C "$p" fetch -q "$REMOTE" || die "fetch failed; lease kept"
-	if git -C "$p" symbolic-ref -q HEAD >/dev/null; then
-		git -C "$p" merge-base --is-ancestor HEAD "$REMOTE/$BASE" ||
-			[[ -n $(git -C "$p" branch -r --contains HEAD) ]] ||
-			die "$slot branch is neither pushed nor merged; lease kept"
-	fi
-	held=$(take_lease "$slot" "$token")
-	if ! git -C "$p" switch -q --detach "$REMOTE/$BASE"; then
-		restore_lease "$held" "$slot"
-		die "could not return $slot to $REMOTE/$BASE; lease kept"
-	fi
-	rm -f "$held"
+	git -C "$p" merge-base --is-ancestor HEAD "$REMOTE/$BASE" ||
+		[[ -n $(git -C "$p" branch -r --contains HEAD) ]] ||
+		die "$slot HEAD is neither pushed nor merged; lease kept"
+	git -C "$p" switch -q --detach "$REMOTE/$BASE" || die "could not return $slot to $REMOTE/$BASE; lease kept"
+	rm "$(lease_file "$slot")"
 	echo "released $slot at $(git -C "$p" rev-parse --short HEAD)"
 }
 
 # Explicit recovery of a lease whose recorded process is gone. The lease is
 # archived, never deleted, and the slot's files are not touched.
 cmd_reclaim() {
-	local slot="" token="" reason="" f pid held archive
+	local slot="" token="" reason="" archive
 	while [[ $# -gt 0 ]]; do
 		case $1 in
 		--slot) slot=$2; shift 2 ;;
@@ -224,12 +234,12 @@ cmd_reclaim() {
 	done
 	[[ -n $slot && -n $token && -n $reason ]] || die "reclaim needs --slot, --token and --reason" 2
 	known_slot "$slot" || die "unknown slot $slot" 2
+	own_lease "$slot" "$token"
 	[[ $(slot_state "$slot" | sed -n 1p) == stale-suspected ]] ||
 		die "$slot is not stale-suspected; reclaim refused"
-	held=$(take_lease "$slot" "$token")
 	archive="$LEASES/archive"
 	mkdir -p "$archive"
-	mv "$held" "$archive/$slot.$(date -u +%Y%m%dT%H%M%SZ).$token.lease"
+	mv "$(lease_file "$slot")" "$archive/$slot.$(date -u +%Y%m%dT%H%M%SZ).$token.lease"
 	echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) reclaim $slot token=$token by=${USER:-} reason=$reason" >>"$archive/audit.log"
 	echo "reclaimed $slot; slot state now: $(slot_state "$slot" | sed -n 1p)"
 }
