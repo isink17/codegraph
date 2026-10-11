@@ -58,26 +58,52 @@ callback()
 	}
 }
 
+// A Lua function's stable key is its scope, qualified name and the 1-based
+// line and byte column of its declaration statement. It is unique and
+// deterministic within one snapshot, not stable across edits.
 func TestLuaDeclarationIdentitySeparatesLexicalDuplicates(t *testing.T) {
 	const source = `local function same() end
 local function outer()
   local function same() end
   do local function same() end end
 end
+local s = "é" local function wide() end
 `
-	parsed, err := NewLua().Parse(context.Background(), "same.lua", []byte(source))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(parsed.Symbols) != 4 {
-		t.Fatalf("symbols = %d, want outer and three same declarations", len(parsed.Symbols))
-	}
-	keys := map[string]bool{}
-	for _, sym := range parsed.Symbols {
-		if keys[sym.StableKey] {
-			t.Errorf("duplicate declaration identity %q", sym.StableKey)
+	keys := func(source string) []string {
+		t.Helper()
+		parsed, err := NewLua().Parse(context.Background(), "same.lua", []byte(source))
+		if err != nil {
+			t.Fatal(err)
 		}
-		keys[sym.StableKey] = true
+		out := []string{}
+		for _, sym := range parsed.Symbols {
+			out = append(out, sym.StableKey)
+		}
+		slices.Sort(out)
+		return out
+	}
+	want := []string{
+		"func:lua:local:outer:2:1",
+		"func:lua:local:same:1:1",
+		"func:lua:local:same:3:3",
+		"func:lua:local:same:4:6",
+		"func:lua:local:wide:6:16",
+	}
+	if got := keys(source); !slices.Equal(got, want) {
+		t.Fatalf("keys = %q, want %q", got, want)
+	}
+	if got := keys(source); !slices.Equal(got, want) {
+		t.Fatalf("reparse keys = %q, want %q", got, want)
+	}
+	moved := []string{
+		"func:lua:local:outer:3:1",
+		"func:lua:local:same:2:1",
+		"func:lua:local:same:4:3",
+		"func:lua:local:same:5:6",
+		"func:lua:local:wide:7:16",
+	}
+	if got := keys("\n" + source); !slices.Equal(got, moved) {
+		t.Fatalf("moved keys = %q, want %q", got, moved)
 	}
 }
 
@@ -112,6 +138,10 @@ end
 local function k() for f = 1, 2 do f() end end
 local function m() for _, f in ipairs(t) do f() end end
 `, []string{}},
+		{"moved declaration binds at its new position", `
+local function f() end
+f()
+`, []string{"f@3:1->2:1"}},
 		{"two calls on one line", `local function a() end
 local function b() end
 local function run() a() b() a() end

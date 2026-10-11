@@ -20,7 +20,13 @@ its state per parser. The grammar is standard Lua 5.4, not Luau; Lua 5.5
 `global` declarations do not parse.
 
 The adapter extracts function declarations, literal `require` specifier
-strings, and call references. It emits a call edge only for a bare `name(...)`
+strings, and call references. A function's stable key is
+`func:lua:<local|global>:<qualified name>:<line>:<col>`, where line and column
+are the 1-based line and byte column of the declaration statement (its
+`local` or `function` keyword). The key is unique and deterministic within one
+snapshot, so repeated local names in nested scopes stay distinct; it is not an
+identity across edits: moving a declaration changes its key, and graph diffs
+show it as removed and added. It emits a call edge only for a bare `name(...)`
 call whose innermost lexical binding is a `local function` statement of the
 same file that is never assigned to anywhere in its scope, closures included;
 the edge's evidence names that declaration's position, and the resolver binds
