@@ -58,11 +58,11 @@ func TestDeclarationPairsProveContinuityOnlyInsideOneDirectory(t *testing.T) {
 		{name: "not Go", base: func() Revision {
 			f := goFile("p/a.lua")
 			f.Language = "lua"
-			return pairRevision(f, store.SemanticDeclaration{Language: "lua", Kind: "function", Name: "f", QualifiedName: "M.f", StableKey: "func:lua:M.f:1:1"})
+			return pairRevision(f, store.SemanticDeclaration{Language: "lua", Kind: "function", Name: "f", QualifiedName: "M.f", StableKey: "func:lua:global:M.f:1:1"})
 		}(), head: func() Revision {
 			f := goFile("p/b.lua")
 			f.Language = "lua"
-			return pairRevision(f, store.SemanticDeclaration{Language: "lua", Kind: "function", Name: "f", QualifiedName: "M.f", StableKey: "func:lua:M.f:1:1"})
+			return pairRevision(f, store.SemanticDeclaration{Language: "lua", Kind: "function", Name: "f", QualifiedName: "M.f", StableKey: "func:lua:global:M.f:1:1"})
 		}(), refused: []string{refuseLanguageNotProven}},
 		{name: "same GOOS", base: pairRevision(goFile("p/a_linux.go"), fn), head: pairRevision(goFile("p/b_linux.go"), fn), pairs: 1},
 		{name: "duplicate declarations", base: pairRevision(goFile("p/a.go"), goFunc("init"), goFunc("init"), fn), head: pairRevision(goFile("p/b.go"), goFunc("init"), goFunc("init"), fn), pairs: 1, refused: []string{refuseDeclarationNotUnique, refuseDeclarationNotUnique}},
