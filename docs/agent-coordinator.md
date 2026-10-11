@@ -22,6 +22,9 @@ $C status                   # task states plus pool.sh status
 $C cancel <task-id>         # stop a task's agent; work and lease are kept
 ```
 
+`cancel` needs the coordinator lock, so stop a running `run` loop (Ctrl-C;
+agents keep running) before cancelling, then `resume`.
+
 `run` without `--once` stays in the foreground while agents run and polls
 every `--poll` seconds (default 30). It exits when no agent is running and
 no further step is possible (waiting for review capacity, CI or the owner).
@@ -57,7 +60,7 @@ Run it from a checkout whose `scripts/agent-pool/pool.sh` is the current
 | `branch` | task branch, default `task/<id>`; unique per queue |
 | `depends_on` | task ids that must be **completed** (PR merged) first; cycles are rejected |
 | `agent` | `claude`, `codex` or `command` (argv in `command`; used by tests) |
-| `scope` | `fnmatch` patterns (`*` also matches `/`). Every changed file must match one. Tasks whose scopes may overlap never run at the same time. |
+| `scope` | `fnmatch` patterns (`*` also matches `/`). Every added, changed or deleted path must match one (renames count as both paths). A task whose scope may overlap another started, unmerged task waits until that task's PR is merged. |
 | `validate` | shell commands the coordinator runs in the slot after the agent exits |
 | `allowed_tools` | extra Claude Code tool rules for the implementer |
 | `review` | reviewer `agent` (`claude`, `codex`, `command`), optional `focus` |
@@ -75,8 +78,8 @@ pending ─▶ running ─▶ awaiting_review ─▶ reviewing ─┬▶ awaitin
 blocked · failed · interrupted   (need the owner; nothing is retried automatically)
 ```
 
-1. **pending → running.** Dependencies completed, no running task with an
-   overlapping scope, fewer than two implementation tasks running. `pool.sh
+1. **pending → running.** Dependencies completed, no started and unmerged
+   task with an overlapping scope, fewer than two implementation tasks running. `pool.sh
    prepare --all` moves idle slots to the current base, then `pool.sh
    acquire --slot auto` takes a worker or reports `BLOCKED_POOL_BUSY`; the
    task stays queued. The coordinator creates (or, for rework, switches to)
@@ -91,7 +94,9 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
 3. **Review.** One review at a time. The review slot is leased with
    `--review` (busy: `BLOCKED_REVIEW_BUSY`, the task waits), detached at the
    PR head that GitHub reports, and a reviewer runs in a new session with
-   read-only tools. Afterwards the slot must still be clean and at that head,
+   only Read, Grep and Glob; the coordinator writes the full diff against
+   `origin/<base>` to a file the reviewer may read. No shell is allowed:
+   `git diff --output` would write files. Afterwards the slot must still be clean and at that head,
    otherwise the review is invalid. The coordinator writes the merge-gate
    artifact itself (`PR`, `Reviewed-Head` = the head it checked out,
    `Verdict`, `Blocking`) and releases the slot. `REQUEST_CHANGES` or any
@@ -103,9 +108,12 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
    does not contain the current `origin/<base>` → `blocked` (stale base)
    until the owner updates the branch, which changes the head and so
    requires new CI and a new review; any failed, cancelled or timed-out
-   check → `blocked` until a rerun is green; pending checks or no `ci`
+   check (every check counts, also several with one name) → `blocked` until
+   a rerun is green; pending checks or no `ci`
    check → `awaiting_ci`. When all is green, `merge-gate.sh PR HEAD REVIEW`
-   runs in verification mode; only a pass reports **MERGE_READY**.
+   (with `--base <base>`) runs in verification mode; only a pass reports
+   **MERGE_READY**. A refusal (for example `mergeable` still `UNKNOWN`) is
+   rechecked on every pass.
 
 ## Safety contract
 
@@ -125,9 +133,11 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   slot: lease present (`pool.sh status`), token present, and the process
   identified by PID **and** start time. Still running → wait. Exit file →
   post-run checks. Gone without exit status → `interrupted`, lease and work
-  kept. A crash between acquire and launch leaves the slot recorded on the
-  task, which is then marked `interrupted` instead of acquiring a second
-  slot. A missing `state.json` with tokens or events present, or a
+  kept. Before calling `pool.sh acquire` the coordinator saves a
+  `starting` marker; a crash before the leased slot is saved leaves the
+  marker, and the task becomes `interrupted` (the lease shows up in
+  `pool.sh status` with `task=<id>`) instead of acquiring a second slot.
+  A release and the next status are saved together. A missing `state.json` with tokens or events present, or a
   malformed one, is refused and left untouched.
 - **Processes.** `cancel` signals the agent's process group only when the
   recorded PID still has the recorded start time; a reused PID is never
@@ -136,7 +146,8 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   criteria. Claude Code runs with `-p --output-format json --session-id
   <uuid> --permission-mode dontAsk --allowedTools …`: tools outside the
   list are denied, never prompted, and no bypass flag is ever passed.
-  Reviewers additionally get `--disallowedTools Edit Write NotebookEdit`.
+  Reviewers get only `Read Grep Glob` plus `--disallowedTools Edit Write
+  NotebookEdit`, and `--add-dir` for the diff file.
   Codex runs `codex exec --json -s workspace-write|read-only`. Authentication
   is the owner's job (`claude`/`codex login`); the coordinator never handles
   credentials.
@@ -172,7 +183,8 @@ It never touches the live pool.
 
 - Single host. One review at a time. At most two implementation tasks.
 - Scope overlap is decided on literal pattern prefixes, conservatively; it
-  does not inspect the actual diff of running tasks.
+  does not inspect the actual diff of other tasks.
+- `cancel` cannot run while a `run` loop holds the lock.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no
   retry command and no automatic lease recovery. The owner inspects the
   slot and either fixes and releases the lease with the token in

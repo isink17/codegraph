@@ -53,6 +53,7 @@ FAKE_GH = textwrap.dedent('''\
 # Merge gate stand-in: checks the review file names the PR and head; can be told to refuse.
 FAKE_GATE = textwrap.dedent('''\
     #!/bin/sh
+    [ "$1" = --base ] && [ "$2" = v2.0 ] && shift 2
     [ -e "$FAKE_GATE_REFUSE" ] && { echo "merge-gate: BLOCKED: test"; exit 1; }
     grep -qx "PR: #$1" "$3" && grep -qx "Reviewed-Head: $2" "$3" && grep -qx "Verdict: APPROVE" "$3" &&
         grep -qx "Blocking: 0" "$3" || { echo "merge-gate: BLOCKED: review"; exit 1; }
@@ -217,8 +218,9 @@ class Pool(unittest.TestCase):
         self.assertEqual(self.pool_state(B), "free")
         self.to_ready("a")
         self.assertEqual(self.status("b"), "pending")  # ready is not completed
+        self.assertEqual(self.status("c"), "pending")  # a's PR is still open
         self.set_pr(self.st()["a"]["pr"], state="MERGED")
-        self.run_until(lambda: self.status("b") not in ("pending",))
+        self.run_until(lambda: self.status("b") != "pending" and self.status("c") != "pending")
         self.assertEqual(self.status("a"), "completed")
 
     def test_plan_rejects_bad_specs(self):
@@ -324,6 +326,45 @@ class Pool(unittest.TestCase):
         for tid, why in reasons.items():
             self.assertIn(expect[tid], why)
         self.assertEqual(json.loads(self.db.read_text())["prs"], [])
+
+    def test_rename_from_outside_scope_is_refused(self):
+        self.git("-C", str(self.seed), "switch", "-q", "--detach", "origin/v2.0")
+        (self.seed / "secret.txt").write_text("keep\n")
+        self.git("-C", str(self.seed), "add", "secret.txt")
+        self.git("-C", str(self.seed), "commit", "-q", "-m", "secret")
+        self.git("-C", str(self.seed), "push", "-q", "origin", "HEAD:v2.0")
+        self.plan(self.task("x", sh("mkdir -p work && git mv secret.txt work/x.txt && git commit -qm mv")))
+        self.run_until(lambda: self.status("x") == "failed")
+        self.assertIn("secret.txt", self.st()["x"]["reason"])
+
+    def crash_after_acquire(self, status, review=False):
+        """Simulates a coordinator killed after pool.sh leased a slot but
+        before the slot was saved: only the starting marker is on disk."""
+        st = json.loads((self.state / "state.json").read_text())
+        slot = R if review else "auto"
+        st["tasks"]["x"].update(status=status, starting=slot, slot=None)
+        (self.state / "state.json").write_text(json.dumps(st))
+        args = ["acquire", "--slot", slot, "--task", "x", "--agent", "coordinator/command"]
+        subprocess.run([str(POOL), *args, *(["--review"] if review else [])], env=self.env, check=True,
+                       capture_output=True)
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "interrupted")
+        self.assertIn("did not complete", self.st()["x"]["reason"])
+        leased = [s for s in (A, B, R) if self.lease(s)]
+        self.assertEqual(len(leased), 1, leased)  # no second slot taken
+
+    def test_crash_between_acquire_and_save_never_takes_a_second_slot(self):
+        self.plan(self.task("x", commit("x")))
+        self.crash_after_acquire("pending")
+
+    def test_crash_between_review_acquire_and_save(self):
+        out = subprocess.run([str(POOL), "acquire", "--slot", R, "--task", "hold", "--agent", "t", "--review"],
+                             env=self.env, capture_output=True, text=True, check=True).stdout
+        self.plan(self.task("x", commit("x")))
+        self.run_until(lambda: self.status("x") == "awaiting_review")
+        subprocess.run([str(POOL), "release", "--slot", R, "--token", out.split("token=")[1].strip()],
+                       env=self.env, check=True, capture_output=True)
+        self.crash_after_acquire("awaiting_review", review=True)
 
     def test_failed_git_fetch_leaves_task_pending(self):
         self.git("-C", str(self.seed), "remote", "set-url", "origin", str(self.t / "missing.git"))
@@ -434,6 +475,12 @@ class Pool(unittest.TestCase):
         self.coord("run", "--once")
         self.assertEqual(self.status("x"), "blocked")
         self.assertIn("merge gate refused", self.st()["x"]["reason"])
+        (self.t / "gate-refuse").unlink()  # e.g. mergeable was UNKNOWN: rechecked on the next pass
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "ready_for_owner")
+        self.set_pr(n, checks=[{"name": "ci", "conclusion": "SUCCESS"}, {"name": "ci", "conclusion": "FAILURE"}])
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "blocked")  # a duplicate failing check is not hidden
 
     def test_base_advance_after_review_blocks_until_new_review(self):
         self.plan(self.task("x", commit("x")))

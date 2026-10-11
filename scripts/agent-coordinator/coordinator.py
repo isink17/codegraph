@@ -73,8 +73,9 @@ def git(slot_path, *args, check=True):
 
 
 def write_atomic(path, text, mode=0o600):
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    os.fchmod(fd, mode)
     with os.fdopen(fd, "w") as f:
         f.write(text)
         f.flush()
@@ -205,11 +206,11 @@ def implement_prompt(task, slot_path, findings=""):
     return "\n".join(lines)
 
 
-def review_prompt(task, pr, head, base):
+def review_prompt(task, pr, head, base, diff_file):
     return "\n".join([
         f"Independent review of PR #{pr} for task {task['id']}: {task['description']}",
-        f"The working tree is detached at the exact head {head}. Review the complete diff",
-        f"`git diff {REMOTE}/{base}...{head}`. Do not modify, create or delete any file.",
+        f"The working tree is detached at the exact head {head}. The complete diff",
+        f"`git diff {REMOTE}/{base}...{head}` is in {diff_file}. Do not modify, create or delete any file.",
         "Acceptance criteria:", *[f"- {a}" for a in task["acceptance"]],
         task["review"]["focus"],
         "End your answer with exactly these lines:",
@@ -218,25 +219,29 @@ def review_prompt(task, pr, head, base):
     ])
 
 
-READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)",
-                   "Bash(git show:*)", "Bash(git status:*)"]
+# No Bash for reviewers: git diff/log accept --output, which writes files.
+# The coordinator hands the reviewer the diff as a file instead.
+READ_ONLY_TOOLS = ["Read", "Grep", "Glob"]
 IMPL_TOOLS = ["Read", "Edit", "Write", "Grep", "Glob", "Bash(git add:*)", "Bash(git commit:*)",
               "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)"]
 
 
-def claude_argv(prompt, session, tools, review):
+def claude_argv(prompt, session, tools, review, add_dirs=()):
     argv = ["claude", "-p", prompt, "--output-format", "json", "--session-id", session,
-            "--permission-mode", "dontAsk", "--allowedTools", *tools]
+            "--permission-mode", "dontAsk"]
+    for d in add_dirs:
+        argv += ["--add-dir", str(d)]
+    argv += ["--allowedTools", *tools]
     if review:
         argv += ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
     return argv
 
 
-def codex_argv(prompt, session, tools, review):
+def codex_argv(prompt, session, tools, review, add_dirs=()):
     return ["codex", "exec", "--json", "-s", "read-only" if review else "workspace-write", prompt]
 
 
-def command_argv(prompt, session, tools, review):
+def command_argv(prompt, session, tools, review, add_dirs=()):
     raise AssertionError("command adapter argv comes from the task")
 
 
@@ -339,25 +344,36 @@ class Coordinator:
             args += ["--pr", str(t["pr"])]
         if review:
             args.append("--review")
+        # Recorded before the lease exists: a crash before the slot is saved
+        # leaves this marker, and the task is then interrupted rather than
+        # given a second slot.
+        t["starting"] = slot
+        self.save()
         p = self.pool(*args)
         m = re.search(r"^leased (\S+) token=([0-9a-f]+)$", p.stdout, re.M)
         if p.returncode != 0 or not m:
+            t.pop("starting")
+            self.save()
             return None, p.returncode, p.stderr.strip()
         t["slot"] = m.group(1)
         self.store_token(t, m.group(2))
+        t.pop("starting")
+        self.save()
         return m.group(1), 0, ""
 
-    def release(self, t):
+    def release(self, t, status, **fields):
+        """Releases the task's slot and records the next status in the same
+        save, so no crash can separate them."""
         token = self.read_token(t)
         if not token:
             return False, "lease token missing"
         p = self.pool("release", "--slot", t["slot"], "--token", token)
         if p.returncode != 0:
             return False, p.stderr.strip()
-        self.token_path(t).unlink()
-        self.event(t["id"], "released", slot=t["slot"])
-        t["slot"] = None
-        self.save()
+        token_file, slot = self.token_path(t), t["slot"]
+        self.event(t["id"], "released", slot=slot)
+        self.set(t, status, slot=None, process=None, **fields)
+        token_file.unlink()
         return True, ""
 
     # ------------------------------------------------------------ GitHub
@@ -441,7 +457,10 @@ def deps_met(c, t):
 
 def conflicts(c, t):
     for o in c.state["tasks"].values():
-        if o["id"] != t["id"] and o["status"] == RUNNING and scopes_overlap(o["scope"], t["scope"]):
+        # Serialised until the other task's PR is merged, so two open PRs
+        # never touch the same files.
+        if o["id"] != t["id"] and o["status"] not in (PENDING, COMPLETED) \
+                and scopes_overlap(o["scope"], t["scope"]):
             return o["id"]
     return None
 
@@ -453,7 +472,6 @@ def start_impl(c, t, findings=""):
             return "BLOCKED_POOL_BUSY"
         c.event(t["id"], "acquire_refused", detail=err)
         return f"acquire refused: {err}"
-    c.save()
     p = slot_path(slot)
     try:
         if run(["git", "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
@@ -489,7 +507,7 @@ def finish_impl(c, t, rc):
     head = git(p, "rev-parse", "HEAD")
     if head == t.get("head") or git(p, "rev-list", "--count", f"{t['base_sha']}..HEAD") == "0":
         return c.block(t, "agent produced no new commit; lease kept", FAILED)
-    changed = git(p, "diff", "--name-only", f"{t['base_sha']}...HEAD").splitlines()
+    changed = git(p, "diff", "--no-renames", "--name-only", f"{t['base_sha']}...HEAD").splitlines()
     outside = [f for f in changed if not in_scope(f, t["scope"])]
     if outside:
         return c.block(t, f"changes outside scope: {outside[:5]}; lease kept", FAILED)
@@ -517,10 +535,9 @@ def finish_impl(c, t, rc):
         return c.block(t, f"PR not opened: {e}; lease kept")
     t["pr"] = pr
     c.event(t["id"], "published", pr=pr, head=head)
-    ok, err = c.release(t)
+    ok, err = c.release(t, AWAITING_REVIEW)
     if not ok:
         return c.block(t, f"release of {t['slot']} refused: {err}")
-    c.set(t, AWAITING_REVIEW, process=None)
     print(f"{t['id']}: PR #{pr} at {head[:12]}, awaiting review")
 
 
@@ -541,8 +558,10 @@ def start_review(c, t):
     run(["git", "-C", str(REPO), "fetch", "-q", REMOTE])
     slot, rc, err = c.acquire(t, REVIEW_SLOT, review=True)
     if not slot:
-        return "BLOCKED_REVIEW_BUSY" if rc in (1, 3) else f"review acquire refused: {err}"
-    c.save()
+        if c.pool_status().get(REVIEW_SLOT) == "busy":
+            return "BLOCKED_REVIEW_BUSY"
+        c.event(t["id"], "acquire_refused", detail=err)
+        return f"review acquire refused: {err}"
     p = slot_path(slot)
     try:
         git(p, "fetch", "-q", REMOTE, f"+refs/pull/{t['pr']}/head:refs/coordinator/review", check=False)
@@ -550,10 +569,14 @@ def start_review(c, t):
     except Refused as e:
         return c.block(t, f"review checkout of {head[:12]} failed: {e}; review lease kept")
     t["review_session"] = str(uuid.uuid4())
-    prompt = review_prompt(t, t["pr"], head, t["base"])
+    diff_dir = c.runs / f"{t['id']}-diff-{head[:12]}"
+    diff_dir.mkdir(mode=0o700, exist_ok=True)
+    diff_file = diff_dir / "pr.diff"
+    write_atomic(diff_file, git(p, "diff", f"{REMOTE}/{t['base']}...{head}") + "\n")
+    prompt = review_prompt(t, t["pr"], head, t["base"], diff_file)
     r = t["review"]
     argv = r["command"] if r["agent"] == "command" else ADAPTERS[r["agent"]](
-        prompt, t["review_session"], READ_ONLY_TOOLS, True)
+        prompt, t["review_session"], READ_ONLY_TOOLS, True, [diff_dir])
     t["process"] = launch(c, t, argv, p, "review")
     c.set(t, REVIEWING, review_head=head)
     print(f"{t['id']}: reviewing PR #{t['pr']} at {head[:12]}")
@@ -583,13 +606,12 @@ def finish_review(c, t, rc):
         f"Reviewer: coordinator/{t['review']['agent']} session {t['review_session']} (review slot)",
         "", body.strip(), ""]), mode=0o644)
     c.event(t["id"], "reviewed", head=head, verdict=verdict[-1], blocking=int(blocking[-1]), artifact=str(artifact))
-    ok, err = c.release(t)
+    if approve:
+        ok, err = c.release(t, AWAITING_CI, review_file=str(artifact), approved_head=head)
+    else:
+        ok, err = c.release(t, CHANGES_REQUIRED, findings=body.strip()[-8000:], approved_head=None)
     if not ok:
         return c.block(t, f"review slot release refused: {err}")
-    if approve:
-        c.set(t, AWAITING_CI, process=None, review_file=str(artifact), approved_head=head)
-    else:
-        c.set(t, CHANGES_REQUIRED, process=None, findings=body.strip()[-8000:], approved_head=None)
     print(f"{t['id']}: review of {head[:12]}: {'APPROVE' if approve else 'REQUEST_CHANGES'}")
 
 
@@ -621,17 +643,18 @@ def reconcile_pr(c, t, pr=None):
             c.set(t, AWAITING_REVIEW)
         return None
     checks = pr.get("statusCheckRollup") or []
-    states = {(x.get("name") or x.get("context")): (x.get("conclusion") or x.get("state") or "PENDING")
-              for x in checks}
+    # A list, not a dict: two checks with one name must both pass.
+    states = [((x.get("name") or x.get("context")), (x.get("conclusion") or x.get("state") or "PENDING"))
+              for x in checks]
     pending = ("PENDING", "EXPECTED")
-    bad = {n: s for n, s in states.items() if s not in ("SUCCESS", "NEUTRAL", "SKIPPED", *pending)}
+    bad = [(n, s) for n, s in states if s not in ("SUCCESS", "NEUTRAL", "SKIPPED", *pending)]
     if bad:
         return c.block(t, f"CI not green at {head[:12]}: {bad}")
-    if "ci" not in states or any(s in pending for s in states.values()):
+    if "ci" not in [n for n, _ in states] or any(s in pending for _, s in states):
         if t["status"] != AWAITING_CI:
             c.set(t, AWAITING_CI)
         return None
-    gate = run([GATE, str(t["pr"]), head, t["review_file"]], cwd=REPO)
+    gate = run([GATE, "--base", t["base"], str(t["pr"]), head, t["review_file"]], cwd=REPO)
     c.event(t["id"], "merge_gate_verify", exit=gate.returncode, output=(gate.stdout + gate.stderr).strip()[-500:])
     if gate.returncode != 0:
         return c.block(t, f"merge gate refused: {(gate.stdout + gate.stderr).strip()[-300:]}")
@@ -685,13 +708,19 @@ def schedule(c):
     busy_note = None
     for t in tasks.values():
         if t["status"] in (AWAITING_CI, READY) or (t["status"] == BLOCKED and t.get("pr")
-                                                    and t.get("reason", "").startswith(("stale base", "CI not green"))):
+                                                    and t.get("reason", "").startswith(("stale base", "CI not green", "merge gate refused"))):
             before = t["status"]
             try:
                 reconcile_pr(c, t)
             except Refused as e:
                 print(f"{t['id']}: {e}")
             changed |= t["status"] != before
+    for t in tasks.values():
+        if t["status"] in (PENDING, CHANGES_REQUIRED, AWAITING_REVIEW) and (t.get("starting") or t.get("slot")):
+            # Crashed while acquiring a slot: a lease with task=<id> may exist
+            # (pool.sh status shows it). It stays until the owner inspects it.
+            c.block(t, f"a previous slot acquisition ({t.get('slot') or t.get('starting')}) did not complete; "
+                       f"check pool.sh status for task={t['id']}", INTERRUPTED)
     for t in tasks.values():
         if t["status"] == AWAITING_REVIEW and not any(o["status"] == REVIEWING for o in tasks.values()):
             r = start_review(c, t)
@@ -704,11 +733,6 @@ def schedule(c):
         if sum(o["status"] == RUNNING for o in tasks.values()) >= MAX_IMPL:
             busy_note = "BLOCKED_POOL_BUSY"
             break
-        if t.get("slot"):
-            # Crashed between acquiring a slot and recording the launch: the
-            # lease stays with this task until the owner inspects it.
-            c.block(t, f"a previous start did not complete; lease on {t['slot']} kept", INTERRUPTED)
-            continue
         if not deps_met(c, t):
             continue
         other = conflicts(c, t)
