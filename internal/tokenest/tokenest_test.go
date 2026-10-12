@@ -32,3 +32,9 @@ func TestOfStringEqualsFromBytes(t *testing.T) {
 		t.Fatal("OfString and FromBytes disagree")
 	}
 }
+
+func TestOfStringCountsUTF8Bytes(t *testing.T) {
+	if got, want := OfString("ééé"), FromBytes(6); got != want {
+		t.Fatalf("OfString(\"ééé\") = %d, want %d", got, want)
+	}
+}
