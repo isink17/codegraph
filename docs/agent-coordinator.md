@@ -22,8 +22,14 @@ $C status                   # task states plus pool.sh status
 $C cancel <task-id>         # stop a task's agent; work and lease are kept
 ```
 
-`cancel` needs the coordinator lock, so stop a running `run` loop (Ctrl-C;
-agents keep running) before cancelling, then `resume`.
+`cancel` needs the coordinator lock. It cannot run while a `run` loop is in
+the foreground: stop the loop (Ctrl-C; agents keep running), cancel, then
+`resume`. Cancellation is therefore never immediate while a loop runs.
+`cancel` sends SIGTERM to the agent's process group and waits
+`CG_COORD_CANCEL_WAIT` seconds (default 5). If any process of the group is
+still alive, it prints `cancellation incomplete`, exits 1 and leaves the
+task in its state with its lease and work; the slot is not reused. The task
+becomes `interrupted` (never published) once `resume` sees the group gone.
 
 `run` without `--once` stays in the foreground while agents run and polls
 every `--poll` seconds (default 30). It exits when no agent is running and
@@ -111,7 +117,12 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
    check (every check counts, also several with one name) → `blocked` until
    a rerun is green; pending checks or no `ci`
    check → `awaiting_ci`. When all is green, `merge-gate.sh PR HEAD REVIEW`
-   (with `--base <base>`) runs in verification mode; only a pass reports
+   (with `--base <base>`) runs in verification mode. The gate is the one
+   committed on `origin/<base>` (copied to `<state>/gates/<blob>.sh`), never
+   the main checkout's copy, which may be old or modified; `CG_COORD_GATE`
+   overrides it. Either must print a usage naming `--base` when run without
+   arguments (exit 2), otherwise the task is blocked with `merge gate
+   unavailable` and rechecked on every pass; only a pass reports
    **MERGE_READY**. A refusal (for example `mergeable` still `UNKNOWN`) is
    rechecked on every pass.
 
@@ -127,30 +138,61 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   coordinator on the same state refuses; a crashed one leaves no lock.
   Coordinators with different state directories are still serialised per
   slot by `pool.sh`'s atomic acquire.
-- **Crash recovery.** Agents run detached, and a shell wrapper writes their
-  exit status to a file, so a coordinator crash neither kills an agent nor
-  loses its result. `run`/`resume` first reconciles every task that holds a
-  slot: lease present (`pool.sh status`), token present, and the process
-  identified by PID **and** start time. Still running → wait. Exit file →
-  post-run checks. Gone without exit status → `interrupted`, lease and work
-  kept. Before calling `pool.sh acquire` the coordinator saves a
-  `starting` marker; a crash before the leased slot is saved leaves the
-  marker, and the task becomes `interrupted` (the lease shows up in
-  `pool.sh status` with `task=<id>`) instead of acquiring a second slot.
-  A release and the next status are saved together. A missing `state.json` with tokens or events present, or a
-  malformed one, is refused and left untouched.
-- **Processes.** `cancel` signals the agent's process group only when the
-  recorded PID still has the recorded start time; a reused PID is never
-  signalled. Cancellation does not touch the work tree, branch or lease.
+- **Crash recovery.** `run`/`resume` reconciles before acting, and each
+  step that a crash could cut in half is a recorded transaction:
+  - *Acquire.* Before `pool.sh acquire` the coordinator saves a `starting`
+    marker with a fresh transaction id, passed to pool.sh as the lease
+    `owner=coordinator:<id>`. pool.sh's output (with the token) and exit
+    status go to private files in `<state>/tokens/`. Afterwards, and after
+    any crash, the files and `pool.sh status` decide: a lease with that
+    owner and a matching token in the output is adopted and the task
+    continues; no live pool.sh for the transaction, no slot lock and no
+    lease with that owner means nothing was leased, so the marker is
+    cleared. Anything else (malformed output, a lease without a readable
+    token, a slot lock left by a killed pool.sh) keeps the marker, marks
+    the task `interrupted` and names the owner id to inspect. While any
+    marker is open, no slot is acquired for any task. A lease is never
+    deleted or overwritten.
+  - *Launch.* The task is saved as `running`/`reviewing` with its run
+    directory before the process exists. The wrapper writes its PID before
+    running the agent and the exit status after it, and its command line
+    names the run directory. Reconcile adopts a live wrapper it finds that
+    way, treats a missing PID file with no live wrapper as proof that the
+    agent never started (`interrupted`, lease kept, nothing relaunched), and
+    otherwise matches PID **and** start time. A process gone without exit
+    status is `interrupted`; while any process of its group is alive it
+    counts as running.
+  - *Release.* The next status is saved as a `releasing` intent before
+    `pool.sh release`. If a crash follows, the lease decides: still ours →
+    the intent is dropped; gone → the intent applies, but only after GitHub
+    confirms that the PR is open at the published head (a released slot
+    proves the release, not that the task finished); otherwise the task is
+    `interrupted` for the owner. The worker is never reacquired.
+  A missing `state.json` with tokens or events present, or a malformed one,
+  is refused and left untouched. `CG_COORD_FAULT=<point>` makes the
+  coordinator exit at a named point; the tests use it to cut every step.
+- **Processes.** `cancel` signals only a process group whose leader still
+  has the recorded PID and start time, or, if the leader has exited, a
+  group that still exists (a PID cannot be reused while it names a live
+  group). Unverifiable processes are not signalled. Cancellation never
+  touches the work tree, branch or lease.
+- **Secret isolation.** Agents run as the owner's user, so file modes do
+  not hide tokens from them, and prompt instructions are not a boundary.
+  On macOS every agent and every validation command runs under
+  `sandbox-exec` with reads and writes of `<state>` and the pool's lease
+  directory denied; a reviewer may read only its diff directory there. On
+  other platforms Claude Code agents are refused; `command` agents
+  (owner-written argv) run unsandboxed. The Codex adapter is disabled:
+  `codex exec` applies its own Seatbelt sandbox, which cannot nest inside
+  ours, and its `read-only` mode still reads every file.
 - **Agents.** Launching needs a planned task with scope and acceptance
   criteria. Claude Code runs with `-p --output-format json --session-id
   <uuid> --permission-mode dontAsk --allowedTools …`: tools outside the
   list are denied, never prompted, and no bypass flag is ever passed.
   Reviewers get only `Read Grep Glob` plus `--disallowedTools Edit Write
   NotebookEdit`, and `--add-dir` for the diff file.
-  Codex runs `codex exec --json -s workspace-write|read-only`. Authentication
-  is the owner's job (`claude`/`codex login`); the coordinator never handles
-  credentials.
+  Authentication is the owner's job (`claude login`); the coordinator never
+  handles credentials.
 - **Git.** No force push, no reset, no clean, no stash, no worktree
   creation, no branch deletion. Failed tasks keep their slot, branch and
   files for the owner.
@@ -163,11 +205,13 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
 |---|---|
 | `state.json` | task states; written atomically (temp file, fsync, rename) |
 | `events.jsonl` | append-only, fsynced event log |
-| `tokens/` | lease tokens, 0600 |
+| `tokens/` | lease tokens, 0600; acquire transaction files |
+| `gates/` | merge gates copied from `origin/<base>` |
 | `runs/<task>-<kind>-…/` | agent output, exit status, validation logs, review artifact |
 
 Other variables: `CG_COORD_POOL` (pool.sh), `CG_COORD_GH` (`gh`),
-`CG_COORD_GATE` (merge gate), and pool.sh's own `CG_POOL_*`.
+`CG_COORD_GATE` (merge gate override), `CG_COORD_CANCEL_WAIT`, and
+pool.sh's own `CG_POOL_*`.
 
 ## Tests
 
@@ -177,23 +221,30 @@ python3 scripts/agent-coordinator/test_coordinator.py
 
 Each test builds a throwaway bare remote, three worktree slots and a lease
 directory, and uses a fake `gh`, a fake merge gate and shell-script agents.
-It never touches the live pool.
+It never touches the live pool. Crash windows are cut with
+`CG_COORD_FAULT`; `CG_TEST_COORD=<path>` runs the suite against another
+coordinator version.
 
-## Limitations of v1
+## Limitations
 
 - Single host. One review at a time. At most two implementation tasks.
 - Scope overlap is decided on literal pattern prefixes, conservatively; it
   does not inspect the actual diff of other tasks.
-- `cancel` cannot run while a `run` loop holds the lock.
+- `cancel` cannot run while a `run` loop holds the lock (see Commands).
+- Tasks whose scopes overlap never run implementation at the same time.
+  Two tasks that both already have an open PR (adopted PRs, or rework) do
+  not wait for each other's merge, so their PRs may touch the same files;
+  the second to merge needs the owner to update its branch (stale base).
+  `status` shows `waiting_on=<task>` for a task held back by an overlap.
+- An agent's descendants that leave its process group (a new session) are
+  not tracked or signalled.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no
   retry command and no automatic lease recovery. The owner inspects the
   slot and either fixes and releases the lease with the token in
   `<state>/tokens/`, or uses `pool.sh reclaim`.
 - Stale base and failing CI are detected, not repaired.
-- The Codex adapter uses only flags verified with `codex exec --help`; it
-  has not been run end to end. Its `workspace-write` sandbox may refuse
-  writes to the shared `.git` directory of a linked worktree, so a Codex
-  implementer may be unable to commit.
+- The Codex adapter is disabled (see Secret isolation) and has never been
+  run end to end.
 - The Claude Code adapter's tool list must include every command the agent
   needs (for example `Bash(go test:*)`), via `allowed_tools`.
 

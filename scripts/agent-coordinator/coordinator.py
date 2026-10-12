@@ -35,7 +35,13 @@ POOL_ROOT = Path(os.environ.get("CG_POOL_ROOT", HOME / "Projekti"))
 REPO = Path(os.environ.get("CG_POOL_REPO", HOME / "Projekti/codegraph"))
 REMOTE = os.environ.get("CG_POOL_REMOTE", "origin")
 GH = os.environ.get("CG_COORD_GH", "gh")
-GATE = os.environ.get("CG_COORD_GATE", str(REPO / ".github/scripts/merge-gate.sh"))
+# Unset: the gate committed on <remote>/<base> is used, never the main
+# checkout's copy, which may be stale or modified.
+GATE_OVERRIDE = os.environ.get("CG_COORD_GATE")
+GATE_PATH = ".github/scripts/merge-gate.sh"
+LEASES = Path(os.environ.get("CG_POOL_LEASES", HOME / "Projekti/codegraph-evidence/pool"))
+CANCEL_WAIT = float(os.environ.get("CG_COORD_CANCEL_WAIT", "5"))
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 REVIEW_SLOT = "codegraph-review"
 MAX_IMPL = 2
 
@@ -59,6 +65,13 @@ class Refused(Exception):
 
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def fault(point):
+    """Test hook: CG_COORD_FAULT=<point> kills the coordinator at that point,
+    as a crash would, without cleanup."""
+    if os.environ.get("CG_COORD_FAULT") == point:
+        os._exit(70)
 
 
 def run(argv, cwd=None, check=False, env=None):
@@ -88,6 +101,53 @@ def proc_start(pid):
     A pid plus its start time identifies a process; a pid alone does not."""
     p = run(["ps", "-o", "lstart=", "-p", str(pid)])
     return (p.stdout.strip() or None) if p.returncode == 0 else None
+
+
+def group_alive(pgid):
+    """True while any process of the group remains. Agents run as session
+    leaders, so the group outlives the wrapper while a child survives."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+# ---------------------------------------------------------------- isolation
+#
+# Agents run as the owner's user, so file modes cannot hide the lease tokens
+# from them. On macOS every agent and validation command runs under
+# sandbox-exec with reads and writes of the coordinator state and the lease
+# directory denied; only the review diff is readable. Where no sandbox
+# exists, claude and codex agents are refused; command agents (owner-written
+# argv, used by tests) run unsandboxed.
+
+def sandbox_available():
+    return sys.platform == "darwin" and os.access(SANDBOX_EXEC, os.X_OK)
+
+
+def sandboxed(argv, allow_read=()):
+    if not sandbox_available():
+        return None
+    def q(p):
+        p = os.path.realpath(p)
+        if '"' in p or "\\" in p:
+            raise Refused(f"cannot sandbox path {p!r}")
+        return f'(subpath "{p}")'
+    profile = (f"(version 1)(allow default)(deny file-read-data file-write* {q(STATE_DIR)} {q(LEASES)})"
+               + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
+    return [SANDBOX_EXEC, "-p", profile, *argv]
+
+
+def isolate(agent, argv, allow_read=()):
+    wrapped = sandboxed(argv, allow_read)
+    if wrapped:
+        return wrapped
+    if agent != "command":
+        raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
+    return argv
 
 
 def scope_prefix(pattern):
@@ -143,6 +203,11 @@ def load_tasks(path):
         review = t.get("review", {})
         if review.get("agent", "claude") not in ADAPTERS:
             raise Refused(f"task {tid}: review agent must be one of {sorted(ADAPTERS)}")
+        # codex exec applies its own Seatbelt sandbox, which cannot nest in
+        # ours, and its read-only mode still reads every file: no boundary
+        # keeps it from the lease tokens.
+        if "codex" in (t.get("agent"), review.get("agent")):
+            raise Refused(f"task {tid}: the codex adapter is disabled until it can be isolated from lease tokens")
         out[tid] = {
             "id": tid,
             "description": t["description"],
@@ -335,46 +400,147 @@ class Coordinator:
         return run([str(POOL), *args])
 
     def pool_status(self):
-        out = self.pool("status").stdout
-        return {m.group(1): m.group(2) for m in re.finditer(r"^(\S+): (\S+)$", out, re.M)}
+        """{slot: {"state": ..., lease fields...}} from pool.sh status, which
+        never prints tokens. Refuses when the status cannot be read: every
+        decision based on it must fail closed."""
+        p = self.pool("status")
+        if p.returncode != 0:
+            raise Refused(f"pool.sh status failed: {p.stderr.strip()}")
+        slots, cur = {}, None
+        for line in p.stdout.splitlines():
+            m = re.match(r"^(codegraph-[\w.-]+): (free|busy|stale-suspected|inconsistent)$", line)
+            if m:
+                cur = slots[m.group(1)] = {"state": m.group(2)}
+            elif cur is not None and line.startswith("  ") and "=" in line:
+                k, v = line.strip().split("=", 1)
+                cur.setdefault(k, v)
+        return slots
+
+    def lease_held(self, t):
+        """True when the task's own lease is still on its slot. Leases are
+        matched by the transaction id written as their owner, so a lease
+        someone else took on the same slot is never mistaken for ours."""
+        lease = self.pool_status().get(t["slot"], {})
+        if t.get("lease_txn"):
+            return lease.get("owner") == f"coordinator:{t['lease_txn']}"
+        return lease.get("task") == t["id"]  # lease taken by a v1 coordinator
+
+    # An acquire is a transaction: the marker (with a fresh id passed to
+    # pool.sh as the lease owner) is saved first, pool.sh writes its output,
+    # which holds the token, and its exit status to private files in the token
+    # directory. Whatever point a crash or malformed output interrupts, the
+    # files and the pool's leases decide the outcome; the marker is cleared
+    # only when no lease carries the id, and while any marker is open no
+    # other slot is acquired.
 
     def acquire(self, t, slot, review=False):
-        args = ["acquire", "--slot", slot, "--task", t["id"], "--agent", f"coordinator/{t['agent']}"]
+        txn = uuid.uuid4().hex
+        args = ["acquire", "--slot", slot, "--task", t["id"], "--agent", f"coordinator/{t['agent']}",
+                "--owner", f"coordinator:{txn}"]
         if t.get("pr"):
             args += ["--pr", str(t["pr"])]
         if review:
             args.append("--review")
-        # Recorded before the lease exists: a crash before the slot is saved
-        # leaves this marker, and the task is then interrupted rather than
-        # given a second slot.
-        t["starting"] = slot
+        t["starting"] = {"slot": slot, "txn": txn, "from": t["status"]}
         self.save()
-        p = self.pool(*args)
-        m = re.search(r"^leased (\S+) token=([0-9a-f]+)$", p.stdout, re.M)
-        if p.returncode != 0 or not m:
+        self.event(t["id"], "acquire_begin", slot=slot, txn=txn)
+        base = self.tokens / f"acquire-{txn}"
+        subprocess.run(["/bin/sh", "-c", '"$@" >"$0.out" 2>"$0.err"; echo $? >"$0.rc.tmp" && mv "$0.rc.tmp" "$0.rc"',
+                        str(base), str(POOL), *args], start_new_session=True)
+        fault("acquire_before_parse")
+        return self.settle_acquire(t)
+
+    def settle_acquire(self, t):
+        """Returns (slot, rc, err). slot is set when the lease is ours and its
+        token is stored. slot None with the marker still on the task means
+        the outcome is unknown; with the marker gone, nothing was leased."""
+        m = t["starting"]
+        owner = f"coordinator:{m['txn']}"
+        base = self.tokens / f"acquire-{m['txn']}"
+        files = {k: Path(f"{base}.{k}") for k in ("out", "err", "rc")}
+        # Order matters: first make sure no process of this transaction can
+        # still write a lease, then look for one.
+        if find_wrapper(owner):
+            return None, None, "pool.sh acquire is still running"
+        locked = not files["rc"].exists() and list(LEASES.glob(".*.lock"))
+        held = next((s for s, v in self.pool_status().items() if v.get("owner") == owner), None)
+        if held:
+            out = files["out"].read_text() if files["out"].exists() else ""
+            got = re.search(r"^leased (\S+) token=([0-9a-f]{32})$", out, re.M)
+            if not got or got.group(1) != held:
+                return None, None, f"{held} is leased with owner={owner} but pool.sh output did not yield its token"
+            fault("acquire_before_token")
+            t["slot"], t["lease_txn"] = held, m["txn"]
+            self.store_token(t, got.group(2))
             t.pop("starting")
             self.save()
-            return None, p.returncode, p.stderr.strip()
-        t["slot"] = m.group(1)
-        self.store_token(t, m.group(2))
-        t.pop("starting")
-        self.save()
-        return m.group(1), 0, ""
+            self.event(t["id"], "acquired", slot=held, txn=m["txn"])
+            rc, err = 0, ""
+        elif locked:
+            # pool.sh holds a slot lock while it writes a lease; a lock left
+            # by a killed pool.sh may hide a lease in the making.
+            return None, None, f"pool.sh was interrupted and a slot lock is held in {LEASES}"
+        else:
+            # pool.sh finished, never ran, or died outside a slot lock, and
+            # no lease carries the id: nothing was leased.
+            rc = (int(files["rc"].read_text().strip() or 1) if files["rc"].exists() else 1) or 1
+            err = files["err"].read_text().strip() if files["err"].exists() else "pool.sh did not run"
+            t.pop("starting")
+            self.save()
+            self.event(t["id"], "acquire_none", txn=m["txn"], exit=rc)
+        for f in files.values():
+            f.unlink(missing_ok=True)
+        return (held, rc, err) if held else (None, rc, err)
 
     def release(self, t, status, **fields):
-        """Releases the task's slot and records the next status in the same
-        save, so no crash can separate them."""
+        """Releases the task's slot and records the next status. The intent is
+        saved first, so a crash after pool.sh released the slot leaves a
+        record that reconcile completes from the lease state."""
         token = self.read_token(t)
         if not token:
             return False, "lease token missing"
+        t["releasing"] = {"next": status, "fields": fields}
+        self.save()
         p = self.pool("release", "--slot", t["slot"], "--token", token)
-        if p.returncode != 0:
-            return False, p.stderr.strip()
-        token_file, slot = self.token_path(t), t["slot"]
-        self.event(t["id"], "released", slot=slot)
-        self.set(t, status, slot=None, process=None, **fields)
-        token_file.unlink()
+        fault("release_before_save")
+        try:
+            held = self.lease_held(t)
+        except Refused as e:
+            return False, f"release outcome unknown ({e}); intent kept for reconcile"
+        if held:
+            t.pop("releasing")
+            self.save()
+            return False, p.stderr.strip() or "lease still held after release"
+        self.finish_release(t)
         return True, ""
+
+    def finish_release(self, t):
+        r = t.pop("releasing")
+        token_file = self.token_path(t)
+        self.event(t["id"], "released", slot=t["slot"])
+        self.set(t, r["next"], slot=None, process=None, lease_txn=None, **r["fields"])
+        token_file.unlink(missing_ok=True)
+
+    def merge_gate(self, base):
+        """The gate to verify with: CG_COORD_GATE when set, otherwise the
+        gate committed on <remote>/<base>. Either must accept --base (its
+        usage, printed on no arguments with exit 2, must name it)."""
+        if GATE_OVERRIDE:
+            gate = Path(GATE_OVERRIDE)
+        else:
+            blob = run(["git", "-C", str(REPO), "rev-parse", "-q", "--verify",
+                        f"{REMOTE}/{base}:{GATE_PATH}"]).stdout.strip()
+            if not blob:
+                raise Refused(f"no {GATE_PATH} on {REMOTE}/{base}")
+            (self.dir / "gates").mkdir(mode=0o700, exist_ok=True)
+            gate = self.dir / "gates" / f"{blob}.sh"
+            write_atomic(gate, run(["git", "-C", str(REPO), "cat-file", "blob", blob], check=True).stdout, 0o700)
+        if not os.access(gate, os.X_OK):
+            raise Refused(f"{gate} is not an executable file")
+        probe = run([str(gate)], cwd=REPO)
+        if probe.returncode != 2 or "--base" not in probe.stdout + probe.stderr:
+            raise Refused(f"{gate} does not support --base")
+        return gate
 
     # ------------------------------------------------------------ GitHub
 
@@ -396,20 +562,46 @@ class Coordinator:
 
 # ---------------------------------------------------------------- processes
 
-def launch(c, t, argv, cwd, kind):
-    """Starts argv detached in its own session. The wrapper records the exit
-    status in a file, so it survives a coordinator crash."""
+def launch(c, t, argv, cwd, kind, status, **fields):
+    """Starts argv detached in its own session and moves the task to status.
+    The task is saved as holding the process before it exists; the wrapper
+    writes its pid before running the agent and the exit status after, and
+    its command line names the run directory. So whatever point a crash
+    interrupts, reconcile finds the process or proves it never started."""
     run_dir = c.runs / f"{t['id']}-{kind}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     run_dir.mkdir(mode=0o700)
     exit_file = run_dir / "exit"
-    wrapper = ['/bin/sh', '-c', '"$@"; rc=$?; echo $rc >"$0.tmp" && mv "$0.tmp" "$0"', str(exit_file), *argv]
+    wrapper = ['/bin/sh', '-c', 'echo $$ >"$0.pid.tmp" && mv "$0.pid.tmp" "$0.pid" || exit 125; '
+               '"$@"; rc=$?; echo $rc >"$0.tmp" && mv "$0.tmp" "$0"', str(exit_file), *argv]
+    info = {"pid": None, "start": None, "dir": str(run_dir), "cwd": str(cwd), "kind": kind, "argv0": argv[0]}
+    c.set(t, status, process=info, **fields)
+    fault("launch_before_popen")
     with open(run_dir / "output.log", "w") as log:
         proc = subprocess.Popen(wrapper, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
-    info = {"pid": proc.pid, "start": proc_start(proc.pid), "dir": str(run_dir), "cwd": str(cwd),
-            "kind": kind, "argv0": argv[0]}
+    fault("launch_after_popen")
+    info.update(pid=proc.pid, start=proc_start(proc.pid))
+    fault("launch_before_save")
+    c.save()
+    fault("launch_after_save")
     c.event(t["id"], "launched", **info)
     return info
+
+
+def find_wrapper(needle):
+    """(pid, start) of a live process with needle as one of its arguments
+    (wrappers name their private files); None when there is none. Refuses
+    when ps cannot be read."""
+    p = run(["ps", "-axww", "-o", "pid=,command="])
+    if p.returncode != 0:
+        raise Refused(f"ps failed: {p.stderr.strip()}")
+    for line in p.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if needle in cmd:
+            start = proc_start(pid)
+            if start:
+                return int(pid), start
+    return None
 
 
 def agent_text(agent, out):
@@ -434,13 +626,29 @@ def agent_text(agent, out):
 
 
 def process_state(info):
-    """running | exited | lost. 'lost' means the process is gone and left no
-    exit status: interrupted, never success."""
-    exit_file = Path(info["dir"]) / "exit"
+    """running | exited | lost | unstarted. 'lost' means the process is gone
+    and left no exit status: interrupted, never success. 'unstarted' is
+    proven: the wrapper writes its pid file before the agent runs, and no
+    wrapper for this run is alive. A pid found for an unrecorded launch is
+    adopted into info (the caller saves it)."""
+    run_dir = Path(info["dir"])
+    exit_file = run_dir / "exit"
     if exit_file.exists():
         return "exited", int(exit_file.read_text().strip() or 1)
+    if info.get("pid") is None:
+        found = find_wrapper(str(run_dir / "exit"))
+        if found:
+            info["pid"], info["start"] = found
+            return "running", None
+        if exit_file.exists():  # exited between the two checks
+            return "exited", int(exit_file.read_text().strip() or 1)
+        return ("lost" if (run_dir / "exit.pid").exists() else "unstarted"), None
     start = proc_start(info["pid"])
     if start and start == info["start"]:
+        return "running", None
+    # The wrapper is gone, but an agent that survived a signal keeps the
+    # group alive: never treat that as stopped.
+    if group_alive(info["pid"]):
         return "running", None
     return "lost", None
 
@@ -457,11 +665,16 @@ def deps_met(c, t):
 
 def conflicts(c, t):
     for o in c.state["tasks"].values():
+        if o["id"] == t["id"] or o["status"] in (PENDING, COMPLETED) or not scopes_overlap(o["scope"], t["scope"]):
+            continue
         # Serialised until the other task's PR is merged, so two open PRs
-        # never touch the same files.
-        if o["id"] != t["id"] and o["status"] not in (PENDING, COMPLETED) \
-                and scopes_overlap(o["scope"], t["scope"]):
-            return o["id"]
+        # never touch the same files. Two tasks that both already have a PR
+        # (adopted PRs, or rework) gain nothing by waiting for each other's
+        # merge, which would deadlock their rework; they only never change
+        # files at the same time.
+        if t.get("pr") and o.get("pr") and o["status"] != RUNNING:
+            continue
+        return o["id"]
     return None
 
 
@@ -470,24 +683,41 @@ def start_impl(c, t, findings=""):
     if not slot:
         if rc == 3:
             return "BLOCKED_POOL_BUSY"
+        if t.get("starting"):
+            c.block(t, f"acquire outcome unknown: {err}; owner must inspect", INTERRUPTED)
+            return None
         c.event(t["id"], "acquire_refused", detail=err)
         return f"acquire refused: {err}"
+    return begin_impl(c, t, findings)
+
+
+def begin_impl(c, t, findings=""):
+    slot = t["slot"]
     p = slot_path(slot)
     try:
         if run(["git", "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
             git(p, "switch", "-q", t["branch"])
         else:
-            git(p, "switch", "-q", "-c", t["branch"], "--no-track", f"{REMOTE}/{t['base']}")
+            # An adopted PR's branch exists only on the remote: continue it.
+            remote = f"{REMOTE}/{t['branch']}"
+            start = remote if run(["git", "-C", str(p), "rev-parse", "-q", "--verify",
+                                   f"refs/remotes/{remote}"]).returncode == 0 else f"{REMOTE}/{t['base']}"
+            git(p, "switch", "-q", "-c", t["branch"], "--no-track", start)
     except Refused as e:
         c.block(t, f"cannot check out {t['branch']} in {slot}: {e}; lease kept")
         return None
     t["base_sha"] = git(p, "rev-parse", f"{REMOTE}/{t['base']}")
+    t["head"] = t.get("head") or git(p, "rev-parse", "HEAD")  # the agent must add a commit to this
     t["session"] = str(uuid.uuid4())
     prompt = implement_prompt(t, p, findings)
     tools = IMPL_TOOLS + t["allowed_tools"]
     argv = t["command"] if t["agent"] == "command" else ADAPTERS[t["agent"]](prompt, t["session"], tools, False)
-    t["process"] = launch(c, t, argv, p, "implement")
-    c.set(t, RUNNING, attempt=t.get("attempt", 0) + 1)
+    try:
+        argv = isolate(t["agent"], argv)
+    except Refused as e:
+        c.block(t, f"{e}; lease kept")
+        return None
+    launch(c, t, argv, p, "implement", RUNNING, attempt=t.get("attempt", 0) + 1)
     print(f"{t['id']}: running in {slot}")
     return None
 
@@ -512,7 +742,9 @@ def finish_impl(c, t, rc):
     if outside:
         return c.block(t, f"changes outside scope: {outside[:5]}; lease kept", FAILED)
     for i, cmd in enumerate(t["validate"]):
-        v = subprocess.run(["/bin/sh", "-c", cmd], cwd=p, capture_output=True, text=True)
+        # Validation runs code the agent wrote: same sandbox as the agent.
+        sh_cmd = ["/bin/sh", "-c", cmd]
+        v = subprocess.run(sandboxed(sh_cmd) or sh_cmd, cwd=p, capture_output=True, text=True)
         (evidence / f"validate-{i}.log").write_text(f"$ {cmd}\nexit {v.returncode}\n{v.stdout}{v.stderr}")
         c.event(t["id"], "validated", command=cmd, exit=v.returncode, log=str(evidence / f"validate-{i}.log"))
         if v.returncode != 0:
@@ -554,15 +786,20 @@ def start_review(c, t):
         return f"{e}"
     if pr["state"] != "OPEN":
         return reconcile_pr(c, t, pr)
-    head = pr["headRefOid"]
     run(["git", "-C", str(REPO), "fetch", "-q", REMOTE])
     slot, rc, err = c.acquire(t, REVIEW_SLOT, review=True)
     if not slot:
-        if c.pool_status().get(REVIEW_SLOT) == "busy":
+        if t.get("starting"):
+            return c.block(t, f"review acquire outcome unknown: {err}; owner must inspect", INTERRUPTED)
+        if c.pool_status().get(REVIEW_SLOT, {}).get("state") == "busy":
             return "BLOCKED_REVIEW_BUSY"
         c.event(t["id"], "acquire_refused", detail=err)
         return f"review acquire refused: {err}"
-    p = slot_path(slot)
+    return begin_review(c, t, pr["headRefOid"])
+
+
+def begin_review(c, t, head):
+    p = slot_path(t["slot"])
     try:
         git(p, "fetch", "-q", REMOTE, f"+refs/pull/{t['pr']}/head:refs/coordinator/review", check=False)
         git(p, "checkout", "-q", "--detach", head)
@@ -577,8 +814,11 @@ def start_review(c, t):
     r = t["review"]
     argv = r["command"] if r["agent"] == "command" else ADAPTERS[r["agent"]](
         prompt, t["review_session"], READ_ONLY_TOOLS, True, [diff_dir])
-    t["process"] = launch(c, t, argv, p, "review")
-    c.set(t, REVIEWING, review_head=head)
+    try:
+        argv = isolate(r["agent"], argv, allow_read=[diff_dir])
+    except Refused as e:
+        return c.block(t, f"{e}; review lease kept")
+    launch(c, t, argv, p, "review", REVIEWING, review_head=head)
     print(f"{t['id']}: reviewing PR #{t['pr']} at {head[:12]}")
 
 
@@ -654,7 +894,11 @@ def reconcile_pr(c, t, pr=None):
         if t["status"] != AWAITING_CI:
             c.set(t, AWAITING_CI)
         return None
-    gate = run([GATE, "--base", t["base"], str(t["pr"]), head, t["review_file"]], cwd=REPO)
+    try:
+        gate_path = c.merge_gate(t["base"])
+    except Refused as e:
+        return c.block(t, f"merge gate unavailable: {e}")
+    gate = run([str(gate_path), "--base", t["base"], str(t["pr"]), head, t["review_file"]], cwd=REPO)
     c.event(t["id"], "merge_gate_verify", exit=gate.returncode, output=(gate.stdout + gate.stderr).strip()[-500:])
     if gate.returncode != 0:
         return c.block(t, f"merge gate refused: {(gate.stdout + gate.stderr).strip()[-300:]}")
@@ -666,27 +910,108 @@ def reconcile_pr(c, t, pr=None):
 
 # ---------------------------------------------------------------- reconcile
 
+def recover_release(c, t):
+    """A crash interrupted release(), so pool.sh may or may not have released
+    the slot. The lease decides. Still ours: the intent is dropped and the
+    normal checks continue. Released: the recorded next status applies, but
+    a released slot proves only the release, so a published head must still
+    be the PR's head on GitHub; otherwise the owner decides."""
+    if c.lease_held(t):
+        t.pop("releasing")
+        c.save()
+        c.event(t["id"], "release_not_done", slot=t["slot"])
+        return
+    if t["releasing"]["next"] == AWAITING_REVIEW:
+        try:
+            pr = c.pr_view(t["pr"])
+        except Refused as e:
+            return c.block(t, f"{t['slot']} was released but PR #{t['pr']} cannot be read ({e}); owner must inspect",
+                           INTERRUPTED)
+        if pr["state"] != "OPEN" or pr["headRefOid"] != t["head"]:
+            return c.block(t, f"{t['slot']} was released but PR #{t['pr']} is {pr['state']} at "
+                              f"{pr['headRefOid'][:12]}, not the published {t['head'][:12]}; owner must inspect",
+                           INTERRUPTED)
+    c.event(t["id"], "release_recovered", slot=t["slot"])
+    c.finish_release(t)
+
+
+def recover_acquire(c, t):
+    """Finishes an acquire transaction a crash or malformed output left open.
+    A lease carrying its id with a recorded token is adopted and the task
+    continues; no lease carrying it means nothing was leased; anything else
+    stays open for the owner."""
+    m = t["starting"]
+    if not isinstance(m, dict):  # a v1 marker has no transaction id to match
+        return c.block(t, f"a previous slot acquisition ({m}) did not complete; "
+                          f"check pool.sh status for task={t['id']}", INTERRUPTED)
+    slot, rc, err = c.settle_acquire(t)
+    if slot:
+        c.event(t["id"], "acquire_recovered", slot=slot, txn=m["txn"])
+        if slot == REVIEW_SLOT:
+            try:
+                head = c.pr_view(t["pr"])["headRefOid"]
+            except Refused as e:
+                return c.block(t, f"{e}; review lease kept", INTERRUPTED)
+            return begin_review(c, t, head)
+        return begin_impl(c, t, t.get("findings", "") if m["from"] == CHANGES_REQUIRED else "")
+    if t.get("starting"):
+        return c.block(t, f"acquire transaction {m['txn']} ({m['slot']}) unresolved: {err}; inspect pool.sh "
+                          f"status for owner=coordinator:{m['txn']}; no slot is acquired while it is open",
+                       INTERRUPTED)
+    c.event(t["id"], "acquire_recovered_none", txn=m["txn"], exit=rc)
+    if t["status"] != m["from"]:
+        c.set(t, m["from"], reason=None)
+
+
 def reconcile(c):
-    """Runs before any new action: matches every task holding a slot against
-    its lease and its process. A lease is never released or reclaimed here."""
+    """Runs before any new action: completes interrupted release and acquire
+    transactions, then matches every task holding a slot against its own
+    lease and its process. A lease is never released or reclaimed here."""
+    for t in c.state["tasks"].values():
+        if t.get("releasing"):
+            recover_release(c, t)
+    for t in c.state["tasks"].values():
+        if t.get("starting"):
+            recover_acquire(c, t)
     status = c.pool_status()
     for t in c.state["tasks"].values():
-        if t["status"] not in HOLDS_SLOT:
+        if t["status"] not in HOLDS_SLOT or t.get("releasing"):
             continue
         if not t.get("slot") or not c.read_token(t):
             c.block(t, "running task has no recorded slot or token", INTERRUPTED)
             continue
-        if status.get(t["slot"]) not in ("busy", "stale-suspected"):
-            c.block(t, f"{t['slot']} is {status.get(t['slot'])}, not leased; owner must inspect", INTERRUPTED)
+        lease = status.get(t["slot"], {})
+        ours = (lease.get("owner") == f"coordinator:{t['lease_txn']}" if t.get("lease_txn")
+                else lease.get("task") == t["id"])
+        if lease.get("state") not in ("busy", "stale-suspected") or not ours:
+            c.block(t, f"{t['slot']} is {lease.get('state')} and not leased by this task; owner must inspect",
+                    INTERRUPTED)
             continue
-        st, rc = process_state(t["process"])
+        info = t["process"]
+        recorded = info.get("pid")
+        try:
+            st, rc = process_state(info)
+        except Refused as e:
+            c.block(t, f"cannot determine the agent process ({e}); lease and work kept", INTERRUPTED)
+            continue
+        if info.get("pid") != recorded:
+            c.save()
+            c.event(t["id"], "process_adopted", pid=info["pid"], start=info["start"])
         if st == "running":
+            continue
+        if st == "unstarted":
+            c.block(t, f"the agent was never started (coordinator stopped while launching); lease kept in "
+                       f"{t['slot']}, nothing relaunched", INTERRUPTED)
+            continue
+        if t.get("cancel_requested"):
+            c.block(t, f"cancelled by owner; agent {st}; lease on {t['slot']} kept, work preserved", INTERRUPTED)
             continue
         if st == "lost":
             c.block(t, f"agent process vanished without an exit status; lease and work kept in {t['slot']}",
                     INTERRUPTED)
             continue
-        c.event(t["id"], "exited", exit=rc, kind=t["process"]["kind"])
+        c.event(t["id"], "exited", exit=rc, kind=info["kind"])
+        fault("finish_before_checks")
         try:
             (finish_impl if t["status"] == RUNNING else finish_review)(c, t, rc)
         except Refused as e:
@@ -708,20 +1033,19 @@ def schedule(c):
     busy_note = None
     for t in tasks.values():
         if t["status"] in (AWAITING_CI, READY) or (t["status"] == BLOCKED and t.get("pr")
-                                                    and t.get("reason", "").startswith(("stale base", "CI not green", "merge gate refused"))):
+                                                    and t.get("reason", "").startswith(("stale base", "CI not green", "merge gate"))):
             before = t["status"]
             try:
                 reconcile_pr(c, t)
             except Refused as e:
                 print(f"{t['id']}: {e}")
             changed |= t["status"] != before
+    if any(t.get("starting") for t in tasks.values()):
+        print("acquire transaction open: no slot is acquired until it is resolved")
+        return changed
     for t in tasks.values():
-        if t["status"] in (PENDING, CHANGES_REQUIRED, AWAITING_REVIEW) and (t.get("starting") or t.get("slot")):
-            # Crashed while acquiring a slot: a lease with task=<id> may exist
-            # (pool.sh status shows it). It stays until the owner inspects it.
-            c.block(t, f"a previous slot acquisition ({t.get('slot') or t.get('starting')}) did not complete; "
-                       f"check pool.sh status for task={t['id']}", INTERRUPTED)
-    for t in tasks.values():
+        if any(o.get("starting") for o in tasks.values()):
+            break
         if t["status"] == AWAITING_REVIEW and not any(o["status"] == REVIEWING for o in tasks.values()):
             r = start_review(c, t)
             if r:
@@ -730,12 +1054,18 @@ def schedule(c):
     for t in tasks.values():
         if t["status"] not in (PENDING, CHANGES_REQUIRED):
             continue
+        if any(o.get("starting") for o in tasks.values()):
+            break
         if sum(o["status"] == RUNNING for o in tasks.values()) >= MAX_IMPL:
             busy_note = "BLOCKED_POOL_BUSY"
             break
         if not deps_met(c, t):
             continue
         other = conflicts(c, t)
+        if other != t.get("waiting_on"):
+            t["waiting_on"] = other
+            c.save()
+            c.event(t["id"], "waiting_on", other=other)
         if other:
             continue
         findings = t.get("findings", "") if t["status"] == CHANGES_REQUIRED else ""
@@ -788,7 +1118,7 @@ def cmd_run(c, args):
 def cmd_status(c, args, pool=True):
     for t in c.state["tasks"].values():
         bits = [t["status"]]
-        for k in ("slot", "pr"):
+        for k in ("slot", "pr", "waiting_on"):
             if t.get(k):
                 bits.append(f"{k}={t[k]}")
         if t.get("head"):
@@ -802,23 +1132,44 @@ def cmd_status(c, args, pool=True):
 
 
 def cmd_cancel(c, args):
-    """Stops the task's agent by process group only when pid and start time
-    still match the recorded process. Never touches the work tree or lease."""
+    """Stops the task's agent by SIGTERM to its process group, only when the
+    recorded pid still has the recorded start time and leads its own group.
+    Reports the truth: if the group survives the wait, cancellation is
+    incomplete, the task keeps its status, lease and work, and the slot is
+    not reused; reconcile marks it interrupted once the process has exited.
+    Never touches the work tree or lease."""
     t = c.state["tasks"].get(args.task)
     if not t:
         raise Refused(f"unknown task {args.task}")
+    if t["status"] == COMPLETED:
+        raise Refused(f"task {t['id']} is already completed")
     info = t.get("process")
     if t["status"] in HOLDS_SLOT and info:
         st, _ = process_state(info)
+        c.save()  # a pid found for an unrecorded launch is kept
         if st == "running":
-            os.killpg(info["pid"], signal.SIGTERM)
-            c.event(t["id"], "cancel_signal", pid=info["pid"])
-            for _ in range(50):
-                if process_state(info)[0] != "running":
-                    break
+            pid = info["pid"]
+            try:
+                leader = os.getpgid(pid) == pid
+            except ProcessLookupError:
+                leader = False
+            if not leader or proc_start(pid) != info["start"]:
+                t["cancel_requested"] = True
+                c.save()
+                raise Refused(f"cannot verify the agent of {t['id']} (pid {pid}); nothing signalled, "
+                              "lease and work kept")
+            t["cancel_requested"] = True
+            c.save()
+            os.killpg(pid, signal.SIGTERM)
+            c.event(t["id"], "cancel_signal", pid=pid)
+            deadline = time.monotonic() + CANCEL_WAIT
+            while group_alive(pid) and time.monotonic() < deadline:
                 time.sleep(0.1)
-    if t["status"] == COMPLETED:
-        raise Refused(f"task {t['id']} is already completed")
+            if group_alive(pid):
+                c.event(t["id"], "cancel_incomplete", pid=pid)
+                print(f"{t['id']}: cancellation incomplete: agent process group {pid} still alive after "
+                      f"SIGTERM; lease on {t['slot']} and work kept, slot not reused", file=sys.stderr)
+                return 1
     held = f"; lease on {t['slot']} kept, work preserved" if t.get("slot") else ""
     c.block(t, f"cancelled by owner{held}", INTERRUPTED)
     return 0
