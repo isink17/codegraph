@@ -181,11 +181,16 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   On macOS every agent and every validation command runs under
   `sandbox-exec` with reads and writes of `<state>` and the pool's lease
   directory denied; a reviewer may read only its diff directory there.
-  Because the coordinator and pool.sh later run git and their own scripts
-  outside the sandbox, agents also may not write the shared `.git/hooks`
-  and `.git/config`, any per-worktree config, the slot's `.git` pointer,
-  `scripts/agent-coordinator/` or pool.sh's directory; the coordinator's
-  own git calls disable hooks and fsmonitor as well. On
+  Because the coordinator and pool.sh later run git, gh and their own
+  scripts outside the sandbox, writes are denied by default: an agent may
+  write only its slot (not its `.git` pointer), the repository's objects,
+  refs, logs and packed-refs, its own worktree admin files (not their
+  `config*`, `commondir` or `gitdir`), a private `TMPDIR`, `/tmp`, `/dev`,
+  `~/.claude*`, `~/Library/Caches`, `~/.cache`, `~/go`, and directories
+  listed in `CG_COORD_SANDBOX_WRITABLE` (colon-separated). PATH binaries,
+  `~/.gitconfig`, shared hooks and config, pool.sh and the coordinator are
+  therefore unwritable. `git` and `gh` are resolved to absolute paths at
+  start-up, and the coordinator's git calls disable hooks and fsmonitor. On
   other platforms Claude Code agents are refused; `command` agents
   (owner-written argv) run unsandboxed. The Codex adapter is disabled:
   `codex exec` applies its own Seatbelt sandbox, which cannot nest inside
@@ -248,6 +253,10 @@ coordinator version.
   (pool.sh killed after writing the lease) blocks all acquisition until the
   owner releases or reclaims that lease with the token from the lease file;
   the coordinator then clears the marker by itself on the next pass.
+- A process adopted without a start time (its wrapper died before the
+  coordinator recorded it, or `ps` failed at launch) is tracked by its
+  process group only; a reused PID leading a new group would keep the
+  task `running` (lease kept; `cancel` refuses) until the owner inspects.
 - An agent's descendants that leave its process group (a new session) are
   not tracked or signalled.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no

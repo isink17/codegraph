@@ -91,11 +91,14 @@ class Pool(unittest.TestCase):
         self.slots = t / "slots"
         self.leases = t / "leases"
         self.state = t / "state"
-        self.cwds = t / "cwds"
+        # Agents run sandboxed: they may write only under log/ (and their slot).
+        (t / "log").mkdir()
+        (t / "home").mkdir()
+        self.cwds = t / "log/cwds"
         self.cwds.write_text("")
         self.db = t / "gh.json"
         self.db.write_text(json.dumps({"prs": []}))
-        self.log = t / "agents.log"
+        self.log = t / "log/agents.log"
         (t / "bin").mkdir()
         for name, body in (("gh", FAKE_GH), ("gate", FAKE_GATE)):
             (t / "bin" / name).write_text(body)
@@ -108,7 +111,8 @@ class Pool(unittest.TestCase):
                     "FAKE_GH_DB": str(self.db), "FAKE_ORIGIN": str(self.origin),
                     "FAKE_GATE_REFUSE": str(t / "gate-refuse"), "CG_TEST_LOG": str(self.log),
                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-                    "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": "/dev/null"}
+                    "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "HOME": str(t / "home"), "CG_COORD_SANDBOX_WRITABLE": str(t / "log")}
         self.git("init", "-q", "--bare", str(self.origin))
         self.git("clone", "-q", str(self.origin), str(self.seed))
         self.git("-C", str(self.seed), "commit", "-q", "--allow-empty", "-m", "base")
@@ -432,7 +436,7 @@ class Pool(unittest.TestCase):
         self.assertIn(out.split("token=")[1].strip(), self.lease(R))  # foreign lease untouched
 
     def test_review_rejection_and_rework(self):
-        marker = self.t / "reviewed-once"
+        marker = self.t / "log/reviewed-once"
         review = sh(f'if [ -e {marker} ]; then printf "Verdict: APPROVE\\nBlocking: 0\\n"; '
                     f'else touch {marker}; printf "fix the thing\\nVerdict: REQUEST_CHANGES\\nBlocking: 1\\n"; fi')
         self.plan(self.task("x", commit("x"), review=review))
@@ -866,20 +870,23 @@ class Pool(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin", "sandbox-exec is macOS only")
     def test_agents_cannot_plant_code_the_coordinator_runs(self):
-        hook = self.seed / ".git/hooks/pre-push"
-        pool_before = POOL.read_bytes()
-        plant = (f'echo "cat \"$CG_COORD_STATE\"/tokens/* >{self.t}/stolen" >{hook} 2>&1; '
-                 f'git config core.hooksPath {self.t} 2>&1; echo "gitdir: /tmp" >.git 2>&1; '
-                 f'echo x >>{POOL} 2>&1; ')
+        """Every file that unsandboxed code (the coordinator, pool.sh, git,
+        gh) later executes or reads configuration from stays unwritable."""
+        wt = self.seed / ".git/worktrees" / A
+        targets = {"hook": self.seed / ".git/hooks/pre-push", "config": self.seed / ".git/config",
+                   "commondir": wt / "commondir", "gitdir": wt / "gitdir", "pointer": self.slots / A / ".git",
+                   "pool": POOL, "coordinator": COORD, "gitconfig": self.t / "home/.gitconfig",
+                   "path-shim": self.t / "bin/gh"}
+        before = {k: f.read_bytes() if f.exists() else None for k, f in targets.items()}
+        plant = "".join(f'(echo "#!/bin/sh" >>{f}) 2>/dev/null && echo PLANTED-{k}; ' for k, f in targets.items())
+        plant += f'git config core.hooksPath {self.t} 2>/dev/null && echo PLANTED-hookspath; '
         self.plan(self.task("x", sh(plant + 'mkdir -p work && echo x > work/x.txt && git add work && '
                                             'git commit -qm x')))
         self.run_until(lambda: self.status("x") == "awaiting_ci")
-        self.assertFalse(hook.exists())
-        self.assertFalse((self.t / "stolen").exists())
-        self.assertNotIn("hooksPath", (self.seed / ".git/config").read_text())
-        self.assertEqual(POOL.read_bytes(), pool_before)
         log = next(self.state.glob("runs/x-implement-*/output.log")).read_text()
-        self.assertEqual(log.count("Operation not permitted") + log.count("could not lock config"), 4, log)
+        self.assertNotIn("PLANTED", log)
+        for k, f in targets.items():
+            self.assertEqual(f.read_bytes() if f.exists() else None, before[k], k)
 
     def test_codex_adapter_refused(self):
         f = self.t / "codex.json"
@@ -904,7 +911,7 @@ class Pool(unittest.TestCase):
         self.db.write_text(json.dumps(db))
         tasks = []
         for n, tid in ((1, "p1"), (2, "p2")):
-            m = self.t / f"reviewed-{tid}"
+            m = self.t / f"log/reviewed-{tid}"
             review = sh(f'if [ -e {m} ]; then printf "Verdict: APPROVE\\nBlocking: 0\\n"; '
                         f'else touch {m}; printf "Verdict: REQUEST_CHANGES\\nBlocking: 1\\n"; fi')
             tasks.append(self.task(tid, commit(tid, 1), scope=["work/*"], review=review, pr=n,

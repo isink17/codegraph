@@ -22,7 +22,9 @@ import re
 import shlex
 import signal
 import subprocess
+import shutil
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -34,7 +36,9 @@ STATE_DIR = Path(os.environ.get("CG_COORD_STATE", HOME / "Projekti/codegraph-evi
 POOL_ROOT = Path(os.environ.get("CG_POOL_ROOT", HOME / "Projekti"))
 REPO = Path(os.environ.get("CG_POOL_REPO", HOME / "Projekti/codegraph"))
 REMOTE = os.environ.get("CG_POOL_REMOTE", "origin")
-GH = os.environ.get("CG_COORD_GH", "gh")
+# Resolved once, so later lookups never pick up a binary placed on PATH.
+GH = shutil.which(os.environ.get("CG_COORD_GH", "gh")) or os.environ.get("CG_COORD_GH", "gh")
+GIT = shutil.which("git") or "git"
 # Unset: the gate committed on <remote>/<base> is used, never the main
 # checkout's copy, which may be stale or modified.
 GATE_OVERRIDE = os.environ.get("CG_COORD_GATE")
@@ -88,7 +92,7 @@ GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
 
 
 def git(slot_path, *args, check=True):
-    return run(["git", *GIT_SAFE, "-C", str(slot_path), *args], check=check).stdout.strip()
+    return run([GIT, *GIT_SAFE, "-C", str(slot_path), *args], check=check).stdout.strip()
 
 
 def write_atomic(path, text, mode=0o600):
@@ -142,19 +146,34 @@ def sandboxed(argv, allow_read=(), slot=None):
         if '"' in p or "\\" in p:
             raise Refused(f"cannot sandbox path {p!r}")
         return f'({kind} "{p}")'
-    # The coordinator and pool.sh later run git and their own scripts
-    # outside the sandbox, so nothing an agent can write may change what
-    # they execute: shared hooks and config, per-worktree config, the slot's
-    # gitdir pointer, and the scripts themselves.
+    def rx(p, tail):
+        return f'(regex #"^{re.escape(os.path.realpath(p))}{tail}")'
+    # Writes are denied by default: the coordinator and pool.sh later run
+    # git, gh and their own scripts outside the sandbox, so an agent must
+    # not be able to change any file they execute or read configuration
+    # from (PATH, ~/.gitconfig, shared hooks and config, worktree pointers).
+    # An agent may write its slot, the git objects and refs a commit needs,
+    # its own worktree admin files except their config and pointers, a private
+    # temp directory, /tmp, and its tools' caches; CG_COORD_SANDBOX_WRITABLE adds
+    # owner-chosen directories (colon-separated).
     gitdir = REPO / ".git"
-    no_write = [q(gitdir / "hooks"), q(gitdir / "config", "literal"), q(HERE), q(POOL.parent),
-                f'(regex #"^{re.escape(os.path.realpath(gitdir / "worktrees"))}/[^/]+/config")']
+    tmp = tempfile.mkdtemp(prefix="cg-agent-")  # the agent's own TMPDIR, not the user's
+    writable = [q("/dev"), q(tmp), q("/private/tmp"),
+                q(gitdir / "objects"), q(gitdir / "refs"), q(gitdir / "logs"),
+                q(gitdir / "packed-refs", "literal"), q(gitdir / "packed-refs.lock", "literal"),
+                q(HOME / ".claude"), rx(HOME, r"/\.claude\.json"), q(HOME / "Library/Caches"),
+                q(HOME / ".cache"), q(HOME / "go")]
+    writable += [q(d) for d in os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":") if d]
+    no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
+                rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
     if slot:
+        writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
         no_write.append(q(Path(slot) / ".git", "literal"))
-    profile = (f"(version 1)(allow default)(deny file-read-data file-write* {q(STATE_DIR)} {q(LEASES)})"
-               f"(deny file-write* {' '.join(no_write)})"
+    # Later rules win: allow-list first, then the denials it must not undo.
+    profile = (f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
+               f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)})(deny file-write* {' '.join(no_write)})"
                + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
-    return [SANDBOX_EXEC, "-p", profile, *argv]
+    return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", f"TMPDIR={tmp}", *argv]
 
 
 def isolate(agent, argv, allow_read=(), slot=None):
@@ -545,13 +564,13 @@ class Coordinator:
         if GATE_OVERRIDE:
             gate = Path(GATE_OVERRIDE)
         else:
-            blob = run(["git", *GIT_SAFE, "-C", str(REPO), "rev-parse", "-q", "--verify",
+            blob = run([GIT, *GIT_SAFE, "-C", str(REPO), "rev-parse", "-q", "--verify",
                         f"{REMOTE}/{base}:{GATE_PATH}"]).stdout.strip()
             if not blob:
                 raise Refused(f"no {GATE_PATH} on {REMOTE}/{base}")
             (self.dir / "gates").mkdir(mode=0o700, exist_ok=True)
             gate = self.dir / "gates" / f"{blob}.sh"
-            write_atomic(gate, run(["git", *GIT_SAFE, "-C", str(REPO), "cat-file", "blob", blob], check=True).stdout, 0o700)
+            write_atomic(gate, run([GIT, *GIT_SAFE, "-C", str(REPO), "cat-file", "blob", blob], check=True).stdout, 0o700)
         if not os.access(gate, os.X_OK):
             raise Refused(f"{gate} is not an executable file")
         probe = run([str(gate)], cwd=REPO)
@@ -731,12 +750,12 @@ def begin_impl(c, t, findings=""):
     slot = t["slot"]
     p = slot_path(slot)
     try:
-        if run(["git", *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
+        if run([GIT, *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
             git(p, "switch", "-q", t["branch"])
         else:
             # An adopted PR's branch exists only on the remote: continue it.
             remote = f"{REMOTE}/{t['branch']}"
-            start = remote if run(["git", *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify",
+            start = remote if run([GIT, *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify",
                                    f"refs/remotes/{remote}"]).returncode == 0 else f"{REMOTE}/{t['base']}"
             git(p, "switch", "-q", "-c", t["branch"], "--no-track", start)
     except Refused as e:
@@ -790,7 +809,7 @@ def finish_impl(c, t, rc):
     t["head"] = head
     if not t["publish"]:
         return c.block(t, f"validated at {head[:12]}; publish disabled, lease kept for the owner")
-    push = run(["git", *GIT_SAFE, "-C", str(p), "push", "-q", REMOTE, f"{t['branch']}:refs/heads/{t['branch']}"])
+    push = run([GIT, *GIT_SAFE, "-C", str(p), "push", "-q", REMOTE, f"{t['branch']}:refs/heads/{t['branch']}"])
     if push.returncode != 0:
         return c.block(t, f"push failed (no force is ever used): {push.stderr.strip()}; lease kept")
     try:
@@ -822,7 +841,7 @@ def start_review(c, t):
         return f"{e}"
     if pr["state"] != "OPEN":
         return reconcile_pr(c, t, pr)
-    run(["git", *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
+    run([GIT, *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
     slot, rc, err = c.acquire(t, REVIEW_SLOT, review=True)
     if not slot:
         if t.get("starting"):
@@ -905,9 +924,9 @@ def reconcile_pr(c, t, pr=None):
     if t.get("approved_head") and head != t["approved_head"]:
         c.event(t["id"], "head_changed", approved=t["approved_head"], current=head)
         return c.set(t, AWAITING_REVIEW, approved_head=None, review_file=None, reason="PR head changed after review")
-    run(["git", *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
-    base = run(["git", *GIT_SAFE, "-C", str(REPO), "rev-parse", f"{REMOTE}/{t['base']}"]).stdout.strip()
-    if run(["git", *GIT_SAFE, "-C", str(REPO), "merge-base", "--is-ancestor", base, head]).returncode != 0:
+    run([GIT, *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
+    base = run([GIT, *GIT_SAFE, "-C", str(REPO), "rev-parse", f"{REMOTE}/{t['base']}"]).stdout.strip()
+    if run([GIT, *GIT_SAFE, "-C", str(REPO), "merge-base", "--is-ancestor", base, head]).returncode != 0:
         if t["status"] != BLOCKED or t.get("reason", "").split(":")[0] != "stale base":
             c.block(t, f"stale base: PR #{t['pr']} does not contain {REMOTE}/{t['base']} {base[:12]}; "
                        "owner must update the branch (then CI and a new review are required)")
