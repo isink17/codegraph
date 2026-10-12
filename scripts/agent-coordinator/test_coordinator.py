@@ -588,6 +588,21 @@ class Pool(unittest.TestCase):
         self.assertIn("base-gate", verify[-1]["output"])
         self.assertEqual(g.read_text(), obsolete)  # main checkout untouched
 
+    def test_default_gate_refuses_a_moved_remote_tracking_ref(self):
+        del self.env["CG_COORD_GATE"]
+        self.install_gate(FAKE_GATE)
+        self.plan(self.task("x", commit("x")))
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        self.set_pr(self.st()["x"]["pr"], checks=GREEN)
+        # Something local points origin/v2.0 elsewhere and blocks the fetch.
+        ref = self.seed / ".git/refs/remotes/origin/v2.0"
+        ref.write_text(self.git("-C", str(self.seed), "rev-parse", "HEAD~1") + "\n")
+        Path(f"{ref}.lock").write_text("")
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "blocked")
+        self.assertIn("merge gate unavailable", self.st()["x"]["reason"])
+        self.assertFalse(list((self.state / "gates").glob("*.sh")) if (self.state / "gates").exists() else [])
+
     def test_incompatible_gate_override_blocks_until_fixed(self):
         old = self.t / "bin/oldgate"
         old.write_text("#!/bin/sh\necho 'usage: oldgate PR HEAD REVIEW [--merge]' >&2; exit 2\n")
@@ -888,11 +903,17 @@ class Pool(unittest.TestCase):
         before = {k: f.read_bytes() if f.exists() else None for k, f in targets.items()}
         plant = "".join(f'(echo "#!/bin/sh" >>{f}) 2>/dev/null && echo PLANTED-{k}; ' for k, f in targets.items())
         plant += f'git config core.hooksPath {self.t} 2>/dev/null && echo PLANTED-hookspath; '
+        remote_ref = self.seed / ".git/refs/remotes/origin/v2.0"
+        before["remote-ref"] = remote_ref.read_bytes() if remote_ref.exists() else None
+        plant += (f'(git rev-parse HEAD >{remote_ref}) 2>/dev/null && echo PLANTED-remote-ref; '
+                  f'(: >{remote_ref}.lock) 2>/dev/null && echo PLANTED-ref-lock; ')
+        targets["remote-ref"] = remote_ref
         self.plan(self.task("x", sh(plant + 'mkdir -p work && echo x > work/x.txt && git add work && '
                                             'git commit -qm x')))
         self.run_until(lambda: self.status("x") == "awaiting_ci")
         log = next(self.state.glob("runs/x-implement-*/output.log")).read_text()
         self.assertNotIn("PLANTED", log)
+        self.assertFalse(Path(f"{remote_ref}.lock").exists())
         for k, f in targets.items():
             self.assertEqual(f.read_bytes() if f.exists() else None, before[k], k)
 

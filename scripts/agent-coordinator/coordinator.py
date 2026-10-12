@@ -180,8 +180,9 @@ def sandboxed(argv, allow_read=(), slot=None):
     extra = owner_writable()  # may refuse: before anything is created
     scratch = tempfile.mkdtemp(prefix="cg-agent-")
     writable = [q("/dev"), q(scratch), q("/private/tmp"),
-                q(gitdir / "objects"), q(gitdir / "refs"), q(gitdir / "logs"),
-                q(gitdir / "packed-refs", "literal"), q(gitdir / "packed-refs.lock", "literal"),
+                # Branches only: remote-tracking refs decide which merge gate
+                # runs and what pool.sh treats as the base.
+                q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads"),
                 *[q(d) for d in extra]]
     no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
@@ -587,8 +588,18 @@ class Coordinator:
         if GATE_OVERRIDE:
             gate = Path(GATE_OVERRIDE)
         else:
+            # The local remote-tracking ref must be what the remote has now:
+            # never trust a ref that something local could have moved.
+            run([GIT, *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE], check=True)
+            remote_sha = run([GIT, *GIT_SAFE, "-C", str(REPO), "ls-remote", REMOTE, f"refs/heads/{base}"],
+                             check=True).stdout.split("\t")[0].strip()
+            local_sha = run([GIT, *GIT_SAFE, "-C", str(REPO), "rev-parse", "-q", "--verify",
+                             f"refs/remotes/{REMOTE}/{base}"]).stdout.strip()
+            if not remote_sha or remote_sha != local_sha:
+                raise Refused(f"{REMOTE}/{base} is {local_sha[:12] or 'missing'} locally but "
+                              f"{remote_sha[:12] or 'missing'} on {REMOTE}")
             blob = run([GIT, *GIT_SAFE, "-C", str(REPO), "rev-parse", "-q", "--verify",
-                        f"{REMOTE}/{base}:{GATE_PATH}"]).stdout.strip()
+                        f"{remote_sha}:{GATE_PATH}"]).stdout.strip()
             if not blob:
                 raise Refused(f"no {GATE_PATH} on {REMOTE}/{base}")
             (self.dir / "gates").mkdir(mode=0o700, exist_ok=True)

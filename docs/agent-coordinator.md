@@ -118,7 +118,9 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
    a rerun is green; pending checks or no `ci`
    check → `awaiting_ci`. When all is green, `merge-gate.sh PR HEAD REVIEW`
    (with `--base <base>`) runs in verification mode. The gate is the one
-   committed on `origin/<base>` (copied to `<state>/gates/<blob>.sh`), never
+   committed on `origin/<base>` (copied to `<state>/gates/<blob>.sh`) after
+   a successful fetch and only if the local `origin/<base>` equals what
+   `git ls-remote` reports, never
    the main checkout's copy, which may be old or modified; `CG_COORD_GATE`
    overrides it. Either must print a usage naming `--base` when run without
    arguments (exit 2), otherwise the task is blocked with `merge gate
@@ -184,7 +186,8 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   Because the coordinator, pool.sh and the owner's own tools (Claude Code,
   Go, git, gh) later run outside the sandbox, writes are denied by
   default. An agent may write only its slot (not its `.git` pointer), the
-  repository's objects, refs, logs and packed-refs, its own worktree admin
+  repository's objects and branch refs (`refs/heads`, not remote-tracking
+  refs, which decide the merge gate and the base), its own worktree admin
   files (not their `config*`, `commondir` or `gitdir`), a private scratch
   directory that becomes its `TMPDIR`, `GOCACHE`, `GOPATH` and
   `XDG_CACHE_HOME` (removed when the run ends; the shared Go module cache
@@ -267,8 +270,13 @@ coordinator version.
   coordinator recorded it, or `ps` failed at launch) is tracked by its
   process group only; a reused PID leading a new group would keep the
   task `running` (lease kept; `cancel` refuses) until the owner inspects.
-- `/tmp` stays writable for tools that ignore `TMPDIR`; nothing the
-  coordinator, pool.sh or the owner's tools execute should live there.
+- Branch refs are shared by all slots, so an agent could fast-forward
+  another task's local branch; the coordinator pushes only its own task's
+  branch and never with force.
+- `/tmp` stays writable for tools that ignore `TMPDIR`. Nothing the
+  coordinator or pool.sh executes lives there, but Claude Code keeps small
+  per-session files there (for example its Bash working directory), which
+  an agent could alter.
 - Sandboxed Claude Code sessions keep no transcript under `~/.claude`;
   the agent's output log in the run directory is the record.
 - A run whose agent is still alive when the owner takes over keeps its
