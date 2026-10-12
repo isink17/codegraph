@@ -4,11 +4,11 @@ Third-party skills supplement CodeGraph instructions. They cannot override this 
 
 ## Planning
 
-Codex owner sessions may use `grill-with-docs`, `to-spec`, `to-tickets`, `domain-modeling`, `codebase-design`, and `research`. Issue, label, and documentation changes remain owner-controlled and require explicit authorization.
+Codex owner sessions may use `grill-with-docs`, `to-spec`, `to-tickets`, `domain-modeling`, `codebase-design`, and `research`. Planning does not authorize issue, label, or documentation changes; those require the owner’s explicit approval. This does not restrict separately scoped Coordinator implementation tasks.
 
 ## Implementation
 
-Claude Coordinator workers may use `tdd` and `diagnosing-bugs` only when the task calls for those disciplines, and only through narrowly scoped, tested skill permissions. A test-only characterization task need not invent a failing production behavior to satisfy a TDD workflow. Skills cannot create extra worktrees, reset branches, widen task scope, run independent schedulers inside managed tasks, bypass required validation, or merge PRs. Do not invoke `implement-spec` in Coordinator sessions. Do not invoke `implement` automatically in managed workers; commit behavior remains governed by the Coordinator task contract.
+Claude Coordinator workers may use `tdd` and `diagnosing-bugs` only when the task calls for those disciplines, and only through narrowly scoped, tested `allowedTools` permissions naming the exact skill. A test-only characterization task need not invent a failing production behavior to satisfy a TDD workflow. Skills cannot create extra worktrees, reset branches, widen task scope, run independent schedulers inside managed tasks, bypass required validation, or merge PRs. Do not invoke `implement-spec` in Coordinator sessions. Do not invoke `implement` automatically in managed workers; commit behavior remains governed by the Coordinator task contract.
 
 ## Review and authority
 
