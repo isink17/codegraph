@@ -138,7 +138,31 @@ def sandbox_available():
     return sys.platform == "darwin" and os.access(SANDBOX_EXEC, os.X_OK)
 
 
+# Claude Code's per-session data. Its settings, hooks, CLAUDE.md, agents,
+# commands, skills, plugins and ~/.claude.json (MCP servers) stay
+# unwritable: the owner's own sessions run them unsandboxed.
+CLAUDE_DATA = ["projects", "todos", "shell-snapshots", "statsig", "session-env", "ide", "debug", "plans",
+               "file-history"]
+
+
+def owner_writable():
+    """CG_COORD_SANDBOX_WRITABLE entries, refused if one would contain a
+    protected path or a PATH directory."""
+    protected = [STATE_DIR, LEASES, REPO, HOME / ".claude", HOME / ".claude.json", HERE, POOL.parent,
+                 *[d for d in os.environ.get("PATH", "").split(":") if d]]
+    out = []
+    for d in filter(None, os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":")):
+        r = os.path.realpath(d)
+        bad = [p for p in protected if (os.path.realpath(p) + "/").startswith(r.rstrip("/") + "/")]
+        if bad:
+            raise Refused(f"CG_COORD_SANDBOX_WRITABLE entry {d} contains protected {bad[0]}")
+        out.append(r)
+    return out
+
+
 def sandboxed(argv, allow_read=(), slot=None):
+    """(argv, scratch): argv run under sandbox-exec, and the private scratch
+    directory the caller removes afterwards; None where no sandbox exists."""
     if not sandbox_available():
         return None
     def q(p, kind="subpath"):
@@ -148,22 +172,20 @@ def sandboxed(argv, allow_read=(), slot=None):
         return f'({kind} "{p}")'
     def rx(p, tail):
         return f'(regex #"^{re.escape(os.path.realpath(p))}{tail}")'
-    # Writes are denied by default: the coordinator and pool.sh later run
-    # git, gh and their own scripts outside the sandbox, so an agent must
-    # not be able to change any file they execute or read configuration
-    # from (PATH, ~/.gitconfig, shared hooks and config, worktree pointers).
-    # An agent may write its slot, the git objects and refs a commit needs,
-    # its own worktree admin files except their config and pointers, a private
-    # temp directory, /tmp, and its tools' caches; CG_COORD_SANDBOX_WRITABLE adds
-    # owner-chosen directories (colon-separated).
+    # Writes are denied by default: the coordinator, pool.sh and the owner's
+    # own tools later run git, gh, Go, Claude Code and their scripts outside
+    # the sandbox, so an agent must not change any file they execute or read
+    # configuration from. An agent may write its slot, the git objects and
+    # refs a commit needs, its own worktree admin files except their config
+    # and pointers, a private scratch directory (TMPDIR, Go and XDG caches;
+    # the shared Go module cache stays readable), /tmp, Claude Code's session
+    # data and owner-listed directories.
     gitdir = REPO / ".git"
-    tmp = tempfile.mkdtemp(prefix="cg-agent-")  # the agent's own TMPDIR, not the user's
-    writable = [q("/dev"), q(tmp), q("/private/tmp"),
+    scratch = tempfile.mkdtemp(prefix="cg-agent-")
+    writable = [q("/dev"), q(scratch), q("/private/tmp"),
                 q(gitdir / "objects"), q(gitdir / "refs"), q(gitdir / "logs"),
                 q(gitdir / "packed-refs", "literal"), q(gitdir / "packed-refs.lock", "literal"),
-                q(HOME / ".claude"), rx(HOME, r"/\.claude\.json"), q(HOME / "Library/Caches"),
-                q(HOME / ".cache"), q(HOME / "go")]
-    writable += [q(d) for d in os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":") if d]
+                *[q(HOME / ".claude" / d) for d in CLAUDE_DATA], *[q(d) for d in owner_writable()]]
     no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
     if slot:
@@ -173,16 +195,20 @@ def sandboxed(argv, allow_read=(), slot=None):
     profile = (f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
                f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)})(deny file-write* {' '.join(no_write)})"
                + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
-    return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", f"TMPDIR={tmp}", *argv]
+    env = [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
+                                              ("XDG_CACHE_HOME", "cache"))]
+    gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
+    return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", *env, f"GOMODCACHE={gomod}", *argv], scratch
 
 
 def isolate(agent, argv, allow_read=(), slot=None):
+    """(argv, scratch or None)."""
     wrapped = sandboxed(argv, allow_read, slot)
     if wrapped:
         return wrapped
     if agent != "command":
         raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
-    return argv
+    return argv, None
 
 
 def scope_prefix(pattern):
@@ -598,7 +624,7 @@ class Coordinator:
 
 # ---------------------------------------------------------------- processes
 
-def launch(c, t, argv, cwd, kind, status, **fields):
+def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
     """Starts argv detached in its own session and moves the task to status.
     The task is saved as holding the process before it exists; the wrapper
     writes its pid before running the agent and the exit status after, and
@@ -609,7 +635,8 @@ def launch(c, t, argv, cwd, kind, status, **fields):
     exit_file = run_dir / "exit"
     wrapper = ['/bin/sh', '-c', 'echo $$ >"$0.pid.tmp" && mv "$0.pid.tmp" "$0.pid" || exit 125; '
                '"$@"; rc=$?; echo $rc >"$0.tmp" && mv "$0.tmp" "$0"', str(exit_file), *argv]
-    info = {"pid": None, "start": None, "dir": str(run_dir), "cwd": str(cwd), "kind": kind, "argv0": argv[0]}
+    info = {"pid": None, "start": None, "dir": str(run_dir), "cwd": str(cwd), "kind": kind, "argv0": argv[0],
+            "scratch": scratch}
     c.set(t, status, process=info, **fields)
     fault("launch_before_popen")
     with open(run_dir / "output.log", "w") as log:
@@ -768,11 +795,11 @@ def begin_impl(c, t, findings=""):
     tools = IMPL_TOOLS + t["allowed_tools"]
     argv = t["command"] if t["agent"] == "command" else ADAPTERS[t["agent"]](prompt, t["session"], tools, False)
     try:
-        argv = isolate(t["agent"], argv, slot=p)
+        argv, scratch = isolate(t["agent"], argv, slot=p)
     except Refused as e:
         c.block(t, f"{e}; lease kept")
         return None
-    launch(c, t, argv, p, "implement", RUNNING, attempt=t.get("attempt", 0) + 1)
+    launch(c, t, argv, p, "implement", RUNNING, scratch, attempt=t.get("attempt", 0) + 1)
     print(f"{t['id']}: running in {slot}")
     return None
 
@@ -798,8 +825,12 @@ def finish_impl(c, t, rc):
         return c.block(t, f"changes outside scope: {outside[:5]}; lease kept", FAILED)
     for i, cmd in enumerate(t["validate"]):
         # Validation runs code the agent wrote: same sandbox as the agent.
-        sh_cmd = ["/bin/sh", "-c", cmd]
-        v = subprocess.run(sandboxed(sh_cmd, slot=p) or sh_cmd, cwd=p, capture_output=True, text=True)
+        argv, scratch = sandboxed(["/bin/sh", "-c", cmd], slot=p) or (["/bin/sh", "-c", cmd], None)
+        try:
+            v = subprocess.run(argv, cwd=p, capture_output=True, text=True)
+        finally:
+            if scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
         (evidence / f"validate-{i}.log").write_text(f"$ {cmd}\nexit {v.returncode}\n{v.stdout}{v.stderr}")
         c.event(t["id"], "validated", command=cmd, exit=v.returncode, log=str(evidence / f"validate-{i}.log"))
         if v.returncode != 0:
@@ -870,10 +901,10 @@ def begin_review(c, t, head):
     argv = r["command"] if r["agent"] == "command" else ADAPTERS[r["agent"]](
         prompt, t["review_session"], READ_ONLY_TOOLS, True, [diff_dir])
     try:
-        argv = isolate(r["agent"], argv, allow_read=[diff_dir], slot=p)
+        argv, scratch = isolate(r["agent"], argv, allow_read=[diff_dir], slot=p)
     except Refused as e:
         return c.block(t, f"{e}; review lease kept")
-    launch(c, t, argv, p, "review", REVIEWING, review_head=head)
+    launch(c, t, argv, p, "review", REVIEWING, scratch, review_head=head)
     print(f"{t['id']}: reviewing PR #{t['pr']} at {head[:12]}")
 
 
@@ -1066,6 +1097,8 @@ def reconcile(c):
                     INTERRUPTED)
             continue
         c.event(t["id"], "exited", exit=rc, kind=info["kind"])
+        if info.get("scratch"):
+            shutil.rmtree(info["scratch"], ignore_errors=True)
         fault("finish_before_checks")
         try:
             (finish_impl if t["status"] == RUNNING else finish_review)(c, t, rc)

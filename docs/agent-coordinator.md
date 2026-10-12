@@ -181,16 +181,25 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   On macOS every agent and every validation command runs under
   `sandbox-exec` with reads and writes of `<state>` and the pool's lease
   directory denied; a reviewer may read only its diff directory there.
-  Because the coordinator and pool.sh later run git, gh and their own
-  scripts outside the sandbox, writes are denied by default: an agent may
-  write only its slot (not its `.git` pointer), the repository's objects,
-  refs, logs and packed-refs, its own worktree admin files (not their
-  `config*`, `commondir` or `gitdir`), a private `TMPDIR`, `/tmp`, `/dev`,
-  `~/.claude*`, `~/Library/Caches`, `~/.cache`, `~/go`, and directories
-  listed in `CG_COORD_SANDBOX_WRITABLE` (colon-separated). PATH binaries,
-  `~/.gitconfig`, shared hooks and config, pool.sh and the coordinator are
-  therefore unwritable. `git` and `gh` are resolved to absolute paths at
-  start-up, and the coordinator's git calls disable hooks and fsmonitor. On
+  Because the coordinator, pool.sh and the owner's own tools (Claude Code,
+  Go, git, gh) later run outside the sandbox, writes are denied by
+  default. An agent may write only its slot (not its `.git` pointer), the
+  repository's objects, refs, logs and packed-refs, its own worktree admin
+  files (not their `config*`, `commondir` or `gitdir`), a private scratch
+  directory that becomes its `TMPDIR`, `GOCACHE`, `GOPATH` and
+  `XDG_CACHE_HOME` (removed when the run ends; the shared Go module cache
+  stays readable), `/tmp`, `/dev`, Claude Code's session data under
+  `~/.claude` (`projects`, `todos`, `shell-snapshots`, `statsig`,
+  `session-env`, `ide`, `debug`, `plans`, `file-history`), and directories
+  listed in `CG_COORD_SANDBOX_WRITABLE` (colon-separated; an entry that
+  would contain the state, the lease directory, the repository, `~/.claude`,
+  `~/.claude.json`, the coordinator, pool.sh or a PATH directory is
+  refused). PATH binaries, `~/go`, `~/.gitconfig`, Claude Code's settings,
+  hooks, `CLAUDE.md`, agents, commands, skills, plugins and
+  `~/.claude.json`, shared git hooks and config, pool.sh and the
+  coordinator are unwritable. `git` and `gh` are resolved to absolute
+  paths at start-up, and the coordinator's git calls disable hooks and
+  fsmonitor. On
   other platforms Claude Code agents are refused; `command` agents
   (owner-written argv) run unsandboxed. The Codex adapter is disabled:
   `codex exec` applies its own Seatbelt sandbox, which cannot nest inside
@@ -257,6 +266,10 @@ coordinator version.
   coordinator recorded it, or `ps` failed at launch) is tracked by its
   process group only; a reused PID leading a new group would keep the
   task `running` (lease kept; `cancel` refuses) until the owner inspects.
+- `/tmp` stays writable for tools that ignore `TMPDIR`; nothing the
+  coordinator, pool.sh or the owner's tools execute should live there.
+- A run that ends `interrupted` (never reconciled to an exit) leaves its
+  scratch directory under the system temp directory.
 - An agent's descendants that leave its process group (a new session) are
   not tracked or signalled.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no

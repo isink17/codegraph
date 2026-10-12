@@ -876,7 +876,10 @@ class Pool(unittest.TestCase):
         targets = {"hook": self.seed / ".git/hooks/pre-push", "config": self.seed / ".git/config",
                    "commondir": wt / "commondir", "gitdir": wt / "gitdir", "pointer": self.slots / A / ".git",
                    "pool": POOL, "coordinator": COORD, "gitconfig": self.t / "home/.gitconfig",
-                   "path-shim": self.t / "bin/gh"}
+                   "path-shim": self.t / "bin/gh", "claude-settings": self.t / "home/.claude/settings.json",
+                   "claude-json": self.t / "home/.claude.json", "go-bin": self.t / "home/go/bin/codegraph"}
+        for d in ("home/.claude", "home/go/bin"):
+            (self.t / d).mkdir(parents=True)
         before = {k: f.read_bytes() if f.exists() else None for k, f in targets.items()}
         plant = "".join(f'(echo "#!/bin/sh" >>{f}) 2>/dev/null && echo PLANTED-{k}; ' for k, f in targets.items())
         plant += f'git config core.hooksPath {self.t} 2>/dev/null && echo PLANTED-hookspath; '
@@ -887,6 +890,14 @@ class Pool(unittest.TestCase):
         self.assertNotIn("PLANTED", log)
         for k, f in targets.items():
             self.assertEqual(f.read_bytes() if f.exists() else None, before[k], k)
+
+    @unittest.skipUnless(sys.platform == "darwin", "sandbox-exec is macOS only")
+    def test_owner_writable_dirs_cannot_cover_protected_paths(self):
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", CG_COORD_SANDBOX_WRITABLE=f"{self.t / 'log'}:{self.t}")
+        self.assertEqual(self.status("x"), "blocked")
+        self.assertIn("contains protected", self.st()["x"]["reason"])
+        self.assertFalse(list(Path(tempfile.gettempdir()).glob("cg-agent-*/x")))
 
     def test_codex_adapter_refused(self):
         f = self.t / "codex.json"
