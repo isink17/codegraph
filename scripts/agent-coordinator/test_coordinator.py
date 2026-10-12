@@ -877,8 +877,13 @@ class Pool(unittest.TestCase):
                    "commondir": wt / "commondir", "gitdir": wt / "gitdir", "pointer": self.slots / A / ".git",
                    "pool": POOL, "coordinator": COORD, "gitconfig": self.t / "home/.gitconfig",
                    "path-shim": self.t / "bin/gh", "claude-settings": self.t / "home/.claude/settings.json",
-                   "claude-json": self.t / "home/.claude.json", "go-bin": self.t / "home/go/bin/codegraph"}
-        for d in ("home/.claude", "home/go/bin"):
+                   "claude-json": self.t / "home/.claude.json",
+                   "shell-snapshot": self.t / "home/.claude/shell-snapshots/snapshot-zsh-1.sh",
+                   "session-env": self.t / "home/.claude/session-env/s/env.sh",
+                   "memory": self.t / "home/.claude/projects/p/memory/MEMORY.md",
+                   "ide-lock": self.t / "home/.claude/ide/1.lock", "go-bin": self.t / "home/go/bin/codegraph"}
+        for d in ("home/.claude/shell-snapshots", "home/.claude/session-env/s", "home/.claude/projects/p/memory",
+                  "home/.claude/ide", "home/go/bin"):
             (self.t / d).mkdir(parents=True)
         before = {k: f.read_bytes() if f.exists() else None for k, f in targets.items()}
         plant = "".join(f'(echo "#!/bin/sh" >>{f}) 2>/dev/null && echo PLANTED-{k}; ' for k, f in targets.items())

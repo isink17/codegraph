@@ -138,13 +138,6 @@ def sandbox_available():
     return sys.platform == "darwin" and os.access(SANDBOX_EXEC, os.X_OK)
 
 
-# Claude Code's per-session data. Its settings, hooks, CLAUDE.md, agents,
-# commands, skills, plugins and ~/.claude.json (MCP servers) stay
-# unwritable: the owner's own sessions run them unsandboxed.
-CLAUDE_DATA = ["projects", "todos", "shell-snapshots", "statsig", "session-env", "ide", "debug", "plans",
-               "file-history"]
-
-
 def owner_writable():
     """CG_COORD_SANDBOX_WRITABLE entries, refused if one would contain a
     protected path or a PATH directory."""
@@ -178,14 +171,18 @@ def sandboxed(argv, allow_read=(), slot=None):
     # configuration from. An agent may write its slot, the git objects and
     # refs a commit needs, its own worktree admin files except their config
     # and pointers, a private scratch directory (TMPDIR, Go and XDG caches;
-    # the shared Go module cache stays readable), /tmp, Claude Code's session
-    # data and owner-listed directories.
+    # the shared Go module cache stays readable), /tmp and /dev. Claude
+    # Code's session data is not writable: Claude Code runs without it (verified with
+    # 2.1.296), and its shell snapshots, session environments, memory and
+    # IDE locks are loaded by the owner's own sessions. Owner-listed
+    # directories are added.
     gitdir = REPO / ".git"
+    extra = owner_writable()  # may refuse: before anything is created
     scratch = tempfile.mkdtemp(prefix="cg-agent-")
     writable = [q("/dev"), q(scratch), q("/private/tmp"),
                 q(gitdir / "objects"), q(gitdir / "refs"), q(gitdir / "logs"),
                 q(gitdir / "packed-refs", "literal"), q(gitdir / "packed-refs.lock", "literal"),
-                *[q(HOME / ".claude" / d) for d in CLAUDE_DATA], *[q(d) for d in owner_writable()]]
+                *[q(d) for d in extra]]
     no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
     if slot:
@@ -657,6 +654,12 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
     return info
 
 
+def drop_scratch(info):
+    """Removes a run's scratch directory once its agent is known gone."""
+    if info.get("scratch"):
+        shutil.rmtree(info["scratch"], ignore_errors=True)
+
+
 def find_wrapper(needle):
     """(pid, start) of a live process with needle as one of its arguments
     (wrappers name their private files); None when there is none. Refuses
@@ -1086,19 +1089,21 @@ def reconcile(c):
         if st == "running":
             continue
         if st == "unstarted":
+            drop_scratch(info)
             c.block(t, f"the agent was never started (coordinator stopped while launching); lease kept in "
                        f"{t['slot']}, nothing relaunched", INTERRUPTED)
             continue
         if t.get("cancel_requested"):
+            drop_scratch(info)
             c.block(t, f"cancelled by owner; agent {st}; lease on {t['slot']} kept, work preserved", INTERRUPTED)
             continue
         if st == "lost":
+            drop_scratch(info)
             c.block(t, f"agent process vanished without an exit status; lease and work kept in {t['slot']}",
                     INTERRUPTED)
             continue
         c.event(t["id"], "exited", exit=rc, kind=info["kind"])
-        if info.get("scratch"):
-            shutil.rmtree(info["scratch"], ignore_errors=True)
+        drop_scratch(info)
         fault("finish_before_checks")
         try:
             (finish_impl if t["status"] == RUNNING else finish_review)(c, t, rc)
@@ -1264,6 +1269,8 @@ def cmd_cancel(c, args):
                 print(f"{t['id']}: cancellation incomplete: agent process group {pid} still alive after "
                       f"SIGTERM; lease on {t['slot']} and work kept, slot not reused", file=sys.stderr)
                 return 1
+    if info and process_state(info)[0] != "running":
+        drop_scratch(info)
     held = f"; lease on {t['slot']} kept, work preserved" if t.get("slot") else ""
     c.block(t, f"cancelled by owner{held}", INTERRUPTED)
     return 0

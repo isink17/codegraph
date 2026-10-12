@@ -188,15 +188,16 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   files (not their `config*`, `commondir` or `gitdir`), a private scratch
   directory that becomes its `TMPDIR`, `GOCACHE`, `GOPATH` and
   `XDG_CACHE_HOME` (removed when the run ends; the shared Go module cache
-  stays readable), `/tmp`, `/dev`, Claude Code's session data under
-  `~/.claude` (`projects`, `todos`, `shell-snapshots`, `statsig`,
-  `session-env`, `ide`, `debug`, `plans`, `file-history`), and directories
+  stays readable), `/tmp`, `/dev`, and directories
   listed in `CG_COORD_SANDBOX_WRITABLE` (colon-separated; an entry that
   would contain the state, the lease directory, the repository, `~/.claude`,
   `~/.claude.json`, the coordinator, pool.sh or a PATH directory is
-  refused). PATH binaries, `~/go`, `~/.gitconfig`, Claude Code's settings,
-  hooks, `CLAUDE.md`, agents, commands, skills, plugins and
-  `~/.claude.json`, shared git hooks and config, pool.sh and the
+  refused). Nothing under `~/.claude` or `~/.claude.json` is writable:
+  the owner's own sessions load its settings, hooks, memory, shell
+  snapshots, session environments and IDE locks. Claude Code 2.1.296 runs
+  without writing there (verified); a private `CLAUDE_CONFIG_DIR` is not
+  used because it loses the Keychain login. PATH binaries, `~/go`,
+  `~/.gitconfig`, shared git hooks and config, pool.sh and the
   coordinator are unwritable. `git` and `gh` are resolved to absolute
   paths at start-up, and the coordinator's git calls disable hooks and
   fsmonitor. On
@@ -268,7 +269,9 @@ coordinator version.
   task `running` (lease kept; `cancel` refuses) until the owner inspects.
 - `/tmp` stays writable for tools that ignore `TMPDIR`; nothing the
   coordinator, pool.sh or the owner's tools execute should live there.
-- A run that ends `interrupted` (never reconciled to an exit) leaves its
+- Sandboxed Claude Code sessions keep no transcript under `~/.claude`;
+  the agent's output log in the run directory is the record.
+- A run whose agent is still alive when the owner takes over keeps its
   scratch directory under the system temp directory.
 - An agent's descendants that leave its process group (a new session) are
   not tracked or signalled.
