@@ -103,3 +103,16 @@ func TestMaxPageForDetailScalesDownWithSourceCost(t *testing.T) {
 		t.Fatalf("an omitted detail level must use the card ceiling")
 	}
 }
+
+// TestMaxPageForDetailUnknownLevelUsesCardCeiling pins that a nonempty level
+// the ladder does not recognise falls back to the card ceiling rather than a
+// larger or smaller window.
+func TestMaxPageForDetailUnknownLevelUsesCardCeiling(t *testing.T) {
+	got := MaxPageForDetail("unsupported-detail")
+	if card := MaxPageForDetail("card"); got != card {
+		t.Fatalf("unknown detail ceiling = %d, want card ceiling = %d", got, card)
+	}
+	if got != MaxPage {
+		t.Fatalf("unknown detail ceiling = %d, want MaxPage = %d", got, MaxPage)
+	}
+}
