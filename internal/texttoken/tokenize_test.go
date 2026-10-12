@@ -20,3 +20,21 @@ func TestWeightsString(t *testing.T) {
 		t.Fatalf("single-letter token a should be filtered")
 	}
 }
+
+func TestWeightsStringsAccumulatesAcrossParts(t *testing.T) {
+	got := WeightsStrings("foo", "foo", "bar")
+	if got["foo"] != 2 {
+		t.Fatalf("foo = %v, want 2", got["foo"])
+	}
+	if got["bar"] != 1 {
+		t.Fatalf("bar = %v, want 1", got["bar"])
+	}
+
+	got = WeightsStrings("ab", "cd")
+	if _, ok := got["abcd"]; ok {
+		t.Fatalf("parts must not be joined into abcd: %v", got)
+	}
+	if got["ab"] != 1 || got["cd"] != 1 {
+		t.Fatalf("ab = %v, cd = %v, want 1 and 1", got["ab"], got["cd"])
+	}
+}
