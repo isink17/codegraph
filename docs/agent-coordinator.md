@@ -195,13 +195,16 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   stays readable), `/tmp`, `/dev`, and directories
   listed in `CG_COORD_SANDBOX_WRITABLE` (colon-separated; an entry that
   would contain the state, the lease directory, the repository, `~/.claude`,
-  `~/.claude.json`, the coordinator, pool.sh or a PATH directory is
-  refused). Nothing under `~/.claude` or `~/.claude.json` is writable:
+  `~/.claude.json`, `~/.gitconfig`, `~/.config/git`, `~/.config/gh`, the
+  coordinator, pool.sh or a PATH directory is refused). Nothing under `~/.claude` or `~/.claude.json` is writable:
   the owner's own sessions load its settings, hooks, memory, shell
   snapshots, session environments and IDE locks. Claude Code 2.1.296 runs
   without writing there (verified); a private `CLAUDE_CONFIG_DIR` is not
   used because it loses the Keychain login. PATH binaries, `~/go`,
-  `~/.gitconfig`, shared git hooks and config, pool.sh and the
+  `~/.gitconfig`, the slot's `.claude/`, `.mcp.json`, `CLAUDE.local.md`
+  and `.envrc` (git-ignored, so they would survive release into the owner's
+  next session in that slot; the coordinator also fails a task that leaves
+  any of them), shared git hooks and config, pool.sh and the
   coordinator are unwritable. `git` and `gh` are resolved to absolute
   paths at start-up, and the coordinator's git calls disable hooks and
   fsmonitor. On
@@ -276,6 +279,9 @@ coordinator version.
   genuine SHA. That content still runs only inside later sandboxed agents
   and validation, but it could make validation pass falsely or reach a
   later PR. Only the merge gate is read from a private store.
+- Other ignored files an agent leaves in a slot (build output such as a
+  `codegraph` binary, `.codegraph/` indexes) survive release; they run
+  only if a later session executes them.
 - Branch refs are shared by all slots, so an agent could fast-forward
   another task's local branch; the coordinator pushes only its own task's
   branch and never with force.

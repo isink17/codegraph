@@ -916,9 +916,11 @@ class Pool(unittest.TestCase):
                    "shell-snapshot": self.t / "home/.claude/shell-snapshots/snapshot-zsh-1.sh",
                    "session-env": self.t / "home/.claude/session-env/s/env.sh",
                    "memory": self.t / "home/.claude/projects/p/memory/MEMORY.md",
-                   "ide-lock": self.t / "home/.claude/ide/1.lock", "go-bin": self.t / "home/go/bin/codegraph"}
+                   "ide-lock": self.t / "home/.claude/ide/1.lock",
+                   "slot-claude": self.slots / A / ".claude/settings.local.json",
+                   "slot-mcp": self.slots / A / ".mcp.json", "go-bin": self.t / "home/go/bin/codegraph"}
         for d in ("home/.claude/shell-snapshots", "home/.claude/session-env/s", "home/.claude/projects/p/memory",
-                  "home/.claude/ide", "home/go/bin"):
+                  "home/.claude/ide", "home/go/bin", f"slots/{A}/.claude"):
             (self.t / d).mkdir(parents=True)
         before = {k: f.read_bytes() if f.exists() else None for k, f in targets.items()}
         plant = "".join(f'(echo "#!/bin/sh" >>{f}) 2>/dev/null && echo PLANTED-{k}; ' for k, f in targets.items())
@@ -944,10 +946,26 @@ class Pool(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "sandbox-exec is macOS only")
     def test_owner_writable_dirs_cannot_cover_protected_paths(self):
         self.plan(self.task("x", commit("x")))
-        self.coord("run", "--once", CG_COORD_SANDBOX_WRITABLE=f"{self.t / 'log'}:{self.t}")
+        (self.t / "home/.config/git").mkdir(parents=True)
+        self.coord("run", "--once", CG_COORD_SANDBOX_WRITABLE=f"{self.t / 'log'}:{self.t / 'home/.config'}")
         self.assertEqual(self.status("x"), "blocked")
         self.assertIn("contains protected", self.st()["x"]["reason"])
         self.assertFalse(list(Path(tempfile.gettempdir()).glob("cg-agent-*/x")))
+
+    def test_ignored_tool_configuration_in_slot_fails_the_task(self):
+        # Unsandboxed command agents (or a sandbox gap) could leave it.
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", ok=True)
+        exclude = Path(self.git("-C", str(self.slots / A), "rev-parse", "--git-path", "info/exclude"))
+        if not exclude.is_absolute():
+            exclude = self.slots / A / exclude
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(".claude/\n")
+        (self.slots / A / ".claude").mkdir()
+        (self.slots / A / ".claude/settings.local.json").write_text("{}")
+        self.run_until(lambda: self.status("x") == "failed")
+        self.assertIn("ignored tool configuration", self.st()["x"]["reason"])
+        self.assertIsNotNone(self.lease(A))
 
     def test_codex_adapter_refused(self):
         f = self.t / "codex.json"

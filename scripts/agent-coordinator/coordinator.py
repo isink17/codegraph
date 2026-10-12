@@ -46,6 +46,10 @@ GATE_PATH = ".github/scripts/merge-gate.sh"
 LEASES = Path(os.environ.get("CG_POOL_LEASES", HOME / "Projekti/codegraph-evidence/pool"))
 CANCEL_WAIT = float(os.environ.get("CG_COORD_CANCEL_WAIT", "5"))
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# Files in a slot that tools load as configuration when the owner later
+# works there unsandboxed. All are git-ignored or untracked-safe, so the
+# scope and dirty checks would not see them.
+SLOT_CONFIG = [".claude", ".mcp.json", "CLAUDE.local.md", ".envrc"]
 REVIEW_SLOT = "codegraph-review"
 WORKERS = ["codegraph-worker-a", "codegraph-worker-b"]
 MAX_IMPL = 2
@@ -142,6 +146,7 @@ def owner_writable():
     """CG_COORD_SANDBOX_WRITABLE entries, refused if one would contain a
     protected path or a PATH directory."""
     protected = [STATE_DIR, LEASES, REPO, HOME / ".claude", HOME / ".claude.json", HERE, POOL.parent,
+                 HOME / ".gitconfig", HOME / ".config/git", HOME / ".config/gh",
                  *[d for d in os.environ.get("PATH", "").split(":") if d]]
     out = []
     for d in filter(None, os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":")):
@@ -189,7 +194,7 @@ def sandboxed(argv, allow_read=(), slot=None):
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
     if slot:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
-        no_write.append(q(Path(slot) / ".git", "literal"))
+        no_write += [q(Path(slot) / ".git", "literal"), *[q(Path(slot) / f) for f in SLOT_CONFIG]]
     # Later rules win: allow-list first, then the denials it must not undo.
     profile = (f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
                f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)})(deny file-write* {' '.join(no_write)})"
@@ -824,6 +829,12 @@ def begin_impl(c, t, findings=""):
     return None
 
 
+def planted_config(p):
+    """Ignored files in the slot that tools load as configuration."""
+    return [l[3:] for l in git(p, "status", "--porcelain", "--ignored", "--untracked-files=all").splitlines()
+            if l.startswith("!! ") and l[3:].split("/")[0] in SLOT_CONFIG]
+
+
 def finish_impl(c, t, rc):
     """Never trusts the exit code alone: the tree must be clean, the branch
     must hold new commits, every changed file must be in scope, and every
@@ -834,6 +845,9 @@ def finish_impl(c, t, rc):
         return c.block(t, f"agent exited {rc}; work and lease kept in {t['slot']}", FAILED)
     if git(p, "status", "--porcelain", "--untracked-files=all"):
         return c.block(t, f"agent left {t['slot']} dirty; lease kept", FAILED)
+    planted = planted_config(p)
+    if planted:
+        return c.block(t, f"ignored tool configuration in {t['slot']}: {planted[:5]}; lease kept", FAILED)
     if git(p, "symbolic-ref", "--short", "HEAD", check=False) != t["branch"]:
         return c.block(t, f"agent left {t['slot']} off branch {t['branch']}; lease kept", FAILED)
     head = git(p, "rev-parse", "HEAD")
@@ -938,6 +952,9 @@ def finish_review(c, t, rc):
         return c.block(t, f"reviewer exited {rc}; review lease kept", FAILED)
     if git(p, "status", "--porcelain", "--untracked-files=all") or git(p, "rev-parse", "HEAD") != head:
         return c.block(t, "review slot was modified during review; review invalid, lease kept", FAILED)
+    if planted_config(p):
+        return c.block(t, f"ignored tool configuration in the review slot: {planted_config(p)[:5]}; review "
+                          "invalid, lease kept", FAILED)
     text = agent_text(t["review"]["agent"], out)
     verdict = re.findall(r"^Verdict: (APPROVE|REQUEST_CHANGES)\s*$", text, re.M)
     blocking = re.findall(r"^Blocking: (\d+)\s*$", text, re.M)
@@ -1115,6 +1132,10 @@ def reconcile(c):
             c.block(t, f"cancelled by owner; agent {st}; lease on {t['slot']} kept, work preserved", INTERRUPTED)
             continue
         if st == "lost":
+            run_dir = Path(info["dir"])
+            c.event(t["id"], "process_lost", pid=info.get("pid"), start=info.get("start"),
+                    start_now=proc_start(info["pid"]) if info.get("pid") else None,
+                    pid_file=(run_dir / "exit.pid").exists(), exit_file=(run_dir / "exit").exists())
             drop_scratch(info)
             c.block(t, f"agent process vanished without an exit status; lease and work kept in {t['slot']}",
                     INTERRUPTED)
