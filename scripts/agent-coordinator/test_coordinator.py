@@ -551,6 +551,10 @@ class Pool(unittest.TestCase):
             time.sleep(0.2)
         self.fail(f"fault {point} never reached; status: {self.st()}\n{self.out}")
 
+    def c_start(self, pid):
+        p = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+        return p.stdout.strip() or None
+
     def starts(self, tid):
         return self.log.read_text().split().count(tid) // 2 if self.log.exists() else 0
 
@@ -769,6 +773,11 @@ class Pool(unittest.TestCase):
         self.coord("run", "--once")
         self.assertEqual(self.status("x"), "running")
         self.assertEqual(self.lease(A), lease)  # slot never reused
+        # The wrapper (group leader) is gone; the group is still verified
+        # and signalled, and still reported as surviving.
+        self.assertIsNone(self.c_start(pid))
+        self.assertEqual(self.coord("cancel", "x", CG_COORD_CANCEL_WAIT="0.5").returncode, 1)
+        self.assertIn("cancellation incomplete", self.out)
         os.killpg(pid, signal.SIGKILL)
         for _ in range(50):
             try:

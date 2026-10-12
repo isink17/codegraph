@@ -646,6 +646,10 @@ def process_state(info):
     start = proc_start(info["pid"])
     if start and start == info["start"]:
         return "running", None
+    # Another process with this pid: the pid was reused, which the kernel
+    # never does while it names a live group, so ours is gone.
+    if start:
+        return "lost", None
     # The wrapper is gone, but an agent that survived a signal keeps the
     # group alive: never treat that as stopped.
     if group_alive(info["pid"]):
@@ -1149,11 +1153,17 @@ def cmd_cancel(c, args):
         c.save()  # a pid found for an unrecorded launch is kept
         if st == "running":
             pid = info["pid"]
-            try:
-                leader = os.getpgid(pid) == pid
-            except ProcessLookupError:
-                leader = False
-            if not leader or proc_start(pid) != info["start"]:
+            start = proc_start(pid)
+            if start == info["start"]:
+                try:
+                    verified = os.getpgid(pid) == pid
+                except ProcessLookupError:
+                    verified = False
+            else:
+                # Leader gone: the group id cannot have been reused while
+                # the group still exists.
+                verified = start is None and group_alive(pid)
+            if not verified:
                 t["cancel_requested"] = True
                 c.save()
                 raise Refused(f"cannot verify the agent of {t['id']} (pid {pid}); nothing signalled, "
