@@ -918,9 +918,10 @@ class Pool(unittest.TestCase):
                    "memory": self.t / "home/.claude/projects/p/memory/MEMORY.md",
                    "ide-lock": self.t / "home/.claude/ide/1.lock",
                    "slot-claude": self.slots / A / ".claude/settings.local.json",
-                   "slot-mcp": self.slots / A / ".mcp.json", "go-bin": self.t / "home/go/bin/codegraph"}
+                   "slot-mcp": self.slots / A / ".mcp.json",
+                   "nested-claude": self.slots / A / "work/.claude/settings.json", "go-bin": self.t / "home/go/bin/codegraph"}
         for d in ("home/.claude/shell-snapshots", "home/.claude/session-env/s", "home/.claude/projects/p/memory",
-                  "home/.claude/ide", "home/go/bin", f"slots/{A}/.claude"):
+                  "home/.claude/ide", "home/go/bin", f"slots/{A}/.claude", f"slots/{A}/work/.claude"):
             (self.t / d).mkdir(parents=True)
         before = {k: f.read_bytes() if f.exists() else None for k, f in targets.items()}
         plant = "".join(f'(echo "#!/bin/sh" >>{f}) 2>/dev/null && echo PLANTED-{k}; ' for k, f in targets.items())

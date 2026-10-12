@@ -194,7 +194,8 @@ def sandboxed(argv, allow_read=(), slot=None):
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
     if slot:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
-        no_write += [q(Path(slot) / ".git", "literal"), *[q(Path(slot) / f) for f in SLOT_CONFIG]]
+        no_write += [q(Path(slot) / ".git", "literal"),
+                     rx(slot, "/(.*/)?(" + "|".join(re.escape(f) for f in SLOT_CONFIG) + ")(/|$)")]
     # Later rules win: allow-list first, then the denials it must not undo.
     profile = (f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
                f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)})(deny file-write* {' '.join(no_write)})"
@@ -719,6 +720,14 @@ def agent_text(agent, out):
     return text
 
 
+def exited_or_lost(exit_file):
+    """The wrapper writes the exit file just before it exits, so a process
+    found gone after the first check may have left one meanwhile."""
+    if exit_file.exists():
+        return "exited", int(exit_file.read_text().strip() or 1)
+    return "lost", None
+
+
 def process_state(info):
     """running | exited | lost | unstarted. 'lost' means the process is gone
     and left no exit status: interrupted, never success. 'unstarted' is
@@ -743,7 +752,7 @@ def process_state(info):
         if group_alive(pid):  # wrapper gone, agent alive: adopt the group
             info["pid"], info["start"] = pid, None
             return "running", None
-        return "lost", None
+        return exited_or_lost(exit_file)
     start = proc_start(info["pid"])
     if start and start == info["start"]:
         return "running", None
@@ -752,12 +761,12 @@ def process_state(info):
     # recorded start (ps failed at launch, or an adopted group) the group
     # decides, conservatively.
     if start and info["start"]:
-        return "lost", None
+        return exited_or_lost(exit_file)
     # The wrapper is gone, but an agent that survived a signal keeps the
     # group alive: never treat that as stopped.
     if group_alive(info["pid"]):
         return "running", None
-    return "lost", None
+    return exited_or_lost(exit_file)
 
 
 def slot_path(slot):
@@ -832,7 +841,7 @@ def begin_impl(c, t, findings=""):
 def planted_config(p):
     """Ignored files in the slot that tools load as configuration."""
     return [l[3:] for l in git(p, "status", "--porcelain", "--ignored", "--untracked-files=all").splitlines()
-            if l.startswith("!! ") and l[3:].split("/")[0] in SLOT_CONFIG]
+            if l.startswith("!! ") and set(l[3:].rstrip("/").split("/")) & set(SLOT_CONFIG)]
 
 
 def finish_impl(c, t, rc):
@@ -952,8 +961,9 @@ def finish_review(c, t, rc):
         return c.block(t, f"reviewer exited {rc}; review lease kept", FAILED)
     if git(p, "status", "--porcelain", "--untracked-files=all") or git(p, "rev-parse", "HEAD") != head:
         return c.block(t, "review slot was modified during review; review invalid, lease kept", FAILED)
-    if planted_config(p):
-        return c.block(t, f"ignored tool configuration in the review slot: {planted_config(p)[:5]}; review "
+    planted = planted_config(p)
+    if planted:
+        return c.block(t, f"ignored tool configuration in the review slot: {planted[:5]}; review "
                           "invalid, lease kept", FAILED)
     text = agent_text(t["review"]["agent"], out)
     verdict = re.findall(r"^Verdict: (APPROVE|REQUEST_CHANGES)\s*$", text, re.M)
