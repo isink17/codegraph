@@ -43,6 +43,7 @@ LEASES = Path(os.environ.get("CG_POOL_LEASES", HOME / "Projekti/codegraph-eviden
 CANCEL_WAIT = float(os.environ.get("CG_COORD_CANCEL_WAIT", "5"))
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 REVIEW_SLOT = "codegraph-review"
+WORKERS = ["codegraph-worker-a", "codegraph-worker-b"]
 MAX_IMPL = 2
 
 PENDING, RUNNING, AWAITING_REVIEW, REVIEWING, CHANGES_REQUIRED = (
@@ -81,8 +82,13 @@ def run(argv, cwd=None, check=False, env=None):
     return p
 
 
+# Belt and braces with the sandbox: the coordinator never runs hooks or an
+# fsmonitor from a slot an agent has worked in.
+GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+
+
 def git(slot_path, *args, check=True):
-    return run(["git", "-C", str(slot_path), *args], check=check).stdout.strip()
+    return run(["git", *GIT_SAFE, "-C", str(slot_path), *args], check=check).stdout.strip()
 
 
 def write_atomic(path, text, mode=0o600):
@@ -128,21 +134,31 @@ def sandbox_available():
     return sys.platform == "darwin" and os.access(SANDBOX_EXEC, os.X_OK)
 
 
-def sandboxed(argv, allow_read=()):
+def sandboxed(argv, allow_read=(), slot=None):
     if not sandbox_available():
         return None
-    def q(p):
+    def q(p, kind="subpath"):
         p = os.path.realpath(p)
         if '"' in p or "\\" in p:
             raise Refused(f"cannot sandbox path {p!r}")
-        return f'(subpath "{p}")'
+        return f'({kind} "{p}")'
+    # The coordinator and pool.sh later run git and their own scripts
+    # outside the sandbox, so nothing an agent can write may change what
+    # they execute: shared hooks and config, per-worktree config, the slot's
+    # gitdir pointer, and the scripts themselves.
+    gitdir = REPO / ".git"
+    no_write = [q(gitdir / "hooks"), q(gitdir / "config", "literal"), q(HERE), q(POOL.parent),
+                f'(regex #"^{re.escape(os.path.realpath(gitdir / "worktrees"))}/[^/]+/config")']
+    if slot:
+        no_write.append(q(Path(slot) / ".git", "literal"))
     profile = (f"(version 1)(allow default)(deny file-read-data file-write* {q(STATE_DIR)} {q(LEASES)})"
+               f"(deny file-write* {' '.join(no_write)})"
                + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
     return [SANDBOX_EXEC, "-p", profile, *argv]
 
 
-def isolate(agent, argv, allow_read=()):
-    wrapped = sandboxed(argv, allow_read)
+def isolate(agent, argv, allow_read=(), slot=None):
+    wrapped = sandboxed(argv, allow_read, slot)
     if wrapped:
         return wrapped
     if agent != "command":
@@ -462,7 +478,8 @@ class Coordinator:
         # still write a lease, then look for one.
         if find_wrapper(owner):
             return None, None, "pool.sh acquire is still running"
-        locked = not files["rc"].exists() and list(LEASES.glob(".*.lock"))
+        slots = WORKERS if m["slot"] == "auto" else [m["slot"]]
+        locked = not files["rc"].exists() and any((LEASES / f".{s}.lock").exists() for s in slots)
         held = next((s for s, v in self.pool_status().items() if v.get("owner") == owner), None)
         if held:
             out = files["out"].read_text() if files["out"].exists() else ""
@@ -528,13 +545,13 @@ class Coordinator:
         if GATE_OVERRIDE:
             gate = Path(GATE_OVERRIDE)
         else:
-            blob = run(["git", "-C", str(REPO), "rev-parse", "-q", "--verify",
+            blob = run(["git", *GIT_SAFE, "-C", str(REPO), "rev-parse", "-q", "--verify",
                         f"{REMOTE}/{base}:{GATE_PATH}"]).stdout.strip()
             if not blob:
                 raise Refused(f"no {GATE_PATH} on {REMOTE}/{base}")
             (self.dir / "gates").mkdir(mode=0o700, exist_ok=True)
             gate = self.dir / "gates" / f"{blob}.sh"
-            write_atomic(gate, run(["git", "-C", str(REPO), "cat-file", "blob", blob], check=True).stdout, 0o700)
+            write_atomic(gate, run(["git", *GIT_SAFE, "-C", str(REPO), "cat-file", "blob", blob], check=True).stdout, 0o700)
         if not os.access(gate, os.X_OK):
             raise Refused(f"{gate} is not an executable file")
         probe = run([str(gate)], cwd=REPO)
@@ -580,7 +597,13 @@ def launch(c, t, argv, cwd, kind, status, **fields):
         proc = subprocess.Popen(wrapper, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
     fault("launch_after_popen")
-    info.update(pid=proc.pid, start=proc_start(proc.pid))
+    start = None
+    for _ in range(3):  # ps can fail transiently under load
+        start = proc_start(proc.pid)
+        if start or (exit_file).exists():
+            break
+        time.sleep(0.1)
+    info.update(pid=proc.pid, start=start)
     fault("launch_before_save")
     c.save()
     fault("launch_after_save")
@@ -642,13 +665,22 @@ def process_state(info):
             return "running", None
         if exit_file.exists():  # exited between the two checks
             return "exited", int(exit_file.read_text().strip() or 1)
-        return ("lost" if (run_dir / "exit.pid").exists() else "unstarted"), None
+        pid_file = run_dir / "exit.pid"
+        if not pid_file.exists():
+            return "unstarted", None
+        pid = int(pid_file.read_text().strip())
+        if group_alive(pid):  # wrapper gone, agent alive: adopt the group
+            info["pid"], info["start"] = pid, None
+            return "running", None
+        return "lost", None
     start = proc_start(info["pid"])
     if start and start == info["start"]:
         return "running", None
     # Another process with this pid: the pid was reused, which the kernel
-    # never does while it names a live group, so ours is gone.
-    if start:
+    # never does while it names a live group, so ours is gone. Without a
+    # recorded start (ps failed at launch, or an adopted group) the group
+    # decides, conservatively.
+    if start and info["start"]:
         return "lost", None
     # The wrapper is gone, but an agent that survived a signal keeps the
     # group alive: never treat that as stopped.
@@ -699,12 +731,12 @@ def begin_impl(c, t, findings=""):
     slot = t["slot"]
     p = slot_path(slot)
     try:
-        if run(["git", "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
+        if run(["git", *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
             git(p, "switch", "-q", t["branch"])
         else:
             # An adopted PR's branch exists only on the remote: continue it.
             remote = f"{REMOTE}/{t['branch']}"
-            start = remote if run(["git", "-C", str(p), "rev-parse", "-q", "--verify",
+            start = remote if run(["git", *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify",
                                    f"refs/remotes/{remote}"]).returncode == 0 else f"{REMOTE}/{t['base']}"
             git(p, "switch", "-q", "-c", t["branch"], "--no-track", start)
     except Refused as e:
@@ -717,7 +749,7 @@ def begin_impl(c, t, findings=""):
     tools = IMPL_TOOLS + t["allowed_tools"]
     argv = t["command"] if t["agent"] == "command" else ADAPTERS[t["agent"]](prompt, t["session"], tools, False)
     try:
-        argv = isolate(t["agent"], argv)
+        argv = isolate(t["agent"], argv, slot=p)
     except Refused as e:
         c.block(t, f"{e}; lease kept")
         return None
@@ -748,7 +780,7 @@ def finish_impl(c, t, rc):
     for i, cmd in enumerate(t["validate"]):
         # Validation runs code the agent wrote: same sandbox as the agent.
         sh_cmd = ["/bin/sh", "-c", cmd]
-        v = subprocess.run(sandboxed(sh_cmd) or sh_cmd, cwd=p, capture_output=True, text=True)
+        v = subprocess.run(sandboxed(sh_cmd, slot=p) or sh_cmd, cwd=p, capture_output=True, text=True)
         (evidence / f"validate-{i}.log").write_text(f"$ {cmd}\nexit {v.returncode}\n{v.stdout}{v.stderr}")
         c.event(t["id"], "validated", command=cmd, exit=v.returncode, log=str(evidence / f"validate-{i}.log"))
         if v.returncode != 0:
@@ -758,7 +790,7 @@ def finish_impl(c, t, rc):
     t["head"] = head
     if not t["publish"]:
         return c.block(t, f"validated at {head[:12]}; publish disabled, lease kept for the owner")
-    push = run(["git", "-C", str(p), "push", "-q", REMOTE, f"{t['branch']}:refs/heads/{t['branch']}"])
+    push = run(["git", *GIT_SAFE, "-C", str(p), "push", "-q", REMOTE, f"{t['branch']}:refs/heads/{t['branch']}"])
     if push.returncode != 0:
         return c.block(t, f"push failed (no force is ever used): {push.stderr.strip()}; lease kept")
     try:
@@ -790,7 +822,7 @@ def start_review(c, t):
         return f"{e}"
     if pr["state"] != "OPEN":
         return reconcile_pr(c, t, pr)
-    run(["git", "-C", str(REPO), "fetch", "-q", REMOTE])
+    run(["git", *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
     slot, rc, err = c.acquire(t, REVIEW_SLOT, review=True)
     if not slot:
         if t.get("starting"):
@@ -819,7 +851,7 @@ def begin_review(c, t, head):
     argv = r["command"] if r["agent"] == "command" else ADAPTERS[r["agent"]](
         prompt, t["review_session"], READ_ONLY_TOOLS, True, [diff_dir])
     try:
-        argv = isolate(r["agent"], argv, allow_read=[diff_dir])
+        argv = isolate(r["agent"], argv, allow_read=[diff_dir], slot=p)
     except Refused as e:
         return c.block(t, f"{e}; review lease kept")
     launch(c, t, argv, p, "review", REVIEWING, review_head=head)
@@ -873,9 +905,9 @@ def reconcile_pr(c, t, pr=None):
     if t.get("approved_head") and head != t["approved_head"]:
         c.event(t["id"], "head_changed", approved=t["approved_head"], current=head)
         return c.set(t, AWAITING_REVIEW, approved_head=None, review_file=None, reason="PR head changed after review")
-    run(["git", "-C", str(REPO), "fetch", "-q", REMOTE])
-    base = run(["git", "-C", str(REPO), "rev-parse", f"{REMOTE}/{t['base']}"]).stdout.strip()
-    if run(["git", "-C", str(REPO), "merge-base", "--is-ancestor", base, head]).returncode != 0:
+    run(["git", *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
+    base = run(["git", *GIT_SAFE, "-C", str(REPO), "rev-parse", f"{REMOTE}/{t['base']}"]).stdout.strip()
+    if run(["git", *GIT_SAFE, "-C", str(REPO), "merge-base", "--is-ancestor", base, head]).returncode != 0:
         if t["status"] != BLOCKED or t.get("reason", "").split(":")[0] != "stale base":
             c.block(t, f"stale base: PR #{t['pr']} does not contain {REMOTE}/{t['base']} {base[:12]}; "
                        "owner must update the branch (then CI and a new review are required)")

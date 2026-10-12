@@ -180,7 +180,12 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   not hide tokens from them, and prompt instructions are not a boundary.
   On macOS every agent and every validation command runs under
   `sandbox-exec` with reads and writes of `<state>` and the pool's lease
-  directory denied; a reviewer may read only its diff directory there. On
+  directory denied; a reviewer may read only its diff directory there.
+  Because the coordinator and pool.sh later run git and their own scripts
+  outside the sandbox, agents also may not write the shared `.git/hooks`
+  and `.git/config`, any per-worktree config, the slot's `.git` pointer,
+  `scripts/agent-coordinator/` or pool.sh's directory; the coordinator's
+  own git calls disable hooks and fsmonitor as well. On
   other platforms Claude Code agents are refused; `command` agents
   (owner-written argv) run unsandboxed. The Codex adapter is disabled:
   `codex exec` applies its own Seatbelt sandbox, which cannot nest inside
@@ -236,6 +241,13 @@ coordinator version.
   not wait for each other's merge, so their PRs may touch the same files;
   the second to merge needs the owner to update its branch (stale base).
   `status` shows `waiting_on=<task>` for a task held back by an overlap.
+- Lease tokens are passed to `pool.sh release` as an argument, so a
+  sandboxed agent can see another task's token in `ps` for the duration of
+  that call (needs a pool.sh change to pass it on stdin).
+- An open acquire transaction whose lease exists but whose token was lost
+  (pool.sh killed after writing the lease) blocks all acquisition until the
+  owner releases or reclaims that lease with the token from the lease file;
+  the coordinator then clears the marker by itself on the next pass.
 - An agent's descendants that leave its process group (a new session) are
   not tracked or signalled.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no

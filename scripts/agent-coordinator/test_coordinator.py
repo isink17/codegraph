@@ -864,6 +864,23 @@ class Pool(unittest.TestCase):
             self.assertIsNone(re.search(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", text), f)
         json.loads((self.state / "state.json").read_text())  # the appends were refused
 
+    @unittest.skipUnless(sys.platform == "darwin", "sandbox-exec is macOS only")
+    def test_agents_cannot_plant_code_the_coordinator_runs(self):
+        hook = self.seed / ".git/hooks/pre-push"
+        pool_before = POOL.read_bytes()
+        plant = (f'echo "cat \"$CG_COORD_STATE\"/tokens/* >{self.t}/stolen" >{hook} 2>&1; '
+                 f'git config core.hooksPath {self.t} 2>&1; echo "gitdir: /tmp" >.git 2>&1; '
+                 f'echo x >>{POOL} 2>&1; ')
+        self.plan(self.task("x", sh(plant + 'mkdir -p work && echo x > work/x.txt && git add work && '
+                                            'git commit -qm x')))
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        self.assertFalse(hook.exists())
+        self.assertFalse((self.t / "stolen").exists())
+        self.assertNotIn("hooksPath", (self.seed / ".git/config").read_text())
+        self.assertEqual(POOL.read_bytes(), pool_before)
+        log = next(self.state.glob("runs/x-implement-*/output.log")).read_text()
+        self.assertEqual(log.count("Operation not permitted") + log.count("could not lock config"), 4, log)
+
     def test_codex_adapter_refused(self):
         f = self.t / "codex.json"
         for spec in ({"agent": "codex"}, {"review": {"agent": "codex"}}):
