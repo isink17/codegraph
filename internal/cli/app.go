@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	codegraph "github.com/isink17/codegraph"
 	"github.com/isink17/codegraph/internal/appname"
@@ -1956,10 +1957,48 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			}
 		})
 	}
-	err = w.Run(ctx, repo.RootPath, repoID, cfg.WatchDebounce)
+	statusEvent := func(runState string) map[string]any {
+		return map[string]any{
+			"type":        "watch_status",
+			"repo_root":   repo.RootPath,
+			"repo_id":     repoID,
+			"run_state":   runState,
+			"observed_at": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+	}
+	var ready func()
+	if *jsonl {
+		writeEvent(statusEvent(watchRunStarting))
+		ready = func() {
+			// Readiness is reported synchronously by the watcher; a caller that
+			// canceled first must never see watching.
+			if ctx.Err() != nil {
+				return
+			}
+			writeEvent(statusEvent(watchRunWatching))
+		}
+	}
+	err = w.RunWithReady(ctx, repo.RootPath, repoID, cfg.WatchDebounce, ready)
 	reporterCancel()
 	reporterDone.Wait()
 	if *jsonl {
+		var errDetail string
+		if err != nil {
+			errDetail = sanitizeWatchError(err, repo.RootPath)
+		}
+		terminal := statusEvent(watchRunStopped)
+		switch {
+		case err == nil:
+			terminal["reason"] = "completed"
+		case ctx.Err() != nil && errors.Is(err, context.Canceled):
+			terminal["reason"] = "context_canceled"
+		case ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded):
+			terminal["reason"] = "context_deadline_exceeded"
+		default:
+			terminal["run_state"] = watchRunFailed
+			terminal["error"] = errDetail
+		}
+		_ = writeJSONL(stdout, terminal)
 		event := map[string]any{
 			"type":      "watch_stopped",
 			"repo_root": repo.RootPath,
@@ -1967,11 +2006,44 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			"stats":     w.Stats(),
 		}
 		if err != nil {
-			event["error"] = err.Error()
+			event["error"] = errDetail
 		}
 		_ = writeJSONL(stdout, event)
 	}
 	return err
+}
+
+// Local watch_status run states. They describe only what this invocation
+// observed; they make no claim about other processes or index freshness.
+const (
+	watchRunStarting = "starting"
+	watchRunWatching = "watching"
+	watchRunStopped  = "stopped"
+	watchRunFailed   = "failed"
+)
+
+// maxWatchErrorBytes bounds the sanitized fatal error detail in watch events.
+const maxWatchErrorBytes = 512
+
+// sanitizeWatchError replaces the repository root and the user home directory
+// in a fatal watcher error so JSONL output does not leak absolute paths, and
+// bounds the result to maxWatchErrorBytes on a UTF-8 boundary.
+func sanitizeWatchError(err error, repoRoot string) string {
+	msg := err.Error()
+	if repoRoot != "" {
+		msg = strings.ReplaceAll(msg, repoRoot, "<repo>")
+	}
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" && home != string(filepath.Separator) {
+		msg = strings.ReplaceAll(msg, home, "~")
+	}
+	if len(msg) > maxWatchErrorBytes {
+		cut := maxWatchErrorBytes
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut] + "...(truncated)"
+	}
+	return msg
 }
 
 func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {

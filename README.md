@@ -744,6 +744,30 @@ TESTS=$(git diff --name-only HEAD~1 | codegraph affected-tests --stdin)
 go test $TESTS
 ```
 
+### Watch JSONL events
+
+`codegraph watch --jsonl <path>` writes one JSON object per line. Event types are
+additive: new types may appear in any release, so consumers should switch on
+`type` and ignore types they do not recognize.
+
+- `watch_started` is first; `watch_heartbeat` and `watch_flush_summary` report
+  watcher counters periodically; `watch_stopped` is the final event when the
+  command returns.
+- `watch_status` reports this invocation's local lifecycle with `repo_root`,
+  `repo_id`, `run_state` and `observed_at` (UTC RFC3339Nano, sampled when the
+  line is written). `run_state` is `starting`, then `watching` once watcher
+  setup has succeeded, then a terminal `stopped` (with `reason`: `completed`,
+  `context_canceled` or `context_deadline_exceeded`) or `failed` (with a
+  sanitized `error`). Cancellation before readiness goes from `starting`
+  straight to `stopped`. The terminal status immediately precedes
+  `watch_stopped`.
+
+`watch_status` is observational. It does not say the index is fresh, does not
+describe other processes, and a process killed abruptly emits no terminal
+event. Fatal error text in `watch_status.error` and `watch_stopped.error` has
+the repository root replaced by `<repo>`, the home directory by `~`, and is
+truncated to a bounded length.
+
 Replace `--repo-root .` with nothing if you are already in the repo you want to inspect.
 
 ---
