@@ -588,9 +588,9 @@ class Pool(unittest.TestCase):
         self.assertIn("base-gate", verify[-1]["output"])
         self.assertEqual(g.read_text(), obsolete)  # main checkout untouched
 
-    def test_default_gate_refuses_a_moved_remote_tracking_ref(self):
+    def test_default_gate_ignores_a_moved_remote_tracking_ref(self):
         del self.env["CG_COORD_GATE"]
-        self.install_gate(FAKE_GATE)
+        self.install_gate(FAKE_GATE.replace("merge-gate: PASS", "merge-gate: PASS base-gate"))
         self.plan(self.task("x", commit("x")))
         self.run_until(lambda: self.status("x") == "awaiting_ci")
         self.set_pr(self.st()["x"]["pr"], checks=GREEN)
@@ -599,9 +599,29 @@ class Pool(unittest.TestCase):
         ref.write_text(self.git("-C", str(self.seed), "rev-parse", "HEAD~1") + "\n")
         Path(f"{ref}.lock").write_text("")
         self.coord("run", "--once")
-        self.assertEqual(self.status("x"), "blocked")
-        self.assertIn("merge gate unavailable", self.st()["x"]["reason"])
-        self.assertFalse(list((self.state / "gates").glob("*.sh")) if (self.state / "gates").exists() else [])
+        self.assertEqual(self.status("x"), "ready_for_owner")
+        verify = [e for e in self.events() if e["event"] == "merge_gate_verify"]
+        self.assertIn("base-gate", verify[-1]["output"])  # read from the remote, not the moved ref
+
+    def test_default_gate_ignores_forged_objects_in_the_shared_store(self):
+        del self.env["CG_COORD_GATE"]
+        self.install_gate(FAKE_GATE.replace("merge-gate: PASS", "merge-gate: PASS base-gate"))
+        self.plan(self.task("x", commit("x")))
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        # Replace the gate blob's loose object in the shared store with one
+        # holding other content under the same name (as an agent could).
+        blob = self.git("-C", str(self.seed), "rev-parse", "origin/v2.0:.github/scripts/merge-gate.sh")
+        obj = self.seed / ".git/objects" / blob[:2] / blob[2:]
+        forged = self.t / "forged"
+        forged.write_text("#!/bin/sh\necho FORGED; exit 2 # --base\n")
+        fake = self.git("-C", str(self.seed), "hash-object", "-w", str(forged))
+        obj.chmod(0o644)
+        obj.write_bytes((self.seed / ".git/objects" / fake[:2] / fake[2:]).read_bytes())
+        self.assertIn("FORGED", self.git("-C", str(self.seed), "cat-file", "blob", blob))
+        self.set_pr(self.st()["x"]["pr"], checks=GREEN)
+        self.run_until(lambda: self.status("x") == "ready_for_owner")
+        verify = [e for e in self.events() if e["event"] == "merge_gate_verify"]
+        self.assertIn("base-gate", verify[-1]["output"])
 
     def test_incompatible_gate_override_blocks_until_fixed(self):
         old = self.t / "bin/oldgate"
@@ -908,6 +928,10 @@ class Pool(unittest.TestCase):
         plant += (f'(git rev-parse HEAD >{remote_ref}) 2>/dev/null && echo PLANTED-remote-ref; '
                   f'(: >{remote_ref}.lock) 2>/dev/null && echo PLANTED-ref-lock; ')
         targets["remote-ref"] = remote_ref
+        alternates = self.seed / ".git/objects/info/alternates"
+        before["alternates"] = alternates.read_bytes() if alternates.exists() else None
+        targets["alternates"] = alternates
+        plant += f'(echo {self.t} >>{alternates}) 2>/dev/null && echo PLANTED-alternates; '
         self.plan(self.task("x", sh(plant + 'mkdir -p work && echo x > work/x.txt && git add work && '
                                             'git commit -qm x')))
         self.run_until(lambda: self.status("x") == "awaiting_ci")

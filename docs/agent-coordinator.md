@@ -118,9 +118,10 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
    a rerun is green; pending checks or no `ci`
    check → `awaiting_ci`. When all is green, `merge-gate.sh PR HEAD REVIEW`
    (with `--base <base>`) runs in verification mode. The gate is the one
-   committed on `origin/<base>` (copied to `<state>/gates/<blob>.sh`) after
-   a successful fetch and only if the local `origin/<base>` equals what
-   `git ls-remote` reports, never
+   committed on the remote's `<base>`: it is fetched into a private bare
+   repository `<state>/gate-repo` (agents can write the shared object store,
+   and git trusts objects it already has), checked against `git ls-remote`,
+   and copied to `<state>/gates/<blob>.sh`; never
    the main checkout's copy, which may be old or modified; `CG_COORD_GATE`
    overrides it. Either must print a usage naming `--base` when run without
    arguments (exit 2), otherwise the task is blocked with `merge gate
@@ -229,7 +230,7 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
 | `state.json` | task states; written atomically (temp file, fsync, rename) |
 | `events.jsonl` | append-only, fsynced event log |
 | `tokens/` | lease tokens, 0600; acquire transaction files |
-| `gates/` | merge gates copied from `origin/<base>` |
+| `gates/`, `gate-repo/` | merge gates, and the private repository they are read from |
 | `runs/<task>-<kind>-…/` | agent output, exit status, validation logs, review artifact |
 
 Other variables: `CG_COORD_POOL` (pool.sh), `CG_COORD_GH` (`gh`),
@@ -270,6 +271,11 @@ coordinator version.
   coordinator recorded it, or `ps` failed at launch) is tracked by its
   process group only; a reused PID leading a new group would keep the
   task `running` (lease kept; `cancel` refuses) until the owner inspects.
+- Agents can write the shared object store (their commits need it), so an
+  agent could plant objects that change what other slots check out at a
+  genuine SHA. That content still runs only inside later sandboxed agents
+  and validation, but it could make validation pass falsely or reach a
+  later PR. Only the merge gate is read from a private store.
 - Branch refs are shared by all slots, so an agent could fast-forward
   another task's local branch; the coordinator pushes only its own task's
   branch and never with force.

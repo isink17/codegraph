@@ -185,6 +185,7 @@ def sandboxed(argv, allow_read=(), slot=None):
                 q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads"),
                 *[q(d) for d in extra]]
     no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
+                q(gitdir / "objects/info"),
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
     if slot:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
@@ -588,23 +589,28 @@ class Coordinator:
         if GATE_OVERRIDE:
             gate = Path(GATE_OVERRIDE)
         else:
-            # The local remote-tracking ref must be what the remote has now:
-            # never trust a ref that something local could have moved.
-            run([GIT, *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE], check=True)
-            remote_sha = run([GIT, *GIT_SAFE, "-C", str(REPO), "ls-remote", REMOTE, f"refs/heads/{base}"],
+            # Read from a private bare repository in the state directory,
+            # which agents can neither read nor write: the shared object store
+            # is writable to them, and git trusts objects it already has.
+            url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
+            store = self.dir / "gate-repo"
+            if not (store / "HEAD").exists():
+                run([GIT, "init", "-q", "--bare", str(store)], check=True)
+            run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
+                 f"+refs/heads/{base}:refs/heads/{base}"], check=True)
+            remote_sha = run([GIT, *GIT_SAFE, "ls-remote", url, f"refs/heads/{base}"],
                              check=True).stdout.split("\t")[0].strip()
-            local_sha = run([GIT, *GIT_SAFE, "-C", str(REPO), "rev-parse", "-q", "--verify",
-                             f"refs/remotes/{REMOTE}/{base}"]).stdout.strip()
+            local_sha = run([GIT, *GIT_SAFE, "-C", str(store), "rev-parse", "-q", "--verify",
+                             f"refs/heads/{base}"]).stdout.strip()
             if not remote_sha or remote_sha != local_sha:
-                raise Refused(f"{REMOTE}/{base} is {local_sha[:12] or 'missing'} locally but "
-                              f"{remote_sha[:12] or 'missing'} on {REMOTE}")
-            blob = run([GIT, *GIT_SAFE, "-C", str(REPO), "rev-parse", "-q", "--verify",
+                raise Refused(f"{base} moved during the gate fetch ({local_sha[:12]} vs {remote_sha[:12]})")
+            blob = run([GIT, *GIT_SAFE, "-C", str(store), "rev-parse", "-q", "--verify",
                         f"{remote_sha}:{GATE_PATH}"]).stdout.strip()
             if not blob:
                 raise Refused(f"no {GATE_PATH} on {REMOTE}/{base}")
             (self.dir / "gates").mkdir(mode=0o700, exist_ok=True)
             gate = self.dir / "gates" / f"{blob}.sh"
-            write_atomic(gate, run([GIT, *GIT_SAFE, "-C", str(REPO), "cat-file", "blob", blob], check=True).stdout, 0o700)
+            write_atomic(gate, run([GIT, *GIT_SAFE, "-C", str(store), "cat-file", "blob", blob], check=True).stdout, 0o700)
         if not os.access(gate, os.X_OK):
             raise Refused(f"{gate} is not an executable file")
         probe = run([str(gate)], cwd=REPO)
