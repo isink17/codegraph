@@ -122,6 +122,20 @@ func isWatcherConfigPath(rel string) bool {
 }
 
 func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, debounce time.Duration) error {
+	return w.run(ctx, repoRoot, repoID, debounce, nil)
+}
+
+// RunWithReady behaves exactly like Run and additionally calls ready once,
+// synchronously, after config loading, fsnotify creation, the initial
+// recursive watch registration, any startup dirty-queue flush, and the flush
+// loop start have all succeeded. It is not called when setup fails or ctx is
+// canceled first. Readiness means only that watcher setup succeeded; it does
+// not claim that every OS event will be delivered or that the index is fresh.
+func (w *Watcher) RunWithReady(ctx context.Context, repoRoot string, repoID int64, debounce time.Duration, ready func()) error {
+	return w.run(ctx, repoRoot, repoID, debounce, ready)
+}
+
+func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, debounce time.Duration, ready func()) error {
 	w.eventsSeen.Store(0)
 	w.eventsIgnored.Store(0)
 	w.eventsIgnoredDir.Store(0)
@@ -330,6 +344,13 @@ func (w *Watcher) Run(ctx context.Context, repoRoot string, repoID int64, deboun
 			}
 		}
 	})
+
+	if ready != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ready()
+	}
 
 	for {
 		select {
