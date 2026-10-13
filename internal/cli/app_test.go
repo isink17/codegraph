@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/store"
@@ -789,5 +793,239 @@ func TestComputeMetricDelta(t *testing.T) {
 	}
 	if ns["delta_pct"] != 10.0 {
 		t.Fatalf("ns_per_op delta_pct = %v, want 10", ns["delta_pct"])
+	}
+}
+
+// eventWriter collects JSONL output and calls onEvent synchronously for each
+// complete line, so a test can react to a lifecycle event without sleeping.
+type eventWriter struct {
+	mu      sync.Mutex
+	partial []byte
+	events  []map[string]any
+	lines   []string
+	onEvent func(map[string]any)
+	t       *testing.T
+}
+
+func (w *eventWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.partial = append(w.partial, p...)
+	var ready []map[string]any
+	for {
+		i := bytes.IndexByte(w.partial, '\n')
+		if i < 0 {
+			break
+		}
+		line := string(w.partial[:i])
+		w.partial = w.partial[i+1:]
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			w.t.Errorf("JSONL line does not decode independently: %v: %q", err, line)
+			continue
+		}
+		w.lines = append(w.lines, line)
+		w.events = append(w.events, event)
+		ready = append(ready, event)
+	}
+	w.mu.Unlock()
+	if w.onEvent != nil {
+		for _, event := range ready {
+			w.onEvent(event)
+		}
+	}
+	return len(p), nil
+}
+
+func (w *eventWriter) snapshot() ([]map[string]any, []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]map[string]any(nil), w.events...), append([]string(nil), w.lines...)
+}
+
+func setupWatchRepo(t *testing.T) string {
+	t.Helper()
+	home := filepath.Join(t.TempDir(), "codegraph-home")
+	t.Setenv("CODEGRAPH_HOME", home)
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoRoot) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(main.go) error = %v", err)
+	}
+	prev := startupVersionCheck
+	startupVersionCheck = func(context.Context, io.Writer) {}
+	t.Cleanup(func() { startupVersionCheck = prev })
+	return repoRoot
+}
+
+// watchStatusStates returns the run_state sequence and checks the common
+// watch_status fields on every status event.
+func watchStatusStates(t *testing.T, events []map[string]any) []string {
+	t.Helper()
+	var states []string
+	for _, event := range events {
+		if event["type"] != "watch_status" {
+			continue
+		}
+		for _, key := range []string{"repo_root", "repo_id", "run_state", "observed_at"} {
+			if _, ok := event[key]; !ok {
+				t.Fatalf("watch_status missing %q: %v", key, event)
+			}
+		}
+		raw, _ := event["observed_at"].(string)
+		at, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			t.Fatalf("observed_at %q is not RFC3339Nano: %v", raw, err)
+		}
+		if !strings.HasSuffix(raw, "Z") || at.Location() != time.UTC {
+			t.Fatalf("observed_at %q is not UTC", raw)
+		}
+		states = append(states, event["run_state"].(string))
+	}
+	return states
+}
+
+// assertLegacyWatchEvents checks that legacy events keep their fields, that
+// watch_started is the first event and watch_stopped the last, and that the
+// terminal watch_status immediately precedes watch_stopped.
+func assertLegacyWatchEvents(t *testing.T, events []map[string]any) {
+	t.Helper()
+	if len(events) < 3 {
+		t.Fatalf("too few events: %v", events)
+	}
+	first, last := events[0], events[len(events)-1]
+	if first["type"] != "watch_started" || first["repo_root"] == nil || first["repo_id"] == nil {
+		t.Fatalf("first event = %v, want watch_started with repo fields", first)
+	}
+	if last["type"] != "watch_stopped" || last["repo_root"] == nil || last["repo_id"] == nil || last["stats"] == nil {
+		t.Fatalf("last event = %v, want watch_stopped with repo fields and stats", last)
+	}
+	if events[1]["type"] != "watch_status" || events[1]["run_state"] != "starting" {
+		t.Fatalf("second event = %v, want watch_status starting", events[1])
+	}
+	prev := events[len(events)-2]
+	if prev["type"] != "watch_status" {
+		t.Fatalf("event before watch_stopped = %v, want terminal watch_status", prev)
+	}
+	for _, event := range events[:len(events)-1] {
+		if event["type"] == "watch_stopped" {
+			t.Fatalf("watch_stopped is not the final event: %v", events)
+		}
+	}
+}
+
+func TestRunWatchJSONLLifecycleCancelOnWatching(t *testing.T) {
+	repoRoot := setupWatchRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := &eventWriter{t: t}
+	out.onEvent = func(event map[string]any) {
+		if event["type"] == "watch_status" && event["run_state"] == "watching" {
+			cancel()
+		}
+	}
+	var errOut bytes.Buffer
+	err := Run(ctx, []string{"watch", "--jsonl", repoRoot}, out, &errOut)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run(watch) error = %v, want context.Canceled", err)
+	}
+	events, _ := out.snapshot()
+	states := watchStatusStates(t, events)
+	if want := []string{"starting", "watching", "stopped"}; strings.Join(states, ",") != strings.Join(want, ",") {
+		t.Fatalf("run states = %v, want %v", states, want)
+	}
+	assertLegacyWatchEvents(t, events)
+	terminal := events[len(events)-2]
+	if terminal["reason"] != "context_canceled" {
+		t.Fatalf("terminal reason = %v, want context_canceled", terminal["reason"])
+	}
+	if _, ok := terminal["error"]; ok {
+		t.Fatalf("stopped status must not carry error: %v", terminal)
+	}
+	if got := events[len(events)-1]["error"]; got != "context canceled" {
+		t.Fatalf("legacy watch_stopped error = %v, want context canceled", got)
+	}
+}
+
+func TestRunWatchJSONLCancelBeforeReadyNeverWatching(t *testing.T) {
+	repoRoot := setupWatchRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := &eventWriter{t: t}
+	out.onEvent = func(event map[string]any) {
+		if event["type"] == "watch_status" && event["run_state"] == "starting" {
+			cancel()
+		}
+	}
+	var errOut bytes.Buffer
+	err := Run(ctx, []string{"watch", "--jsonl", repoRoot}, out, &errOut)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run(watch) error = %v, want context.Canceled", err)
+	}
+	events, _ := out.snapshot()
+	states := watchStatusStates(t, events)
+	if want := []string{"starting", "stopped"}; strings.Join(states, ",") != strings.Join(want, ",") {
+		t.Fatalf("run states = %v, want %v", states, want)
+	}
+	assertLegacyWatchEvents(t, events)
+}
+
+func TestRunWatchJSONLStartupFailureIsSanitized(t *testing.T) {
+	repoRoot := setupWatchRepo(t)
+	// A directory where the repo config file belongs makes the watcher's
+	// config load fail with an error that names the absolute path.
+	if err := os.MkdirAll(config.RepoConfigPath(repoRoot), 0o755); err != nil {
+		t.Fatalf("MkdirAll(config) error = %v", err)
+	}
+	out := &eventWriter{t: t}
+	var errOut bytes.Buffer
+	err := Run(context.Background(), []string{"watch", "--jsonl", repoRoot}, out, &errOut)
+	if err == nil {
+		t.Fatal("Run(watch) error = nil, want config load failure")
+	}
+	events, lines := out.snapshot()
+	states := watchStatusStates(t, events)
+	if want := []string{"starting", "failed"}; strings.Join(states, ",") != strings.Join(want, ",") {
+		t.Fatalf("run states = %v, want %v", states, want)
+	}
+	assertLegacyWatchEvents(t, events)
+	terminal, stopped := events[len(events)-2], events[len(events)-1]
+	statusErr, _ := terminal["error"].(string)
+	legacyErr, _ := stopped["error"].(string)
+	for _, detail := range []string{statusErr, legacyErr} {
+		if !strings.Contains(detail, "<repo>") || !strings.Contains(detail, "config.json") {
+			t.Fatalf("sanitized error %q lost useful cause text", detail)
+		}
+	}
+	canonical := events[0]["repo_root"].(string)
+	for _, line := range lines[len(lines)-2:] {
+		var event map[string]any
+		_ = json.Unmarshal([]byte(line), &event)
+		if strings.Contains(event["error"].(string), canonical) || strings.Contains(event["error"].(string), repoRoot) {
+			t.Fatalf("error detail leaks repository path: %s", line)
+		}
+	}
+}
+
+func TestSanitizeWatchErrorRedactsAndBounds(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "user-home")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	repoRoot := filepath.Join(home, "src", "repo")
+	err := fmt.Errorf("open %s: permission denied; cache %s: busy",
+		filepath.Join(repoRoot, "a.go"), filepath.Join(home, ".cache", "x"))
+	got := sanitizeWatchError(err, repoRoot)
+	if strings.Contains(got, home) {
+		t.Fatalf("sanitized error leaks home path: %q", got)
+	}
+	for _, want := range []string{"<repo>", "permission denied", "~", "busy"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sanitized error %q missing %q", got, want)
+		}
+	}
+	long := sanitizeWatchError(errors.New(strings.Repeat("é", maxWatchErrorBytes)), repoRoot)
+	if len(long) > maxWatchErrorBytes+len("...(truncated)") || !utf8.ValidString(long) {
+		t.Fatalf("bounded error has length %d or invalid UTF-8", len(long))
 	}
 }
