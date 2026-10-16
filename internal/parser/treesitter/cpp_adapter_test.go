@@ -172,6 +172,38 @@ void boundary_a(unsigned long value); void boundary_b(unsignedlong renamed);
 	}
 }
 
+// `static` on a class member removes `this`; it does not make the member
+// file-local. Only a non-member static function carries the internal-linkage
+// signature tag the resolver uses to refuse cross-file bindings.
+func TestCppFunctionSignatureStaticLinkage(t *testing.T) {
+	src := `struct A {
+    static void inline_member() {}
+    template <class T> static void template_member() {}
+    static void out_of_line();
+};
+void A::out_of_line() {}
+static void file_local() {}
+namespace ns { static void namespace_local() {} }
+`
+	byName := map[string]string{}
+	for _, sym := range parseCppSymbols(t, "a.cpp", src) {
+		if sym.Kind == "function" {
+			byName[sym.Name] = sym.Signature
+		}
+	}
+	for name, want := range map[string]string{
+		"inline_member":   "()",
+		"template_member": "()",
+		"A::out_of_line":  "()",
+		"file_local":      "static:()",
+		"namespace_local": "static:()",
+	} {
+		if got, ok := byName[name]; !ok || got != want {
+			t.Errorf("%s signature = %q (found %v), want %q", name, got, ok, want)
+		}
+	}
+}
+
 // TestCppCallDstNameKeepsReceiver pins the persisted destination identity for
 // every C++ call syntax the adapter emits.
 //

@@ -463,14 +463,11 @@ func cppAddFunctionFromDeclarator(decl, fnDecl *sitter.Node, module, container s
 
 func cppFunctionSignature(fnDecl *sitter.Node, content []byte) string {
 	linkage := ""
-	inClassDeclaration := false
 	for node := fnDecl; node != nil; node = node.Parent() {
 		text := strings.TrimSpace(nodeText(node, content))
-		if node.Type() == "field_declaration" {
-			inClassDeclaration = true
-		}
 		if strings.HasPrefix(text, "static ") || strings.HasPrefix(text, "static\n") {
-			if !inClassDeclaration {
+			// A static class member has external linkage; only a non-member is file-local.
+			if !cppHasAncestor(node, "field_declaration_list") {
 				linkage = "static:"
 			}
 			break
