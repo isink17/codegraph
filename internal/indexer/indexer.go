@@ -199,7 +199,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if shouldIgnorePath(rel, opts.Exclude) || shouldSkipFile(rel, opts.Include, opts.Exclude) {
 			continue
 		}
-		if info, err := os.Stat(filepath.Join(opts.RepoRoot, rel)); err != nil || !info.Mode().IsRegular() {
+		if info, err := candidateFileInfo(filepath.Join(opts.RepoRoot, rel)); err != nil || info == nil {
 			continue
 		}
 		if adapter := i.registry.AdapterFor(rel); adapter != nil {
@@ -451,20 +451,15 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 					continue
 				}
 				abs := filepath.Join(opts.RepoRoot, rel)
-				info, err := os.Stat(abs)
-				if err != nil {
-					if os.IsNotExist(err) {
-						missingCandidatePaths = append(missingCandidatePaths, rel)
-						continue
-					}
+				info, err := candidateFileInfo(abs)
+				if err != nil && !os.IsNotExist(err) {
 					producerErr <- err
 					return
 				}
-				// Same rule as entryFileInfo below: only regular files are
-				// repository content. os.Stat resolves a link first, so a
-				// candidate that is (or points at) a directory, FIFO, socket,
-				// or device is skipped rather than read.
-				if !info.Mode().IsRegular() {
+				// A candidate the full walk would skip is retired like a
+				// missing one, so both scans leave the same graph behind.
+				if info == nil {
+					missingCandidatePaths = append(missingCandidatePaths, rel)
 					continue
 				}
 				adapter := i.registry.AdapterFor(rel)
@@ -1549,6 +1544,22 @@ func entryFileInfo(path string, d fs.DirEntry) (fs.FileInfo, error) {
 	default:
 		return nil, nil
 	}
+}
+
+// lstat is os.Lstat, indirected so tests can present a path-scoped candidate
+// as a FIFO, device or socket without creating one.
+//
+// Production never assigns to it.
+var lstat = os.Lstat
+
+// candidateFileInfo applies entryFileInfo's rule to an explicit candidate path,
+// so a path-scoped scan admits exactly the entries the full walk would.
+func candidateFileInfo(abs string) (fs.FileInfo, error) {
+	info, err := lstat(abs)
+	if err != nil {
+		return nil, err
+	}
+	return entryFileInfo(abs, fs.FileInfoToDirEntry(info))
 }
 
 func shouldSkipIndexByExtension(relPath string) bool {
