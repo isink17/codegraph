@@ -69,35 +69,17 @@ func (s *Store) QueryBenchTargets(ctx context.Context, repoID int64) (QueryBench
 }
 
 // extremeDegreeSymbol returns the qualified name of the symbol with the highest
-// edge degree in one direction.
+// edge degree in one direction among symbols whose qualified name is unique.
 //
-// The maximum degree is found first and the name is then chosen among the
-// symbols that have exactly that degree, ordered by qualified name. Picking the
-// name that way -- rather than taking whatever row a `ORDER BY count DESC LIMIT
-// 1` happens to yield -- keeps the choice stable across re-indexes, which
-// assign different row ids to the same code.
+// The scenarios look the target up by name, and a name shared by several
+// symbols (C++ TEST macros, overloads) is refused as ambiguous, so only names
+// that resolve to exactly one live symbol are eligible. Ties are broken by
+// qualified name rather than row id, keeping the choice stable across
+// re-indexes, which assign different row ids to the same code.
 func (s *Store) extremeDegreeSymbol(ctx context.Context, repoID int64, degreeCol string) (string, error) {
 	if degreeCol != "dst_symbol_id" && degreeCol != "src_symbol_id" {
 		return "", errors.New("store: unsupported degree column")
 	}
-	var maxDegree sql.NullInt64
-	if err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
-		SELECT MAX(degree) FROM (
-			SELECT COUNT(1) AS degree
-			FROM edges
-			WHERE repo_id = ? AND `+degreeCol+` IS NOT NULL
-			GROUP BY `+degreeCol+`
-		)
-	`, repoID).Scan(&maxDegree); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
-		}
-		return "", err
-	}
-	if !maxDegree.Valid || maxDegree.Int64 == 0 {
-		return "", nil
-	}
-
 	var qname string
 	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx, `
 		SELECT s.qualified_name
@@ -106,13 +88,18 @@ func (s *Store) extremeDegreeSymbol(ctx context.Context, repoID int64, degreeCol
 			FROM edges
 			WHERE repo_id = ? AND `+degreeCol+` IS NOT NULL
 			GROUP BY `+degreeCol+`
-			HAVING degree = ?
 		) agg
 		JOIN symbols s ON s.id = agg.sid
-		WHERE s.repo_id = ?
-		ORDER BY s.qualified_name ASC, s.id ASC
+		JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
+		WHERE s.repo_id = ? AND NOT EXISTS (
+			SELECT 1
+			FROM symbols o
+			JOIN files fo ON fo.id = o.file_id AND fo.repo_id = o.repo_id AND fo.is_deleted = 0
+			WHERE o.repo_id = s.repo_id AND o.qualified_name = s.qualified_name AND o.id <> s.id
+		)
+		ORDER BY agg.degree DESC, s.qualified_name ASC, s.id ASC
 		LIMIT 1
-	`, repoID, maxDegree.Int64, repoID).Scan(&qname)
+	`, repoID, repoID).Scan(&qname)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
