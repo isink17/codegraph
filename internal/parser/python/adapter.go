@@ -62,6 +62,9 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	}
 	var scopes []scope
 	maskedLines := maskPythonLines(lines)
+	// codeLines is the same text with f-string replacement fields left as
+	// code, read only for calls: everything structural reads maskedLines.
+	codeLines := maskPythonCodeLines(lines)
 	// Import syntax is read from the masked source before the line walk, so a
 	// statement spanning several physical lines is still one binding and its
 	// lines never reach call extraction. The bindings themselves are emitted
@@ -75,13 +78,59 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	// open tracks bracket depth carried over from previous lines. A line that
 	// continues an open bracket carries no indentation meaning -- the `):`
 	// closing a signature split over several lines is not a dedent out of the
-	// declaration it belongs to -- and it declares nothing of its own.
+	// declaration it belongs to -- and it declares nothing of its own. Its
+	// calls are still calls of the statement it continues, except inside a
+	// case pattern (patternOpen), which calls nothing.
 	open := 0
+	patternOpen := false
+
+	// emitCalls records the calls a line makes. scan is the line masked with
+	// f-string replacement fields kept (codeLines) and any soft-keyword
+	// pattern syntax blanked out.
+	emitCalls := func(scan, line string, lineNo int) {
+		for _, loc := range callRE.FindAllStringSubmatchIndex(scan, -1) {
+			if len(loc) != 4 {
+				continue
+			}
+			// A chain whose head is itself a call or a subscript (`f().run()`,
+			// `items[0]()`) has no name the parser can state truthfully, so it
+			// emits nothing rather than the tail alone. Neither does a match
+			// right after a non-ASCII rune: outside strings and comments that
+			// rune can only be part of a name `identifier` does not know.
+			if start := loc[2]; start > 0 && (strings.IndexByte(").]", scan[start-1]) >= 0 || scan[start-1] >= utf8.RuneSelf) {
+				continue
+			}
+			name := NormalizeIdentifier(scan[loc[2]:loc[3]])
+			if !strings.Contains(name, ".") && isPythonKeyword(name) {
+				continue
+			}
+			pf.Edges = append(pf.Edges, graph.Edge{
+				SrcSymbolID: 0,
+				DstName:     name,
+				Kind:        "calls",
+				Evidence:    strings.TrimSpace(line),
+				Line:        lineNo,
+				Col:         loc[2] + 1,
+			})
+			pf.References = append(pf.References, graph.Reference{
+				Kind:          "call",
+				Name:          name,
+				QualifiedName: name,
+				Range: graph.Position{
+					StartLine: lineNo,
+					StartCol:  loc[2] + 1,
+					EndLine:   lineNo,
+					EndCol:    len(line) + 1,
+				},
+			})
+		}
+	}
 
 	for i, line := range lines {
 		lineNo := i + 1
 		line = strings.TrimSuffix(line, "\r")
 		masked := strings.TrimSuffix(maskedLines[i], "\r")
+		code := strings.TrimSuffix(codeLines[i], "\r")
 		indent := lineIndent(line)
 		trimmed := strings.TrimSpace(line)
 		continued := open > 0
@@ -90,10 +139,22 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 			open = 0
 		}
 		if strings.TrimSpace(masked) == "" {
+			// A line inside a triple-quoted f-string can still hold a
+			// replacement field, and it belongs to the enclosing body.
+			if strings.TrimSpace(code) != "" {
+				lastLine, lastLen = lineNo, len(line)
+				if !patternOpen && lastFunction(scopes) >= 0 {
+					emitCalls(code, line, lineNo)
+				}
+			}
 			continue
 		}
 		if continued {
 			lastLine, lastLen = lineNo, len(line)
+			if !patternOpen && !importLines[i] && lastFunction(scopes) >= 0 {
+				emitCalls(code, line, lineNo)
+			}
+			patternOpen = patternOpen && open > 0
 			continue
 		}
 
@@ -186,46 +247,12 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		if lastFunction(scopes) < 0 {
 			continue
 		}
-		scan := masked
+		scan := code
 		if from := patternSyntaxEnd(maskedLines, i); from > 0 {
-			scan = strings.Repeat(" ", from) + masked[from:]
+			scan = strings.Repeat(" ", from) + code[from:]
+			patternOpen = open > 0 && strings.HasPrefix(strings.TrimLeft(masked, " \t"), "case")
 		}
-		for _, loc := range callRE.FindAllStringSubmatchIndex(scan, -1) {
-			if len(loc) != 4 {
-				continue
-			}
-			// A chain whose head is itself a call or a subscript (`f().run()`,
-			// `items[0]()`) has no name the parser can state truthfully, so it
-			// emits nothing rather than the tail alone. Neither does a match
-			// right after a non-ASCII rune: outside strings and comments that
-			// rune can only be part of a name `identifier` does not know.
-			if start := loc[2]; start > 0 && (strings.IndexByte(").]", scan[start-1]) >= 0 || scan[start-1] >= utf8.RuneSelf) {
-				continue
-			}
-			name := NormalizeIdentifier(scan[loc[2]:loc[3]])
-			if !strings.Contains(name, ".") && isPythonKeyword(name) {
-				continue
-			}
-			pf.Edges = append(pf.Edges, graph.Edge{
-				SrcSymbolID: 0,
-				DstName:     name,
-				Kind:        "calls",
-				Evidence:    strings.TrimSpace(line),
-				Line:        lineNo,
-				Col:         loc[2] + 1,
-			})
-			pf.References = append(pf.References, graph.Reference{
-				Kind:          "call",
-				Name:          name,
-				QualifiedName: name,
-				Range: graph.Position{
-					StartLine: lineNo,
-					StartCol:  loc[2] + 1,
-					EndLine:   lineNo,
-					EndCol:    len(line) + 1,
-				},
-			})
-		}
+		emitCalls(scan, line, lineNo)
 	}
 
 	// EOF closes every open scope at the file's last content line.
@@ -497,10 +524,39 @@ type pythonLexState struct {
 	quote   byte
 	triple  bool
 	escaped bool
+	// keep leaves the replacement fields of f- and t-strings readable as code;
+	// without it every string is masked whole. fstr marks the open string as
+	// one whose fields are code, and fields holds the open replacement fields,
+	// innermost last.
+	keep   bool
+	fstr   bool
+	fields []pythonField
+}
+
+// pythonField is an open `{...}` replacement field: the string it interrupts,
+// the bracket depth of its expression, whether the expression has ended and a
+// conversion or format spec (masked) is being read, and whether the field sits
+// inside another field's format spec (`{v:{width}}`), which it returns to.
+type pythonField struct {
+	quote  byte
+	triple bool
+	depth  int
+	spec   bool
+	inSpec bool
 }
 
 func maskPythonLines(lines []string) []string {
-	state := pythonLexState{}
+	return maskLines(lines, pythonLexState{})
+}
+
+// maskPythonCodeLines masks like maskPythonLines but keeps the expressions in
+// f- and t-string replacement fields, which are code: `f"{load(x)}"` calls
+// load. Byte positions are the same in both views.
+func maskPythonCodeLines(lines []string) []string {
+	return maskLines(lines, pythonLexState{keep: true})
+}
+
+func maskLines(lines []string, state pythonLexState) []string {
 	masked := make([]string, len(lines))
 	for i, line := range lines {
 		masked[i] = maskPythonLine(line, &state)
@@ -511,34 +567,92 @@ func maskPythonLines(lines []string) []string {
 func maskPythonLine(line string, state *pythonLexState) string {
 	var b strings.Builder
 	b.Grow(len(line))
+	// The code view fills f-string text, field delimiters and specs with a
+	// byte that is neither space nor identifier, so a name before a field
+	// (`f"{a}{(b)}"`) is never read as called across the gap.
+	pad := func() byte {
+		if state.keep {
+			return ';'
+		}
+		return ' '
+	}
 	for i := 0; i < len(line); i++ {
 		ch := line[i]
 		if state.quote != 0 {
+			fill := byte(' ')
+			if state.fstr {
+				fill = pad()
+			}
+			// A backslash never escapes a brace in an f-string: `\{{` is a
+			// backslash and a literal brace, `\{x}` a backslash and a field.
+			if state.fstr && (ch == '{' || ch == '}') {
+				state.escaped = false
+				if i+1 < len(line) && line[i+1] == ch {
+					b.WriteByte(fill)
+					b.WriteByte(fill)
+					i++
+					continue
+				}
+				b.WriteByte(fill)
+				if ch == '{' {
+					state.fields = append(state.fields, pythonField{quote: state.quote, triple: state.triple})
+					state.quote, state.triple, state.fstr = 0, false, false
+				}
+				continue
+			}
 			if state.triple {
 				if i+2 < len(line) && line[i] == state.quote && line[i+1] == state.quote && line[i+2] == state.quote {
-					b.WriteString("   ")
+					b.WriteByte(fill)
+					b.WriteByte(fill)
+					b.WriteByte(fill)
 					i += 2
-					state.quote, state.triple = 0, false
+					state.quote, state.triple, state.fstr = 0, false, false
 				} else {
-					b.WriteByte(' ')
+					b.WriteByte(fill)
 				}
 				continue
 			}
 			if state.escaped {
 				state.escaped = false
-				b.WriteByte(' ')
+				b.WriteByte(fill)
 				continue
 			}
 			if ch == '\\' {
 				state.escaped = true
-				b.WriteByte(' ')
+				b.WriteByte(fill)
 				continue
 			}
-			b.WriteByte(' ')
+			b.WriteByte(fill)
 			if ch == state.quote {
-				state.quote = 0
+				state.quote, state.fstr = 0, false
 			}
 			continue
+		}
+		if n := len(state.fields); n > 0 {
+			field := &state.fields[n-1]
+			if field.spec || ch == '}' && field.depth == 0 {
+				b.WriteByte(pad())
+				switch {
+				case ch == '{':
+					state.fields = append(state.fields, pythonField{quote: field.quote, triple: field.triple, inSpec: true})
+				case ch == '}':
+					if !field.inSpec {
+						state.quote, state.triple, state.fstr = field.quote, field.triple, true
+					}
+					state.fields = state.fields[:n-1]
+				}
+				continue
+			}
+			switch {
+			case strings.IndexByte("([{", ch) >= 0:
+				field.depth++
+			case strings.IndexByte(")]}", ch) >= 0:
+				field.depth--
+			case field.depth == 0 && (ch == ':' || ch == '!' && (i+1 == len(line) || line[i+1] != '=')):
+				field.spec = true
+				b.WriteByte(pad())
+				continue
+			}
 		}
 		if ch == '#' {
 			b.WriteString(strings.Repeat(" ", len(line)-i))
@@ -546,18 +660,43 @@ func maskPythonLine(line string, state *pythonLexState) string {
 		}
 		if ch == '\'' || ch == '"' {
 			state.quote = ch
+			state.fstr = state.keep && interpolatingPrefix(line[:i])
+			fill := byte(' ')
+			if state.fstr {
+				fill = pad()
+			}
 			if i+2 < len(line) && line[i+1] == ch && line[i+2] == ch {
 				state.triple = true
-				b.WriteString("   ")
+				b.WriteByte(fill)
+				b.WriteByte(fill)
+				b.WriteByte(fill)
 				i += 2
 			} else {
-				b.WriteByte(' ')
+				b.WriteByte(fill)
 			}
 			continue
 		}
 		b.WriteByte(ch)
 	}
 	return b.String()
+}
+
+// interpolatingPrefix reports whether the string literal starting right after
+// before carries an f or t prefix (alone or with r, any case), so its
+// replacement fields are expressions.
+func interpolatingPrefix(before string) bool {
+	j := len(before)
+	for j > 0 && (before[j-1]|0x20 >= 'a' && before[j-1]|0x20 <= 'z') {
+		j--
+	}
+	if r, _ := utf8.DecodeLastRuneInString(before[:j]); j > 0 && (isIdentifierRune(r) || before[j-1] >= utf8.RuneSelf) {
+		return false
+	}
+	switch strings.ToLower(before[j:]) {
+	case "f", "rf", "fr", "t", "rt", "tr":
+		return true
+	}
+	return false
 }
 
 func lineIndent(line string) int {
@@ -604,7 +743,7 @@ func isPythonKeyword(name string) bool {
 // every name in its NFKC form, the name CPython binds (PEP 3131). v5 records
 // lambda parameters and match-case captures as local bindings. v6 records
 // lambdas in a def header's defaults, bodies on a header line and class-body
-// bindings. v7 matches a method header's names by their NFKC form. v8 records global/nonlocal names, `del` targets, rebound and decorated class-body names. v9 records decorated module functions and literal module/member writes as negative binding evidence.
+// bindings. v7 matches a method header's names by their NFKC form. v8 records global/nonlocal names, `del` targets, rebound and decorated class-body names. v9 records decorated module functions and literal module/member writes as negative binding evidence. v10 reads calls on bracket-continuation lines and inside f- and t-string replacement fields.
 func (a *Adapter) Profile() parser.Profile {
-	return parser.NewProfile("python", "python-regex:python:v9", true)
+	return parser.NewProfile("python", "python-regex:python:v10", true)
 }
