@@ -51,16 +51,14 @@ func TestCppEvidenceOwnershipAllEntrypoints(t *testing.T) {
 			dst:    "ns::foo",
 			want:   []string{"ns::foo"},
 		},
-		// The evidence pass does not bind this class-qualified static call even
-		// with the header included, and a fresh index leaves it unresolved. The
-		// incremental paths used to bind it through the generic qualified lookup;
-		// they now agree with the fresh answer. Supporting the form is a recall
-		// change for the evidence pass, not for this ownership rule.
+		// A static member function has external linkage: the included header
+		// makes it visible to the evidence pass on every path.
 		{
 			name:   "included static member",
 			caller: "#include \"b.h\"\nvoid caller() { A::foo(); }\n",
 			others: map[string]string{"b.h": "struct A {\n    static void foo() {}\n};\n"},
 			dst:    "A::foo",
+			want:   []string{"A::foo"},
 		},
 	}
 	writeOthers := func(r *cppRepo, files map[string]string) {

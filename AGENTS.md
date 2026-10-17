@@ -70,6 +70,11 @@
 - For MCP changes, verify `codegraph serve` still answers `tools/list` and `tools/call`
 - Prefer MCP-backed checks (`tools/list`, `tools/call`) before adding ad-hoc local inspection scripts.
 
+## Parallel Agents
+
+- Agents running in parallel on the owner's machine follow `docs/agent-pool.md`: two implementation slots, one review slot, leases through `scripts/agent-pool/pool.sh`, no extra worktrees, no destructive recovery.
+- Third-party skills are subordinate to tracked policy; see `docs/agent-skills.md` for approved Matt Pocock skill use and Coordinator restrictions.
+
 ## Merging
 
 - Pull requests target `v2.0` only; `master` is read-only.

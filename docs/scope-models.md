@@ -110,7 +110,7 @@ A bare call binds a target only under these conditions:
 
 A qualified call (`ns::f()`, `::f()`) matches the exact qualified identity, with the same file and include visibility.
 
-In both cases exactly one eligible candidate must remain, and every declaration and definition of that identity must share one signature, so overloads are refused. `static` functions in other files, enums, and test-only definitions called from production code are never targets.
+In both cases exactly one eligible candidate must remain, and every declaration and definition of that identity must share one signature, so overloads are refused. Non-member `static` functions in other files, enums, and test-only definitions called from production code are never targets.
 
 Not modelled:
 - macro expansion
@@ -120,7 +120,7 @@ Not modelled:
 - template instantiation
 - `using` and namespace aliases
 
-A class-qualified call such as `A::foo()` stays unresolved when the static member's body is written inside the class definition in another file. It binds when the header only declares the member and the definition is out of line.
+A class-qualified call such as `A::foo()` to a static member defined in another file binds when the caller includes the file that defines it or a header that declares it, whether the body is written inside the class definition or out of line. Without such an include it stays unresolved.
 
 ## Java
 

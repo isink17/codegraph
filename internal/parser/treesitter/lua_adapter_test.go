@@ -27,20 +27,13 @@ require(moduleName)
 		got[s.StableKey] = s.Kind
 	}
 	for key, kind := range map[string]string{
-		"func:lua:local:localFn":    "function",
-		"func:lua:global:globalFn":  "function",
-		"func:lua:global:M.tableFn": "function",
-		"func:lua:global:M.method":  "method",
+		"func:lua:local:localFn:1:1":    "function",
+		"func:lua:global:globalFn:2:1":  "function",
+		"func:lua:global:M.tableFn:3:1": "function",
+		"func:lua:global:M.method:4:1":  "method",
 	} {
-		found := false
-		for gotKey, gotKind := range got {
-			if gotKind == kind && strings.HasPrefix(gotKey, key+":") {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("no symbol with declaration identity for %q and kind %q", key, kind)
+		if got[key] != kind {
+			t.Errorf("symbol %q = %q, want %q", key, got[key], kind)
 		}
 	}
 	// A computed require can load the debug library, so this file proves no

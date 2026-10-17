@@ -230,4 +230,9 @@ func (a *SwiftAdapter) Profile() parser.Profile {
 func (a *PHPAdapter) Profile() parser.Profile {
 	return parser.NewProfile("php", "treesitter:php:v4", true)
 }
-func (a *CppAdapter) Profile() parser.Profile { return tsProfile("cpp") }
+
+// C++ v2 no longer marks a static member function defined in its class body
+// as file-local, so it can bind from another file that includes it.
+func (a *CppAdapter) Profile() parser.Profile {
+	return parser.NewProfile("cpp", "treesitter:cpp:v2", true)
+}
