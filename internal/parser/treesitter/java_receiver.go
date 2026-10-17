@@ -278,3 +278,106 @@ func javaTypeSignature(node *sitter.Node, content []byte) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// javaFieldReceiverEvidence reports whether a call's receiver, `x` that no
+// local binds or `this.x`, names a field the body of the call's own class
+// declares, and if so graph.JavaFieldReceiverEvidence plus ";Type" for that
+// field's stated class or interface type. A field the class declares hides
+// every inherited and enclosing field of that name. Only a named class's
+// body counts; a field an anonymous, local or enum body declares, or one
+// the class inherits or an enclosing class declares, is not marked. A bare
+// receiver is also not marked when anything in the calling member declares
+// a variable of that name, pattern bindings included.
+func javaFieldReceiverEvidence(call, obj *sitter.Node, content []byte) (string, bool) {
+	if obj == nil {
+		return "", false
+	}
+	var name string
+	bare := false
+	switch obj.Type() {
+	case "identifier":
+		name, bare = nodeText(obj, content), true
+	case "field_access":
+		o, f := childByFieldName(obj, "object"), childByFieldName(obj, "field")
+		if o == nil || o.Type() != "this" || f == nil || f.Type() != "identifier" {
+			return "", false
+		}
+		name = nodeText(f, content)
+	default:
+		return "", false
+	}
+	if javaCallInNestedClassBody(call) {
+		return "", false
+	}
+	var body, member *sitter.Node
+	for prev, n := call, call.Parent(); n != nil && body == nil; prev, n = n, n.Parent() {
+		switch n.Type() {
+		case "class_body":
+			body, member = n, prev
+		case "program", "interface_body", "enum_body", "enum_body_declarations", "annotation_type_body":
+			return "", false
+		}
+	}
+	if body == nil || body.Parent() == nil || body.Parent().Type() != "class_declaration" {
+		return "", false
+	}
+	if bare && javaDeclaresVariable(member, name, content) {
+		return "", false
+	}
+	typ, found := javaFieldType(body, name, content)
+	if !found {
+		return "", false
+	}
+	spelling := javaReceiverTypeSpelling(typ, content)
+	if spelling == "" || javaTypeVariableInScope(call, spelling, content) || javaLocalTypeShadows(call, spelling, content) {
+		return "", false
+	}
+	return graph.JavaFieldReceiverEvidence + ";" + spelling, true
+}
+
+// javaFieldType finds the one field declaration of name in a class body; a
+// duplicate (a recovered parse) finds none. A declarator with its own
+// dimensions declares an array: found, but no type.
+func javaFieldType(body *sitter.Node, name string, content []byte) (*sitter.Node, bool) {
+	var out *sitter.Node
+	n := 0
+	for i := range int(body.NamedChildCount()) {
+		if decl := body.NamedChild(i); decl.Type() == "field_declaration" {
+			if typ, ok := javaDeclaratorBefore(decl, nil, name, content); ok {
+				out = typ
+				n++
+			}
+		}
+	}
+	return out, n == 1
+}
+
+// javaDeclaresVariable reports whether anything under node declares a
+// variable, parameter or pattern binding named name, in scope or not.
+func javaDeclaresVariable(node *sitter.Node, name string, content []byte) bool {
+	if node == nil {
+		return false
+	}
+	switch node.Type() {
+	case "variable_declarator", "formal_parameter", "catch_formal_parameter", "resource", "enhanced_for_statement", "instanceof_expression":
+		if javaNameIs(childByFieldName(node, "name"), name, content) {
+			return true
+		}
+	case "type_pattern", "record_pattern_component", "inferred_parameters":
+		for i := range int(node.NamedChildCount()) {
+			if c := node.NamedChild(i); c.Type() == "identifier" && javaNameIs(c, name, content) {
+				return true
+			}
+		}
+	case "lambda_expression":
+		if p := childByFieldName(node, "parameters"); p != nil && p.Type() == "identifier" && javaNameIs(p, name, content) {
+			return true
+		}
+	}
+	for i := range int(node.NamedChildCount()) {
+		if javaDeclaresVariable(node.NamedChild(i), name, content) {
+			return true
+		}
+	}
+	return false
+}

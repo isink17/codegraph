@@ -86,7 +86,7 @@ func resolveJavaScope(ctx context.Context, q javaQuery, repoID int64, only map[i
 	importFiles := map[int64]struct{}{}
 	for _, e := range edges {
 		importFiles[e.file] = struct{}{}
-		_, receiverType, _ := strings.Cut(e.evidence, graph.JavaLocalReceiverEvidence+";")
+		receiverType, _ := javaReceiverEvidence(e.evidence)
 		for _, part := range strings.FieldsFunc(e.name+"."+receiverType, func(r rune) bool { return r == '.' || r == '$' }) {
 			if part != "" {
 				scopeNames[part] = struct{}{}
@@ -630,8 +630,8 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 		// owner names a local type, which hides every recorded type.
 		return javaScopeSymbol{}, ""
 	}
-	if e.evidence == graph.JavaLocalReceiverEvidence || strings.HasPrefix(e.evidence, graph.JavaLocalReceiverEvidence+";") {
-		// The receiver is a local or parameter, never a type name (JLS 6.4.2).
+	if _, ok := javaReceiverEvidence(e.evidence); ok {
+		// The receiver is a local, parameter or field, never a type name (JLS 6.4.2).
 		return javaReceiverMember(e, byQName, byName, imps, importFiles)
 	}
 	if strings.HasPrefix(name, "this.") {
@@ -745,8 +745,9 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 
 // javaObjectMethodName reports whether name is a method java.lang.Object
 // declares, which every class and interface has in scope (JLS 4.3.2, 9.2).
-// javaReceiverMember binds a call on a local or parameter whose declaration
-// states its type (graph.JavaLocalReceiverEvidence). That declared type is
+// javaReceiverMember binds a call on a local, parameter or field whose
+// declaration states its type (graph.JavaLocalReceiverEvidence,
+// graph.JavaFieldReceiverEvidence). That declared type is
 // the receiver's compile-time type whatever the variable later holds. It
 // binds only when the type is one visible project Java class (not an
 // interface, enum or record, whose supertypes add members) declaring exactly
@@ -758,13 +759,13 @@ func javaMember(e javaScopeEdge, byQName map[string][]javaScopeSymbol, byName ma
 // may compete with the class's.
 func javaReceiverMember(e javaScopeEdge, byQName, byName map[string][]javaScopeSymbol, imports map[int64][]javaScopeImport, importFiles map[int64]struct{}) (javaScopeSymbol, string) {
 	imps := imports[e.file]
-	_, typeName, _ := strings.Cut(e.evidence, graph.JavaLocalReceiverEvidence+";")
-	dot := strings.IndexByte(e.name, '.')
+	typeName, _ := javaReceiverEvidence(e.evidence)
+	dot := strings.LastIndexByte(e.name, '.')
 	if typeName == "" || dot < 0 || !e.callArity.Valid {
 		return javaScopeSymbol{}, ""
 	}
 	member := e.name[dot+1:]
-	if member == "" || strings.Contains(member, ".") || javaObjectMethodName(member) {
+	if member == "" || javaObjectMethodName(member) {
 		return javaScopeSymbol{}, ""
 	}
 	owner, ok, _ := javaType(typeName, e.pkg, e.container, byQName, byName, imps)
@@ -802,6 +803,20 @@ func javaReceiverMember(e javaScopeEdge, byQName, byName map[string][]javaScopeS
 		}
 	}
 	return out, ResolutionStrategyJavaReceiverScope
+}
+
+// javaReceiverEvidence reports whether evidence marks a local or field
+// receiver, and the declared type spelling it carries ("" when none).
+func javaReceiverEvidence(evidence string) (string, bool) {
+	for _, k := range []string{graph.JavaLocalReceiverEvidence, graph.JavaFieldReceiverEvidence} {
+		if evidence == k {
+			return "", true
+		}
+		if rest, found := strings.CutPrefix(evidence, k+";"); found {
+			return rest, true
+		}
+	}
+	return "", false
 }
 
 // javaSupertypesInProject reports whether every supertype owner's clause
