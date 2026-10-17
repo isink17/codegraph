@@ -17,8 +17,8 @@ import (
 // runs directly in it -- not for its methods, which skip the class scope.
 // No case may bind an import CPython does not call; where the graph cannot
 // name what CPython calls, the call stays unresolved. headerCalls says whether
-// the adapter reads calls written in a `def` header at all; the regex adapter
-// does not, so it records no edge there.
+// the adapter reads calls written in a `def` header line at all; the regex
+// adapter does not, so it records no edge there.
 func runPythonDefaultClassScopeCases(t *testing.T, reg *parser.Registry, headerCalls bool) {
 	t.Helper()
 	dir := filepath.Join("testdata", "python_default_class_scope")
@@ -75,8 +75,9 @@ func runPythonDefaultClassScopeCases(t *testing.T, reg *parser.Registry, headerC
 		switch {
 		case tc.file == "c_module.py":
 			want = "<no edge>"
-		case !headerCalls && !strings.HasPrefix(tc.file, "c_"):
-			// Every other case calls on a `def` or `class` header line.
+		case !headerCalls && !strings.HasPrefix(tc.file, "c_") && tc.file != "d_multi.py":
+			// Every other case calls on a `def` or `class` header line; the
+			// regex adapter does read d_multi.py's call, on a continued line.
 			want = "<no edge>"
 		}
 		if got := r.edgeState(t, tc.file, tc.dst); !strings.HasPrefix(got, want) {
