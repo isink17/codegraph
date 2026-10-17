@@ -970,3 +970,77 @@ func TestPythonRegexProfileLocalClassEvidenceConverges(t *testing.T) {
 	runPythonLocalClassProfileConvergence(t,
 		pythonLocalClassV7Adapter{Adapter: pyparser.New(), id: "python-regex:python:v7"}, pyparser.New())
 }
+
+const pythonContinuationCallSource = `def helper(x=None):
+    return x
+
+
+def run(value):
+    total = helper(value,
+                   helper(1))
+    label = f"{helper(2)}"
+    return total, label
+`
+
+// pythonCallLinesV9Adapter reproduces what the regex adapter persisted for
+// pythonContinuationCallSource before v10: no call read on a continuation line
+// or inside an f-string replacement field.
+type pythonCallLinesV9Adapter struct {
+	parser.Adapter
+}
+
+func (pythonCallLinesV9Adapter) Profile() parser.Profile {
+	return parser.Profile{ID: "python-regex:python:v9", EmitsCallEdges: true}
+}
+
+func (a pythonCallLinesV9Adapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
+	pf, err := a.Adapter.Parse(ctx, path, content)
+	if err != nil {
+		return pf, err
+	}
+	edges := pf.Edges[:0]
+	for _, e := range pf.Edges {
+		if e.Line == 6 {
+			edges = append(edges, e)
+		}
+	}
+	refs := pf.References[:0]
+	for _, r := range pf.References {
+		if r.Kind != "call" || r.Range.StartLine == 6 {
+			refs = append(refs, r)
+		}
+	}
+	pf.Edges, pf.References = edges, refs
+	return pf, nil
+}
+
+// The new calls are not derivable from the unchanged file's persisted rows, so
+// the v10 bump must reparse it into exactly a from-scratch graph.
+func TestPythonRegexProfileContinuationCallsConverge(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeProfileFile(t, filepath.Join(root, "mod.py"), pythonContinuationCallSource)
+	current := pyparser.New()
+
+	s := newProfileStore(t)
+	if _, err := New(s.Store, parser.NewRegistry(pythonCallLinesV9Adapter{Adapter: pyparser.New()}), nil).Index(ctx, Options{RepoRoot: root}); err != nil {
+		t.Fatalf("old index: %v", err)
+	}
+	if stale := pythonGraph(t, s); strings.Contains(stale, "call|helper@7") || strings.Contains(stale, "call|helper@8") {
+		t.Fatalf("old graph already has the new calls:\n%s", stale)
+	}
+
+	summary, err := New(s.Store, parser.NewRegistry(current), nil).Update(ctx, Options{RepoRoot: root})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if summary.FilesChanged != 1 || strings.Join(summary.ParserProfileLanguages, ",") != "python" {
+		t.Fatalf("profile bump did not reparse the unchanged file: changed=%d languages=%v",
+			summary.FilesChanged, summary.ParserProfileLanguages)
+	}
+	got := pythonGraph(t, s)
+	requireRows(t, got, "upgraded graph", "call|helper@6->mod.helper", "call|helper@7->mod.helper", "call|helper@8->mod.helper")
+	if want := freshPythonGraph(t, root, current); got != want {
+		t.Fatalf("upgraded graph:\n%s\nfrom-scratch graph:\n%s", got, want)
+	}
+}

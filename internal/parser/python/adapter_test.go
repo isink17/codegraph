@@ -436,3 +436,136 @@ func TestKeywordSyntaxIsNotACall(t *testing.T) {
 		t.Fatalf("calls = %q, want %q", strings.Join(got, " "), want)
 	}
 }
+
+// pythonInterpolationSource puts calls inside f- and t-string replacement
+// fields, in every place a field's expression can sit, next to text that only
+// looks like a call: literal text, `{{`-escaped braces, conversions and format
+// specs, a plain string, and the literal lines of a triple-quoted f-string.
+const pythonInterpolationSource = `def helper(x=None):
+    return x
+
+
+def run(value, items, width):
+    a = f"{helper(value)}"
+    b = f"literal helper(value) {{escaped(x)}} {value!r}"
+    c = f"{value:{width}} {helper(value)=}"
+    d = f"{value:%Y-%m-%d} {items[helper(0)]}"
+    e = rf"\\d{helper(1)}" + F'{ {k: helper(k) for k in items} }'
+    g = f"{'nested' + f'{helper(2)}'}"
+    h = f"""
+    {helper(3)}
+    text call(x)
+    """
+    i = "plain {helper(4)}"
+    j = f"{value != helper(5)}"
+    k = f"{value!s:>{helper(6)}}"
+    m = t"{helper(7)} {(lambda q: q)(value)}"
+    return a, b, c, d, e, g, h, i, j, k, m
+`
+
+// A replacement field is an expression, so its calls are calls; everything
+// else in an f-string is text. The expected calls are exactly CPython's ast,
+// less `(lambda q: q)(value)`, whose callee has no name to record.
+func TestInterpolationCallsAreCalls(t *testing.T) {
+	var got []string
+	for _, e := range parseSource(t, pythonInterpolationSource).Edges {
+		got = append(got, e.DstName+"@"+strconv.Itoa(e.Line))
+	}
+	want := "helper@6 helper@8 helper@9 helper@10 helper@10 helper@11 helper@13 helper@17 helper@18 helper@19"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("calls = %q, want %q", strings.Join(got, " "), want)
+	}
+}
+
+// pythonContinuationSource spreads statements over bracket-continued lines:
+// call arguments, a list display, a method chain and a multi-line case
+// pattern with its guard.
+const pythonContinuationSource = `from os import (
+    path,
+    sep,
+)
+
+
+def helper(x=None):
+    return x
+
+
+class Point:
+    pass
+
+
+def run(value, items):
+    total = helper(value,
+                   helper(items))
+    data = [
+        helper(1),
+        helper(2),
+    ]
+    result = (helper(value)
+              .strip()
+              .lower())
+    match value:
+        case Point(
+            x=Point(),
+        ) if helper(3):
+            pass
+    return total, data, result
+`
+
+// A line continuing an open bracket still makes the calls written on it. The
+// expected calls are CPython's ast with two refusals: a chain continued from
+// an earlier line (`.strip()`) has no name to record, and a case header
+// continued over lines -- pattern and guard -- is skipped whole, so the guard's
+// helper@28 is a known omission rather than a pattern read as calls.
+func TestContinuationLineCallsAreCalls(t *testing.T) {
+	var got []string
+	for _, e := range parseSource(t, pythonContinuationSource).Edges {
+		got = append(got, e.DstName+"@"+strconv.Itoa(e.Line))
+	}
+	want := "helper@16 helper@17 helper@19 helper@20 helper@22"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("calls = %q, want %q", strings.Join(got, " "), want)
+	}
+}
+
+// Field delimiters, literal text and specs separate a name from a following
+// field that starts with `(`, and a backslash never escapes a brace, so none of
+// these lines calls anything CPython's ast does not.
+func TestInterpolationGapsAreNotCalls(t *testing.T) {
+	src := `def run(x, y, a, b, c, w, re):
+    s = f"total: {(x + y)}"
+    u = t"{a}{(b or c)}"
+    v = rf"{x:{(w)}}"
+    p = re.compile(rf"\{{name(x)}}")
+    q = f"\{{bar()}}"
+    r = f"\{helper(x)}"
+    return s, u, v, p, q, r
+`
+	var got []string
+	for _, e := range parseSource(t, src).Edges {
+		got = append(got, e.DstName+"@"+strconv.Itoa(e.Line))
+	}
+	want := "re.compile@5 helper@7"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("calls = %q, want %q", strings.Join(got, " "), want)
+	}
+}
+
+// The lines of a triple-quoted f-string belong to the body that opens it, so
+// a nested function's range covers the fields written on them.
+func TestTripleQuotedFieldStaysInItsFunction(t *testing.T) {
+	src := "def outer():\n    def inner():\n        return f\"\"\"\n{compute()}\n\"\"\"\n    pass\n"
+	pf := parseSource(t, src)
+	var calls []string
+	for _, e := range pf.Edges {
+		calls = append(calls, e.DstName+"@"+strconv.Itoa(e.Line))
+	}
+	if strings.Join(calls, " ") != "compute@4" {
+		t.Fatalf("calls = %q, want compute@4", strings.Join(calls, " "))
+	}
+	for _, s := range pf.Symbols {
+		if s.Name == "inner" && s.Range.EndLine != 5 {
+			t.Fatalf("inner ends at line %d, want 5", s.Range.EndLine)
+		}
+	}
+}
