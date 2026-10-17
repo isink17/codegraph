@@ -85,10 +85,16 @@ func TestGoAdapterParity(t *testing.T) {
 		}
 		var nativeLocals, sitterLocals []string
 		for _, b := range native.Scope.GoLocals {
-			nativeLocals = append(nativeLocals, fmt.Sprintf("local %s [%d-%d] %s|%s|%s ptr=%v", b.Name, b.ScopeStartLine, b.ScopeEndLine, b.TypeName, b.TypePackage, b.TypeImportPath, b.Pointer))
+			nativeLocals = append(nativeLocals, fmt.Sprintf("local %s [%d-%d] %s|%s|%s ptr=%v init=%s|%s", b.Name, b.ScopeStartLine, b.ScopeEndLine, b.TypeName, b.TypePackage, b.TypeImportPath, b.Pointer, b.InitFunction, b.InitImportPath))
+		}
+		for _, r := range native.Scope.GoFunctionResults {
+			nativeLocals = append(nativeLocals, "result "+r.Function+" "+r.TypeName+"|"+r.TypeImportPath)
 		}
 		for _, b := range sitter.Scope.GoLocals {
-			sitterLocals = append(sitterLocals, fmt.Sprintf("local %s [%d-%d] %s|%s|%s ptr=%v", b.Name, b.ScopeStartLine, b.ScopeEndLine, b.TypeName, b.TypePackage, b.TypeImportPath, b.Pointer))
+			sitterLocals = append(sitterLocals, fmt.Sprintf("local %s [%d-%d] %s|%s|%s ptr=%v init=%s|%s", b.Name, b.ScopeStartLine, b.ScopeEndLine, b.TypeName, b.TypePackage, b.TypeImportPath, b.Pointer, b.InitFunction, b.InitImportPath))
+		}
+		for _, r := range sitter.Scope.GoFunctionResults {
+			sitterLocals = append(sitterLocals, "result "+r.Function+" "+r.TypeName+"|"+r.TypeImportPath)
 		}
 		sort.Strings(nativeLocals)
 		sort.Strings(sitterLocals)
@@ -124,5 +130,27 @@ func run() {
 	}
 	if got, want := byName["u"], "|Unknown|"; got != want {
 		t.Errorf("own-package receiver type = %q, want %q", got, want)
+	}
+}
+
+// TestGoInitializerEvidenceTreeSitter holds the tree-sitter adapter to the
+// initializer expectations the go/ast adapter is held to.
+func TestGoInitializerEvidenceTreeSitter(t *testing.T) {
+	pf, err := NewGo().Parse(context.Background(), "main.go", []byte(gofixture.GoInitializerSource))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	locals, results, chained := gofixture.RenderGoInitializerEvidence(pf)
+	for _, c := range []struct {
+		what      string
+		got, want []string
+	}{
+		{"locals", locals, gofixture.GoInitializerLocals},
+		{"results", results, gofixture.GoInitializerResults},
+		{"chained calls", chained, gofixture.GoInitializerChainedCalls},
+	} {
+		if strings.Join(c.got, "\n") != strings.Join(c.want, "\n") {
+			t.Errorf("%s:\n got:\n  %s\nwant:\n  %s", c.what, strings.Join(c.got, "\n  "), strings.Join(c.want, "\n  "))
+		}
 	}
 }

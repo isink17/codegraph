@@ -2180,6 +2180,7 @@ const fileGraphRowsPredicate = `(
 	OR EXISTS (SELECT 1 FROM rust_module_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM rust_value_item_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM go_local_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM go_function_result_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM file_scope_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM file_tokens t WHERE t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM test_links t WHERE t.test_file_id = f.id)
@@ -2470,6 +2471,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM go_local_binding_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM go_function_result_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2640,6 +2644,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM go_local_binding_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM go_function_result_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2879,21 +2886,30 @@ func insertParsedFileGraph(
 		}
 	}
 	if len(parsed.Scope.GoLocals) > 0 {
-		const goLocalCols = "repo_id, file_id, name, scope_start_line, scope_end_line, type_name, type_package, type_import_path, is_pointer"
-		args := make([]any, 0, min(len(parsed.Scope.GoLocals), sqliteImportValuesBatchRows)*9)
+		const goLocalCols = "repo_id, file_id, name, scope_start_line, scope_end_line, type_name, type_package, type_import_path, is_pointer, init_function, init_import_path"
+		args := make([]any, 0, min(len(parsed.Scope.GoLocals), sqliteImportValuesBatchRows)*11)
 		for _, local := range parsed.Scope.GoLocals {
-			args = append(args, repoID, fileID, local.Name, local.ScopeStartLine, local.ScopeEndLine, local.TypeName, local.TypePackage, local.TypeImportPath, boolInt(local.Pointer))
-			if len(args) >= sqliteImportValuesBatchRows*9 {
-				if err := execBatchInsert(ctx, tx, "go_local_binding_evidence", goLocalCols, 9, args, stats); err != nil {
+			args = append(args, repoID, fileID, local.Name, local.ScopeStartLine, local.ScopeEndLine, local.TypeName, local.TypePackage, local.TypeImportPath, boolInt(local.Pointer), local.InitFunction, local.InitImportPath)
+			if len(args) >= sqliteImportValuesBatchRows*11 {
+				if err := execBatchInsert(ctx, tx, "go_local_binding_evidence", goLocalCols, 11, args, stats); err != nil {
 					return nil, err
 				}
 				args = args[:0]
 			}
 		}
 		if len(args) > 0 {
-			if err := execBatchInsert(ctx, tx, "go_local_binding_evidence", goLocalCols, 9, args, stats); err != nil {
+			if err := execBatchInsert(ctx, tx, "go_local_binding_evidence", goLocalCols, 11, args, stats); err != nil {
 				return nil, err
 			}
+		}
+	}
+	if len(parsed.Scope.GoFunctionResults) > 0 {
+		args := make([]any, 0, len(parsed.Scope.GoFunctionResults)*5)
+		for _, r := range parsed.Scope.GoFunctionResults {
+			args = append(args, repoID, fileID, r.Function, r.TypeName, r.TypeImportPath)
+		}
+		if err := execBatchInsert(ctx, tx, "go_function_result_evidence", "repo_id, file_id, function_name, type_name, type_import_path", 5, args, stats); err != nil {
+			return nil, err
 		}
 	}
 	if len(parsed.Scope.SwiftLexicalBindings) > 0 {
@@ -5281,6 +5297,12 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 			}
 		}
 	}
+
+	goInitNames, err := s.invalidateGoInitializerBindings(ctx, repoID, names)
+	if err != nil {
+		return ResolveEdgesForNamesStats{}, err
+	}
+	names = mergeResolverNames(names, goInitNames)
 
 	invalidateStarted := time.Now()
 	invalidated, err := s.invalidateNameEvidenceBindings(ctx, repoID, names, scopes.rustFiles, rubyChanged, languageScope)

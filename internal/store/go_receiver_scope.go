@@ -26,16 +26,26 @@ import (
 //
 // The second is the bind. Where the syntax states the local's type outright,
 // `go_receiver_scope` resolves the call to the one method of that name on that
-// type in a proven package. Where it does not -- `s := NewStore()`, a range
+// type in a proven package. Where it does not -- `s, err := Load()`, a range
 // variable, a type-switch binding -- the edge stays unresolved. That is the
 // intended outcome, not a gap to close later by guessing: the evidence that
 // proves `x` is local is exactly the evidence that proves it is not the package
 // it is spelled like, and a wrong high-confidence edge costs more than a
 // missing one.
 //
-// Deliberately not inferred here: return types (`s := NewStore()`), field types,
-// interface implementations, embedded/promoted methods, and anything else
-// needing dataflow. Each is a separate slice.
+// A local with no spelled type is typed through its initializer only when the
+// initializer is a call of a package-level function (`s := NewStore()`,
+// `s := pkg.NewStore()`, and the receiver `NewStore()` of `NewStore().Close()`)
+// that is the one non-method declaration of its name in the package it names,
+// is not generic, and has exactly one named result type. The result type is
+// read from that function's own file, so a qualifier in it follows that file's
+// imports. Multi-value initializers, method calls, function values, type
+// assertions and interface results bind nothing: an interface's methods are not
+// symbols here, so a call on one has no candidate.
+//
+// Deliberately not inferred here: field types, interface implementations,
+// embedded/promoted methods, and anything else needing dataflow. Each is a
+// separate slice.
 //
 // Pointer/value method sets: no filtering, and that is the correct answer for
 // the shapes this evidence proves rather than a gap. Every local this file can
@@ -91,12 +101,14 @@ func goSelectorQualifier(dstName string) (qualifier, method string, ok bool) {
 
 // goLocalBinding is one row of go_local_binding_evidence.
 type goLocalBinding struct {
-	name       string
-	startLine  int
-	endLine    int
-	typeName   string
-	typePkg    string
-	importPath string
+	name           string
+	startLine      int
+	endLine        int
+	typeName       string
+	typePkg        string
+	importPath     string
+	initFunction   string
+	initImportPath string
 }
 
 // goReceiverEdge is an unresolved Go selector call whose qualifier some binding
@@ -168,7 +180,7 @@ func (s *Store) resolveGoReceiverScopeWithBound(ctx context.Context, q execQueri
 
 	typed := make([]goReceiverEdge, 0, len(edges))
 	for _, e := range edges {
-		if e.binding.typeName == "" {
+		if e.binding.typeName == "" && e.binding.initFunction == "" {
 			continue
 		}
 		if scope != nil {
@@ -211,21 +223,84 @@ func (s *Store) resolveGoReceiverScopeWithBound(ctx context.Context, q execQueri
 	// import leaves this repository.
 	type target struct {
 		dir      string
-		pkg      string // caller's package, own-package edges only
+		pkg      string // required package name, when the type is read unqualified
 		ownPkg   bool
 		typeName string
 		method   string
 	}
+
+	// Initializer functions are looked up in one query over every name the
+	// batch needs, then each edge keeps the one function its call names.
+	var functions map[string][]goInitFunction
+	initNames := map[string]struct{}{}
+	for _, e := range typed {
+		if e.binding.initFunction != "" {
+			initNames[e.binding.initFunction] = struct{}{}
+		}
+	}
+	if len(initNames) > 0 {
+		functions, err = goInitFunctions(ctx, q, repoID, initNames)
+		if err != nil {
+			return 0, bound, err
+		}
+	}
+
 	targets := make(map[int64]target, len(typed))
 	wanted := make(map[string]struct{}, len(typed))
 	for _, e := range typed {
 		t := target{typeName: e.binding.typeName, method: e.method}
+		callerDir := path.Dir(e.filePath)
 		switch {
+		case e.binding.initFunction != "":
+			fnDir, fnPkg := callerDir, e.callerPk
+			if e.binding.initImportPath != "" {
+				if err := loadModules(); err != nil {
+					return 0, bound, err
+				}
+				dir, ok := modulePackageDir(modules, e.binding.initImportPath)
+				if !ok {
+					continue
+				}
+				fnDir, fnPkg = dir, ""
+			} else if fnPkg == "" {
+				continue
+			}
+			var only goInitFunction
+			found := 0
+			for _, fn := range functions[fnDir+"\x00"+e.binding.initFunction] {
+				if fnPkg != "" && fn.pkg != fnPkg {
+					continue
+				}
+				// The caller-kind rule of the method candidates below, applied
+				// to the declaration that names the type.
+				if fn.isTest && (e.binding.initImportPath != "" || !e.isTest) {
+					continue
+				}
+				found++
+				only = fn
+			}
+			if found != 1 || only.kind != "function" || only.resultType == "" {
+				continue
+			}
+			t.typeName = only.resultType
+			if only.resultImportPath == "" {
+				t.dir, t.pkg = fnDir, only.pkg
+				t.ownPkg = fnDir == callerDir && only.pkg == e.callerPk
+				break
+			}
+			if err := loadModules(); err != nil {
+				return 0, bound, err
+			}
+			dir, ok := modulePackageDir(modules, only.resultImportPath)
+			if !ok {
+				continue
+			}
+			t.dir = dir
 		case e.binding.typePkg == "":
 			if e.callerPk == "" {
 				continue
 			}
-			t.dir = path.Dir(e.filePath)
+			t.dir = callerDir
 			t.pkg = e.callerPk
 			t.ownPkg = true
 		default:
@@ -262,7 +337,7 @@ func (s *Store) resolveGoReceiverScopeWithBound(ctx context.Context, q execQueri
 		var only goReceiverCandidate
 		found := 0
 		for _, c := range candidates[t.dir+"\x00"+t.typeName+"\x00"+t.method] {
-			if t.ownPkg && c.pkg != t.pkg {
+			if t.pkg != "" && c.pkg != t.pkg {
 				continue
 			}
 			// Same caller-kind rule the rest of the resolver uses: a test
@@ -327,7 +402,8 @@ func goReceiverScopeEdges(ctx context.Context, q execQuerier, repoID int64) ([]g
 		SELECT e.id, e.file_id, f.path, e.line, e.dst_name,
 		       COALESCE(src.qualified_name, ''),
 		       g.name, g.scope_start_line, g.scope_end_line,
-		       g.type_name, g.type_package, g.type_import_path
+		       g.type_name, g.type_package, g.type_import_path,
+		       g.init_function, g.init_import_path
 		FROM edges e
 		JOIN files f ON f.id = e.file_id AND f.repo_id = e.repo_id
 		JOIN go_local_binding_evidence g
@@ -352,7 +428,8 @@ func goReceiverScopeEdges(ctx context.Context, q execQuerier, repoID int64) ([]g
 		var dstName string
 		var b goLocalBinding
 		if err := rows.Scan(&e.id, &e.fileID, &e.filePath, &e.line, &dstName, &e.callerPk,
-			&b.name, &b.startLine, &b.endLine, &b.typeName, &b.typePkg, &b.importPath); err != nil {
+			&b.name, &b.startLine, &b.endLine, &b.typeName, &b.typePkg, &b.importPath,
+			&b.initFunction, &b.initImportPath); err != nil {
 			return nil, err
 		}
 		qualifier, method, ok := goSelectorQualifier(dstName)
@@ -414,6 +491,66 @@ func goReceiverScopeCandidates(ctx context.Context, q execQuerier, repoID int64,
 	return out, rows.Err()
 }
 
+// goInitFunction is one package-level declaration an initializer call could
+// name. Every non-method kind is loaded so a value or type of the same name in
+// the package makes the call undecidable instead of letting the function win.
+type goInitFunction struct {
+	kind             string
+	pkg              string
+	isTest           bool
+	resultType       string
+	resultImportPath string
+}
+
+// goInitFunctions loads the Go non-method declarations named in names, keyed by
+// directory and name, with the recorded result type of each function.
+func goInitFunctions(ctx context.Context, q execQuerier, repoID int64, names map[string]struct{}) (map[string][]goInitFunction, error) {
+	list := make([]any, 0, len(names))
+	for name := range names {
+		list = append(list, name)
+	}
+	out := map[string][]goInitFunction{}
+	for start := 0; start < len(list); start += sqliteInClauseBatchSize {
+		chunk := list[start:min(start+sqliteInClauseBatchSize, len(list))]
+		rows, err := q.QueryContext(ctx, `
+			SELECT s.kind, s.name, s.qualified_name, f.path,
+			       COALESCE(r.type_name, ''), COALESCE(r.type_import_path, ''), COUNT(r.id)
+			FROM symbols s
+			JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
+			LEFT JOIN go_function_result_evidence r
+			  ON s.kind = 'function' AND r.repo_id = s.repo_id AND r.file_id = s.file_id AND r.function_name = s.name
+			WHERE s.repo_id = ? AND s.language = 'go' AND s.kind <> 'method'
+			  AND s.name IN (`+placeholders(len(chunk))+`)
+			GROUP BY s.id
+		`, append([]any{repoID}, chunk...)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var fn goInitFunction
+			var name, qualified, filePath string
+			var results int
+			if err := rows.Scan(&fn.kind, &name, &qualified, &filePath, &fn.resultType, &fn.resultImportPath, &results); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if results != 1 {
+				fn.resultType, fn.resultImportPath = "", ""
+			}
+			fn.pkg = goPackageNameOf(qualified)
+			fn.isTest = IsTestFilePath(filePath)
+			key := path.Dir(filePath) + "\x00" + name
+			out[key] = append(out[key], fn)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func insertGoReceiverRows(ctx context.Context, q execQuerier, rows [][]any) error {
 	for start := 0; start < len(rows); start += 400 {
 		end := min(start+400, len(rows))
@@ -466,6 +603,73 @@ func goLocalQualifierClaims(ctx context.Context, q execQuerier, repoID int64) (m
 		claims[id] = struct{}{}
 	}
 	return claims, rows.Err()
+}
+
+// invalidateGoInitializerBindings returns the spelling of every Go call whose
+// receiver binding is initialized by a call of one of names, so the batch
+// decides it again, and unbinds the ones go_receiver_scope bound. The answer
+// depends on the called function's declaration and result, which can change in
+// a file the caller never touches -- turning an unresolved call bindable as
+// much as a bound one stale -- while the destination method stays put.
+func (s *Store) invalidateGoInitializerBindings(ctx context.Context, repoID int64, names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	var present int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM go_local_binding_evidence WHERE repo_id = ? AND init_function <> '')`, repoID).Scan(&present)
+	if err != nil || present == 0 {
+		return nil, err
+	}
+	spellings := map[string]struct{}{}
+	var stale []int64
+	for start := 0; start < len(names); start += sqliteInClauseBatchSize {
+		chunk := names[start:min(start+sqliteInClauseBatchSize, len(names))]
+		args := []any{repoID}
+		for _, name := range chunk {
+			args = append(args, name)
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT DISTINCT e.id, e.dst_name, e.dst_symbol_id IS NOT NULL
+			FROM go_local_binding_evidence g
+			JOIN edges e ON e.repo_id = g.repo_id AND e.file_id = g.file_id
+			 AND e.line BETWEEN g.scope_start_line AND g.scope_end_line
+			 AND substr(e.dst_name, 1, instr(e.dst_name, '.') - 1) = g.name
+			WHERE g.repo_id = ? AND g.init_function IN (`+placeholders(len(chunk))+`)
+			  AND (e.dst_symbol_id IS NULL OR e.resolution_strategy = '`+ResolutionStrategyGoReceiverScope+`')
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var name string
+			var bound bool
+			if err := rows.Scan(&id, &name, &bound); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			spellings[name] = struct{}{}
+			if bound {
+				stale = append(stale, id)
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, chunk := range chunkInt64s(stale, sqliteInClauseBatchSize) {
+		args := []any{repoID}
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET `+resolverClearResolutionSQL+`
+			WHERE repo_id = ? AND id IN (`+placeholders(len(chunk))+`)`, args...); err != nil {
+			return nil, err
+		}
+	}
+	return sortedKeys(spellings), nil
 }
 
 // goReceiverScopeModules reads the repository's module declarations, the same
