@@ -22,9 +22,14 @@ Publishing for later releases.
 1. Create and push the approved `v2.0.0` git tag. Do not retag different
    release bytes.
 2. Let the GitHub release workflow build and test all six native targets.
+   Before its asset guard runs, the workflow stages the npm package version
+   from the tag (`v2.0.0` becomes `2.0.0`) in its own working copy with
+   `npm version --no-git-tag-version`; a tag that is not `vMAJOR.MINOR.PATCH`
+   fails the release. Nothing is committed, so `npm/package.json` stays
+   `0.0.0-dev` in source and the workflow does not publish to npm.
 3. Confirm the GitHub Release is public and its complete asset set is uploaded.
 4. From a clean checkout of that exact `v2.0.0` tag, stage npm package version
-   `2.0.0` locally. This edits `npm/package.json` and `npm/package-lock.json`;
+   `2.0.0` locally, as the workflow did in its own working copy. This edits `npm/package.json` and `npm/package-lock.json`;
    do not commit these release-preparation version edits. Revert them after
    publication if the checkout is kept.
 5. Complete every pre-publication check below, including the six-asset checksum

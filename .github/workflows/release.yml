@@ -174,6 +174,25 @@ jobs:
 
           tail -n +2 release-notes-full.md > release-notes.md
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # npm/package.json stays 0.0.0-dev in source; the release version is staged
+      # from the immutable tag in this job's working copy only and never committed.
+      - name: Stage npm package version from the release tag
+        shell: bash
+        working-directory: npm
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "v${version}" != "${GITHUB_REF_NAME}" || ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release tag ${GITHUB_REF_NAME} is not vMAJOR.MINOR.PATCH; refusing to stage an npm version" >&2
+            exit 1
+          fi
+          npm version "${version}" --no-git-tag-version --ignore-scripts
+
       - name: Verify complete native asset set and checksums
         shell: bash
         run: |
