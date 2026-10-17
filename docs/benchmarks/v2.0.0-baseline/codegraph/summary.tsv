@@ -1,0 +1,5 @@
+scenario	n	p50_ms	p95_ms	max_ms	max_rss_mib
+cold_index	5	101080	101810	101810	1018
+edit_update_go	10	45620	45980	45980	138
+edit_update_py	10	43700	46230	46230	137
+noop_update	10	280	330	330	83

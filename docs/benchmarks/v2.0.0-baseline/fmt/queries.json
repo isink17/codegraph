@@ -1,0 +1,151 @@
+{
+  "schema": "codegraph.query_bench/v1",
+  "repository": {
+    "root": "<corpus>",
+    "files": 122,
+    "symbols": 5660,
+    "edges": 16348,
+    "references": 18010
+  },
+  "runs": 20,
+  "warmup": 3,
+  "budget_ms": 50,
+  "results": [
+    {
+      "name": "graph_stats",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 14.551,
+      "p95_ms": 15.247,
+      "max_ms": 15.33,
+      "result_count": 4,
+      "budget_met": true
+    },
+    {
+      "name": "list_files",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 0.046,
+      "p95_ms": 0.053,
+      "max_ms": 0.127,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "symbol_lookup",
+      "status": "measured",
+      "target": "testing::internal::ColoredPrintf",
+      "samples": 20,
+      "p50_ms": 1.624,
+      "p95_ms": 1.635,
+      "max_ms": 1.647,
+      "result_count": 1,
+      "budget_met": true
+    },
+    {
+      "name": "symbol_search",
+      "status": "measured",
+      "target": "ColoredPrintf",
+      "samples": 20,
+      "p50_ms": 0.102,
+      "p95_ms": 0.106,
+      "max_ms": 0.107,
+      "result_count": 1,
+      "budget_met": true
+    },
+    {
+      "name": "find_callers",
+      "status": "measured",
+      "target": "testing::internal::ColoredPrintf",
+      "samples": 20,
+      "p50_ms": 1.957,
+      "p95_ms": 2.017,
+      "max_ms": 2.67,
+      "result_count": 19,
+      "budget_met": true
+    },
+    {
+      "name": "find_callees",
+      "status": "measured",
+      "target": "detail::parse_chrono_format",
+      "samples": 20,
+      "p50_ms": 0.387,
+      "p95_ms": 0.391,
+      "max_ms": 0.409,
+      "result_count": 0,
+      "budget_met": true
+    },
+    {
+      "name": "related_tests",
+      "status": "skipped",
+      "skip_reason": "repository has no resolved test links, so no target file could be selected",
+      "samples": 0,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0,
+      "result_count": 0,
+      "budget_met": false
+    },
+    {
+      "name": "impact_radius",
+      "status": "measured",
+      "target": "testing::internal::ColoredPrintf",
+      "samples": 20,
+      "p50_ms": 6.704,
+      "p95_ms": 6.871,
+      "max_ms": 6.924,
+      "result_count": 34,
+      "budget_met": true
+    },
+    {
+      "name": "trace_dependencies",
+      "status": "measured",
+      "target": "detail::parse_chrono_format",
+      "samples": 20,
+      "p50_ms": 0.177,
+      "p95_ms": 0.184,
+      "max_ms": 0.197,
+      "result_count": 1,
+      "budget_met": true
+    },
+    {
+      "name": "dead_code",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 8.896,
+      "p95_ms": 8.997,
+      "max_ms": 9.103,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "context_for_task",
+      "status": "measured",
+      "target": "ColoredPrintf",
+      "samples": 20,
+      "p50_ms": 4.676,
+      "p95_ms": 5.113,
+      "max_ms": 5.384,
+      "result_count": 13,
+      "budget_met": true
+    },
+    {
+      "name": "architecture_overview",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 33.636,
+      "p95_ms": 33.861,
+      "max_ms": 33.91,
+      "result_count": 7,
+      "budget_met": true
+    }
+  ],
+  "summary": {
+    "measured": 11,
+    "skipped": 1,
+    "within_budget": 11,
+    "over_budget": 0,
+    "slowest": "architecture_overview",
+    "slowest_p95_ms": 33.861
+  }
+}
