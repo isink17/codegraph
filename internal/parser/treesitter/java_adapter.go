@@ -48,6 +48,9 @@ type JavaAdapter struct {
 	// method parameter count, no type supertype signature and no declared
 	// type of a call's local or parameter receiver.
 	legacyReceiverType bool
+	// legacyFieldReceiver reproduces treesitter:java:v13, which did not mark
+	// calls on a field of the calling class.
+	legacyFieldReceiver bool
 }
 
 func NewJava() *JavaAdapter { return &JavaAdapter{} }
@@ -56,69 +59,76 @@ func NewJava() *JavaAdapter { return &JavaAdapter{} }
 // constructor arity facts v4 records. It exists only to reproduce v3
 // databases in profile-transition tests.
 func NewJavaV3() *JavaAdapter {
-	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV4 returns a parser that reports treesitter:java:v4 and does not mark
 // calls inside nested class bodies. It exists only to reproduce v4 databases
 // in profile-transition tests.
 func NewJavaV4() *JavaAdapter {
-	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV5 returns a parser that reports treesitter:java:v5 and spells a
 // generic construction's class with its type arguments. It exists only to
 // reproduce v5 databases in profile-transition tests.
 func NewJavaV5() *JavaAdapter {
-	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV6 returns a parser that reports treesitter:java:v6 and does not mark
 // constructions of a member type the calling class declares. It exists only
 // to reproduce v6 databases in profile-transition tests.
 func NewJavaV6() *JavaAdapter {
-	return &JavaAdapter{legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV7 returns a parser that reports treesitter:java:v7 and records no
 // column on edges. It exists only to reproduce v7 databases in
 // profile-transition tests.
 func NewJavaV7() *JavaAdapter {
-	return &JavaAdapter{legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV8 returns a parser that reports treesitter:java:v8 and does not mark
 // constructions in classes that spell no supertype. It exists only to
 // reproduce v8 databases in profile-transition tests.
 func NewJavaV8() *JavaAdapter {
-	return &JavaAdapter{legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV9 returns a parser that reports treesitter:java:v9 and reads
 // imports from raw text, so `import staticpkg.Bag;` names pkg.Bag. It exists
 // only to reproduce v9 databases in profile-transition tests.
 func NewJavaV9() *JavaAdapter {
-	return &JavaAdapter{legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV10 returns a parser that reports treesitter:java:v10 and does not
 // mark bare calls in classes that spell no supertype. It exists only to
 // reproduce v10 databases in profile-transition tests.
 func NewJavaV10() *JavaAdapter {
-	return &JavaAdapter{legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 // NewJavaV12 returns a parser that reports treesitter:java:v12 and records no
 // receiver type, method arity or type signature. It exists only to reproduce
 // v12 databases in profile-transition tests.
-func NewJavaV12() *JavaAdapter { return &JavaAdapter{legacyReceiverType: true} }
+func NewJavaV12() *JavaAdapter {
+	return &JavaAdapter{legacyReceiverType: true, legacyFieldReceiver: true}
+}
+
+// NewJavaV13 returns a parser that reports treesitter:java:v13 and does not
+// mark calls on a field of the calling class. It exists only to reproduce
+// v13 databases in profile-transition tests.
+func NewJavaV13() *JavaAdapter { return &JavaAdapter{legacyFieldReceiver: true} }
 
 // NewJavaV2 returns a parser that reports treesitter:java:v2 and takes the
 // first `package x;` spelled anywhere in the file, comments and strings
 // included, as its package. It exists only to reproduce v2 databases in
 // profile-transition tests.
 func NewJavaV2() *JavaAdapter {
-	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true}
+	return &JavaAdapter{legacyPackage: true, legacyArity: true, legacyNestedScope: true, legacyGenericConstruction: true, legacyOwnMember: true, legacyLineOnly: true, legacyNoInherited: true, legacyImportText: true, legacyCallSupertype: true, legacyReceiverType: true, legacyFieldReceiver: true}
 }
 
 func (a *JavaAdapter) Language() string     { return "java" }
@@ -145,7 +155,7 @@ func (a *JavaAdapter) Parse(ctx context.Context, path string, content []byte) (g
 
 	javaExtractImports(root, content, &pf, a.legacyImportText)
 	javaExtractSymbols(root, pf.Scope.Package, "", "module", content, &pf)
-	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember, !a.legacyLineOnly, !a.legacyNoInherited, !a.legacyCallSupertype, !a.legacyReceiverType)
+	javaExtractCalls(root, content, &pf, !a.legacyNestedScope, !a.legacyGenericConstruction, !a.legacyOwnMember, !a.legacyLineOnly, !a.legacyNoInherited, !a.legacyCallSupertype, !a.legacyReceiverType, !a.legacyFieldReceiver)
 	if a.legacyReceiverType {
 		for i := range pf.Symbols {
 			switch pf.Symbols[i].Kind {
@@ -448,7 +458,7 @@ func javaVisibility(node *sitter.Node, content []byte) string {
 	return "package"
 }
 
-func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember, markColumn, markNoInherited, markNoSupertype, markReceiver bool) {
+func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, markNested, rawConstruction, markOwnMember, markColumn, markNoInherited, markNoSupertype, markReceiver, markFieldReceiver bool) {
 	for _, creation := range findDescendants(root, "object_creation_expression") {
 		typeNode := childByFieldName(creation, "type")
 		if typeNode == nil {
@@ -485,6 +495,8 @@ func javaExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile, m
 		evidence := nodeText(call, content)
 		obj := childByFieldName(call, "object")
 		if receiver, ok := javaLocalReceiverEvidence(call, obj, content); markReceiver && ok {
+			evidence = receiver
+		} else if receiver, ok := javaFieldReceiverEvidence(call, obj, content); markFieldReceiver && ok {
 			evidence = receiver
 		} else if markNested && (obj == nil || obj.Type() == "this") && javaCallInNestedClassBody(call) {
 			evidence = graph.JavaCallNestedClassScopeEvidence

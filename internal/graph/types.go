@@ -141,6 +141,13 @@ const JavaNoSupertypeCallEvidence = "java:no_supertype_clause"
 // a union or a type variable, and the call binds nothing.
 const JavaLocalReceiverEvidence = "java:local_receiver"
 
+// JavaFieldReceiverEvidence marks a Java call `x.m(...)` or `this.x.m(...)`
+// whose receiver x is a field the calling named class's own body declares,
+// with no local of that name declared in the calling member. Like a local, x
+// is never a type name (JLS 6.4.2). It is always followed by ";" and the
+// field's stated class or interface type, type arguments dropped.
+const JavaFieldReceiverEvidence = "java:field_receiver"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,

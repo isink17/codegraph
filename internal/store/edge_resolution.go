@@ -149,8 +149,8 @@ const (
 	ResolutionStrategyJavaConstructor        = "java_constructor"
 
 	// ResolutionStrategyJavaReceiverScope: the edge is a Java call `x.m(...)`
-	// whose receiver x is a local or parameter whose declaration states its
-	// class type, and that class is the one visible project class of that
+	// whose receiver x is a local, parameter or own-class field whose
+	// declaration states its class type, and that class is the one visible project class of that
 	// name and declares exactly one method of that name the argument count
 	// admits. See javaReceiverMember in java_scope.go.
 	ResolutionStrategyJavaReceiverScope = "java_receiver_scope"
