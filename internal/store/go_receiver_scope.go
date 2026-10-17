@@ -634,7 +634,7 @@ func (s *Store) invalidateGoInitializerBindings(ctx context.Context, repoID int6
 			JOIN edges e ON e.repo_id = g.repo_id AND e.file_id = g.file_id
 			 AND e.line BETWEEN g.scope_start_line AND g.scope_end_line
 			 AND substr(e.dst_name, 1, instr(e.dst_name, '.') - 1) = g.name
-			WHERE g.repo_id = ? AND g.init_function IN (`+placeholders(len(chunk))+`)
+			WHERE g.repo_id = ? AND g.init_function <> '' AND g.init_function IN (`+placeholders(len(chunk))+`)
 			  AND (e.dst_symbol_id IS NULL OR e.resolution_strategy = '`+ResolutionStrategyGoReceiverScope+`')
 		`, args...)
 		if err != nil {

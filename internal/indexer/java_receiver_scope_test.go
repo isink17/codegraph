@@ -69,7 +69,7 @@ func assertJavaReceiverTargets(t *testing.T, r *lifecycleRepo, step string, keyT
 		"app.Use.params|v.key":        {""},
 		"app.Use.params|o.key":        {keyTarget},
 		"app.Use.shadow|field.key":    {keyTarget},
-		"app.Use.viaField|field.solo": {""},
+		"app.Use.viaField|field.solo": {"app.Sub.solo"},
 		"app.Use.generic|t.key":       {""},
 		"app.Use.supers|e.remove":     {""},
 		"app.Use.supers|s2.ping":      {"app.Ser.ping"},
