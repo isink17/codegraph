@@ -6,7 +6,7 @@ with the real CLI on one machine. It sets regression floors derived from those
 measurements. The floors are **local macOS arm64 floors for this machine
 class**, not cross-platform guarantees and not CI budgets (no CI enforcement
 exists). Methodology rules from
-[cg14-benchmark-methodology.md](cg14-benchmark-methodology.md) apply.
+[benchmark-methodology.md](benchmark-methodology.md) apply.
 
 Raw samples: [benchmarks/v2.0.0-baseline/](benchmarks/v2.0.0-baseline/)
 (`samples.tsv` per run, `summary.tsv`, `queries.json` from `bench-queries`).

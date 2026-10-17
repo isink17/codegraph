@@ -957,7 +957,7 @@ Pull requests target the `v2.0` branch. A change that touches only `CHANGELOG.md
 - [Architectural constraints](constraints.md)
 - [Git history](git-history.md)
 - [Kotlin Gradle evidence](gradle-evidence.md)
-- [Benchmark methodology](benchmark-methodology.md)
+- [Benchmark methodology](benchmark-methodology.md) and the [v2.0 performance baseline](performance.md)
 - [AI assistant guidance](ai-assistant-guidance.md)
 - [npm release procedure](../npm/RELEASE.md)
 - [Changelog](../CHANGELOG.md)

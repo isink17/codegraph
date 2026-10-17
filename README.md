@@ -65,6 +65,7 @@ Go, Python, TypeScript, JavaScript, Java, Kotlin, Rust, C#, Ruby, Swift, PHP and
 - [Detailed reference](docs/README-detailed.md): MCP tools and contracts, database behavior and compatibility, CLI, configuration, architecture, known limitations
 - [Changelog](CHANGELOG.md)
 - [Language scope models](docs/scope-models.md)
+- [Performance baseline](docs/performance.md): measured indexing, update and query timings with reproducible commands
 - [Safe to edit](docs/safe-to-edit.md), [constraints](docs/constraints.md), [edge explanations](docs/explain.md), [Git history](docs/git-history.md)
 
 ## License
