@@ -389,6 +389,7 @@ func (s *Store) resolveGoPackageScopedBareNames(ctx context.Context, tx *sql.Tx,
 		  AND f.language = 'go' AND src.language = 'go'
 		  AND NOT `+sqlNotBareName("e.dst_name")+`
 		  AND `+sqlGoHasPackageName("src.qualified_name")+`
+		  AND NOT `+sqlGoLocallyBoundBare+`
 	`, repoID); err != nil {
 		return 0, err
 	}
@@ -442,6 +443,48 @@ func (s *Store) resolveGoPackageScopedBareNames(ctx context.Context, tx *sql.Tx,
 		}
 	}
 	return int(n), nil
+}
+
+// sqlGoLocallyBoundBare holds for a bare call edge `e` whose name a local
+// declaration of the calling file (a variable, a closure, a parameter) binds
+// on the call's line. Go resolves the identifier to that local, never to the
+// package-level declaration of the same name, so the edge must not bind it.
+// Scopes are line ranges: a call on the line that declares the local is
+// withheld even when it names the outer declaration (`f := f()`), which
+// leaves it unresolved rather than wrong.
+const sqlGoLocallyBoundBare = `EXISTS (
+			SELECT 1 FROM go_local_binding_evidence g
+			WHERE g.repo_id = e.repo_id AND g.file_id = e.file_id
+			  AND g.name = e.dst_name
+			  AND e.line BETWEEN g.scope_start_line AND g.scope_end_line)`
+
+// goLocallyBoundBareEdges is the binder's twin of sqlGoLocallyBoundBare: the
+// unresolved bare Go call edges among edgeIDs that a local declaration binds.
+func goLocallyBoundBareEdges(ctx context.Context, q queryContexter, repoID int64, edgeIDs []int64) (map[int64]struct{}, error) {
+	out := map[int64]struct{}{}
+	for _, chunk := range chunkInt64s(edgeIDs, sqliteInClauseBatchSize) {
+		args := []any{repoID}
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := q.QueryContext(ctx, `SELECT e.id FROM edges e
+			WHERE e.repo_id = ? AND e.id IN (`+placeholders(len(chunk))+`) AND `+sqlGoLocallyBoundBare, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[id] = struct{}{}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // goScopeName keys a candidate group by the package it lives in and the name it

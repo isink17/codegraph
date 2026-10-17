@@ -53,11 +53,17 @@ var resolverPolicyRegistry = map[string]int{
 	// package's `errors.Is` through exact_qualified.
 	// Go's 3 maps an import of the repository-root module's own path to the
 	// root package; epoch 2 leaves those calls unresolved.
+	// Go's 4 withholds a bare call whose name a local declaration binds on its
+	// line; epoch 3 may bind a call of a local closure to the package-level
+	// function it shadows.
+	// Java's 2 never reads a local or parameter receiver as a type name (JLS
+	// 6.4.2) and binds calls on explicitly typed ones; epoch 1 may bind such
+	// a receiver spelled like a type to that type's static method.
 	"cpp":        1,
 	"csharp":     4,
 	"dart":       1,
-	"go":         3,
-	"java":       1,
+	"go":         4,
+	"java":       2,
 	"kotlin":     1,
 	"hcl":        1,
 	"lua":        1,
@@ -136,6 +142,27 @@ func (s *Store) PlanResolverPolicies(ctx context.Context, repoID int64, affected
 	}
 	sort.Strings(stale)
 	return stale, nil
+}
+
+// PendingResolverPolicies returns, sorted, the languages with live files whose
+// edges were not decided by the current policy: the next update re-decides
+// them, and until then their edges may be ones the current policy refuses.
+// It reads only, and refuses a marker this binary cannot honour.
+func (s *Store) PendingResolverPolicies(ctx context.Context, repoID int64) ([]string, error) {
+	all := make([]string, 0, len(s.policies()))
+	for language := range s.policies() {
+		all = append(all, language)
+	}
+	sort.Strings(all)
+	present, err := s.languagesWithLiveFiles(ctx, repoID, all)
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[string]bool, len(present))
+	for _, language := range present {
+		live[language] = true
+	}
+	return s.PlanResolverPolicies(ctx, repoID, func(language string) bool { return live[language] })
 }
 
 // parseResolverPolicyVersion accepts only the canonical decimal form this
