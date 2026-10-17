@@ -301,6 +301,7 @@ func (f *lifecycleFixture) parserOwnedRows(rel string) map[string]int {
 		"scope_import_evidence":           `SELECT COUNT(*) FROM scope_import_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
 		"scope_module_candidate_evidence": `SELECT COUNT(*) FROM scope_module_candidate_evidence t JOIN files f ON f.id = t.source_file_id WHERE f.repo_id = ? AND f.path = ?`,
 		"go_local_binding_evidence":       `SELECT COUNT(*) FROM go_local_binding_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
+		"go_function_result_evidence":     `SELECT COUNT(*) FROM go_function_result_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
 		"rust_module_evidence":            `SELECT COUNT(*) FROM rust_module_evidence t JOIN files f ON f.id = t.file_id WHERE f.repo_id = ? AND f.path = ?`,
 		"test_links":                      `SELECT COUNT(*) FROM test_links t JOIN files f ON f.id = t.test_file_id WHERE f.repo_id = ? AND f.path = ?`,
 	} {

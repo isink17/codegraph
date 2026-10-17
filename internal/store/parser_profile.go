@@ -111,6 +111,7 @@ const FileParserOwnedEvidencePredicate = `(
 		OR EXISTS (SELECT 1 FROM rust_module_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM rust_value_item_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM go_local_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+		OR EXISTS (SELECT 1 FROM go_function_result_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM swift_lexical_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM swift_inheritance_relations t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 		OR EXISTS (SELECT 1 FROM swift_declaration_facts t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)

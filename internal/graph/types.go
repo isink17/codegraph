@@ -262,6 +262,7 @@ type ScopeEvidence struct {
 	Modules              []RustModule
 	RustValueItems       []RustValueItem
 	GoLocals             []GoLocalBinding
+	GoFunctionResults    []GoFunctionResult
 	SwiftLexicalBindings []SwiftLexicalBinding
 	JVMFacade            JVMFileFacade
 	// TerraformComplete reports that the HCL adapter parsed this Terraform
@@ -321,10 +322,10 @@ const (
 // answer to the first question, and no answer at all to the second: it vetoes,
 // and it binds nothing.
 //
-// The range is the whole enclosing block, not the span from the declaration
-// onwards. That over-suppresses a use textually above its own `:=` (which Go
-// would reject anyway) and costs nothing a correct program relies on, and it is
-// the one scope rule both Go adapters can compute identically.
+// A receiver, parameter, named result, range or type-switch variable covers
+// its whole construct. A `var`, `const` or `:=` binding covers its block from
+// the line its declaration starts on, so a use above it, which names an outer
+// binding, is not claimed by the inner one.
 type GoLocalBinding struct {
 	Name           string
 	ScopeStartLine int
@@ -347,6 +348,28 @@ type GoLocalBinding struct {
 	// Pointer records that the proven type was a pointer expression. It is the
 	// only method-set input this evidence carries.
 	Pointer bool
+
+	// InitFunction names the package-level function whose single result
+	// initializes a binding with no spelled type (`s := NewServer()`); the
+	// resolver types the binding only through that function's
+	// GoFunctionResult. InitImportPath is the import the call was qualified
+	// through, empty for the file's own package. A call whose callee or
+	// qualifier a local binds records neither.
+	//
+	// A selector call made directly on such a call (`NewServer().Start()`) is
+	// recorded as a binding named `NewServer()` over the inner call's lines,
+	// so the edge `NewServer().Start` is owned like any local receiver call.
+	InitFunction   string
+	InitImportPath string
+}
+
+// GoFunctionResult is the single named result type of a non-generic
+// package-level Go function. TypeImportPath is empty when the type is named
+// without a qualifier, which means the function's own package.
+type GoFunctionResult struct {
+	Function       string
+	TypeName       string
+	TypeImportPath string
 }
 
 type ScopeImport struct {

@@ -110,6 +110,7 @@ func (a *GoAdapter) Parse(ctx context.Context, path string, content []byte) (gra
 	// ---- lexical bindings ----
 	locals := newGoLocalIndex(goCollectLocals(root, content, importAliases))
 	pf.Scope.GoLocals = locals.bindings
+	pf.Scope.GoFunctionResults = goCollectFunctionResults(root, content, importAliases)
 
 	// ---- call edges ----
 	goExtractCalls(root, content, importAliases, locals, &pf)
@@ -308,6 +309,12 @@ func goExtractCalls(root *sitter.Node, content []byte, imports map[string]string
 			continue
 		}
 		name := goCallName(fnNode, content, imports, locals)
+		if callee, inner, ok := goChainedCallNode(fnNode, content); ok {
+			name = ""
+			if !locals.boundAt(callee, int(inner.StartPoint().Row)+1) {
+				name = callee + "()." + nodeText(childByFieldName(fnNode, "field"), content)
+			}
+		}
 		if name == "" {
 			continue
 		}

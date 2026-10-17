@@ -241,8 +241,8 @@ func runGoLocalQualifierCases(t *testing.T, reg *parser.Registry) {
 	}
 }
 
-// TestGoUnknownLocalTypeStaysUnresolved is the veto. `s := factory()` proves s
-// is local and proves nothing about its type, so the edge must resolve to
+// TestGoUnknownLocalTypeStaysUnresolved is the veto. `s, _ := factory()` proves
+// s is local and proves nothing about its type, so the edge must resolve to
 // nothing at all -- not to the same-named method that dot_tail2 would otherwise
 // hand it.
 func TestGoUnknownLocalTypeStaysUnresolved(t *testing.T) {
@@ -255,10 +255,10 @@ type Thing struct{}
 
 func (t *Thing) Only() {}
 
-func factory() *Thing { return nil }
+func factory() (*Thing, error) { return nil, nil }
 
 func run() {
-	s := factory()
+	s, _ := factory()
 	s.Only()
 }
 `,
@@ -393,10 +393,10 @@ type Other struct{}
 func (t *Thing) Get() {}
 func (o *Other) Get() {}
 
-func build() *Other { return nil }
+func build() (*Other, error) { return nil, nil }
 
 func caller() {
-	store := build()
+	store, _ := build()
 	store.Get()
 }
 `,

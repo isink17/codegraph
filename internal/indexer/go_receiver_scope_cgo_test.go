@@ -16,3 +16,7 @@ import (
 func TestGoLocalQualifierNeverBecomesPackageImportTreeSitter(t *testing.T) {
 	runGoLocalQualifierCases(t, parser.NewRegistry(tsparser.NewGo()))
 }
+
+func TestGoReceiverThroughFunctionResultTreeSitter(t *testing.T) {
+	runGoReceiverThroughFunctionResult(t, parser.NewRegistry(tsparser.NewGo()))
+}

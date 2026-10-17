@@ -116,3 +116,23 @@ func run() {
 		t.Errorf("own-package receiver type = %q, want %q", got, want)
 	}
 }
+
+func TestGoInitializerEvidence(t *testing.T) {
+	pf, err := New().Parse(context.Background(), "main.go", []byte(gofixture.GoInitializerSource))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	locals, results, chained := gofixture.RenderGoInitializerEvidence(pf)
+	for _, c := range []struct {
+		what      string
+		got, want []string
+	}{
+		{"locals", locals, gofixture.GoInitializerLocals},
+		{"results", results, gofixture.GoInitializerResults},
+		{"chained calls", chained, gofixture.GoInitializerChainedCalls},
+	} {
+		if strings.Join(c.got, "\n") != strings.Join(c.want, "\n") {
+			t.Errorf("%s:\n got:\n  %s\nwant:\n  %s", c.what, strings.Join(c.got, "\n  "), strings.Join(c.want, "\n  "))
+		}
+	}
+}

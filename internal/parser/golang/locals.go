@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 
+	"github.com/isink17/codegraph/internal/classify"
 	"github.com/isink17/codegraph/internal/graph"
 )
 
@@ -12,14 +13,24 @@ import (
 //
 // The output is deliberately one-sided evidence. It says a name is local; it
 // does not say what the name holds unless the syntax spells the type out. A
-// `s := NewStore()` binding is recorded with no type at all, which is the whole
-// point: knowing `s` is local is what stops the resolver rewriting `s.Close()`
-// into an imported package, and not knowing its type is what stops the
-// resolver guessing which `Close` it meant.
+// `s := NewStore()` binding carries no type, only the function it was
+// initialized from; the resolver types it through that function's recorded
+// result or not at all.
 type goLocalCollector struct {
 	fset    *token.FileSet
 	imports map[string]string
 	out     []graph.GoLocalBinding
+	inits   []goInitRef
+}
+
+// goInitRef is an initializer call awaiting the shadow check, which needs every
+// binding of the file first.
+type goInitRef struct {
+	index      int
+	callee     string
+	qualifier  string
+	importPath string
+	line       int
 }
 
 func collectGoLocals(fset *token.FileSet, file *ast.File, imports map[string]string) []graph.GoLocalBinding {
@@ -40,7 +51,82 @@ func collectGoLocals(fset *token.FileSet, file *ast.File, imports map[string]str
 		c.stmt(fn.Body)
 		c.funcLits(fn.Body)
 	}
+
+	idx := newGoLocalIndex(c.out)
+	for _, ref := range c.inits {
+		shadow := ref.callee
+		if ref.qualifier != "" {
+			shadow = ref.qualifier
+		}
+		if idx.boundAt(shadow, ref.line) {
+			continue
+		}
+		c.out[ref.index].InitFunction = ref.callee
+		c.out[ref.index].InitImportPath = ref.importPath
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if callee, inner, ok := goChainedCall(call.Fun); ok && !idx.boundAt(callee, c.fset.Position(inner.Pos()).Line) {
+			start, end := c.span(inner.Pos(), inner.End())
+			c.out = append(c.out, graph.GoLocalBinding{Name: callee + "()", ScopeStartLine: start, ScopeEndLine: end, InitFunction: callee})
+		}
+		return true
+	})
 	return c.out
+}
+
+// goChainedCall matches a selector made directly on a call of a bare function
+// name, `NewServer().Start`, and returns that name and the inner call.
+func goChainedCall(fun ast.Expr) (string, *ast.CallExpr, bool) {
+	sel, ok := fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", nil, false
+	}
+	inner, ok := sel.X.(*ast.CallExpr)
+	if !ok {
+		return "", nil, false
+	}
+	id, ok := inner.Fun.(*ast.Ident)
+	if !ok {
+		return "", nil, false
+	}
+	// A predeclared function or conversion (`new(T)`, `string(b)`) is never a
+	// function this graph records a result for.
+	if _, builtin := classify.BuiltinCandidate("go", id.Name); builtin {
+		return "", nil, false
+	}
+	return id.Name, inner, true
+}
+
+// collectGoFunctionResults records the result type of every non-generic
+// package-level function with exactly one result whose type is a named type.
+func collectGoFunctionResults(file *ast.File, imports map[string]string) []graph.GoFunctionResult {
+	var out []graph.GoFunctionResult
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || fn.Type == nil || fn.Type.TypeParams != nil || fn.Type.Results == nil {
+			continue
+		}
+		results := fn.Type.Results.List
+		if len(results) != 1 || len(results[0].Names) > 1 {
+			continue
+		}
+		name, pkg, _ := goTypeSpelling(results[0].Type)
+		if name == "" {
+			continue
+		}
+		r := graph.GoFunctionResult{Function: fn.Name.Name, TypeName: name}
+		if pkg != "" {
+			if r.TypeImportPath = imports[pkg]; r.TypeImportPath == "" {
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // funcLits records the bindings of every function literal in a subtree.
@@ -75,9 +161,9 @@ func (c *goLocalCollector) span(pos, end token.Pos) (int, int) {
 	return c.fset.Position(pos).Line, c.fset.Position(end).Line
 }
 
-func (c *goLocalCollector) emit(name string, start, end int, typ ast.Expr) {
+func (c *goLocalCollector) emit(name string, start, end int, typ ast.Expr) bool {
 	if name == "" || name == "_" {
-		return
+		return false
 	}
 	b := graph.GoLocalBinding{Name: name, ScopeStartLine: start, ScopeEndLine: end}
 	if typ != nil {
@@ -87,6 +173,30 @@ func (c *goLocalCollector) emit(name string, start, end int, typ ast.Expr) {
 		}
 	}
 	c.out = append(c.out, b)
+	return true
+}
+
+// initFrom records that the binding just emitted is initialized by a call of a
+// bare or import-qualified function name. Any other initializer proves nothing.
+func (c *goLocalCollector) initFrom(value ast.Expr) {
+	call, ok := value.(*ast.CallExpr)
+	if !ok {
+		return
+	}
+	ref := goInitRef{index: len(c.out) - 1, line: c.fset.Position(call.Pos()).Line}
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		ref.callee = fun.Name
+	case *ast.SelectorExpr:
+		pkg, ok := fun.X.(*ast.Ident)
+		if !ok || c.imports[pkg.Name] == "" {
+			return
+		}
+		ref.callee, ref.qualifier, ref.importPath = fun.Sel.Name, pkg.Name, c.imports[pkg.Name]
+	default:
+		return
+	}
+	c.inits = append(c.inits, ref)
 }
 
 func (c *goLocalCollector) fields(list *ast.FieldList, start, end int) {
@@ -176,7 +286,9 @@ func (c *goLocalCollector) stmt(n ast.Stmt) {
 	}
 }
 
-// declare records what a single statement binds into the scope that holds it.
+// declare records what a single statement binds into the scope that holds it,
+// from the line the declaration starts on: a use above it names an outer
+// binding.
 func (c *goLocalCollector) declare(n ast.Stmt, start, end int) {
 	switch s := n.(type) {
 	case *ast.DeclStmt:
@@ -189,6 +301,7 @@ func (c *goLocalCollector) declare(n ast.Stmt, start, end int) {
 			if !ok {
 				continue
 			}
+			specStart := max(start, c.fset.Position(value.Pos()).Line)
 			for i, name := range value.Names {
 				// `var x T` states the type. `var x = expr` does not, unless
 				// the expression is a composite literal naming its own type.
@@ -196,22 +309,28 @@ func (c *goLocalCollector) declare(n ast.Stmt, start, end int) {
 				if typ == nil && i < len(value.Values) {
 					typ = compositeLiteralType(value.Values[i])
 				}
-				c.emit(name.Name, start, end, typ)
+				if c.emit(name.Name, specStart, end, typ) && typ == nil && decl.Tok == token.VAR && len(value.Names) == 1 && len(value.Values) == 1 {
+					c.initFrom(value.Values[0])
+				}
 			}
 		}
 	case *ast.AssignStmt:
 		if s.Tok != token.DEFINE {
 			return
 		}
+		start = max(start, c.fset.Position(s.Pos()).Line)
 		// Only a 1:1 assignment can carry a type across. `a, b := f()` binds
-		// both names untyped.
+		// both names untyped. An initializer call is read only for a single
+		// name: with several, `:=` may redeclare one that keeps its old type.
 		paired := len(s.Lhs) == len(s.Rhs)
 		for i, lhs := range s.Lhs {
 			var typ ast.Expr
 			if paired {
 				typ = compositeLiteralType(s.Rhs[i])
 			}
-			c.identTyped(lhs, start, end, typ)
+			if c.identTyped(lhs, start, end, typ) && typ == nil && len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+				c.initFrom(s.Rhs[0])
+			}
 		}
 	}
 }
@@ -220,10 +339,11 @@ func (c *goLocalCollector) ident(n ast.Expr, start, end int) {
 	c.identTyped(n, start, end, nil)
 }
 
-func (c *goLocalCollector) identTyped(n ast.Expr, start, end int, typ ast.Expr) {
+func (c *goLocalCollector) identTyped(n ast.Expr, start, end int, typ ast.Expr) bool {
 	if id, ok := n.(*ast.Ident); ok {
-		c.emit(id.Name, start, end, typ)
+		return c.emit(id.Name, start, end, typ)
 	}
+	return false
 }
 
 // compositeLiteralType returns the type a composite literal names directly, and

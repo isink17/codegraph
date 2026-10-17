@@ -73,6 +73,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 
 	locals := newGoLocalIndex(collectGoLocals(fset, file, importAliases))
 	pf.Scope.GoLocals = locals.bindings
+	pf.Scope.GoFunctionResults = collectGoFunctionResults(file, importAliases)
 
 	contextStack := []*graph.Symbol{}
 	enterFuncStack := []bool{}
@@ -243,7 +244,21 @@ func visibility(name string) string {
 // and the qualifier is kept verbatim. The resulting `x.Method` spelling is what
 // the Go receiver-scope resolver reads, and what the local-qualifier veto stops
 // every generic strategy from binding by coincidence.
+//
+// A selector made directly on a call of a bare function name is spelled
+// `F().Method`, the qualifier collectGoLocals binds for it. Deeper chains
+// produce no edge.
 func callName(fset *token.FileSet, expr ast.Expr, imports map[string]string, locals goLocalIndex) string {
+	if callee, inner, ok := goChainedCall(expr); ok {
+		if locals.boundAt(callee, fset.Position(inner.Pos()).Line) {
+			return ""
+		}
+		return callee + "()." + expr.(*ast.SelectorExpr).Sel.Name
+	}
+	return qualifiedCallName(fset, expr, imports, locals)
+}
+
+func qualifiedCallName(fset *token.FileSet, expr ast.Expr, imports map[string]string, locals goLocalIndex) string {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		return e.Name
@@ -251,7 +266,7 @@ func callName(fset *token.FileSet, expr ast.Expr, imports map[string]string, loc
 		if id, ok := e.X.(*ast.Ident); ok && locals.boundAt(id.Name, fset.Position(id.Pos()).Line) {
 			return id.Name + "." + e.Sel.Name
 		}
-		left := callName(fset, e.X, imports, locals)
+		left := qualifiedCallName(fset, e.X, imports, locals)
 		if left == "" {
 			return ""
 		}
@@ -260,9 +275,9 @@ func callName(fset *token.FileSet, expr ast.Expr, imports map[string]string, loc
 		}
 		return left + "." + e.Sel.Name
 	case *ast.ParenExpr:
-		return callName(fset, e.X, imports, locals)
+		return qualifiedCallName(fset, e.X, imports, locals)
 	case *ast.IndexListExpr:
-		return callName(fset, e.X, imports, locals)
+		return qualifiedCallName(fset, e.X, imports, locals)
 	default:
 		return ""
 	}
@@ -456,6 +471,8 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 
 // Profile identifies the non-cgo Go adapter, which parses with go/ast and does
 // build a call graph. See cgparser.Profile for the versioning rule.
+// v2 records initializer calls on local bindings, single function result
+// types, and edges for selector calls made directly on a call result.
 func (a *Adapter) Profile() cgparser.Profile {
-	return cgparser.Profile{ID: "go-ast:go:v1", EmitsCallEdges: true}
+	return cgparser.Profile{ID: "go-ast:go:v2", EmitsCallEdges: true}
 }

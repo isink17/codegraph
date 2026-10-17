@@ -8,11 +8,11 @@ import "github.com/isink17/codegraph/internal/parser"
 // graph, which is the capability the non-cgo fallbacks lose for nine of these
 // languages. See parser.Profile for when to bump a version suffix.
 
-func tsProfile(language string) parser.Profile {
-	return parser.NewProfile(language, "treesitter:"+language+":v1", true)
+// Go v2 records initializer calls on local bindings, single function result
+// types, and edges for selector calls made directly on a call result.
+func (a *GoAdapter) Profile() parser.Profile {
+	return parser.NewProfile("go", "treesitter:go:v2", true)
 }
-
-func (a *GoAdapter) Profile() parser.Profile { return tsProfile("go") }
 
 // HCL v2 reads references inside operators. Its relationship graph is its
 // Terraform `references` edges; it emits no `calls`. It still declares a

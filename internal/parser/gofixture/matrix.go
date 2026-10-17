@@ -7,6 +7,14 @@
 // an adapter that decided differently would make the confidence a lie.
 package gofixture
 
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
+)
+
 // GoShadowMatrixSource is the shadow matrix both Go adapters must agree on.
 //
 // Every function here binds `store` -- the spelling of the file's own import
@@ -140,32 +148,32 @@ var GoShadowMatrixCalls = map[int]string{
 // `name [start-end] type ptr`. An empty type is the point of the case, not a
 // gap: it vetoes the import rewrite and binds nothing.
 var GoShadowMatrixLocals = []string{
-	"f [65-68] : false",
+	"f [66-68] : false",
 	"f [88-88] : false",
 	// `var fn func(store *Thing)` declares fn and nothing else: the parameter
 	// name inside the type binds no local, so no `store` binding appears for
 	// it and the import rewrite still reaches line 95.
-	"fn [92-96] : false",
+	"fn [93-96] : false",
 	"items [39-43] : false",
-	"ptr [31-36] Thing: true",
+	"ptr [34-36] Thing: true",
 	"store [10-10] Thing: true",
 	"store [13-13] Thing: true",
 	"store [16-16] Thing: true",
-	"store [19-22] Thing: true",
-	"store [25-28] : false",
-	"store [31-36] Thing: false",
+	"store [20-22] Thing: true",
+	"store [26-28] : false",
+	"store [32-36] Thing: false",
 	"store [40-42] : false",
 	"store [47-50] : false",
-	"store [55-58] Thing: true",
+	"store [56-58] Thing: true",
 	"store [66-66] Thing: true",
 	"store [80-83] Thing: true",
 	"t [7-7] Thing: true",
 	"v [46-51] any: false",
 }
 
-// GoReceiverTypeSource covers the receiver-type shapes go_receiver_scope binds
-// through, and the ones it deliberately refuses. Both adapters must project it
-// identically.
+// GoReceiverTypeSource covers the receiver-type evidence shapes both adapters
+// must project identically. Its "proven" and "NOT proven" labels describe the
+// evidence each shape records, not a resolution this fixture checks.
 const GoReceiverTypeSource = `package main
 
 import store "example.com/project/store"
@@ -198,7 +206,7 @@ func (p *Pair[K, V]) Also() { p.Do() }
 // proven: qualified type resolves through the import
 func runQualified(s *store.Store) { s.Close() }
 
-// NOT proven: return type of a constructor
+// evidence: initializer call of a constructor with a recorded result
 func runFactory() {
 	s := NewStore()
 	s.Close()
@@ -221,3 +229,106 @@ type closer interface{ Close() }
 
 func NewStore() *Store { return nil }
 `
+
+// GoInitializerSource covers the initializer shapes a local binding records a
+// called function for, the function result shapes the file records, and the
+// selector calls made directly on a call result. Both adapters must project it
+// identically.
+const GoInitializerSource = `package main
+
+import srv "example.com/project/srv"
+
+type Server struct{}
+
+func (s *Server) Start() {}
+
+func NewServer() *Server         { return nil }
+func NewNamed() (s *Server)      { return nil }
+func NewPair() (*Server, error)  { return nil, nil }
+func NewRemote() *srv.Server     { return nil }
+func NewBox[T any]() *Box[T]     { return nil }
+func NewTwo() (a, b *Server)     { return nil, nil }
+func NewSlice() []Server         { return nil }
+func NewUnknown() *other.Server  { return nil }
+func (s *Server) Clone() *Server { return nil }
+
+type Box[T any] struct{}
+
+func run(cfg *Server) {
+	a := NewServer()
+	var b = NewServer()
+	c := srv.New()
+	d, _ := NewPair()
+	e := cfg.Clone()
+	f := NewBox[int]()
+	var g *Server = NewServer()
+	h, k := NewServer(), NewServer()
+	NewServer().Start()
+	srv.New().Start()
+	NewBox[int]().Start()
+	(NewServer()).Start()
+	NewServer().
+		Start()
+	new(Server).Start()
+	_, _, _, _, _, _, _, _, _ = a, b, c, d, e, f, g, h, k
+}
+
+func shadow(NewServer func() *Server, srv *Server) {
+	a := NewServer()
+	b := srv.Clone()
+	NewServer().Start()
+	_, _ = a, b
+}
+`
+
+// GoInitializerLocals is every binding GoInitializerSource declares that
+// carries an initializer, rendered as `name [start-end] init=function|import`.
+// `b := srv.Clone()` on a local qualifier, `NewServer()` on a parameter of that
+// name, multi-value and generic initializers, and an explicit type all record
+// none.
+var GoInitializerLocals = []string{
+	"NewServer() [30-30] init=NewServer|",
+	"NewServer() [34-34] init=NewServer|",
+	"a [22-38] init=NewServer|",
+	"b [23-38] init=NewServer|",
+	"c [24-38] init=New|example.com/project/srv",
+}
+
+// GoInitializerResults is every function result GoInitializerSource records,
+// rendered as `function type|import`. Generic, multi-result, unnamed-type,
+// unresolvable-qualifier functions and methods record none.
+var GoInitializerResults = []string{
+	"NewNamed Server|",
+	"NewRemote Server|example.com/project/srv",
+	"NewServer Server|",
+}
+
+// GoInitializerChainedCalls is every call edge GoInitializerSource spells on a
+// call result, as `line dst_name`. Qualified, generic, parenthesized,
+// predeclared and shadowed callees produce none.
+var GoInitializerChainedCalls = []string{
+	"30 NewServer().Start",
+	"34 NewServer().Start",
+}
+
+// RenderGoInitializerEvidence renders a parse in the shapes of
+// GoInitializerLocals, GoInitializerResults and GoInitializerChainedCalls.
+func RenderGoInitializerEvidence(pf graph.ParsedFile) (locals, results, chained []string) {
+	for _, b := range pf.Scope.GoLocals {
+		if b.InitFunction != "" || b.InitImportPath != "" {
+			locals = append(locals, fmt.Sprintf("%s [%d-%d] init=%s|%s", b.Name, b.ScopeStartLine, b.ScopeEndLine, b.InitFunction, b.InitImportPath))
+		}
+	}
+	for _, r := range pf.Scope.GoFunctionResults {
+		results = append(results, r.Function+" "+r.TypeName+"|"+r.TypeImportPath)
+	}
+	for _, e := range pf.Edges {
+		if strings.Contains(e.DstName, "().") {
+			chained = append(chained, fmt.Sprintf("%d %s", e.Line, e.DstName))
+		}
+	}
+	sort.Strings(locals)
+	sort.Strings(results)
+	sort.Strings(chained)
+	return locals, results, chained
+}
