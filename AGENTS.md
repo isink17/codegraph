@@ -87,4 +87,5 @@
 
 - Keep `README.md` and `CHANGELOG.md` aligned with shipped behavior for each tag.
 - Add a new changelog section for each release (for example `v1.0.2 -> v1.0.3`) before tagging.
+- Before tagging, rename `## Unreleased` in `CHANGELOG.md` to `## vX.Y.Z - DD-MM-YYYY`; the release workflow publishes that section as the release notes and fails when no heading starts with `## vX.Y.Z -`.
 - Tag releases with semantic version tags (`vX.Y.Z`) after tests/build pass.
