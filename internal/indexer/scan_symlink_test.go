@@ -424,3 +424,115 @@ func TestUpdateTraversalFailureKeepsUnvisitedFilesAndRecovers(t *testing.T) {
 		t.Fatalf("recovered stats = %+v, want %+v", after, before)
 	}
 }
+
+type stubFileInfo struct {
+	fs.FileInfo
+	mode fs.FileMode
+}
+
+func (i stubFileInfo) Mode() fs.FileMode { return i.mode }
+func (i stubFileInfo) IsDir() bool       { return i.mode.IsDir() }
+
+func withLstat(t *testing.T, fn func(string) (fs.FileInfo, error)) {
+	t.Helper()
+	prev := lstat
+	lstat = fn
+	t.Cleanup(func() { lstat = prev })
+}
+
+// A path-scoped update admits exactly the entries the full walk admits: a
+// candidate that has become non-regular is skipped, never read, and its stale
+// row is retired just as a full update would retire it.
+func TestUpdatePathScopedNonRegularCandidateMatchesFullWalk(t *testing.T) {
+	cases := []struct {
+		name string
+		mode fs.FileMode
+	}{
+		{"named pipe", fs.ModeNamedPipe},
+		{"device", fs.ModeDevice},
+		{"socket", fs.ModeSocket},
+		{"directory", fs.ModeDir},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			repoRoot := t.TempDir()
+			writeFile(t, filepath.Join(repoRoot, "a.go"), "package a\n\nfunc A() {}\n")
+			writeFile(t, filepath.Join(repoRoot, "mid.go"), "package a\n\nfunc M() {}\n")
+
+			s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+			if err != nil {
+				t.Fatalf("store.Open() error = %v", err)
+			}
+			defer s.Close()
+			idx := New(s, parser.NewRegistry(goparser.New()), nil)
+			if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
+				t.Fatalf("Index() error = %v", err)
+			}
+
+			midAbs := filepath.Join(repoRoot, "mid.go")
+			withLstat(t, func(path string) (fs.FileInfo, error) {
+				info, err := os.Lstat(path)
+				if err != nil || path != midAbs {
+					return info, err
+				}
+				return stubFileInfo{FileInfo: info, mode: tc.mode}, nil
+			})
+			prevRead := readFile
+			readFile = func(path string) ([]byte, error) {
+				if path == midAbs {
+					t.Errorf("non-regular candidate %s was read", path)
+				}
+				return prevRead(path)
+			}
+			t.Cleanup(func() { readFile = prevRead })
+
+			if _, err := idx.Update(ctx, Options{RepoRoot: repoRoot, Paths: []string{"mid.go"}}); err != nil {
+				t.Fatalf("Update() error = %v", err)
+			}
+			repo, err := s.UpsertRepo(ctx, repoRoot)
+			if err != nil {
+				t.Fatalf("UpsertRepo() error = %v", err)
+			}
+			files, err := s.ExistingFiles(ctx, repo.ID)
+			if err != nil {
+				t.Fatalf("ExistingFiles() error = %v", err)
+			}
+			got := make([]string, 0, len(files))
+			for path := range files {
+				got = append(got, filepath.ToSlash(path))
+			}
+			sort.Strings(got)
+
+			withWalkDir(t, substituteEntry("mid.go", func(d fs.DirEntry) fs.DirEntry {
+				return stubEntry{DirEntry: d, mode: tc.mode}
+			}))
+			want := indexedPaths(t, repoRoot)
+			if !equalPaths(got, want) || !equalPaths(got, []string{"a.go"}) {
+				t.Fatalf("path-scoped paths = %v, full walk = %v, want [a.go]", got, want)
+			}
+		})
+	}
+}
+
+// A candidate link that cannot be classified is skipped by the full walk, so a
+// path-scoped update must not fail the scan on it either.
+func TestUpdatePathScopedSymlinkLoopIsSkippedNotFatal(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, "a.go"), "package a\n\nfunc A() {}\n")
+	symlink(t, "loop.go", filepath.Join(repoRoot, "loop.go"))
+
+	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	if _, err := idx.Index(ctx, Options{RepoRoot: repoRoot}); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	if _, err := idx.Update(ctx, Options{RepoRoot: repoRoot, Paths: []string{"loop.go"}}); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+}
