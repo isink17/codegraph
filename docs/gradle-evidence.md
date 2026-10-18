@@ -1,4 +1,4 @@
-# CG-35 Kotlin Gradle evidence artifact
+# Kotlin Gradle evidence artifact
 
 This contract defines an explicitly produced artifact for one selected Kotlin
 Gradle compilation. It is not a Gradle invocation path for ordinary indexing.
@@ -68,10 +68,10 @@ values.
 Evidence is usable only when schema, repository/build/compilation identity, and
 current input fingerprint match. Otherwise the artifact is rejected or all
 affected dimensions remain unknown; timestamp-only acceptance is forbidden.
-Import validation is read-only and does not write scope evidence to SQLite in
-this first slice. The classifier remains disabled.
+Import validation is read-only and does not write scope evidence to SQLite.
+The classifier remains disabled.
 
-## Initial producer slice
+## Current producer
 
 `codegraph export-gradle-evidence` explicitly runs the executable supplied with
 `--gradle` for one selected Kotlin/JVM project and compilation. It resolves that
@@ -80,7 +80,7 @@ Kotlin source-set roots. It never discovers or launches a project wrapper
 implicitly. The integration fixture pins Kotlin Gradle Plugin 2.3.20 and asserts
 Gradle 9.3.1.
 
-This first producer deliberately reports source and dependency dimensions as
+The producer deliberately reports source and dependency dimensions as
 `incomplete`; generated/excluded roots and external metadata as `unknown`; and
 compiler identity as `incomplete`. It observes the Gradle runtime JDK, not a
 selected Kotlin compiler toolchain. Classpath file dependencies and artifact
@@ -103,3 +103,19 @@ Gradle starts, including symlinked parents.
 dimensions to unknown. `Artifact.ValidateCurrent` refuses a changed fingerprint;
 `CurrentFingerprint` recomputes the local file inputs above. These checks do not
 attest omitted Gradle inputs or promote incomplete evidence to complete.
+
+## Stored JVM type evidence
+
+Independently of this artifact, the index stores JVM source facts (migrations
+006 and 007): Java and Kotlin type declarations, callable parameter and result
+positions, modifiers, generic and value-class syntax, and Kotlin typealias
+target spellings, plus six per-repository compilation-scope dimensions with
+the same names and states as above. Every dimension starts and stays `unknown`,
+because nothing imports build evidence. Type-dependency observations are
+recorded only when scope is complete, so in practice none are.
+
+These facts describe source syntax, not canonical JVM identity. No resolver
+consumes them to bind a call. Kotlin calls whose JVM name or descriptor depends
+on the compilation (value and inline classes, typealiases from dependencies,
+mangled names) stay unresolved: a repository's source alone cannot prove which
+JVM method such a call reaches.

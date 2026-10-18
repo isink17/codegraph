@@ -1,0 +1,151 @@
+{
+  "schema": "codegraph.query_bench/v1",
+  "repository": {
+    "root": "<corpus>",
+    "files": 797,
+    "symbols": 8186,
+    "edges": 76443,
+    "references": 200176
+  },
+  "runs": 20,
+  "warmup": 3,
+  "budget_ms": 50,
+  "results": [
+    {
+      "name": "graph_stats",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 98.857,
+      "p95_ms": 102.181,
+      "max_ms": 103.334,
+      "result_count": 6,
+      "budget_met": false
+    },
+    {
+      "name": "list_files",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 0.072,
+      "p95_ms": 0.08,
+      "max_ms": 0.141,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "symbol_lookup",
+      "status": "measured",
+      "target": "store.swiftScopeFixture.symbol",
+      "samples": 20,
+      "p50_ms": 2.897,
+      "p95_ms": 2.93,
+      "max_ms": 3.017,
+      "result_count": 1,
+      "budget_met": true
+    },
+    {
+      "name": "symbol_search",
+      "status": "measured",
+      "target": "symbol",
+      "samples": 20,
+      "p50_ms": 1.007,
+      "p95_ms": 1.039,
+      "max_ms": 1.232,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "find_callers",
+      "status": "measured",
+      "target": "store.swiftScopeFixture.symbol",
+      "samples": 20,
+      "p50_ms": 8.893,
+      "p95_ms": 9.308,
+      "max_ms": 9.968,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "find_callees",
+      "status": "measured",
+      "target": "indexer.Indexer.run",
+      "samples": 20,
+      "p50_ms": 7.732,
+      "p95_ms": 8.236,
+      "max_ms": 8.365,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "related_tests",
+      "status": "measured",
+      "target": "internal/store/swift_scope.go",
+      "samples": 20,
+      "p50_ms": 2.729,
+      "p95_ms": 2.752,
+      "max_ms": 2.772,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "impact_radius",
+      "status": "measured",
+      "target": "store.swiftScopeFixture.symbol",
+      "samples": 20,
+      "p50_ms": 35.549,
+      "p95_ms": 37.94,
+      "max_ms": 39.191,
+      "result_count": 277,
+      "budget_met": true
+    },
+    {
+      "name": "trace_dependencies",
+      "status": "measured",
+      "target": "indexer.Indexer.run",
+      "samples": 20,
+      "p50_ms": 2.569,
+      "p95_ms": 2.699,
+      "max_ms": 3.483,
+      "result_count": 70,
+      "budget_met": true
+    },
+    {
+      "name": "dead_code",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 10.537,
+      "p95_ms": 10.684,
+      "max_ms": 10.762,
+      "result_count": 20,
+      "budget_met": true
+    },
+    {
+      "name": "context_for_task",
+      "status": "measured",
+      "target": "symbol",
+      "samples": 20,
+      "p50_ms": 30.266,
+      "p95_ms": 31.893,
+      "max_ms": 32.099,
+      "result_count": 36,
+      "budget_met": true
+    },
+    {
+      "name": "architecture_overview",
+      "status": "measured",
+      "samples": 20,
+      "p50_ms": 191.01,
+      "p95_ms": 201.043,
+      "max_ms": 202.65,
+      "result_count": 7,
+      "budget_met": false
+    }
+  ],
+  "summary": {
+    "measured": 12,
+    "skipped": 0,
+    "within_budget": 10,
+    "over_budget": 2,
+    "slowest": "architecture_overview",
+    "slowest_p95_ms": 201.043
+  }
+}

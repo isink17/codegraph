@@ -225,3 +225,30 @@ func TestJavaFieldReceiverProfileConvergence(t *testing.T) {
 	assertJavaFieldReceiverTargets(t, r, "update", javaFieldReceiverWant("app.Repo.save"))
 	r.assertFreshParity(t, "field receiver profile convergence")
 }
+
+// A field of a parameterized project class type binds by the raw class name;
+// a field typed by a bare type variable does not.
+func TestJavaParameterizedFieldReceiver(t *testing.T) {
+	r := newLifecycleRepo(t, map[string]string{
+		"app/Node.java": `package app;
+public class Node<T> {
+  Node<T> next;
+  T value;
+  public void g() {}
+  void walk() { next.g(); this.next.g(); }
+}
+`,
+		"app/List.java": `package app;
+public class List {
+  Node<String> head;
+  void f() { head.g(); }
+}
+`,
+	})
+	assertJavaFieldReceiverTargets(t, r, "fresh", map[string][]string{
+		"app.Node.walk|next.g":      {"app.Node.g"},
+		"app.Node.walk|this.next.g": {"app.Node.g"},
+		"app.List.f|head.g":         {"app.Node.g"},
+	})
+	r.assertFreshParity(t, "fresh")
+}

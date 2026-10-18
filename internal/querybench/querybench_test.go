@@ -489,3 +489,44 @@ func TestLegacyPathFormatFailsClosedBeforeAnyRead(t *testing.T) {
 		t.Fatalf("related_tests on marked repository = %+v, want measured against a relocated src/pkg/ file", got)
 	}
 }
+
+// TestAmbiguousHotSymbolIsNotSelected pins that a qualified name shared by
+// several symbols is never chosen as a target, even when it has the highest
+// degree, because the by-name scenarios would refuse it as ambiguous.
+func TestAmbiguousHotSymbolIsNotSelected(t *testing.T) {
+	ctx := context.Background()
+	s, repoID, root := seededRepo(t, false)
+
+	var inputs []store.ReplaceFileGraphInput
+	for f := 0; f < 2; f++ {
+		pf := graph.ParsedFile{Language: "go"}
+		pf.Symbols = append(pf.Symbols, graph.Symbol{
+			Language: "go", Kind: "function", Name: "Dup", QualifiedName: "pkg.Dup",
+			Range:     graph.Position{StartLine: 1, StartCol: 1, EndLine: 9, EndCol: 1},
+			StableKey: fmt.Sprintf("go:pkg.Dup#%d", f),
+		})
+		for i := 0; i < 4; i++ {
+			pf.Edges = append(pf.Edges,
+				graph.Edge{DstName: fmt.Sprintf("pkg.Caller%d", i), Kind: "calls", Evidence: "x", Line: 2},
+				graph.Edge{DstName: "pkg.Helper", Kind: "calls", Evidence: "x", Line: 3 + i})
+		}
+		inputs = append(inputs, store.ReplaceFileGraphInput{
+			Path: fmt.Sprintf("dup%d.go", f), Language: "go", SizeBytes: 100,
+			ContentHash: fmt.Sprintf("d%d", f), Parsed: pf,
+		})
+	}
+	if _, err := s.ReplaceFileGraphsBatch(ctx, repoID, 1, inputs); err != nil {
+		t.Fatalf("ReplaceFileGraphsBatch: %v", err)
+	}
+	if _, err := s.ResolveEdges(ctx, repoID); err != nil {
+		t.Fatalf("ResolveEdges: %v", err)
+	}
+
+	report, err := Run(ctx, s, repoID, root, Options{Runs: 1, Warmup: 0})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := resultByName(t, report, "find_callees").Target; got != "pkg.Fanout" {
+		t.Fatalf("find_callees target = %q, want pkg.Fanout", got)
+	}
+}

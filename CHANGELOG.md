@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+<!-- Release step: these are the v2.0.0 notes. Before tagging, rename the heading above to `## v2.0.0 - DD-MM-YYYY` (the release date) and delete this comment. The release workflow publishes the section whose heading starts with `## v2.0.0 -` and fails without one. -->
+
+### What CodeGraph 2.0 is
+
+CodeGraph is a local-first code context engine and MCP server. It indexes a repository into a local SQLite graph of symbols and source-supported relationships and serves that graph to MCP clients and the CLI, with no hosted backend. Version 2 rebuilds the graph around evidence: a relationship is recorded only when parsed source supports it, ambiguous or unsupported calls stay unresolved rather than guessed, and answers say when the stored graph cannot back them.
+
+### Highlights
+
+- **Languages.** Tree-sitter parsers in native (CGO) builds for 16 language categories: Go, Python, TypeScript, JavaScript, Java, Kotlin, Rust, C#, Ruby, Swift, PHP and C/C++, plus new conservative Dart, Scala, Lua and HCL/Terraform support. Each language's resolution rules and limits are documented in `docs/scope-models.md`.
+- **Evidence-based resolution.** Versioned parser profiles and resolver policies: `update` reparses or re-decides only what a change affects, and fresh and incremental indexing are tested to produce the same graph. Callers, callees, impact, related tests and trace refuse an ambiguous symbol name instead of picking one.
+- **MCP surface.** 32 tools in the default full mode. An opt-in gateway mode (`--tool-mode gateway`) advertises four core tools plus `tool_search` and `tool_call` and reaches every other tool on demand.
+- **Context economy.** Progressive disclosure (`detail=card|skeleton|excerpt|full`, `card` by default over MCP), `format=compact` on bulk tools, a token-budgeted `context_for_task` with continuation cursors, and bounded result pages that reject out-of-range arguments.
+- **New analysis.** `diff` (semantic graph diff between two commits), `safe_to_edit` (fail-closed edit assessment), `check_constraints` (architectural dependency rules), `audit`, `explain` (why an edge is or is not resolved), Git history enrichment (`file_history`), a read-only `freshness` report in `stats`, `bench-queries`, `recover-scans`, and an explicitly invoked `export-gradle-evidence`.
+- **Distribution.** Native release archives for six platforms with SHA-256 sidecars; archives and the binary (`codegraph licenses`) carry `THIRD_PARTY_NOTICES`.
+
+### Breaking changes
+
+- **New database file.** v2 stores its graph in `.codegraph/codegraph.v2.sqlite` (custom and global stores use `codegraph.v2-<repo-hash>.sqlite`). v1 `codegraph.sqlite` databases are not imported, migrated or modified, and both can coexist. The first v2 run needs a full `codegraph index`.
+- **Smaller MCP default payloads.** `find_symbol`, `search_symbols`, `find_callers`, `find_callees` and `get_impact_radius` default to `detail=card` over MCP; pass `detail=full` for the previous payload. CLI output is unchanged unless `--detail` is passed.
+- **Ambiguous symbol targets fail closed.** Pass an exact qualified name or a `symbol_id` where a short name matches several symbols.
+- **One repository per MCP server.** A server serves the repository resolved at startup; `repo_root`/`repo_path` on `index_repo` and `update_graph` may only name that repository. Start one server per repository.
+
+### Database compatibility and upgrade
+
+- Development indexes created before the v2 baseline are refused before any write with `unsupported pre-v2 development index ...; rebuild with: codegraph index <repo-path> --rebuild`.
+- Indexes created from the v2 baseline (`v2-20261002`) upgrade in place through the embedded migrations (currently up to 010) when opened. Parser profile and resolver policy changes are applied by the next `update`, which reparses or re-decides only the affected files and edges.
+- A database that records a migration newer than the running binary is refused rather than downgraded.
+- `codegraph index . --rebuild` needs exclusive database access: stop `codegraph serve` and `codegraph watch` for that repository first.
+
+### Builds without CGO
+
+Release binaries are native CGO builds. A `CGO_ENABLED=0` build is reduced: Go (`go/ast`) and Python (regex fallback) keep call edges, every other language gets heuristic symbol and import navigation without call edges, and symbols, imports and search are less complete. Relationship answers and `codegraph doctor` report this capability. Such a build refuses to update a graph that a call-capable build produced for a language, rather than discarding its call edges.
+
+### Platforms
+
+Release archives: `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64` (tar.gz) and `windows_amd64`, `windows_arm64` (zip), each with a SHA-256 sidecar, plus the raw binaries. Building from source needs Go 1.26.0 or newer and a C compiler. The npm installer package (`@isink17/codegraph`) is prepared but is published separately after the GitHub Release.
+
+### Detailed changes
+
 Go: a call on a local initialized from a package-level function (`s := NewServer(); s.Start()`, `var s = NewServer()`, `s := pkg.New()`) and a call made directly on such a call (`NewServer().Start()`) now resolve to the method of the function's result type (`go_receiver_scope`). It binds only when the call names exactly one non-method declaration in its package, a non-generic function with one named result type, and that type has exactly one method of the name. Multi-value initializers (`s, err := Load()`), method calls, function values, interface results, generic functions, a callee or qualifier a local binds, and chains through an import-qualified call (`pkg.New().Start()`) or more than one call stay unresolved. Schema migration 10; Go parser profiles `treesitter:go:v2` and `go-ast:go:v2`, so existing Go files are reparsed on the next update.
 
 Java: a call on a field the calling class declares (`repo.save()` with no local `repo` in the calling method, constructor, initializer or lambda, or `this.repo.save()`) now resolves through the field's declared type under the same `java_receiver_scope` rules as a typed local: one visible project Java class, one method of that name admitting the argument count, no `java.lang.Object` method name, and only project or marker supertypes. A bare receiver whose name any variable, parameter or pattern binding of the calling member declares is never read as the field (a typed local in scope still binds as a local). A field the class only inherits or an enclosing class declares, a field of an anonymous, local or enum body, interface, type-variable, array and library field types, and a field type a local class or method type parameter shadows at the call stay unresolved. A parameterized project class type (`Node<T> next; next.g()`) resolves by its raw class name. Java parser profile `treesitter:java:v14` (unchanged Java files are reparsed once); the resolver policy is unchanged, since only the new parse carries the evidence.

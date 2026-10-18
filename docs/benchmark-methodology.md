@@ -1,4 +1,4 @@
-# CG-14 benchmark methodology authority
+# Benchmark methodology
 
 This document defines the minimum evidence needed to compare CodeGraph runs.
 It is methodology, not a performance target or release authorization.
@@ -63,6 +63,21 @@ summaries are derived from the artifact, never maintained as independent
 measurements. Provider tokens and quality results are optional and remain
 separate from local latency and estimated token counts.
 
-This authority creates no release floors and does not authorize public
-benchmark claims. CG-22/23 own the concrete benchmark artifact and execution
-policy.
+Raw timings are stored per named scenario in nanoseconds, with warmup count,
+sample count, operations per sample and aggregation policy (`benchstat` in v1);
+public-mode output emits each raw sample as a Go benchmark `ns/op` row.
+Comparability is reported as an explicit boolean plus stable refusal reasons,
+and serialization is deterministic for the same artifact data
+(`internal/benchmark`).
+
+This methodology sets no release floor and is not itself a performance claim.
+
+## Fixtures
+
+The synthetic ~100k-symbol query fixture (`BenchmarkQueryLatency100k`) is built
+through the production store write and resolver paths over a deterministic
+nonuniform graph; its canonical repository marker is part of its identity.
+`codegraph bench-queries` instead reads an already-indexed repository and
+reports its root and graph size. The two measure different workloads and need
+distinct fixture and scenario identities. `bench-queries` output is
+observational: it is not a comparable result across machines.
