@@ -212,6 +212,12 @@ func use() {
 		r.assertFreshParity(t, reg, step)
 	}
 	check("baseline", "a/types.go:a.Server.Start [go_receiver_scope/high]")
+	if summary, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update"}); err != nil {
+		t.Fatal(err)
+	} else if summary.FilesIndexed != 0 {
+		t.Fatalf("no-op update indexed %d files", summary.FilesIndexed)
+	}
+	check("no-op update", "a/types.go:a.Server.Start [go_receiver_scope/high]")
 
 	r.write(t, "a/ctor.go", "package a\n\nfunc NewServer() *Other { return nil }\n")
 	r.update(t)
