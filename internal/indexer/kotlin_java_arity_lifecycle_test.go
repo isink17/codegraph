@@ -78,6 +78,10 @@ class Caller {
 	assertTarget(4, one)
 	assertTarget(5, 0)
 	r.assertFreshParity(t, "initial arity-1 target")
+	if summary := r.update(t); summary.FilesIndexed != 0 {
+		t.Fatalf("no-op update indexed %d files", summary.FilesIndexed)
+	}
+	r.assertFreshParity(t, "no-op update")
 
 	r.write(t, "Actions.kt", kotlin("fun run(x: kotlin.String) {}\n"))
 	r.update(t, "Actions.kt")
