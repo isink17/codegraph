@@ -104,11 +104,12 @@ const (
 	CoverageUnavailable = "unavailable"
 )
 
-// Risk is change-risk evidence derived from the changes above. It carries no
-// score: every entry cites the removed declaration and the base-side calls it
-// rests on, and Coverage says how far an empty list can be trusted.
+// Risk reports direct dependent edges into removed declarations. This is an
+// evidence slice, not a complete change-risk score: missing relationships and
+// non-removal changes are outside its scope.
 type Risk struct {
-	Coverage SectionCoverage `json:"coverage"`
+	Assessment string          `json:"assessment"` // insufficient_evidence; no aggregate score is defined yet
+	Coverage   SectionCoverage `json:"coverage"`
 	// RemovedDeclarationDependents lists, for each declaration_removed change,
 	// the resolved edges into it (calls or any other edge kind) in the base
 	// revision from a declaration that still exists in the head revision.
@@ -634,7 +635,7 @@ func endpointIdentity(v store.SemanticEndpoint) string {
 // into the head revision. Only resolved edges are evidence, so the list is never complete: an unresolved, dynamic or
 // cross-language call can reach a removed declaration without appearing here.
 func removedDeclarationRisk(changes []Change, cov Coverage, headDecls []store.SemanticDeclaration, baseEdges, headEdges []store.SemanticEdge) Risk {
-	r := Risk{RemovedDeclarationDependents: []RemovedDeclarationDependents{}}
+	r := Risk{Assessment: "insufficient_evidence", RemovedDeclarationDependents: []RemovedDeclarationDependents{}}
 	if cov.Symbols.State == CoverageUnavailable || cov.Edges.State == CoverageUnavailable {
 		r.Coverage = SectionCoverage{State: CoverageUnavailable, Reason: "removed declarations or edges were not compared"}
 		return r

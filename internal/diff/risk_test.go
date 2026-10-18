@@ -45,6 +45,9 @@ func TestRiskCitesCallersOfRemovedDeclaration(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := got.Diff.Risk
+	if r.Assessment != "insufficient_evidence" {
+		t.Fatalf("risk assessment = %q", r.Assessment)
+	}
 	if r.Coverage.State != CoveragePartial || !strings.Contains(r.Coverage.Reason, "only resolved edges") {
 		t.Fatalf("risk coverage = %+v", r.Coverage)
 	}
@@ -121,7 +124,7 @@ func TestRiskUnavailableWhenEdgesNotCompared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := got.Diff.Risk; r.Coverage.State != CoverageUnavailable || len(r.RemovedDeclarationDependents) != 0 {
+	if r := got.Diff.Risk; r.Assessment != "insufficient_evidence" || r.Coverage.State != CoverageUnavailable || len(r.RemovedDeclarationDependents) != 0 {
 		t.Fatalf("risk = %+v", r)
 	}
 }
@@ -155,6 +158,9 @@ func TestRiskMarksAmbiguousHeadSite(t *testing.T) {
 	got, err := Compare(base, head, 0, 100)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got.Diff.Risk.Assessment != "insufficient_evidence" {
+		t.Fatalf("ambiguous evidence must remain insufficient: %+v", got.Diff.Risk)
 	}
 	r := got.Diff.Risk.RemovedDeclarationDependents
 	if len(r) != 1 || len(r[0].Edges) != 1 || !r[0].Edges[0].HeadAmbiguous || r[0].Edges[0].Head != nil {
