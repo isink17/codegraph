@@ -55,3 +55,8 @@ cmp "$dir/index.before" "$dir/corpus/.codegraph/codegraph.v2.sqlite"
 [ -n "$(git -C "$dir/corpus" status --porcelain)" ]
 [ -f "$dir/out/raw/edit_update_a_go.1.json" ]
 [ -f "$dir/out/raw/edit_update_b_go.1.json" ]
+
+ln -s "$dir/corpus" "$dir/corpus-link"
+sh "$(dirname "$0")/run.sh" "$dir/fake-codegraph" "$dir/corpus-link" "$dir/symlink-root-out" 1 1 a.go
+cmp "$dir/a.before" "$dir/corpus/a.go"
+cmp "$dir/index.before" "$dir/corpus/.codegraph/codegraph.v2.sqlite"

@@ -30,7 +30,8 @@ fi
 
 bin=$1 corpus=$2 out=$3 cold=$4 updates=$5
 shift 5
-cp -R "$corpus" "$tmp/corpus"
+mkdir "$tmp/corpus"
+cp -R "$corpus"/. "$tmp/corpus"
 corpus=$(CDPATH= cd "$tmp/corpus" && pwd -P)
 validate_edit_target() {
 	case "$1" in
