@@ -5,6 +5,9 @@
 #   run.sh --summarize SAMPLES_TSV
 set -eu
 
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/release-bench.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
 # Reads "scenario run wall_ms rss_bytes" rows; prints n, nearest-rank p50/p95, max.
 summarize() {
 	printf 'scenario\tn\tp50_ms\tp95_ms\tmax_ms\tmax_rss_mib\n'
@@ -27,6 +30,8 @@ fi
 
 bin=$1 corpus=$2 out=$3 cold=$4 updates=$5
 shift 5
+cp -R "$corpus" "$tmp/corpus"
+corpus=$tmp/corpus
 mkdir -p "$out/raw" "$out/home"
 export CODEGRAPH_HOME="$out/home" CODEGRAPH_NO_UPDATE_CHECK=1
 samples="$out/samples.tsv"
@@ -54,14 +59,13 @@ while [ "$i" -le "$updates" ]; do
 	i=$((i + 1))
 done
 for f in "$@"; do
-	name=edit_update_$(printf '%s' "${f##*.}")
+	name=edit_update_$(printf '%s_%s' "${f##*.}" "${f##*/}" | tr '/ .' '___')
 	i=1
 	while [ "$i" -le "$updates" ]; do
 		printf '\n' >>"$corpus/$f"
 		timed "$name" "$i" "$bin" update "$corpus"
 		i=$((i + 1))
 	done
-	git -C "$corpus" checkout --quiet -- "$f"
 done
 "$bin" update "$corpus" >/dev/null
 "$bin" stats "$corpus" >"$out/stats.json"
