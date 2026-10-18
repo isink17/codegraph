@@ -31,7 +31,27 @@ fi
 bin=$1 corpus=$2 out=$3 cold=$4 updates=$5
 shift 5
 cp -R "$corpus" "$tmp/corpus"
-corpus=$tmp/corpus
+corpus=$(CDPATH= cd "$tmp/corpus" && pwd -P)
+validate_edit_target() {
+	case "$1" in
+		''|/*|..|../*|*/..|*/../*) echo "unsafe edit target: $1" >&2; return 1 ;;
+	esac
+	path=$corpus part=$1
+	while :; do
+		component=${part%%/*}
+		path=$path/$component
+		[ ! -L "$path" ] || { echo "symlink edit target: $1" >&2; return 1; }
+		[ "$part" = "$component" ] && break
+		part=${part#*/}
+	done
+	[ -f "$path" ] || { echo "edit target must be a regular file: $1" >&2; return 1; }
+	resolved=$(CDPATH= cd -- "$(dirname "$corpus/$1")" && pwd -P)/$(basename "$corpus/$1")
+	case "$resolved" in
+		"$corpus"/*) ;;
+		*) echo "edit target escapes corpus: $1" >&2; return 1 ;;
+	esac
+}
+for f in "$@"; do validate_edit_target "$f"; done
 mkdir -p "$out/raw" "$out/home"
 export CODEGRAPH_HOME="$out/home" CODEGRAPH_NO_UPDATE_CHECK=1
 samples="$out/samples.tsv"

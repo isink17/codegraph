@@ -34,13 +34,16 @@ Raw samples: [benchmarks/v2.0.0-baseline/](benchmarks/v2.0.0-baseline/)
 ## Method
 
 `scripts/release-bench/run.sh BIN CORPUS OUT COLD_RUNS UPDATE_RUNS EDIT_FILE...`
-runs every scenario as a separate CLI process under `/usr/bin/time -l` and
-records wall time and peak RSS:
+copies the corpus to a disposable temporary directory, runs every scenario
+there as a separate CLI process under `/usr/bin/time -l`, and records wall time
+and peak RSS. Edit targets must be regular files inside that copy; absolute,
+traversal, and symlinked paths are rejected. The original repository and index
+are left untouched:
 
-- `cold_index`: delete `CORPUS/.codegraph`, then `codegraph index`. 5 runs.
+- `cold_index`: delete the copy's `.codegraph`, then `codegraph index`. 5 runs.
 - `noop_update`: `codegraph update` with nothing changed. 10 runs.
-- `edit_update_<ext>`: append one newline to one file, then `codegraph update`;
-  repeated 10 times per file, then the file is restored with `git checkout`.
+- `edit_update_<ext>_<file>`: append one newline to one file, then
+  `codegraph update`; repeated 10 times per file in the disposable copy.
   Files: fmt `src/os.cc`, `support/printable.py`; CodeGraph
   `internal/query/context_budget.go`, `scripts/cg33-oracle/oracle.py`.
 - queries: `codegraph bench-queries CORPUS --runs 20 --warmup 3` on the final

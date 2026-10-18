@@ -13,14 +13,18 @@ want=$(printf 'scenario\tn\tp50_ms\tp95_ms\tmax_ms\tmax_rss_mib\ncold\t2\t100\t9
 echo ok
 
 mkdir -p "$dir/corpus/.codegraph"
+mkdir -p "$dir/corpus/parent"
 printf 'tracked source\n' >"$dir/corpus/a.go"
 printf 'tracked source\n' >"$dir/corpus/b.go"
+printf 'parent source\n' >"$dir/corpus/parent/c.go"
 git -C "$dir/corpus" init -q
 git -C "$dir/corpus" add a.go b.go
+git -C "$dir/corpus" add parent/c.go
 git -C "$dir/corpus" -c user.name=test -c user.email=test@example.invalid commit -qm initial
 printf 'uncommitted change\n' >>"$dir/corpus/a.go"
 printf 'existing index\n' >"$dir/corpus/.codegraph/codegraph.v2.sqlite"
 cp "$dir/corpus/a.go" "$dir/a.before"
+cp "$dir/corpus/b.go" "$dir/b.before"
 cp "$dir/corpus/.codegraph/codegraph.v2.sqlite" "$dir/index.before"
 cat >"$dir/fake-codegraph" <<'EOF'
 #!/bin/sh
@@ -33,8 +37,20 @@ case "$cmd" in
 esac
 EOF
 chmod +x "$dir/fake-codegraph"
+ln -s "$dir/corpus/a.go" "$dir/corpus/absolute-link.go"
+ln -s parent "$dir/corpus/linked-parent"
+assert_rejected() {
+	if sh "$(dirname "$0")/run.sh" "$dir/fake-codegraph" "$dir/corpus" "$dir/rejected-out" 1 1 "$1"; then
+		echo "unsafe target accepted: $1" >&2
+		exit 1
+	fi
+}
+assert_rejected absolute-link.go
+assert_rejected linked-parent/c.go
+assert_rejected ../outside.go
 sh "$(dirname "$0")/run.sh" "$dir/fake-codegraph" "$dir/corpus" "$dir/out" 1 1 a.go b.go
 cmp "$dir/a.before" "$dir/corpus/a.go"
+cmp "$dir/b.before" "$dir/corpus/b.go"
 cmp "$dir/index.before" "$dir/corpus/.codegraph/codegraph.v2.sqlite"
 [ -n "$(git -C "$dir/corpus" status --porcelain)" ]
 [ -f "$dir/out/raw/edit_update_a_go.1.json" ]
