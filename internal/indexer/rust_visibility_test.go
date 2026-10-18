@@ -415,6 +415,10 @@ func TestRustPrivateVisibilityFollowsIncrementalChanges(t *testing.T) {
 			}
 		}
 		assertRustCallTarget(t, r, "no helper", "m.rs", "super::helper", "")
+		if summary := r.update(t); summary.FilesIndexed != 0 {
+			t.Fatalf("no-op update indexed %d files", summary.FilesIndexed)
+		}
+		r.assertFreshParity(t, "no-op update")
 		r.write(t, "lib.rs", "mod m; mod a; mod b; fn helper() {}")
 		update("lib.rs")
 		r.assertFreshParity(t, "private helper added")
