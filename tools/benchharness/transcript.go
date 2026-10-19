@@ -258,22 +258,25 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 	return nil
 }
 
-var localCommandPrefixes = []string{"<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"}
+// localCommandRE matches one complete local slash-command wrapper element;
+// RE2 has no backreferences, so each tag has its own alternative.
+var localCommandRE = func() *regexp.Regexp {
+	var alts []string
+	for _, tag := range []string{"command-name", "command-message", "command-args", "local-command-stdout", "local-command-stderr", "local-command-caveat"} {
+		alts = append(alts, "<"+tag+">.*?</"+tag+">")
+	}
+	return regexp.MustCompile("(?s)" + strings.Join(alts, "|"))
+}()
 
-// localCommandOnly reports user content made only of Claude Code's local
-// slash-command wrappers (such as /exit), which the model never answers.
+// localCommandOnly reports user content made only of complete Claude Code
+// local slash-command wrappers (such as /exit), which the model never answers.
 func localCommandOnly(texts []string) bool {
 	found := false
 	for _, s := range texts {
-		s = strings.TrimSpace(s)
-		if s == "" {
+		if strings.TrimSpace(s) == "" {
 			continue
 		}
-		local := false
-		for _, p := range localCommandPrefixes {
-			local = local || strings.HasPrefix(s, p)
-		}
-		if !local {
+		if strings.TrimSpace(localCommandRE.ReplaceAllString(s, "")) != "" {
 			return false
 		}
 		found = true

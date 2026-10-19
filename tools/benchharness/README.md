@@ -204,15 +204,20 @@ each session's final main-session answer is scored against its task's
 `required` and `forbidden` facts. A fact is `substring`, `regex` (RE2) or
 `number` (a regex with one capture group whose text, commas removed, equals
 `value`); `ignore_case` is optional. The answer is the text blocks of the last
-main-session request (a text or thinking block repeated across events of one
-`message.id` counts once); a session whose last request called a tool, that
+main-session request (identical text or thinking blocks within one
+`message.id` count once, so a block the model genuinely repeats is also
+counted once); a session whose last request called a tool, that
 was followed by a user message, or that has no text is `unscored` with that
 reason. User events marked `isMeta` and local slash-command wrappers
-(`<command-name>`, `<command-message>`, `<local-command-stdout>`,
-`<local-command-stderr>`, `<local-command-caveat>`, as written by `/exit`) do
-not count as a following user message. Interactive sessions can still end in
-shapes this does not recognize; headless (`claude -p`) recordings are the
-reliable path. Records store per-fact results, counts and the answer's
+(content made only of complete `<command-name>`, `<command-message>`,
+`<command-args>`, `<local-command-stdout>`, `<local-command-stderr>` and
+`<local-command-caveat>` elements, as written by `/exit` or `/model`) do not
+count as a following user message; any other text, or an unclosed or
+mismatched tag, does. Because `isMeta` events are ignored, an interactive
+session interrupted after a custom slash command is scored on the previous
+answer, and interactive sessions can end in other shapes this does not
+recognize; headless (`claude -p`) recordings avoid both and are the reliable
+path. Records store per-fact results, counts and the answer's
 SHA-256, not its text, plus the task-set file itself as `task_set_json`, the
 exact bytes ingest hashed; `validate` rechecks them against
 `task_set_sha256` and checks every evaluation against the facts they define.
