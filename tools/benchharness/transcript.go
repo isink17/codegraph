@@ -26,6 +26,7 @@ type rawEvent struct {
 	Type        string `json:"type"`
 	Subtype     string `json:"subtype"`
 	IsSidechain bool   `json:"isSidechain"`
+	IsMeta      bool   `json:"isMeta"`
 	Timestamp   string `json:"timestamp"`
 	Version     string `json:"version"`
 	Message     *struct {
@@ -38,6 +39,8 @@ type rawEvent struct {
 
 type rawBlock struct {
 	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input"`
@@ -61,6 +64,13 @@ type toolResult struct {
 type request struct {
 	usage
 	sidechain bool
+	// gap is the main-session content written between the previous main
+	// request and this one; reset marks a compaction boundary inside it.
+	gap     []segment
+	reset   bool
+	text    []string
+	toolUse bool
+	blocks  map[string]bool
 }
 
 // Transcript is the parsed content of one Claude Code JSONL session file.
@@ -72,8 +82,14 @@ type Transcript struct {
 	toolUses    []toolUse
 	results     map[string]toolResult
 	compactions int
-	first, last time.Time
-	timestamps  int
+
+	pending      []segment
+	pendingReset bool
+	toolCats     map[string]string
+	lastMain     *request
+	userAfter    bool
+	first, last  time.Time
+	timestamps   int
 }
 
 // ParseTranscript reads a Claude Code JSONL transcript. Claude Code writes one
@@ -82,7 +98,7 @@ type Transcript struct {
 // fields must agree across those events; output_tokens is a streamed snapshot
 // and the largest value seen for an id is kept.
 func ParseTranscript(r io.Reader) (*Transcript, error) {
-	t := &Transcript{mainModels: map[string]bool{}, sideModels: map[string]bool{}, versions: map[string]bool{}, results: map[string]toolResult{}}
+	t := &Transcript{mainModels: map[string]bool{}, sideModels: map[string]bool{}, versions: map[string]bool{}, results: map[string]toolResult{}, toolCats: map[string]string{}}
 	byID := map[string]*request{}
 	seenTool := map[string]bool{}
 	br := bufio.NewReader(r)
@@ -131,6 +147,7 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 	case "system":
 		if ev.Subtype == "compact_boundary" && !ev.IsSidechain {
 			t.compactions++
+			t.pending, t.pendingReset = nil, true
 		}
 	case "assistant":
 		m := ev.Message
@@ -145,18 +162,24 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 		if m.ID == "" || m.Usage == nil || m.Model == "" {
 			return errors.New("assistant message without id, model or usage")
 		}
-		if prev, ok := byID[m.ID]; ok {
-			if prev.Input != m.Usage.Input || prev.CacheRead != m.Usage.CacheRead || prev.CacheCreation != m.Usage.CacheCreation {
+		req, ok := byID[m.ID]
+		if ok {
+			if req.Input != m.Usage.Input || req.CacheRead != m.Usage.CacheRead || req.CacheCreation != m.Usage.CacheCreation {
 				return fmt.Errorf("message %s: conflicting usage across events", m.ID)
 			}
-			if prev.sidechain != ev.IsSidechain {
+			if req.sidechain != ev.IsSidechain {
 				return fmt.Errorf("message %s: appears in both main session and sidechain", m.ID)
 			}
-			prev.Output = max(prev.Output, m.Usage.Output)
+			req.Output = max(req.Output, m.Usage.Output)
 		} else {
-			req := &request{usage: *m.Usage, sidechain: ev.IsSidechain}
+			req = &request{usage: *m.Usage, sidechain: ev.IsSidechain, blocks: map[string]bool{}}
 			byID[m.ID] = req
 			t.requests = append(t.requests, req)
+			if !req.sidechain {
+				req.gap, req.reset = t.pending, t.pendingReset
+				t.pending, t.pendingReset = nil, false
+				t.lastMain, t.userAfter = req, false
+			}
 		}
 		if ev.IsSidechain {
 			t.sideModels[m.Model] = true
@@ -164,22 +187,101 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 			t.mainModels[m.Model] = true
 		}
 		for _, bl := range blocks(m.Content) {
-			if bl.Type == "tool_use" && !seenTool[bl.ID] {
+			// Events of one message.id may repeat a text or thinking block.
+			if bl.Type == "text" || bl.Type == "thinking" {
+				key := bl.Type + "\x00" + bl.Text + "\x00" + bl.Thinking
+				if req.blocks[key] {
+					continue
+				}
+				req.blocks[key] = true
+			}
+			switch {
+			case bl.Type == "tool_use" && !seenTool[bl.ID]:
 				seenTool[bl.ID] = true
-				t.toolUses = append(t.toolUses, toolUse{ID: bl.ID, Name: bl.Name, Input: bl.Input, Sidechain: ev.IsSidechain})
+				u := toolUse{ID: bl.ID, Name: bl.Name, Input: bl.Input, Sidechain: ev.IsSidechain}
+				t.toolUses = append(t.toolUses, u)
+				// An empty category marks a sidechain tool whose result is not
+				// main-session context.
+				t.toolCats[u.ID] = ""
+				if !ev.IsSidechain {
+					req.toolUse = true
+					t.toolCats[u.ID] = residualCategory(u)
+					t.addSegment(catAssistant, runes(bl.Name)+runes(string(bl.Input)), false)
+				}
+			case ev.IsSidechain:
+			case bl.Type == "text":
+				req.text = append(req.text, bl.Text)
+				t.addSegment(catAssistant, runes(bl.Text), false)
+			case bl.Type == "thinking":
+				t.addSegment(catAssistant, runes(bl.Thinking), false)
 			}
 		}
 	case "user":
 		if ev.Message == nil {
 			return nil
 		}
-		for _, bl := range blocks(ev.Message.Content) {
-			if bl.Type == "tool_result" {
-				t.results[bl.ToolUseID] = toolResult{IsError: bl.IsError, Text: contentText(bl.Content)}
+		var prompt string
+		var texts []string
+		if json.Unmarshal(ev.Message.Content, &prompt) == nil {
+			texts = append(texts, prompt)
+			if !ev.IsSidechain {
+				t.addSegment(catUserText, runes(prompt), false)
 			}
+		}
+		nonText := false
+		for _, bl := range blocks(ev.Message.Content) {
+			switch {
+			case bl.Type == "tool_result":
+				nonText = true
+				res := toolResult{IsError: bl.IsError, Text: contentText(bl.Content)}
+				t.results[bl.ToolUseID] = res
+				cat, ok := t.toolCats[bl.ToolUseID]
+				if !ok {
+					cat = catOtherTool
+				}
+				if !ev.IsSidechain && cat != "" {
+					t.addSegment(cat, runes(res.Text), true)
+				}
+			case bl.Type == "text":
+				texts = append(texts, bl.Text)
+				if !ev.IsSidechain {
+					t.addSegment(catUserText, runes(bl.Text), false)
+				}
+			default:
+				nonText = true
+			}
+		}
+		if !ev.IsSidechain && t.lastMain != nil && !ev.IsMeta && (nonText || !localCommandOnly(texts)) {
+			t.userAfter = true
 		}
 	}
 	return nil
+}
+
+// localCommandRE matches one complete local slash-command wrapper element;
+// RE2 has no backreferences, so each tag has its own alternative.
+var localCommandRE = func() *regexp.Regexp {
+	var alts []string
+	for _, tag := range []string{"command-name", "command-message", "command-args", "local-command-stdout", "local-command-stderr", "local-command-caveat"} {
+		alts = append(alts, "<"+tag+">.*?</"+tag+">")
+	}
+	return regexp.MustCompile("(?s)" + strings.Join(alts, "|"))
+}()
+
+// localCommandOnly reports user content made only of complete Claude Code
+// local slash-command wrappers (such as /exit), which the model never answers.
+func localCommandOnly(texts []string) bool {
+	found := false
+	for _, s := range texts {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		if strings.TrimSpace(localCommandRE.ReplaceAllString(s, "")) != "" {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 // blocks decodes a content array; a plain string content (a typed prompt) has
@@ -201,11 +303,11 @@ func contentText(raw json.RawMessage) string {
 		Text string `json:"text"`
 	}
 	_ = json.Unmarshal(raw, &parts)
-	var b strings.Builder
-	for _, p := range parts {
-		b.WriteString(p.Text)
+	texts := make([]string, len(parts))
+	for i, p := range parts {
+		texts[i] = p.Text
 	}
-	return b.String()
+	return strings.Join(texts, "\n")
 }
 
 // SessionMetrics are the per-session numbers derived from one transcript.
@@ -293,8 +395,8 @@ var deniedRE = regexp.MustCompile(`^(?:Hook )?PreToolUse:\S+ (?:hook error|denie
 
 // notFoundLineRE matches one shell line reporting that the codegraph binary
 // itself was not found (bash, dash and zsh shapes).
-var notFoundLineRE = regexp.MustCompile(`^(?:\S+: )?(?:(?:line )?\d+: )?\S*codegraph(?:\.exe)?: (?:command )?not found$` +
-	`|^(?:\S+: )?command not found: \S*codegraph(?:\.exe)?$`)
+var notFoundLineRE = regexp.MustCompile(`^(?:\S+: )?(?:(?:line )?\d+: )?(?:\S*[/\\])?codegraph(?:\.exe)?: (?:command )?not found$` +
+	`|^(?:\S+: )?command not found: (?:\S*[/\\])?codegraph(?:\.exe)?$`)
 
 var exitCodeLineRE = regexp.MustCompile(`^Exit code \d+$`)
 

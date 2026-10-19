@@ -142,6 +142,8 @@ func TestCLIPattern(t *testing.T) {
 		`echo "$(codegraph stats)"`,
 		"echo `codegraph stats`",
 		"while true; do codegraph stats; done",
+		"command -p codegraph stats",
+		"command codegraph stats",
 	}
 	misses := []string{
 		"grep -rn codegraph .",
@@ -159,6 +161,9 @@ func TestCLIPattern(t *testing.T) {
 		"npx codegraph-other",
 		"command -v codegraph",
 		"command -V codegraph",
+		"command -pv codegraph",
+		"command -Vp codegraph",
+		"command -p -v codegraph",
 	}
 	for _, c := range hits {
 		if !runsCodegraph(c) {
@@ -202,6 +207,13 @@ func TestContaminationOutcomes(t *testing.T) {
 		use("16", "Bash", `{"command":"codegraph stats"}`), result("16", "files: 3\nbash: line 2: codegraph: command not found", true),
 		use("17", "Bash", `{"command":"codegraph stats"}`), result("17", "symbols: 10\nlog: codegraph: command not found", true),
 		use("18", "Bash", `{"command":"codegraph stats"}`), result("18", "sh: 1: codegraph: not found", true),
+		use("19", "Bash", `{"command":"codegraph stats"}`), result("19", "bash: ./notcodegraph: command not found", true),
+		use("20", "Bash", `{"command":"codegraph stats"}`), result("20", "zsh: command not found: mycodegraph", true),
+		use("21", "Bash", `{"command":"./bin/codegraph stats"}`), result("21", "bash: ./bin/codegraph: command not found", true),
+		use("22", "Bash", `{"command":"codegraph stats"}`),
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"22","is_error":true,"content":[{"type":"text","text":"Exit code 127"},{"type":"text","text":"bash: codegraph: command not found"}]}]}}`,
+		use("23", "Bash", `{"command":"codegraph stats"}`),
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"23","is_error":true,"content":[{"type":"text","text":"files: 3"},{"type":"text","text":"bash: codegraph: command not found"}]}]}}`,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -212,8 +224,9 @@ func TestContaminationOutcomes(t *testing.T) {
 		got = append(got, call.ToolUseID+":"+call.Kind+":"+call.Outcome)
 	}
 	want := "1:cli:blocked 2:cli:blocked 3:cli:error 4:mcp:succeeded 5:skill:no_result 6:mcp:blocked 9:cli:error 10:cli:error 11:cli:blocked 12:subagent:unverified" +
-		" 13:cli:error 14:cli:blocked 15:cli:error 16:cli:error 17:cli:error 18:cli:blocked"
-	if strings.Join(got, " ") != want || !c.Contaminated || c.BlockedAttempts != 6 {
+		" 13:cli:error 14:cli:blocked 15:cli:error 16:cli:error 17:cli:error 18:cli:blocked" +
+		" 19:cli:error 20:cli:error 21:cli:blocked 22:cli:blocked 23:cli:error"
+	if strings.Join(got, " ") != want || !c.Contaminated || c.BlockedAttempts != 8 {
 		t.Fatalf("got %v contaminated=%v blocked=%d", got, c.Contaminated, c.BlockedAttempts)
 	}
 
@@ -244,7 +257,7 @@ func TestIngestFixture(t *testing.T) {
 	if err := ValidateIngest(rec); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec.Sessions) != 3 || rec.Sessions[0].Arm != "baseline" || rec.Sessions[0].Rep != 1 {
+	if len(rec.Sessions) != 4 || rec.Sessions[0].Arm != "baseline" || rec.Sessions[0].Rep != 1 || rec.Sessions[3].Rep != 2 {
 		t.Fatalf("sessions not sorted: %+v", rec.Sessions)
 	}
 	clean, dirty, treat := rec.Sessions[0], rec.Sessions[1], rec.Sessions[2]

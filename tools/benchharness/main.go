@@ -86,7 +86,7 @@ func run(args []string, stdout io.Writer) error {
 				err = ValidateIngest(ir)
 			}
 			if err == nil && *fixture != "" {
-				err = fmt.Errorf("validate: --fixture does not apply to %s", IngestSchema)
+				err = fmt.Errorf("validate: --fixture does not apply to %s", ir.Schema)
 			}
 			if err == nil && *sha != "" && ir.Manifest.CodeGraph.SHA != *sha {
 				err = fmt.Errorf("stale record: codegraph sha %s, expected %s", ir.Manifest.CodeGraph.SHA, *sha)
@@ -138,7 +138,7 @@ func run(args []string, stdout io.Writer) error {
 		for _, p := range fs.Args() {
 			if ir, err := loadIngest(p); err != nil || ir != nil {
 				if err == nil {
-					err = fmt.Errorf("compare: not supported for %s", IngestSchema)
+					err = fmt.Errorf("compare: not supported for agent transcript ingest records")
 				}
 				return err
 			}
@@ -180,7 +180,7 @@ func loadIngest(path string) (*IngestRecord, error) {
 	var head struct {
 		Schema string `json:"schema"`
 	}
-	if json.Unmarshal(b, &head) != nil || head.Schema != IngestSchema {
+	if json.Unmarshal(b, &head) != nil || (head.Schema != IngestSchema && head.Schema != IngestSchemaV1) {
 		return nil, nil
 	}
 	var r IngestRecord

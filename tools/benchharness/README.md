@@ -44,11 +44,11 @@ units outside count/bytes/estimated_tokens/ratio, any accuracy/F1 claim, and
 recall/coverage/unresolved_share values without complete ground truth. `--expect-sha`
 and `--fixture` reject stale records.
 
-## Agent transcripts (`agent-transcript-ab/v1`)
+## Agent transcripts (`agent-transcript-ab/v2`)
 
 `ingest` reads Claude Code JSONL transcripts that an operator already recorded
 for an A/B campaign (one arm without CodeGraph, one or more arms with it) and
-writes one deterministic `codegraph.agent_transcript_ingest/v1` record. It runs
+writes one deterministic `codegraph.agent_transcript_ingest/v2` record. It runs
 no model and makes no network calls. No paid runs were made for this tool; the
 bundled transcripts under `testdata/transcripts/` are hand-written synthetic
 fixtures, and nothing produced by `ingest` is a published claim.
@@ -62,11 +62,13 @@ fixtures, and nothing produced by `ingest` is a published claim.
 The manifest (`codegraph.agent_run_manifest/v1`, see
 `testdata/transcripts/manifest.json`) records the client name and version,
 the full model ID, effort, the CodeGraph commit and binary SHA-256, the corpus
-repository and commit, the task-set SHA-256, per-arm tool mode, MCP config and
+repository and commit, the task-set SHA-256 and optionally the task set's
+relative path (`task_set`), per-arm tool mode, MCP config and
 settings SHA-256, isolation flags, free-text uncertainties, and per session the
 arm, task, repetition, relative transcript path and transcript SHA-256.
 `ingest` refuses a transcript whose SHA-256, main-session model or client
-version differs from the manifest. Config hashes and isolation flags are
+version differs from the manifest, a task set whose SHA-256 differs from
+`task_set_sha256`, and a session whose task is not in the task set. Config hashes and isolation flags are
 recorded, not verified; every isolation flag that is false becomes a listed
 limitation.
 
@@ -112,7 +114,8 @@ in-file sidechain) is checked for:
   as the last path segment or with `.exe`, `npx`/`bunx` of a `codegraph`
   package, and `go run .../cmd/codegraph[@version]`. Arguments
   (`cd /src/codegraph`, `git -C /src/codegraph`, `ls .codegraph`,
-  `grep codegraph`, `command -v codegraph`) do not match. Not detected:
+  `grep codegraph`, `command -v codegraph`, and any `command` option cluster
+  containing `v` or `V` such as `-pv`) do not match. Not detected:
   aliases, shell functions, `eval`, scripts, variables used as the command,
   `find -exec codegraph`, `watch codegraph`, a redirection glued to the name
   (`codegraph>out`, `>out codegraph`), `env -S 'codegraph ...'` and
@@ -126,7 +129,9 @@ denial shapes (a result starting with `PreToolUse:<tool> hook error` or
 `Hook PreToolUse:<tool> denied`, `Permission to use `, `The user doesn't want
 to proceed`, or a result whose every non-empty line is either `Exit code N` or
 a shell reporting the codegraph binary not found, such as
-`bash: line 1: codegraph: command not found` or `sh: 1: codegraph: not found`);
+`bash: line 1: codegraph: command not found` or `sh: 1: codegraph: not found`;
+the name must be `codegraph` itself, bare or as the last path segment, so
+`./notcodegraph: command not found` is not a block);
 otherwise
 `succeeded`, `error` (codegraph may have run and printed output), `no_result`,
 or `unverified` for subagent calls. A session with any attempt that is not
@@ -134,6 +139,11 @@ or `unverified` for subagent calls. A session with any attempt that is not
 `--include-contaminated` is given; `summarize` prints contamination before any
 statistic. A baseline arm that needs subagents therefore needs its subagents
 disabled or its results read with `--include-contaminated` and that caveat.
+
+Output alone cannot tell a blocked call from a codegraph run that printed
+nothing: an empty successful result is `succeeded` and an empty error result is
+`error`, so both contaminate. Multi-block tool results are joined with line
+breaks before these checks.
 
 `validate --expect-sha` compares the manifest's CodeGraph commit; `--fixture`
 and `compare` do not apply to ingest records and are refused.
@@ -147,3 +157,86 @@ user-level instructions, skills and plugins that mention CodeGraph (user
 isolated; keep model, effort, prompts and client version identical across
 arms; randomize session order from a published seed and run several
 repetitions per task and arm.
+
+### Residual context attribution (`context-delta-char-share/v1`)
+
+Each session's `residual` splits `final_context_tokens` into `codegraph`
+(CodeGraph MCP tools and Bash commands that run codegraph, in any arm),
+`file_read` (Read), `search` (Grep, Glob, LS), `shell` (other Bash),
+`other_tool`, `assistant` (text, thinking and tool-call blocks), `user_text`,
+`initial_request` and `unattributed`. Every category carries a `basis`:
+
+- `measured`: `initial_request` is the first main-session request's
+  `input + cache_read + cache_creation`, the exact provider count of the system
+  prompt, tool schemas and first prompt. The final context and all totals are
+  measured too.
+- `estimated`: for each later main-session request, the growth over the
+  previous request is split over the content written between the two (the
+  previous answer's blocks, tool results, user text) in proportion to its
+  character count, with the largest-remainder method so shares sum to the
+  measured growth exactly. These are apportioned provider tokens, not token
+  counts of the content.
+- `unavailable`: `unattributed` holds growth over a gap with no visible
+  content, and, after a `compact_boundary` or any drop in context, the whole
+  context at that request; attribution restarts from there (`resets`).
+
+Categories always sum to the measured final context. Sidechain requests and
+their tool results are excluded; subagent context is not attributed.
+Error sources: content the transcript does not show (redacted thinking,
+attachments, system reminders) has its tokens spread over the visible content
+of the same gap; tokenizer density differs between source code, JSON and prose,
+so one character does not cost the same everywhere; cache accounting noise
+moves into the next gap. `summarize` prints a per-session table and per-arm
+median/min/max with the basis in each unit (`provider_tokens`,
+`estimated_provider_tokens`, `unattributed_provider_tokens`).
+
+Compared with the external residual-occupancy method this adapts (measured
+context deltas priced by characters), this one does not calibrate a
+chars-per-token ratio on tool-dominated gaps or print a per-result error bar,
+and it does not model partial eviction: any context drop resets attribution
+instead of evicting the oldest results. It therefore reports more as
+`unattributed` and never invents a resident set it cannot see.
+
+### Answer correctness (`codegraph.agent_task_set/v1`)
+
+When the manifest names a task set (see `testdata/transcripts/tasks.json`),
+each session's final main-session answer is scored against its task's
+`required` and `forbidden` facts. A fact is `substring`, `regex` (RE2) or
+`number` (a regex with one capture group whose text, commas removed, equals
+`value`); `ignore_case` is optional. The answer is the text blocks of the last
+main-session request (identical text or thinking blocks within one
+`message.id` count once, so a block the model genuinely repeats is also
+counted once); a session whose last request called a tool, that
+was followed by a user message, or that has no text is `unscored` with that
+reason. User events marked `isMeta` and local slash-command wrappers
+(content made only of complete `<command-name>`, `<command-message>`,
+`<command-args>`, `<local-command-stdout>`, `<local-command-stderr>` and
+`<local-command-caveat>` elements, as written by `/exit` or `/model`) do not
+count as a following user message; any other text, or an unclosed or
+mismatched tag, does. Because `isMeta` events are ignored, an interactive
+session interrupted after a custom slash command is scored on the previous
+answer, and interactive sessions can end in other shapes this does not
+recognize; headless (`claude -p`) recordings avoid both and are the reliable
+path. Records store per-fact results, counts and the answer's
+SHA-256, not its text, plus the task-set file itself as `task_set_json`, the
+exact bytes ingest hashed; `validate` rechecks them against
+`task_set_sha256` and checks every evaluation against the facts they define.
+Per arm, `correctness` sums scored and unscored sessions, required facts
+matched over total, forbidden hits, and sessions with every required fact and
+no forbidden one, over included (uncontaminated) sessions. This is rubric
+matching, not a semantic judgment: an answer can match every fact and still be
+wrong, or be right in words the rubric does not anticipate. No model judges
+answers. Subagent answers are not scored. Task-set tasks with no session are
+listed as limitations.
+
+### Schema compatibility
+
+`codegraph.agent_transcript_ingest/v2` (methodology `agent-transcript-ab/v2`)
+adds `task_set_json`, per-session `residual` and `evaluation`, per-arm
+`correctness`, and `residual_*` per-arm statistics, and changes contamination
+outcomes for the not-found and `command -pv` fixes; the version is bumped so a
+v1 reader never sees fields or outcomes it does not know. `validate` and
+`summarize` still accept `/v1` records under v1 rules (no residual,
+evaluation or task set). `codegraph.agent_run_manifest/v1` gains only the
+optional `task_set` field; existing manifests are unchanged.
+`codegraph.benchmark/v1` is unchanged.
