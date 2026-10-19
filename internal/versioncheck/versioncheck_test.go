@@ -279,8 +279,8 @@ func TestRunCheckOutdated(t *testing.T) {
 	if !strings.Contains(s, "not on the latest version") {
 		t.Fatalf("expected outdated message, got: %q", s)
 	}
-	if !strings.Contains(s, installCmd) {
-		t.Fatalf("expected install command, got: %q", s)
+	if !strings.Contains(s, upgradeHint) || strings.Contains(s, "go install") {
+		t.Fatalf("expected installer upgrade hint, got: %q", s)
 	}
 	if !strings.Contains(s, releasesPage) {
 		t.Fatalf("expected releases page, got: %q", s)
@@ -315,8 +315,8 @@ func TestRunCheckUnknownVersion(t *testing.T) {
 	if !strings.Contains(s, "v1.3.0") {
 		t.Fatalf("expected latest version in output, got: %q", s)
 	}
-	if !strings.Contains(s, installCmd) {
-		t.Fatalf("expected install command, got: %q", s)
+	if !strings.Contains(s, upgradeHint) || strings.Contains(s, "go install") {
+		t.Fatalf("expected installer upgrade hint, got: %q", s)
 	}
 }
 
