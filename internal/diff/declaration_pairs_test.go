@@ -39,6 +39,17 @@ func goFunc(name string) store.SemanticDeclaration {
 	return store.SemanticDeclaration{Language: "go", Kind: "function", Name: name, QualifiedName: "p." + name, StableKey: "func:p::" + name, StartLine: 3, EndLine: 3}
 }
 
+// goReasons drops the go.mod renames' language_not_proven rows.
+func goReasons(d DeclarationPairs) []string {
+	out := []string{}
+	for _, r := range reasons(d) {
+		if r != refuseLanguageNotProven {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 func reasons(d DeclarationPairs) []string {
 	out := []string{}
 	for _, r := range d.Refused {
@@ -205,8 +216,12 @@ func inModule(f store.SemanticFile, root, modulePath, importPath string) store.S
 	return f
 }
 
+// withModules records modules and puts an identical go.mod for each in the tree.
 func withModules(r Revision, modules ...store.SemanticGoModule) Revision {
 	r.GraphData.GoModules = &store.SemanticGoModules{Modules: append([]store.SemanticGoModule{}, modules...), Workspaces: []string{}}
+	for _, m := range modules {
+		r.TreeFiles = append(r.TreeFiles, SourceFile{Path: path.Join(m.Root, "go.mod"), ContentHash: "gomod"})
+	}
 	return r
 }
 
@@ -231,6 +246,15 @@ func TestDeclarationPairsAcrossDirectories(t *testing.T) {
 		{name: "module root moved with its package", base: moveBase(), head: moveHead(), pairs: 1},
 		{name: "same names in distinct packages", base: withModules(pairRevision(inModule(goFile("x/a.go"), ".", "example.com/m", "example.com/m/x"), fn), root), head: withModules(pairRevision(inModule(goFile("y/a.go"), ".", "example.com/m", "example.com/m/y"), fn), root), refused: []string{refuseModuleIdentityChanged}},
 		{name: "module renamed while moved", base: moveBase(), head: withModules(pairRevision(inModule(goFile("y/p/a.go"), "y", "example.com/n", "example.com/n/p"), fn), store.SemanticGoModule{Root: "y", Path: "example.com/n"}), refused: []string{refuseModuleIdentityChanged}},
+		{name: "module split keeps import path", base: withModules(pairRevision(inModule(goFile("a/b/x.go"), ".", "example.com/m", "example.com/m/a/b"), fn), root), head: withModules(pairRevision(inModule(goFile("c/b/x.go"), "c", "example.com/m/a", "example.com/m/a/b"), fn), root, store.SemanticGoModule{Root: "c", Path: "example.com/m/a"}), refused: []string{refuseModuleIdentityChanged}},
+		{name: "go.mod edited while moved", base: moveBase(), head: edit(moveHead(), func(r *Revision) {
+			for i := range r.TreeFiles {
+				if r.TreeFiles[i].Path == "y/go.mod" {
+					r.TreeFiles[i].ContentHash = "edited"
+				}
+			}
+		}), refused: []string{refuseModuleRootChanged}},
+		{name: "go.mod missing from the tree", base: moveBase(), head: edit(moveHead(), func(r *Revision) { r.TreeFiles = r.TreeFiles[:1] }), refused: []string{refuseModuleEvidenceMissing}},
 		{name: "module path declared twice", base: moveBase(), head: edit(moveHead(), func(r *Revision) {
 			r.GraphData.GoModules.Modules = append(r.GraphData.GoModules.Modules, movedRoot("z"))
 		}), refused: []string{refuseModulePathNotUnique}},
@@ -259,8 +283,8 @@ func TestDeclarationPairsAcrossDirectories(t *testing.T) {
 			if tc.refused == nil {
 				tc.refused = []string{}
 			}
-			if !reflect.DeepEqual(reasons(d), tc.refused) {
-				t.Fatalf("refused = %v, want %v", reasons(d), tc.refused)
+			if !reflect.DeepEqual(goReasons(d), tc.refused) {
+				t.Fatalf("refused = %v, want %v", goReasons(d), tc.refused)
 			}
 			if len(got.Diff.Symbols.Removed) != 1 || len(got.Diff.Symbols.Added) != 1 {
 				t.Fatalf("declaration changes hidden: %+v", got.Diff.Symbols)
@@ -483,6 +507,41 @@ func TestCompareCommitsCrossDirectoryLifecycle(t *testing.T) {
 		// A refused move keeps its caller cited.
 		if n := ruleCount(got.Diff.Risk, RuleRemovedDeclarationDependent); n != 1 {
 			t.Fatalf("risk = %s", canonical(got.Diff.Risk))
+		}
+	})
+	t.Run("nested module claims the moved import path", func(t *testing.T) {
+		got := moveScenario(t, map[string]string{
+			"go.mod":   "module example.com/m\n",
+			"a/b/x.go": "package b\n\nfunc B() {}\n",
+			"main.go":  "package main\n\nimport \"example.com/m/a/b\"\n\nfunc main() { b.B() }\n",
+		}, func(r *gittest.Repo) {
+			r.Write("c/go.mod", "module example.com/m/a\n")
+			gitMove(t, r, "a/b/x.go", "c/b/x.go")
+		})
+		if want := []string{"a/b/x.go>c/b/x.go:" + refuseModuleIdentityChanged}; !reflect.DeepEqual(goRefusals(got.Diff.DeclarationPairs), want) || len(got.Diff.DeclarationPairs.Pairs) != 0 {
+			t.Fatalf("declaration pairs = %s", canonical(got.Diff.DeclarationPairs))
+		}
+	})
+	t.Run("module renamed so the import path coincides", func(t *testing.T) {
+		got := moveScenario(t, map[string]string{
+			"go.mod":   "module example.com/m\n",
+			"x/p/a.go": "package p\n\nfunc A() {}\n",
+		}, func(r *gittest.Repo) {
+			r.Write("go.mod", "module example.com/m/x\n")
+			gitMove(t, r, "x/p/a.go", "p/a.go")
+		})
+		if want := []string{"x/p/a.go>p/a.go:" + refuseModuleIdentityChanged}; !reflect.DeepEqual(goRefusals(got.Diff.DeclarationPairs), want) || len(got.Diff.DeclarationPairs.Pairs) != 0 {
+			t.Fatalf("declaration pairs = %s", canonical(got.Diff.DeclarationPairs))
+		}
+	})
+	t.Run("go.mod edited during the move", func(t *testing.T) {
+		got := moveScenario(t, app, func(r *gittest.Repo) {
+			moveModule(r)
+			r.Write("sub/go.mod", "module example.com/m\n\ngo 1.23\n")
+		})
+		d := got.Diff.DeclarationPairs
+		if want := []string{"cmd/main.go>sub/cmd/main.go:" + refuseModuleRootChanged, "p/a.go>sub/p/a.go:" + refuseModuleRootChanged}; !reflect.DeepEqual(goRefusals(d), want) || len(d.Pairs) != 0 {
+			t.Fatalf("declaration pairs = %s", canonical(d))
 		}
 	})
 	t.Run("content changed during the move", func(t *testing.T) {

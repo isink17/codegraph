@@ -91,17 +91,19 @@ combined `// +build`) constraint, and each completed scan records every `go.mod`
 and `go.work` of the repository. A file's import path is the module path of the
 nearest `go.mod` at or above it plus its directory relative to that module
 root. Since an import path names a directory, two files in different
-directories share one only when the module root moved with them and still
-declares the same module path. A cross-directory rename pairs only then, and is
+directories share one only when the module root moved with them, still
+declares the same module path and its `go.mod` bytes are unchanged (as a
+same-directory rename requires). A cross-directory rename pairs only then, and is
 refused otherwise:
 
 | `reason` | When |
 |---|---|
-| `module_evidence_unavailable` | Either side has no recorded module evidence (an index written before it was recorded), a file has no recorded package identity, or a file is outside every module or under a `go.mod` without a module path. |
+| `module_evidence_unavailable` | Either side has no recorded module evidence (an index written before it was recorded), a file has no recorded package identity, a file is outside every module or under a `go.mod` without a module path, or the module's `go.mod` is missing from a revision's tree. |
 | `workspace_uncertain` | Either revision has a `go.work`. |
-| `module_replace_in_repo` | A `go.mod` of either revision replaces a module by a directory. |
+| `module_replace_in_repo` | A `go.mod` of either revision replaces a module by a directory path, inside or outside the repository. |
 | `module_path_not_unique` | Two module roots declare the file's module path. |
-| `module_identity_changed` | The import paths differ: a different package, even with the same package clause and names. |
+| `module_identity_changed` | The import paths or the module paths differ: a different package, even with the same package clause and names, or the same import path now owned by another module. |
+| `module_root_changed` | The `go.mod` of the file's module differs in bytes between the two revisions. |
 | `package_identity_changed` | The package clause or the external test role (`_test` package in a `_test.go` file) differs. |
 | `build_role_changed` | The build constraint or the file name's build role differs. |
 | `package_ignored` | A path is under `testdata`, `vendor`, or a directory starting with `_` or `.`. |

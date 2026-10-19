@@ -99,7 +99,7 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 			refuse(refuseParserSemanticsDiffer)
 			continue
 		case path.Dir(r.From) != path.Dir(r.To):
-			if reason := crossDirectoryRefusal(base.GoModules, head.GoModules, bf, hf); reason != "" {
+			if reason := crossDirectoryRefusal(base.GoModules, head.GoModules, bf, hf, baseTree, headTree); reason != "" {
 				refuse(reason)
 				continue
 			}
@@ -138,8 +138,9 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 // be proven to belong to one package, or "" when the indexed evidence gives
 // them the same import path, package clause, test role and build constraint.
 // An import path names a directory, so that holds only when the module root
-// moved with the package and still declares the same module path.
-func crossDirectoryRefusal(baseModules, headModules *store.SemanticGoModules, bf, hf store.SemanticFile) string {
+// moved with the package, still declares the same module path, and its go.mod
+// bytes are unchanged (as a same-directory rename requires).
+func crossDirectoryRefusal(baseModules, headModules *store.SemanticGoModules, bf, hf store.SemanticFile, baseTree, headTree []SourceFile) string {
 	switch {
 	case goIgnoredDirectory(bf.Path) || goIgnoredDirectory(hf.Path):
 		return refusePackageIgnored
@@ -157,8 +158,17 @@ func crossDirectoryRefusal(baseModules, headModules *store.SemanticGoModules, bf
 		return refuseModuleEvidenceMissing
 	case moduleRoots(baseModules, b.ModulePath) != 1 || moduleRoots(headModules, h.ModulePath) != 1:
 		return refuseModulePathNotUnique
-	case b.ImportPath != h.ImportPath:
+	case b.ModulePath != h.ModulePath || b.ImportPath != h.ImportPath:
 		return refuseModuleIdentityChanged
+	case baseTree == nil || headTree == nil:
+		return refuseModuleEvidenceMissing
+	}
+	baseMod, headMod := treeHash(baseTree, path.Join(b.ModuleRoot, "go.mod")), treeHash(headTree, path.Join(h.ModuleRoot, "go.mod"))
+	switch {
+	case baseMod == "" || headMod == "":
+		return refuseModuleEvidenceMissing
+	case baseMod != headMod:
+		return refuseModuleRootChanged
 	case b.PackageClause != h.PackageClause || b.ExternalTest != h.ExternalTest:
 		return refusePackageChanged
 	case b.BuildConstraint != h.BuildConstraint:
@@ -181,6 +191,15 @@ func repoModuleRefusal(base, head *store.SemanticGoModules) string {
 			if mod.LocalReplace {
 				return refuseModuleReplaceInRepo
 			}
+		}
+	}
+	return ""
+}
+
+func treeHash(tree []SourceFile, p string) string {
+	for _, f := range tree {
+		if f.Path == p {
+			return f.ContentHash
 		}
 	}
 	return ""
@@ -226,7 +245,7 @@ func changedContentMoves(renames FileRenames, base, head store.SemanticGraph, in
 			incomplete[f.Path] || renamed[f.Path] || goIgnoredDirectory(f.Path) {
 			return ""
 		}
-		return canonical([]any{g.ImportPath, g.PackageClause, g.ExternalTest, g.BuildConstraint, goBuildRole(f.Path), path.Base(f.Path)})
+		return canonical([]any{g.ModulePath, g.ImportPath, g.PackageClause, g.ExternalTest, g.BuildConstraint, goBuildRole(f.Path), path.Base(f.Path)})
 	}
 	inTree := func(tree []SourceFile) map[string]bool {
 		out := make(map[string]bool, len(tree))
