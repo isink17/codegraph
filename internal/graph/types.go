@@ -563,6 +563,18 @@ const (
 	FreshnessUnknown          = "unknown"
 )
 
+// Freshness verdicts, in the order they are decided. None claims the working
+// tree matches the graph: consistent_with_last_scan means only that no stored
+// fact and no live writer contradicts the last completed scan.
+const (
+	FreshnessVerdictIndexIncomplete        = "index_incomplete"
+	FreshnessVerdictWriterActive           = "writer_active"
+	FreshnessVerdictAbandonedScan          = "abandoned_scan"
+	FreshnessVerdictLivenessUnknown        = "liveness_unknown"
+	FreshnessVerdictStaleKnown             = "stale_known"
+	FreshnessVerdictConsistentWithLastScan = "consistent_with_last_scan"
+)
+
 // Freshness is a read-only account of what the stored graph can say about its
 // own staleness. Every field has an explicit unknown; nothing claims "fresh".
 //
@@ -573,8 +585,10 @@ const (
 // latest_scan_failed even when an earlier failed full update left its work
 // undone; Coverage is where whole-repository evidence lives.
 type Freshness struct {
-	State             string                `json:"state"`
-	Reasons           []string              `json:"reasons"`
+	State   string   `json:"state"`
+	Reasons []string `json:"reasons"`
+	// Verdict is one FreshnessVerdict* value; see docs/freshness.md.
+	Verdict           string                `json:"verdict"`
 	LastCompletedScan *FreshnessScan        `json:"last_completed_scan"`
 	LatestScan        *FreshnessScan        `json:"latest_scan"`
 	RunningScans      FreshnessRunningScans `json:"running_scans"`
@@ -585,6 +599,11 @@ type Freshness struct {
 	Worktree   FreshnessWorktree `json:"worktree"`
 	Filesystem string            `json:"filesystem"`
 	Coverage   FreshnessCoverage `json:"coverage"`
+	// ResolverPolicyPending lists languages whose edges an older resolver
+	// policy decided; nil when it cannot be read (see ResolverPolicy).
+	ResolverPolicyPending []string `json:"resolver_policy_pending"`
+	// ResolverPolicy is "converged", "pending" or "unknown".
+	ResolverPolicy string `json:"resolver_policy"`
 }
 
 // FreshnessCoverage is the recorded evidence of whole-repository coverage. It
@@ -633,11 +652,12 @@ type FreshnessRunningScans struct {
 	// AfterLastCompleted counts running rows newer than the last completed
 	// scan; older ones were superseded.
 	AfterLastCompleted int64 `json:"after_last_completed"`
-	// Liveness is always "unknown": scans hold no lease, so a running row
-	// cannot be told apart from one whose process died. A scan that fails or
-	// is cancelled closes its own row as failed; only a process that dies
-	// mid-scan, or a failure that could not itself be recorded, leaves one
-	// running.
+	// Liveness comes from a non-blocking probe of the shared scan lock:
+	// "active" when a scan of this database holds it (with or without a row
+	// yet), "abandoned" when rows read running while the probe held the lock
+	// exclusively (no live process owns them; run recover-scans), "none" when
+	// neither, and "unknown" when the lock cannot be probed. The lock is
+	// host-local and a binary that predates it takes none.
 	Liveness string `json:"liveness"`
 }
 

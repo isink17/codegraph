@@ -48,6 +48,8 @@ type Watcher struct {
 	// profileConverges counts the full passes this watcher ran because a
 	// path-scoped flush could not safely convert a language's parser profile.
 	profileConverges atomic.Int64
+
+	overflows atomic.Int64
 }
 
 type WatchStats struct {
@@ -70,6 +72,10 @@ type WatchStats struct {
 	// ProfileConverges counts the full passes forced by a parser-profile
 	// transition a path-scoped flush could not safely make.
 	ProfileConverges int64 `json:"profile_converges,omitempty"`
+
+	// Overflows counts event-queue overflows, each answered by a full
+	// reconciliation update.
+	Overflows int64 `json:"overflows,omitempty"`
 
 	QueueExecs   int64 `json:"queue_execs"`
 	QueueSkipped int64 `json:"queue_skipped"`
@@ -99,6 +105,7 @@ func (w *Watcher) Stats() WatchStats {
 		UpdatePaths: w.updatePaths.Load(),
 
 		ProfileConverges: w.profileConverges.Load(),
+		Overflows:        w.overflows.Load(),
 
 		QueueExecs:   w.queueExecs.Load(),
 		QueueSkipped: w.queueSkipped.Load(),
@@ -153,6 +160,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 	w.updateRuns.Store(0)
 	w.updatePaths.Store(0)
 	w.profileConverges.Store(0)
+	w.overflows.Store(0)
 	if debounce <= 0 {
 		debounce = 750 * time.Millisecond
 	}
@@ -166,7 +174,14 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 
 	var forceFullScan atomic.Bool
 
-	fsw, err := fsnotify.NewWatcher()
+	newFSWatcher := func() (*fsnotify.Watcher, error) {
+		fw, err := fsnotify.NewWatcher()
+		if err == nil && watcherCreatedHook != nil {
+			watcherCreatedHook(fw)
+		}
+		return fw, err
+	}
+	fsw, err := newFSWatcher()
 	if err != nil {
 		return err
 	}
@@ -174,18 +189,40 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 	eventsCh := fsw.Events
 	errorsCh := fsw.Errors
 
-	addWatchTreeTo := func(target *fsnotify.Watcher, root string) error {
+	// watchedDirs holds every registered directory's native path. Only the
+	// event goroutine touches it.
+	watchedDirs := map[string]struct{}{}
+	// addWatchTreeTo registers root and its directories and passes each
+	// indexable file under it to found, when non-nil. Entries removed during
+	// the walk are skipped, nothing is left in them to watch; a missing
+	// repository root is still an error.
+	addWatchTreeTo := func(target *fsnotify.Watcher, root string, found func(rel string)) error {
+		addDir := func(path string) error {
+			if err := target.Add(path); err != nil {
+				if errors.Is(err, fs.ErrNotExist) && path != repoRoot {
+					return filepath.SkipDir
+				}
+				return err
+			}
+			watchedDirs[path] = struct{}{}
+			return nil
+		}
 		return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if errors.Is(err, fs.ErrNotExist) && path != repoRoot {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
+			logicalRel := ""
 			if path != repoRoot {
 				rel, relErr := filepath.Rel(repoRoot, path)
 				if relErr != nil {
 					return relErr
 				}
 				nativeRel := filepath.Clean(rel)
-				logicalRel, logicalErr := platform.NativeRelativeToLogical(nativeRel)
+				var logicalErr error
+				logicalRel, logicalErr = platform.NativeRelativeToLogical(nativeRel)
 				if logicalErr != nil {
 					return logicalErr
 				}
@@ -193,7 +230,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 					if pathpkg.Base(logicalRel) == config.RepoArtifactsDir {
 						// Keep watching repo-local config updates even though artifacts are
 						// never indexable.
-						if addErr := target.Add(path); addErr != nil {
+						if addErr := addDir(path); addErr != nil && addErr != filepath.SkipDir {
 							return addErr
 						}
 					}
@@ -201,12 +238,15 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 				}
 			}
 			if d.IsDir() {
-				return target.Add(path)
+				return addDir(path)
+			}
+			if found != nil && !indexer.ShouldIgnorePath(logicalRel, excludes) && !indexer.ShouldSkipFile(logicalRel, includes, excludes) {
+				found(logicalRel)
 			}
 			return nil
 		})
 	}
-	addWatchTree := func(root string) error { return addWatchTreeTo(fsw, root) }
+	addWatchTree := func(root string) error { return addWatchTreeTo(fsw, root, nil) }
 
 	resetWatcher := func() error {
 		// Rebuild the watcher so include/exclude changes take effect (especially
@@ -215,11 +255,12 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 		// the old one, so events on already-watched paths keep flowing through
 		// the old watcher during the rebuild instead of falling into a window
 		// where neither watcher is active.
-		next, err := fsnotify.NewWatcher()
+		next, err := newFSWatcher()
 		if err != nil {
 			return err
 		}
-		if err := addWatchTreeTo(next, repoRoot); err != nil {
+		clear(watchedDirs)
+		if err := addWatchTreeTo(next, repoRoot, nil); err != nil {
 			_ = next.Close()
 			return err
 		}
@@ -286,6 +327,14 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 	}
 
 	flushSignalCh := make(chan struct{}, 1)
+	signalFlush := func() {
+		select {
+		case flushSignalCh <- struct{}{}:
+			w.flushSignals.Add(1)
+		default:
+			w.coalescedSignals.Add(1)
+		}
+	}
 	flushErrCh := make(chan error, 1)
 
 	// Coalesce repeated fsnotify events for the same file between flushes to avoid
@@ -396,12 +445,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 					if err := resetWatcher(); err != nil {
 						return err
 					}
-					select {
-					case flushSignalCh <- struct{}{}:
-						w.flushSignals.Add(1)
-					default:
-						w.coalescedSignals.Add(1)
-					}
+					signalFlush()
 				}
 				w.eventsIgnored.Add(1)
 				continue
@@ -412,13 +456,62 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
 				if info, statErr := os.Stat(event.Name); statErr == nil && info.IsDir() {
-					if err := addWatchTree(event.Name); err != nil {
+					if createdDirHook != nil {
+						createdDirHook(event.Name)
+					}
+					// A directory moved or copied in brings files that raise no
+					// events of their own, and files written before its watch
+					// was added raised none either.
+					var files []string
+					if err := addWatchTreeTo(fsw, event.Name, func(rel string) { files = append(files, rel) }); err != nil {
 						return err
 					}
-					// Directory creates are not indexable file updates.
 					w.eventsIgnored.Add(1)
 					w.eventsIgnoredDir.Add(1)
+					if len(files) > 0 {
+						if err := w.queueDirtyPathsWithRetry(ctx, repoID, files, "create"); err != nil {
+							w.queueErrors.Add(1)
+							return err
+						}
+						w.queueExecs.Add(1)
+						signalFlush()
+					}
 					continue
+				}
+			}
+			if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				if _, wasDir := watchedDirs[event.Name]; wasDir {
+					if _, statErr := os.Lstat(event.Name); errors.Is(statErr, fs.ErrNotExist) {
+						// Its files raise no events when it is moved out.
+						prefix := event.Name + string(filepath.Separator)
+						for dir := range watchedDirs {
+							if dir == event.Name || strings.HasPrefix(dir, prefix) {
+								_ = fsw.Remove(dir)
+								delete(watchedDirs, dir)
+							}
+						}
+						live, err := w.store.LiveFilePaths(ctx, repoID)
+						if err != nil {
+							return err
+						}
+						var gone []string
+						for _, p := range live {
+							if strings.HasPrefix(p, rel+"/") {
+								gone = append(gone, p)
+							}
+						}
+						if len(gone) > 0 {
+							if err := w.queueDirtyPathsWithRetry(ctx, repoID, gone, "remove"); err != nil {
+								w.queueErrors.Add(1)
+								return err
+							}
+							w.queueExecs.Add(1)
+							signalFlush()
+						}
+						w.eventsIgnored.Add(1)
+						w.eventsIgnoredDir.Add(1)
+						continue
+					}
 				}
 			}
 			if indexer.ShouldSkipFile(rel, includes, excludes) {
@@ -442,19 +535,39 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			} else {
 				w.queueSkipped.Add(1)
 			}
-			select {
-			case flushSignalCh <- struct{}{}:
-				w.flushSignals.Add(1)
-			default:
-				w.coalescedSignals.Add(1)
-			}
+			signalFlush()
 		case err, ok := <-errorsCh:
 			if !ok {
 				return nil
 			}
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				// Dropped events cannot be replayed; reconcile everything
+				// through the incremental full update, which skips files
+				// whose size and mtime are unchanged.
+				w.overflows.Add(1)
+				forceFullScan.Store(true)
+				signalFlush()
+				continue
+			}
 			return err
 		}
 	}
+}
+
+func (w *Watcher) queueDirtyPathsWithRetry(ctx context.Context, repoID int64, paths []string, reason string) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if lastErr = w.store.QueueDirtyFiles(ctx, repoID, paths, reason); lastErr == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt*50) * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("queue %d dirty files: %w", len(paths), lastErr)
 }
 
 func (w *Watcher) queueDirtyWithRetry(ctx context.Context, repoID int64, path, reason string) error {
@@ -498,3 +611,10 @@ func (w *Watcher) updateConverging(ctx context.Context, repoRoot string, opts in
 	_, err = w.indexer.Update(ctx, indexer.Options{RepoRoot: repoRoot, ScanKind: "watch_config"})
 	return err
 }
+
+// Test hooks: watcherCreatedHook sees every fsnotify watcher Run creates;
+// createdDirHook runs before a newly created directory is registered.
+var (
+	watcherCreatedHook func(*fsnotify.Watcher)
+	createdDirHook     func(path string)
+)

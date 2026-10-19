@@ -35,7 +35,7 @@ func freshness(t *testing.T, s *Store, repoID int64) graph.Freshness {
 	if f.State == "fresh" || slices.Contains(f.Reasons, "fresh") {
 		t.Fatalf("freshness claims fresh: %+v", f)
 	}
-	if f.RunningScans.Liveness != "unknown" || f.Watcher != "not_in_this_process" || f.Filesystem != "not_checked" {
+	if !slices.Contains([]string{"active", "abandoned", "none", "unknown"}, f.RunningScans.Liveness) || f.Verdict == "" || f.Watcher != "not_in_this_process" || f.Filesystem != "not_checked" {
 		t.Fatalf("fixed honesty fields changed: %+v", f)
 	}
 	return f
@@ -108,9 +108,12 @@ func TestFreshnessRunningScan(t *testing.T) {
 	s, repoID := freshnessStore(t, t.TempDir())
 	orphan := scan(t, s, repoID, "update", "running", "")
 	scan(t, s, repoID, "index", "completed", "")
+	s.releaseAllScanLocks() // the orphan's process died
 	f := freshness(t, s, repoID)
-	// A running row older than the last completed scan was superseded.
-	if f.RunningScans.Count != 1 || f.RunningScans.AfterLastCompleted != 0 || f.State != graph.FreshnessNoKnownStaleness {
+	// A dead running row older than the last completed scan was superseded,
+	// but still needs recovery.
+	if f.RunningScans.Count != 1 || f.RunningScans.AfterLastCompleted != 0 || f.State != graph.FreshnessNoKnownStaleness ||
+		f.RunningScans.Liveness != "abandoned" || f.Verdict != graph.FreshnessVerdictAbandonedScan {
 		t.Fatalf("orphan %d: %+v", orphan, f)
 	}
 	running := scan(t, s, repoID, "update", "running", "")

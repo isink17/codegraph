@@ -20,11 +20,31 @@ const freshnessUnknown = "unknown"
 // staleness. It never writes and never claims "fresh". Every row is read in
 // one read-only transaction, so the scan, queue and history fields describe
 // one snapshot. HEAD is then read with one bounded git call outside that
-// snapshot; a commit landing between the two is not detectable here.
+// snapshot; a commit landing between the two is not detectable here. The scan
+// lock is probed first and, when free, held across that read, so a running row
+// it reads cannot belong to a live lock-aware scan.
 func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshness, error) {
+	probe, release := s.probeScanLock()
 	f, err := s.freshnessRows(ctx, repoID)
+	release()
 	if err != nil {
 		return graph.Freshness{}, err
+	}
+	switch {
+	case probe == scanLockHeld:
+		f.RunningScans.Liveness = "active"
+	case probe == scanLockFree && f.RunningScans.Count > 0:
+		f.RunningScans.Liveness = "abandoned"
+	case probe == scanLockFree:
+		f.RunningScans.Liveness = "none"
+	}
+	f.ResolverPolicy = freshnessUnknown
+	if pending, err := s.PendingResolverPolicies(ctx, repoID); err == nil {
+		f.ResolverPolicyPending = append([]string{}, pending...)
+		f.ResolverPolicy = "converged"
+		if len(pending) > 0 {
+			f.ResolverPolicy = "pending"
+		}
 	}
 	f.Worktree.HeadNow = freshnessUnknown
 	headCtx, cancel := context.WithTimeout(ctx, freshnessHeadTimeout)
@@ -47,7 +67,7 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	if f.LatestScan != nil && f.LatestScan.Status == "failed" {
 		f.Reasons = append(f.Reasons, "latest_scan_failed")
 	}
-	if f.RunningScans.AfterLastCompleted > 0 {
+	if f.RunningScans.AfterLastCompleted > 0 || f.RunningScans.Liveness == "active" {
 		f.Reasons = append(f.Reasons, "scan_running_or_abandoned")
 	}
 	if f.DirtyQueue.Queued+f.DirtyQueue.InFlight > 0 {
@@ -64,7 +84,25 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	default:
 		f.State = graph.FreshnessNoKnownStaleness
 	}
+	f.Verdict = freshnessVerdict(f)
 	return f, nil
+}
+
+func freshnessVerdict(f graph.Freshness) string {
+	switch {
+	case f.LastCompletedScan == nil:
+		return graph.FreshnessVerdictIndexIncomplete
+	case f.RunningScans.Liveness == "active":
+		return graph.FreshnessVerdictWriterActive
+	case f.RunningScans.Liveness == "abandoned":
+		return graph.FreshnessVerdictAbandonedScan
+	case f.RunningScans.Count > 0:
+		return graph.FreshnessVerdictLivenessUnknown
+	case len(f.Reasons) > 0:
+		return graph.FreshnessVerdictStaleKnown
+	default:
+		return graph.FreshnessVerdictConsistentWithLastScan
+	}
 }
 
 func (s *Store) freshnessRows(ctx context.Context, repoID int64) (graph.Freshness, error) {
