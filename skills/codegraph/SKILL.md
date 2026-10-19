@@ -97,8 +97,10 @@ Details, audit, and fallback rules: `references/trust.md`.
   `codegraph find_callees . <symbol>`,
   `codegraph get_impact_radius . --symbol <name>`, and
   `git diff --name-only | codegraph find_related_tests --stdin`.
-- No index yet: `codegraph index .` once, then `codegraph update .` after
-  changes (or `codegraph watch .` for automatic updates).
+- No index yet: ask the user before creating one. Indexing writes a
+  `.codegraph/` directory into the repository. Once they agree, run
+  `codegraph index .` once, then `codegraph update .` after changes (or
+  `codegraph watch .` for automatic updates).
 - Neither available: fall back to ordinary source search, and suggest
   installing CodeGraph (https://github.com/isink17/codegraph) rather than
   installing it unprompted.

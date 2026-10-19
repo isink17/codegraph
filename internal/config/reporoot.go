@@ -23,7 +23,8 @@ var (
 // Empty inputs are treated as "not provided".
 //
 // This chain selects which repository a *process* opens, which is a startup
-// decision. An already-running MCP server does not use it: that server is scoped
+// decision. `serve` does not use it: an MCP client may start anywhere, so serve
+// never falls back to the working directory (see cli.resolveServeRoot). An already-running MCP server does not use it: that server is scoped
 // to the one repository it was opened for and never calls this, so a tool
 // argument cannot retarget it. See mcp.Server.assertActiveRepo.
 func ResolveRepoRoot(flagValue, toolParam string) (string, error) {
@@ -34,14 +35,8 @@ func ResolveRepoRoot(flagValue, toolParam string) (string, error) {
 		return v, nil
 	}
 
-	cmd := execCommand("git", "rev-parse", "--show-toplevel")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = new(bytes.Buffer)
-	if err := cmd.Run(); err == nil {
-		if v := strings.TrimSpace(stdout.String()); v != "" {
-			return v, nil
-		}
+	if v, ok := GitTopLevel(); ok {
+		return v, nil
 	}
 
 	wd, err := getwd()
@@ -52,4 +47,18 @@ func ResolveRepoRoot(flagValue, toolParam string) (string, error) {
 	}
 
 	return "", fmt.Errorf("unable to resolve repo root: provide --repo-root or repo_root, or run from a git repo")
+}
+
+// GitTopLevel reports the git toplevel of the current working directory, if
+// there is one. For a linked worktree that is the worktree's own root.
+func GitTopLevel() (string, bool) {
+	cmd := execCommand("git", "rev-parse", "--show-toplevel")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = new(bytes.Buffer)
+	if err := cmd.Run(); err != nil {
+		return "", false
+	}
+	v := strings.TrimSpace(stdout.String())
+	return v, v != ""
 }

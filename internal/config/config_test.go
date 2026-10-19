@@ -8,7 +8,7 @@ import (
 
 func TestRepoDBExcludePatternsCoverV1AndV2Artifacts(t *testing.T) {
 	patterns := RepoDBExcludePatterns()
-	if len(patterns) != 2 || patterns[0] != "codegraph.sqlite*" || patterns[1] != "codegraph.v2.sqlite*" {
+	if len(patterns) != 3 || patterns[0] != "codegraph.sqlite*" || patterns[1] != "codegraph.v2.sqlite*" || patterns[2] != "codegraph.v2-*.sqlite*" {
 		t.Fatalf("RepoDBExcludePatterns() = %#v", patterns)
 	}
 }

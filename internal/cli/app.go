@@ -214,17 +214,8 @@ func runDoctor(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 		if err != nil {
 			return err
 		}
-		candidates, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
-		if err != nil {
+		if dbPath, err = existingRepoDBPath(cfg, repoRoot, canonical); err != nil {
 			return err
-		}
-		for _, candidate := range candidates {
-			if st, statErr := os.Stat(candidate); statErr == nil && st.Size() > 0 {
-				dbPath = candidate
-				break
-			} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-				return statErr
-			}
 		}
 	}
 
@@ -1401,7 +1392,7 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if err != nil {
 		return err
 	}
-	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -1442,20 +1433,9 @@ func runRecoverScans(ctx context.Context, cfg config.Config, stdout io.Writer, a
 	}
 	// Look the database up without dbPathForRepo, which creates its parent
 	// directory: a refusal must leave the repository untouched.
-	paths, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
+	dbPath, err := existingRepoDBPath(cfg, repoRoot, canonical)
 	if err != nil {
 		return err
-	}
-	dbPath := ""
-	for _, path := range paths {
-		st, err := os.Stat(path)
-		if err == nil && st.Size() > 0 {
-			dbPath = path
-			break
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
 	}
 	if dbPath == "" {
 		return fmt.Errorf("repository %s is not indexed", repoRoot)
@@ -1643,7 +1623,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 	if err != nil {
 		return err
 	}
-	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
+	app, repo, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -1835,23 +1815,53 @@ func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, 
 		return err
 	}
 	repoRootCandidate := strings.TrimSpace(*repoRootFlag)
+	if fs.NArg() > 1 || (repoRootCandidate != "" && fs.NArg() == 1 && fs.Arg(0) != repoRootCandidate) {
+		return fmt.Errorf("serve takes one repository root, got %q and %q", repoRootCandidate, strings.Join(fs.Args(), " "))
+	}
 	if repoRootCandidate == "" && fs.NArg() > 0 {
 		repoRootCandidate = fs.Arg(0)
 	}
-	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
+	repoRoot, dbPath, reason, err := resolveServeRoot(cfg, repoRootCandidate)
 	if err != nil {
 		return err
 	}
-	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
-	if err != nil {
-		return err
+	// opened is whichever App this session ends up holding: the existing graph
+	// now, or the one index_repo creates later.
+	var opened *App
+	defer func() {
+		if opened != nil {
+			_ = opened.Close()
+		}
+	}()
+	var server *mcp.Server
+	if dbPath != "" {
+		app, repo, err := openIndexedApp(ctx, cfg, repoRoot, dbPath)
+		switch {
+		case err == nil:
+			opened = app
+			server = mcp.NewServer(repo.RootPath, repo.ID, app.Store, app.Indexer, app.Query, stderr)
+			fmt.Fprintf(stderr, "%s: serving %s (%s); graph database %s\n", appname.BinaryName, repoRoot, reason, dbPath)
+		case errors.Is(err, store.ErrRepoNotIndexed):
+			// The database holds no graph yet: serve uninitialized below.
+		default:
+			return err
+		}
 	}
-	defer app.Close()
-	server := mcp.NewServer(repo.RootPath, repoID, app.Store, app.Indexer, app.Query, stderr)
+	if server == nil {
+		server = mcp.NewUninitializedServer(repoRoot, func(ctx context.Context) (mcp.Backend, error) {
+			app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+			if err != nil {
+				return mcp.Backend{}, err
+			}
+			opened = app
+			return mcp.Backend{RepoID: repoID, Store: app.Store, Indexer: app.Indexer, Query: app.Query}, nil
+		}, stderr)
+		fmt.Fprintf(stderr, "%s: serving %s (%s); not indexed yet, nothing is written until index_repo\n", appname.BinaryName, repoRoot, reason)
+	}
 	if err := server.SetToolMode(toolMode); err != nil {
 		return err
 	}
-	if repoCfg, err := config.LoadRepo(repo.RootPath); err == nil {
+	if repoCfg, err := config.LoadRepo(repoRoot); err == nil {
 		if repoCfg.Agent.Enabled || repoCfg.Agent.BaseURL != "" || repoCfg.Agent.Model != "" {
 			server.SetAgentConfig(repoCfg.Agent.BaseURL, repoCfg.Agent.Model)
 		}
@@ -1865,6 +1875,62 @@ func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, 
 		writeUsageSummary(stderr, server.UsageSnapshot())
 	}
 	return serveErr
+}
+
+// resolveServeRoot selects the one repository a serve process is scoped to,
+// without creating anything, and says why. An explicit root is used whether or
+// not it is indexed. Without one, the git toplevel of the working directory is
+// adopted only when it already has a graph database: an MCP client launched in
+// an arbitrary directory must not turn that directory into a repository. The
+// working directory itself is never a fallback.
+func resolveServeRoot(cfg config.Config, explicit string) (root, dbPath, reason string, err error) {
+	if explicit != "" {
+		st, err := os.Stat(explicit)
+		if err != nil {
+			return "", "", "", fmt.Errorf("--repo-root %s: %w", explicit, err)
+		}
+		if !st.IsDir() {
+			return "", "", "", fmt.Errorf("--repo-root %s is not a directory", explicit)
+		}
+		root, reason = explicit, "from --repo-root"
+	} else {
+		top, ok := config.GitTopLevel()
+		if !ok {
+			return "", "", "", fmt.Errorf("no active repository: the working directory is not inside a git repository; start %s serve with --repo-root <path>", appname.BinaryName)
+		}
+		root, reason = top, "git toplevel of the working directory, already indexed"
+	}
+	canonical, err := store.CanonicalRepoPath(root)
+	if err != nil {
+		return "", "", "", err
+	}
+	if dbPath, err = existingRepoDBPath(cfg, root, canonical); err != nil {
+		return "", "", "", err
+	}
+	if dbPath == "" && explicit == "" {
+		return "", "", "", fmt.Errorf("no active repository: %s has no %s graph database, and serve does not adopt an unindexed directory; start %s serve with --repo-root %s to index it on request, or run %s index %s first",
+			root, appname.BinaryName, appname.BinaryName, root, appname.BinaryName, root)
+	}
+	return canonical, dbPath, reason, nil
+}
+
+// openIndexedApp opens an existing graph database for a long-lived session.
+// Unlike openApp it never inserts a repo row: a database that holds no graph
+// for root reports why instead of being rebound to it.
+func openIndexedApp(ctx context.Context, cfg config.Config, root, dbPath string) (*App, graph.Repo, error) {
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+	if err != nil {
+		return nil, graph.Repo{}, err
+	}
+	repo, found, err := s.FindRepo(ctx, root)
+	if err == nil && !found {
+		err = repoRowMissingError(ctx, s, root, dbPath)
+	}
+	if err != nil {
+		_ = s.Close()
+		return nil, graph.Repo{}, err
+	}
+	return newApp(s, repo.CanonicalPath), repo, nil
 }
 
 // writeUsageSummary prints a session's usage report to w. A marshal failure is
@@ -2087,7 +2153,7 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if fs.NArg() > 0 {
 		repoRoot = fs.Arg(0)
 	}
-	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -2153,7 +2219,7 @@ func runVisualize(ctx context.Context, cfg config.Config, stdout io.Writer, args
 		return err
 	}
 
-	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -2288,9 +2354,15 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		if err != nil {
 			return err
 		}
-		dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+		// Maintenance applies to an existing graph only; cleaning a repository
+		// must never be how its database gets created.
+		dbPath, err := existingRepoDBPath(cfg, repoRoot, canonical)
 		if err != nil {
 			return err
+		}
+		if dbPath == "" {
+			return notIndexedError(fmt.Sprintf("%s is not indexed: no graph database found (run %s index %s)",
+				repoRoot, appname.BinaryName, repoRoot))
 		}
 		res := dbResult{Path: dbPath, CanonicalRepo: canonical}
 		before := fileSize(dbPath)
@@ -2530,21 +2602,22 @@ func openApp(ctx context.Context, cfg config.Config, repoRoot string) (*App, gra
 	if err != nil {
 		return nil, graphRepo{}, 0, err
 	}
-	registry := newDefaultRegistry()
-	repoCfg, _ := config.LoadRepo(canonical)
-	embedder := newEmbedder(repoCfg.Embedding)
-	idx := indexer.New(s, registry, embedder)
 	repo, err := s.UpsertRepo(ctx, canonical)
 	if err != nil {
 		_ = s.Close()
 		return nil, graphRepo{}, 0, err
 	}
-	app := &App{
+	return newApp(s, canonical), graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
+}
+
+func newApp(s *store.Store, canonical string) *App {
+	repoCfg, _ := config.LoadRepo(canonical)
+	embedder := newEmbedder(repoCfg.Embedding)
+	return &App{
 		Store:   s,
-		Indexer: idx,
+		Indexer: indexer.New(s, newDefaultRegistry(), embedder),
 		Query:   query.New(s, embedder),
 	}
-	return app, graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
 }
 
 func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
@@ -2581,13 +2654,12 @@ func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error
 	return paths[0], nil
 }
 
+// repoDBPathsForRepo derives the database path from the canonical root, the
+// same identity the repo row is keyed by, so a symlinked spelling of a root can
+// never name a different database than the root itself.
 func repoDBPathsForRepo(cfg config.Config, repoRoot, canonical string) ([]string, error) {
 	if config.IsRepoDBDir(cfg.DBDir) {
-		absRoot, err := filepath.Abs(repoRoot)
-		if err != nil {
-			return nil, err
-		}
-		return []string{filepath.Join(absRoot, config.RepoArtifactsDir, store.RepoDatabaseFileName)}, nil
+		return []string{filepath.Join(canonical, config.RepoArtifactsDir, store.RepoDatabaseFileName)}, nil
 	}
 	return []string{filepath.Join(cfg.DBDir, store.V2DBFileNameForRepo(canonical))}, nil
 }
@@ -2674,7 +2746,7 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout, stderr io.
 		return fmt.Errorf("usage: %s %s [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...", appname.BinaryName, cmdName)
 	}
 
-	app, _, repoID, err := openApp(ctx, cfg, repoRoot)
+	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}

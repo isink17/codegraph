@@ -39,6 +39,45 @@ type Server struct {
 	// usage is this server's local context meter. One server lifetime is one
 	// metering session; nothing about it is persisted, exported, or reported.
 	usage *usage.Meter
+	// open creates the graph database of a server started without one. It is
+	// nil once the server has a store.
+	open func(context.Context) (Backend, error)
+}
+
+// Backend is the opened graph database of the server's repository.
+type Backend struct {
+	RepoID  int64
+	Store   *store.Store
+	Indexer *indexer.Indexer
+	Query   *query.Service
+}
+
+// NewUninitializedServer builds a server for a repository that has no graph
+// database yet. It answers initialize and tools/list without touching disk, and
+// every tool reports "not indexed" until index_repo calls open. Only index_repo
+// initializes: a query or an update must never be how a graph comes to exist.
+func NewUninitializedServer(repoRoot string, open func(context.Context) (Backend, error), errOut io.Writer) *Server {
+	s := NewServer(repoRoot, 0, nil, nil, nil, errOut)
+	s.open = open
+	return s
+}
+
+// uninitializedTools may run before the server has a store: index_repo creates
+// it, update_graph refuses with the same advice, and usage_stats reads only
+// the in-process meter.
+var uninitializedTools = map[string]bool{"index_repo": true, "update_graph": true, "usage_stats": true}
+
+func (s *Server) notIndexedError() error {
+	return fmt.Errorf("%s is not indexed yet: call index_repo to build its graph, or run `codegraph index %s`", s.repoRoot, s.repoRoot)
+}
+
+func (s *Server) initialize(ctx context.Context) error {
+	b, err := s.open(ctx)
+	if err != nil {
+		return err
+	}
+	s.repoID, s.store, s.indexer, s.query, s.open = b.RepoID, b.Store, b.Indexer, b.Query, nil
+	return nil
 }
 
 // NewServer builds an MCP server. repoRoot is the active repository root,
@@ -286,6 +325,9 @@ func (s *Server) dispatchTool(ctx context.Context, name string, raw json.RawMess
 	desc, ok := dispatchableTool(name)
 	if !ok {
 		return nil, fmt.Errorf("unknown tool %q", name)
+	}
+	if s.store == nil && !uninitializedTools[name] {
+		return nil, s.notIndexedError()
 	}
 	result, err := desc.handler(s, ctx, raw)
 	if err != nil || result == nil || !disclosesLimitations(name, raw) {
@@ -698,6 +740,14 @@ func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bo
 	// requested root.
 	if err := s.assertActiveRepoArgs(req.RepoRoot, req.RepoPath); err != nil {
 		return nil, err
+	}
+	if s.store == nil {
+		if update {
+			return nil, s.notIndexedError()
+		}
+		if err := s.initialize(ctx); err != nil {
+			return nil, err
+		}
 	}
 	opts := indexer.Options{
 		RepoRoot: s.repoRoot,
