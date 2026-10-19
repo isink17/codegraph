@@ -20,6 +20,7 @@ import (
 
 type liveRepo struct {
 	root   string
+	dbPath string
 	s      *store.Store
 	repoID int64
 	w      *Watcher
@@ -53,7 +54,8 @@ func startLiveRepoDebounce(t *testing.T, files map[string]string, debounce time.
 	for rel, body := range files {
 		writeFile(t, filepath.Join(root, rel), body)
 	}
-	s, err := store.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +68,7 @@ func startLiveRepoDebounce(t *testing.T, files map[string]string, debounce time.
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &liveRepo{root: root, s: s, repoID: repo.ID}
+	r := &liveRepo{root: root, dbPath: dbPath, s: s, repoID: repo.ID}
 	t.Cleanup(func() { _ = s.Close() })
 	r.start(t, idx, debounce)
 	return r
@@ -193,6 +195,10 @@ func TestWatcherReconcilesAfterEventOverflow(t *testing.T) {
 	if err := first.fsw.Add(r.root); err != nil {
 		t.Fatal(err)
 	}
+	startup, err := r.s.FreshnessStatus(context.Background(), r.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	first.errs <- fsnotify.ErrEventOverflow
 	deadline := time.After(5 * time.Second)
 	for {
@@ -200,7 +206,7 @@ func TestWatcherReconcilesAfterEventOverflow(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if f.LastCompletedScan != nil && f.LastCompletedScan.Kind == "watch_config" {
+		if f.LastCompletedScan != nil && f.LastCompletedScan.Kind == "watch_config" && f.LastCompletedScan.ID > startup.LastCompletedScan.ID {
 			break
 		}
 		select {
