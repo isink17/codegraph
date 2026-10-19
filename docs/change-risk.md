@@ -37,11 +37,13 @@ A dependent relationship is one (dependent declaration, depended-on declaration)
 pair taken from the resolved base edges, where the dependent still exists in
 head. A dependent exists in head when its full identity (path, language, kind,
 qualified name, signature and stable key) is unchanged, when `declaration_pairs`
-proves it moved with a renamed file, or when its signature changed and its
-path, language, kind and qualified name name exactly one declaration on each
-side; the last two are cited with `dependent_head`. Any other dependent whose
-key still names declarations in head (an overloaded dependent whose signature
-changed) is not scored and is listed as `dependent_identity_ambiguous`; if no
+proves it moved with a renamed file, or when its signature changed and, among
+the declarations with its path, language, kind and qualified name that have no
+counterpart on the other side, it is the only one in base and one is left in
+head; the last two are cited with `dependent_head`. With no such head
+declaration the dependent was removed. With several (two overloads whose
+signatures both changed) it is not scored and is listed as
+`dependent_identity_ambiguous`; if no
 other surviving dependent cites the removal it depended on, that removal shows
 as uncertainty too. A dependent that is gone from head is not scored. Several
 call sites between the same pair are one relationship, and each relationship is
@@ -105,7 +107,7 @@ release, any change to what a rule cites or scores needs a new model id.
 |---|---|
 | `removed_declaration_without_resolved_dependents` | A removed declaration had no resolved base edge from a declaration that survives. Zero resolved callers is not evidence of zero callers. |
 | `dependent_site_ambiguous` | Several head edges share the base edge's site. |
-| `dependent_identity_ambiguous` | A dependent's identity changed and its path, language, kind and qualified name do not name one declaration on each side. |
+| `dependent_identity_ambiguous` | A dependent's identity changed and several declarations under its path, language, kind and qualified name are left without a counterpart, so it cannot be paired. |
 | `dependent_rebinding_unproven` | A dependent of a removed declaration references a sibling it already used, no more often than in base (`identity` is the relationship, `detail` the sibling). |
 | `dependent_binding_partial` | A dependent still resolves to the declaration, but at fewer references than base sites, next to unresolved or other-target references by the same name. |
 | `declaration_ambiguous`, `edge_ambiguous` | The diff could not match identities one to one. |

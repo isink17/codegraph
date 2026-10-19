@@ -482,32 +482,46 @@ func removedDependents(removed map[string]bool, headDecls []store.SemanticDeclar
 }
 
 // headDependents maps each base declaration to its head identity: itself when
-// it survives, its declaration_pairs counterpart, or else the only head
-// declaration with the same path, language, kind and qualified name when that
-// key also names exactly one base declaration (its signature changed).
-// ambiguous holds the base declarations left unmapped although head still has
-// declarations under their key.
+// it survives, its declaration_pairs counterpart, or else, among the
+// declarations with the same path, language, kind and qualified name that have
+// no counterpart, the only head one when it is also the only base one (its
+// signature changed). ambiguous holds base declarations left unmapped while
+// several such unmatched candidates remain; with none in head the declaration
+// was removed.
 func headDependents(baseDecls, headDecls []store.SemanticDeclaration, pairedTo map[string]string) (map[string]string, map[string]bool) {
 	nameKey := func(d store.SemanticDeclaration) string {
 		return canonical([]string{d.Path, d.Language, d.Kind, d.QualifiedName})
 	}
-	baseByName, headByName := group(baseDecls, nameKey), group(headDecls, nameKey)
-	surviving := make(map[string]bool, len(headDecls))
-	for _, d := range headDecls {
-		surviving[declIdentity(d)] = true
+	inBase, inHead, pairTarget := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, d := range baseDecls {
+		inBase[declIdentity(d)] = true
 	}
+	for _, d := range headDecls {
+		inHead[declIdentity(d)] = true
+	}
+	for _, to := range pairedTo {
+		pairTarget[to] = true
+	}
+	unmatchedBase := group(filter(baseDecls, func(d store.SemanticDeclaration) bool {
+		id := declIdentity(d)
+		return !inHead[id] && pairedTo[id] == ""
+	}), nameKey)
+	unmatchedHead := group(filter(headDecls, func(d store.SemanticDeclaration) bool {
+		id := declIdentity(d)
+		return !inBase[id] && !pairTarget[id]
+	}), nameKey)
 	out, ambiguous := make(map[string]string, len(baseDecls)), map[string]bool{}
 	for _, d := range baseDecls {
-		id := declIdentity(d)
-		k := nameKey(d)
+		id, k := declIdentity(d), nameKey(d)
 		switch {
-		case surviving[id]:
+		case inHead[id]:
 			out[id] = id
 		case pairedTo[id] != "":
 			out[id] = pairedTo[id]
-		case len(baseByName[k]) == 1 && len(headByName[k]) == 1:
-			out[id] = declIdentity(headByName[k][0])
-		case len(headByName[k]) > 0:
+		case len(unmatchedHead[k]) == 0:
+		case len(unmatchedBase[k]) == 1 && len(unmatchedHead[k]) == 1:
+			out[id] = declIdentity(unmatchedHead[k][0])
+		default:
 			ambiguous[id] = true
 		}
 	}

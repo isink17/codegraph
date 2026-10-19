@@ -555,19 +555,38 @@ func TestRiskDependentAcrossSignatureChange(t *testing.T) {
 	}
 }
 
-// Two overloads of the dependent share its qualified name: no unique pairing,
-// so the dependent is disclosed, not scored, and the removal stays uncertain.
-func TestRiskDependentSignatureChangeAmongOverloadsIsUncertainty(t *testing.T) {
+// Overloads of the dependent share its qualified name. Only declarations
+// without a counterpart compete: a deleted overload is removed, one changed
+// overload next to an unchanged sibling is paired, and two changed overloads
+// are ambiguous.
+func TestRiskDependentOverloads(t *testing.T) {
 	gone, a, b := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A"), riskDecl("a.go", "A")
 	b.Signature = "func A(s string)"
-	a2 := a
-	a2.Signature = "func A(x int)"
+	a2, b2 := a, b
+	a2.Signature, b2.Signature = "func A(x int)", "func A(s []string)"
+	unresolved := store.SemanticDeclaration{QualifiedName: "Gone"}
 	files := indexed("a.go", "lib.go")
-	base := riskRevision(files, []store.SemanticDeclaration{gone, a, b}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
-	head := riskRevision(files, []store.SemanticDeclaration{a2, b}, []store.SemanticEdge{riskCall(a2, store.SemanticDeclaration{QualifiedName: "Gone"}, 4, 2, "unresolved")})
-	r := compareRisk(t, base, head)
-	if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "dependent_identity_ambiguous", declIdentity(a)) || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
-		t.Fatalf("risk = %+v", r)
+	base := riskRevision(files, []store.SemanticDeclaration{gone, a, b}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved"), riskCall(b, gone, 8, 2, "resolved")})
+
+	deleted := compareRisk(t, base, riskRevision(files, []store.SemanticDeclaration{b}, []store.SemanticEdge{riskCall(b, unresolved, 8, 2, "unresolved")}))
+	if ev := component(t, deleted, RuleRemovedDeclarationDependent).Evidence; *deleted.Score != 20 || len(ev) != 1 || ev[0].Dependent != declIdentity(b) || hasUncertainty(deleted, "dependent_identity_ambiguous", "") {
+		t.Fatalf("deleted overload: %+v", deleted)
+	}
+
+	changed := compareRisk(t, base, riskRevision(files, []store.SemanticDeclaration{a2, b}, []store.SemanticEdge{riskCall(a2, unresolved, 4, 2, "unresolved"), riskCall(b, unresolved, 8, 2, "unresolved")}))
+	ev := component(t, changed, RuleRemovedDeclarationDependent).Evidence
+	if *changed.Score != 40 || len(ev) != 2 || hasUncertainty(changed, "dependent_identity_ambiguous", "") {
+		t.Fatalf("changed overload: %+v", changed)
+	}
+	for _, e := range ev {
+		if e.Dependent == declIdentity(a) && e.DependentHead != declIdentity(a2) || e.Dependent == declIdentity(b) && e.DependentHead != "" {
+			t.Fatalf("evidence = %+v", e)
+		}
+	}
+
+	both := compareRisk(t, base, riskRevision(files, []store.SemanticDeclaration{a2, b2}, []store.SemanticEdge{riskCall(a2, unresolved, 4, 2, "unresolved"), riskCall(b2, unresolved, 8, 2, "unresolved")}))
+	if both.Assessment != AssessmentLimitedEvidence || *both.Score != 0 || !hasUncertainty(both, "dependent_identity_ambiguous", declIdentity(a)) || !hasUncertainty(both, "dependent_identity_ambiguous", declIdentity(b)) || !hasUncertainty(both, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
+		t.Fatalf("both changed: %+v", both)
 	}
 }
 
@@ -613,6 +632,12 @@ func TestRiskPartialBindingIsUncertainty(t *testing.T) {
 	base := riskRevision(files, decls, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, x, 6, 2, "resolved")})
 	head := riskRevision(files, decls, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, store.SemanticDeclaration{QualifiedName: "X"}, 6, 2, "unresolved")})
 	if r := compareRisk(t, base, head); r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "dependent_binding_partial", "") {
+		t.Fatalf("risk = %+v", r)
+	}
+	// One call now resolves to another declaration with the same name.
+	shadow := riskDecl("other/lib.go", "X")
+	moved := riskRevision(indexed("a.go", "lib.go", "other/lib.go"), append(decls, shadow), []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, shadow, 6, 2, "resolved")})
+	if r := compareRisk(t, base, moved); r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "dependent_binding_partial", "") {
 		t.Fatalf("risk = %+v", r)
 	}
 	// An unresolved reference that was already there next to an unchanged
