@@ -255,3 +255,49 @@ func TestWatcherStopsOnUnreadableConfig(t *testing.T) {
 		t.Fatalf("watcher kept running on an unreadable config: %+v", r.w.Stats())
 	}
 }
+
+// A tree that could not be fully registered at start is not reported
+// watching, even though the start-up pass completed.
+func TestWatcherStartsRecoveringWhenRegistrationFails(t *testing.T) {
+	var failing atomic.Bool
+	failing.Store(true)
+	addWatchHook = func(path string) error {
+		if failing.Load() && filepath.Base(path) == "sub" {
+			return fmt.Errorf("add watch: %w", syscall.EMFILE)
+		}
+		return nil
+	}
+	t.Cleanup(func() { addWatchHook = nil })
+	shortRetries(t)
+	r := startLiveRepo(t, map[string]string{"main.go": "package main\n", "sub/a.go": goFile})
+	if st := r.w.Stats(); st.State != StateRecovering || st.LastTransient != "emfile" {
+		t.Fatalf("after ready: %+v, want recovering", st)
+	}
+	failing.Store(false)
+	r.waitState(t, StateWatching)
+	writeFile(t, filepath.Join(r.root, "sub", "b.go"), goFile)
+	r.waitLive(t, "file in directory registered by recovery", func(p []string) bool {
+		return slices.Contains(p, "sub/b.go")
+	})
+}
+
+// A failed start-up pass is retried without waiting for an event.
+func TestWatcherRetriesFailedStartupReconciliation(t *testing.T) {
+	var calls atomic.Int64
+	updateHook = func(indexer.Options) error {
+		if calls.Add(1) == 1 {
+			return fmt.Errorf("walk: %w", syscall.ENFILE)
+		}
+		return nil
+	}
+	t.Cleanup(func() { updateHook = nil })
+	shortRetries(t)
+	r := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
+	st := r.waitState(t, StateWatching)
+	if st.Reconciles != 1 || st.TransientErrors != 1 || st.LastTransient != "enfile" {
+		t.Fatalf("stats %+v", st)
+	}
+	if f := r.freshness(t); f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("verdict %s reasons %v", f.Verdict, f.Reasons)
+	}
+}

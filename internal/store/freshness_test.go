@@ -436,6 +436,21 @@ func TestFreshnessReconcilePendingUntilLaterFullScan(t *testing.T) {
 	if f := freshness(t, s, repoID); !slices.Contains(f.Reasons, "reconcile_pending") {
 		t.Fatalf("a path-scoped scan cleared it: %v", f.Reasons)
 	}
+	// A full scan already running when the mark is taken read the tree too
+	// early to clear it.
+	id, started, err := s.BeginScanWithScope(ctx, repoID, "watch_config", ScanScopeFull, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkReconcilePending(ctx, repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteScan(ctx, id, ScanSummary{RepoID: repoID, ScanID: id}, started, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if f := freshness(t, s, repoID); !slices.Contains(f.Reasons, "reconcile_pending") {
+		t.Fatalf("a full scan running at the mark cleared it: %v", f.Reasons)
+	}
 	complete(ScanScopeFull)
 	if f := freshness(t, s, repoID); f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
 		t.Fatalf("after a later full scan: verdict %s reasons %v", f.Verdict, f.Reasons)

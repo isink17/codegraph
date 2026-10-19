@@ -243,3 +243,48 @@ func TestReferenceIdentityUsesExactCallOccurrence(t *testing.T) {
 		t.Fatal("unexpected extra reference")
 	}
 }
+
+// A C++ call edge may be spelled with its owner while the reference keeps the
+// member name; the evidence's trailing member, after a separator, matches it.
+func TestReferenceIdentityMatchesCppMemberEvidence(t *testing.T) {
+	for _, languages := range [][]string{nil, {"cpp"}} {
+		ctx := context.Background()
+		s, repoID := newQueryTestStore(t)
+		parsed := graph.ParsedFile{
+			Symbols: []graph.Symbol{
+				{Language: "cpp", Kind: "function", Name: "caller", QualifiedName: "caller", StableKey: "caller", Range: graph.Position{StartLine: 1, EndLine: 4}},
+				{Language: "cpp", Kind: "method", Name: "run", QualifiedName: "Widget::run", StableKey: "Widget::run", Range: graph.Position{StartLine: 6, EndLine: 7}},
+			},
+			References: []graph.Reference{
+				{Kind: "call", Name: "run", Range: graph.Position{StartLine: 2, StartCol: 4, EndLine: 2, EndCol: 10}},
+				{Kind: "call", Name: "run", Range: graph.Position{StartLine: 3, StartCol: 4, EndLine: 3, EndCol: 10}},
+			},
+			Edges: []graph.Edge{
+				{DstName: "Widget::run", Kind: "calls", Line: 2, Col: 4, Evidence: "w->run"},
+				{DstName: "Widget::run", Kind: "calls", Line: 3, Col: 4, Evidence: "wrun"},
+			},
+		}
+		if err := s.ReplaceFileGraph(ctx, repoID, 1, "main.cpp", "cpp", 1, 1, "cpp", parsed); err != nil {
+			t.Fatal(err)
+		}
+		var target int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM symbols WHERE repo_id=? AND stable_key='Widget::run'`, repoID).Scan(&target); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=? WHERE repo_id=?`, target, repoID); err != nil {
+			t.Fatal(err)
+		}
+		if err := reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, languages); err != nil {
+			t.Fatal(err)
+		}
+		var bound, separatorless *int64
+		if err := s.db.QueryRowContext(ctx, `SELECT
+			(SELECT symbol_id FROM references_tbl WHERE repo_id=? AND start_line=2),
+			(SELECT symbol_id FROM references_tbl WHERE repo_id=? AND start_line=3)`, repoID, repoID).Scan(&bound, &separatorless); err != nil {
+			t.Fatal(err)
+		}
+		if bound == nil || *bound != target || separatorless != nil {
+			t.Fatalf("languages %v: member evidence bound %v, separatorless %v, want %d and nil", languages, bound, separatorless, target)
+		}
+	}
+}
