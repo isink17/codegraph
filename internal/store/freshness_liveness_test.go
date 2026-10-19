@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"os"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -181,5 +183,36 @@ func TestFreshnessLockHeldBeforeRowIsWriterActive(t *testing.T) {
 	}
 	if f := freshness(t, s, repoID); f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
 		t.Fatalf("after release: %+v", f)
+	}
+}
+
+// A lock that cannot be probed is unknown, not proof that no writer runs.
+func TestFreshnessUnprobeableLockIsLivenessUnknown(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a permission-denied open")
+	}
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	if err := os.Chmod(scanLockPath(s.path), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(scanLockPath(s.path), 0o644) })
+	f := freshness(t, s, repoID)
+	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictLivenessUnknown {
+		t.Fatalf("unprobeable lock: %+v", f)
+	}
+}
+
+// Without a lock file no lock-aware scan has ever run, so no such writer
+// can hold it: a graph with no running rows reads as before.
+func TestFreshnessMissingLockFileWithoutRowsIsConsistent(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	if err := os.Remove(scanLockPath(s.path)); err != nil {
+		t.Fatal(err)
+	}
+	f := freshness(t, s, repoID)
+	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("missing lock file: %+v", f)
 	}
 }

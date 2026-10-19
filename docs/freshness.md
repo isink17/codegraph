@@ -19,7 +19,7 @@ non-blocking probe of the scan lock.
 | `index_incomplete` | No scan of this repository ever completed. |
 | `writer_active` | The scan lock is held and no other repository in the database has running rows: a scan is writing, possibly before its row exists or with a row older than a scan that already completed. Re-read after it finishes. |
 | `abandoned_scan` | Scan rows read `running` while no lock-aware process held the scan lock; a scan by a binary older than the lock is not seen. Run `codegraph recover-scans`. |
-| `liveness_unknown` | Rows read `running` and their writer cannot be told live or dead (no lock file, as with a binary that predates the lock, or an I/O error), or the lock is held while another repository in the same database has running rows. Never `consistent_with_last_scan` while the lock is held. |
+| `liveness_unknown` | Rows read `running` and their writer cannot be told live or dead (no lock file, as with a binary that predates the lock), the lock could not be probed, or the lock is held while another repository in the same database has running rows. Never `consistent_with_last_scan` while the lock is held or unprobeable. |
 | `stale_known` | A stored fact says the graph is behind: see `reasons`. |
 | `consistent_with_last_scan` | No stored fact and no live writer contradicts the last completed scan. Edits since then are not checked. |
 
@@ -53,11 +53,17 @@ inserted until the row is closed. The status read tries to take that lock
 exclusively without waiting, retrying 10 times 10 ms apart; reads in one
 process take turns. When it succeeds it keeps the lock across its row read,
 so no scan can begin meanwhile and every `running` row it reads has no
-lock-aware owner. When every attempt fails the lock is held by a writer of
-this repository unless another repository in the database has running rows:
-a scan takes the lock before it inserts its row, and that insert can wait on
-a busy database. With another repository's rows running the holder cannot be
-attributed and liveness is `unknown`.
+lock-aware owner. When every attempt fails the hold is attributed to a writer
+of this repository (assumed, not proven) unless another repository in the
+database has running rows: a scan takes the lock before it inserts its row,
+and that insert can wait on a busy database. With another repository's rows
+running the holder cannot be attributed and liveness is `unknown`.
+
+When the lock cannot be probed (an open or lock error other than a missing
+file) liveness is `unknown` and the verdict `liveness_unknown`, since a
+writer may hold it. A missing lock file means no lock-aware scan has ever
+run on this database, so none can hold it; liveness is `unknown` and the
+verdict follows the rows (a pre-lock binary's scan is not seen).
 
 A new scan waiting for the lock is delayed by at most one of its 50 ms
 retries, and `recover-scans` retries over the same 100 ms window before
@@ -72,9 +78,10 @@ Limits:
 - A status read in another process that holds the lock for more than about
   100 ms (a very slow disk) reads as a writer, and makes `recover-scans`
   refuse; rerun either.
-- When repository A has a dead running row and repository B in the same
-  database has a scan that holds the lock before inserting its row, A reads
-  `writer_active` rather than `abandoned_scan` (the safe side).
+- Repository A, with or without running rows, reads `writer_active` while
+  repository B in the same database has a scan that holds the lock before
+  inserting its row; a dead row of A then reads `writer_active` rather than
+  `abandoned_scan` (the safe side).
 
 ## Watcher
 

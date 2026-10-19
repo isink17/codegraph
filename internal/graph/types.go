@@ -658,8 +658,8 @@ type FreshnessRunningScans struct {
 	// "abandoned" when rows read running while the probe held the lock
 	// exclusively, so no lock-aware process holds it (a scan by a binary older
 	// than the lock is not seen; run recover-scans); "none" when the lock is
-	// free and nothing runs; "unknown" when it cannot be probed, or is held
-	// beside another repository's running rows.
+	// free and nothing runs; "unknown" when there is no lock file, it cannot
+	// be probed, or it is held beside another repository's running rows.
 	Liveness string `json:"liveness"`
 }
 

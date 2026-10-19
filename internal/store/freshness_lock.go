@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"sync"
 	"time"
@@ -9,7 +11,11 @@ import (
 type scanLockProbe int
 
 const (
-	scanLockUnknown scanLockProbe = iota
+	// scanLockAbsent: no lock file (or no database file), so no lock-aware
+	// scan has run and none can hold it.
+	scanLockAbsent scanLockProbe = iota
+	// scanLockError: the lock could not be probed; a writer may hold it.
+	scanLockError
 	scanLockHeld
 	scanLockFree
 )
@@ -32,17 +38,20 @@ func (s *Store) probeScanLock() (scanLockProbe, func()) {
 	scanLockProbeMu.Lock()
 	noop := scanLockProbeMu.Unlock
 	if s.path == "" {
-		return scanLockUnknown, noop
+		return scanLockAbsent, noop
 	}
 	f, err := os.Open(scanLockPath(s.path))
+	if errors.Is(err, fs.ErrNotExist) {
+		return scanLockAbsent, noop
+	}
 	if err != nil {
-		return scanLockUnknown, noop
+		return scanLockError, noop
 	}
 	for attempt := 1; ; attempt++ {
 		ok, err := lockFile(f, true)
 		if err != nil {
 			_ = f.Close()
-			return scanLockUnknown, noop
+			return scanLockError, noop
 		}
 		if ok {
 			return scanLockFree, func() {

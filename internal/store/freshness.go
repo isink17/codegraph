@@ -88,11 +88,12 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	default:
 		f.State = graph.FreshnessNoKnownStaleness
 	}
-	f.Verdict = freshnessVerdict(f, probe == scanLockHeld)
+	f.Verdict = freshnessVerdict(f, probe == scanLockHeld || probe == scanLockError)
 	return f, nil
 }
 
-func freshnessVerdict(f graph.Freshness, lockHeld bool) string {
+// lockUncertain is true when the lock is held or could not be probed.
+func freshnessVerdict(f graph.Freshness, lockUncertain bool) string {
 	switch {
 	case f.LastCompletedScan == nil:
 		return graph.FreshnessVerdictIndexIncomplete
@@ -100,7 +101,7 @@ func freshnessVerdict(f graph.Freshness, lockHeld bool) string {
 		return graph.FreshnessVerdictWriterActive
 	case f.RunningScans.Liveness == "abandoned":
 		return graph.FreshnessVerdictAbandonedScan
-	case f.RunningScans.Count > 0 || lockHeld:
+	case f.RunningScans.Count > 0 || lockUncertain:
 		return graph.FreshnessVerdictLivenessUnknown
 	case len(f.Reasons) > 0:
 		return graph.FreshnessVerdictStaleKnown
