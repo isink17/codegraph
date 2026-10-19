@@ -1,10 +1,16 @@
 package diff
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/isink17/codegraph/internal/githistory/gittest"
+	"github.com/isink17/codegraph/internal/indexer"
+	"github.com/isink17/codegraph/internal/parser"
+	goparser "github.com/isink17/codegraph/internal/parser/golang"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -23,6 +29,7 @@ func riskCall(from, to store.SemanticDeclaration, line, col int, state string) s
 func riskRevision(files []store.SemanticFile, decls []store.SemanticDeclaration, edges []store.SemanticEdge) Revision {
 	r := coverageRevision(files, edges, store.GraphCapability{})
 	r.GraphData.Declarations = decls
+	r.GraphData.State.JVMScope.State = "complete"
 	return r
 }
 
@@ -45,8 +52,13 @@ func TestRiskCitesCallersOfRemovedDeclaration(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := got.Diff.Risk
-	if r.Assessment != "insufficient_evidence" {
-		t.Fatalf("risk assessment = %q", r.Assessment)
+	// A still calls Gone, now unresolved; B no longer references it.
+	if r.Assessment != AssessmentRiskEvidence || r.Score == nil || *r.Score != 20 || r.Level != RiskLevelLow {
+		t.Fatalf("risk = %s %v %s", r.Assessment, r.Score, r.Level)
+	}
+	ev := component(t, r, RuleRemovedDeclarationDependent).Evidence
+	if len(ev) != 1 || ev[0].Change != "declaration_removed" || ev[0].Declaration != declIdentity(gone) || ev[0].Dependent != declIdentity(a) || ev[0].File != "a.go" || !slices.Equal(ev[0].HeadStates, []string{"unresolved"}) || len(ev[0].Sites) != 1 || len(ev[0].HeadSites) != 1 {
+		t.Fatalf("evidence = %+v", ev)
 	}
 	if r.Coverage.State != CoveragePartial || !strings.Contains(r.Coverage.Reason, "only resolved edges") {
 		t.Fatalf("risk coverage = %+v", r.Coverage)
@@ -113,6 +125,9 @@ func TestRiskSkipsRemovedCallersAndIncompleteFiles(t *testing.T) {
 	if r.Coverage.State != CoveragePartial || !strings.Contains(r.Coverage.Reason, "without a current parse") {
 		t.Fatalf("risk coverage = %+v", r.Coverage)
 	}
+	if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(gone)) || !hasUncertainty(r, "edges_coverage_partial", "") {
+		t.Fatalf("risk = %+v", r)
+	}
 }
 
 func TestRiskUnavailableWhenEdgesNotCompared(t *testing.T) {
@@ -124,7 +139,7 @@ func TestRiskUnavailableWhenEdgesNotCompared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := got.Diff.Risk; r.Assessment != "insufficient_evidence" || r.Coverage.State != CoverageUnavailable || len(r.RemovedDeclarationDependents) != 0 {
+	if r := got.Diff.Risk; r.Assessment != AssessmentInsufficientEvidence || r.Score != nil || r.Level != RiskLevelUnknown || r.Coverage.State != CoverageUnavailable || len(r.RemovedDeclarationDependents) != 0 || len(r.Components) != 4 {
 		t.Fatalf("risk = %+v", r)
 	}
 }
@@ -159,11 +174,381 @@ func TestRiskMarksAmbiguousHeadSite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Diff.Risk.Assessment != "insufficient_evidence" {
-		t.Fatalf("ambiguous evidence must remain insufficient: %+v", got.Diff.Risk)
+	// A no longer references Gone; the ambiguous site is disclosed, not scored.
+	if rk := got.Diff.Risk; rk.Assessment != AssessmentLimitedEvidence || *rk.Score != 0 || !hasUncertainty(rk, "dependent_site_ambiguous", "") || !hasUncertainty(rk, "edge_ambiguous", "") {
+		t.Fatalf("risk = %+v", rk)
 	}
 	r := got.Diff.Risk.RemovedDeclarationDependents
 	if len(r) != 1 || len(r[0].Edges) != 1 || !r[0].Edges[0].HeadAmbiguous || r[0].Edges[0].Head != nil {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+func component(t *testing.T, r Risk, rule string) RiskComponent {
+	t.Helper()
+	for _, c := range r.Components {
+		if c.Rule == rule {
+			return c
+		}
+	}
+	t.Fatalf("no component %s in %+v", rule, r.Components)
+	return RiskComponent{}
+}
+
+// hasUncertainty matches reason and, when given, identity.
+func hasUncertainty(r Risk, reason, identity string) bool {
+	for _, u := range r.Uncertainty {
+		if u.Reason == reason && (identity == "" || u.Identity == identity) {
+			return true
+		}
+	}
+	return false
+}
+
+func compareRisk(t *testing.T, base, head Revision) Risk {
+	t.Helper()
+	got, err := Compare(base, head, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got.Diff.Risk
+}
+
+func TestRiskSelfDiffHasNoRiskEvidence(t *testing.T) {
+	x, a := riskDecl("lib.go", "X"), riskDecl("a.go", "A")
+	rev := riskRevision(indexed("a.go", "lib.go"), []store.SemanticDeclaration{x, a}, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved")})
+	r := compareRisk(t, rev, rev)
+	if r.Assessment != AssessmentNoRiskEvidence || r.Score == nil || *r.Score != 0 || r.Level != RiskLevelNone || len(r.Uncertainty) != 0 || r.Model != RiskModel || r.ScoreKind != RiskScoreKind {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+// Only an unresolved edge names the removed declaration: no evidence, but the
+// risk is never reported as absent.
+func TestRiskUnresolvedDependentIsNotEvidence(t *testing.T) {
+	gone, a := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A")
+	dynamic := riskCall(a, store.SemanticDeclaration{QualifiedName: "Gone"}, 4, 2, "unresolved")
+	base := riskRevision(indexed("a.go", "lib.go"), []store.SemanticDeclaration{gone, a}, []store.SemanticEdge{dynamic})
+	head := riskRevision(indexed("a.go", "lib.go"), []store.SemanticDeclaration{a}, []store.SemanticEdge{dynamic})
+	r := compareRisk(t, base, head)
+	if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+func TestRiskDependentReboundToAnotherDeclaration(t *testing.T) {
+	gone, moved, a := riskDecl("lib.go", "Gone"), riskDecl("other/lib.go", "Gone"), riskDecl("a.go", "A")
+	files := indexed("a.go", "lib.go", "other/lib.go")
+	base := riskRevision(files, []store.SemanticDeclaration{gone, a}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
+	// The same name now binds to a declaration in another directory, on a shifted line.
+	head := riskRevision(files, []store.SemanticDeclaration{moved, a}, []store.SemanticEdge{riskCall(a, moved, 6, 2, "resolved")})
+	r := compareRisk(t, base, head)
+	if component(t, r, RuleRemovedDeclarationDependent).Count != 0 || *r.Score != 5 || r.Level != RiskLevelLow {
+		t.Fatalf("risk = %+v", r)
+	}
+	ev := component(t, r, RuleDependentRetargeted).Evidence
+	if len(ev) != 1 || ev[0].Change != "binding_changed" || ev[0].Declaration != declIdentity(gone) || !slices.Equal(ev[0].HeadTargets, []string{declIdentity(moved)}) {
+		t.Fatalf("evidence = %+v", ev)
+	}
+	// A renamed callee the dependent was updated to is not a rebinding.
+	renamed := riskDecl("lib.go", "Renamed")
+	head = riskRevision(files, []store.SemanticDeclaration{renamed, a}, []store.SemanticEdge{riskCall(a, renamed, 4, 2, "resolved")})
+	if r := compareRisk(t, base, head); *r.Score != 0 {
+		t.Fatalf("updated caller scored: %+v", r.Components)
+	}
+}
+
+// An unrelated call landing on a shifted line and column is not a rebinding.
+func TestRiskIgnoresSiteCoincidence(t *testing.T) {
+	x, y, a := riskDecl("lib.go", "X"), riskDecl("lib.go", "Y"), riskDecl("a.go", "A")
+	decls := []store.SemanticDeclaration{x, y, a}
+	base := riskRevision(indexed("a.go", "lib.go"), decls, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, y, 9, 2, "resolved")})
+	head := riskRevision(indexed("a.go", "lib.go"), decls, []store.SemanticEdge{riskCall(a, y, 4, 2, "resolved"), riskCall(a, x, 12, 2, "resolved")})
+	got, err := Compare(base, head, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Diff.Edges.Retargeted) != 1 || *got.Diff.Risk.Score != 0 || got.Diff.Risk.Assessment != AssessmentNoRiskEvidence {
+		t.Fatalf("retargeted=%d risk=%+v", len(got.Diff.Edges.Retargeted), got.Diff.Risk)
+	}
+}
+
+func TestRiskSurvivingTargetChanges(t *testing.T) {
+	x, y, a := riskDecl("lib.go", "X"), riskDecl("lib.go", "Y"), riskDecl("a.go", "A")
+	decls := []store.SemanticDeclaration{x, y, a}
+	base := riskRevision(indexed("a.go", "lib.go"), decls, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, y, 5, 2, "resolved")})
+	shadow := riskDecl("other/lib.go", "X")
+	unresolved := riskCall(a, store.SemanticDeclaration{QualifiedName: "Y"}, 5, 2, "ambiguous")
+	head := riskRevision(indexed("a.go", "lib.go", "other/lib.go"), append(decls, shadow), []store.SemanticEdge{riskCall(a, shadow, 4, 2, "resolved"), unresolved})
+	r := compareRisk(t, base, head)
+	lost, moved := component(t, r, RuleDependentResolutionLost), component(t, r, RuleDependentRetargeted)
+	if lost.Count != 1 || lost.Evidence[0].Declaration != declIdentity(y) || lost.Evidence[0].Change != "resolution_lost" || !slices.Equal(lost.Evidence[0].HeadStates, []string{"ambiguous"}) || moved.Count != 1 || moved.Evidence[0].Declaration != declIdentity(x) || *r.Score != 15 {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+func TestRiskChangedDeclarationWithDependents(t *testing.T) {
+	x, a, b := riskDecl("lib.go", "X"), riskDecl("a.go", "A"), riskDecl("b.go", "B")
+	one, two := 1, 2
+	x2 := x
+	x.ArityMin, x.ArityMax, x2.ArityMin, x2.ArityMax = &one, &one, &two, &two
+	edges := []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, x, 6, 2, "resolved"), riskCall(b, x, 3, 2, "resolved")}
+	base := riskRevision(indexed("a.go", "b.go", "lib.go"), []store.SemanticDeclaration{x, a, b}, edges)
+	head := riskRevision(indexed("a.go", "b.go", "lib.go"), []store.SemanticDeclaration{x2, a, b}, edges)
+	r := compareRisk(t, base, head)
+	c := component(t, r, RuleChangedDeclarationDependent)
+	// Two call sites from A are one dependent relationship.
+	if c.Count != 2 || len(c.Evidence[0].Sites) != 2 || c.Evidence[0].Dependent != declIdentity(a) || *r.Score != 10 {
+		t.Fatalf("component = %+v", c)
+	}
+}
+
+func TestRiskDistinctDependentsAndCaps(t *testing.T) {
+	gone := riskDecl("lib.go", "Gone")
+	decls := []store.SemanticDeclaration{gone}
+	var edges []store.SemanticEdge
+	for i, name := range []string{"A", "B", "C", "D"} {
+		d := riskDecl(strings.ToLower(name)+".go", name)
+		decls = append(decls, d)
+		edges = append(edges, riskCall(d, gone, 3, 2, "resolved"), riskCall(d, gone, 7+i, 2, "resolved"))
+	}
+	var still []store.SemanticEdge
+	for _, d := range decls[1:] {
+		still = append(still, riskCall(d, store.SemanticDeclaration{QualifiedName: "Gone"}, 3, 2, "unresolved"), riskCall(d, store.SemanticDeclaration{QualifiedName: "Gone"}, 20, 2, "unresolved"))
+	}
+	files := indexed("a.go", "b.go", "c.go", "d.go", "lib.go")
+	r := compareRisk(t, riskRevision(files, decls, edges), riskRevision(files, decls[1:], still))
+	c := component(t, r, RuleRemovedDeclarationDependent)
+	if c.Count != 4 || c.Points != 60 || *r.Score != 60 || r.Level != RiskLevelHigh {
+		t.Fatalf("component = %d/%d score %d", c.Count, c.Points, *r.Score)
+	}
+	for _, ev := range c.Evidence {
+		if len(ev.Sites) != 2 {
+			t.Fatalf("sites of one dependent were split: %+v", ev)
+		}
+	}
+}
+
+func TestRiskLevelBoundaries(t *testing.T) {
+	for score, want := range map[int]string{0: RiskLevelNone, 1: RiskLevelLow, 24: RiskLevelLow, 25: RiskLevelMedium, 49: RiskLevelMedium, 50: RiskLevelHigh, 100: RiskLevelHigh} {
+		if got := RiskLevel(score); got != want {
+			t.Fatalf("RiskLevel(%d) = %s, want %s", score, got, want)
+		}
+	}
+	max := 0
+	for _, r := range riskRules {
+		max += r.maxPoints
+	}
+	if max < RiskMaxScore {
+		t.Fatalf("rule caps sum to %d; score can never reach %d", max, RiskMaxScore)
+	}
+}
+
+// Declarations with the same qualified name in two directories keep separate
+// identities: removing one does not cite callers of the other.
+func TestRiskIdentityAcrossDirectories(t *testing.T) {
+	one, two, a := riskDecl("one/x.go", "Same"), riskDecl("two/x.go", "Same"), riskDecl("a.go", "A")
+	files := indexed("a.go", "one/x.go", "two/x.go")
+	edges := []store.SemanticEdge{riskCall(a, two, 4, 2, "resolved")}
+	r := compareRisk(t, riskRevision(files, []store.SemanticDeclaration{one, two, a}, edges), riskRevision(files, []store.SemanticDeclaration{two, a}, edges))
+	if *r.Score != 0 || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(one)) {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+func TestRiskAmbiguousDeclarationIsUncertainty(t *testing.T) {
+	x, x2, a := riskDecl("lib.go", "X"), riskDecl("lib.go", "X"), riskDecl("a.go", "A")
+	x2.StartLine = 9
+	files := indexed("a.go", "lib.go")
+	r := compareRisk(t, riskRevision(files, []store.SemanticDeclaration{x, a}, nil), riskRevision(files, []store.SemanticDeclaration{x, x2, a}, nil))
+	if r.Assessment != AssessmentLimitedEvidence || !hasUncertainty(r, "declaration_ambiguous", declIdentity(x)) {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+func TestRiskIncompatibleSemanticsIsInsufficient(t *testing.T) {
+	gone, a := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A")
+	base := riskRevision(indexed("a.go", "lib.go"), []store.SemanticDeclaration{gone, a}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
+	head := riskRevision(indexed("a.go", "lib.go"), []store.SemanticDeclaration{a}, nil)
+	head.GraphData.State.ResolverPolicies = map[string]string{"go": "v2"}
+	r := compareRisk(t, base, head)
+	if r.Assessment != AssessmentInsufficientEvidence || r.Score != nil || !hasUncertainty(r, "comparison_limitation", "") {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+// Risk covers the whole change set: every page carries the same assessment.
+func TestRiskIsPageInvariant(t *testing.T) {
+	gone, x, a, b := riskDecl("lib.go", "Gone"), riskDecl("lib.go", "X"), riskDecl("a.go", "A"), riskDecl("b.go", "B")
+	base := riskRevision(indexed("a.go", "b.go", "lib.go"), []store.SemanticDeclaration{gone, x, a, b}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved"), riskCall(b, x, 3, 2, "resolved")})
+	head := riskRevision(indexed("a.go", "b.go", "lib.go"), []store.SemanticDeclaration{x, a, b}, []store.SemanticEdge{riskCall(b, store.SemanticDeclaration{QualifiedName: "X"}, 3, 2, "unresolved")})
+	full, err := Compare(base, head, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := canonical(full.Diff.Risk)
+	for off := 0; off <= full.Diff.Total; off++ {
+		page, err := Compare(base, head, off, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if canonical(page.Diff.Risk) != want {
+			t.Fatalf("risk at offset %d differs", off)
+		}
+	}
+	slices.Reverse(base.GraphData.Declarations)
+	slices.Reverse(head.GraphData.Edges)
+	if canonical(compareRisk(t, base, head)) != want {
+		t.Fatal("risk depends on input order")
+	}
+}
+
+func TestCompareCommitsRiskLifecycle(t *testing.T) {
+	r := gittest.Init(t)
+	r.Write("go.mod", "module example.com/m\n\ngo 1.22\n")
+	r.Write("lib.go", "package main\n\nfunc Gone() {}\n")
+	r.Write("util.go", "package main\n\nfunc Helper() {}\n")
+	r.Write("main.go", "package main\n\nfunc main() {\n\tGone()\n\tHelper()\n}\n")
+	base := r.Commit("", "base")
+	r.Git("mv", "util.go", "helpers.go")
+	head := r.Commit("", "rename only")
+	r.Write("lib.go", "package main\n")
+	broken := r.Commit("", "remove Gone")
+	reg := parser.NewRegistry(goparser.New())
+
+	self, err := CompareCommits(t.Context(), r.Dir, base, base, reg, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rk := self.Diff.Risk; rk.Assessment != AssessmentNoRiskEvidence || *rk.Score != 0 {
+		t.Fatalf("self-diff risk = %+v", rk)
+	}
+	// A provable same-package rename moves Helper; its caller binds to the same declaration.
+	renamed, err := CompareCommits(t.Context(), r.Dir, base, head, reg, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rk := renamed.Diff.Risk; rk.Assessment != AssessmentNoRiskEvidence || *rk.Score != 0 || len(rk.RemovedDeclarationDependents) != 1 || len(renamed.Diff.DeclarationPairs.Pairs) != 1 {
+		t.Fatalf("rename risk = %+v pairs %+v", rk, renamed.Diff.DeclarationPairs)
+	}
+	removed, err := CompareCommits(t.Context(), r.Dir, head, broken, reg, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk := removed.Diff.Risk
+	ev := component(t, rk, RuleRemovedDeclarationDependent).Evidence
+	if rk.Assessment != AssessmentRiskEvidence || *rk.Score != 20 || len(ev) != 1 || !strings.Contains(ev[0].Declaration, "Gone") || !strings.Contains(ev[0].Dependent, `"main.go"`) || !slices.Equal(ev[0].HeadStates, []string{"unresolved"}) {
+		t.Fatalf("removal risk = %+v", rk)
+	}
+}
+
+// Risk read from an incrementally updated graph equals risk read from a
+// fresh index of the same tree, and a no-op update changes nothing.
+func TestRiskFreshIncrementalAndNoOpParity(t *testing.T) {
+	root := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	graphOf := func(st *store.Store) Revision {
+		repo, ok, err := st.FindRepo(t.Context(), root)
+		if err != nil || !ok {
+			t.Fatalf("repo lookup: %v %v", ok, err)
+		}
+		g, err := st.SemanticGraph(t.Context(), repo.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Revision{GraphData: g}
+	}
+	open := func() (*store.Store, *indexer.Indexer) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "g.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return st, indexer.New(st, parser.NewRegistry(goparser.New()), nil)
+	}
+	opts := indexer.Options{RepoRoot: root, NoHistory: true}
+	write("a.go", "package main\nfunc A() { B(); Gone() }\n")
+	write("b.go", "package main\nfunc B() {}\n")
+	write("gone.go", "package main\nfunc Gone() {}\n")
+	incSt, inc := open()
+	if _, err := inc.Index(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+	base := graphOf(incSt)
+	if err := os.Remove(filepath.Join(root, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inc.Update(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+	updated := compareRisk(t, base, graphOf(incSt))
+	if _, err := inc.Update(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+	noop := compareRisk(t, base, graphOf(incSt))
+	freshSt, fresh := open()
+	if _, err := fresh.Index(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+	fromFresh := compareRisk(t, base, graphOf(freshSt))
+	if updated.Score == nil || *updated.Score != 20 || canonical(updated) != canonical(fromFresh) || canonical(updated) != canonical(noop) {
+		t.Fatalf("risk differs\nincremental %s\nno-op %s\nfresh %s", canonical(updated), canonical(noop), canonical(fromFresh))
+	}
+}
+
+// Repository-wide limitations are cited only through the changed files they
+// affect.
+func TestRiskScopesRepositoryLimitationsToChangedFiles(t *testing.T) {
+	a := riskDecl("a.go", "A")
+	tree := func(readme, java string) []SourceFile {
+		return []SourceFile{{Path: "README", ContentHash: readme}, {Path: "a.go", ContentHash: "1", Language: "go"}, {Path: "B.java", ContentHash: java, Language: "java"}}
+	}
+	rev := func(files []SourceFile) Revision {
+		r := riskRevision(append(indexed("a.go"), store.SemanticFile{Path: "README", ParseState: store.ParseStateIndexed}), []store.SemanticDeclaration{a}, nil)
+		r.GraphData.State.JVMScope.State = "unknown"
+		r.TreeFiles = files
+		return r
+	}
+	unchanged := compareRisk(t, rev(tree("r", "j")), rev(tree("r", "j")))
+	if unchanged.Assessment != AssessmentNoRiskEvidence {
+		t.Fatalf("untouched limitations limited the assessment: %+v", unchanged)
+	}
+	changed := compareRisk(t, rev(tree("r", "j")), rev(tree("r2", "j2")))
+	if changed.Assessment != AssessmentLimitedEvidence || !hasUncertainty(changed, "changed_file_without_semantic_coverage", "README") || !hasUncertainty(changed, "changed_file_jvm_scope_unknown", "B.java") || len(changed.Uncertainty) != 2 {
+		t.Fatalf("risk = %+v", changed)
+	}
+}
+
+// Removing one overload rebinds its callers to a sibling the dependent already
+// used; that rebinding is cited, not absorbed by the sibling's relationship.
+func TestRiskRemovedOverloadReboundToSibling(t *testing.T) {
+	narrow, wide, a := riskDecl("lib.go", "Foo"), riskDecl("lib.go", "Foo"), riskDecl("a.go", "A")
+	narrow.Signature, wide.Signature = "func Foo(int)", "func Foo(int64)"
+	files := indexed("a.go", "lib.go")
+	base := riskRevision(files, []store.SemanticDeclaration{narrow, wide, a}, []store.SemanticEdge{riskCall(a, narrow, 4, 2, "resolved"), riskCall(a, wide, 5, 2, "resolved")})
+	head := riskRevision(files, []store.SemanticDeclaration{wide, a}, []store.SemanticEdge{riskCall(a, wide, 4, 2, "resolved"), riskCall(a, wide, 5, 2, "resolved")})
+	r := compareRisk(t, base, head)
+	ev := component(t, r, RuleDependentRetargeted).Evidence
+	if r.Assessment != AssessmentRiskEvidence || *r.Score != 5 || len(ev) != 1 || ev[0].Declaration != declIdentity(narrow) || !slices.Equal(ev[0].HeadTargets, []string{declIdentity(wide)}) {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+// A dependent whose own identity changed (here its signature) is not a
+// surviving dependent: it is not scored, and the removal stays uncertain.
+func TestRiskDependentWithChangedSignatureIsUncertainty(t *testing.T) {
+	gone, a := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A")
+	a2 := a
+	a2.Signature = "func A(x int)"
+	files := indexed("a.go", "lib.go")
+	base := riskRevision(files, []store.SemanticDeclaration{gone, a}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
+	head := riskRevision(files, []store.SemanticDeclaration{a2}, []store.SemanticEdge{riskCall(a2, store.SemanticDeclaration{QualifiedName: "Gone"}, 4, 2, "unresolved")})
+	r := compareRisk(t, base, head)
+	if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
 		t.Fatalf("risk = %+v", r)
 	}
 }
