@@ -1,0 +1,74 @@
+{
+  "schema": "codegraph.agent_run_manifest/v1",
+  "client": {
+    "name": "claude-code",
+    "version": "9.9.9-test"
+  },
+  "model": "claude-test-model-1",
+  "effort": "high",
+  "codegraph": {
+    "sha": "1111111111111111111111111111111111111111",
+    "binary_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "corpus": {
+    "repo": "https://example.invalid/fixture-service",
+    "commit": "3333333333333333333333333333333333333333"
+  },
+  "task_set_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+  "arms": [
+    {
+      "name": "baseline",
+      "codegraph_enabled": false,
+      "tool_mode": "none",
+      "mcp_config_sha256": "d457de5ec7fd37b24eb1b7f0510a26e33d2dea0d4d3769252fd5946b86882426",
+      "settings_sha256": "f49cb2377f652d3e67dcfa98dbc821ba2e7e98a8d9bab30e82b1e3858fba4ee3",
+      "isolation": {
+        "strict_mcp_config": true,
+        "path_sanitized": true,
+        "cli_block_hook": true,
+        "user_instructions_isolated": false,
+        "user_skills_isolated": false
+      }
+    },
+    {
+      "name": "codegraph-mcp",
+      "codegraph_enabled": true,
+      "tool_mode": "full",
+      "mcp_config_sha256": "e67be67c375ddada2f645ea4edb9d79b3dcbbb07a0839b78fa2f906d1735aa77",
+      "settings_sha256": "b3bf4f9aa51ea06ecca6de10d2663546e906df98721fc5d4b554b814fdb7c0a5",
+      "isolation": {
+        "strict_mcp_config": true,
+        "path_sanitized": false,
+        "cli_block_hook": false,
+        "user_instructions_isolated": false,
+        "user_skills_isolated": false
+      }
+    }
+  ],
+  "sessions": [
+    {
+      "arm": "codegraph-mcp",
+      "task": "t1",
+      "rep": 1,
+      "transcript": "treatment.jsonl",
+      "transcript_sha256": "b08d96326f5cceef00f72bd1e79c2b369b783c07c521b90ea6b8ead736ff4ee8"
+    },
+    {
+      "arm": "baseline",
+      "task": "t1",
+      "rep": 2,
+      "transcript": "baseline-contaminated.jsonl",
+      "transcript_sha256": "2e78b08f8cb50781c408234a6f30eb3d5c501e0fae6e390a48fa1a4a1fca8fb3"
+    },
+    {
+      "arm": "baseline",
+      "task": "t1",
+      "rep": 1,
+      "transcript": "baseline-clean.jsonl",
+      "transcript_sha256": "42a0a1df243ad686dc2b7b746cb11ece119f3c08e85bd58ddfcfedf5692eb07f"
+    }
+  ],
+  "uncertainties": [
+    "Synthetic fixture: hand-written events, not a recorded session."
+  ]
+}

@@ -271,6 +271,7 @@ columns once instead of repeating a JSON key on every row.
 
 ### Added
 
+- **Agent transcript ingestion in `tools/benchharness`.** A developer-only `ingest` command reads recorded Claude Code JSONL transcripts listed in a provenance manifest (`codegraph.agent_run_manifest/v1`) and writes a deterministic `codegraph.agent_transcript_ingest/v1` record: requests deduplicated by `message.id`, processed tokens kept separate from final and peak context, compactions, wall clock, tool calls by name, sidechain usage reported apart from main-session totals, and contamination checks for the without-CodeGraph arm (MCP, skill or CLI use, blocked attempts told apart from calls that ran). `summarize` shows contamination first and per-arm median/min/max with contaminated sessions excluded by default. No model runs or published numbers are included.
 - **`format=json|compact` on nine bulk tools.** `find_symbol`, `search_symbols`, `find_callers`,
   `find_callees`, `get_impact_radius`, `find_related_tests`, `find_dead_code`, `list_files`, and
   `trace_dependencies` accept an optional `format`. The default is `json`; newer releases may
