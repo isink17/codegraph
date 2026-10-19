@@ -32,6 +32,7 @@ type Revision struct {
 	IndexPolicy IndexPolicy         `json:"-"`
 	// source reads a file of the revision's tree, or reports it unavailable.
 	source func(path string) ([]byte, bool)
+	blobs  *blobReader
 }
 
 type Result struct {

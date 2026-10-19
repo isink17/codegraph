@@ -17,8 +17,9 @@ import (
 
 // goSource is what a Go file's bytes say outside and inside its top-level
 // declarations. context holds everything a declaration can depend on that is
-// not part of its own bytes: the package clause, the imports (and a cgo
-// preamble), and directives that precede no declaration.
+// not part of its own bytes: the package clause, the imports and their
+// comments (a cgo preamble), directives that name their target, and
+// directives that precede no declaration.
 type goSource struct {
 	context string
 	decls   []goTopDecl
@@ -27,6 +28,22 @@ type goSource struct {
 type goTopDecl struct {
 	startLine, endLine int
 	hash               string
+	// initializes is set for a var declaration with initializer values:
+	// package initialization runs those in file order.
+	initializes bool
+}
+
+func initializesVars(d ast.Decl) bool {
+	g, ok := d.(*ast.GenDecl)
+	if !ok || g.Tok != token.VAR {
+		return false
+	}
+	for _, s := range g.Specs {
+		if v, ok := s.(*ast.ValueSpec); ok && len(v.Values) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // parseGoSource reads a file only when the bytes are the ones the index
@@ -54,31 +71,51 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 	}
 	sort.Strings(imports)
 	ctx = append(ctx, imports...)
-	for _, d := range f.Decls {
-		if g, ok := d.(*ast.GenDecl); ok && g.Tok == token.IMPORT && g.Doc != nil {
-			for _, s := range g.Specs {
-				if is, ok := s.(*ast.ImportSpec); ok && is.Path.Value == `"C"` {
-					ctx = append(ctx, "cgo "+string(content[off(g.Doc.Pos()):off(g.Doc.End())]))
-				}
+	// Every comment of an import declaration is context: the comment on a
+	// "C" import, in or outside a group, is the cgo preamble.
+	isImport := make([]bool, len(f.Decls))
+	var importRanges [][2]token.Pos
+	for i, d := range f.Decls {
+		if g, ok := d.(*ast.GenDecl); ok && g.Tok == token.IMPORT {
+			isImport[i] = true
+			from := g.Pos()
+			if g.Doc != nil {
+				from = g.Doc.Pos()
 			}
+			importRanges = append(importRanges, [2]token.Pos{from, g.End()})
 		}
 	}
+	inImport := func(p token.Pos) bool {
+		for _, r := range importRanges {
+			if p >= r[0] && p < r[1] {
+				return true
+			}
+		}
+		return false
+	}
 	// A directive applies to the declaration after it, so it is hashed with
-	// that declaration; one inside a declaration is part of its bytes.
+	// that declaration; one inside a declaration is part of its bytes. A
+	// directive that names its target (linkname, cgo) applies anywhere.
 	attached := make([][]string, len(f.Decls))
 	for _, group := range f.Comments {
 		for _, c := range group.List {
-			if c.Pos() < f.Package {
+			switch {
+			case c.Pos() < f.Package:
 				ctx = append(ctx, "header "+c.Text)
 				continue
-			}
-			if !goDirective(c.Text) {
+			case inImport(c.Pos()):
+				ctx = append(ctx, "import "+c.Text)
+				continue
+			case !goDirective(c.Text):
+				continue
+			case strings.HasPrefix(c.Text, "//go:linkname") || strings.HasPrefix(c.Text, "//go:cgo_"):
+				ctx = append(ctx, "named "+c.Text)
 				continue
 			}
 			i := sort.Search(len(f.Decls), func(i int) bool { return f.Decls[i].End() > c.Pos() })
 			switch {
-			case i == len(f.Decls):
-				ctx = append(ctx, "trailing "+c.Text)
+			case i == len(f.Decls) || isImport[i]:
+				ctx = append(ctx, "unattached "+c.Text)
 			case f.Decls[i].Pos() > c.Pos():
 				attached[i] = append(attached[i], c.Text)
 			}
@@ -92,7 +129,7 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 		}
 		h.Write([]byte{0})
 		h.Write(content[off(d.Pos()):off(d.End())])
-		out.decls = append(out.decls, goTopDecl{startLine: fset.Position(d.Pos()).Line, endLine: fset.Position(d.End()).Line, hash: hex.EncodeToString(h.Sum(nil))})
+		out.decls = append(out.decls, goTopDecl{startLine: fset.Position(d.Pos()).Line, endLine: fset.Position(d.End()).Line, hash: hex.EncodeToString(h.Sum(nil)), initializes: initializesVars(d)})
 	}
 	return out, true
 }
@@ -110,25 +147,25 @@ func goDirective(text string) bool {
 
 // declarationHash is the hash of the one top-level declaration whose lines
 // hold d, when no other top-level declaration shares a line with it.
-func (s goSource) declarationHash(d store.SemanticDeclaration) (string, bool) {
+func (s goSource) declarationHash(d store.SemanticDeclaration) (goTopDecl, bool) {
 	match := -1
 	for i, t := range s.decls {
 		if t.endLine < d.StartLine || t.startLine > d.EndLine {
 			continue
 		}
 		if match >= 0 || t.startLine > d.StartLine || t.endLine < d.EndLine {
-			return "", false
+			return goTopDecl{}, false
 		}
 		match = i
 	}
 	if match < 0 {
-		return "", false
+		return goTopDecl{}, false
 	}
 	t := s.decls[match]
 	if match > 0 && s.decls[match-1].endLine >= t.startLine || match+1 < len(s.decls) && s.decls[match+1].startLine <= t.endLine {
-		return "", false
+		return goTopDecl{}, false
 	}
-	return t.hash, true
+	return t, true
 }
 
 // goModuleScope says which modules of one revision a go.work or a replace by

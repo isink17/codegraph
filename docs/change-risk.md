@@ -133,12 +133,16 @@ iota ... )` group, the group). It pairs only when:
 - its identity without path and position (kind, qualified name with receiver,
   signature, stable key, visibility, staticness, arity) is unique among all
   declarations of that package identity in each revision,
+- it is not a receiverless `init` function and not a `var` declaration with
+  initializer values: package initialization runs those in file order, so a
+  move to a file that sorts differently can change what the program does,
 - its own bytes are equal, and so are the compiler directives (`//go:`,
   `//line`, `//export`, `//extern`) before it; its doc comment and its position
   may change,
-- its file's package clause, imports (name and path, in any order), cgo
-  preamble, header comments and directives that precede no declaration are
-  equal.
+- its file's package clause, imports (name and path, in any order), every
+  comment inside or on an import declaration (the cgo preamble, in or outside a
+  group), header comments, `//go:linkname` and `//go:cgo_*` directives wherever
+  they are, and directives that precede no declaration or an import are equal.
 
 A declaration found on both sides that fails one of these is listed under
 `refused` with the base declaration and the reason; one that exists on one side
@@ -146,14 +150,21 @@ only is not a move candidate and is not listed:
 
 | `reason` | When |
 |---|---|
-| `declaration_not_unique` | The identity occurs more than once in the package on either side (several `init` functions). |
+| `declaration_order_dependent` | A receiverless `init` function, or a `var` declaration with initializer values (for a grouped `var ( ... )`, any spec with values). Constants, types, functions, methods and variables without initializer are not affected by file order. |
+| `declaration_not_unique` | The identity occurs more than once in the package on either side. |
 | `declaration_content_unavailable` | A file could not be read back from Git, its bytes differ from the indexed ones, it does not parse, or the declaration does not map to exactly one top-level declaration that shares no line with another. |
-| `declaration_context_changed` | The file's package clause, imports, cgo preamble, header comments or trailing directives differ. |
+| `declaration_context_changed` | The file's package clause, imports, import comments, header comments, linkname or cgo directives, or unattached directives differ. |
 | `declaration_content_changed` | The declaration's bytes or the directives before it differ. |
 
 The module refusals of the table above (`workspace_uncertain`,
 `module_replace_in_repo`, `module_root_changed`, `module_evidence_unavailable`)
 apply per declaration too.
+
+Known limit: an exact rename pairs every declaration of the file, including
+`init` functions and initialized variables. A same-directory rename that
+changes where the file sorts among its package's files (`a.go` to `z.go`) can
+change initialization order without changing a byte; such pairs are not
+refused today.
 
 `score` is the sum of component points, clamped to 100. Each component lists
 `points_each`, `max_points`, `count`, `points` and its `evidence` rows:

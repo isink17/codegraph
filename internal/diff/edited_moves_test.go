@@ -1,8 +1,10 @@
 package diff
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -32,11 +34,11 @@ func lines(start, end int) store.SemanticDeclaration {
 
 func TestGoSourceDeclarationHash(t *testing.T) {
 	hashAt := func(t *testing.T, content string, d store.SemanticDeclaration) string {
-		h, ok := sourceOf(t, content).declarationHash(d)
+		top, ok := sourceOf(t, content).declarationHash(d)
 		if !ok {
 			t.Fatalf("no hash at %d..%d in %q", d.StartLine, d.EndLine, content)
 		}
-		return h
+		return top.hash
 	}
 	t.Run("doc comment and position are not content", func(t *testing.T) {
 		a := hashAt(t, "package p\n\nfunc A() {}\n", lines(3, 3))
@@ -70,8 +72,29 @@ func TestGoSourceDeclarationHash(t *testing.T) {
 				t.Fatalf("context of %q equals %q", other, plain)
 			}
 		}
-		if ctx("package p\n\n// #include <a.h>\nimport \"C\"\n") == ctx("package p\n\n// #include <b.h>\nimport \"C\"\n") {
-			t.Fatal("cgo preamble change kept the context")
+		for _, pair := range [][2]string{
+			{"package p\n\n// #include <a.h>\nimport \"C\"\n", "package p\n\n// #include <b.h>\nimport \"C\"\n"},
+			{"package p\n\nimport (\n\t// #define X 1\n\t\"C\"\n)\n", "package p\n\nimport (\n\t// #define X 2\n\t\"C\"\n)\n"},
+			{"package p\n\n//go:linkname x runtime.x\nimport \"unsafe\"\n\nvar _ unsafe.Pointer\n", "package p\n\nimport \"unsafe\"\n\nvar _ unsafe.Pointer\n"},
+			{"package p\n\n//go:linkname x runtime.y\nfunc B() {}\n\nfunc A() {}\n", "package p\n\nfunc B() {}\n\nfunc A() {}\n"},
+		} {
+			if ctx(pair[0]) == ctx(pair[1]) {
+				t.Fatalf("context of %q equals %q", pair[0], pair[1])
+			}
+		}
+	})
+	t.Run("var initializers", func(t *testing.T) {
+		src := sourceOf(t, "package p\n\nvar A = f()\n\nvar B int\n\nconst C = 1\n\nfunc f() int { return 1 }\n")
+		var got []bool
+		for _, l := range []int{3, 5, 7, 9} {
+			top, ok := src.declarationHash(lines(l, l))
+			if !ok {
+				t.Fatalf("line %d", l)
+			}
+			got = append(got, top.initializes)
+		}
+		if want := []bool{true, false, false, false}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("initializes = %v, want %v", got, want)
 		}
 	})
 	t.Run("grouped constants hash their whole group", func(t *testing.T) {
@@ -233,15 +256,72 @@ func TestCompareCommitsEditedMoves(t *testing.T) {
 				}
 			})
 			t.Run("duplicate shape in a kept file", func(t *testing.T) {
-				got := editScenario(t, adapter, with(app, map[string]string{"p/i.go": "package p\n\nfunc init() {}\n", "p/a.go": lib + "\nfunc init() {}\n"}), func(r *gittest.Repo) {
+				got := editScenario(t, adapter, with(app, map[string]string{"p/i.go": "package p\n\nfunc D() {}\n", "p/a.go": lib + "\nfunc D() {}\n"}), func(r *gittest.Repo) {
 					r.Git("rm", "-q", "p/a.go")
-					r.Write("p/b.go", lib+"\nfunc init() {}\n\nfunc C() {}\n")
+					r.Write("p/b.go", lib+"\nfunc D() {}\n\nfunc C() {}\n")
 				})
 				d := got.Diff.DeclarationPairs
 				if want := []string{"p/a.go>p/b.go:p.A", "p/a.go>p/b.go:p.B"}; !reflect.DeepEqual(pairedPaths(d), want) || !reflect.DeepEqual(goRefusals(d), []string{"p/a.go>p/b.go:" + refuseDeclarationNotUnique}) {
 					t.Fatalf("pairs = %v, refused %v", pairedPaths(d), goRefusals(d))
 				}
 			})
+			// An init elsewhere under another build constraint or in a test
+			// file can run before or after the moved one.
+			for _, sibling := range []string{"p/m_linux.go", "p/m_test.go"} {
+				t.Run("init with a sibling in "+sibling, func(t *testing.T) {
+					got := editScenario(t, adapter, with(app, map[string]string{sibling: "package p\n\nfunc init() {}\n", "p/a.go": lib + "\nfunc init() {}\n"}), func(r *gittest.Repo) {
+						r.Git("rm", "-q", "p/a.go")
+						r.Write("p/z.go", lib+"\nfunc init() {}\n\nfunc C() {}\n")
+					})
+					d := got.Diff.DeclarationPairs
+					if want := []string{"p/a.go>p/z.go:p.A", "p/a.go>p/z.go:p.B"}; !reflect.DeepEqual(pairedPaths(d), want) || !reflect.DeepEqual(goRefusals(d), []string{"p/a.go>p/z.go:" + refuseDeclOrderDependent}) {
+						t.Fatalf("pairs = %v, refused %v", pairedPaths(d), goRefusals(d))
+					}
+				})
+			}
+			t.Run("package variables", func(t *testing.T) {
+				vars := "package p\n\nvar X = 1\n\nvar Y int\n"
+				got := editScenario(t, adapter, with(app, map[string]string{"p/v.go": vars, "p/w.go": "package p\n\nvar W = X + 1\n"}), func(r *gittest.Repo) {
+					r.Git("rm", "-q", "p/v.go")
+					r.Write("p/zz.go", vars+"\nfunc C() {}\n")
+				})
+				d := got.Diff.DeclarationPairs
+				if want := []string{"p/v.go>p/zz.go:p.Y"}; !reflect.DeepEqual(pairedPaths(d), want) || !reflect.DeepEqual(goRefusals(d), []string{"p/v.go>p/zz.go:" + refuseDeclOrderDependent}) {
+					t.Fatalf("pairs = %v, refused %v", pairedPaths(d), goRefusals(d))
+				}
+			})
+			t.Run("grouped cgo preamble edited", func(t *testing.T) {
+				cgo := func(v string) string {
+					return "package p\n\nimport (\n\t// #define X " + v + "\n\t\"C\"\n)\n\nfunc F() int { return int(C.X) }\n"
+				}
+				got := editScenario(t, adapter, with(app, map[string]string{"p/c.go": cgo("1")}), func(r *gittest.Repo) {
+					r.Git("rm", "-q", "p/c.go")
+					r.Write("p/d.go", cgo("2"))
+				})
+				if d := got.Diff.DeclarationPairs; len(d.Pairs) != 0 || !reflect.DeepEqual(goRefusals(d), []string{"p/c.go>p/d.go:" + refuseDeclContextChanged}) {
+					t.Fatalf("declaration pairs = %s", canonical(d))
+				}
+			})
+			for name, base := range map[string]string{
+				"linkname before the imports":      "package p\n\n//go:linkname v runtime.v\nimport _ \"unsafe\"\n\nvar v int\n\nfunc F() int { return v }\n",
+				"linkname before another function": "package p\n\nimport _ \"unsafe\"\n\n//go:linkname v runtime.v\nfunc G() {}\n\nvar v int\n\nfunc F() int { return v }\n",
+			} {
+				t.Run(name+" dropped", func(t *testing.T) {
+					got := editScenario(t, adapter, with(app, map[string]string{"p/l.go": base}), func(r *gittest.Repo) {
+						r.Git("rm", "-q", "p/l.go")
+						r.Write("p/m.go", "package p\n\nimport _ \"unsafe\"\n\nfunc G() {}\n\nvar v int\n\nfunc F() int { return v }\n")
+					})
+					d := got.Diff.DeclarationPairs
+					for _, p := range d.Pairs {
+						if p.FromPath == "p/l.go" {
+							t.Fatalf("paired %s", canonical(p))
+						}
+					}
+					if len(goRefusals(d)) == 0 {
+						t.Fatalf("declaration pairs = %s", canonical(d))
+					}
+				})
+			}
 		})
 	}
 }
@@ -358,5 +438,31 @@ func TestGoModuleScope(t *testing.T) {
 	tree[1].ContentHash = func() string { s := sha256.Sum256([]byte(files["b/go.mod"])); return hex.EncodeToString(s[:]) }()
 	if r := newGoModuleScope(modules, tree, source).refusal("d"); r != refuseModuleReplaceInRepo {
 		t.Fatalf("absolute replace: refusal = %q", r)
+	}
+}
+
+func TestCompareSnapshotsCancelledWhileReadingBlobs(t *testing.T) {
+	r := gittest.Init(t)
+	r.Write("go.mod", "module example.com/m\n")
+	r.Write("p/a.go", "package p\n\nfunc A() {}\n")
+	base := r.Commit("", "base")
+	r.Git("rm", "-q", "p/a.go")
+	r.Write("p/b.go", "package p\n\nfunc A() {}\n\nfunc B() {}\n")
+	head := r.Commit("", "change")
+	ctx, cancel := context.WithCancel(t.Context())
+	registry := parser.NewRegistry(goparser.New())
+	from, err := snapshot(ctx, r.Dir, base, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer from.blobs.close()
+	to, err := snapshot(ctx, r.Dir, head, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer to.blobs.close()
+	cancel()
+	if _, err := compareSnapshots(ctx, from, to, 0, 100); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }

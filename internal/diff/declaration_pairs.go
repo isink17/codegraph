@@ -72,6 +72,7 @@ const (
 	refuseDeclContentChanged    = "declaration_content_changed"
 	refuseDeclContextChanged    = "declaration_context_changed"
 	refuseDeclContentMissing    = "declaration_content_unavailable"
+	refuseDeclOrderDependent    = "declaration_order_dependent"
 )
 
 func declarationPairs(renames FileRenames, base, head store.SemanticGraph, semanticOK bool, incomplete map[string]bool, baseTree, headTree []SourceFile, baseSrc, headSrc func(string) ([]byte, bool)) DeclarationPairs {
@@ -389,8 +390,9 @@ func goBuildRole(p string) string {
 // editedMoves pairs declarations that left removed Go files for added files
 // of the same package identity when nothing a declaration means can differ:
 // the module keeps its import identity, the declaration's shape is unique in
-// that package on both sides, and its own bytes, the directives before it and
-// its file's package clause and imports are equal. A shape found on both
+// that package on both sides, it does not take part in file-ordered package
+// initialization, and its own bytes, the directives before it and its file's
+// package clause, imports and file-wide directives are equal. A shape found on both
 // sides that fails any of these is refused with the reason.
 func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete map[string]bool, baseTree, headTree []SourceFile, baseScope, headScope goModuleScope, baseSrc, headSrc func(string) ([]byte, bool)) ([]DeclarationPair, []RefusedPairing) {
 	if base.GoModules == nil || head.GoModules == nil || baseTree == nil || headTree == nil {
@@ -475,13 +477,13 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 		s.parsed[p] = out
 		return out
 	}
-	hash := func(s *side, d store.SemanticDeclaration) (string, string, bool) {
+	hash := func(s *side, d store.SemanticDeclaration) (string, goTopDecl, bool) {
 		gs := source(s, d.Path)
 		if gs == nil {
-			return "", "", false
+			return "", goTopDecl{}, false
 		}
-		dh, ok := gs.declarationHash(d)
-		return gs.context, dh, ok
+		top, ok := gs.declarationHash(d)
+		return gs.context, top, ok
 	}
 	var pairs []DeclarationPair
 	var refused []RefusedPairing
@@ -509,6 +511,11 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 				continue
 			}
 			reason := groupReason
+			// init functions run in file order, and init may repeat under
+			// another build constraint or in a test file.
+			if reason == "" && bs[0].Kind == "function" && bs[0].Name == "init" {
+				reason = refuseDeclOrderDependent
+			}
 			if reason == "" && (b.shapes[k][sh] != 1 || h.shapes[k][sh] != 1) {
 				reason = refuseDeclarationNotUnique
 			}
@@ -518,9 +525,11 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 				switch {
 				case !bok || !hok:
 					reason = refuseDeclContentMissing
+				case bh.initializes || hh.initializes:
+					reason = refuseDeclOrderDependent
 				case bc != hc:
 					reason = refuseDeclContextChanged
-				case bh != hh:
+				case bh.hash != hh.hash:
 					reason = refuseDeclContentChanged
 				default:
 					pairs = append(pairs, DeclarationPair{FromPath: bs[0].Path, ToPath: as[0].Path, Before: bs[0], After: as[0]})

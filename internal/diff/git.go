@@ -78,11 +78,31 @@ func CompareCommits(ctx context.Context, repoRoot, baseRef, headRef string, regi
 	if err != nil {
 		return Result{}, fmt.Errorf("base revision: %w", err)
 	}
+	defer base.blobs.close()
 	head, err := snapshot(ctx, repoRoot, headRef, registry)
 	if err != nil {
 		return Result{}, fmt.Errorf("head revision: %w", err)
 	}
-	return Compare(base, head, offset, limit)
+	defer head.blobs.close()
+	return compareSnapshots(ctx, base, head, offset, limit)
+}
+
+// compareSnapshots fails rather than report a file that could not be read
+// back from Git as unavailable evidence.
+func compareSnapshots(ctx context.Context, base, head Revision, offset, limit int) (Result, error) {
+	res, err := Compare(base, head, offset, limit)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	for _, b := range []*blobReader{base.blobs, head.blobs} {
+		if b.err != nil {
+			return Result{}, fmt.Errorf("read Git blob: %w", b.err)
+		}
+	}
+	return res, nil
 }
 
 func snapshot(ctx context.Context, repoRoot, ref string, registry *parser.Registry) (Revision, error) {
@@ -151,15 +171,95 @@ func snapshot(ctx context.Context, repoRoot, ref string, registry *parser.Regist
 	for _, e := range entries {
 		objects[e.name] = e
 	}
+	blobs := &blobReader{ctx: ctx, root: repoRoot}
 	source := func(p string) ([]byte, bool) {
 		e, ok := objects[p]
 		if !ok || e.mode == "120000" {
 			return nil, false
 		}
-		data, err := gitOutputBytesLimited(ctx, repoRoot, maxSourceBytes, "cat-file", "blob", e.object)
-		return data, err == nil
+		data, ok := blobs.read(e.object, maxSourceBytes)
+		return data, ok
 	}
-	return Revision{Revision: ref, Commit: commit, Tree: tree, GraphData: graph, TreeFiles: treeFiles, IndexPolicy: policy, source: source}, nil
+	return Revision{Revision: ref, Commit: commit, Tree: tree, GraphData: graph, TreeFiles: treeFiles, IndexPolicy: policy, source: source, blobs: blobs}, nil
+}
+
+// blobReader serves blobs from one `git cat-file --batch` process, started on
+// first use. err holds the first failure of the process itself; a blob over
+// the limit is only unavailable.
+type blobReader struct {
+	ctx  context.Context
+	root string
+	cmd  *exec.Cmd
+	in   io.WriteCloser
+	out  *bufio.Reader
+	err  error
+}
+
+func (b *blobReader) read(object string, limit int64) ([]byte, bool) {
+	if b == nil || b.err != nil {
+		return nil, false
+	}
+	if b.cmd == nil {
+		if b.err = b.ctx.Err(); b.err != nil {
+			return nil, false
+		}
+		cmd := gitCommand(b.ctx, b.root, "cat-file", "--batch")
+		in, err := cmd.StdinPipe()
+		if err == nil {
+			var out io.ReadCloser
+			if out, err = cmd.StdoutPipe(); err == nil {
+				b.out = bufio.NewReader(out)
+				err = cmd.Start()
+			}
+		}
+		if err != nil {
+			b.err = err
+			return nil, false
+		}
+		b.cmd, b.in = cmd, in
+	}
+	fail := func(err error) ([]byte, bool) {
+		if ctxErr := b.ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		b.err = err
+		return nil, false
+	}
+	if _, err := io.WriteString(b.in, object+"\n"); err != nil {
+		return fail(err)
+	}
+	header, err := b.out.ReadString('\n')
+	if err != nil {
+		return fail(err)
+	}
+	fields := strings.Fields(header)
+	if len(fields) != 3 || fields[0] != object || fields[1] != "blob" {
+		return fail(fmt.Errorf("invalid Git blob response %q", strings.TrimSpace(header)))
+	}
+	size, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || size < 0 {
+		return fail(fmt.Errorf("invalid Git blob size %q", fields[2]))
+	}
+	if size > limit {
+		if _, err := io.CopyN(io.Discard, b.out, size+1); err != nil {
+			return fail(err)
+		}
+		return nil, false
+	}
+	data := make([]byte, size+1)
+	if _, err := io.ReadFull(b.out, data); err != nil {
+		return fail(err)
+	}
+	return data[:size], true
+}
+
+func (b *blobReader) close() {
+	if b == nil || b.cmd == nil {
+		return
+	}
+	_ = b.in.Close()
+	_ = b.cmd.Wait()
+	b.cmd = nil
 }
 
 func parseTree(raw []byte) ([]treeEntry, error) {
