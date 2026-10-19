@@ -120,7 +120,8 @@ func TestStrictFreshnessRunningScans(t *testing.T) {
 		s.run(t, indexer.Options{})
 		res := s.strictCase(t, StatusOK, VerdictUnknown, ExitFreshnessUnknown)
 		hasReasons(t, res, "scan_running_or_abandoned", "full_scan_overlapped_another_scan")
-		if res.Freshness.State != graph.FreshnessNoKnownStaleness {
+		// The older row's writer still holds the scan lock, so it is live.
+		if res.Freshness.State != graph.FreshnessKnownStale {
 			t.Fatalf("state = %s", res.Freshness.State)
 		}
 	})

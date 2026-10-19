@@ -112,7 +112,8 @@ func (s *Store) releaseAllScanLocks() {
 
 // RecoverAbandonedScans records every running scan row as failed when no
 // process holds the scan lock, and returns their ids in ascending order. It
-// returns ErrScanActive, changing nothing, while any scan holds the lock.
+// returns ErrScanActive, changing nothing, while any scan holds the lock
+// (or anything holds it longer than a status read's retry window).
 //
 // A recovered row is failed, never completed: it certifies nothing, and strict
 // freshness still requires a later completed full scan. Rows written by a
@@ -131,12 +132,24 @@ func (s *Store) RecoverAbandonedScans(ctx context.Context) ([]int64, error) {
 		return nil, err
 	}
 	defer f.Close()
-	ok, err := lockFile(f, true)
-	if err != nil {
-		return nil, fmt.Errorf("lock scan: %w", err)
-	}
-	if !ok {
-		return nil, ErrScanActive
+	// A status read holds the lock exclusively for its own short row read;
+	// only a hold outlasting the same window it allows is treated as a scan.
+	for attempt := 1; ; attempt++ {
+		ok, err := lockFile(f, true)
+		if err != nil {
+			return nil, fmt.Errorf("lock scan: %w", err)
+		}
+		if ok {
+			break
+		}
+		if attempt == scanLockProbeAttempts {
+			return nil, ErrScanActive
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(scanLockProbeWait):
+		}
 	}
 	defer func() { _ = unlockFile(f) }()
 
