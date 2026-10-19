@@ -23,7 +23,7 @@ func main() {
 
 func run(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: benchharness run|validate|summarize|compare ...")
+		return fmt.Errorf("usage: benchharness run|ingest|validate|summarize|compare ...")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
@@ -53,10 +53,47 @@ func run(args []string, stdout io.Writer) error {
 			return err
 		}
 		return os.WriteFile(*out, b, 0o644)
+	case "ingest":
+		manifest := fs.String("manifest", "", "agent run manifest JSON (required)")
+		date := fs.String("date", "", "UTC timestamp to record (RFC 3339)")
+		out := fs.String("out", "", "ingest record JSON output path (required)")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *manifest == "" || *date == "" || *out == "" {
+			return fmt.Errorf("ingest: --manifest --date --out are all required")
+		}
+		rec, err := Ingest(*manifest, *date)
+		if err != nil {
+			return err
+		}
+		if err := ValidateIngest(rec); err != nil {
+			return fmt.Errorf("produced ingest record is invalid: %w", err)
+		}
+		b, err := marshalJSON(rec)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(*out, b, 0o644)
 	case "validate":
 		sha := fs.String("expect-sha", "", "reject the record unless codegraph.sha equals this")
 		fixture := fs.String("fixture", "", "reject the record unless the fixture hash matches this directory")
 		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if ir, err := loadIngest(fs.Arg(0)); err != nil || ir != nil {
+			if err == nil {
+				err = ValidateIngest(ir)
+			}
+			if err == nil && *fixture != "" {
+				err = fmt.Errorf("validate: --fixture does not apply to %s", IngestSchema)
+			}
+			if err == nil && *sha != "" && ir.Manifest.CodeGraph.SHA != *sha {
+				err = fmt.Errorf("stale record: codegraph sha %s, expected %s", ir.Manifest.CodeGraph.SHA, *sha)
+			}
+			if err == nil {
+				_, err = fmt.Fprintln(stdout, "valid")
+			}
 			return err
 		}
 		rec, err := load(fs.Arg(0))
@@ -72,7 +109,17 @@ func run(args []string, stdout io.Writer) error {
 		_, err = fmt.Fprintln(stdout, "valid")
 		return err
 	case "summarize":
+		includeContaminated := fs.Bool("include-contaminated", false, "agent ingest records: include contaminated sessions in per-arm statistics")
 		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if ir, err := loadIngest(fs.Arg(0)); err != nil || ir != nil {
+			if err == nil {
+				err = ValidateIngest(ir)
+			}
+			if err == nil {
+				_, err = io.WriteString(stdout, SummarizeIngest(ir, *includeContaminated))
+			}
 			return err
 		}
 		rec, err := load(fs.Arg(0))
@@ -87,6 +134,14 @@ func run(args []string, stdout io.Writer) error {
 	case "compare":
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
+		}
+		for _, p := range fs.Args() {
+			if ir, err := loadIngest(p); err != nil || ir != nil {
+				if err == nil {
+					err = fmt.Errorf("compare: not supported for %s", IngestSchema)
+				}
+				return err
+			}
 		}
 		a, err := load(fs.Arg(0))
 		if err != nil {
@@ -106,6 +161,15 @@ func run(args []string, stdout io.Writer) error {
 }
 
 func load(path string) (*Record, error) {
+	var r Record
+	if err := decodeStrict(path, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// loadIngest returns nil, nil when the file is not an agent ingest record.
+func loadIngest(path string) (*IngestRecord, error) {
 	if path == "" {
 		return nil, fmt.Errorf("record path required")
 	}
@@ -113,18 +177,44 @@ func load(path string) (*Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	var r Record
-	if err := dec.Decode(&r); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	var head struct {
+		Schema string `json:"schema"`
+	}
+	if json.Unmarshal(b, &head) != nil || head.Schema != IngestSchema {
+		return nil, nil
+	}
+	var r IngestRecord
+	if err := decodeStrict(path, &r); err != nil {
+		return nil, err
 	}
 	return &r, nil
 }
 
+func decodeStrict(path string, v any) error {
+	if path == "" {
+		return fmt.Errorf("record path required")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return decodeStrictBytes(path, b, v)
+}
+
+func decodeStrictBytes(path string, b []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
 // Marshal is the canonical encoding: indented, trailing newline.
-func Marshal(r *Record) ([]byte, error) {
-	b, err := json.MarshalIndent(r, "", "  ")
+func Marshal(r *Record) ([]byte, error) { return marshalJSON(r) }
+
+func marshalJSON(v any) ([]byte, error) {
+	b, err := json.MarshalIndent(v, "", "  ")
 	return append(b, '\n'), err
 }
 
