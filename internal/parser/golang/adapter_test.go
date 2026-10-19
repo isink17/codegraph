@@ -107,3 +107,13 @@ func TestCallOccurrenceColumnsCoverUnicodeCRLFAndNestedCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRecordsGoFileIdentity(t *testing.T) {
+	pf, err := New().Parse(context.Background(), "p/a_test.go", []byte("//go:build linux\n\npackage p_test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pf.Scope.GoFile == nil || pf.Scope.GoFile.Package != "p_test" || pf.Scope.GoFile.BuildConstraint != "linux" {
+		t.Fatalf("GoFile = %+v", pf.Scope.GoFile)
+	}
+}

@@ -263,6 +263,7 @@ type ScopeEvidence struct {
 	RustValueItems       []RustValueItem
 	GoLocals             []GoLocalBinding
 	GoFunctionResults    []GoFunctionResult
+	GoFile               *GoFileIdentity
 	SwiftLexicalBindings []SwiftLexicalBinding
 	JVMFacade            JVMFileFacade
 	// TerraformComplete reports that the HCL adapter parsed this Terraform
@@ -277,6 +278,14 @@ type ScopeEvidence struct {
 	// and upvalues of any other file, so no Lua lexical binding in the
 	// repository is proven while it is indexed.
 	LuaDebugFree bool
+}
+
+// GoFileIdentity is what a Go file's own header says about the package it
+// joins; a Go file whose header did not parse has none. BuildConstraint is the //go:build (or combined // +build) expression
+// in canonical form, empty when there is none.
+type GoFileIdentity struct {
+	Package         string
+	BuildConstraint string
 }
 
 // JVMFileFacade is the JVM class a Kotlin source file compiles its top-level

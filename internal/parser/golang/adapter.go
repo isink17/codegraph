@@ -74,6 +74,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	locals := newGoLocalIndex(collectGoLocals(fset, file, importAliases))
 	pf.Scope.GoLocals = locals.bindings
 	pf.Scope.GoFunctionResults = collectGoFunctionResults(file, importAliases)
+	pf.Scope.GoFile = cgparser.GoFileIdentity(content)
 
 	contextStack := []*graph.Symbol{}
 	enterFuncStack := []bool{}
@@ -472,7 +473,8 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 // Profile identifies the non-cgo Go adapter, which parses with go/ast and does
 // build a call graph. See cgparser.Profile for the versioning rule.
 // v2 records initializer calls on local bindings, single function result
-// types, and edges for selector calls made directly on a call result.
+// types, and edges for selector calls made directly on a call result. v3
+// records the package clause and build constraint.
 func (a *Adapter) Profile() cgparser.Profile {
-	return cgparser.Profile{ID: "go-ast:go:v2", EmitsCallEdges: true}
+	return cgparser.Profile{ID: "go-ast:go:v3", EmitsCallEdges: true}
 }

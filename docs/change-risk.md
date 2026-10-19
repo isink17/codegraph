@@ -41,8 +41,10 @@ proves it moved with a renamed file, or when its signature changed and, among
 the declarations with its path, language, kind and qualified name that have no
 counterpart on the other side, it is the only one in base and one is left in
 head; the last two are cited with `dependent_head`. With no such head
-declaration the dependent was removed. With several (two overloads whose
-signatures both changed) it is not scored and is listed as
+declaration the dependent was removed. This is pairing by elimination: it holds
+only when exactly one such declaration is left on each side. Any other count
+(two overloads whose signatures both changed, two in base against one in head,
+one in base against two in head) is not scored and is listed as
 `dependent_identity_ambiguous`; if no
 other surviving dependent cites the removal it depended on, that removal shows
 as uncertainty too. A dependent that is gone from head is not scored. Several
@@ -74,11 +76,41 @@ is not cited. A removed declaration without any resolved base edge from a
 surviving declaration is listed under `uncertainty`. A depended-on declaration
 whose signature changed is a removal plus an addition: callers that now
 resolve to the new signature are cited as `dependent_retargeted`, even when
-only the spelling changed (`interface{}` to `any`). Declarations moved across
-directories, with modified content or outside Go are not paired
-(`declaration_pairs` covers exact same-directory Go renames only): callers of
-such a move are cited as `dependent_retargeted`, and a moved dependent is not
-scored.
+only the spelling changed (`interface{}` to `any`). `declaration_pairs` covers
+exact Go renames only: inside one directory, and across directories when the
+indexed module evidence gives both files the same import path, package clause,
+test role and build constraint (a module root moved with its packages, see
+below). Declarations of any other move, of a move with modified content, or
+outside Go are not paired: callers of such a move are cited as
+`dependent_retargeted`, and a moved dependent is not scored.
+
+### Go package identity
+
+Each Go file's index records its package clause and its `//go:build` (or
+combined `// +build`) constraint, and each completed scan records every `go.mod`
+and `go.work` of the repository. A file's import path is the module path of the
+nearest `go.mod` at or above it plus its directory relative to that module
+root. Since an import path names a directory, two files in different
+directories share one only when the module root moved with them and still
+declares the same module path. A cross-directory rename pairs only then, and is
+refused otherwise:
+
+| `reason` | When |
+|---|---|
+| `module_evidence_unavailable` | Either side has no recorded module evidence (an index written before it was recorded), a file has no recorded package identity, or a file is outside every module or under a `go.mod` without a module path. |
+| `workspace_uncertain` | Either revision has a `go.work`. |
+| `module_replace_in_repo` | A `go.mod` of either revision replaces a module by a directory. |
+| `module_path_not_unique` | Two module roots declare the file's module path. |
+| `module_identity_changed` | The import paths differ: a different package, even with the same package clause and names. |
+| `package_identity_changed` | The package clause or the external test role (`_test` package in a `_test.go` file) differs. |
+| `build_role_changed` | The build constraint or the file name's build role differs. |
+| `package_ignored` | A path is under `testdata`, `vendor`, or a directory starting with `_` or `.`. |
+
+A Go file removed from one directory and added under another with the same
+file name and package identity but different bytes is listed under `refused`
+as `content_changed`: nothing proves its declarations kept their content, so
+none of them is paired. When several files fit, or the bytes are shared by
+other moved files, each candidate is `move_ambiguous`.
 
 `score` is the sum of component points, clamped to 100. Each component lists
 `points_each`, `max_points`, `count`, `points` and its `evidence` rows:
@@ -97,6 +129,15 @@ The rule table (rules, `points_each`, `max_points`) and what each rule cites are
 fixed per model id. `codegraph.change-risk/v1` has not shipped in a release, so
 the dependent pairing and sibling counting above are part of v1. After a
 release, any change to what a rule cites or scores needs a new model id.
+
+Cross-directory Go pairs keep the model at v1. Every rule is defined in terms of
+`declaration_pairs` (a paired declaration is the same declaration, a paired
+dependent survives), and those definitions are unchanged. A new pair only
+removes citations and uncertainty rows of a move whose identity the module
+evidence proves (a caller's binding to the moved declaration is no longer
+`dependent_retargeted`, the moved declaration no longer
+`removed_declaration_without_resolved_dependents`); it never adds points. A
+move without that proof is cited exactly as before.
 
 ## Uncertainty
 

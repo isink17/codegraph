@@ -11,6 +11,7 @@ import (
 	golang "github.com/smacker/go-tree-sitter/golang"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/parser"
 )
 
 // GoAdapter parses Go source files using tree-sitter.
@@ -111,6 +112,7 @@ func (a *GoAdapter) Parse(ctx context.Context, path string, content []byte) (gra
 	locals := newGoLocalIndex(goCollectLocals(root, content, importAliases))
 	pf.Scope.GoLocals = locals.bindings
 	pf.Scope.GoFunctionResults = goCollectFunctionResults(root, content, importAliases)
+	pf.Scope.GoFile = parser.GoFileIdentity(content)
 
 	// ---- call edges ----
 	goExtractCalls(root, content, importAliases, locals, &pf)

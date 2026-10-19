@@ -20,3 +20,7 @@ func TestGoLocalQualifierNeverBecomesPackageImportTreeSitter(t *testing.T) {
 func TestGoReceiverThroughFunctionResultTreeSitter(t *testing.T) {
 	runGoReceiverThroughFunctionResult(t, parser.NewRegistry(tsparser.NewGo()))
 }
+
+func TestGoPackageIdentityIndexAndUpdateParityTreeSitter(t *testing.T) {
+	runGoPackageIdentityParity(t, parser.NewRegistry(tsparser.NewGo()))
+}

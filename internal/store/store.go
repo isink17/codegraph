@@ -2269,6 +2269,7 @@ const fileGraphRowsPredicate = `(
 	OR EXISTS (SELECT 1 FROM rust_value_item_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM go_local_binding_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM go_function_result_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
+	OR EXISTS (SELECT 1 FROM go_file_identity_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM file_scope_evidence t WHERE t.repo_id = f.repo_id AND t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM file_tokens t WHERE t.file_id = f.id)
 	OR EXISTS (SELECT 1 FROM test_links t WHERE t.test_file_id = f.id)
@@ -2562,6 +2563,9 @@ func deleteFileGraphsBatch(ctx context.Context, tx *sql.Tx, repoID int64, fileID
 	if err := execInChunks(`DELETE FROM go_function_result_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
+	if err := execInChunks(`DELETE FROM go_file_identity_evidence WHERE file_id IN (`, `)`, fileIDs); err != nil {
+		return err
+	}
 	if err := execInChunks(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (`, `)`, fileIDs); err != nil {
 		return err
 	}
@@ -2735,6 +2739,9 @@ func deleteFileGraphsBatchFromTemp(ctx context.Context, tx *sql.Tx, repoID int64
 		return err
 	}
 	if err := exec(`DELETE FROM go_function_result_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
+		return err
+	}
+	if err := exec(`DELETE FROM go_file_identity_evidence WHERE file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
 		return err
 	}
 	if err := exec(`DELETE FROM scope_module_candidate_evidence WHERE source_file_id IN (SELECT id FROM tmp_delete_file_ids)`); err != nil {
@@ -2997,6 +3004,11 @@ func insertParsedFileGraph(
 			args = append(args, repoID, fileID, r.Function, r.TypeName, r.TypeImportPath)
 		}
 		if err := execBatchInsert(ctx, tx, "go_function_result_evidence", "repo_id, file_id, function_name, type_name, type_import_path", 5, args, stats); err != nil {
+			return nil, err
+		}
+	}
+	if parsed.Language == "go" && parsed.Scope.GoFile != nil {
+		if err := execBatchInsert(ctx, tx, "go_file_identity_evidence", "repo_id, file_id, package_clause, build_constraint", 4, []any{repoID, fileID, parsed.Scope.GoFile.Package, parsed.Scope.GoFile.BuildConstraint}, stats); err != nil {
 			return nil, err
 		}
 	}

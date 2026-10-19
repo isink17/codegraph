@@ -12,9 +12,10 @@ import (
 )
 
 type goModule struct {
-	path    string
-	root    string
-	blocked bool
+	path         string
+	root         string
+	blocked      bool
+	localReplace bool
 }
 
 type ownModuleScope struct {
@@ -274,12 +275,19 @@ func repoGoModules(ctx context.Context, tx *sql.Tx, repoID int64) ([]goModule, e
 // repoGoModules so callers holding only the read/write surface (execQuerier)
 // can reach it after looking the root up themselves.
 func goModulesUnderRoot(root string) ([]goModule, error) {
+	modules, _, err := goModuleTreeUnderRoot(root)
+	return modules, err
+}
+
+// goModuleTreeUnderRoot also lists the directories holding a go.work.
+func goModuleTreeUnderRoot(root string) ([]goModule, []string, error) {
 	if _, err := os.Stat(root); os.IsNotExist(err) {
-		return nil, nil
+		return nil, nil, nil
 	} else if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var modules []goModule
+	var workspaces []string
 	err := filepath.WalkDir(root, func(filePath string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -290,7 +298,17 @@ func goModulesUnderRoot(root string) ([]goModule, error) {
 			}
 			return nil
 		}
-		if entry.Name() != "go.mod" {
+		if entry.Name() != "go.mod" && entry.Name() != "go.work" {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, filepath.Dir(filePath))
+		if relErr != nil {
+			return relErr
+		}
+		if entry.Name() == "go.work" {
+			// Any go.work, even a symlink or a malformed one, can put this
+			// tree in workspace mode.
+			workspaces = append(workspaces, filepath.ToSlash(rel))
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -308,23 +326,26 @@ func goModulesUnderRoot(root string) ([]goModule, error) {
 			return err
 		}
 		parsed, err := modfile.Parse(filePath, data, nil)
-		rel, relErr := filepath.Rel(root, filepath.Dir(filePath))
-		if relErr != nil {
-			return relErr
-		}
 		if err != nil || parsed.Module == nil || parsed.Module.Mod.Path == "" {
 			// A go.mod is a module boundary even when malformed. Letting a
 			// parent module claim this subtree would fabricate import evidence.
 			modules = append(modules, goModule{root: filepath.ToSlash(rel), blocked: true})
 			return nil
 		}
-		modules = append(modules, goModule{path: parsed.Module.Mod.Path, root: filepath.ToSlash(rel)})
+		module := goModule{path: parsed.Module.Mod.Path, root: filepath.ToSlash(rel)}
+		for _, r := range parsed.Replace {
+			// modfile leaves Version empty exactly when New is a directory.
+			if r.New.Version == "" {
+				module.localReplace = true
+			}
+		}
+		modules = append(modules, module)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return modules, nil
+	return modules, workspaces, nil
 }
 
 func modulePackageDir(modules []goModule, importPath string) (string, bool) {
