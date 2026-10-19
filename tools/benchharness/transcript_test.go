@@ -250,7 +250,7 @@ func TestContaminationOutcomes(t *testing.T) {
 func jsonString(s string) string { b, _ := json.Marshal(s); return string(b) }
 
 func TestIngestFixture(t *testing.T) {
-	rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z")
+	rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,12 +370,12 @@ func TestIngestRejectsManifestMismatch(t *testing.T) {
 		"absolute path":  {func(m *Manifest) { m.Sessions[0].Transcript = "/etc/x.jsonl" }, "relative path"},
 		"duplicate":      {func(m *Manifest) { m.Sessions[1] = m.Sessions[2] }, "duplicate"},
 	} {
-		_, err := Ingest(copyFixture(t, tc.edit), "2026-01-02T00:00:00Z")
+		_, err := Ingest(copyFixture(t, tc.edit), "2026-01-02T00:00:00Z", "")
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: want error containing %q, got %v", name, tc.want, err)
 		}
 	}
-	if _, err := Ingest(fixtureManifest, "not-a-date"); err == nil {
+	if _, err := Ingest(fixtureManifest, "not-a-date", ""); err == nil {
 		t.Error("bad date accepted")
 	}
 }
@@ -397,7 +397,7 @@ func TestValidateIngestRejectsTampering(t *testing.T) {
 			r.Sessions[1].Contamination.Calls[1].Outcome = "blocked"
 		},
 	} {
-		rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z")
+		rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z", "")
 		if err != nil {
 			t.Fatal(err)
 		}

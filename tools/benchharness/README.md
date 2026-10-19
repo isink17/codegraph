@@ -44,16 +44,18 @@ units outside count/bytes/estimated_tokens/ratio, any accuracy/F1 claim, and
 recall/coverage/unresolved_share values without complete ground truth. `--expect-sha`
 and `--fixture` reject stale records.
 
-## Agent transcripts (`agent-transcript-ab/v2`)
+## Agent transcripts (`agent-transcript-ab/v3`)
 
 `ingest` reads Claude Code JSONL transcripts that an operator already recorded
 for an A/B campaign (one arm without CodeGraph, one or more arms with it) and
-writes one deterministic `codegraph.agent_transcript_ingest/v2` record. It runs
+writes one deterministic `codegraph.agent_transcript_ingest/v3` record. It runs
 no model and makes no network calls. No paid runs were made for this tool; the
-bundled transcripts under `testdata/transcripts/` are hand-written synthetic
-fixtures, and nothing produced by `ingest` is a published claim.
+bundled transcripts under `testdata/transcripts/`, `testdata/subagents/` and
+`testdata/calibration/` (and the calibration artifact made from them) are
+hand-written synthetic fixtures, and nothing produced by `ingest` is a published claim.
 
-    go run ./tools/benchharness ingest --manifest runs/manifest.json \
+    go run ./tools/benchharness calibrate --out calibration.json runs/*.jsonl runs/*/subagents/agent-*.jsonl
+    go run ./tools/benchharness ingest --manifest runs/manifest.json --calibration calibration.json \
       --date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --out ingest.json
     go run ./tools/benchharness validate ingest.json
     go run ./tools/benchharness summarize ingest.json > summary.md
@@ -65,7 +67,9 @@ the full model ID, effort, the CodeGraph commit and binary SHA-256, the corpus
 repository and commit, the task-set SHA-256 and optionally the task set's
 relative path (`task_set`), per-arm tool mode, MCP config and
 settings SHA-256, isolation flags, free-text uncertainties, and per session the
-arm, task, repetition, relative transcript path and transcript SHA-256.
+arm, task, repetition, relative transcript path and transcript SHA-256, and
+optionally `subagents`, a list of the session's subagent transcripts (relative
+path and SHA-256; see `testdata/subagents/manifest.json`).
 `ingest` refuses a transcript whose SHA-256, main-session model or client
 version differs from the manifest, a task set whose SHA-256 differs from
 `task_set_sha256`, and a session whose task is not in the task set. Config hashes and isolation flags are
@@ -91,8 +95,38 @@ limitation.
 - `wall_clock_ms`: last minus first main-session event timestamp (null with
   fewer than two). `tool_calls`: main-session `tool_use` blocks by tool name.
 - Sidechain (subagent) events inside the transcript are reported under
-  `sidechain` and excluded from every main-session total. Subagent transcripts
-  stored in separate files are not ingested.
+  `sidechain` and excluded from every main-session total.
+- Subagent transcripts: Claude Code writes each subagent to
+  `<session>/subagents/agent-<id>.jsonl` next to `<session>.jsonl`. `ingest`
+  always reads every `agent-*.jsonl` file in that directory and records each
+  with its SHA-256 under the session's `subagents`. When the manifest lists the
+  session's `subagents` (an empty list included), a discovered file that is not
+  listed, a listed file that is missing, or a hash mismatch is an error. Other
+  files there (`.meta.json`, fork markers) are not read. A subagent file's
+  events must carry its own `agentId` (or none) and the manifest's client
+  version; its model may differ from the main session's.
+- Linking: the `tool_result` of a `Task`/`Agent` call carries
+  `toolUseResult.agentId`; that call is the subagent's parent (`main`, or the
+  spawning subagent for nested agents, with `depth` counted from the main
+  session). A subagent file no result names is listed with no parent (depth 0,
+  for example teammates); a `Task`/`Agent` call whose result names no file is
+  counted in `workload.unlinked_agent_calls`. A file named by two calls is an
+  error.
+- Cross-file deduplication: each `message.id` counts once across the session's
+  files, owned by the main thread first, then subagents in spawn order, then
+  unlinked subagents by id, then sidechain events inside the main file. A fork
+  that copies its parent's history therefore does not count it again
+  (`duplicate_requests`), and a sidechain request recorded both inside the main
+  file and in its subagent file counts once, under the subagent. The same id
+  with different input or cache usage in two files is an error. Copies with
+  the same usage may still differ in content, so this applies to token
+  accounting only: linking and contamination read every copy of every
+  `tool_use` (see Contamination).
+- Per subagent: the same metrics as a main session (requests, processed,
+  final and peak context, tool calls, wall clock), from its own file only.
+  `workload` reports main, subagent-file and in-file sidechain processed
+  tokens and their total. Context sizes are never summed across agents; the
+  main session's final and peak context stay main-only.
 - Per arm, `summarize` shows the nearest-rank median (an observed session
   value), min and max of each metric over included sessions. Provider token
   counts are labelled `provider_tokens`, not estimates.
@@ -121,8 +155,17 @@ in-file sidechain) is checked for:
   (`codegraph>out`, `>out codegraph`), `env -S 'codegraph ...'` and
   `go run ./cmd/codegraph/`. Heredoc bodies and trailing `# comments` are read
   as commands, so they can give false positives;
-- a `Task`/`Agent` call: the subagent's own transcript is a separate file that
-  is not ingested, so its CodeGraph use cannot be ruled out.
+- a `Task`/`Agent` call that is not linked to a subagent file (see Linking):
+  its CodeGraph use cannot be ruled out. A linked call is not an attempt; the
+  subagent file's own tool calls are checked by the same rules instead, and
+  attempts carry the `agent` that made them (`main`, `sidechain` or a
+  subagent id). Nested calls are linked the same way, so a chain is checked
+  only as far as its files are linked. Every copy of a `tool_use` is checked,
+  including copies on requests another file owns; attempts are listed once
+  per `tool_use` id (main, linked subagents in spawn order, unlinked
+  subagents, then in-file sidechains), and an outcome that is not `blocked` in
+  any copy wins. `agent-*.jsonl` files whose id has characters outside
+  `[A-Za-z0-9_-]` are an error.
 
 Each attempt gets an outcome from its `tool_result`: `blocked` only for exact
 denial shapes (a result starting with `PreToolUse:<tool> hook error` or
@@ -134,11 +177,12 @@ the name must be `codegraph` itself, bare or as the last path segment, so
 `./notcodegraph: command not found` is not a block);
 otherwise
 `succeeded`, `error` (codegraph may have run and printed output), `no_result`,
-or `unverified` for subagent calls. A session with any attempt that is not
+or `unverified` for unlinked subagent calls. A session with any attempt that is not
 `blocked` is contaminated and excluded from per-arm statistics unless
 `--include-contaminated` is given; `summarize` prints contamination before any
 statistic. A baseline arm that needs subagents therefore needs its subagents
-disabled or its results read with `--include-contaminated` and that caveat.
+disabled, its subagent files recorded next to the transcript, or its results
+read with `--include-contaminated` and that caveat.
 
 Output alone cannot tell a blocked call from a codegraph run that printed
 nothing: an empty successful result is `succeeded` and an empty error result is
@@ -181,7 +225,8 @@ Each session's `residual` splits `final_context_tokens` into `codegraph`
   context at that request; attribution restarts from there (`resets`).
 
 Categories always sum to the measured final context. Sidechain requests and
-their tool results are excluded; subagent context is not attributed.
+their tool results are excluded; subagent context is not attributed. In `/v3`
+records this method carries `uncalibrated: true`.
 Error sources: content the transcript does not show (redacted thinking,
 attachments, system reminders) has its tokens spread over the visible content
 of the same gap; tokenizer density differs between source code, JSON and prose,
@@ -191,11 +236,49 @@ median/min/max with the basis in each unit (`provider_tokens`,
 `estimated_provider_tokens`, `unattributed_provider_tokens`).
 
 Compared with the external residual-occupancy method this adapts (measured
-context deltas priced by characters), this one does not calibrate a
-chars-per-token ratio on tool-dominated gaps or print a per-result error bar,
-and it does not model partial eviction: any context drop resets attribution
+context deltas priced by characters; colbymchenry/codegraph @
+0d33925aa3ac4d34ba9f425b24029332597f1941, a different project whose numbers
+are not ours), this method does not calibrate; the calibrated method below
+fits per-category ratios on dominated gaps and reports interquartile bounds
+per category rather than a per-result error bar. Neither models partial
+eviction: any context drop resets attribution
 instead of evicting the oldest results. It therefore reports more as
 `unattributed` and never invents a resident set it cannot see.
+
+### Residual calibration (`context-delta-calibrated/v1`)
+
+`calibrate --out calibration.json <transcript>...` fits characters per 1000
+provider tokens (`codegraph.residual_calibration/v1`) from recorded usage. For
+each main-thread request after the first (a file with no main-session request
+is read as a subagent file), the measured growth over the previous request is
+compared with the visible characters written in between. A gap is a sample
+when growth is positive, no compaction or context drop happened, the gap has
+at least 100 characters, and its `message.id` was not sampled from another
+input (forks copy history). Every sample enters the global fit; it also enters
+a category's fit when that category holds at least 90% of the gap's
+characters. Fits are nearest-rank median, quartiles, minimum and maximum
+(integers). A category with fewer than 5 samples is priced by the global fit;
+with fewer than 5 global samples the artifact is `sufficient: false`. Inputs
+are recorded by SHA-256 only, in hash order, so the artifact does not depend
+on paths or argument order.
+
+`ingest --calibration` embeds the artifact and its SHA-256 (the file must be
+in the canonical encoding `calibrate` writes, so `validate` can tie the copy to
+the hash). With a sufficient calibration, each gap's segments are priced at
+their category's median ratio: priced tokens up to the measured growth go to
+the categories and the rest of the growth to `unattributed`; a gap priced
+above its growth is scaled down to it (largest remainder). Compactions and
+drops reset as before; no eviction is inferred. Each estimated category also
+reports `calibrated`: the median-ratio price of its characters since the last
+reset (`estimate_tokens`) and the price at the upper and lower quartile ratio
+(`low_tokens`, `high_tokens`), uncapped, so the reconciled `tokens` can fall
+outside that range when hidden content or cache noise moved a gap; `validate`
+recomputes them from the embedded calibration. The range is the spread of
+observed ratios, not a confidence interval: mixed-content gaps, hidden content
+and tokenizer differences all widen it. Without a calibration, or with an
+insufficient one, ingest keeps `context-delta-char-share/v1` flagged
+`uncalibrated` and lists why under limitations. Measured totals are never
+replaced by estimates.
 
 ### Answer correctness (`codegraph.agent_task_set/v1`)
 
@@ -230,6 +313,16 @@ answers. Subagent answers are not scored. Task-set tasks with no session are
 listed as limitations.
 
 ### Schema compatibility
+
+`codegraph.agent_transcript_ingest/v3` (methodology `agent-transcript-ab/v3`)
+adds per-session `subagents` and `workload`, an `agent` on each contamination
+call, the optional embedded `calibration`, the residual `uncalibrated` flag and
+per-category `calibrated` estimates, and per-arm `subagent_processed_tokens`
+and `total_processed_tokens`; linked Task/Agent calls are no longer
+contamination attempts. `validate` and `summarize` still accept `/v2` and
+`/v1` records under their own rules (`testdata/ingest-v2.json`,
+`testdata/ingest-v1.json`). `codegraph.agent_run_manifest/v1` gains only the
+optional per-session `subagents` list.
 
 `codegraph.agent_transcript_ingest/v2` (methodology `agent-transcript-ab/v2`)
 adds `task_set_json`, per-session `residual` and `evaluation`, per-arm

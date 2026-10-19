@@ -23,7 +23,7 @@ func main() {
 
 func run(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: benchharness run|ingest|validate|summarize|compare ...")
+		return fmt.Errorf("usage: benchharness run|ingest|calibrate|validate|summarize|compare ...")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
@@ -57,13 +57,14 @@ func run(args []string, stdout io.Writer) error {
 		manifest := fs.String("manifest", "", "agent run manifest JSON (required)")
 		date := fs.String("date", "", "UTC timestamp to record (RFC 3339)")
 		out := fs.String("out", "", "ingest record JSON output path (required)")
+		calibration := fs.String("calibration", "", "residual calibration artifact from calibrate (optional)")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if *manifest == "" || *date == "" || *out == "" {
 			return fmt.Errorf("ingest: --manifest --date --out are all required")
 		}
-		rec, err := Ingest(*manifest, *date)
+		rec, err := Ingest(*manifest, *date, *calibration)
 		if err != nil {
 			return err
 		}
@@ -71,6 +72,26 @@ func run(args []string, stdout io.Writer) error {
 			return fmt.Errorf("produced ingest record is invalid: %w", err)
 		}
 		b, err := marshalJSON(rec)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(*out, b, 0o644)
+	case "calibrate":
+		out := fs.String("out", "", "calibration artifact JSON output path (required)")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *out == "" || fs.NArg() == 0 {
+			return fmt.Errorf("calibrate: --out and at least one transcript path are required")
+		}
+		cal, err := Calibrate(fs.Args())
+		if err != nil {
+			return err
+		}
+		if err := validateCalibration(cal); err != nil {
+			return fmt.Errorf("produced calibration is invalid: %w", err)
+		}
+		b, err := marshalJSON(cal)
 		if err != nil {
 			return err
 		}
@@ -180,7 +201,7 @@ func loadIngest(path string) (*IngestRecord, error) {
 	var head struct {
 		Schema string `json:"schema"`
 	}
-	if json.Unmarshal(b, &head) != nil || (head.Schema != IngestSchema && head.Schema != IngestSchemaV1) {
+	if json.Unmarshal(b, &head) != nil || (head.Schema != IngestSchema && head.Schema != IngestSchemaV2 && head.Schema != IngestSchemaV1) {
 		return nil, nil
 	}
 	var r IngestRecord

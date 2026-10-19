@@ -100,7 +100,7 @@ func TestFinalAnswer(t *testing.T) {
 }
 
 func TestIngestEvaluation(t *testing.T) {
-	rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z")
+	rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,12 +140,12 @@ func TestIngestRejectsTaskSetMismatch(t *testing.T) {
 		"absolute":     {func(m *Manifest) { m.TaskSet = "/etc/tasks.json" }, "relative path"},
 		"missing file": {func(m *Manifest) { m.TaskSet = "nope.json" }, "nope.json"},
 	} {
-		_, err := Ingest(copyFixture(t, tc.edit), "2026-01-02T00:00:00Z")
+		_, err := Ingest(copyFixture(t, tc.edit), "2026-01-02T00:00:00Z", "")
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: want error containing %q, got %v", name, tc.want, err)
 		}
 	}
-	noTasks, err := Ingest(copyFixture(t, func(m *Manifest) { m.TaskSet = "" }), "2026-01-02T00:00:00Z")
+	noTasks, err := Ingest(copyFixture(t, func(m *Manifest) { m.TaskSet = "" }), "2026-01-02T00:00:00Z", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestValidateIngestRejectsEvaluationAndResidualTampering(t *testing.T) {
 		"residual gone":   func(r *IngestRecord) { r.Sessions[2].Residual = nil },
 		"v1 with extras":  func(r *IngestRecord) { r.Schema, r.Methodology = IngestSchemaV1, IngestMethodologyV1 },
 	} {
-		rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z")
+		rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z", "")
 		if err != nil {
 			t.Fatal(err)
 		}

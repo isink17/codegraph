@@ -1,0 +1,95 @@
+{
+  "schema": "codegraph.residual_calibration/v1",
+  "method": "context-delta-calibrated/v1",
+  "dominant_share_permille": 900,
+  "min_gap_chars": 100,
+  "min_samples": 5,
+  "sources": [
+    {
+      "sha256": "e1b1956d133d2dd2069bce9ab4784e9d90c6c62597b9fbd71d5a92093563efe1",
+      "requests": 10,
+      "samples": 9
+    }
+  ],
+  "sufficient": true,
+  "global": {
+    "samples": 9,
+    "chars_per_1000_tokens_median": 3457,
+    "chars_per_1000_tokens_q1": 2693,
+    "chars_per_1000_tokens_q3": 3543,
+    "chars_per_1000_tokens_min": 2515,
+    "chars_per_1000_tokens_max": 3710
+  },
+  "categories": [
+    {
+      "category": "codegraph",
+      "source": "global",
+      "samples": 0,
+      "chars_per_1000_tokens_median": 0,
+      "chars_per_1000_tokens_q1": 0,
+      "chars_per_1000_tokens_q3": 0,
+      "chars_per_1000_tokens_min": 0,
+      "chars_per_1000_tokens_max": 0
+    },
+    {
+      "category": "file_read",
+      "source": "category",
+      "samples": 6,
+      "chars_per_1000_tokens_median": 3526,
+      "chars_per_1000_tokens_q1": 3457,
+      "chars_per_1000_tokens_q3": 3565,
+      "chars_per_1000_tokens_min": 3415,
+      "chars_per_1000_tokens_max": 3710
+    },
+    {
+      "category": "search",
+      "source": "global",
+      "samples": 0,
+      "chars_per_1000_tokens_median": 0,
+      "chars_per_1000_tokens_q1": 0,
+      "chars_per_1000_tokens_q3": 0,
+      "chars_per_1000_tokens_min": 0,
+      "chars_per_1000_tokens_max": 0
+    },
+    {
+      "category": "shell",
+      "source": "global",
+      "samples": 3,
+      "chars_per_1000_tokens_median": 2655,
+      "chars_per_1000_tokens_q1": 2515,
+      "chars_per_1000_tokens_q3": 2693,
+      "chars_per_1000_tokens_min": 2515,
+      "chars_per_1000_tokens_max": 2693
+    },
+    {
+      "category": "other_tool",
+      "source": "global",
+      "samples": 0,
+      "chars_per_1000_tokens_median": 0,
+      "chars_per_1000_tokens_q1": 0,
+      "chars_per_1000_tokens_q3": 0,
+      "chars_per_1000_tokens_min": 0,
+      "chars_per_1000_tokens_max": 0
+    },
+    {
+      "category": "assistant",
+      "source": "global",
+      "samples": 0,
+      "chars_per_1000_tokens_median": 0,
+      "chars_per_1000_tokens_q1": 0,
+      "chars_per_1000_tokens_q3": 0,
+      "chars_per_1000_tokens_min": 0,
+      "chars_per_1000_tokens_max": 0
+    },
+    {
+      "category": "user_text",
+      "source": "global",
+      "samples": 0,
+      "chars_per_1000_tokens_median": 0,
+      "chars_per_1000_tokens_q1": 0,
+      "chars_per_1000_tokens_q3": 0,
+      "chars_per_1000_tokens_min": 0,
+      "chars_per_1000_tokens_max": 0
+    }
+  ]
+}

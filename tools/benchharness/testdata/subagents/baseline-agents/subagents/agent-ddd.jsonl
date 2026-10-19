@@ -1,0 +1,1 @@
+{"agentId": "ddd", "isSidechain": true, "message": {"content": [{"text": "teammate note", "type": "text"}], "id": "d1", "model": "claude-test-model-1", "role": "assistant", "usage": {"cache_creation_input_tokens": 50, "cache_read_input_tokens": 0, "input_tokens": 1, "output_tokens": 3}}, "timestamp": "2026-01-01T00:00:22.000Z", "type": "assistant", "version": "9.9.9-test"}

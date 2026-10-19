@@ -1,0 +1,100 @@
+{
+  "schema": "codegraph.agent_run_manifest/v1",
+  "client": {
+    "name": "claude-code",
+    "version": "9.9.9-test"
+  },
+  "model": "claude-test-model-1",
+  "effort": "high",
+  "codegraph": {
+    "sha": "1111111111111111111111111111111111111111",
+    "binary_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "corpus": {
+    "repo": "https://example.invalid/fixture-service",
+    "commit": "3333333333333333333333333333333333333333"
+  },
+  "task_set_sha256": "8df3f4cf82a6f4b92faaede616faaf8c6c043c026e0ef0d2126c91a5ef3b06ef",
+  "arms": [
+    {
+      "name": "baseline",
+      "codegraph_enabled": false,
+      "tool_mode": "none",
+      "mcp_config_sha256": "d457de5ec7fd37b24eb1b7f0510a26e33d2dea0d4d3769252fd5946b86882426",
+      "settings_sha256": "f49cb2377f652d3e67dcfa98dbc821ba2e7e98a8d9bab30e82b1e3858fba4ee3",
+      "isolation": {
+        "strict_mcp_config": true,
+        "path_sanitized": true,
+        "cli_block_hook": true,
+        "user_instructions_isolated": false,
+        "user_skills_isolated": false
+      }
+    },
+    {
+      "name": "codegraph-mcp",
+      "codegraph_enabled": true,
+      "tool_mode": "full",
+      "mcp_config_sha256": "e67be67c375ddada2f645ea4edb9d79b3dcbbb07a0839b78fa2f906d1735aa77",
+      "settings_sha256": "b3bf4f9aa51ea06ecca6de10d2663546e906df98721fc5d4b554b814fdb7c0a5",
+      "isolation": {
+        "strict_mcp_config": true,
+        "path_sanitized": false,
+        "cli_block_hook": false,
+        "user_instructions_isolated": false,
+        "user_skills_isolated": false
+      }
+    }
+  ],
+  "sessions": [
+    {
+      "arm": "baseline",
+      "task": "t1",
+      "rep": 1,
+      "transcript": "baseline-agents.jsonl",
+      "transcript_sha256": "976bdd7d1744d354107fa099ad2f88c24a41f890bc844e5a928b33c215b34cf5",
+      "subagents": [
+        {
+          "transcript": "baseline-agents/subagents/agent-aaa.jsonl",
+          "transcript_sha256": "3136160531162a5be88cdf3ad55a3a5c5a12fa72350a5491ab465774ef4c471b"
+        },
+        {
+          "transcript": "baseline-agents/subagents/agent-bbb.jsonl",
+          "transcript_sha256": "a37c164db5f8eea829e4ccd8532ad10cd664a39a36c6b6ace4c9c5c9d24daab7"
+        },
+        {
+          "transcript": "baseline-agents/subagents/agent-ccc.jsonl",
+          "transcript_sha256": "d94d125bd6d0f062a1c9608edabb921fc6bac5f04aa18d36406912b1e20d89bf"
+        },
+        {
+          "transcript": "baseline-agents/subagents/agent-ddd.jsonl",
+          "transcript_sha256": "8b8163eb14482c382592c388174ab97649cff23f0b0685f6bd0b104a44b1e955"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "task": "t1",
+      "rep": 2,
+      "transcript": "baseline-subagent-cg.jsonl",
+      "transcript_sha256": "3e90940a5126732ae2e437878a8397963bd88fa9cdeff71f6e569f310635f300"
+    },
+    {
+      "arm": "baseline",
+      "task": "t1",
+      "rep": 3,
+      "transcript": "baseline-missing.jsonl",
+      "transcript_sha256": "c7b35f8c4d59216a45fefb55e82cbd3de1d810499fdab7b5df780de4dee1f74b",
+      "subagents": []
+    },
+    {
+      "arm": "codegraph-mcp",
+      "task": "t1",
+      "rep": 1,
+      "transcript": "treatment-agents.jsonl",
+      "transcript_sha256": "8ab0268ff5086759ce2cda6a43bac8274ac7f008c683daf61c154a230fa613f8"
+    }
+  ],
+  "uncertainties": [
+    "Synthetic fixture: hand-written events, not a recorded session."
+  ]
+}
