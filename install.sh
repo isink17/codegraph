@@ -13,9 +13,10 @@ esac
 
 dest=${CODEGRAPH_INSTALL_DIR:-${HOME:?HOME is not set}/.local/bin}
 bin="$dest/codegraph"
+if [ -d "$bin" ]; then die "$bin is a directory, not a codegraph binary; remove or rename it first"; fi
 
 if [ "$uninstall" = true ]; then
-  if [ -e "$bin" ]; then
+  if [ -e "$bin" ] || [ -L "$bin" ]; then
     rm -f "$bin"
     echo "Removed $bin"
   else
@@ -31,7 +32,10 @@ os=$(uname -s); arch=$(uname -m)
 case "$os" in
   Linux)
     # Release binaries are glibc CGO builds and do not run on musl.
-    if ldd --version 2>&1 | grep -qi musl; then
+    # CODEGRAPH_INSTALL_TEST_ROOT is a test-only prefix for the loader lookup.
+    musl=false
+    for loader in "${CODEGRAPH_INSTALL_TEST_ROOT:-}"/lib/ld-musl-*; do [ -e "$loader" ] && musl=true; done
+    if [ "$musl" = true ] || ldd --version 2>&1 | grep -qi musl; then
       die "unsupported C library: musl (release binaries require glibc); build from source instead"
     fi
     case "$arch" in

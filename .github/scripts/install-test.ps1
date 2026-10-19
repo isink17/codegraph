@@ -110,6 +110,8 @@ try {
   Expect-Failure 'Invalid SHA-256 sidecar' @{ Version = 'v2.0.4' }; Assert-Kept 'invalid sidecar'
   Set-Content "$asset.sha256" '' -NoNewline
   Expect-Failure 'Invalid SHA-256 sidecar' @{ Version = 'v2.0.4' }; Assert-Kept 'empty sidecar'
+  Set-Content "$asset.sha256" 'abcdef0123456789'
+  Expect-Failure 'Invalid SHA-256 sidecar' @{ Version = 'v2.0.4' }; Assert-Kept 'short sidecar'
   Remove-Item "$asset.sha256"
   Expect-Failure 'Download failed' @{ Version = 'v2.0.4' }; Assert-Kept 'missing sidecar'
   Expect-Failure 'Download failed' @{ Version = 'v9.9.9' }; Assert-Kept 'missing asset'
@@ -172,6 +174,29 @@ try {
   $out = Install @{ Uninstall = $true }
   if ($out -notlike '*not installed*') { throw "missing not-installed message: $out" }
   'ok uninstall'
+
+  $dirDest = Join-Path $tmp 'dirdest'
+  New-Item -ItemType Directory -Path (Join-Path $dirDest 'codegraph.exe') | Out-Null
+  Expect-Failure 'is a directory' @{ Version = 'v2.0.1'; InstallDir = $dirDest }
+  Expect-Failure 'is a directory' @{ Uninstall = $true; InstallDir = $dirDest }
+  if (!(Test-Path -LiteralPath (Join-Path $dirDest 'codegraph.exe') -PathType Container) -or (Get-ChildItem -LiteralPath $dirDest -Force -Filter '.codegraph-*')) {
+    throw 'directory at binary path was changed'
+  }
+  'ok directory at binary path'
+
+  $env:CODEGRAPH_INSTALL_DIR = Join-Path $tmp 'bin [x]'; $env:CODEGRAPH_INSTALL_TEST_ARCH = 'X64'
+  $bracketExe = Join-Path $env:CODEGRAPH_INSTALL_DIR 'codegraph.exe'
+  Install @{ Version = 'v2.0.0' } | Out-Null
+  New-Item -ItemType File -Path ($bracketExe + '.old-stale') | Out-Null
+  Install @{ Version = 'v2.0.1' } | Out-Null
+  if ((& $bracketExe --version | Out-String).Trim() -ne 'codegraph v2.0.1') { throw 'upgrade in bracketed install dir failed' }
+  if (Get-ChildItem -LiteralPath $env:CODEGRAPH_INSTALL_DIR -Force | Where-Object { $_.Name -like '.codegraph-*' -or $_.Name -like 'codegraph.exe.old-*' }) {
+    throw 'leftover files in bracketed install dir'
+  }
+  Install @{ Uninstall = $true } | Out-Null
+  if (Test-Path -LiteralPath $bracketExe) { throw 'uninstall in bracketed install dir failed' }
+  $env:CODEGRAPH_INSTALL_DIR = $dest; Remove-Item Env:CODEGRAPH_INSTALL_TEST_ARCH
+  'ok install dir with wildcard characters'
 
   'PowerShell installer tests passed'
 } finally {

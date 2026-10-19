@@ -86,9 +86,11 @@ echo 'not-a-digest' >"$rel/v2.0.4/codegraph-v2.0.4-linux_amd64.sha256"
 expect_fail 'invalid SHA-256 sidecar' Linux x86_64 v2.0.4; kept 'invalid sidecar'
 : >"$rel/v2.0.4/codegraph-v2.0.4-linux_amd64.sha256"
 expect_fail 'invalid SHA-256 sidecar' Linux x86_64 v2.0.4; kept 'empty sidecar'
+echo 'abcdef0123456789' >"$rel/v2.0.4/codegraph-v2.0.4-linux_amd64.sha256"
+expect_fail 'invalid SHA-256 sidecar' Linux x86_64 v2.0.4; kept 'short sidecar'
 rm "$rel/v2.0.4/codegraph-v2.0.4-linux_amd64.sha256"
 expect_fail 'download failed' Linux x86_64 v2.0.4; kept 'missing sidecar'
-echo 'ok invalid, empty and missing sidecar'
+echo 'ok invalid, empty, short and missing sidecar'
 
 expect_fail 'download failed' Linux x86_64 v9.9.9; kept 'missing asset'
 expect_fail 'invalid version' Linux x86_64 2.0.0; kept 'invalid version'
@@ -101,6 +103,8 @@ expect_fail 'run install.ps1' MINGW64_NT-10.0-22631 x86_64 v2.0.1
 expect_fail 'run install.ps1' MSYS_NT-10.0 x86_64 v2.0.1
 expect_fail 'run install.ps1' CYGWIN_NT-10.0 x86_64 v2.0.1
 STUB_LDD='musl libc (x86_64)' expect_fail 'unsupported C library: musl' Linux x86_64 v2.0.1; kept 'musl'
+mkdir -p "$tmp/muslroot/lib"; touch "$tmp/muslroot/lib/ld-musl-x86_64.so.1"
+CODEGRAPH_INSTALL_TEST_ROOT="$tmp/muslroot" expect_fail 'unsupported C library: musl' Linux x86_64 v2.0.1; kept 'musl loader'
 echo 'ok unsupported platforms'
 
 publish v2.0.1 linux_arm64
@@ -131,6 +135,7 @@ echo 'ok PATH shadow warning'
 
 # Interrupted download: the staged file is removed and the old binary stays.
 cp "$dest/codegraph" "$tmp/before"
+shells="bash /bin/sh"; ! command -v dash >/dev/null || shells="$shells dash"
 mkdir "$tmp/slow"
 cat >"$tmp/slow/curl" <<'SH'
 #!/bin/sh
@@ -139,14 +144,23 @@ echo partial >"$out"
 exec sleep 30
 SH
 chmod +x "$tmp/slow/curl"
-STUB_OS=Linux STUB_ARCH=x86_64 PATH="$tmp/slow:$stubs:$PATH" bash "$root/install.sh" v2.0.1 >"$tmp/out" 2>&1 &
-pid=$!
-for _ in $(seq 100); do [ -n "$(find "$dest" -name '.codegraph.*' -size +0)" ] && break; sleep 0.1; done
-[ -n "$(find "$dest" -name '.codegraph.*' -size +0)" ] || fail 'interrupt test never started downloading'
-kill -TERM "$pid"; pkill -P "$pid" sleep || true
-wait "$pid" && fail 'interrupted install exited 0'
-kept 'interrupted download'
-echo 'ok interrupted download'
+for shell in $shells; do
+  STUB_OS=Linux STUB_ARCH=x86_64 PATH="$tmp/slow:$stubs:$PATH" $shell "$root/install.sh" v2.0.1 >"$tmp/out" 2>&1 &
+  pid=$!
+  for _ in $(seq 100); do [ -n "$(find "$dest" -name '.codegraph.*' -size +0)" ] && break; sleep 0.1; done
+  [ -n "$(find "$dest" -name '.codegraph.*' -size +0)" ] || fail "interrupt test never started downloading ($shell)"
+  kill -TERM "$pid"; pkill -P "$pid" sleep || true
+  wait "$pid" && fail "interrupted install exited 0 ($shell)"
+  kept "interrupted download ($shell)"
+  echo "ok interrupted download ($shell)"
+done
+
+# A directory where the binary belongs is refused, never moved into or removed.
+mkdir -p "$tmp/dirdest/codegraph"
+CODEGRAPH_INSTALL_DIR="$tmp/dirdest" expect_fail 'is a directory' Linux x86_64 v2.0.1
+CODEGRAPH_INSTALL_DIR="$tmp/dirdest" expect_fail 'is a directory' Linux x86_64 --uninstall
+[ -d "$tmp/dirdest/codegraph" ] && [ -z "$(find "$tmp/dirdest" -name '.codegraph.*')" ] || fail 'directory at binary path was changed'
+echo 'ok directory at binary path'
 
 touch "$dest/unrelated"
 expect_ok Linux x86_64 --uninstall
@@ -155,6 +169,9 @@ expect_ok Linux x86_64 --uninstall
 grep -q "Removed $dest/codegraph" "$tmp/out" || fail 'missing uninstall message'
 expect_ok Linux x86_64 --uninstall
 grep -q 'not installed' "$tmp/out" || fail 'missing not-installed message'
+ln -s "$tmp/does-not-exist" "$dest/codegraph"
+expect_ok Linux x86_64 --uninstall
+[ ! -L "$dest/codegraph" ] || fail 'uninstall left a dangling symlink'
 echo 'ok uninstall'
 
 echo 'installer tests passed'
