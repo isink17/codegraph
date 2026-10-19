@@ -9,9 +9,10 @@ import "github.com/isink17/codegraph/internal/parser"
 // languages. See parser.Profile for when to bump a version suffix.
 
 // Go v2 records initializer calls on local bindings, single function result
-// types, and edges for selector calls made directly on a call result.
+// types, and edges for selector calls made directly on a call result. v3
+// records the package clause and build constraint.
 func (a *GoAdapter) Profile() parser.Profile {
-	return parser.NewProfile("go", "treesitter:go:v2", true)
+	return parser.NewProfile("go", "treesitter:go:v3", true)
 }
 
 // HCL v2 reads references inside operators. Its relationship graph is its

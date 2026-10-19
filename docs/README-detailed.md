@@ -522,7 +522,7 @@ CodeGraph writes state only for a repository you select explicitly.
 
 - **v1 databases.** v2 stores its graph in `.codegraph/codegraph.v2.sqlite` in the repository (custom and global stores use `codegraph.v2-<repo-hash>.sqlite`). A v1 `codegraph.sqlite` is not imported, migrated or modified, and both can coexist. The first v2 run needs a full `codegraph index .`.
 - **Development indexes from before the v2 baseline** are refused before any write with `unsupported pre-v2 development index ...; rebuild with: codegraph index <repo-path> --rebuild`.
-- **Indexes created from the v2 baseline** (`v2-20261002`) upgrade in place through the embedded SQLite migrations (currently up to 010) when opened. Parser profile and resolver policy changes are then applied by the next `update`.
+- **Indexes created from the v2 baseline** (`v2-20261002`) upgrade in place through the embedded SQLite migrations (currently up to 011) when opened. Parser profile and resolver policy changes are then applied by the next `update`.
 - **Newer databases.** A database that records a migration newer than the running binary is refused; use a binary at least as new as the one that wrote it.
 - **Rebuilds** (`codegraph index . --rebuild`) need exclusive database access: stop `codegraph serve` and `codegraph watch` for that repository first.
 

@@ -22,17 +22,19 @@ type goRepo struct {
 	store  *store.Store
 	idx    *Indexer
 	repoID int64
+	dbPath string
 }
 
 func newGoRepo(t *testing.T, reg *parser.Registry, files map[string]string) *goRepo {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(filepath.Join(t.TempDir(), "codegraph.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "codegraph.sqlite")
+	s, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	r := &goRepo{ctx: ctx, root: t.TempDir(), store: s, idx: New(s, reg, nil)}
+	r := &goRepo{ctx: ctx, root: t.TempDir(), store: s, idx: New(s, reg, nil), dbPath: dbPath}
 	for rel, content := range files {
 		r.write(t, rel, content)
 	}

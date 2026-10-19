@@ -15,6 +15,9 @@ type SemanticGraph struct {
 	Edges         []SemanticEdge        `json:"edges"`
 	TestLinks     []SemanticTestLink    `json:"test_links"`
 	State         SemanticGraphState    `json:"state"`
+	// GoModules is nil when no completed scan recorded the repository's Go
+	// modules.
+	GoModules *SemanticGoModules `json:"go_modules,omitempty"`
 }
 
 type SemanticFile struct {
@@ -25,6 +28,8 @@ type SemanticFile struct {
 	ParserProfile       string `json:"parser_profile"`
 	ParserCallEdges     bool   `json:"parser_call_edges"`
 	ParserSemanticEpoch int    `json:"parser_semantic_epoch"`
+	// Go is nil for a Go file whose parser recorded no package identity.
+	Go *SemanticGoFile `json:"go,omitempty"`
 }
 
 type SemanticDeclaration struct {
@@ -114,18 +119,36 @@ func (s *Store) SemanticGraph(ctx context.Context, repoID int64) (SemanticGraph,
 		return out, err
 	}
 
-	rows, err := tx.QueryContext(ctx, `SELECT path,language,content_sha256,parse_state,parser_profile,parser_call_edges,parser_semantic_epoch FROM files WHERE repo_id=? AND is_deleted=0 ORDER BY path`, repoID)
+	modules, known, err := goModuleEvidence(ctx, tx, repoID)
+	if err != nil {
+		return out, err
+	}
+	if known {
+		out.GoModules = &SemanticGoModules{Modules: []SemanticGoModule{}, Workspaces: []string{}}
+		for _, m := range modules {
+			if m.Kind == "workspace" {
+				out.GoModules.Workspaces = append(out.GoModules.Workspaces, m.Root)
+			} else {
+				out.GoModules.Modules = append(out.GoModules.Modules, SemanticGoModule{Root: m.Root, Path: m.ModulePath, LocalReplace: m.LocalReplace})
+			}
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT f.path,f.language,f.content_sha256,f.parse_state,f.parser_profile,f.parser_call_edges,f.parser_semantic_epoch,g.package_clause,g.build_constraint FROM files f LEFT JOIN go_file_identity_evidence g ON g.repo_id=f.repo_id AND g.file_id=f.id AND f.language='go' WHERE f.repo_id=? AND f.is_deleted=0 ORDER BY f.path`, repoID)
 	if err != nil {
 		return out, err
 	}
 	for rows.Next() {
 		var f SemanticFile
 		var call int
-		if err := rows.Scan(&f.Path, &f.Language, &f.ContentHash, &f.ParseState, &f.ParserProfile, &call, &f.ParserSemanticEpoch); err != nil {
+		var pkg, build sql.NullString
+		if err := rows.Scan(&f.Path, &f.Language, &f.ContentHash, &f.ParseState, &f.ParserProfile, &call, &f.ParserSemanticEpoch, &pkg, &build); err != nil {
 			rows.Close()
 			return out, err
 		}
 		f.ParserCallEdges = call != 0
+		if pkg.Valid {
+			f.Go = goFileIdentity(f.Path, pkg.String, build.String, out.GoModules)
+		}
 		out.Files = append(out.Files, f)
 	}
 	if err := rows.Err(); err != nil {

@@ -186,7 +186,7 @@ func TestSupportedLanguagesReportsPersistedCapability(t *testing.T) {
 
 	rich, ctx := capabilityFixture(t, false)
 	text, _ = callToolRaw(t, rich, ctx, "supported_languages", map[string]any{})
-	if !strings.Contains(text, `"graph_capability":{"state":"call_capable","languages":[{"language":"go","graph_capability":"call_capable","parser_profiles":["go-ast:go:v2"]}]}`) {
+	if !strings.Contains(text, `"graph_capability":{"state":"call_capable","languages":[{"language":"go","graph_capability":"call_capable","parser_profiles":["go-ast:go:v3"]}]}`) {
 		t.Fatalf("rich supported_languages = %s", text)
 	}
 }

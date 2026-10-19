@@ -588,6 +588,19 @@ func TestRiskDependentOverloads(t *testing.T) {
 	if both.Assessment != AssessmentLimitedEvidence || *both.Score != 0 || !hasUncertainty(both, "dependent_identity_ambiguous", declIdentity(a)) || !hasUncertainty(both, "dependent_identity_ambiguous", declIdentity(b)) || !hasUncertainty(both, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
 		t.Fatalf("both changed: %+v", both)
 	}
+	// Pairing is by elimination: only one unmatched declaration on each side
+	// pairs, so two base against one head and one base against two head are
+	// both ambiguous.
+	merged := compareRisk(t, base, riskRevision(files, []store.SemanticDeclaration{a2}, []store.SemanticEdge{riskCall(a2, unresolved, 4, 2, "unresolved")}))
+	if merged.Assessment != AssessmentLimitedEvidence || *merged.Score != 0 || !hasUncertainty(merged, "dependent_identity_ambiguous", declIdentity(a)) || !hasUncertainty(merged, "dependent_identity_ambiguous", declIdentity(b)) {
+		t.Fatalf("two base, one head: %+v", merged)
+	}
+	c2 := a
+	c2.Signature = "func A(f float64)"
+	split := compareRisk(t, base, riskRevision(files, []store.SemanticDeclaration{a2, b, c2}, []store.SemanticEdge{riskCall(a2, unresolved, 4, 2, "unresolved"), riskCall(b, unresolved, 8, 2, "unresolved")}))
+	if ev := component(t, split, RuleRemovedDeclarationDependent).Evidence; *split.Score != 20 || len(ev) != 1 || ev[0].Dependent != declIdentity(b) || !hasUncertainty(split, "dependent_identity_ambiguous", declIdentity(a)) {
+		t.Fatalf("one base, two head: %+v", split)
+	}
 }
 
 // A dependent that dropped its call to a removed declaration while keeping its
