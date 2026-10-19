@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/latency"
 )
@@ -140,15 +141,16 @@ func validateManifest(m *Manifest) error {
 // IngestRecord is the deterministic output of ingest. Arms are recomputable
 // from Sessions; validate checks that they are.
 type IngestRecord struct {
-	Schema         string          `json:"schema"`
-	Methodology    string          `json:"methodology"`
-	DateUTC        string          `json:"date_utc"`
-	ManifestSHA256 string          `json:"manifest_sha256"`
-	Manifest       Manifest        `json:"manifest"`
-	TaskSet        *TaskSet        `json:"task_set,omitempty"`
-	Sessions       []SessionResult `json:"sessions"`
-	Arms           []ArmSummary    `json:"arms"`
-	Limitations    []string        `json:"limitations"`
+	Schema         string   `json:"schema"`
+	Methodology    string   `json:"methodology"`
+	DateUTC        string   `json:"date_utc"`
+	ManifestSHA256 string   `json:"manifest_sha256"`
+	Manifest       Manifest `json:"manifest"`
+	// TaskSetJSON is the task-set file exactly as ingest read and hashed it.
+	TaskSetJSON string          `json:"task_set_json,omitempty"`
+	Sessions    []SessionResult `json:"sessions"`
+	Arms        []ArmSummary    `json:"arms"`
+	Limitations []string        `json:"limitations"`
 }
 
 type SessionResult struct {
@@ -220,16 +222,14 @@ func Ingest(manifestPath, date string) (*IngestRecord, error) {
 	}
 	rec := &IngestRecord{Schema: IngestSchema, Methodology: IngestMethodology, DateUTC: date, ManifestSHA256: sha256Hex(raw), Manifest: m}
 	dir := filepath.Dir(manifestPath)
-	tasks, err := loadTaskSet(dir, &m)
+	tasks, raw, err := loadTaskSet(dir, &m)
 	if err != nil {
 		return nil, err
 	}
-	if tasks != nil {
-		rec.TaskSet = tasks
-	}
+	rec.TaskSetJSON = string(raw)
 	var errs []error
 	for _, ref := range m.Sessions {
-		s, err := ingestSession(dir, ref, &m, arms[ref.Arm], rec.TaskSet)
+		s, err := ingestSession(dir, ref, &m, arms[ref.Arm], tasks)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("session %s/%s/%d: %w", ref.Arm, ref.Task, ref.Rep, err))
 			continue
@@ -250,24 +250,35 @@ func Ingest(manifestPath, date string) (*IngestRecord, error) {
 		return a.Rep < b.Rep
 	})
 	rec.Arms = armSummaries(rec.Sessions, false)
-	rec.Limitations = limitations(&m, rec.TaskSet)
+	rec.Limitations = limitations(&m, tasks)
 	return rec, nil
 }
 
 // loadTaskSet reads the manifest's task set, checks it against
 // task_set_sha256 and requires a task for every session. It returns nil when
 // the manifest names no task set.
-func loadTaskSet(dir string, m *Manifest) (*TaskSet, error) {
+func loadTaskSet(dir string, m *Manifest) (*TaskSet, []byte, error) {
 	if m.TaskSet == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	path := filepath.Join(dir, filepath.FromSlash(m.TaskSet))
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	ts, err := parseTaskSet(path, raw, m)
+	return ts, raw, err
+}
+
+// parseTaskSet checks raw against the manifest's task_set_sha256, decodes and
+// validates it, and requires a task for every session.
+func parseTaskSet(path string, raw []byte, m *Manifest) (*TaskSet, error) {
 	if got := sha256Hex(raw); got != m.TaskSetSHA256 {
 		return nil, fmt.Errorf("task set sha256 %s, manifest says %s", got, m.TaskSetSHA256)
+	}
+	// The bytes are stored as a JSON string, which cannot carry invalid UTF-8.
+	if !utf8.Valid(raw) {
+		return nil, errors.New("task set is not valid UTF-8")
 	}
 	var ts TaskSet
 	if err := decodeStrictBytes(path, raw, &ts); err != nil {
@@ -463,18 +474,18 @@ func ValidateIngest(r *IngestRecord) error {
 	if !(r.Schema == IngestSchema && r.Methodology == IngestMethodology) && !(v1 && r.Methodology == IngestMethodologyV1) {
 		bad("schema/methodology %q/%q, want %q/%q or %q/%q", r.Schema, r.Methodology, IngestSchema, IngestMethodology, IngestSchemaV1, IngestMethodologyV1)
 	}
+	var tasks *TaskSet
 	switch {
-	case v1 && (r.TaskSet != nil || r.Manifest.TaskSet != ""):
+	case v1 && (r.TaskSetJSON != "" || r.Manifest.TaskSet != ""):
 		bad("%s records carry no task set", IngestSchemaV1)
-	case !v1 && (r.TaskSet != nil) != (r.Manifest.TaskSet != ""):
-		bad("task_set must be present exactly when the manifest names one")
-	case r.TaskSet != nil:
-		if err := validateTaskSet(r.TaskSet); err != nil {
+	case !v1 && (r.TaskSetJSON != "") != (r.Manifest.TaskSet != ""):
+		bad("task_set_json must be present exactly when the manifest names a task set")
+	case r.TaskSetJSON != "":
+		ts, err := parseTaskSet("task_set_json", []byte(r.TaskSetJSON), &r.Manifest)
+		if err != nil {
 			bad("%v", err)
 		}
-		if err := checkSessionTasks(&r.Manifest, r.TaskSet); err != nil {
-			bad("%v", err)
-		}
+		tasks = ts
 	}
 	if _, err := time.Parse(time.RFC3339, r.DateUTC); err != nil {
 		bad("date_utc: %v", err)
@@ -528,10 +539,11 @@ func ValidateIngest(r *IngestRecord) error {
 			}
 		}
 		var task *Task
-		if r.TaskSet != nil {
-			task = findTask(r.TaskSet, s.Task)
+		if tasks != nil {
+			task = findTask(tasks, s.Task)
 		}
 		switch {
+		case r.TaskSetJSON != "" && tasks == nil:
 		case (task != nil) != (s.Evaluation != nil):
 			bad("session %s: evaluation must be present exactly when its task is in the task set", id)
 		case task != nil:
@@ -624,7 +636,7 @@ func SummarizeIngest(r *IngestRecord, includeContaminated bool) string {
 
 func writeCorrectness(b *strings.Builder, r *IngestRecord, arms []ArmSummary) {
 	b.WriteString("\n## Answer correctness (rubric matching)\n\n")
-	if r.TaskSet == nil {
+	if r.TaskSetJSON == "" {
 		b.WriteString("Not measured: the manifest names no task set.\n")
 		return
 	}

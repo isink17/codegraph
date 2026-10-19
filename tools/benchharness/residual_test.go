@@ -104,3 +104,22 @@ func TestApportionSumsExactly(t *testing.T) {
 		t.Fatal("no characters must return nil")
 	}
 }
+
+func TestResidualCountsRepeatedBlocksOnce(t *testing.T) {
+	tr, err := parse(t,
+		asstLine("a", false, 10, 0, 90, 1, `{"type":"thinking","thinking":"hmm"}`),
+		asstLine("a", false, 10, 0, 90, 1, `{"type":"text","text":"answer 42"}`),
+		asstLine("a", false, 10, 0, 90, 1, `{"type":"text","text":"answer 42"}`),
+		asstLine("a", false, 10, 0, 90, 1, `{"type":"thinking","thinking":"hmm"}`),
+		`{"type":"user","message":{"content":"next"}}`,
+		asstLine("b", false, 10, 0, 106, 1, `{"type":"text","text":"ok"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range tr.Residual().Categories {
+		if c.Category == catAssistant && (c.Chars != 12 || c.Tokens != 12) {
+			t.Fatalf("assistant counted twice: %+v", c)
+		}
+	}
+}

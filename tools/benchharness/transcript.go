@@ -26,6 +26,7 @@ type rawEvent struct {
 	Type        string `json:"type"`
 	Subtype     string `json:"subtype"`
 	IsSidechain bool   `json:"isSidechain"`
+	IsMeta      bool   `json:"isMeta"`
 	Timestamp   string `json:"timestamp"`
 	Version     string `json:"version"`
 	Message     *struct {
@@ -69,6 +70,7 @@ type request struct {
 	reset   bool
 	text    []string
 	toolUse bool
+	blocks  map[string]bool
 }
 
 // Transcript is the parsed content of one Claude Code JSONL session file.
@@ -170,7 +172,7 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 			}
 			req.Output = max(req.Output, m.Usage.Output)
 		} else {
-			req = &request{usage: *m.Usage, sidechain: ev.IsSidechain}
+			req = &request{usage: *m.Usage, sidechain: ev.IsSidechain, blocks: map[string]bool{}}
 			byID[m.ID] = req
 			t.requests = append(t.requests, req)
 			if !req.sidechain {
@@ -185,6 +187,14 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 			t.mainModels[m.Model] = true
 		}
 		for _, bl := range blocks(m.Content) {
+			// Events of one message.id may repeat a text or thinking block.
+			if bl.Type == "text" || bl.Type == "thinking" {
+				key := bl.Type + "\x00" + bl.Text + "\x00" + bl.Thinking
+				if req.blocks[key] {
+					continue
+				}
+				req.blocks[key] = true
+			}
 			switch {
 			case bl.Type == "tool_use" && !seenTool[bl.ID]:
 				seenTool[bl.ID] = true
@@ -210,16 +220,19 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 		if ev.Message == nil {
 			return nil
 		}
-		if !ev.IsSidechain && t.lastMain != nil {
-			t.userAfter = true
-		}
 		var prompt string
-		if json.Unmarshal(ev.Message.Content, &prompt) == nil && !ev.IsSidechain {
-			t.addSegment(catUserText, runes(prompt), false)
+		var texts []string
+		if json.Unmarshal(ev.Message.Content, &prompt) == nil {
+			texts = append(texts, prompt)
+			if !ev.IsSidechain {
+				t.addSegment(catUserText, runes(prompt), false)
+			}
 		}
+		nonText := false
 		for _, bl := range blocks(ev.Message.Content) {
 			switch {
 			case bl.Type == "tool_result":
+				nonText = true
 				res := toolResult{IsError: bl.IsError, Text: contentText(bl.Content)}
 				t.results[bl.ToolUseID] = res
 				cat, ok := t.toolCats[bl.ToolUseID]
@@ -229,12 +242,43 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 				if !ev.IsSidechain && cat != "" {
 					t.addSegment(cat, runes(res.Text), true)
 				}
-			case bl.Type == "text" && !ev.IsSidechain:
-				t.addSegment(catUserText, runes(bl.Text), false)
+			case bl.Type == "text":
+				texts = append(texts, bl.Text)
+				if !ev.IsSidechain {
+					t.addSegment(catUserText, runes(bl.Text), false)
+				}
+			default:
+				nonText = true
 			}
+		}
+		if !ev.IsSidechain && t.lastMain != nil && !ev.IsMeta && (nonText || !localCommandOnly(texts)) {
+			t.userAfter = true
 		}
 	}
 	return nil
+}
+
+var localCommandPrefixes = []string{"<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"}
+
+// localCommandOnly reports user content made only of Claude Code's local
+// slash-command wrappers (such as /exit), which the model never answers.
+func localCommandOnly(texts []string) bool {
+	found := false
+	for _, s := range texts {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		local := false
+		for _, p := range localCommandPrefixes {
+			local = local || strings.HasPrefix(s, p)
+		}
+		if !local {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 // blocks decodes a content array; a plain string content (a typed prompt) has

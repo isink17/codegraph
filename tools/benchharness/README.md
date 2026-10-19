@@ -204,9 +204,18 @@ each session's final main-session answer is scored against its task's
 `required` and `forbidden` facts. A fact is `substring`, `regex` (RE2) or
 `number` (a regex with one capture group whose text, commas removed, equals
 `value`); `ignore_case` is optional. The answer is the text blocks of the last
-main-session request; a session whose last request called a tool, that was
-followed by a user message, or that has no text is `unscored` with that reason.
-Records store per-fact results, counts and the answer's SHA-256, not its text.
+main-session request (a text or thinking block repeated across events of one
+`message.id` counts once); a session whose last request called a tool, that
+was followed by a user message, or that has no text is `unscored` with that
+reason. User events marked `isMeta` and local slash-command wrappers
+(`<command-name>`, `<command-message>`, `<local-command-stdout>`,
+`<local-command-stderr>`, `<local-command-caveat>`, as written by `/exit`) do
+not count as a following user message. Interactive sessions can still end in
+shapes this does not recognize; headless (`claude -p`) recordings are the
+reliable path. Records store per-fact results, counts and the answer's
+SHA-256, not its text, plus the task-set file itself as `task_set_json`, the
+exact bytes ingest hashed; `validate` rechecks them against
+`task_set_sha256` and checks every evaluation against the facts they define.
 Per arm, `correctness` sums scored and unscored sessions, required facts
 matched over total, forbidden hits, and sessions with every required fact and
 no forbidden one, over included (uncontaminated) sessions. This is rubric
@@ -218,7 +227,7 @@ listed as limitations.
 ### Schema compatibility
 
 `codegraph.agent_transcript_ingest/v2` (methodology `agent-transcript-ab/v2`)
-adds `task_set`, per-session `residual` and `evaluation`, per-arm
+adds `task_set_json`, per-session `residual` and `evaluation`, per-arm
 `correctness`, and `residual_*` per-arm statistics, and changes contamination
 outcomes for the not-found and `command -pv` fixes; the version is bumped so a
 v1 reader never sees fields or outcomes it does not know. `validate` and

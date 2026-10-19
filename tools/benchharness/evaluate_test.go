@@ -65,6 +65,17 @@ func TestFinalAnswer(t *testing.T) {
 			"", "ended_with_tool_use"},
 		"user after": {[]string{asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"one"}`), `{"type":"user","message":{"content":"more?"}}`},
 			"", "ended_with_user_message"},
+		"repeated block": {[]string{asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"answer 42"}`), asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"answer 42"}`)},
+			"answer 42", ""},
+		"meta after": {[]string{asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"one"}`), `{"type":"user","isMeta":true,"message":{"content":"Caveat: local"}}`},
+			"one", ""},
+		"local command after": {[]string{asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"one"}`),
+			`{"type":"user","message":{"content":"<command-name>/exit</command-name>\n<command-message>exit</command-message>"}}`,
+			`{"type":"user","message":{"content":[{"type":"text","text":"<local-command-stdout>Bye!</local-command-stdout>"}]}}`},
+			"one", ""},
+		"text after local command": {[]string{asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"one"}`),
+			`{"type":"user","message":{"content":"<command-name>/clear</command-name> and also why?"}}`, `{"type":"user","message":{"content":"why?"}}`},
+			"", "ended_with_user_message"},
 		"thinking only": {[]string{asstLine("a", false, 1, 0, 0, 1, `{"type":"thinking","thinking":"hmm"}`)}, "", "no_answer_text"},
 		"sidechain after": {[]string{asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"main"}`), asstLine("s", true, 1, 0, 0, 1, `{"type":"text","text":"side"}`)},
 			"main", ""},
@@ -129,7 +140,7 @@ func TestIngestRejectsTaskSetMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if noTasks.TaskSet != nil || noTasks.Sessions[0].Evaluation != nil || noTasks.Arms[0].Correctness != nil || noTasks.Limitations[0] != limitNoEvaluation {
+	if noTasks.TaskSetJSON != "" || noTasks.Sessions[0].Evaluation != nil || noTasks.Arms[0].Correctness != nil || noTasks.Limitations[0] != limitNoEvaluation {
 		t.Fatal("ingest without a task set must not score")
 	}
 	if err := ValidateIngest(noTasks); err != nil {
@@ -144,7 +155,14 @@ func TestValidateIngestRejectsEvaluationAndResidualTampering(t *testing.T) {
 		"forbidden count": func(r *IngestRecord) { r.Sessions[0].Evaluation.ForbiddenHits = 1 },
 		"unscored reason": func(r *IngestRecord) { r.Sessions[3].Evaluation.Reason = "judge said so" },
 		"evaluation gone": func(r *IngestRecord) { r.Sessions[0].Evaluation = nil },
-		"task set gone":   func(r *IngestRecord) { r.TaskSet = nil },
+		"task set gone":   func(r *IngestRecord) { r.TaskSetJSON = "" },
+		"fact pattern": func(r *IngestRecord) {
+			edited := strings.Replace(r.TaskSetJSON, `"called from\\s+main"`, `"called from"`, 1)
+			if edited == r.TaskSetJSON {
+				t.Fatal("fact pattern not found in stored task set")
+			}
+			r.TaskSetJSON = edited
+		},
 		"arm correctness": func(r *IngestRecord) { r.Arms[1].Correctness.AllRequiredMet = 2 },
 		"residual sum":    func(r *IngestRecord) { r.Sessions[2].Residual.Categories[0].Tokens++ },
 		"residual basis":  func(r *IngestRecord) { r.Sessions[2].Residual.Categories[0].Basis = basisMeasured },
