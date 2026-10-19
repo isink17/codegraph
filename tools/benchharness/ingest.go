@@ -175,9 +175,9 @@ type Stat struct {
 
 var baseLimitations = []string{
 	"Answer quality is not measured; token or time differences are not improvements on their own.",
-	"Subagent transcripts stored in separate files are not ingested; sidechain events inside a transcript are reported separately and excluded from main-session totals.",
+	"Subagent transcripts stored in separate files are not ingested; sidechain events inside a transcript are reported separately and excluded from main-session totals; in arms without CodeGraph every Task/Agent call is unverified and contaminates the session.",
 	"output_tokens is the largest streamed snapshot per message.id and may undercount.",
-	"Contamination detection is pattern-based (MCP server name, Skill input, Bash command position); obfuscated invocations are not detected.",
+	"Contamination detection is pattern-based (MCP server name, Skill input, shell command word); aliases, functions, eval, scripts and variables used as commands are not detected.",
 	"Config hashes and isolation flags are recorded by the operator in the manifest and are not verified by ingest.",
 	"Records are measurements of the listed sessions only, not published claims.",
 }
@@ -192,7 +192,7 @@ func Ingest(manifestPath, date string) (*IngestRecord, error) {
 		return nil, err
 	}
 	var m Manifest
-	if err := decodeStrict(manifestPath, &m); err != nil {
+	if err := decodeStrictBytes(manifestPath, raw, &m); err != nil {
 		return nil, err
 	}
 	if err := validateManifest(&m); err != nil {
@@ -364,6 +364,10 @@ func ValidateIngest(r *IngestRecord) error {
 	if len(r.Sessions) != len(r.Manifest.Sessions) {
 		bad("%d sessions, manifest lists %d", len(r.Sessions), len(r.Manifest.Sessions))
 	}
+	listed := map[string]bool{}
+	for _, ref := range r.Manifest.Sessions {
+		listed[fmt.Sprintf("%s/%s/%d/%s", ref.Arm, ref.Task, ref.Rep, ref.TranscriptSHA256)] = true
+	}
 	enabled := map[string]bool{}
 	for _, a := range r.Manifest.Arms {
 		enabled[a.Name] = a.CodeGraphEnabled
@@ -376,8 +380,15 @@ func ValidateIngest(r *IngestRecord) error {
 		if s.InputTokens+s.CacheReadTokens+s.CacheCreation != s.ProcessedTokens {
 			bad("session %s: processed_tokens != input + cache_read + cache_creation", id)
 		}
+		if !listed[id+"/"+s.TranscriptSHA256] {
+			bad("session %s: no manifest entry with transcript sha256 %s", id, s.TranscriptSHA256)
+		}
+		delete(listed, id+"/"+s.TranscriptSHA256)
 		if s.Contamination.Checked == enabled[s.Arm] {
 			bad("session %s: contamination must be checked exactly for arms without CodeGraph", id)
+		}
+		if c, b := contaminationTotals(s.Contamination.Calls); c != s.Contamination.Contaminated || b != s.Contamination.BlockedAttempts {
+			bad("session %s: contamination totals do not match its calls", id)
 		}
 	}
 	if len(r.Limitations) == 0 {

@@ -98,18 +98,38 @@ limitation.
 ### Contamination
 
 For an arm with `codegraph_enabled: false`, every `tool_use` (main session and
-sidechain) is checked for: an MCP tool whose server name contains `codegraph`;
-a `Skill` call naming a codegraph skill; a Bash command that runs the
-`codegraph` binary in command position (start, after `;`, `&&`, `|`, `(`,
-`$(`, a newline, `VAR=value` prefixes or `env`/`exec`/`time`/`xargs`/... ,
-bare or as the last path segment), or `go run .../cmd/codegraph`. Paths and
-mentions (`cd /src/codegraph`, `ls .codegraph`, `grep codegraph`) do not match.
-Each attempt is classified from its `tool_result`: `blocked` when it is an
-error from a hook or the permission system (or `command not found`),
-otherwise `succeeded`, `error` (codegraph may have run and printed output) or
-`no_result`. A session with any attempt that was not `blocked` is contaminated
-and excluded from per-arm statistics unless `--include-contaminated` is given;
-`summarize` prints contamination before any statistic.
+in-file sidechain) is checked for:
+
+- an MCP tool whose server name contains `codegraph`;
+- a `Skill` call naming a codegraph skill;
+- a Bash command that runs the `codegraph` binary as a command. The command
+  line is tokenized like a shell (quotes, escapes, `;`, `&&`, `|`, `(`, `{`,
+  `!`, newlines, `$(...)` and backticks, including inside double quotes,
+  and `bash -c`/`sh -c` scripts), then each simple command's command word is
+  taken after `VAR=value` prefixes, `if`/`then`/`do`/`while`/... keywords and
+  wrappers with their options (`env`, `sudo`, `timeout`, `nice`, `time`,
+  `xargs`, `stdbuf`, `nohup`, `exec`, `command`). It matches `codegraph` bare,
+  as the last path segment or with `.exe`, `npx`/`bunx` of a `codegraph`
+  package, and `go run .../cmd/codegraph[@version]`. Arguments
+  (`cd /src/codegraph`, `git -C /src/codegraph`, `ls .codegraph`,
+  `grep codegraph`) do not match. Aliases, shell functions, `eval`, scripts and
+  variables used as the command are not detected;
+- a `Task`/`Agent` call: the subagent's own transcript is a separate file that
+  is not ingested, so its CodeGraph use cannot be ruled out.
+
+Each attempt gets an outcome from its `tool_result`: `blocked` only for exact
+denial shapes (a result starting with `PreToolUse:<tool> hook error` or
+`Hook PreToolUse:<tool> denied`, `Permission to use `, `The user doesn't want
+to proceed`, or a shell reporting `codegraph: command not found`); otherwise
+`succeeded`, `error` (codegraph may have run and printed output), `no_result`,
+or `unverified` for subagent calls. A session with any attempt that is not
+`blocked` is contaminated and excluded from per-arm statistics unless
+`--include-contaminated` is given; `summarize` prints contamination before any
+statistic. A baseline arm that needs subagents therefore needs its subagents
+disabled or its results read with `--include-contaminated` and that caveat.
+
+`validate --expect-sha` compares the manifest's CodeGraph commit; `--fixture`
+and `compare` do not apply to ingest records and are refused.
 
 Detection is a check, not the control. Before recording, the operator should,
 for the baseline arm: use a strict per-arm MCP config with no CodeGraph server;

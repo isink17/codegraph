@@ -118,6 +118,30 @@ func TestCLIPattern(t *testing.T) {
 		"ls\ncodegraph stats",
 		"go run ./cmd/codegraph index .",
 		"echo x | codegraph",
+		"env X=1 codegraph stats",
+		`bash -c "codegraph stats"`,
+		`bash -c 'codegraph stats'`,
+		`sh -c 'cd /x && codegraph stats'`,
+		"timeout 60 codegraph stats",
+		"nice codegraph stats",
+		`"$HOME/go/bin/codegraph" stats`,
+		`'codegraph' stats`,
+		`\codegraph stats`,
+		"{ codegraph stats; }",
+		"if codegraph stats; then :; fi",
+		"! codegraph stats",
+		"time -p codegraph",
+		"sudo -u x codegraph",
+		"xargs -n1 codegraph",
+		"xargs -n 1 codegraph",
+		"codegraph.exe stats",
+		`C:\\tools\\codegraph.exe stats`,
+		"npx codegraph stats",
+		"npx -y @isink17/codegraph@latest stats",
+		"go run github.com/isink17/codegraph/cmd/codegraph@latest stats",
+		`echo "$(codegraph stats)"`,
+		"echo `codegraph stats`",
+		"while true; do codegraph stats; done",
 	}
 	misses := []string{
 		"grep -rn codegraph .",
@@ -128,14 +152,19 @@ func TestCLIPattern(t *testing.T) {
 		"cat codegraph.txt",
 		"./bin/notcodegraph stats",
 		"go test ./cmd/codegraph/...",
+		`cd "/x/codegraph"`,
+		"git -C /x/codegraph status",
+		`echo "codegraph stats"`,
+		"bash ./codegraph.sh",
+		"npx codegraph-other",
 	}
 	for _, c := range hits {
-		if !cliRE.MatchString(c) {
+		if !runsCodegraph(c) {
 			t.Errorf("not detected: %q", c)
 		}
 	}
 	for _, c := range misses {
-		if cliRE.MatchString(c) {
+		if runsCodegraph(c) {
 			t.Errorf("false positive: %q", c)
 		}
 	}
@@ -161,6 +190,10 @@ func TestContaminationOutcomes(t *testing.T) {
 		use("6", "mcp__plugin_codegraph_cg__stats", `{}`), result("6", "Permission to use it has been denied.", true),
 		use("7", "mcp__other__codegraph_lookalike", `{}`), result("7", "ok", false),
 		use("8", "Bash", `{"command":"grep codegraph README.md"}`), result("8", "ok", false),
+		use("9", "Bash", `{"command":"codegraph find_symbol useAuth && npm test"}`), result("9", "FAIL src/hooks/useAuth.test.ts", true),
+		use("10", "Bash", `{"command":"codegraph stats && rg foo"}`), result("10", "files: 3\nbash: rg: command not found", true),
+		use("11", "Bash", `{"command":"codegraph stats"}`), result("11", "zsh: command not found: codegraph", true),
+		use("12", "Task", `{"prompt":"explore"}`), result("12", "done", false),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -170,17 +203,25 @@ func TestContaminationOutcomes(t *testing.T) {
 	for _, call := range c.Calls {
 		got = append(got, call.ToolUseID+":"+call.Kind+":"+call.Outcome)
 	}
-	want := "1:cli:blocked 2:cli:blocked 3:cli:error 4:mcp:succeeded 5:skill:no_result 6:mcp:blocked"
-	if strings.Join(got, " ") != want || !c.Contaminated || c.BlockedAttempts != 3 {
+	want := "1:cli:blocked 2:cli:blocked 3:cli:error 4:mcp:succeeded 5:skill:no_result 6:mcp:blocked 9:cli:error 10:cli:error 11:cli:blocked 12:subagent:unverified"
+	if strings.Join(got, " ") != want || !c.Contaminated || c.BlockedAttempts != 4 {
 		t.Fatalf("got %v contaminated=%v blocked=%d", got, c.Contaminated, c.BlockedAttempts)
 	}
 
-	blockedOnly, err := parse(t, use("1", "Bash", `{"command":"codegraph stats"}`), result("1", "hook denied", true))
+	blockedOnly, err := parse(t, use("1", "Bash", `{"command":"codegraph stats"}`), result("1", "Hook PreToolUse:Bash denied this tool", true))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c := blockedOnly.Contamination(); c.Contaminated || c.BlockedAttempts != 1 {
 		t.Fatalf("blocked-only attempt must not contaminate: %+v", c)
+	}
+
+	subagentOnly, err := parse(t, use("1", "Agent", `{"prompt":"look around"}`), result("1", "done", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := subagentOnly.Contamination(); !c.Contaminated || c.Calls[0].Outcome != "unverified" {
+		t.Fatalf("unchecked subagent must contaminate: %+v", c)
 	}
 }
 
@@ -236,6 +277,18 @@ func TestIngestDeterministic(t *testing.T) {
 	var v bytes.Buffer
 	if err := run([]string{"validate", out}, &v); err != nil || v.String() != "valid\n" {
 		t.Fatalf("validate: %v %q", err, v.String())
+	}
+	if err := run([]string{"validate", "--expect-sha", strings.Repeat("1", 40), out}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("validate --expect-sha matching: %v", err)
+	}
+	if err := run([]string{"validate", "--expect-sha", strings.Repeat("9", 40), out}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("validate --expect-sha mismatch: %v", err)
+	}
+	if err := run([]string{"validate", "--fixture", "testdata/go-calls", out}, &bytes.Buffer{}); err == nil {
+		t.Fatal("validate --fixture accepted for an ingest record")
+	}
+	if err := run([]string{"compare", out, out}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("compare on ingest record: %v", err)
 	}
 	var s1, s2 bytes.Buffer
 	if err := run([]string{"summarize", out}, &s1); err != nil {
@@ -314,6 +367,13 @@ func TestValidateIngestRejectsTampering(t *testing.T) {
 		"schema":        func(r *IngestRecord) { r.Schema = SchemaVersion },
 		"limitations":   func(r *IngestRecord) { r.Limitations = nil },
 		"dropped":       func(r *IngestRecord) { r.Sessions = r.Sessions[:2] },
+		"blocked count": func(r *IngestRecord) { r.Sessions[0].Contamination.BlockedAttempts = 0 },
+		"swapped sha":   func(r *IngestRecord) { r.Sessions[0].TranscriptSHA256 = r.Sessions[1].TranscriptSHA256 },
+		"duplicated":    func(r *IngestRecord) { r.Sessions[2] = r.Sessions[1] },
+		"call outcome": func(r *IngestRecord) {
+			r.Sessions[1].Contamination.Calls[0].Outcome = "blocked"
+			r.Sessions[1].Contamination.Calls[1].Outcome = "blocked"
+		},
 	} {
 		rec, err := Ingest(fixtureManifest, "2026-01-02T00:00:00Z")
 		if err != nil {

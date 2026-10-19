@@ -285,17 +285,18 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// cliRE matches the codegraph binary in command position: at the start, after
-// a shell separator or substitution, after VAR=value prefixes or common
-// wrappers. A path argument (`cd /src/codegraph`, `ls .codegraph`,
-// `grep codegraph`) is not a command position and does not match.
-var cliRE = regexp.MustCompile("(?:^|[;&|(\\n`]|\\$\\()\\s*(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*(?:(?:env|exec|time|command|nohup|xargs|sudo)\\s+)*(?:\\S*/)?codegraph(?:\\s|$|[;&|)`])" +
-	"|\\bgo\\s+run\\s+\\S*cmd/codegraph(?:\\s|$)")
+// blockedRE matches the exact tool_result shapes of a PreToolUse hook denial,
+// a permission denial, or a shell that could not find the codegraph binary.
+// Any other error counts as contaminating because codegraph may have run.
+var blockedRE = regexp.MustCompile(`^(?:Hook )?PreToolUse:\S+ (?:hook error|denied)` +
+	`|^Permission to use ` +
+	`|^The user doesn't want to proceed` +
+	`|(?m)^(?:\S+: )?(?:line \d+: )?\S*codegraph(?:\.exe)?: (?:command )?not found` +
+	`|(?m)^(?:\S+: )?command not found: \S*codegraph(?:\.exe)?$`)
 
-// blockMarkers identify an error tool_result produced by a hook or the
-// permission system rather than by codegraph itself. Any other error counts
-// as contaminating because codegraph may have run and printed output.
-var blockMarkers = []string{"pretooluse", "hook", "command not found", "permission to use", "doesn't want to proceed"}
+func blockedResult(text string) bool {
+	return blockedRE.MatchString(strings.TrimSpace(text))
+}
 
 // ContaminationCall is one CodeGraph use attempt in an arm that must not use it.
 type ContaminationCall struct {
@@ -309,7 +310,8 @@ type ContaminationCall struct {
 
 // Contamination reports CodeGraph use in a without-CodeGraph arm. A session is
 // contaminated when any attempt was not blocked (succeeded, failed inside
-// codegraph, or has no result to prove it was blocked).
+// codegraph, has no result to prove it was blocked, or ran in a subagent
+// whose transcript was not checked).
 type Contamination struct {
 	Checked         bool                `json:"checked"`
 	Contaminated    bool                `json:"contaminated"`
@@ -333,9 +335,13 @@ func classifyUse(u toolUse) (kind, detail string) {
 			Command string `json:"command"`
 		}
 		_ = json.Unmarshal(u.Input, &in)
-		if cliRE.MatchString(in.Command) {
+		if runsCodegraph(in.Command) {
 			return "cli", in.Command
 		}
+	case u.Name == "Task" || u.Name == "Agent":
+		// Subagent tool calls live in separate transcript files that are not
+		// ingested, so their CodeGraph use cannot be ruled out.
+		return "subagent", ""
 	}
 	return "", ""
 }
@@ -347,27 +353,36 @@ func (t *Transcript) Contamination() Contamination {
 		if kind == "" {
 			continue
 		}
-		res, ok := t.results[u.ID]
-		outcome := "no_result"
-		if ok {
-			outcome = "succeeded"
-			if res.IsError {
-				outcome = "error"
-				low := strings.ToLower(res.Text)
-				for _, m := range blockMarkers {
-					if strings.Contains(low, m) {
-						outcome = "blocked"
-						break
-					}
-				}
-			}
-		}
-		if outcome == "blocked" {
-			c.BlockedAttempts++
-		} else {
-			c.Contaminated = true
-		}
-		c.Calls = append(c.Calls, ContaminationCall{ToolUseID: u.ID, Tool: u.Name, Kind: kind, Detail: detail, Sidechain: u.Sidechain, Outcome: outcome})
+		call := ContaminationCall{ToolUseID: u.ID, Tool: u.Name, Kind: kind, Detail: detail, Sidechain: u.Sidechain, Outcome: callOutcome(kind, t.results, u.ID)}
+		c.Calls = append(c.Calls, call)
 	}
+	c.Contaminated, c.BlockedAttempts = contaminationTotals(c.Calls)
 	return c
+}
+
+func callOutcome(kind string, results map[string]toolResult, id string) string {
+	if kind == "subagent" {
+		return "unverified"
+	}
+	res, ok := results[id]
+	switch {
+	case !ok:
+		return "no_result"
+	case !res.IsError:
+		return "succeeded"
+	case blockedResult(res.Text):
+		return "blocked"
+	}
+	return "error"
+}
+
+func contaminationTotals(calls []ContaminationCall) (contaminated bool, blocked int) {
+	for _, c := range calls {
+		if c.Outcome == "blocked" {
+			blocked++
+		} else {
+			contaminated = true
+		}
+	}
+	return contaminated, blocked
 }

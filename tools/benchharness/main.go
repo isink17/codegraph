@@ -85,6 +85,12 @@ func run(args []string, stdout io.Writer) error {
 			if err == nil {
 				err = ValidateIngest(ir)
 			}
+			if err == nil && *fixture != "" {
+				err = fmt.Errorf("validate: --fixture does not apply to %s", IngestSchema)
+			}
+			if err == nil && *sha != "" && ir.Manifest.CodeGraph.SHA != *sha {
+				err = fmt.Errorf("stale record: codegraph sha %s, expected %s", ir.Manifest.CodeGraph.SHA, *sha)
+			}
 			if err == nil {
 				_, err = fmt.Fprintln(stdout, "valid")
 			}
@@ -128,6 +134,14 @@ func run(args []string, stdout io.Writer) error {
 	case "compare":
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
+		}
+		for _, p := range fs.Args() {
+			if ir, err := loadIngest(p); err != nil || ir != nil {
+				if err == nil {
+					err = fmt.Errorf("compare: not supported for %s", IngestSchema)
+				}
+				return err
+			}
 		}
 		a, err := load(fs.Arg(0))
 		if err != nil {
@@ -184,6 +198,10 @@ func decodeStrict(path string, v any) error {
 	if err != nil {
 		return err
 	}
+	return decodeStrictBytes(path, b, v)
+}
+
+func decodeStrictBytes(path string, b []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
