@@ -30,13 +30,12 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	if err != nil {
 		return graph.Freshness{}, err
 	}
-	// A held lock is attributed to this repository only when its own rows
-	// are the only running ones: a scan holds the lock for a few
-	// milliseconds before its row exists, far less than the probe's retries,
-	// so a hold with no running row of this repository is another status
-	// read or another repository's writer.
+	// A scan takes the lock before inserting its row, and the insert can
+	// wait on a busy database, so a held lock counts as this repository's
+	// writer even without a row. The lock is per database: beside another
+	// repository's running rows the holder cannot be attributed.
 	switch {
-	case probe == scanLockHeld && f.RunningScans.Count > 0 && otherRunning == 0:
+	case probe == scanLockHeld && otherRunning == 0:
 		f.RunningScans.Liveness = "active"
 	case probe == scanLockFree && f.RunningScans.Count > 0:
 		f.RunningScans.Liveness = "abandoned"
@@ -89,11 +88,11 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	default:
 		f.State = graph.FreshnessNoKnownStaleness
 	}
-	f.Verdict = freshnessVerdict(f)
+	f.Verdict = freshnessVerdict(f, probe == scanLockHeld)
 	return f, nil
 }
 
-func freshnessVerdict(f graph.Freshness) string {
+func freshnessVerdict(f graph.Freshness, lockHeld bool) string {
 	switch {
 	case f.LastCompletedScan == nil:
 		return graph.FreshnessVerdictIndexIncomplete
@@ -101,7 +100,7 @@ func freshnessVerdict(f graph.Freshness) string {
 		return graph.FreshnessVerdictWriterActive
 	case f.RunningScans.Liveness == "abandoned":
 		return graph.FreshnessVerdictAbandonedScan
-	case f.RunningScans.Count > 0:
+	case f.RunningScans.Count > 0 || lockHeld:
 		return graph.FreshnessVerdictLivenessUnknown
 	case len(f.Reasons) > 0:
 		return graph.FreshnessVerdictStaleKnown

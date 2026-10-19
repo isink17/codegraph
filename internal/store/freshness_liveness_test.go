@@ -151,8 +151,8 @@ func TestFreshnessOtherRepositoryWriterIsNotAttributed(t *testing.T) {
 	}
 	scan(t, s, other.ID, "update", "running", "")
 	f := freshness(t, s, repoID)
-	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictConsistentWithLastScan || f.State != graph.FreshnessNoKnownStaleness {
-		t.Fatalf("other repo's writer attributed: %+v", f)
+	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictLivenessUnknown {
+		t.Fatalf("held lock beside another repository's writer: %+v", f)
 	}
 	// This repository's own running row beside another repository's live
 	// writer cannot be told live or abandoned.
@@ -160,5 +160,26 @@ func TestFreshnessOtherRepositoryWriterIsNotAttributed(t *testing.T) {
 	f = freshness(t, s, repoID)
 	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictLivenessUnknown {
 		t.Fatalf("ambiguous writer: %+v", f)
+	}
+}
+
+// A scan takes the lock before it inserts its row, and that insert can wait
+// on a busy database; the graph is not consistent meanwhile.
+func TestFreshnessLockHeldBeforeRowIsWriterActive(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	writer := openSameStore(t, s)
+	lock, err := writer.acquireScanLock(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := freshness(t, s, repoID)
+	releaseScanLockFile(lock)
+	if f.RunningScans.Count != 0 || f.RunningScans.Liveness != "active" || f.Verdict != graph.FreshnessVerdictWriterActive || f.State != graph.FreshnessKnownStale {
+		t.Fatalf("pre-insert writer: %+v", f)
+	}
+	if f := freshness(t, s, repoID); f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("after release: %+v", f)
 	}
 }

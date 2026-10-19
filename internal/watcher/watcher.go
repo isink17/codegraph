@@ -248,13 +248,17 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 	}
 	addWatchTree := func(root string) error { return addWatchTreeTo(fsw, root, nil) }
 
-	resetWatcher := func() error {
-		// Rebuild the watcher so include/exclude changes take effect (especially
-		// for directories that were previously skipped and not watched). Build
-		// and fully populate the new watcher before swapping it in and closing
-		// the old one, so events on already-watched paths keep flowing through
-		// the old watcher during the rebuild instead of falling into a window
-		// where neither watcher is active.
+	// resetWatcher rebuilds the watcher so include/exclude changes take effect
+	// (especially for directories that were previously skipped and not
+	// watched). By default the new watcher is fully populated before the old
+	// one closes, so events on already-watched paths keep flowing during the
+	// rebuild. closeFirst closes the old one first instead, so the tree is
+	// never registered twice (inotify watches and kqueue descriptors are
+	// limited); the caller must cover the gap with a full scan.
+	resetWatcher := func(closeFirst bool) error {
+		if closeFirst {
+			_ = fsw.Close()
+		}
 		next, err := newFSWatcher()
 		if err != nil {
 			return err
@@ -268,7 +272,9 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 		fsw = next
 		eventsCh = next.Events
 		errorsCh = next.Errors
-		_ = old.Close()
+		if !closeFirst {
+			_ = old.Close()
+		}
 		return nil
 	}
 
@@ -442,7 +448,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 					includes = nextCfg.Include
 					excludes = nextCfg.Exclude
 					forceFullScan.Store(true)
-					if err := resetWatcher(); err != nil {
+					if err := resetWatcher(false); err != nil {
 						return err
 					}
 					signalFlush()
@@ -539,12 +545,12 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			if errors.Is(err, fsnotify.ErrEventOverflow) {
 				// Dropped events cannot be replayed: directories created
 				// meanwhile are unwatched and files changed meanwhile are
-				// unqueued. Re-register the tree, then reconcile everything
-				// through the incremental full update, which skips files whose
-				// size and mtime are unchanged and covers events lost during
-				// the re-registration.
+				// unqueued. Re-register the tree, releasing the old watches
+				// first, then reconcile everything through the incremental
+				// full update, which skips files whose size and mtime are
+				// unchanged and covers events lost during the re-registration.
 				w.overflows.Add(1)
-				if err := resetWatcher(); err != nil {
+				if err := resetWatcher(true); err != nil {
 					return err
 				}
 				forceFullScan.Store(true)

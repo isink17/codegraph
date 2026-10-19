@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,9 +167,16 @@ func TestWatcherReconcilesAfterEventOverflow(t *testing.T) {
 		errs chan error
 	}
 	inject := make(chan injected, 4)
+	var prev *fsnotify.Watcher
+	var stillWatched atomic.Int64
+	stillWatched.Store(-1)
 	// Errors is swapped for a test-owned channel: sending on fsnotify's own
 	// channel races with its shutdown.
 	watcherCreatedHook = func(w *fsnotify.Watcher) {
+		if prev != nil {
+			stillWatched.Store(int64(len(prev.WatchList())))
+		}
+		prev = w
 		errs := make(chan error, 1)
 		w.Errors = errs
 		inject <- injected{w, errs}
@@ -203,6 +211,10 @@ func TestWatcherReconcilesAfterEventOverflow(t *testing.T) {
 	}
 	if got := r.w.Stats().Overflows; got != 1 {
 		t.Fatalf("Overflows = %d, want 1", got)
+	}
+	// The forced scan ran after the reset, so the hook has returned.
+	if n := stillWatched.Load(); n != 0 {
+		t.Fatalf("old watcher held %d watches while the new one registered", n)
 	}
 	r.waitLive(t, "reconciled file", func(p []string) bool {
 		return slices.Contains(p, "newdir/m.go")

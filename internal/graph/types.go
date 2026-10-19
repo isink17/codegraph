@@ -653,12 +653,13 @@ type FreshnessRunningScans struct {
 	// scan; older ones were superseded.
 	AfterLastCompleted int64 `json:"after_last_completed"`
 	// Liveness comes from a non-blocking probe of the shared scan lock:
-	// "active" when the lock is held and only this repository has running
-	// rows; "abandoned" when rows read running while the probe held the lock
+	// "active" when the lock is held and no other repository in the database
+	// has running rows (a scan takes the lock before inserting its row);
+	// "abandoned" when rows read running while the probe held the lock
 	// exclusively, so no lock-aware process holds it (a scan by a binary older
 	// than the lock is not seen; run recover-scans); "none" when the lock is
 	// free and nothing runs; "unknown" when it cannot be probed, or is held
-	// with no running row of this repository or beside another repository's.
+	// beside another repository's running rows.
 	Liveness string `json:"liveness"`
 }
 
