@@ -14,7 +14,8 @@
     "repo": "https://example.invalid/fixture-service",
     "commit": "3333333333333333333333333333333333333333"
   },
-  "task_set_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+  "task_set_sha256": "8df3f4cf82a6f4b92faaede616faaf8c6c043c026e0ef0d2126c91a5ef3b06ef",
+  "task_set": "tasks.json",
   "arms": [
     {
       "name": "baseline",
@@ -51,7 +52,14 @@
       "task": "t1",
       "rep": 1,
       "transcript": "treatment.jsonl",
-      "transcript_sha256": "b08d96326f5cceef00f72bd1e79c2b369b783c07c521b90ea6b8ead736ff4ee8"
+      "transcript_sha256": "2eafc248ea30b413fdc14fb136b00cac62b9cee8c1603be125edd4dd2082e1d1"
+    },
+    {
+      "arm": "codegraph-mcp",
+      "task": "t1",
+      "rep": 2,
+      "transcript": "treatment-unfinished.jsonl",
+      "transcript_sha256": "1c4a2562f700033b2956ff039c09e5d6a7f171dac5ba0d0e9e2082eec2188fd2"
     },
     {
       "arm": "baseline",

@@ -1,0 +1,47 @@
+{
+  "schema": "codegraph.agent_task_set/v1",
+  "tasks": [
+    {
+      "id": "t1",
+      "prompt": "Explain how the fixture service starts.",
+      "required": [
+        {
+          "id": "entry",
+          "kind": "substring",
+          "pattern": "start",
+          "ignore_case": true
+        },
+        {
+          "id": "caller",
+          "kind": "regex",
+          "pattern": "called from\\s+main"
+        },
+        {
+          "id": "line",
+          "kind": "number",
+          "pattern": "main\\.go:(\\d+)",
+          "value": 3
+        }
+      ],
+      "forbidden": [
+        {
+          "id": "wrong-caller",
+          "kind": "substring",
+          "pattern": "init()"
+        }
+      ]
+    },
+    {
+      "id": "t2",
+      "prompt": "List the service's configuration flags.",
+      "required": [
+        {
+          "id": "port",
+          "kind": "substring",
+          "pattern": "--port"
+        }
+      ],
+      "forbidden": []
+    }
+  ]
+}

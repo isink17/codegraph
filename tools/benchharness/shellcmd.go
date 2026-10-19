@@ -169,13 +169,13 @@ func commandRunsCodegraph(words []string, depth int) bool {
 			args = skipOptions(name, args)
 			return len(args) > 0 && isCodegraphPackage(args[0])
 		case "command":
-			// command -v/-V only looks the name up.
+			// command -v/-V (alone or in a cluster such as -pv) only looks the name up.
 			for _, a := range args {
-				if a == "-v" || a == "-V" {
-					return false
-				}
-				if !strings.HasPrefix(a, "-") {
+				if !strings.HasPrefix(a, "-") || a == "--" {
 					break
+				}
+				if strings.ContainsAny(a[1:], "vV") {
+					return false
 				}
 			}
 		case "bash", "sh", "zsh", "dash", "ksh":
