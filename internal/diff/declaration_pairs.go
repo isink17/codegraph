@@ -6,6 +6,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -145,7 +146,7 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 				}
 			}
 		}
-		orderKept := fileOrderKept(baseTree, headTree, r.From, r.To)
+		orderKept := sync.OnceValue(func() bool { return fileOrderKept(baseTree, headTree, r.From, r.To) })
 		before, after := groupByShape(baseDecls[r.From]), groupByShape(headDecls[r.To])
 		for _, key := range sortedKeys(before) {
 			b, a := before[key], after[key]
@@ -566,7 +567,7 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 				case bh.hash != hh.hash:
 					reason = refuseDeclContentChanged
 				default:
-					if reason = moveRefusal(bs[0], bh, false, path.Dir(bs[0].Path), path.Dir(as[0].Path), ev); reason == "" {
+					if reason = moveRefusal(bs[0], bh, func() bool { return false }, path.Dir(bs[0].Path), path.Dir(as[0].Path), ev); reason == "" {
 						pairs = append(pairs, DeclarationPair{FromPath: bs[0].Path, ToPath: as[0].Path, Before: bs[0], After: as[0]})
 						continue
 					}
@@ -588,9 +589,9 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 
 // moveRefusal is why a Go declaration whose bytes are equal in another file
 // may still mean something else, or "". Every pairing path applies it.
-func moveRefusal(d store.SemanticDeclaration, top goTopDecl, orderKept bool, fromDir, toDir string, ev moveEvidence) string {
+func moveRefusal(d store.SemanticDeclaration, top goTopDecl, orderKept func() bool, fromDir, toDir string, ev moveEvidence) string {
 	switch {
-	case !orderKept && orderDependent(d, top.initializes):
+	case orderDependent(d, top.initializes) && !orderKept():
 		return refuseDeclOrderDependent
 	case !embedsKept(top.embeds, fromDir, toDir, ev):
 		return refuseDeclEmbedUnproven
