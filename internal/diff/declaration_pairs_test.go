@@ -1,6 +1,9 @@
 package diff
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,13 +18,27 @@ import (
 
 // pairRevision is one side of a single-file rename: the file's projection and
 // its declarations, as an index of that revision would report them.
+// The file's bytes depend only on the fixture's content hash, so equal
+// fixture hashes stay equal bytes; lines 3 to 20 each hold one function.
 func pairRevision(file store.SemanticFile, decls ...store.SemanticDeclaration) Revision {
 	for i := range decls {
 		decls[i].Path = file.Path
 	}
+	content := "package p\n// " + file.ContentHash + "\n"
+	for line := 3; line <= 20; line++ {
+		content += fmt.Sprintf("func f%d() {}\n", line)
+	}
+	sum := sha256.Sum256([]byte(content))
+	file.ContentHash = hex.EncodeToString(sum[:])
 	return Revision{
 		TreeFiles: []SourceFile{{Path: file.Path, ContentHash: file.ContentHash, Language: file.Language}},
 		GraphData: store.SemanticGraph{Files: []store.SemanticFile{file}, Declarations: decls},
+		source: func(p string) ([]byte, bool) {
+			if p == file.Path {
+				return []byte(content), true
+			}
+			return nil, false
+		},
 	}
 }
 

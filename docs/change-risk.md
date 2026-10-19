@@ -133,9 +133,8 @@ iota ... )` group, the group). It pairs only when:
 - its identity without path and position (kind, qualified name with receiver,
   signature, stable key, visibility, staticness, arity) is unique among all
   declarations of that package identity in each revision,
-- it is not a receiverless `init` function and not a `var` declaration with
-  initializer values: package initialization runs those in file order, so a
-  move to a file that sorts differently can change what the program does,
+- it does not run in file order (see [Shared eligibility](#shared-eligibility)):
+  the files differ, so the declaration's place among them is not kept,
 - its own bytes are equal, and so are the compiler directives (`//go:`,
   `//line`, `//export`, `//extern`) before it; its doc comment and its position
   may change,
@@ -150,7 +149,8 @@ only is not a move candidate and is not listed:
 
 | `reason` | When |
 |---|---|
-| `declaration_order_dependent` | A receiverless `init` function, or a `var` declaration with initializer values (for a grouped `var ( ... )`, any spec with values). Constants, types, functions, methods and variables without initializer are not affected by file order. |
+| `declaration_order_dependent` | The declaration runs in file order (see below). |
+| `declaration_embed_unproven` | A `//go:embed` before or inside the declaration cannot be shown to embed the same bytes (see below). |
 | `declaration_not_unique` | The identity occurs more than once in the package on either side. |
 | `declaration_content_unavailable` | A file could not be read back from Git, its bytes differ from the indexed ones, it does not parse, or the declaration does not map to exactly one top-level declaration that shares no line with another. |
 | `declaration_context_changed` | The file's package clause, imports, import comments, header comments, linkname or cgo directives, or unattached directives differ. |
@@ -160,11 +160,36 @@ The module refusals of the table above (`workspace_uncertain`,
 `module_replace_in_repo`, `module_root_changed`, `module_evidence_unavailable`)
 apply per declaration too.
 
-Known limit: an exact rename pairs every declaration of the file, including
-`init` functions and initialized variables. A same-directory rename that
-changes where the file sorts among its package's files (`a.go` to `z.go`) can
-change initialization order without changing a byte; such pairs are not
-refused today.
+### Shared eligibility
+
+Every pairing path (exact rename in or across directories, edited move) also
+refuses a declaration whose own bytes cannot show that it means the same thing
+in its new file. These rows carry the base declaration:
+
+- `declaration_order_dependent`: a receiverless `init` function or a `var`
+  declaration with initializer values (for a grouped `var ( ... )`, any spec
+  with values) runs during package initialization in file order, and a `Test`,
+  `Benchmark`, `Fuzz` or `Example` function of a `_test.go` file (the name
+  followed by nothing or by a character that is not a lower-case letter;
+  `TestMain` excluded) runs under `go test` in file order. The go command lists
+  a package's files sorted by name, test files after the others. An exact
+  rename keeps that order when every other `.go` file of the same test role in
+  the old directory is in the new directory, on the same side of the file name,
+  and no other `.go` file joined it (`a.go` to `b.go` next to `m.go` keeps it,
+  `a.go` to `z.go` does not); then such declarations pair. An edited move never
+  keeps it. Constants, types, methods, other functions and variables without
+  initializer pair regardless of order.
+- `declaration_embed_unproven`: a `//go:embed` pattern resolves against the
+  source file's directory, so identical bytes can embed different content after
+  a move. A declaration with `//go:embed` pairs only when every pattern names
+  one file (no glob, no `all:`, no quoted name, a clean relative path) that, in
+  both revisions, is a regular file readable from Git, not a directory, not
+  under a nested `go.mod`, and has equal bytes. A missing, unreadable or
+  changed file refuses; so does every pattern form not listed.
+
+Both refusals read the file back from Git; when an exact rename's file cannot
+be read or parsed, or a declaration shares a line with another top-level
+declaration, its declarations are refused as `declaration_content_unavailable`.
 
 `score` is the sum of component points, clamped to 100. Each component lists
 `points_each`, `max_points`, `count`, `points` and its `evidence` rows:
@@ -184,8 +209,8 @@ fixed per model id. `codegraph.change-risk/v1` has not shipped in a release, so
 the dependent pairing and sibling counting above are part of v1. After a
 release, any change to what a rule cites or scores needs a new model id.
 
-Cross-directory Go pairs, edited moves and the scoped `go.work` and replace
-checks keep the model at v1. Every rule is defined in terms of
+Cross-directory Go pairs, edited moves, the scoped `go.work` and replace
+checks, and the shared eligibility refusals keep the model at v1. Every rule is defined in terms of
 `declaration_pairs` (a paired declaration is the same declaration, a paired
 dependent survives), and those definitions are unchanged. An edited-move pair
 asserts the same thing an exact rename does, for one declaration instead of a
@@ -196,7 +221,9 @@ uncertainty rows of a move whose identity the evidence proves (a caller's
 binding to the moved declaration is no longer `dependent_retargeted`, the moved
 declaration no longer `removed_declaration_without_resolved_dependents`); it
 never adds points. A move without that proof, including a moved declaration
-whose content changed, is cited exactly as before.
+whose content changed, is cited exactly as before. The shared eligibility
+refusals only withdraw pairs, so they can only restore citations a pair would
+have removed.
 
 ## Uncertainty
 

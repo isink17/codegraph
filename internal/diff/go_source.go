@@ -31,6 +31,8 @@ type goTopDecl struct {
 	// initializes is set for a var declaration with initializer values:
 	// package initialization runs those in file order.
 	initializes bool
+	// embeds holds the //go:embed directives before or inside it.
+	embeds []string
 }
 
 func initializesVars(d ast.Decl) bool {
@@ -97,8 +99,14 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 	// that declaration; one inside a declaration is part of its bytes. A
 	// directive that names its target (linkname, cgo) applies anywhere.
 	attached := make([][]string, len(f.Decls))
+	embeds := make([][]string, len(f.Decls))
 	for _, group := range f.Comments {
 		for _, c := range group.List {
+			if goEmbed(c.Text) {
+				if i := sort.Search(len(f.Decls), func(i int) bool { return f.Decls[i].End() > c.Pos() }); i < len(f.Decls) && !isImport[i] {
+					embeds[i] = append(embeds[i], c.Text)
+				}
+			}
 			switch {
 			case c.Pos() < f.Package:
 				ctx = append(ctx, "header "+c.Text)
@@ -129,7 +137,7 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 		}
 		h.Write([]byte{0})
 		h.Write(content[off(d.Pos()):off(d.End())])
-		out.decls = append(out.decls, goTopDecl{startLine: fset.Position(d.Pos()).Line, endLine: fset.Position(d.End()).Line, hash: hex.EncodeToString(h.Sum(nil)), initializes: initializesVars(d)})
+		out.decls = append(out.decls, goTopDecl{startLine: fset.Position(d.Pos()).Line, endLine: fset.Position(d.End()).Line, hash: hex.EncodeToString(h.Sum(nil)), initializes: initializesVars(d), embeds: embeds[i]})
 	}
 	return out, true
 }
@@ -143,6 +151,64 @@ func goDirective(text string) bool {
 		}
 	}
 	return false
+}
+
+func goEmbed(text string) bool {
+	rest, ok := strings.CutPrefix(text, "//go:embed")
+	return ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t')
+}
+
+// embedsKept reports that every //go:embed of a declaration that moved from
+// fromDir to toDir names one regular file whose bytes are equal in both
+// revisions. A pattern resolves against the source file's directory, so equal
+// declaration bytes prove nothing about what is embedded.
+// ponytail: globs, directories, quoted names and all: refuse; resolving them
+// as the go command does would keep those pairs.
+func embedsKept(directives []string, fromDir, toDir string, ev moveEvidence) bool {
+	var patterns []string
+	for _, d := range directives {
+		fields := strings.Fields(strings.TrimPrefix(d, "//go:embed"))
+		if len(fields) == 0 {
+			return false
+		}
+		for _, p := range fields {
+			if strings.ContainsAny(p, "\"`*?[\\") || strings.HasPrefix(p, "all:") || path.Clean(p) != p || path.IsAbs(p) || p == "." || p == ".." || strings.HasPrefix(p, "../") {
+				return false
+			}
+			patterns = append(patterns, p)
+		}
+	}
+	// regular is the content hash of the file p names under dir when it is a
+	// readable regular blob outside any nested module, or "".
+	regular := func(tree []SourceFile, src func(string) ([]byte, bool), dir, p string) string {
+		file, hash := path.Join(dir, p), ""
+		nested := map[string]bool{}
+		for d := path.Dir(p); d != "."; d = path.Dir(d) {
+			nested[path.Join(dir, d, "go.mod")] = true
+		}
+		for _, f := range tree {
+			switch {
+			case f.Path == file:
+				hash = f.ContentHash
+			case strings.HasPrefix(f.Path, file+"/") || nested[f.Path]:
+				return ""
+			}
+		}
+		if hash == "" || src == nil {
+			return ""
+		}
+		if _, ok := src(file); !ok {
+			return ""
+		}
+		return hash
+	}
+	for _, p := range patterns {
+		b := regular(ev.baseTree, ev.baseSrc, fromDir, p)
+		if b == "" || b != regular(ev.headTree, ev.headSrc, toDir, p) {
+			return false
+		}
+	}
+	return true
 }
 
 // declarationHash is the hash of the one top-level declaration whose lines

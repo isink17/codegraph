@@ -6,6 +6,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/store"
 )
@@ -23,8 +25,10 @@ import (
 // are unchanged (a module root that moved with its packages). A file removed
 // and another added under the same package identity pair a declaration only
 // when its own bytes, the directives before it and the file's imports are
-// equal (see editedMoves). Every other language is refused: callers reach Lua,
-// C/C++, Ruby and PHP declarations through the file path (require, include)
+// equal (see editedMoves). Every path also refuses a declaration that runs in
+// file order or embeds files it cannot prove equal (see moveRefusal). Every
+// other language is refused: callers reach Lua, C/C++, Ruby and PHP
+// declarations through the file path (require, include)
 // and Kotlin top-level functions through a class named after the file, while
 // their stable keys may not carry the path.
 type DeclarationPairs struct {
@@ -73,7 +77,15 @@ const (
 	refuseDeclContextChanged    = "declaration_context_changed"
 	refuseDeclContentMissing    = "declaration_content_unavailable"
 	refuseDeclOrderDependent    = "declaration_order_dependent"
+	refuseDeclEmbedUnproven     = "declaration_embed_unproven"
 )
+
+// moveEvidence is what both revisions hold beyond the index: every tree file
+// and a reader for its bytes.
+type moveEvidence struct {
+	baseTree, headTree []SourceFile
+	baseSrc, headSrc   func(string) ([]byte, bool)
+}
 
 func declarationPairs(renames FileRenames, base, head store.SemanticGraph, semanticOK bool, incomplete map[string]bool, baseTree, headTree []SourceFile, baseSrc, headSrc func(string) ([]byte, bool)) DeclarationPairs {
 	d := DeclarationPairs{Pairs: []DeclarationPair{}, Refused: []RefusedPairing{}}
@@ -82,6 +94,7 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 		return d
 	}
 	baseSrc, headSrc = memoSource(baseSrc), memoSource(headSrc)
+	ev := moveEvidence{baseTree: baseTree, headTree: headTree, baseSrc: baseSrc, headSrc: headSrc}
 	var baseScope, headScope goModuleScope
 	if base.GoModules != nil && head.GoModules != nil {
 		baseScope, headScope = newGoModuleScope(base.GoModules, baseTree, baseSrc), newGoModuleScope(head.GoModules, headTree, headSrc)
@@ -123,6 +136,16 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 			refuse(refuseModuleRootChanged)
 			continue
 		}
+		// The bytes are equal, so the base file says what both declare.
+		var gs *goSource
+		if baseSrc != nil {
+			if data, ok := baseSrc(r.From); ok {
+				if parsed, ok := parseGoSource(data, bf.ContentHash); ok {
+					gs = &parsed
+				}
+			}
+		}
+		orderKept := fileOrderKept(baseTree, headTree, r.From, r.To)
 		before, after := groupByShape(baseDecls[r.From]), groupByShape(headDecls[r.To])
 		for _, key := range sortedKeys(before) {
 			b, a := before[key], after[key]
@@ -134,13 +157,23 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 			case len(a) == 0:
 				d.Refused = append(d.Refused, RefusedPairing{FromPath: r.From, ToPath: r.To, Reason: refuseDeclarationUnmatched, Declaration: &b[0]})
 			default:
+				reason := refuseDeclContentMissing
+				if gs != nil {
+					if top, ok := gs.declarationHash(b[0]); ok {
+						reason = moveRefusal(b[0], top, orderKept, path.Dir(r.From), path.Dir(r.To), ev)
+					}
+				}
+				if reason != "" {
+					d.Refused = append(d.Refused, RefusedPairing{FromPath: r.From, ToPath: r.To, Reason: reason, Declaration: &b[0]})
+					continue
+				}
 				d.Pairs = append(d.Pairs, DeclarationPair{FromPath: r.From, ToPath: r.To, Before: b[0], After: a[0]})
 			}
 		}
 	}
 	if semanticOK {
 		d.Refused = append(d.Refused, changedContentMoves(renames, base, head, incomplete, baseTree, headTree, baseScope, headScope)...)
-		pairs, refused := editedMoves(renames, base, head, incomplete, baseTree, headTree, baseScope, headScope, baseSrc, headSrc)
+		pairs, refused := editedMoves(renames, base, head, incomplete, baseScope, headScope, ev)
 		d.Pairs = append(d.Pairs, pairs...)
 		d.Refused = append(d.Refused, refused...)
 	}
@@ -390,12 +423,12 @@ func goBuildRole(p string) string {
 // editedMoves pairs declarations that left removed Go files for added files
 // of the same package identity when nothing a declaration means can differ:
 // the module keeps its import identity, the declaration's shape is unique in
-// that package on both sides, it does not take part in file-ordered package
-// initialization, and its own bytes, the directives before it and its file's
+// that package on both sides, it does not run in file order, its embedded
+// files are equal, and its own bytes, the directives before it and its file's
 // package clause, imports and file-wide directives are equal. A shape found on both
 // sides that fails any of these is refused with the reason.
-func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete map[string]bool, baseTree, headTree []SourceFile, baseScope, headScope goModuleScope, baseSrc, headSrc func(string) ([]byte, bool)) ([]DeclarationPair, []RefusedPairing) {
-	if base.GoModules == nil || head.GoModules == nil || baseTree == nil || headTree == nil {
+func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete map[string]bool, baseScope, headScope goModuleScope, ev moveEvidence) ([]DeclarationPair, []RefusedPairing) {
+	if base.GoModules == nil || head.GoModules == nil || ev.baseTree == nil || ev.headTree == nil {
 		return nil, nil
 	}
 	renamed := map[string]bool{}
@@ -423,7 +456,7 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 		}
 		return out
 	}
-	baseMap, headMap := treeMap(baseTree), treeMap(headTree)
+	baseMap, headMap := treeMap(ev.baseTree), treeMap(ev.headTree)
 	build := func(g store.SemanticGraph, other map[string]string, src func(string) ([]byte, bool)) *side {
 		s := &side{other: other, decls: declarationsByPath(g.Declarations), files: filesByPath(g.Files), src: src,
 			parsed: map[string]*goSource{}, keys: map[string]string{}, movedKeys: map[string]bool{}, shapes: map[string]map[string]int{}, moved: map[string]map[string][]store.SemanticDeclaration{}, roots: map[string]string{}}
@@ -441,7 +474,7 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 		}
 		return s
 	}
-	b, h := build(base, headMap, baseSrc), build(head, baseMap, headSrc)
+	b, h := build(base, headMap, ev.baseSrc), build(head, baseMap, ev.headSrc)
 	// Only packages with a removed file in base and an added one in head can
 	// hold a move; shapes are counted for those alone.
 	for _, s := range []*side{b, h} {
@@ -511,9 +544,10 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 				continue
 			}
 			reason := groupReason
-			// init functions run in file order, and init may repeat under
-			// another build constraint or in a test file.
-			if reason == "" && bs[0].Kind == "function" && bs[0].Name == "init" {
+			// The files differ, so the declaration's place in them is not
+			// kept; init may also repeat under another build constraint or in
+			// a test file.
+			if reason == "" && orderDependent(bs[0], false) {
 				reason = refuseDeclOrderDependent
 			}
 			if reason == "" && (b.shapes[k][sh] != 1 || h.shapes[k][sh] != 1) {
@@ -532,8 +566,10 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 				case bh.hash != hh.hash:
 					reason = refuseDeclContentChanged
 				default:
-					pairs = append(pairs, DeclarationPair{FromPath: bs[0].Path, ToPath: as[0].Path, Before: bs[0], After: as[0]})
-					continue
+					if reason = moveRefusal(bs[0], bh, false, path.Dir(bs[0].Path), path.Dir(as[0].Path), ev); reason == "" {
+						pairs = append(pairs, DeclarationPair{FromPath: bs[0].Path, ToPath: as[0].Path, Before: bs[0], After: as[0]})
+						continue
+					}
 				}
 			}
 			for i := range bs {
@@ -548,6 +584,67 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 	})
 	sort.Slice(refused, func(i, j int) bool { return canonical(refused[i]) < canonical(refused[j]) })
 	return pairs, refused
+}
+
+// moveRefusal is why a Go declaration whose bytes are equal in another file
+// may still mean something else, or "". Every pairing path applies it.
+func moveRefusal(d store.SemanticDeclaration, top goTopDecl, orderKept bool, fromDir, toDir string, ev moveEvidence) string {
+	switch {
+	case !orderKept && orderDependent(d, top.initializes):
+		return refuseDeclOrderDependent
+	case !embedsKept(top.embeds, fromDir, toDir, ev):
+		return refuseDeclEmbedUnproven
+	}
+	return ""
+}
+
+// orderDependent reports a declaration that runs in the order the go command
+// lists a package's files: a receiverless init or a var with initializer
+// values (package initialization), and a test, benchmark, fuzz test or example
+// of a _test.go file (go test runs them in source order). TestMain runs once.
+func orderDependent(d store.SemanticDeclaration, initializes bool) bool {
+	if initializes || d.Kind == "function" && d.Name == "init" {
+		return true
+	}
+	if d.Kind != "function" || !strings.HasSuffix(d.Path, "_test.go") || d.Name == "TestMain" {
+		return false
+	}
+	for _, prefix := range []string{"Test", "Benchmark", "Fuzz", "Example"} {
+		if rest, ok := strings.CutPrefix(d.Name, prefix); ok {
+			r, _ := utf8.DecodeRuneInString(rest)
+			return rest == "" || !unicode.IsLower(r)
+		}
+	}
+	return false
+}
+
+// fileOrderKept reports that renaming from to to keeps the file's place in
+// the order the go command passes a package's files to the compiler and to go
+// test: sorted by name, test files after the others. Every other .go file of
+// the same test role in the old directory is in the new one, on the same side
+// of the name, and no other file joined.
+func fileOrderKept(baseTree, headTree []SourceFile, from, to string) bool {
+	others := func(tree []SourceFile, p string) map[string]bool {
+		out := map[string]bool{}
+		dir, test := path.Dir(p), strings.HasSuffix(p, "_test.go")
+		for _, f := range tree {
+			if f.Path != p && path.Dir(f.Path) == dir && strings.HasSuffix(f.Path, ".go") && strings.HasSuffix(f.Path, "_test.go") == test {
+				out[path.Base(f.Path)] = true
+			}
+		}
+		return out
+	}
+	b, h := others(baseTree, from), others(headTree, to)
+	if len(b) != len(h) {
+		return false
+	}
+	fromName, toName := path.Base(from), path.Base(to)
+	for n := range b {
+		if !h[n] || (n < fromName) != (n < toName) {
+			return false
+		}
+	}
+	return true
 }
 
 // movedShape is a declaration's identity without its path or position.
