@@ -23,10 +23,10 @@ import (
 // build role can change membership, and across directories only when the
 // indexed module evidence gives both files the same module path, import path,
 // package clause, test role and build constraint and the module's go.mod bytes
-// are unchanged (a module root that moved with its packages). A file removed
-// and another added under the same package identity pair a declaration only
-// when its own bytes, the directives before it and the file's imports are
-// equal (see editedMoves). Every path also refuses a declaration that runs in
+// are unchanged (a module root that moved with its packages). A declaration
+// that left one file for another of the same package identity, removed, added
+// or kept, pairs only when its own bytes, the directives before it and the
+// file's imports are equal (see editedMoves). Every path also refuses a declaration that runs in
 // file order or embeds files it cannot prove equal (see moveRefusal). Every
 // other language is refused: callers reach Lua, C/C++, Ruby and PHP
 // declarations through the file path (require, include)
@@ -421,13 +421,18 @@ func goBuildRole(p string) string {
 	return role
 }
 
-// editedMoves pairs declarations that left removed Go files for added files
-// of the same package identity when nothing a declaration means can differ:
-// the module keeps its import identity, the declaration's shape is unique in
-// that package on both sides, it does not run in file order, its embedded
-// files are equal, and its own bytes, the directives before it and its file's
-// package clause, imports and file-wide directives are equal. A shape found on both
-// sides that fails any of these is refused with the reason.
+// editedMoves pairs declarations that left one Go file for another of the
+// same package identity, whether either file was removed, added or kept, when
+// nothing a declaration means can differ: the module keeps its import
+// identity, the declaration's shape is unique in that package on both sides,
+// it does not run in file order, its embedded files are equal, and its own
+// bytes, the directives before it and its file's package clause, imports and
+// file-wide directives are equal. A declaration moved only when its identity
+// is gone from base and new in head. A shape found moved on both sides that
+// fails any of these is refused with the reason.
+// ponytail: the whole file context must be equal, so a cut and paste between
+// files with different imports is refused; comparing only the imports the
+// declaration names needs each import's package name.
 func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete map[string]bool, baseScope, headScope goModuleScope, ev moveEvidence) ([]DeclarationPair, []RefusedPairing) {
 	if base.GoModules == nil || head.GoModules == nil || ev.baseTree == nil || ev.headTree == nil {
 		return nil, nil
@@ -437,15 +442,19 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 		renamed[r.From], renamed[r.To] = true, true
 	}
 	type side struct {
-		other     map[string]string
-		decls     map[string][]store.SemanticDeclaration
-		files     map[string]store.SemanticFile
-		src       func(string) ([]byte, bool)
-		parsed    map[string]*goSource
-		keys      map[string]string
-		movedKeys map[string]bool
+		decls  map[string][]store.SemanticDeclaration
+		files  map[string]store.SemanticFile
+		src    func(string) ([]byte, bool)
+		parsed map[string]*goSource
+		keys   map[string]string
+		// touched holds files removed, added or edited (not exact renames),
+		// the only ones a declaration can leave or join; touchedKeys their
+		// packages and ids the identities they declare.
+		touched     map[string]bool
+		touchedKeys map[string]bool
+		ids         map[string]bool
 		// shapes counts every declaration of a package identity; moved holds
-		// those of removed (base) or added (head) files.
+		// those whose identity is not on the other side.
 		shapes map[string]map[string]int
 		moved  map[string]map[string][]store.SemanticDeclaration
 		roots  map[string]string
@@ -458,9 +467,9 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 		return out
 	}
 	baseMap, headMap := treeMap(ev.baseTree), treeMap(ev.headTree)
-	build := func(g store.SemanticGraph, other map[string]string, src func(string) ([]byte, bool)) *side {
-		s := &side{other: other, decls: declarationsByPath(g.Declarations), files: filesByPath(g.Files), src: src,
-			parsed: map[string]*goSource{}, keys: map[string]string{}, movedKeys: map[string]bool{}, shapes: map[string]map[string]int{}, moved: map[string]map[string][]store.SemanticDeclaration{}, roots: map[string]string{}}
+	build := func(g store.SemanticGraph, own, other map[string]string, src func(string) ([]byte, bool)) *side {
+		s := &side{decls: declarationsByPath(g.Declarations), files: filesByPath(g.Files), src: src, parsed: map[string]*goSource{}, keys: map[string]string{},
+			touched: map[string]bool{}, touchedKeys: map[string]bool{}, ids: map[string]bool{}, shapes: map[string]map[string]int{}, moved: map[string]map[string][]store.SemanticDeclaration{}, roots: map[string]string{}}
 		for _, f := range g.Files {
 			gf := f.Go
 			if f.Language != "go" || gf == nil || gf.ModuleState != store.GoModuleComplete || moduleRoots(g.GoModules, gf.ModulePath) != 1 ||
@@ -469,30 +478,48 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 			}
 			k := canonical([]any{gf.ModulePath, gf.ImportPath, gf.PackageClause, gf.ExternalTest, gf.BuildConstraint, goBuildRole(f.Path), f.ParserProfile, f.ParserSemanticEpoch, f.ParserCallEdges})
 			s.keys[f.Path], s.roots[k] = k, gf.ModuleRoot
-			if _, kept := other[f.Path]; !kept && !renamed[f.Path] {
-				s.movedKeys[k] = true
+			if !renamed[f.Path] && own[f.Path] != other[f.Path] {
+				s.touched[f.Path], s.touchedKeys[k] = true, true
+				for _, d := range s.decls[f.Path] {
+					s.ids[declIdentity(d)] = true
+				}
 			}
 		}
 		return s
 	}
-	b, h := build(base, headMap, ev.baseSrc), build(head, baseMap, ev.headSrc)
-	// Only packages with a removed file in base and an added one in head can
-	// hold a move; shapes are counted for those alone.
+	b, h := build(base, baseMap, headMap, ev.baseSrc), build(head, headMap, baseMap, ev.headSrc)
+	// A declaration of an unchanged file keeps its identity, so the other
+	// side's ids need only touched files. Shapes are counted only for
+	// packages with a moved declaration on both sides.
+	for _, pair := range [][2]*side{{b, h}, {h, b}} {
+		s, o := pair[0], pair[1]
+		for p := range s.touched {
+			k := s.keys[p]
+			if !o.touchedKeys[k] {
+				continue
+			}
+			for _, d := range s.decls[p] {
+				if o.ids[declIdentity(d)] {
+					continue
+				}
+				if s.moved[k] == nil {
+					s.moved[k] = map[string][]store.SemanticDeclaration{}
+				}
+				sh := movedShape(d)
+				s.moved[k][sh] = append(s.moved[k][sh], d)
+			}
+		}
+	}
 	for _, s := range []*side{b, h} {
 		for p, k := range s.keys {
-			if !b.movedKeys[k] || !h.movedKeys[k] {
+			if b.moved[k] == nil || h.moved[k] == nil {
 				continue
 			}
 			if s.shapes[k] == nil {
-				s.shapes[k], s.moved[k] = map[string]int{}, map[string][]store.SemanticDeclaration{}
+				s.shapes[k] = map[string]int{}
 			}
-			_, kept := s.other[p]
 			for _, d := range s.decls[p] {
-				sh := movedShape(d)
-				s.shapes[k][sh]++
-				if !kept && !renamed[p] {
-					s.moved[k][sh] = append(s.moved[k][sh], d)
-				}
+				s.shapes[k][movedShape(d)]++
 			}
 		}
 	}

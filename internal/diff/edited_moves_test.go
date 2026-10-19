@@ -466,3 +466,90 @@ func TestCompareSnapshotsCancelledWhileReadingBlobs(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
+
+func TestCompareCommitsMovesBetweenKeptFiles(t *testing.T) {
+	const (
+		fnA     = "func A() string { return strings.ToUpper(\"a\") }\n"
+		fnB     = "func B() int { return 1 }\n"
+		fnC     = "func C() string { return strings.ToLower(\"c\") }\n"
+		strs    = "package p\n\nimport \"strings\"\n\n"
+		initFn  = "func init() {}\n"
+		changed = "func A() string { return strings.ToUpper(\"A\") }\n"
+	)
+	app := map[string]string{
+		"go.mod":      "module example.com/m\n\ngo 1.22\n",
+		"p/a.go":      strs + fnA + "\n" + fnB + "\n" + initFn,
+		"p/b.go":      strs + fnC,
+		"cmd/main.go": "package main\n\nimport \"example.com/m/p\"\n\nfunc main() { _ = p.A(); _ = p.B(); _ = p.C() }\n",
+	}
+	for name, adapter := range testGoAdapters {
+		t.Run(name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				change    func(r *gittest.Repo)
+				pairs     []string
+				refused   []string
+				retargets int
+			}{
+				{name: "cut and pasted between kept files", change: func(r *gittest.Repo) {
+					r.Write("p/a.go", "package p\n\n"+fnB+"\n"+initFn)
+					r.Write("p/b.go", strs+fnC+"\n"+fnA)
+				}, pairs: []string{"p/a.go>p/b.go:p.A"}},
+				{name: "removed file merged into a kept file", change: func(r *gittest.Repo) {
+					r.Git("rm", "-q", "p/a.go")
+					r.Write("p/b.go", strs+fnA+"\n"+fnB+"\n"+fnC+"\n"+initFn)
+				}, pairs: []string{"p/a.go>p/b.go:p.A", "p/a.go>p/b.go:p.B"}, refused: []string{"p/a.go>p/b.go:" + refuseDeclOrderDependent}},
+				{name: "kept file split into an added file", change: func(r *gittest.Repo) {
+					r.Write("p/a.go", "package p\n\n"+fnB+"\n"+initFn)
+					r.Write("p/c.go", strs+fnA)
+				}, pairs: []string{"p/a.go>p/c.go:p.A"}},
+				{name: "moved and edited", change: func(r *gittest.Repo) {
+					r.Write("p/a.go", "package p\n\n"+fnB+"\n"+initFn)
+					r.Write("p/b.go", strs+fnC+"\n"+changed)
+				}, pairs: []string{}, refused: []string{"p/a.go>p/b.go:" + refuseDeclContentChanged}, retargets: 1},
+				{name: "moved into a file with other imports", change: func(r *gittest.Repo) {
+					r.Write("p/a.go", "package p\n\n"+fnB+"\n"+initFn)
+					r.Write("p/b.go", "package p\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\n"+fnC+"\n"+fnA+"\nvar _ = fmt.Sprint\n")
+				}, pairs: []string{}, refused: []string{"p/a.go>p/b.go:" + refuseDeclContextChanged}, retargets: 1},
+				{name: "init moved", change: func(r *gittest.Repo) {
+					r.Write("p/a.go", strs+fnA+"\n"+fnB)
+					r.Write("p/b.go", strs+fnC+"\n"+initFn)
+				}, pairs: []string{}, refused: []string{"p/a.go>p/b.go:" + refuseDeclOrderDependent}},
+				{name: "moved to another package", change: func(r *gittest.Repo) {
+					r.Write("p/a.go", "package p\n\n"+fnB+"\n"+initFn)
+					r.Write("q/b.go", strs+fnA)
+				}, pairs: []string{}},
+				{name: "edited in place", change: func(r *gittest.Repo) {
+					r.Write("p/a.go", strs+changed+"\n"+fnB+"\n"+initFn)
+					r.Write("p/b.go", strs+fnC+"\nfunc D() {}\n")
+				}, pairs: []string{}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					got := editScenario(t, adapter, app, tc.change)
+					d := got.Diff.DeclarationPairs
+					if tc.refused == nil {
+						tc.refused = []string{}
+					}
+					if !reflect.DeepEqual(pairedPaths(d), tc.pairs) || !reflect.DeepEqual(goRefusals(d), tc.refused) {
+						t.Fatalf("pairs = %v, refused %v", pairedPaths(d), goRefusals(d))
+					}
+					if n := ruleCount(got.Diff.Risk, RuleDependentRetargeted); n != tc.retargets {
+						t.Fatalf("retargeted = %d, risk = %s", n, canonical(got.Diff.Risk))
+					}
+					if len(tc.refused) == 0 && len(tc.pairs) > 0 && (got.Diff.Risk.Score == nil || *got.Diff.Risk.Score != 0) {
+						t.Fatalf("proven move scored: %s", canonical(got.Diff.Risk))
+					}
+					paired := map[string]bool{}
+					for _, p := range d.Pairs {
+						paired[declIdentity(p.Before)] = true
+					}
+					for _, u := range got.Diff.Risk.Uncertainty {
+						if paired[u.Identity] {
+							t.Fatalf("paired declaration left uncertainty: %s", canonical(u))
+						}
+					}
+				})
+			}
+		})
+	}
+}

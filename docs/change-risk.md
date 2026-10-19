@@ -80,9 +80,9 @@ only the spelling changed (`interface{}` to `any`). `declaration_pairs` covers
 Go only: exact renames inside one directory, exact renames across directories
 when the indexed module evidence gives both files the same module path, import
 path, package clause, test role and build constraint (a module root moved with
-its packages), and single declarations moved between edited files of one
-package when their own bytes and their file's imports are unchanged (see
-below). Declarations of any other move, a declaration whose content changed,
+its packages), and single declarations moved between files of one package
+(removed, added or kept) when their own bytes and their file's imports are
+unchanged (see below). Declarations of any other move, a declaration whose content changed,
 and declarations outside Go are not paired: callers of such a move are cited as
 `dependent_retargeted`, and a moved dependent is not scored.
 
@@ -119,10 +119,15 @@ declarations are then judged one by one, as below.
 
 ### Edited moves
 
-A declaration can also be paired when it leaves a removed Go file for an added
-Go file of the same package identity (module path, import path, package
-clause, external test role, build constraint, file name build role and parser
-semantics; the directories may be equal) and nothing it means can differ. The
+A declaration can also be paired when it leaves one Go file for another of the
+same package identity (module path, import path, package clause, external test
+role, build constraint, file name build role and parser semantics; the
+directories may be equal) and nothing it means can differ. Either file may be
+removed, added or kept: a function cut from `a.go` and pasted into `b.go`, both
+kept, is a move too. A declaration moved only when its identity (path,
+language, kind, qualified name, signature, stable key) is gone from base and
+new in head; one that stays in its file while the file is edited is never a
+candidate. Exact renames are judged as above, not here. The
 diff reads both files from Git and parses them again; the declaration is the
 whole top-level declaration that holds it (for a constant in a `const ( ...
 iota ... )` group, the group). It pairs only when:
@@ -138,14 +143,21 @@ iota ... )` group, the group). It pairs only when:
 - its own bytes are equal, and so are the compiler directives (`//go:`,
   `//line`, `//export`, `//extern`) before it; its doc comment and its position
   may change,
-- its file's package clause, imports (name and path, in any order), every
+- its old file's (in base) and its new file's (in head) package clause,
+  imports (name and path, in any order), every
   comment inside or on an import declaration (the cgo preamble, in or outside a
   group), header comments, `//go:linkname` and `//go:cgo_*` directives wherever
   they are, and directives that precede no declaration or an import are equal.
 
-A declaration found on both sides that fails one of these is listed under
-`refused` with the base declaration and the reason; one that exists on one side
-only is not a move candidate and is not listed:
+The whole file context must be equal, so a cut and paste between two kept
+files whose imports differ is refused as `declaration_context_changed`, even
+when the declaration uses none of the differing imports: telling which imports
+a declaration names needs each import's package name, which the diff does not
+resolve.
+
+A declaration found moved on both sides that fails one of these is listed
+under `refused` with the base declaration and the reason; one that moved on
+one side only is not a move candidate and is not listed:
 
 | `reason` | When |
 |---|---|
@@ -209,7 +221,8 @@ fixed per model id. `codegraph.change-risk/v1` has not shipped in a release, so
 the dependent pairing and sibling counting above are part of v1. After a
 release, any change to what a rule cites or scores needs a new model id.
 
-Cross-directory Go pairs, edited moves, the scoped `go.work` and replace
+Cross-directory Go pairs, edited moves (between removed, added or kept
+files), the scoped `go.work` and replace
 checks, and the shared eligibility refusals keep the model at v1. Every rule is defined in terms of
 `declaration_pairs` (a paired declaration is the same declaration, a paired
 dependent survives), and those definitions are unchanged. An edited-move pair
