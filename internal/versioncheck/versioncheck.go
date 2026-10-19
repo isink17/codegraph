@@ -21,7 +21,7 @@ const (
 	stateFileName       = "version-state.json"
 	githubLatestRelease = "https://api.github.com/repos/isink17/codegraph/releases/latest"
 	releasesPage        = "https://github.com/isink17/codegraph/releases"
-	installCmd          = "go install github.com/isink17/codegraph/cmd/codegraph@latest"
+	upgradeHint         = "re-run install.sh (macOS, Linux) or install.ps1 (Windows), or download the binary from the releases page"
 )
 
 const versionCheckTimeout = 5 * time.Second
@@ -265,7 +265,7 @@ func runCheck(ctx context.Context, current string, fetchFn func(context.Context,
 			fmt.Fprintln(w, "\ncodegraph is up to date.")
 		} else {
 			fmt.Fprintln(w, "\ncodegraph is not on the latest version.")
-			fmt.Fprintf(w, "\nUpdate with:\n  %s\n\nReleases:\n  %s\n", installCmd, releasesPage)
+			fmt.Fprintf(w, "\nUpdate with:\n  %s\n\nReleases:\n  %s\n", upgradeHint, releasesPage)
 		}
 		return nil
 	}
@@ -273,7 +273,7 @@ func runCheck(ctx context.Context, current string, fetchFn func(context.Context,
 	if unknownCurrent {
 		fmt.Fprintln(w, "\nLocal version could not be reliably determined.")
 	}
-	fmt.Fprintf(w, "\nUpdate with:\n  %s\n\nReleases:\n  %s\n", installCmd, releasesPage)
+	fmt.Fprintf(w, "\nUpdate with:\n  %s\n\nReleases:\n  %s\n", upgradeHint, releasesPage)
 	return nil
 }
 

@@ -10,6 +10,32 @@ The full reference for CodeGraph: installation details, client configuration, la
 
 ## Install
 
+### With the installer scripts
+
+Once v2.0.0 is released, `install.sh` (macOS, Linux) and `install.ps1` (Windows) at the repository root install the native binary for the current machine:
+
+~~~bash
+sh install.sh v2.0.0              # omit the version to install the latest release
+sh install.sh --uninstall
+~~~
+
+~~~powershell
+.\install.ps1 -Version v2.0.0
+.\install.ps1 -Uninstall
+~~~
+
+Piped from `curl` or `irm`, pass arguments as `sh -s -- v2.0.0` or set `CODEGRAPH_VERSION`. Environment overrides: `CODEGRAPH_VERSION` (release tag, `vX.Y.Z`), `CODEGRAPH_INSTALL_DIR` (default `~/.local/bin`, or `%LOCALAPPDATA%\Programs\CodeGraph` on Windows) and `CODEGRAPH_RELEASE_BASE_URL` (default `https://github.com/isink17/codegraph/releases/download`).
+
+Each run downloads `codegraph-<version>-<os>_<arch>` (`.exe` on Windows) and its `.sha256` sidecar into a staging file inside the install directory, refuses to continue unless the SHA-256 matches and the staged binary's `--version` prints `codegraph <version>`, and only then renames it over the installed binary. On Windows a running `codegraph.exe` (for example an MCP server) is renamed aside first and the leftover is removed on the next run. Neither script edits `PATH` or shell profiles: they print a hint when the install directory is not on `PATH` and a warning when another `codegraph` (an older `go install` or npm copy) comes first on `PATH`.
+
+Platforms: Linux and macOS on x86_64 and arm64, Windows on x64 and ARM64. An x86_64 shell under Rosetta 2 gets the native `darwin_arm64` build, and Windows uses the OS architecture, so x64 PowerShell on an ARM64 machine gets `windows_arm64`. Linux with musl libc (Alpine) is refused because release binaries are glibc CGO builds; 32-bit systems and other operating systems are refused with an explicit error. MSYS2, Git Bash and Cygwin are pointed to `install.ps1`. On those platforms, build from source.
+
+Offline install: copy the asset and its sidecar into `DIR/vX.Y.Z/`, then run `CODEGRAPH_RELEASE_BASE_URL=file:///absolute/DIR sh install.sh vX.Y.Z`, or on Windows set `$env:CODEGRAPH_RELEASE_BASE_URL = 'file:///C:/absolute/DIR'` before `.\install.ps1 -Version vX.Y.Z`.
+
+Upgrade by re-running the installer with the new version (or no version for the latest): it uses the same checksum and version checks. v2.0 has no `codegraph upgrade` command, and `go install ...@latest` does not reach v2 releases because the module path has no `/v2` suffix. `--uninstall` / `-Uninstall` removes only the `codegraph` binary in the install directory; repository `.codegraph` indexes, configuration and MCP client entries written by `codegraph install` stay.
+
+Recovery: a failed or interrupted run leaves the previously installed binary untouched and removes its staging files, so re-run the installer once the cause (network, disk space, a bad release asset) is fixed. If a Windows upgrade cannot move the new binary in, the previous `codegraph.exe` is moved back and the error says so.
+
 ### From a release archive
 
 Once v2.0.0 is released, [GitHub Releases](https://github.com/isink17/codegraph/releases) will provide native archives with SHA-256 sidecar files for `darwin_amd64`, `darwin_arm64`, `linux_amd64`, `linux_arm64`, `windows_amd64` and `windows_arm64`. Windows archives are ZIP files; the others are tar.gz. Each release also carries the raw binaries with their own sidecars. Release binaries are native CGO builds.
