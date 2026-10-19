@@ -31,6 +31,8 @@ const (
 	maxTreeListingBytes       = 64 << 20
 	maxSnapshotFiles          = 100_000
 	maxSnapshotBytes    int64 = 512 << 20
+	// maxSourceBytes bounds one file read back for declaration continuity.
+	maxSourceBytes int64 = 16 << 20
 )
 
 type boundedCapture struct {
@@ -145,7 +147,19 @@ func snapshot(ctx context.Context, repoRoot, ref string, registry *parser.Regist
 	if err != nil {
 		return Revision{}, err
 	}
-	return Revision{Revision: ref, Commit: commit, Tree: tree, GraphData: graph, TreeFiles: treeFiles, IndexPolicy: policy}, nil
+	objects := make(map[string]treeEntry, len(entries))
+	for _, e := range entries {
+		objects[e.name] = e
+	}
+	source := func(p string) ([]byte, bool) {
+		e, ok := objects[p]
+		if !ok || e.mode == "120000" {
+			return nil, false
+		}
+		data, err := gitOutputBytesLimited(ctx, repoRoot, maxSourceBytes, "cat-file", "blob", e.object)
+		return data, err == nil
+	}
+	return Revision{Revision: ref, Commit: commit, Tree: tree, GraphData: graph, TreeFiles: treeFiles, IndexPolicy: policy, source: source}, nil
 }
 
 func parseTree(raw []byte) ([]treeEntry, error) {
