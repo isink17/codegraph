@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/isink17/codegraph/internal/githistory"
@@ -25,7 +26,7 @@ const freshnessUnknown = "unknown"
 // it reads cannot belong to a live lock-aware scan.
 func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshness, error) {
 	probe, release := s.probeScanLock()
-	f, otherRunning, err := s.freshnessRows(ctx, repoID)
+	f, otherRunning, reconcilePending, err := s.freshnessRows(ctx, repoID)
 	release()
 	if err != nil {
 		return graph.Freshness{}, err
@@ -48,6 +49,14 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 		f.ResolverPolicy = "converged"
 		if len(pending) > 0 {
 			f.ResolverPolicy = "pending"
+		}
+	}
+	f.ParserProfile = freshnessUnknown
+	if groups, err := s.FileParserProfileGroups(ctx, repoID); err == nil {
+		f.ParserProfileUnconverged = unconvergedParserProfiles(groups)
+		f.ParserProfile = "converged"
+		if len(f.ParserProfileUnconverged) > 0 {
+			f.ParserProfile = "unconverged"
 		}
 	}
 	f.Worktree.HeadNow = freshnessUnknown
@@ -80,6 +89,12 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	if f.Worktree.HeadChanged == "yes" {
 		f.Reasons = append(f.Reasons, "head_moved")
 	}
+	if reconcilePending {
+		f.Reasons = append(f.Reasons, "reconcile_pending")
+	}
+	if len(f.ParserProfileUnconverged) > 0 {
+		f.Reasons = append(f.Reasons, "parser_profile_unconverged")
+	}
 	switch {
 	case len(f.Reasons) > 0 && (f.LastCompletedScan != nil || len(f.Reasons) > 1):
 		f.State = graph.FreshnessKnownStale
@@ -90,6 +105,28 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	}
 	f.Verdict = freshnessVerdict(f, probe == scanLockHeld || probe == scanLockError)
 	return f, nil
+}
+
+// unconvergedParserProfiles returns the languages a scan left part-way
+// through a parser-profile transition, or indexed before profiles were
+// recorded: a scan converges every file of a language to one profile.
+func unconvergedParserProfiles(groups []FileParserProfileGroup) []string {
+	first := map[string]string{}
+	out := []string{}
+	for _, g := range groups {
+		if g.Language == "" || g.Files == 0 {
+			continue
+		}
+		seen, ok := first[g.Language]
+		if !ok {
+			first[g.Language] = g.Profile
+		}
+		if (g.Profile == "" || (ok && seen != g.Profile)) && !slices.Contains(out, g.Language) {
+			out = append(out, g.Language)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // lockUncertain is true when the lock is held or could not be probed.
@@ -110,10 +147,10 @@ func freshnessVerdict(f graph.Freshness, lockUncertain bool) string {
 	}
 }
 
-func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshness, otherRunning int64, err error) {
+func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshness, otherRunning int64, reconcilePending bool, err error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -131,16 +168,16 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshn
 	if err := tx.QueryRowContext(ctx, `SELECT root_path, canonical_path FROM repos WHERE id = ?`, repoID).
 		Scan(&f.Worktree.RepoRoot, &f.Worktree.CanonicalPath); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return graph.Freshness{}, 0, fmt.Errorf("%w: repo %d", ErrRepoNotIndexed, repoID)
+			return graph.Freshness{}, 0, false, fmt.Errorf("%w: repo %d", ErrRepoNotIndexed, repoID)
 		}
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 
 	// A read-only handle does not migrate, so a database from before scope
 	// recording has none of its columns; it reads as unrecorded.
 	var coverageColumns int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('scans') WHERE name IN ('scope', 'head_at_start', 'head_at_finish', 'overlapping_scans')`).Scan(&coverageColumns); err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 	f.Coverage.Recorded = coverageColumns == 4
 	scanQuery := `SELECT id, scan_kind, status, started_at, COALESCE(finished_at, ''), error_text, '', '', '', NULL FROM scans WHERE repo_id = ?`
@@ -177,14 +214,14 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshn
 		return &sc, nil
 	}
 	if f.LastCompletedScan, err = readScan(` AND status = 'completed'`); err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 	if f.LatestScan, err = readScan(``); err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 	if f.Coverage.Recorded {
 		if f.Coverage.LastFullScan, err = readScan(` AND status = 'completed' AND scope = 'full'`); err != nil {
-			return graph.Freshness{}, 0, err
+			return graph.Freshness{}, 0, false, err
 		}
 		// A failed scan counts when it started after the last full scan began
 		// or closed at or after the moment it began: either way it was running
@@ -202,7 +239,7 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshn
 			SELECT COUNT(1) FROM scans
 			WHERE repo_id = ? AND status = 'failed' AND (id > ? OR (? <> '' AND COALESCE(finished_at, '') >= ?))`,
 			repoID, lastFullID, lastFullStarted, lastFullStarted).Scan(&f.Coverage.FailedAfterLastFull); err != nil {
-			return graph.Freshness{}, 0, err
+			return graph.Freshness{}, 0, false, err
 		}
 	}
 	var lastCompletedID int64
@@ -212,7 +249,7 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshn
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(1), COALESCE(SUM(id > ?), 0) FROM scans WHERE repo_id = ? AND status = 'running'`,
 		lastCompletedID, repoID).Scan(&f.RunningScans.Count, &f.RunningScans.AfterLastCompleted); err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 
 	var oldest sql.NullString
@@ -223,7 +260,7 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshn
 			MIN(CASE WHEN reason <> 'watch_inflight' THEN queued_at END)
 		FROM dirty_files WHERE repo_id = ?`, repoID).
 		Scan(&f.DirtyQueue.Queued, &f.DirtyQueue.InFlight, &oldest); err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 	f.DirtyQueue.OldestQueuedAt = oldest.String
 
@@ -231,22 +268,43 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshn
 	// no table; that reads as no anchor, like an absent row.
 	var tables int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='git_history_state'`).Scan(&tables); err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
 	if tables > 0 {
 		var status, watermark string
 		err := tx.QueryRowContext(ctx, `SELECT status, watermark_sha FROM git_history_state WHERE repo_id = ?`, repoID).Scan(&status, &watermark)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return graph.Freshness{}, 0, err
+			return graph.Freshness{}, 0, false, err
 		}
 		if err == nil && status != githistory.StatusAbsent && watermark != "" {
 			f.Worktree.HeadAtIndex = watermark
 			f.Worktree.HeadAtIndexSource = "git_history_watermark"
 		}
 	}
+	var marker int64
+	err = tx.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM settings WHERE key = ?`, reconcilePendingKey(repoID)).Scan(&marker)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return graph.Freshness{}, 0, false, err
+	}
+	reconcilePending = err == nil && (f.Coverage.LastFullScan == nil || f.Coverage.LastFullScan.ID <= marker)
 	// The scan lock is per database, which may hold other repositories.
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM scans WHERE repo_id <> ? AND status = 'running'`, repoID).Scan(&otherRunning); err != nil {
-		return graph.Freshness{}, 0, err
+		return graph.Freshness{}, 0, false, err
 	}
-	return f, otherRunning, tx.Commit()
+	return f, otherRunning, reconcilePending, tx.Commit()
+}
+
+func reconcilePendingKey(repoID int64) string {
+	return fmt.Sprintf("reconcile_pending_after_scan:%d", repoID)
+}
+
+// MarkReconcilePending records that the graph may be missing changes no scan
+// has seen, such as those made while a watcher was down or degraded. Freshness
+// reports reconcile_pending until a full scan that begins after this call
+// completes, whichever process runs it.
+func (s *Store) MarkReconcilePending(ctx context.Context, repoID int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO settings(key, value) VALUES(?, (SELECT COALESCE(MAX(id), 0) FROM scans))
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, reconcilePendingKey(repoID))
+	return err
 }

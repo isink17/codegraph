@@ -604,6 +604,12 @@ type Freshness struct {
 	ResolverPolicyPending []string `json:"resolver_policy_pending"`
 	// ResolverPolicy is "converged", "pending" or "unknown".
 	ResolverPolicy string `json:"resolver_policy"`
+	// ParserProfileUnconverged lists languages whose files carry more than
+	// one parser profile, or none recorded; nil when it cannot be read.
+	ParserProfileUnconverged []string `json:"parser_profile_unconverged"`
+	// ParserProfile is "converged", "unconverged" or "unknown". It compares
+	// the stored files with each other, not with this binary's parsers.
+	ParserProfile string `json:"parser_profile"`
 }
 
 // FreshnessCoverage is the recorded evidence of whole-repository coverage. It

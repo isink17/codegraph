@@ -8818,6 +8818,10 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 	return out, evidence, nil
 }
 
+// IsBusy reports whether err is SQLite reporting the database busy or locked,
+// which a later retry can clear.
+func IsBusy(err error) bool { return isSQLiteBusy(err) }
+
 func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason string) error {
 	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {
 		return err

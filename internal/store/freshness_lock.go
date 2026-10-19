@@ -28,6 +28,8 @@ var (
 	scanLockProbeWait     = 10 * time.Millisecond
 	// ponytail: one mutex for every database; per-path if status reads contend.
 	scanLockProbeMu sync.Mutex
+	// probeLockFile is lockFile; tests replace it to fail the lock call.
+	probeLockFile = lockFile
 )
 
 // probeScanLock tries to take the scan lock exclusively without waiting on a
@@ -48,7 +50,7 @@ func (s *Store) probeScanLock() (scanLockProbe, func()) {
 		return scanLockError, noop
 	}
 	for attempt := 1; ; attempt++ {
-		ok, err := lockFile(f, true)
+		ok, err := probeLockFile(f, true)
 		if err != nil {
 			_ = f.Close()
 			return scanLockError, noop
