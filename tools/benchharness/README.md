@@ -118,7 +118,10 @@ limitation.
   that copies its parent's history therefore does not count it again
   (`duplicate_requests`), and a sidechain request recorded both inside the main
   file and in its subagent file counts once, under the subagent. The same id
-  with different input or cache usage in two files is an error.
+  with different input or cache usage in two files is an error. Copies with
+  the same usage may still differ in content, so this applies to token
+  accounting only: linking and contamination read every copy of every
+  `tool_use` (see Contamination).
 - Per subagent: the same metrics as a main session (requests, processed,
   final and peak context, tool calls, wall clock), from its own file only.
   `workload` reports main, subagent-file and in-file sidechain processed
@@ -157,7 +160,12 @@ in-file sidechain) is checked for:
   subagent file's own tool calls are checked by the same rules instead, and
   attempts carry the `agent` that made them (`main`, `sidechain` or a
   subagent id). Nested calls are linked the same way, so a chain is checked
-  only as far as its files are linked.
+  only as far as its files are linked. Every copy of a `tool_use` is checked,
+  including copies on requests another file owns; attempts are listed once
+  per `tool_use` id (main, linked subagents in spawn order, unlinked
+  subagents, then in-file sidechains), and an outcome that is not `blocked` in
+  any copy wins. `agent-*.jsonl` files whose id has characters outside
+  `[A-Za-z0-9_-]` are an error.
 
 Each attempt gets an outcome from its `tool_result`: `blocked` only for exact
 denial shapes (a result starting with `PreToolUse:<tool> hook error` or

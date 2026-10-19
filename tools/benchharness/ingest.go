@@ -352,7 +352,7 @@ func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet
 	if err != nil {
 		return SessionResult{}, err
 	}
-	subs, checked, unlinked, err := sessionAgents(dir, ref, m, t)
+	subs, checked, unlinked, threads, err := sessionAgents(dir, ref, m, t)
 	if err != nil {
 		return SessionResult{}, err
 	}
@@ -365,11 +365,7 @@ func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet
 	}
 	c := Contamination{Calls: []ContaminationCall{}}
 	if !arm.CodeGraphEnabled {
-		c = Contamination{Checked: true, Calls: t.contaminationCalls("main", checked)}
-		for _, s := range subs {
-			c.Calls = append(c.Calls, s.t.contaminationCalls(s.res.AgentID, checked)...)
-		}
-		c.Contaminated, c.BlockedAttempts = contaminationTotals(c.Calls)
+		c = sessionContamination(threads, checked)
 	}
 	res := t.Residual(cal)
 	out := SessionResult{Arm: ref.Arm, Task: ref.Task, Rep: ref.Rep, TranscriptSHA256: ref.TranscriptSHA256, SessionMetrics: sm, Contamination: c, Residual: &res}
@@ -535,6 +531,7 @@ func ValidateIngest(r *IngestRecord) error {
 		bad("schema/methodology %q/%q, want %q/%q, %q/%q or %q/%q", r.Schema, r.Methodology, IngestSchema, IngestMethodology,
 			IngestSchemaV2, IngestMethodologyV2, IngestSchemaV1, IngestMethodologyV1)
 	}
+	calInvalid := false
 	switch {
 	case !v3 && (r.Calibration != nil || r.CalibrationSHA256 != ""):
 		bad("%s records carry no calibration", r.Schema)
@@ -546,6 +543,7 @@ func ValidateIngest(r *IngestRecord) error {
 		}
 		if err := validateCalibration(r.Calibration); err != nil {
 			bad("%v", err)
+			calInvalid = true
 		}
 		if b, err := marshalJSON(r.Calibration); err != nil || sha256Hex(b) != r.CalibrationSHA256 {
 			bad("calibration does not match calibration_sha256")
@@ -636,6 +634,7 @@ func ValidateIngest(r *IngestRecord) error {
 			bad("session %s: residual attribution missing", id)
 		case v3 && (s.Residual.Method == CalibratedMethod) != calibrated:
 			bad("session %s: residual method %s, but the record's calibration sufficient=%t", id, s.Residual.Method, calibrated)
+		case calInvalid:
 		default:
 			if err := validateResidual(s.Residual, s.FinalContext, v3, r.Calibration); err != nil {
 				bad("session %s: %v", id, err)

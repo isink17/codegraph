@@ -66,8 +66,12 @@ func discoverSubagents(dir, transcript string) ([]string, error) {
 	}
 	var out []string
 	for _, e := range entries {
-		if !agentFileRE.MatchString(e.Name()) {
+		n := e.Name()
+		if !strings.HasPrefix(n, "agent-") || !strings.HasSuffix(n, ".jsonl") {
 			continue
+		}
+		if !agentFileRE.MatchString(n) {
+			return nil, fmt.Errorf("%s/%s: agent id has characters outside [A-Za-z0-9_-]", sub, n)
 		}
 		if !e.Type().IsRegular() {
 			return nil, fmt.Errorf("%s/%s is not a regular file", sub, e.Name())
@@ -148,8 +152,10 @@ func loadSubagents(dir string, ref SessionRef, m *Manifest) ([]*agentFile, error
 // (so a fork's copy of its parent's history counts once, under the parent),
 // then unlinked files by id, then sidechain events inside the main file. It
 // returns the Task/Agent tool_use ids linked to a file and the count of calls
-// that are not.
-func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool, unlinked int, err error) {
+// that are not. Linking reads every copy of a call, including copies on
+// requests another file owns. threads lists the session's agents in that
+// owner order for contamination checks.
+func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool, unlinked int, threads []thread, err error) {
 	byID := map[string]*agentFile{}
 	for _, s := range subs {
 		byID[s.res.AgentID] = s
@@ -175,8 +181,9 @@ func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool
 		return dups, nil
 	}
 	if _, err := claim(main, false); err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
+	threads = []thread{{"main", main, false}}
 	checked = map[string]bool{}
 	type node struct {
 		name  string
@@ -188,7 +195,7 @@ func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool
 		n := queue[0]
 		queue = queue[1:]
 		for _, u := range n.t.toolUses {
-			if (u.Name != "Task" && u.Name != "Agent") || u.req.dup || u.Sidechain {
+			if (u.Name != "Task" && u.Name != "Agent") || u.Sidechain {
 				continue
 			}
 			child := byID[n.t.links[u.ID]]
@@ -196,35 +203,43 @@ func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool
 				continue
 			}
 			if child.done {
-				return nil, 0, fmt.Errorf("subagent %s is named by more than one Task/Agent result", child.res.AgentID)
+				// A fork's copy of the call that already linked this child.
+				if child.res.ToolUseID == u.ID {
+					continue
+				}
+				return nil, 0, nil, fmt.Errorf("subagent %s is named by more than one Task/Agent result", child.res.AgentID)
 			}
 			child.done = true
 			child.res.Parent, child.res.ToolUseID, child.res.Depth = n.name, u.ID, n.depth+1
 			if child.res.DuplicateRequests, err = claim(child.t, false); err != nil {
-				return nil, 0, err
+				return nil, 0, nil, err
 			}
 			checked[u.ID] = true
+			threads = append(threads, thread{child.res.AgentID, child.t, false})
 			queue = append(queue, node{child.res.AgentID, child.t, n.depth + 1})
 		}
 	}
 	for _, s := range subs {
 		if !s.done {
 			if s.res.DuplicateRequests, err = claim(s.t, false); err != nil {
-				return nil, 0, err
+				return nil, 0, nil, err
 			}
+			threads = append(threads, thread{s.res.AgentID, s.t, false})
 		}
 	}
 	if _, err := claim(main, true); err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
+	threads = append(threads, thread{"sidechain", main, true})
+	calls := map[string]bool{}
 	for _, t := range append([]*Transcript{main}, agentTranscripts(subs)...) {
 		for _, u := range t.toolUses {
-			if (u.Name == "Task" || u.Name == "Agent") && !u.req.dup && !checked[u.ID] {
-				unlinked++
+			if (u.Name == "Task" || u.Name == "Agent") && !checked[u.ID] {
+				calls[u.ID] = true
 			}
 		}
 	}
-	return checked, unlinked, nil
+	return checked, len(calls), threads, nil
 }
 
 func agentTranscripts(subs []*agentFile) []*Transcript {
@@ -236,20 +251,20 @@ func agentTranscripts(subs []*agentFile) []*Transcript {
 }
 
 // sessionAgents parses, links and measures a session's subagent files.
-func sessionAgents(dir string, ref SessionRef, m *Manifest, main *Transcript) ([]*agentFile, map[string]bool, int, error) {
+func sessionAgents(dir string, ref SessionRef, m *Manifest, main *Transcript) ([]*agentFile, map[string]bool, int, []thread, error) {
 	subs, err := loadSubagents(dir, ref, m)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, nil, err
 	}
-	checked, unlinked, err := linkSubagents(main, subs)
+	checked, unlinked, threads, err := linkSubagents(main, subs)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, nil, err
 	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].res.AgentID < subs[j].res.AgentID })
 	for _, s := range subs {
 		s.res.SessionMetrics = s.t.Metrics()
 	}
-	return subs, checked, unlinked, nil
+	return subs, checked, unlinked, threads, nil
 }
 
 func workload(s *SessionResult, unlinkedCalls int) *Workload {

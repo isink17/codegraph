@@ -505,35 +505,56 @@ func classifyUse(u toolUse) (kind, detail string) {
 		}
 	case u.Name == "Task" || u.Name == "Agent":
 		// Unverified unless the spawned agent's own transcript file is linked
-		// and checked (see contaminationCalls).
+		// and checked (see sessionContamination).
 		return "subagent", ""
 	}
 	return "", ""
 }
 
 func (t *Transcript) Contamination() Contamination {
-	c := Contamination{Checked: true, Calls: t.contaminationCalls("main", nil)}
-	c.Contaminated, c.BlockedAttempts = contaminationTotals(c.Calls)
-	return c
+	return sessionContamination([]thread{{"main", t, false}, {"sidechain", t, true}}, nil)
 }
 
-// contaminationCalls lists this file's CodeGraph use attempts. A Task/Agent
-// call in checked is linked to a subagent file whose calls are listed under
-// that agent instead, so it is not itself an unverified attempt.
-func (t *Transcript) contaminationCalls(agent string, checked map[string]bool) []ContaminationCall {
-	calls := []ContaminationCall{}
-	for _, u := range t.toolUses {
-		kind, detail := classifyUse(u)
-		if kind == "" || u.req.dup || (kind == "subagent" && checked[u.ID]) {
-			continue
+// thread is one agent's view of a transcript file; sidechain selects the
+// in-file sidechain events of a main file.
+type thread struct {
+	agent     string
+	t         *Transcript
+	sidechain bool
+}
+
+// sessionContamination lists CodeGraph use attempts from every copy of every
+// tool_use, including copies on requests whose tokens another file owns:
+// duplicates of one message.id may differ in content, so contamination takes
+// the union. Calls are deduplicated by tool_use id in thread order, and a
+// copy whose outcome is not blocked overrides a blocked one. A Task/Agent call
+// in checked is linked to a subagent file whose calls are listed under that
+// agent instead, so it is not itself an unverified attempt.
+func sessionContamination(threads []thread, checked map[string]bool) Contamination {
+	c := Contamination{Checked: true, Calls: []ContaminationCall{}}
+	at := map[string]int{}
+	for _, th := range threads {
+		for _, u := range th.t.toolUses {
+			if u.Sidechain != th.sidechain {
+				continue
+			}
+			kind, detail := classifyUse(u)
+			if kind == "" || (kind == "subagent" && checked[u.ID]) {
+				continue
+			}
+			outcome := callOutcome(kind, th.t.results, u.ID)
+			if i, ok := at[u.ID]; ok {
+				if c.Calls[i].Outcome == "blocked" && outcome != "blocked" {
+					c.Calls[i].Outcome = outcome
+				}
+				continue
+			}
+			at[u.ID] = len(c.Calls)
+			c.Calls = append(c.Calls, ContaminationCall{Agent: th.agent, ToolUseID: u.ID, Tool: u.Name, Kind: kind, Detail: detail, Sidechain: u.Sidechain, Outcome: outcome})
 		}
-		a := agent
-		if u.Sidechain {
-			a = "sidechain"
-		}
-		calls = append(calls, ContaminationCall{Agent: a, ToolUseID: u.ID, Tool: u.Name, Kind: kind, Detail: detail, Sidechain: u.Sidechain, Outcome: callOutcome(kind, t.results, u.ID)})
 	}
-	return calls
+	c.Contaminated, c.BlockedAttempts = contaminationTotals(c.Calls)
+	return c
 }
 
 func callOutcome(kind string, results map[string]toolResult, id string) string {

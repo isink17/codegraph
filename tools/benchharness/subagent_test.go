@@ -81,16 +81,13 @@ func TestLinkNestedUnlinkedCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	subs := []*agentFile{{res: SubagentResult{AgentID: "x1"}, t: sub}}
-	checked, unlinked, err := linkSubagents(main, subs)
+	checked, unlinked, threads, err := linkSubagents(main, subs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls := sub.contaminationCalls("x1", checked)
+	calls := sessionContamination(threads, checked).Calls
 	if !checked["tu1"] || unlinked != 1 || len(calls) != 1 || calls[0].Agent != "x1" || calls[0].Outcome != "unverified" {
 		t.Fatalf("nested call without a file: checked=%v unlinked=%d calls=%+v", checked, unlinked, calls)
-	}
-	if len(main.contaminationCalls("main", checked)) != 0 {
-		t.Fatal("linked call listed as unverified")
 	}
 }
 
@@ -271,5 +268,116 @@ func TestIngestSubagentsDeterministic(t *testing.T) {
 	}
 	if !bytes.Equal(outs[0], outs[1]) || len(outs[0]) == 0 {
 		t.Fatal("ingest output differs between runs")
+	}
+}
+
+func spawnResult(id, agent string) string {
+	return `{"type":"user","toolUseResult":{"agentId":"` + agent + `"},"message":{"content":[{"type":"tool_result","tool_use_id":"` + id + `","content":"ok"}]}}`
+}
+
+func ownFile(t *testing.T, lines ...string) *Transcript {
+	t.Helper()
+	tr, err := parseTranscript(strings.NewReader(strings.Join(lines, "\n")+"\n"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tr
+}
+
+func sessionCalls(t *testing.T, main *Transcript, subs ...*agentFile) (Contamination, int) {
+	t.Helper()
+	checked, unlinked, threads, err := linkSubagents(main, subs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sessionContamination(threads, checked), unlinked
+}
+
+func TestContaminationReadsDuplicateCopies(t *testing.T) {
+	cg := `{"type":"tool_use","id":"cg1","name":"mcp__codegraph__find_symbol","input":{}}`
+	// A subagent's copy of a main message.id carries a codegraph call that
+	// the owning copy does not.
+	main, err := parse(t,
+		asstLine("m0", false, 1, 0, 10, 1, `{"type":"text","text":"hi"}`),
+		asstLine("m1", false, 1, 10, 5, 1, `{"type":"tool_use","id":"tu1","name":"Agent","input":{}}`),
+		spawnResult("tu1", "x1"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x1 := ownFile(t, asstLine("m0", true, 1, 0, 10, 1, cg), toolResultLine("cg1", "Start main.go:3"), asstLine("s1", true, 1, 0, 30, 1, `{"type":"text","text":"done"}`))
+	c, _ := sessionCalls(t, main, &agentFile{res: SubagentResult{AgentID: "x1"}, t: x1})
+	if !c.Contaminated || len(c.Calls) != 1 || c.Calls[0].Agent != "x1" || c.Calls[0].Outcome != "succeeded" {
+		t.Fatalf("codegraph call on a dropped copy: %+v", c)
+	}
+
+	// An in-file sidechain call stays checked when a subagent file owns the
+	// request with text only.
+	main, err = parse(t,
+		asstLine("m0", false, 1, 0, 10, 1, `{"type":"text","text":"hi"}`),
+		asstLine("s1", true, 1, 0, 30, 1, cg),
+		toolResultLine("cg1", "Start main.go:3"),
+		asstLine("m1", false, 1, 10, 5, 1, `{"type":"text","text":"done"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x1 = ownFile(t, asstLine("s1", true, 1, 0, 30, 1, `{"type":"text","text":"side"}`))
+	c, _ = sessionCalls(t, main, &agentFile{res: SubagentResult{AgentID: "x1"}, t: x1})
+	if !c.Contaminated || len(c.Calls) != 1 || c.Calls[0].Agent != "sidechain" {
+		t.Fatalf("in-file sidechain call hidden by a text-only copy: %+v", c)
+	}
+
+	// A copy that ran is not hidden by a blocked copy of the same tool_use.
+	b := ownFile(t, asstLine("b0", true, 1, 0, 10, 1, `{"type":"tool_use","id":"cli","name":"Bash","input":{"command":"codegraph stats"}}`),
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"cli","is_error":true,"content":"bash: codegraph: command not found"}]}}`)
+	r := ownFile(t, asstLine("b0", true, 1, 0, 10, 1, `{"type":"tool_use","id":"cli","name":"Bash","input":{"command":"codegraph stats"}}`), toolResultLine("cli", "files: 3"))
+	c = sessionContamination([]thread{{"b", b, false}, {"r", r, false}}, nil)
+	if !c.Contaminated || len(c.Calls) != 1 || c.Calls[0].Outcome != "succeeded" || c.BlockedAttempts != 0 {
+		t.Fatalf("blocked copy masks a run: %+v", c)
+	}
+}
+
+func TestLinksCallsOnDroppedCopies(t *testing.T) {
+	main, err := parse(t,
+		asstLine("m0", false, 1, 0, 10, 1, `{"type":"tool_use","id":"tu1","name":"Agent","input":{}}`),
+		spawnResult("tu1", "y1"),
+		asstLine("s9", true, 1, 0, 30, 1, `{"type":"tool_use","id":"tu9","name":"Task","input":{}}`),
+		asstLine("m1", false, 1, 10, 5, 1, `{"type":"text","text":"done"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// y1 holds a copy of main's m0 that also spawns z2; x1 owns s9 as text.
+	y1 := ownFile(t, asstLine("m0", true, 1, 0, 10, 1, `{"type":"tool_use","id":"tu5","name":"Agent","input":{}}`), spawnResult("tu5", "z2"))
+	z2 := ownFile(t, asstLine("z", true, 1, 0, 5, 1, `{"type":"text","text":"z"}`))
+	x1 := ownFile(t, asstLine("s9", true, 1, 0, 30, 1, `{"type":"text","text":"side"}`))
+	subs := []*agentFile{{res: SubagentResult{AgentID: "x1"}, t: x1}, {res: SubagentResult{AgentID: "y1"}, t: y1}, {res: SubagentResult{AgentID: "z2"}, t: z2}}
+	c, unlinked := sessionCalls(t, main, subs...)
+	if subs[2].res.Parent != "y1" || subs[2].res.Depth != 2 || unlinked != 1 || len(c.Calls) != 1 || c.Calls[0].ToolUseID != "tu9" || c.Calls[0].Outcome != "unverified" {
+		t.Fatalf("z2 parent %q depth %d, unlinked %d, calls %+v", subs[2].res.Parent, subs[2].res.Depth, unlinked, c.Calls)
+	}
+}
+
+func TestValidateRejectsZeroRatioCalibration(t *testing.T) {
+	rec := ingestSubagents(t, fixtureManifest, calibrationFixture)
+	rec.Calibration.Global.Median, rec.Calibration.Global.Q1, rec.Calibration.Global.Min, rec.Calibration.Global.Q3 = 0, 0, 0, 0
+	for i := range rec.Calibration.Categories {
+		rec.Calibration.Categories[i].Source = "global"
+	}
+	if ValidateIngest(rec) == nil {
+		t.Fatal("zero-ratio calibration accepted")
+	}
+	if e := calibratedEstimate(10, RatioFit{}, "global"); e.Estimate != 10000 {
+		t.Fatalf("zero ratio guard: %+v", e)
+	}
+}
+
+func TestDiscoverRejectsBadAgentName(t *testing.T) {
+	path := copySubagentFixture(t, func(d string) {
+		_ = os.WriteFile(filepath.Join(d, "baseline-agents", "subagents", "agent-a.b.jsonl"), []byte("\n"), 0o644)
+	}, false)
+	if _, err := Ingest(path, "2026-01-02T00:00:00Z", ""); err == nil || !strings.Contains(err.Error(), "agent-a.b.jsonl") {
+		t.Fatalf("bad agent file name: %v", err)
 	}
 }

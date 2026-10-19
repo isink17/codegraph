@@ -102,12 +102,16 @@ type CalibratedEstimate struct {
 	High        int    `json:"high_tokens"`
 }
 
+// safeRatio guards division in records that failed validation; a valid fit has
+// every ratio at least 1.
+func safeRatio(x int) int64 { return int64(max(x, 1)) }
+
 func calibratedEstimate(chars int, f RatioFit, source string) *CalibratedEstimate {
 	c := int64(chars) * 1000
 	return &CalibratedEstimate{RatioSource: source,
-		Estimate: int((c + int64(f.Median)/2) / int64(f.Median)),
-		Low:      int(c / int64(f.Q3)),
-		High:     int((c + int64(f.Q1) - 1) / int64(f.Q1))}
+		Estimate: int((c + safeRatio(f.Median)/2) / safeRatio(f.Median)),
+		Low:      int(c / safeRatio(f.Q3)),
+		High:     int((c + safeRatio(f.Q1) - 1) / safeRatio(f.Q1))}
 }
 
 // With a sufficient calibration each gap's segments are priced at their
@@ -197,7 +201,7 @@ func priceGap(delta int, segs []segment, cal *Calibration) []int {
 	var sum int64
 	for i, sg := range segs {
 		f, _ := cal.fit(sg.cat)
-		w[i] = int64(sg.chars) * 1_000_000 / int64(f.Median)
+		w[i] = int64(sg.chars) * 1_000_000 / safeRatio(f.Median)
 		sum += w[i]
 	}
 	if sum == 0 {
