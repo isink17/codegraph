@@ -56,6 +56,9 @@ type RiskEvidence struct {
 	HeadSites   []string `json:"head_sites,omitempty"`
 	HeadStates  []string `json:"head_states,omitempty"`
 	HeadTargets []string `json:"head_targets,omitempty"`
+	// DependentHead is the dependent's head identity when it differs from
+	// Dependent (a declaration_pairs move or a unique signature change).
+	DependentHead string `json:"dependent_head,omitempty"`
 }
 
 type RiskUncertainty struct {
@@ -190,27 +193,30 @@ func assessRisk(changes []Change, cov Coverage, lims []string, baseDecls, headDe
 	}
 
 	withColumn := useEdgeColumns(baseEdges, headEdges)
-	surviving := make(map[string]bool, len(headDecls))
-	for _, d := range headDecls {
-		surviving[declIdentity(d)] = true
-	}
+	headDependent, ambiguousDependent := headDependents(baseDecls, headDecls, pairedTo)
 	// A base relationship is judged by what the same dependent references by
 	// the same name in head, not by the call site: a site is a line and column,
 	// and an edit that shifts lines can land an unrelated call on it.
 	type relationship struct {
-		dependent, declaration, file, name string
-		sites                              []string
+		dependent, head, declaration, file, name string
+		sites                                    []string
 	}
 	rels := map[string]*relationship{}
 	baseTargets := map[string]map[string]bool{}
 	for _, e := range baseEdges {
 		dep, decl := endpointIdentity(e.Source), endpointIdentity(e.Target)
-		if e.Target.State != "resolved" || dep == decl || !surviving[dep] {
+		if e.Target.State != "resolved" || dep == decl {
+			continue
+		}
+		if headDependent[dep] == "" {
+			if ambiguousDependent[dep] {
+				r.Uncertainty = append(r.Uncertainty, RiskUncertainty{Reason: "dependent_identity_ambiguous", Identity: dep})
+			}
 			continue
 		}
 		key := canonical([]string{decl, dep})
 		if rels[key] == nil {
-			rels[key] = &relationship{dependent: dep, declaration: decl, file: e.Source.Path, name: referenceName(e.Target.QualifiedName)}
+			rels[key] = &relationship{dependent: dep, head: headDependent[dep], declaration: decl, file: e.Source.Path, name: referenceName(e.Target.QualifiedName)}
 		}
 		rels[key].sites = append(rels[key].sites, edgeSite(e, withColumn))
 		if baseTargets[dep] == nil {
@@ -235,14 +241,22 @@ func assessRisk(changes []Change, cov Coverage, lims []string, baseDecls, headDe
 	for _, key := range union(rels, rels) {
 		rel := rels[key]
 		ev := RiskEvidence{Declaration: rel.declaration, Dependent: rel.dependent, File: rel.file, Sites: rel.sites}
-		bound, unbound, elsewhere := false, false, false
-		for _, ref := range headRefs[rel.dependent][rel.name] {
+		if rel.head != rel.dependent {
+			ev.DependentHead = rel.head
+		}
+		bound, unbound, elsewhere := 0, false, false
+		siblingSites := map[string][]string{}
+		for _, ref := range headRefs[rel.head][rel.name] {
 			h, target := ref.edge, ref.target
 			// A reference resolving to another declaration the dependent
-			// already used in base belongs to that relationship, unless this
-			// declaration is gone: then it may be the call that rebound to a
-			// sibling, such as a removed overload.
-			if h.Target.State == "resolved" && target != rel.declaration && baseTargets[rel.dependent][target] && !removed[rel.declaration] {
+			// already used in base belongs to that relationship. If this
+			// declaration is gone, references to such a sibling beyond the
+			// sibling's own base sites are rebindings (a removed overload whose
+			// callers fall back); that is decided below, once counted.
+			if h.Target.State == "resolved" && target != rel.declaration && target != pairedTo[rel.declaration] && baseTargets[rel.dependent][target] {
+				if removed[rel.declaration] {
+					siblingSites[target] = append(siblingSites[target], edgeSite(h, withColumn))
+				}
 				continue
 			}
 			ev.HeadSites = append(ev.HeadSites, edgeSite(h, withColumn))
@@ -251,10 +265,27 @@ func assessRisk(changes []Change, cov Coverage, lims []string, baseDecls, headDe
 			case h.Target.State != "resolved":
 				unbound = true
 			case target == rel.declaration || target == pairedTo[rel.declaration]:
-				bound = true
+				bound++
 			default:
 				elsewhere = true
 				ev.HeadTargets = append(ev.HeadTargets, target)
+			}
+		}
+		unproven := ""
+		for _, sibling := range union(siblingSites, siblingSites) {
+			sites := uniqueStrings(siblingSites[sibling])
+			if len(sites) <= len(uniqueStrings(rels[canonical([]string{sibling, rel.dependent})].sites)) {
+				// As many sibling references as in base: the dependent may
+				// have dropped its call to the removed declaration, or dropped
+				// a sibling call and rebound this one. The graph cannot tell.
+				unproven = sibling
+				continue
+			}
+			elsewhere = true
+			ev.HeadSites = append(ev.HeadSites, sites...)
+			ev.HeadTargets = append(ev.HeadTargets, sibling)
+			for range sites {
+				ev.HeadStates = append(ev.HeadStates, "resolved")
 			}
 		}
 		normalizeEvidence(&ev)
@@ -265,14 +296,21 @@ func assessRisk(changes []Change, cov Coverage, lims []string, baseDecls, headDe
 		case removed[rel.declaration] && unbound:
 			ev.Change = "declaration_removed"
 			found[RuleRemovedDeclarationDependent] = append(found[RuleRemovedDeclarationDependent], ev)
-		case bound:
+		case bound > 0:
 			// Still resolves to the same, or a provably moved, declaration.
+			// Fewer such references than base sites, next to unresolved or
+			// other-target ones, may be a partial loss.
+			if (unbound || elsewhere) && bound < len(uniqueStrings(rel.sites)) {
+				r.Uncertainty = append(r.Uncertainty, RiskUncertainty{Reason: "dependent_binding_partial", Identity: key})
+			}
 		case elsewhere:
 			ev.Change = "binding_changed"
 			found[RuleDependentRetargeted] = append(found[RuleDependentRetargeted], ev)
 		case unbound:
 			ev.Change = "resolution_lost"
 			found[RuleDependentResolutionLost] = append(found[RuleDependentResolutionLost], ev)
+		case unproven != "":
+			r.Uncertainty = append(r.Uncertainty, RiskUncertainty{Reason: "dependent_rebinding_unproven", Identity: key, Detail: "sibling " + unproven})
 		}
 		// No reference by that name remains: the dependent no longer uses it.
 	}
@@ -441,4 +479,37 @@ func removedDependents(removed map[string]bool, headDecls []store.SemanticDeclar
 		out = append(out, RemovedDeclarationDependents{Declaration: decl, Edges: calls})
 	}
 	return out
+}
+
+// headDependents maps each base declaration to its head identity: itself when
+// it survives, its declaration_pairs counterpart, or else the only head
+// declaration with the same path, language, kind and qualified name when that
+// key also names exactly one base declaration (its signature changed).
+// ambiguous holds the base declarations left unmapped although head still has
+// declarations under their key.
+func headDependents(baseDecls, headDecls []store.SemanticDeclaration, pairedTo map[string]string) (map[string]string, map[string]bool) {
+	nameKey := func(d store.SemanticDeclaration) string {
+		return canonical([]string{d.Path, d.Language, d.Kind, d.QualifiedName})
+	}
+	baseByName, headByName := group(baseDecls, nameKey), group(headDecls, nameKey)
+	surviving := make(map[string]bool, len(headDecls))
+	for _, d := range headDecls {
+		surviving[declIdentity(d)] = true
+	}
+	out, ambiguous := make(map[string]string, len(baseDecls)), map[string]bool{}
+	for _, d := range baseDecls {
+		id := declIdentity(d)
+		k := nameKey(d)
+		switch {
+		case surviving[id]:
+			out[id] = id
+		case pairedTo[id] != "":
+			out[id] = pairedTo[id]
+		case len(baseByName[k]) == 1 && len(headByName[k]) == 1:
+			out[id] = declIdentity(headByName[k][0])
+		case len(headByName[k]) > 0:
+			ambiguous[id] = true
+		}
+	}
+	return out, ambiguous
 }

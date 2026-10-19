@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -538,9 +539,9 @@ func TestRiskRemovedOverloadReboundToSibling(t *testing.T) {
 	}
 }
 
-// A dependent whose own identity changed (here its signature) is not a
-// surviving dependent: it is not scored, and the removal stays uncertain.
-func TestRiskDependentWithChangedSignatureIsUncertainty(t *testing.T) {
+// A dependent whose signature changed is the only declaration under its path,
+// kind and qualified name on both sides: it is paired and scored.
+func TestRiskDependentAcrossSignatureChange(t *testing.T) {
 	gone, a := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A")
 	a2 := a
 	a2.Signature = "func A(x int)"
@@ -548,7 +549,113 @@ func TestRiskDependentWithChangedSignatureIsUncertainty(t *testing.T) {
 	base := riskRevision(files, []store.SemanticDeclaration{gone, a}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
 	head := riskRevision(files, []store.SemanticDeclaration{a2}, []store.SemanticEdge{riskCall(a2, store.SemanticDeclaration{QualifiedName: "Gone"}, 4, 2, "unresolved")})
 	r := compareRisk(t, base, head)
-	if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
+	ev := component(t, r, RuleRemovedDeclarationDependent).Evidence
+	if r.Assessment != AssessmentRiskEvidence || *r.Score != 20 || len(ev) != 1 || ev[0].Dependent != declIdentity(a) || ev[0].DependentHead != declIdentity(a2) {
 		t.Fatalf("risk = %+v", r)
+	}
+}
+
+// Two overloads of the dependent share its qualified name: no unique pairing,
+// so the dependent is disclosed, not scored, and the removal stays uncertain.
+func TestRiskDependentSignatureChangeAmongOverloadsIsUncertainty(t *testing.T) {
+	gone, a, b := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A"), riskDecl("a.go", "A")
+	b.Signature = "func A(s string)"
+	a2 := a
+	a2.Signature = "func A(x int)"
+	files := indexed("a.go", "lib.go")
+	base := riskRevision(files, []store.SemanticDeclaration{gone, a, b}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
+	head := riskRevision(files, []store.SemanticDeclaration{a2, b}, []store.SemanticEdge{riskCall(a2, store.SemanticDeclaration{QualifiedName: "Gone"}, 4, 2, "unresolved")})
+	r := compareRisk(t, base, head)
+	if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "dependent_identity_ambiguous", declIdentity(a)) || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+// A dependent that dropped its call to a removed declaration while keeping its
+// own call to a same-name sibling (an overload, or a method of another
+// receiver) has not rebound anything. The graph cannot tell that from a
+// dropped sibling call plus a rebinding, so it is uncertainty, not points.
+func TestRiskDroppedCallKeepingSiblingIsNotRebinding(t *testing.T) {
+	overload := func() (store.SemanticDeclaration, store.SemanticDeclaration) {
+		narrow, wide := riskDecl("lib.go", "Foo"), riskDecl("lib.go", "Foo")
+		narrow.Signature, wide.Signature = "func Foo(int)", "func Foo(int64)"
+		return narrow, wide
+	}
+	receivers := func() (store.SemanticDeclaration, store.SemanticDeclaration) {
+		one, two := riskDecl("lib.go", "Close"), riskDecl("lib.go", "Close")
+		one.Kind, two.Kind = "method", "method"
+		one.QualifiedName, two.QualifiedName = "p.File.Close", "p.Conn.Close"
+		one.StableKey, two.StableKey = "method:p:File.Close", "method:p:Conn.Close"
+		return one, two
+	}
+	for name, decls := range map[string]func() (store.SemanticDeclaration, store.SemanticDeclaration){"overload": overload, "receiver": receivers} {
+		t.Run(name, func(t *testing.T) {
+			gone, sibling := decls()
+			a := riskDecl("a.go", "A")
+			files := indexed("a.go", "lib.go")
+			base := riskRevision(files, []store.SemanticDeclaration{gone, sibling, a}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved"), riskCall(a, sibling, 5, 2, "resolved")})
+			// Deleting line 4 shifts the kept sibling call onto it.
+			head := riskRevision(files, []store.SemanticDeclaration{sibling, a}, []store.SemanticEdge{riskCall(a, sibling, 4, 2, "resolved")})
+			r := compareRisk(t, base, head)
+			if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "dependent_rebinding_unproven", "") {
+				t.Fatalf("risk = %+v", r)
+			}
+		})
+	}
+}
+
+// Fewer references to a surviving declaration than base sites, next to an
+// unresolved one by the same name, may be a lost resolution: disclosed.
+func TestRiskPartialBindingIsUncertainty(t *testing.T) {
+	x, a := riskDecl("lib.go", "X"), riskDecl("a.go", "A")
+	decls := []store.SemanticDeclaration{x, a}
+	files := indexed("a.go", "lib.go")
+	base := riskRevision(files, decls, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, x, 6, 2, "resolved")})
+	head := riskRevision(files, decls, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), riskCall(a, store.SemanticDeclaration{QualifiedName: "X"}, 6, 2, "unresolved")})
+	if r := compareRisk(t, base, head); r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "dependent_binding_partial", "") {
+		t.Fatalf("risk = %+v", r)
+	}
+	// An unresolved reference that was already there next to an unchanged
+	// resolved one is not a loss.
+	dynamic := riskCall(a, store.SemanticDeclaration{QualifiedName: "X"}, 6, 2, "unresolved")
+	same := riskRevision(files, decls, []store.SemanticEdge{riskCall(a, x, 4, 2, "resolved"), dynamic})
+	if r := compareRisk(t, same, same); r.Assessment != AssessmentNoRiskEvidence {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+// Risk rules and weights are part of the model id: a released model never
+// changes what it cites or how many points it gives.
+func TestRiskModelPinsRules(t *testing.T) {
+	want := "removed_declaration_dependent 20 60;dependent_resolution_lost 10 30;dependent_retargeted 5 20;changed_declaration_dependent 5 20;"
+	got := ""
+	for _, r := range riskRules {
+		got += r.rule + " " + strconv.Itoa(r.pointsEach) + " " + strconv.Itoa(r.maxPoints) + ";"
+	}
+	if RiskModel != "codegraph.change-risk/v1" || got != want {
+		t.Fatalf("model %s rules %s: changing the rule table needs a new model id", RiskModel, got)
+	}
+}
+
+// A caller whose file was renamed in the same change is paired through
+// declaration_pairs, so its broken call to a removed declaration is scored.
+func TestCompareCommitsRiskPairsMovedDependent(t *testing.T) {
+	r := gittest.Init(t)
+	r.Write("go.mod", "module example.com/m\n\ngo 1.22\n")
+	r.Write("lib.go", "package main\n\nfunc Gone() {}\n")
+	r.Write("use.go", "package main\n\nfunc Use() {\n\tGone()\n}\n")
+	r.Write("main.go", "package main\n\nfunc main() { Use() }\n")
+	base := r.Commit("", "base")
+	r.Git("mv", "use.go", "caller.go")
+	r.Write("lib.go", "package main\n")
+	head := r.Commit("", "move caller, remove Gone")
+	got, err := CompareCommits(t.Context(), r.Dir, base, head, parser.NewRegistry(goparser.New()), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk := got.Diff.Risk
+	ev := component(t, rk, RuleRemovedDeclarationDependent).Evidence
+	if *rk.Score != 20 || len(ev) != 1 || !strings.Contains(ev[0].Dependent, `"use.go"`) || !strings.Contains(ev[0].DependentHead, `"caller.go"`) {
+		t.Fatalf("risk = %+v", rk)
 	}
 }
