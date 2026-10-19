@@ -73,8 +73,8 @@ type WatchStats struct {
 	// transition a path-scoped flush could not safely make.
 	ProfileConverges int64 `json:"profile_converges,omitempty"`
 
-	// Overflows counts event-queue overflows, each answered by a full
-	// reconciliation update.
+	// Overflows counts event-queue overflows, each answered by re-registering
+	// the watch tree and a full reconciliation update.
 	Overflows int64 `json:"overflows,omitempty"`
 
 	QueueExecs   int64 `json:"queue_execs"`
@@ -490,15 +490,11 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 								delete(watchedDirs, dir)
 							}
 						}
-						live, err := w.store.LiveFilePaths(ctx, repoID)
+						// Descendants were dropped from watchedDirs above, so
+						// their own events do not repeat this query.
+						gone, err := w.store.LiveFilePathsUnder(ctx, repoID, rel)
 						if err != nil {
 							return err
-						}
-						var gone []string
-						for _, p := range live {
-							if strings.HasPrefix(p, rel+"/") {
-								gone = append(gone, p)
-							}
 						}
 						if len(gone) > 0 {
 							if err := w.queueDirtyPathsWithRetry(ctx, repoID, gone, "remove"); err != nil {
@@ -541,10 +537,16 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 				return nil
 			}
 			if errors.Is(err, fsnotify.ErrEventOverflow) {
-				// Dropped events cannot be replayed; reconcile everything
-				// through the incremental full update, which skips files
-				// whose size and mtime are unchanged.
+				// Dropped events cannot be replayed: directories created
+				// meanwhile are unwatched and files changed meanwhile are
+				// unqueued. Re-register the tree, then reconcile everything
+				// through the incremental full update, which skips files whose
+				// size and mtime are unchanged and covers events lost during
+				// the re-registration.
 				w.overflows.Add(1)
+				if err := resetWatcher(); err != nil {
+					return err
+				}
 				forceFullScan.Store(true)
 				signalFlush()
 				continue

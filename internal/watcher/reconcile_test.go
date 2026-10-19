@@ -157,19 +157,60 @@ func TestWatcherRetiresFilesOfRemovedDirectory(t *testing.T) {
 	})
 }
 
-// Dropped events cannot be replayed, so an overflow reconciles the whole
-// repository through the incremental update instead of stopping the watcher.
+// Dropped events cannot be replayed, so an overflow re-registers the watch
+// tree and reconciles the repository through the incremental update instead
+// of stopping the watcher.
 func TestWatcherReconcilesAfterEventOverflow(t *testing.T) {
-	inject := make(chan *fsnotify.Watcher, 4)
-	watcherCreatedHook = func(w *fsnotify.Watcher) { inject <- w }
+	type injected struct {
+		fsw  *fsnotify.Watcher
+		errs chan error
+	}
+	inject := make(chan injected, 4)
+	// Errors is swapped for a test-owned channel: sending on fsnotify's own
+	// channel races with its shutdown.
+	watcherCreatedHook = func(w *fsnotify.Watcher) {
+		errs := make(chan error, 1)
+		w.Errors = errs
+		inject <- injected{w, errs}
+	}
 	t.Cleanup(func() { watcherCreatedHook = nil })
 	r := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
-	fsw := <-inject
-	// A change the watcher never saw, standing in for the dropped events.
-	writeFile(t, filepath.Join(r.root, "missed", "m.go"), goFile)
-	fsw.Errors <- fsnotify.ErrEventOverflow
-	r.waitLive(t, "reconciled files", func(p []string) bool {
-		return slices.Contains(p, "missed/m.go")
+	first := <-inject
+	// Hide a new directory and a file from the watcher, standing in for the
+	// dropped events.
+	if err := first.fsw.Remove(r.root); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(r.root, "newdir", "m.go"), goFile)
+	if err := first.fsw.Add(r.root); err != nil {
+		t.Fatal(err)
+	}
+	first.errs <- fsnotify.ErrEventOverflow
+	deadline := time.After(5 * time.Second)
+	for {
+		f, err := r.s.FreshnessStatus(context.Background(), r.repoID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.LastCompletedScan != nil && f.LastCompletedScan.Kind == "watch_config" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("no forced full scan: %+v stats %+v", f.LastCompletedScan, r.w.Stats())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if got := r.w.Stats().Overflows; got != 1 {
+		t.Fatalf("Overflows = %d, want 1", got)
+	}
+	r.waitLive(t, "reconciled file", func(p []string) bool {
+		return slices.Contains(p, "newdir/m.go")
+	})
+	// The directory created during the dropped events is watched again.
+	writeFile(t, filepath.Join(r.root, "newdir", "x.go"), goFile)
+	r.waitLive(t, "file in re-registered directory", func(p []string) bool {
+		return slices.Contains(p, "newdir/x.go")
 	})
 }
 

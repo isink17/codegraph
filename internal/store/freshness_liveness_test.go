@@ -118,3 +118,47 @@ func TestFreshnessProbeDoesNotBlockScans(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A status read's brief exclusive hold is not a running scan: recovery waits
+// it out instead of refusing.
+func TestRecoverAbandonedScansWaitsOutStatusRead(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "update", "running", "")
+	s.releaseAllScanLocks()
+	probe, release := s.probeScanLock()
+	if probe != scanLockFree {
+		release()
+		t.Fatalf("probe = %v", probe)
+	}
+	go func() {
+		time.Sleep(3 * scanLockProbeWait)
+		release()
+	}()
+	ids, err := openSameStore(t, s).RecoverAbandonedScans(context.Background())
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("ids=%v err=%v", ids, err)
+	}
+}
+
+// The scan lock is per database: another repository's live scan in the same
+// database is not this repository's writer.
+func TestFreshnessOtherRepositoryWriterIsNotAttributed(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	other, err := s.UpsertRepo(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan(t, s, other.ID, "update", "running", "")
+	f := freshness(t, s, repoID)
+	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictConsistentWithLastScan || f.State != graph.FreshnessNoKnownStaleness {
+		t.Fatalf("other repo's writer attributed: %+v", f)
+	}
+	// This repository's own running row beside another repository's live
+	// writer cannot be told live or abandoned.
+	scan(t, s, repoID, "update", "running", "")
+	f = freshness(t, s, repoID)
+	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictLivenessUnknown {
+		t.Fatalf("ambiguous writer: %+v", f)
+	}
+}

@@ -17,9 +17,9 @@ non-blocking probe of the scan lock.
 | Verdict | Meaning |
 | --- | --- |
 | `index_incomplete` | No scan of this repository ever completed. |
-| `writer_active` | A scan of this database holds the scan lock now, possibly before its row exists or while a newer scan already completed. Rows are changing; re-read after it finishes. |
-| `abandoned_scan` | Scan rows read `running` while no process held the scan lock. Their process died; run `codegraph recover-scans`. |
-| `liveness_unknown` | Rows read `running` and the lock could not be probed (no lock file, as with a scan by a binary that predates the lock, or an I/O error). |
+| `writer_active` | The scan lock is held and this repository's own rows read `running`, possibly older than a scan that already completed. Rows are changing; re-read after it finishes. |
+| `abandoned_scan` | Scan rows read `running` while no lock-aware process held the scan lock; a scan by a binary older than the lock is not seen. Run `codegraph recover-scans`. |
+| `liveness_unknown` | Rows read `running` and their writer cannot be told live or dead: no lock file (a binary that predates the lock), an I/O error, or the lock held while another repository in the same database also has running rows. |
 | `stale_known` | A stored fact says the graph is behind: see `reasons`. |
 | `consistent_with_last_scan` | No stored fact and no live writer contradicts the last completed scan. Edits since then are not checked. |
 
@@ -44,21 +44,33 @@ the usual not-indexed error.
 
 `state` (`known_stale`, `unknown`, `no_known_staleness`) and `reasons` keep
 their earlier meaning. `scan_running_or_abandoned` now also fires when the
-lock shows a live writer whose row is older than the last completed scan, or
-that has not inserted its row yet.
+lock shows a live writer whose row is older than the last completed scan.
 
 ## Writer liveness
 
 Every scan holds a shared OS lock on `<db>.scan.lock` from before its row is
 inserted until the row is closed. The status read tries to take that lock
-exclusively without waiting (a few 10 ms retries, so another status read is
-not mistaken for a scan). When it succeeds it keeps the lock across its row
-read, so no scan can begin meanwhile and every `running` row it reads is
-proven abandoned. A new scan waiting for the lock is delayed by at most one of
-its 50 ms retries. Limits: the lock is host-local (a writer on another machine
-sharing the database is not seen), a binary that predates the lock takes none,
-and a `recover-scans` that collides with a status read refuses and can be
-rerun.
+exclusively without waiting, retrying 10 times 10 ms apart; reads in one
+process take turns. When it succeeds it keeps the lock across its row read,
+so no scan can begin meanwhile and every `running` row it reads has no
+lock-aware owner. When every attempt fails the hold is attributed to a writer
+only if this repository has running rows and no other repository in the
+database does; a scan inserts its row within milliseconds of taking the lock.
+Otherwise liveness is `unknown`.
+
+A new scan waiting for the lock is delayed by at most one of its 50 ms
+retries, and `recover-scans` retries over the same 100 ms window before
+refusing.
+
+Limits:
+
+- The lock is host-local: a writer on another machine sharing the database
+  is not seen.
+- A binary that predates the lock takes none; its live scans read
+  `abandoned`.
+- A status read in another process that holds the lock for more than about
+  100 ms (a very slow disk) reads as a writer when this repository has a
+  running row, and makes `recover-scans` refuse; rerun either.
 
 ## Watcher
 
@@ -71,7 +83,9 @@ dirty queue before any flush, so a stopped watcher leaves them for the next
   the repository (they raise no events of their own);
 - queues the indexed files under a watched directory that is removed or moved
   out, so they leave the graph;
-- answers an event-queue overflow with one reconciliation pass (the
+- answers an event-queue overflow by re-registering the whole watch tree
+  (directories created during the dropped events were never registered) and
+  then one reconciliation pass (the
   incremental full update, which skips files whose size and mtime did not
   change) instead of stopping, and counts it in `overflows`;
 - ignores a new directory that is removed before it can be registered.
