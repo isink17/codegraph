@@ -168,6 +168,16 @@ func commandRunsCodegraph(words []string, depth int) bool {
 		case "npx", "bunx", "pnpx":
 			args = skipOptions(name, args)
 			return len(args) > 0 && isCodegraphPackage(args[0])
+		case "command":
+			// command -v/-V only looks the name up.
+			for _, a := range args {
+				if a == "-v" || a == "-V" {
+					return false
+				}
+				if !strings.HasPrefix(a, "-") {
+					break
+				}
+			}
 		case "bash", "sh", "zsh", "dash", "ksh":
 			for i, a := range args {
 				if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "c") {

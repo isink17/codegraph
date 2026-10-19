@@ -157,6 +157,8 @@ func TestCLIPattern(t *testing.T) {
 		`echo "codegraph stats"`,
 		"bash ./codegraph.sh",
 		"npx codegraph-other",
+		"command -v codegraph",
+		"command -V codegraph",
 	}
 	for _, c := range hits {
 		if !runsCodegraph(c) {
@@ -194,6 +196,12 @@ func TestContaminationOutcomes(t *testing.T) {
 		use("10", "Bash", `{"command":"codegraph stats && rg foo"}`), result("10", "files: 3\nbash: rg: command not found", true),
 		use("11", "Bash", `{"command":"codegraph stats"}`), result("11", "zsh: command not found: codegraph", true),
 		use("12", "Task", `{"prompt":"explore"}`), result("12", "done", false),
+		use("13", "Bash", `{"command":"~/go/bin/codegraph stats; codegraph index"}`), result("13", "files: 3\nbash: line 1: codegraph: command not found", true),
+		use("14", "Bash", `{"command":"codegraph stats"}`), result("14", "Exit code 127\nbash: line 1: codegraph: command not found", true),
+		use("15", "Bash", `{"command":"codegraph stats"}`), result("15", "Exit code 1\nbash: line 1: codegraph: command not found\nfiles: 3\nerror: bad flag", true),
+		use("16", "Bash", `{"command":"codegraph stats"}`), result("16", "files: 3\nbash: line 2: codegraph: command not found", true),
+		use("17", "Bash", `{"command":"codegraph stats"}`), result("17", "symbols: 10\nlog: codegraph: command not found", true),
+		use("18", "Bash", `{"command":"codegraph stats"}`), result("18", "sh: 1: codegraph: not found", true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -203,8 +211,9 @@ func TestContaminationOutcomes(t *testing.T) {
 	for _, call := range c.Calls {
 		got = append(got, call.ToolUseID+":"+call.Kind+":"+call.Outcome)
 	}
-	want := "1:cli:blocked 2:cli:blocked 3:cli:error 4:mcp:succeeded 5:skill:no_result 6:mcp:blocked 9:cli:error 10:cli:error 11:cli:blocked 12:subagent:unverified"
-	if strings.Join(got, " ") != want || !c.Contaminated || c.BlockedAttempts != 4 {
+	want := "1:cli:blocked 2:cli:blocked 3:cli:error 4:mcp:succeeded 5:skill:no_result 6:mcp:blocked 9:cli:error 10:cli:error 11:cli:blocked 12:subagent:unverified" +
+		" 13:cli:error 14:cli:blocked 15:cli:error 16:cli:error 17:cli:error 18:cli:blocked"
+	if strings.Join(got, " ") != want || !c.Contaminated || c.BlockedAttempts != 6 {
 		t.Fatalf("got %v contaminated=%v blocked=%d", got, c.Contaminated, c.BlockedAttempts)
 	}
 

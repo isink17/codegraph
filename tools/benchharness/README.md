@@ -112,15 +112,22 @@ in-file sidechain) is checked for:
   as the last path segment or with `.exe`, `npx`/`bunx` of a `codegraph`
   package, and `go run .../cmd/codegraph[@version]`. Arguments
   (`cd /src/codegraph`, `git -C /src/codegraph`, `ls .codegraph`,
-  `grep codegraph`) do not match. Aliases, shell functions, `eval`, scripts and
-  variables used as the command are not detected;
+  `grep codegraph`, `command -v codegraph`) do not match. Not detected:
+  aliases, shell functions, `eval`, scripts, variables used as the command,
+  `find -exec codegraph`, `watch codegraph`, a redirection glued to the name
+  (`codegraph>out`, `>out codegraph`), `env -S 'codegraph ...'` and
+  `go run ./cmd/codegraph/`. Heredoc bodies and trailing `# comments` are read
+  as commands, so they can give false positives;
 - a `Task`/`Agent` call: the subagent's own transcript is a separate file that
   is not ingested, so its CodeGraph use cannot be ruled out.
 
 Each attempt gets an outcome from its `tool_result`: `blocked` only for exact
 denial shapes (a result starting with `PreToolUse:<tool> hook error` or
 `Hook PreToolUse:<tool> denied`, `Permission to use `, `The user doesn't want
-to proceed`, or a shell reporting `codegraph: command not found`); otherwise
+to proceed`, or a result whose every non-empty line is either `Exit code N` or
+a shell reporting the codegraph binary not found, such as
+`bash: line 1: codegraph: command not found` or `sh: 1: codegraph: not found`);
+otherwise
 `succeeded`, `error` (codegraph may have run and printed output), `no_result`,
 or `unverified` for subagent calls. A session with any attempt that is not
 `blocked` is contaminated and excluded from per-arm statistics unless

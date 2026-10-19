@@ -285,17 +285,39 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// blockedRE matches the exact tool_result shapes of a PreToolUse hook denial,
-// a permission denial, or a shell that could not find the codegraph binary.
-// Any other error counts as contaminating because codegraph may have run.
-var blockedRE = regexp.MustCompile(`^(?:Hook )?PreToolUse:\S+ (?:hook error|denied)` +
+// deniedRE matches the exact tool_result shapes of a PreToolUse hook denial
+// or a permission denial.
+var deniedRE = regexp.MustCompile(`^(?:Hook )?PreToolUse:\S+ (?:hook error|denied)` +
 	`|^Permission to use ` +
-	`|^The user doesn't want to proceed` +
-	`|(?m)^(?:\S+: )?(?:line \d+: )?\S*codegraph(?:\.exe)?: (?:command )?not found` +
-	`|(?m)^(?:\S+: )?command not found: \S*codegraph(?:\.exe)?$`)
+	`|^The user doesn't want to proceed`)
 
+// notFoundLineRE matches one shell line reporting that the codegraph binary
+// itself was not found (bash, dash and zsh shapes).
+var notFoundLineRE = regexp.MustCompile(`^(?:\S+: )?(?:(?:line )?\d+: )?\S*codegraph(?:\.exe)?: (?:command )?not found$` +
+	`|^(?:\S+: )?command not found: \S*codegraph(?:\.exe)?$`)
+
+var exitCodeLineRE = regexp.MustCompile(`^Exit code \d+$`)
+
+// blockedResult reports a hook or permission denial, or a result made only of
+// codegraph-not-found and exit-code lines. Any other error counts as
+// contaminating because codegraph may have run and printed output.
 func blockedResult(text string) bool {
-	return blockedRE.MatchString(strings.TrimSpace(text))
+	text = strings.TrimSpace(text)
+	if deniedRE.MatchString(text) {
+		return true
+	}
+	notFound := false
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "" || exitCodeLineRE.MatchString(line):
+		case notFoundLineRE.MatchString(line):
+			notFound = true
+		default:
+			return false
+		}
+	}
+	return notFound
 }
 
 // ContaminationCall is one CodeGraph use attempt in an arm that must not use it.
