@@ -246,15 +246,23 @@ func newCommandList() []*command {
 		{
 			name:        "diff",
 			description: "compare two local commits by their indexed semantic graphs",
-			usageLines:  []string{"  diff <base> <head> [--repo-root PATH] [--limit N --offset N]"},
+			usageLines: []string{
+				"  diff <base> <head> [--repo-root PATH] [--limit N --offset N]",
+				"    [--fail-on-risk SCORE|LEVEL [--insufficient-evidence fail|pass]]",
+				"    prints the full result first; without --fail-on-risk risk never changes the exit code",
+				"    with --fail-on-risk: exits 0 below the threshold, 1 at or above it, 2 invalid input or error,",
+				"    3 insufficient evidence (unless --insufficient-evidence pass)",
+			},
 			flags: []commandFlag{
 				{name: "--repo-root PATH", description: "repository root (defaults to current repository)"},
-				{name: "--limit N", description: "changes per page (default 20, max 500)"},
+				{name: "--limit N", description: "changes per page (default 20, max 500); risk always covers every change"},
 				{name: "--offset N", description: "offset into the change list"},
+				{name: "--fail-on-risk VALUE", description: "risk score 1..100, or low (1), medium (25), high (50), that fails the command"},
+				{name: "--insufficient-evidence VALUE", description: "fail (default, exit 3) or pass when risk cannot be assessed"},
 			},
-			examples: []string{"codegraph diff main~1 main", "codegraph diff --repo-root . main~1 main"},
+			examples: []string{"codegraph diff main~1 main", "codegraph diff --repo-root . main~1 main", "codegraph diff origin/v2.0 HEAD --fail-on-risk medium"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
-				return runDiff(ctx, stdout, args)
+				return runDiff(ctx, stdout, stderr, args)
 			},
 		},
 		{

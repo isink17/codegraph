@@ -139,7 +139,7 @@ This installs the Agent Skill from the repository, not the CodeGraph binary. The
 | `detect_frameworks` | Detect frameworks and libraries used in the repo |
 | `cross_language_links` | Find and create cross-language symbol references |
 | `benchmark_tokens` | Estimate token savings vs. reading raw files |
-| `diff` | Compare two local commits as deterministic semantic graph changes (files, declarations, edges, test links), with rename annotations and removed-declaration dependents |
+| `diff` | Compare two local commits as deterministic semantic graph changes (files, declarations, edges, test links), with rename annotations and an evidence-backed change-risk assessment (`diff.risk`, see `docs/change-risk.md`) |
 
 ### Repository Management
 
@@ -728,6 +728,20 @@ git diff --name-only | codegraph affected-tests --stdin
 # CI integration
 TESTS=$(git diff --name-only HEAD~1 | codegraph affected-tests --stdin)
 go test $TESTS
+```
+
+### Change risk gate
+
+`codegraph diff` scores the dependents a change breaks or rebinds, citing each
+relationship (see `docs/change-risk.md`). The gate is opt-in and prints the full
+JSON before deciding the exit code:
+
+```bash
+# exit 0 below 25, 1 at or above, 2 invalid input, 3 risk cannot be assessed
+codegraph diff origin/v2.0 HEAD --fail-on-risk medium
+
+# allow incomparable graphs (exit 0 instead of 3)
+codegraph diff origin/v2.0 HEAD --fail-on-risk 20 --insufficient-evidence pass
 ```
 
 ### Watch JSONL events
