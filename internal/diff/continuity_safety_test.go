@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/githistory/gittest"
@@ -206,5 +207,27 @@ func TestOrderDependent(t *testing.T) {
 		if got := orderDependent(store.SemanticDeclaration{Path: tc.path, Kind: tc.kind, Name: tc.name}, false); got != tc.want {
 			t.Errorf("%s %s %s = %v", tc.path, tc.kind, tc.name, got)
 		}
+	}
+}
+
+// A file whose name is the pattern's literal spelling must not stand in for
+// the file the go command embeds.
+func TestCompareCommitsEmbedPatternSpellings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file names with quotes and colons")
+	}
+	for name, pattern := range map[string]string{"quoted": `"data.txt"`, "all:": "all:data.txt"} {
+		t.Run(name, func(t *testing.T) {
+			files := map[string]string{
+				"go.mod":       "module example.com/m\n\ngo 1.22\n",
+				"p/a.go":       "package p\n\nimport _ \"embed\"\n\n//go:embed " + pattern + "\nvar Data string\n",
+				"p/data.txt":   "one\n",
+				"p/" + pattern: "one\n",
+			}
+			d := editScenario(t, testGoAdapters["go-ast"], files, func(r *gittest.Repo) { r.Git("mv", "p/a.go", "p/b.go") }).Diff.DeclarationPairs
+			if want := []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}; len(d.Pairs) != 0 || !reflect.DeepEqual(goRefusals(d), want) {
+				t.Fatalf("pairs = %v, refused %v", pairedPaths(d), goRefusals(d))
+			}
+		})
 	}
 }
