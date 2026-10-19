@@ -235,7 +235,7 @@ func TestSafeExistingOpenRejectsUnsupportedWithoutWrites(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			validationErr := validateExistingDatabaseLocked(t.Context(), db, path)
+			validationErr := validateExistingDatabaseLocked(t.Context(), db, path, nil)
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}

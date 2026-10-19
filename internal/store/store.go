@@ -551,10 +551,93 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		}
 	} else {
 		var err error
-		if db, err = openExistingValidated(path, opts); err != nil {
+		if db, err = openExistingValidated(path, opts, nil); err != nil {
 			return nil, err
 		}
 	}
+	return finishOpen(db, path, isNewDB, opts)
+}
+
+// RepoMismatchError reports an existing database that records another
+// repository than the one it was opened for.
+type RepoMismatchError struct {
+	Path      string
+	Recorded  string
+	Requested string
+}
+
+func (e *RepoMismatchError) Error() string {
+	return fmt.Sprintf("%s holds the graph of %s, not %s", e.Path, e.Recorded, e.Requested)
+}
+
+// OpenExistingWithOptions opens a graph database that must already exist and
+// hold the graph of repoRoot. Unlike OpenWithOptions it never creates the file
+// or its directory: the connection itself is mode=rw, so a database deleted
+// after the caller looked it up fails to open instead of being recreated.
+//
+// A missing, empty, or never-indexed database returns ErrRepoNotIndexed; one
+// recording another root returns *RepoMismatchError. Both are decided under the
+// same write lock as the format check, before any persistent pragma or
+// migration, so a refused database is left exactly as it was. An empty
+// repoRoot skips the identity check, for maintenance over every database.
+func OpenExistingWithOptions(path string, opts OpenOptions, repoRoot string) (*Store, error) {
+	var verify func(context.Context, *sql.Conn) error
+	if repoRoot != "" {
+		canonical, err := CanonicalRepoPath(repoRoot)
+		if err != nil {
+			return nil, err
+		}
+		verify = func(ctx context.Context, conn *sql.Conn) error {
+			return verifyRepoIdentity(ctx, conn, path, canonical)
+		}
+	}
+	notIndexed := func(err error) error {
+		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+			return fmt.Errorf("%w: no graph database at %s", ErrRepoNotIndexed, path)
+		}
+		return err
+	}
+	if st, err := os.Stat(path); err != nil {
+		return nil, notIndexed(err)
+	} else if st.Size() == 0 {
+		return nil, fmt.Errorf("%w: graph database at %s is empty", ErrRepoNotIndexed, path)
+	}
+	db, err := openExistingValidated(path, opts, verify)
+	if err != nil {
+		return nil, notIndexed(err)
+	}
+	return finishOpen(db, path, false, opts)
+}
+
+// verifyRepoIdentity runs inside the locked validation transaction. Only the
+// baseline repos table is read, so it holds for every accepted schema version.
+func verifyRepoIdentity(ctx context.Context, conn *sql.Conn, path, canonical string) error {
+	var tables int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='repos'`).Scan(&tables); err != nil {
+		return fmt.Errorf("read repository identity %s: %w", path, err)
+	}
+	if tables == 0 {
+		return fmt.Errorf("%w: graph database at %s holds no graph", ErrRepoNotIndexed, path)
+	}
+	var found int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(1) FROM repos WHERE canonical_path = ?`, canonical).Scan(&found); err != nil {
+		return fmt.Errorf("read repository identity %s: %w", path, err)
+	}
+	if found > 0 {
+		return nil
+	}
+	var recorded string
+	err := conn.QueryRowContext(ctx, `SELECT canonical_path FROM repos ORDER BY id ASC LIMIT 1`).Scan(&recorded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: graph database at %s holds no graph for %s", ErrRepoNotIndexed, path, canonical)
+	}
+	if err != nil {
+		return fmt.Errorf("read repository identity %s: %w", path, err)
+	}
+	return &RepoMismatchError{Path: path, Recorded: recorded, Requested: canonical}
+}
+
+func finishOpen(db *sql.DB, path string, isNewDB bool, opts OpenOptions) (*Store, error) {
 	if err := withSQLiteBusyRetry(6*time.Second, 50*time.Millisecond, func() error {
 		return applyPragmas(db, isNewDB, opts.PerformanceProfile)
 	}); err != nil {
@@ -584,7 +667,9 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 // skipped rather than fatal, because the locked check below reaches the same
 // verdict with SQLite's own write serialization instead of filesystem
 // quiescence.
-func openExistingValidated(path string, opts OpenOptions) (*sql.DB, error) {
+//
+// verify, when set, runs inside that same locked transaction.
+func openExistingValidated(path string, opts OpenOptions, verify func(context.Context, *sql.Conn) error) (*sql.DB, error) {
 	if err := validateExistingDatabase(path); err != nil && !errors.Is(err, errSQLiteValidationUnstable) {
 		return nil, err
 	}
@@ -596,7 +681,7 @@ func openExistingValidated(path string, opts OpenOptions) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateExistingDatabaseLocked(context.Background(), db, path); err != nil {
+	if err := validateExistingDatabaseLocked(context.Background(), db, path, verify); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -609,7 +694,7 @@ func openExistingValidated(path string, opts OpenOptions) (*sql.DB, error) {
 // means waiting for the winner. It writes nothing: BEGIN IMMEDIATE takes a
 // RESERVED lock without dirtying a page, and the transaction is always rolled
 // back.
-func validateExistingDatabaseLocked(ctx context.Context, db *sql.DB, path string) error {
+func validateExistingDatabaseLocked(ctx context.Context, db *sql.DB, path string, verify func(context.Context, *sql.Conn) error) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
@@ -622,6 +707,9 @@ func validateExistingDatabaseLocked(ctx context.Context, db *sql.DB, path string
 		return err
 	}
 	validationErr := validateDatabaseFormat(ctx, conn, path)
+	if validationErr == nil && verify != nil {
+		validationErr = verify(ctx, conn)
+	}
 	_, rollbackErr := conn.ExecContext(ctx, `ROLLBACK`)
 	if validationErr != nil {
 		return validationErr

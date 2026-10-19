@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -495,3 +497,94 @@ func TestIndexingExcludesCodeGraphState(t *testing.T) {
 }
 
 func jsonString(s string) string { b, _ := json.Marshal(s); return string(b) }
+
+func dbArtifacts(t *testing.T, dbPath string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal"} {
+		if b, err := os.ReadFile(p); err == nil {
+			out[p] = string(b)
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	return out
+}
+
+func storageConfigs(t *testing.T) map[string]config.Config {
+	return map[string]config.Config{
+		"repo-local": {DBDir: config.RepoDBDir},
+		"central":    {DBDir: filepath.Join(t.TempDir(), "central")},
+	}
+}
+
+func createRepoDatabase(t *testing.T, cfg config.Config, root string) string {
+	t.Helper()
+	app, _, _, err := openApp(context.Background(), cfg, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	canonical, _ := store.CanonicalRepoPath(root)
+	dbPath, err := existingRepoDBPath(cfg, root, canonical)
+	if err != nil || dbPath == "" {
+		t.Fatalf("existingRepoDBPath = %q, %v", dbPath, err)
+	}
+	return dbPath
+}
+
+// A database deleted after existingRepoDBPath found it is reported as not
+// indexed; neither it nor its directory is recreated.
+func TestOpenIndexedAppNeverRecreatesVanishedDatabase(t *testing.T) {
+	repoStateCLI(t)
+	for name, cfg := range storageConfigs(t) {
+		root := sourceRepo(t)
+		dbPath := createRepoDatabase(t, cfg, root)
+		dir := filepath.Dir(dbPath)
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := openIndexedApp(context.Background(), cfg, root, dbPath); !errors.Is(err, store.ErrRepoNotIndexed) {
+			t.Errorf("%s: err = %v, want not indexed", name, err)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("%s: database directory recreated: %v", name, err)
+		}
+	}
+}
+
+func TestOpenIndexedAppRejectsForeignDatabaseUnchanged(t *testing.T) {
+	repoStateCLI(t)
+	for name, cfg := range storageConfigs(t) {
+		owner := sourceRepo(t)
+		ownerDB := createRepoDatabase(t, cfg, owner)
+		other := sourceRepo(t)
+		canonical, _ := store.CanonicalRepoPath(other)
+		paths, err := repoDBPathsForRepo(cfg, other, canonical)
+		if err != nil {
+			t.Fatal(err)
+		}
+		foreign := paths[0]
+		data, err := os.ReadFile(ownerDB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, foreign, string(data))
+		want := dbArtifacts(t, foreign)
+
+		_, _, err = openIndexedApp(context.Background(), cfg, other, foreign)
+		if !errors.As(err, new(repoMismatchError)) {
+			t.Errorf("%s: err = %v, want repoMismatchError", name, err)
+		}
+		if got := dbArtifacts(t, foreign); !maps.Equal(want, got) {
+			t.Errorf("%s: foreign database changed", name)
+		}
+		if app, _, err := openIndexedApp(context.Background(), cfg, owner, ownerDB); err != nil {
+			t.Errorf("%s: owner open: %v", name, err)
+		} else {
+			app.Close()
+		}
+	}
+}

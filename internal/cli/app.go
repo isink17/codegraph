@@ -1440,7 +1440,7 @@ func runRecoverScans(ctx context.Context, cfg config.Config, stdout io.Writer, a
 	if dbPath == "" {
 		return fmt.Errorf("repository %s is not indexed", repoRoot)
 	}
-	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+	s, err := store.OpenExistingWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile}, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -1933,8 +1933,15 @@ func resolveServeRoot(cfg config.Config, explicit string) (root, dbPath, reason 
 // Unlike openApp it never inserts a repo row: a database that holds no graph
 // for root reports why instead of being rebound to it.
 func openIndexedApp(ctx context.Context, cfg config.Config, root, dbPath string) (*App, graph.Repo, error) {
-	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
-	if err != nil {
+	s, err := store.OpenExistingWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile}, root)
+	var mismatch *store.RepoMismatchError
+	switch {
+	case errors.As(err, &mismatch):
+		return nil, graph.Repo{}, repoMismatchMessage(dbPath, mismatch.Recorded, root)
+	case errors.Is(err, store.ErrRepoNotIndexed):
+		return nil, graph.Repo{}, notIndexedError(fmt.Sprintf("%s is not indexed: %s holds no graph for it (run %s index %s)",
+			root, dbPath, appname.BinaryName, root))
+	case err != nil:
 		return nil, graph.Repo{}, err
 	}
 	repo, found, err := s.FindRepo(ctx, root)
@@ -2382,7 +2389,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		res := dbResult{Path: dbPath, CanonicalRepo: canonical}
 		before := fileSize(dbPath)
 		res.SizeBefore = before
-		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+		s, err := store.OpenExistingWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile}, repoRoot)
 		if err != nil {
 			return err
 		}
@@ -2453,7 +2460,7 @@ func runClean(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 		dbPath := filepath.Join(cfg.DBDir, entry.Name())
 		sizeBefore := fileSize(dbPath) + fileSize(dbPath+"-wal") + fileSize(dbPath+"-shm")
 		res := dbResult{Path: dbPath, SizeBefore: sizeBefore}
-		s, err := store.OpenWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile})
+		s, err := store.OpenExistingWithOptions(dbPath, store.OpenOptions{PerformanceProfile: cfg.DBPerformanceProfile}, "")
 		if err != nil {
 			res.Action = "skipped"
 			res.Error = err.Error()
