@@ -1,0 +1,977 @@
+{
+  "schema": "codegraph.agent_transcript_ingest/v2",
+  "methodology": "agent-transcript-ab/v2",
+  "date_utc": "2026-01-02T00:00:00Z",
+  "manifest_sha256": "eddad98068765950a12b4496a60b1516d33f1431f4984174fbfdf6e4e0e5f3f6",
+  "manifest": {
+    "schema": "codegraph.agent_run_manifest/v1",
+    "client": {
+      "name": "claude-code",
+      "version": "9.9.9-test"
+    },
+    "model": "claude-test-model-1",
+    "effort": "high",
+    "codegraph": {
+      "sha": "1111111111111111111111111111111111111111",
+      "binary_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "corpus": {
+      "repo": "https://example.invalid/fixture-service",
+      "commit": "3333333333333333333333333333333333333333"
+    },
+    "task_set_sha256": "8df3f4cf82a6f4b92faaede616faaf8c6c043c026e0ef0d2126c91a5ef3b06ef",
+    "task_set": "tasks.json",
+    "arms": [
+      {
+        "name": "baseline",
+        "codegraph_enabled": false,
+        "tool_mode": "none",
+        "mcp_config_sha256": "d457de5ec7fd37b24eb1b7f0510a26e33d2dea0d4d3769252fd5946b86882426",
+        "settings_sha256": "f49cb2377f652d3e67dcfa98dbc821ba2e7e98a8d9bab30e82b1e3858fba4ee3",
+        "isolation": {
+          "strict_mcp_config": true,
+          "path_sanitized": true,
+          "cli_block_hook": true,
+          "user_instructions_isolated": false,
+          "user_skills_isolated": false
+        }
+      },
+      {
+        "name": "codegraph-mcp",
+        "codegraph_enabled": true,
+        "tool_mode": "full",
+        "mcp_config_sha256": "e67be67c375ddada2f645ea4edb9d79b3dcbbb07a0839b78fa2f906d1735aa77",
+        "settings_sha256": "b3bf4f9aa51ea06ecca6de10d2663546e906df98721fc5d4b554b814fdb7c0a5",
+        "isolation": {
+          "strict_mcp_config": true,
+          "path_sanitized": false,
+          "cli_block_hook": false,
+          "user_instructions_isolated": false,
+          "user_skills_isolated": false
+        }
+      }
+    ],
+    "sessions": [
+      {
+        "arm": "codegraph-mcp",
+        "task": "t1",
+        "rep": 1,
+        "transcript": "treatment.jsonl",
+        "transcript_sha256": "2eafc248ea30b413fdc14fb136b00cac62b9cee8c1603be125edd4dd2082e1d1"
+      },
+      {
+        "arm": "codegraph-mcp",
+        "task": "t1",
+        "rep": 2,
+        "transcript": "treatment-unfinished.jsonl",
+        "transcript_sha256": "1c4a2562f700033b2956ff039c09e5d6a7f171dac5ba0d0e9e2082eec2188fd2"
+      },
+      {
+        "arm": "baseline",
+        "task": "t1",
+        "rep": 2,
+        "transcript": "baseline-contaminated.jsonl",
+        "transcript_sha256": "2e78b08f8cb50781c408234a6f30eb3d5c501e0fae6e390a48fa1a4a1fca8fb3"
+      },
+      {
+        "arm": "baseline",
+        "task": "t1",
+        "rep": 1,
+        "transcript": "baseline-clean.jsonl",
+        "transcript_sha256": "42a0a1df243ad686dc2b7b746cb11ece119f3c08e85bd58ddfcfedf5692eb07f"
+      }
+    ],
+    "uncertainties": [
+      "Synthetic fixture: hand-written events, not a recorded session."
+    ]
+  },
+  "task_set_json": "{\n  \"schema\": \"codegraph.agent_task_set/v1\",\n  \"tasks\": [\n    {\n      \"id\": \"t1\",\n      \"prompt\": \"Explain how the fixture service starts.\",\n      \"required\": [\n        {\n          \"id\": \"entry\",\n          \"kind\": \"substring\",\n          \"pattern\": \"start\",\n          \"ignore_case\": true\n        },\n        {\n          \"id\": \"caller\",\n          \"kind\": \"regex\",\n          \"pattern\": \"called from\\\\s+main\"\n        },\n        {\n          \"id\": \"line\",\n          \"kind\": \"number\",\n          \"pattern\": \"main\\\\.go:(\\\\d+)\",\n          \"value\": 3\n        }\n      ],\n      \"forbidden\": [\n        {\n          \"id\": \"wrong-caller\",\n          \"kind\": \"substring\",\n          \"pattern\": \"init()\"\n        }\n      ]\n    },\n    {\n      \"id\": \"t2\",\n      \"prompt\": \"List the service's configuration flags.\",\n      \"required\": [\n        {\n          \"id\": \"port\",\n          \"kind\": \"substring\",\n          \"pattern\": \"--port\"\n        }\n      ],\n      \"forbidden\": []\n    }\n  ]\n}\n",
+  "sessions": [
+    {
+      "arm": "baseline",
+      "task": "t1",
+      "rep": 1,
+      "transcript_sha256": "42a0a1df243ad686dc2b7b746cb11ece119f3c08e85bd58ddfcfedf5692eb07f",
+      "models": [
+        "claude-test-model-1"
+      ],
+      "client_versions": [
+        "9.9.9-test"
+      ],
+      "requests": 5,
+      "input_tokens": 60,
+      "cache_read_input_tokens": 430,
+      "cache_creation_input_tokens": 260,
+      "output_tokens": 130,
+      "processed_tokens": 750,
+      "final_context_tokens": 100,
+      "peak_context_tokens": 202,
+      "compactions": 1,
+      "wall_clock_ms": 90000,
+      "tool_calls": {
+        "Bash": 3,
+        "Read": 1
+      },
+      "tool_calls_total": 4,
+      "sidechain": {
+        "models": [
+          "claude-test-model-1"
+        ],
+        "requests": 1,
+        "processed_tokens": 550,
+        "output_tokens": 30,
+        "tool_calls": 1
+      },
+      "contamination": {
+        "checked": true,
+        "contaminated": false,
+        "blocked_attempts": 1,
+        "calls": [
+          {
+            "tool_use_id": "tu4",
+            "tool": "Bash",
+            "kind": "cli",
+            "detail": "codegraph find_symbol Start",
+            "sidechain": false,
+            "outcome": "blocked"
+          }
+        ]
+      },
+      "residual": {
+        "method": "context-delta-char-share/v1",
+        "final_context_tokens": 100,
+        "resets": 1,
+        "categories": [
+          {
+            "category": "codegraph",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "file_read",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "search",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "shell",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "other_tool",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "assistant",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "user_text",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "initial_request",
+            "basis": "measured",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "unattributed",
+            "basis": "unavailable",
+            "tokens": 100,
+            "chars": 0,
+            "tool_results": 0
+          }
+        ]
+      },
+      "evaluation": {
+        "status": "scored",
+        "answer_sha256": "07df60f76e6d8914358b754224986cc0b5a15d6c140ad82a6f34a44495df16af",
+        "answer_chars": 26,
+        "required_total": 3,
+        "required_matched": 2,
+        "forbidden_hits": 0,
+        "required": [
+          {
+            "id": "entry",
+            "matched": true
+          },
+          {
+            "id": "caller",
+            "matched": true
+          },
+          {
+            "id": "line",
+            "matched": false
+          }
+        ],
+        "forbidden": [
+          {
+            "id": "wrong-caller",
+            "matched": false
+          }
+        ]
+      }
+    },
+    {
+      "arm": "baseline",
+      "task": "t1",
+      "rep": 2,
+      "transcript_sha256": "2e78b08f8cb50781c408234a6f30eb3d5c501e0fae6e390a48fa1a4a1fca8fb3",
+      "models": [
+        "claude-test-model-1"
+      ],
+      "client_versions": [
+        "9.9.9-test"
+      ],
+      "requests": 3,
+      "input_tokens": 17,
+      "cache_read_input_tokens": 260,
+      "cache_creation_input_tokens": 150,
+      "output_tokens": 60,
+      "processed_tokens": 427,
+      "final_context_tokens": 162,
+      "peak_context_tokens": 162,
+      "compactions": 0,
+      "wall_clock_ms": 30000,
+      "tool_calls": {
+        "Bash": 1,
+        "mcp__codegraph__find_symbol": 1
+      },
+      "tool_calls_total": 2,
+      "sidechain": {
+        "models": [],
+        "requests": 0,
+        "processed_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0
+      },
+      "contamination": {
+        "checked": true,
+        "contaminated": true,
+        "blocked_attempts": 0,
+        "calls": [
+          {
+            "tool_use_id": "tu1",
+            "tool": "mcp__codegraph__find_symbol",
+            "kind": "mcp",
+            "sidechain": false,
+            "outcome": "succeeded"
+          },
+          {
+            "tool_use_id": "tu2",
+            "tool": "Bash",
+            "kind": "cli",
+            "detail": "FOO=1 /opt/bin/codegraph stats",
+            "sidechain": false,
+            "outcome": "succeeded"
+          }
+        ]
+      },
+      "residual": {
+        "method": "context-delta-char-share/v1",
+        "final_context_tokens": 162,
+        "resets": 0,
+        "categories": [
+          {
+            "category": "codegraph",
+            "basis": "estimated",
+            "tokens": 12,
+            "chars": 23,
+            "tool_results": 2
+          },
+          {
+            "category": "file_read",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "search",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "shell",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "other_tool",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "assistant",
+            "basis": "estimated",
+            "tokens": 40,
+            "chars": 94,
+            "tool_results": 0
+          },
+          {
+            "category": "user_text",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "initial_request",
+            "basis": "measured",
+            "tokens": 110,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "unattributed",
+            "basis": "unavailable",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          }
+        ]
+      },
+      "evaluation": {
+        "status": "scored",
+        "answer_sha256": "07df60f76e6d8914358b754224986cc0b5a15d6c140ad82a6f34a44495df16af",
+        "answer_chars": 26,
+        "required_total": 3,
+        "required_matched": 2,
+        "forbidden_hits": 0,
+        "required": [
+          {
+            "id": "entry",
+            "matched": true
+          },
+          {
+            "id": "caller",
+            "matched": true
+          },
+          {
+            "id": "line",
+            "matched": false
+          }
+        ],
+        "forbidden": [
+          {
+            "id": "wrong-caller",
+            "matched": false
+          }
+        ]
+      }
+    },
+    {
+      "arm": "codegraph-mcp",
+      "task": "t1",
+      "rep": 1,
+      "transcript_sha256": "2eafc248ea30b413fdc14fb136b00cac62b9cee8c1603be125edd4dd2082e1d1",
+      "models": [
+        "claude-test-model-1"
+      ],
+      "client_versions": [
+        "9.9.9-test"
+      ],
+      "requests": 2,
+      "input_tokens": 15,
+      "cache_read_input_tokens": 300,
+      "cache_creation_input_tokens": 380,
+      "output_tokens": 70,
+      "processed_tokens": 695,
+      "final_context_tokens": 385,
+      "peak_context_tokens": 385,
+      "compactions": 0,
+      "wall_clock_ms": 20000,
+      "tool_calls": {
+        "mcp__codegraph__context_for_task": 1
+      },
+      "tool_calls_total": 1,
+      "sidechain": {
+        "models": [],
+        "requests": 0,
+        "processed_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0
+      },
+      "contamination": {
+        "checked": false,
+        "contaminated": false,
+        "blocked_attempts": 0,
+        "calls": []
+      },
+      "residual": {
+        "method": "context-delta-char-share/v1",
+        "final_context_tokens": 385,
+        "resets": 0,
+        "categories": [
+          {
+            "category": "codegraph",
+            "basis": "estimated",
+            "tokens": 16,
+            "chars": 15,
+            "tool_results": 1
+          },
+          {
+            "category": "file_read",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "search",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "shell",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "other_tool",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "assistant",
+            "basis": "estimated",
+            "tokens": 59,
+            "chars": 57,
+            "tool_results": 0
+          },
+          {
+            "category": "user_text",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "initial_request",
+            "basis": "measured",
+            "tokens": 310,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "unattributed",
+            "basis": "unavailable",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          }
+        ]
+      },
+      "evaluation": {
+        "status": "scored",
+        "answer_sha256": "28890f8a1758abb6ab26f599ac9a5d094a95b7beecc421677dc8ad99f39f1a0f",
+        "answer_chars": 38,
+        "required_total": 3,
+        "required_matched": 3,
+        "forbidden_hits": 0,
+        "required": [
+          {
+            "id": "entry",
+            "matched": true
+          },
+          {
+            "id": "caller",
+            "matched": true
+          },
+          {
+            "id": "line",
+            "matched": true
+          }
+        ],
+        "forbidden": [
+          {
+            "id": "wrong-caller",
+            "matched": false
+          }
+        ]
+      }
+    },
+    {
+      "arm": "codegraph-mcp",
+      "task": "t1",
+      "rep": 2,
+      "transcript_sha256": "1c4a2562f700033b2956ff039c09e5d6a7f171dac5ba0d0e9e2082eec2188fd2",
+      "models": [
+        "claude-test-model-1"
+      ],
+      "client_versions": [
+        "9.9.9-test"
+      ],
+      "requests": 2,
+      "input_tokens": 15,
+      "cache_read_input_tokens": 300,
+      "cache_creation_input_tokens": 410,
+      "output_tokens": 50,
+      "processed_tokens": 725,
+      "final_context_tokens": 425,
+      "peak_context_tokens": 425,
+      "compactions": 0,
+      "wall_clock_ms": 6000,
+      "tool_calls": {
+        "Bash": 1,
+        "Read": 1,
+        "mcp__codegraph__find_symbol": 1
+      },
+      "tool_calls_total": 3,
+      "sidechain": {
+        "models": [],
+        "requests": 0,
+        "processed_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0
+      },
+      "contamination": {
+        "checked": false,
+        "contaminated": false,
+        "blocked_attempts": 0,
+        "calls": []
+      },
+      "residual": {
+        "method": "context-delta-char-share/v1",
+        "final_context_tokens": 425,
+        "resets": 0,
+        "categories": [
+          {
+            "category": "codegraph",
+            "basis": "estimated",
+            "tokens": 24,
+            "chars": 28,
+            "tool_results": 1
+          },
+          {
+            "category": "file_read",
+            "basis": "estimated",
+            "tokens": 31,
+            "chars": 37,
+            "tool_results": 1
+          },
+          {
+            "category": "search",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "shell",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "other_tool",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "assistant",
+            "basis": "estimated",
+            "tokens": 70,
+            "chars": 83,
+            "tool_results": 0
+          },
+          {
+            "category": "user_text",
+            "basis": "estimated",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "initial_request",
+            "basis": "measured",
+            "tokens": 300,
+            "chars": 0,
+            "tool_results": 0
+          },
+          {
+            "category": "unattributed",
+            "basis": "unavailable",
+            "tokens": 0,
+            "chars": 0,
+            "tool_results": 0
+          }
+        ]
+      },
+      "evaluation": {
+        "status": "unscored",
+        "reason": "ended_with_tool_use",
+        "answer_chars": 0,
+        "required_total": 3,
+        "required_matched": 0,
+        "forbidden_hits": 0,
+        "required": [],
+        "forbidden": []
+      }
+    }
+  ],
+  "arms": [
+    {
+      "arm": "baseline",
+      "sessions": 2,
+      "contaminated": 1,
+      "blocked_attempts_only": 1,
+      "included": 1,
+      "includes_contaminated": false,
+      "stats": [
+        {
+          "name": "processed_tokens",
+          "unit": "provider_tokens",
+          "n": 1,
+          "median": 750,
+          "min": 750,
+          "max": 750
+        },
+        {
+          "name": "final_context_tokens",
+          "unit": "provider_tokens",
+          "n": 1,
+          "median": 100,
+          "min": 100,
+          "max": 100
+        },
+        {
+          "name": "peak_context_tokens",
+          "unit": "provider_tokens",
+          "n": 1,
+          "median": 202,
+          "min": 202,
+          "max": 202
+        },
+        {
+          "name": "output_tokens",
+          "unit": "provider_tokens",
+          "n": 1,
+          "median": 130,
+          "min": 130,
+          "max": 130
+        },
+        {
+          "name": "requests",
+          "unit": "count",
+          "n": 1,
+          "median": 5,
+          "min": 5,
+          "max": 5
+        },
+        {
+          "name": "tool_calls_total",
+          "unit": "count",
+          "n": 1,
+          "median": 4,
+          "min": 4,
+          "max": 4
+        },
+        {
+          "name": "compactions",
+          "unit": "count",
+          "n": 1,
+          "median": 1,
+          "min": 1,
+          "max": 1
+        },
+        {
+          "name": "wall_clock_ms",
+          "unit": "milliseconds",
+          "n": 1,
+          "median": 90000,
+          "min": 90000,
+          "max": 90000
+        },
+        {
+          "name": "residual_codegraph_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_file_read_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_search_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_shell_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_other_tool_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_assistant_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_user_text_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_initial_request_tokens",
+          "unit": "provider_tokens",
+          "n": 1,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_unattributed_tokens",
+          "unit": "unattributed_provider_tokens",
+          "n": 1,
+          "median": 100,
+          "min": 100,
+          "max": 100
+        }
+      ],
+      "correctness": {
+        "scored": 1,
+        "unscored": 0,
+        "required_matched": 2,
+        "required_total": 3,
+        "forbidden_hits": 0,
+        "all_required_no_forbidden": 0
+      }
+    },
+    {
+      "arm": "codegraph-mcp",
+      "sessions": 2,
+      "contaminated": 0,
+      "blocked_attempts_only": 0,
+      "included": 2,
+      "includes_contaminated": false,
+      "stats": [
+        {
+          "name": "processed_tokens",
+          "unit": "provider_tokens",
+          "n": 2,
+          "median": 695,
+          "min": 695,
+          "max": 725
+        },
+        {
+          "name": "final_context_tokens",
+          "unit": "provider_tokens",
+          "n": 2,
+          "median": 385,
+          "min": 385,
+          "max": 425
+        },
+        {
+          "name": "peak_context_tokens",
+          "unit": "provider_tokens",
+          "n": 2,
+          "median": 385,
+          "min": 385,
+          "max": 425
+        },
+        {
+          "name": "output_tokens",
+          "unit": "provider_tokens",
+          "n": 2,
+          "median": 50,
+          "min": 50,
+          "max": 70
+        },
+        {
+          "name": "requests",
+          "unit": "count",
+          "n": 2,
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        {
+          "name": "tool_calls_total",
+          "unit": "count",
+          "n": 2,
+          "median": 1,
+          "min": 1,
+          "max": 3
+        },
+        {
+          "name": "compactions",
+          "unit": "count",
+          "n": 2,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "wall_clock_ms",
+          "unit": "milliseconds",
+          "n": 2,
+          "median": 6000,
+          "min": 6000,
+          "max": 20000
+        },
+        {
+          "name": "residual_codegraph_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 2,
+          "median": 16,
+          "min": 16,
+          "max": 24
+        },
+        {
+          "name": "residual_file_read_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 2,
+          "median": 0,
+          "min": 0,
+          "max": 31
+        },
+        {
+          "name": "residual_search_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 2,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_shell_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 2,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_other_tool_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 2,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_assistant_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 2,
+          "median": 59,
+          "min": 59,
+          "max": 70
+        },
+        {
+          "name": "residual_user_text_tokens",
+          "unit": "estimated_provider_tokens",
+          "n": 2,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        {
+          "name": "residual_initial_request_tokens",
+          "unit": "provider_tokens",
+          "n": 2,
+          "median": 300,
+          "min": 300,
+          "max": 310
+        },
+        {
+          "name": "residual_unattributed_tokens",
+          "unit": "unattributed_provider_tokens",
+          "n": 2,
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      ],
+      "correctness": {
+        "scored": 1,
+        "unscored": 1,
+        "required_matched": 3,
+        "required_total": 3,
+        "forbidden_hits": 0,
+        "all_required_no_forbidden": 1
+      }
+    }
+  ],
+  "limitations": [
+    "Answer correctness is rubric matching of the final main-session answer against the task set's required and forbidden substrings, regexes and numbers; it is not a semantic judgment, and token or time differences are not improvements on their own.",
+    "Residual attribution: the first request's context and every total are measured provider tokens; per-category splits of later context growth are estimated by character share of the visible content written between requests (hidden or redacted content, attachments and tokenizer density differences move tokens between categories); context after a compaction or a context drop is unattributed.",
+    "Subagent transcripts stored in separate files are not ingested; sidechain events inside a transcript are reported separately and excluded from main-session totals; in arms without CodeGraph every Task/Agent call is unverified and contaminates the session.",
+    "output_tokens is the largest streamed snapshot per message.id and may undercount.",
+    "Contamination detection is pattern-based (MCP server name, Skill input, shell command word); aliases, functions, eval, scripts and variables used as commands are not detected.",
+    "Config hashes and isolation flags are recorded by the operator in the manifest and are not verified by ingest.",
+    "Records are measurements of the listed sessions only, not published claims.",
+    "arm baseline: user-level instructions (CLAUDE.md) not isolated.",
+    "arm baseline: user-level skills not isolated.",
+    "arm codegraph-mcp: user-level instructions (CLAUDE.md) not isolated.",
+    "arm codegraph-mcp: user-level skills not isolated.",
+    "task set: task t2 has no session.",
+    "manifest: Synthetic fixture: hand-written events, not a recorded session."
+  ]
+}

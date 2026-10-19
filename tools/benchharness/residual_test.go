@@ -33,12 +33,12 @@ func TestResidualAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := tr.Residual()
+	r := tr.Residual(nil)
 	got := residualTokens(r)
 	if r.FinalContext != 1201 || got[catInitial] != 100 || got[catFileRead] < 600 || got[catCodegraph] < 400 || got[catSearch] != 0 || got[catOtherTool] != 0 || r.Resets != 0 {
 		t.Fatalf("residual: %+v", r)
 	}
-	if err := validateResidual(&r, 1201); err != nil {
+	if err := validateResidual(&r, 1201, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range r.Categories {
@@ -63,7 +63,7 @@ func TestResidualResetsOnCompactionAndDrop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := tr.Residual()
+	r := tr.Residual(nil)
 	if got := residualTokens(r); r.Resets != 2 || r.FinalContext != 40 || got[catUnattributed] != 40 || got[catSearch] != 0 || got[catInitial] != 0 {
 		t.Fatalf("after compaction and drop: %+v", r)
 	}
@@ -74,7 +74,7 @@ func TestResidualResetsOnCompactionAndDrop(t *testing.T) {
 		asstLine("b", false, 10, 0, 40, 1, `{"type":"text","text":""}`),
 		asstLine("c", false, 10, 0, 70, 1, `{"type":"text","text":""}`),
 	)
-	r = beforeDrop.Residual()
+	r = beforeDrop.Residual(nil)
 	if got := residualTokens(r); r.Resets != 1 || got[catUnattributed] != 80 || got[catFileRead] != 0 {
 		t.Fatalf("empty gap must stay unattributed: %+v", r)
 	}
@@ -117,7 +117,7 @@ func TestResidualCountsRepeatedBlocksOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range tr.Residual().Categories {
+	for _, c := range tr.Residual(nil).Categories {
 		if c.Category == catAssistant && (c.Chars != 12 || c.Tokens != 12) {
 			t.Fatalf("assistant counted twice: %+v", c)
 		}

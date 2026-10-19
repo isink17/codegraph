@@ -29,7 +29,10 @@ type rawEvent struct {
 	IsMeta      bool   `json:"isMeta"`
 	Timestamp   string `json:"timestamp"`
 	Version     string `json:"version"`
-	Message     *struct {
+	AgentID     string `json:"agentId"`
+	// ToolUseResult on a Task/Agent tool_result names the spawned agent.
+	ToolUseResult json.RawMessage `json:"toolUseResult"`
+	Message       *struct {
 		ID      string          `json:"id"`
 		Model   string          `json:"model"`
 		Content json.RawMessage `json:"content"`
@@ -54,6 +57,7 @@ type toolUse struct {
 	Name      string
 	Input     json.RawMessage
 	Sidechain bool
+	req       *request
 }
 
 type toolResult struct {
@@ -63,7 +67,12 @@ type toolResult struct {
 
 type request struct {
 	usage
+	id        string
+	model     string
 	sidechain bool
+	// dup marks a request owned by another transcript file (a fork's copied
+	// history or a sidechain also recorded in its subagent file).
+	dup bool
 	// gap is the main-session content written between the previous main
 	// request and this one; reset marks a compaction boundary inside it.
 	gap     []segment
@@ -77,11 +86,15 @@ type request struct {
 type Transcript struct {
 	requests    []*request
 	mainModels  map[string]bool
-	sideModels  map[string]bool
 	versions    map[string]bool
 	toolUses    []toolUse
 	results     map[string]toolResult
 	compactions int
+	// links maps a Task/Agent tool_use id to the agent id its result names.
+	links    map[string]string
+	agentIDs map[string]bool
+	// own parses a subagent file: its sidechain events are its own thread.
+	own bool
 
 	pending      []segment
 	pendingReset bool
@@ -97,8 +110,13 @@ type Transcript struct {
 // and usage, so requests are deduplicated by message.id. Input and cache
 // fields must agree across those events; output_tokens is a streamed snapshot
 // and the largest value seen for an id is kept.
-func ParseTranscript(r io.Reader) (*Transcript, error) {
-	t := &Transcript{mainModels: map[string]bool{}, sideModels: map[string]bool{}, versions: map[string]bool{}, results: map[string]toolResult{}, toolCats: map[string]string{}}
+func ParseTranscript(r io.Reader) (*Transcript, error) { return parseTranscript(r, false) }
+
+// parseTranscript with own set reads a subagent file, whose events are all
+// marked isSidechain; it may hold no request at all.
+func parseTranscript(r io.Reader, own bool) (*Transcript, error) {
+	t := &Transcript{mainModels: map[string]bool{}, versions: map[string]bool{}, results: map[string]toolResult{}, toolCats: map[string]string{},
+		links: map[string]string{}, agentIDs: map[string]bool{}, own: own}
 	byID := map[string]*request{}
 	seenTool := map[string]bool{}
 	br := bufio.NewReader(r)
@@ -116,7 +134,7 @@ func ParseTranscript(r io.Reader) (*Transcript, error) {
 			return nil, readErr
 		}
 	}
-	if len(t.mainModels) == 0 {
+	if len(t.mainModels) == 0 && !own {
 		return nil, errors.New("transcript has no main-session model request")
 	}
 	return t, nil
@@ -127,8 +145,14 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 	if err := json.Unmarshal(b, &ev); err != nil {
 		return err
 	}
+	if t.own {
+		ev.IsSidechain = false
+	}
 	if ev.Version != "" {
 		t.versions[ev.Version] = true
+	}
+	if ev.AgentID != "" {
+		t.agentIDs[ev.AgentID] = true
 	}
 	if !ev.IsSidechain && ev.Timestamp != "" {
 		ts, err := time.Parse(time.RFC3339Nano, ev.Timestamp)
@@ -172,7 +196,7 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 			}
 			req.Output = max(req.Output, m.Usage.Output)
 		} else {
-			req = &request{usage: *m.Usage, sidechain: ev.IsSidechain, blocks: map[string]bool{}}
+			req = &request{usage: *m.Usage, id: m.ID, model: m.Model, sidechain: ev.IsSidechain, blocks: map[string]bool{}}
 			byID[m.ID] = req
 			t.requests = append(t.requests, req)
 			if !req.sidechain {
@@ -181,9 +205,7 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 				t.lastMain, t.userAfter = req, false
 			}
 		}
-		if ev.IsSidechain {
-			t.sideModels[m.Model] = true
-		} else {
+		if !ev.IsSidechain {
 			t.mainModels[m.Model] = true
 		}
 		for _, bl := range blocks(m.Content) {
@@ -198,7 +220,7 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 			switch {
 			case bl.Type == "tool_use" && !seenTool[bl.ID]:
 				seenTool[bl.ID] = true
-				u := toolUse{ID: bl.ID, Name: bl.Name, Input: bl.Input, Sidechain: ev.IsSidechain}
+				u := toolUse{ID: bl.ID, Name: bl.Name, Input: bl.Input, Sidechain: ev.IsSidechain, req: req}
 				t.toolUses = append(t.toolUses, u)
 				// An empty category marks a sidechain tool whose result is not
 				// main-session context.
@@ -229,10 +251,18 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 			}
 		}
 		nonText := false
-		for _, bl := range blocks(ev.Message.Content) {
+		var spawned struct {
+			AgentID string `json:"agentId"`
+		}
+		_ = json.Unmarshal(ev.ToolUseResult, &spawned)
+		bls := blocks(ev.Message.Content)
+		for _, bl := range bls {
 			switch {
 			case bl.Type == "tool_result":
 				nonText = true
+				if spawned.AgentID != "" && len(bls) == 1 {
+					t.links[bl.ToolUseID] = spawned.AgentID
+				}
 				res := toolResult{IsError: bl.IsError, Text: contentText(bl.Content)}
 				t.results[bl.ToolUseID] = res
 				cat, ok := t.toolCats[bl.ToolUseID]
@@ -345,10 +375,14 @@ func (t *Transcript) Metrics() SessionMetrics {
 		ClientVersions: sortedKeys(t.versions),
 		ToolCalls:      map[string]int{},
 		Compactions:    t.compactions,
-		Sidechain:      SidechainStats{Models: sortedKeys(t.sideModels)},
 	}
+	sideModels := map[string]bool{}
 	for _, r := range t.requests {
+		if r.dup {
+			continue
+		}
 		if r.sidechain {
+			sideModels[r.model] = true
 			s.Sidechain.Requests++
 			s.Sidechain.ProcessedTokens += r.context()
 			s.Sidechain.OutputTokens += r.Output
@@ -364,6 +398,9 @@ func (t *Transcript) Metrics() SessionMetrics {
 		s.PeakContext = max(s.PeakContext, r.context())
 	}
 	for _, u := range t.toolUses {
+		if u.req.dup {
+			continue
+		}
 		if u.Sidechain {
 			s.Sidechain.ToolCalls++
 			continue
@@ -371,6 +408,7 @@ func (t *Transcript) Metrics() SessionMetrics {
 		s.ToolCalls[u.Name]++
 		s.ToolCallsTotal++
 	}
+	s.Sidechain.Models = sortedKeys(sideModels)
 	if t.timestamps >= 2 {
 		ms := int(t.last.Sub(t.first).Milliseconds())
 		s.WallClockMS = &ms
@@ -424,6 +462,9 @@ func blockedResult(text string) bool {
 
 // ContaminationCall is one CodeGraph use attempt in an arm that must not use it.
 type ContaminationCall struct {
+	// Agent is "main", "sidechain" (in-file subagent events no subagent file
+	// owns) or a subagent id; absent in records before v3.
+	Agent     string `json:"agent,omitempty"`
 	ToolUseID string `json:"tool_use_id"`
 	Tool      string `json:"tool"`
 	Kind      string `json:"kind"`
@@ -463,25 +504,36 @@ func classifyUse(u toolUse) (kind, detail string) {
 			return "cli", in.Command
 		}
 	case u.Name == "Task" || u.Name == "Agent":
-		// Subagent tool calls live in separate transcript files that are not
-		// ingested, so their CodeGraph use cannot be ruled out.
+		// Unverified unless the spawned agent's own transcript file is linked
+		// and checked (see contaminationCalls).
 		return "subagent", ""
 	}
 	return "", ""
 }
 
 func (t *Transcript) Contamination() Contamination {
-	c := Contamination{Checked: true, Calls: []ContaminationCall{}}
-	for _, u := range t.toolUses {
-		kind, detail := classifyUse(u)
-		if kind == "" {
-			continue
-		}
-		call := ContaminationCall{ToolUseID: u.ID, Tool: u.Name, Kind: kind, Detail: detail, Sidechain: u.Sidechain, Outcome: callOutcome(kind, t.results, u.ID)}
-		c.Calls = append(c.Calls, call)
-	}
+	c := Contamination{Checked: true, Calls: t.contaminationCalls("main", nil)}
 	c.Contaminated, c.BlockedAttempts = contaminationTotals(c.Calls)
 	return c
+}
+
+// contaminationCalls lists this file's CodeGraph use attempts. A Task/Agent
+// call in checked is linked to a subagent file whose calls are listed under
+// that agent instead, so it is not itself an unverified attempt.
+func (t *Transcript) contaminationCalls(agent string, checked map[string]bool) []ContaminationCall {
+	calls := []ContaminationCall{}
+	for _, u := range t.toolUses {
+		kind, detail := classifyUse(u)
+		if kind == "" || u.req.dup || (kind == "subagent" && checked[u.ID]) {
+			continue
+		}
+		a := agent
+		if u.Sidechain {
+			a = "sidechain"
+		}
+		calls = append(calls, ContaminationCall{Agent: a, ToolUseID: u.ID, Tool: u.Name, Kind: kind, Detail: detail, Sidechain: u.Sidechain, Outcome: callOutcome(kind, t.results, u.ID)})
+	}
+	return calls
 }
 
 func callOutcome(kind string, results map[string]toolResult, id string) string {

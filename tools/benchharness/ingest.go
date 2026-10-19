@@ -21,9 +21,12 @@ import (
 
 const (
 	ManifestSchema    = "codegraph.agent_run_manifest/v1"
-	IngestSchema      = "codegraph.agent_transcript_ingest/v2"
-	IngestMethodology = "agent-transcript-ab/v2"
-	// v1 records (no residual attribution or evaluation) still validate.
+	IngestSchema      = "codegraph.agent_transcript_ingest/v3"
+	IngestMethodology = "agent-transcript-ab/v3"
+	// v2 records (no subagent files or calibration) and v1 records (no
+	// residual attribution or evaluation) still validate.
+	IngestSchemaV2      = "codegraph.agent_transcript_ingest/v2"
+	IngestMethodologyV2 = "agent-transcript-ab/v2"
 	IngestSchemaV1      = "codegraph.agent_transcript_ingest/v1"
 	IngestMethodologyV1 = "agent-transcript-ab/v1"
 )
@@ -83,6 +86,9 @@ type SessionRef struct {
 	Rep              int    `json:"rep"`
 	Transcript       string `json:"transcript"`
 	TranscriptSHA256 string `json:"transcript_sha256"`
+	// Subagents, when present (even empty), must list exactly the
+	// agent-*.jsonl files next to the transcript.
+	Subagents *[]SubagentRef `json:"subagents,omitempty"`
 }
 
 var (
@@ -134,6 +140,15 @@ func validateManifest(m *Manifest) error {
 		if s.Transcript == "" || filepath.IsAbs(s.Transcript) || !sha64RE.MatchString(s.TranscriptSHA256) {
 			bad("session %s: transcript must be a relative path with a 64-hex sha256", k)
 		}
+		if s.Subagents != nil {
+			paths := map[string]bool{}
+			for _, a := range *s.Subagents {
+				if paths[a.Transcript] || !strings.HasPrefix(a.Transcript, subagentDir(s.Transcript)+"/") || !sha64RE.MatchString(a.TranscriptSHA256) {
+					bad("session %s: subagent %q must be a unique path under %s/ with a 64-hex sha256", k, a.Transcript, subagentDir(s.Transcript))
+				}
+				paths[a.Transcript] = true
+			}
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -147,10 +162,14 @@ type IngestRecord struct {
 	ManifestSHA256 string   `json:"manifest_sha256"`
 	Manifest       Manifest `json:"manifest"`
 	// TaskSetJSON is the task-set file exactly as ingest read and hashed it.
-	TaskSetJSON string          `json:"task_set_json,omitempty"`
-	Sessions    []SessionResult `json:"sessions"`
-	Arms        []ArmSummary    `json:"arms"`
-	Limitations []string        `json:"limitations"`
+	TaskSetJSON string `json:"task_set_json,omitempty"`
+	// Calibration is the residual calibration artifact ingest read, with the
+	// sha256 of its bytes.
+	CalibrationSHA256 string          `json:"calibration_sha256,omitempty"`
+	Calibration       *Calibration    `json:"calibration,omitempty"`
+	Sessions          []SessionResult `json:"sessions"`
+	Arms              []ArmSummary    `json:"arms"`
+	Limitations       []string        `json:"limitations"`
 }
 
 type SessionResult struct {
@@ -159,9 +178,11 @@ type SessionResult struct {
 	Rep              int    `json:"rep"`
 	TranscriptSHA256 string `json:"transcript_sha256"`
 	SessionMetrics
-	Contamination Contamination `json:"contamination"`
-	Residual      *Residual     `json:"residual,omitempty"`
-	Evaluation    *Evaluation   `json:"evaluation,omitempty"`
+	Contamination Contamination    `json:"contamination"`
+	Residual      *Residual        `json:"residual,omitempty"`
+	Evaluation    *Evaluation      `json:"evaluation,omitempty"`
+	Subagents     []SubagentResult `json:"subagents,omitempty"`
+	Workload      *Workload        `json:"workload,omitempty"`
 }
 
 type ArmSummary struct {
@@ -190,10 +211,11 @@ const (
 	limitNoEvaluation = "Answer quality is not measured; token or time differences are not improvements on their own."
 	limitEvaluation   = "Answer correctness is rubric matching of the final main-session answer against the task set's required and forbidden substrings, regexes and numbers; it is not a semantic judgment, and token or time differences are not improvements on their own."
 	limitResidual     = "Residual attribution: the first request's context and every total are measured provider tokens; per-category splits of later context growth are estimated by character share of the visible content written between requests (hidden or redacted content, attachments and tokenizer density differences move tokens between categories); context after a compaction or a context drop is unattributed."
+	limitCalibrated   = "Residual attribution: the first request's context and every total are measured provider tokens; per-category splits of later context growth are estimated by pricing the visible content written between requests at chars-per-token ratios fitted on recorded provider usage (see calibration), with growth beyond the priced content unattributed; the fit spreads over gaps that mix content types and hidden content, so the bounds are the interquartile range of observed ratios, not a confidence interval; context after a compaction or a context drop is unattributed."
 )
 
 var baseLimitations = []string{
-	"Subagent transcripts stored in separate files are not ingested; sidechain events inside a transcript are reported separately and excluded from main-session totals; in arms without CodeGraph every Task/Agent call is unverified and contaminates the session.",
+	"Subagent transcripts are read from the session's subagents/ directory (agent-*.jsonl) and linked to the Task/Agent call whose result names their agent id; agents spawned without such a result (teammates, resumed agents) are listed as unlinked, and in arms without CodeGraph a Task/Agent call without a linked subagent file is unverified and contaminates the session. Main-session totals and context exclude subagents; processed tokens are also reported per subagent and as a session total, context sizes per agent only.",
 	"output_tokens is the largest streamed snapshot per message.id and may undercount.",
 	"Contamination detection is pattern-based (MCP server name, Skill input, shell command word); aliases, functions, eval, scripts and variables used as commands are not detected.",
 	"Config hashes and isolation flags are recorded by the operator in the manifest and are not verified by ingest.",
@@ -201,7 +223,8 @@ var baseLimitations = []string{
 }
 
 // Ingest parses every transcript named by the manifest at manifestPath.
-func Ingest(manifestPath, date string) (*IngestRecord, error) {
+// calibrationPath may be empty.
+func Ingest(manifestPath, date, calibrationPath string) (*IngestRecord, error) {
 	if _, err := time.Parse(time.RFC3339, date); err != nil {
 		return nil, fmt.Errorf("--date: %w", err)
 	}
@@ -227,9 +250,14 @@ func Ingest(manifestPath, date string) (*IngestRecord, error) {
 		return nil, err
 	}
 	rec.TaskSetJSON = string(raw)
+	if calibrationPath != "" {
+		if rec.Calibration, rec.CalibrationSHA256, err = loadCalibration(calibrationPath); err != nil {
+			return nil, err
+		}
+	}
 	var errs []error
 	for _, ref := range m.Sessions {
-		s, err := ingestSession(dir, ref, &m, arms[ref.Arm], tasks)
+		s, err := ingestSession(dir, ref, &m, arms[ref.Arm], tasks, rec.Calibration)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("session %s/%s/%d: %w", ref.Arm, ref.Task, ref.Rep, err))
 			continue
@@ -250,7 +278,7 @@ func Ingest(manifestPath, date string) (*IngestRecord, error) {
 		return a.Rep < b.Rep
 	})
 	rec.Arms = armSummaries(rec.Sessions, false)
-	rec.Limitations = limitations(&m, tasks)
+	rec.Limitations = limitations(&m, tasks, rec.Calibration)
 	return rec, nil
 }
 
@@ -312,7 +340,7 @@ func findTask(ts *TaskSet, id string) *Task {
 	return nil
 }
 
-func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet) (SessionResult, error) {
+func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet, cal *Calibration) (SessionResult, error) {
 	b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(ref.Transcript)))
 	if err != nil {
 		return SessionResult{}, err
@@ -321,6 +349,10 @@ func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet
 		return SessionResult{}, fmt.Errorf("transcript sha256 %s, manifest says %s", got, ref.TranscriptSHA256)
 	}
 	t, err := ParseTranscript(bytes.NewReader(b))
+	if err != nil {
+		return SessionResult{}, err
+	}
+	subs, checked, unlinked, err := sessionAgents(dir, ref, m, t)
 	if err != nil {
 		return SessionResult{}, err
 	}
@@ -333,10 +365,18 @@ func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet
 	}
 	c := Contamination{Calls: []ContaminationCall{}}
 	if !arm.CodeGraphEnabled {
-		c = t.Contamination()
+		c = Contamination{Checked: true, Calls: t.contaminationCalls("main", checked)}
+		for _, s := range subs {
+			c.Calls = append(c.Calls, s.t.contaminationCalls(s.res.AgentID, checked)...)
+		}
+		c.Contaminated, c.BlockedAttempts = contaminationTotals(c.Calls)
 	}
-	res := t.Residual()
+	res := t.Residual(cal)
 	out := SessionResult{Arm: ref.Arm, Task: ref.Task, Rep: ref.Rep, TranscriptSHA256: ref.TranscriptSHA256, SessionMetrics: sm, Contamination: c, Residual: &res}
+	for _, s := range subs {
+		out.Subagents = append(out.Subagents, s.res)
+	}
+	out.Workload = workload(&out, unlinked)
 	if ts != nil {
 		answer, reason := t.FinalAnswer()
 		e := evaluate(*findTask(ts, ref.Task), answer, reason)
@@ -345,12 +385,20 @@ func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet
 	return out, nil
 }
 
-func limitations(m *Manifest, ts *TaskSet) []string {
+func limitations(m *Manifest, ts *TaskSet, cal *Calibration) []string {
 	out := []string{limitNoEvaluation}
 	if ts != nil {
 		out[0] = limitEvaluation
 	}
-	out = append(append(out, limitResidual), baseLimitations...)
+	switch {
+	case cal != nil && cal.Sufficient:
+		out = append(out, limitCalibrated)
+	case cal != nil:
+		out = append(out, limitResidual, "Residual calibration has too few samples; attribution is uncalibrated.")
+	default:
+		out = append(out, limitResidual, "Residual attribution is uncalibrated (no calibration given).")
+	}
+	out = append(out, baseLimitations...)
 	for _, a := range m.Arms {
 		iso := a.Isolation
 		for _, f := range []struct {
@@ -397,6 +445,18 @@ var statDefs = []struct {
 	{"tool_calls_total", "count", func(s SessionResult) *int { return &s.ToolCallsTotal }},
 	{"compactions", "count", func(s SessionResult) *int { return &s.Compactions }},
 	{"wall_clock_ms", "milliseconds", func(s SessionResult) *int { return s.WallClockMS }},
+	{"subagent_processed_tokens", "provider_tokens", func(s SessionResult) *int {
+		if s.Workload == nil {
+			return nil
+		}
+		return &s.Workload.SubagentProcessed
+	}},
+	{"total_processed_tokens", "provider_tokens", func(s SessionResult) *int {
+		if s.Workload == nil {
+			return nil
+		}
+		return &s.Workload.TotalProcessed
+	}},
 }
 
 func armSummaries(sessions []SessionResult, includeContaminated bool) []ArmSummary {
@@ -470,9 +530,34 @@ func intStat(name, unit string, xs []int) Stat {
 func ValidateIngest(r *IngestRecord) error {
 	var errs []error
 	bad := func(f string, a ...any) { errs = append(errs, fmt.Errorf(f, a...)) }
-	v1 := r.Schema == IngestSchemaV1
-	if !(r.Schema == IngestSchema && r.Methodology == IngestMethodology) && !(v1 && r.Methodology == IngestMethodologyV1) {
-		bad("schema/methodology %q/%q, want %q/%q or %q/%q", r.Schema, r.Methodology, IngestSchema, IngestMethodology, IngestSchemaV1, IngestMethodologyV1)
+	v1, v3 := r.Schema == IngestSchemaV1, r.Schema == IngestSchema
+	if !(v3 && r.Methodology == IngestMethodology) && !(r.Schema == IngestSchemaV2 && r.Methodology == IngestMethodologyV2) && !(v1 && r.Methodology == IngestMethodologyV1) {
+		bad("schema/methodology %q/%q, want %q/%q, %q/%q or %q/%q", r.Schema, r.Methodology, IngestSchema, IngestMethodology,
+			IngestSchemaV2, IngestMethodologyV2, IngestSchemaV1, IngestMethodologyV1)
+	}
+	switch {
+	case !v3 && (r.Calibration != nil || r.CalibrationSHA256 != ""):
+		bad("%s records carry no calibration", r.Schema)
+	case (r.Calibration != nil) != (r.CalibrationSHA256 != ""):
+		bad("calibration and calibration_sha256 must be present together")
+	case r.Calibration != nil:
+		if !sha64RE.MatchString(r.CalibrationSHA256) {
+			bad("calibration_sha256 must be 64 hex")
+		}
+		if err := validateCalibration(r.Calibration); err != nil {
+			bad("%v", err)
+		}
+		if b, err := marshalJSON(r.Calibration); err != nil || sha256Hex(b) != r.CalibrationSHA256 {
+			bad("calibration does not match calibration_sha256")
+		}
+	}
+	calibrated := r.Calibration != nil && r.Calibration.Sufficient
+	refs := map[string]*SessionRef{}
+	for i, ref := range r.Manifest.Sessions {
+		refs[fmt.Sprintf("%s/%s/%d", ref.Arm, ref.Task, ref.Rep)] = &r.Manifest.Sessions[i]
+		if !v3 && ref.Subagents != nil {
+			bad("%s manifests declare no subagents", r.Schema)
+		}
 	}
 	var tasks *TaskSet
 	switch {
@@ -526,6 +611,22 @@ func ValidateIngest(r *IngestRecord) error {
 			bad("session %s: contamination totals do not match its calls", id)
 		}
 		switch {
+		case v3:
+			if ref := refs[id]; ref != nil {
+				if err := validateSubagents(&s, ref); err != nil {
+					bad("session %s: %v", id, err)
+				}
+			}
+		case s.Subagents != nil || s.Workload != nil:
+			bad("session %s: %s records carry no subagents or workload", id, r.Schema)
+		default:
+			for _, c := range s.Contamination.Calls {
+				if c.Agent != "" {
+					bad("session %s: %s contamination calls carry no agent", id, r.Schema)
+				}
+			}
+		}
+		switch {
 		case v1:
 			if s.Residual != nil || s.Evaluation != nil {
 				bad("session %s: %s records carry no residual or evaluation", id, IngestSchemaV1)
@@ -533,8 +634,10 @@ func ValidateIngest(r *IngestRecord) error {
 			continue
 		case s.Residual == nil:
 			bad("session %s: residual attribution missing", id)
+		case v3 && (s.Residual.Method == CalibratedMethod) != calibrated:
+			bad("session %s: residual method %s, but the record's calibration sufficient=%t", id, s.Residual.Method, calibrated)
 		default:
-			if err := validateResidual(s.Residual, s.FinalContext); err != nil {
+			if err := validateResidual(s.Residual, s.FinalContext, v3, r.Calibration); err != nil {
 				bad("session %s: %v", id, err)
 			}
 		}
@@ -570,6 +673,10 @@ func SummarizeIngest(r *IngestRecord, includeContaminated bool) string {
 		r.Schema, r.Methodology, r.DateUTC, r.ManifestSHA256)
 	fmt.Fprintf(&b, "- Client: %s %s; model %s; effort %s\n- CodeGraph: %s (binary sha256 %s)\n- Corpus: %s @ %s\n- Task set sha256: %s\n",
 		m.Client.Name, m.Client.Version, m.Model, m.Effort, m.CodeGraph.SHA, m.CodeGraph.BinarySHA256, m.Corpus.Repo, m.Corpus.Commit, m.TaskSetSHA256)
+	if c := r.Calibration; c != nil {
+		fmt.Fprintf(&b, "- Residual calibration: sha256 %s, %s, sufficient %t, %d global samples from %d transcripts\n",
+			r.CalibrationSHA256, c.Method, c.Sufficient, c.Global.Samples, len(c.Sources))
+	}
 	b.WriteString("\nMeasurements of the listed sessions only; not a published claim.\n")
 
 	arms := armSummaries(r.Sessions, includeContaminated)
@@ -588,7 +695,11 @@ func SummarizeIngest(r *IngestRecord, includeContaminated bool) string {
 	}
 	for _, s := range r.Sessions {
 		for _, c := range s.Contamination.Calls {
-			fmt.Fprintf(&b, "- %s/%s/%d: %s %s %s %q\n", s.Arm, s.Task, s.Rep, c.Outcome, c.Kind, c.Tool, c.Detail)
+			agent := ""
+			if c.Agent != "" {
+				agent = " [" + c.Agent + "]"
+			}
+			fmt.Fprintf(&b, "- %s/%s/%d%s: %s %s %s %q\n", s.Arm, s.Task, s.Rep, agent, c.Outcome, c.Kind, c.Tool, c.Detail)
 		}
 	}
 
@@ -608,6 +719,9 @@ func SummarizeIngest(r *IngestRecord, includeContaminated bool) string {
 	if r.Schema != IngestSchemaV1 {
 		statTable("Residual context per arm", true)
 		writeResidualSessions(&b, r.Sessions)
+	}
+	if r.Schema == IngestSchema {
+		writeAgents(&b, r)
 	}
 
 	b.WriteString("\n## Sessions\n\n| Arm | Task | Rep | Processed | Final ctx | Peak ctx | Output | Requests | Compactions | Tool calls | Wall ms | Sidechain processed | Contaminated |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
@@ -688,6 +802,39 @@ func writeResidualSessions(b *strings.Builder, sessions []SessionResult) {
 			fmt.Fprintf(b, " %d |", c.Tokens)
 		}
 		b.WriteString("\n")
+	}
+}
+
+func writeAgents(b *strings.Builder, r *IngestRecord) {
+	b.WriteString("\n## Workload per session (provider tokens)\n\nProcessed tokens summed across agents; context sizes are per agent and never summed.\n\n" +
+		"| Arm | Task | Rep | Main processed | Subagent processed | In-file sidechain processed | Total processed | Linked subagents | Unlinked subagents | Unlinked Task/Agent calls |\n|---|---|---|---|---|---|---|---|---|---|\n")
+	for _, s := range r.Sessions {
+		w := s.Workload
+		fmt.Fprintf(b, "| %s | %s | %d | %d | %d | %d | %d | %d | %d | %d |\n", s.Arm, s.Task, s.Rep, w.MainProcessed, w.SubagentProcessed,
+			w.SidechainProcessed, w.TotalProcessed, w.LinkedSubagents, w.UnlinkedSubagents, w.UnlinkedAgentCalls)
+	}
+	b.WriteString("\n## Subagents\n\n| Arm | Task | Rep | Agent | Parent | Depth | Requests | Processed | Final ctx | Peak ctx | Tool calls | Duplicate requests | Transcript sha256 |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	for _, s := range r.Sessions {
+		for _, a := range s.Subagents {
+			parent := a.Parent
+			if parent == "" {
+				parent = "unlinked"
+			}
+			fmt.Fprintf(b, "| %s | %s | %d | %s | %s | %d | %d | %d | %d | %d | %d | %d | %s |\n", s.Arm, s.Task, s.Rep, a.AgentID, parent, a.Depth,
+				a.Requests, a.ProcessedTokens, a.FinalContext, a.PeakContext, a.ToolCallsTotal, a.DuplicateRequests, a.TranscriptSHA256)
+		}
+	}
+	if r.Calibration == nil || !r.Calibration.Sufficient {
+		return
+	}
+	b.WriteString("\n## Calibrated residual estimates (estimated provider tokens)\n\nReconciled tokens sum to the measured final context; the estimate prices each category's characters at the median ratio and the range at the interquartile ratios, uncapped.\n\n" +
+		"| Arm | Task | Rep | Category | Reconciled | Estimate | Low | High | Ratio source |\n|---|---|---|---|---|---|---|---|---|\n")
+	for _, s := range r.Sessions {
+		for _, c := range s.Residual.Categories {
+			if e := c.Calibrated; e != nil && c.Chars > 0 {
+				fmt.Fprintf(b, "| %s | %s | %d | %s | %d | %d | %d | %d | %s |\n", s.Arm, s.Task, s.Rep, c.Category, c.Tokens, e.Estimate, e.Low, e.High, e.RatioSource)
+			}
+		}
 	}
 }
 
