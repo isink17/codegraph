@@ -27,7 +27,7 @@ func TestV2RepoPathIgnoresLegacyDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(repoRoot, config.RepoArtifactsDir, store.RepoDatabaseFileName)
+	want := filepath.Join(canonical, config.RepoArtifactsDir, store.RepoDatabaseFileName)
 	if path != want {
 		t.Fatalf("v2 path = %q, want %q", path, want)
 	}

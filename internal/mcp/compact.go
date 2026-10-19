@@ -97,6 +97,9 @@ func (s *Server) callToolContent(ctx context.Context, name string, raw json.RawM
 	if err := validateToolArguments(name, raw); err != nil {
 		return "", err
 	}
+	if s.store == nil && !uninitializedTools[name] {
+		return "", s.notIndexedError()
+	}
 	format, rawDetail, err := formatAndDetailArguments(raw)
 	if err != nil {
 		return "", err

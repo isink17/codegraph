@@ -23,6 +23,7 @@ CodeGraph is a local-first code context engine and MCP server. It indexes a repo
 - **Smaller MCP default payloads.** `find_symbol`, `search_symbols`, `find_callers`, `find_callees` and `get_impact_radius` default to `detail=card` over MCP; pass `detail=full` for the previous payload. CLI output is unchanged unless `--detail` is passed.
 - **Ambiguous symbol targets fail closed.** Pass an exact qualified name or a `symbol_id` where a short name matches several symbols.
 - **One repository per MCP server.** A server serves the repository resolved at startup; `repo_root`/`repo_path` on `index_repo` and `update_graph` may only name that repository. Start one server per repository.
+- **No implicit repository state.** `serve` no longer creates `.codegraph/` or a database at startup. Without `--repo-root` it adopts the git toplevel only when that toplevel is already indexed, and never falls back to the working directory; otherwise it starts with no active repository and every tool returns an actionable error. With an unindexed `--repo-root`, tools report "not indexed" until `index_repo` builds the graph. `stats`, the query commands, `graph`, `visualize`, `affected-tests` and `clean` open only an existing database and report "not indexed" instead of creating one. A database recorded for a different root is reported instead of being reused.
 
 ### Database compatibility and upgrade
 

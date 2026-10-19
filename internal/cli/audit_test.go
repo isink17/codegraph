@@ -191,6 +191,11 @@ func TestAuditOutputsReportJSON(t *testing.T) {
 		t.Errorf("status = %v, want ok on an empty graph", report["status"])
 	}
 	repository, _ := report["repository"].(map[string]any)
+	// The database is addressed by the canonical root (t.TempDir may sit behind
+	// a symlink, as /var does on macOS).
+	if canonical, err := filepath.EvalSymlinks(dbPath); err == nil {
+		dbPath = canonical
+	}
 	if repository["db_path"] != dbPath {
 		t.Errorf("repository.db_path = %v, want %v", repository["db_path"], dbPath)
 	}

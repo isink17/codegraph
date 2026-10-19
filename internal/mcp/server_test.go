@@ -308,3 +308,98 @@ func readAllFrames(t *testing.T, buf *bytes.Buffer) []map[string]any {
 		responses = append(responses, decoded)
 	}
 }
+
+// An uninitialized server answers nothing from a graph and creates its
+// database only when index_repo, for its own repository, asks for it.
+func TestUninitializedServerOpensOnlyOnIndexRepo(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeRepoFile(t, repoRoot, "main.go", "package main\n\nfunc main() {}\n")
+	other := t.TempDir()
+
+	opens := 0
+	var opened *store.Store
+	server := NewUninitializedServer(repoRoot, func(ctx context.Context) (Backend, error) {
+		opens++
+		s := openTestStore(t)
+		opened = s
+		repo, err := s.UpsertRepo(ctx, repoRoot)
+		if err != nil {
+			return Backend{}, err
+		}
+		return Backend{RepoID: repo.ID, Store: s, Indexer: indexer.New(s, parser.NewRegistry(goparser.New()), nil), Query: query.New(s, nil)}, nil
+	}, io.Discard)
+	t.Cleanup(func() {
+		if opened != nil {
+			_ = opened.Close()
+		}
+	})
+
+	for _, call := range []struct{ name, args string }{
+		{"find_symbol", `{"query":"main"}`},
+		{"graph_stats", `{}`},
+		{"update_graph", `{}`},
+	} {
+		if _, err := server.callTool(ctx, call.name, json.RawMessage(call.args)); err == nil || !bytes.Contains([]byte(err.Error()), []byte("not indexed yet")) {
+			t.Errorf("%s error = %v, want not indexed", call.name, err)
+		}
+	}
+	if err := server.SetToolMode(ToolModeGateway); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range []struct{ name, args string }{
+		{"find_symbol", `{"query":"main","format":"compact"}`},
+		{"tool_call", `{"name":"find_callers","arguments":{"symbol":"main"}}`},
+		{"tool_call", `{"name":"find_callers","arguments":{"symbol":"main","format":"compact"}}`},
+	} {
+		if _, err := server.callToolText(ctx, call.name, json.RawMessage(call.args)); err == nil || !bytes.Contains([]byte(err.Error()), []byte("not indexed yet")) {
+			t.Errorf("%s %s error = %v, want not indexed", call.name, call.args, err)
+		}
+	}
+	if _, err := server.callTool(ctx, "index_repo", json.RawMessage(`{"repo_root":`+mustJSONString(t, other)+`}`)); err == nil {
+		t.Error("index_repo accepted another repository")
+	}
+	if opens != 0 {
+		t.Fatalf("database opened %d times before an accepted index_repo", opens)
+	}
+
+	if _, err := server.callTool(ctx, "index_repo", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("index_repo: %v", err)
+	}
+	if _, err := server.callTool(ctx, "find_symbol", json.RawMessage(`{"query":"main"}`)); err != nil {
+		t.Fatalf("find_symbol after index_repo: %v", err)
+	}
+	if _, err := server.callTool(ctx, "index_repo", json.RawMessage(`{}`)); err != nil || opens != 1 {
+		t.Fatalf("second index_repo: err %v, opens %d, want the opened database reused", err, opens)
+	}
+}
+
+func mustJSONString(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestInactiveServerRefusesEveryToolWithoutOpening(t *testing.T) {
+	ctx := context.Background()
+	server := NewInactiveServer("no active repository: start serve with --repo-root", io.Discard)
+	if err := server.SetToolMode(ToolModeGateway); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range []struct{ name, args string }{
+		{"index_repo", `{}`},
+		{"update_graph", `{}`},
+		{"find_symbol", `{"query":"main","format":"compact"}`},
+		{"tool_call", `{"name":"graph_stats","arguments":{}}`},
+	} {
+		if _, err := server.callToolText(ctx, call.name, json.RawMessage(call.args)); err == nil || !bytes.Contains([]byte(err.Error()), []byte("no active repository")) {
+			t.Errorf("%s error = %v, want the inactive reason", call.name, err)
+		}
+	}
+	if len(server.toolDefinitions()) == 0 {
+		t.Fatal("inactive server advertises no tools")
+	}
+}
