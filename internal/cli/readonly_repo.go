@@ -9,7 +9,6 @@ import (
 	"github.com/isink17/codegraph/internal/appname"
 	"github.com/isink17/codegraph/internal/config"
 	"github.com/isink17/codegraph/internal/graph"
-	"github.com/isink17/codegraph/internal/query"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -123,14 +122,31 @@ type notIndexedError string
 func (e notIndexedError) Error() string { return string(e) }
 func (e notIndexedError) Unwrap() error { return store.ErrRepoNotIndexed }
 
-// openAppReadOnly is openIndexedRepoReadOnly shaped as an App for the query
-// commands. It has no Indexer: a read-only command never indexes.
-func openAppReadOnly(ctx context.Context, cfg config.Config, repoRootCandidate string) (*App, graphRepo, int64, error) {
-	r, err := openIndexedRepoReadOnly(ctx, cfg, repoRootCandidate)
+// openExistingApp opens a repository's existing graph database for the query
+// commands, or reports "not indexed". It never creates a database or a repo
+// row, but unlike openIndexedRepoReadOnly it opens the file in place: a query
+// must keep working while watch or serve writes, must not copy the database on
+// every call, and must still apply pending migrations after an upgrade.
+func openExistingApp(ctx context.Context, cfg config.Config, repoRootCandidate string) (*App, graphRepo, int64, error) {
+	repoRoot, err := config.ResolveRepoRoot(repoRootCandidate, "")
 	if err != nil {
 		return nil, graphRepo{}, 0, err
 	}
-	repoCfg, _ := config.LoadRepo(r.Repo.CanonicalPath)
-	app := &App{Store: r.Store, Query: query.New(r.Store, newEmbedder(repoCfg.Embedding))}
-	return app, graphRepo{ID: r.Repo.ID, RootPath: r.Repo.RootPath}, r.Repo.ID, nil
+	canonical, err := store.CanonicalRepoPath(repoRoot)
+	if err != nil {
+		return nil, graphRepo{}, 0, err
+	}
+	dbPath, err := existingRepoDBPath(cfg, repoRoot, canonical)
+	if err != nil {
+		return nil, graphRepo{}, 0, err
+	}
+	if dbPath == "" {
+		return nil, graphRepo{}, 0, notIndexedError(fmt.Sprintf("%s is not indexed: no graph database found (run %s index %s)",
+			repoRoot, appname.BinaryName, repoRoot))
+	}
+	app, repo, err := openIndexedApp(ctx, cfg, repoRoot, dbPath)
+	if err != nil {
+		return nil, graphRepo{}, 0, err
+	}
+	return app, graphRepo{ID: repo.ID, RootPath: repo.RootPath}, repo.ID, nil
 }

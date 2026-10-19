@@ -215,21 +215,40 @@ func TestServeIndexRepoCreatesThenLaterSessionReuses(t *testing.T) {
 	}
 }
 
-func TestServeWithoutRootRefusesUnindexedGitToplevel(t *testing.T) {
+// assertInactive checks a session that found no repository: it connects, and
+// every tool, index_repo included, explains how to select one.
+func assertInactive(t *testing.T, res serveResult, err error, want string) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if res.toolCount(t) == 0 {
+		t.Fatal("tools/list advertised no tools")
+	}
+	for _, id := range []float64{10, 11, 12} {
+		text, isErr := res.toolText(t, id)
+		if !isErr || !strings.Contains(text, "no active repository") || !strings.Contains(text, want) {
+			t.Errorf("call %v = %q (error %v), want no active repository / %q", id, text, isErr, want)
+		}
+	}
+	if !strings.Contains(res.stderr, "no active repository") {
+		t.Errorf("stderr does not explain the missing repository: %q", res.stderr)
+	}
+}
+
+func TestServeWithoutRootLeavesUnindexedGitToplevelInactive(t *testing.T) {
 	repoStateCLI(t)
 	root := sourceRepo(t)
 	writeFile(t, filepath.Join(root, "sub", "x.go"), "package sub\n")
 	before := treeListing(t, root)
 	t.Chdir(filepath.Join(root, "sub"))
 
-	_, err := serveSession(t, nil)
-	if err == nil || !strings.Contains(err.Error(), "no active repository") || !strings.Contains(err.Error(), "--repo-root") {
-		t.Fatalf("serve error = %v, want an actionable no-active-repository error", err)
-	}
+	res, err := serveSession(t, nil, callFindHello, callIndex, `{"name":"find_symbol","arguments":{"query":"Hello","format":"compact"}}`)
+	assertInactive(t, res, err, "--repo-root")
 	assertUntouched(t, root, before)
 }
 
-func TestServeWithoutRootOutsideGitRefusesWithoutFallingBackToCwd(t *testing.T) {
+func TestServeWithoutRootOutsideGitNeverFallsBackToCwd(t *testing.T) {
 	repoStateCLI(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -240,10 +259,8 @@ func TestServeWithoutRootOutsideGitRefusesWithoutFallingBackToCwd(t *testing.T) 
 	t.Chdir(dir)
 	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
 
-	_, err := serveSession(t, nil)
-	if err == nil || !strings.Contains(err.Error(), "not inside a git repository") {
-		t.Fatalf("serve error = %v, want a refusal outside git", err)
-	}
+	res, err := serveSession(t, nil, callFindHello, callIndex, callUpdate)
+	assertInactive(t, res, err, "not inside a git repository")
 	assertUntouched(t, dir, before)
 }
 
@@ -283,10 +300,9 @@ func TestServeWorktreeNeverSharesMainCheckoutDatabase(t *testing.T) {
 	before := treeListing(t, wt)
 	t.Chdir(wt)
 
-	if _, err := serveSession(t, nil); err == nil || !strings.Contains(err.Error(), "no active repository") {
-		t.Fatalf("serve in unindexed worktree error = %v, want refusal", err)
-	}
-	res, err := serveSession(t, []string{"--repo-root", wt}, callFindHello)
+	res, err := serveSession(t, nil, callFindHello, callIndex, callGraphStats)
+	assertInactive(t, res, err, wt)
+	res, err = serveSession(t, []string{"--repo-root", wt}, callFindHello)
 	if err != nil {
 		t.Fatalf("serve --repo-root worktree: %v", err)
 	}

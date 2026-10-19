@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -42,6 +43,9 @@ type Server struct {
 	// open creates the graph database of a server started without one. It is
 	// nil once the server has a store.
 	open func(context.Context) (Backend, error)
+	// inactive explains why a server has no repository at all; every tool,
+	// index_repo included, answers with it.
+	inactive string
 }
 
 // Backend is the opened graph database of the server's repository.
@@ -62,12 +66,24 @@ func NewUninitializedServer(repoRoot string, open func(context.Context) (Backend
 	return s
 }
 
+// NewInactiveServer builds a server that has no repository. It answers
+// initialize and tools/list so the client connects and the model can read why,
+// and refuses every tool with reason. It never opens or creates a database.
+func NewInactiveServer(reason string, errOut io.Writer) *Server {
+	s := NewServer("", 0, nil, nil, nil, errOut)
+	s.inactive = reason
+	return s
+}
+
 // uninitializedTools may run before the server has a store: index_repo creates
 // it, update_graph refuses with the same advice, and usage_stats reads only
 // the in-process meter.
 var uninitializedTools = map[string]bool{"index_repo": true, "update_graph": true, "usage_stats": true}
 
 func (s *Server) notIndexedError() error {
+	if s.inactive != "" {
+		return errors.New(s.inactive)
+	}
 	return fmt.Errorf("%s is not indexed yet: call index_repo to build its graph, or run `codegraph index %s`", s.repoRoot, s.repoRoot)
 }
 
@@ -742,7 +758,7 @@ func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bo
 		return nil, err
 	}
 	if s.store == nil {
-		if update {
+		if update || s.open == nil {
 			return nil, s.notIndexedError()
 		}
 		if err := s.initialize(ctx); err != nil {

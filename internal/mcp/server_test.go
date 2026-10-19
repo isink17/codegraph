@@ -344,8 +344,17 @@ func TestUninitializedServerOpensOnlyOnIndexRepo(t *testing.T) {
 			t.Errorf("%s error = %v, want not indexed", call.name, err)
 		}
 	}
-	if _, err := server.callToolText(ctx, "tool_call", json.RawMessage(`{"name":"find_callers","arguments":{"symbol":"main"}}`)); err == nil {
-		t.Error("gateway tool_call reached a graph before indexing")
+	if err := server.SetToolMode(ToolModeGateway); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range []struct{ name, args string }{
+		{"find_symbol", `{"query":"main","format":"compact"}`},
+		{"tool_call", `{"name":"find_callers","arguments":{"symbol":"main"}}`},
+		{"tool_call", `{"name":"find_callers","arguments":{"symbol":"main","format":"compact"}}`},
+	} {
+		if _, err := server.callToolText(ctx, call.name, json.RawMessage(call.args)); err == nil || !bytes.Contains([]byte(err.Error()), []byte("not indexed yet")) {
+			t.Errorf("%s %s error = %v, want not indexed", call.name, call.args, err)
+		}
 	}
 	if _, err := server.callTool(ctx, "index_repo", json.RawMessage(`{"repo_root":`+mustJSONString(t, other)+`}`)); err == nil {
 		t.Error("index_repo accepted another repository")
@@ -372,4 +381,25 @@ func mustJSONString(t *testing.T, s string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func TestInactiveServerRefusesEveryToolWithoutOpening(t *testing.T) {
+	ctx := context.Background()
+	server := NewInactiveServer("no active repository: start serve with --repo-root", io.Discard)
+	if err := server.SetToolMode(ToolModeGateway); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range []struct{ name, args string }{
+		{"index_repo", `{}`},
+		{"update_graph", `{}`},
+		{"find_symbol", `{"query":"main","format":"compact"}`},
+		{"tool_call", `{"name":"graph_stats","arguments":{}}`},
+	} {
+		if _, err := server.callToolText(ctx, call.name, json.RawMessage(call.args)); err == nil || !bytes.Contains([]byte(err.Error()), []byte("no active repository")) {
+			t.Errorf("%s error = %v, want the inactive reason", call.name, err)
+		}
+	}
+	if len(server.toolDefinitions()) == 0 {
+		t.Fatal("inactive server advertises no tools")
+	}
 }

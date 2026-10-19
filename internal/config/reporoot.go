@@ -24,9 +24,10 @@ var (
 //
 // This chain selects which repository a *process* opens, which is a startup
 // decision. `serve` does not use it: an MCP client may start anywhere, so serve
-// never falls back to the working directory (see cli.resolveServeRoot). An already-running MCP server does not use it: that server is scoped
-// to the one repository it was opened for and never calls this, so a tool
-// argument cannot retarget it. See mcp.Server.assertActiveRepo.
+// never falls back to the working directory (see cli.resolveServeRoot). An
+// already-running MCP server does not use it either: that server is scoped to
+// the one repository it was opened for, so a tool argument cannot retarget it.
+// See mcp.Server.assertActiveRepo.
 func ResolveRepoRoot(flagValue, toolParam string) (string, error) {
 	if v := strings.TrimSpace(toolParam); v != "" {
 		return v, nil

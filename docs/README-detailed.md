@@ -57,6 +57,8 @@ Normal commands may check GitHub Releases once per 24 hours. Set `DO_NOT_TRACK` 
 }
 ~~~
 
+Without `--repo-root`, `serve` adopts the git toplevel of the client's working directory only when it is already indexed; add `"--repo-root", "<path>"` to `args` to pin a repository. See [Repository state](#repository-state).
+
 For Codex, use the printed TOML snippet in its MCP configuration:
 
 ~~~toml
@@ -484,7 +486,7 @@ Use `codegraph clean .` for database maintenance such as WAL checkpointing, VACU
 CodeGraph writes state only for a repository you select explicitly.
 
 - **Creation.** Only `codegraph init`, `codegraph index`/`update`/`watch`, and the MCP `index_repo` tool create `.codegraph/` and the graph database. Read-only commands (`stats`, the query commands, `graph`, `visualize`, `affected-tests`, `doctor`, `audit`, `explain`, `safe-to-edit`, `version`, `--help`) and `clean` open an existing database or report "not indexed"; they create nothing.
-- **`serve` root selection.** With `--repo-root` (or a positional path), serve uses that directory. If it is not indexed yet, initialize and `tools/list` still work, other tools report "not indexed", and `index_repo` creates the database. Without a root, serve uses the git toplevel of its working directory only when that toplevel already has a graph database. Otherwise it exits with an error and writes nothing. It never falls back to the working directory itself. The chosen root and the reason are printed to stderr.
+- **`serve` root selection.** With `--repo-root` (or a positional path), serve uses that directory. If it is not indexed yet, initialize and `tools/list` still work, other tools report "not indexed", and `index_repo` creates the database. Without a root, serve uses the git toplevel of its working directory only when that toplevel already has a graph database. Otherwise it starts with no active repository: the client connects, every tool (including `index_repo`) returns an error explaining how to select one, and nothing is written. It never falls back to the working directory itself. The chosen root and the reason are printed to stderr.
 - **One server, one repository.** A tool argument can name the active repository but never select another one.
 - **Worktrees.** Each git worktree is its own repository with its own `.codegraph/`. A linked worktree never reads or redirects to its main checkout's database, so index each worktree you want to query.
 - **Identity.** The database path and the repository row both use the canonical root (absolute, symlinks resolved), so a symlinked spelling opens the same database. A database whose recorded root differs from the requested root (for example, a moved repository or a copied `.codegraph/`) is reported, not rebound. Run `codegraph index <path> --rebuild` to replace it.

@@ -1392,7 +1392,7 @@ func runStats(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if err != nil {
 		return err
 	}
-	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
+	app, _, repoID, err := openExistingApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -1623,7 +1623,7 @@ func runQueryCommand(ctx context.Context, cfg config.Config, stdout io.Writer, q
 	if err != nil {
 		return err
 	}
-	app, repo, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
+	app, repo, repoID, err := openExistingApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -1822,7 +1822,10 @@ func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, 
 		repoRootCandidate = fs.Arg(0)
 	}
 	repoRoot, dbPath, reason, err := resolveServeRoot(cfg, repoRootCandidate)
-	if err != nil {
+	var inactive noActiveRepoError
+	if errors.As(err, &inactive) {
+		fmt.Fprintf(stderr, "%s: %s\n", appname.BinaryName, inactive)
+	} else if err != nil {
 		return err
 	}
 	// opened is whichever App this session ends up holding: the existing graph
@@ -1834,7 +1837,9 @@ func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, 
 		}
 	}()
 	var server *mcp.Server
-	if dbPath != "" {
+	if inactive != "" {
+		server = mcp.NewInactiveServer(string(inactive), stderr)
+	} else if dbPath != "" {
 		app, repo, err := openIndexedApp(ctx, cfg, repoRoot, dbPath)
 		switch {
 		case err == nil:
@@ -1877,12 +1882,19 @@ func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, 
 	return serveErr
 }
 
+// noActiveRepoError means serve found no repository it may adopt. Serve still
+// starts, so the client connects and every tool can tell the model why.
+type noActiveRepoError string
+
+func (e noActiveRepoError) Error() string { return string(e) }
+
 // resolveServeRoot selects the one repository a serve process is scoped to,
 // without creating anything, and says why. An explicit root is used whether or
 // not it is indexed. Without one, the git toplevel of the working directory is
 // adopted only when it already has a graph database: an MCP client launched in
 // an arbitrary directory must not turn that directory into a repository. The
-// working directory itself is never a fallback.
+// working directory itself is never a fallback. Finding nothing to adopt is a
+// noActiveRepoError.
 func resolveServeRoot(cfg config.Config, explicit string) (root, dbPath, reason string, err error) {
 	if explicit != "" {
 		st, err := os.Stat(explicit)
@@ -1896,7 +1908,7 @@ func resolveServeRoot(cfg config.Config, explicit string) (root, dbPath, reason 
 	} else {
 		top, ok := config.GitTopLevel()
 		if !ok {
-			return "", "", "", fmt.Errorf("no active repository: the working directory is not inside a git repository; start %s serve with --repo-root <path>", appname.BinaryName)
+			return "", "", "", noActiveRepoError(fmt.Sprintf("no active repository: the working directory is not inside a git repository; start %s serve with --repo-root <path>", appname.BinaryName))
 		}
 		root, reason = top, "git toplevel of the working directory, already indexed"
 	}
@@ -1908,8 +1920,8 @@ func resolveServeRoot(cfg config.Config, explicit string) (root, dbPath, reason 
 		return "", "", "", err
 	}
 	if dbPath == "" && explicit == "" {
-		return "", "", "", fmt.Errorf("no active repository: %s has no %s graph database, and serve does not adopt an unindexed directory; start %s serve with --repo-root %s to index it on request, or run %s index %s first",
-			root, appname.BinaryName, appname.BinaryName, root, appname.BinaryName, root)
+		return "", "", "", noActiveRepoError(fmt.Sprintf("no active repository: %s has no %s graph database, and serve does not adopt an unindexed directory; start %s serve with --repo-root %s to index it on request, or run %s index %s first",
+			root, appname.BinaryName, appname.BinaryName, root, appname.BinaryName, root))
 	}
 	return canonical, dbPath, reason, nil
 }
@@ -2153,7 +2165,7 @@ func runGraph(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 	if fs.NArg() > 0 {
 		repoRoot = fs.Arg(0)
 	}
-	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
+	app, _, repoID, err := openExistingApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -2219,7 +2231,7 @@ func runVisualize(ctx context.Context, cfg config.Config, stdout io.Writer, args
 		return err
 	}
 
-	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
+	app, _, repoID, err := openExistingApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -2746,7 +2758,7 @@ func runAffectedTests(ctx context.Context, cfg config.Config, stdout, stderr io.
 		return fmt.Errorf("usage: %s %s [--repo-root PATH] [--stdin] [--json] [--limit N] <file>...", appname.BinaryName, cmdName)
 	}
 
-	app, _, repoID, err := openAppReadOnly(ctx, cfg, repoRoot)
+	app, _, repoID, err := openExistingApp(ctx, cfg, repoRoot)
 	if err != nil {
 		return err
 	}
