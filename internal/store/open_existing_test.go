@@ -10,7 +10,7 @@ import (
 )
 
 // indexedDatabase creates a closed database that records root, with migration
-// 10 rolled back so the next writable open has a migration to apply.
+// 11 rolled back so the next writable open has a migration to apply.
 func indexedDatabase(t *testing.T, root string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), RepoDatabaseFileName)
@@ -22,11 +22,9 @@ func indexedDatabase(t *testing.T, root string) string {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
-		`DROP INDEX idx_go_local_binding_evidence_init`,
-		`DROP TABLE go_function_result_evidence`,
-		`ALTER TABLE go_local_binding_evidence DROP COLUMN init_function`,
-		`ALTER TABLE go_local_binding_evidence DROP COLUMN init_import_path`,
-		`DELETE FROM schema_migrations WHERE version = 10`,
+		`DROP TABLE go_file_identity_evidence`,
+		`DROP TABLE go_module_evidence`,
+		`DELETE FROM schema_migrations WHERE version = 11`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -139,7 +137,7 @@ func TestOpenExistingRejectsForeignRootBeforeMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ro.Close()
-	if hasMigrationVersion(t, ro, 10) {
+	if hasMigrationVersion(t, ro, 11) {
 		t.Error("migration applied to a foreign database")
 	}
 	repos, err := ro.ListRepos(t.Context(), 10, 0)
@@ -160,7 +158,7 @@ func TestOpenExistingMigratesMatchingRoot(t *testing.T) {
 		t.Fatalf("open via symlink: %v", err)
 	}
 	defer s.Close()
-	if !hasMigrationVersion(t, s, 10) {
+	if !hasMigrationVersion(t, s, 11) {
 		t.Error("pending migration not applied")
 	}
 	if _, found, err := s.FindRepo(t.Context(), owner); err != nil || !found {

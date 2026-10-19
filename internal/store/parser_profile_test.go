@@ -105,6 +105,8 @@ func TestFileParserProfileGroupsCountEvidenceWithoutSymbols(t *testing.T) {
 			VALUES(?1, ?2, 'x', 1, 2)`},
 		{"go_function_result_evidence", `INSERT INTO go_function_result_evidence(repo_id, file_id, function_name, type_name)
 			VALUES(?1, ?2, 'New', 'T')`},
+		{"go_file_identity_evidence", `INSERT INTO go_file_identity_evidence(repo_id, file_id, package_clause, build_constraint)
+			VALUES(?1, ?2, 'p', '')`},
 		{"swift_lexical_binding_evidence", `INSERT INTO swift_lexical_binding_evidence(repo_id, file_id, name, binding_kind, scope_start_line, scope_end_line)
 			VALUES(?1, ?2, 'x', 'value', 1, 2)`},
 		{"test_links", `INSERT INTO test_links(repo_id, test_file_id, reason, score) VALUES(?1, ?2, 'name', 1.0)`},

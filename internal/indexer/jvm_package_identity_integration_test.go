@@ -128,7 +128,7 @@ func TestJVMRawTextPackageProfileConvergence(t *testing.T) {
 			t.Fatalf("%s reconvergence update = %+v", step.language, summary)
 		}
 	}
-	for path, want := range map[string]string{"com/real/Caller.java": "treesitter:java:v14", "docs/Helper.java": "treesitter:java:v14", "com/real/Caller.kt": "treesitter:kotlin:v12", "docs/Helper.kt": "treesitter:kotlin:v12", "com/real/Other.kt": "treesitter:kotlin:v12", "docs/User.java": "treesitter:java:v14", "docs/User.kt": "treesitter:kotlin:v12", "main.go": "go-ast:go:v2"} {
+	for path, want := range map[string]string{"com/real/Caller.java": "treesitter:java:v14", "docs/Helper.java": "treesitter:java:v14", "com/real/Caller.kt": "treesitter:kotlin:v12", "docs/Helper.kt": "treesitter:kotlin:v12", "com/real/Other.kt": "treesitter:kotlin:v12", "docs/User.java": "treesitter:java:v14", "docs/User.kt": "treesitter:kotlin:v12", "main.go": "go-ast:go:v3"} {
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile = %q, want %q", path, got, want)
 		}

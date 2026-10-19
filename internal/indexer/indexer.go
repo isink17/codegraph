@@ -176,6 +176,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	goModules, err := store.DiscoverGoModuleEvidence(opts.RepoRoot)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
 	previousFingerprint, fingerprintKnown, err := i.store.SwiftPMManifestFingerprint(ctx, repo.ID)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -1267,6 +1271,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		}
 	}
 	if err := i.store.SetSwiftPMManifestFingerprint(ctx, repo.ID, swiftModules.fingerprint); err != nil {
+		return summary, i.failScan(ctx, scanID, summary, started, err)
+	}
+	if err := i.store.ReplaceGoModuleEvidence(ctx, repo.ID, goModules); err != nil {
 		return summary, i.failScan(ctx, scanID, summary, started, err)
 	}
 	summary.HeadAtFinish = scanHead(ctx, opts.RepoRoot)

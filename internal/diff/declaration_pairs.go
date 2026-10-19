@@ -16,9 +16,13 @@ import (
 // risk still cites their dependents.
 //
 // Continuity is asserted only when the move cannot change what a declaration
-// means. Version 1 pairs only Go files renamed inside one directory: the
-// directory is the package's import path, and only the file name's build role
-// can change membership. Every other language is refused: callers reach Lua,
+// means. Only Go files are paired: inside one directory, where the directory
+// is the package's import path and only the file name's build role can change
+// membership, and across directories only when the indexed module evidence
+// gives both files the same import path, package clause, test role and build
+// constraint (a module root that moved with its packages). A cross-directory
+// move whose content changed is listed as refused, never paired. Every other
+// language is refused: callers reach Lua,
 // C/C++, Ruby and PHP declarations through the file path (require, include)
 // and Kotlin top-level functions through a class named after the file, while
 // their stable keys may not carry the path.
@@ -57,6 +61,13 @@ const (
 	refuseDeclarationUnmatched  = "declaration_unmatched"
 	refuseModuleRootChanged     = "module_root_changed"
 	refuseModuleEvidenceMissing = "module_evidence_unavailable"
+	refuseWorkspaceUncertain    = "workspace_uncertain"
+	refuseModuleReplaceInRepo   = "module_replace_in_repo"
+	refuseModulePathNotUnique   = "module_path_not_unique"
+	refusePackageChanged        = "package_identity_changed"
+	refusePackageIgnored        = "package_ignored"
+	refuseContentChanged        = "content_changed"
+	refuseMoveAmbiguous         = "move_ambiguous"
 )
 
 func declarationPairs(renames FileRenames, base, head store.SemanticGraph, semanticOK bool, incomplete map[string]bool, baseTree, headTree []SourceFile) DeclarationPairs {
@@ -88,8 +99,10 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 			refuse(refuseParserSemanticsDiffer)
 			continue
 		case path.Dir(r.From) != path.Dir(r.To):
-			refuse(refuseModuleIdentityChanged)
-			continue
+			if reason := crossDirectoryRefusal(base.GoModules, head.GoModules, bf, hf, baseTree, headTree); reason != "" {
+				refuse(reason)
+				continue
+			}
 		case goBuildRole(r.From) != goBuildRole(r.To):
 			refuse(refuseBuildRoleChanged)
 			continue
@@ -115,7 +128,168 @@ func declarationPairs(renames FileRenames, base, head store.SemanticGraph, seman
 			}
 		}
 	}
+	if semanticOK {
+		d.Refused = append(d.Refused, changedContentMoves(renames, base, head, incomplete, baseTree, headTree)...)
+	}
 	return d
+}
+
+// crossDirectoryRefusal is why two Go files in different directories cannot
+// be proven to belong to one package, or "" when the indexed evidence gives
+// them the same import path, package clause, test role and build constraint.
+// An import path names a directory, so that holds only when the module root
+// moved with the package, still declares the same module path, and its go.mod
+// bytes are unchanged (as a same-directory rename requires).
+func crossDirectoryRefusal(baseModules, headModules *store.SemanticGoModules, bf, hf store.SemanticFile, baseTree, headTree []SourceFile) string {
+	switch {
+	case goIgnoredDirectory(bf.Path) || goIgnoredDirectory(hf.Path):
+		return refusePackageIgnored
+	case goBuildRole(bf.Path) != goBuildRole(hf.Path):
+		return refuseBuildRoleChanged
+	case baseModules == nil || headModules == nil || bf.Go == nil || hf.Go == nil:
+		return refuseModuleEvidenceMissing
+	}
+	if reason := repoModuleRefusal(baseModules, headModules); reason != "" {
+		return reason
+	}
+	b, h := bf.Go, hf.Go
+	switch {
+	case b.ModuleState != store.GoModuleComplete || h.ModuleState != store.GoModuleComplete:
+		return refuseModuleEvidenceMissing
+	case moduleRoots(baseModules, b.ModulePath) != 1 || moduleRoots(headModules, h.ModulePath) != 1:
+		return refuseModulePathNotUnique
+	case b.ModulePath != h.ModulePath || b.ImportPath != h.ImportPath:
+		return refuseModuleIdentityChanged
+	case baseTree == nil || headTree == nil:
+		return refuseModuleEvidenceMissing
+	}
+	baseMod, headMod := treeHash(baseTree, path.Join(b.ModuleRoot, "go.mod")), treeHash(headTree, path.Join(h.ModuleRoot, "go.mod"))
+	switch {
+	case baseMod == "" || headMod == "":
+		return refuseModuleEvidenceMissing
+	case baseMod != headMod:
+		return refuseModuleRootChanged
+	case b.PackageClause != h.PackageClause || b.ExternalTest != h.ExternalTest:
+		return refusePackageChanged
+	case b.BuildConstraint != h.BuildConstraint:
+		return refuseBuildRoleChanged
+	}
+	return ""
+}
+
+// repoModuleRefusal refuses repositories whose import paths may not map to
+// their directories: a go.work can join modules, and a replace by a
+// directory can substitute one module for another.
+func repoModuleRefusal(base, head *store.SemanticGoModules) string {
+	for _, m := range []*store.SemanticGoModules{base, head} {
+		if len(m.Workspaces) > 0 {
+			return refuseWorkspaceUncertain
+		}
+	}
+	for _, m := range []*store.SemanticGoModules{base, head} {
+		for _, mod := range m.Modules {
+			if mod.LocalReplace {
+				return refuseModuleReplaceInRepo
+			}
+		}
+	}
+	return ""
+}
+
+func treeHash(tree []SourceFile, p string) string {
+	for _, f := range tree {
+		if f.Path == p {
+			return f.ContentHash
+		}
+	}
+	return ""
+}
+
+func moduleRoots(m *store.SemanticGoModules, modulePath string) int {
+	n := 0
+	for _, mod := range m.Modules {
+		if mod.Path == modulePath {
+			n++
+		}
+	}
+	return n
+}
+
+// goIgnoredDirectory reports a path the go command never builds as an
+// ordinary package: under testdata, vendor, or a directory starting with _
+// or a dot.
+func goIgnoredDirectory(p string) bool {
+	for _, el := range strings.Split(path.Dir(p), "/") {
+		if el == "testdata" || el == "vendor" || strings.HasPrefix(el, "_") || (strings.HasPrefix(el, ".") && el != ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// changedContentMoves lists Go files removed from one directory and added
+// under another with the same file name and package identity but different
+// bytes. Their declarations are not paired: nothing proves a declaration's
+// content survived the edit.
+func changedContentMoves(renames FileRenames, base, head store.SemanticGraph, incomplete map[string]bool, baseTree, headTree []SourceFile) []RefusedPairing {
+	if base.GoModules == nil || head.GoModules == nil || repoModuleRefusal(base.GoModules, head.GoModules) != "" || baseTree == nil || headTree == nil {
+		return nil
+	}
+	renamed := map[string]bool{}
+	for _, r := range renames.Exact {
+		renamed[r.From], renamed[r.To] = true, true
+	}
+	key := func(f store.SemanticFile, modules *store.SemanticGoModules) string {
+		g := f.Go
+		if f.Language != "go" || g == nil || g.ModuleState != store.GoModuleComplete || moduleRoots(modules, g.ModulePath) != 1 ||
+			incomplete[f.Path] || renamed[f.Path] || goIgnoredDirectory(f.Path) {
+			return ""
+		}
+		return canonical([]any{g.ModulePath, g.ImportPath, g.PackageClause, g.ExternalTest, g.BuildConstraint, goBuildRole(f.Path), path.Base(f.Path)})
+	}
+	inTree := func(tree []SourceFile) map[string]bool {
+		out := make(map[string]bool, len(tree))
+		for _, f := range tree {
+			out[f.Path] = true
+		}
+		return out
+	}
+	baseIn, headIn := inTree(baseTree), inTree(headTree)
+	removed, added := map[string][]store.SemanticFile{}, map[string][]store.SemanticFile{}
+	for _, f := range base.Files {
+		if k := key(f, base.GoModules); k != "" && !headIn[f.Path] {
+			removed[k] = append(removed[k], f)
+		}
+	}
+	for _, f := range head.Files {
+		if k := key(f, head.GoModules); k != "" && !baseIn[f.Path] {
+			added[k] = append(added[k], f)
+		}
+	}
+	var out []RefusedPairing
+	for k, from := range removed {
+		to := added[k]
+		// Equal bytes that are not an exact rename are shared with other
+		// moved files (file_renames lists them as ambiguous).
+		reason := refuseContentChanged
+		if len(from) != 1 || len(to) != 1 || from[0].ContentHash == to[0].ContentHash {
+			reason = refuseMoveAmbiguous
+		}
+		// ponytail: every removed/added combination is listed; a key is an
+		// import path plus file name, so groups stay small.
+		for _, f := range from {
+			for _, t := range to {
+				out = append(out, RefusedPairing{FromPath: f.Path, ToPath: t.Path, Reason: reason})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FromPath != out[j].FromPath {
+			return out[i].FromPath < out[j].FromPath
+		}
+		return out[i].ToPath < out[j].ToPath
+	})
+	return out
 }
 
 // declarationShape is a declaration's identity without its path. Equal shapes
