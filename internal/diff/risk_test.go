@@ -522,3 +522,33 @@ func TestRiskScopesRepositoryLimitationsToChangedFiles(t *testing.T) {
 		t.Fatalf("risk = %+v", changed)
 	}
 }
+
+// Removing one overload rebinds its callers to a sibling the dependent already
+// used; that rebinding is cited, not absorbed by the sibling's relationship.
+func TestRiskRemovedOverloadReboundToSibling(t *testing.T) {
+	narrow, wide, a := riskDecl("lib.go", "Foo"), riskDecl("lib.go", "Foo"), riskDecl("a.go", "A")
+	narrow.Signature, wide.Signature = "func Foo(int)", "func Foo(int64)"
+	files := indexed("a.go", "lib.go")
+	base := riskRevision(files, []store.SemanticDeclaration{narrow, wide, a}, []store.SemanticEdge{riskCall(a, narrow, 4, 2, "resolved"), riskCall(a, wide, 5, 2, "resolved")})
+	head := riskRevision(files, []store.SemanticDeclaration{wide, a}, []store.SemanticEdge{riskCall(a, wide, 4, 2, "resolved"), riskCall(a, wide, 5, 2, "resolved")})
+	r := compareRisk(t, base, head)
+	ev := component(t, r, RuleDependentRetargeted).Evidence
+	if r.Assessment != AssessmentRiskEvidence || *r.Score != 5 || len(ev) != 1 || ev[0].Declaration != declIdentity(narrow) || !slices.Equal(ev[0].HeadTargets, []string{declIdentity(wide)}) {
+		t.Fatalf("risk = %+v", r)
+	}
+}
+
+// A dependent whose own identity changed (here its signature) is not a
+// surviving dependent: it is not scored, and the removal stays uncertain.
+func TestRiskDependentWithChangedSignatureIsUncertainty(t *testing.T) {
+	gone, a := riskDecl("lib.go", "Gone"), riskDecl("a.go", "A")
+	a2 := a
+	a2.Signature = "func A(x int)"
+	files := indexed("a.go", "lib.go")
+	base := riskRevision(files, []store.SemanticDeclaration{gone, a}, []store.SemanticEdge{riskCall(a, gone, 4, 2, "resolved")})
+	head := riskRevision(files, []store.SemanticDeclaration{a2}, []store.SemanticEdge{riskCall(a2, store.SemanticDeclaration{QualifiedName: "Gone"}, 4, 2, "unresolved")})
+	r := compareRisk(t, base, head)
+	if r.Assessment != AssessmentLimitedEvidence || *r.Score != 0 || !hasUncertainty(r, "removed_declaration_without_resolved_dependents", declIdentity(gone)) {
+		t.Fatalf("risk = %+v", r)
+	}
+}

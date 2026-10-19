@@ -48,13 +48,16 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 		gated = gated || strings.HasPrefix(a, "-") && flagName(a) == "--fail-on-risk"
 	}
 	seen := map[string]bool{}
+	gateFlags := map[string]bool{"--fail-on-risk": true, "--insufficient-evidence": true}
 	for i := 0; i < len(args); i++ {
 		if !strings.HasPrefix(args[i], "-") {
 			positional = append(positional, args[i])
 			continue
 		}
 		name := flagName(args[i])
-		if seen[name] {
+		// Last-wins parsing stays for the original flags; a gate flag given
+		// twice is contradictory.
+		if seen[name] && gateFlags[name] {
 			return diffUsageError(gated, fmt.Errorf("%s given more than once", name))
 		}
 		seen[name] = true
@@ -70,7 +73,7 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	if err := fs.Parse(flags); err != nil {
 		return diffUsageError(gated, err)
 	}
-	gate, err := parseDiffGate(*failOnRisk, *insufficient)
+	gate, err := parseDiffGate(gated, *failOnRisk, seen["--insufficient-evidence"], *insufficient)
 	if err != nil {
 		return diffUsageError(gated, err)
 	}
@@ -88,7 +91,7 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(res); err != nil {
-		return err
+		return diffUsageError(gated, err)
 	}
 	if gate.threshold == 0 {
 		return nil
@@ -113,17 +116,19 @@ func diffUsageError(gated bool, err error) error {
 	return err
 }
 
-func parseDiffGate(failOnRisk, insufficient string) (diffGate, error) {
-	if failOnRisk == "" {
-		if insufficient != "" {
+// parseDiffGate takes whether each flag was given, so an empty value is an
+// error rather than an absent gate.
+func parseDiffGate(gated bool, failOnRisk string, insufficientSet bool, insufficient string) (diffGate, error) {
+	if !gated {
+		if insufficientSet {
 			return diffGate{}, fmt.Errorf("--insufficient-evidence requires --fail-on-risk")
 		}
 		return diffGate{}, nil
 	}
 	g := diffGate{failInsufficient: true}
-	switch insufficient {
-	case "", "fail":
-	case "pass":
+	switch {
+	case !insufficientSet, insufficient == "fail":
+	case insufficient == "pass":
 		g.failInsufficient = false
 	default:
 		return diffGate{}, fmt.Errorf("invalid --insufficient-evidence %q: want fail or pass", insufficient)

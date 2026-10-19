@@ -12,9 +12,10 @@ change lists but never change `risk`.
 
 - The score is an **ordinal evidence index** (`score_kind:
   evidence_index_not_probability`), not a calibrated failure probability.
-- Every point comes from a cited dependent relationship in the two compared
-  graphs. File churn, symbol counts, Git history and unresolved name matches
-  never add points.
+- Every point needs a resolved edge in the base graph between two declarations;
+  the head side is then judged by the names the dependent references, resolved
+  or not. File churn, symbol counts, Git history and unresolved references
+  without such a base edge never add points.
 - No assessment proves a change safe. Only resolved edges are cited, so an
   unresolved, dynamic, reflective or cross-language dependent can still break.
   `risk.coverage` is therefore never `complete`.
@@ -34,7 +35,9 @@ Levels: `low` from 1, `medium` from 25, `high` from 50.
 
 A dependent relationship is one (dependent declaration, depended-on declaration)
 pair taken from the resolved base edges, where the dependent still exists in
-head. Several call sites between the same pair are one relationship, and each
+head with its full identity (path, kind, qualified name, signature and stable
+key unchanged). A dependent whose own signature also changed is not scored; the
+removal it depended on then shows only as uncertainty. Several call sites between the same pair are one relationship, and each
 relationship is cited by at most one rule.
 
 A relationship is judged by what the same dependent references **by the same
@@ -43,7 +46,9 @@ are all `M`), not by the call site alone. A call site is a line and column, and
 an edit that shifts lines can land an unrelated call on it; such coincidences
 appear in `edges.retargeted` but are not cited as risk. A head reference that
 resolves to another declaration the dependent already used in base belongs to
-that other relationship.
+that other relationship, except when the depended-on declaration was removed:
+then it counts as a rebinding, so removing one overload whose callers fall back
+to a sibling overload is cited.
 
 | Rule | `change` | Cites | Points each | Cap |
 |---|---|---|---|---|

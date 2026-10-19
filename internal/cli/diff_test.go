@@ -117,27 +117,32 @@ func TestDiffCLIAndMCPReturnSameDocument(t *testing.T) {
 
 func TestParseDiffGate(t *testing.T) {
 	for _, tc := range []struct {
-		risk, insufficient string
-		threshold          int
-		failInsufficient   bool
-		err                bool
+		gated            bool
+		risk             string
+		insufficientSet  bool
+		insufficient     string
+		threshold        int
+		failInsufficient bool
+		err              bool
 	}{
-		{"", "", 0, false, false},
-		{"", "pass", 0, false, true},
-		{"low", "", 1, true, false},
-		{"medium", "fail", 25, true, false},
-		{"high", "pass", 50, false, false},
-		{"1", "", 1, true, false},
-		{"100", "", 100, true, false},
-		{"0", "", 0, false, true},
-		{"101", "", 0, false, true},
-		{"-5", "", 0, false, true},
-		{"HIGH", "", 0, false, true},
-		{"high", "maybe", 0, false, true},
+		{false, "", false, "", 0, false, false},
+		{false, "", true, "pass", 0, false, true},
+		{true, "", false, "", 0, false, true},
+		{true, "low", true, "", 0, false, true},
+		{true, "low", false, "", 1, true, false},
+		{true, "medium", true, "fail", 25, true, false},
+		{true, "high", true, "pass", 50, false, false},
+		{true, "1", false, "", 1, true, false},
+		{true, "100", false, "", 100, true, false},
+		{true, "0", false, "", 0, false, true},
+		{true, "101", false, "", 0, false, true},
+		{true, "-5", false, "", 0, false, true},
+		{true, "HIGH", false, "", 0, false, true},
+		{true, "high", true, "maybe", 0, false, true},
 	} {
-		g, err := parseDiffGate(tc.risk, tc.insufficient)
+		g, err := parseDiffGate(tc.gated, tc.risk, tc.insufficientSet, tc.insufficient)
 		if (err != nil) != tc.err || g.threshold != tc.threshold || g.failInsufficient != tc.failInsufficient {
-			t.Fatalf("parseDiffGate(%q, %q) = %+v, %v", tc.risk, tc.insufficient, g, err)
+			t.Fatalf("parseDiffGate(%v, %q, %v, %q) = %+v, %v", tc.gated, tc.risk, tc.insufficientSet, tc.insufficient, g, err)
 		}
 	}
 }
@@ -219,6 +224,8 @@ func TestDiffCLIRiskGateExitCodes(t *testing.T) {
 		{base, removed, "--fail-on-risk", "low", "--insufficient-evidence", "maybe"},
 		{base, "--fail-on-risk", "low"},
 		{base, removed, "--fail-on-risk"},
+		{base, removed, "--fail-on-risk="},
+		{base, removed, "--fail-on-risk", "low", "--insufficient-evidence="},
 	} {
 		if out, _, code := run(args...); code != diffExitInvalid || out != "" {
 			t.Fatalf("%v: exit %d, output %q", args, code, out)
@@ -226,5 +233,9 @@ func TestDiffCLIRiskGateExitCodes(t *testing.T) {
 	}
 	if out, _, code := run(base, removed, "--insufficient-evidence", "pass"); code != 1 || out != "" {
 		t.Fatalf("--insufficient-evidence without a gate: exit %d", code)
+	}
+	// Ungated parsing is unchanged: a repeated original flag still takes the last value.
+	if out, _, code := run(base, removed, "--limit", "5", "--limit", "1"); code != 0 || !strings.Contains(out, `"limit": 1`) {
+		t.Fatalf("repeated --limit: exit %d", code)
 	}
 }

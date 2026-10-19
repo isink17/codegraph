@@ -218,20 +218,31 @@ func assessRisk(changes []Change, cov Coverage, lims []string, baseDecls, headDe
 		}
 		baseTargets[dep][decl] = true
 	}
-	headRefs := map[string][]store.SemanticEdge{}
+	type reference struct {
+		edge   store.SemanticEdge
+		target string
+	}
+	headRefs := map[string]map[string][]reference{}
 	for _, e := range headEdges {
-		headRefs[endpointIdentity(e.Source)] = append(headRefs[endpointIdentity(e.Source)], e)
+		dep := endpointIdentity(e.Source)
+		if headRefs[dep] == nil {
+			headRefs[dep] = map[string][]reference{}
+		}
+		name := referenceName(e.Target.QualifiedName)
+		headRefs[dep][name] = append(headRefs[dep][name], reference{edge: e, target: endpointIdentity(e.Target)})
 	}
 	cited := map[string]bool{}
 	for _, key := range union(rels, rels) {
 		rel := rels[key]
 		ev := RiskEvidence{Declaration: rel.declaration, Dependent: rel.dependent, File: rel.file, Sites: rel.sites}
 		bound, unbound, elsewhere := false, false, false
-		for _, h := range headRefs[rel.dependent] {
-			target := endpointIdentity(h.Target)
+		for _, ref := range headRefs[rel.dependent][rel.name] {
+			h, target := ref.edge, ref.target
 			// A reference resolving to another declaration the dependent
-			// already used in base belongs to that relationship.
-			if referenceName(h.Target.QualifiedName) != rel.name || h.Target.State == "resolved" && target != rel.declaration && baseTargets[rel.dependent][target] {
+			// already used in base belongs to that relationship, unless this
+			// declaration is gone: then it may be the call that rebound to a
+			// sibling, such as a removed overload.
+			if h.Target.State == "resolved" && target != rel.declaration && baseTargets[rel.dependent][target] && !removed[rel.declaration] {
 				continue
 			}
 			ev.HeadSites = append(ev.HeadSites, edgeSite(h, withColumn))
