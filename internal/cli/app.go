@@ -1848,6 +1848,9 @@ func runServeWith(ctx context.Context, cfg config.Config, in io.Reader, stdout, 
 			fmt.Fprintf(stderr, "%s: serving %s (%s); graph database %s\n", appname.BinaryName, repoRoot, reason, dbPath)
 		case errors.Is(err, store.ErrRepoNotIndexed):
 			// The database holds no graph yet: serve uninitialized below.
+		case errors.As(err, new(repoMismatchError)):
+			fmt.Fprintf(stderr, "%s: %v\n", appname.BinaryName, err)
+			server = mcp.NewInactiveServer(err.Error(), stderr)
 		default:
 			return err
 		}

@@ -107,12 +107,17 @@ func repoRowMissingError(ctx context.Context, s *store.Store, repoRoot, dbPath s
 		return err
 	}
 	if found {
-		return fmt.Errorf("%s holds the graph of %s, not %s; it is not reused for another root (run %s index %s --rebuild to replace it)",
-			dbPath, other.CanonicalPath, repoRoot, appname.BinaryName, repoRoot)
+		return repoMismatchError(fmt.Sprintf("%s holds the graph of %s, not %s; it is not reused for another root (run %s index %s --rebuild to replace it)",
+			dbPath, other.CanonicalPath, repoRoot, appname.BinaryName, repoRoot))
 	}
 	return notIndexedError(fmt.Sprintf("%s is not indexed: %s holds no graph for it (run %s index %s)",
 		repoRoot, dbPath, appname.BinaryName, repoRoot))
 }
+
+// repoMismatchError reports a database recorded for a different root.
+type repoMismatchError string
+
+func (e repoMismatchError) Error() string { return string(e) }
 
 // notIndexedError keeps the established message while letting callers that
 // report "not indexed" as a status, rather than a failure, recognise it with

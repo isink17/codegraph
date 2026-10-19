@@ -749,6 +749,9 @@ func (s *Server) handleIndex(ctx context.Context, raw json.RawMessage, update bo
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	if s.inactive != "" {
+		return nil, s.notIndexedError()
+	}
 	// This server is scoped to one repository, resolved once at startup. A tool
 	// argument may assert that repository but may never select another, so no
 	// cwd/git fallback resolution runs here: the answer is already s.repoRoot.

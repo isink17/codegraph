@@ -225,7 +225,13 @@ func assertInactive(t *testing.T, res serveResult, err error, want string) {
 	if res.toolCount(t) == 0 {
 		t.Fatal("tools/list advertised no tools")
 	}
-	for _, id := range []float64{10, 11, 12} {
+	if len(res.responses) < 3 {
+		t.Fatalf("got %d responses, want tool calls answered", len(res.responses))
+	}
+	for id := range res.responses {
+		if id < 10 {
+			continue
+		}
 		text, isErr := res.toolText(t, id)
 		if !isErr || !strings.Contains(text, "no active repository") || !strings.Contains(text, want) {
 			t.Errorf("call %v = %q (error %v), want no active repository / %q", id, text, isErr, want)
@@ -259,7 +265,9 @@ func TestServeWithoutRootOutsideGitNeverFallsBackToCwd(t *testing.T) {
 	t.Chdir(dir)
 	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
 
-	res, err := serveSession(t, nil, callFindHello, callIndex, callUpdate)
+	res, err := serveSession(t, nil, callFindHello, callIndex, callUpdate,
+		`{"name":"index_repo","arguments":{"repo_root":`+jsonString(dir)+`}}`,
+		`{"name":"index_repo","arguments":{"repo_root":"/"}}`)
 	assertInactive(t, res, err, "not inside a git repository")
 	assertUntouched(t, dir, before)
 }
@@ -343,8 +351,14 @@ func TestDatabaseRecordedForAnotherRootIsReportedNotRebound(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := serveSession(t, []string{"--repo-root", moved}); err == nil || !strings.Contains(err.Error(), "holds the graph of") {
-		t.Fatalf("serve error = %v, want the recorded root reported", err)
+	res, err := serveSession(t, []string{"--repo-root", moved}, callFindHello, callIndex)
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	for _, id := range []float64{10, 11} {
+		if text, isErr := res.toolText(t, id); !isErr || !strings.Contains(text, "holds the graph of") {
+			t.Errorf("call %v = %q (error %v), want the recorded root reported", id, text, isErr)
+		}
 	}
 	if _, _, err := runCLI(t, "stats", moved); err == nil || !strings.Contains(err.Error(), "holds the graph of") {
 		t.Fatalf("stats error = %v, want the recorded root reported", err)
@@ -479,3 +493,5 @@ func TestIndexingExcludesCodeGraphState(t *testing.T) {
 		t.Fatalf("update of an unchanged tree rewrote files: %+v", result.Summary)
 	}
 }
+
+func jsonString(s string) string { b, _ := json.Marshal(s); return string(b) }
