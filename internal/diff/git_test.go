@@ -5,9 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/isink17/codegraph/internal/githistory/gittest"
 	"github.com/isink17/codegraph/internal/graph"
@@ -296,4 +300,99 @@ func allChanges(r Result) []Change {
 	out = append(out, r.Diff.TestLinks.Removed...)
 	out = append(out, r.Diff.TestLinks.Changed...)
 	return out
+}
+
+func TestBlobReader(t *testing.T) {
+	r := gittest.Init(t)
+	r.Write("a.txt", "alpha\n")
+	r.Write("b.txt", "bravo bravo\n")
+	r.Commit("", "base")
+	a, b, tree := r.Git("rev-parse", "HEAD:a.txt"), r.Git("rev-parse", "HEAD:b.txt"), r.Git("rev-parse", "HEAD^{tree}")
+	t.Run("reads, skips a blob over the limit and reads on", func(t *testing.T) {
+		br := &blobReader{ctx: t.Context(), root: r.Dir}
+		defer br.close()
+		if got, ok := br.read(a, 64); !ok || string(got) != "alpha\n" {
+			t.Fatalf("first read = %q, %v", got, ok)
+		}
+		if got, ok := br.read(b, 4); ok || got != nil {
+			t.Fatalf("over-limit read = %q, %v", got, ok)
+		}
+		if got, ok := br.read(b, 64); !ok || string(got) != "bravo bravo\n" || br.err != nil {
+			t.Fatalf("read after skip = %q, %v, %v", got, ok, br.err)
+		}
+	})
+	for name, object := range map[string]string{"missing object": strings.Repeat("0", len(a)), "tree object": tree} {
+		t.Run(name+" fails and stops git", func(t *testing.T) {
+			br := &blobReader{ctx: t.Context(), root: r.Dir}
+			if _, ok := br.read(object, 1<<20); ok || br.err == nil || br.cmd != nil {
+				t.Fatalf("ok = %v, err = %v, process kept = %v", ok, br.err, br.cmd != nil)
+			}
+			if _, ok := br.read(a, 64); ok {
+				t.Fatal("read after a failure")
+			}
+			br.close()
+		})
+	}
+	t.Run("cancelled before first read", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		br := &blobReader{ctx: ctx, root: r.Dir}
+		if _, ok := br.read(a, 64); ok || !errors.Is(br.err, context.Canceled) || br.cmd != nil {
+			t.Fatalf("err = %v", br.err)
+		}
+		br.close()
+	})
+}
+
+// fakeGit puts a git on PATH that answers every cat-file request with script.
+func fakeGit(t *testing.T, script string) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake git is a shell script")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte("#!/bin/sh\nread object\n"+script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestBlobReaderStopsAStalledGit(t *testing.T) {
+	const object = "0123456789012345678901234567890123456789"
+	finish := func(t *testing.T, br *blobReader) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() { br.close(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("close waits on git")
+		}
+	}
+	t.Run("bad header", func(t *testing.T) {
+		// A reply git keeps writing (or a git that never exits) must not hang close.
+		fakeGit(t, "printf '%s tree 4\\n' \"$object\"\nexec sleep 600\n")
+		br := &blobReader{ctx: t.Context(), root: t.TempDir()}
+		if _, ok := br.read(object, 64); ok || br.err == nil {
+			t.Fatalf("err = %v", br.err)
+		}
+		finish(t, br)
+	})
+	t.Run("short body", func(t *testing.T) {
+		fakeGit(t, "printf '%s blob 100\\nabc' \"$object\"\nexec sleep 600\n")
+		ctx, cancel := context.WithCancel(t.Context())
+		br := &blobReader{ctx: ctx, root: t.TempDir()}
+		time.AfterFunc(200*time.Millisecond, cancel)
+		if _, ok := br.read(object, 1<<10); ok || !errors.Is(br.err, context.Canceled) {
+			t.Fatalf("err = %v", br.err)
+		}
+		finish(t, br)
+	})
+	t.Run("over-limit body cut short", func(t *testing.T) {
+		fakeGit(t, "printf '%s blob 100\\nabc' \"$object\"\n")
+		br := &blobReader{ctx: t.Context(), root: t.TempDir()}
+		if _, ok := br.read(object, 10); ok || br.err == nil {
+			t.Fatalf("err = %v", br.err)
+		}
+		finish(t, br)
+	})
 }
