@@ -77,11 +77,13 @@ surviving declaration is listed under `uncertainty`. A depended-on declaration
 whose signature changed is a removal plus an addition: callers that now
 resolve to the new signature are cited as `dependent_retargeted`, even when
 only the spelling changed (`interface{}` to `any`). `declaration_pairs` covers
-exact Go renames only: inside one directory, and across directories when the
-indexed module evidence gives both files the same import path, package clause,
-test role and build constraint (a module root moved with its packages, see
-below). Declarations of any other move, of a move with modified content, or
-outside Go are not paired: callers of such a move are cited as
+Go only: exact renames inside one directory, exact renames across directories
+when the indexed module evidence gives both files the same module path, import
+path, package clause, test role and build constraint (a module root moved with
+its packages), and single declarations moved between edited files of one
+package when their own bytes and their file's imports are unchanged (see
+below). Declarations of any other move, a declaration whose content changed,
+and declarations outside Go are not paired: callers of such a move are cited as
 `dependent_retargeted`, and a moved dependent is not scored.
 
 ### Go package identity
@@ -91,16 +93,17 @@ combined `// +build`) constraint, and each completed scan records every `go.mod`
 and `go.work` of the repository. A file's import path is the module path of the
 nearest `go.mod` at or above it plus its directory relative to that module
 root. Since an import path names a directory, two files in different
-directories share one only when the module root moved with them, still
-declares the same module path and its `go.mod` bytes are unchanged (as a
-same-directory rename requires). A cross-directory rename pairs only then, and is
-refused otherwise:
+directories share one only when the module root moved with them and still
+declares the same module path. A cross-directory rename pairs only then, and
+only when the bytes of that module's `go.mod` are unchanged (a same-directory
+rename instead compares every `go.mod` and `go.work` in its directory and its
+parents). It is refused otherwise:
 
 | `reason` | When |
 |---|---|
 | `module_evidence_unavailable` | Either side has no recorded module evidence (an index written before it was recorded), a file has no recorded package identity, a file is outside every module or under a `go.mod` without a module path, or the module's `go.mod` is missing from a revision's tree. |
-| `workspace_uncertain` | Either revision has a `go.work`. |
-| `module_replace_in_repo` | A `go.mod` of either revision replaces a module by a directory path, inside or outside the repository. |
+| `workspace_uncertain` | In either revision a `go.work` lists the file's module in `use`, or a `go.work` cannot be read or parsed, or one of its `use` paths is absolute. A module no `go.work` uses keeps its import identity; a `go.work` added, removed or edited between the revisions is judged by what each revision's `go.work` uses. |
+| `module_replace_in_repo` | In either revision the file's module declares a replace by a directory path (to a directory inside or outside the repository), or is the target directory of such a replace in another `go.mod` or a `go.work`, or a `go.mod` with such a replace cannot be read or parsed, or a replace path is absolute. Modules a replace does not involve keep their import identity. |
 | `module_path_not_unique` | Two module roots declare the file's module path. |
 | `module_identity_changed` | The import paths or the module paths differ: a different package, even with the same package clause and names, or the same import path now owned by another module. |
 | `module_root_changed` | The `go.mod` of the file's module differs in bytes between the two revisions. |
@@ -110,9 +113,83 @@ refused otherwise:
 
 A Go file removed from one directory and added under another with the same
 file name and package identity but different bytes is listed under `refused`
-as `content_changed`: nothing proves its declarations kept their content, so
-none of them is paired. When several files fit, or the bytes are shared by
-other moved files, each candidate is `move_ambiguous`.
+as `content_changed`: the file is not a rename. When several files fit, or the
+bytes are shared by other moved files, each candidate is `move_ambiguous`. Its
+declarations are then judged one by one, as below.
+
+### Edited moves
+
+A declaration can also be paired when it leaves a removed Go file for an added
+Go file of the same package identity (module path, import path, package
+clause, external test role, build constraint, file name build role and parser
+semantics; the directories may be equal) and nothing it means can differ. The
+diff reads both files from Git and parses them again; the declaration is the
+whole top-level declaration that holds it (for a constant in a `const ( ...
+iota ... )` group, the group). It pairs only when:
+
+- its module's import identity holds as for a cross-directory rename (no
+  `go.work` uses it, no replace involves it, its module's `go.mod` bytes are
+  unchanged),
+- its identity without path and position (kind, qualified name with receiver,
+  signature, stable key, visibility, staticness, arity) is unique among all
+  declarations of that package identity in each revision,
+- it does not run in file order (see [Shared eligibility](#shared-eligibility)):
+  the files differ, so the declaration's place among them is not kept,
+- its own bytes are equal, and so are the compiler directives (`//go:`,
+  `//line`, `//export`, `//extern`) before it; its doc comment and its position
+  may change,
+- its file's package clause, imports (name and path, in any order), every
+  comment inside or on an import declaration (the cgo preamble, in or outside a
+  group), header comments, `//go:linkname` and `//go:cgo_*` directives wherever
+  they are, and directives that precede no declaration or an import are equal.
+
+A declaration found on both sides that fails one of these is listed under
+`refused` with the base declaration and the reason; one that exists on one side
+only is not a move candidate and is not listed:
+
+| `reason` | When |
+|---|---|
+| `declaration_order_dependent` | The declaration runs in file order (see below). |
+| `declaration_embed_unproven` | A `//go:embed` before or inside the declaration cannot be shown to embed the same bytes (see below). |
+| `declaration_not_unique` | The identity occurs more than once in the package on either side. |
+| `declaration_content_unavailable` | A file could not be read back from Git, its bytes differ from the indexed ones, it does not parse, or the declaration does not map to exactly one top-level declaration that shares no line with another. |
+| `declaration_context_changed` | The file's package clause, imports, import comments, header comments, linkname or cgo directives, or unattached directives differ. |
+| `declaration_content_changed` | The declaration's bytes or the directives before it differ. |
+
+The module refusals of the table above (`workspace_uncertain`,
+`module_replace_in_repo`, `module_root_changed`, `module_evidence_unavailable`)
+apply per declaration too.
+
+### Shared eligibility
+
+Every pairing path (exact rename in or across directories, edited move) also
+refuses a declaration whose own bytes cannot show that it means the same thing
+in its new file. These rows carry the base declaration:
+
+- `declaration_order_dependent`: a receiverless `init` function or a `var`
+  declaration with initializer values (for a grouped `var ( ... )`, any spec
+  with values) runs during package initialization in file order, and a `Test`,
+  `Benchmark`, `Fuzz` or `Example` function of a `_test.go` file (the name
+  followed by nothing or by a character that is not a lower-case letter;
+  `TestMain` excluded) runs under `go test` in file order. The go command lists
+  a package's files sorted by name, test files after the others. An exact
+  rename keeps that order when every other `.go` file of the same test role in
+  the old directory is in the new directory, on the same side of the file name,
+  and no other `.go` file joined it (`a.go` to `b.go` next to `m.go` keeps it,
+  `a.go` to `z.go` does not); then such declarations pair. An edited move never
+  keeps it. Constants, types, methods, other functions and variables without
+  initializer pair regardless of order.
+- `declaration_embed_unproven`: a `//go:embed` pattern resolves against the
+  source file's directory, so identical bytes can embed different content after
+  a move. A declaration with `//go:embed` pairs only when every pattern names
+  one file (no glob, no `all:`, no quoted name, a clean relative path) that, in
+  both revisions, is a regular file readable from Git, not a directory, not
+  under a nested `go.mod`, and has equal bytes. A missing, unreadable or
+  changed file refuses; so does every pattern form not listed.
+
+Both refusals read the file back from Git; when an exact rename's file cannot
+be read or parsed, or a declaration shares a line with another top-level
+declaration, its declarations are refused as `declaration_content_unavailable`.
 
 `score` is the sum of component points, clamped to 100. Each component lists
 `points_each`, `max_points`, `count`, `points` and its `evidence` rows:
@@ -132,14 +209,21 @@ fixed per model id. `codegraph.change-risk/v1` has not shipped in a release, so
 the dependent pairing and sibling counting above are part of v1. After a
 release, any change to what a rule cites or scores needs a new model id.
 
-Cross-directory Go pairs keep the model at v1. Every rule is defined in terms of
+Cross-directory Go pairs, edited moves, the scoped `go.work` and replace
+checks, and the shared eligibility refusals keep the model at v1. Every rule is defined in terms of
 `declaration_pairs` (a paired declaration is the same declaration, a paired
-dependent survives), and those definitions are unchanged. A new pair only
-removes citations and uncertainty rows of a move whose identity the module
-evidence proves (a caller's binding to the moved declaration is no longer
-`dependent_retargeted`, the moved declaration no longer
-`removed_declaration_without_resolved_dependents`); it never adds points. A
-move without that proof is cited exactly as before.
+dependent survives), and those definitions are unchanged. An edited-move pair
+asserts the same thing an exact rename does, for one declaration instead of a
+whole file: the same package and the same bytes, read in the same file scope
+(imports, cgo preamble, directives). An exact rename never proved the rest of
+the package unchanged either. A new pair only removes citations and
+uncertainty rows of a move whose identity the evidence proves (a caller's
+binding to the moved declaration is no longer `dependent_retargeted`, the moved
+declaration no longer `removed_declaration_without_resolved_dependents`); it
+never adds points. A move without that proof, including a moved declaration
+whose content changed, is cited exactly as before. The shared eligibility
+refusals only withdraw pairs, so they can only restore citations a pair would
+have removed.
 
 ## Uncertainty
 

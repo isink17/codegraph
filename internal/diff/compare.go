@@ -30,6 +30,9 @@ type Revision struct {
 	GraphData   store.SemanticGraph `json:"-"`
 	TreeFiles   []SourceFile        `json:"-"`
 	IndexPolicy IndexPolicy         `json:"-"`
+	// source reads a file of the revision's tree, or reports it unavailable.
+	source func(path string) ([]byte, bool)
+	blobs  *blobReader
 }
 
 type Result struct {
@@ -193,7 +196,7 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	}
 	coverage := sectionCoverage(base, head, baseEdges, headEdges, semanticOK, compatible, len(incomplete))
 	renames := fileRenames(revisionFiles(base), revisionFiles(head), sameJSON(base.IndexPolicy, head.IndexPolicy))
-	pairs := declarationPairs(renames, base.GraphData, head.GraphData, semanticOK, incomplete, base.TreeFiles, head.TreeFiles)
+	pairs := declarationPairs(renames, base.GraphData, head.GraphData, semanticOK, incomplete, base.TreeFiles, head.TreeFiles, base.source, head.source)
 	doc := DiffDocument{Schema: Schema, Coverage: coverage, FileRenames: renames, DeclarationPairs: pairs, Risk: assessRisk(all, coverage, lims, base.GraphData.Declarations, head.GraphData.Declarations, baseEdges, headEdges, pairs), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
 	for _, c := range changes {
 		addToSections(&doc, c)

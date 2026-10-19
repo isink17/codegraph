@@ -1,6 +1,9 @@
 package diff
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,13 +18,27 @@ import (
 
 // pairRevision is one side of a single-file rename: the file's projection and
 // its declarations, as an index of that revision would report them.
+// The file's bytes depend only on the fixture's content hash, so equal
+// fixture hashes stay equal bytes; lines 3 to 20 each hold one function.
 func pairRevision(file store.SemanticFile, decls ...store.SemanticDeclaration) Revision {
 	for i := range decls {
 		decls[i].Path = file.Path
 	}
+	content := "package p\n// " + file.ContentHash + "\n"
+	for line := 3; line <= 20; line++ {
+		content += fmt.Sprintf("func f%d() {}\n", line)
+	}
+	sum := sha256.Sum256([]byte(content))
+	file.ContentHash = hex.EncodeToString(sum[:])
 	return Revision{
 		TreeFiles: []SourceFile{{Path: file.Path, ContentHash: file.ContentHash, Language: file.Language}},
 		GraphData: store.SemanticGraph{Files: []store.SemanticFile{file}, Declarations: decls},
+		source: func(p string) ([]byte, bool) {
+			if p == file.Path {
+				return []byte(content), true
+			}
+			return nil, false
+		},
 	}
 }
 
@@ -328,7 +345,17 @@ func TestDeclarationPairsRefuseChangedContentMoves(t *testing.T) {
 				t.Fatal(err)
 			}
 			d := got.Diff.DeclarationPairs
-			if len(d.Pairs) != 0 || !reflect.DeepEqual(d.Refused, tc.want) {
+			// Declaration rows of these moves are refused for the missing
+			// go.mod (TestEditedMoves covers them).
+			fileRows := []RefusedPairing{}
+			for _, r := range d.Refused {
+				if r.Declaration == nil {
+					fileRows = append(fileRows, r)
+				} else if r.Reason != refuseModuleEvidenceMissing {
+					t.Fatalf("declaration row %+v", r)
+				}
+			}
+			if len(d.Pairs) != 0 || !reflect.DeepEqual(fileRows, tc.want) {
 				t.Fatalf("declaration pairs = %+v, want refused %+v", d, tc.want)
 			}
 		})
@@ -544,23 +571,39 @@ func TestCompareCommitsCrossDirectoryLifecycle(t *testing.T) {
 			t.Fatalf("declaration pairs = %s", canonical(d))
 		}
 	})
-	t.Run("content changed during the move", func(t *testing.T) {
+	t.Run("doc comment added during the move", func(t *testing.T) {
 		got := moveScenario(t, app, func(r *gittest.Repo) {
 			moveModule(r)
 			r.Write("sub/p/a.go", "package p\n\n// A does nothing.\nfunc A() {}\n")
 		})
 		d := got.Diff.DeclarationPairs
-		if want := []string{"cmd/main.go>sub/cmd/main.go:main.main"}; !reflect.DeepEqual(pairedPaths(d), want) {
+		if want := []string{"cmd/main.go>sub/cmd/main.go:main.main", "p/a.go>sub/p/a.go:p.A"}; !reflect.DeepEqual(pairedPaths(d), want) {
 			t.Fatalf("pairs = %v", pairedPaths(d))
 		}
 		if want := []string{"p/a.go>sub/p/a.go:" + refuseContentChanged}; !reflect.DeepEqual(goRefusals(d), want) {
 			t.Fatalf("refused = %v", goRefusals(d))
 		}
 	})
+	t.Run("body changed during the move", func(t *testing.T) {
+		got := moveScenario(t, app, func(r *gittest.Repo) {
+			moveModule(r)
+			r.Write("sub/p/a.go", "package p\n\nfunc A() { println() }\n")
+		})
+		d := got.Diff.DeclarationPairs
+		if want := []string{"cmd/main.go>sub/cmd/main.go:main.main"}; !reflect.DeepEqual(pairedPaths(d), want) {
+			t.Fatalf("pairs = %v", pairedPaths(d))
+		}
+		if want := []string{"p/a.go>sub/p/a.go:" + refuseContentChanged, "p/a.go>sub/p/a.go:" + refuseDeclContentChanged}; !reflect.DeepEqual(goRefusals(d), want) {
+			t.Fatalf("refused = %v", goRefusals(d))
+		}
+	})
 	t.Run("identical files moved together", func(t *testing.T) {
 		got := moveScenario(t, with(app, map[string]string{"p/b.go": "package p\n\nfunc A() {}\n"}), moveModule)
 		d := got.Diff.DeclarationPairs
-		if want := []string{"p/a.go>sub/p/a.go:" + refuseMoveAmbiguous, "p/b.go>sub/p/b.go:" + refuseMoveAmbiguous}; !reflect.DeepEqual(goRefusals(d), want) {
+		want := []string{"p/a.go>sub/p/a.go:" + refuseMoveAmbiguous, "p/b.go>sub/p/b.go:" + refuseMoveAmbiguous,
+			"p/a.go>sub/p/a.go:" + refuseDeclarationNotUnique, "p/a.go>sub/p/b.go:" + refuseDeclarationNotUnique,
+			"p/b.go>sub/p/a.go:" + refuseDeclarationNotUnique, "p/b.go>sub/p/b.go:" + refuseDeclarationNotUnique}
+		if !reflect.DeepEqual(goRefusals(d), want) {
 			t.Fatalf("refused = %v", goRefusals(d))
 		}
 	})
