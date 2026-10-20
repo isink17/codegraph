@@ -7,6 +7,9 @@ import (
 	"testing"
 
 	"github.com/isink17/codegraph/internal/githistory/gittest"
+	"github.com/isink17/codegraph/internal/parser"
+	goparser "github.com/isink17/codegraph/internal/parser/golang"
+	"github.com/isink17/codegraph/internal/store"
 )
 
 func TestCompareCommitsImportAwareMoves(t *testing.T) {
@@ -22,6 +25,8 @@ func TestCompareCommitsImportAwareMoves(t *testing.T) {
 		name string
 		// fn moves from p/a.go (imports from) to p/b.go (imports to).
 		fn, from, to []string
+		// headFn, when set, replaces fn in the head file.
+		headFn []string
 		// header replaces the package clause line of the head file; tail ends it.
 		header  string
 		tail    string
@@ -65,6 +70,22 @@ func TestCompareCommitsImportAwareMoves(t *testing.T) {
 			gomod: "require tools v1.0.0\n",
 			from:  []string{`"strings"`}, to: []string{`"strings"`, `"tools/fmt"`},
 			refused: []string{"p/a.go>p/b.go:" + refuseDeclContextChanged}},
+		{name: "dotless path a replaced module provides", fn: []string{upper},
+			gomod: "replace tools => example.com/tools v1.0.0\n",
+			from:  []string{`"strings"`}, to: []string{`"strings"`, `"tools/fmt"`},
+			refused: []string{"p/a.go>p/b.go:" + refuseDeclContextChanged}},
+		{name: "own package with an external test package proven", fn: []string{upper},
+			extra: map[string]string{"w/w_test.go": "package other_test\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) {}\n"},
+			from:  []string{`"strings"`}, to: []string{`"strings"`, `"example.com/m/w"`},
+			pairs: []string{"p/a.go>p/b.go:p.A"}},
+		{name: "content and imports both changed reports the context", fn: []string{upper},
+			headFn: []string{"func A() string { return strings.ToUpper(\"b\") }\n"},
+			from:   []string{`"strings"`}, to: []string{`"fmt"`, `"strings"`},
+			refused: []string{"p/a.go>p/b.go:" + refuseDeclContextChanged}},
+		{name: "content changed with equal imports", fn: []string{upper},
+			headFn: []string{"func A() string { return strings.ToUpper(\"b\") }\n"},
+			from:   []string{`"strings"`}, to: []string{`"strings"`},
+			refused: []string{"p/a.go>p/b.go:" + refuseDeclContentChanged}},
 		{name: "own package named apart from its directory proven", fn: []string{upper},
 			from: []string{`"strings"`}, to: []string{`"strings"`, `"example.com/m/w"`},
 			pairs: []string{"p/a.go>p/b.go:p.A"}},
@@ -141,9 +162,13 @@ func TestCompareCommitsImportAwareMoves(t *testing.T) {
 				tc.pairs = []string{}
 			}
 			for name, adapter := range testGoAdapters {
+				headFn := tc.fn
+				if tc.headFn != nil {
+					headFn = tc.headFn
+				}
 				got := editScenario(t, adapter, files, func(r *gittest.Repo) {
 					r.Write("p/a.go", pkg(tc.from...)+fnB)
-					r.Write(toPath, header(pkg(tc.to...)+"func C() {}\n\n"+strings.Join(tc.fn, "")+tc.tail))
+					r.Write(toPath, header(pkg(tc.to...)+"func C() {}\n\n"+strings.Join(headFn, "")+tc.tail))
 				})
 				d := got.Diff.DeclarationPairs
 				if !reflect.DeepEqual(pairedPaths(d), tc.pairs) || !reflect.DeepEqual(goRefusals(d), tc.refused) {
@@ -207,5 +232,80 @@ func TestImportsAgree(t *testing.T) {
 	}
 	if agree("// Copyright a\n\npackage p\n\nimport \"strings\"\n\n"+fn, "package p\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\n"+fn) {
 		t.Fatal("header comment change agreed")
+	}
+}
+
+// Evidence a Git snapshot cannot produce: a go.mod read back with bytes its
+// tree entry does not hash to, and a file of the imported package whose index
+// rows do not describe its bytes. Either leaves the added import's name
+// unprovable.
+func TestImportNameNeedsTrustedEvidence(t *testing.T) {
+	fn := "func A() string { return strings.ToUpper(\"a\") }\n"
+	for _, tc := range []struct {
+		name   string
+		gomod  string
+		to     string
+		tamper func(head *Revision)
+	}{
+		{name: "go.mod bytes differ from the tree", gomod: "replace tools => example.com/tools v1.0.0\n", to: `"tools/fmt"`,
+			tamper: func(head *Revision) {
+				src := head.source
+				head.source = func(p string) ([]byte, bool) {
+					if p == "go.mod" {
+						return []byte("module example.com/m\n\ngo 1.22\n"), true
+					}
+					return src(p)
+				}
+			}},
+		{name: "imported package file incomplete", to: `"example.com/m/w"`,
+			tamper: func(head *Revision) {
+				files := append([]store.SemanticFile(nil), head.GraphData.Files...)
+				for i := range files {
+					if files[i].Path == "w/w.go" {
+						files[i].ParseState = store.ParseStateFailed
+					}
+				}
+				head.GraphData.Files = files
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := gittest.Init(t)
+			r.Write("go.mod", "module example.com/m\n\ngo 1.22\n"+tc.gomod)
+			r.Write("w/w.go", "package other\n\nfunc F() int { return 3 }\n")
+			r.Write("p/a.go", "package p\n\nimport \"strings\"\n\n"+fn)
+			r.Write("p/b.go", "package p\n\nfunc C() {}\n")
+			base := r.Commit("", "base")
+			r.Write("p/a.go", "package p\n")
+			r.Write("p/b.go", "package p\n\nimport (\n\t\"strings\"\n\t"+tc.to+"\n)\n\nfunc C() {}\n\n"+fn)
+			head := r.Commit("", "change")
+			registry := parser.NewRegistry(goparser.New())
+			for _, tampered := range []bool{false, true} {
+				from, err := snapshot(t.Context(), r.Dir, base, registry)
+				if err != nil {
+					t.Fatal(err)
+				}
+				to, err := snapshot(t.Context(), r.Dir, head, registry)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tampered {
+					tc.tamper(&to)
+				}
+				got, err := compareSnapshots(t.Context(), from, to, 0, 100)
+				from.blobs.close()
+				to.blobs.close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				d := got.Diff.DeclarationPairs
+				want := []string{"p/a.go>p/b.go:" + refuseDeclContextChanged}
+				if !tampered && tc.gomod == "" {
+					want = []string{}
+				}
+				if !reflect.DeepEqual(goRefusals(d), want) {
+					t.Fatalf("tampered=%v: pairs = %v, refused %v, want refused %v", tampered, pairedPaths(d), goRefusals(d), want)
+				}
+			}
+		})
 	}
 }

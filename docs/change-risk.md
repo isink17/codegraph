@@ -19,6 +19,10 @@ change lists but never change `risk`.
 - No assessment proves a change safe. Only resolved edges are cited, so an
   unresolved, dynamic, reflective or cross-language dependent can still break.
   `risk.coverage` is therefore never `complete`.
+- With `CGO_ENABLED=0` (parser profile `go-ast:go:v3`) a Go function's
+  stored signature omits its parameters and results, so a signature change is
+  not seen. Results on pinned real repositories, with known false positives
+  and negatives, are in `docs/change-risk-verification.md`.
 
 ## Assessments
 
