@@ -17,17 +17,23 @@ var goTypeAliasFiles = map[string]string{
 
 // A go/ast index written before alias signatures were prefixed with `= `.
 func TestGoTypeAliasProfileUpgrade(t *testing.T) {
-	runGoTypeAliasProfileUpgrade(t, goNativeRegistry(), "go-ast:go:v5", "go-ast:go:v6",
+	runGoProfileUpgrade(t, goNativeRegistry(), goTypeAliasFiles, "go-ast:go:v5", "go-ast:go:v6",
 		`UPDATE symbols SET signature=substr(signature, 3) WHERE language='go' AND signature LIKE '= %'`,
 		`UPDATE symbols SET signature='[T any] []T' WHERE language='go' AND qualified_name='p.GenAlias'`)
 }
 
-// runGoTypeAliasProfileUpgrade rewrites a fresh index into what the previous
-// profile stored, then checks that a path-scoped update reparses every Go
+// runGoProfileUpgrade rewrites a fresh index into what the previous profile
+// stored, then checks that a path-scoped update of p/b.go reparses every Go
 // file into the graph a fresh index has.
-func runGoTypeAliasProfileUpgrade(t *testing.T, reg *parser.Registry, previous, current string, stale ...string) {
+func runGoProfileUpgrade(t *testing.T, reg *parser.Registry, files map[string]string, previous, current string, stale ...string) {
 	t.Helper()
-	r := newGoRepo(t, reg, goTypeAliasFiles)
+	goFiles := 0
+	for path := range files {
+		if strings.HasSuffix(path, ".go") {
+			goFiles++
+		}
+	}
+	r := newGoRepo(t, reg, files)
 	r.store.SetParserProfiles(reg.LanguageProfiles())
 	_, freshJSON := r.semanticJSON(t)
 
@@ -56,7 +62,7 @@ func runGoTypeAliasProfileUpgrade(t *testing.T, reg *parser.Registry, previous, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.FilesChanged != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "go" {
+	if summary.FilesChanged != goFiles || strings.Join(summary.ParserProfileLanguages, ",") != "go" {
 		t.Fatalf("path-scoped upgrade = %+v, want every Go file reparsed", summary)
 	}
 	if _, got := r.semanticJSON(t); got != freshJSON {

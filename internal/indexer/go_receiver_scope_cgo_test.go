@@ -26,7 +26,7 @@ func TestGoPackageIdentityIndexAndUpdateParityTreeSitter(t *testing.T) {
 }
 
 func TestGoSignatureProfileUpgradeTreeSitter(t *testing.T) {
-	runGoSignatureProfileUpgrade(t, parser.NewRegistry(tsparser.NewGo()), "treesitter:go:v3", "treesitter:go:v5")
+	runGoSignatureProfileUpgrade(t, parser.NewRegistry(tsparser.NewGo()), "treesitter:go:v3", "treesitter:go:v6")
 }
 
 // On this fixture both Go parser families store the same declarations, so a cgo

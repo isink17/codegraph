@@ -44,7 +44,7 @@ func TestGoTypeAliasFamilyParity(t *testing.T) {
 // and an unbound conversion.
 func TestGoTypeAliasProfileUpgradeTreeSitter(t *testing.T) {
 	aliases := `SELECT id FROM symbols WHERE language='go' AND qualified_name IN ('p.Plain','p.Grouped','p.Remote')`
-	runGoTypeAliasProfileUpgrade(t, parser.NewRegistry(tsparser.NewGo()), "treesitter:go:v4", "treesitter:go:v5",
+	runGoProfileUpgrade(t, parser.NewRegistry(tsparser.NewGo()), goTypeAliasFiles, "treesitter:go:v4", "treesitter:go:v6",
 		`UPDATE edges SET dst_symbol_id=NULL, resolution_strategy='', resolution_confidence='' WHERE dst_symbol_id IN (`+aliases+`)`,
 		`DELETE FROM symbols WHERE id IN (`+aliases+`)`)
 }

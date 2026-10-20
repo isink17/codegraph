@@ -126,7 +126,7 @@ func goSignatureSet(g store.SemanticGraph) string {
 // Both Go parser families keep one semantic epoch, so switching between a cgo
 // and a non-cgo build is never refused as a semantic downgrade.
 func TestGoParserFamiliesShareSemanticEpoch(t *testing.T) {
-	if a, b := parser.SemanticEpochForProfile("go-ast:go:v6"), parser.SemanticEpochForProfile("treesitter:go:v5"); a == 0 || a != b {
+	if a, b := parser.SemanticEpochForProfile("go-ast:go:v6"), parser.SemanticEpochForProfile("treesitter:go:v6"); a == 0 || a != b {
 		t.Fatalf("go-ast epoch %d, tree-sitter epoch %d", a, b)
 	}
 }
