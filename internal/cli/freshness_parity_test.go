@@ -13,6 +13,7 @@ import (
 	"github.com/isink17/codegraph/internal/constraints"
 	"github.com/isink17/codegraph/internal/editsafety"
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/store"
 )
 
@@ -92,7 +93,7 @@ func compactJSON(t *testing.T, raw json.RawMessage) json.RawMessage {
 // verdict path: stats and graph_stats print the same object, strict
 // check_constraints exits 3 and safe_to_edit withholds its verdict.
 func TestFreshnessParityAcrossSurfaces(t *testing.T) {
-	root, _ := safeToEditRepo(t, map[string]string{constraints.ConfigFileName: cliConstraintsConfig})
+	root, repo := safeToEditRepo(t, map[string]string{constraints.ConfigFileName: cliConstraintsConfig})
 	opened, err := openIndexedRepoReadOnly(context.Background(), loadTestConfig(t), root)
 	if err != nil {
 		t.Fatal(err)
@@ -183,4 +184,21 @@ func TestFreshnessParityAcrossSurfaces(t *testing.T) {
 	expect("watching", "", store.LiveWatcherWatching)
 	lock.Close()
 	expect("watcher exited", "", store.LiveWatcherNone)
+
+	// A commit touching two files, then a path-scoped update of one: the
+	// other is still stale, so HEAD reads as moved until a full scan.
+	repo.Write("internal/u1/x.go", "package util\n\nfunc Dup() {}\n\nfunc One() {}\n")
+	repo.Write("internal/u2/x.go", "package util\n\nfunc Dup() {}\n\nfunc Two() {}\n")
+	repo.Commit("", "two")
+	if _, err := indexer.New(st, newDefaultRegistry(), nil).Update(context.Background(), indexer.Options{RepoRoot: root, Paths: []string{"internal/u1/x.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	moved := expect("path-scoped update at a new HEAD", "head_moved", store.LiveWatcherNone)
+	if w := moved.freshness.Worktree; w.HeadChanged != "yes" || w.HeadAtIndexSource != "last_full_scan" || w.HeadAtIndex != moved.freshness.Coverage.LastFullScan.HeadAtFinish {
+		t.Fatalf("path-scoped update at a new HEAD: %+v", w)
+	}
+	if _, _, err := runCLI(t, "update", root); err != nil {
+		t.Fatal(err)
+	}
+	expect("full update", "", store.LiveWatcherNone)
 }
