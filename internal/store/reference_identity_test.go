@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -274,7 +275,7 @@ func TestReferenceIdentityMatchesCppMemberEvidence(t *testing.T) {
 		if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=? WHERE repo_id=?`, target, repoID); err != nil {
 			t.Fatal(err)
 		}
-		if err := reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, languages); err != nil {
+		if err := s.reconcileReferenceIdentitiesStandalone(ctx, repoID, languages); err != nil {
 			t.Fatal(err)
 		}
 		var bound, separatorless *int64
@@ -285,6 +286,80 @@ func TestReferenceIdentityMatchesCppMemberEvidence(t *testing.T) {
 		}
 		if bound == nil || *bound != target || separatorless != nil {
 			t.Fatalf("languages %v: member evidence bound %v, separatorless %v, want %d and nil", languages, bound, separatorless, target)
+		}
+	}
+}
+
+// The member-evidence match is C++ only: a Go call spelled with its receiver
+// keeps an unbound reference when the edge names a different target.
+func TestReferenceIdentityMemberEvidenceIsCppOnly(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	parsed := graph.ParsedFile{
+		Symbols: []graph.Symbol{
+			{Language: "go", Kind: "function", Name: "caller", QualifiedName: "caller", StableKey: "caller", Range: graph.Position{StartLine: 1, EndLine: 4}},
+			{Language: "go", Kind: "method", Name: "run", QualifiedName: "Widget.run", StableKey: "Widget.run", Range: graph.Position{StartLine: 6, EndLine: 7}},
+		},
+		References: []graph.Reference{
+			{Kind: "call", Name: "run", Range: graph.Position{StartLine: 2, StartCol: 4, EndLine: 2, EndCol: 9}},
+		},
+		Edges: []graph.Edge{
+			{DstName: "Widget.run", Kind: "calls", Line: 2, Col: 4, Evidence: "w.run"},
+		},
+	}
+	if err := s.ReplaceFileGraph(ctx, repoID, 1, "main.go", "go", 1, 1, "go", parsed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT id FROM symbols WHERE repo_id=? AND stable_key='Widget.run') WHERE repo_id=?`, repoID, repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReconcileReferenceIdentities(ctx, repoID); err != nil {
+		t.Fatal(err)
+	}
+	var bound *int64
+	if err := s.db.QueryRowContext(ctx, `SELECT symbol_id FROM references_tbl WHERE repo_id=?`, repoID).Scan(&bound); err != nil {
+		t.Fatal(err)
+	}
+	if bound != nil {
+		t.Fatalf("Go member evidence bound the reference to %d", *bound)
+	}
+}
+
+// The pass stages references in a temp table, which lives on one pooled
+// connection; readers using the pool meanwhile must not split its statements.
+func TestReferenceIdentityReconcileWithConcurrentReaders(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	parsed := graph.ParsedFile{
+		Symbols:    []graph.Symbol{{Language: "go", Kind: "function", Name: "f", QualifiedName: "f", StableKey: "f", Range: graph.Position{StartLine: 1, EndLine: 3}}},
+		References: []graph.Reference{{Kind: "call", Name: "f", Range: graph.Position{StartLine: 2, StartCol: 2, EndLine: 2, EndCol: 3}}},
+		Edges:      []graph.Edge{{DstName: "f", Kind: "calls", Line: 2, Col: 2}},
+	}
+	if err := s.ReplaceFileGraph(ctx, repoID, 1, "main.go", "go", 1, 1, "go", parsed); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	for range 8 {
+		readers.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var n int
+				_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM references_tbl`).Scan(&n)
+			}
+		})
+	}
+	defer func() {
+		close(stop)
+		readers.Wait()
+	}()
+	for i := range 300 {
+		if err := s.ReconcileReferenceIdentities(ctx, repoID); err != nil {
+			t.Fatalf("run %d: %v", i, err)
 		}
 	}
 }

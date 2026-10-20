@@ -10,7 +10,40 @@ import (
 // Keeping this as one set-based pass prevents reference binding from becoming
 // a second resolver or a Go-side join.
 func (s *Store) ReconcileReferenceIdentities(ctx context.Context, repoID int64) error {
-	return reconcileReferenceIdentities(ctx, s.db, repoID)
+	return s.reconcileReferenceIdentitiesStandalone(ctx, repoID, nil)
+}
+
+// reconcileReferenceIdentitiesStandalone runs the pass on one connection in
+// one IMMEDIATE transaction: its temp table lives on that connection, so the
+// statements must not spread across the pool, and a rollback discards a table
+// an error left filled. IMMEDIATE takes the write lock up front, where the
+// busy timeout applies; a deferred transaction upgrading from its read gets
+// SQLITE_BUSY at once while pooled readers come and go.
+func (s *Store) reconcileReferenceIdentitiesStandalone(ctx context.Context, repoID int64, languages []string) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			// Detached: a cancelled ctx would skip the ROLLBACK and return the
+			// connection to the pool inside the transaction.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+		}
+	}()
+	if err := reconcileReferenceIdentitiesForLanguages(ctx, conn, repoID, languages); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // referenceIdentityDeriveSQL derives, for every reference staged in
