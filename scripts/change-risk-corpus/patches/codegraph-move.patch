@@ -1,0 +1,71 @@
+diff --git a/internal/diff/declaration_pairs.go b/internal/diff/declaration_pairs.go
+index 609b52e..12eb840 100644
+--- a/internal/diff/declaration_pairs.go
++++ b/internal/diff/declaration_pairs.go
+@@ -237,28 +237,6 @@ func treeHash(tree []SourceFile, p string) string {
+ 	return ""
+ }
+ 
+-func moduleRoots(m *store.SemanticGoModules, modulePath string) int {
+-	n := 0
+-	for _, mod := range m.Modules {
+-		if mod.Path == modulePath {
+-			n++
+-		}
+-	}
+-	return n
+-}
+-
+-// goIgnoredDirectory reports a path the go command never builds as an
+-// ordinary package: under testdata, vendor, or a directory starting with _
+-// or a dot.
+-func goIgnoredDirectory(p string) bool {
+-	for _, el := range strings.Split(path.Dir(p), "/") {
+-		if el == "testdata" || el == "vendor" || strings.HasPrefix(el, "_") || (strings.HasPrefix(el, ".") && el != ".") {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+ // changedContentMoves lists Go files removed from one directory and added
+ // under another with the same file name and package identity but different
+ // bytes. The file is not a rename; editedMoves judges its declarations one by
+diff --git a/internal/diff/risk.go b/internal/diff/risk.go
+index 8eb0561..7ccd26f 100644
+--- a/internal/diff/risk.go
++++ b/internal/diff/risk.go
+@@ -2,6 +2,7 @@ package diff
+ 
+ import (
+ 	"encoding/json"
++	"path"
+ 	"sort"
+ 	"strings"
+ 
+@@ -527,3 +528,25 @@ func headDependents(baseDecls, headDecls []store.SemanticDeclaration, pairedTo m
+ 	}
+ 	return out, ambiguous
+ }
++
++func moduleRoots(m *store.SemanticGoModules, modulePath string) int {
++	n := 0
++	for _, mod := range m.Modules {
++		if mod.Path == modulePath {
++			n++
++		}
++	}
++	return n
++}
++
++// goIgnoredDirectory reports a path the go command never builds as an
++// ordinary package: under testdata, vendor, or a directory starting with _
++// or a dot.
++func goIgnoredDirectory(p string) bool {
++	for _, el := range strings.Split(path.Dir(p), "/") {
++		if el == "testdata" || el == "vendor" || strings.HasPrefix(el, "_") || (strings.HasPrefix(el, ".") && el != ".") {
++			return true
++		}
++	}
++	return false
++}

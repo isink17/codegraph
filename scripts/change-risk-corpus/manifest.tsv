@@ -1,0 +1,46 @@
+# Real-corpus verification of `codegraph diff` change risk. Tab separated.
+# repo	name	url	pin	oracle-module (module path written into a go.mod of the oracle copy only; - when the repository has one)
+repo	uuid	https://github.com/google/uuid.git	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	-
+repo	errors	https://github.com/pkg/errors.git	87f8819acf6dc28bf5d3c14b334268236d686f48	github.com/pkg/errors
+repo	codegraph	https://github.com/isink17/codegraph.git	355de90cef8758457afe2968e14d88332306987e	-
+# case	id	repo	kind	base	head	label
+# kind self: base diffed against itself. history: a real commit against its first parent.
+# controlled: head is an edit applied to base in a scratch clone and committed with a fixed identity and date.
+# label: what the construction claims; run.py checks it against the Go toolchain on both revisions.
+#   compile_break      base builds and vets, head does not
+#   behavior_break     both build and vet, base tests pass, head tests fail
+#   compiles           both build and vet (no claim about behavior)
+#   rebind_compiles    both build and vet, an identifier of a moved declaration binds another package
+#   -                  no constructed claim (self diffs and real history)
+case	uuid-self	uuid	self	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	-
+case	errors-self	errors	self	87f8819acf6dc28bf5d3c14b334268236d686f48	87f8819acf6dc28bf5d3c14b334268236d686f48	-
+case	codegraph-self	codegraph	self	355de90cef8758457afe2968e14d88332306987e	355de90cef8758457afe2968e14d88332306987e	-
+case	uuid-2d3c2a9	uuid	history	2d3c2a9cc518326daf99a383f07c4d3c44317e4d~1	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	-
+case	uuid-0e97ed3	uuid	history	0e97ed3~1	0e97ed3	-
+case	uuid-e8d82d3	uuid	history	e8d82d3~1	e8d82d3	-
+case	uuid-a2b2b32	uuid	history	a2b2b32~1	a2b2b32	-
+case	uuid-9ee7366	uuid	history	9ee7366~1	9ee7366	-
+case	uuid-b35aa6a	uuid	history	b35aa6a~1	b35aa6a	-
+case	uuid-6e10cd1	uuid	history	6e10cd1~1	6e10cd1	-
+case	errors-614d223	errors	history	614d223~1	614d223	-
+case	errors-49f8f61	errors	history	49f8f61~1	49f8f61	-
+case	errors-004deef	errors	history	004deef~1	004deef	-
+case	errors-6d954f5	errors	history	6d954f5~1	6d954f5	-
+case	errors-7f95ac1	errors	history	7f95ac1~1	7f95ac1	-
+case	errors-ee1923e	errors	history	ee1923e~1	ee1923e	-
+case	errors-e9933c1	errors	history	e9933c1~1	e9933c1	-
+case	codegraph-13fbb0f	codegraph	history	13fbb0fb27~1	13fbb0fb27	-
+case	codegraph-60228c8	codegraph	history	60228c8e61~1	60228c8e61	-
+case	codegraph-89f3557	codegraph	history	89f3557469~1	89f3557469	-
+case	codegraph-f2932b4	codegraph	history	f2932b43e1~1	f2932b43e1	-
+case	uuid-move	uuid	controlled	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	edit:uuid-move	compiles
+case	uuid-move-header-differs	uuid	controlled	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	edit:uuid-move-header-differs	compiles
+case	uuid-remove-used	uuid	controlled	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	edit:uuid-remove-used	compile_break
+case	uuid-rename-definition	uuid	controlled	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	edit:uuid-rename-definition	compile_break
+case	uuid-rename-everywhere	uuid	controlled	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	edit:uuid-rename-everywhere	compiles
+case	uuid-add-parameter	uuid	controlled	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	edit:uuid-add-parameter	compile_break
+case	uuid-body-change	uuid	controlled	2d3c2a9cc518326daf99a383f07c4d3c44317e4d	edit:uuid-body-change	behavior_break
+case	errors-remove-used	errors	controlled	87f8819acf6dc28bf5d3c14b334268236d686f48	edit:errors-remove-used	compile_break
+case	errors-move	errors	controlled	87f8819acf6dc28bf5d3c14b334268236d686f48	edit:errors-move	compiles
+case	codegraph-move	codegraph	controlled	355de90cef8758457afe2968e14d88332306987e	patch:codegraph-move.patch	compiles
+case	codegraph-rebind	codegraph	controlled	355de90cef8758457afe2968e14d88332306987e	patch:codegraph-rebind.patch	rebind_compiles
