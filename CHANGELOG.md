@@ -214,6 +214,8 @@ Java calls in files with a package declaration now bind to the caller's own clas
 
 Performance: dot-suffix resolution no longer builds candidate groups for dotted names that only ordinary Ruby calls carry, since Ruby owns those calls and no generic strategy may bind them. On the Rails repository a full index dropped from about 250 s to about 77 s and a 5-file incremental update from about 200 s to about 31 s, with an identical graph.
 
+Performance: Swift self-call resolution aggregates declaration facts once per symbol instead of rescanning every Swift declaration fact for each candidate method. The inherited final class method and inherited static method stress tests dropped from about 23 s and 16 s to about 3 s and 2.5 s, with an identical graph. No schema change.
+
 The non-CGO Python parser no longer records keyword syntax as calls: `with x as (a, b)`
 called `as`, a match statement called `match`, and a case pattern such as
 `case Point(x=0)` called `Point`. Match subjects, case guards and ordinary calls named
