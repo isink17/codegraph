@@ -111,7 +111,8 @@ limitation.
   session). A subagent file no result names is listed with no parent (depth 0,
   for example teammates); a `Task`/`Agent` call whose result names no file is
   counted in `workload.unlinked_agent_calls`. A file named by two calls is an
-  error.
+  error, and so is a call whose copies (for example a fork's copy of its
+  parent's history, or two results in one file) name two different agents.
 - Cross-file deduplication: each `message.id` counts once across the session's
   files, owned by the main thread first, then subagents in spawn order, then
   unlinked subagents by id, then sidechain events inside the main file. A fork
@@ -163,8 +164,10 @@ in-file sidechain) is checked for:
   only as far as its files are linked. Every copy of a `tool_use` is checked,
   including copies on requests another file owns; attempts are listed once
   per `tool_use` id (main, linked subagents in spawn order, unlinked
-  subagents, then in-file sidechains), and an outcome that is not `blocked` in
-  any copy wins. `agent-*.jsonl` files whose id has characters outside
+  subagents, then in-file sidechains). A copy without a `tool_result` never
+  overrides another copy's outcome; one with a result replaces `no_result`.
+  Copies of a CodeGraph attempt whose results differ (across files or within
+  one file) are an error, so ingest never picks one of them. `agent-*.jsonl` files whose id has characters outside
   `[A-Za-z0-9_-]` are an error.
 
 Each attempt gets an outcome from its `tool_result`: `blocked` only for exact

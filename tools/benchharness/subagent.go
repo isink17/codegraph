@@ -160,6 +160,9 @@ func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool
 	for _, s := range subs {
 		byID[s.res.AgentID] = s
 	}
+	if err := checkCopies(append([]*Transcript{main}, agentTranscripts(subs)...)); err != nil {
+		return nil, 0, nil, err
+	}
 	owned := map[string]*request{}
 	claim := func(t *Transcript, sidechain bool) (dups int, err error) {
 		for _, r := range t.requests {
@@ -240,6 +243,42 @@ func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool
 		}
 	}
 	return checked, len(calls), threads, nil
+}
+
+// checkCopies fails when copies of one tool_use id name different spawned
+// agents, or carry different results for a call contamination would classify,
+// so neither linking nor contamination silently picks one copy.
+func checkCopies(ts []*Transcript) error {
+	attempts := map[string]bool{}
+	for _, t := range ts {
+		for _, u := range t.toolUses {
+			if kind, _ := classifyUse(u); kind != "" && kind != "subagent" {
+				attempts[u.ID] = true
+			}
+		}
+	}
+	links := map[string]string{}
+	results := map[string]toolResult{}
+	for _, t := range ts {
+		for _, id := range slices.Sorted(maps.Keys(t.links)) {
+			a := t.links[id]
+			if prev, ok := links[id]; ok && prev != a {
+				return fmt.Errorf("tool_use %s: copies name agents %q and %q", id, prev, a)
+			}
+			links[id] = a
+		}
+		for _, id := range slices.Sorted(maps.Keys(t.results)) {
+			if !attempts[id] {
+				continue
+			}
+			r := t.results[id]
+			if prev, ok := results[id]; t.conflicts[id] || ok && prev != r {
+				return fmt.Errorf("tool_use %s: copies carry conflicting tool results", id)
+			}
+			results[id] = r
+		}
+	}
+	return nil
 }
 
 func agentTranscripts(subs []*agentFile) []*Transcript {
