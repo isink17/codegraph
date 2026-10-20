@@ -40,7 +40,7 @@ the usual not-indexed error.
 | `parser_profile`, `parser_profile_unconverged` | `converged`, `unconverged` (with languages), `unknown` | per-file parser provenance |
 | `parser_profile_compatibility` | `state` `current`, `obsolete`, `unknown`; `reason`; `languages` | per-file parser provenance and the reading binary's parsers |
 | `worktree.repo_root`, `.canonical_path` | the repository the graph belongs to | `repos` |
-| `worktree.head_at_index`, `.head_now`, `.head_changed` | `unknown` when either HEAD cannot be read | history watermark, one git call |
+| `worktree.head_at_index`, `.head_at_index_source`, `.head_now`, `.head_changed` | `unknown` when either HEAD cannot be read; source `last_full_scan`, `git_history_watermark` or `none` | last full scan's `head_at_finish`, else history watermark; one git call |
 | `watcher` | always `not_in_this_process` | neither `stats` nor `serve` runs a watcher, and no watcher liveness is persisted |
 | `live_watcher` | `watching`, `unverified`, `none`, `unknown` | watcher lock probes; see [Watcher](#watcher) |
 | `filesystem` | always `not_checked` | |
@@ -67,6 +67,21 @@ All three make the verdict `stale_known`, and so count as known staleness wherev
 freshness gates a decision: `check_constraints --strict-freshness` exits 3
 (known stale) and `safe_to_edit` returns no verdict, with reason `known_stale`
 and exit 3, as for any other stale reason.
+
+## HEAD
+
+`head_at_index` is HEAD at the finish of the last completed full scan
+(`head_at_index_source: "last_full_scan"`). A path-scoped `update` or watch
+flush never changes it, so after a commit only some of whose files were
+rescanned, `head_changed` is `yes` and `head_moved` makes the verdict
+`stale_known` until a full scan runs at the current HEAD. HEADs are compared by
+commit id, so checking out the full scan's commit again, attached or detached,
+reads unchanged. Without a completed full scan that recorded its HEAD (rows from
+before coverage recording, or Git unreadable during the scan), the anchor is
+the Git history watermark (`git_history_watermark`): HEAD as probed by the
+latest scan that reached its history phase, path-scoped ones included, so
+`head_changed: "no"` there does not mean the whole graph was rebuilt at that
+HEAD. With neither, `head_at_index` is `unknown` (source `none`).
 
 ## Parser compatibility
 
@@ -176,6 +191,10 @@ size and mtime did not change) together with the queued work, before it
 reports ready, so starting a watcher costs one incremental `update`. Changes
 made while no watcher ran are found by that pass, not by events. A pass that is cancelled or crashes leaves `reconcile_pending`
 (and usually a `failed` scan row); the next start runs it again.
+
+A running watcher flushes only the paths it saw change, which never counts
+as a full scan, so after every commit freshness reads `stale_known` with
+`head_moved` until a full `codegraph update` or a watcher restart reconciles.
 
 `stats.state` is:
 

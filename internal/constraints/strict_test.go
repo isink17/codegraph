@@ -211,10 +211,11 @@ func TestStrictFreshnessTransitions(t *testing.T) {
 	// HEAD moved past the Git history watermark: known stale.
 	s.expect(t, StatusOK, VerdictKnownStale, ExitKnownStale)
 
-	// A path-scoped update advances the watermark but proves no full coverage.
+	// A path-scoped update advances the watermark but not the last full
+	// scan, so HEAD still reads as moved.
 	s.run(t, indexer.Options{Paths: []string{"internal/domain/a.go"}})
-	res = s.expect(t, StatusViolations, VerdictInsufficientCoverage, ExitInsufficientCoverage)
-	if !slices.Equal(res.Freshness.Reasons, []string{"head_moved_since_full_scan"}) {
+	res = s.expect(t, StatusViolations, VerdictKnownStale, ExitKnownStale)
+	if !slices.Equal(res.Freshness.Reasons, []string{"head_moved"}) {
 		t.Fatalf("reasons = %v", res.Freshness.Reasons)
 	}
 

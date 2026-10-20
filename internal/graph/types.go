@@ -710,11 +710,12 @@ type FreshnessDirtyQueue struct {
 type FreshnessWorktree struct {
 	RepoRoot      string `json:"repo_root"`
 	CanonicalPath string `json:"canonical_path"`
-	// HeadAtIndex is git_history_state.watermark_sha: HEAD as probed by the
-	// most recent scan that reached its history phase. That scan may have
-	// failed afterwards, and a path-scoped update or watch flush advances it
-	// too, so HeadChanged "no" does not mean the whole graph was rebuilt at
-	// that HEAD. "unknown" when history is absent or disabled.
+	// HeadAtIndex is HEAD at the finish of the last completed full scan
+	// (source "last_full_scan"). Without such a scan that recorded its HEAD,
+	// it is git_history_state.watermark_sha (source "git_history_watermark"):
+	// HEAD as probed by the most recent scan that reached its history phase,
+	// which may have failed afterwards or been path-scoped. "unknown" (source
+	// "none") when neither is recorded.
 	HeadAtIndex       string `json:"head_at_index"`
 	HeadAtIndexSource string `json:"head_at_index_source"`
 	HeadNow           string `json:"head_now"`
