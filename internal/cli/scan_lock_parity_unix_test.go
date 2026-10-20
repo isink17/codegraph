@@ -8,6 +8,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -32,6 +33,8 @@ func TestFreshnessParityWithScanLockedBeforeRow(t *testing.T) {
 		}
 		os.Stdout.WriteString("locked\n")
 		_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+		// An unreachable f could be finalized during the wait, closing the fd and dropping the lock.
+		runtime.KeepAlive(f)
 		os.Exit(0)
 	}
 	root, repo := safeToEditRepo(t, map[string]string{constraints.ConfigFileName: cliConstraintsConfig})
