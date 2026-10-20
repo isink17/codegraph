@@ -1970,8 +1970,9 @@ func writeUsageSummary(w io.Writer, report usage.Report) {
 
 // runWatch stops in order on SIGINT or SIGTERM: the watcher is canceled and
 // joined, with --jsonl the terminal events are written, and then the store is
-// closed. The process then exits with 128 plus the signal number. A signal
-// before the store has opened can exit the same way without any events.
+// closed. The process then exits with 128 plus the signal number, unless a
+// watcher error wins the race and is returned instead. A signal before the
+// store has opened can exit the same way without any events.
 func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
 	ctx, stopSignals := watchSignalContext(ctx)
 	defer stopSignals()

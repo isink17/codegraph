@@ -792,7 +792,9 @@ additive: new types may appear in any release, so consumers should switch on
 Once its store is open, the first SIGINT or SIGTERM makes `watch` cancel and
 join the watcher, write the terminal `watch_status` (`reason: "signal"`) and
 `watch_stopped` events (with `--jsonl`), close the store and exit with 128
-plus the signal number (130 or 143). `watch_stopped` does not mean the store
+plus the signal number (130 or 143). If the shutdown races a watcher failure
+(a flush error that arrives before the cancellation), the run instead reports
+`failed` with that error and exits as for that error. `watch_stopped` does not mean the store
 is already closed; wait for the process to exit for that. A signal that
 arrives while the store is still opening, before `watch_started`, can end the
 command with 130 or 143 and no events. Changes queued but not yet flushed stay
