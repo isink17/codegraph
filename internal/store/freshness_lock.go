@@ -81,21 +81,26 @@ func (s *Store) lockDB() string {
 
 // liveChangedSinceSnapshot reports whether the database a read-only store's
 // snapshot was taken from may have changed since: a file the snapshot copied
-// changed size, modification time or identity, appeared, disappeared, or
-// cannot be read. It is false for a store that serves its database directly.
+// changed size, modification time or identity, or cannot be read. An empty
+// or missing WAL or journal counts as one state, since SQLite creates and
+// removes them as connections open and close; emptying one moves its content
+// into the database file, whose change is seen. It is false for a store that
+// serves its database directly.
 func (s *Store) liveChangedSinceSnapshot() bool {
 	if s.path != "" || s.liveDB == "" {
 		return false
 	}
 	for _, p := range sqlitePersistentArtifactPaths(s.liveDB) {
 		st, err := os.Stat(p)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return true
+		}
 		copied, ok := s.liveArtifacts[p]
+		nowEmpty := err != nil || (p != s.liveDB && st.Size() == 0)
+		wasEmpty := !ok || (p != s.liveDB && copied.info.Size() == 0)
 		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			if ok {
-				return true
-			}
-		case err != nil || !ok || !sqliteInspectionFileInfoEqual(copied.info, st):
+		case nowEmpty && wasEmpty:
+		case nowEmpty != wasEmpty || !sqliteInspectionFileInfoEqual(copied.info, st):
 			return true
 		}
 	}

@@ -125,17 +125,22 @@ verdict follows the rows (a pre-lock binary's scan is not seen).
 
 A read-only handle (`check_constraints --strict-freshness` and `safe_to_edit`
 on the CLI) reads rows from a snapshot taken when it opened the database and
-probes the live database's scan lock, never the snapshot's, without holding
-it: a held lock reads `writer_active` as above. A `running` row in the
+probes the live database's scan lock, never the snapshot's, holding it only
+while it reads the snapshot rows, as above: a held lock reads
+`writer_active`. A `running` row in the
 snapshot may belong to a scan that finished after the snapshot was taken, so
 with the lock free it reads `unknown` (`liveness_unknown`), never
 `abandoned`. After the probe the read compares the database's files (size,
 modification time, identity of the database, WAL and journal) with the ones
-the snapshot copied; any difference, including a scan that began and
-finished between the snapshot and the read, makes strict freshness
-`unknown` with `scan_activity_during_check`. That comparison misses a write
-that keeps a file's size and modification time on a file system with coarse
-timestamps.
+the snapshot copied (an empty or missing WAL or journal counts as one
+state, as SQLite creates and removes them when connections open and close);
+any difference, including a scan that began and finished between the
+snapshot and the read, makes strict freshness `unknown` with
+`scan_activity_during_check`. It errs both ways: a write that keeps a file's
+size and modification time on a file system with coarse timestamps, or whose
+metadata Windows has not yet updated for a file another process holds open,
+is missed; a checkpoint, or a write by another repository's scan or watcher
+in the same database, reads as a change.
 
 A new scan waiting for the lock is delayed by at most one of its 50 ms
 retries, and `recover-scans` retries over the same 100 ms window before

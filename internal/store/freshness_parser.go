@@ -96,7 +96,11 @@ func classifyParserLanguage(language string, groups []FileParserProfileGroup, cu
 			older = true
 			continue
 		}
-		unknown = min(unknown, slices.Index(parserUnknownReasons, reason))
+		i := slices.Index(parserUnknownReasons, reason)
+		if i < 0 {
+			i = len(parserUnknownReasons) - 1
+		}
+		unknown = min(unknown, i)
 	}
 	switch {
 	case unknown < len(parserUnknownReasons):

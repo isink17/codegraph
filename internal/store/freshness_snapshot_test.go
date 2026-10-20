@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -70,5 +73,32 @@ func TestSnapshotFreshnessSeesLiveDatabaseChange(t *testing.T) {
 	}
 	if live := freshness(t, s, repoID); live.LiveChangedSinceSnapshot {
 		t.Fatalf("a live store reports a snapshot change: %+v", live)
+	}
+}
+
+// SQLite creates an empty WAL when a connection opens the database and
+// removes it when the last one closes; neither is a change.
+func TestSnapshotFreshnessIgnoresEmptyWALComingAndGoing(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wal := s.path + "-wal"
+	if _, err := os.Stat(wal); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("closed database keeps a WAL: %v", err)
+	}
+	ro := openSnapshot(t, s)
+	if err := os.WriteFile(wal, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if f := freshness(t, ro, repoID); f.LiveChangedSinceSnapshot {
+		t.Fatal("an empty WAL appearing reads as a change")
+	}
+	if err := os.WriteFile(wal, []byte("frame"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if f := freshness(t, ro, repoID); !f.LiveChangedSinceSnapshot {
+		t.Fatal("a WAL gaining content reads as unchanged")
 	}
 }
