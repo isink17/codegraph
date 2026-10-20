@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
@@ -161,7 +162,9 @@ func TestRecoverAbandonedScansAfterProcessKill(t *testing.T) {
 			os.Exit(2)
 		}
 		os.Stdout.WriteString(strconv.FormatInt(id, 10) + "\n")
+		// Unreachable, the store would be finalized and its lock fd closed while sleeping.
 		time.Sleep(time.Minute)
+		runtime.KeepAlive(s)
 		os.Exit(0)
 	}
 	db := filepath.Join(t.TempDir(), RepoDatabaseFileName)

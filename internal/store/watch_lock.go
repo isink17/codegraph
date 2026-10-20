@@ -14,9 +14,9 @@ import (
 //
 //   - <db>.watch-<repo>.lock, shared, while it cannot vouch for its event
 //     coverage (starting up, or recovering from a failure) or holds no live
-//     lock. Freshness reads
-//     reconcile_pending while any holder lives, so a full scan by another
-//     process cannot clear evidence of a failure that is still going on.
+//     lock. Freshness reads reconcile_pending while any holder lives, so a
+//     full scan by another process cannot clear evidence of a failure that
+//     is still going on.
 //   - <db>.watch-<repo>.live.lock, exclusive, for its whole run. Status reads
 //     probe it shared, so they never mistake one another for a watcher.
 //

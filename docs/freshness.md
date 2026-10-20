@@ -229,12 +229,13 @@ exits; nothing about a watcher is stored.
 
 - `<database>.watch-<repo id>.lock`, shared, while its state is not
   `watching` or it does not hold the live lock. Freshness reports
-  `reconcile_pending` while any process holds it, so a full scan by another process cannot clear the reason while a live
-  watcher is still reconciling or recovering: the scan covers changes made
-  before it, not events the watcher keeps missing. The hold that follows a
-  failure is best effort, like the marker written with it: it waits up to
-  1 s for status reads probing the lock, outside the lock that guards the
-  watcher's state, and a hold that fails leaves only the marker.
+  `reconcile_pending` while any process holds it, so a full scan by another
+  process cannot clear the reason while a live watcher is still reconciling
+  or recovering: the scan covers changes made before it, not events the
+  watcher keeps missing. The hold that follows a failure is best effort, like
+  the marker written with it: it waits up to 1 s for status reads probing the
+  lock, outside the lock that guards the watcher's state, and a hold that
+  fails leaves only the marker.
 - `<database>.watch-<repo id>.live.lock`, exclusive, for its whole run.
   Status reads probe it shared, so they never mistake one another for a
   watcher and never wait on each other.
@@ -273,8 +274,11 @@ Limits:
   after the first exits, status reads `unverified` with `reconcile_pending`,
   never `watching` or `none`. It tries for the live lock again only when it
   next reconciles, after a recovery, and then reads `watching`; restart it to
-  read `watching` sooner. Both watchers flush; their writes are serialized by
-  the database, not by these locks.
+  read `watching` sooner. Each of these tries, at startup and at every
+  reconciliation, waits up to 1 s for the live lock and can delay event
+  draining and shutdown by as long; a single watcher is unaffected. Both
+  watchers flush; their writes are serialized by the database, not by these
+  locks.
 - One read can be wrong for an instant: a watcher that exits and another that
   starts within the same read, or a watcher whose locks the operating system
   is releasing as it dies, can read `watching` for that read. Nothing is

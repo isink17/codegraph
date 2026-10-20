@@ -300,7 +300,10 @@ func TestLiveWatcherAfterProcessKill(t *testing.T) {
 			os.Exit(2)
 		}
 		os.Stdout.WriteString("ready\n")
+		// Unreachable, lock and s would be finalized and their lock fds closed while sleeping.
 		time.Sleep(time.Minute)
+		runtime.KeepAlive(lock)
+		runtime.KeepAlive(s)
 		os.Exit(0)
 	}
 	for _, state := range []string{"watching", "unverified"} {
