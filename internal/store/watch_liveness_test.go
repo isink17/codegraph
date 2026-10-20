@@ -75,8 +75,9 @@ func TestLiveWatcherFollowsLocks(t *testing.T) {
 	check("exited", LiveWatcherNone, false)
 }
 
-// A second watcher of the same repository waits out the first's live lock
-// and runs unseen; it is never reported watching while it is not.
+// A second watcher of the same repository waits out the first's live lock;
+// it is never reported watching while it is not, and without the live lock it
+// keeps its unverified lock after it reconciles.
 func TestLiveWatcherSecondWatcherNeverClaimsWatching(t *testing.T) {
 	old := scanLockProbeWait
 	scanLockProbeWait = time.Millisecond
@@ -100,9 +101,109 @@ func TestLiveWatcherSecondWatcherNeverClaimsWatching(t *testing.T) {
 		t.Fatalf("second still reconciling: %s", f.LiveWatcher)
 	}
 	second.Release()
-	if f := freshness(t, s, repoID); f.LiveWatcher != LiveWatcherWatching {
-		t.Fatalf("both watching: %s", f.LiveWatcher)
+	if f := freshness(t, s, repoID); f.LiveWatcher != LiveWatcherUnverified || !slices.Contains(f.Reasons, "reconcile_pending") {
+		t.Fatalf("both watching, second without the live lock: %s %v", f.LiveWatcher, f.Reasons)
 	}
+}
+
+// A second watcher that never got the live lock stays visible once the first
+// exits: unverified with reconcile_pending, which a full scan by another
+// handle cannot clear, until it reconciles again and takes the live lock.
+func TestLiveWatcherSecondVisibleAfterFirstExits(t *testing.T) {
+	old := scanLockProbeWait
+	scanLockProbeWait = time.Millisecond
+	t.Cleanup(func() { scanLockProbeWait = old })
+	s, repoID := freshnessStore(t, t.TempDir())
+	completeFullScan(t, s, repoID)
+	reader := openSameStore(t, s)
+	first, _ := s.OpenWatcherLock(repoID)
+	second, _ := s.OpenWatcherLock(repoID)
+	t.Cleanup(first.Close)
+	t.Cleanup(second.Close)
+	for _, l := range []*WatcherLock{first, second} {
+		if err := l.Hold(); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.HoldLive(); err != nil {
+			t.Fatal(err)
+		}
+		l.Release()
+	}
+	first.Close()
+	completeFullScan(t, s, repoID)
+	f := freshness(t, reader, repoID)
+	if f.LiveWatcher != LiveWatcherUnverified || !slices.Contains(f.Reasons, "reconcile_pending") || f.Verdict == graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("first exited, second runs: live_watcher %s verdict %s reasons %v", f.LiveWatcher, f.Verdict, f.Reasons)
+	}
+	if err := second.Hold(); err != nil {
+		t.Fatal(err)
+	}
+	second.Release()
+	if f := freshness(t, reader, repoID); f.LiveWatcher != LiveWatcherWatching || slices.Contains(f.Reasons, "reconcile_pending") {
+		t.Fatalf("second reconciled again: live_watcher %s reasons %v", f.LiveWatcher, f.Reasons)
+	}
+	second.Close()
+	if got := liveState(reader, repoID); got != LiveWatcherNone {
+		t.Fatalf("both exited: %s", got)
+	}
+}
+
+// Two watcher processes of one repository, killed in either order: while
+// one runs, status never reads none, and a full scan by another process
+// never clears reconcile_pending for the one that runs without the live lock.
+func TestLiveWatcherTwoProcessesKilled(t *testing.T) {
+	for _, killFirst := range []bool{true, false} {
+		name := "second killed first"
+		if killFirst {
+			name = "first killed first"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			s, repoID := freshnessStore(t, root)
+			completeFullScan(t, s, repoID)
+			first := startWatchLockChild(t, s.path, root)
+			if got := liveState(s, repoID); got != LiveWatcherWatching {
+				t.Fatalf("first alone: %s", got)
+			}
+			second := startWatchLockChild(t, s.path, root)
+			f := freshness(t, s, repoID)
+			if f.LiveWatcher != LiveWatcherUnverified || !slices.Contains(f.Reasons, "reconcile_pending") {
+				t.Fatalf("both running: live_watcher %s reasons %v", f.LiveWatcher, f.Reasons)
+			}
+			killed, survivor := second, LiveWatcherWatching
+			if killFirst {
+				killed, survivor = first, LiveWatcherUnverified
+			}
+			_ = killed.Process.Kill()
+			_ = killed.Wait()
+			completeFullScan(t, s, repoID)
+			f = freshness(t, s, repoID)
+			if f.LiveWatcher != survivor || slices.Contains(f.Reasons, "reconcile_pending") != (survivor == LiveWatcherUnverified) {
+				t.Fatalf("one killed: live_watcher %s reasons %v, want %s", f.LiveWatcher, f.Reasons, survivor)
+			}
+		})
+	}
+}
+
+// startWatchLockChild runs TestLiveWatcherAfterProcessKill's child in the
+// watching state and returns once it reports ready; it is killed when the
+// test ends.
+func startWatchLockChild(t *testing.T, db, root string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLiveWatcherAfterProcessKill$")
+	cmd.Env = append(os.Environ(), "CODEGRAPH_WATCH_LOCK_CHILD_DB="+db, "CODEGRAPH_WATCH_LOCK_CHILD_ROOT="+root, "CODEGRAPH_WATCH_LOCK_CHILD_STATE=watching")
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	if line, err := bufio.NewReader(out).ReadString('\n'); err != nil || line != "ready\n" {
+		t.Fatalf("child: %q %v", line, err)
+	}
+	return cmd
 }
 
 // A lock that cannot be opened proves nothing: unknown, and an unverified

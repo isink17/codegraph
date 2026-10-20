@@ -13,7 +13,8 @@ import (
 // however it exits:
 //
 //   - <db>.watch-<repo>.lock, shared, while it cannot vouch for its event
-//     coverage (starting up, or recovering from a failure). Freshness reads
+//     coverage (starting up, or recovering from a failure) or holds no live
+//     lock. Freshness reads
 //     reconcile_pending while any holder lives, so a full scan by another
 //     process cannot clear evidence of a failure that is still going on.
 //   - <db>.watch-<repo>.live.lock, exclusive, for its whole run. Status reads
@@ -106,7 +107,7 @@ func (l *WatcherLock) Hold() error {
 
 // HoldLive takes the live lock for the rest of the watcher's run. Hold must
 // have been called first. Another watcher of the same repository may hold it
-// already; this one then runs unseen by status reads.
+// already; this one then keeps the unverified lock (see Release).
 func (l *WatcherLock) HoldLive() error {
 	if l == nil || l.liveHeld {
 		return nil
@@ -126,8 +127,22 @@ func (l *WatcherLock) HoldLive() error {
 	return nil
 }
 
+// Release drops the unverified lock once the watcher has reconciled. A
+// watcher without the live lock tries for it again first and keeps the
+// unverified lock while another watcher still holds it: dropped, nothing would
+// show it once that watcher exits.
 func (l *WatcherLock) Release() {
 	if l == nil || !l.held {
+		return
+	}
+	if err := l.HoldLive(); err != nil || !l.liveHeld {
+		return
+	}
+	l.unlockUnverified()
+}
+
+func (l *WatcherLock) unlockUnverified() {
+	if !l.held {
 		return
 	}
 	_ = unlockFile(l.f)
@@ -146,7 +161,7 @@ func (l *WatcherLock) Close() {
 		watcherLockStep()
 	}
 	_ = l.live.Close()
-	l.Release()
+	l.unlockUnverified()
 	_ = l.f.Close()
 }
 
