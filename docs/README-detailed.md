@@ -783,14 +783,21 @@ additive: new types may appear in any release, so consumers should switch on
   `repo_id`, `run_state` and `observed_at` (UTC RFC3339Nano, sampled when the
   line is written). `run_state` is `starting`, then `watching` once watcher
   setup has succeeded, then a terminal `stopped` (with `reason`: `completed`,
-  `context_canceled` or `context_deadline_exceeded`) or `failed` (with a
-  sanitized `error`). Cancellation before readiness goes from `starting`
+  `signal`, `context_canceled` or `context_deadline_exceeded`) or `failed`
+  (with a sanitized `error`). A `signal` stop also names it in `signal`
+  (`interrupt` or `terminated`). Cancellation before readiness goes from `starting`
   straight to `stopped`. The terminal status immediately precedes
   `watch_stopped`.
 
+On SIGINT or SIGTERM, `watch` cancels and joins the watcher, closes the
+store, writes the terminal events and exits with 128 plus the signal number
+(130 or 143). Changes queued but not yet flushed stay queued for the next run.
+A second signal during that shutdown kills the process. Signal shutdown is
+tested on Unix only; on Windows Ctrl+C takes the same path.
+
 `watch_status` is observational. It does not say the index is fresh, does not
-describe other processes, and a process killed abruptly emits no terminal
-event. Fatal error text in `watch_status.error` and `watch_stopped.error` has
+describe other processes, and a process killed abruptly (SIGKILL, a crash)
+emits no terminal event. Fatal error text in `watch_status.error` and `watch_stopped.error` has
 the repository root replaced by `<repo>`, the home directory by `~`, and is
 truncated to a bounded length.
 
