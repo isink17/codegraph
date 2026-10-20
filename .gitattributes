@@ -6,3 +6,6 @@ npm/THIRD_PARTY_NOTICES text eol=lf
 
 # Benchmark fixtures are hashed byte-for-byte; keep them LF on every platform.
 tools/benchharness/testdata/** text eol=lf
+
+# Patches applied verbatim by the corpus run; their context lines keep the source whitespace.
+scripts/change-risk-corpus/patches/*.patch -whitespace

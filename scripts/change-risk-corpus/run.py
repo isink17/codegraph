@@ -22,6 +22,7 @@ COMMIT_ENV = {
     "GIT_AUTHOR_NAME": "corpus", "GIT_AUTHOR_EMAIL": "corpus@example.invalid",
     "GIT_COMMITTER_NAME": "corpus", "GIT_COMMITTER_EMAIL": "corpus@example.invalid",
     "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
 }
 
 

@@ -126,9 +126,11 @@ errors-49f8f61); none is a compile break.
 ## Known false negatives
 
 - **`CGO_ENABLED=0` misses signature changes.** The go-ast adapter renders a
-  function's parameters and results as the literal text `*ast.FuncType`
-  (`internal/parser/golang/adapter.go`, `printer` has no `*ast.FuncType`
-  case), so `func encodeHex*ast.FuncType` is the stored signature before and
+  function's parameters and results as the literal text `*ast.FuncType`: in
+  `internal/parser/golang/adapter.go` `formatNode`, `case ast.Expr` precedes
+  `case *ast.FuncType`, and `*ast.FuncType` is an `ast.Expr`, so the
+  `FuncType` case is unreachable and `printer`'s default writes the type name
+  (`%T`). So `func encodeHex*ast.FuncType` is the stored signature before and
   after a parameter is added. The declaration looks unchanged: no symbol change,
   no edge change, no rule, `no_risk_evidence`, and `--fail-on-risk low`
   passes a change the compiler rejects. Same cause for `uuid-2d3c2a9` and the

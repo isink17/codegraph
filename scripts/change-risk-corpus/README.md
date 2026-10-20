@@ -25,3 +25,7 @@ traceability to evidence rows, the source checkout's HEAD, status, index,
 refs and file times before and after, and `go build`, `go vet` and `go test`
 on both revisions in an exported copy (a `go.mod` is added to that copy only
 for a repository without one). `results/results.json` holds the rows.
+
+The oracle executes code from the corpus repositories: their `go build`,
+`go vet` and `go test` run on this machine, and the Go command downloads the
+modules they require.
