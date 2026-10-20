@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -1966,7 +1968,58 @@ func writeUsageSummary(w io.Writer, report usage.Report) {
 	fmt.Fprintf(w, "codegraph: usage summary (local estimate, not provider billing): %s\n", payload)
 }
 
+// runWatch stops in order on SIGINT or SIGTERM: the watcher is canceled and
+// joined, with --jsonl the terminal events are written, and then the store is
+// closed. The process then exits with 128 plus the signal number, unless a
+// watcher error wins the race and is returned instead. A signal before the
+// store has opened can exit the same way without any events.
 func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
+	ctx, stopSignals := watchSignalContext(ctx)
+	defer stopSignals()
+	err := watchRepo(ctx, cfg, stdout, args)
+	if sig, ok := stopSignal(ctx); ok && errors.Is(err, context.Canceled) {
+		code := 1
+		if num, isNum := sig.(syscall.Signal); isNum {
+			code = 128 + int(num)
+		}
+		return &ExitError{Code: code}
+	}
+	return err
+}
+
+type watchSignalCause struct{ sig os.Signal }
+
+func (c watchSignalCause) Error() string { return c.sig.String() + " signal received" }
+
+// watchSignalContext cancels ctx on the first SIGINT or SIGTERM, then restores
+// the default handling so a second signal still kills a stuck shutdown.
+func watchSignalContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(parent)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-ch:
+			signal.Stop(ch)
+			cancel(watchSignalCause{sig})
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(ch)
+		cancel(nil)
+	}
+}
+
+func stopSignal(ctx context.Context) (os.Signal, bool) {
+	var cause watchSignalCause
+	if errors.As(context.Cause(ctx), &cause) {
+		return cause.sig, true
+	}
+	return nil, false
+}
+
+func watchRepo(ctx context.Context, cfg config.Config, stdout io.Writer, args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	jsonl := fs.Bool("jsonl", false, "output line-delimited JSON events")
@@ -2075,9 +2128,13 @@ func runWatch(ctx context.Context, cfg config.Config, stdout io.Writer, args []s
 			errDetail = sanitizeWatchError(err, repo.RootPath)
 		}
 		terminal := statusEvent(watchRunStopped)
+		sig, signaled := stopSignal(ctx)
 		switch {
 		case err == nil:
 			terminal["reason"] = "completed"
+		case errors.Is(err, context.Canceled) && signaled:
+			terminal["reason"] = "signal"
+			terminal["signal"] = sig.String()
 		case ctx.Err() != nil && errors.Is(err, context.Canceled):
 			terminal["reason"] = "context_canceled"
 		case ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded):

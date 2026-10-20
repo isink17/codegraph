@@ -783,14 +783,29 @@ additive: new types may appear in any release, so consumers should switch on
   `repo_id`, `run_state` and `observed_at` (UTC RFC3339Nano, sampled when the
   line is written). `run_state` is `starting`, then `watching` once watcher
   setup has succeeded, then a terminal `stopped` (with `reason`: `completed`,
-  `context_canceled` or `context_deadline_exceeded`) or `failed` (with a
-  sanitized `error`). Cancellation before readiness goes from `starting`
+  `signal`, `context_canceled` or `context_deadline_exceeded`) or `failed`
+  (with a sanitized `error`). A `signal` stop also names it in `signal`
+  (`interrupt` or `terminated`). Cancellation before readiness goes from `starting`
   straight to `stopped`. The terminal status immediately precedes
   `watch_stopped`.
 
+Once its store is open, the first SIGINT or SIGTERM makes `watch` cancel and
+join the watcher, write the terminal `watch_status` (`reason: "signal"`) and
+`watch_stopped` events (with `--jsonl`), close the store and exit with 128
+plus the signal number (130 or 143). If the shutdown races a watcher failure
+and that error is returned instead of the cancellation, the run reports
+`failed` with that error and exits as for that error. `watch_stopped` does not mean the store
+is already closed; wait for the process to exit for that. A signal that
+arrives while the store is still opening, before `watch_started`, can end the
+command with 130 or 143 and no events. Changes queued but not yet flushed stay
+queued for the next run, and an interrupted reconciliation stays pending; it
+is never reported as complete. A second signal kills a stalled shutdown.
+SIGKILL and crashes emit no terminal events. Signal shutdown is tested on Unix
+only; on Windows Ctrl+C is expected to take the same path but is untested.
+
 `watch_status` is observational. It does not say the index is fresh, does not
-describe other processes, and a process killed abruptly emits no terminal
-event. Fatal error text in `watch_status.error` and `watch_stopped.error` has
+describe other processes, and a process killed abruptly (SIGKILL, a crash)
+emits no terminal event. Fatal error text in `watch_status.error` and `watch_stopped.error` has
 the repository root replaced by `<repo>`, the home directory by `~`, and is
 truncated to a bounded length.
 
