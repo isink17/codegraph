@@ -58,7 +58,7 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 	if st.Size() == 0 {
 		return nil, fmt.Errorf("%w: graph database at %s is empty", ErrRepoNotIndexed, dbPath)
 	}
-	snapshotPath, cleanup, err := createSQLiteValidationSnapshot(dbPath)
+	snapshotPath, cleanup, artifacts, err := createSQLiteValidationSnapshotArtifacts(dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 		return nil, err
 	}
 	keepSnapshot = true
-	return &Store{db: db, cleanup: cleanup, watchLockDB: dbPath}, nil
+	return &Store{db: db, cleanup: cleanup, liveDB: dbPath, liveArtifacts: artifacts}, nil
 }
 
 // FindRepo looks up a repository by root path without creating it.

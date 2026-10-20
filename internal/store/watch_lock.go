@@ -40,6 +40,10 @@ const (
 	LiveWatcherUnverified = "unverified"
 )
 
+// watcherLockStep runs after each step of the protocol a WatcherLock takes;
+// tests read status there.
+var watcherLockStep = func() {}
+
 // WatcherLock is one watcher's handle on those locks. It is not safe for
 // concurrent use; a nil *WatcherLock holds nothing.
 type WatcherLock struct {
@@ -96,6 +100,7 @@ func (l *WatcherLock) Hold() error {
 		return errors.New("hold watcher lock: still probed after retries")
 	}
 	l.held = true
+	watcherLockStep()
 	return nil
 }
 
@@ -106,11 +111,18 @@ func (l *WatcherLock) HoldLive() error {
 	if l == nil || l.liveHeld {
 		return nil
 	}
+	if !l.held {
+		// Taken first, the live lock alone would read as watching.
+		return errors.New("hold watcher live lock: unverified lock not held")
+	}
 	ok, err := holdLock(l.live, true)
 	if err != nil {
 		return fmt.Errorf("hold watcher live lock: %w", err)
 	}
 	l.liveHeld = ok
+	if ok {
+		watcherLockStep()
+	}
 	return nil
 }
 
@@ -120,6 +132,7 @@ func (l *WatcherLock) Release() {
 	}
 	_ = unlockFile(l.f)
 	l.held = false
+	watcherLockStep()
 }
 
 // Close releases the live lock before the unverified one.
@@ -130,6 +143,7 @@ func (l *WatcherLock) Close() {
 	if l.liveHeld {
 		_ = unlockFile(l.live)
 		l.liveHeld = false
+		watcherLockStep()
 	}
 	_ = l.live.Close()
 	l.Release()
@@ -170,10 +184,7 @@ func probeLock(path string, exclusive bool, attempts int) scanLockProbe {
 // turns with each other and with the scan lock probe, so their own probes
 // cannot make one another read a holder.
 func (s *Store) watcherStatus(repoID int64) (live string, unverified bool) {
-	db := s.path
-	if db == "" {
-		db = s.watchLockDB
-	}
+	db := s.lockDB()
 	if db == "" {
 		return LiveWatcherNone, false
 	}

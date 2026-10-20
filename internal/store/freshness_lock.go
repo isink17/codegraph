@@ -39,10 +39,11 @@ var (
 func (s *Store) probeScanLock() (scanLockProbe, func()) {
 	scanLockProbeMu.Lock()
 	noop := scanLockProbeMu.Unlock
-	if s.path == "" {
+	db := s.lockDB()
+	if db == "" {
 		return scanLockAbsent, noop
 	}
-	f, err := os.Open(scanLockPath(s.path))
+	f, err := os.Open(scanLockPath(db))
 	if errors.Is(err, fs.ErrNotExist) {
 		return scanLockAbsent, noop
 	}
@@ -67,4 +68,36 @@ func (s *Store) probeScanLock() (scanLockProbe, func()) {
 		}
 		time.Sleep(scanLockProbeWait)
 	}
+}
+
+// lockDB is the live database whose locks this store probes: its own file,
+// or the one a read-only store's snapshot was taken from.
+func (s *Store) lockDB() string {
+	if s.path != "" {
+		return s.path
+	}
+	return s.liveDB
+}
+
+// liveChangedSinceSnapshot reports whether the database a read-only store's
+// snapshot was taken from may have changed since: a file the snapshot copied
+// changed size, modification time or identity, appeared, disappeared, or
+// cannot be read. It is false for a store that serves its database directly.
+func (s *Store) liveChangedSinceSnapshot() bool {
+	if s.path != "" || s.liveDB == "" {
+		return false
+	}
+	for _, p := range sqlitePersistentArtifactPaths(s.liveDB) {
+		st, err := os.Stat(p)
+		copied, ok := s.liveArtifacts[p]
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			if ok {
+				return true
+			}
+		case err != nil || !ok || !sqliteInspectionFileInfoEqual(copied.info, st):
+			return true
+		}
+	}
+	return false
 }

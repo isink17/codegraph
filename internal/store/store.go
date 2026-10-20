@@ -165,9 +165,12 @@ type Store struct {
 	// path is the database file; scan locks live beside it. Empty for stores
 	// built in tests without a file, which take no scan lock.
 	path string
-	// watchLockDB is the database whose watcher locks a read-only store,
-	// which serves a snapshot and has no path, probes.
-	watchLockDB string
+	// liveDB is the database a read-only store, which serves a snapshot and
+	// has no path, took that snapshot from: its scan and watcher locks are
+	// probed there, and liveArtifacts, the files the snapshot copied, tell
+	// whether it has changed since.
+	liveDB        string
+	liveArtifacts map[string]sqliteInspectionArtifact
 	// scanLocks holds the shared scan lock of each scan this store began and
 	// has not yet recorded as finished.
 	scanLockMu      sync.Mutex
@@ -828,6 +831,13 @@ func openImmutableValidated(path string, opts OpenOptions) (*sql.DB, error) {
 }
 
 func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
+	snapshotPath, cleanup, _, err := createSQLiteValidationSnapshotArtifacts(path)
+	return snapshotPath, cleanup, err
+}
+
+// createSQLiteValidationSnapshotArtifacts also returns the source files the
+// snapshot reproduces, as they were while it was taken.
+func createSQLiteValidationSnapshotArtifacts(path string) (string, func() error, map[string]sqliteInspectionArtifact, error) {
 	validationSnapshotCalls.Add(1)
 	// ponytail: three retries bound unstable sidecar copying; a continuously busy database fails closed.
 	for attempt := 0; attempt < 3; attempt++ {
@@ -840,14 +850,14 @@ func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
 			if errors.Is(err, errSQLiteInspectionChanged) {
 				continue
 			}
-			return "", nil, err
+			return "", nil, nil, err
 		}
 		snapshotPath, cleanup, err := vacuumSQLiteSnapshot(path, artifacts)
 		if err != nil {
 			if errors.Is(err, errSQLiteInspectionChanged) || isTransientSQLiteInspectionLock(err) {
 				continue
 			}
-			return "", nil, err
+			return "", nil, nil, err
 		}
 		current, err := readSQLiteInspectionArtifacts(path)
 		if err != nil {
@@ -855,14 +865,14 @@ func createSQLiteValidationSnapshot(path string) (string, func() error, error) {
 			if errors.Is(err, errSQLiteInspectionChanged) {
 				continue
 			}
-			return "", nil, err
+			return "", nil, nil, err
 		}
 		if sqliteInspectionArtifactsEqual(artifacts, current) {
-			return snapshotPath, cleanup, nil
+			return snapshotPath, cleanup, artifacts, nil
 		}
 		_ = cleanup()
 	}
-	return "", nil, fmt.Errorf("%w: database %s changed while creating validation snapshot", errSQLiteValidationUnstable, path)
+	return "", nil, nil, fmt.Errorf("%w: database %s changed while creating validation snapshot", errSQLiteValidationUnstable, path)
 }
 
 var errSQLiteInspectionChanged = errors.New("database artifacts changed during inspection")

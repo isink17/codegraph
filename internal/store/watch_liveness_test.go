@@ -270,18 +270,62 @@ func TestParserProfileCompatibilityClassification(t *testing.T) {
 			{Language: "python", Profile: "treesitter:python:v2", CallEdges: true, Files: 3},
 			{Language: "python", Profile: "treesitter:python:v1", CallEdges: true, Files: 1},
 		}, "obsolete", "older_version"},
+		{"older and other family", []FileParserProfileGroup{
+			{Language: "go", Profile: "treesitter:go:v2", CallEdges: true, Files: 3},
+			{Language: "go", Profile: "regex:go:v1", Files: 1},
+		}, "unknown", "other_parser_family"},
+		{"older and newer", []FileParserProfileGroup{
+			{Language: "go", Profile: "treesitter:go:v2", CallEdges: true, Files: 3},
+			{Language: "go", Profile: "treesitter:go:v4", CallEdges: true, Files: 1},
+		}, "unknown", "newer_version"},
+		{"older and unrecorded", []FileParserProfileGroup{
+			{Language: "rust", Profile: "treesitter:rust:v1", CallEdges: true, Files: 3},
+			{Language: "rust", Profile: "", Files: 1},
+		}, "unknown", "unrecorded_provenance"},
+		{"older and call-capable data, symbols-only binary", []FileParserProfileGroup{
+			{Language: "java", Profile: "heuristic:java:v0", Files: 3},
+			{Language: "java", Profile: "treesitter:java:v5", CallEdges: true, Files: 1},
+		}, "unknown", "call_capable_build_required"},
+		{"refused downgrade outranks every other reason", []FileParserProfileGroup{
+			{Language: "java", Profile: "", Files: 1},
+			{Language: "java", Profile: "heuristic:java:v9", Files: 1},
+			{Language: "java", Profile: "regex:java:v1", Files: 1},
+			{Language: "java", Profile: "treesitter:java:v5", CallEdges: true, Files: 1},
+		}, "unknown", "call_capable_build_required"},
+		{"other family outranks newer", []FileParserProfileGroup{
+			{Language: "go", Profile: "treesitter:go:v4", CallEdges: true, Files: 1},
+			{Language: "go", Profile: "go-ast:go:v3", CallEdges: true, Files: 1},
+			{Language: "go", Profile: "", Files: 1},
+		}, "unknown", "other_parser_family"},
 		{"symbols-only data for a symbols-only binary", []FileParserProfileGroup{{Language: "java", Profile: "heuristic:java:v0", Files: 1}}, "obsolete", "older_version"},
 		{"no files", []FileParserProfileGroup{{Language: "ruby", Profile: "treesitter:ruby:v0", Files: 0}}, "current", "matches_this_binary"},
 	}
 	for _, c := range cases {
-		got := parserProfileCompatibility(c.groups, current)
-		if got.State != c.state || got.Reason != c.reason {
-			t.Errorf("%s: %s/%s, want %s/%s (%+v)", c.name, got.State, got.Reason, c.state, c.reason, got.Languages)
-		}
-		if (got.State == "current") != (len(got.Languages) == 0) {
-			t.Errorf("%s: languages %+v for state %s", c.name, got.Languages, got.State)
+		// Every order of the groups classifies alike.
+		for _, groups := range permutations(c.groups) {
+			got := parserProfileCompatibility(groups, current)
+			if got.State != c.state || got.Reason != c.reason {
+				t.Errorf("%s: %s/%s, want %s/%s (%+v)", c.name, got.State, got.Reason, c.state, c.reason, got.Languages)
+			}
+			if (got.State == "current") != (len(got.Languages) == 0) {
+				t.Errorf("%s: languages %+v for state %s", c.name, got.Languages, got.State)
+			}
 		}
 	}
+}
+
+func permutations[T any](in []T) [][]T {
+	if len(in) <= 1 {
+		return [][]T{slices.Clone(in)}
+	}
+	var out [][]T
+	for i := range in {
+		rest := append(slices.Clone(in[:i]), in[i+1:]...)
+		for _, p := range permutations(rest) {
+			out = append(out, append([]T{in[i]}, p...))
+		}
+	}
+	return out
 }
 
 // Stored provenance is judged against the parsers of the binary reading it:

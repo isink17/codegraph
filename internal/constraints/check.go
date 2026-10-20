@@ -600,8 +600,10 @@ func strictFreshness(status string, lastScanID int64, before, after graph.Freshn
 	}
 	// Any running row, even one older than the last completed scan, may be a
 	// live writer changing rows under the check; scans hold no lease, so an
-	// abandoned row cannot be told apart and also reads as unknown.
-	if (before.RunningScans.Count > 0 || after.RunningScans.Count > 0) && !slices.Contains(unknown, "scan_running_or_abandoned") {
+	// abandoned row cannot be told apart and also reads as unknown. So does a
+	// scan lock that is held, or cannot be probed, with no row: a scan takes
+	// it before inserting its row.
+	if (writerPossible(before) || writerPossible(after)) && !slices.Contains(unknown, "scan_running_or_abandoned") {
 		unknown = append(unknown, "scan_running_or_abandoned")
 	}
 	if !sameScanState(before, after) || before.LatestScan == nil || before.LatestScan.ID != lastScanID {
@@ -619,9 +621,17 @@ func strictFreshness(status string, lastScanID int64, before, after graph.Freshn
 	return out
 }
 
+func writerPossible(f graph.Freshness) bool {
+	return f.RunningScans.Count > 0 || f.Verdict == graph.FreshnessVerdictWriterActive || f.Verdict == graph.FreshnessVerdictLivenessUnknown
+}
+
 // sameScanState reports whether no scan began, closed or queued work between
-// two freshness reads, and HEAD did not move.
+// two freshness reads, HEAD did not move, and neither read came from a
+// snapshot whose database has changed since.
 func sameScanState(a, b graph.Freshness) bool {
+	if a.LiveChangedSinceSnapshot || b.LiveChangedSinceSnapshot {
+		return false
+	}
 	scan := func(sc *graph.FreshnessScan) string {
 		if sc == nil {
 			return ""

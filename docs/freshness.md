@@ -85,6 +85,14 @@ language is:
 | `unknown` | `unrecorded_provenance` | indexed before provenance was recorded |
 | `unknown` | `no_adapter` | this binary has no parser for the language |
 
+A language is `obsolete` only when every stored profile that differs from
+this binary's is an older version of its family. One profile this binary
+cannot place makes the whole language `unknown`, however many others are
+merely older, with the first reason in the table's order that any of its
+profiles has (`call_capable_build_required`, `other_parser_family`,
+`newer_version`, `unrecorded_provenance`), so the order profiles are read in
+never changes it.
+
 The object's `state` is `obsolete` when any language is, else `unknown` when
 any is, else `current`, with the `reason` of the first such language;
 `languages` lists every language that is not current, with its
@@ -114,6 +122,20 @@ file) liveness is `unknown` and the verdict `liveness_unknown`, since a
 writer may hold it. A missing lock file means no lock-aware scan has ever
 run on this database, so none can hold it; liveness is `unknown` and the
 verdict follows the rows (a pre-lock binary's scan is not seen).
+
+A read-only handle (`check_constraints --strict-freshness` and `safe_to_edit`
+on the CLI) reads rows from a snapshot taken when it opened the database and
+probes the live database's scan lock, never the snapshot's, without holding
+it: a held lock reads `writer_active` as above. A `running` row in the
+snapshot may belong to a scan that finished after the snapshot was taken, so
+with the lock free it reads `unknown` (`liveness_unknown`), never
+`abandoned`. After the probe the read compares the database's files (size,
+modification time, identity of the database, WAL and journal) with the ones
+the snapshot copied; any difference, including a scan that began and
+finished between the snapshot and the read, makes strict freshness
+`unknown` with `scan_activity_during_check`. That comparison misses a write
+that keeps a file's size and modification time on a file system with coarse
+timestamps.
 
 A new scan waiting for the lock is delayed by at most one of its 50 ms
 retries, and `recover-scans` retries over the same 100 ms window before
@@ -240,7 +262,5 @@ Limits:
   is releasing as it dies, can read `watching` for that read. Nothing is
   persisted, so the next read is right.
 - A CLI `check_constraints --strict-freshness` or `safe_to_edit` reads rows
-  from a snapshot taken when it opened the database. It probes the watcher
-  locks at read time but not the scan lock, so a scan that holds the scan
-  lock before inserting its row is not seen there; `stats` and the MCP tools
-  see it.
+  from a snapshot taken when it opened the database and probes the live
+  locks at read time; see [Writer liveness](#writer-liveness).

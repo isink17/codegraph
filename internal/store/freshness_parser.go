@@ -29,10 +29,11 @@ const (
 // this binary's. A language is obsolete only when every profile that differs
 // is an older version of the same parser family, so the next scan by this
 // binary reparses it. It is unknown when this binary cannot say which profile
-// is current for that data: no adapter for the language, a refused downgrade
-// (the data came from a call-capable build, as tree-sitter data read by a
-// build without cgo), another parser family, a newer version, or no recorded
-// provenance.
+// is current for any of its data: no adapter for the language, a refused
+// downgrade (the data came from a call-capable build, as tree-sitter data read
+// by a build without cgo), another parser family, a newer version, or no
+// recorded provenance. Across languages an obsolete one, a proven stale fact,
+// sets the graph's state; the unknown ones are still listed.
 func parserProfileCompatibility(groups []FileParserProfileGroup, current map[string]parser.Profile) graph.FreshnessParserCompatibility {
 	byLanguage := map[string][]FileParserProfileGroup{}
 	for _, g := range groups {
@@ -72,7 +73,11 @@ func classifyParserLanguage(language string, groups []FileParserProfileGroup, cu
 		return out
 	}
 	out.Current = profile.ID
-	unknownReason := ""
+	// Every differing profile is judged before deciding: one profile this
+	// binary cannot place makes the language unknown however many others
+	// are merely older. The reason is the first in parserUnknownReasons any
+	// profile has, so the order groups arrive in cannot change it.
+	older, unknown := false, len(parserUnknownReasons)
 	for _, g := range groups {
 		if g.Profile == profile.ID {
 			continue
@@ -88,18 +93,22 @@ func classifyParserLanguage(language string, groups []FileParserProfileGroup, cu
 			reason = compareProfileVersions(g.Profile, profile.ID)
 		}
 		if reason == "" {
-			out.State, out.Reason = parserCompatObsolete, "older_version"
-			return out
+			older = true
+			continue
 		}
-		if unknownReason == "" {
-			unknownReason = reason
-		}
+		unknown = min(unknown, slices.Index(parserUnknownReasons, reason))
 	}
-	if unknownReason != "" {
-		out.State, out.Reason = freshnessUnknown, unknownReason
+	switch {
+	case unknown < len(parserUnknownReasons):
+		out.State, out.Reason = freshnessUnknown, parserUnknownReasons[unknown]
+	case older:
+		out.State, out.Reason = parserCompatObsolete, "older_version"
 	}
 	return out
 }
+
+// parserUnknownReasons, most decisive first.
+var parserUnknownReasons = []string{"call_capable_build_required", "other_parser_family", "newer_version", "unrecorded_provenance"}
 
 // compareProfileVersions returns "" when stored is an older version of
 // current's family ("<family>:<language>:v<n>"), and why not otherwise.

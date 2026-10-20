@@ -618,6 +618,9 @@ type Freshness struct {
 	// ParserProfileCompatibility compares the stored profiles with the
 	// parsers of the binary reading them.
 	ParserProfileCompatibility FreshnessParserCompatibility `json:"parser_profile_compatibility"`
+	// LiveChangedSinceSnapshot is true when the freshness was read from a
+	// snapshot and the database it was taken from may have changed since.
+	LiveChangedSinceSnapshot bool `json:"-"`
 }
 
 // FreshnessParserCompatibility is "current" when every stored profile is this

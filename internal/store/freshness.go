@@ -34,15 +34,18 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	// A scan takes the lock before inserting its row, and the insert can
 	// wait on a busy database, so a held lock counts as this repository's
 	// writer even without a row. The lock is per database: beside another
-	// repository's running rows the holder cannot be attributed.
+	// repository's running rows the holder cannot be attributed. A snapshot's
+	// running row may belong to a scan that finished after the snapshot was
+	// taken, so only rows read under the free lock read as abandoned.
 	switch {
 	case probe == scanLockHeld && otherRunning == 0:
 		f.RunningScans.Liveness = "active"
-	case probe == scanLockFree && f.RunningScans.Count > 0:
-		f.RunningScans.Liveness = "abandoned"
-	case probe == scanLockFree:
+	case probe == scanLockFree && f.RunningScans.Count == 0:
 		f.RunningScans.Liveness = "none"
+	case probe == scanLockFree && s.path != "":
+		f.RunningScans.Liveness = "abandoned"
 	}
+	f.LiveChangedSinceSnapshot = s.liveChangedSinceSnapshot()
 	f.ResolverPolicy = freshnessUnknown
 	if pending, err := s.PendingResolverPolicies(ctx, repoID); err == nil {
 		f.ResolverPolicyPending = append([]string{}, pending...)
