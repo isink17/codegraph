@@ -84,11 +84,13 @@ type request struct {
 
 // Transcript is the parsed content of one Claude Code JSONL session file.
 type Transcript struct {
-	requests    []*request
-	mainModels  map[string]bool
-	versions    map[string]bool
-	toolUses    []toolUse
-	results     map[string]toolResult
+	requests   []*request
+	mainModels map[string]bool
+	versions   map[string]bool
+	toolUses   []toolUse
+	results    map[string]toolResult
+	// conflicts marks tool_use ids with differing results in this file.
+	conflicts   map[string]bool
 	compactions int
 	// links maps a Task/Agent tool_use id to the agent id its result names.
 	links    map[string]string
@@ -115,7 +117,7 @@ func ParseTranscript(r io.Reader) (*Transcript, error) { return parseTranscript(
 // parseTranscript with own set reads a subagent file, whose events are all
 // marked isSidechain; it may hold no request at all.
 func parseTranscript(r io.Reader, own bool) (*Transcript, error) {
-	t := &Transcript{mainModels: map[string]bool{}, versions: map[string]bool{}, results: map[string]toolResult{}, toolCats: map[string]string{},
+	t := &Transcript{mainModels: map[string]bool{}, versions: map[string]bool{}, results: map[string]toolResult{}, conflicts: map[string]bool{}, toolCats: map[string]string{},
 		links: map[string]string{}, agentIDs: map[string]bool{}, own: own}
 	byID := map[string]*request{}
 	seenTool := map[string]bool{}
@@ -261,9 +263,15 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 			case bl.Type == "tool_result":
 				nonText = true
 				if spawned.AgentID != "" && len(bls) == 1 {
+					if a, ok := t.links[bl.ToolUseID]; ok && a != spawned.AgentID {
+						return fmt.Errorf("tool_use %s: results name agents %q and %q", bl.ToolUseID, a, spawned.AgentID)
+					}
 					t.links[bl.ToolUseID] = spawned.AgentID
 				}
 				res := toolResult{IsError: bl.IsError, Text: contentText(bl.Content)}
+				if r, ok := t.results[bl.ToolUseID]; ok && r != res {
+					t.conflicts[bl.ToolUseID] = true
+				}
 				t.results[bl.ToolUseID] = res
 				cat, ok := t.toolCats[bl.ToolUseID]
 				if !ok {
@@ -511,6 +519,8 @@ func classifyUse(u toolUse) (kind, detail string) {
 	return "", ""
 }
 
+// Contamination checks one file without checkCopies; ingest goes through
+// linkSubagents, which rejects conflicting result copies first.
 func (t *Transcript) Contamination() Contamination {
 	return sessionContamination([]thread{{"main", t, false}, {"sidechain", t, true}}, nil)
 }
@@ -526,8 +536,10 @@ type thread struct {
 // sessionContamination lists CodeGraph use attempts from every copy of every
 // tool_use, including copies on requests whose tokens another file owns:
 // duplicates of one message.id may differ in content, so contamination takes
-// the union. Calls are deduplicated by tool_use id in thread order, and a
-// copy whose outcome is not blocked overrides a blocked one. A Task/Agent call
+// the union. Calls are deduplicated by tool_use id in thread order; a copy
+// without a result never overrides, and a copy with one overrides no_result
+// or blocked with any other outcome (linkSubagents rejects differing result
+// copies before this point). A Task/Agent call
 // in checked is linked to a subagent file whose calls are listed under that
 // agent instead, so it is not itself an unverified attempt.
 func sessionContamination(threads []thread, checked map[string]bool) Contamination {
@@ -544,7 +556,7 @@ func sessionContamination(threads []thread, checked map[string]bool) Contaminati
 			}
 			outcome := callOutcome(kind, th.t.results, u.ID)
 			if i, ok := at[u.ID]; ok {
-				if c.Calls[i].Outcome == "blocked" && outcome != "blocked" {
+				if prev := c.Calls[i].Outcome; outcome != "no_result" && (prev == "no_result" || prev == "blocked" && outcome != "blocked") {
 					c.Calls[i].Outcome = outcome
 				}
 				continue
@@ -562,9 +574,14 @@ func callOutcome(kind string, results map[string]toolResult, id string) string {
 		return "unverified"
 	}
 	res, ok := results[id]
-	switch {
-	case !ok:
+	if !ok {
 		return "no_result"
+	}
+	return resultOutcome(res)
+}
+
+func resultOutcome(res toolResult) string {
+	switch {
 	case !res.IsError:
 		return "succeeded"
 	case blockedResult(res.Text):
