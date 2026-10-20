@@ -200,6 +200,12 @@ func (s *Store) watcherStatus(repoID int64) (live string, unverified bool) {
 		return LiveWatcherUnverified, true
 	case scanLockError:
 		return freshnessUnknown, true
+	case scanLockAbsent:
+		// A watcher creates both files before taking either, so the
+		// unverified one was removed, and a watcher may still hold it.
+		if first != scanLockAbsent {
+			return freshnessUnknown, true
+		}
 	}
 	if first != scanLockHeld {
 		return liveProbeState(first), false

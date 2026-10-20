@@ -150,6 +150,9 @@ Limits:
 
 - The lock is host-local: a writer on another machine sharing the database
   is not seen.
+- A lock file removed while a scan holds it hides that scan; its `running`
+  row still reads `liveness_unknown`, but a scan that has not yet inserted
+  its row is not seen.
 - A binary that predates the lock takes none; its live scans read
   `abandoned`.
 - A status read in another process that holds the lock for more than about
@@ -244,7 +247,7 @@ reverse. `live_watcher` reads:
 | `unverified` | the first lock is held: a live watcher of this repository is starting up or recovering |
 | `watching` | the live lock is held, before and after the first lock was found free: a live watcher reconciled |
 | `none` | neither is held, or no lock file exists |
-| `unknown` | a lock could not be probed (a permission or lock error) |
+| `unknown` | a lock could not be probed (a permission or lock error), or the live lock file exists without the first one, which a watcher never leaves: the first was removed and may still be held. `reconcile_pending` is kept until the next `codegraph watch` recreates it |
 
 A crashed watcher leaves `none` and only the persisted `reconcile_pending`
 marker, which the next completed full scan clears. Repositories in one
@@ -257,6 +260,11 @@ Limits:
 
 - The locks are host-local: a watcher on another machine sharing the
   database over a network file system reads `none`, as no lock is seen.
+- A lock file removed while a watcher holds it hides that hold: the watcher
+  keeps locking the removed file. Removing only the first reads `unknown`
+  (above); removing both reads `none`, and a full scan by another process
+  can then clear `reconcile_pending` while the watcher still recovers.
+  Never remove these files while a watcher runs.
 - A watcher built before the live lock takes only the first lock; it reads
   `unverified` while it holds it and `none` otherwise.
 - A second watcher of the same repository waits up to 1 s for the live lock
