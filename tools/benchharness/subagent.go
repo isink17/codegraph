@@ -154,11 +154,15 @@ func loadSubagents(dir string, ref SessionRef, m *Manifest) ([]*agentFile, error
 // returns the Task/Agent tool_use ids linked to a file and the count of calls
 // that are not. Linking reads every copy of a call, including copies on
 // requests another file owns. threads lists the session's agents in that
-// owner order for contamination checks.
-func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool, unlinked int, threads []thread, err error) {
+// owner order for contamination checks, which run only when contamination is
+// set (a without-CodeGraph arm).
+func linkSubagents(main *Transcript, subs []*agentFile, contamination bool) (checked map[string]bool, unlinked int, threads []thread, err error) {
 	byID := map[string]*agentFile{}
 	for _, s := range subs {
 		byID[s.res.AgentID] = s
+	}
+	if err := checkCopies(append([]*Transcript{main}, agentTranscripts(subs)...), contamination); err != nil {
+		return nil, 0, nil, err
 	}
 	owned := map[string]*request{}
 	claim := func(t *Transcript, sidechain bool) (dups int, err error) {
@@ -242,6 +246,47 @@ func linkSubagents(main *Transcript, subs []*agentFile) (checked map[string]bool
 	return checked, len(calls), threads, nil
 }
 
+// checkCopies fails when copies of one tool_use id name different spawned
+// agents, so linking never picks one copy. With contamination set it also
+// fails when copies carry different results for a call contamination would
+// classify, so the outcome is never picked either; an arm with CodeGraph
+// enabled never reads those outcomes.
+func checkCopies(ts []*Transcript, contamination bool) error {
+	attempts := map[string]bool{}
+	for _, t := range ts {
+		for _, u := range t.toolUses {
+			if kind, _ := classifyUse(u); contamination && kind != "" && kind != "subagent" {
+				attempts[u.ID] = true
+			}
+		}
+	}
+	links := map[string]string{}
+	results := map[string]toolResult{}
+	for _, t := range ts {
+		for _, id := range slices.Sorted(maps.Keys(t.links)) {
+			a := t.links[id]
+			if prev, ok := links[id]; ok && prev != a {
+				return fmt.Errorf("tool_use %s: copies name agents %q and %q", id, prev, a)
+			}
+			links[id] = a
+		}
+		for _, id := range slices.Sorted(maps.Keys(t.results)) {
+			if !attempts[id] {
+				continue
+			}
+			r := t.results[id]
+			if t.conflicts[id] {
+				return fmt.Errorf("tool_use %s: copies within one transcript file carry conflicting tool results", id)
+			}
+			if prev, ok := results[id]; ok && prev != r {
+				return fmt.Errorf("tool_use %s: copies across transcript files carry conflicting tool results (%s and %s)", id, resultOutcome(prev), resultOutcome(r))
+			}
+			results[id] = r
+		}
+	}
+	return nil
+}
+
 func agentTranscripts(subs []*agentFile) []*Transcript {
 	out := make([]*Transcript, len(subs))
 	for i, s := range subs {
@@ -251,12 +296,12 @@ func agentTranscripts(subs []*agentFile) []*Transcript {
 }
 
 // sessionAgents parses, links and measures a session's subagent files.
-func sessionAgents(dir string, ref SessionRef, m *Manifest, main *Transcript) ([]*agentFile, map[string]bool, int, []thread, error) {
+func sessionAgents(dir string, ref SessionRef, m *Manifest, main *Transcript, contamination bool) ([]*agentFile, map[string]bool, int, []thread, error) {
 	subs, err := loadSubagents(dir, ref, m)
 	if err != nil {
 		return nil, nil, 0, nil, err
 	}
-	checked, unlinked, threads, err := linkSubagents(main, subs)
+	checked, unlinked, threads, err := linkSubagents(main, subs, contamination)
 	if err != nil {
 		return nil, nil, 0, nil, err
 	}
