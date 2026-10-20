@@ -59,6 +59,11 @@ Two reasons are newer:
   whose parser profile differs from every stored file is not detected until
   its next scan converges them.
 
+Both make the verdict `stale_known`, and so count as known staleness wherever
+freshness gates a decision: `check_constraints --strict-freshness` exits 3
+(known stale) and `safe_to_edit` returns no verdict, with reason `known_stale`
+and exit 3, as for any other stale reason.
+
 ## Writer liveness
 
 Every scan holds a shared OS lock on `<db>.scan.lock` from before its row is
@@ -106,8 +111,8 @@ for the next `watch` or `update`.
 Every start records `reconcile_pending`, registers the watch tree, and runs
 one reconciliation pass (the incremental full update, which skips files whose
 size and mtime did not change) together with the queued work, before it
-reports ready. Changes made while no watcher ran are found by that pass, not
-by events. A pass that is cancelled or crashes leaves `reconcile_pending`
+reports ready, so starting a watcher costs one incremental `update`. Changes
+made while no watcher ran are found by that pass, not by events. A pass that is cancelled or crashes leaves `reconcile_pending`
 (and usually a `failed` scan row); the next start runs it again.
 
 `stats.state` is:
@@ -127,7 +132,9 @@ released first) and re-reading the repository config; a failed flush or queue
 write by a full pass. It reads `watching` again only after a pass that began
 after the latest failure completes with the tree registered. Every other
 error stops the watcher with that error: an unreadable or invalid repository
-config after a change, a closed or corrupt database, a missing or unreadable
+config after a change (malformed JSON, as from a file caught mid-write, is
+first retried through the registration path up to 5 times, about 8 s with the
+default delays, and reads `last_transient: config_invalid` meanwhile), a closed or corrupt database, a missing or unreadable
 repository root, a refused parser downgrade, cancellation.
 
 The watcher also:

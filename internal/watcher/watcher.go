@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -135,6 +136,10 @@ var (
 	retryBaseDelay = 250 * time.Millisecond
 	retryMaxDelay  = 30 * time.Second
 )
+
+// maxConfigRetries bounds the recovery attempts spent on a malformed config;
+// with the default delays the watcher stops about 8 s after the first one.
+const maxConfigRetries = 5
 
 func nextDelay(d time.Duration) time.Duration {
 	return min(d*2, retryMaxDelay)
@@ -437,6 +442,20 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 		}
 	}
 
+	// A config file caught mid-write reads as malformed JSON. It is retried
+	// through the recovery path a bounded number of times before the watcher
+	// stops; any other config error stops it at once.
+	configRetries := 0
+	retryConfig := func(err error) bool {
+		var syntaxErr *json.SyntaxError
+		if !errors.As(err, &syntaxErr) || configRetries >= maxConfigRetries {
+			return false
+		}
+		configRetries++
+		degradeRegistration("config_invalid")
+		return true
+	}
+
 	// Until a reconciliation completes, freshness reports reconcile_pending,
 	// so an interrupted start-up pass is never read as consistent.
 	if err := w.store.MarkReconcilePending(ctx, repoID); err != nil {
@@ -648,7 +667,15 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			// The configuration is read again too: a change to it may have
 			// raised no event while the tree was unregistered.
 			nextCfg, err := config.LoadRepo(repoRoot)
-			if err == nil {
+			if err != nil {
+				if _, ok := transientKind(err); !ok {
+					if retryConfig(err) {
+						continue
+					}
+					return fmt.Errorf("reload repository config: %w", err)
+				}
+			} else {
+				configRetries = 0
 				includes, excludes = nextCfg.Include, nextCfg.Exclude
 				err = resetWatcher(true)
 			}
@@ -717,10 +744,14 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 						degradeRegistration(kind)
 						continue
 					}
+					if retryConfig(loadErr) {
+						continue
+					}
 					// Carrying on with the old include/exclude rules would
 					// index against a configuration the user replaced.
 					return fmt.Errorf("reload repository config: %w", loadErr)
 				}
+				configRetries = 0
 				includes = nextCfg.Include
 				excludes = nextCfg.Exclude
 				markPending()
@@ -877,7 +908,10 @@ func (w *Watcher) queueDirtyPathsWithRetry(ctx context.Context, repoID int64, pa
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if lastErr = w.store.QueueDirtyFiles(ctx, repoID, paths, reason); lastErr == nil {
+		if lastErr = queueFailure(); lastErr == nil {
+			lastErr = w.store.QueueDirtyFiles(ctx, repoID, paths, reason)
+		}
+		if lastErr == nil {
 			return nil
 		}
 		select {
@@ -893,10 +927,11 @@ func (w *Watcher) queueDirtyWithRetry(ctx context.Context, repoID int64, path, r
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if err := w.store.QueueDirtyFile(ctx, repoID, path, reason); err == nil {
+		if lastErr = queueFailure(); lastErr == nil {
+			lastErr = w.store.QueueDirtyFile(ctx, repoID, path, reason)
+		}
+		if lastErr == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
 		delay := time.Duration(attempt*50) * time.Millisecond
 		select {
@@ -939,10 +974,19 @@ func (w *Watcher) updateConverging(ctx context.Context, repoRoot string, opts in
 // Test hooks: watcherCreatedHook sees every fsnotify watcher Run creates;
 // createdDirHook runs before a newly created directory is registered;
 // addWatchHook, when it returns an error, fails one directory registration;
-// updateHook, when it returns an error, fails one index update.
+// updateHook, when it returns an error, fails one index update; queueHook,
+// when it returns an error, fails one dirty-queue write attempt.
 var (
 	watcherCreatedHook func(*fsnotify.Watcher)
 	createdDirHook     func(path string)
 	addWatchHook       func(path string) error
 	updateHook         func(indexer.Options) error
+	queueHook          func() error
 )
+
+func queueFailure() error {
+	if queueHook != nil {
+		return queueHook()
+	}
+	return nil
+}

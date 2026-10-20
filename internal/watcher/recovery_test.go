@@ -240,9 +240,10 @@ func TestWatcherInterruptedReconciliationIsRedone(t *testing.T) {
 	}
 }
 
-// A configuration the watcher cannot read is an error, not silently the old
-// configuration.
+// A configuration that stays malformed is an error after bounded retries,
+// not silently the old configuration.
 func TestWatcherStopsOnUnreadableConfig(t *testing.T) {
+	shortRetries(t)
 	r := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
 	writeFile(t, filepath.Join(r.root, ".codegraph", "config.json"), `{"exclude":`)
 	select {
@@ -251,8 +252,64 @@ func TestWatcherStopsOnUnreadableConfig(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "reload repository config") {
 			t.Fatalf("err = %v, want a config reload error", err)
 		}
+		if st := r.w.Stats(); st.TransientErrors < maxConfigRetries || st.LastTransient != "config_invalid" {
+			t.Fatalf("stopped without retrying: %+v", st)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("watcher kept running on an unreadable config: %+v", r.w.Stats())
+	}
+}
+
+// A config file caught mid-write is retried; once it parses, its rules apply.
+func TestWatcherRetriesTruncatedConfig(t *testing.T) {
+	shortRetries(t)
+	r := startLiveRepo(t, map[string]string{"main.go": "package main\n", "skip/s.go": goFile})
+	writeFile(t, filepath.Join(r.root, ".codegraph", "config.json"), `{"exclude":`)
+	st := r.waitState(t, StateRecovering)
+	if st.LastTransient != "config_invalid" {
+		t.Fatalf("LastTransient = %q, want config_invalid", st.LastTransient)
+	}
+	writeFile(t, filepath.Join(r.root, ".codegraph", "config.json"), `{"exclude":["skip/**"]}`)
+	r.waitLive(t, "excluded file retired", func(p []string) bool { return slices.Equal(p, []string{"main.go"}) })
+	r.waitState(t, StateWatching)
+}
+
+// An event whose dirty-queue write fails stays covered: the reconciliation
+// pass that follows finds the change.
+func TestWatcherReconcilesAfterQueueWriteFailure(t *testing.T) {
+	var failures atomic.Int64
+	failures.Store(-1)
+	queueHook = func() error {
+		if failures.Add(-1) >= 0 {
+			return errors.New("database is locked (5) (SQLITE_BUSY)")
+		}
+		return nil
+	}
+	t.Cleanup(func() { queueHook = nil })
+	shortRetries(t)
+	r := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
+	failures.Store(3) // every attempt of the next write
+	writeFile(t, filepath.Join(r.root, "lost.go"), goFile)
+	r.waitLive(t, "file whose queue write failed", func(p []string) bool { return slices.Contains(p, "lost.go") })
+	st := r.waitState(t, StateWatching)
+	if st.QueueErrors != 1 || st.LastTransient != "sqlite_busy" || st.Reconciles < 2 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestHealthReconciledIgnoresPassOlderThanFailure(t *testing.T) {
+	var h health
+	h.reset()
+	h.setRegistered()
+	since := h.failureCount()
+	h.degrade("sqlite_busy", false)
+	h.reconciled(since)
+	if state, _ := h.snapshot(); state != StateRecovering {
+		t.Fatalf("a pass begun before the failure set %s", state)
+	}
+	h.reconciled(h.failureCount())
+	if state, _ := h.snapshot(); state != StateWatching {
+		t.Fatalf("a pass begun after the failure left %s", state)
 	}
 }
 
