@@ -8,7 +8,8 @@ import (
 
 // The pre-aggregated facts join must report exactly what the direct LEFT JOIN
 // reported, including the doubled counts of a symbol matched by two candidate
-// rows (an empty and an exact signature).
+// rows (an empty and an exact signature), and must ignore facts of another
+// repository that point at the same symbol ids.
 func TestSwiftDeclarationFactsBySymbolMatchesDirectJoin(t *testing.T) {
 	f := newSwiftScopeFixture(t)
 	other := f.file("Other.swift")
@@ -22,6 +23,18 @@ func TestSwiftDeclarationFactsBySymbolMatchesDirectJoin(t *testing.T) {
 	f.dispatchFact(other, mixed, true, "class")
 	f.dispatchFact(f.mainFile, twice, false, "instance")
 	f.dispatchFact(f.mainFile, twice, true, "")
+	otherRepo, err := f.store.UpsertRepo(f.ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRepoFile, err := insertTestFileLang(f.ctx, f.store, otherRepo.ID, "Foreign.swift", "swift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `INSERT INTO swift_declaration_facts(repo_id,file_id,symbol_id,is_final,dispatch_kind) VALUES(?,?,?,1,'class'),(?,?,?,1,'class')`,
+		otherRepo.ID, otherRepoFile, none, otherRepo.ID, otherRepoFile, twice); err != nil {
+		t.Fatal(err)
+	}
 
 	conn, err := f.store.db.Conn(f.ctx)
 	if err != nil {
@@ -40,7 +53,7 @@ func TestSwiftDeclarationFactsBySymbolMatchesDirectJoin(t *testing.T) {
 	const where = ` WHERE s.repo_id=? AND f.is_deleted=0 GROUP BY s.id ORDER BY s.id`
 	direct := `SELECT s.id,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'') ` +
 		from + `LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id` + where
-	aggregated := `SELECT s.id,COALESCE(SUM(d.facts),0),COALESCE(SUM(d.finals),0),COALESCE(MIN(d.dispatch_min),''),COALESCE(MAX(d.dispatch_max),'') ` +
+	aggregated := `SELECT s.id,` + swiftDeclarationFactsAggregates + ` ` +
 		from + `LEFT JOIN ` + swiftDeclarationFactsBySymbol + ` d ON d.symbol_id=s.id` + where
 
 	load := func(query string, args ...any) []string {
