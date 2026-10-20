@@ -260,7 +260,7 @@ func goTypeSymbol(typeSpec *sitter.Node, pkg string, content []byte) graph.Symbo
 
 // goIsTypeAlias reports whether a type spec declares an alias. The grammar
 // has no generic alias, so `type A[T any] = B[T]` is a type_spec whose `=` is
-// an ERROR node.
+// an ERROR node. This assumes the file is valid Go; go/ast rejects invalid files.
 func goIsTypeAlias(typeSpec *sitter.Node, content []byte) bool {
 	if typeSpec.Type() == "type_alias" {
 		return true
