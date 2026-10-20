@@ -28,11 +28,7 @@ func (s *Store) reconcileReferenceIdentitiesStandalone(ctx context.Context, repo
 	committed := false
 	defer func() {
 		if !committed {
-			// Detached: a cancelled ctx would skip the ROLLBACK and return the
-			// connection to the pool inside the transaction. It runs even when
-			// BEGIN reported an error, since a cancel can race a BEGIN that took
-			// effect; with no transaction open it fails harmlessly.
-			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+			rollbackManualTx(ctx, conn)
 		}
 	}()
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {

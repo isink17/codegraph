@@ -8931,11 +8931,7 @@ func (s *Store) ClaimDirtyFiles(ctx context.Context, repoID int64, claimAt, clai
 		if committed {
 			return
 		}
-		// Detached from ctx: a cancelled ctx would skip the ROLLBACK and hand
-		// the pooled connection back still inside the write transaction. It
-		// runs even when BEGIN reported an error, since a cancel can race a
-		// BEGIN that took effect; with no transaction open it fails harmlessly.
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+		rollbackManualTx(ctx, conn)
 	}()
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return nil, err
@@ -9054,11 +9050,7 @@ func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, er
 		if committed {
 			return
 		}
-		// Detached from ctx: a cancelled ctx would skip the ROLLBACK and hand
-		// the pooled connection back still inside the write transaction. It
-		// runs even when BEGIN reported an error, since a cancel can race a
-		// BEGIN that took effect; with no transaction open it fails harmlessly.
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+		rollbackManualTx(ctx, conn)
 	}()
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return nil, err
