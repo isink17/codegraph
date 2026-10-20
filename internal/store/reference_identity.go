@@ -25,17 +25,19 @@ func (s *Store) reconcileReferenceIdentitiesStandalone(ctx context.Context, repo
 		return err
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return err
-	}
 	committed := false
 	defer func() {
 		if !committed {
 			// Detached: a cancelled ctx would skip the ROLLBACK and return the
-			// connection to the pool inside the transaction.
+			// connection to the pool inside the transaction. It runs even when
+			// BEGIN reported an error, since a cancel can race a BEGIN that took
+			// effect; with no transaction open it fails harmlessly.
 			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
 		}
 	}()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
 	if err := reconcileReferenceIdentitiesForLanguages(ctx, conn, repoID, languages); err != nil {
 		return err
 	}

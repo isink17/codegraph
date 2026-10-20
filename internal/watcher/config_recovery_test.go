@@ -118,8 +118,17 @@ func TestDegradedWatcherKeepsReconcilePendingAcrossExternalScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = other.Close() })
-	if _, err := indexer.New(other, parser.NewRegistry(goparser.New()), nil).Update(context.Background(), indexer.Options{RepoRoot: r.root}); err != nil {
-		t.Fatal(err)
+	// The degraded watcher keeps writing its marker; a scan that loses that
+	// race is simply run again, as a user would.
+	otherIdx := indexer.New(other, parser.NewRegistry(goparser.New()), nil)
+	for attempt := 1; ; attempt++ {
+		_, err := otherIdx.Update(context.Background(), indexer.Options{RepoRoot: r.root})
+		if err == nil {
+			break
+		}
+		if !store.IsBusy(err) || attempt == 5 {
+			t.Fatal(err)
+		}
 	}
 	if st := r.w.Stats(); st.State != StateRecovering {
 		t.Fatalf("watcher recovered during the test: %+v", st)
