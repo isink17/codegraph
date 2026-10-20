@@ -24,3 +24,20 @@ func TestGoReceiverThroughFunctionResultTreeSitter(t *testing.T) {
 func TestGoPackageIdentityIndexAndUpdateParityTreeSitter(t *testing.T) {
 	runGoPackageIdentityParity(t, parser.NewRegistry(tsparser.NewGo()))
 }
+
+func TestGoSignatureProfileUpgradeTreeSitter(t *testing.T) {
+	runGoSignatureProfileUpgrade(t, parser.NewRegistry(tsparser.NewGo()), "treesitter:go:v3", "treesitter:go:v4")
+}
+
+// On this fixture both Go parser families store the same declarations, so a cgo
+// and a non-cgo index differ only in the recorded parser profile. Not true in
+// general: a non-generic alias (`type B = int`) is a type symbol only in go/ast.
+func TestGoSignatureFamilyParity(t *testing.T) {
+	declarations := func(reg *parser.Registry) string {
+		g, _ := newGoRepo(t, reg, goSignatureProfileFiles).semanticJSON(t)
+		return canonicalJSON(g.Declarations)
+	}
+	if a, b := declarations(goNativeRegistry()), declarations(parser.NewRegistry(tsparser.NewGo())); a != b {
+		t.Fatalf("declarations differ:\n go/ast:      %s\n tree-sitter: %s", a, b)
+	}
+}

@@ -16,7 +16,7 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		profile   string
 		callEdges bool
 	}{
-		"go":         {"go-ast:go:v4", true},
+		"go":         {"go-ast:go:v5", true},
 		"python":     {"python-regex:python:v10", true},
 		"java":       {"heuristic:java:v1", false},
 		"lua":        {"heuristic:lua:v1", false},

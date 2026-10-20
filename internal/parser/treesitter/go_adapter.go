@@ -233,6 +233,9 @@ func goTypeSymbol(typeSpec *sitter.Node, pkg string, content []byte) graph.Symbo
 			sig = nodeText(typeNode, content)
 		}
 	}
+	if tparams := childByFieldName(typeSpec, "type_parameters"); tparams != nil {
+		sig = nodeText(tparams, content) + " " + sig
+	}
 
 	return graph.Symbol{
 		Language:      "go",
@@ -293,6 +296,9 @@ func goFuncSignature(fn *sitter.Node, content []byte) string {
 	}
 	if nameNode := childByFieldName(fn, "name"); nameNode != nil {
 		b.WriteString(nodeText(nameNode, content))
+	}
+	if tparams := childByFieldName(fn, "type_parameters"); tparams != nil {
+		b.WriteString(nodeText(tparams, content))
 	}
 	if params := childByFieldName(fn, "parameters"); params != nil {
 		b.WriteString(nodeText(params, content))

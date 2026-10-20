@@ -194,7 +194,7 @@ func buildTypeSymbol(fset *token.FileSet, content []byte, pkg string, ts *ast.Ty
 		Name:          name,
 		QualifiedName: pkg + "." + name,
 		ContainerName: pkg,
-		Signature:     renderTypeSignature(content, fset.File(ts.Pos()), ts.Type),
+		Signature:     renderTypeSignature(content, fset.File(ts.Pos()), ts),
 		Visibility:    visibility(name),
 		Range:         toRange(fset, ts.Pos(), ts.End()),
 		DocSummary:    doc,
@@ -313,8 +313,7 @@ func declText(content []byte, file *token.File, node ast.Node) string {
 	return string(content[file.Offset(node.Pos()):file.Offset(node.End())])
 }
 
-// renderFuncSignature spells `func (recv) Name(params) results`. A type
-// parameter list is not part of it, matching the tree-sitter adapter.
+// renderFuncSignature spells `func (recv) Name[tparams](params) results`.
 func renderFuncSignature(content []byte, file *token.File, fn *ast.FuncDecl) string {
 	var b strings.Builder
 	b.WriteString("func ")
@@ -323,6 +322,9 @@ func renderFuncSignature(content []byte, file *token.File, fn *ast.FuncDecl) str
 		b.WriteByte(' ')
 	}
 	b.WriteString(fn.Name.Name)
+	if fn.Type.TypeParams != nil {
+		b.WriteString(declText(content, file, fn.Type.TypeParams))
+	}
 	b.WriteString(declText(content, file, fn.Type.Params))
 	if fn.Type.Results != nil {
 		b.WriteByte(' ')
@@ -331,14 +333,20 @@ func renderFuncSignature(content []byte, file *token.File, fn *ast.FuncDecl) str
 	return b.String()
 }
 
-func renderTypeSignature(content []byte, file *token.File, typ ast.Expr) string {
-	switch typ.(type) {
+// renderTypeSignature spells a generic type's type parameter list, then a
+// space, before `struct`, `interface` or the type's source text.
+func renderTypeSignature(content []byte, file *token.File, ts *ast.TypeSpec) string {
+	sig := declText(content, file, ts.Type)
+	switch ts.Type.(type) {
 	case *ast.StructType:
-		return "struct"
+		sig = "struct"
 	case *ast.InterfaceType:
-		return "interface"
+		sig = "interface"
 	}
-	return declText(content, file, typ)
+	if ts.TypeParams != nil {
+		return declText(content, file, ts.TypeParams) + " " + sig
+	}
+	return sig
 }
 
 func renderNode(content []byte, fset *token.FileSet, node ast.Node) string {
@@ -400,7 +408,8 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 // types, and edges for selector calls made directly on a call result. v3
 // records the package clause and build constraint. v4 stores signatures as the
 // declaration's source text, as the tree-sitter adapter does, instead of a
-// lossy rendering that dropped parameters and results.
+// lossy rendering that dropped parameters and results. v5 adds the type
+// parameter list to function and type signatures.
 func (a *Adapter) Profile() cgparser.Profile {
-	return cgparser.Profile{ID: "go-ast:go:v4", EmitsCallEdges: true}
+	return cgparser.Profile{ID: "go-ast:go:v5", EmitsCallEdges: true}
 }

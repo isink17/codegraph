@@ -19,13 +19,15 @@ change lists but never change `risk`.
 - No assessment proves a change safe. Only resolved edges are cited, so an
   unresolved, dynamic, reflective or cross-language dependent can still break.
   `risk.coverage` is therefore never `complete`.
-- Both Go parsers (`treesitter:go:v3`, and `go-ast:go:v4` with
+- Both Go parsers (`treesitter:go:v4`, and `go-ast:go:v5` with
   `CGO_ENABLED=0`) store a function's signature as its source text: receiver,
-  parameters and results, but not its type parameter list. A changed signature
-  is therefore a removed and an added declaration in either build, and so is a
-  reformatted one; a change to a type parameter list or constraint alone is not
-  seen. Results on pinned real repositories, with known false positives and
-  negatives, are in `docs/change-risk-verification.md`.
+  type parameter list, parameters and results. A generic type's signature
+  starts with its type parameter list (`[T comparable] struct`). A changed
+  signature, a changed type parameter or constraint included, is therefore a
+  removed and an added declaration in either build, and so is a reformatted
+  one. A type use is no resolved edge, so a changed generic type is reported
+  as uncertainty, not points. Results on pinned real repositories, with known
+  false positives and negatives, are in `docs/change-risk-verification.md`.
 
 ## Assessments
 
