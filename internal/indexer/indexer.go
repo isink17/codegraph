@@ -73,6 +73,11 @@ func New(s *store.Store, registry *parser.Registry, embedder embedding.Embedder)
 	if embedder == nil {
 		embedder = embedding.NewNoop()
 	}
+	// Freshness on this store judges stored provenance against the parsers
+	// this indexer would write with.
+	if s != nil && registry != nil {
+		s.SetParserProfiles(registry.LanguageProfiles())
+	}
 	return &Indexer{store: s, registry: registry, embedder: embedder}
 }
 

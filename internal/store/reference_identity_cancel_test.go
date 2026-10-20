@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
-	"fmt"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -48,6 +51,7 @@ func TestReferenceIdentityReconcileCancelledRollsBack(t *testing.T) {
 	if before == after {
 		t.Fatalf("fixture derives nothing: %s", after)
 	}
+	s.db.SetMaxOpenConns(1)
 	cancelled := 0
 	for i := range 200 {
 		clearIdentities()
@@ -65,15 +69,78 @@ func TestReferenceIdentityReconcileCancelledRollsBack(t *testing.T) {
 		if err != nil && identities() != before {
 			t.Fatalf("run %d failed with %v but kept its writes", i, err)
 		}
-		// A connection returned inside a transaction would fail this write.
-		if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`UPDATE references_tbl SET start_col = start_col WHERE repo_id = %d`, repoID)); err != nil {
-			t.Fatalf("run %d: pool unusable after cancellation: %v", i, err)
+		// The pool has one connection, the one the run used: returned inside
+		// a transaction it could not begin another.
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+			t.Fatalf("run %d: connection returned inside a transaction: %v", i, err)
+		}
+		if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
 	}
 	if cancelled == 0 {
 		t.Fatal("no run was cancelled")
 	}
 	if err := s.ReconcileReferenceIdentities(ctx, repoID); err != nil || identities() != after {
 		t.Fatalf("pass after cancellations: %v, %s", err, identities())
+	}
+}
+
+// beginErrConn reports a cancellation for a BEGIN that took effect, the race
+// a cancelled context can lose.
+type beginErrConn struct{ driver.Conn }
+
+func (c beginErrConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	res, err := c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+	if err == nil && query == `BEGIN IMMEDIATE` {
+		return nil, context.Canceled
+	}
+	return res, err
+}
+
+type beginErrConnector struct {
+	drv driver.Driver
+	dsn string
+}
+
+func (c beginErrConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.drv.Open(c.dsn)
+	return beginErrConn{conn}, err
+}
+
+func (c beginErrConnector) Driver() driver.Driver { return c.drv }
+
+// A BEGIN that took effect but reported an error is rolled back before its
+// connection returns to the pool.
+func TestReferenceIdentityRollsBackBeginReportedFailed(t *testing.T) {
+	ctx := context.Background()
+	probe, err := sql.Open(sqliteDriverName, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv := probe.Driver()
+	_ = probe.Close()
+	db := sql.OpenDB(beginErrConnector{drv: drv, dsn: filepath.Join(t.TempDir(), "graph.sqlite")})
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	s := &Store{db: db}
+	if err := s.ReconcileReferenceIdentities(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN`); err != nil {
+		t.Fatalf("connection returned inside a transaction: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+		t.Fatal(err)
 	}
 }

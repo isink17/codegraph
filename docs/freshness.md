@@ -7,8 +7,8 @@ never says "fresh": changes on disk since the last scan are not checked
 (`filesystem: "not_checked"`) unless a scan has run since.
 
 Reading it never writes the database and never creates a file. It runs one
-read-only transaction, one bounded `git rev-parse HEAD` (2 s), and one
-non-blocking probe of the scan lock.
+read-only transaction, one bounded `git rev-parse HEAD` (2 s), and
+non-blocking probes of the scan lock and the repository's watcher locks.
 
 ## Verdict
 
@@ -38,15 +38,17 @@ the usual not-indexed error.
 | `dirty_queue.queued`, `.in_flight`, `.oldest_queued_at` | persisted watcher work | `dirty_files` |
 | `resolver_policy`, `resolver_policy_pending` | `converged`, `pending` (with languages), `unknown` | stored resolver policy markers |
 | `parser_profile`, `parser_profile_unconverged` | `converged`, `unconverged` (with languages), `unknown` | per-file parser provenance |
+| `parser_profile_compatibility` | `state` `current`, `obsolete`, `unknown`; `reason`; `languages` | per-file parser provenance and the reading binary's parsers |
 | `worktree.repo_root`, `.canonical_path` | the repository the graph belongs to | `repos` |
 | `worktree.head_at_index`, `.head_now`, `.head_changed` | `unknown` when either HEAD cannot be read | history watermark, one git call |
 | `watcher` | always `not_in_this_process` | neither `stats` nor `serve` runs a watcher, and no watcher liveness is persisted |
+| `live_watcher` | `watching`, `unverified`, `none`, `unknown` | watcher lock probes; see [Watcher](#watcher) |
 | `filesystem` | always `not_checked` | |
 
 `state` (`known_stale`, `unknown`, `no_known_staleness`) and `reasons` keep
 their earlier meaning. `scan_running_or_abandoned` now also fires when the
 lock shows a live writer whose row is older than the last completed scan.
-Two reasons are newer:
+Three reasons are newer:
 
 - `reconcile_pending`: a watcher started, or lost events or queue writes,
   and no full scan that began after that has completed. It is a database
@@ -57,12 +59,50 @@ Two reasons are newer:
   scan converges every file of a language, so this is a transition left
   unfinished. The stored files are compared with each other only: a binary
   whose parser profile differs from every stored file is not detected until
-  its next scan converges them.
+  its next scan converges them; `parser_profile_compatibility` does.
+- `parser_profile_obsolete`: `parser_profile_compatibility.state` is
+  `obsolete` (see [Parser compatibility](#parser-compatibility)).
 
-Both make the verdict `stale_known`, and so count as known staleness wherever
+All three make the verdict `stale_known`, and so count as known staleness wherever
 freshness gates a decision: `check_constraints --strict-freshness` exits 3
 (known stale) and `safe_to_edit` returns no verdict, with reason `known_stale`
 and exit 3, as for any other stale reason.
+
+## Parser compatibility
+
+`parser_profile` compares the stored files with each other;
+`parser_profile_compatibility` compares them with the parsers of the binary
+reading them, the registry the indexer plans profile transitions with. A
+language is:
+
+| State | Reason | Meaning |
+| --- | --- | --- |
+| `current` | | every stored file carries this binary's profile |
+| `obsolete` | `older_version` | some files carry an older version of this binary's parser family (`<family>:<language>:v<n>`); this binary's next scan reparses them |
+| `unknown` | `call_capable_build_required` | call-capable or unrecorded data that this binary, which emits no call edges for the language, refuses to replace, as a build without CGO reading tree-sitter data |
+| `unknown` | `other_parser_family` | another parser family wrote it, such as `go-ast` data read by a tree-sitter build |
+| `unknown` | `newer_version` | a newer binary wrote it |
+| `unknown` | `unrecorded_provenance` | indexed before provenance was recorded |
+| `unknown` | `no_adapter` | this binary has no parser for the language |
+
+A language is `obsolete` only when every stored profile that differs from
+this binary's is an older version of its family. One profile this binary
+cannot place makes the whole language `unknown`, however many others are
+merely older, with the first reason in the table's order that any of its
+profiles has (`call_capable_build_required`, `other_parser_family`,
+`newer_version`, `unrecorded_provenance`), so the order profiles are read in
+never changes it.
+
+The object's `state` is `obsolete` when any language is, else `unknown` when
+any is, else `current`, with the `reason` of the first such language;
+`languages` lists every language that is not current, with its
+`stored_profiles` and `current_profile`. When the provenance cannot be read
+it is `unknown` with reason `provenance_unreadable`, and `no_parser_registry`
+when the reading process has no parser registry. Only `obsolete` is a stale
+reason: an `unknown` compatibility leaves the verdict alone, since a graph a
+richer build wrote is not stale for that build. A build without CGO
+therefore never calls tree-sitter data obsolete or current. It is one
+aggregate query, the one `parser_profile` already runs.
 
 ## Writer liveness
 
@@ -82,6 +122,25 @@ file) liveness is `unknown` and the verdict `liveness_unknown`, since a
 writer may hold it. A missing lock file means no lock-aware scan has ever
 run on this database, so none can hold it; liveness is `unknown` and the
 verdict follows the rows (a pre-lock binary's scan is not seen).
+
+A read-only handle (`check_constraints --strict-freshness` and `safe_to_edit`
+on the CLI) reads rows from a snapshot taken when it opened the database and
+probes the live database's scan lock, never the snapshot's, holding it only
+while it reads the snapshot rows, as above: a held lock reads
+`writer_active`. A `running` row in the
+snapshot may belong to a scan that finished after the snapshot was taken, so
+with the lock free it reads `unknown` (`liveness_unknown`), never
+`abandoned`. After the probe the read compares the database's files (size,
+modification time, identity of the database, WAL and journal) with the ones
+the snapshot copied (an empty or missing WAL or journal counts as one
+state, as SQLite creates and removes them when connections open and close);
+any difference, including a scan that began and finished between the
+snapshot and the read, makes strict freshness `unknown` with
+`scan_activity_during_check`. It errs both ways: a write that keeps a file's
+size and modification time on a file system with coarse timestamps, or whose
+metadata Windows has not yet updated for a file another process holds open,
+is missed; a checkpoint, or a write by another repository's scan or watcher
+in the same database, reads as a change.
 
 A new scan waiting for the lock is delayed by at most one of its 50 ms
 retries, and `recover-scans` retries over the same 100 ms window before
@@ -159,15 +218,54 @@ The watcher also:
   config inside;
 - ignores a new directory that is removed before it can be registered.
 
-While its state is not `watching`, a watcher also holds a shared OS lock on
-`<database>.watch-<repo id>.lock`, and freshness reports `reconcile_pending`
-while any process holds it. A full scan by another process therefore cannot
-clear the reason while a live watcher is still reconciling or recovering: the
-scan covers changes made before it, not events the watcher keeps missing. The
-operating system releases the lock when the watcher exits, however it exits,
-so a crashed watcher leaves only the persisted marker, which the next
-completed full scan clears. Like the scan lock, it is local to the host.
+### Watcher locks
 
-Limits: no other watcher state is persisted, so `stats` and `graph_stats`
-keep `watcher: "not_in_this_process"`; the lock says that some live watcher
-has not reconciled, not which one or why.
+A watcher holds two OS locks beside the database, both local to the host and
+both released by the operating system when the watcher exits, however it
+exits; nothing about a watcher is stored.
+
+- `<database>.watch-<repo id>.lock`, shared, while its state is not
+  `watching`. Freshness reports `reconcile_pending` while any process holds
+  it, so a full scan by another process cannot clear the reason while a live
+  watcher is still reconciling or recovering: the scan covers changes made
+  before it, not events the watcher keeps missing. The hold that follows a
+  failure is best effort, like the marker written with it: it waits up to
+  1 s for status reads probing the lock, outside the lock that guards the
+  watcher's state, and a hold that fails leaves only the marker.
+- `<database>.watch-<repo id>.live.lock`, exclusive, for its whole run.
+  Status reads probe it shared, so they never mistake one another for a
+  watcher and never wait on each other.
+
+A watcher takes the first lock before the second and releases them in
+reverse. `live_watcher` reads:
+
+| Value | Meaning |
+| --- | --- |
+| `unverified` | the first lock is held: a live watcher of this repository is starting up or recovering |
+| `watching` | the live lock is held, before and after the first lock was found free: a live watcher reconciled |
+| `none` | neither is held, or no lock file exists |
+| `unknown` | a lock could not be probed (a permission or lock error) |
+
+A crashed watcher leaves `none` and only the persisted `reconcile_pending`
+marker, which the next completed full scan clears. Repositories in one
+database have separate locks and are reported apart. The read never creates
+a lock file, and a read-only handle (`check_constraints --strict-freshness`
+and `safe_to_edit` on the CLI read a snapshot of the database) probes the
+live database's locks, so every surface sees the same watcher.
+
+Limits:
+
+- The locks are host-local: a watcher on another machine sharing the
+  database over a network file system reads `none`, as no lock is seen.
+- A watcher built before the live lock takes only the first lock; it reads
+  `unverified` while it holds it and `none` otherwise.
+- A second watcher of the same repository waits up to 1 s for the live lock
+  and then runs without it; it is reported through the first lock only, and
+  reads `none` once the first watcher exits.
+- One read can be wrong for an instant: a watcher that exits and another that
+  starts within the same read, or a watcher whose locks the operating system
+  is releasing as it dies, can read `watching` for that read. Nothing is
+  persisted, so the next read is right.
+- A CLI `check_constraints --strict-freshness` or `safe_to_edit` reads rows
+  from a snapshot taken when it opened the database and probes the live
+  locks at read time; see [Writer liveness](#writer-liveness).

@@ -57,6 +57,14 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 	runningThenFailed.Reasons = []string{"never_completed", "latest_scan_failed", "scan_running_or_abandoned"}
 	both := freshnessAt("h1", fullScan("h1", "h1", "yes"))
 	both.Coverage.FailedAfterLastFull = 1
+	// A scan holding the lock before inserting its row, and a lock that
+	// could not be probed: graph_stats reads writer_active and
+	// liveness_unknown without any running row.
+	preInsertWriter := freshnessAt("h1", fullScan("h1", "h1", "none"))
+	preInsertWriter.State, preInsertWriter.Reasons = graph.FreshnessKnownStale, []string{"scan_running_or_abandoned"}
+	preInsertWriter.RunningScans.Liveness, preInsertWriter.Verdict = "active", graph.FreshnessVerdictWriterActive
+	lockUnknown := freshnessAt("h1", fullScan("h1", "h1", "none"))
+	lockUnknown.RunningScans.Liveness, lockUnknown.Verdict = "unknown", graph.FreshnessVerdictLivenessUnknown
 
 	cases := []struct {
 		name    string
@@ -70,6 +78,8 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 		{"full coverage violations", StatusViolations, freshnessAt("h1", fullScan("h1", "h1", "none")), VerdictFullCoverageAtHead, 1, []string{}},
 		{"dirty queue status", StatusStale, freshnessAt("h1", fullScan("h1", "h1", "none")), VerdictKnownStale, ExitKnownStale, []string{"dirty_queue_nonempty"}},
 		{"older scan still running", StatusOK, olderRunning, VerdictUnknown, ExitFreshnessUnknown, []string{"scan_running_or_abandoned"}},
+		{"scan lock held before its row", StatusOK, preInsertWriter, VerdictUnknown, ExitFreshnessUnknown, []string{"scan_running_or_abandoned"}},
+		{"scan lock not probeable", StatusOK, lockUnknown, VerdictUnknown, ExitFreshnessUnknown, []string{"scan_running_or_abandoned"}},
 		{"stale status adds queue reason", StatusStale, staleNoQueueReason, VerdictKnownStale, ExitKnownStale, []string{"head_moved", "dirty_queue_nonempty"}},
 		{"known stale state", StatusOK, stale, VerdictKnownStale, ExitKnownStale, []string{"head_moved"}},
 		{"never completed", StatusOK, neverCompleted, VerdictUnknown, ExitFreshnessUnknown, []string{"never_completed"}},
@@ -108,10 +118,11 @@ func TestStrictFreshnessVerdicts(t *testing.T) {
 		t.Fatalf("graph read a newer scan than freshness: %+v", got)
 	}
 	for name, mutate := range map[string]func(*graph.Freshness){
-		"new scan":    func(f *graph.Freshness) { f.LatestScan = &graph.FreshnessScan{ID: 8, Status: "running"} },
-		"scan closed": func(f *graph.Freshness) { f.LatestScan = &graph.FreshnessScan{ID: 7, Status: "failed"} },
-		"queued":      func(f *graph.Freshness) { f.DirtyQueue.Queued = 1 },
-		"head moved":  func(f *graph.Freshness) { f.Worktree.HeadNow = "h2" },
+		"new scan":                func(f *graph.Freshness) { f.LatestScan = &graph.FreshnessScan{ID: 8, Status: "running"} },
+		"scan closed":             func(f *graph.Freshness) { f.LatestScan = &graph.FreshnessScan{ID: 7, Status: "failed"} },
+		"queued":                  func(f *graph.Freshness) { f.DirtyQueue.Queued = 1 },
+		"head moved":              func(f *graph.Freshness) { f.Worktree.HeadNow = "h2" },
+		"snapshot source changed": func(f *graph.Freshness) { f.LiveChangedSinceSnapshot = true },
 	} {
 		after := proven
 		mutate(&after)

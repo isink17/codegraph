@@ -34,15 +34,18 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	// A scan takes the lock before inserting its row, and the insert can
 	// wait on a busy database, so a held lock counts as this repository's
 	// writer even without a row. The lock is per database: beside another
-	// repository's running rows the holder cannot be attributed.
+	// repository's running rows the holder cannot be attributed. A snapshot's
+	// running row may belong to a scan that finished after the snapshot was
+	// taken, so only rows read under the free lock read as abandoned.
 	switch {
 	case probe == scanLockHeld && otherRunning == 0:
 		f.RunningScans.Liveness = "active"
-	case probe == scanLockFree && f.RunningScans.Count > 0:
-		f.RunningScans.Liveness = "abandoned"
-	case probe == scanLockFree:
+	case probe == scanLockFree && f.RunningScans.Count == 0:
 		f.RunningScans.Liveness = "none"
+	case probe == scanLockFree && s.path != "":
+		f.RunningScans.Liveness = "abandoned"
 	}
+	f.LiveChangedSinceSnapshot = s.liveChangedSinceSnapshot()
 	f.ResolverPolicy = freshnessUnknown
 	if pending, err := s.PendingResolverPolicies(ctx, repoID); err == nil {
 		f.ResolverPolicyPending = append([]string{}, pending...)
@@ -52,11 +55,16 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 		}
 	}
 	f.ParserProfile = freshnessUnknown
+	f.ParserProfileCompatibility = graph.FreshnessParserCompatibility{State: freshnessUnknown, Reason: "provenance_unreadable", Languages: []graph.FreshnessParserLanguage{}}
 	if groups, err := s.FileParserProfileGroups(ctx, repoID); err == nil {
 		f.ParserProfileUnconverged = unconvergedParserProfiles(groups)
 		f.ParserProfile = "converged"
 		if len(f.ParserProfileUnconverged) > 0 {
 			f.ParserProfile = "unconverged"
+		}
+		f.ParserProfileCompatibility.Reason = "no_parser_registry"
+		if current := s.parserProfiles.Load(); current != nil {
+			f.ParserProfileCompatibility = parserProfileCompatibility(groups, *current)
 		}
 	}
 	f.Worktree.HeadNow = freshnessUnknown
@@ -89,11 +97,16 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	if f.Worktree.HeadChanged == "yes" {
 		f.Reasons = append(f.Reasons, "head_moved")
 	}
-	if reconcilePending || s.watcherUnverified(repoID) {
+	var unverified bool
+	f.LiveWatcher, unverified = s.watcherStatus(repoID)
+	if reconcilePending || unverified {
 		f.Reasons = append(f.Reasons, "reconcile_pending")
 	}
 	if len(f.ParserProfileUnconverged) > 0 {
 		f.Reasons = append(f.Reasons, "parser_profile_unconverged")
+	}
+	if f.ParserProfileCompatibility.State == parserCompatObsolete {
+		f.Reasons = append(f.Reasons, "parser_profile_obsolete")
 	}
 	switch {
 	case len(f.Reasons) > 0 && (f.LastCompletedScan != nil || len(f.Reasons) > 1):

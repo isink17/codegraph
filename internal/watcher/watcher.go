@@ -84,29 +84,53 @@ type health struct {
 	// one cannot clear it.
 	failures uint64
 	// lock is held whenever state is not watching, so other processes read
-	// reconcile_pending until this watcher reconciles.
-	lock *store.WatcherLock
+	// reconcile_pending until this watcher reconciles. lockMu serializes
+	// syncLock, which can wait out status reads, outside mu.
+	lockMu sync.Mutex
+	lock   *store.WatcherLock
 }
 
+// reset takes both watcher locks, the unverified one first; see
+// store.WatcherLock.
 func (h *health) reset(lock *store.WatcherLock) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.state, h.registered, h.lastTransient, h.failures = StateReconciling, false, "", 0
 	h.lock = lock
-	return lock.Hold()
+	h.mu.Unlock()
+	h.lockMu.Lock()
+	defer h.lockMu.Unlock()
+	if err := lock.Hold(); err != nil {
+		return err
+	}
+	return lock.HoldLive()
 }
 
 func (h *health) degrade(kind string, unregistered bool) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.state, h.lastTransient = StateRecovering, kind
 	h.failures++
 	if unregistered {
 		h.registered = false
 	}
-	// Best effort, like the reconcile_pending marker written with it: a hold
-	// that fails leaves only the marker, which an external full scan clears.
-	_ = h.lock.Hold()
+	h.mu.Unlock()
+	h.syncLock()
+}
+
+// syncLock makes the lock follow the state as it reads once the previous call
+// is done, so the last call leaves them agreeing. A hold is best effort, like
+// the reconcile_pending marker written with it: one that fails leaves only
+// the marker, which an external full scan clears.
+func (h *health) syncLock() {
+	h.lockMu.Lock()
+	defer h.lockMu.Unlock()
+	h.mu.Lock()
+	watching := h.state == StateWatching
+	h.mu.Unlock()
+	if watching {
+		h.lock.Release()
+	} else {
+		_ = h.lock.Hold()
+	}
 }
 
 func (h *health) setRegistered() {
@@ -125,10 +149,13 @@ func (h *health) failureCount() uint64 {
 // since.
 func (h *health) reconciled(since uint64) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.registered && h.failures == since {
+	ok := h.registered && h.failures == since
+	if ok {
 		h.state = StateWatching
-		h.lock.Release()
+	}
+	h.mu.Unlock()
+	if ok {
+		h.syncLock()
 	}
 }
 
