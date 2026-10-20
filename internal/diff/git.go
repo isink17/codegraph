@@ -184,8 +184,8 @@ func snapshot(ctx context.Context, repoRoot, ref string, registry *parser.Regist
 }
 
 // blobReader serves blobs from one `git cat-file --batch` process, started on
-// first use. err holds the first failure of the process itself; a blob over
-// the limit is only unavailable.
+// first use. err holds the first failure of the process itself, which also
+// stops the process; a blob over the limit is only unavailable.
 type blobReader struct {
 	ctx  context.Context
 	root string
@@ -223,6 +223,10 @@ func (b *blobReader) read(object string, limit int64) ([]byte, bool) {
 			err = ctxErr
 		}
 		b.err = err
+		// The reply is out of step or unread: git may block writing it, so
+		// closing stdin would not end the process.
+		_ = b.cmd.Process.Kill()
+		b.close()
 		return nil, false
 	}
 	if _, err := io.WriteString(b.in, object+"\n"); err != nil {

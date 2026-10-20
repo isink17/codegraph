@@ -1,7 +1,10 @@
 package diff
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/githistory/gittest"
@@ -60,6 +63,20 @@ func TestCompareCommitsEmbedContinuity(t *testing.T) {
 					pairs: []string{"p/a.go>p/b.go:p.A"}, refused: []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}},
 				{name: "exact rename, resource is a directory", files: merged(app, map[string]string{"p/a.go": embedded("static"), "p/static/x.txt": "x\n"}), change: func(r *gittest.Repo) { r.Git("mv", "p/a.go", "p/b.go") },
 					pairs: []string{"p/a.go>p/b.go:p.A"}, refused: []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}},
+				{name: "exact rename, resource under a nested module", files: merged(app, map[string]string{"p/a.go": embedded("sub/data.txt"), "p/sub/data.txt": "one\n", "p/sub/go.mod": "module example.com/sub\n"}),
+					change: func(r *gittest.Repo) { r.Git("mv", "p/a.go", "p/b.go") }, pairs: []string{"p/a.go>p/b.go:p.A"}, refused: []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}},
+				{name: "exact rename, quoted pattern", files: merged(app, map[string]string{"p/a.go": embedded(`"data.txt"`)}), change: func(r *gittest.Repo) { r.Git("mv", "p/a.go", "p/b.go") },
+					pairs: []string{"p/a.go>p/b.go:p.A"}, refused: []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}},
+				{name: "exact rename, all: pattern", files: merged(app, map[string]string{"p/a.go": embedded("all:data.txt")}), change: func(r *gittest.Repo) { r.Git("mv", "p/a.go", "p/b.go") },
+					pairs: []string{"p/a.go>p/b.go:p.A"}, refused: []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}},
+				// The link's blob holds its target, so the tree hashes are equal.
+				{name: "exact rename, resource is a symlink", files: merged(app, map[string]string{"p/data.txt": "real.txt", "p/real.txt": "one\n"}), change: func(r *gittest.Repo) {
+					r.Git("mv", "p/a.go", "p/b.go")
+					r.Git("rm", "-q", "p/data.txt")
+					if err := os.Symlink("real.txt", filepath.Join(r.Dir, "p", "data.txt")); err != nil {
+						t.Skip(err)
+					}
+				}, pairs: []string{"p/a.go>p/b.go:p.A"}, refused: []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}},
 				{name: "module root moved with an equal resource", files: moved, change: func(r *gittest.Repo) { gitMove(t, r, "libs", "mods") },
 					pairs: []string{"libs/p/a.go>mods/p/a.go:p.A", "libs/p/a.go>mods/p/a.go:p.Data"}},
 				{name: "module root moved, resource at the new path differs", files: moved, change: func(r *gittest.Repo) {
@@ -190,5 +207,27 @@ func TestOrderDependent(t *testing.T) {
 		if got := orderDependent(store.SemanticDeclaration{Path: tc.path, Kind: tc.kind, Name: tc.name}, false); got != tc.want {
 			t.Errorf("%s %s %s = %v", tc.path, tc.kind, tc.name, got)
 		}
+	}
+}
+
+// A file whose name is the pattern's literal spelling must not stand in for
+// the file the go command embeds.
+func TestCompareCommitsEmbedPatternSpellings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file names with quotes and colons")
+	}
+	for name, pattern := range map[string]string{"quoted": `"data.txt"`, "all:": "all:data.txt"} {
+		t.Run(name, func(t *testing.T) {
+			files := map[string]string{
+				"go.mod":       "module example.com/m\n\ngo 1.22\n",
+				"p/a.go":       "package p\n\nimport _ \"embed\"\n\n//go:embed " + pattern + "\nvar Data string\n",
+				"p/data.txt":   "one\n",
+				"p/" + pattern: "one\n",
+			}
+			d := editScenario(t, testGoAdapters["go-ast"], files, func(r *gittest.Repo) { r.Git("mv", "p/a.go", "p/b.go") }).Diff.DeclarationPairs
+			if want := []string{"p/a.go>p/b.go:" + refuseDeclEmbedUnproven}; len(d.Pairs) != 0 || !reflect.DeepEqual(goRefusals(d), want) {
+				t.Fatalf("pairs = %v, refused %v", pairedPaths(d), goRefusals(d))
+			}
+		})
 	}
 }

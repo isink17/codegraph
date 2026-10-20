@@ -42,6 +42,16 @@ func pairRevision(file store.SemanticFile, decls ...store.SemanticDeclaration) R
 	}
 }
 
+// sourceRevision is pairRevision with the file's bytes given.
+func sourceRevision(file store.SemanticFile, content string, decls ...store.SemanticDeclaration) Revision {
+	r := pairRevision(file, decls...)
+	sum := sha256.Sum256([]byte(content))
+	file.ContentHash = hex.EncodeToString(sum[:])
+	r.TreeFiles[0].ContentHash, r.GraphData.Files[0].ContentHash = file.ContentHash, file.ContentHash
+	r.source = func(p string) ([]byte, bool) { return []byte(content), p == file.Path }
+	return r
+}
+
 // withTree adds files, such as go.mod, to a revision's tree.
 func withTree(r Revision, files ...SourceFile) Revision {
 	r.TreeFiles = append(r.TreeFiles, files...)
@@ -113,6 +123,15 @@ func TestDeclarationPairsSameDirectory(t *testing.T) {
 		{name: "tree unknown", base: pairRevision(goFile("p/a.go"), fn), head: func() Revision { r := pairRevision(goFile("p/b.go"), fn); r.TreeFiles = nil; return r }(), refused: []string{refuseModuleEvidenceMissing}},
 		{name: "external test package within the test role", base: pairRevision(goFile("p/a_test.go"), goFunc("TestA")), head: pairRevision(goFile("p/b_test.go"), goFunc("TestA")), pairs: 1},
 		{name: "build-constrained content", base: pairRevision(func() store.SemanticFile { f := goFile("p/a.go"); f.ContentHash = "linux"; return f }(), fn), head: pairRevision(func() store.SemanticFile { f := goFile("p/b.go"); f.ContentHash = "linux"; return f }(), fn), pairs: 1},
+		{name: "renamed file unreadable", base: func() Revision {
+			r := pairRevision(goFile("p/a.go"), fn)
+			r.source = func(string) ([]byte, bool) { return nil, false }
+			return r
+		}(), head: pairRevision(goFile("p/b.go"), fn), refused: []string{refuseDeclContentMissing}},
+		{name: "renamed file without a reader", base: func() Revision { r := pairRevision(goFile("p/a.go"), fn); r.source = nil; return r }(), head: pairRevision(goFile("p/b.go"), fn), refused: []string{refuseDeclContentMissing}},
+		{name: "declaration spans two top-level declarations", base: pairRevision(goFile("p/a.go"), func() store.SemanticDeclaration { d := goFunc("A"); d.EndLine = 4; return d }()),
+			head: pairRevision(goFile("p/b.go"), func() store.SemanticDeclaration { d := goFunc("A"); d.EndLine = 4; return d }()), refused: []string{refuseDeclContentMissing}},
+		{name: "declaration shares a line", base: sourceRevision(goFile("p/a.go"), "package p\n\nfunc A() {}; func B() {}\n", fn), head: sourceRevision(goFile("p/b.go"), "package p\n\nfunc A() {}; func B() {}\n", fn), refused: []string{refuseDeclContentMissing}},
 		{name: "graph capability differs", base: pairRevision(goFile("p/a.go"), fn), head: func() Revision {
 			r := pairRevision(goFile("p/b.go"), fn)
 			r.GraphData.State.Pending = "resolver"
