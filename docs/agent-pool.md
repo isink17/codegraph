@@ -118,6 +118,31 @@ process is running.
   Old worktrees are removed with `git worktree remove` only after their
   content is verified integrated and the owner approved the exact list.
 
+## Plane tracking
+
+The coordinator keeps the Plane ticket of every PR in step with GitHub.
+
+- Sync after each completed review, merge, acceptance audit, and each
+  meaningful change in the remaining acceptance criteria.
+- One coordinator-owned comment per ticket and PR, tagged
+  `codegraph-coordinator-sync/v1 isink17/codegraph#<PR>`, updated in place.
+  Comments without that tag are never edited. More than one tagged comment
+  for the same PR is an error to reconcile by hand.
+- The comment states: PR URL, exact reviewed head, verdict and blocking
+  count, test commands with their actual results and who ran them, merge
+  status and squash SHA, related acceptance criteria, remaining work and
+  blockers, platform verification, evidence paths, and the sync time.
+- A sync counts only after the persisted comment is read back from the API.
+- Check the PR-to-ticket mapping before writing, and check that Plane is
+  reachable before merging. A failed post-merge sync keeps the merge, is
+  logged as unsynchronized in the evidence directory, is retried, and stops
+  further merges until it reconciles or the owner grants an exception.
+- A merge or an approving review never completes a ticket. `Done` needs every
+  acceptance criterion evaluated with evidence, blockers resolved or
+  dispositioned, and the owner's approval of that transition. Otherwise the
+  ticket keeps its state.
+- Plane credentials never appear in logs, commits, comments or reports.
+
 ## Tests
 
 `scripts/agent-pool/pool_test.sh` runs against a throwaway pool and never
