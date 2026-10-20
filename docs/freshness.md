@@ -228,13 +228,14 @@ both released by the operating system when the watcher exits, however it
 exits; nothing about a watcher is stored.
 
 - `<database>.watch-<repo id>.lock`, shared, while its state is not
-  `watching`. Freshness reports `reconcile_pending` while any process holds
-  it, so a full scan by another process cannot clear the reason while a live
-  watcher is still reconciling or recovering: the scan covers changes made
-  before it, not events the watcher keeps missing. The hold that follows a
-  failure is best effort, like the marker written with it: it waits up to
-  1 s for status reads probing the lock, outside the lock that guards the
-  watcher's state, and a hold that fails leaves only the marker.
+  `watching` or it does not hold the live lock. Freshness reports
+  `reconcile_pending` while any process holds it, so a full scan by another
+  process cannot clear the reason while a live watcher is still reconciling
+  or recovering: the scan covers changes made before it, not events the
+  watcher keeps missing. The hold that follows a failure is best effort, like
+  the marker written with it: it waits up to 1 s for status reads probing the
+  lock, outside the lock that guards the watcher's state, and a hold that
+  fails leaves only the marker.
 - `<database>.watch-<repo id>.live.lock`, exclusive, for its whole run.
   Status reads probe it shared, so they never mistake one another for a
   watcher and never wait on each other.
@@ -244,7 +245,7 @@ reverse. `live_watcher` reads:
 
 | Value | Meaning |
 | --- | --- |
-| `unverified` | the first lock is held: a live watcher of this repository is starting up or recovering |
+| `unverified` | the first lock is held: a live watcher of this repository is starting up or recovering, or runs without the live lock (see the limits below) |
 | `watching` | the live lock is held, before and after the first lock was found free: a live watcher reconciled |
 | `none` | neither is held, or no lock file exists |
 | `unknown` | a lock could not be probed (a permission or lock error), or the live lock file exists without the first one, which a watcher never leaves: the first was removed and may still be held. `reconcile_pending` is kept until the next `codegraph watch` recreates it |
@@ -268,8 +269,16 @@ Limits:
 - A watcher built before the live lock takes only the first lock; it reads
   `unverified` while it holds it and `none` otherwise.
 - A second watcher of the same repository waits up to 1 s for the live lock
-  and then runs without it; it is reported through the first lock only, and
-  reads `none` once the first watcher exits.
+  and then runs without it. It keeps the first lock for as long as it runs
+  without the live lock, even after it reconciles: while two watchers run, and
+  after the first exits, status reads `unverified` with `reconcile_pending`,
+  never `watching` or `none`. It tries for the live lock again only when it
+  next reconciles, after a recovery, and then reads `watching`; restart it to
+  read `watching` sooner. Each of these tries, at startup and at every
+  reconciliation, waits up to 1 s for the live lock and can delay event
+  draining and shutdown by as long; a single watcher is unaffected. Both
+  watchers flush; their writes are serialized by the database, not by these
+  locks.
 - One read can be wrong for an instant: a watcher that exits and another that
   starts within the same read, or a watcher whose locks the operating system
   is releasing as it dies, can read `watching` for that read. Nothing is
