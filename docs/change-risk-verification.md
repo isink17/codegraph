@@ -8,7 +8,10 @@ README); the run below used Go 1.26.1 on darwin/arm64, binaries built from
 parser profile `treesitter:go:v3`; byte-identical to the build without the
 fix) and `CGO_ENABLED=0` (`go-ast:go:v4`). The earlier run at `97430a4` used
 `go-ast:go:v3`, whose signatures were wrong; where its results differ they are
-noted below.
+noted below. A rerun with type parameter lists in signatures
+(`treesitter:go:v4`, `go-ast:go:v5`) gave the same assessment, score, rules,
+pairs, refusals, uncertainty, determinism and CGO agreement in all 32 cases:
+no case of this corpus changes a type parameter list.
 
 The score is an evidence index, not a probability. Nothing below treats an
 earlier CodeGraph output as ground truth: every label comes from the Go
@@ -128,14 +131,18 @@ errors-49f8f61); none is a compile break.
 
 ## Known false negatives
 
-- **Type parameter lists are not part of a Go signature.** Both parsers store
-  a function's receiver, parameters and results as source text, without its
-  type parameter list, so a change to a type parameter or its constraint alone
-  (`func F[T any]` to `func F[T comparable]`) is not seen in either build. Not
-  exercised by this corpus. (`go-ast:go:v3` missed every Go signature change
-  with `CGO_ENABLED=0`: it stored `func encodeHex*ast.FuncType` before and
-  after a parameter was added; `go-ast:go:v4` stores the source text, as the
-  tree-sitter parser does.)
+- **A changed generic type is not scored.** Since `treesitter:go:v4` and
+  `go-ast:go:v5` a type parameter list is part of the stored signature of a
+  function and of a type, so a change to a type parameter or its constraint
+  alone (`func F[T any]` to `func F[T comparable]`) is a changed declaration
+  in both builds and its resolved callers are cited. A type use is no
+  resolved edge, so `type Box[T any]` to `type Box[T comparable]` is reported
+  only as `removed_declaration_without_resolved_dependents` uncertainty, even
+  when an instantiation stops compiling. Neither is exercised by this corpus;
+  the controlled cases are unit tests (`TestGoTypeParameterChangeMatrix`).
+  (Before that, a type parameter change alone was not seen in either build.
+  `go-ast:go:v3` missed every Go signature change with `CGO_ENABLED=0`: it
+  stored `func encodeHex*ast.FuncType` before and after a parameter was added.)
 - **Body-only changes are not modeled.** `uuid-body-change` swaps two nibbles,
   breaks every parse, and scores 0. The rules score only resolved base edges
   whose targets were removed, retargeted or changed in visibility, staticness
@@ -148,8 +155,8 @@ errors-49f8f61); none is a compile break.
 ## Known false positives
 
 - **A reformatted signature is a changed declaration.** The signature is source
-  text, so rewrapping a parameter list or editing a comment inside it gives the
-  declaration a new identity and its callers are cited as retargeted, in both
+  text, so rewrapping a parameter or type parameter list or editing a comment
+  inside it gives the declaration a new identity and its callers are cited as retargeted, in both
   builds. Not exercised by this corpus.
 
 - **Moves refused by the conservative file-context rule.** A cut and paste is
@@ -187,7 +194,7 @@ errors-49f8f61); none is a compile break.
 | No unexplained score: every component traceable to evidence rows | implemented and validated (128/128 documents) |
 | User checkout never mutated (tested) | implemented and validated (`TestCompareCommitsExactTreeDeterminismAndCheckoutImmutability`; 32/32 corpus cases) |
 | `codegraph diff` and MCP equivalent | implemented; MCP parity validated on a fixture only |
-| Semantic projection (files, symbols, signatures, edges, test links) | implemented; signatures agree across builds (29/32 documents identical); type parameter lists are not stored (above) |
+| Semantic projection (files, symbols, signatures, edges, test links) | implemented; signatures, type parameter lists included, agree across builds (29/32 documents identical) |
 | Revision indexing in a temporary database per revision | implemented and validated |
 | Change risk with documented inputs, component scores and evidence rows | implemented and validated for traceability; quality limits above |
 | CI mode (JSON, exit threshold, reproducible) | implemented and validated (unit tests; 6 corpus runs) |
