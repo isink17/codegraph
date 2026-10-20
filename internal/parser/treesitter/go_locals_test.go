@@ -164,3 +164,13 @@ func TestGoSignatureMatrixTreeSitter(t *testing.T) {
 		t.Errorf("signatures:\n got:\n%s\n\nwant:\n%s", got, want)
 	}
 }
+
+func TestGoTypeAliasSymbolsTreeSitter(t *testing.T) {
+	pf, err := NewGo().Parse(context.Background(), "alias.go", []byte(gofixture.GoTypeAliasSource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(gofixture.RenderGoTypeSymbols(pf), "\n"), strings.Join(gofixture.GoTypeAliasSymbols, "\n"); got != want {
+		t.Errorf("type symbols:\n got:\n%s\n\nwant:\n%s", got, want)
+	}
+}
