@@ -3,10 +3,13 @@ package watcher
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/indexer"
 	"github.com/isink17/codegraph/internal/parser"
 	goparser "github.com/isink17/codegraph/internal/parser/golang"
@@ -73,5 +76,33 @@ func TestWatcherPathScopedUpdateConvergesProfile(t *testing.T) {
 	}
 	if got := w.Stats().ProfileConverges; got != 0 {
 		t.Fatalf("ProfileConverges = %d after convergence, want 0", got)
+	}
+}
+
+// Provenance a scan never converged reads unconverged in freshness until the
+// start-up reconciliation converges it.
+func TestWatcherStartConvergesUnrecordedProfile(t *testing.T) {
+	r := startLiveRepo(t, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
+	if err := r.stop(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stop: %v", err)
+	}
+	dsn, err := store.BuildSQLiteDSN(r.dbPath, store.OpenOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open(store.SQLiteDriverName(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`UPDATE files SET parser_profile = '', parser_call_edges = 0`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	if f := r.freshness(t); f.ParserProfile != "unconverged" || f.Verdict != graph.FreshnessVerdictStaleKnown {
+		t.Fatalf("rewound: profile %s verdict %s", f.ParserProfile, f.Verdict)
+	}
+	r.start(t, newTestIndexer(r.s), time.Hour)
+	if f := r.freshness(t); f.ParserProfile != "converged" || f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("after start: profile %s %v verdict %s reasons %v", f.ParserProfile, f.ParserProfileUnconverged, f.Verdict, f.Reasons)
 	}
 }

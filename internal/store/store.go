@@ -5248,7 +5248,7 @@ func (s *Store) ResolveEdgesForPaths(ctx context.Context, repoID int64, paths []
 	if err := s.resolveEdgesForPaths(ctx, repoID, paths, nil, nil); err != nil {
 		return err
 	}
-	return reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, sortedKeys(langs))
+	return s.reconcileReferenceIdentitiesStandalone(ctx, repoID, sortedKeys(langs))
 }
 
 func (s *Store) rubyPathsChanged(ctx context.Context, repoID int64, paths []string) (bool, error) {
@@ -5460,7 +5460,7 @@ func (s *Store) ResolveEdgesForPathsAndNames(ctx context.Context, repoID int64, 
 		if len(languageScope) == 0 {
 			err = s.ReconcileReferenceIdentities(ctx, repoID)
 		} else {
-			err = reconcileReferenceIdentitiesForLanguages(ctx, s.db, repoID, sortedKeys(languageScope))
+			err = s.reconcileReferenceIdentitiesStandalone(ctx, repoID, sortedKeys(languageScope))
 		}
 	}
 	return stats, err
@@ -8817,6 +8817,10 @@ func scanExportEdges(rows *sql.Rows) ([]ExportEdge, []exportEdgeEvidence, error)
 	}
 	return out, evidence, nil
 }
+
+// IsBusy reports whether err is SQLite reporting the database busy or locked,
+// which a later retry can clear.
+func IsBusy(err error) bool { return isSQLiteBusy(err) }
 
 func (s *Store) QueueDirtyFile(ctx context.Context, repoID int64, path, reason string) error {
 	if err := s.EnsureCanonicalRepositoryPaths(ctx, repoID, false); err != nil {

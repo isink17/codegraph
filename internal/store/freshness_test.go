@@ -409,3 +409,65 @@ func TestFreshnessCoverageFailedScansWithoutFullScan(t *testing.T) {
 		t.Fatalf("failed scans without a full scan: %+v", got)
 	}
 }
+
+// A pending reconciliation clears only with a full scan that began after it
+// was recorded.
+func TestFreshnessReconcilePendingUntilLaterFullScan(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	if err := s.MarkReconcilePending(ctx, repoID); err != nil {
+		t.Fatal(err)
+	}
+	f := freshness(t, s, repoID)
+	if f.Verdict != graph.FreshnessVerdictStaleKnown || !slices.Contains(f.Reasons, "reconcile_pending") {
+		t.Fatalf("marked: verdict %s reasons %v", f.Verdict, f.Reasons)
+	}
+	complete := func(scope string) {
+		id, started, err := s.BeginScanWithScope(ctx, repoID, "watch", scope, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CompleteScan(ctx, id, ScanSummary{RepoID: repoID, ScanID: id}, started, "completed", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	complete(ScanScopePaths)
+	if f := freshness(t, s, repoID); !slices.Contains(f.Reasons, "reconcile_pending") {
+		t.Fatalf("a path-scoped scan cleared it: %v", f.Reasons)
+	}
+	// A full scan already running when the mark is taken read the tree too
+	// early to clear it.
+	id, started, err := s.BeginScanWithScope(ctx, repoID, "watch_config", ScanScopeFull, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkReconcilePending(ctx, repoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteScan(ctx, id, ScanSummary{RepoID: repoID, ScanID: id}, started, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if f := freshness(t, s, repoID); !slices.Contains(f.Reasons, "reconcile_pending") {
+		t.Fatalf("a full scan running at the mark cleared it: %v", f.Reasons)
+	}
+	complete(ScanScopeFull)
+	if f := freshness(t, s, repoID); f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("after a later full scan: verdict %s reasons %v", f.Verdict, f.Reasons)
+	}
+}
+
+func TestUnconvergedParserProfiles(t *testing.T) {
+	got := unconvergedParserProfiles([]FileParserProfileGroup{
+		{Language: "go", Profile: "go:v1", Files: 3},
+		{Language: "java", Profile: "", Files: 1},
+		{Language: "kotlin", Profile: "kt:v1", Files: 2},
+		{Language: "kotlin", Profile: "kt:v1", CallEdges: true, Files: 1},
+		{Language: "python", Profile: "py:v1", Files: 1},
+		{Language: "python", Profile: "py:v2", Files: 1},
+		{Language: "rust", Profile: "", Files: 0},
+	})
+	if !slices.Equal(got, []string{"java", "python"}) {
+		t.Fatalf("unconverged = %v", got)
+	}
+}

@@ -216,3 +216,34 @@ func TestFreshnessMissingLockFileWithoutRowsIsConsistent(t *testing.T) {
 		t.Fatalf("missing lock file: %+v", f)
 	}
 }
+
+// Without a lock file a running row's writer cannot be told live or dead: a
+// binary that predates the lock takes none.
+func TestFreshnessMissingLockFileWithRunningRowIsLivenessUnknown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("an open lock file cannot be removed")
+	}
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	scan(t, s, repoID, "update", "running", "")
+	if err := os.Remove(scanLockPath(s.path)); err != nil {
+		t.Fatal(err)
+	}
+	f := freshness(t, s, repoID)
+	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictLivenessUnknown {
+		t.Fatalf("missing lock file with a running row: %+v", f)
+	}
+}
+
+// A lock call that fails, rather than finding the lock held, proves nothing
+// about a writer.
+func TestFreshnessLockCallErrorIsLivenessUnknown(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	scan(t, s, repoID, "index", "completed", "")
+	probeLockFile = func(*os.File, bool) (bool, error) { return false, os.ErrInvalid }
+	t.Cleanup(func() { probeLockFile = lockFile })
+	f := freshness(t, s, repoID)
+	if f.RunningScans.Liveness != "unknown" || f.Verdict != graph.FreshnessVerdictLivenessUnknown {
+		t.Fatalf("lock call error: %+v", f)
+	}
+}

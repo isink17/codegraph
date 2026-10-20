@@ -37,6 +37,7 @@ the usual not-indexed error.
 | `running_scans.liveness` | `active`, `abandoned`, `none`, `unknown` | scan lock probe |
 | `dirty_queue.queued`, `.in_flight`, `.oldest_queued_at` | persisted watcher work | `dirty_files` |
 | `resolver_policy`, `resolver_policy_pending` | `converged`, `pending` (with languages), `unknown` | stored resolver policy markers |
+| `parser_profile`, `parser_profile_unconverged` | `converged`, `unconverged` (with languages), `unknown` | per-file parser provenance |
 | `worktree.repo_root`, `.canonical_path` | the repository the graph belongs to | `repos` |
 | `worktree.head_at_index`, `.head_now`, `.head_changed` | `unknown` when either HEAD cannot be read | history watermark, one git call |
 | `watcher` | always `not_in_this_process` | neither `stats` nor `serve` runs a watcher, and no watcher liveness is persisted |
@@ -45,6 +46,23 @@ the usual not-indexed error.
 `state` (`known_stale`, `unknown`, `no_known_staleness`) and `reasons` keep
 their earlier meaning. `scan_running_or_abandoned` now also fires when the
 lock shows a live writer whose row is older than the last completed scan.
+Two reasons are newer:
+
+- `reconcile_pending`: a watcher started, or lost events or queue writes,
+  and no full scan that began after that has completed. It is a database
+  setting, not a schema change; any completed full scan clears it, including
+  `codegraph update` from another process.
+- `parser_profile_unconverged`: a language's files carry more than one
+  parser profile, or none recorded (indexed before provenance was kept). A
+  scan converges every file of a language, so this is a transition left
+  unfinished. The stored files are compared with each other only: a binary
+  whose parser profile differs from every stored file is not detected until
+  its next scan converges them.
+
+Both make the verdict `stale_known`, and so count as known staleness wherever
+freshness gates a decision: `check_constraints --strict-freshness` exits 3
+(known stale) and `safe_to_edit` returns no verdict, with reason `known_stale`
+and exit 3, as for any other stale reason.
 
 ## Writer liveness
 
@@ -85,22 +103,71 @@ Limits:
 
 ## Watcher
 
-`codegraph watch` is the only process that runs a watcher; its counters and
-readiness are process-local (`watch --jsonl`). Events are written to the
-dirty queue before any flush, so a stopped watcher leaves them for the next
-`watch` or `update`. The watcher:
+`codegraph watch` is the only process that runs a watcher; its state and
+counters are process-local (`watch --jsonl`, `stats.state`). Events are
+written to the dirty queue before any flush, so a stopped watcher leaves them
+for the next `watch` or `update`.
+
+Every start records `reconcile_pending`, registers the watch tree, and runs
+one reconciliation pass (the incremental full update, which skips files whose
+size and mtime did not change) together with the queued work, before it
+reports ready, so starting a watcher costs one incremental `update`. Changes
+made while no watcher ran are found by that pass, not by events. A pass that is cancelled or crashes leaves `reconcile_pending`
+(and usually a `failed` scan row); the next start runs it again.
+
+`stats.state` is:
+
+| State | Meaning |
+| --- | --- |
+| `reconciling` | The start-up pass has not completed. |
+| `watching` | The tree is registered and a pass completed after the last failure. |
+| `recovering` | A retryable failure left registration or queued work unverified. |
+
+Retryable failures are the OS running out of watches or descriptors
+(`ENOSPC`, `EMFILE`, `ENFILE`) and SQLite reporting busy or locked. On one the
+watcher records `reconcile_pending`, keeps every claimed path in the dirty
+queue, and retries after a delay that doubles from 250 ms to 30 s. A failed
+registration is retried by re-registering the whole tree (the old watches are
+released first) and re-reading the repository config; a failed flush or queue
+write by a full pass. It reads `watching` again only after a pass that began
+after the latest failure completes with the tree registered. Every other
+error stops the watcher with that error: an unreadable or invalid repository
+config after a change, a closed or corrupt database, a missing or unreadable
+repository root, a refused parser downgrade, cancellation.
+
+A repository config that is not valid JSON, as a file caught mid-write reads,
+is the one config error that is retried, whichever reads it first: an event,
+a recovery attempt or a flush (the indexer reads the config too). The watcher
+reads `recovering` with `last_transient: config_invalid`, stops flushing,
+keeps the dirty queue, and re-reads the config on the registration backoff.
+Only those scheduled attempts count: after 5 that still find it malformed,
+about 8 s with the default delays, the watcher stops; a burst of events from
+one slow write spends none. A valid config resumes it with a reconciliation
+pass under the new rules. Valid JSON the config cannot hold (a wrong type)
+stops it at once.
+
+The watcher also:
 
 - queues the files inside a directory that is created, moved or copied into
   the repository (they raise no events of their own);
 - queues the indexed files under a watched directory that is removed or moved
   out, so they leave the graph;
-- answers an event-queue overflow by re-registering the whole watch tree
-  (directories created during the dropped events were never registered) and
-  then one reconciliation pass (the
-  incremental full update, which skips files whose size and mtime did not
-  change) instead of stopping, and counts it in `overflows`;
+- answers an event-queue overflow by re-registering the whole watch tree and
+  then one reconciliation pass instead of stopping, and counts it in
+  `overflows`;
+- registers a `.codegraph` directory created while it runs and reads the
+  config inside;
 - ignores a new directory that is removed before it can be registered.
 
-Other watcher errors still stop it with the error; claimed dirty paths stay
-queued for the next run. Changes made while no watcher runs are not seen
-until an `update`.
+While its state is not `watching`, a watcher also holds a shared OS lock on
+`<database>.watch-<repo id>.lock`, and freshness reports `reconcile_pending`
+while any process holds it. A full scan by another process therefore cannot
+clear the reason while a live watcher is still reconciling or recovering: the
+scan covers changes made before it, not events the watcher keeps missing. The
+operating system releases the lock when the watcher exits, however it exits,
+so a crashed watcher leaves only the persisted marker, which the next
+completed full scan clears. Like the scan lock, it is local to the host.
+
+Limits: no other watcher state is persisted, so `stats` and `graph_stats`
+keep `watcher: "not_in_this_process"`; the lock says that some live watcher
+has not reconciled, not which one or why.
