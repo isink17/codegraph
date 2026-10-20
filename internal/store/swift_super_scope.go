@@ -400,6 +400,14 @@ func swiftSuperExtensionTargetAncestryClosed(selectedOwner string, file int64, r
 	}
 }
 
+// swiftSuperCandidatesQuery (bind repo_id twice) aggregates facts per symbol first:
+// swift_declaration_facts has no symbol_id index, so a direct join rescans every fact per candidate.
+const swiftSuperCandidatesQuery = `SELECT s.id,s.file_id,s.container_name,s.name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,s.start_line,s.start_col,s.end_line,s.end_col,COALESCE(SUM(d.facts),0),COALESCE(MAX(d.dispatch_max),''),MAX(d.override_max),MAX(d.final_max)
+FROM symbols s JOIN files f ON f.id=s.file_id JOIN tmp_swift_super_candidates k ON k.owner=s.container_name AND k.name=s.name
+LEFT JOIN (SELECT symbol_id,COUNT(*) AS facts,MAX(dispatch_kind) AS dispatch_max,MAX(is_override) AS override_max,MAX(is_final) AS final_max
+	FROM swift_declaration_facts WHERE repo_id=? GROUP BY symbol_id) d ON d.symbol_id=s.id
+WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=0 GROUP BY s.id`
+
 func (s *Store) resolveSwiftSuperScope(ctx context.Context, q javaQuery, repoID int64, only map[int64]struct{}) (int, error) {
 	buildScopes, err := loadSwiftBuildScopes(ctx, q, repoID)
 	if err != nil {
@@ -586,10 +594,7 @@ FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols src ON src.id=e.src_sym
 	}
 
 	var candidates []swiftSuperCandidate
-	err = sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.container_name,s.name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,s.start_line,s.start_col,s.end_line,s.end_col,COUNT(d.id),COALESCE(MAX(d.dispatch_kind),''),MAX(d.is_override),MAX(d.is_final)
-FROM symbols s JOIN files f ON f.id=s.file_id JOIN tmp_swift_super_candidates k ON k.owner=s.container_name AND k.name=s.name
-LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
-WHERE s.repo_id=? AND s.language='swift' AND s.kind='function' AND f.is_deleted=0 GROUP BY s.id`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+	err = sqliteBatchedQuery(ctx, q, swiftSuperCandidatesQuery, "", []any{repoID, repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftSuperCandidate
 		if err := rows.Scan(&c.id, &c.file, &c.owner, &c.name, &c.signature, &c.visibility, &c.static, &c.min, &c.max, &c.startLine, &c.startCol, &c.endLine, &c.endCol, &c.factCount, &c.dispatch, &c.isOverride, &c.isFinal); err != nil {
 			return err
