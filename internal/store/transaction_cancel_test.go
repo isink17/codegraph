@@ -6,13 +6,14 @@ import (
 	"database/sql/driver"
 	"errors"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// execHookConn passes every Exec through hook, which runs the statement with
-// exec and may cancel or fail it around that point.
+// execHookConn passes every Exec and Query through hook, which runs the
+// statement with exec and may cancel or fail it around that point.
 type execHookConn struct {
 	driver.Conn
 	hook func(ctx context.Context, query string, exec func() error) error
@@ -25,6 +26,19 @@ func (c execHookConn) ExecContext(ctx context.Context, query string, args []driv
 		return err
 	})
 	return res, err
+}
+
+func (c execHookConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	var rows driver.Rows
+	err := c.hook(ctx, query, func() (err error) {
+		rows, err = c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
+		return err
+	})
+	if err != nil && rows != nil {
+		_ = rows.Close()
+		rows = nil
+	}
+	return rows, err
 }
 
 type execHookConnector struct {
@@ -67,7 +81,7 @@ type cancelAfter struct {
 }
 
 func (c *cancelAfter) hook(ctx context.Context, query string, exec func() error) error {
-	if query != c.query || !c.armed.CompareAndSwap(true, false) {
+	if !strings.Contains(query, c.query) || !c.armed.CompareAndSwap(true, false) {
 		return exec()
 	}
 	if err := exec(); err != nil {
@@ -96,6 +110,16 @@ func requireFreeConnection(t *testing.T, db *sql.DB) {
 	}
 }
 
+// requireConnectionKept fails unless the transaction's connection was rolled
+// back and returned to the pool rather than discarded.
+func requireConnectionKept(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if n := db.Stats().OpenConnections; n != 1 {
+		t.Fatalf("open connections = %d, want the pooled connection kept", n)
+	}
+	requireFreeConnection(t, db)
+}
+
 func dirtyRows(t *testing.T, s *Store, repoID int64) []string {
 	t.Helper()
 	rows, err := s.db.QueryContext(context.Background(), `SELECT path || ':' || reason FROM dirty_files WHERE repo_id = ? ORDER BY path`, repoID)
@@ -116,18 +140,49 @@ func dirtyRows(t *testing.T, s *Store, repoID int64) []string {
 	return out
 }
 
+// withoutReturning rejects DELETE ... RETURNING the way SQLite builds older
+// than 3.35 do, so DrainDirtyFiles takes its fallback path.
+func withoutReturning(next func(context.Context, string, func() error) error) func(context.Context, string, func() error) error {
+	return func(ctx context.Context, query string, exec func() error) error {
+		if strings.Contains(query, "RETURNING path") {
+			return errors.New(`near "RETURNING": syntax error`)
+		}
+		return next(ctx, query, exec)
+	}
+}
+
+func drainDirtyFiles(ctx context.Context, s *Store, repoID int64) ([]string, error) {
+	return s.DrainDirtyFiles(ctx, repoID)
+}
+
 var dirtyQueueTransactions = []struct {
 	name string
 	run  func(context.Context, *Store, int64) ([]string, error)
+	// noReturning runs the store without DELETE ... RETURNING support.
+	noReturning bool
+	// lastWrite is a substring of the last statement before COMMIT.
+	lastWrite string
 	// committed is dirty_files once the transaction took effect.
 	committed []string
 }{
 	{"claim", func(ctx context.Context, s *Store, repoID int64) ([]string, error) {
 		return s.ClaimDirtyFiles(ctx, repoID, "2026-01-01T00:00:00Z", "watch_inflight")
-	}, []string{"a.go:watch_inflight"}},
-	{"drain", func(ctx context.Context, s *Store, repoID int64) ([]string, error) {
-		return s.DrainDirtyFiles(ctx, repoID)
-	}, nil},
+	}, false, "UPDATE dirty_files", []string{"a.go:watch_inflight"}},
+	{"drain", drainDirtyFiles, false, "DELETE FROM dirty_files", nil},
+	{"drain_without_returning", drainDirtyFiles, true, "DELETE FROM dirty_files", nil},
+}
+
+func dirtyQueueStore(t *testing.T, noReturning bool, hook func(context.Context, string, func() error) error) (*Store, int64) {
+	t.Helper()
+	if noReturning {
+		hook = withoutReturning(hook)
+	}
+	s, repoID := hookedStore(t, hook)
+	if err := s.QueueDirtyFile(context.Background(), repoID, "a.go", "event"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.SetMaxOpenConns(1)
+	return s, repoID
 }
 
 // A cancellation that lands as COMMIT takes effect must not be reported as a
@@ -137,11 +192,7 @@ func TestDirtyQueueCommitRacingCancelReportsCommit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bg := context.Background()
 			fault := &cancelAfter{query: `COMMIT`}
-			s, repoID := hookedStore(t, fault.hook)
-			if err := s.QueueDirtyFile(bg, repoID, "a.go", "event"); err != nil {
-				t.Fatal(err)
-			}
-			s.db.SetMaxOpenConns(1)
+			s, repoID := dirtyQueueStore(t, tc.noReturning, fault.hook)
 			ctx, cancel := context.WithCancel(bg)
 			defer cancel()
 			fault.cancel = cancel
@@ -165,11 +216,7 @@ func TestDirtyQueueBeginReportedFailedRollsBack(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bg := context.Background()
 			fault := &cancelAfter{query: `BEGIN IMMEDIATE`}
-			s, repoID := hookedStore(t, fault.hook)
-			if err := s.QueueDirtyFile(bg, repoID, "a.go", "event"); err != nil {
-				t.Fatal(err)
-			}
-			s.db.SetMaxOpenConns(1)
+			s, repoID := dirtyQueueStore(t, tc.noReturning, fault.hook)
 			ctx, cancel := context.WithCancel(bg)
 			defer cancel()
 			fault.cancel = cancel
@@ -177,7 +224,7 @@ func TestDirtyQueueBeginReportedFailedRollsBack(t *testing.T) {
 			if _, err := tc.run(ctx, s, repoID); !errors.Is(err, context.Canceled) {
 				t.Fatalf("err = %v, want context.Canceled", err)
 			}
-			requireFreeConnection(t, s.db)
+			requireConnectionKept(t, s.db)
 			if got := dirtyRows(t, s, repoID); !slices.Equal(got, []string{"a.go:event"}) {
 				t.Fatalf("dirty rows = %q, want untouched", got)
 			}
@@ -185,14 +232,25 @@ func TestDirtyQueueBeginReportedFailedRollsBack(t *testing.T) {
 	}
 }
 
-// A statement failure inside the binder's transaction rolls it back, so the
-// transaction's connection returns to the pool.
+// A statement failure inside the binder's transaction, including creating its
+// TEMP table, rolls it back, so the transaction's connection returns to the pool.
 func TestResolveEdgeTargetsStatementFailureReleasesConnection(t *testing.T) {
+	for _, stmt := range []string{
+		`CREATE TEMP TABLE IF NOT EXISTS tmp_kotlin_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`,
+		`DELETE FROM tmp_kotlin_scope_veto`,
+	} {
+		t.Run(strings.Fields(stmt)[0], func(t *testing.T) {
+			resolveEdgeTargetsFailingAt(t, stmt)
+		})
+	}
+}
+
+func resolveEdgeTargetsFailingAt(t *testing.T, stmt string) {
 	ctx := context.Background()
 	injected := errors.New("injected statement failure")
 	var armed atomic.Bool
 	s, repoID := hookedStore(t, func(_ context.Context, query string, exec func() error) error {
-		if query == `DELETE FROM tmp_kotlin_scope_veto` && armed.CompareAndSwap(true, false) {
+		if query == stmt && armed.CompareAndSwap(true, false) {
 			return injected
 		}
 		return exec()

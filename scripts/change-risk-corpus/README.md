@@ -17,7 +17,11 @@ python3 -I scripts/change-risk-corpus/summarize.py /abs/empty-dir
 self diffs, real commits against their first parent, and controlled edits.
 A controlled edit is applied to its base in a scratch clone (`run.py` edit
 functions, or a patch under `patches/`) and committed with a fixed identity
-and date, so its SHA is the same on every run. `--case ID` limits a run.
+and date, so its SHA is the same on every run. Every git, `codegraph` and Go
+command runs without inherited `GIT_*` variables, without the system git
+config and with an empty global git config in the work directory, so
+`core.autocrlf`, filters, hooks or a `GIT_DIR` from the caller cannot change
+the clones or the controlled SHAs. `--case ID` limits a run.
 
 Per case `run.py` runs each binary twice and records: exit codes, byte
 equality of the two runs, CGO / `CGO_ENABLED=0` agreement, the score's

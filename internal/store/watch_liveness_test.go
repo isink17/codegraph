@@ -3,6 +3,7 @@ package store
 import (
 	"bufio"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"runtime"
@@ -423,5 +424,93 @@ func TestLiveWatcherSeenByReadOnlyStore(t *testing.T) {
 	lock.Release()
 	if f := readOnly(); f.LiveWatcher != LiveWatcherWatching || f.Verdict != graph.FreshnessVerdictConsistentWithLastScan {
 		t.Fatalf("watching: %s %s %v", f.LiveWatcher, f.Verdict, f.Reasons)
+	}
+}
+
+// A watcher keeps holding its unverified lock file after the file is removed,
+// out of sight of status reads. A live lock file without the unverified one
+// is never written by a watcher, so the read fails closed instead of
+// reporting a reconciled watcher, even after a full scan by another handle.
+func TestLiveWatcherMissingUnverifiedLockIsUnknown(t *testing.T) {
+	for _, state := range []string{"recovering", "exited"} {
+		t.Run(state, func(t *testing.T) {
+			s, repoID := freshnessStore(t, t.TempDir())
+			completeFullScan(t, s, repoID)
+			reader := openSameStore(t, s)
+			lock, err := s.OpenWatcherLock(repoID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(lock.Close)
+			if err := lock.Hold(); err != nil {
+				t.Fatal(err)
+			}
+			if err := lock.HoldLive(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(watchLockPath(s.path, repoID)); err != nil {
+				t.Skipf("cannot remove a held lock file here: %v", err)
+			}
+			if state == "exited" {
+				lock.Close()
+			}
+			completeFullScan(t, s, repoID)
+			f := freshness(t, reader, repoID)
+			if f.LiveWatcher != freshnessUnknown || !slices.Contains(f.Reasons, "reconcile_pending") || f.Verdict == graph.FreshnessVerdictConsistentWithLastScan {
+				t.Fatalf("live_watcher %s verdict %s reasons %v", f.LiveWatcher, f.Verdict, f.Reasons)
+			}
+		})
+	}
+}
+
+// A lock call that fails, as on a file system without OS locks, proves
+// nothing about a watcher: unknown, and reconcile_pending is kept.
+func TestLiveWatcherLockCallErrorIsUnknown(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	completeFullScan(t, s, repoID)
+	lock, err := s.OpenWatcherLock(repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
+	probeLockFile = func(*os.File, bool) (bool, error) { return false, errors.New("no locks here") }
+	t.Cleanup(func() { probeLockFile = lockFile })
+	f := freshness(t, s, repoID)
+	if f.LiveWatcher != freshnessUnknown || !slices.Contains(f.Reasons, "reconcile_pending") || f.Verdict == graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("live_watcher %s verdict %s reasons %v", f.LiveWatcher, f.Verdict, f.Reasons)
+	}
+}
+
+// A second watcher waiting for the live lock takes it when the first exits
+// within its wait, and is then reported like any other watcher.
+func TestLiveWatcherSecondTakesOverWhenFirstExits(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	completeFullScan(t, s, repoID)
+	first, _ := s.OpenWatcherLock(repoID)
+	second, _ := s.OpenWatcherLock(repoID)
+	t.Cleanup(first.Close)
+	t.Cleanup(second.Close)
+	if err := first.Hold(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.HoldLive(); err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+	if err := second.Hold(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- second.HoldLive() }()
+	first.Close()
+	if err := <-done; err != nil || !second.liveHeld {
+		t.Fatalf("second watcher did not take the live lock: %v", err)
+	}
+	if got := liveState(s, repoID); got != LiveWatcherUnverified {
+		t.Fatalf("second reconciling: %s", got)
+	}
+	second.Release()
+	if got := liveState(s, repoID); got != LiveWatcherWatching {
+		t.Fatalf("second watching: %s", got)
 	}
 }

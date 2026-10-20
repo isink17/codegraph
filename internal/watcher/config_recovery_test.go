@@ -2,6 +2,8 @@ package watcher
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,12 +80,33 @@ func TestWatcherConfigRetriesCountAttemptsNotEvents(t *testing.T) {
 func TestWatcherStopsAtOnceOnInvalidConfigValue(t *testing.T) {
 	shortRetries(t)
 	r := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
-	writeFile(t, filepath.Join(r.root, ".codegraph", "config.json"), `{"exclude": 5}`)
+	cfgDir := filepath.Join(r.root, ".codegraph")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Renamed into place so no reader sees the file half-written, which would
+	// rightly be retried as malformed JSON.
+	tmp, err := os.CreateTemp(cfgDir, "config-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmp.WriteString(`{"exclude": 5}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp.Name(), filepath.Join(cfgDir, "config.json")); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case err := <-r.done:
 		r.done <- err
-		if err == nil || !strings.Contains(err.Error(), "reload repository config") {
-			t.Fatalf("err = %v, want a config reload error", err)
+		// The config reload and the indexer's own read of the config can each
+		// see the value first; either way the cause is the rejected field.
+		typeErr, ok := errors.AsType[*json.UnmarshalTypeError](err)
+		if !ok || typeErr.Struct != "RepoConfig" || typeErr.Field != "exclude" {
+			t.Fatalf("err = %v, want the invalid exclude value", err)
 		}
 		if st := r.w.Stats(); st.TransientErrors != 0 {
 			t.Fatalf("invalid config value was retried: %+v", st)
