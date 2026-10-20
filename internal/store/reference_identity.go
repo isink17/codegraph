@@ -39,7 +39,9 @@ func (s *Store) reconcileReferenceIdentitiesStandalone(ctx context.Context, repo
 	if err := reconcileReferenceIdentitiesForLanguages(ctx, conn, repoID, languages); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+	// Detached too: a cancel racing a COMMIT that took effect would report a
+	// failure for writes that were kept.
+	if _, err := conn.ExecContext(context.WithoutCancel(ctx), `COMMIT`); err != nil {
 		return err
 	}
 	committed = true

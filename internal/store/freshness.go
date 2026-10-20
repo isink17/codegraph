@@ -89,7 +89,7 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	if f.Worktree.HeadChanged == "yes" {
 		f.Reasons = append(f.Reasons, "head_moved")
 	}
-	if reconcilePending {
+	if reconcilePending || s.watcherUnverified(repoID) {
 		f.Reasons = append(f.Reasons, "reconcile_pending")
 	}
 	if len(f.ParserProfileUnconverged) > 0 {

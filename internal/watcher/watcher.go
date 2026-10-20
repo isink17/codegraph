@@ -2,7 +2,6 @@ package watcher
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -84,12 +83,17 @@ type health struct {
 	// failures counts degradations, so a pass that started before the latest
 	// one cannot clear it.
 	failures uint64
+	// lock is held whenever state is not watching, so other processes read
+	// reconcile_pending until this watcher reconciles.
+	lock *store.WatcherLock
 }
 
-func (h *health) reset() {
+func (h *health) reset(lock *store.WatcherLock) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.state, h.registered, h.lastTransient, h.failures = StateReconciling, false, "", 0
+	h.lock = lock
+	return lock.Hold()
 }
 
 func (h *health) degrade(kind string, unregistered bool) {
@@ -100,6 +104,9 @@ func (h *health) degrade(kind string, unregistered bool) {
 	if unregistered {
 		h.registered = false
 	}
+	// Best effort, like the reconcile_pending marker written with it: a hold
+	// that fails leaves only the marker, which an external full scan clears.
+	_ = h.lock.Hold()
 }
 
 func (h *health) setRegistered() {
@@ -121,6 +128,7 @@ func (h *health) reconciled(since uint64) {
 	defer h.mu.Unlock()
 	if h.registered && h.failures == since {
 		h.state = StateWatching
+		h.lock.Release()
 	}
 }
 
@@ -137,8 +145,9 @@ var (
 	retryMaxDelay  = 30 * time.Second
 )
 
-// maxConfigRetries bounds the recovery attempts spent on a malformed config;
-// with the default delays the watcher stops about 8 s after the first one.
+// maxConfigRetries bounds the scheduled recovery attempts that find the
+// config still malformed; with the default delays the watcher stops about 8 s
+// after it first read it.
 const maxConfigRetries = 5
 
 func nextDelay(d time.Duration) time.Duration {
@@ -285,7 +294,14 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 	} {
 		c.Store(0)
 	}
-	w.health.reset()
+	lock, err := w.store.OpenWatcherLock(repoID)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := w.health.reset(lock); err != nil {
+		return err
+	}
 	if debounce <= 0 {
 		debounce = 750 * time.Millisecond
 	}
@@ -442,16 +458,18 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 		}
 	}
 
-	// A config file caught mid-write reads as malformed JSON. It is retried
-	// through the recovery path a bounded number of times before the watcher
-	// stops; any other config error stops it at once.
+	// A config file caught mid-write reads as malformed JSON, whether an
+	// event, a recovery attempt or a flush reads it first. Flushes pause and
+	// the recovery path re-reads it; only its scheduled attempts count toward
+	// maxConfigRetries, so a burst of events cannot spend them. Any other
+	// config error stops the watcher at once.
+	var configPaused atomic.Bool
 	configRetries := 0
-	retryConfig := func(err error) bool {
-		var syntaxErr *json.SyntaxError
-		if !errors.As(err, &syntaxErr) || configRetries >= maxConfigRetries {
+	pauseForConfig := func(err error) bool {
+		if !errors.Is(err, config.ErrMalformedRepoConfig) {
 			return false
 		}
-		configRetries++
+		configPaused.Store(true)
 		degradeRegistration("config_invalid")
 		return true
 	}
@@ -538,6 +556,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 		}
 	}
 	flushErrCh := make(chan error, 1)
+	configErrCh := make(chan error, 1)
 
 	// degradeQueue records a retryable failure that may have lost an event
 	// before it reached the dirty queue; a reconciliation pass covers it.
@@ -555,14 +574,18 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 	w.flushRuns.Add(1)
 	if err := flush(); err != nil {
 		w.flushErrors.Add(1)
-		kind, ok := transientKind(err)
-		if !ok {
-			return err
+		if pauseForConfig(err) {
+			forceFullScan.Store(true)
+		} else {
+			kind, ok := transientKind(err)
+			if !ok {
+				return err
+			}
+			w.transientErrors.Add(1)
+			w.health.degrade(kind, false)
+			markPending()
+			flushDelay = retryBaseDelay
 		}
-		w.transientErrors.Add(1)
-		w.health.degrade(kind, false)
-		markPending()
-		flushDelay = retryBaseDelay
 	}
 
 	// Coalesce repeated fsnotify events for the same file between flushes to avoid
@@ -616,6 +639,11 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 				if !pending {
 					continue
 				}
+				if configPaused.Load() {
+					// Resumed by the signal that follows a valid config.
+					retrying = false
+					continue
+				}
 				pending, retrying = false, false
 				seenMu.Lock()
 				clear(seenSinceFlush)
@@ -627,6 +655,18 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 					continue
 				}
 				w.flushErrors.Add(1)
+				if errors.Is(err, config.ErrMalformedRepoConfig) && loopCtx.Err() == nil {
+					// The indexer re-reads the config; recovery happens on the
+					// event goroutine, which owns the retry schedule.
+					forceFullScan.Store(true)
+					configPaused.Store(true)
+					pending = true
+					select {
+					case configErrCh <- err:
+					default:
+					}
+					continue
+				}
 				if kind, ok := transientKind(err); ok && loopCtx.Err() == nil {
 					// Claimed paths stay in the dirty queue and the next claim
 					// takes them again; the retry is a full pass because the
@@ -662,6 +702,8 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			return ctx.Err()
 		case err := <-flushErrCh:
 			return err
+		case err := <-configErrCh:
+			pauseForConfig(err)
 		case <-recoverAt:
 			recoverAt, recoverTimer = nil, nil
 			// The configuration is read again too: a change to it may have
@@ -669,13 +711,17 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			nextCfg, err := config.LoadRepo(repoRoot)
 			if err != nil {
 				if _, ok := transientKind(err); !ok {
-					if retryConfig(err) {
-						continue
+					if errors.Is(err, config.ErrMalformedRepoConfig) {
+						configRetries++
+						if configRetries < maxConfigRetries && pauseForConfig(err) {
+							continue
+						}
 					}
 					return fmt.Errorf("reload repository config: %w", err)
 				}
 			} else {
 				configRetries = 0
+				configPaused.Store(false)
 				includes, excludes = nextCfg.Include, nextCfg.Exclude
 				err = resetWatcher(true)
 			}
@@ -744,7 +790,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 						degradeRegistration(kind)
 						continue
 					}
-					if retryConfig(loadErr) {
+					if pauseForConfig(loadErr) {
 						continue
 					}
 					// Carrying on with the old include/exclude rules would
@@ -752,6 +798,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 					return fmt.Errorf("reload repository config: %w", loadErr)
 				}
 				configRetries = 0
+				configPaused.Store(false)
 				includes = nextCfg.Include
 				excludes = nextCfg.Exclude
 				markPending()
@@ -762,6 +809,15 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 						return err
 					}
 					degradeRegistration(kind)
+				} else {
+					// The whole tree is registered again, which is what a
+					// pending recovery attempt would do.
+					if recoverTimer != nil {
+						recoverTimer.Stop()
+						recoverAt, recoverTimer = nil, nil
+					}
+					registerDelay = retryBaseDelay
+					w.health.setRegistered()
 				}
 				signalFlush()
 				continue

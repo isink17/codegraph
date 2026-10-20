@@ -299,7 +299,7 @@ func TestWatcherReconcilesAfterQueueWriteFailure(t *testing.T) {
 
 func TestHealthReconciledIgnoresPassOlderThanFailure(t *testing.T) {
 	var h health
-	h.reset()
+	_ = h.reset(nil)
 	h.setRegistered()
 	since := h.failureCount()
 	h.degrade("sqlite_busy", false)

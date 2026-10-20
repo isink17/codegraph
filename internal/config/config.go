@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,6 +183,10 @@ func SaveIfMissing(cfg Config) (string, bool, error) {
 	return path, true, nil
 }
 
+// ErrMalformedRepoConfig wraps a repository config.json that is not valid
+// JSON, which is also how a file caught mid-write reads.
+var ErrMalformedRepoConfig = errors.New("malformed repository config")
+
 func LoadRepo(repoRoot string) (RepoConfig, error) {
 	cfg := RepoConfig{
 		SemanticMaxTerms: 8,
@@ -195,6 +200,9 @@ func LoadRepo(repoRoot string) (RepoConfig, error) {
 	}
 	if err == nil {
 		if err := json.Unmarshal(data, &cfg); err != nil {
+			if _, ok := errors.AsType[*json.SyntaxError](err); ok {
+				return RepoConfig{}, fmt.Errorf("%w: %w", ErrMalformedRepoConfig, err)
+			}
 			return RepoConfig{}, err
 		}
 	}

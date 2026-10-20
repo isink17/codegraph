@@ -132,10 +132,19 @@ released first) and re-reading the repository config; a failed flush or queue
 write by a full pass. It reads `watching` again only after a pass that began
 after the latest failure completes with the tree registered. Every other
 error stops the watcher with that error: an unreadable or invalid repository
-config after a change (malformed JSON, as from a file caught mid-write, is
-first retried through the registration path up to 5 times, about 8 s with the
-default delays, and reads `last_transient: config_invalid` meanwhile), a closed or corrupt database, a missing or unreadable
+config after a change, a closed or corrupt database, a missing or unreadable
 repository root, a refused parser downgrade, cancellation.
+
+A repository config that is not valid JSON, as a file caught mid-write reads,
+is the one config error that is retried, whichever reads it first: an event,
+a recovery attempt or a flush (the indexer reads the config too). The watcher
+reads `recovering` with `last_transient: config_invalid`, stops flushing,
+keeps the dirty queue, and re-reads the config on the registration backoff.
+Only those scheduled attempts count: after 5 that still find it malformed,
+about 8 s with the default delays, the watcher stops; a burst of events from
+one slow write spends none. A valid config resumes it with a reconciliation
+pass under the new rules. Valid JSON the config cannot hold (a wrong type)
+stops it at once.
 
 The watcher also:
 
@@ -150,8 +159,15 @@ The watcher also:
   config inside;
 - ignores a new directory that is removed before it can be registered.
 
-Limits: the watcher's state is not persisted beyond `reconcile_pending`, so
-`stats` and `graph_stats` keep `watcher: "not_in_this_process"`. A full scan
-by another process clears `reconcile_pending` while a degraded watcher is
-still retrying registration; the watcher records it again at its next
-attempt (within 30 s).
+While its state is not `watching`, a watcher also holds a shared OS lock on
+`<database>.watch-<repo id>.lock`, and freshness reports `reconcile_pending`
+while any process holds it. A full scan by another process therefore cannot
+clear the reason while a live watcher is still reconciling or recovering: the
+scan covers changes made before it, not events the watcher keeps missing. The
+operating system releases the lock when the watcher exits, however it exits,
+so a crashed watcher leaves only the persisted marker, which the next
+completed full scan clears. Like the scan lock, it is local to the host.
+
+Limits: no other watcher state is persisted, so `stats` and `graph_stats`
+keep `watcher: "not_in_this_process"`; the lock says that some live watcher
+has not reconciled, not which one or why.
