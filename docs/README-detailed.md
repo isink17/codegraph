@@ -793,7 +793,7 @@ Once its store is open, the first SIGINT or SIGTERM makes `watch` cancel and
 join the watcher, write the terminal `watch_status` (`reason: "signal"`) and
 `watch_stopped` events (with `--jsonl`), close the store and exit with 128
 plus the signal number (130 or 143). If the shutdown races a watcher failure
-(a flush error that arrives before the cancellation), the run instead reports
+and that error is returned instead of the cancellation, the run reports
 `failed` with that error and exits as for that error. `watch_stopped` does not mean the store
 is already closed; wait for the process to exit for that. A signal that
 arrives while the store is still opening, before `watch_started`, can end the
@@ -801,7 +801,7 @@ command with 130 or 143 and no events. Changes queued but not yet flushed stay
 queued for the next run, and an interrupted reconciliation stays pending; it
 is never reported as complete. A second signal kills a stalled shutdown.
 SIGKILL and crashes emit no terminal events. Signal shutdown is tested on Unix
-only; on Windows Ctrl+C takes the same path.
+only; on Windows Ctrl+C is expected to take the same path but is untested.
 
 `watch_status` is observational. It does not say the index is fresh, does not
 describe other processes, and a process killed abruptly (SIGKILL, a crash)
