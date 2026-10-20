@@ -175,8 +175,8 @@ func TestSupportedLanguagesTool(t *testing.T) {
 	if _, ok := entry["extensions"]; !ok {
 		t.Fatalf("entry = %v, missing extensions", entry)
 	}
-	if got, ok := entry["parser_profile"].(string); !ok || got != "go-ast:go:v3" {
-		t.Fatalf("parser_profile = %v, want go-ast:go:v3", entry["parser_profile"])
+	if got, ok := entry["parser_profile"].(string); !ok || got != "go-ast:go:v4" {
+		t.Fatalf("parser_profile = %v, want go-ast:go:v4", entry["parser_profile"])
 	}
 	if got, ok := entry["call_edges"].(bool); !ok || !got {
 		t.Fatalf("call_edges = %v, want true", entry["call_edges"])
