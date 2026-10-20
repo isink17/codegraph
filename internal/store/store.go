@@ -555,6 +555,9 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
+		if dsn, err = sqliteDSNWithParam(dsn, "_txlock", sqliteWriteTxLock); err != nil {
+			return nil, err
+		}
 		if db, err = sql.Open(sqliteDriverName, dsn); err != nil {
 			return nil, err
 		}
@@ -1131,7 +1134,10 @@ func buildSQLiteSafeExistingDSN(path string, opts OpenOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return sqliteDSNWithParam(dsn, "mode", "rw")
+	if dsn, err = sqliteDSNWithParam(dsn, "mode", "rw"); err != nil {
+		return "", err
+	}
+	return sqliteDSNWithParam(dsn, "_txlock", sqliteWriteTxLock)
 }
 
 func sqliteDSNWithParam(dsn, key, value string) (string, error) {
