@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -54,7 +55,7 @@ func TestWatchStopsGracefullyOnSignal(t *testing.T) {
 			}
 
 			cmd := exec.Command(os.Args[0], "-test.run=^TestWatchStopsGracefullyOnSignal$")
-			cmd.Env = append(os.Environ(), "CODEGRAPH_WATCH_SIGNAL_CHILD="+repoRoot)
+			cmd.Env = append(os.Environ(), "CODEGRAPH_WATCH_SIGNAL_CHILD="+repoRoot, "CODEGRAPH_NO_UPDATE_CHECK=1")
 			stdout, err := cmd.StdoutPipe()
 			if err != nil {
 				t.Fatal(err)
@@ -104,11 +105,20 @@ func TestWatchStopsGracefullyOnSignal(t *testing.T) {
 			if err := cmd.Process.Signal(tc.sig); err != nil {
 				t.Fatal(err)
 			}
+			var hung atomic.Bool
+			killHung := time.AfterFunc(60*time.Second, func() {
+				hung.Store(true)
+				_ = cmd.Process.Kill()
+			})
 			for event := range events {
 				seen = append(seen, event)
 			}
 			waitErr := cmd.Wait()
+			killHung.Stop()
 			finished = true
+			if hung.Load() {
+				t.Fatalf("watch did not exit within 60s of %s; killed it: %v", tc.name, seen)
+			}
 			var exitErr *exec.ExitError
 			if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 128+int(tc.sig) {
 				t.Fatalf("exit = %v, want status %d", waitErr, 128+int(tc.sig))

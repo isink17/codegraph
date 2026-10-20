@@ -789,9 +789,10 @@ additive: new types may appear in any release, so consumers should switch on
   straight to `stopped`. The terminal status immediately precedes
   `watch_stopped`.
 
-On SIGINT or SIGTERM, `watch` cancels and joins the watcher, closes the
-store, writes the terminal events and exits with 128 plus the signal number
-(130 or 143). Changes queued but not yet flushed stay queued for the next run.
+On SIGINT or SIGTERM, `watch` cancels and joins the watcher, writes the
+terminal events, closes the store and exits with 128 plus the signal number
+(130 or 143). `watch_stopped` does not mean the store is already closed; wait
+for the process to exit for that. Changes queued but not yet flushed stay queued for the next run.
 A second signal during that shutdown kills the process. Signal shutdown is
 tested on Unix only; on Windows Ctrl+C takes the same path.
 
