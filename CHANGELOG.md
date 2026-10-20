@@ -220,6 +220,8 @@ Performance: dot-suffix resolution no longer builds candidate groups for dotted 
 
 Performance: Swift self-call resolution aggregates declaration facts once per symbol instead of rescanning every Swift declaration fact for each candidate method. The inherited final class method and inherited static method stress tests dropped from about 23 s and 16 s to about 3 s and 2.5 s, with an identical graph. No schema change.
 
+Performance: Swift `super` call resolution aggregates declaration facts once per symbol instead of rescanning the repository's Swift declaration facts for each candidate method. On a synthetic repository with 3,000 `super` calls, full edge resolution dropped from about 7.7 s to about 1.0 s, with an identical graph. No schema change.
+
 The non-CGO Python parser no longer records keyword syntax as calls: `with x as (a, b)`
 called `as`, a match statement called `match`, and a case pattern such as
 `case Point(x=0)` called `Point`. Match subjects, case guards and ordinary calls named
