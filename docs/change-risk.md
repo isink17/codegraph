@@ -19,10 +19,13 @@ change lists but never change `risk`.
 - No assessment proves a change safe. Only resolved edges are cited, so an
   unresolved, dynamic, reflective or cross-language dependent can still break.
   `risk.coverage` is therefore never `complete`.
-- With `CGO_ENABLED=0` (parser profile `go-ast:go:v3`) a Go function's
-  stored signature omits its parameters and results, so a signature change is
-  not seen. Results on pinned real repositories, with known false positives
-  and negatives, are in `docs/change-risk-verification.md`.
+- Both Go parsers (`treesitter:go:v3`, and `go-ast:go:v4` with
+  `CGO_ENABLED=0`) store a function's signature as its source text: receiver,
+  parameters and results, but not its type parameter list. A changed signature
+  is therefore a removed and an added declaration in either build, and so is a
+  reformatted one; a change to a type parameter list or constraint alone is not
+  seen. Results on pinned real repositories, with known false positives and
+  negatives, are in `docs/change-risk-verification.md`.
 
 ## Assessments
 

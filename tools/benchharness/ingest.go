@@ -352,7 +352,7 @@ func ingestSession(dir string, ref SessionRef, m *Manifest, arm Arm, ts *TaskSet
 	if err != nil {
 		return SessionResult{}, err
 	}
-	subs, checked, unlinked, threads, err := sessionAgents(dir, ref, m, t)
+	subs, checked, unlinked, threads, err := sessionAgents(dir, ref, m, t, !arm.CodeGraphEnabled)
 	if err != nil {
 		return SessionResult{}, err
 	}

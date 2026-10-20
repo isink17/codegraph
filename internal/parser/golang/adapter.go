@@ -1,9 +1,7 @@
 package golang
 
 import (
-	"bytes"
 	"context"
-	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -83,14 +81,14 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			sym := buildFuncSymbol(fset, pkgName, d, commentMap[d])
+			sym := buildFuncSymbol(fset, content, pkgName, d, commentMap[d])
 			pf.Symbols = append(pf.Symbols, sym)
 			symbolByKey[sym.StableKey] = &pf.Symbols[len(pf.Symbols)-1]
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
-					sym := buildTypeSymbol(fset, pkgName, s, commentMap[s])
+					sym := buildTypeSymbol(fset, content, pkgName, s, commentMap[s])
 					pf.Symbols = append(pf.Symbols, sym)
 					symbolByKey[sym.StableKey] = &pf.Symbols[len(pf.Symbols)-1]
 				case *ast.ValueSpec:
@@ -161,7 +159,7 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 	return pf, nil
 }
 
-func buildFuncSymbol(fset *token.FileSet, pkg string, fn *ast.FuncDecl, doc string) graph.Symbol {
+func buildFuncSymbol(fset *token.FileSet, content []byte, pkg string, fn *ast.FuncDecl, doc string) graph.Symbol {
 	name := fn.Name.Name
 	qualified := pkg + "." + name
 	container := pkg
@@ -180,7 +178,7 @@ func buildFuncSymbol(fset *token.FileSet, pkg string, fn *ast.FuncDecl, doc stri
 		Name:          name,
 		QualifiedName: qualified,
 		ContainerName: container,
-		Signature:     renderFuncSignature(fn),
+		Signature:     renderFuncSignature(content, fset.File(fn.Pos()), fn),
 		Visibility:    visibility(name),
 		Range:         toRange(fset, fn.Pos(), fn.End()),
 		DocSummary:    doc,
@@ -188,7 +186,7 @@ func buildFuncSymbol(fset *token.FileSet, pkg string, fn *ast.FuncDecl, doc stri
 	}
 }
 
-func buildTypeSymbol(fset *token.FileSet, pkg string, ts *ast.TypeSpec, doc string) graph.Symbol {
+func buildTypeSymbol(fset *token.FileSet, content []byte, pkg string, ts *ast.TypeSpec, doc string) graph.Symbol {
 	name := ts.Name.Name
 	return graph.Symbol{
 		Language:      "go",
@@ -196,7 +194,7 @@ func buildTypeSymbol(fset *token.FileSet, pkg string, ts *ast.TypeSpec, doc stri
 		Name:          name,
 		QualifiedName: pkg + "." + name,
 		ContainerName: pkg,
-		Signature:     renderExpr(ts.Type),
+		Signature:     renderTypeSignature(content, fset.File(ts.Pos()), ts.Type),
 		Visibility:    visibility(name),
 		Range:         toRange(fset, ts.Pos(), ts.End()),
 		DocSummary:    doc,
@@ -307,23 +305,40 @@ func receiverName(expr ast.Expr) string {
 	}
 }
 
-func renderExpr(expr ast.Expr) string {
-	var buf bytes.Buffer
-	_ = formatNode(&buf, expr)
-	return buf.String()
+// declText is a node's source text. Signatures are spelled verbatim, as the
+// tree-sitter Go adapter spells them, so both builds store the same signature
+// for the same declaration. The positions come from parsing content itself, so
+// there is no rendering step that could fail or lose a part of the type.
+func declText(content []byte, file *token.File, node ast.Node) string {
+	return string(content[file.Offset(node.Pos()):file.Offset(node.End())])
 }
 
-func renderFuncSignature(fn *ast.FuncDecl) string {
-	var buf bytes.Buffer
-	buf.WriteString("func ")
+// renderFuncSignature spells `func (recv) Name(params) results`. A type
+// parameter list is not part of it, matching the tree-sitter adapter.
+func renderFuncSignature(content []byte, file *token.File, fn *ast.FuncDecl) string {
+	var b strings.Builder
+	b.WriteString("func ")
 	if fn.Recv != nil {
-		buf.WriteString("(")
-		_ = formatNode(&buf, fn.Recv)
-		buf.WriteString(") ")
+		b.WriteString(declText(content, file, fn.Recv))
+		b.WriteByte(' ')
 	}
-	buf.WriteString(fn.Name.Name)
-	_ = formatNode(&buf, fn.Type)
-	return buf.String()
+	b.WriteString(fn.Name.Name)
+	b.WriteString(declText(content, file, fn.Type.Params))
+	if fn.Type.Results != nil {
+		b.WriteByte(' ')
+		b.WriteString(declText(content, file, fn.Type.Results))
+	}
+	return b.String()
+}
+
+func renderTypeSignature(content []byte, file *token.File, typ ast.Expr) string {
+	switch typ.(type) {
+	case *ast.StructType:
+		return "struct"
+	case *ast.InterfaceType:
+		return "interface"
+	}
+	return declText(content, file, typ)
 }
 
 func renderNode(content []byte, fset *token.FileSet, node ast.Node) string {
@@ -333,97 +348,6 @@ func renderNode(content []byte, fset *token.FileSet, node ast.Node) string {
 		return ""
 	}
 	return string(content[start:end])
-}
-
-func formatNode(buf *bytes.Buffer, node any) error {
-	switch n := node.(type) {
-	case ast.Expr:
-		return printer(buf, n)
-	case *ast.FieldList:
-		if n == nil {
-			return nil
-		}
-		buf.WriteByte('(')
-		for i, field := range n.List {
-			if i > 0 {
-				buf.WriteString(", ")
-			}
-			for j, name := range field.Names {
-				if j > 0 {
-					buf.WriteString(", ")
-				}
-				buf.WriteString(name.Name)
-			}
-			if len(field.Names) > 0 {
-				buf.WriteByte(' ')
-			}
-			if field.Type != nil {
-				_ = printer(buf, field.Type)
-			}
-		}
-		buf.WriteByte(')')
-		return nil
-	case *ast.FuncType:
-		if n == nil {
-			return nil
-		}
-		_ = formatNode(buf, n.Params)
-		if n.Results != nil && len(n.Results.List) > 0 {
-			buf.WriteByte(' ')
-			if len(n.Results.List) == 1 && len(n.Results.List[0].Names) == 0 {
-				_ = printer(buf, n.Results.List[0].Type)
-			} else {
-				_ = formatNode(buf, n.Results)
-			}
-		}
-		return nil
-	default:
-		return nil
-	}
-}
-
-func printer(buf *bytes.Buffer, expr ast.Expr) error {
-	switch e := expr.(type) {
-	case *ast.Ident:
-		buf.WriteString(e.Name)
-	case *ast.SelectorExpr:
-		_ = printer(buf, e.X)
-		buf.WriteByte('.')
-		buf.WriteString(e.Sel.Name)
-	case *ast.StarExpr:
-		buf.WriteByte('*')
-		_ = printer(buf, e.X)
-	case *ast.ArrayType:
-		buf.WriteString("[]")
-		_ = printer(buf, e.Elt)
-	case *ast.MapType:
-		buf.WriteString("map[")
-		_ = printer(buf, e.Key)
-		buf.WriteByte(']')
-		_ = printer(buf, e.Value)
-	case *ast.InterfaceType:
-		buf.WriteString("interface{}")
-	case *ast.StructType:
-		buf.WriteString("struct")
-	case *ast.IndexExpr:
-		_ = printer(buf, e.X)
-		buf.WriteByte('[')
-		_ = printer(buf, e.Index)
-		buf.WriteByte(']')
-	case *ast.IndexListExpr:
-		_ = printer(buf, e.X)
-		buf.WriteByte('[')
-		for i, index := range e.Indices {
-			if i > 0 {
-				buf.WriteString(", ")
-			}
-			_ = printer(buf, index)
-		}
-		buf.WriteByte(']')
-	default:
-		buf.WriteString(fmt.Sprintf("%T", expr))
-	}
-	return nil
 }
 
 func commentText(group *ast.CommentGroup) string {
@@ -474,7 +398,9 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 // build a call graph. See cgparser.Profile for the versioning rule.
 // v2 records initializer calls on local bindings, single function result
 // types, and edges for selector calls made directly on a call result. v3
-// records the package clause and build constraint.
+// records the package clause and build constraint. v4 stores signatures as the
+// declaration's source text, as the tree-sitter adapter does, instead of a
+// lossy rendering that dropped parameters and results.
 func (a *Adapter) Profile() cgparser.Profile {
-	return cgparser.Profile{ID: "go-ast:go:v3", EmitsCallEdges: true}
+	return cgparser.Profile{ID: "go-ast:go:v4", EmitsCallEdges: true}
 }
