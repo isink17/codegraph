@@ -235,3 +235,87 @@ func signatures(t *testing.T, changes []Change, side string) []string {
 	}
 	return out
 }
+
+// TestGoTypeAliasChangeMatrix pins that a type alias is a declaration in every
+// Go adapter of this build and that its signature tells an alias from a
+// defined type, so retargeting an alias or turning it into a defined type is a
+// removed and an added declaration whose resolved dependents are cited.
+func TestGoTypeAliasChangeMatrix(t *testing.T) {
+	const lib = `package p
+
+type Base struct{ X int }
+
+type Other struct{ X int }
+
+func NewBase() Base { return Base{} }
+
+type Plain = Base
+
+type Loose = Base
+
+type (
+	Grouped = Base
+)
+`
+	const caller = `package p
+
+func Use() Plain { return Plain(NewBase()) }
+
+func UseGrouped() Grouped { return Grouped(NewBase()) }
+`
+	cases := []struct {
+		name, from, to string
+		before, after  string
+		unscored       bool
+	}{
+		{name: "comment only", from: "type Loose = Base", to: "// Loose is loose.\ntype Loose = Base"},
+		{name: "target changed", from: "type Plain = Base", to: "type Plain = Other", before: "= Base", after: "= Other"},
+		{name: "alias to defined type", from: "type Plain = Base", to: "type Plain Base", before: "= Base", after: "Base"},
+		{name: "defined type to alias", from: "type Other struct{ X int }", to: "type Other = struct{ X int }", before: "struct", after: "= struct", unscored: true},
+		{name: "grouped target changed", from: "Grouped = Base", to: "Grouped = *Base", before: "= Base", after: "= *Base"},
+		{name: "unused alias target changed", from: "type Loose = Base", to: "type Loose = *Base", before: "= Base", after: "= *Base", unscored: true},
+	}
+	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.24\n", "p/lib.go": lib, "p/use.go": caller}
+	docs := map[string]map[string]string{}
+	for name, adapter := range testGoAdapters {
+		docs[name] = map[string]string{}
+		t.Run(name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					if !strings.Contains(lib, tc.from) {
+						t.Fatalf("edit %q not in the source", tc.from)
+					}
+					edit := func(r *gittest.Repo) { r.Write("p/lib.go", strings.Replace(lib, tc.from, tc.to, 1)) }
+					d := editScenario(t, adapter, files, edit).Diff
+					removed, added := signatures(t, d.Symbols.Removed, "before"), signatures(t, d.Symbols.Added, "after")
+					switch {
+					case tc.before == "":
+						if len(removed)+len(added)+len(d.Symbols.Changed) != 0 || d.Risk.Assessment != "no_risk_evidence" {
+							t.Fatalf("unchanged alias: removed %v, added %v, risk %s", removed, added, canonical(d.Risk))
+						}
+					case strings.Join(removed, "|") != tc.before || strings.Join(added, "|") != tc.after:
+						t.Fatalf("signatures: removed %v, added %v; want %q -> %q", removed, added, tc.before, tc.after)
+					case tc.unscored:
+						if d.Risk.Assessment != "limited_evidence" || len(d.Risk.Uncertainty) != 1 || d.Risk.Uncertainty[0].Reason != "removed_declaration_without_resolved_dependents" {
+							t.Fatalf("changed alias without dependents: %s", canonical(d.Risk))
+						}
+					case d.Risk.Assessment != "risk_evidence" || ruleCount(d.Risk, RuleDependentRetargeted) == 0:
+						t.Fatalf("dependent of a changed alias not cited: %s", canonical(d.Risk))
+					}
+					doc := canonical(d)
+					if again := canonical(editScenario(t, adapter, files, edit).Diff); again != doc {
+						t.Fatalf("repeated diff differs:\n%s\n%s", doc, again)
+					}
+					docs[name][tc.name] = doc
+				})
+			}
+		})
+	}
+	if len(docs) > 1 {
+		for _, tc := range cases {
+			if a, b := docs["go-ast"][tc.name], docs["tree-sitter"][tc.name]; a != b {
+				t.Errorf("%s: adapters disagree:\n go/ast:      %s\n tree-sitter: %s", tc.name, a, b)
+			}
+		}
+	}
+}

@@ -11,7 +11,9 @@ fix) and `CGO_ENABLED=0` (`go-ast:go:v4`). The earlier run at `97430a4` used
 noted below. A rerun with type parameter lists in signatures
 (`treesitter:go:v4`, `go-ast:go:v5`) gave the same assessment, score, rules,
 pairs, refusals, uncertainty, determinism and CGO agreement in all 32 cases:
-no case of this corpus changes a type parameter list.
+no case of this corpus changes a type parameter list. A rerun with type
+aliases recorded alike in both builds (`treesitter:go:v5`, `go-ast:go:v6`)
+again matched in all 32 cases: no case changes an alias.
 
 The score is an evidence index, not a probability. Nothing below treats an
 earlier CodeGraph output as ground truth: every label comes from the Go

@@ -11,9 +11,11 @@ import "github.com/isink17/codegraph/internal/parser"
 // Go v2 records initializer calls on local bindings, single function result
 // types, and edges for selector calls made directly on a call result. v3
 // records the package clause and build constraint. v4 adds the type parameter
-// list to function and type signatures.
+// list to function and type signatures. v5 records a non-generic type alias
+// (`type A = B`) as a type symbol, as go/ast always did, and prefixes every
+// alias's signature with `= `.
 func (a *GoAdapter) Profile() parser.Profile {
-	return parser.NewProfile("go", "treesitter:go:v4", true)
+	return parser.NewProfile("go", "treesitter:go:v5", true)
 }
 
 // HCL v2 reads references inside operators. Its relationship graph is its

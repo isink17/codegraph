@@ -89,7 +89,11 @@ func (a *GoAdapter) Parse(ctx context.Context, path string, content []byte) (gra
 
 	// ---- type declarations ----
 	for _, genDecl := range findChildren(root, "type_declaration") {
-		for _, typeSpec := range findDescendants(genDecl, "type_spec") {
+		for i := range int(genDecl.ChildCount()) {
+			typeSpec := genDecl.Child(i)
+			if t := typeSpec.Type(); t != "type_spec" && t != "type_alias" {
+				continue
+			}
 			sym := goTypeSymbol(typeSpec, pkgName, content)
 			pf.Symbols = append(pf.Symbols, sym)
 			symbolByKey[sym.StableKey] = &pf.Symbols[len(pf.Symbols)-1]
@@ -233,6 +237,9 @@ func goTypeSymbol(typeSpec *sitter.Node, pkg string, content []byte) graph.Symbo
 			sig = nodeText(typeNode, content)
 		}
 	}
+	if goIsTypeAlias(typeSpec, content) {
+		sig = "= " + sig
+	}
 	if tparams := childByFieldName(typeSpec, "type_parameters"); tparams != nil {
 		sig = nodeText(tparams, content) + " " + sig
 	}
@@ -249,6 +256,21 @@ func goTypeSymbol(typeSpec *sitter.Node, pkg string, content []byte) graph.Symbo
 		DocSummary:    doc,
 		StableKey:     "type:" + pkg + ":" + name,
 	}
+}
+
+// goIsTypeAlias reports whether a type spec declares an alias. The grammar
+// has no generic alias, so `type A[T any] = B[T]` is a type_spec whose `=` is
+// an ERROR node. This assumes the file is valid Go; go/ast rejects invalid files.
+func goIsTypeAlias(typeSpec *sitter.Node, content []byte) bool {
+	if typeSpec.Type() == "type_alias" {
+		return true
+	}
+	for i := range int(typeSpec.ChildCount()) {
+		if c := typeSpec.Child(i); c.Type() == "ERROR" && strings.TrimSpace(nodeText(c, content)) == "=" {
+			return true
+		}
+	}
+	return false
 }
 
 func goAddValueSymbols(pf *graph.ParsedFile, spec *sitter.Node, pkg string, content []byte) {
