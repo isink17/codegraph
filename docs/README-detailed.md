@@ -789,12 +789,17 @@ additive: new types may appear in any release, so consumers should switch on
   straight to `stopped`. The terminal status immediately precedes
   `watch_stopped`.
 
-On SIGINT or SIGTERM, `watch` cancels and joins the watcher, writes the
-terminal events, closes the store and exits with 128 plus the signal number
-(130 or 143). `watch_stopped` does not mean the store is already closed; wait
-for the process to exit for that. Changes queued but not yet flushed stay queued for the next run.
-A second signal during that shutdown kills the process. Signal shutdown is
-tested on Unix only; on Windows Ctrl+C takes the same path.
+Once its store is open, the first SIGINT or SIGTERM makes `watch` cancel and
+join the watcher, write the terminal `watch_status` (`reason: "signal"`) and
+`watch_stopped` events (with `--jsonl`), close the store and exit with 128
+plus the signal number (130 or 143). `watch_stopped` does not mean the store
+is already closed; wait for the process to exit for that. A signal that
+arrives while the store is still opening, before `watch_started`, can end the
+command with 130 or 143 and no events. Changes queued but not yet flushed stay
+queued for the next run, and an interrupted reconciliation stays pending; it
+is never reported as complete. A second signal kills a stalled shutdown.
+SIGKILL and crashes emit no terminal events. Signal shutdown is tested on Unix
+only; on Windows Ctrl+C takes the same path.
 
 `watch_status` is observational. It does not say the index is fresh, does not
 describe other processes, and a process killed abruptly (SIGKILL, a crash)
