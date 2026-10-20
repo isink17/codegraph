@@ -2,8 +2,10 @@ package diff
 
 import (
 	"go/build"
+	"go/token"
 	"io"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/store"
+	"golang.org/x/mod/modfile"
 )
 
 // DeclarationPairs annotates declarations of a moved file that are provably
@@ -26,7 +29,8 @@ import (
 // are unchanged (a module root that moved with its packages). A declaration
 // that left one file for another of the same package identity, removed, added
 // or kept, pairs only when its own bytes, the directives before it and the
-// file's imports are equal (see editedMoves). Every path also refuses a declaration that runs in
+// file's imports, or the bindings of every name it spells, are equal (see
+// editedMoves). Every path also refuses a declaration that runs in
 // file order or embeds files it cannot prove equal (see moveRefusal). Every
 // other language is refused: callers reach Lua, C/C++, Ruby and PHP
 // declarations through the file path (require, include)
@@ -427,12 +431,11 @@ func goBuildRole(p string) string {
 // identity, the declaration's shape is unique in that package on both sides,
 // it does not run in file order, its embedded files are equal, and its own
 // bytes, the directives before it and its file's package clause, imports and
-// file-wide directives are equal. A declaration moved only when its identity
-// is gone from base and new in head. A shape found moved on both sides that
-// fails any of these is refused with the reason.
-// ponytail: the whole file context must be equal, so a cut and paste between
-// files with different imports is refused; comparing only the imports the
-// declaration names needs each import's package name.
+// file-wide directives are equal. The import specs may differ when no name an
+// added or dropped import binds is spelled in the declaration (see
+// importsAgree). A declaration moved only when its identity is gone from base
+// and new in head. A shape found moved on both sides that fails any of these
+// is refused with the reason.
 func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete map[string]bool, baseScope, headScope goModuleScope, ev moveEvidence) ([]DeclarationPair, []RefusedPairing) {
 	if base.GoModules == nil || head.GoModules == nil || ev.baseTree == nil || ev.headTree == nil {
 		return nil, nil
@@ -458,6 +461,11 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 		shapes map[string]map[string]int
 		moved  map[string]map[string][]store.SemanticDeclaration
 		roots  map[string]string
+		// pkgNames maps a module path and import path to the package clause
+		// all its files declare, "" when they disagree or one is incomplete.
+		pkgNames map[string]string
+		mods     map[string]*modfile.File
+		tree     map[string]string
 	}
 	treeMap := func(tree []SourceFile) map[string]string {
 		out := make(map[string]string, len(tree))
@@ -469,9 +477,18 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 	baseMap, headMap := treeMap(ev.baseTree), treeMap(ev.headTree)
 	build := func(g store.SemanticGraph, own, other map[string]string, src func(string) ([]byte, bool)) *side {
 		s := &side{decls: declarationsByPath(g.Declarations), files: filesByPath(g.Files), src: src, parsed: map[string]*goSource{}, keys: map[string]string{},
-			touched: map[string]bool{}, touchedKeys: map[string]bool{}, ids: map[string]bool{}, shapes: map[string]map[string]int{}, moved: map[string]map[string][]store.SemanticDeclaration{}, roots: map[string]string{}}
+			touched: map[string]bool{}, touchedKeys: map[string]bool{}, ids: map[string]bool{}, shapes: map[string]map[string]int{}, moved: map[string]map[string][]store.SemanticDeclaration{}, roots: map[string]string{},
+			pkgNames: map[string]string{}, mods: map[string]*modfile.File{}, tree: own}
 		for _, f := range g.Files {
 			gf := f.Go
+			if f.Language == "go" && gf != nil && gf.ModuleState == store.GoModuleComplete && !gf.ExternalTest {
+				pk := gf.ModulePath + "\n" + gf.ImportPath
+				if prev, seen := s.pkgNames[pk]; incomplete[f.Path] || seen && prev != gf.PackageClause {
+					s.pkgNames[pk] = ""
+				} else if !seen {
+					s.pkgNames[pk] = gf.PackageClause
+				}
+			}
 			if f.Language != "go" || gf == nil || gf.ModuleState != store.GoModuleComplete || moduleRoots(g.GoModules, gf.ModulePath) != 1 ||
 				incomplete[f.Path] || goIgnoredDirectory(f.Path) {
 				continue
@@ -538,13 +555,53 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 		s.parsed[p] = out
 		return out
 	}
-	hash := func(s *side, d store.SemanticDeclaration) (string, goTopDecl, bool) {
+	hash := func(s *side, d store.SemanticDeclaration) (*goSource, goTopDecl, bool) {
 		gs := source(s, d.Path)
 		if gs == nil {
-			return "", goTopDecl{}, false
+			return nil, goTopDecl{}, false
 		}
 		top, ok := gs.declarationHash(d)
-		return gs.context, top, ok
+		return gs, top, ok
+	}
+	// importName is the name an import of file binds, when it is provable:
+	// an explicit name, the package clause of a package of the file's own
+	// module, or the last element of a standard library path.
+	importName := func(s *side, g store.SemanticGraph, file string, im goImport) (string, bool) {
+		switch {
+		case im.name == "." || im.path == "C":
+			return "", false
+		case im.name != "":
+			return im.name, true
+		}
+		gf := s.files[file].Go
+		if im.path == gf.ModulePath || strings.HasPrefix(im.path, gf.ModulePath+"/") {
+			n := s.pkgNames[gf.ModulePath+"\n"+im.path]
+			return n, n != ""
+		}
+		if len(g.GoModules.Workspaces) > 0 {
+			return "", false
+		}
+		mf, ok := s.mods[gf.ModuleRoot]
+		if !ok {
+			modPath := path.Join(gf.ModuleRoot, "go.mod")
+			if s.src != nil {
+				if data, ok := s.src(modPath); ok && sha256Hex(data) == s.tree[modPath] {
+					mf, _ = modfile.Parse("go.mod", data, nil)
+				}
+			}
+			s.mods[gf.ModuleRoot] = mf
+		}
+		if mf == nil {
+			return "", false
+		}
+		var deps []string
+		for _, r := range mf.Require {
+			deps = append(deps, r.Mod.Path)
+		}
+		for _, r := range mf.Replace {
+			deps = append(deps, r.Old.Path)
+		}
+		return goStdName(im.path, deps)
 	}
 	var pairs []DeclarationPair
 	var refused []RefusedPairing
@@ -589,7 +646,9 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 					reason = refuseDeclContentMissing
 				case bh.initializes || hh.initializes:
 					reason = refuseDeclOrderDependent
-				case bc != hc:
+				case bc.context != hc.context && (bh.hash != hh.hash || len(bh.embeds) > 0 ||
+					!importsAgree(bc, hc, bh.idents, func(im goImport) (string, bool) { return importName(b, base, bs[0].Path, im) },
+						func(im goImport) (string, bool) { return importName(h, head, as[0].Path, im) })):
 					reason = refuseDeclContextChanged
 				case bh.hash != hh.hash:
 					reason = refuseDeclContentChanged
@@ -612,6 +671,79 @@ func editedMoves(renames FileRenames, base, head store.SemanticGraph, incomplete
 	})
 	sort.Slice(refused, func(i, j int) bool { return canonical(refused[i]) < canonical(refused[j]) })
 	return pairs, refused
+}
+
+// importsAgree reports that two files whose import specs differ give every
+// identifier of a declaration the same binding. Everything else of their
+// context must be equal, neither may have a linkname or cgo directive, a dot
+// import or an import of "C", and each import only one of them has must bind
+// a provable name the declaration never spells, so no spelled name can refer
+// to it, be shadowed by a local that would otherwise refer to it, or collide
+// with it. An import both have binds the same name in both. A blank import
+// binds nothing; what its package initialization does is the package's
+// change, not the declaration's.
+func importsAgree(b, h *goSource, idents map[string]bool, bName, hName func(goImport) (string, bool)) bool {
+	if b.fixed != h.fixed || b.named || h.named {
+		return false
+	}
+	set := func(list []goImport) map[goImport]bool {
+		out := make(map[goImport]bool, len(list))
+		for _, im := range list {
+			out[im] = true
+		}
+		return out
+	}
+	only := func(list []goImport, other map[goImport]bool, name func(goImport) (string, bool)) bool {
+		for _, im := range list {
+			if im.name == "." || im.path == "C" {
+				return false
+			}
+			if other[im] {
+				continue
+			}
+			if n, ok := name(im); !ok || idents[n] {
+				return false
+			}
+		}
+		return true
+	}
+	return only(b.imports, set(h.imports), bName) && only(h.imports, set(b.imports), hName)
+}
+
+// goStdName is the package name of a standard library import path: one whose
+// first element has no dot, that no module the importing go.mod requires or
+// replaces provides, and whose last element is an identifier other than a
+// major version suffix (math/rand/v2 is package rand). Internal and vendored
+// paths, which other modules cannot import and some of which are named
+// otherwise, and anything else are unknown.
+func goStdName(p string, deps []string) (string, bool) {
+	first, _, _ := strings.Cut(p, "/")
+	if strings.Contains(first, ".") || first == "vendor" || slices.Contains(strings.Split(p, "/"), "internal") {
+		return "", false
+	}
+	for _, d := range deps {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return "", false
+		}
+	}
+	last := path.Base(p)
+	if !token.IsIdentifier(last) || isMajorVersion(last) {
+		return "", false
+	}
+	return last, true
+}
+
+func isMajorVersion(el string) bool {
+	rest, ok := strings.CutPrefix(el, "v")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // moveRefusal is why a Go declaration whose bytes are equal in another file

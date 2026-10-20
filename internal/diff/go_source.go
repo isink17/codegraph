@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/store"
@@ -22,8 +23,17 @@ import (
 // directives that precede no declaration.
 type goSource struct {
 	context string
+	// fixed is context without the import specs; imports lists them. named
+	// is set when the file has a //go:linkname or //go:cgo_ directive.
+	fixed   string
+	imports []goImport
+	named   bool
 	decls   []goTopDecl
 }
+
+// goImport is one import spec: name is the explicit name ("", "_", "." or an
+// identifier) and path the unquoted import path.
+type goImport struct{ name, path string }
 
 type goTopDecl struct {
 	startLine, endLine int
@@ -33,6 +43,8 @@ type goTopDecl struct {
 	initializes bool
 	// embeds holds the //go:embed directives before or inside it.
 	embeds []string
+	// idents holds every identifier spelled inside it.
+	idents map[string]bool
 }
 
 func initializesVars(d ast.Decl) bool {
@@ -51,8 +63,7 @@ func initializesVars(d ast.Decl) bool {
 // parseGoSource reads a file only when the bytes are the ones the index
 // parsed (contentHash) and the whole file parses.
 func parseGoSource(content []byte, contentHash string) (goSource, bool) {
-	sum := sha256.Sum256(content)
-	if hex.EncodeToString(sum[:]) != contentHash {
+	if sha256Hex(content) != contentHash {
 		return goSource{}, false
 	}
 	fset := token.NewFileSet()
@@ -62,17 +73,23 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 	}
 	tf := fset.File(f.Pos())
 	off := func(p token.Pos) int { return tf.Offset(p) }
-	ctx := []string{"package " + f.Name.Name}
+	var ctx []string
 	var imports []string
+	var specs []goImport
 	for _, spec := range f.Imports {
 		name := ""
 		if spec.Name != nil {
 			name = spec.Name.Name
 		}
 		imports = append(imports, name+" "+spec.Path.Value)
+		p, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			return goSource{}, false
+		}
+		specs = append(specs, goImport{name: name, path: p})
 	}
 	sort.Strings(imports)
-	ctx = append(ctx, imports...)
+	named := false
 	// Every comment of an import declaration is context: the comment on a
 	// "C" import, in or outside a group, is the cgo preamble.
 	isImport := make([]bool, len(f.Decls))
@@ -118,6 +135,7 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 				continue
 			case strings.HasPrefix(c.Text, "//go:linkname") || strings.HasPrefix(c.Text, "//go:cgo_"):
 				ctx = append(ctx, "named "+c.Text)
+				named = true
 				continue
 			}
 			i := sort.Search(len(f.Decls), func(i int) bool { return f.Decls[i].End() > c.Pos() })
@@ -129,7 +147,13 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 			}
 		}
 	}
-	out := goSource{context: strings.Join(ctx, "\n")}
+	pkg := "package " + f.Name.Name
+	out := goSource{
+		context: strings.Join(append(append([]string{pkg}, imports...), ctx...), "\n"),
+		fixed:   strings.Join(append([]string{pkg}, ctx...), "\n"),
+		imports: specs,
+		named:   named,
+	}
 	for i, d := range f.Decls {
 		h := sha256.New()
 		for _, dir := range attached[i] {
@@ -137,9 +161,21 @@ func parseGoSource(content []byte, contentHash string) (goSource, bool) {
 		}
 		h.Write([]byte{0})
 		h.Write(content[off(d.Pos()):off(d.End())])
-		out.decls = append(out.decls, goTopDecl{startLine: fset.Position(d.Pos()).Line, endLine: fset.Position(d.End()).Line, hash: hex.EncodeToString(h.Sum(nil)), initializes: initializesVars(d), embeds: embeds[i]})
+		idents := map[string]bool{}
+		ast.Inspect(d, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok {
+				idents[id.Name] = true
+			}
+			return true
+		})
+		out.decls = append(out.decls, goTopDecl{startLine: fset.Position(d.Pos()).Line, endLine: fset.Position(d.End()).Line, hash: hex.EncodeToString(h.Sum(nil)), initializes: initializesVars(d), embeds: embeds[i], idents: idents})
 	}
 	return out, true
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // goDirective reports a comment the toolchain reads as an instruction rather
@@ -255,8 +291,7 @@ func newGoModuleScope(m *store.SemanticGoModules, tree []SourceFile, source func
 		if !ok {
 			return nil, false
 		}
-		sum := sha256.Sum256(b)
-		return b, hex.EncodeToString(sum[:]) == h
+		return b, sha256Hex(b) == h
 	}
 	target := func(root, dir string) (string, bool) {
 		if filepath.IsAbs(dir) || path.IsAbs(dir) || strings.Contains(dir, `\`) {
