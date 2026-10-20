@@ -216,7 +216,19 @@ func TestValidateIngestRejectsSubagentTampering(t *testing.T) {
 			r.Sessions[2].Contamination.Contaminated = false
 			r.Sessions[2].Contamination.BlockedAttempts = 1
 		},
-		"unknown agent": func(r *IngestRecord) { r.Sessions[1].Contamination.Calls[0].Agent = "zzz" },
+		"unknown agent":           func(r *IngestRecord) { r.Sessions[1].Contamination.Calls[0].Agent = "zzz" },
+		"unlinked call count":     func(r *IngestRecord) { r.Sessions[2].Workload.UnlinkedAgentCalls = 0 },
+		"unverified call outcome": func(r *IngestRecord) { r.Sessions[2].Contamination.Calls[0].Outcome = "succeeded" },
+		"unlinked with tool_use":  func(r *IngestRecord) { r.Sessions[0].Subagents[3].ToolUseID = "tu_x" },
+		"subagent token sum":      func(r *IngestRecord) { r.Sessions[0].Subagents[0].InputTokens++ },
+		"negative unlinked calls": func(r *IngestRecord) { r.Sessions[3].Workload.UnlinkedAgentCalls = -1 },
+		"duplicate subagent": func(r *IngestRecord) {
+			s := &r.Sessions[1]
+			s.Subagents = append(s.Subagents, s.Subagents[0])
+			s.Workload.SubagentProcessed += s.Subagents[0].ProcessedTokens
+			s.Workload.TotalProcessed += s.Subagents[0].ProcessedTokens
+			s.Workload.LinkedSubagents++
+		},
 		"v2 with subagents": func(r *IngestRecord) {
 			r.Schema, r.Methodology = IngestSchemaV2, IngestMethodologyV2
 		},

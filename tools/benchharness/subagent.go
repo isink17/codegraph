@@ -223,7 +223,7 @@ func linkSubagents(main *Transcript, subs []*agentFile, contamination bool) (che
 			queue = append(queue, node{child.res.AgentID, child.t, n.depth + 1})
 		}
 	}
-	for _, s := range subs {
+	for _, s := range slices.SortedFunc(slices.Values(subs), func(a, b *agentFile) int { return strings.Compare(a.res.AgentID, b.res.AgentID) }) {
 		if !s.done {
 			if s.res.DuplicateRequests, err = claim(s.t, false); err != nil {
 				return nil, 0, nil, err

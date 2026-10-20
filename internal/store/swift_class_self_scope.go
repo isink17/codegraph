@@ -9,6 +9,17 @@ import (
 	"github.com/isink17/codegraph/internal/graph"
 )
 
+// swiftDeclarationFactsBySymbol pre-aggregates declaration facts per symbol
+// (bind repo_id). swift_declaration_facts has no symbol_id index, so a direct
+// LEFT JOIN rescans every repo fact for each candidate row. Callers SUM the
+// counts so a symbol joined k times still reports k times its facts, exactly
+// as COUNT(d.id) over the direct join did.
+const swiftDeclarationFactsBySymbol = `(SELECT symbol_id,COUNT(*) AS facts,SUM(CASE WHEN is_final=1 THEN 1 ELSE 0 END) AS finals,MIN(dispatch_kind) AS dispatch_min,MAX(dispatch_kind) AS dispatch_max
+	FROM swift_declaration_facts WHERE repo_id=? GROUP BY symbol_id)`
+
+// swiftDeclarationFactsAggregates selects facts, finals, dispatch min and max from d.
+const swiftDeclarationFactsAggregates = `COALESCE(SUM(d.facts),0),COALESCE(SUM(d.finals),0),COALESCE(MIN(d.dispatch_min),''),COALESCE(MAX(d.dispatch_max),'')`
+
 type swiftClassSelfOwner struct {
 	id, file, facts, finals int64
 	qname, kind             string
@@ -193,9 +204,9 @@ func (s *Store) resolveSwiftClassSelf(ctx context.Context, q javaQuery, repoID i
 		return 0, err
 	}
 	var candidates []swiftScopeSymbol
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max,`+swiftDeclarationFactsAggregates+`
 		FROM symbols s JOIN tmp_swift_class_self_candidates c ON c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature) AND c.is_static=s.is_static
-		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+		JOIN files f ON f.id=s.file_id LEFT JOIN `+swiftDeclarationFactsBySymbol+` d ON d.symbol_id=s.id WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID, repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftScopeSymbol
 		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.kind, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
 			return err
@@ -509,9 +520,9 @@ func (s *Store) resolveSwiftClassSelfMultilevelInherited(ctx context.Context, q 
 	}
 	sort.Strings(methodNames)
 	var candidates []swiftInheritedSelfCandidate
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
-		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
-		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' AND s.name IN (`, "%s) GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max", []any{repoID}, stringSliceToAny(methodNames), true,
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,`+swiftDeclarationFactsAggregates+`
+		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN `+swiftDeclarationFactsBySymbol+` d ON d.symbol_id=s.id
+		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' AND s.name IN (`, "%s) GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max", []any{repoID, repoID}, stringSliceToAny(methodNames), true,
 		func(rows *sql.Rows) error {
 			var c swiftInheritedSelfCandidate
 			if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.visibility, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
@@ -846,11 +857,11 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalMethod(ctx context.Context, q
 		return 0, err
 	}
 	var candidates []swiftInheritedSelfCandidate
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,`+swiftDeclarationFactsAggregates+`
 		FROM symbols s JOIN tmp_swift_inherited_self_candidates c ON c.file_id=s.file_id AND c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature)
-		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
+		JOIN files f ON f.id=s.file_id LEFT JOIN `+swiftDeclarationFactsBySymbol+` d ON d.symbol_id=s.id
 		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function' AND s.is_static=0
-		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID, repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftInheritedSelfCandidate
 		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.visibility, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
 			return err
@@ -1080,11 +1091,11 @@ func (s *Store) resolveSwiftClassSelfInheritedStaticMethod(ctx context.Context, 
 		return 0, err
 	}
 	var candidates []swiftInheritedSelfCandidate
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,`+swiftDeclarationFactsAggregates+`
 		FROM symbols s JOIN tmp_swift_inherited_static_self_candidates c ON c.file_id=s.file_id AND c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature)
-		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
+		JOIN files f ON f.id=s.file_id LEFT JOIN `+swiftDeclarationFactsBySymbol+` d ON d.symbol_id=s.id
 		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function'
-		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID, repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftInheritedSelfCandidate
 		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.visibility, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
 			return err
@@ -1300,11 +1311,11 @@ func (s *Store) resolveSwiftClassSelfInheritedFinalClassMethod(ctx context.Conte
 		return 0, err
 	}
 	var candidates []swiftInheritedSelfCandidate
-	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,COUNT(d.id),COALESCE(SUM(CASE WHEN d.is_final=1 THEN 1 ELSE 0 END),0),COALESCE(MIN(d.dispatch_kind),''),COALESCE(MAX(d.dispatch_kind),'')
+	if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,`+swiftDeclarationFactsAggregates+`
 		FROM symbols s JOIN tmp_swift_inherited_final_class_candidates c ON c.file_id=s.file_id AND c.owner=s.container_name AND c.name=s.name AND (c.signature='' OR c.signature=s.signature)
-		JOIN files f ON f.id=s.file_id LEFT JOIN swift_declaration_facts d ON d.repo_id=s.repo_id AND d.symbol_id=s.id
+		JOIN files f ON f.id=s.file_id LEFT JOIN `+swiftDeclarationFactsBySymbol+` d ON d.symbol_id=s.id
 		WHERE s.repo_id=? AND s.language='swift' AND f.is_deleted=0 AND s.kind='function'
-		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID}, nil, false, func(rows *sql.Rows) error {
+		GROUP BY s.id,s.file_id,s.name,s.container_name,s.signature,s.visibility,s.kind,s.is_static,s.arity_min,s.arity_max`, "", []any{repoID, repoID}, nil, false, func(rows *sql.Rows) error {
 		var c swiftInheritedSelfCandidate
 		if err := rows.Scan(&c.id, &c.file, &c.name, &c.owner, &c.sig, &c.visibility, &c.static, &c.arityMin, &c.arityMax, &c.dispatchFacts, &c.finalFacts, &c.dispatchMin, &c.dispatchMax); err != nil {
 			return err
