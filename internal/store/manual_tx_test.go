@@ -55,7 +55,7 @@ func TestDirtyQueueCancelBeforeCommitRollsBack(t *testing.T) {
 			if armed.Load() {
 				t.Fatal("fault was never injected")
 			}
-			requireFreeConnection(t, s.db)
+			requireConnectionKept(t, s.db)
 			if got := dirtyRows(t, s, repoID); !slices.Equal(got, []string{"a.go:event"}) {
 				t.Fatalf("dirty rows = %q, want untouched", got)
 			}
@@ -140,10 +140,7 @@ func TestDirtyQueueFailedBeginKeepsConnection(t *testing.T) {
 			if _, err := tc.run(context.Background(), s, repoID); !errors.Is(err, fault.injected) {
 				t.Fatalf("err = %v, want the injected failure", err)
 			}
-			if n := s.db.Stats().OpenConnections; n != 1 {
-				t.Fatalf("open connections = %d, want the pooled connection kept", n)
-			}
-			requireFreeConnection(t, s.db)
+			requireConnectionKept(t, s.db)
 		})
 	}
 }

@@ -110,6 +110,16 @@ func requireFreeConnection(t *testing.T, db *sql.DB) {
 	}
 }
 
+// requireConnectionKept fails unless the transaction's connection was rolled
+// back and returned to the pool rather than discarded.
+func requireConnectionKept(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if n := db.Stats().OpenConnections; n != 1 {
+		t.Fatalf("open connections = %d, want the pooled connection kept", n)
+	}
+	requireFreeConnection(t, db)
+}
+
 func dirtyRows(t *testing.T, s *Store, repoID int64) []string {
 	t.Helper()
 	rows, err := s.db.QueryContext(context.Background(), `SELECT path || ':' || reason FROM dirty_files WHERE repo_id = ? ORDER BY path`, repoID)
@@ -214,7 +224,7 @@ func TestDirtyQueueBeginReportedFailedRollsBack(t *testing.T) {
 			if _, err := tc.run(ctx, s, repoID); !errors.Is(err, context.Canceled) {
 				t.Fatalf("err = %v, want context.Canceled", err)
 			}
-			requireFreeConnection(t, s.db)
+			requireConnectionKept(t, s.db)
 			if got := dirtyRows(t, s, repoID); !slices.Equal(got, []string{"a.go:event"}) {
 				t.Fatalf("dirty rows = %q, want untouched", got)
 			}
