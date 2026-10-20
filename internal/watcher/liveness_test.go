@@ -108,6 +108,40 @@ func TestWatcherLivenessLifecycle(t *testing.T) {
 	r.waitLiveWatcher(t, store.LiveWatcherWatching)
 }
 
+// A second watcher of one repository runs and flushes without the live lock
+// the first holds; once the first stops, other processes still see it, as
+// unverified with reconcile_pending, never as no watcher.
+func TestWatcherLivenessSecondWatcherAfterFirstStops(t *testing.T) {
+	first := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
+	first.waitState(t, StateWatching)
+	first.waitLiveWatcher(t, store.LiveWatcherWatching)
+	s, err := store.Open(first.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	second := &liveRepo{root: first.root, dbPath: first.dbPath, s: s, repoID: first.repoID}
+	second.start(t, indexer.New(s, parser.NewRegistry(goparser.New()), nil), 20*time.Millisecond)
+	second.waitState(t, StateWatching)
+
+	if err := first.stop(t); err != nil && err != context.Canceled {
+		t.Fatal(err)
+	}
+	f := second.externalFreshness(t)
+	if f.LiveWatcher != store.LiveWatcherUnverified || !slices.Contains(f.Reasons, "reconcile_pending") {
+		t.Fatalf("first stopped, second runs: live_watcher %s reasons %v", f.LiveWatcher, f.Reasons)
+	}
+	writeFile(t, filepath.Join(first.root, "added.go"), goFile)
+	second.waitLive(t, "second flushes", func(paths []string) bool { return slices.Contains(paths, "added.go") })
+
+	if err := second.stop(t); err != nil && err != context.Canceled {
+		t.Fatal(err)
+	}
+	if f := second.externalFreshness(t); f.LiveWatcher != store.LiveWatcherNone {
+		t.Fatalf("both stopped: %s", f.LiveWatcher)
+	}
+}
+
 // Two repositories in one database each report only their own watcher.
 func TestWatcherLivenessIsPerRepository(t *testing.T) {
 	r := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
