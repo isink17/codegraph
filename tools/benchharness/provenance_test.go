@@ -279,3 +279,122 @@ func TestIngestResultConflictOnlyFailsBaseline(t *testing.T) {
 		t.Fatalf("enabled arm accounting changed:\ngot  %+v %+v\nwant %+v %+v", got.Subagents, *got.Workload, want.Subagents, *want.Workload)
 	}
 }
+
+// File names sort "agent-a-b.jsonl" before "agent-a.jsonl"; unlinked files
+// must still own shared requests in agent id order.
+func TestUnlinkedSubagentsOwnInIDOrder(t *testing.T) {
+	line := func(id string) string {
+		return `{"agentId": "` + id + `", "isSidechain": true, "message": {"content": [{"text": "note", "type": "text"}], "id": "shared", "model": "claude-test-model-1", "role": "assistant", "usage": {"cache_creation_input_tokens": 40, "cache_read_input_tokens": 0, "input_tokens": 1, "output_tokens": 2}}, "type": "assistant", "version": "9.9.9-test"}` + "\n"
+	}
+	rec := ingestSubagents(t, copySubagentFixture(t, func(d string) {
+		for _, id := range []string{"a-b", "a"} {
+			if err := os.WriteFile(filepath.Join(d, "baseline-subagent-cg", "subagents", "agent-"+id+".jsonl"), []byte(line(id)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}, false), "")
+	var got []string
+	for _, a := range rec.Sessions[1].Subagents {
+		got = append(got, fmt.Sprintf("%s:%d/%d", a.AgentID, a.DuplicateRequests, a.ProcessedTokens))
+	}
+	if want := "a:0/41 a-b:1/0 eee:0/"; !strings.HasPrefix(strings.Join(got, " "), want) {
+		t.Fatalf("subagents %v, want prefix %q", got, want)
+	}
+
+	main, err := parse(t, asstLine("m0", false, 1, 0, 10, 1, `{"type":"text","text":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range [][]string{{"a-b", "a"}, {"a", "a-b"}} {
+		var subs []*agentFile
+		for _, id := range order {
+			subs = append(subs, &agentFile{res: SubagentResult{AgentID: id}, t: ownFile(t, asstLine("shared", true, 1, 0, 40, 2, `{"type":"tool_use","id":"cg-`+id+`","name":"mcp__codegraph__stats","input":{}}`))})
+		}
+		checked, _, threads, err := linkSubagents(main, subs, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var calls []string
+		for _, c := range sessionContamination(threads, checked).Calls {
+			calls = append(calls, c.Agent+":"+c.ToolUseID)
+		}
+		dups := map[string]int{}
+		for _, s := range subs {
+			dups[s.res.AgentID] = s.res.DuplicateRequests
+		}
+		if dups["a"] != 0 || dups["a-b"] != 1 || strings.Join(calls, " ") != "a:cg-a a-b:cg-a-b" {
+			t.Fatalf("input order %v: duplicates %v, calls %v", order, dups, calls)
+		}
+	}
+}
+
+func TestCrossFileUsageDedup(t *testing.T) {
+	spawn := `{"type":"tool_use","id":"tu1","name":"Agent","input":{}}`
+	for name, copyLine := range map[string]string{
+		"input":          asstLine("m0", true, 2, 0, 10, 1, spawn),
+		"cache read":     asstLine("m0", true, 1, 1, 10, 1, spawn),
+		"cache creation": asstLine("m0", true, 1, 0, 11, 1, spawn),
+	} {
+		main, err := parse(t, asstLine("m0", false, 1, 0, 10, 1, spawn), spawnResult("tu1", "x1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs := []*agentFile{{res: SubagentResult{AgentID: "x1"}, t: ownFile(t, copyLine)}}
+		if _, _, _, err := linkSubagents(main, subs, false); err == nil || !strings.Contains(err.Error(), "conflicting usage across transcript files") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	// output_tokens is a streamed snapshot: the owner keeps the largest.
+	main, err := parse(t, asstLine("m0", false, 1, 0, 10, 3, spawn), spawnResult("tu1", "x1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x1 := ownFile(t, asstLine("m0", true, 1, 0, 10, 9, spawn), asstLine("s1", true, 1, 0, 20, 4, `{"type":"text","text":"done"}`))
+	subs := []*agentFile{{res: SubagentResult{AgentID: "x1"}, t: x1}}
+	if _, _, _, err := linkSubagents(main, subs, false); err != nil {
+		t.Fatal(err)
+	}
+	if m, s := main.Metrics(), x1.Metrics(); m.OutputTokens != 9 || m.ProcessedTokens != 11 || s.OutputTokens != 4 || s.ProcessedTokens != 21 || subs[0].res.DuplicateRequests != 1 {
+		t.Fatalf("main %d/%d, x1 %d/%d dup %d", m.OutputTokens, m.ProcessedTokens, s.OutputTokens, s.ProcessedTokens, subs[0].res.DuplicateRequests)
+	}
+}
+
+func TestSidechainAgentCallIsNotLinkedToMain(t *testing.T) {
+	// An in-file sidechain agent, not main, spawned x1.
+	main, err := parse(t,
+		asstLine("m0", false, 1, 0, 10, 1, `{"type":"text","text":"hi"}`),
+		asstLine("s0", true, 1, 0, 30, 1, `{"type":"tool_use","id":"tu9","name":"Task","input":{}}`),
+		`{"type":"user","isSidechain":true,"toolUseResult":{"agentId":"x1"},"message":{"content":[{"type":"tool_result","tool_use_id":"tu9","content":"ok"}]}}`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subs := []*agentFile{{res: SubagentResult{AgentID: "x1"}, t: ownFile(t, asstLine("x", true, 1, 0, 5, 1, `{"type":"text","text":"x"}`))}}
+	c, unlinked := sessionCalls(t, main, subs...)
+	if subs[0].res.Parent != "" || subs[0].res.Depth != 0 || unlinked != 1 || len(c.Calls) != 1 || c.Calls[0].Agent != "sidechain" || c.Calls[0].Outcome != "unverified" {
+		t.Fatalf("x1 %+v, unlinked %d, calls %+v", subs[0].res, unlinked, c.Calls)
+	}
+
+	s := &SessionResult{SessionMetrics: main.Metrics(), Subagents: []SubagentResult{subs[0].res}}
+	s.Subagents[0].SessionMetrics = subs[0].t.Metrics()
+	if w := *workload(s, unlinked); w != (Workload{MainProcessed: 11, SubagentProcessed: 6, SidechainProcessed: 31, TotalProcessed: 48, UnlinkedSubagents: 1, UnlinkedAgentCalls: 1}) {
+		t.Fatalf("workload %+v", w)
+	}
+}
+
+func TestMultiResultEventDoesNotLink(t *testing.T) {
+	// toolUseResult cannot tell which of two results it belongs to.
+	main, err := parse(t,
+		asstLine("m0", false, 1, 0, 10, 1, `{"type":"tool_use","id":"tu1","name":"Agent","input":{}},{"type":"tool_use","id":"tu2","name":"Agent","input":{}}`),
+		`{"type":"user","toolUseResult":{"agentId":"x1"},"message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"},{"type":"tool_result","tool_use_id":"tu2","content":"ok"}]}}`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subs := []*agentFile{{res: SubagentResult{AgentID: "x1"}, t: ownFile(t, asstLine("x", true, 1, 0, 5, 1, `{"type":"text","text":"x"}`))}}
+	c, unlinked := sessionCalls(t, main, subs...)
+	if subs[0].res.Parent != "" || unlinked != 2 || len(c.Calls) != 2 || c.Calls[0].Outcome != "unverified" || c.Calls[1].Outcome != "unverified" {
+		t.Fatalf("x1 %+v, unlinked %d, calls %+v", subs[0].res, unlinked, c.Calls)
+	}
+}
