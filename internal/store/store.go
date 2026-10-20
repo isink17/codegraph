@@ -7258,9 +7258,11 @@ func (s *Store) resolveEdgeTargets(ctx context.Context, repoID int64, targets []
 		return outcome, err
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_kotlin_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		_ = tx.Rollback()
 		return outcome, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tmp_kotlin_scope_veto`); err != nil {
+		_ = tx.Rollback()
 		return outcome, err
 	}
 	for _, target := range targets {
@@ -8924,18 +8926,20 @@ func (s *Store) ClaimDirtyFiles(ctx context.Context, repoID int64, claimAt, clai
 	}
 	defer conn.Close()
 
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return nil, err
-	}
 	committed := false
 	defer func() {
 		if committed {
 			return
 		}
 		// Detached from ctx: a cancelled ctx would skip the ROLLBACK and hand
-		// the pooled connection back still inside the write transaction.
+		// the pooled connection back still inside the write transaction. It
+		// runs even when BEGIN reported an error, since a cancel can race a
+		// BEGIN that took effect; with no transaction open it fails harmlessly.
 		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
 	}()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
 
 	rows, err := conn.QueryContext(ctx, `SELECT path FROM dirty_files WHERE repo_id = ? ORDER BY queued_at`, repoID)
 	if err != nil {
@@ -8972,7 +8976,12 @@ func (s *Store) ClaimDirtyFiles(ctx context.Context, repoID int64, claimAt, clai
 		}
 	}
 
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Detached too: a cancel racing a COMMIT that took effect would report a
+	// failure for a claim that was kept.
+	if _, err := conn.ExecContext(context.WithoutCancel(ctx), `COMMIT`); err != nil {
 		return nil, err
 	}
 	committed = true
@@ -9040,18 +9049,20 @@ func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, er
 	}
 	defer conn.Close()
 
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return nil, err
-	}
 	committed := false
 	defer func() {
 		if committed {
 			return
 		}
 		// Detached from ctx: a cancelled ctx would skip the ROLLBACK and hand
-		// the pooled connection back still inside the write transaction.
+		// the pooled connection back still inside the write transaction. It
+		// runs even when BEGIN reported an error, since a cancel can race a
+		// BEGIN that took effect; with no transaction open it fails harmlessly.
 		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
 	}()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
 
 	rows, err := conn.QueryContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ? RETURNING path, queued_at`, repoID)
 	if err == nil {
@@ -9076,7 +9087,12 @@ func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, er
 		for i := range drainedRows {
 			out[i] = drainedRows[i].path
 		}
-		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Detached too: a cancel racing a COMMIT that took effect would report
+		// a failure for rows already deleted, losing them.
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), `COMMIT`); err != nil {
 			return nil, err
 		}
 		committed = true
@@ -9108,7 +9124,10 @@ func (s *Store) DrainDirtyFiles(ctx context.Context, repoID int64) ([]string, er
 	if _, err := conn.ExecContext(ctx, `DELETE FROM dirty_files WHERE repo_id = ?`, repoID); err != nil {
 		return nil, err
 	}
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(context.WithoutCancel(ctx), `COMMIT`); err != nil {
 		return nil, err
 	}
 	committed = true
