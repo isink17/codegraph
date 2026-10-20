@@ -332,3 +332,106 @@ func RenderGoInitializerEvidence(pf graph.ParsedFile) (locals, results, chained 
 	sort.Strings(chained)
 	return locals, results, chained
 }
+
+// GoSignatureSource exercises every declaration shape whose stored signature
+// both Go adapters must spell identically.
+const GoSignatureSource = `package sig
+
+import "io"
+
+type Celsius float64
+type Point struct{ X, Y int }
+type Reader interface{ Read(p []byte) (int, error) }
+type Grid [4][4]int
+type Handler func(w io.Writer, code int) error
+type Index map[string][]*Point
+type Feed <-chan Point
+type Paren (struct{})
+type Set[T comparable] map[T]struct{}
+type List[T any] struct{ items []T }
+
+func Plain() {}
+func Unnamed(int, string) {}
+func Grouped(a, b int, s string) {}
+func Variadic(format string, args ...any) {}
+func Single() error { return nil }
+func Multi() (int, error) { return 0, nil }
+func Named() (n int, err error) { return }
+func EmptyResults() () {}
+func Arrays(a [3]int, b [2 * 3]string, c [][2]byte) [8]uint8 { return [8]uint8{} }
+func Maps(m map[string]map[int]bool) map[Point]*Point { return nil }
+func Chans(in <-chan int, out chan<- string, both chan struct{}) {}
+func Funcs(f func(int) (string, error), g func()) func(...int) func() bool { return nil }
+func Literals(i interface{ Close() error }, s struct{ A int; B string }) interface{} { return nil }
+func Parens(p (*Point)) (r (int)) { return }
+func Qualified(w io.Writer, r *io.Reader) io.ReadCloser { return nil }
+func Map[K comparable, V any](m map[K]V, f func(V) V) map[K]V { return m }
+func Commented(a int /* first */, b string) {}
+func Wrapped(
+	a int,
+	b string,
+) (
+	int,
+	error,
+) {
+	return 0, nil
+}
+
+func (p Point) Value() int { return p.X }
+func (p *Point) Pointer(dx, dy int) {}
+func (*Point) Anonymous() {}
+func (l *List[T]) Push(v T) *List[T] { return l }
+func (s Set[T]) Has(v T) bool { return false }
+`
+
+// GoSignatures is every symbol signature GoSignatureSource yields, as
+// `kind qualified_name: signature`, sorted. Signatures are the declaration's
+// source text, so a function's type parameter list is not part of it; both
+// adapters omit it alike.
+var GoSignatures = []string{
+	"function sig.Arrays: func Arrays(a [3]int, b [2 * 3]string, c [][2]byte) [8]uint8",
+	"function sig.Chans: func Chans(in <-chan int, out chan<- string, both chan struct{})",
+	"function sig.Commented: func Commented(a int /* first */, b string)",
+	"function sig.EmptyResults: func EmptyResults() ()",
+	"function sig.Funcs: func Funcs(f func(int) (string, error), g func()) func(...int) func() bool",
+	"function sig.Grouped: func Grouped(a, b int, s string)",
+	"function sig.Literals: func Literals(i interface{ Close() error }, s struct{ A int; B string }) interface{}",
+	"function sig.Map: func Map(m map[K]V, f func(V) V) map[K]V",
+	"function sig.Maps: func Maps(m map[string]map[int]bool) map[Point]*Point",
+	"function sig.Multi: func Multi() (int, error)",
+	"function sig.Named: func Named() (n int, err error)",
+	"function sig.Parens: func Parens(p (*Point)) (r (int))",
+	"function sig.Plain: func Plain()",
+	"function sig.Qualified: func Qualified(w io.Writer, r *io.Reader) io.ReadCloser",
+	"function sig.Single: func Single() error",
+	"function sig.Unnamed: func Unnamed(int, string)",
+	"function sig.Variadic: func Variadic(format string, args ...any)",
+	"function sig.Wrapped: func Wrapped(\n\ta int,\n\tb string,\n) (\n\tint,\n\terror,\n)",
+	"method sig.List.Push: func (l *List[T]) Push(v T) *List[T]",
+	"method sig.Point.Anonymous: func (*Point) Anonymous()",
+	"method sig.Point.Pointer: func (p *Point) Pointer(dx, dy int)",
+	"method sig.Point.Value: func (p Point) Value() int",
+	"method sig.Set.Has: func (s Set[T]) Has(v T) bool",
+	"type sig.Celsius: float64",
+	"type sig.Feed: <-chan Point",
+	"type sig.Grid: [4][4]int",
+	"type sig.Handler: func(w io.Writer, code int) error",
+	"type sig.Index: map[string][]*Point",
+	"type sig.List: struct",
+	"type sig.Paren: (struct{})",
+	"type sig.Point: struct",
+	"type sig.Reader: interface",
+	"type sig.Set: map[T]struct{}",
+}
+
+// RenderGoSignatures renders a parse in the shape of GoSignatures.
+func RenderGoSignatures(pf graph.ParsedFile) []string {
+	var out []string
+	for _, s := range pf.Symbols {
+		if s.Kind != "value" {
+			out = append(out, s.Kind+" "+s.QualifiedName+": "+s.Signature)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
