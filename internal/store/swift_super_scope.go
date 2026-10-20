@@ -401,7 +401,7 @@ func swiftSuperExtensionTargetAncestryClosed(selectedOwner string, file int64, r
 }
 
 // swiftSuperCandidatesQuery (bind repo_id twice) aggregates facts per symbol first:
-// swift_declaration_facts has no symbol_id index, so a direct join rescans every fact per candidate.
+// swift_declaration_facts has no symbol_id index, so a direct join rescans the repo's facts per candidate.
 const swiftSuperCandidatesQuery = `SELECT s.id,s.file_id,s.container_name,s.name,s.signature,s.visibility,s.is_static,s.arity_min,s.arity_max,s.start_line,s.start_col,s.end_line,s.end_col,COALESCE(SUM(d.facts),0),COALESCE(MAX(d.dispatch_max),''),MAX(d.override_max),MAX(d.final_max)
 FROM symbols s JOIN files f ON f.id=s.file_id JOIN tmp_swift_super_candidates k ON k.owner=s.container_name AND k.name=s.name
 LEFT JOIN (SELECT symbol_id,COUNT(*) AS facts,MAX(dispatch_kind) AS dispatch_max,MAX(is_override) AS override_max,MAX(is_final) AS final_max
