@@ -594,6 +594,7 @@ func strictFreshness(status string, lastScanID int64, before, after graph.Freshn
 			insufficient = append(insufficient, "head_moved_during_full_scan")
 		case before.Worktree.HeadNow == "unknown":
 			unknown = append(unknown, "head_now_unknown")
+		// Only hand-built freshness data reaches this: head_moved already reads known_stale.
 		case full.HeadAtFinish != before.Worktree.HeadNow:
 			insufficient = append(insufficient, "head_moved_since_full_scan")
 		}

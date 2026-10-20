@@ -107,6 +107,22 @@ func TestFreshnessHeadFallsBackToWatermark(t *testing.T) {
 	expectHead(t, s, repoID, "full scan without HEAD", first, "git_history_watermark", false)
 }
 
+// With Git history absent there is no watermark, so a commit after a full
+// scan used to read head_changed "unknown"; the full scan's HEAD anchors it.
+func TestFreshnessHeadMovedWithoutHistory(t *testing.T) {
+	r := gittest.Init(t)
+	first := r.Commit("", "one")
+	s, repoID := freshnessStore(t, r.Dir)
+	id, started := scopedScan(t, s, repoID, ScanScopeFull, first)
+	if err := s.ReplaceGitHistory(context.Background(), repoID, githistory.State{Status: githistory.StatusAbsent}, []githistory.FileStats{}, nil, GitSymbolUpdate{}); err != nil {
+		t.Fatal(err)
+	}
+	completeScan(t, s, id, started, "completed", first)
+	expectHead(t, s, repoID, "full scan", first, "last_full_scan", false)
+	r.Commit("", "two")
+	expectHead(t, s, repoID, "commit", first, "last_full_scan", true)
+}
+
 func fileSum(t *testing.T, path string) [32]byte {
 	t.Helper()
 	b, err := os.ReadFile(path)

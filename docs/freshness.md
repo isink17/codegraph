@@ -192,6 +192,10 @@ reports ready, so starting a watcher costs one incremental `update`. Changes
 made while no watcher ran are found by that pass, not by events. A pass that is cancelled or crashes leaves `reconcile_pending`
 (and usually a `failed` scan row); the next start runs it again.
 
+A running watcher flushes only the paths it saw change, which never counts
+as a full scan, so after every commit freshness reads `stale_known` with
+`head_moved` until a full `codegraph update` or a watcher restart reconciles.
+
 `stats.state` is:
 
 | State | Meaning |
