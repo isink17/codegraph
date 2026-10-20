@@ -156,8 +156,8 @@ errors-49f8f61); none is a compile break.
 
 - **A reformatted signature is a changed declaration.** The signature is source
   text, so rewrapping a parameter or type parameter list or editing a comment
-  inside it gives the declaration a new identity and its callers are cited as retargeted, in both
-  builds. Not exercised by this corpus.
+  inside it gives the declaration a new identity and its callers are cited as
+  retargeted, in both builds. Not exercised by this corpus.
 
 - **Moves refused by the conservative file-context rule.** A cut and paste is
   paired only when the two files' headers are byte-equal and every differing

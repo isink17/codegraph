@@ -26,8 +26,8 @@ change lists but never change `risk`.
   signature, a changed type parameter or constraint included, is therefore a
   removed and an added declaration in either build, and so is a reformatted
   one. A type use is no resolved edge, so a changed generic type is reported
-  as uncertainty, not points. Results on pinned real repositories, with known false positives and
-  negatives, are in `docs/change-risk-verification.md`.
+  as uncertainty, not points. Results on pinned real repositories, with known
+  false positives and negatives, are in `docs/change-risk-verification.md`.
 
 ## Assessments
 
