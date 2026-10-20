@@ -81,7 +81,7 @@ func TestLinkNestedUnlinkedCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	subs := []*agentFile{{res: SubagentResult{AgentID: "x1"}, t: sub}}
-	checked, unlinked, threads, err := linkSubagents(main, subs)
+	checked, unlinked, threads, err := linkSubagents(main, subs, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func ownFile(t *testing.T, lines ...string) *Transcript {
 
 func sessionCalls(t *testing.T, main *Transcript, subs ...*agentFile) (Contamination, int) {
 	t.Helper()
-	checked, unlinked, threads, err := linkSubagents(main, subs)
+	checked, unlinked, threads, err := linkSubagents(main, subs, true)
 	if err != nil {
 		t.Fatal(err)
 	}

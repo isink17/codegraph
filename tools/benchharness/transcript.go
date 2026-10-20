@@ -519,6 +519,8 @@ func classifyUse(u toolUse) (kind, detail string) {
 	return "", ""
 }
 
+// Contamination checks one file without checkCopies; ingest goes through
+// linkSubagents, which rejects conflicting result copies first.
 func (t *Transcript) Contamination() Contamination {
 	return sessionContamination([]thread{{"main", t, false}, {"sidechain", t, true}}, nil)
 }
@@ -572,9 +574,14 @@ func callOutcome(kind string, results map[string]toolResult, id string) string {
 		return "unverified"
 	}
 	res, ok := results[id]
-	switch {
-	case !ok:
+	if !ok {
 		return "no_result"
+	}
+	return resultOutcome(res)
+}
+
+func resultOutcome(res toolResult) string {
+	switch {
 	case !res.IsError:
 		return "succeeded"
 	case blockedResult(res.Text):

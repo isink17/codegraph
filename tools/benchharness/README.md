@@ -166,9 +166,12 @@ in-file sidechain) is checked for:
   per `tool_use` id (main, linked subagents in spawn order, unlinked
   subagents, then in-file sidechains). A copy without a `tool_result` never
   overrides another copy's outcome; one with a result replaces `no_result`.
-  Copies of a CodeGraph attempt whose results differ (across files or within
-  one file) are an error, so ingest never picks one of them. `agent-*.jsonl` files whose id has characters outside
-  `[A-Za-z0-9_-]` are an error.
+  In an arm without CodeGraph, copies of a CodeGraph attempt whose results
+  differ (across files or within one file) are an error, so ingest never
+  picks one of them; an arm with CodeGraph enabled computes no contamination
+  and does not check them. In every arm, copies of a Task/Agent call that
+  name different agents are an error. `agent-*.jsonl` files whose id has
+  characters outside `[A-Za-z0-9_-]` are an error.
 
 Each attempt gets an outcome from its `tool_result`: `blocked` only for exact
 denial shapes (a result starting with `PreToolUse:<tool> hook error` or
