@@ -17,13 +17,18 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# Inherited GIT_* variables (GIT_DIR, GIT_INDEX_FILE, ...) and the user's or
+# system's git config (core.autocrlf, filters, hooks) would change what is
+# cloned and committed, so every git, codegraph and go command gets this env.
 # A fixed identity and date make every controlled commit SHA reproducible.
-COMMIT_ENV = {
+# main() points GIT_CONFIG_GLOBAL at an empty file in the work directory.
+ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+ENV.update({
     "GIT_AUTHOR_NAME": "corpus", "GIT_AUTHOR_EMAIL": "corpus@example.invalid",
     "GIT_COMMITTER_NAME": "corpus", "GIT_COMMITTER_EMAIL": "corpus@example.invalid",
     "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
-    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-}
+    "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+})
 
 
 def replace(path, old, new, count=1):
@@ -139,14 +144,14 @@ EDITS = {
 
 
 def run(cmd, cwd=None, env=None, check=True):
-    p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True)
+    p = subprocess.run(cmd, cwd=cwd, env=env or ENV, capture_output=True)
     if check and p.returncode != 0:
         raise SystemExit(f"{' '.join(cmd)}: rc={p.returncode}\n{p.stderr.decode(errors='replace')}")
     return p
 
 
-def git(repo, *args, env=None):
-    return run(["git", "-C", repo, *args], env=env).stdout.decode().strip()
+def git(repo, *args):
+    return run(["git", "-C", repo, *args]).stdout.decode().strip()
 
 
 def read_manifest():
@@ -199,12 +204,12 @@ def toolchain(work, repos, name, rev, cache):
         shutil.rmtree(dest)
     os.makedirs(dest)
     archive = run(["git", "-C", f"{work}/repos/{name}", "archive", commit]).stdout
-    subprocess.run(["tar", "-x", "-C", dest], input=archive, check=True)
+    subprocess.run(["tar", "-x", "-C", dest], input=archive, env=ENV, check=True)
     module = repos[name]["oracle_module"]
     if module and not os.path.exists(f"{dest}/go.mod"):
         with open(f"{dest}/go.mod", "w") as f:
             f.write(f"module {module}\n\ngo 1.13\n")
-    env = dict(os.environ, GOFLAGS="-mod=mod", GOWORK="off")
+    env = dict(ENV, GOFLAGS="-mod=mod", GOWORK="off")
     out = {"commit": commit}
     for step, cmd in [("build", ["go", "build", "./..."]), ("vet", ["go", "vet", "./..."]), ("test", ["go", "test", "-count=1", "./..."])]:
         if step == "test" and name == "codegraph":
@@ -239,9 +244,8 @@ def controlled_commit(work, case):
         EDITS[arg](edit)
     else:
         git(edit, "apply", os.path.join(HERE, "patches", arg))
-    env = dict(os.environ, **COMMIT_ENV)
-    git(edit, "add", "-A", env=env)
-    git(edit, "commit", "--quiet", "--no-verify", "-m", case["id"], env=env)
+    git(edit, "add", "-A")
+    git(edit, "commit", "--quiet", "--no-verify", "-m", case["id"])
     sha = git(edit, "rev-parse", "HEAD")
     git(f"{work}/repos/{name}", "fetch", "--quiet", edit, sha)
     return sha
@@ -314,7 +318,9 @@ def main():
         raise SystemExit(f"work directory must be empty: {work}")
     for sub in ("repos", "edit", "oracle", "results", "home"):
         os.makedirs(f"{work}/{sub}", exist_ok=True)
-    env = dict(os.environ, CODEGRAPH_HOME=f"{work}/home", CODEGRAPH_NO_UPDATE_CHECK="1")
+    ENV["GIT_CONFIG_GLOBAL"] = f"{work}/gitconfig"
+    open(ENV["GIT_CONFIG_GLOBAL"], "w").close()
+    env = dict(ENV, CODEGRAPH_HOME=f"{work}/home", CODEGRAPH_NO_UPDATE_CHECK="1")
     repos, cases = read_manifest()
     if a.case:
         cases = [c for c in cases if c["id"] in a.case]
