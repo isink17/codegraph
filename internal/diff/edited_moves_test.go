@@ -222,7 +222,8 @@ func TestCompareCommitsEditedMoves(t *testing.T) {
 					r.Write("p/b.go", "package p\n\nimport \"example.com/m/strings\"\n\nfunc A() string { return strings.ToUpper(\"a\") }\n\nfunc B() int { return 1 }\n")
 				})
 				d := got.Diff.DeclarationPairs
-				if len(d.Pairs) != 0 || !reflect.DeepEqual(goRefusals(d), []string{"p/a.go>p/b.go:" + refuseDeclContextChanged, "p/a.go>p/b.go:" + refuseDeclContextChanged}) {
+				// B spells no name the imports bind, so only A is refused.
+				if want := []string{"p/a.go>p/b.go:p.B"}; !reflect.DeepEqual(pairedPaths(d), want) || !reflect.DeepEqual(goRefusals(d), []string{"p/a.go>p/b.go:" + refuseDeclContextChanged}) || d.Refused[0].Declaration.QualifiedName != "p.A" {
 					t.Fatalf("declaration pairs = %s", canonical(d))
 				}
 			})
@@ -510,7 +511,7 @@ func TestCompareCommitsMovesBetweenKeptFiles(t *testing.T) {
 				{name: "moved into a file with other imports", change: func(r *gittest.Repo) {
 					r.Write("p/a.go", "package p\n\n"+fnB+"\n"+initFn)
 					r.Write("p/b.go", "package p\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\n"+fnC+"\n"+fnA+"\nvar _ = fmt.Sprint\n")
-				}, pairs: []string{}, refused: []string{"p/a.go>p/b.go:" + refuseDeclContextChanged}, retargets: 1},
+				}, pairs: []string{"p/a.go>p/b.go:p.A"}},
 				{name: "init moved", change: func(r *gittest.Repo) {
 					r.Write("p/a.go", strs+fnA+"\n"+fnB)
 					r.Write("p/b.go", strs+fnC+"\n"+initFn)
