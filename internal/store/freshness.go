@@ -294,6 +294,12 @@ func (s *Store) freshnessRows(ctx context.Context, repoID int64) (f graph.Freshn
 			f.Worktree.HeadAtIndexSource = "git_history_watermark"
 		}
 	}
+	// Every scan advances the watermark, path-scoped ones included, so it
+	// would hide a HEAD move that only part of the graph has caught up with.
+	if full := f.Coverage.LastFullScan; full != nil && full.HeadAtFinish != "" {
+		f.Worktree.HeadAtIndex = full.HeadAtFinish
+		f.Worktree.HeadAtIndexSource = "last_full_scan"
+	}
 	var marker int64
 	err = tx.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM settings WHERE key = ?`, reconcilePendingKey(repoID)).Scan(&marker)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {

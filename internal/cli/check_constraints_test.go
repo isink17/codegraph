@@ -242,7 +242,7 @@ func TestCheckConstraintsCLIStrictExitCodes(t *testing.T) {
 	opened.Close()
 
 	// A new commit indexed only path-scoped: the history watermark follows
-	// HEAD, but no full scan covers it, so strict exits 5.
+	// HEAD, but no full scan covers it, so HEAD reads as moved: strict exits 3.
 	repo.Write("internal/domain/a.go", "package domain\n\nimport \"example.com/m/internal/infra\"\n\nfunc A() { infra.B() }\n")
 	repo.Commit("", "two")
 	st, err := store.Open(dbPath)
@@ -254,7 +254,8 @@ func TestCheckConstraintsCLIStrictExitCodes(t *testing.T) {
 	}
 	st.Close()
 	out, res, code = checkCLI(t, "check_constraints", root, "--strict-freshness")
-	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictInsufficientCoverage || code != constraints.ExitInsufficientCoverage {
+	if res.Status != constraints.StatusViolations || res.Freshness == nil || res.Freshness.Verdict != constraints.VerdictKnownStale || code != constraints.ExitKnownStale ||
+		!slices.Contains(res.Freshness.Reasons, "head_moved") {
 		t.Fatalf("path-scoped only: status %s exit %d\n%s", res.Status, code, out)
 	}
 	if _, _, code := checkCLI(t, "check_constraints", root); code != 1 {
