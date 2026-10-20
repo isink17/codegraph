@@ -93,7 +93,7 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 		return nil, err
 	}
 	keepSnapshot = true
-	return &Store{db: db, cleanup: cleanup}, nil
+	return &Store{db: db, cleanup: cleanup, watchLockDB: dbPath}, nil
 }
 
 // FindRepo looks up a repository by root path without creating it.

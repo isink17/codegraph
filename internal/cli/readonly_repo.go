@@ -67,6 +67,7 @@ func openIndexedRepoReadOnly(ctx context.Context, cfg config.Config, repoRootCan
 		_ = s.Close()
 		return nil, err
 	}
+	s.SetParserProfiles(newDefaultRegistry().LanguageProfiles())
 	return &readOnlyRepo{Store: s, Repo: repo, Root: repoRoot, DBPath: dbPath}, nil
 }
 

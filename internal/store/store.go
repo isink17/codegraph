@@ -165,6 +165,9 @@ type Store struct {
 	// path is the database file; scan locks live beside it. Empty for stores
 	// built in tests without a file, which take no scan lock.
 	path string
+	// watchLockDB is the database whose watcher locks a read-only store,
+	// which serves a snapshot and has no path, probes.
+	watchLockDB string
 	// scanLocks holds the shared scan lock of each scan this store began and
 	// has not yet recorded as finished.
 	scanLockMu      sync.Mutex
@@ -172,9 +175,12 @@ type Store struct {
 	orphanScanLocks []*os.File
 	// resolverPolicies overrides resolverPolicyRegistry; nil outside tests.
 	resolverPolicies map[string]int
-	cleanup          func() error
-	cleanupOnce      sync.Once
-	cleanupErr       error
+	// parserProfiles is the reading binary's parser registry, which freshness
+	// compares stored provenance with; nil until SetParserProfiles.
+	parserProfiles atomic.Pointer[map[string]parser.Profile]
+	cleanup        func() error
+	cleanupOnce    sync.Once
+	cleanupErr     error
 	// neighborStmts counts the statements the batched context-neighbour
 	// pipeline issues. The number is the load-bearing property of P19 -- it must
 	// not grow with the seed count -- and wall-clock cannot prove that, so the

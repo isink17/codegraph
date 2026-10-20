@@ -595,10 +595,15 @@ type Freshness struct {
 	DirtyQueue        FreshnessDirtyQueue   `json:"dirty_queue"`
 	// Watcher is "not_in_this_process": the processes that answer graph_stats
 	// and stats never run a watcher, and no watcher liveness is persisted.
-	Watcher    string            `json:"watcher"`
-	Worktree   FreshnessWorktree `json:"worktree"`
-	Filesystem string            `json:"filesystem"`
-	Coverage   FreshnessCoverage `json:"coverage"`
+	Watcher string `json:"watcher"`
+	// LiveWatcher is what OS locks on this host prove about a watcher of this
+	// repository in any process: "watching", "unverified" (starting up or
+	// recovering), "none", or "unknown" when a lock could not be probed. A
+	// watcher on another host reads "none".
+	LiveWatcher string            `json:"live_watcher"`
+	Worktree    FreshnessWorktree `json:"worktree"`
+	Filesystem  string            `json:"filesystem"`
+	Coverage    FreshnessCoverage `json:"coverage"`
 	// ResolverPolicyPending lists languages whose edges an older resolver
 	// policy decided; nil when it cannot be read (see ResolverPolicy).
 	ResolverPolicyPending []string `json:"resolver_policy_pending"`
@@ -610,6 +615,29 @@ type Freshness struct {
 	// ParserProfile is "converged", "unconverged" or "unknown". It compares
 	// the stored files with each other, not with this binary's parsers.
 	ParserProfile string `json:"parser_profile"`
+	// ParserProfileCompatibility compares the stored profiles with the
+	// parsers of the binary reading them.
+	ParserProfileCompatibility FreshnessParserCompatibility `json:"parser_profile_compatibility"`
+}
+
+// FreshnessParserCompatibility is "current" when every stored profile is this
+// binary's, "obsolete" when some language holds an older version of this
+// binary's parser (the next scan reparses it), and "unknown" otherwise. Reason
+// explains State; Languages lists every language that is not current.
+type FreshnessParserCompatibility struct {
+	State     string                    `json:"state"`
+	Reason    string                    `json:"reason"`
+	Languages []FreshnessParserLanguage `json:"languages"`
+}
+
+type FreshnessParserLanguage struct {
+	Language string `json:"language"`
+	State    string `json:"state"`
+	Reason   string `json:"reason"`
+	// Stored lists the distinct stored profiles; "unknown" for files indexed
+	// before provenance was recorded.
+	Stored  []string `json:"stored_profiles"`
+	Current string   `json:"current_profile,omitempty"`
 }
 
 // FreshnessCoverage is the recorded evidence of whole-repository coverage. It

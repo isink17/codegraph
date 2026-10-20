@@ -52,11 +52,16 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 		}
 	}
 	f.ParserProfile = freshnessUnknown
+	f.ParserProfileCompatibility = graph.FreshnessParserCompatibility{State: freshnessUnknown, Reason: "provenance_unreadable", Languages: []graph.FreshnessParserLanguage{}}
 	if groups, err := s.FileParserProfileGroups(ctx, repoID); err == nil {
 		f.ParserProfileUnconverged = unconvergedParserProfiles(groups)
 		f.ParserProfile = "converged"
 		if len(f.ParserProfileUnconverged) > 0 {
 			f.ParserProfile = "unconverged"
+		}
+		f.ParserProfileCompatibility.Reason = "no_parser_registry"
+		if current := s.parserProfiles.Load(); current != nil {
+			f.ParserProfileCompatibility = parserProfileCompatibility(groups, *current)
 		}
 	}
 	f.Worktree.HeadNow = freshnessUnknown
@@ -89,11 +94,16 @@ func (s *Store) FreshnessStatus(ctx context.Context, repoID int64) (graph.Freshn
 	if f.Worktree.HeadChanged == "yes" {
 		f.Reasons = append(f.Reasons, "head_moved")
 	}
-	if reconcilePending || s.watcherUnverified(repoID) {
+	var unverified bool
+	f.LiveWatcher, unverified = s.watcherStatus(repoID)
+	if reconcilePending || unverified {
 		f.Reasons = append(f.Reasons, "reconcile_pending")
 	}
 	if len(f.ParserProfileUnconverged) > 0 {
 		f.Reasons = append(f.Reasons, "parser_profile_unconverged")
+	}
+	if f.ParserProfileCompatibility.State == parserCompatObsolete {
+		f.Reasons = append(f.Reasons, "parser_profile_obsolete")
 	}
 	switch {
 	case len(f.Reasons) > 0 && (f.LastCompletedScan != nil || len(f.Reasons) > 1):
