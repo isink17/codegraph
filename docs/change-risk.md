@@ -144,16 +144,42 @@ iota ... )` group, the group). It pairs only when:
   `//line`, `//export`, `//extern`) before it; its doc comment and its position
   may change,
 - its old file's (in base) and its new file's (in head) package clause,
-  imports (name and path, in any order), every
-  comment inside or on an import declaration (the cgo preamble, in or outside a
-  group), header comments, `//go:linkname` and `//go:cgo_*` directives wherever
-  they are, and directives that precede no declaration or an import are equal.
+  every comment inside or on an import declaration (the cgo preamble, in or
+  outside a group), header comments (build constraints included),
+  `//go:linkname` and `//go:cgo_*` directives wherever they are, and
+  directives that precede no declaration or an import are equal,
+- and their imports (name and path, in any order) are equal, or they differ
+  only where the declaration cannot see it (next section).
 
-The whole file context must be equal, so a cut and paste between two kept
-files whose imports differ is refused as `declaration_context_changed`, even
-when the declaration uses none of the differing imports: telling which imports
-a declaration names needs each import's package name, which the diff does not
-resolve.
+#### Imports that differ
+
+A cut and paste between files whose imports differ pairs only when every
+identifier the declaration spells binds the same thing in both files. An
+import both files have (same name and path) binds the same name in both. Each
+import only one file has must bind a name that can be proven and that the
+declaration never spells anywhere (not as a selector, a parameter, a local, a
+field or a type), so no spelled name can refer to it, be shadowed by a local
+that would otherwise refer to it, or collide with it. A name is proven when it
+is:
+
+- the import's explicit name (`y "gopkg.in/yaml.v3"`; `_` binds nothing),
+- for a package of the importing file's own module, the package clause every
+  indexed file of that import path declares (a package named apart from its
+  directory, `package other` in `w/`, binds `other`); files that disagree or
+  one that did not parse leave it unknown,
+- for a standard library path (first element without a dot, no `internal` or
+  `vendor` element, not provided by a module the `go.mod` requires or
+  replaces, no `go.work` in the repository), its last element when that is an
+  identifier and not a major version (`math/rand/v2` is unknown). A test checks
+  this rule against `go list std`.
+
+Anything else, a third-party default name (`gopkg.in/yaml.v3`,
+`github.com/x/go-thing`, a `/v2` path) included, is unknown and refuses. The
+pair is also refused when either file has a dot import or imports `"C"`, when
+either has a `//go:linkname` or `//go:cgo_*` directive, when the declaration
+has a `//go:embed`, or when any other part of the context differs. A blank
+import changes which packages initialize, which is the package's change, not
+the declaration's. Every such refusal is `declaration_context_changed`.
 
 A declaration found moved on both sides that fails one of these is listed
 under `refused` with the base declaration and the reason; one that moved on
@@ -165,7 +191,7 @@ one side only is not a move candidate and is not listed:
 | `declaration_embed_unproven` | A `//go:embed` before or inside the declaration cannot be shown to embed the same bytes (see below). |
 | `declaration_not_unique` | The identity occurs more than once in the package on either side. |
 | `declaration_content_unavailable` | A file could not be read back from Git, its bytes differ from the indexed ones, it does not parse, or the declaration does not map to exactly one top-level declaration that shares no line with another. |
-| `declaration_context_changed` | The file's package clause, imports, import comments, header comments, linkname or cgo directives, or unattached directives differ. |
+| `declaration_context_changed` | The file's package clause, import comments, header comments, linkname or cgo directives, or unattached directives differ, or its imports differ in a way the declaration may see (see [Imports that differ](#imports-that-differ)). |
 | `declaration_content_changed` | The declaration's bytes or the directives before it differ. |
 
 The module refusals of the table above (`workspace_uncertain`,
