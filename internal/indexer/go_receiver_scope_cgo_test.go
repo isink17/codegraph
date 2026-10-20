@@ -24,3 +24,19 @@ func TestGoReceiverThroughFunctionResultTreeSitter(t *testing.T) {
 func TestGoPackageIdentityIndexAndUpdateParityTreeSitter(t *testing.T) {
 	runGoPackageIdentityParity(t, parser.NewRegistry(tsparser.NewGo()))
 }
+
+func TestGoSignatureProfileUpgradeTreeSitter(t *testing.T) {
+	runGoSignatureProfileUpgrade(t, parser.NewRegistry(tsparser.NewGo()), "treesitter:go:v3", "treesitter:go:v4")
+}
+
+// Both Go parser families store the same declarations for the same tree, so a
+// cgo and a non-cgo index differ only in the recorded parser profile.
+func TestGoSignatureFamilyParity(t *testing.T) {
+	declarations := func(reg *parser.Registry) string {
+		g, _ := newGoRepo(t, reg, goSignatureProfileFiles).semanticJSON(t)
+		return canonicalJSON(g.Declarations)
+	}
+	if a, b := declarations(goNativeRegistry()), declarations(parser.NewRegistry(tsparser.NewGo())); a != b {
+		t.Fatalf("declarations differ:\n go/ast:      %s\n tree-sitter: %s", a, b)
+	}
+}

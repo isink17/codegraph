@@ -349,6 +349,12 @@ type Feed <-chan Point
 type Paren (struct{})
 type Set[T comparable] map[T]struct{}
 type List[T any] struct{ items []T }
+type Pair[K comparable, V any] struct{}
+type Number interface{ ~int | ~float64 }
+type Tree[T interface{ ~int | ~string }] []T
+const n = 2
+type Vec [n]int
+type Sized [2 * n]int
 
 func Plain() {}
 func Unnamed(int, string) {}
@@ -367,6 +373,14 @@ func Parens(p (*Point)) (r (int)) { return }
 func Qualified(w io.Writer, r *io.Reader) io.ReadCloser { return nil }
 func Map[K comparable, V any](m map[K]V, f func(V) V) map[K]V { return m }
 func Commented(a int /* first */, b string) {}
+func Ordered[T ~int | ~int64 | ~string](a, b T) bool { return a < b }
+func Constrained[S ~[]E, E comparable](s S, v E) int { return 0 }
+func Ptr[P *E, E any](p P) {}
+func Iface[T interface{ String() string }](v T) string { return "" }
+func WrappedTypes[
+	K comparable,
+	V Number,
+](m map[K]V) {}
 func Wrapped(
 	a int,
 	b string,
@@ -386,27 +400,31 @@ func (s Set[T]) Has(v T) bool { return false }
 
 // GoSignatures is every symbol signature GoSignatureSource yields, as
 // `kind qualified_name: signature`, sorted. Signatures are the declaration's
-// source text, so a function's type parameter list is not part of it; both
-// adapters omit it alike.
+// source text, type parameter lists included.
 var GoSignatures = []string{
 	"function sig.Arrays: func Arrays(a [3]int, b [2 * 3]string, c [][2]byte) [8]uint8",
 	"function sig.Chans: func Chans(in <-chan int, out chan<- string, both chan struct{})",
 	"function sig.Commented: func Commented(a int /* first */, b string)",
+	"function sig.Constrained: func Constrained[S ~[]E, E comparable](s S, v E) int",
 	"function sig.EmptyResults: func EmptyResults() ()",
 	"function sig.Funcs: func Funcs(f func(int) (string, error), g func()) func(...int) func() bool",
 	"function sig.Grouped: func Grouped(a, b int, s string)",
+	"function sig.Iface: func Iface[T interface{ String() string }](v T) string",
 	"function sig.Literals: func Literals(i interface{ Close() error }, s struct{ A int; B string }) interface{}",
-	"function sig.Map: func Map(m map[K]V, f func(V) V) map[K]V",
+	"function sig.Map: func Map[K comparable, V any](m map[K]V, f func(V) V) map[K]V",
 	"function sig.Maps: func Maps(m map[string]map[int]bool) map[Point]*Point",
 	"function sig.Multi: func Multi() (int, error)",
 	"function sig.Named: func Named() (n int, err error)",
+	"function sig.Ordered: func Ordered[T ~int | ~int64 | ~string](a, b T) bool",
 	"function sig.Parens: func Parens(p (*Point)) (r (int))",
 	"function sig.Plain: func Plain()",
+	"function sig.Ptr: func Ptr[P *E, E any](p P)",
 	"function sig.Qualified: func Qualified(w io.Writer, r *io.Reader) io.ReadCloser",
 	"function sig.Single: func Single() error",
 	"function sig.Unnamed: func Unnamed(int, string)",
 	"function sig.Variadic: func Variadic(format string, args ...any)",
 	"function sig.Wrapped: func Wrapped(\n\ta int,\n\tb string,\n) (\n\tint,\n\terror,\n)",
+	"function sig.WrappedTypes: func WrappedTypes[\n\tK comparable,\n\tV Number,\n](m map[K]V)",
 	"method sig.List.Push: func (l *List[T]) Push(v T) *List[T]",
 	"method sig.Point.Anonymous: func (*Point) Anonymous()",
 	"method sig.Point.Pointer: func (p *Point) Pointer(dx, dy int)",
@@ -417,11 +435,16 @@ var GoSignatures = []string{
 	"type sig.Grid: [4][4]int",
 	"type sig.Handler: func(w io.Writer, code int) error",
 	"type sig.Index: map[string][]*Point",
-	"type sig.List: struct",
+	"type sig.List: [T any] struct",
+	"type sig.Number: interface",
+	"type sig.Pair: [K comparable, V any] struct",
 	"type sig.Paren: (struct{})",
 	"type sig.Point: struct",
 	"type sig.Reader: interface",
-	"type sig.Set: map[T]struct{}",
+	"type sig.Set: [T comparable] map[T]struct{}",
+	"type sig.Sized: [2 * n]int",
+	"type sig.Tree: [T interface{ ~int | ~string }] []T",
+	"type sig.Vec: [n]int",
 }
 
 // RenderGoSignatures renders a parse in the shape of GoSignatures.

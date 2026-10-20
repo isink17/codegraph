@@ -6,27 +6,40 @@ import (
 	"testing"
 
 	"github.com/isink17/codegraph/internal/parser"
+	"github.com/isink17/codegraph/internal/store"
 )
 
-// An index whose Go signatures were written by the previous go-ast profile is
+var goSignatureProfileFiles = map[string]string{
+	"go.mod": "module example.com/m\n\ngo 1.22\n",
+	"p/a.go": "package p\n\ntype Box[T comparable] struct{ v T }\n\nfunc A[K comparable, V ~int | ~string](n int, s ...string) (string, error) { return \"\", nil }\n",
+	"p/b.go": "package p\n\nfunc B() { _, _ = A[int, int](1) }\n",
+}
+
+// The signatures the previous profile of either Go parser family stored for
+// goSignatureProfileFiles: no type parameter lists.
+var goSignaturesWithoutTypeParams = map[string]string{
+	"p.A":   "func A(n int, s ...string) (string, error)",
+	"p.Box": "struct",
+}
+
+func TestGoSignatureProfileUpgrade(t *testing.T) {
+	runGoSignatureProfileUpgrade(t, goNativeRegistry(), "go-ast:go:v4", "go-ast:go:v5")
+}
+
+// An index whose Go signatures were written by the previous profile is
 // reported obsolete, and even a path-scoped update reparses every Go file into
 // the fresh index's graph, so no mixed-profile graph is left behind.
-func TestGoSignatureProfileUpgrade(t *testing.T) {
-	reg := goNativeRegistry()
-	files := map[string]string{
-		"go.mod": "module example.com/m\n\ngo 1.22\n",
-		"p/a.go": "package p\n\nfunc A(n int, s ...string) (string, error) { return \"\", nil }\n",
-		"p/b.go": "package p\n\nfunc B() { _, _ = A(1) }\n",
+func runGoSignatureProfileUpgrade(t *testing.T, reg *parser.Registry, previous, current string) {
+	t.Helper()
+	files := map[string]string{}
+	for k, v := range goSignatureProfileFiles {
+		files[k] = v
 	}
 	r := newGoRepo(t, reg, files)
 	r.store.SetParserProfiles(reg.LanguageProfiles())
 	fresh, freshJSON := r.semanticJSON(t)
-	sigs := map[string]string{}
-	for _, d := range fresh.Declarations {
-		sigs[d.QualifiedName] = d.Signature
-	}
-	if got := sigs["p.A"]; got != "func A(n int, s ...string) (string, error)" {
-		t.Fatalf("fresh signature = %q", got)
+	if got := goSignatureSet(fresh); got != "p.A: func A[K comparable, V ~int | ~string](n int, s ...string) (string, error)|p.Box: [T comparable] struct|p.B: func B()" {
+		t.Fatalf("fresh signatures = %s", got)
 	}
 
 	db, err := sql.Open("sqlite", r.dbPath)
@@ -34,20 +47,20 @@ func TestGoSignatureProfileUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for _, stmt := range []string{
-		`UPDATE symbols SET signature='func ' || name || '*ast.FuncType' WHERE language='go' AND kind='function'`,
-		`UPDATE files SET parser_profile='go-ast:go:v3' WHERE language='go'`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("%s: %v", stmt, err)
+	for name, sig := range goSignaturesWithoutTypeParams {
+		if _, err := db.Exec(`UPDATE symbols SET signature=? WHERE language='go' AND qualified_name=?`, sig, name); err != nil {
+			t.Fatal(err)
 		}
+	}
+	if _, err := db.Exec(`UPDATE files SET parser_profile=? WHERE language='go'`, previous); err != nil {
+		t.Fatal(err)
 	}
 	f, err := r.store.FreshnessStatus(r.ctx, r.repoID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c := f.ParserProfileCompatibility; c.State != "obsolete" || c.Reason != "older_version" || len(c.Languages) != 1 ||
-		strings.Join(c.Languages[0].Stored, ",") != "go-ast:go:v3" || c.Languages[0].Current != "go-ast:go:v4" {
+		strings.Join(c.Languages[0].Stored, ",") != previous || c.Languages[0].Current != current {
 		t.Fatalf("older index compatibility = %+v", c)
 	}
 
@@ -68,27 +81,52 @@ func TestGoSignatureProfileUpgrade(t *testing.T) {
 		t.Fatalf("second update = %+v, %v; want a no-op", again, err)
 	}
 
-	edited := "package p\n\nfunc A(n int64, s []string) string { return \"\" }\n"
+	edited := "package p\n\ntype Box[T any] struct{ v T }\n\nfunc A[K comparable, V any](n int, s ...string) (string, error) { return \"\", nil }\n"
 	r.write(t, "p/a.go", edited)
 	if _, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update", Paths: []string{"p/a.go"}}); err != nil {
 		t.Fatal(err)
 	}
-	_, incremental := r.semanticJSON(t)
+	g, incremental := r.semanticJSON(t)
 	files["p/a.go"] = edited
 	_, reindexed := newGoRepo(t, reg, files).semanticJSON(t)
 	if incremental != reindexed {
 		t.Fatalf("incremental update differs from a fresh index:\n got %s\nwant %s", incremental, reindexed)
 	}
-	if !strings.Contains(incremental, `"func A(n int64, s []string) string"`) {
-		t.Fatalf("edited signature not stored: %s", incremental)
+	if got := goSignatureSet(g); got != "p.A: func A[K comparable, V any](n int, s ...string) (string, error)|p.Box: [T any] struct|p.B: func B()" {
+		t.Fatalf("edited signatures = %s", got)
+	}
+
+	// An index a newer build wrote is not claimed as current or older, and an
+	// update reparses it into this build's graph rather than keeping its rows.
+	newer := previous[:strings.LastIndexByte(previous, ':')] + ":v99"
+	if _, err := db.Exec(`UPDATE files SET parser_profile=? WHERE language='go'`, newer); err != nil {
+		t.Fatal(err)
+	}
+	if f, err = r.store.FreshnessStatus(r.ctx, r.repoID); err != nil || f.ParserProfileCompatibility.Reason != "newer_version" {
+		t.Fatalf("newer index compatibility = %+v, %v", f.ParserProfileCompatibility, err)
+	}
+	if _, err := r.idx.Update(r.ctx, Options{RepoRoot: r.root, ScanKind: "update", Paths: []string{"p/b.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, got := r.semanticJSON(t); got != reindexed {
+		t.Fatalf("index after a newer build differs from a fresh one:\n got %s\nwant %s", got, reindexed)
 	}
 }
 
-// The signature fix changes the go-ast profile ID only. Both Go parser
-// families keep one semantic epoch, so switching between a cgo and a non-cgo
-// build is never refused as a semantic downgrade.
+func goSignatureSet(g store.SemanticGraph) string {
+	var out []string
+	for _, d := range g.Declarations {
+		if d.Language == "go" {
+			out = append(out, d.QualifiedName+": "+d.Signature)
+		}
+	}
+	return strings.Join(out, "|")
+}
+
+// Both Go parser families keep one semantic epoch, so switching between a cgo
+// and a non-cgo build is never refused as a semantic downgrade.
 func TestGoParserFamiliesShareSemanticEpoch(t *testing.T) {
-	if a, b := parser.SemanticEpochForProfile("go-ast:go:v4"), parser.SemanticEpochForProfile("treesitter:go:v3"); a == 0 || a != b {
+	if a, b := parser.SemanticEpochForProfile("go-ast:go:v5"), parser.SemanticEpochForProfile("treesitter:go:v4"); a == 0 || a != b {
 		t.Fatalf("go-ast epoch %d, tree-sitter epoch %d", a, b)
 	}
 }
