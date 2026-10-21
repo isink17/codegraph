@@ -292,7 +292,7 @@ have removed.
 | `changed_file_without_semantic_coverage` | A changed file has no recognized language, so nothing in it is in the graph. |
 | `changed_file_jvm_scope_unknown` | A changed Java, Kotlin or Scala file while the JVM compilation scope is unknown. |
 | `comparison_limitation` | Any other limitation from `comparison.limitations`. |
-| `go_declaration_change_unmodeled` | A modified Go file changed a top-level declaration outside function bodies (a struct field, an interface method, a constant's or variable's type or value) and no declaration change of the diff falls inside it, so the graph has nothing to cite (`identity` is the file, `detail` the declaration: `type Base`, `const Limit`, `func (*T) M`). Comments, formatting and trailing commas are ignored; function bodies are left to the edge comparison. |
+| `go_declaration_change_unmodeled` | A modified Go file changed a top-level declaration outside function bodies (a struct field, an interface method, a constant's or variable's type or value) and no declaration change of the diff falls inside it, so the graph has nothing to cite (`identity` is the file, `detail` the declaration: `type Base`, `const Limit`, `func (*T) M`). Comments, formatting and trailing commas are ignored; bodies of `func` declarations are left to the edge comparison, while a function literal in a variable's value is part of that value. |
 | `go_declaration_shape_unavailable` | A modified Go file could not be read or parsed with `go/parser` on one side, so unmodeled declaration changes in it cannot be ruled out. |
 
 ## CI gate

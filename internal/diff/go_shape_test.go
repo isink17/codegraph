@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -171,5 +172,35 @@ func TestGoShapesKeysAndNormalization(t *testing.T) {
 	}
 	if _, ok := goShapes([]byte("package p\nfunc {")); ok {
 		t.Fatal("broken source parsed")
+	}
+}
+
+func TestGoUnmodeledReportsUnreadableSource(t *testing.T) {
+	src := []byte("package p\n\ntype T struct{ A int }\n")
+	file := func(b []byte) json.RawMessage {
+		raw, _ := json.Marshal(SourceFile{Path: "p/a.go", ContentHash: sha256Hex(b), Language: "go"})
+		return raw
+	}
+	head := []byte("package p\n\ntype T struct{ A string }\n")
+	changes := []Change{{Kind: "file_modified", Identity: "p/a.go", Before: file(src), After: file(head)}}
+	read := func(b []byte) func(string) ([]byte, bool) { return func(string) ([]byte, bool) { return b, true } }
+	broken := []byte("package p\n\ntype T struct{\n")
+	for name, h := range map[string]Revision{"nil source": {}, "unparsable": {source: read(broken)}} {
+		changes[0].After = file(broken)
+		if name == "nil source" {
+			changes[0].After = file(head)
+		}
+		got := goUnmodeledUncertainty(changes, Revision{source: read(src)}, h, nil)
+		if len(got) != 1 || got[0].Reason != "go_declaration_shape_unavailable" || got[0].Identity != "p/a.go" {
+			t.Fatalf("%s: %+v", name, got)
+		}
+	}
+	got := goUnmodeledUncertainty(changes[:0:0], Revision{}, Revision{}, nil)
+	if len(got) != 0 {
+		t.Fatalf("no changes: %+v", got)
+	}
+	changes[0].After = file(head)
+	if got := goUnmodeledUncertainty(changes, Revision{source: read(src)}, Revision{source: read(head)}, nil); len(got) != 1 || got[0].Detail != "type T" {
+		t.Fatalf("readable: %+v", got)
 	}
 }

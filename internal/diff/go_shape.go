@@ -132,7 +132,7 @@ func goTokens(src []byte) string {
 // removed or changed: struct fields, interface methods, constant values and
 // types are no declarations of their own, so such a change would otherwise
 // look like no change at all. An added declaration models nothing about the
-// base one. Function bodies are left to the edge comparison.
+// base one. Bodies of func declarations are left to the edge comparison.
 func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete map[string]bool) []RiskUncertainty {
 	var modeled []store.SemanticDeclaration
 	for _, c := range changes {
