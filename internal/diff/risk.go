@@ -145,10 +145,11 @@ func RiskLevel(score int) string {
 	return RiskLevelNone
 }
 
-func assessRisk(changes []Change, cov Coverage, lims []string, baseDecls, headDecls []store.SemanticDeclaration, baseEdges, headEdges []store.SemanticEdge, pairs DeclarationPairs) Risk {
+func assessRisk(changes []Change, cov Coverage, lims []string, unmodeled []RiskUncertainty, baseDecls, headDecls []store.SemanticDeclaration, baseEdges, headEdges []store.SemanticEdge, pairs DeclarationPairs) Risk {
 	r := Risk{Model: RiskModel, ScoreKind: RiskScoreKind, Uncertainty: []RiskUncertainty{}, RemovedDeclarationDependents: []RemovedDeclarationDependents{}}
 	found := map[string][]RiskEvidence{}
 	r.Uncertainty = append(r.Uncertainty, limitationUncertainty(changes, lims)...)
+	r.Uncertainty = append(r.Uncertainty, unmodeled...)
 	if cov.Symbols.State == CoverageUnavailable || cov.Edges.State == CoverageUnavailable {
 		r.Assessment, r.Level = AssessmentInsufficientEvidence, RiskLevelUnknown
 		r.Coverage = SectionCoverage{State: CoverageUnavailable, Reason: "removed declarations or edges were not compared"}
