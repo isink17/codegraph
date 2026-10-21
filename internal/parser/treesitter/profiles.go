@@ -13,9 +13,11 @@ import "github.com/isink17/codegraph/internal/parser"
 // records the package clause and build constraint. v4 adds the type parameter
 // list to function and type signatures. v5 records a non-generic type alias
 // (`type A = B`) as a type symbol, as go/ast always did, and prefixes every
-// alias's signature with `= `.
+// alias's signature with `= `. v6 records every name of a multi-name var or
+// const spec (`var a, b int`), not only the first, and no longer records a var
+// or const declared in a function literal that initializes a package value.
 func (a *GoAdapter) Profile() parser.Profile {
-	return parser.NewProfile("go", "treesitter:go:v5", true)
+	return parser.NewProfile("go", "treesitter:go:v6", true)
 }
 
 // HCL v2 reads references inside operators. Its relationship graph is its
