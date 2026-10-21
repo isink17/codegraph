@@ -103,10 +103,7 @@ func (a *GoAdapter) Parse(ctx context.Context, path string, content []byte) (gra
 	// ---- value declarations (var/const) ----
 	for _, kind := range []string{"var_declaration", "const_declaration"} {
 		for _, decl := range findChildren(root, kind) {
-			for _, spec := range findDescendants(decl, "var_spec") {
-				goAddValueSymbols(&pf, spec, pkgName, content)
-			}
-			for _, spec := range findDescendants(decl, "const_spec") {
+			for _, spec := range goValueSpecs(decl) {
 				goAddValueSymbols(&pf, spec, pkgName, content)
 			}
 		}
@@ -273,39 +270,44 @@ func goIsTypeAlias(typeSpec *sitter.Node, content []byte) bool {
 	return false
 }
 
-func goAddValueSymbols(pf *graph.ParsedFile, spec *sitter.Node, pkg string, content []byte) {
-	nameNode := childByFieldName(spec, "name")
-	if nameNode == nil {
-		// Multiple names: iterate children looking for identifiers
-		for i := 0; i < int(spec.ChildCount()); i++ {
-			c := spec.Child(i)
-			if c.Type() == "identifier" {
-				name := nodeText(c, content)
-				pf.Symbols = append(pf.Symbols, graph.Symbol{
-					Language:      "go",
-					Kind:          "value",
-					Name:          name,
-					QualifiedName: pkg + "." + name,
-					ContainerName: pkg,
-					Visibility:    goVisibility(name),
-					Range:         nodeRange(c),
-					StableKey:     "value:" + pkg + ":" + name,
-				})
-			}
+// goValueSpecs returns a declaration's var and const specs, leaving out those
+// inside a function literal in an initializer: they declare locals.
+func goValueSpecs(decl *sitter.Node) []*sitter.Node {
+	var out []*sitter.Node
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		switch n.Type() {
+		case "func_literal":
+			return
+		case "var_spec", "const_spec":
+			out = append(out, n)
 		}
-		return
+		for i := range int(n.ChildCount()) {
+			walk(n.Child(i))
+		}
 	}
-	name := nodeText(nameNode, content)
-	pf.Symbols = append(pf.Symbols, graph.Symbol{
-		Language:      "go",
-		Kind:          "value",
-		Name:          name,
-		QualifiedName: pkg + "." + name,
-		ContainerName: pkg,
-		Visibility:    goVisibility(name),
-		Range:         nodeRange(nameNode),
-		StableKey:     "value:" + pkg + ":" + name,
-	})
+	walk(decl)
+	return out
+}
+
+func goAddValueSymbols(pf *graph.ParsedFile, spec *sitter.Node, pkg string, content []byte) {
+	for i := range int(spec.ChildCount()) {
+		c := spec.Child(i)
+		if c.Type() != "identifier" || spec.FieldNameForChild(i) != "name" {
+			continue
+		}
+		name := nodeText(c, content)
+		pf.Symbols = append(pf.Symbols, graph.Symbol{
+			Language:      "go",
+			Kind:          "value",
+			Name:          name,
+			QualifiedName: pkg + "." + name,
+			ContainerName: pkg,
+			Visibility:    goVisibility(name),
+			Range:         nodeRange(c),
+			StableKey:     "value:" + pkg + ":" + name,
+		})
+	}
 }
 
 func goFuncSignature(fn *sitter.Node, content []byte) string {

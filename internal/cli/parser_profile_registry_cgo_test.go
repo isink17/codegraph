@@ -51,7 +51,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:cpp:v2"
 		}
 		if lang.Language == "go" {
-			want = "treesitter:go:v5"
+			want = "treesitter:go:v6"
 		}
 		if lang.Language == "dart" {
 			want = "treesitter:dart:v3"
