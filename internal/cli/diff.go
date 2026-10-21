@@ -26,6 +26,7 @@ const (
 type diffGate struct {
 	threshold        int
 	failInsufficient bool
+	failUncertainty  bool
 }
 
 func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error {
@@ -36,6 +37,7 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	offset := fs.Int("offset", 0, "offset into the deterministic change list")
 	failOnRisk := fs.String("fail-on-risk", "", "fail when the risk score reaches a score 1..100 or a level: low, medium, high")
 	insufficient := fs.String("insufficient-evidence", "", "with --fail-on-risk: fail (default) or pass when risk cannot be assessed")
+	fs.Bool("fail-on-uncertainty", false, "fail when the result is limited_evidence with explicit uncertainty")
 	valueFlags := map[string]bool{"--repo-root": true, "--limit": true, "--offset": true, "--fail-on-risk": true, "--insufficient-evidence": true}
 	var positional, flags []string
 	flagName := func(arg string) string {
@@ -45,10 +47,10 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	// Invalid input exits 2 once a gate is requested anywhere on the line.
 	gated := false
 	for _, a := range args {
-		gated = gated || strings.HasPrefix(a, "-") && flagName(a) == "--fail-on-risk"
+		gated = gated || strings.HasPrefix(a, "-") && (flagName(a) == "--fail-on-risk" || flagName(a) == "--fail-on-uncertainty")
 	}
 	seen := map[string]bool{}
-	gateFlags := map[string]bool{"--fail-on-risk": true, "--insufficient-evidence": true}
+	gateFlags := map[string]bool{"--fail-on-risk": true, "--insufficient-evidence": true, "--fail-on-uncertainty": true}
 	for i := 0; i < len(args); i++ {
 		if !strings.HasPrefix(args[i], "-") {
 			positional = append(positional, args[i])
@@ -73,7 +75,7 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	if err := fs.Parse(flags); err != nil {
 		return diffUsageError(gated, err)
 	}
-	gate, err := parseDiffGate(gated, *failOnRisk, seen["--insufficient-evidence"], *insufficient)
+	gate, err := parseDiffGate(gated, *failOnRisk, seen["--insufficient-evidence"], *insufficient, seen["--fail-on-uncertainty"])
 	if err != nil {
 		return diffUsageError(gated, err)
 	}
@@ -93,7 +95,7 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	if err := enc.Encode(res); err != nil {
 		return diffUsageError(gated, err)
 	}
-	if gate.threshold == 0 {
+	if gate.threshold == 0 && !gate.failUncertainty {
 		return nil
 	}
 	code, verdict := gate.evaluate(res.Diff.Risk)
@@ -102,7 +104,7 @@ func runDiff(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	if r.Score != nil {
 		score = strconv.Itoa(*r.Score)
 	}
-	fmt.Fprintf(stderr, "diff risk: %s, assessment %s, score %s (%s), threshold %d, %d uncertainty rows, comparison %s\n", verdict, r.Assessment, score, r.Level, gate.threshold, len(r.Uncertainty), res.Comparison.Status)
+	fmt.Fprintf(stderr, "diff risk: %s, assessment %s, score %s (%s), threshold %d, fail_on_uncertainty %t, %d uncertainty rows, comparison %s\n", verdict, r.Assessment, score, r.Level, gate.threshold, gate.failUncertainty, len(r.Uncertainty), res.Comparison.Status)
 	if code != diffExitPass {
 		return &ExitError{Code: code}
 	}
@@ -118,14 +120,23 @@ func diffUsageError(gated bool, err error) error {
 
 // parseDiffGate takes whether each flag was given, so an empty value is an
 // error rather than an absent gate.
-func parseDiffGate(gated bool, failOnRisk string, insufficientSet bool, insufficient string) (diffGate, error) {
+func parseDiffGate(gated bool, failOnRisk string, insufficientSet bool, insufficient string, failOnUncertainty bool) (diffGate, error) {
 	if !gated {
 		if insufficientSet {
 			return diffGate{}, fmt.Errorf("--insufficient-evidence requires --fail-on-risk")
 		}
-		return diffGate{}, nil
+		return diffGate{failUncertainty: failOnUncertainty}, nil
 	}
-	g := diffGate{failInsufficient: true}
+	g := diffGate{failInsufficient: failOnRisk != "", failUncertainty: failOnUncertainty}
+	if failOnRisk == "" {
+		if insufficientSet {
+			return diffGate{}, fmt.Errorf("--insufficient-evidence requires --fail-on-risk")
+		}
+		if !failOnUncertainty {
+			return diffGate{}, fmt.Errorf("a diff gate is required")
+		}
+		return g, nil
+	}
 	switch {
 	case !insufficientSet, insufficient == "fail":
 	case insufficient == "pass":
@@ -147,13 +158,16 @@ func parseDiffGate(gated bool, failOnRisk string, insufficientSet bool, insuffic
 }
 
 func (g diffGate) evaluate(r diff.Risk) (int, string) {
+	if g.failUncertainty && r.Assessment == diff.AssessmentLimitedEvidence && len(r.Uncertainty) > 0 {
+		return diffExitRisk, "fail (uncertainty)"
+	}
 	if r.Score == nil {
 		if g.failInsufficient {
 			return diffExitInsufficient, "fail (insufficient evidence)"
 		}
 		return diffExitPass, "pass (insufficient evidence allowed)"
 	}
-	if *r.Score >= g.threshold {
+	if g.threshold > 0 && *r.Score >= g.threshold {
 		return diffExitRisk, "fail"
 	}
 	return diffExitPass, "pass"

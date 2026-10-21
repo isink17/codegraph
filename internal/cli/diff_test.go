@@ -121,28 +121,31 @@ func TestParseDiffGate(t *testing.T) {
 		risk             string
 		insufficientSet  bool
 		insufficient     string
+		failUncertainty  bool
 		threshold        int
 		failInsufficient bool
 		err              bool
 	}{
-		{false, "", false, "", 0, false, false},
-		{false, "", true, "pass", 0, false, true},
-		{true, "", false, "", 0, false, true},
-		{true, "low", true, "", 0, false, true},
-		{true, "low", false, "", 1, true, false},
-		{true, "medium", true, "fail", 25, true, false},
-		{true, "high", true, "pass", 50, false, false},
-		{true, "1", false, "", 1, true, false},
-		{true, "100", false, "", 100, true, false},
-		{true, "0", false, "", 0, false, true},
-		{true, "101", false, "", 0, false, true},
-		{true, "-5", false, "", 0, false, true},
-		{true, "HIGH", false, "", 0, false, true},
-		{true, "high", true, "maybe", 0, false, true},
+		{gated: false, threshold: 0},
+		{insufficientSet: true, insufficient: "pass", err: true},
+		{gated: true, err: true},
+		{gated: true, risk: "low", insufficientSet: true, err: true},
+		{gated: true, risk: "low", threshold: 1, failInsufficient: true},
+		{gated: true, risk: "medium", insufficientSet: true, insufficient: "fail", threshold: 25, failInsufficient: true},
+		{gated: true, risk: "high", insufficientSet: true, insufficient: "pass", threshold: 50},
+		{gated: true, risk: "1", threshold: 1, failInsufficient: true},
+		{gated: true, risk: "100", threshold: 100, failInsufficient: true},
+		{gated: true, risk: "0", err: true},
+		{gated: true, risk: "101", err: true},
+		{gated: true, risk: "-5", err: true},
+		{gated: true, risk: "HIGH", err: true},
+		{gated: true, risk: "high", insufficientSet: true, insufficient: "maybe", err: true},
+		{gated: true, failUncertainty: true},
+		{gated: true, risk: "low", failUncertainty: true, threshold: 1, failInsufficient: true},
 	} {
-		g, err := parseDiffGate(tc.gated, tc.risk, tc.insufficientSet, tc.insufficient)
-		if (err != nil) != tc.err || g.threshold != tc.threshold || g.failInsufficient != tc.failInsufficient {
-			t.Fatalf("parseDiffGate(%v, %q, %v, %q) = %+v, %v", tc.gated, tc.risk, tc.insufficientSet, tc.insufficient, g, err)
+		g, err := parseDiffGate(tc.gated, tc.risk, tc.insufficientSet, tc.insufficient, tc.failUncertainty)
+		if (err != nil) != tc.err || g.threshold != tc.threshold || g.failInsufficient != tc.failInsufficient || g.failUncertainty != tc.failUncertainty {
+			t.Fatalf("parseDiffGate(%v, %q, %v, %q, %v) = %+v, %v", tc.gated, tc.risk, tc.insufficientSet, tc.insufficient, tc.failUncertainty, g, err)
 		}
 	}
 }
@@ -161,6 +164,11 @@ func TestDiffGateEvaluateBoundaries(t *testing.T) {
 		{score(100), g, diffExitRisk},
 		{diff.Risk{}, g, diffExitInsufficient},
 		{diff.Risk{}, diffGate{threshold: 25}, diffExitPass},
+		{diff.Risk{Assessment: diff.AssessmentLimitedEvidence, Uncertainty: []diff.RiskUncertainty{{Reason: "unmodeled"}}}, diffGate{failUncertainty: true}, diffExitRisk},
+		{diff.Risk{Assessment: diff.AssessmentLimitedEvidence, Uncertainty: []diff.RiskUncertainty{{Reason: "unmodeled"}}}, diffGate{threshold: 25, failInsufficient: true, failUncertainty: true}, diffExitRisk},
+		{diff.Risk{Assessment: diff.AssessmentRiskEvidence, Uncertainty: []diff.RiskUncertainty{{Reason: "unmodeled"}}}, diffGate{failUncertainty: true}, diffExitPass},
+		{diff.Risk{Assessment: diff.AssessmentNoRiskEvidence}, diffGate{failUncertainty: true}, diffExitPass},
+		{diff.Risk{Assessment: diff.AssessmentInsufficientEvidence, Uncertainty: []diff.RiskUncertainty{{Reason: "incomplete"}}}, diffGate{failUncertainty: true}, diffExitPass},
 	} {
 		if got, _ := tc.gate.evaluate(tc.r); got != tc.want {
 			t.Fatalf("evaluate(%v, %+v) = %d, want %d", tc.r.Score, tc.gate, got, tc.want)
@@ -233,6 +241,15 @@ func TestDiffCLIRiskGateExitCodes(t *testing.T) {
 	}
 	if out, _, code := run(base, removed, "--insufficient-evidence", "pass"); code != 1 || out != "" {
 		t.Fatalf("--insufficient-evidence without a gate: exit %d", code)
+	}
+	if out, stderr, code := run(base, base, "--fail-on-uncertainty"); code != diffExitPass || out == "" || !strings.Contains(stderr, "fail_on_uncertainty true") {
+		t.Fatalf("uncertainty-only gate: exit %d, stderr %q", code, stderr)
+	}
+	if out, _, code := run(base, removed, "--fail-on-risk", "low", "--fail-on-uncertainty"); code != diffExitRisk || out == "" {
+		t.Fatalf("combined gates: exit %d", code)
+	}
+	if out, _, code := run(base, removed, "--fail-on-uncertainty", "--fail-on-uncertainty"); code != diffExitInvalid || out != "" {
+		t.Fatalf("repeated uncertainty gate: exit %d, output %q", code, out)
 	}
 	// Ungated parsing is unchanged: a repeated original flag still takes the last value.
 	if out, _, code := run(base, removed, "--limit", "5", "--limit", "1"); code != 0 || !strings.Contains(out, `"limit": 1`) {
