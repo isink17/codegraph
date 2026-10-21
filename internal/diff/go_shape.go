@@ -8,22 +8,27 @@ import (
 	"go/token"
 	"go/types"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/isink17/codegraph/internal/store"
 )
 
-// goShape is one top-level Go declaration outside function bodies: its line
-// span and its tokens without comments, trailing commas or the semicolons
+// goShape is one top-level Go declaration outside function bodies: its name,
+// line span and tokens without comments, trailing commas or the semicolons
 // before a closing bracket, so reformatting and comments do not change it.
 type goShape struct {
+	name               string
 	startLine, endLine int
 	tokens             string
 }
 
 // goShapes keys every top-level declaration of a Go file except imports:
-// "func Name" or "func (Recv) Name", "type Name", "const A,B" or "var A,B".
-// A const spec that repeats the previous expression implicitly carries it.
+// "func Name" or "func (Recv) Name", "type Name", "const Name" or "var Name".
+// A value is keyed per name with its own expression, so splitting or joining
+// a multi-name spec compares like for like. A const that repeats the previous
+// expression implicitly carries it, and one whose expression uses iota also
+// carries its index in the group.
 func goShapes(content []byte) (map[string][]goShape, bool) {
 	fset := token.NewFileSet()
 	f, err := goparser.ParseFile(fset, "", content, goparser.SkipObjectResolution)
@@ -31,11 +36,15 @@ func goShapes(content []byte) (map[string][]goShape, bool) {
 		return nil, false
 	}
 	tf := fset.File(f.Pos())
+	src := func(n ast.Node) string {
+		if n == nil {
+			return ""
+		}
+		return goTokens(content[tf.Offset(n.Pos()):tf.Offset(n.End())])
+	}
 	out := map[string][]goShape{}
-	add := func(key string, from, to token.Pos, prefix string) {
-		s := goShape{startLine: fset.Position(from).Line, endLine: fset.Position(to).Line}
-		s.tokens = prefix + goTokens(content[tf.Offset(from):tf.Offset(to)])
-		out[key] = append(out[key], s)
+	add := func(key, name string, from, to token.Pos, tokens string) {
+		out[key] = append(out[key], goShape{name: name, startLine: fset.Position(from).Line, endLine: fset.Position(to).Line, tokens: tokens})
 	}
 	for _, d := range f.Decls {
 		switch d := d.(type) {
@@ -47,28 +56,39 @@ func goShapes(content []byte) (map[string][]goShape, bool) {
 			if d.Body != nil {
 				end = d.Body.Pos()
 			}
-			add(key, d.Pos(), end, "")
+			add(key, d.Name.Name, d.Pos(), end, goTokens(content[tf.Offset(d.Pos()):tf.Offset(end)]))
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
 				continue
 			}
-			implicit := ""
-			for _, spec := range d.Specs {
+			var typ ast.Expr
+			var values []ast.Expr
+			for index, spec := range d.Specs {
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
-					add("type "+s.Name.Name, s.Pos(), s.End(), "")
+					add("type "+s.Name.Name, s.Name.Name, s.Pos(), s.End(), src(s))
 				case *ast.ValueSpec:
-					names := make([]string, len(s.Names))
+					if d.Tok == token.VAR || s.Type != nil || len(s.Values) > 0 {
+						typ, values = s.Type, s.Values
+					}
 					for i, n := range s.Names {
-						names[i] = n.Name
+						value := ""
+						switch {
+						case len(values) == len(s.Names):
+							value = src(values[i])
+						case len(values) > 0:
+							parts := make([]string, len(values))
+							for j, v := range values {
+								parts[j] = src(v)
+							}
+							value = strings.Join(parts, " , ")
+						}
+						shape := src(typ) + " = " + value
+						if d.Tok == token.CONST && strings.Contains(" "+value+" ", " iota ") {
+							shape = "iota#" + strconv.Itoa(index) + " " + shape
+						}
+						add(d.Tok.String()+" "+n.Name, n.Name, s.Pos(), s.End(), shape)
 					}
-					prefix := ""
-					if d.Tok == token.CONST && s.Type == nil && len(s.Values) == 0 {
-						prefix = implicit
-					} else if d.Tok == token.CONST {
-						implicit = goTokens(content[tf.Offset(s.Names[len(s.Names)-1].End()):tf.Offset(s.End())]) + " | "
-					}
-					add(d.Tok.String()+" "+strings.Join(names, ","), s.Pos(), s.End(), prefix)
 				}
 			}
 		}
@@ -108,38 +128,29 @@ func goTokens(src []byte) string {
 }
 
 // goUnmodeledUncertainty reports Go declarations whose shape changed in a
-// modified file while no declaration change of the diff falls inside them:
-// struct fields, interface methods, constant values and types are no
-// declarations of their own, so such a change would otherwise look like no
-// change at all. Function bodies are left to the edge comparison.
+// modified file while no base declaration of the same name inside them was
+// removed or changed: struct fields, interface methods, constant values and
+// types are no declarations of their own, so such a change would otherwise
+// look like no change at all. An added declaration models nothing about the
+// base one. Function bodies are left to the edge comparison.
 func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete map[string]bool) []RiskUncertainty {
-	if base.source == nil || head.source == nil {
-		return nil
-	}
-	type span struct{ start, end int }
-	modeled := map[string][2][]span{}
+	var modeled []store.SemanticDeclaration
 	for _, c := range changes {
-		if !strings.HasPrefix(c.Kind, "declaration_") {
+		if !strings.HasPrefix(c.Kind, "declaration_") || c.Before == nil {
 			continue
 		}
-		for side, raw := range []json.RawMessage{c.Before, c.After} {
-			var decls []store.SemanticDeclaration
-			var d store.SemanticDeclaration
-			if json.Unmarshal(raw, &d) == nil && d.Path != "" {
-				decls = []store.SemanticDeclaration{d}
-			} else {
-				_ = json.Unmarshal(raw, &decls)
-			}
-			for _, d := range decls {
-				m := modeled[d.Path]
-				m[side] = append(m[side], span{d.StartLine, d.EndLine})
-				modeled[d.Path] = m
-			}
+		var d store.SemanticDeclaration
+		if json.Unmarshal(c.Before, &d) == nil && d.Path != "" {
+			modeled = append(modeled, d)
+		} else {
+			var ds []store.SemanticDeclaration
+			_ = json.Unmarshal(c.Before, &ds)
+			modeled = append(modeled, ds...)
 		}
 	}
-	covered := func(path string, side int, s goShape) bool {
-		for _, m := range modeled[path][side] {
-			if m.start <= s.endLine && m.end >= s.startLine {
+	covered := func(path string, s goShape) bool {
+		for _, m := range modeled {
+			if m.Path == path && m.Name == s.name && m.StartLine <= s.endLine && m.EndLine >= s.startLine {
 				return true
 			}
 		}
@@ -153,6 +164,9 @@ func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete ma
 			continue
 		}
 		read := func(r Revision, h string) (map[string][]goShape, bool) {
+			if r.source == nil {
+				return nil, false
+			}
 			b, ok := r.source(c.Identity)
 			if !ok || sha256Hex(b) != h {
 				return nil, false
@@ -172,10 +186,7 @@ func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete ma
 			}
 			hidden := true
 			for _, s := range x {
-				hidden = hidden && !covered(c.Identity, 0, s)
-			}
-			for _, s := range y {
-				hidden = hidden && !covered(c.Identity, 1, s)
+				hidden = hidden && !covered(c.Identity, s)
 			}
 			if hidden {
 				out = append(out, RiskUncertainty{Reason: "go_declaration_change_unmodeled", Identity: c.Identity, Detail: key})
