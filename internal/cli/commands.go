@@ -249,6 +249,7 @@ func newCommandList() []*command {
 			usageLines: []string{
 				"  diff <base> <head> [--repo-root PATH] [--limit N --offset N]",
 				"    [--fail-on-risk SCORE|LEVEL [--insufficient-evidence fail|pass]]",
+				"    [--fail-on-uncertainty] rejects limited_evidence with explicit uncertainty",
 				"    prints the full result first; without --fail-on-risk risk never changes the exit code",
 				"    with --fail-on-risk: exits 0 below the threshold, 1 at or above it, 2 invalid input or error,",
 				"    3 insufficient evidence (unless --insufficient-evidence pass)",
@@ -259,6 +260,7 @@ func newCommandList() []*command {
 				{name: "--offset N", description: "offset into the change list"},
 				{name: "--fail-on-risk VALUE", description: "risk score 1..100, or low (1), medium (25), high (50), that fails the command"},
 				{name: "--insufficient-evidence VALUE", description: "fail (default, exit 3) or pass when risk cannot be assessed"},
+				{name: "--fail-on-uncertainty", description: "fail limited_evidence results that contain explicit uncertainty"},
 			},
 			examples: []string{"codegraph diff main~1 main", "codegraph diff --repo-root . main~1 main", "codegraph diff origin/v2.0 HEAD --fail-on-risk medium"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {

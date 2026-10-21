@@ -42,6 +42,23 @@ change lists but never change `risk`.
 
 Levels: `low` from 1, `medium` from 25, `high` from 50.
 
+## Optional uncertainty gate
+
+`--fail-on-uncertainty` is an opt-in policy gate. It leaves the JSON document,
+risk score, and existing `--fail-on-risk` behavior unchanged. When enabled, it
+returns exit 1 only for `limited_evidence` results that contain one or more
+explicit `risk.uncertainty` rows. It does not reject `no_risk_evidence`, and it
+does not reject `risk_evidence` merely because that result also reports an
+uncertainty row. `insufficient_evidence` keeps its existing exit behavior: it
+is rejected by `--fail-on-risk` unless `--insufficient-evidence pass` is given;
+the uncertainty gate does not change that policy.
+
+The option may be used by itself or with `--fail-on-risk`. Without either
+option, diff remains observational and exits successfully when the document
+is produced. A gated invocation prints the usual stderr summary, including
+whether the uncertainty gate was enabled. Invalid or repeated gate flags keep
+the existing exit 2 input-error behavior.
+
 ## Rules (model `codegraph.change-risk/v1`)
 
 A dependent relationship is one (dependent declaration, depended-on declaration)
