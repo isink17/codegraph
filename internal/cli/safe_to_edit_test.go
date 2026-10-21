@@ -255,7 +255,8 @@ func TestSafeToEditCLIConstraintsAndFreshness(t *testing.T) {
 	dbPath, repoID := opened.DBPath, opened.Repo.ID
 	opened.Close()
 
-	// Path-scoped indexing of a new commit: no full scan covers HEAD.
+	// Path-scoped indexing of a new commit: no full scan covers HEAD, so HEAD
+	// reads as moved since the last one.
 	repo.Write("internal/infra/b.go", safeToEditFiles["internal/infra/b.go"]+"\nfunc Extra() {}\n")
 	repo.Commit("", "two")
 	st, err := store.Open(dbPath)
@@ -267,7 +268,7 @@ func TestSafeToEditCLIConstraintsAndFreshness(t *testing.T) {
 	}
 	st.Close()
 	if _, res, code, _ := safeToEdit(t, root, "--symbol", "infra.B"); res.Status != editsafety.StatusUnknown || res.Verdict != nil ||
-		res.Reason != editsafety.ReasonInsufficientCoverage || code != editsafety.ExitInsufficientCoverage || len(res.Evidence.ConstraintViolations) == 0 {
+		res.Reason != editsafety.ReasonKnownStale || code != editsafety.ExitKnownStale || len(res.Evidence.ConstraintViolations) == 0 {
 		t.Fatalf("path-scoped: %s %s %s exit %d", res.Status, verdictOf(res), res.Reason, code)
 	}
 	if _, _, err := runCLI(t, "update", root); err != nil {

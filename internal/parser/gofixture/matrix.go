@@ -458,3 +458,64 @@ func RenderGoSignatures(pf graph.ParsedFile) []string {
 	sort.Strings(out)
 	return out
 }
+
+// GoTypeAliasSource declares type aliases in every position both Go adapters
+// must record identically, next to ordinary type declarations as controls.
+// Types declared inside a function body are not symbols in either adapter.
+const GoTypeAliasSource = `package alias
+
+import "example.com/m/q"
+
+type Base struct{}
+
+// Plain is an alias.
+type Plain = Base
+
+type (
+	// Grouped is an alias in a group.
+	Grouped = Base
+	// Count is a defined type in a group.
+	Count int
+)
+
+type List[T any] []T
+
+type GenAlias[T any] = List[T]
+
+type Remote = q.T
+
+type Ptr = *Base
+
+func Local() {
+	type LocalAlias = Base
+	type LocalNamed int
+	var _ LocalAlias
+	var _ LocalNamed
+}
+`
+
+// GoTypeAliasSymbols is what both adapters record for GoTypeAliasSource. An
+// alias is a type symbol whose signature is `= ` and its target's source text.
+var GoTypeAliasSymbols = []string{
+	"alias.Base [5:6-5:19] struct |  | type:alias:Base",
+	"alias.Plain [8:6-8:18] = Base | Plain is an alias. | type:alias:Plain",
+	"alias.Grouped [12:2-12:16] = Base |  | type:alias:Grouped",
+	"alias.Count [14:2-14:11] int |  | type:alias:Count",
+	"alias.List [17:6-17:21] [T any] []T |  | type:alias:List",
+	"alias.GenAlias [19:6-19:31] [T any] = List[T] |  | type:alias:GenAlias",
+	"alias.Remote [21:6-21:18] = q.T |  | type:alias:Remote",
+	"alias.Ptr [23:6-23:17] = *Base |  | type:alias:Ptr",
+}
+
+// RenderGoTypeSymbols renders every type symbol of a parse as
+// `qualified_name [range] signature | doc | stable_key`, in source order.
+func RenderGoTypeSymbols(pf graph.ParsedFile) []string {
+	var out []string
+	for _, s := range pf.Symbols {
+		if s.Kind == "type" {
+			r := s.Range
+			out = append(out, fmt.Sprintf("%s [%d:%d-%d:%d] %s | %s | %s", s.QualifiedName, r.StartLine, r.StartCol, r.EndLine, r.EndCol, s.Signature, s.DocSummary, s.StableKey))
+		}
+	}
+	return out
+}

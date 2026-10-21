@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -48,8 +49,8 @@ func coverageOf(t *testing.T, s *store.Store, root string) graph.Freshness {
 }
 
 // A full scan records scope full and HEAD at both ends. A later path-scoped
-// update at a new HEAD advances the Git history watermark, so head_changed
-// reads "no", but it never becomes the last full scan.
+// update at a new HEAD never becomes the last full scan, so HEAD still reads
+// as moved since it.
 func TestScanCoverageFullThenPathScopedAtNewHead(t *testing.T) {
 	ctx := context.Background()
 	r, first, s, _ := coverageFixture(t)
@@ -75,8 +76,8 @@ func TestScanCoverageFullThenPathScopedAtNewHead(t *testing.T) {
 	if f.LatestScan.Scope != store.ScanScopePaths || f.LatestScan.HeadAtStart != second || f.LatestScan.HeadAtFinish != second {
 		t.Fatalf("latest = %+v", f.LatestScan)
 	}
-	if f.Worktree.HeadAtIndex != second || f.Worktree.HeadChanged != "no" {
-		t.Fatalf("watermark should follow the path-scoped scan: %+v", f.Worktree)
+	if f.Worktree.HeadAtIndex != first || f.Worktree.HeadAtIndexSource != "last_full_scan" || f.Worktree.HeadChanged != "yes" || !slices.Contains(f.Reasons, "head_moved") {
+		t.Fatalf("a path-scoped scan hid the HEAD move: %+v %v", f.Worktree, f.Reasons)
 	}
 	if f.Coverage.LastFullScan == nil || f.Coverage.LastFullScan.ID != full.ID || f.Coverage.LastFullScan.HeadAtFinish != first {
 		t.Fatalf("path-scoped scan proved full coverage: %+v", f.Coverage.LastFullScan)

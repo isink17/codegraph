@@ -334,7 +334,8 @@ func renderFuncSignature(content []byte, file *token.File, fn *ast.FuncDecl) str
 }
 
 // renderTypeSignature spells a generic type's type parameter list, then a
-// space, before `struct`, `interface` or the type's source text.
+// space, before `struct`, `interface` or the type's source text. An alias's
+// target is prefixed with `= ` so it never reads like a defined type.
 func renderTypeSignature(content []byte, file *token.File, ts *ast.TypeSpec) string {
 	sig := declText(content, file, ts.Type)
 	switch ts.Type.(type) {
@@ -342,6 +343,9 @@ func renderTypeSignature(content []byte, file *token.File, ts *ast.TypeSpec) str
 		sig = "struct"
 	case *ast.InterfaceType:
 		sig = "interface"
+	}
+	if ts.Assign.IsValid() {
+		sig = "= " + sig
 	}
 	if ts.TypeParams != nil {
 		return declText(content, file, ts.TypeParams) + " " + sig
@@ -409,7 +413,8 @@ func linkTests(pkg string, pf *graph.ParsedFile) {
 // records the package clause and build constraint. v4 stores signatures as the
 // declaration's source text, as the tree-sitter adapter does, instead of a
 // lossy rendering that dropped parameters and results. v5 adds the type
-// parameter list to function and type signatures.
+// parameter list to function and type signatures. v6 prefixes a type alias's
+// signature with `= `.
 func (a *Adapter) Profile() cgparser.Profile {
-	return cgparser.Profile{ID: "go-ast:go:v5", EmitsCallEdges: true}
+	return cgparser.Profile{ID: "go-ast:go:v6", EmitsCallEdges: true}
 }
