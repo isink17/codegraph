@@ -240,33 +240,58 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   and the campaign's ci-local and PM runs read by allow-list only: the
   system (`/System`, `/usr`, `/bin`, `/sbin`, `/Library` without its
   keychains, `/opt`, `/Applications`, `/private/etc`, `/private/var/db`,
-  `/dev`, `/private/tmp`), the install directories of the tools they run
+  `/dev`; not `/private/tmp`, which holds other sessions' files), the
+  install directories of the tools they run
   (codex, node, go, git, python3, …; a prefix containing the home
-  directory or a protected path is never used), the Go module cache and
+  directory or a protected path, or lying directly in the home directory
+  like `~/.local` or `~/go`, is never used), the Go module cache and
   GOROOT, `CG_COORD_SANDBOX_READABLE` entries, the slot, the repository's
   git directory, owner-writable directories and their scratch directory.
   Nothing else in the home directory is readable (synthetic canaries in
   `~/.aws`, `~/.ssh`, `~/.gitconfig`, shell history, `~/Documents`, the
   keychain, the evidence root and the primary checkout were verified
   unreadable; `go build` with cgo, `go test` and `git commit` work).
-  File metadata (existence, size) stays visible. `GIT_CONFIG_GLOBAL` is
-  `/dev/null`, so commits use the repository's own identity. Network:
+  File metadata (existence, size) stays visible. Writes: only the scratch
+  directory, `/dev`, owner-listed directories and, for implementers, the
+  slot and the git objects and branch refs a commit needs. The process
+  starts from an empty environment (`env -i`) plus `PATH`, `HOME`, `USER`,
+  `LOGNAME`, `LANG`, `LC_*`, `TERM`, `SHELL`, `PWD`, the scratch-based
+  `TMPDIR`/Go/XDG variables, and names listed in `CG_COORD_SANDBOX_ENV`;
+  tokens and agent sockets in the coordinator's environment never reach
+  it. `GIT_CONFIG_GLOBAL` is `/dev/null`, so commits use the repository's
+  own identity. cgo builds use the Command Line Tools' `clang` directly
+  (`CC`, `SDKROOT` resolved outside the sandbox), never through `xcrun`,
+  whose lookup cache in the per-user temp directory the owner's own
+  builds trust; that cache is neither readable nor writable inside. The
+  scratch directory must not be under `/tmp` (refused). Network:
   outbound only to localhost (and DNS); Codex agents additionally reach
   TCP port 443 of any host, for their model API — seatbelt cannot filter
   by host name, so there is no destination allow-list, and what they can
-  send is what they can read. Claude Code agents run in the legacy
-  profile instead (reads allowed except the evidence root, coordinator
+  send is what they can read. Claude Code agents are refused unless the
+  owner sets `CG_COORD_ALLOW_CLAUDE=1`; they then run in the legacy
+  profile (reads allowed except the evidence root, coordinator
   state, `CG_COORD_DENY_READ`, `~/.ssh`, `~/.config/gh`, `~/.netrc`,
   `~/.git-credentials`, `~/.codex`; keychain readable; network open),
-  because Claude Code keeps its login in the keychain; the campaign
-  supervisor refuses them.
+  because Claude Code keeps its login in the keychain — where `gh` also
+  keeps the owner's GitHub token, so a Claude agent can read it. The
+  campaign supervisor refuses them. Both adapters default to `codex`.
+- **Verified content.** Agents can write the shared object store, and git
+  does not re-hash objects it already has. Before a review, the PR's head
+  branch is fetched from the remote into the coordinator's private
+  repository (`<state>/gate-repo`) and must be exactly the head under
+  review; after the review slot is checked out, its files must hash to
+  that head's tree in the private repository (`checkout_mismatch`
+  otherwise, the task fails with the review lease kept). The diff the
+  reviewer reads comes from the private repository. The campaign's
+  ci-local checkout is verified the same way.
 - **Authorization gate.** With `CG_COORD_AUTHORIZED` set (the campaign
   sets it), a task is launched, continued, resumed after an acquire or
   reviewed only while its id is in that file; an unreadable or malformed
   file authorizes nothing. A refused continuation keeps lease and work as
   `blocked` (`deauthorized: …`) and resumes when the task is authorized
-  again; a refused launch or review leaves the task where it is. Agents
-  already running finish. Each refusal is a `deauthorized` event.
+  again (only if it still holds its lease; otherwise it is `interrupted`
+  for the owner); a refused launch or review leaves the task where it is.
+  Agents already running finish. Each refusal is a `deauthorized` event.
 - **Agents.** Launching needs a planned task with scope and acceptance
   criteria. Claude Code runs with `-p --output-format json --session-id
   <uuid> --permission-mode dontAsk --allowedTools …`: tools outside the
@@ -358,10 +383,10 @@ coordinator version.
   supervisor updates stale branches, see `docs/agent-campaign.md`). Rework
   fast-forwards the local task branch to the remote one first, so a base
   merged in on GitHub is kept.
-- A Codex agent can read its own login (`auth.json` in its `CODEX_HOME`),
-  and a Claude Code agent the keychain, as any agent can read the
-  credentials it runs with. Other files the owner can read and network
-  access remain open to agents (the profile allows by default).
+- A Codex agent can read its own login (`auth.json` in its `CODEX_HOME`).
+  In the opt-in legacy profile, a Claude Code agent can read the keychain
+  (including `gh`'s GitHub token), other owner files outside the denied
+  paths, and the network.
 - Tests must run with a `TMPDIR` outside `/private/tmp`, which agents may
   write; the fixture refuses otherwise.
 - The Claude Code adapter's tool list must include every command the agent

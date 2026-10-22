@@ -225,7 +225,10 @@ class Fixture(unittest.TestCase):
                     "FAKE_GATE_REFUSE": str(t / "gate-refuse"), "CG_TEST_LOG": str(self.log),
                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
                     "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": "/dev/null",
-                    "HOME": str(t / "home"), "CG_COORD_SANDBOX_WRITABLE": str(t / "log")}
+                    "HOME": str(t / "home"), "CG_COORD_SANDBOX_WRITABLE": str(t / "log"),
+                    # Agents inherit only these (and the basics): see ENV_KEEP.
+                    "CG_COORD_SANDBOX_ENV": "CG_TEST_LOG:CG_COORD_STATE:CTL:FAKE_ORIGIN:GIT_AUTHOR_NAME:"
+                                            "GIT_AUTHOR_EMAIL:GIT_COMMITTER_NAME:GIT_COMMITTER_EMAIL"}
         self.git("init", "-q", "--bare", str(self.origin))
         self.git("clone", "-q", str(self.origin), str(self.seed))
         self.git("-C", str(self.seed), "commit", "-q", "--allow-empty", "-m", "base")
@@ -1177,6 +1180,46 @@ class Pool(Fixture):
         self.run_until(lambda: self.status("x") == "awaiting_ci")
         self.assertIn("reauthorized", [e["event"] for e in self.events()])
 
+    def test_claude_agents_need_an_explicit_opt_in(self):
+        self.plan({**self.task("x", None), "agent": "claude", "command": None})
+        self.run_until(lambda: self.status("x") == "blocked")
+        self.assertIn("CG_COORD_ALLOW_CLAUDE", self.st()["x"]["reason"])
+
+    def test_reauthorized_task_without_its_lease_is_not_launched(self):
+        self.gate("x")
+        self.plan(self.task("x", sh("true"), max_attempts=3))
+        self.coord("run", "--once", ok=True)
+        self.gate()
+        self.run_until(lambda: self.status("x") == "blocked")
+        t = self.st()["x"]
+        token = (self.state / "tokens" / f"x.{t['slot']}.token").read_text().strip()
+        subprocess.run([str(POOL), "release", "--slot", t["slot"], "--token", token], env=self.env, check=True,
+                       capture_output=True)
+        self.foreign_lease(t["slot"])
+        self.gate("x")
+        self.run_until(lambda: self.status("x") == "interrupted")
+        self.assertIn("lease", self.st()["x"]["reason"])
+        self.assertEqual(len(self.starts_of("x")), 1)
+
+    def test_review_refuses_a_checkout_that_differs_from_the_remote(self):
+        """An agent rewrote a loose object in the shared store: the review
+        slot would show content the remote does not have."""
+        import zlib
+        self.gate("x")
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", ok=True)
+        self.gate()  # hold the review until the store is tampered with
+        self.run_until(lambda: self.status("x") == "awaiting_review", 30)
+        self.gate("x")
+        blob = self.git("-C", str(self.seed), "rev-parse", "task/x:work/x.txt")
+        obj = self.seed / ".git/objects" / blob[:2] / blob[2:]
+        forged = b"forged\n"
+        obj.chmod(0o644)
+        obj.write_bytes(zlib.compress(b"blob %d\0" % len(forged) + forged))
+        self.run_until(lambda: self.status("x") == "failed")
+        self.assertIn("differs from the remote", self.st()["x"]["reason"])
+        self.assertIn("checkout_mismatch", [e["event"] for e in self.events()])
+
     def test_missing_review_slot_waits_without_losing_work(self):
         hidden = self.t / "review-moved"
         (self.slots / R).rename(hidden)
@@ -1266,12 +1309,26 @@ class Pool(Fixture):
         for f in probes.values():
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text("secret")
+        user_tmp = os.path.realpath(subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True,
+                                                   text=True).stdout.strip())
+        tmp_canary = Path(tempfile.mkdtemp(dir="/private/tmp")) / "canary"
+        tmp_canary.write_text("secret")
+        self.addCleanup(shutil.rmtree, tmp_canary.parent, True)
+        probes["private-tmp"] = tmp_canary
         reads = "; ".join(f'cat {f} >/dev/null 2>&1 && echo LEAK-{k}' for k, f in probes.items())
-        self.plan(self.task("x", sh(f'({reads}) >>"$CG_TEST_LOG"; mkdir -p work && echo x >work/x.txt && '
+        reads += (f'; echo x >/private/tmp/cg-probe-$$ 2>/dev/null && echo LEAK-tmp-write'
+                  f'; echo x >>{user_tmp}/xcrun_db 2>/dev/null && echo LEAK-xcrun-write'
+                  f'; cat {user_tmp}/xcrun_db >/dev/null 2>&1 && echo LEAK-xcrun-read'
+                  '; [ -n "$CG_ENV_CANARY" ] && echo LEAK-env'
+                  '; cat work/x.txt >/dev/null 2>&1 && echo READ-OK')  # positive control: the slot
+        self.env["CG_ENV_CANARY"] = "token"
+        self.plan(self.task("x", sh(f'mkdir -p work && echo x >work/x.txt && ({reads}) >>"$CG_TEST_LOG"; '
                                     'git add work && git commit -qm x'),
                             validate=[f'({reads}) >>"$CG_TEST_LOG"; true']))
         self.run_until(lambda: self.status("x") == "awaiting_ci")
-        self.assertNotIn("LEAK", self.log.read_text())
+        log = self.log.read_text()
+        self.assertNotIn("LEAK", log)
+        self.assertEqual(log.count("READ-OK"), 2)
 
 
     # ------------------------------------------------------------ overlapping adopted PRs

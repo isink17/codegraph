@@ -71,7 +71,14 @@ DENY_READ = [p for p in os.environ.get("CG_COORD_DENY_READ", "").split(":") if p
 SECRETS = [".ssh", ".config/gh", ".netrc", ".git-credentials", ".codex", "Library/Keychains"]
 # Readable to strict-sandboxed processes: the system, not the home directory.
 SYSTEM_READ = ["/System", "/usr", "/bin", "/sbin", "/Library", "/opt", "/Applications", "/private/etc",
-               "/private/var/db", "/private/var/select", "/dev", "/private/tmp"]
+               "/private/var/db", "/private/var/select", "/dev"]
+# The only environment a sandboxed process inherits; everything else (tokens,
+# agent sockets, the owner's settings) stays out. CG_COORD_SANDBOX_ENV adds
+# owner-chosen names.
+ENV_KEEP = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL",
+            *filter(None, os.environ.get("CG_COORD_SANDBOX_ENV", "").split(":"))]
+CLT = Path("/Library/Developer/CommandLineTools")
+ALLOW_CLAUDE = os.environ.get("CG_COORD_ALLOW_CLAUDE") == "1"
 # Set by the campaign supervisor: a JSON file {"tasks": [ids]} of the tasks
 # currently authorized. Unset: every planned task is (owner-driven runs).
 AUTH_GATE = os.environ.get("CG_COORD_AUTHORIZED")
@@ -192,9 +199,15 @@ def tool_dirs():
     directory, contains it, or holds anything protected is not used;
     CG_COORD_SANDBOX_READABLE adds owner-listed directories under the same
     rule."""
-    protected = [HOME, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS]]
+    protected = [HOME, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS],
+                 HOME / ".local", HOME / ".config", HOME / "Library"]
+    home = os.path.realpath(HOME)
     def safe(d):
         r = os.path.realpath(d).rstrip("/") + "/"
+        # A directory right in the home directory (~/.local, ~/go, ~/bin)
+        # holds more than one tool; never allow it whole.
+        if os.path.dirname(r.rstrip("/")) == home:
+            return False
         return not any((os.path.realpath(p).rstrip("/") + "/").startswith(r) for p in protected)
     out = []
     for name in TOOLS:
@@ -214,7 +227,16 @@ def tool_dirs():
     return tuple(sorted({*out, gomod, *([goroot] if goroot else [])}))
 
 
-def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keychain=False):
+@functools.lru_cache(maxsize=None)
+def sdk_root():
+    """Resolved outside the sandbox: inside it, cc must not go through xcrun,
+    whose lookup cache in the per-user temp directory the owner's own
+    builds trust."""
+    p = run(["xcrun", "--show-sdk-path"]) if shutil.which("xcrun") else None
+    return p.stdout.strip() if p and p.returncode == 0 else ""
+
+
+def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keychain=False, cwd=None):
     """(argv, scratch): argv run under sandbox-exec, and the private scratch
     directory the caller removes afterwards; None where no sandbox exists.
     readonly: only the scratch directory, /tmp and /dev are writable (no slot,
@@ -247,13 +269,13 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
     # directories are added.
     gitdir = REPO / ".git"
     extra = owner_writable()  # may refuse: before anything is created
+    if os.path.realpath(tempfile.gettempdir()).startswith(("/private/tmp/", "/tmp/")):
+        raise Refused(f"TMPDIR {tempfile.gettempdir()} is under /tmp; scratch directories there would be shared "
+                      "with Claude Code agents")
     scratch = tempfile.mkdtemp(prefix="cg-agent-")
-    writable = [q("/dev"), q(scratch), q("/private/tmp"), *[q(d) for d in extra]]
-    # cc (via xcrun) keeps a lookup cache in the per-user temp directory
-    # whatever TMPDIR says; cgo builds fail without it.
-    user_tmp = run(["getconf", "DARWIN_USER_TEMP_DIR"]).stdout.strip()
-    if user_tmp:
-        writable.append(rx(user_tmp, "/xcrun_db"))
+    writable = [q("/dev"), q(scratch), *[q(d) for d in extra]]
+    if keychain:
+        writable.append(q("/private/tmp"))  # Claude Code keeps per-session files there
     if not readonly:
         # Branches only: remote-tracking refs decide which merge gate runs
         # and what pool.sh treats as the base.
@@ -272,8 +294,7 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
         profile += (f"(deny file-read-data {' '.join(protected)})"
                     f"(deny file-read* {' '.join(q(HOME / d) for d in SECRETS if d != 'Library/Keychains')})")
     else:
-        readable = [q(scratch), *[q(d) for d in [*SYSTEM_READ, *tool_dirs(), *extra]], q(gitdir),
-                    *([rx(user_tmp, "/xcrun_db")] if user_tmp else [])]
+        readable = [q(scratch), *[q(d) for d in [*SYSTEM_READ, *tool_dirs(), *extra]], q(gitdir)]
         if slot:
             readable.append(q(slot))
         profile += (f"(deny file-read*)(allow file-read-metadata)(allow file-read* (literal \"/\") {' '.join(readable)})"
@@ -286,22 +307,31 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
                     + ("(allow network-outbound (remote tcp \"*:443\"))" if codex else ""))
     profile += (f"(deny file-write* {' '.join(no_write)})"
                 + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
-    env = [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
-                                              ("XDG_CACHE_HOME", "cache"), ("XDG_CONFIG_HOME", "config"),
-                                              ("GOENV", "config/go/env"))]
+    env = [f"{k}={os.environ[k]}" for k in ENV_KEEP if k in os.environ]
+    env += [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
+                                               ("XDG_CACHE_HOME", "cache"), ("XDG_CONFIG_HOME", "config"),
+                                               ("GOENV", "config/go/env"))]
+    if cwd or slot:
+        env.append(f"PWD={os.path.realpath(cwd or slot)}")  # without it, getcwd needs the parents
     if not keychain:
         # The owner's ~/.gitconfig is unreadable (it may name credential
         # helpers); the repository's own config, with its identity, is not.
         env += ["GIT_CONFIG_GLOBAL=/dev/null"]
+        if (CLT / "usr/bin/clang").exists() and sdk_root():
+            env += [f"CC={CLT}/usr/bin/clang", f"SDKROOT={sdk_root()}",
+                    f"PATH={CLT}/usr/bin:{os.environ.get('PATH', '/usr/bin:/bin')}"]
     if codex:
         env.append(f"CODEX_HOME={scratch}/codex-home")
     gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
-    return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", *env, f"GOMODCACHE={gomod}", *argv], scratch
+    return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", "-i", *env, f"GOMODCACHE={gomod}", *argv], scratch
 
 
-def isolate(agent, argv, allow_read=(), slot=None, readonly=False):
+def isolate(agent, argv, allow_read=(), slot=None, readonly=False, cwd=None):
     """(argv, scratch or None, codex auth digest or None)."""
-    wrapped = sandboxed(argv, allow_read, slot, readonly, agent == "codex", agent == "claude")
+    if agent == "claude" and not ALLOW_CLAUDE:
+        raise Refused("Claude Code agents need the keychain, which also holds the owner's GitHub token; "
+                      "set CG_COORD_ALLOW_CLAUDE=1 to run them anyway")
+    wrapped = sandboxed(argv, allow_read, slot, readonly, agent == "codex", agent == "claude", cwd)
     if not wrapped:
         if agent != "command":
             raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
@@ -394,12 +424,12 @@ def load_tasks(path, known=()):
         for req in ("description", "scope", "acceptance", "validate"):
             if not t.get(req):
                 raise Refused(f"task {tid}: {req} is required")
-        if t.get("agent", "claude") not in ADAPTERS:
+        if t.get("agent", "codex") not in ADAPTERS:
             raise Refused(f"task {tid}: agent must be one of {sorted(ADAPTERS)}")
         if t.get("agent") == "command" and not isinstance(t.get("command"), list):
             raise Refused(f"task {tid}: agent \"command\" needs a \"command\" argv list")
         review = t.get("review", {})
-        if review.get("agent", "claude") not in ADAPTERS:
+        if review.get("agent", "codex") not in ADAPTERS:
             raise Refused(f"task {tid}: review agent must be one of {sorted(ADAPTERS)}")
         attempts = t.get("max_attempts", 1)
         if type(attempts) is not int or not 1 <= attempts <= MAX_ATTEMPTS:
@@ -410,12 +440,12 @@ def load_tasks(path, known=()):
             "base": t.get("base", "v2.0"),
             "branch": t.get("branch", f"task/{tid}"),
             "depends_on": list(t.get("depends_on", [])),
-            "agent": t.get("agent", "claude"),
+            "agent": t.get("agent", "codex"),
             "command": t.get("command"),
             "scope": list(t["scope"]),
             "acceptance": list(t["acceptance"]),
             "validate": list(t["validate"]),
-            "review": {"agent": review.get("agent", "claude"), "command": review.get("command"),
+            "review": {"agent": review.get("agent", "codex"), "command": review.get("command"),
                        "focus": review.get("focus", "")},
             "prompt": t.get("prompt", ""),
             "publish": t.get("publish", True),
@@ -738,10 +768,7 @@ class Coordinator:
             # Read from a private bare repository in the state directory,
             # which agents can neither read nor write: the shared object store
             # is writable to them, and git trusts objects it already has.
-            url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
-            store = self.dir / "gate-repo"
-            if not (store / "HEAD").exists():
-                run([GIT, "init", "-q", "--bare", str(store)], check=True)
+            url, store = self.private_store()
             run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
                  f"+refs/heads/{base}:refs/heads/{base}"], check=True)
             remote_sha = run([GIT, *GIT_SAFE, "ls-remote", url, f"refs/heads/{base}"],
@@ -763,6 +790,46 @@ class Coordinator:
         if probe.returncode != 2 or "--base" not in probe.stdout + probe.stderr:
             raise Refused(f"{gate} does not support --base")
         return gate
+
+    # ------------------------------------------------------------ verified content
+    # Agents can write the shared object store, and git does not re-hash
+    # objects it already has, so a checkout from it may differ from what the
+    # remote holds at the same SHA. What is reviewed and tested is therefore
+    # checked against a private repository fetched from the remote.
+
+    def private_store(self):
+        url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
+        store = self.dir / "gate-repo"
+        if not (store / "HEAD").exists():
+            run([GIT, "init", "-q", "--bare", str(store)], check=True)
+        return url, store
+
+    def fetch_verified(self, branch, sha):
+        """Fetches the remote branch into the private repository; refuses
+        unless it is exactly sha."""
+        url, store = self.private_store()
+        run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
+             f"+refs/heads/{branch}:refs/verify/{branch}"], check=True)
+        got = run([GIT, *GIT_SAFE, "-C", str(store), "rev-parse", "-q", "--verify", f"refs/verify/{branch}"]).stdout.strip()
+        if got != sha:
+            raise Refused(f"remote {branch} is {got[:12] or 'missing'}, not {sha[:12]}")
+        return store
+
+    def worktree_matches(self, path, sha):
+        """True when the files in path are exactly the tree of sha in the
+        private repository (tracked content and modes, and no untracked
+        file that is not ignored)."""
+        _, store = self.private_store()
+        idx = self.dir / f".verify-{uuid.uuid4().hex}.index"
+        env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+        g = [GIT, *GIT_SAFE, "--git-dir", str(store), "--work-tree", str(path)]
+        try:
+            run([*g, "read-tree", sha], cwd=path, env=env, check=True)
+            run([*g, "add", "-A", "."], cwd=path, env=env, check=True)
+            tree = run([*g, "write-tree"], cwd=path, env=env, check=True).stdout.strip()
+        finally:
+            idx.unlink(missing_ok=True)
+        return tree == run([*g, "rev-parse", f"{sha}^{{tree}}"], check=True).stdout.strip()
 
     # ------------------------------------------------------------ GitHub
 
@@ -1122,6 +1189,10 @@ def start_review(c, t):
     if pr["state"] != "OPEN":
         return reconcile_pr(c, t, pr)
     run([GIT, *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
+    try:
+        c.fetch_verified(pr["headRefName"], pr["headRefOid"])
+    except Refused as e:
+        return f"PR head not verifiable yet: {e}"
     slot, rc, err = c.acquire(t, REVIEW_SLOT, review=True)
     if not slot:
         if t.get("starting"):
@@ -1138,13 +1209,24 @@ def begin_review(c, t, head):
     try:
         git(p, "fetch", "-q", REMOTE, f"+refs/pull/{t['pr']}/head:refs/coordinator/review", check=False)
         git(p, "checkout", "-q", "--detach", head)
+        branch = c.pr_view(t["pr"])["headRefName"]
+        store = c.fetch_verified(branch, head)
+        if not c.worktree_matches(p, head):
+            c.event(t["id"], "checkout_mismatch", slot=t["slot"], head=head)
+            return c.block(t, f"the review checkout of {head[:12]} differs from the remote's content (the shared "
+                              "object store may have been altered); review lease kept", FAILED)
+        url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
+        run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
+             f"+refs/heads/{t['base']}:refs/verify-base/{t['base']}"], check=True)
+        diff = run([GIT, *GIT_SAFE, "-C", str(store), "diff", f"refs/verify-base/{t['base']}...{head}"],
+                   check=True).stdout
     except Refused as e:
         return c.block(t, f"review checkout of {head[:12]} failed: {e}; review lease kept")
     t["review_session"] = str(uuid.uuid4())
     diff_dir = c.runs / f"{t['id']}-diff-{head[:12]}"
     diff_dir.mkdir(mode=0o700, exist_ok=True)
     diff_file = diff_dir / "pr.diff"
-    write_atomic(diff_file, git(p, "diff", f"{REMOTE}/{t['base']}...{head}") + "\n")
+    write_atomic(diff_file, diff + "\n")
     prompt = review_prompt(t, t["pr"], head, t["base"], diff_file)
     r = t["review"]
     argv = r["command"] if r["agent"] == "command" else ADAPTERS[r["agent"]](
@@ -1411,6 +1493,9 @@ def schedule(c):
     for t in tasks.values():
         if t["status"] == BLOCKED and (t.get("reason") or "").startswith(DEAUTHORIZED) and t.get("slot") \
                 and authorized(c, t, "resume"):
+            if not c.read_token(t) or not c.lease_held(t):
+                c.block(t, f"reauthorized, but its lease on {t['slot']} is gone; owner must inspect", INTERRUPTED)
+                continue
             c.event(t["id"], "reauthorized", slot=t["slot"])
             if t["slot"] == REVIEW_SLOT:
                 try:

@@ -52,6 +52,9 @@ MAX_BRANCH_UPDATES = 3
 SYNC_RETRY_SECONDS = 60
 RULESET = "repos/isink17/codegraph/rulesets/24420032"
 # Limits on what PR code writes as local CI evidence.
+CI_TIMEOUT = float(os.environ.get("CG_CAMPAIGN_CI_TIMEOUT", "3600"))
+MERGE_WAIT = float(os.environ.get("CG_CAMPAIGN_MERGE_WAIT", "1800"))
+STREAM_CHUNK = 4 << 20
 EVIDENCE_LIMITS = {"depth": 12, "files": 5000, "file_bytes": 256 << 20, "total_bytes": 1 << 30}
 CAMPAIGN_FIELDS = {"ticket"}
 
@@ -109,11 +112,12 @@ def plane_tickets(tickets):
     results = plane_get(f"projects/{PLANE_PROJECT}/states/").get("results")
     if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
         raise PlaneDown("malformed Plane states")
-    states = {r.get("id"): r.get("group") for r in results}
+    states = {r.get("id"): r.get("group") for r in results
+              if isinstance(r.get("id"), str) and isinstance(r.get("group"), str)}
     out = {}
     for tk in tickets:
         w = plane_get(f"work-items/{tk}/")
-        if not isinstance(states.get(w.get("state")), str):
+        if not isinstance(w.get("state"), str) or w["state"] not in states:
             raise PlaneDown(f"{tk}: unknown state {w.get('state')}")
         name, desc = w.get("name"), w.get("description_stripped")
         out[tk] = {"group": states[w["state"]], "name": name if isinstance(name, str) else "",
@@ -154,6 +158,7 @@ class Campaign:
         else:
             self.state = {"version": 1, "tasks": {}, "merges": {}, "unsynced": [], "halt": None, "deadline": None}
         self.state.setdefault("ci_rejected", [])
+        self.state.setdefault("ci_ok", [])
         self.authorized = set()
         offsets = self.dir / "stream-offsets.json"
         data = co.parse_json(offsets.read_text()) if offsets.exists() else {}
@@ -205,12 +210,7 @@ class Campaign:
         co.write_atomic(self.gate_file, json.dumps({"tasks": sorted(ids), "utc": stamp()}) + "\n")
         return valid
 
-    def still_authorized(self, tid):
-        """A fresh read of the file right before an irreversible step."""
-        try:
-            return any(spec["id"] == tid for _, spec in task_specs(load_authorization(self.auth_file)))
-        except Refused:
-            return False
+
 
     def coordinator(self, *args, stream=True):
         """Runs coordinator.py on the campaign's state; output is streamed."""
@@ -237,15 +237,21 @@ def load_authorization(path):
     if not isinstance(a, dict) or not isinstance(a.get("tickets"), dict) or not a["tickets"]:
         raise Refused(f"{path}: needs a non-empty \"tickets\" object")
     merge = a.setdefault("merge", {"mode": "none"})
-    if merge.get("mode") not in MERGE_MODES:
+    if not isinstance(merge, dict) or merge.get("mode") not in MERGE_MODES:
         raise Refused(f"{path}: merge.mode must be one of {MERGE_MODES}")
     if merge["mode"] == "exception":
-        d = Path(merge.get("exception_dir", ""))
+        d = merge.get("exception_dir")
+        if not isinstance(d, str) or not os.path.isabs(d):
+            raise Refused(f"{path}: merge.exception_dir must be an absolute path")
         for f in ("merge-exception.sh", "ci-local.sh"):
-            if not os.access(d / f, os.X_OK):
+            if not os.access(Path(d) / f, os.X_OK):
                 raise Refused(f"{path}: merge.exception_dir has no executable {f}")
-    if a.get("expires") and stamp()[:10] > a["expires"]:
-        raise Refused(f"{path}: authorization expired on {a['expires']}")
+    expires = a.get("expires")
+    if expires is not None:
+        if not isinstance(expires, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", expires):
+            raise Refused(f"{path}: expires must be YYYY-MM-DD")
+        if stamp()[:10] > expires:
+            raise Refused(f"{path}: authorization expired on {expires}")
     seen = {}
     for tk, spec in a["tickets"].items():
         if not re.fullmatch(r"CG-\d+", tk) or not isinstance(spec, dict) or not isinstance(spec.get("tasks"), list):
@@ -261,6 +267,25 @@ def load_authorization(path):
                 raise Refused(f"{path}: task {tid} is listed under {seen[tid]} and {tk}")
             seen[tid] = tk
     return a
+
+
+def fresh_authorized(c, tid, mode=None):
+    """Re-checks, right before a side effect, everything this pass's
+    authorization rested on: the file still lists the task, the merge
+    terms (mode, exception directory) are unchanged when mode is given,
+    and Plane still has its ticket open. Any doubt is a refusal."""
+    try:
+        auth = load_authorization(c.auth_file)
+        tk = next((tk for tk, spec in task_specs(auth) if spec["id"] == tid), None)
+        ok = tk is not None and (mode is None or (
+            auth["merge"]["mode"] == mode == c.auth["merge"]["mode"]
+            and auth["merge"].get("exception_dir") == c.auth["merge"].get("exception_dir")))
+        ok = ok and plane_tickets([tk])[tk]["group"] in OPEN_GROUPS
+    except (Refused, PlaneDown):
+        ok = False
+    if not ok:
+        c.event("deauthorized", task=tid, action="side effect", mode=mode)
+    return ok
 
 
 def task_specs(auth):
@@ -279,7 +304,7 @@ def plan(c, plane):
     new = []
     for tk, spec in task_specs(c.auth):
         tid = spec["id"]
-        group = plane[tk]["group"]
+        group = plane.get(tk, {}).get("group")
         if tid in known:
             c.state["tasks"].setdefault(tid, tk)
             if group not in OPEN_GROUPS and known[tid]["status"] == co.PENDING:
@@ -343,10 +368,13 @@ def stream_agents(c):
         try:
             with open(log, "rb") as f:
                 f.seek(c.offsets.get(str(log), 0))
-                data = f.read()
+                data = f.read(STREAM_CHUNK)
         except OSError:
             continue
         cut = data.rfind(b"\n") + 1
+        if not cut and len(data) == STREAM_CHUNK:  # one line longer than a chunk: skip it
+            say(f"{m.group(1)}:{m.group(2)}", f"[{len(data)} bytes without a line break skipped]")
+            cut, data = len(data), b""
         c.offsets[str(log)] = c.offsets.get(str(log), 0) + cut
         for line in data[:cut].decode(errors="replace").splitlines():
             text = render(line)
@@ -377,46 +405,65 @@ def run_logged(c, tag, argv, log, cwd=None, env=None):
     return rc, "".join(out)
 
 
-def run_merge(c, tag, argv, log):
-    """Runs the merge authority's --merge step so that nothing interrupts it
-    halfway (it relaxes and restores a ruleset): its own session, output to
-    its log rather than a pipe, and SIGINT/SIGTERM deferred until it exits."""
-    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+def run_detached(c, tag, argv, log, cwd, timeout=None, defer_signals=False, wrapper=None):
+    """Runs argv in its own session with its output in log (streamed to the
+    terminal), not a pipe. defer_signals: SIGINT/SIGTERM wait until it exits
+    (a merge relaxes and restores a ruleset). timeout: the session is killed
+    after that many seconds (rc None). wrapper: a name put on the command
+    line (/bin/sh -c ... <name>), so a later supervisor can find the process
+    if this one dies. When it returns, nothing of the session is left
+    running."""
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)} if defer_signals else {}
+    argv = [str(a) for a in argv]
+    if wrapper:
+        argv = ["/bin/sh", "-c", '"$@"; exit $?', wrapper, *argv]  # not exec: the name must stay visible
     try:
         with open(log, "a") as f:
-            f.write(f"$ {' '.join(map(str, argv))}\n")
+            f.write(f"$ {' '.join(argv)}\n")
             start = f.tell()
             f.flush()
-            p = subprocess.Popen([str(a) for a in argv], cwd=co.REPO, stdout=f, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
-        seen = start
+            p = subprocess.Popen(argv, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+        seen, end = start, (time.monotonic() + timeout if timeout else None)
         while True:
             rc = p.poll()
+            if rc is None and end and time.monotonic() > end:
+                say(tag, f"timed out after {timeout:.0f}s; killing its session")
+                rc = None
+                break
             with open(log, "rb") as f:
                 f.seek(seen)
-                new = f.read()
+                new = f.read(STREAM_CHUNK)
             done = len(new) if rc is not None else new.rfind(b"\n") + 1
             for line in new[:done].decode(errors="replace").splitlines():
-                say(tag, line)
+                say(tag, line[:500])
             seen += done
-            if rc is not None:
+            if rc is not None and len(new) < STREAM_CHUNK:
                 break
-            time.sleep(0.2)
+            if rc is None:
+                time.sleep(0.2)
+        try:
+            os.killpg(p.pid, signal.SIGKILL)  # leftovers of the session (test daemons) go too
+        except (ProcessLookupError, PermissionError):
+            pass
+        p.wait()
         with open(log, "a") as f:
             f.write(f"\nexit {rc}\n")
-        with open(log, errors="replace") as f:
+        with open(log, "rb") as f:
             f.seek(start)
-            return rc, f.read()
+            return rc, f.read(co.MAX_JSON_LINE * 8).decode(errors="replace")
     finally:
         for s, h in old.items():
             signal.signal(s, h)
 
 
-def ci_passed(cidir, head, base, rejected=()):
+def ci_passed(cidir, head, base, rejected=(), accepted=None):
     """True only for a well-formed, complete pass of exactly this head on
-    this base whose evidence was never rejected. Anything else (missing,
-    empty, truncated, oversized, malformed, nested, wrong types) is a fail."""
-    if f"{head}:{base}" in rejected:
+    this base whose evidence was never rejected and, when accepted is
+    given, was promoted after a clean exit of ci-local. Anything else
+    (missing, empty, truncated, oversized, malformed, nested, wrong types)
+    is a fail."""
+    if f"{head}:{base}" in rejected or (accepted is not None and f"{head}:{base}" not in accepted):
         return False
     try:
         f = cidir / "summary.json"
@@ -465,32 +512,50 @@ def local_ci(c, tid, t, head, base, cidir):
     try:
         co.git(sp, "fetch", "-q", co.REMOTE)
         co.git(sp, "switch", "-q", "--detach", head)
+        coord = co.Coordinator(c.coord_dir)
+        coord.fetch_verified(t["branch"], head)
+        if not coord.worktree_matches(sp, head):
+            raise co.Refused(f"the checkout of {head[:12]} in {slot} differs from the remote's content")
         pkgs = go_packages(head, base)
         # Passed as text: the sandbox denies reads of the evidence root.
         ci = (Path(c.auth["merge"]["exception_dir"]) / "ci-local.sh").read_text()
         argv = ["/bin/bash", "-c", ci, "ci-local.sh", str(sp), head, base, "@OUT@", *([".", *pkgs] if pkgs else [])]
-        wrapped = co.sandboxed(argv, slot=sp)
+        wrapped = co.sandboxed(argv, slot=sp, cwd=sp)
         if not wrapped:
             raise co.Refused("ci-local needs the macOS sandbox")
         argv, scratch = wrapped
         out = Path(scratch) / "ci"
         argv = [str(out) if a == "@OUT@" else a for a in argv]
+        # Evidence lands in a fresh directory and becomes cidir, with a
+        # ci_ok record, only after a clean exit, a clean copy and a valid
+        # summary; whatever else happens (failure, kill, crash) it never is.
+        key = f"{head}:{base}"
+        if key in c.state["ci_ok"]:
+            c.state["ci_ok"].remove(key)
+        shutil.rmtree(cidir, ignore_errors=True)
+        staging = cidir.parent / f".ci-local-{uuid.uuid4().hex[:8]}"
         try:
-            rc, _ = run_logged(c, tag, argv, cidir.parent / "ci-local.log", cwd=sp)
-            problems, errors = copy_evidence(out, cidir)
-            if errors and not problems:
-                why = f"ci-local evidence not copied: {errors[:3]}"
-                (cidir / "summary.json").unlink(missing_ok=True)
-            if problems:
-                why = f"ci-local evidence rejected: {problems[:3]}"
-                (cidir / "summary.json").unlink(missing_ok=True)
-                c.state["ci_rejected"].append(f"{head}:{base}")
-                c.save()
-                c.event("ci_rejected", task=tid, head=head, base=base, problems=problems[:3])
+            rc, _ = run_detached(c, tag, argv, cidir.parent / "ci-local.log", cwd=sp, timeout=CI_TIMEOUT)
+            problems, errors = copy_evidence(out, staging)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
-        if not why and (rc != 0 or not ci_passed(cidir, head, base, c.state["ci_rejected"])):
-            why = f"local CI failed for {head[:12]} (exit {rc}); evidence {cidir}"
+        if problems:
+            why = f"ci-local evidence rejected: {problems[:3]}"
+            c.state["ci_rejected"].append(key)
+            c.event("ci_rejected", task=tid, head=head, base=base, problems=problems[:3])
+        elif errors:
+            why = f"ci-local evidence not copied: {errors[:3]}"
+        elif rc != 0:
+            why = f"local CI failed for {head[:12]} (exit {rc})"
+        elif not ci_passed(staging, head, base, c.state["ci_rejected"]):
+            why = f"local CI summary for {head[:12]} is not a complete pass"
+        if why:
+            staging.rename(cidir.parent / f"ci-local.failed-{now().strftime('%Y%m%dT%H%M%S')}") \
+                if staging.exists() else None
+        else:
+            staging.rename(cidir)
+            c.state["ci_ok"].append(key)
+        c.save()
     except co.Refused as e:
         why = f"ci-local setup failed: {e}"
     finally:
@@ -597,13 +662,24 @@ def merge_one(c, tid, t, mode):
         return None
     out = c.dir / "merges" / f"pr-{pr}" / head
     out.mkdir(parents=True, exist_ok=True)
+    marker = {"head": head, "pr": pr, "base": base, "evidence": str(out), "mode": mode,
+              "exception_dir": c.auth["merge"].get("exception_dir"), "wrapper": f"cg-merge-{uuid.uuid4().hex}"}
+    pv = gh_json("pr", "view", str(pr), "--json", "state,headRefOid,mergeCommit")
+    if pv.get("state") != "OPEN":
+        # Merged or closed outside this attempt: settle it, never merge again.
+        m["merging"] = {**marker, "wrapper": None}
+        reconcile_merge(c, tid, m, f"PR #{pr} is already {pv.get('state')}")
+        return m.get("squash") if m.get("status") == "merged" else None
     if mode == "exception":
         cidir = out / "ci-local"
         if f"{head}:{base}" in c.state["ci_rejected"]:
             m["attempts"] = MAX_MERGE_ATTEMPTS
             m["reason"] = f"local CI evidence for {head[:12]} on {base[:12]} was rejected; owner must inspect"
             return None
-        if not ci_passed(cidir, head, base, c.state["ci_rejected"]):
+        if not ci_passed(cidir, head, base, c.state["ci_rejected"], c.state["ci_ok"]):
+            if not fresh_authorized(c, tid):
+                m["reason"] = "deauthorized before local CI"
+                return None
             why = local_ci(c, tid, t, head, base, cidir)
             if why == "BLOCKED_POOL_BUSY":
                 return None  # not an attempt: waits for a worker
@@ -622,17 +698,19 @@ def merge_one(c, tid, t, mode):
     if rc != 0:
         m["reason"] = f"merge authority refused verification (exit {rc})"
         return None
-    if not c.still_authorized(tid):
-        c.event("deauthorized", task=tid, action="merge")
+    if not fresh_authorized(c, tid, mode):
         m["reason"] = "deauthorized right before the merge"
         return None
-    m["merging"] = {"head": head, "pr": pr, "base": base, "evidence": str(out), "utc": stamp()}
+    m["merging"] = {**marker, "utc": stamp()}
     c.save()
-    rc, text = run_merge(c, tag, [*verify, "--merge"], out / "merge.log")
+    rc, text = run_detached(c, tag, [*verify, "--merge"], out / "merge.log", co.REPO, defer_signals=True,
+                            wrapper=marker["wrapper"])
     if rc == 3:
-        m.pop("merging")
+        # The marker stays: once the owner clears the halt, start-up
+        # reconciles it against GitHub and the ruleset again.
         c.state["halt"] = f"ruleset restoration failed while merging PR #{pr}; see {out / 'merge.log'}"
         m["reason"] = c.state["halt"]
+        c.save()
         return None
     squash = re.search(r"MERGED #?\d+ (?:as )?([0-9a-f]{40})", text)
     # The script's word is not enough: GitHub and the ruleset decide.
@@ -653,13 +731,16 @@ def gh_json(*args):
     return data
 
 
-def ruleset_intact(c):
-    """API read-back of ruleset 24420032 compared with the campaign's
-    snapshot (exception mode); the gate mode never changes it."""
-    if c.auth["merge"]["mode"] != "exception":
+def ruleset_intact(mk):
+    """API read-back of ruleset 24420032 compared with the snapshot of the
+    exception the merge ran under (the marker's mode, not today's); the
+    gate mode never changes the ruleset."""
+    if mk.get("mode") == "gate":
         return True
     keys = ("name", "target", "enforcement", "conditions", "rules", "bypass_actors")
-    snap = co.parse_json((Path(c.auth["merge"]["exception_dir"]).parent / "ruleset-24420032-start.json").read_text(),
+    if not mk.get("exception_dir"):
+        raise co.Refused("no exception directory recorded for this merge")
+    snap = co.parse_json((Path(mk["exception_dir"]).parent / "ruleset-24420032-start.json").read_text(),
                          co.MAX_JSON_LINE * 8)
     live = gh_json("api", RULESET)
     if not isinstance(snap, dict):
@@ -674,14 +755,27 @@ def reconcile_merge(c, tid, m, why):
     recorded and queued for Plane sync. Still open at that head with the
     ruleset intact: nothing happened. Anything else, or no answer: halt."""
     mk = m["merging"]
+    if mk.get("wrapper") and co.find_wrapper(mk["wrapper"]):
+        # A merge script outlived the supervisor that started it: never start
+        # another next to it; wait for it, then settle.
+        say("pm", f"{tid}: an earlier merge of PR #{mk['pr']} is still running; waiting for it")
+        end = time.monotonic() + MERGE_WAIT
+        while co.find_wrapper(mk["wrapper"]) and time.monotonic() < end:
+            time.sleep(2)
+        if co.find_wrapper(mk["wrapper"]):
+            c.state["halt"] = f"a merge of PR #{mk['pr']} ({tid}) is still running after {MERGE_WAIT:.0f}s"
+            c.event("halt", reason=c.state["halt"])
+            c.save()
+            return
     try:
         pv = gh_json("pr", "view", str(mk["pr"]), "--json", "state,headRefOid,mergeCommit")
-        intact = ruleset_intact(c)
-    except (co.Refused, OSError) as e:
+        intact = ruleset_intact(mk)
+    except (co.Refused, OSError, TypeError, ValueError) as e:
         pv, intact = None, False
         why += f"; state unreadable ({e})"
-    merged = pv and pv.get("state") == "MERGED" and pv.get("headRefOid") == mk["head"] \
-        and isinstance(pv.get("mergeCommit"), dict) and re.fullmatch(r"[0-9a-f]{40}", str(pv["mergeCommit"].get("oid")))
+    merged = bool(pv and pv.get("state") == "MERGED" and pv.get("headRefOid") == mk["head"]
+                  and isinstance(pv.get("mergeCommit"), dict)
+                  and re.fullmatch(r"[0-9a-f]{40}", str(pv["mergeCommit"].get("oid"))))
     if intact and merged:
         m.pop("merging")
         m.update(status="merged", squash=pv["mergeCommit"]["oid"], reason=None, base=mk["base"],
@@ -748,6 +842,8 @@ def update_stale(c):
         m = c.state["merges"].setdefault(tid, {"attempts": 0})
         if tid not in c.authorized or not stale(t) or m.get("updates", 0) >= MAX_BRANCH_UPDATES:
             continue
+        if not fresh_authorized(c, tid):
+            continue
         m["updates"] = m.get("updates", 0) + 1
         c.save()
         p = co.run([co.GH, "pr", "update-branch", str(t["pr"])], cwd=co.REPO)
@@ -810,6 +906,8 @@ def movable(c, tasks):
         s, m = t["status"], c.state["merges"].get(tid, {})
         if s in (co.RUNNING, co.REVIEWING):
             out.add(tid)  # in flight: finishes whatever the authorization says
+        elif m.get("status") == "merged" and s != co.COMPLETED:
+            out.add(tid)  # one more pass lets the coordinator record the merge
         elif tid not in c.authorized:
             continue
         elif s in (co.AWAITING_REVIEW, co.CHANGES_REQUIRED) or (
@@ -905,7 +1003,10 @@ def cmd_run(c, args):
         tasks = c.tasks()
         summary(c, tasks, deadline)
         unplanned = plane is None or not valid or any(
-            spec["id"] not in tasks and plane[tk]["group"] in OPEN_GROUPS for tk, spec in task_specs(c.auth))
+            spec["id"] not in tasks and plane.get(tk, {}).get("group") in OPEN_GROUPS for tk, spec in task_specs(c.auth))
+        if c.state["halt"]:
+            why, code = f"HALT: {c.state['halt']}", 1
+            break
         if not movable(c, tasks) and not unplanned and not c.state["unsynced"]:
             why = "IDLE: nothing left that the campaign can move without the owner"
             break
@@ -964,7 +1065,8 @@ def cmd_propose(c, args):
         raise Refused(f"Plane unavailable: {e}")
     prompt = PM_PROMPT.format(ticket=tk, name=info["name"], description=info["description"][:6000],
                               prefix=tk.lower())
-    argv, scratch, auth = co.isolate("codex", co.ADAPTERS["codex"](prompt, None, [], True), readonly=True)
+    argv, scratch, auth = co.isolate("codex", co.ADAPTERS["codex"](prompt, None, [], True), readonly=True,
+                                     slot=co.REPO, cwd=co.REPO)
     out_dir = c.dir / "proposals"
     out_dir.mkdir(exist_ok=True)
     log = out_dir / f"{tk}-{now().strftime('%Y%m%dT%H%M%S')}.log"
@@ -975,7 +1077,7 @@ def cmd_propose(c, args):
     answer = co.agent_text("codex", text)
     proposal = log.with_suffix(".json")
     try:
-        data = json.loads(answer[answer.index("{"):answer.rindex("}") + 1])
+        data = co.parse_json(answer[answer.index("{"):answer.rindex("}") + 1])
         co.write_atomic(proposal, json.dumps(data, indent=2) + "\n", 0o644)
         if not isinstance(data, dict) or not isinstance(data.get("tasks"), list) or \
                 not all(isinstance(t, dict) and isinstance(t.get("review", {}), dict) for t in data["tasks"]):

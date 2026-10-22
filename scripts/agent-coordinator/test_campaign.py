@@ -50,10 +50,12 @@ FAKE_CI = textwrap.dedent('''\
     [ "$(git -C "$slot" rev-parse HEAD)" = "$head" ] || { echo "slot not at head"; exit 2; }
     mkdir -p "$out"
     rc=0; [ -e "$CTL/ci-fail" ] && rc=1
+    lie=0; [ -e "$CTL/ci-lie" ] && lie=1
     [ -e "$CTL/ci-symlink" ] && ln -s "$CTL/secret" "$out/leak"
     if [ -e "$CTL/ci-dirlink" ]; then mv "$out" "$out.real"; ln -s "$CTL/secretdir" "$out"; fi
     echo "{\\"step\\":\\"native-test\\",\\"rc\\":$rc}" >"$out/steps.jsonl"
-    if [ $rc = 0 ]; then failed='[]'; ok=true; else failed='["native-test"]'; ok=false; fi
+    if [ $rc = 0 ] || [ $lie = 1 ]; then failed='[]'; ok=true; else failed='["native-test"]'; ok=false; fi
+    [ $lie = 1 ] && rc=1
     echo "{\\"head\\":\\"$head\\",\\"base\\":\\"$base\\",\\"all_passed\\":$ok,\\"failed\\":$failed}" >"$out/summary.json"
     echo "native-test rc=$rc"
     exit $rc
@@ -352,6 +354,13 @@ class Campaign(CampaignFixture):
                                  "--poll", "0.2"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True)
 
+    def wait_for_call(self, key, limit=60):
+        for _ in range(limit * 10):
+            if any(c["key"] == key for c in self.codex_calls()):
+                return
+            time.sleep(0.1)
+        self.fail(f"codex was never called for {key}")
+
     def wait_for(self, path, limit=60):
         for _ in range(limit * 10):
             if path.exists():
@@ -398,6 +407,54 @@ class Campaign(CampaignFixture):
         self.assertIn("state unreadable", self.cstate()["halt"])
         self.assertEqual(len(self.merges()), 1)
 
+    def test_orphaned_merge_script_is_waited_for_not_repeated(self):
+        (self.ctl / "merge-slow").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        p = self.start_campaign()
+        self.wait_for(self.ctl / "merging")
+        p.kill()  # the supervisor dies; the merge script, in its own session, carries on
+        p.communicate(timeout=30)
+        self.campaign("run", ok=True)
+        self.assertIn("still running; waiting", self.out)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.status("a"), "completed")
+        self.assertIsNone(self.cstate()["halt"])
+
+    def test_marker_is_reconciled_against_the_mode_it_was_written_in(self):
+        self.crash_in_merge("merge-crash-before", tasks=("a",))
+        auth = json.loads((self.camp / "authorization.json").read_text())
+        auth["merge"] = {"mode": "none"}  # the owner switches modes; the ruleset is still relaxed
+        (self.camp / "authorization.json").write_text(json.dumps(auth))
+        self.campaign("run", ok=False)
+        self.assertIn("ruleset not verified", self.cstate()["halt"])
+
+    def test_restore_failure_keeps_the_marker_for_reconciliation(self):
+        (self.ctl / "restore-fail").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.campaign("run", ok=False)
+        self.assertIn("merging", self.cstate()["merges"]["a"])
+        (self.ctl / "restore-fail").unlink()
+        st = self.cstate()
+        st["halt"] = None  # the owner verified the ruleset and cleared the halt
+        (self.camp / "campaign.json").write_text(json.dumps(st))
+        self.campaign("run", ok=True)
+        self.assertIn("not merged", json.dumps([e for e in self.cevents() if e["event"] == "merge_reconciled"]))
+        self.assertEqual(self.status("a"), "completed")
+
+    def test_failed_ci_run_with_a_passing_summary_is_never_accepted(self):
+        (self.ctl / "ci-lie").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.campaign("run", ok=True)
+        self.assertEqual(self.calls("merge-calls"), [])
+        self.assertFalse((self.camp / "merges/pr-1" / self.st()["a"]["approved_head"] / "ci-local").exists())
+        (self.ctl / "ci-lie").unlink()
+        st = self.cstate()
+        st["merges"]["a"]["attempts"] = 0
+        (self.camp / "campaign.json").write_text(json.dumps(st))
+        self.campaign("run", ok=True)  # a restart re-runs CI rather than trusting the old files
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(len((self.t / "log/agents.log.ci").read_text().splitlines()), 3)
+
     def test_merge_without_acknowledgement_is_settled_from_github(self):
         (self.ctl / "merge-no-ack").write_text("")
         self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
@@ -424,10 +481,7 @@ class Campaign(CampaignFixture):
         self.set_plane(tickets={"CG-1": "started", "CG-2": "started"})
         self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}, "CG-2": {"tasks": [self.ctask("z")]}})
         p = self.start_campaign()
-        for _ in range(100):
-            if (self.state / "state.json").exists() and self.status("a") == "running":
-                break
-            time.sleep(0.1)
+        self.wait_for_call("a")
         self.write_auth({"CG-2": {"tasks": [self.ctask("z")]}})  # CG-1 revoked while a runs
         out, _ = p.communicate(timeout=180)
         self.assertEqual(self.status("z"), "completed", out)
@@ -477,11 +531,7 @@ class Campaign(CampaignFixture):
         self.codex_plan({"a": ["sleep-commit"]})
         self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
         p = self.start_campaign()
-        for _ in range(100):
-            if (self.state / "state.json").exists() and self.status("a") == "running":
-                break
-            time.sleep(0.2)
-        time.sleep(0.5)
+        self.wait_for_call("a")
         p.kill()
         first, _ = p.communicate(timeout=30)
         self.campaign("run", ok=True)

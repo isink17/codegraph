@@ -96,8 +96,11 @@ and merge rights:
   continuation, review, branch update or merge, while running agents
   finish. Removing a task records `deauthorized` and stops new work on it;
   its branch, commits, PR and evidence are kept, and it continues if it is
-  authorized again. The merge step re-reads the file once more right
-  before merging. Plane sync of a merge that already happened is
+  authorized again. Right before a branch update, before leasing a worker
+  for local CI and right before `--merge`, the supervisor re-reads the
+  file and that ticket's Plane state again and, for the merge, requires
+  the same merge mode and exception directory as at the start of the
+  pass. Plane sync of a merge that already happened is
   reconciliation and still runs.
 
 `campaign.py propose --dir D CG-N` (PM decomposition) runs one read-only,
@@ -136,12 +139,18 @@ Safety rules:
   counts as one. A worker busy for local CI is not an attempt.
 - The `--merge` step runs in its own session with its output in its log,
   and Ctrl-C/SIGTERM wait until it exits. A `merging` marker (PR, head,
-  base) is saved before it starts. Its outcome is never taken from the
+  base, merge mode, exception directory, and a name on the script's
+  command line) is saved before it starts. A supervisor that finds a
+  marker whose script is still running (it outlived a killed supervisor)
+  waits for it (`CG_CAMPAIGN_MERGE_WAIT`, default 30 minutes, then
+  `halt`), never starting a second merge. A PR found already merged or
+  closed before a merge is settled the same way, never merged again. Its outcome is never taken from the
   script's output or from a missing acknowledgement: after the step, and
   at start-up for a marker a crash, power loss or kill left, the
   supervisor reconciles from GitHub (`gh pr view --json
   state,headRefOid,mergeCommit`) and, in exception mode, a read-back of
-  ruleset 24420032 compared with the campaign snapshot. Merged at the
+  ruleset 24420032 compared with the snapshot of the exception the merge
+  ran under (the marker's, not today's mode). Merged at the
   approved head with the ruleset intact: recorded and queued for Plane
   sync (the queue is saved before the sync, so a crash between merge and
   sync retries the sync, never the merge). Still open at that head with
@@ -150,14 +159,21 @@ Safety rules:
 - Merge script exit 3 (ruleset restoration failed) or an uncertain outcome
   sets `halt` in `campaign.json`: the supervisor exits with 1 and refuses
   to merge on every later run until the owner has verified the PR, ruleset
-  24420032 and Plane and removed `halt` (and `merging`) from
-  `campaign.json`.
+  24420032 and Plane and removed `halt`. The `merging` marker stays, so
+  the next start reconciles it against GitHub and the ruleset again (and
+  halts again if they still disagree).
 - A task whose ticket is no longer open in Plane is not merged.
 - ci-local output is untrusted: it is copied without following links,
   iteratively, within limits (depth 12, 5000 files, 256 MiB per file,
   1 GiB in all); `summary.json` must be at most 1 MiB, well-formed and of
-  the expected types. Links or exceeded limits reject the evidence of that
-  head on that base permanently (`ci_rejected`, kept across restarts); an
+  the expected types. ci-local runs in its own session, is killed with
+  everything it started after `CG_CAMPAIGN_CI_TIMEOUT` seconds (default
+  3600) and when it ends, and its output is copied into a staging
+  directory that becomes the evidence directory, with a `ci_ok` record,
+  only after a zero exit, a clean copy and a valid summary; a failed or
+  interrupted run's files are kept as `ci-local.failed-*` and never read.
+  Links or exceeded limits reject the evidence of that head on that base
+  permanently (`ci_rejected`, kept across restarts); an
   I/O error only fails the attempt. Agent output, Plane and gh responses
   are parsed with the same bounds; malformed input is never success and
   never crashes the supervisor.
