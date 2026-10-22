@@ -51,6 +51,7 @@ FAKE_CI = textwrap.dedent('''\
     mkdir -p "$out"
     rc=0; [ -e "$CTL/ci-fail" ] && rc=1
     [ -e "$CTL/ci-symlink" ] && ln -s "$CTL/secret" "$out/leak"
+    if [ -e "$CTL/ci-dirlink" ]; then mv "$out" "$out.real"; ln -s "$CTL/secretdir" "$out"; fi
     echo "{\\"step\\":\\"native-test\\",\\"rc\\":$rc}" >"$out/steps.jsonl"
     if [ $rc = 0 ]; then failed='[]'; ok=true; else failed='["native-test"]'; ok=false; fi
     echo "{\\"head\\":\\"$head\\",\\"base\\":\\"$base\\",\\"all_passed\\":$ok,\\"failed\\":$failed}" >"$out/summary.json"
@@ -378,6 +379,17 @@ class Campaign(CampaignFixture):
         self.assertEqual(self.calls("merge-calls"), [])
         self.assertIn("symbolic links", self.cstate()["merges"]["a"]["reason"])
         self.assertFalse([f for f in self.camp.rglob("leak")])
+
+    def test_symlinked_local_ci_output_directory_is_rejected(self):
+        (self.ctl / "secretdir").mkdir()
+        (self.ctl / "secretdir/summary.json").write_text("{}")
+        (self.ctl / "secretdir/lease.token").write_text("token")
+        (self.ctl / "ci-dirlink").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.campaign("run", ok=True)
+        self.assertEqual(self.calls("merge-calls"), [])
+        self.assertIn("symbolic links", self.cstate()["merges"]["a"]["reason"])
+        self.assertFalse([f for f in self.camp.rglob("lease.token")])
 
     def test_campaign_files_writable_by_agents_are_refused(self):
         self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})

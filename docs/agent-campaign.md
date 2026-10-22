@@ -180,7 +180,9 @@ part of an agent run or of ci-local, not separate agents.
 - Stop: `campaign.py stop --dir "$D"` (or `touch "$D/STOP"`). The supervisor
   exits after its current step; running agents finish; nothing is launched
   or continued. Remove the file to resume.
-- Interrupt: Ctrl-C (or SIGTERM) exits with 130; agents keep running.
+- Interrupt: Ctrl-C (or SIGTERM) exits with 130; agents keep running. During
+  a merge both wait until the merge script exits; the script itself ignores
+  them too (only SIGKILL stops it, which leaves `halt` set).
 - Resume: rerun the same `run` command. The stored deadline is kept unless
   `--minutes` is given; the coordinator adopts running agents and finished
   ones by their exit files; an interrupted ci-local lease is released or
@@ -220,6 +222,12 @@ reach the live pool, Plane or GitHub.
 ## Limitations
 
 - Single host, macOS only for codex and claude agents.
+- Keep campaign directories under the evidence root: agents cannot read
+  anything there, but a campaign directory elsewhere is readable to other
+  campaigns' agents.
+- Claude Code agents, and the Bash tools they are allowed (for example
+  `go test` running agent-written tests), can read the keychain, where
+  Claude Code keeps its login. Prefer `codex` agents for unattended work.
 - PM decomposition is a proposal; nothing an agent writes becomes
   authorized work.
 - A Codex agent can read its own login; it cannot read the keychain, ssh or gh

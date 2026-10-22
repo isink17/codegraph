@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -116,7 +117,7 @@ class Campaign:
         self.events_file = self.dir / "events.jsonl"
         self.stop_file = self.dir / "STOP"
         self.coord_dir = self.dir / "coordinator"
-        self.offsets = {}
+        self.offsets = None  # first pass: start at the end of existing logs
         self.sync_tried = 0.0  # per process: a restarted supervisor retries at once
 
     def lock(self):
@@ -269,6 +270,8 @@ def stream_agents(c):
     """Prints what every agent run has written since the last pass, also
     runs that started and ended between two passes."""
     slots = {t["id"]: t.get("slot") for t in c.tasks().values()}
+    if c.offsets is None:
+        c.offsets = {str(f): f.stat().st_size for f in (c.coord_dir / "runs").glob("*/output.log")}
     for log in sorted((c.coord_dir / "runs").glob("*/output.log")):
         m = re.match(r"(.+)-(implement|review)-\d+-[0-9a-f]+$", log.parent.name)
         if not m:
@@ -321,19 +324,19 @@ def run_merge(c, tag, argv, log):
         seen = start
         while True:
             rc = p.poll()
-            with open(log) as f:
+            with open(log, "rb") as f:
                 f.seek(seen)
                 new = f.read()
-            done = new.rfind("\n") + 1
-            for line in new[:done].splitlines():
+            done = len(new) if rc is not None else new.rfind(b"\n") + 1
+            for line in new[:done].decode(errors="replace").splitlines():
                 say(tag, line)
-            seen += len(new[:done].encode())
-            if rc is not None and done == len(new):
+            seen += done
+            if rc is not None:
                 break
             time.sleep(0.2)
         with open(log, "a") as f:
-            f.write(f"exit {rc}\n")
-        with open(log) as f:
+            f.write(f"\nexit {rc}\n")
+        with open(log, errors="replace") as f:
             f.seek(start)
             return rc, f.read()
     finally:
@@ -397,17 +400,10 @@ def local_ci(c, tid, t, head, base, cidir):
         argv = [str(out) if a == "@OUT@" else a for a in argv]
         try:
             rc, _ = run_logged(c, tag, argv, cidir.parent / "ci-local.log", cwd=sp)
-            if out.exists():
-                # PR code could leave links to files it cannot read; copy
-                # links as links and reject the evidence if there are any.
-                shutil.copytree(out, cidir, symlinks=True, dirs_exist_ok=True, ignore=shutil.ignore_patterns("tmp"))
-                links = [str(Path(d) / n) for d, ds, fs in os.walk(cidir) for n in ds + fs
-                         if (Path(d) / n).is_symlink()]
-                for link in links:
-                    os.unlink(link)
-                if links:
-                    why = f"ci-local output contained symbolic links {links[:3]}; evidence rejected"
-                    (cidir / "summary.json").unlink(missing_ok=True)
+            links = copy_evidence(out, cidir)
+            if links:
+                why = f"ci-local output contained symbolic links {links[:3]}; evidence rejected"
+                (cidir / "summary.json").unlink(missing_ok=True)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
         if not why and (rc != 0 or not ci_passed(cidir, head, base)):
@@ -417,6 +413,48 @@ def local_ci(c, tid, t, head, base, cidir):
     finally:
         why = "; ".join(filter(None, [why, settle_ci_lease(c)])) or None
     return why
+
+
+def copy_evidence(src, dst):
+    """Copies the regular files of src (written by PR code) into dst without
+    following any symbolic link, src itself included: every directory and
+    file is opened relative to its parent's descriptor with O_NOFOLLOW, so a
+    link swapped in meanwhile fails instead of being read. Returns the links
+    found; nothing else is copied (tmp/ is skipped)."""
+    links = []
+
+    def walk(dfd, rel):
+        for name in os.listdir(dfd):
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            path = f"{rel}/{name}" if rel else name
+            if stat.S_ISLNK(st.st_mode):
+                links.append(path)
+            elif stat.S_ISDIR(st.st_mode) and path != "tmp":
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+                try:
+                    (dst / path).mkdir(parents=True, exist_ok=True)
+                    walk(fd, path)
+                finally:
+                    os.close(fd)
+            elif stat.S_ISREG(st.st_mode):
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                with os.fdopen(fd, "rb") as f, open(dst / path, "wb") as g:
+                    shutil.copyfileobj(f, g)
+
+    try:
+        top = os.open(src, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return links
+    except OSError:
+        return [str(src)]
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        walk(top, "")
+    except OSError as e:
+        links.append(f"unreadable: {e}")
+    finally:
+        os.close(top)
+    return links
 
 
 def settle_ci_lease(c):
@@ -579,7 +617,7 @@ def merge_ready(c, plane):
         m = c.state["merges"].get(tid, {})
         if (t["status"] != want or not t.get("approved_head") or not t.get("review_file") or tid not in c.state["tasks"]
                 or m.get("status") == "merged" or m.get("attempts", 0) >= MAX_MERGE_ATTEMPTS
-                or plane[c.state["tasks"][tid]]["group"] not in OPEN_GROUPS):
+                or plane.get(c.state["tasks"][tid], {}).get("group") not in OPEN_GROUPS):
             continue
         say("pm", f"{tid}: merging PR #{t['pr']} at {t['approved_head'][:12]} ({mode})")
         try:
@@ -772,7 +810,10 @@ def cmd_propose(c, args):
     try:
         data = json.loads(answer[answer.index("{"):answer.rindex("}") + 1])
         co.write_atomic(proposal, json.dumps(data, indent=2) + "\n", 0o644)
-        for t in data.get("tasks", []):
+        if not isinstance(data, dict) or not isinstance(data.get("tasks"), list) or \
+                not all(isinstance(t, dict) and isinstance(t.get("review", {}), dict) for t in data["tasks"]):
+            raise ValueError("expected {\"tasks\": [step objects with an object review]}")
+        for t in data["tasks"]:
             extra = set(t) - PM_FIELDS
             if extra or t.get("agent") not in ("codex", "claude") or \
                     t.get("review", {}).get("agent") not in ("codex", "claude") or set(t.get("review", {})) - {"agent", "focus"}:

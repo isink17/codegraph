@@ -1197,6 +1197,36 @@ class Pool(Fixture):
         self.assertNotIn("LEAK", self.log.read_text())
 
 
+    # ------------------------------------------------------------ overlapping adopted PRs
+
+    def test_overlapping_adopted_prs_rework_one_at_a_time(self):
+        db = {"prs": []}
+        for n, tid in ((1, "p1"), (2, "p2")):
+            clone = self.t / f"c{tid}"
+            self.git("clone", "-q", "-b", "v2.0", str(self.origin), str(clone))
+            (clone / "work").mkdir()
+            (clone / "work" / f"{tid}-init.txt").write_text(tid)
+            self.git("-C", str(clone), "add", "work")
+            self.git("-C", str(clone), "commit", "-qm", tid)
+            self.git("-C", str(clone), "push", "-q", "origin", f"HEAD:task/{tid}")
+            db["prs"].append({"number": n, "head": f"task/{tid}", "base": "v2.0", "state": "OPEN", "checks": []})
+        self.db.write_text(json.dumps(db))
+        tasks = []
+        for n, tid in ((1, "p1"), (2, "p2")):
+            m = self.t / f"log/reviewed-{tid}"
+            review = sh(f'if [ -e {m} ]; then printf "Verdict: APPROVE\\nBlocking: 0\\n"; '
+                        f'else touch {m}; printf "Verdict: REQUEST_CHANGES\\nBlocking: 1\\n"; fi')
+            tasks.append(self.task(tid, commit(tid, 1), scope=["work/*"], review=review, pr=n,
+                                   branch=f"task/{tid}"))
+        self.plan(*tasks)
+        self.run_until(lambda: all(t["status"] == "awaiting_ci" for t in self.st().values()), 90)
+        words = [l.split()[0] for l in self.log.read_text().splitlines()]
+        self.assertEqual(words, ["start", "end", "start", "end"])  # rework never overlapped
+        self.assertTrue([e for e in self.events() if e["event"] == "waiting_on" and e.get("other")])
+        for tid in ("p1", "p2"):
+            self.assertIn(f"{tid}-init.txt", self.git("--git-dir", str(self.origin), "ls-tree", "-r",
+                                                      "--name-only", f"task/{tid}"))
+
 
 class Units(unittest.TestCase):
     def setUp(self):
