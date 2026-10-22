@@ -16,6 +16,7 @@ Exit codes: 0 ok, 1 refused or a task failed/interrupted, 2 usage.
 import argparse
 import fcntl
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,13 @@ SLOT_CONFIG = [".claude", ".mcp.json", "CLAUDE.local.md", ".envrc"]
 REVIEW_SLOT = "codegraph-review"
 WORKERS = ["codegraph-worker-a", "codegraph-worker-b"]
 MAX_IMPL = 2
+# Present: no agent is launched or continued; running agents are left alone.
+STOP_FILE = Path(os.environ.get("CG_COORD_STOP", STATE_DIR / "STOP"))
+# Codex agents get a private CODEX_HOME seeded with these; the owner's
+# ~/.codex (config, hooks, rules, MCP servers, sessions) is never loaded.
+CODEX_AUTH = Path(os.environ.get("CG_COORD_CODEX_AUTH", HOME / ".codex/auth.json"))
+CODEX_CONFIG = os.environ.get("CG_COORD_CODEX_CONFIG")
+MAX_ATTEMPTS = 5
 
 PENDING, RUNNING, AWAITING_REVIEW, REVIEWING, CHANGES_REQUIRED = (
     "pending", "running", "awaiting_review", "reviewing", "review_changes_required")
@@ -63,7 +71,8 @@ TERMINAL = {COMPLETED}
 HOLDS_SLOT = {RUNNING, REVIEWING}
 
 TASK_FIELDS = {"id", "description", "base", "branch", "depends_on", "agent", "scope",
-               "acceptance", "validate", "review", "prompt", "publish", "allowed_tools", "command", "pr"}
+               "acceptance", "validate", "review", "prompt", "publish", "allowed_tools", "command", "pr",
+               "max_attempts"}
 
 
 class Refused(Exception):
@@ -158,9 +167,12 @@ def owner_writable():
     return out
 
 
-def sandboxed(argv, allow_read=(), slot=None):
+def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False):
     """(argv, scratch): argv run under sandbox-exec, and the private scratch
-    directory the caller removes afterwards; None where no sandbox exists."""
+    directory the caller removes afterwards; None where no sandbox exists.
+    readonly: only the scratch directory, /tmp and /dev are writable (no slot,
+    no repository). codex: the keychain is unreadable and CODEX_HOME is a
+    private directory in scratch (see codex_home)."""
     if not sandbox_available():
         return None
     def q(p, kind="subpath"):
@@ -184,15 +196,15 @@ def sandboxed(argv, allow_read=(), slot=None):
     gitdir = REPO / ".git"
     extra = owner_writable()  # may refuse: before anything is created
     scratch = tempfile.mkdtemp(prefix="cg-agent-")
-    writable = [q("/dev"), q(scratch), q("/private/tmp"),
-                # Branches only: remote-tracking refs decide which merge gate
-                # runs and what pool.sh treats as the base.
-                q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads"),
-                *[q(d) for d in extra]]
+    writable = [q("/dev"), q(scratch), q("/private/tmp"), *[q(d) for d in extra]]
+    if not readonly:
+        # Branches only: remote-tracking refs decide which merge gate runs
+        # and what pool.sh treats as the base.
+        writable += [q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads")]
     no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 q(gitdir / "objects/info"),
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
-    if slot:
+    if slot and not readonly:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
         no_write += [q(Path(slot) / ".git", "literal"),
                      rx(slot, "/(.*/)?(" + "|".join(re.escape(f) for f in SLOT_CONFIG) + ")(/|$)")]
@@ -202,18 +214,71 @@ def sandboxed(argv, allow_read=(), slot=None):
                + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
     env = [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
                                               ("XDG_CACHE_HOME", "cache"))]
+    if codex:
+        # Codex reads its login from auth.json, never the keychain, which
+        # holds the owner's other credentials (Plane, GitHub). Denying the
+        # keychain files keeps TLS trust evaluation working; denying the
+        # security daemon does not.
+        profile += f"(deny file-read* {q(HOME / 'Library/Keychains')})"
+        env.append(f"CODEX_HOME={scratch}/codex-home")
     gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
     return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", *env, f"GOMODCACHE={gomod}", *argv], scratch
 
 
-def isolate(agent, argv, allow_read=(), slot=None):
-    """(argv, scratch or None)."""
-    wrapped = sandboxed(argv, allow_read, slot)
-    if wrapped:
-        return wrapped
-    if agent != "command":
-        raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
-    return argv, None
+def isolate(agent, argv, allow_read=(), slot=None, readonly=False):
+    """(argv, scratch or None, codex auth digest or None)."""
+    wrapped = sandboxed(argv, allow_read, slot, readonly, agent == "codex")
+    if not wrapped:
+        if agent != "command":
+            raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
+        return argv, None, None
+    if agent != "codex":
+        return *wrapped, None
+    try:
+        return *wrapped, codex_home(Path(wrapped[1]) / "codex-home")
+    except OSError as e:
+        shutil.rmtree(wrapped[1], ignore_errors=True)
+        raise Refused(f"cannot prepare CODEX_HOME: {e}")
+
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def codex_home(home):
+    """Seeds a private CODEX_HOME with the owner's login (and an optional
+    owner-written config.toml). Returns the login's digest, which
+    return_codex_login compares afterwards."""
+    home.mkdir(mode=0o700)
+    shutil.copyfile(CODEX_AUTH, home / "auth.json")
+    os.chmod(home / "auth.json", 0o600)
+    if CODEX_CONFIG:
+        shutil.copyfile(CODEX_CONFIG, home / "config.toml")
+    return sha256(CODEX_AUTH)
+
+
+def return_codex_login(info):
+    """A login refreshed inside a run replaces the owner's copy, because a
+    refresh may rotate the token the owner's copy still holds. Only when the
+    owner's file is unchanged since the copy and the new one is the same
+    account; anything else is left alone and reported."""
+    digest = info.get("codex_auth")
+    new = Path(info["scratch"]) / "codex-home/auth.json"
+    if not digest or not new.exists():
+        return None
+    try:
+        if sha256(new) == digest:
+            return None
+        if sha256(CODEX_AUTH) != digest:
+            return "owner's Codex login changed during the run; refreshed copy discarded"
+        old, fresh = json.loads(CODEX_AUTH.read_text()), json.loads(new.read_text())
+        account = lambda d: ((d.get("tokens") or {}).get("account_id"), d.get("auth_mode"), sorted(d))
+        if not isinstance(fresh, dict) or account(old) != account(fresh):
+            return "refreshed Codex login does not match the owner's account; discarded"
+        write_atomic(CODEX_AUTH, new.read_text())
+        return "refreshed Codex login returned to the owner's CODEX_HOME"
+    except (OSError, ValueError, AttributeError) as e:
+        return f"refreshed Codex login not returned: {e}"
 
 
 def scope_prefix(pattern):
@@ -239,7 +304,9 @@ def in_scope(path, scope):
 
 # ---------------------------------------------------------------- task model
 
-def load_tasks(path):
+def load_tasks(path, known=()):
+    """Validated tasks from path. Dependencies may also name tasks in known
+    (already planned)."""
     try:
         data = json.loads(Path(path).read_text())
     except (OSError, ValueError) as e:
@@ -269,11 +336,9 @@ def load_tasks(path):
         review = t.get("review", {})
         if review.get("agent", "claude") not in ADAPTERS:
             raise Refused(f"task {tid}: review agent must be one of {sorted(ADAPTERS)}")
-        # codex exec applies its own Seatbelt sandbox, which cannot nest in
-        # ours, and its read-only mode still reads every file: no boundary
-        # keeps it from the lease tokens.
-        if "codex" in (t.get("agent"), review.get("agent")):
-            raise Refused(f"task {tid}: the codex adapter is disabled until it can be isolated from lease tokens")
+        attempts = t.get("max_attempts", 1)
+        if type(attempts) is not int or not 1 <= attempts <= MAX_ATTEMPTS:
+            raise Refused(f"task {tid}: max_attempts must be an integer from 1 to {MAX_ATTEMPTS}")
         out[tid] = {
             "id": tid,
             "description": t["description"],
@@ -291,10 +356,11 @@ def load_tasks(path):
             "publish": t.get("publish", True),
             "allowed_tools": list(t.get("allowed_tools", [])),
             "pr": t.get("pr"),
+            "max_attempts": attempts,
         }
     for tid, t in out.items():
         for d in t["depends_on"]:
-            if d not in out:
+            if d not in out and d not in known:
                 raise Refused(f"task {tid} depends on unknown task {d}")
     seen, done = set(), set()
 
@@ -305,7 +371,8 @@ def load_tasks(path):
             raise Refused(f"dependency cycle through {n}")
         seen.add(n)
         for d in out[n]["depends_on"]:
-            visit(d)
+            if d in out:
+                visit(d)
         done.add(n)
     for tid in out:
         visit(tid)
@@ -320,7 +387,7 @@ def load_tasks(path):
 # Each adapter returns the argv to run in the slot. Only flags verified
 # against the installed CLIs' --help are used; none bypasses permissions.
 
-def implement_prompt(task, slot_path, findings=""):
+def implement_prompt(task, slot_path, findings="", previous=""):
     lines = [
         f"Task {task['id']}: {task['description']}",
         f"Working directory: {slot_path} (branch {task['branch']}, based on {REMOTE}/{task['base']}).",
@@ -334,6 +401,10 @@ def implement_prompt(task, slot_path, findings=""):
         lines += ["", task["prompt"]]
     if findings:
         lines += ["", "An independent review requested changes. Address them:", findings]
+    if previous:
+        lines += ["", "A previous attempt ended without passing the coordinator's checks:", previous,
+                  "Its work is still in this directory. Continue from the current state; the task is",
+                  "complete only when the checks pass, not when you say so."]
     return "\n".join(lines)
 
 
@@ -369,7 +440,11 @@ def claude_argv(prompt, session, tools, review, add_dirs=()):
 
 
 def codex_argv(prompt, session, tools, review, add_dirs=()):
-    return ["codex", "exec", "--json", "-s", "read-only" if review else "workspace-write", prompt]
+    # codex exec's own Seatbelt sandbox cannot nest inside ours, so it is
+    # switched off; this argv is only ever run under sandboxed() (isolate
+    # refuses codex where no sandbox exists), which is the boundary:
+    # writable slot for implementers, nothing but scratch for reviewers.
+    return ["codex", "exec", "--json", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", prompt]
 
 
 def command_argv(prompt, session, tools, review, add_dirs=()):
@@ -644,7 +719,7 @@ class Coordinator:
 
 # ---------------------------------------------------------------- processes
 
-def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
+def launch(c, t, argv, cwd, kind, status, scratch=None, codex_auth=None, **fields):
     """Starts argv detached in its own session and moves the task to status.
     The task is saved as holding the process before it exists; the wrapper
     writes its pid before running the agent and the exit status after, and
@@ -656,7 +731,7 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
     wrapper = ['/bin/sh', '-c', 'echo $$ >"$0.pid.tmp" && mv "$0.pid.tmp" "$0.pid" || exit 125; '
                '"$@"; rc=$?; echo $rc >"$0.tmp" && mv "$0.tmp" "$0"', str(exit_file), *argv]
     info = {"pid": None, "start": None, "dir": str(run_dir), "cwd": str(cwd), "kind": kind, "argv0": argv[0],
-            "scratch": scratch}
+            "scratch": scratch, "codex_auth": codex_auth}
     c.set(t, status, process=info, **fields)
     fault("launch_before_popen")
     with open(run_dir / "output.log", "w") as log:
@@ -680,6 +755,9 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
 def drop_scratch(info):
     """Removes a run's scratch directory once its agent is known gone."""
     if info.get("scratch"):
+        note = return_codex_login(info)
+        if note:
+            print(note)
         shutil.rmtree(info["scratch"], ignore_errors=True)
 
 
@@ -795,6 +873,7 @@ def conflicts(c, t):
 
 
 def start_impl(c, t, findings=""):
+    t["tries"] = 0
     slot, rc, err = c.acquire(t, "auto")
     if not slot:
         if rc == 3:
@@ -807,12 +886,17 @@ def start_impl(c, t, findings=""):
     return begin_impl(c, t, findings)
 
 
-def begin_impl(c, t, findings=""):
+def begin_impl(c, t, findings="", previous=""):
     slot = t["slot"]
     p = slot_path(slot)
     try:
         if run([GIT, *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
             git(p, "switch", "-q", t["branch"])
+            # The PR branch may have moved on the remote (base merged in on
+            # GitHub); continue from there, never from behind it.
+            remote = f"refs/remotes/{REMOTE}/{t['branch']}"
+            if run([GIT, *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", remote]).returncode == 0:
+                git(p, "merge", "-q", "--ff-only", remote)
         else:
             # An adopted PR's branch exists only on the remote: continue it.
             remote = f"{REMOTE}/{t['branch']}"
@@ -825,15 +909,17 @@ def begin_impl(c, t, findings=""):
     t["base_sha"] = git(p, "rev-parse", f"{REMOTE}/{t['base']}")
     t["head"] = t.get("head") or git(p, "rev-parse", "HEAD")  # the agent must add a commit to this
     t["session"] = str(uuid.uuid4())
-    prompt = implement_prompt(t, p, findings)
+    t["impl_findings"] = findings
+    prompt = implement_prompt(t, p, findings, previous)
     tools = IMPL_TOOLS + t["allowed_tools"]
     argv = t["command"] if t["agent"] == "command" else ADAPTERS[t["agent"]](prompt, t["session"], tools, False)
     try:
-        argv, scratch = isolate(t["agent"], argv, slot=p)
+        argv, scratch, auth = isolate(t["agent"], argv, slot=p)
     except Refused as e:
         c.block(t, f"{e}; lease kept")
         return None
-    launch(c, t, argv, p, "implement", RUNNING, scratch, attempt=t.get("attempt", 0) + 1)
+    launch(c, t, argv, p, "implement", RUNNING, scratch, auth, attempt=t.get("attempt", 0) + 1,
+           tries=t.get("tries", 0) + 1)
     print(f"{t['id']}: running in {slot}")
     return None
 
@@ -844,6 +930,19 @@ def planted_config(p):
             if l.startswith("!! ") and set(l[3:].rstrip("/").split("/")) & set(SLOT_CONFIG)]
 
 
+def unfinished(c, t, reason):
+    """An agent that stopped short of the checks is continued in the same
+    slot with the reason, up to max_attempts executions; then, or under
+    STOP, the task fails with its lease and work kept."""
+    if t.get("tries", 1) >= t.get("max_attempts", 1):
+        return c.block(t, reason, FAILED)
+    if STOP_FILE.exists():
+        return c.block(t, f"{reason}; not continued: {STOP_FILE} present", INTERRUPTED)
+    c.event(t["id"], "continue", reason=reason, tries=t.get("tries", 1))
+    print(f"{t['id']}: continuing ({t.get('tries', 1) + 1}/{t['max_attempts']}): {reason}")
+    return begin_impl(c, t, t.get("impl_findings", ""), reason)
+
+
 def finish_impl(c, t, rc):
     """Never trusts the exit code alone: the tree must be clean, the branch
     must hold new commits, every changed file must be in scope, and every
@@ -851,9 +950,9 @@ def finish_impl(c, t, rc):
     p = slot_path(t["slot"])
     evidence = Path(t["process"]["dir"])
     if rc != 0:
-        return c.block(t, f"agent exited {rc}; work and lease kept in {t['slot']}", FAILED)
+        return unfinished(c, t, f"agent exited {rc}; work and lease kept in {t['slot']}")
     if git(p, "status", "--porcelain", "--untracked-files=all"):
-        return c.block(t, f"agent left {t['slot']} dirty; lease kept", FAILED)
+        return unfinished(c, t, f"agent left {t['slot']} dirty; lease kept")
     planted = planted_config(p)
     if planted:
         return c.block(t, f"ignored tool configuration in {t['slot']}: {planted[:5]}; lease kept", FAILED)
@@ -861,11 +960,11 @@ def finish_impl(c, t, rc):
         return c.block(t, f"agent left {t['slot']} off branch {t['branch']}; lease kept", FAILED)
     head = git(p, "rev-parse", "HEAD")
     if head == t.get("head") or git(p, "rev-list", "--count", f"{t['base_sha']}..HEAD") == "0":
-        return c.block(t, "agent produced no new commit; lease kept", FAILED)
+        return unfinished(c, t, "agent produced no new commit; lease kept")
     changed = git(p, "diff", "--no-renames", "--name-only", f"{t['base_sha']}...HEAD").splitlines()
     outside = [f for f in changed if not in_scope(f, t["scope"])]
     if outside:
-        return c.block(t, f"changes outside scope: {outside[:5]}; lease kept", FAILED)
+        return unfinished(c, t, f"changes outside scope: {outside[:5]}; lease kept")
     for i, cmd in enumerate(t["validate"]):
         # Validation runs code the agent wrote: same sandbox as the agent.
         argv, scratch = sandboxed(["/bin/sh", "-c", cmd], slot=p) or (["/bin/sh", "-c", cmd], None)
@@ -877,9 +976,9 @@ def finish_impl(c, t, rc):
         (evidence / f"validate-{i}.log").write_text(f"$ {cmd}\nexit {v.returncode}\n{v.stdout}{v.stderr}")
         c.event(t["id"], "validated", command=cmd, exit=v.returncode, log=str(evidence / f"validate-{i}.log"))
         if v.returncode != 0:
-            return c.block(t, f"validation failed: {cmd}; lease kept", FAILED)
+            return unfinished(c, t, f"validation failed: {cmd}; lease kept")
     if git(p, "status", "--porcelain", "--untracked-files=all"):
-        return c.block(t, "validation left the tree dirty; lease kept", FAILED)
+        return unfinished(c, t, "validation left the tree dirty; lease kept")
     t["head"] = head
     if not t["publish"]:
         return c.block(t, f"validated at {head[:12]}; publish disabled, lease kept for the owner")
@@ -944,10 +1043,10 @@ def begin_review(c, t, head):
     argv = r["command"] if r["agent"] == "command" else ADAPTERS[r["agent"]](
         prompt, t["review_session"], READ_ONLY_TOOLS, True, [diff_dir])
     try:
-        argv, scratch = isolate(r["agent"], argv, allow_read=[diff_dir], slot=p)
+        argv, scratch, auth = isolate(r["agent"], argv, allow_read=[diff_dir], slot=p, readonly=True)
     except Refused as e:
         return c.block(t, f"{e}; review lease kept")
-    launch(c, t, argv, p, "review", REVIEWING, scratch, review_head=head)
+    launch(c, t, argv, p, "review", REVIEWING, scratch, auth, review_head=head)
     print(f"{t['id']}: reviewing PR #{t['pr']} at {head[:12]}")
 
 
@@ -1184,6 +1283,9 @@ def schedule(c):
     if any(t.get("starting") for t in tasks.values()):
         print("acquire transaction open: no slot is acquired until it is resolved")
         return changed
+    if STOP_FILE.exists():
+        print(f"STOP: {STOP_FILE} present; no agent is launched")
+        return changed
     for t in tasks.values():
         if any(o.get("starting") for o in tasks.values()):
             break
@@ -1225,8 +1327,8 @@ def schedule(c):
 # ---------------------------------------------------------------- commands
 
 def cmd_plan(c, args):
-    tasks = load_tasks(args.tasks)
     existing = c.state["tasks"]
+    tasks = load_tasks(args.tasks, existing)
     for tid, t in tasks.items():
         if tid in existing:
             if existing[tid]["status"] != PENDING:

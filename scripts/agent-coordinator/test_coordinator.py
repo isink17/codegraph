@@ -49,6 +49,15 @@ FAKE_GH = textwrap.dedent('''\
         p = next(p for p in db["prs"] if p["number"] == int(a[2]))
         print(json.dumps({"number": p["number"], "state": p["state"], "headRefOid": head(p["head"]),
                           "headRefName": p["head"], "baseRefName": p["base"], "statusCheckRollup": p["checks"]}))
+    elif a[:2] == ["pr", "update-branch"]:
+        import tempfile
+        p = next(p for p in db["prs"] if p["number"] == int(a[2]))
+        w = tempfile.mkdtemp()
+        g = lambda *x: subprocess.run(["git", "-C", w, *x], check=True, capture_output=True)
+        subprocess.run(["git", "clone", "-q", "-b", p["head"], os.environ["FAKE_ORIGIN"], w], check=True)
+        g("merge", "-q", "--no-edit", "origin/" + p["base"])
+        g("push", "-q", "origin", "HEAD:" + p["head"])
+        print("updated")
     else:
         sys.exit("fake gh: unsupported " + " ".join(a))
 ''')
@@ -66,6 +75,95 @@ FAKE_GATE = textwrap.dedent('''\
 
 GREEN = [{"name": "ci", "conclusion": "SUCCESS"}, {"name": "race", "conclusion": "SUCCESS"}]
 
+# codex stand-in. Per task, log/codex-plan.json lists one action per
+# execution (the last repeats); every call is recorded in log/codex-calls.jsonl
+# with what the sandbox let it see and do.
+FAKE_CODEX = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    import json, os, re, subprocess, sys
+    from pathlib import Path
+    log = Path(os.environ["CG_TEST_LOG"]).parent
+    prompt = sys.argv[-1]
+    if prompt.startswith("You are the project manager"):
+        print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+                                                             "text": (log / "pm-answer.json").read_text()}}))
+        sys.exit(0)
+    role = "review" if prompt.startswith("Independent review") else "implement"
+    tid = re.search(r"[Tt]ask ([A-Za-z0-9._-]+):", prompt).group(1)
+    key = tid if role == "implement" else "review:" + tid
+    calls = log / "codex-calls.jsonl"
+    n = sum(1 for l in calls.read_text().splitlines() if json.loads(l)["key"] == key) if calls.exists() else 0
+    plan = json.loads((log / "codex-plan.json").read_text()) if (log / "codex-plan.json").exists() else {}
+    acts = plan.get(key) or ["commit" if role == "implement" else "approve"]
+    act = acts[min(n, len(acts) - 1)]
+    home = Path(os.environ.get("CODEX_HOME", ""))
+    def can(f):
+        try:
+            f()
+            return True
+        except Exception:
+            return False
+    def touch_slot():
+        Path("probe-write").write_text("x")
+        Path("probe-write").unlink()
+    def make_ref():
+        subprocess.run(["git", "branch", "probe-ref"], check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-D", "probe-ref"], capture_output=True)
+    rec = {"key": key, "role": role, "act": act, "argv": sys.argv[1:-1], "prompt": prompt,
+           "codex_home": str(home), "auth_copied": (home / "auth.json").is_file(),
+           "keychain_readable": can(lambda: (Path.home() / "Library/Keychains/probe").read_text()),
+           "state_readable": can(lambda: (Path(os.environ["CG_COORD_STATE"]) / "state.json").read_text()),
+           "slot_write_ok": can(touch_slot), "ref_write_ok": can(make_ref)}
+    with open(calls, "a") as f:
+        f.write(json.dumps(rec) + "\\n")
+    with open(os.environ["CG_TEST_LOG"], "a") as f:
+        f.write(f"start {key}\\n")
+    def emit(kind, **item):
+        print(json.dumps({"type": kind, "item": item} if item else {"type": kind}), flush=True)
+    def say(text):
+        emit("item.completed", type="agent_message", text=text)
+    emit("thread.started")
+    if role == "review":
+        verdict = "REQUEST_CHANGES\\nBlocking: 1" if act == "reject" else "APPROVE\\nBlocking: 0"
+        say("reviewed\\nVerdict: " + verdict)
+        sys.exit(0)
+    if act == "claim-done":
+        say("DONE. All acceptance criteria are met and tests pass.")
+        sys.exit(0)
+    if act == "exit1":
+        sys.exit(1)
+    if act == "sleep-commit":
+        import time
+        time.sleep(4)
+    os.makedirs("work", exist_ok=True)
+    with open(f"work/{tid}.txt", "a") as f:
+        f.write(f"{tid} {n}\\n")
+    for cmd in (["git", "add", "work"], ["git", "commit", "-qm", tid]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        emit("item.completed", type="command_execution", command=" ".join(cmd), exit_code=r.returncode)
+    if act in ("refresh-commit", "foreign-commit"):
+        a = json.loads((home / "auth.json").read_text())
+        if act == "refresh-commit":
+            a["tokens"]["access_token"] = "refreshed"
+        else:
+            a["tokens"]["account_id"] = "acct-2"
+        (home / "auth.json").write_text(json.dumps(a))
+    say("DONE")
+''')
+
+
+def install_fake_codex(t, env):
+    """Puts the fake codex first on PATH, with a fake login and a keychain
+    file the sandbox must hide."""
+    (t / "bin/codex").write_text(FAKE_CODEX)
+    (t / "bin/codex").chmod(0o755)
+    (t / "home/.codex").mkdir(parents=True, exist_ok=True)
+    (t / "home/.codex/auth.json").write_text(json.dumps(
+        {"auth_mode": "chatgpt", "tokens": {"account_id": "acct-1", "access_token": "a"}}))
+    (t / "home/Library/Keychains").mkdir(parents=True, exist_ok=True)
+    (t / "home/Library/Keychains/probe").write_text("secret")
+    env["PATH"] = f"{t / 'bin'}:{env['PATH']}"
+
 
 def sh(script):
     return ["/bin/sh", "-c", script]
@@ -81,9 +179,18 @@ def commit(name, sleep=0):
 APPROVE = sh('git diff --stat "origin/v2.0...HEAD" >/dev/null && printf "looks fine\\nVerdict: APPROVE\\nBlocking: 0\\n"')
 
 
-class Pool(unittest.TestCase):
+class Fixture(unittest.TestCase):
+    """Throwaway remote, slots, leases and fakes; shared with test_campaign.py."""
+
     def setUp(self):
         self.t = Path(tempfile.mkdtemp()).resolve()
+        self.all_out = ""
+        # Agents may write /private/tmp, so fixtures there would make every
+        # sandbox assertion pass or fail for the wrong reason.
+        if str(self.t).startswith("/private/tmp/"):
+            shutil.rmtree(self.t, True)
+            self.fail(f"TMPDIR {tempfile.gettempdir()} is under /private/tmp, which the agent sandbox leaves "
+                      "writable; run the tests with the default TMPDIR")
         self.addCleanup(shutil.rmtree, self.t, True)
         t = self.t
         self.origin = t / "origin.git"
@@ -130,6 +237,7 @@ class Pool(unittest.TestCase):
         p = subprocess.run([sys.executable, str(COORD), *args], env={**self.env, **env},
                            capture_output=True, text=True)
         self.out = p.stdout + p.stderr
+        self.all_out += self.out
         if ok is not None:
             self.assertEqual(p.returncode == 0, ok, self.out)
         return p
@@ -189,6 +297,8 @@ class Pool(unittest.TestCase):
         for tok in tokens:
             self.assertNotIn(tok, self.out)
 
+
+class Pool(Fixture):
     # ------------------------------------------------------------ scheduling
 
     def test_two_concurrent_third_queued_then_full_flow(self):
@@ -968,12 +1078,102 @@ class Pool(unittest.TestCase):
         self.assertIn("ignored tool configuration", self.st()["x"]["reason"])
         self.assertIsNotNone(self.lease(A))
 
-    def test_codex_adapter_refused(self):
-        f = self.t / "codex.json"
-        for spec in ({"agent": "codex"}, {"review": {"agent": "codex"}}):
-            f.write_text(json.dumps({"tasks": [{**self.task("x", commit("x")), **spec}]}))
+    def test_plan_rejects_bad_max_attempts(self):
+        f = self.t / "attempts.json"
+        for bad in (0, 6, "2", True):
+            f.write_text(json.dumps({"tasks": [self.task("x", commit("x"), max_attempts=bad)]}))
             self.coord("plan", str(f), ok=False)
-            self.assertIn("codex adapter is disabled", self.out)
+            self.assertIn("max_attempts", self.out)
+
+    # ------------------------------------------------------------ continuation and STOP
+
+    def test_agent_that_stops_short_is_continued_in_place(self):
+        # First execution exits 0 without a commit, the second leaves dirty
+        # work, the third commits it: one slot, one lease, one PR.
+        n = self.t / "log/n"
+        agent = sh(f'echo x >>{n}; c=$(wc -l <{n}); echo "start $c" >>"$CG_TEST_LOG"; '
+                   f'[ $c -eq 1 ] && exit 0; mkdir -p work; echo $c >work/x.txt; [ $c -eq 2 ] && exit 0; '
+                   f'git add work && git commit -qm x')
+        self.plan(self.task("x", agent, max_attempts=3))
+        self.run_until(lambda: self.status("x") == "awaiting_ci", 60)
+        cont = [e for e in self.events() if e["event"] == "continue"]
+        self.assertEqual([e["reason"].split(";")[0] for e in cont],
+                         ["agent produced no new commit", f"agent left {A} dirty"])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "acquired" and e["slot"] != R]), 1)
+        self.assertEqual(self.st()["x"]["tries"], 3)
+        self.assertEqual(len(json.loads(self.db.read_text())["prs"]), 1)
+
+    def test_continuation_is_bounded(self):
+        self.plan(self.task("x", commit("x"), validate=["false"], max_attempts=2))
+        self.run_until(lambda: self.status("x") == "failed", 40)
+        self.assertEqual(len(self.starts_of("x")), 2)
+        self.assertIn("validation failed", self.st()["x"]["reason"])
+        self.assertIsNotNone(self.lease(self.st()["x"]["slot"]))
+        self.coord("run", "--once")
+        self.assertEqual(len(self.starts_of("x")), 2)
+
+    def test_stop_file_prevents_launch_and_continuation(self):
+        stop = self.state / "STOP"
+        self.state.mkdir(exist_ok=True)
+        self.plan(self.task("a", sh("sleep 1; true"), max_attempts=3))
+        self.coord("run", "--once", ok=True)
+        self.assertEqual(self.status("a"), "running")
+        stop.write_text("")
+        self.plan(self.task("b", commit("b")))
+        self.run_until(lambda: self.status("a") == "interrupted")
+        self.assertIn("not continued", self.st()["a"]["reason"])
+        self.assertEqual(self.status("b"), "pending")
+        self.assertIn("STOP", self.out)
+        stop.unlink()
+        self.run_until(lambda: self.status("b") == "awaiting_ci")
+
+    def starts_of(self, tid):
+        return [e for e in self.events() if e["event"] == "launched" and e["task"] == tid and e["kind"] == "implement"]
+
+    # ------------------------------------------------------------ codex adapter
+
+    def install_codex(self):
+        install_fake_codex(self.t, self.env)
+
+    def test_codex_implements_and_reviews_inside_the_sandbox(self):
+        self.install_codex()
+        (self.t / "log/codex-plan.json").write_text(json.dumps(
+            {"x": ["claim-done", "commit"], "review:x": ["write-then-approve"]}))
+        self.plan({**self.task("x", None, max_attempts=2), "agent": "codex", "command": None,
+                   "review": {"agent": "codex"}})
+        self.run_until(lambda: self.status("x") in ("awaiting_ci", "failed"), 60)
+        self.assertEqual(self.status("x"), "awaiting_ci", self.st()["x"].get("reason"))
+        calls = [json.loads(l) for l in (self.t / "log/codex-calls.jsonl").read_text().splitlines()]
+        self.assertEqual([c["role"] for c in calls], ["implement", "implement", "review"])
+        for c in calls:
+            self.assertEqual(c["argv"][:4], ["exec", "--json", "--ephemeral",
+                                             "--dangerously-bypass-approvals-and-sandbox"])
+            self.assertTrue(c["codex_home"].startswith(tempfile.gettempdir().rstrip("/")) or
+                            "/cg-agent-" in c["codex_home"], c)
+            self.assertNotEqual(c["codex_home"], str(self.t / "home/.codex"))
+            self.assertTrue(c["auth_copied"])
+            self.assertFalse(c["keychain_readable"])
+            self.assertFalse(c["state_readable"])
+        self.assertIn("previous attempt ended", calls[1]["prompt"])
+        self.assertIn("no new commit", calls[1]["prompt"])
+        self.assertFalse(calls[2]["slot_write_ok"])  # reviewer cannot write the review slot
+        self.assertFalse(calls[2]["ref_write_ok"])   # nor create a branch
+        self.assertEqual(self.git("-C", str(self.slots / R), "status", "--porcelain", "--untracked-files=all"), "")
+        launched = [e for e in self.events() if e["event"] == "launched"]
+        self.assertTrue(all(e["argv0"] == "/usr/bin/sandbox-exec" for e in launched))
+        self.assert_no_token_leak()
+
+    def test_refreshed_codex_login_is_returned_only_when_safe(self):
+        self.install_codex()
+        auth = self.t / "home/.codex/auth.json"
+        (self.t / "log/codex-plan.json").write_text(json.dumps({"x": ["refresh-commit"], "y": ["foreign-commit"]}))
+        self.plan({**self.task("x", None), "agent": "codex", "command": None})
+        self.run_until(lambda: self.status("x") == "awaiting_ci", 60)
+        self.assertEqual(json.loads(auth.read_text())["tokens"]["access_token"], "refreshed")
+        self.plan({**self.task("y", None), "agent": "codex", "command": None})
+        self.run_until(lambda: self.status("y") == "awaiting_ci", 60)
+        self.assertEqual(json.loads(auth.read_text())["tokens"]["account_id"], "acct-1")
+        self.assertIn("does not match the owner's account", self.out + self.all_out)
 
     # ------------------------------------------------------------ overlapping adopted PRs
 
@@ -1029,10 +1229,20 @@ class Units(unittest.TestCase):
         self.assertTrue(o([], ["docs/*"]))
 
     def test_adapters_never_bypass_permissions(self):
-        for name in ("claude", "codex"):
-            for review in (False, True):
-                argv = self.c.ADAPTERS[name]("p", "s", ["Read"], review)
-                self.assertFalse([a for a in argv if "dangerously" in a or a == "bypassPermissions"], argv)
+        for review in (False, True):
+            argv = self.c.ADAPTERS["claude"]("p", "s", ["Read"], review)
+            self.assertFalse([a for a in argv if "dangerously" in a or a == "bypassPermissions"], argv)
+
+    def test_codex_never_runs_outside_the_coordinator_sandbox(self):
+        argv = self.c.ADAPTERS["codex"]("p", "s", ["Read"], False)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        real = self.c.sandbox_available
+        self.c.sandbox_available = lambda: False
+        try:
+            with self.assertRaises(self.c.Refused):
+                self.c.isolate("codex", argv)
+        finally:
+            self.c.sandbox_available = real
 
 
 if __name__ == "__main__":
