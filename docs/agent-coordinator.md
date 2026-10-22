@@ -267,7 +267,12 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   builds trust; that cache is neither readable nor writable inside. The
   scratch directory must not be under `/tmp` (refused). Network:
   outbound only to this host (seatbelt's `localhost`, which includes the
-  host's own interface addresses) and DNS; Codex agents additionally reach
+  host's own interface addresses) and DNS, except every TCP or UDP port
+  already listening when the process starts (adb, local API proxies, file
+  servers would otherwise hand out what the file rules keep back; ports
+  opened later, such as a test's own listener, work;
+  `CG_COORD_SANDBOX_LOCAL_PORTS` allows listed ports; if the listeners
+  cannot be listed, no local port is reachable); Codex agents additionally reach
   TCP port 443 of any host, for their model API — seatbelt cannot filter
   by host name, so there is no destination allow-list, and what they can
   send is what they can read. Claude Code agents are refused unless the

@@ -1255,12 +1255,17 @@ class Pool(Fixture):
                        if subprocess.run(["curl", "-s", "-m", "5", "-o", "/dev/null", u]).returncode == 0), None)
         if not remote:
             self.skipTest("no non-localhost target reachable from this host")
-        probe = (f'(curl -s -m 5 -o /dev/null http://127.0.0.1:{port}/ && echo LOCAL-OK; '
-                 f'curl -s -m 5 -o /dev/null {remote} && echo REMOTE-REACHED) >>"$CG_TEST_LOG"; true')
+        # The listener above exists before launch (like adb or a proxy): denied.
+        # A listener the sandboxed process opens itself (a test's httptest): allowed.
+        own = ('python3 -c "import socket;s=socket.socket();s.bind((\'127.0.0.1\',0));s.listen();'
+               'c=socket.create_connection(s.getsockname());print(\'OWN-LISTENER-OK\')"')
+        probe = (f'(curl -s -m 5 -o /dev/null http://127.0.0.1:{port}/ && echo PREEXISTING-REACHED; '
+                 f'curl -s -m 5 -o /dev/null {remote} && echo REMOTE-REACHED; {own}) >>"$CG_TEST_LOG"; true')
         self.plan(self.task("x", commit("x"), validate=[probe]))
         self.run_until(lambda: self.status("x") == "awaiting_ci")
         log = self.log.read_text()
-        self.assertIn("LOCAL-OK", log)
+        self.assertIn("OWN-LISTENER-OK", log)
+        self.assertNotIn("PREEXISTING-REACHED", log)
         self.assertNotIn("REMOTE-REACHED", log)
 
     def starts_of(self, tid):

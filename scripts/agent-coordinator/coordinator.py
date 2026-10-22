@@ -227,6 +227,22 @@ def tool_dirs():
     return tuple(sorted({*out, gomod, *([goroot] if goroot else [])}))
 
 
+def listening_ports():
+    """Ports something on this host already listens on (TCP and UDP),
+    read outside the sandbox; None when that cannot be determined. They
+    are denied inside: a local service (adb, an API proxy, a file server)
+    would hand out what the file and network rules keep back. Ports opened
+    later, such as a test's own listener, stay reachable.
+    CG_COORD_SANDBOX_LOCAL_PORTS lists ports the owner allows anyway."""
+    p = run(["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-Fn"])
+    if p.returncode not in (0, 1) or (p.returncode == 1 and p.stderr.strip()):
+        return None
+    allowed = set(filter(None, os.environ.get("CG_COORD_SANDBOX_LOCAL_PORTS", "").split(",")))
+    ports = {m.group(1) for line in p.stdout.splitlines() if line.startswith("n")
+             for m in [re.search(r":(\d+)$", line.split("->")[0])] if m}
+    return sorted(ports - allowed - {"0"}, key=int)
+
+
 @functools.lru_cache(maxsize=None)
 def sdk_root():
     """Resolved outside the sandbox: inside it, cc must not go through xcrun,
@@ -305,6 +321,11 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
                     "(deny network-outbound)(allow network-outbound (remote ip \"localhost:*\") "
                     "(remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"
                     + ("(allow network-outbound (remote tcp \"*:443\"))" if codex else ""))
+        ports = listening_ports()
+        if ports is None:  # unknown: no local service either
+            profile += '(deny network-outbound (remote ip "localhost:*"))'
+        elif ports:
+            profile += "(deny network-outbound " + " ".join(f'(remote ip "localhost:{n}")' for n in ports) + ")"
     profile += (f"(deny file-write* {' '.join(no_write)})"
                 + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
     env = [f"{k}={os.environ[k]}" for k in ENV_KEEP if k in os.environ]

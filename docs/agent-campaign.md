@@ -281,6 +281,9 @@ reach the live pool, Plane or GitHub.
   git directory, tool install prefixes, the Go module cache, `/opt`,
   `/Library`, `/Applications`, `/private/tmp`) is readable to agents. File
   metadata is visible everywhere.
+- A local service started after an agent launched is reachable to it (only
+  ports listening at launch are denied). Do not leave unauthenticated local
+  servers running during a campaign.
 - Codex agents can open TCP connections to port 443 of any host (no
   host-name allow-list in seatbelt). What they could send is what they
   can read: the task's code, toolchains, and their own Codex login.
