@@ -104,7 +104,8 @@ and merge rights:
   reconciliation and still runs.
 
 `campaign.py propose --dir D CG-N` (PM decomposition) runs one read-only,
-sandboxed Codex process on the ticket's Plane text and writes
+sandboxed Codex process, in a clean export of the remote `v2.0` (never the
+primary checkout), on the ticket's Plane text and writes
 `<dir>/proposals/CG-N-<time>.json`, validated as a task list. It is never
 planned automatically: the owner reviews it and copies the steps into
 `authorization.json`.
@@ -166,7 +167,10 @@ Safety rules:
 - ci-local output is untrusted: it is copied without following links,
   iteratively, within limits (depth 12, 5000 files, 256 MiB per file,
   1 GiB in all); `summary.json` must be at most 1 MiB, well-formed and of
-  the expected types. ci-local runs in its own session, is killed with
+  the expected types. ci-local runs read-only (it cannot change the slot
+it tests), only in a worker slot without untracked or ignored files (an
+earlier run's leftovers could take part in the build; the owner removes
+them), in its own session, is killed with
   everything it started after `CG_CAMPAIGN_CI_TIMEOUT` seconds (default
   3600) and when it ends, and its output is copied into a staging
   directory that becomes the evidence directory, with a `ci_ok` record,

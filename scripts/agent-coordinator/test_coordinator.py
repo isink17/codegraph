@@ -91,6 +91,8 @@ FAKE_CODEX = textwrap.dedent('''\
     log = Path(os.environ["CG_TEST_LOG"]).parent
     prompt = sys.argv[-1]
     if prompt.startswith("You are the project manager"):
+        with open(log / "codex-calls.jsonl", "a") as f:
+            f.write(json.dumps({"key": "pm", "role": "pm", "cwd": os.getcwd()}) + "\\n")
         print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
                                                              "text": (log / "pm-answer.json").read_text()}}))
         sys.exit(0)
@@ -1317,7 +1319,7 @@ class Pool(Fixture):
         probes["private-tmp"] = tmp_canary
         reads = "; ".join(f'cat {f} >/dev/null 2>&1 && echo LEAK-{k}' for k, f in probes.items())
         reads += (f'; echo x >/private/tmp/cg-probe-$$ 2>/dev/null && echo LEAK-tmp-write'
-                  f'; echo x >>{user_tmp}/xcrun_db 2>/dev/null && echo LEAK-xcrun-write'
+                  f'; (: >{user_tmp}/cg-sandbox-probe-$$) 2>/dev/null && echo LEAK-usertmp-write'
                   f'; cat {user_tmp}/xcrun_db >/dev/null 2>&1 && echo LEAK-xcrun-read'
                   '; [ -n "$CG_ENV_CANARY" ] && echo LEAK-env'
                   '; cat work/x.txt >/dev/null 2>&1 && echo READ-OK')  # positive control: the slot

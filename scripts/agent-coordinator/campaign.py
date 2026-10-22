@@ -28,6 +28,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -425,28 +426,20 @@ def run_detached(c, tag, argv, log, cwd, timeout=None, defer_signals=False, wrap
             p = subprocess.Popen(argv, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                  start_new_session=True)
         seen, end = start, (time.monotonic() + timeout if timeout else None)
-        while True:
-            rc = p.poll()
-            if rc is None and end and time.monotonic() > end:
-                say(tag, f"timed out after {timeout:.0f}s; killing its session")
-                rc = None
-                break
-            with open(log, "rb") as f:
-                f.seek(seen)
-                new = f.read(STREAM_CHUNK)
-            done = len(new) if rc is not None else new.rfind(b"\n") + 1
-            for line in new[:done].decode(errors="replace").splitlines():
-                say(tag, line[:500])
-            seen += done
-            if rc is not None and len(new) < STREAM_CHUNK:
-                break
-            if rc is None:
-                time.sleep(0.2)
+        finished = False
         try:
-            os.killpg(p.pid, signal.SIGKILL)  # leftovers of the session (test daemons) go too
-        except (ProcessLookupError, PermissionError):
-            pass
-        p.wait()
+            rc = stream_until_exit(tag, p, log, seen, end, timeout)
+            finished = True
+        finally:
+            # Leftovers of the session (test daemons) go too, also when this
+            # supervisor is interrupted; a merge script is never killed
+            # halfway (a later supervisor finds it by its wrapper name).
+            if finished or not defer_signals:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                p.wait()
         with open(log, "a") as f:
             f.write(f"\nexit {rc}\n")
         with open(log, "rb") as f:
@@ -455,6 +448,26 @@ def run_detached(c, tag, argv, log, cwd, timeout=None, defer_signals=False, wrap
     finally:
         for s, h in old.items():
             signal.signal(s, h)
+
+
+def stream_until_exit(tag, p, log, seen, end, timeout):
+    """Streams log while p runs; its exit code, or None on timeout."""
+    while True:
+        rc = p.poll()
+        if rc is None and end and time.monotonic() > end:
+            say(tag, f"timed out after {timeout:.0f}s; killing its session")
+            return None
+        with open(log, "rb") as f:
+            f.seek(seen)
+            new = f.read(STREAM_CHUNK)
+        done = len(new) if rc is not None else new.rfind(b"\n") + 1
+        for line in new[:done].decode(errors="replace").splitlines():
+            say(tag, line[:500])
+        seen += done
+        if rc is not None and len(new) < STREAM_CHUNK:
+            return rc
+        if rc is None:
+            time.sleep(0.2)
 
 
 def ci_passed(cidir, head, base, rejected=(), accepted=None):
@@ -512,6 +525,9 @@ def local_ci(c, tid, t, head, base, cidir):
     try:
         co.git(sp, "fetch", "-q", co.REMOTE)
         co.git(sp, "switch", "-q", "--detach", head)
+        if co.git(sp, "status", "--porcelain", "--ignored", "--untracked-files=all"):
+            raise co.Refused(f"{slot} holds untracked or ignored files (left by an earlier run); they could take "
+                             "part in the build, so local CI does not run there until the owner removes them")
         coord = co.Coordinator(c.coord_dir)
         coord.fetch_verified(t["branch"], head)
         if not coord.worktree_matches(sp, head):
@@ -520,7 +536,8 @@ def local_ci(c, tid, t, head, base, cidir):
         # Passed as text: the sandbox denies reads of the evidence root.
         ci = (Path(c.auth["merge"]["exception_dir"]) / "ci-local.sh").read_text()
         argv = ["/bin/bash", "-c", ci, "ci-local.sh", str(sp), head, base, "@OUT@", *([".", *pkgs] if pkgs else [])]
-        wrapped = co.sandboxed(argv, slot=sp, cwd=sp)
+        # Read-only: the PR's tests must not change what they test.
+        wrapped = co.sandboxed(argv, slot=sp, cwd=sp, readonly=True)
         if not wrapped:
             raise co.Refused("ci-local needs the macOS sandbox")
         argv, scratch = wrapped
@@ -665,8 +682,12 @@ def merge_one(c, tid, t, mode):
     marker = {"head": head, "pr": pr, "base": base, "evidence": str(out), "mode": mode,
               "exception_dir": c.auth["merge"].get("exception_dir"), "wrapper": f"cg-merge-{uuid.uuid4().hex}"}
     pv = gh_json("pr", "view", str(pr), "--json", "state,headRefOid,mergeCommit")
+    if pv.get("state") == "CLOSED":
+        m["attempts"] = MAX_MERGE_ATTEMPTS
+        m["reason"] = f"PR #{pr} was closed without merging; owner must decide"
+        return None
     if pv.get("state") != "OPEN":
-        # Merged or closed outside this attempt: settle it, never merge again.
+        # Merged outside this attempt: settle it, never merge again.
         m["merging"] = {**marker, "wrapper": None}
         reconcile_merge(c, tid, m, f"PR #{pr} is already {pv.get('state')}")
         return m.get("squash") if m.get("status") == "merged" else None
@@ -789,7 +810,8 @@ def reconcile_merge(c, tid, m, why):
     else:
         c.state["halt"] = (f"merge of PR #{mk['pr']} ({tid}) has an uncertain outcome ({why}; PR "
                            f"{pv.get('state') if pv else 'unknown'}, ruleset {'intact' if intact else 'not verified'}); "
-                           "verify GitHub, ruleset 24420032 and Plane, then remove halt and merging from campaign.json")
+                           "verify GitHub, ruleset 24420032 and Plane, then remove halt from campaign.json "
+                           "(the merging marker stays and is reconciled again)")
         c.event("halt", reason=c.state["halt"])
     c.save()
 
@@ -1065,15 +1087,27 @@ def cmd_propose(c, args):
         raise Refused(f"Plane unavailable: {e}")
     prompt = PM_PROMPT.format(ticket=tk, name=info["name"], description=info["description"][:6000],
                               prefix=tk.lower())
+    # The PM reads a clean export of the remote base, never the primary
+    # checkout (its ignored files hold local configuration and notes).
+    coord = co.Coordinator(c.coord_dir)
+    url, store = coord.private_store()
+    co.run([co.GIT, *co.GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
+            "+refs/heads/v2.0:refs/verify-base/v2.0"], check=True)
+    tree = Path(tempfile.mkdtemp(prefix="cg-pm-tree-"))
+    archive = subprocess.Popen([co.GIT, *co.GIT_SAFE, "-C", str(store), "archive", "refs/verify-base/v2.0"],
+                               stdout=subprocess.PIPE)
+    subprocess.run(["tar", "-x", "-C", str(tree)], stdin=archive.stdout, check=True)
+    archive.wait()
     argv, scratch, auth = co.isolate("codex", co.ADAPTERS["codex"](prompt, None, [], True), readonly=True,
-                                     slot=co.REPO, cwd=co.REPO)
+                                     slot=tree, cwd=tree)
     out_dir = c.dir / "proposals"
     out_dir.mkdir(exist_ok=True)
     log = out_dir / f"{tk}-{now().strftime('%Y%m%dT%H%M%S')}.log"
     try:
-        rc, text = run_logged(c, f"pm:{tk}", argv, log, cwd=co.REPO)
+        rc, text = run_logged(c, f"pm:{tk}", argv, log, cwd=tree)
     finally:
         co.drop_scratch({"scratch": scratch, "codex_auth": auth})
+        shutil.rmtree(tree, ignore_errors=True)
     answer = co.agent_text("codex", text)
     proposal = log.with_suffix(".json")
     try:

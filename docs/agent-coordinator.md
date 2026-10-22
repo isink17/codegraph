@@ -260,7 +260,9 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   tokens and agent sockets in the coordinator's environment never reach
   it. `GIT_CONFIG_GLOBAL` is `/dev/null`, so commits use the repository's
   own identity. cgo builds use the Command Line Tools' `clang` directly
-  (`CC`, `SDKROOT` resolved outside the sandbox), never through `xcrun`,
+  (`CC`, `SDKROOT` resolved outside the sandbox, and the Command Line
+  Tools' `usr/bin` first on `PATH`, so `git` and `python3` in validation
+  commands are Apple's), never through `xcrun`,
   whose lookup cache in the per-user temp directory the owner's own
   builds trust; that cache is neither readable nor writable inside. The
   scratch directory must not be under `/tmp` (refused). Network:
@@ -283,7 +285,8 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   that head's tree in the private repository (`checkout_mismatch`
   otherwise, the task fails with the review lease kept). The diff the
   reviewer reads comes from the private repository. The campaign's
-  ci-local checkout is verified the same way.
+  ci-local checkout is verified the same way, with ignored files counted
+  (Go compiles ignored directories too).
 - **Authorization gate.** With `CG_COORD_AUTHORIZED` set (the campaign
   sets it), a task is launched, continued, resumed after an acquire or
   reviewed only while its id is in that file; an unreadable or malformed

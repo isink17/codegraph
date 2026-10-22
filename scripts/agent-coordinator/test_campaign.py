@@ -47,6 +47,8 @@ FAKE_CI = textwrap.dedent('''\
     #!/bin/bash
     slot=$1 head=$2 base=$3 out=$4
     echo "ci $head $base $*" >>"$CG_TEST_LOG.ci"
+    if [ -e "$CTL/ci-write" ]; then (echo x >"$slot/planted.go") 2>/dev/null && echo SLOT-WRITTEN >>"$CG_TEST_LOG.ci" ||
+        echo SLOT-WRITE-DENIED >>"$CG_TEST_LOG.ci"; fi
     [ "$(git -C "$slot" rev-parse HEAD)" = "$head" ] || { echo "slot not at head"; exit 2; }
     mkdir -p "$out"
     rc=0; [ -e "$CTL/ci-fail" ] && rc=1
@@ -584,6 +586,25 @@ class Campaign(CampaignFixture):
         self.campaign("run", ok=True)  # a restart does not accept the rejected head's evidence
         self.assertEqual(self.calls("merge-calls"), [])
 
+    def test_local_ci_refuses_a_slot_with_leftover_files_and_cannot_write_it(self):
+        (self.ctl / "ci-write").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        (self.seed / ".git/info").mkdir(exist_ok=True)
+        (self.seed / ".git/info/exclude").write_text("*.bin\n")
+        for s in (A, B):  # an earlier run left an ignored file behind; pool.sh still sees the slot idle
+            (self.slots / s / "leftover.bin").write_text("x")
+        self.campaign("run", ok=True, minutes="0.5")
+        self.assertEqual(self.calls("merge-calls"), [])
+        self.assertIn("untracked or ignored files", json.dumps(self.cstate()["merges"]))
+        for s in (A, B):
+            (self.slots / s / "leftover.bin").unlink()
+        st = self.cstate()
+        st["merges"]["a"]["attempts"] = 0
+        (self.camp / "campaign.json").write_text(json.dumps(st))
+        self.campaign("run", ok=True)
+        self.assertIn("SLOT-WRITE-DENIED", (self.t / "log/agents.log.ci").read_text())
+        self.assertEqual(len(self.merges()), 1)
+
     def test_campaign_files_writable_by_agents_are_refused(self):
         self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
         self.campaign("run", ok=True, minutes="0")
@@ -663,6 +684,9 @@ class Campaign(CampaignFixture):
         self.campaign("propose", "CG-1", ok=True)
         proposal = Path(self.out.split("proposal for CG-1: ")[1].split()[0])
         self.assertEqual(json.loads(proposal.read_text())["tasks"][0]["id"], "cg-1-step")
+        pm = [c for c in self.codex_calls() if c["key"] == "pm"]
+        self.assertEqual(len(pm), 1)
+        self.assertNotEqual(os.path.realpath(pm[0]["cwd"]), os.path.realpath(self.seed))  # a clean export, not the checkout
         self.assertEqual((self.camp / "authorization.json").read_text(), before)
         self.assertFalse((self.state / "state.json").exists())
         self.campaign("propose", "CG-9", ok=False)

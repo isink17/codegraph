@@ -269,7 +269,7 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
     # directories are added.
     gitdir = REPO / ".git"
     extra = owner_writable()  # may refuse: before anything is created
-    if os.path.realpath(tempfile.gettempdir()).startswith(("/private/tmp/", "/tmp/")):
+    if (os.path.realpath(tempfile.gettempdir()) + "/").startswith("/private/tmp/"):
         raise Refused(f"TMPDIR {tempfile.gettempdir()} is under /tmp; scratch directories there would be shared "
                       "with Claude Code agents")
     scratch = tempfile.mkdtemp(prefix="cg-agent-")
@@ -817,15 +817,15 @@ class Coordinator:
 
     def worktree_matches(self, path, sha):
         """True when the files in path are exactly the tree of sha in the
-        private repository (tracked content and modes, and no untracked
-        file that is not ignored)."""
+        private repository: tracked content and modes, and no other file,
+        ignored ones included (Go compiles ignored directories too)."""
         _, store = self.private_store()
         idx = self.dir / f".verify-{uuid.uuid4().hex}.index"
         env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
         g = [GIT, *GIT_SAFE, "--git-dir", str(store), "--work-tree", str(path)]
         try:
             run([*g, "read-tree", sha], cwd=path, env=env, check=True)
-            run([*g, "add", "-A", "."], cwd=path, env=env, check=True)
+            run([*g, "add", "-A", "--force", "."], cwd=path, env=env, check=True)
             tree = run([*g, "write-tree"], cwd=path, env=env, check=True).stdout.strip()
         finally:
             idx.unlink(missing_ok=True)
