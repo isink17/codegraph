@@ -82,7 +82,7 @@ FAKE_MERGE = textwrap.dedent('''\
     if [ -e "$CTL/restore-fail" ]; then
         echo "merge-exception: RULESET_RESTORE_FAILED: ruleset 24420032 may be weakened; stop all merges"; exit 3
     fi
-    [ -e "$CTL/merge-crash-before" ] && { cp "$CTL/relaxed.json" "$FAKE_RULESET"; kill -9 $PPID; sleep 30; }
+    [ -e "$CTL/merge-crash-before" ] && { cp "$CTL/relaxed.json" "$FAKE_RULESET"; kill -9 $(ps -o ppid= -p $PPID); sleep 30; }
     git --git-dir "$FAKE_ORIGIN" update-ref refs/heads/v2.0 "$sha"
     python3 - "$pr" "$sha" <<'EOF'
     import json, os, sys
@@ -91,7 +91,7 @@ FAKE_MERGE = textwrap.dedent('''\
     p.update(state="MERGED", squash=sys.argv[2], merged_head=sys.argv[2])
     json.dump(db, open(os.environ["FAKE_GH_DB"], "w"))
     EOF
-    [ -e "$CTL/merge-crash-after" ] && { kill -9 $PPID; sleep 30; }
+    [ -e "$CTL/merge-crash-after" ] && { kill -9 $(ps -o ppid= -p $PPID); sleep 30; }
     [ -e "$CTL/merge-no-ack" ] && exit 0
     echo "merge-exception: MERGED #$pr as $sha; waiver record x"
 ''')
