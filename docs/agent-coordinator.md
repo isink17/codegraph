@@ -268,7 +268,7 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   scratch directory must not be under `/tmp` (refused). Network:
   outbound only to this host (seatbelt's `localhost`, which includes the
   host's own interface addresses) and DNS, except every TCP or UDP port
-  already listening when the process starts (adb, local API proxies, file
+  already listening when the process starts, of any user (adb, local API proxies, file
   servers would otherwise hand out what the file rules keep back; ports
   opened later, such as a test's own listener, work;
   `CG_COORD_SANDBOX_LOCAL_PORTS` allows listed ports; if the listeners

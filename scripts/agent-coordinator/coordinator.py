@@ -232,15 +232,27 @@ def listening_ports():
     read outside the sandbox; None when that cannot be determined. They
     are denied inside: a local service (adb, an API proxy, a file server)
     would hand out what the file and network rules keep back. Ports opened
-    later, such as a test's own listener, stay reachable.
+    later, such as a test's own listener, stay reachable. netstat sees
+    every user's sockets, lsof adds what it can name;
     CG_COORD_SANDBOX_LOCAL_PORTS lists ports the owner allows anyway."""
+    ports = set()
+    for proto, state in (("tcp", "LISTEN"), ("udp", None)):
+        p = run(["/usr/sbin/netstat", "-an", "-p", proto])
+        if p.returncode != 0:
+            return None
+        for line in p.stdout.splitlines():
+            f = line.split()
+            if len(f) >= 4 and f[0].startswith(proto) and (state is None or f[-1] == state):
+                m = re.search(r"\.(\d+)$", f[3])
+                if m:
+                    ports.add(int(m.group(1)))
     p = run(["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-Fn"])
     if p.returncode not in (0, 1) or (p.returncode == 1 and p.stderr.strip()):
         return None
-    allowed = set(filter(None, os.environ.get("CG_COORD_SANDBOX_LOCAL_PORTS", "").split(",")))
-    ports = {m.group(1) for line in p.stdout.splitlines() if line.startswith("n")
-             for m in [re.search(r":(\d+)$", line.split("->")[0])] if m}
-    return sorted(ports - allowed - {"0"}, key=int)
+    ports |= {int(m.group(1)) for line in p.stdout.splitlines() if line.startswith("n")
+              for m in [re.search(r":(\d+)$", line.split("->")[0])] if m}
+    allowed = {int(x) for x in os.environ.get("CG_COORD_SANDBOX_LOCAL_PORTS", "").split(",") if x.strip().isdigit()}
+    return sorted(ports - allowed - {0})
 
 
 @functools.lru_cache(maxsize=None)
