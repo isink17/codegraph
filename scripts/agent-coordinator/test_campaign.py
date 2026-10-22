@@ -680,6 +680,8 @@ class Campaign(CampaignFixture):
     def test_propose_writes_a_proposal_and_plans_nothing(self):
         self.authorize({"CG-1": {"tasks": []}}, mode="none")
         (self.t / "log/pm-answer.json").write_text(json.dumps({"tasks": [self.ctask("cg-1-step")]}))
+        (self.seed / "TODO.md").write_text("private notes")  # an untracked file of the primary checkout
+        (self.t / "log/pm-canary").write_text(str(self.seed / "TODO.md"))
         before = (self.camp / "authorization.json").read_text()
         self.campaign("propose", "CG-1", ok=True)
         proposal = Path(self.out.split("proposal for CG-1: ")[1].split()[0])
@@ -687,6 +689,7 @@ class Campaign(CampaignFixture):
         pm = [c for c in self.codex_calls() if c["key"] == "pm"]
         self.assertEqual(len(pm), 1)
         self.assertNotEqual(os.path.realpath(pm[0]["cwd"]), os.path.realpath(self.seed))  # a clean export, not the checkout
+        self.assertFalse(pm[0]["canary_readable"])  # the primary checkout's ignored files stay unreadable
         self.assertEqual((self.camp / "authorization.json").read_text(), before)
         self.assertFalse((self.state / "state.json").exists())
         self.campaign("propose", "CG-9", ok=False)

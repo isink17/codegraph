@@ -1213,8 +1213,11 @@ def begin_review(c, t, head):
         store = c.fetch_verified(branch, head)
         if not c.worktree_matches(p, head):
             c.event(t["id"], "checkout_mismatch", slot=t["slot"], head=head)
-            return c.block(t, f"the review checkout of {head[:12]} differs from the remote's content (the shared "
-                              "object store may have been altered); review lease kept", FAILED)
+            leftovers = git(p, "status", "--porcelain", "--ignored", "--untracked-files=all")
+            why = (f"untracked or ignored files are in the review slot: {leftovers.splitlines()[:3]}" if leftovers
+                   else "the shared object store may have been altered")
+            return c.block(t, f"the review checkout of {head[:12]} differs from the remote's content ({why}); "
+                              "review lease kept", FAILED)
         url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
         run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
              f"+refs/heads/{t['base']}:refs/verify-base/{t['base']}"], check=True)

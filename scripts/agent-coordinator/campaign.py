@@ -556,6 +556,11 @@ def local_ci(c, tid, t, head, base, cidir):
             problems, errors = copy_evidence(out, staging)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+        # Nothing may have changed the tested files meanwhile (a process left
+        # behind by an earlier run, for instance).
+        if not problems and (co.git(sp, "status", "--porcelain", "--ignored", "--untracked-files=all")
+                             or not coord.worktree_matches(sp, head)):
+            problems = [f"{slot} changed during local CI"]
         if problems:
             why = f"ci-local evidence rejected: {problems[:3]}"
             c.state["ci_rejected"].append(key)
@@ -1094,19 +1099,23 @@ def cmd_propose(c, args):
     co.run([co.GIT, *co.GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
             "+refs/heads/v2.0:refs/verify-base/v2.0"], check=True)
     tree = Path(tempfile.mkdtemp(prefix="cg-pm-tree-"))
-    archive = subprocess.Popen([co.GIT, *co.GIT_SAFE, "-C", str(store), "archive", "refs/verify-base/v2.0"],
-                               stdout=subprocess.PIPE)
-    subprocess.run(["tar", "-x", "-C", str(tree)], stdin=archive.stdout, check=True)
-    archive.wait()
-    argv, scratch, auth = co.isolate("codex", co.ADAPTERS["codex"](prompt, None, [], True), readonly=True,
-                                     slot=tree, cwd=tree)
-    out_dir = c.dir / "proposals"
-    out_dir.mkdir(exist_ok=True)
-    log = out_dir / f"{tk}-{now().strftime('%Y%m%dT%H%M%S')}.log"
+    scratch = auth = None
     try:
+        archive = subprocess.Popen([co.GIT, *co.GIT_SAFE, "-C", str(store), "archive", "refs/verify-base/v2.0"],
+                                   stdout=subprocess.PIPE)
+        tar = subprocess.run(["tar", "-x", "-C", str(tree)], stdin=archive.stdout)
+        archive.stdout.close()
+        if archive.wait() != 0 or tar.returncode != 0:
+            raise Refused("could not export v2.0 for the PM")
+        argv, scratch, auth = co.isolate("codex", co.ADAPTERS["codex"](prompt, None, [], True), readonly=True,
+                                         slot=tree, cwd=tree)
+        out_dir = c.dir / "proposals"
+        out_dir.mkdir(exist_ok=True)
+        log = out_dir / f"{tk}-{now().strftime('%Y%m%dT%H%M%S')}.log"
         rc, text = run_logged(c, f"pm:{tk}", argv, log, cwd=tree)
     finally:
-        co.drop_scratch({"scratch": scratch, "codex_auth": auth})
+        if scratch:
+            co.drop_scratch({"scratch": scratch, "codex_auth": auth})
         shutil.rmtree(tree, ignore_errors=True)
     answer = co.agent_text("codex", text)
     proposal = log.with_suffix(".json")

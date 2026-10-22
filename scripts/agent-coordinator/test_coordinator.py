@@ -92,7 +92,13 @@ FAKE_CODEX = textwrap.dedent('''\
     prompt = sys.argv[-1]
     if prompt.startswith("You are the project manager"):
         with open(log / "codex-calls.jsonl", "a") as f:
-            f.write(json.dumps({"key": "pm", "role": "pm", "cwd": os.getcwd()}) + "\\n")
+            canary = (log / "pm-canary").read_text() if (log / "pm-canary").exists() else ""
+            try:
+                open(canary).read()
+                readable = True
+            except OSError:
+                readable = False
+            f.write(json.dumps({"key": "pm", "role": "pm", "cwd": os.getcwd(), "canary_readable": readable}) + "\\n")
         print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
                                                              "text": (log / "pm-answer.json").read_text()}}))
         sys.exit(0)
