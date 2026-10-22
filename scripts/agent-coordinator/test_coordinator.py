@@ -1246,9 +1246,12 @@ class Pool(Fixture):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.shutdown)
         port = srv.server_address[1]
-        lan = subprocess.run(["ipconfig", "getifaddr", "en0"], capture_output=True, text=True).stdout.strip()
-        # A remote target the host itself can reach, so a refusal is the sandbox's.
-        remote = next((u for u in ([f"http://{lan}:{port}/"] if lan else []) + ["https://example.com/"]
+        # Another host the machine itself can reach, so a refusal is the
+        # sandbox's. Not this host's own LAN address: seatbelt counts every
+        # local interface address as localhost.
+        gw = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
+        gw = next((l.split()[-1] for l in gw.splitlines() if "gateway:" in l), "")
+        remote = next((u for u in ([f"http://{gw}/"] if gw else []) + ["https://example.com/"]
                        if subprocess.run(["curl", "-s", "-m", "5", "-o", "/dev/null", u]).returncode == 0), None)
         if not remote:
             self.skipTest("no non-localhost target reachable from this host")

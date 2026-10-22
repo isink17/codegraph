@@ -1179,5 +1179,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Explicitly: a shell starting a background job leaves SIGINT ignored,
+    # and Python keeps an inherited ignore; Ctrl-C is the documented stop.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     sys.exit(main())

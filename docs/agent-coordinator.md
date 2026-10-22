@@ -266,7 +266,8 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   whose lookup cache in the per-user temp directory the owner's own
   builds trust; that cache is neither readable nor writable inside. The
   scratch directory must not be under `/tmp` (refused). Network:
-  outbound only to localhost (and DNS); Codex agents additionally reach
+  outbound only to this host (seatbelt's `localhost`, which includes the
+  host's own interface addresses) and DNS; Codex agents additionally reach
   TCP port 443 of any host, for their model API — seatbelt cannot filter
   by host name, so there is no destination allow-list, and what they can
   send is what they can read. Claude Code agents are refused unless the
