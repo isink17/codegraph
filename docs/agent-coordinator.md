@@ -232,14 +232,17 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   `CG_COORD_CODEX_CONFIG` names one, an owner-written `config.toml`; the
   owner's `~/.codex` (config, hooks, rules, MCP servers with their
   credentials, sessions, shell snapshots) is never loaded or written.
-  `~/Library/Keychains` is unreadable to Codex agents, so the Plane and
-  other keychain items are out of reach (denying the security daemon
-  instead breaks TLS). A login that Codex refreshed during the run is
-  copied back over the owner's `auth.json` when the run ends, because a
-  refresh can rotate the token the owner's copy holds; only when the
-  owner's file is unchanged since the copy and the new one has the same
-  keys, auth mode and account. The run's JSONL events in `output.log` are
-  the transcript.
+  Every agent and validation command is denied reads of the evidence root
+  (`CG_COORD_EVIDENCE`, other coordinators' and campaigns' state and
+  tokens), of `CG_COORD_DENY_READ` entries, and of `~/.ssh`, `~/.config/gh`,
+  `~/.netrc`, `~/.git-credentials`, `~/.codex` and `~/Library/Keychains`
+  (the keychain stays readable only to Claude Code agents, which keep their
+  login there; denying the keychain files keeps TLS working, denying the
+  security daemon does not). The login copy is never written back, since
+  the agent controls it; if Codex refreshed it during a run, the
+  coordinator says so, because a refresh may rotate the token the owner's
+  copy holds (`codex login` fixes that). The run's JSONL events in
+  `output.log` are the transcript.
 - **Agents.** Launching needs a planned task with scope and acceptance
   criteria. Claude Code runs with `-p --output-format json --session-id
   <uuid> --permission-mode dontAsk --allowedTools …`: tools outside the
@@ -332,7 +335,9 @@ coordinator version.
   fast-forwards the local task branch to the remote one first, so a base
   merged in on GitHub is kept.
 - A Codex agent can read its own login (`auth.json` in its `CODEX_HOME`),
-  as any agent can read the credentials it runs with.
+  and a Claude Code agent the keychain, as any agent can read the
+  credentials it runs with. Other files the owner can read and network
+  access remain open to agents (the profile allows by default).
 - Tests must run with a `TMPDIR` outside `/private/tmp`, which agents may
   write; the fixture refuses otherwise.
 - The Claude Code adapter's tool list must include every command the agent

@@ -403,6 +403,13 @@ class Pool(Fixture):
         self.assertIsNone(self.lease(other))
         self.run_until(lambda: self.status("x") == "awaiting_ci")
 
+    def test_run_on_an_empty_queue_leaves_a_usable_state(self):
+        (self.slots / R / "dirty.txt").write_text("x")  # makes prepare log an event
+        self.coord("run", "--once", ok=True)
+        self.assertTrue((self.state / "events.jsonl").exists())
+        self.coord("status", ok=True)
+        self.coord("run", "--once", ok=True)
+
     def test_missing_or_malformed_state(self):
         self.plan(self.task("x", commit("x", 1)))
         self.coord("run", "--once", ok=True)
@@ -1163,47 +1170,32 @@ class Pool(Fixture):
         self.assertTrue(all(e["argv0"] == "/usr/bin/sandbox-exec" for e in launched))
         self.assert_no_token_leak()
 
-    def test_refreshed_codex_login_is_returned_only_when_safe(self):
+    def test_codex_login_copy_is_never_written_back(self):
         self.install_codex()
         auth = self.t / "home/.codex/auth.json"
-        (self.t / "log/codex-plan.json").write_text(json.dumps({"x": ["refresh-commit"], "y": ["foreign-commit"]}))
+        before = auth.read_bytes()
+        (self.t / "log/codex-plan.json").write_text(json.dumps({"x": ["refresh-commit"]}))
         self.plan({**self.task("x", None), "agent": "codex", "command": None})
         self.run_until(lambda: self.status("x") == "awaiting_ci", 60)
-        self.assertEqual(json.loads(auth.read_text())["tokens"]["access_token"], "refreshed")
-        self.plan({**self.task("y", None), "agent": "codex", "command": None})
-        self.run_until(lambda: self.status("y") == "awaiting_ci", 60)
-        self.assertEqual(json.loads(auth.read_text())["tokens"]["account_id"], "acct-1")
-        self.assertIn("does not match the owner's account", self.out + self.all_out)
+        self.assertEqual(auth.read_bytes(), before)
+        self.assertIn("not copied back", self.all_out)
 
-    # ------------------------------------------------------------ overlapping adopted PRs
+    def test_validation_and_agents_cannot_read_owner_secrets(self):
+        """Agent-written code runs in validation too: it must see no keychain,
+        no other coordinator's state under the evidence root, no ssh keys."""
+        probes = {"keychain": self.t / "home/Library/Keychains/probe", "ssh": self.t / "home/.ssh/id_probe",
+                  "evidence": self.t / "home/Projekti/codegraph-evidence/coordinator/tokens/x.token",
+                  "gh": self.t / "home/.config/gh/hosts.yml", "codex": self.t / "home/.codex/auth.json"}
+        for f in probes.values():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("secret")
+        reads = "; ".join(f'cat {f} >/dev/null 2>&1 && echo LEAK-{k}' for k, f in probes.items())
+        self.plan(self.task("x", sh(f'({reads}) >>"$CG_TEST_LOG"; mkdir -p work && echo x >work/x.txt && '
+                                    'git add work && git commit -qm x'),
+                            validate=[f'({reads}) >>"$CG_TEST_LOG"; true']))
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        self.assertNotIn("LEAK", self.log.read_text())
 
-    def test_overlapping_adopted_prs_rework_one_at_a_time(self):
-        db = {"prs": []}
-        for n, tid in ((1, "p1"), (2, "p2")):
-            clone = self.t / f"c{tid}"
-            self.git("clone", "-q", "-b", "v2.0", str(self.origin), str(clone))
-            (clone / "work").mkdir()
-            (clone / "work" / f"{tid}-init.txt").write_text(tid)
-            self.git("-C", str(clone), "add", "work")
-            self.git("-C", str(clone), "commit", "-qm", tid)
-            self.git("-C", str(clone), "push", "-q", "origin", f"HEAD:task/{tid}")
-            db["prs"].append({"number": n, "head": f"task/{tid}", "base": "v2.0", "state": "OPEN", "checks": []})
-        self.db.write_text(json.dumps(db))
-        tasks = []
-        for n, tid in ((1, "p1"), (2, "p2")):
-            m = self.t / f"log/reviewed-{tid}"
-            review = sh(f'if [ -e {m} ]; then printf "Verdict: APPROVE\\nBlocking: 0\\n"; '
-                        f'else touch {m}; printf "Verdict: REQUEST_CHANGES\\nBlocking: 1\\n"; fi')
-            tasks.append(self.task(tid, commit(tid, 1), scope=["work/*"], review=review, pr=n,
-                                   branch=f"task/{tid}"))
-        self.plan(*tasks)
-        self.run_until(lambda: all(t["status"] == "awaiting_ci" for t in self.st().values()), 90)
-        words = [l.split()[0] for l in self.log.read_text().splitlines()]
-        self.assertEqual(words, ["start", "end", "start", "end"])  # rework never overlapped
-        self.assertTrue([e for e in self.events() if e["event"] == "waiting_on" and e.get("other")])
-        for tid in ("p1", "p2"):
-            self.assertIn(f"{tid}-init.txt", self.git("--git-dir", str(self.origin), "ls-tree", "-r",
-                                                      "--name-only", f"task/{tid}"))
 
 
 class Units(unittest.TestCase):

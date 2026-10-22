@@ -266,12 +266,13 @@ def render(line):
 
 
 def stream_agents(c):
-    """Prints what every agent run has written since the last pass."""
-    for t in c.tasks().values():
-        info = t.get("process") or {}
-        if not info.get("dir"):
+    """Prints what every agent run has written since the last pass, also
+    runs that started and ended between two passes."""
+    slots = {t["id"]: t.get("slot") for t in c.tasks().values()}
+    for log in sorted((c.coord_dir / "runs").glob("*/output.log")):
+        m = re.match(r"(.+)-(implement|review)-\d+-[0-9a-f]+$", log.parent.name)
+        if not m:
             continue
-        log = Path(info["dir"]) / "output.log"
         try:
             with open(log, "rb") as f:
                 f.seek(c.offsets.get(str(log), 0))
@@ -283,7 +284,7 @@ def stream_agents(c):
         for line in data[:cut].decode(errors="replace").splitlines():
             text = render(line)
             if text:
-                say(f"{t['id']}:{info.get('kind')}@{t.get('slot') or '-'}", text)
+                say(f"{m.group(1)}:{m.group(2)}@{slots.get(m.group(1)) or '-'}", text)
 
 
 # ---------------------------------------------------------------- merging
@@ -303,6 +304,41 @@ def run_logged(c, tag, argv, log, cwd=None, env=None):
         rc = p.wait()
         f.write(f"exit {rc}\n")
     return rc, "".join(out)
+
+
+def run_merge(c, tag, argv, log):
+    """Runs the merge authority's --merge step so that nothing interrupts it
+    halfway (it relaxes and restores a ruleset): its own session, output to
+    its log rather than a pipe, and SIGINT/SIGTERM deferred until it exits."""
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        with open(log, "a") as f:
+            f.write(f"$ {' '.join(map(str, argv))}\n")
+            start = f.tell()
+            f.flush()
+            p = subprocess.Popen([str(a) for a in argv], cwd=co.REPO, stdout=f, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        seen = start
+        while True:
+            rc = p.poll()
+            with open(log) as f:
+                f.seek(seen)
+                new = f.read()
+            done = new.rfind("\n") + 1
+            for line in new[:done].splitlines():
+                say(tag, line)
+            seen += len(new[:done].encode())
+            if rc is not None and done == len(new):
+                break
+            time.sleep(0.2)
+        with open(log, "a") as f:
+            f.write(f"exit {rc}\n")
+        with open(log) as f:
+            f.seek(start)
+            return rc, f.read()
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
 
 
 def ci_passed(cidir, head, base):
@@ -345,25 +381,36 @@ def local_ci(c, tid, t, head, base, cidir):
     c.save()
     c.event("ci_leased", task=tid, slot=slot)
     sp = co.slot_path(slot)
+    why = None
     try:
         co.git(sp, "fetch", "-q", co.REMOTE)
         co.git(sp, "switch", "-q", "--detach", head)
         pkgs = go_packages(head, base)
-        ci = Path(c.auth["merge"]["exception_dir"]) / "ci-local.sh"
-        argv = ["/bin/bash", str(ci), str(sp), head, base, "@OUT@", *([".", *pkgs] if pkgs else [])]
+        # Passed as text: the sandbox denies reads of the evidence root.
+        ci = (Path(c.auth["merge"]["exception_dir"]) / "ci-local.sh").read_text()
+        argv = ["/bin/bash", "-c", ci, "ci-local.sh", str(sp), head, base, "@OUT@", *([".", *pkgs] if pkgs else [])]
         wrapped = co.sandboxed(argv, slot=sp)
         if not wrapped:
-            return "ci-local needs the macOS sandbox"
+            raise co.Refused("ci-local needs the macOS sandbox")
         argv, scratch = wrapped
         out = Path(scratch) / "ci"
         argv = [str(out) if a == "@OUT@" else a for a in argv]
         try:
             rc, _ = run_logged(c, tag, argv, cidir.parent / "ci-local.log", cwd=sp)
             if out.exists():
-                shutil.copytree(out, cidir, dirs_exist_ok=True, ignore=shutil.ignore_patterns("tmp"))
+                # PR code could leave links to files it cannot read; copy
+                # links as links and reject the evidence if there are any.
+                shutil.copytree(out, cidir, symlinks=True, dirs_exist_ok=True, ignore=shutil.ignore_patterns("tmp"))
+                links = [str(Path(d) / n) for d, ds, fs in os.walk(cidir) for n in ds + fs
+                         if (Path(d) / n).is_symlink()]
+                for link in links:
+                    os.unlink(link)
+                if links:
+                    why = f"ci-local output contained symbolic links {links[:3]}; evidence rejected"
+                    (cidir / "summary.json").unlink(missing_ok=True)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
-        if rc != 0 or not ci_passed(cidir, head, base):
+        if not why and (rc != 0 or not ci_passed(cidir, head, base)):
             why = f"local CI failed for {head[:12]} (exit {rc}); evidence {cidir}"
     except co.Refused as e:
         why = f"ci-local setup failed: {e}"
@@ -432,17 +479,29 @@ def merge_one(c, tid, t, mode):
     if rc != 0:
         m["reason"] = f"merge authority refused verification (exit {rc})"
         return None
-    rc, text = run_logged(c, tag, [*verify, "--merge"], out / "merge.log", cwd=co.REPO)
+    m["merging"] = {"head": head, "utc": stamp()}
+    c.save()
+    rc, text = run_merge(c, tag, [*verify, "--merge"], out / "merge.log")
+    m.pop("merging")
+    squash = re.search(r"MERGED #?\d+ (?:as )?([0-9a-f]{40})", text)
+    if rc == 0 and squash:
+        m.update(status="merged", squash=squash.group(1), reason=None, base=base, evidence=str(out))
+        return squash.group(1)
     if rc == 3:
         c.state["halt"] = f"ruleset restoration failed while merging PR #{pr}; see {out / 'merge.log'}"
-        m["reason"] = c.state["halt"]
-        return None
-    squash = re.search(r"MERGED #?\d+ (?:as )?([0-9a-f]{40})", text)
-    if rc != 0 or not squash:
-        m["reason"] = f"merge failed (exit {rc}); see {out / 'merge.log'}"
-        return None
-    m.update(status="merged", squash=squash.group(1), reason=None, base=base, evidence=str(out))
-    return squash.group(1)
+    else:
+        # Refused before anything changed only if the PR is still open at
+        # the approved head; any other outcome needs the owner.
+        try:
+            pv = co.Coordinator(c.coord_dir).pr_view(pr)
+            still_open = pv["state"] == "OPEN" and pv["headRefOid"] == head
+        except co.Refused:
+            still_open = False
+        if not still_open:
+            c.state["halt"] = (f"merge of PR #{pr} ended with exit {rc} and an unknown outcome; verify the PR, "
+                               f"ruleset 24420032 and Plane; see {out / 'merge.log'}")
+    m["reason"] = c.state["halt"] or f"merge refused (exit {rc}); see {out / 'merge.log'}"
+    return None
 
 
 def sync_body(c, tid, t, ticket):
@@ -501,7 +560,7 @@ def update_stale(c):
                   + ("done; new head needs a new review" if p.returncode == 0 else f"failed: {p.stderr.strip()}"))
 
 
-def merge_ready(c):
+def merge_ready(c, plane):
     """Merges approved tasks one at a time, and only while Plane is in step:
     a failed post-merge sync stops all merging until it is retried
     successfully."""
@@ -519,10 +578,15 @@ def merge_ready(c):
     for tid, t in c.tasks().items():
         m = c.state["merges"].get(tid, {})
         if (t["status"] != want or not t.get("approved_head") or not t.get("review_file") or tid not in c.state["tasks"]
-                or m.get("status") == "merged" or m.get("attempts", 0) >= MAX_MERGE_ATTEMPTS):
+                or m.get("status") == "merged" or m.get("attempts", 0) >= MAX_MERGE_ATTEMPTS
+                or plane[c.state["tasks"][tid]]["group"] not in OPEN_GROUPS):
             continue
         say("pm", f"{tid}: merging PR #{t['pr']} at {t['approved_head'][:12]} ({mode})")
-        squash = merge_one(c, tid, t, mode)
+        try:
+            squash = merge_one(c, tid, t, mode)
+        except co.Refused as e:
+            squash = None
+            c.state["merges"].setdefault(tid, {"attempts": 0})["reason"] = f"merge step failed: {e}"
         c.save()
         c.event("merge", task=tid, pr=t["pr"], head=t["approved_head"], squash=squash,
                 reason=c.state["merges"][tid].get("reason"))
@@ -574,10 +638,30 @@ def summary(c, tasks, deadline):
 
 
 def cmd_run(c, args):
-    for d in filter(None, os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":")):
-        a, b = str(c.dir) + "/", os.path.realpath(d).rstrip("/") + "/"
-        if a.startswith(b) or b.startswith(a):
-            raise Refused(f"CG_COORD_SANDBOX_WRITABLE entry {d} would let agents write the campaign")
+    # Everything the supervisor later reads or runs as the owner must be out
+    # of the agents' reach.
+    writable = ["/private/tmp", "/tmp", "/dev",
+                *filter(None, os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":"))]
+    owned = [c.dir, Path(PLANE_SYNC)]
+    if c.auth["merge"]["mode"] == "exception":
+        owned.append(Path(c.auth["merge"]["exception_dir"]))
+    for path in owned:
+        a = os.path.realpath(path).rstrip("/") + "/"
+        for d in writable:
+            b = os.path.realpath(d).rstrip("/") + "/"
+            if a.startswith(b) or b.startswith(a):
+                raise Refused(f"{path} is writable to agents (under {d}); move it")
+    for tid, m in c.state["merges"].items():
+        if m.get("merging") and not c.state["halt"]:
+            c.state["halt"] = (f"the supervisor stopped while merging {tid} at {m['merging']['head'][:12]}; verify "
+                               "the PR, ruleset 24420032 and Plane, then remove halt and merging")
+            c.event("halt", reason=c.state["halt"])
+    try:
+        why = settle_ci_lease(c)
+    except co.Refused as e:
+        why = str(e)
+    if why:
+        say("campaign", f"ci-local lease: {why}")
     if args.minutes is not None or not c.state.get("deadline") or c.state["deadline"] <= stamp():
         c.state["deadline"] = stamp(now() + timedelta(minutes=args.minutes if args.minutes is not None else 120))
     deadline = datetime.strptime(c.state["deadline"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -611,7 +695,7 @@ def cmd_run(c, args):
         c.coordinator("run", "--once")
         stream_agents(c)
         if plane is not None:
-            merge_ready(c)
+            merge_ready(c, plane)
             c.save()
         tasks = c.tasks()
         summary(c, tasks, deadline)
@@ -645,6 +729,8 @@ def cmd_stop(c, args):
           "no agent is launched or continued. Remove the file and rerun to resume.")
     return 0
 
+
+PM_FIELDS = {"id", "description", "depends_on", "agent", "scope", "acceptance", "validate", "review", "max_attempts"}
 
 PM_PROMPT = """You are the project manager for CodeGraph ticket {ticket}: {name}
 
@@ -686,6 +772,11 @@ def cmd_propose(c, args):
     try:
         data = json.loads(answer[answer.index("{"):answer.rindex("}") + 1])
         co.write_atomic(proposal, json.dumps(data, indent=2) + "\n", 0o644)
+        for t in data.get("tasks", []):
+            extra = set(t) - PM_FIELDS
+            if extra or t.get("agent") not in ("codex", "claude") or \
+                    t.get("review", {}).get("agent") not in ("codex", "claude") or set(t.get("review", {})) - {"agent", "focus"}:
+                raise ValueError(f"step {t.get('id')} uses fields or agents a proposal may not set: {sorted(extra)}")
         co.load_tasks(proposal, c.tasks())
     except (ValueError, co.Refused) as e:
         raise Refused(f"PM proposal is not a valid task list ({e}); raw output in {log}")
@@ -713,6 +804,7 @@ def main(argv=None):
         return 1
     os.environ["CG_COORD_STATE"] = str(c.coord_dir)
     os.environ["CG_COORD_STOP"] = str(c.stop_file)
+    os.environ["CG_COORD_DENY_READ"] = ":".join(filter(None, [os.environ.get("CG_COORD_DENY_READ"), str(c.dir)]))
     sys.path.insert(0, str(HERE))
     sys.dont_write_bytecode = True
     import coordinator

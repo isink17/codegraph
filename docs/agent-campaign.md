@@ -120,10 +120,17 @@ Safety rules:
   merged.
 - At most `MAX_MERGE_ATTEMPTS` (2) merge attempts per task; failed local CI
   counts as one. A worker busy for local CI is not an attempt.
-- Merge script exit 3 (ruleset restoration failed) sets `halt` in
+- The `--merge` step runs in its own session with its output in its log,
+  and Ctrl-C/SIGTERM wait until it exits, so nothing stops it between
+  relaxing and restoring the ruleset. A `merging` marker is saved before it
+  starts; finding one at start-up (the supervisor was killed) sets `halt`.
+- Merge script exit 3 (ruleset restoration failed), or any other failure
+  after which the PR is not still open at the approved head, sets `halt` in
   `campaign.json`: the supervisor exits with 1 and refuses to merge on every
-  later run until the owner has verified ruleset 24420032 and removed
-  `halt`.
+  later run until the owner has verified the PR, ruleset 24420032 and Plane
+  and removed `halt` (and `merging`) from `campaign.json`.
+- A task whose ticket is no longer open in Plane is not merged.
+- ci-local evidence containing symbolic links is rejected.
 - A failed post-merge sync is recorded in `unsynced`; no further merge
   happens until it succeeds. The merge itself is kept.
 - Plane is written only by `plane-sync.sh` (one marked comment per ticket
@@ -143,9 +150,14 @@ Safety rules:
 | `<dir>/merges/pr-N/<head>/` | ci-local evidence, merge log, Plane sync body and log |
 | `<dir>/STOP` | stop request |
 
-`campaign.lock` (flock) admits one supervisor per directory. Agents cannot
-read `<dir>/coordinator` (tokens, state) or write anywhere in `<dir>`; a
-`CG_COORD_SANDBOX_WRITABLE` entry overlapping `<dir>` is refused.
+`campaign.lock` (flock) admits one supervisor per directory. Agents can
+neither read nor write `<dir>` (it is passed to the coordinator as
+`CG_COORD_DENY_READ`). The supervisor refuses to start when `<dir>`, the
+exception directory or `plane-sync.sh` lies where agents may write
+(`/private/tmp`, `/dev`, `CG_COORD_SANDBOX_WRITABLE`). `ci-local.sh` is
+passed to the sandbox as text because the evidence root is unreadable
+there. Proposals may use only the PM fields with `codex` or `claude`
+agents; a `command` agent is refused.
 
 ## Operating
 
@@ -210,8 +222,9 @@ reach the live pool, Plane or GitHub.
 - Single host, macOS only for codex and claude agents.
 - PM decomposition is a proposal; nothing an agent writes becomes
   authorized work.
-- A Codex agent can read its own login; it cannot read other keychain items,
-  lease tokens or coordinator state.
+- A Codex agent can read its own login; it cannot read the keychain, ssh or gh
+  credentials, lease tokens or any coordinator or campaign state. Other
+  owner-readable files and the network stay open.
 - `ci-local.sh` runs PR code; tests could forge its evidence files. Review
   of the code is the guard, as in the manual campaigns. Modules must
   already be in the Go module cache (sandboxed runs cannot download).

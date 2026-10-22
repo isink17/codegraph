@@ -60,6 +60,12 @@ STOP_FILE = Path(os.environ.get("CG_COORD_STOP", STATE_DIR / "STOP"))
 # ~/.codex (config, hooks, rules, MCP servers, sessions) is never loaded.
 CODEX_AUTH = Path(os.environ.get("CG_COORD_CODEX_AUTH", HOME / ".codex/auth.json"))
 CODEX_CONFIG = os.environ.get("CG_COORD_CODEX_CONFIG")
+# Unreadable to every agent and validation command: other coordinators' and
+# campaigns' state and tokens live under the evidence root.
+EVIDENCE = Path(os.environ.get("CG_COORD_EVIDENCE", HOME / "Projekti/codegraph-evidence"))
+DENY_READ = [p for p in os.environ.get("CG_COORD_DENY_READ", "").split(":") if p]
+# Owner credentials no agent needs.
+SECRETS = [".ssh", ".config/gh", ".netrc", ".git-credentials", ".codex", "Library/Keychains"]
 MAX_ATTEMPTS = 5
 
 PENDING, RUNNING, AWAITING_REVIEW, REVIEWING, CHANGES_REQUIRED = (
@@ -167,12 +173,13 @@ def owner_writable():
     return out
 
 
-def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False):
+def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keychain=False):
     """(argv, scratch): argv run under sandbox-exec, and the private scratch
     directory the caller removes afterwards; None where no sandbox exists.
     readonly: only the scratch directory, /tmp and /dev are writable (no slot,
-    no repository). codex: the keychain is unreadable and CODEX_HOME is a
-    private directory in scratch (see codex_home)."""
+    no repository). codex: CODEX_HOME is a private directory in scratch (see
+    codex_home). keychain: the keychain stays readable (Claude Code keeps its
+    login there); everything else runs without it."""
     if not sandbox_available():
         return None
     def q(p, kind="subpath"):
@@ -210,16 +217,15 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False):
                      rx(slot, "/(.*/)?(" + "|".join(re.escape(f) for f in SLOT_CONFIG) + ")(/|$)")]
     # Later rules win: allow-list first, then the denials it must not undo.
     profile = (f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
-               f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)})(deny file-write* {' '.join(no_write)})"
+               f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)} {q(EVIDENCE)} {' '.join(q(d) for d in DENY_READ)})"
+               # Denying the keychain files keeps TLS trust evaluation
+               # working; denying the security daemon does not.
+               f"(deny file-read* {' '.join(q(HOME / d) for d in SECRETS if not keychain or d != 'Library/Keychains')})"
+               f"(deny file-write* {' '.join(no_write)})"
                + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
     env = [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
                                               ("XDG_CACHE_HOME", "cache"))]
     if codex:
-        # Codex reads its login from auth.json, never the keychain, which
-        # holds the owner's other credentials (Plane, GitHub). Denying the
-        # keychain files keeps TLS trust evaluation working; denying the
-        # security daemon does not.
-        profile += f"(deny file-read* {q(HOME / 'Library/Keychains')})"
         env.append(f"CODEX_HOME={scratch}/codex-home")
     gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
     return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", *env, f"GOMODCACHE={gomod}", *argv], scratch
@@ -227,7 +233,7 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False):
 
 def isolate(agent, argv, allow_read=(), slot=None, readonly=False):
     """(argv, scratch or None, codex auth digest or None)."""
-    wrapped = sandboxed(argv, allow_read, slot, readonly, agent == "codex")
+    wrapped = sandboxed(argv, allow_read, slot, readonly, agent == "codex", agent == "claude")
     if not wrapped:
         if agent != "command":
             raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
@@ -248,7 +254,7 @@ def sha256(path):
 def codex_home(home):
     """Seeds a private CODEX_HOME with the owner's login (and an optional
     owner-written config.toml). Returns the login's digest, which
-    return_codex_login compares afterwards."""
+    codex_login_note compares afterwards."""
     home.mkdir(mode=0o700)
     shutil.copyfile(CODEX_AUTH, home / "auth.json")
     os.chmod(home / "auth.json", 0o600)
@@ -257,28 +263,19 @@ def codex_home(home):
     return sha256(CODEX_AUTH)
 
 
-def return_codex_login(info):
-    """A login refreshed inside a run replaces the owner's copy, because a
-    refresh may rotate the token the owner's copy still holds. Only when the
-    owner's file is unchanged since the copy and the new one is the same
-    account; anything else is left alone and reported."""
+def codex_login_note(info):
+    """The copy is never written back: an agent controls it. If Codex
+    refreshed it during the run, the owner is told, because a refresh may
+    rotate the token the owner's own copy holds."""
     digest = info.get("codex_auth")
     new = Path(info["scratch"]) / "codex-home/auth.json"
-    if not digest or not new.exists():
-        return None
     try:
-        if sha256(new) == digest:
-            return None
-        if sha256(CODEX_AUTH) != digest:
-            return "owner's Codex login changed during the run; refreshed copy discarded"
-        old, fresh = json.loads(CODEX_AUTH.read_text()), json.loads(new.read_text())
-        account = lambda d: ((d.get("tokens") or {}).get("account_id"), d.get("auth_mode"), sorted(d))
-        if not isinstance(fresh, dict) or account(old) != account(fresh):
-            return "refreshed Codex login does not match the owner's account; discarded"
-        write_atomic(CODEX_AUTH, new.read_text())
-        return "refreshed Codex login returned to the owner's CODEX_HOME"
-    except (OSError, ValueError, AttributeError) as e:
-        return f"refreshed Codex login not returned: {e}"
+        if digest and new.exists() and sha256(new) != digest:
+            return ("Codex changed its login copy during the run (token refresh?); not copied back. If the "
+                    "owner's codex later reports an invalid login, run `codex login`.")
+    except OSError:
+        pass
+    return None
 
 
 def scope_prefix(pattern):
@@ -755,7 +752,7 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, codex_auth=None, **field
 def drop_scratch(info):
     """Removes a run's scratch directory once its agent is known gone."""
     if info.get("scratch"):
-        note = return_codex_login(info)
+        note = codex_login_note(info)
         if note:
             print(note)
         shutil.rmtree(info["scratch"], ignore_errors=True)
@@ -896,7 +893,10 @@ def begin_impl(c, t, findings="", previous=""):
             # GitHub); continue from there, never from behind it.
             remote = f"refs/remotes/{REMOTE}/{t['branch']}"
             if run([GIT, *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", remote]).returncode == 0:
+                before = git(p, "rev-parse", "HEAD")
                 git(p, "merge", "-q", "--ff-only", remote)
+                if git(p, "rev-parse", "HEAD") != before:
+                    t["head"] = git(p, "rev-parse", "HEAD")  # the agent must add a commit to this
         else:
             # An adopted PR's branch exists only on the remote: continue it.
             remote = f"{REMOTE}/{t['branch']}"
@@ -949,15 +949,16 @@ def finish_impl(c, t, rc):
     validation command must pass. Any failure keeps the lease and the work."""
     p = slot_path(t["slot"])
     evidence = Path(t["process"]["dir"])
-    if rc != 0:
-        return unfinished(c, t, f"agent exited {rc}; work and lease kept in {t['slot']}")
-    if git(p, "status", "--porcelain", "--untracked-files=all"):
-        return unfinished(c, t, f"agent left {t['slot']} dirty; lease kept")
+    # Never continued, whatever else went wrong.
     planted = planted_config(p)
     if planted:
         return c.block(t, f"ignored tool configuration in {t['slot']}: {planted[:5]}; lease kept", FAILED)
     if git(p, "symbolic-ref", "--short", "HEAD", check=False) != t["branch"]:
         return c.block(t, f"agent left {t['slot']} off branch {t['branch']}; lease kept", FAILED)
+    if rc != 0:
+        return unfinished(c, t, f"agent exited {rc}; work and lease kept in {t['slot']}")
+    if git(p, "status", "--porcelain", "--untracked-files=all"):
+        return unfinished(c, t, f"agent left {t['slot']} dirty; lease kept")
     head = git(p, "rev-parse", "HEAD")
     if head == t.get("head") or git(p, "rev-list", "--count", f"{t['base_sha']}..HEAD") == "0":
         return unfinished(c, t, "agent produced no new commit; lease kept")
@@ -1177,6 +1178,9 @@ def recover_acquire(c, t):
         return c.block(t, f"a previous slot acquisition ({m}) did not complete; "
                           f"check pool.sh status for task={t['id']}", INTERRUPTED)
     slot, rc, err = c.settle_acquire(t)
+    if slot and STOP_FILE.exists():
+        return c.block(t, f"acquired {slot} before a stop; not launched: {STOP_FILE} present, lease kept",
+                       INTERRUPTED)
     if slot:
         c.event(t["id"], "acquire_recovered", slot=slot, txn=m["txn"])
         if slot == REVIEW_SLOT:
@@ -1346,6 +1350,7 @@ def cmd_plan(c, args):
 
 
 def cmd_run(c, args):
+    c.save()  # the events a pass writes are never left without a state file
     while True:
         changed = schedule(c)
         live = [t for t in c.state["tasks"].values() if t["status"] in HOLDS_SLOT]

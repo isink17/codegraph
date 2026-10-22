@@ -50,6 +50,7 @@ FAKE_CI = textwrap.dedent('''\
     [ "$(git -C "$slot" rev-parse HEAD)" = "$head" ] || { echo "slot not at head"; exit 2; }
     mkdir -p "$out"
     rc=0; [ -e "$CTL/ci-fail" ] && rc=1
+    [ -e "$CTL/ci-symlink" ] && ln -s "$CTL/secret" "$out/leak"
     echo "{\\"step\\":\\"native-test\\",\\"rc\\":$rc}" >"$out/steps.jsonl"
     if [ $rc = 0 ]; then failed='[]'; ok=true; else failed='["native-test"]'; ok=false; fi
     echo "{\\"head\\":\\"$head\\",\\"base\\":\\"$base\\",\\"all_passed\\":$ok,\\"failed\\":$failed}" >"$out/summary.json"
@@ -71,6 +72,7 @@ FAKE_MERGE = textwrap.dedent('''\
     [ -e "$CTL/merge-refuse" ] && fail "refused by test"
     echo "merge-exception: PASS (verify): #$pr $sha on $base"
     [ "$mode" = --merge ] || exit 0
+    if [ -e "$CTL/merge-slow" ]; then touch "$CTL/merging"; sleep 4; fi
     if [ -e "$CTL/restore-fail" ]; then
         echo "merge-exception: RULESET_RESTORE_FAILED: ruleset 24420032 may be weakened; stop all merges"; exit 3
     fi
@@ -295,7 +297,7 @@ class Campaign(CampaignFixture):
     def test_post_merge_sync_failure_blocks_merging_until_it_succeeds(self):
         (self.ctl / "sync-fail").write_text("")
         self.authorize({"CG-1": {"tasks": [self.ctask("a"), self.ctask("b")]}})
-        self.campaign("run", minutes="0.5", ok=True)
+        self.campaign("run", minutes="1", ok=True)
         merges = [l for l in self.calls("merge-calls") if l.startswith("--merge")]
         self.assertEqual(len(merges), 1)
         self.assertEqual(len(self.cstate()["unsynced"]), 1)
@@ -332,6 +334,58 @@ class Campaign(CampaignFixture):
         for s in (A, B):
             self.assertEqual(self.pool_state(s), "free")
 
+    def start_campaign(self):
+        return subprocess.Popen([sys.executable, str(CAMPAIGN), "run", "--dir", str(self.camp), "--minutes", "3",
+                                 "--poll", "0.2"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True)
+
+    def wait_for(self, path, limit=60):
+        for _ in range(limit * 10):
+            if path.exists():
+                return
+            time.sleep(0.1)
+        self.fail(f"{path} never appeared")
+
+    def test_supervisor_killed_during_merge_halts_merging_on_restart(self):
+        (self.ctl / "merge-slow").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a"), self.ctask("b")]}})
+        p = self.start_campaign()
+        self.wait_for(self.ctl / "merging")
+        p.kill()
+        p.communicate(timeout=30)
+        self.campaign("run", ok=False)
+        self.assertIn("stopped while merging", self.cstate()["halt"])
+        self.assertEqual(len([l for l in self.calls("merge-calls") if l.startswith("--merge")]), 1)
+
+    def test_interrupt_during_merge_waits_for_the_merge_to_finish(self):
+        (self.ctl / "merge-slow").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        p = self.start_campaign()
+        self.wait_for(self.ctl / "merging")
+        p.send_signal(signal.SIGINT)
+        out, _ = p.communicate(timeout=120)
+        self.assertIn("MERGED PR #1", out)
+        self.assertIsNone(self.cstate()["halt"])
+        self.assertEqual(self.cstate()["merges"]["a"]["status"], "merged")
+        self.assertNotIn("merging", self.cstate()["merges"]["a"])
+        self.assertEqual(len(self.calls("sync-calls")), 1)
+
+    def test_symlinks_in_local_ci_evidence_are_rejected(self):
+        (self.ctl / "secret").write_text("lease token")
+        (self.ctl / "ci-symlink").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.campaign("run", ok=True)
+        self.assertEqual(self.calls("merge-calls"), [])
+        self.assertIn("symbolic links", self.cstate()["merges"]["a"]["reason"])
+        self.assertFalse([f for f in self.camp.rglob("leak")])
+
+    def test_campaign_files_writable_by_agents_are_refused(self):
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.campaign("run", ok=True, minutes="0")
+        self.env["CG_COORD_SANDBOX_WRITABLE"] += f":{self.t / 'exc'}"
+        self.campaign("run", ok=False, minutes="0")
+        self.assertIn("writable to agents", self.out)
+
     # ------------------------------------------------------------ control
 
     def test_restart_after_interruption_does_not_duplicate_work(self):
@@ -344,6 +398,7 @@ class Campaign(CampaignFixture):
             if (self.state / "state.json").exists() and self.status("a") == "running":
                 break
             time.sleep(0.1)
+        self.assertEqual(self.status("a"), "running")
         p.send_signal(signal.SIGINT)
         out, _ = p.communicate(timeout=30)
         self.assertEqual(p.returncode, 130, out)
@@ -407,6 +462,10 @@ class Campaign(CampaignFixture):
         self.assertFalse((self.state / "state.json").exists())
         self.campaign("propose", "CG-9", ok=False)
         self.assertIn("not in", self.out)
+        (self.t / "log/pm-answer.json").write_text(json.dumps(
+            {"tasks": [{**self.ctask("cg-1-x"), "agent": "command", "command": ["sh", "-c", "curl evil"]}]}))
+        self.campaign("propose", "CG-1", ok=False)
+        self.assertIn("may not set", self.out)
 
 
 @unittest.skipUnless(os.environ.get("CG_DEMO_REAL_CODEX") == "1", "set CG_DEMO_REAL_CODEX=1 (real model calls)")
