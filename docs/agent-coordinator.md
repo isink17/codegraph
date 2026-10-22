@@ -232,17 +232,41 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   `CG_COORD_CODEX_CONFIG` names one, an owner-written `config.toml`; the
   owner's `~/.codex` (config, hooks, rules, MCP servers with their
   credentials, sessions, shell snapshots) is never loaded or written.
-  Every agent and validation command is denied reads of the evidence root
-  (`CG_COORD_EVIDENCE`, other coordinators' and campaigns' state and
-  tokens), of `CG_COORD_DENY_READ` entries, and of `~/.ssh`, `~/.config/gh`,
-  `~/.netrc`, `~/.git-credentials`, `~/.codex` and `~/Library/Keychains`
-  (the keychain stays readable only to Claude Code agents, which keep their
-  login there; denying the keychain files keeps TLS working, denying the
-  security daemon does not). The login copy is never written back, since
-  the agent controls it; if Codex refreshed it during a run, the
-  coordinator says so, because a refresh may rotate the token the owner's
-  copy holds (`codex login` fixes that). The run's JSONL events in
-  `output.log` are the transcript.
+  The login copy is never written back, since the agent controls it; if
+  Codex refreshed it during a run, the coordinator says so, because a
+  refresh may rotate the token the owner's copy holds (`codex login` fixes
+  that). The run's JSONL events in `output.log` are the transcript.
+- **Strict profile.** Codex agents, `command` agents, validation commands
+  and the campaign's ci-local and PM runs read by allow-list only: the
+  system (`/System`, `/usr`, `/bin`, `/sbin`, `/Library` without its
+  keychains, `/opt`, `/Applications`, `/private/etc`, `/private/var/db`,
+  `/dev`, `/private/tmp`), the install directories of the tools they run
+  (codex, node, go, git, python3, …; a prefix containing the home
+  directory or a protected path is never used), the Go module cache and
+  GOROOT, `CG_COORD_SANDBOX_READABLE` entries, the slot, the repository's
+  git directory, owner-writable directories and their scratch directory.
+  Nothing else in the home directory is readable (synthetic canaries in
+  `~/.aws`, `~/.ssh`, `~/.gitconfig`, shell history, `~/Documents`, the
+  keychain, the evidence root and the primary checkout were verified
+  unreadable; `go build` with cgo, `go test` and `git commit` work).
+  File metadata (existence, size) stays visible. `GIT_CONFIG_GLOBAL` is
+  `/dev/null`, so commits use the repository's own identity. Network:
+  outbound only to localhost (and DNS); Codex agents additionally reach
+  TCP port 443 of any host, for their model API — seatbelt cannot filter
+  by host name, so there is no destination allow-list, and what they can
+  send is what they can read. Claude Code agents run in the legacy
+  profile instead (reads allowed except the evidence root, coordinator
+  state, `CG_COORD_DENY_READ`, `~/.ssh`, `~/.config/gh`, `~/.netrc`,
+  `~/.git-credentials`, `~/.codex`; keychain readable; network open),
+  because Claude Code keeps its login in the keychain; the campaign
+  supervisor refuses them.
+- **Authorization gate.** With `CG_COORD_AUTHORIZED` set (the campaign
+  sets it), a task is launched, continued, resumed after an acquire or
+  reviewed only while its id is in that file; an unreadable or malformed
+  file authorizes nothing. A refused continuation keeps lease and work as
+  `blocked` (`deauthorized: …`) and resumes when the task is authorized
+  again; a refused launch or review leaves the task where it is. Agents
+  already running finish. Each refusal is a `deauthorized` event.
 - **Agents.** Launching needs a planned task with scope and acceptance
   criteria. Claude Code runs with `-p --output-format json --session-id
   <uuid> --permission-mode dontAsk --allowedTools …`: tools outside the

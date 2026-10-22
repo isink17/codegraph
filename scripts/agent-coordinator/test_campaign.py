@@ -71,19 +71,24 @@ FAKE_MERGE = textwrap.dedent('''\
     grep -q '"all_passed":true' "$cidir/summary.json" || fail "local ci"
     [ "$(git --git-dir "$FAKE_ORIGIN" rev-parse refs/heads/v2.0)" = "$base" ] || fail "base moved"
     [ -e "$CTL/merge-refuse" ] && fail "refused by test"
+    if [ -e "$CTL/revoke-on-verify" ]; then echo '{"tickets": {"CG-9": {"tasks": []}}, "merge": {"mode": "none"}}' >"$(cat "$CTL/revoke-on-verify")"; fi
     echo "merge-exception: PASS (verify): #$pr $sha on $base"
     [ "$mode" = --merge ] || exit 0
     if [ -e "$CTL/merge-slow" ]; then touch "$CTL/merging"; sleep 4; fi
     if [ -e "$CTL/restore-fail" ]; then
         echo "merge-exception: RULESET_RESTORE_FAILED: ruleset 24420032 may be weakened; stop all merges"; exit 3
     fi
+    [ -e "$CTL/merge-crash-before" ] && { cp "$CTL/relaxed.json" "$FAKE_RULESET"; kill -9 $PPID; sleep 30; }
     git --git-dir "$FAKE_ORIGIN" update-ref refs/heads/v2.0 "$sha"
-    python3 - "$pr" <<'EOF'
+    python3 - "$pr" "$sha" <<'EOF'
     import json, os, sys
     db = json.load(open(os.environ["FAKE_GH_DB"]))
-    next(p for p in db["prs"] if p["number"] == int(sys.argv[1]))["state"] = "MERGED"
+    p = next(p for p in db["prs"] if p["number"] == int(sys.argv[1]))
+    p.update(state="MERGED", squash=sys.argv[2], merged_head=sys.argv[2])
     json.dump(db, open(os.environ["FAKE_GH_DB"], "w"))
     EOF
+    [ -e "$CTL/merge-crash-after" ] && { kill -9 $PPID; sleep 30; }
+    [ -e "$CTL/merge-no-ack" ] && exit 0
     echo "merge-exception: MERGED #$pr as $sha; waiver record x"
 ''')
 
@@ -92,6 +97,7 @@ FAKE_SYNC = textwrap.dedent('''\
     echo "$1 $2 $3" >>"$CTL/sync-calls"
     [ -e "$CTL/sync-fail" ] && { echo "plane-sync: FAILED: unreachable"; exit 1; }
     grep -q "Reviewed head" "$3" || exit 1
+    grep -qx "$1#$2" "$CTL/comments" 2>/dev/null || echo "$1#$2" >>"$CTL/comments"
     echo "plane-sync: SYNCED $1 #$2"
 ''')
 
@@ -111,6 +117,12 @@ class CampaignFixture(Fixture):
             path.write_text(body)
             path.chmod(0o755)
         self.plane = t / "plane.json"
+        ruleset = {"name": "v2.0 merge gate", "target": "branch", "enforcement": "active", "conditions": {},
+                   "rules": [{"type": "required_status_checks"}], "bypass_actors": []}
+        (t / "ruleset-24420032-start.json").write_text(json.dumps(ruleset))
+        (t / "ruleset-live.json").write_text(json.dumps(ruleset))
+        (self.ctl / "relaxed.json").write_text(json.dumps({**ruleset, "rules": []}))
+        self.env.update(FAKE_RULESET=str(t / "ruleset-live.json"), FAKE_GH_DOWN=str(self.ctl / "gh-down"))
         self.set_plane(tickets={"CG-1": "started"})
         self.env.update(CG_CAMPAIGN_PLANE_CMD=str(t / "bin/plane"), FAKE_PLANE=str(self.plane),
                         CG_CAMPAIGN_PLANE_SYNC=str(t / "bin/plane-sync"), CTL=str(self.ctl))
@@ -347,16 +359,139 @@ class Campaign(CampaignFixture):
             time.sleep(0.1)
         self.fail(f"{path} never appeared")
 
-    def test_supervisor_killed_during_merge_halts_merging_on_restart(self):
-        (self.ctl / "merge-slow").write_text("")
-        self.authorize({"CG-1": {"tasks": [self.ctask("a"), self.ctask("b")]}})
+    def merges(self):
+        return [l for l in self.calls("merge-calls") if l.startswith("--merge")]
+
+    def crash_in_merge(self, ctl, tasks=("a", "b")):
+        """Runs until the merge script kills the supervisor (SIGKILL, as a
+        crash or power loss would) at the boundary named by ctl."""
+        (self.ctl / ctl).write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask(t) for t in tasks]}})
         p = self.start_campaign()
-        self.wait_for(self.ctl / "merging")
-        p.kill()
-        p.communicate(timeout=30)
+        out, _ = p.communicate(timeout=180)
+        self.assertEqual(p.returncode, -9, out)
+        (self.ctl / ctl).unlink()
+        self.assertIn("merging", json.dumps(self.cstate()["merges"]))
+
+    def test_crash_after_github_merge_is_reconciled_not_repeated(self):
+        self.crash_in_merge("merge-crash-after")
+        self.campaign("run", ok=True)
+        self.assertIsNone(self.cstate()["halt"])
+        self.assertEqual({k: v["status"] for k, v in self.st().items()}, {"a": "completed", "b": "completed"})
+        self.assertEqual(len(self.merges()), 2)  # a merged once, never again; then b
+        self.assertIn("merge_reconciled", [e["event"] for e in self.cevents()])
+        self.assertEqual(len(self.calls("comments")), 2)  # the crash lost no Plane sync
+
+    def test_crash_with_ruleset_relaxed_halts_until_owner_verifies(self):
+        self.crash_in_merge("merge-crash-before")
         self.campaign("run", ok=False)
-        self.assertIn("stopped while merging", self.cstate()["halt"])
-        self.assertEqual(len([l for l in self.calls("merge-calls") if l.startswith("--merge")]), 1)
+        self.assertIn("uncertain outcome", self.cstate()["halt"])
+        self.assertIn("ruleset not verified", self.cstate()["halt"])
+        self.campaign("run", ok=False)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.calls("sync-calls"), [])
+
+    def test_unreadable_github_after_crash_halts(self):
+        self.crash_in_merge("merge-crash-after", tasks=("a",))
+        (self.ctl / "gh-down").write_text("")
+        self.campaign("run", ok=False)
+        self.assertIn("state unreadable", self.cstate()["halt"])
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_merge_without_acknowledgement_is_settled_from_github(self):
+        (self.ctl / "merge-no-ack").write_text("")
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.campaign("run", ok=True)
+        self.assertEqual(self.status("a"), "completed")
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.cstate()["merges"]["a"]["status"], "merged")
+
+    def test_ruleset_not_restored_after_a_reported_success_halts(self):
+        (self.ctl / "merge-no-ack").write_text("")
+        (self.ctl / "relaxed.json").replace(self.t / "ruleset-live.json")  # the script "restored" nothing
+        self.authorize({"CG-1": {"tasks": [self.ctask("a"), self.ctask("b")]}})
+        self.campaign("run", ok=False)
+        self.assertIn("ruleset not verified", self.cstate()["halt"])
+        self.assertEqual(len(self.merges()), 1)
+
+    # ------------------------------------------------------------ authorization revocation
+
+    def write_auth(self, tickets, mode="exception"):
+        self.authorize(tickets, mode=mode)
+
+    def test_revocation_mid_implementation_stops_review_but_not_other_work(self):
+        self.codex_plan({"a": ["sleep-commit"]})
+        self.set_plane(tickets={"CG-1": "started", "CG-2": "started"})
+        self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}, "CG-2": {"tasks": [self.ctask("z")]}})
+        p = self.start_campaign()
+        for _ in range(100):
+            if (self.state / "state.json").exists() and self.status("a") == "running":
+                break
+            time.sleep(0.1)
+        self.write_auth({"CG-2": {"tasks": [self.ctask("z")]}})  # CG-1 revoked while a runs
+        out, _ = p.communicate(timeout=180)
+        self.assertEqual(self.status("z"), "completed", out)
+        self.assertEqual(self.status("a"), "awaiting_review")  # its work is published and kept, not reviewed
+        self.assertNotIn("review:a", [c["key"] for c in self.codex_calls()])
+        self.assertIn("deauthorized", [e["event"] for e in self.cevents()])
+        self.assertTrue(self.git("--git-dir", str(self.origin), "rev-parse", "task/a"))
+        self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}, "CG-2": {"tasks": [self.ctask("z")]}})
+        self.campaign("run", ok=True)
+        self.assertEqual(self.status("a"), "completed")
+
+    def test_revocation_blocks_branch_update(self):
+        self.set_plane(tickets={"CG-1": "started", "CG-2": "started"})
+        self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}, "CG-2": {"tasks": [self.ctask("b")]}}, mode="none")
+        self.campaign("run", ok=True)
+        a, b = self.st()["a"], self.st()["b"]
+        self.git("--git-dir", str(self.origin), "update-ref", "refs/heads/v2.0", a["approved_head"])
+        self.set_pr(a["pr"], state="MERGED")
+        self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}})  # CG-2 revoked
+        self.campaign("run", ok=True)
+        self.assertEqual(self.status("b"), "blocked")
+        self.assertNotIn("branch_update", [e["event"] for e in self.cevents()])
+        self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}, "CG-2": {"tasks": [self.ctask("b")]}})
+        self.campaign("run", ok=True)
+        self.assertIn("branch_update", [e["event"] for e in self.cevents()])
+        self.assertEqual(self.status("b"), "completed")
+
+    def test_revocation_right_before_merge_prevents_it(self):
+        (self.ctl / "revoke-on-verify").write_text(str(self.camp / "authorization.json"))
+        self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.campaign("run", ok=True)
+        self.assertEqual(self.merges(), [])
+        self.assertIn("deauthorized", self.cstate()["merges"]["a"]["reason"])
+
+    def test_invalid_authorization_fails_closed(self):
+        self.write_auth({"CG-1": {"tasks": [self.ctask("a")]}}, mode="none")
+        self.campaign("run", ok=True)
+        (self.camp / "authorization.json").write_text('{"tickets": ')
+        self.set_plane(tickets={"CG-1": "started"})
+        self.campaign("run", ok=False)  # refuses to start on an unreadable file
+        self.assertIn("authorization.json", self.out)
+        self.assertEqual(self.status("a"), "awaiting_ci")
+
+    # ------------------------------------------------------------ live output
+
+    def test_restart_resumes_the_live_stream_without_loss_or_duplicates(self):
+        self.codex_plan({"a": ["sleep-commit"]})
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        p = self.start_campaign()
+        for _ in range(100):
+            if (self.state / "state.json").exists() and self.status("a") == "running":
+                break
+            time.sleep(0.2)
+        time.sleep(0.5)
+        p.kill()
+        first, _ = p.communicate(timeout=30)
+        self.campaign("run", ok=True)
+        both = first + self.out
+        self.assertEqual(both.count("$ git commit -qm a"), 1, both)
+        self.assertEqual(both.count("» reviewed"), 1)
+        (self.camp / "stream-offsets.json").write_text("[[[")  # damaged: no replay
+        self.campaign("status", ok=True)
+        self.campaign("run", ok=True)
+        self.assertNotIn("$ git commit -qm a", self.out)
 
     def test_interrupt_during_merge_waits_for_the_merge_to_finish(self):
         (self.ctl / "merge-slow").write_text("")
@@ -377,7 +512,10 @@ class Campaign(CampaignFixture):
         self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
         self.campaign("run", ok=True)
         self.assertEqual(self.calls("merge-calls"), [])
-        self.assertIn("symbolic links", self.cstate()["merges"]["a"]["reason"])
+        rej = [e for e in self.cevents() if e["event"] == "ci_rejected"]
+        self.assertEqual(len(rej), 1)
+        self.assertRegex(" ".join(rej[0]["problems"]), "symbolic link|not a directory")
+        self.assertIn("was rejected", self.cstate()["merges"]["a"]["reason"])
         self.assertFalse([f for f in self.camp.rglob("leak")])
 
     def test_symlinked_local_ci_output_directory_is_rejected(self):
@@ -388,8 +526,13 @@ class Campaign(CampaignFixture):
         self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
         self.campaign("run", ok=True)
         self.assertEqual(self.calls("merge-calls"), [])
-        self.assertIn("symbolic links", self.cstate()["merges"]["a"]["reason"])
+        rej = [e for e in self.cevents() if e["event"] == "ci_rejected"]
+        self.assertEqual(len(rej), 1)
+        self.assertRegex(" ".join(rej[0]["problems"]), "symbolic link|not a directory")
+        self.assertIn("was rejected", self.cstate()["merges"]["a"]["reason"])
         self.assertFalse([f for f in self.camp.rglob("lease.token")])
+        self.campaign("run", ok=True)  # a restart does not accept the rejected head's evidence
+        self.assertEqual(self.calls("merge-calls"), [])
 
     def test_campaign_files_writable_by_agents_are_refused(self):
         self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
@@ -510,10 +653,73 @@ class RealCodex(CampaignFixture):
 
 
 class Units(unittest.TestCase):
-    def test_render(self):
+    def setUp(self):
         sys.path.insert(0, str(HERE))
         import campaign
-        r = campaign.render
+        import coordinator
+        campaign.co = coordinator
+        self.cp, self.co = campaign, coordinator
+        import tempfile
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+
+    def summary(self, text):
+        (self.d / "ci").mkdir(exist_ok=True)
+        (self.d / "ci/summary.json").write_text(text)
+        return self.cp.ci_passed(self.d / "ci", "h" * 40, "b" * 40)
+
+    def test_ci_summary_is_untrusted(self):
+        good = {"head": "h" * 40, "base": "b" * 40, "all_passed": True, "failed": []}
+        self.assertTrue(self.summary(json.dumps(good)))
+        bad = ["", "{", json.dumps(good)[:-5], "[" * 100000 + "]" * 100000, "null", "[]", '"x"',
+               json.dumps({**good, "all_passed": "true"}), json.dumps({**good, "failed": None}),
+               json.dumps({**good, "head": ["h" * 40]}), json.dumps({**good, "pad": "x" * (2 << 20)}),
+               json.dumps({**good, "base": "c" * 40})]
+        for text in bad:
+            self.assertFalse(self.summary(text), text[:60])
+        self.assertFalse(self.cp.ci_passed(self.d / "ci", "h" * 40, "b" * 40, [f"{'h' * 40}:{'b' * 40}"]))
+        self.assertFalse(self.cp.ci_passed(self.d / "missing", "h" * 40, "b" * 40))
+
+    def test_agent_output_parsing_is_bounded(self):
+        deep = "[" * 200000 + "]" * 200000
+        self.assertIsNone(self.co.parse_json(deep))
+        self.assertIsNone(self.co.parse_json("{" + "x" * (2 << 20)))
+        self.assertEqual(self.co.agent_text("codex", deep + "\n" + '{"type":"item.completed","item":[1]}\n'), "")
+        self.assertEqual(self.co.agent_text("codex", '{"type":"item.completed","item":{"type":"agent_message","text":7}}'), "")
+        self.assertEqual(self.cp.render('{"type":"item.completed","item":{"type":"agent_message","text":{"a":1}}}'), "» ")
+        self.assertIsNotNone(self.cp.render(deep[:500]))
+
+    def test_evidence_copy_is_bounded_and_link_free(self):
+        src, dst = self.d / "out", self.d / "dst"
+        deep = src
+        for i in range(40):
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        (deep / "x").write_text("x")
+        rejected, errors = self.cp.copy_evidence(src, dst)
+        self.assertTrue(rejected and "nesting" in rejected[0])
+        many = self.d / "many"
+        many.mkdir()
+        old = dict(self.cp.EVIDENCE_LIMITS)
+        self.cp.EVIDENCE_LIMITS.update(files=10)
+        try:
+            for i in range(20):
+                (many / f"f{i}").write_text("x")
+            self.assertTrue(self.cp.copy_evidence(many, self.d / "dst2")[0])
+        finally:
+            self.cp.EVIDENCE_LIMITS.update(old)
+        os.symlink(many, self.d / "linkdir")
+        self.assertTrue(self.cp.copy_evidence(self.d / "linkdir", self.d / "dst3")[0])
+        self.assertEqual(self.cp.copy_evidence(self.d / "nothing", self.d / "dst4")[0], [])  # missing: an error
+        ok = self.d / "ok"
+        (ok / "logs").mkdir(parents=True)
+        (ok / "summary.json").write_text("{}")
+        (ok / "logs/a.log").write_text("a")
+        self.assertEqual(self.cp.copy_evidence(ok, self.d / "dst5"), ([], []))
+        self.assertEqual((self.d / "dst5/logs/a.log").read_text(), "a")
+
+    def test_render(self):
+        r = self.cp.render
         self.assertEqual(r('{"type":"item.completed","item":{"type":"command_execution","command":"go test","exit_code":1}}'),
                          "$ go test  (exit 1)")
         self.assertEqual(r('{"type":"item.completed","item":{"type":"agent_message","text":"a\\n b"}}'), "» a b")

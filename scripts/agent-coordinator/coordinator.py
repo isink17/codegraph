@@ -16,6 +16,7 @@ Exit codes: 0 ok, 1 refused or a task failed/interrupted, 2 usage.
 import argparse
 import fcntl
 import fnmatch
+import functools
 import hashlib
 import json
 import os
@@ -64,8 +65,18 @@ CODEX_CONFIG = os.environ.get("CG_COORD_CODEX_CONFIG")
 # campaigns' state and tokens live under the evidence root.
 EVIDENCE = Path(os.environ.get("CG_COORD_EVIDENCE", HOME / "Projekti/codegraph-evidence"))
 DENY_READ = [p for p in os.environ.get("CG_COORD_DENY_READ", "").split(":") if p]
-# Owner credentials no agent needs.
+# Owner credentials no agent needs. Only denied explicitly in the legacy
+# profile Claude Code agents run in; every other sandboxed process reads
+# nothing in the home directory that is not on its allow-list.
 SECRETS = [".ssh", ".config/gh", ".netrc", ".git-credentials", ".codex", "Library/Keychains"]
+# Readable to strict-sandboxed processes: the system, not the home directory.
+SYSTEM_READ = ["/System", "/usr", "/bin", "/sbin", "/Library", "/opt", "/Applications", "/private/etc",
+               "/private/var/db", "/private/var/select", "/dev", "/private/tmp"]
+# Set by the campaign supervisor: a JSON file {"tasks": [ids]} of the tasks
+# currently authorized. Unset: every planned task is (owner-driven runs).
+AUTH_GATE = os.environ.get("CG_COORD_AUTHORIZED")
+MAX_JSON_LINE = 1 << 20
+TOOLS = ["codex", "node", "go", "gofmt", "git", "python3", "bash", "sh", "jq", "sed", "awk"]
 MAX_ATTEMPTS = 5
 
 PENDING, RUNNING, AWAITING_REVIEW, REVIEWING, CHANGES_REQUIRED = (
@@ -173,13 +184,47 @@ def owner_writable():
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def tool_dirs():
+    """Directories the strict profile lets agents read for their tools: each
+    tool's bin directory and, when safe, its install prefix (for codex, the
+    Node installation holding its package). A prefix that is the home
+    directory, contains it, or holds anything protected is not used;
+    CG_COORD_SANDBOX_READABLE adds owner-listed directories under the same
+    rule."""
+    protected = [HOME, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS]]
+    def safe(d):
+        r = os.path.realpath(d).rstrip("/") + "/"
+        return not any((os.path.realpath(p).rstrip("/") + "/").startswith(r) for p in protected)
+    out = []
+    for name in TOOLS:
+        w = shutil.which(name)
+        if not w:
+            continue
+        for path in {w, os.path.realpath(w)}:
+            for d in (Path(path).parent, Path(path).parent.parent):
+                if safe(d):
+                    out.append(str(d))
+    for d in filter(None, os.environ.get("CG_COORD_SANDBOX_READABLE", "").split(":")):
+        if not safe(d):
+            raise Refused(f"CG_COORD_SANDBOX_READABLE entry {d} contains a protected path")
+        out.append(d)
+    gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
+    goroot = run(["go", "env", "GOROOT"]).stdout.strip() if shutil.which("go") else ""
+    return tuple(sorted({*out, gomod, *([goroot] if goroot else [])}))
+
+
 def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keychain=False):
     """(argv, scratch): argv run under sandbox-exec, and the private scratch
     directory the caller removes afterwards; None where no sandbox exists.
     readonly: only the scratch directory, /tmp and /dev are writable (no slot,
     no repository). codex: CODEX_HOME is a private directory in scratch (see
-    codex_home). keychain: the keychain stays readable (Claude Code keeps its
-    login there); everything else runs without it."""
+    codex_home). keychain: the legacy profile for Claude Code agents, which
+    keep their login in the keychain: reads are allowed except the protected
+    paths. Everything else runs in the strict profile: reads only of the
+    system, its tools, the Go module cache, the slot, the repository's git
+    directory, its scratch directory and allow_read; network only to
+    localhost and, for codex (its model API), TCP 443."""
     if not sandbox_available():
         return None
     def q(p, kind="subpath"):
@@ -204,6 +249,11 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
     extra = owner_writable()  # may refuse: before anything is created
     scratch = tempfile.mkdtemp(prefix="cg-agent-")
     writable = [q("/dev"), q(scratch), q("/private/tmp"), *[q(d) for d in extra]]
+    # cc (via xcrun) keeps a lookup cache in the per-user temp directory
+    # whatever TMPDIR says; cgo builds fail without it.
+    user_tmp = run(["getconf", "DARWIN_USER_TEMP_DIR"]).stdout.strip()
+    if user_tmp:
+        writable.append(rx(user_tmp, "/xcrun_db"))
     if not readonly:
         # Branches only: remote-tracking refs decide which merge gate runs
         # and what pool.sh treats as the base.
@@ -215,16 +265,34 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
         no_write += [q(Path(slot) / ".git", "literal"),
                      rx(slot, "/(.*/)?(" + "|".join(re.escape(f) for f in SLOT_CONFIG) + ")(/|$)")]
+    protected = [q(STATE_DIR), q(LEASES), q(EVIDENCE), *[q(d) for d in DENY_READ]]
     # Later rules win: allow-list first, then the denials it must not undo.
-    profile = (f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
-               f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)} {q(EVIDENCE)} {' '.join(q(d) for d in DENY_READ)})"
-               # Denying the keychain files keeps TLS trust evaluation
-               # working; denying the security daemon does not.
-               f"(deny file-read* {' '.join(q(HOME / d) for d in SECRETS if not keychain or d != 'Library/Keychains')})"
-               f"(deny file-write* {' '.join(no_write)})"
-               + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
+    profile = f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
+    if keychain:
+        profile += (f"(deny file-read-data {' '.join(protected)})"
+                    f"(deny file-read* {' '.join(q(HOME / d) for d in SECRETS if d != 'Library/Keychains')})")
+    else:
+        readable = [q(scratch), *[q(d) for d in [*SYSTEM_READ, *tool_dirs(), *extra]], q(gitdir),
+                    *([rx(user_tmp, "/xcrun_db")] if user_tmp else [])]
+        if slot:
+            readable.append(q(slot))
+        profile += (f"(deny file-read*)(allow file-read-metadata)(allow file-read* (literal \"/\") {' '.join(readable)})"
+                    # Denying the keychain files keeps TLS trust evaluation
+                    # working; denying the security daemon does not.
+                    f"(deny file-read* {' '.join(protected)} {q('/Library/Keychains')} "
+                    f"{' '.join(q(HOME / d) for d in SECRETS)})"
+                    "(deny network-outbound)(allow network-outbound (remote ip \"localhost:*\") "
+                    "(remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"
+                    + ("(allow network-outbound (remote tcp \"*:443\"))" if codex else ""))
+    profile += (f"(deny file-write* {' '.join(no_write)})"
+                + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
     env = [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
-                                              ("XDG_CACHE_HOME", "cache"))]
+                                              ("XDG_CACHE_HOME", "cache"), ("XDG_CONFIG_HOME", "config"),
+                                              ("GOENV", "config/go/env"))]
+    if not keychain:
+        # The owner's ~/.gitconfig is unreadable (it may name credential
+        # helpers); the repository's own config, with its identity, is not.
+        env += ["GIT_CONFIG_GLOBAL=/dev/null"]
     if codex:
         env.append(f"CODEX_HOME={scratch}/codex-home")
     gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
@@ -489,8 +557,8 @@ class Coordinator:
         try:
             self.state = json.loads(self.state_file.read_text())
             assert isinstance(self.state.get("tasks"), dict)
-        except (ValueError, AssertionError, AttributeError) as e:
-            raise Refused(f"{self.state_file} is malformed ({e}); left untouched")
+        except (ValueError, AssertionError, AttributeError, RecursionError) as e:
+            raise Refused(f"{self.state_file} is malformed ({type(e).__name__}); left untouched")
 
     def save(self):
         write_atomic(self.state_file, json.dumps(self.state, indent=2, sort_keys=True) + "\n")
@@ -781,18 +849,30 @@ def agent_text(agent, out):
         return out
     text = ""
     for line in out.splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
+        rec = parse_json(line)
         if not isinstance(rec, dict):
             continue
+        item = rec.get("item")
+        item = item if isinstance(item, dict) else {}
+        found = None
         if agent == "claude" and rec.get("type") == "result":
-            text = rec.get("result") or ""
-        item = rec.get("item") or {}
+            found = rec.get("result")
         if agent == "codex" and rec.get("type") == "item.completed" and item.get("type") == "agent_message":
-            text = item.get("text") or ""
+            found = item.get("text")
+        if found is not None:
+            text = found if isinstance(found, str) else ""
     return text
+
+
+def parse_json(text, limit=MAX_JSON_LINE):
+    """JSON from untrusted output, or None: oversized, malformed and too
+    deeply nested input are all just not JSON."""
+    if len(text) > limit:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        return None
 
 
 def exited_or_lost(exit_file):
@@ -849,6 +929,30 @@ def slot_path(slot):
 
 
 # ---------------------------------------------------------------- scheduling
+
+def authorized(c, t, action):
+    """True when the campaign's gate (if any) authorizes t now. Fails closed:
+    an unreadable or malformed gate authorizes nothing. A refusal is
+    recorded once per task and action."""
+    if not AUTH_GATE:
+        return True
+    try:
+        data = parse_json(Path(AUTH_GATE).read_text())
+        ok = isinstance(data, dict) and isinstance(data.get("tasks"), list) and t["id"] in data["tasks"]
+    except OSError:
+        ok = False
+    if not ok and t.get("deauthorized") != action:
+        t["deauthorized"] = action
+        c.save()
+        c.event(t["id"], "deauthorized", action=action)
+    elif ok and t.get("deauthorized"):
+        t.pop("deauthorized")
+        c.save()
+    return ok
+
+
+DEAUTHORIZED = "deauthorized"
+
 
 def deps_met(c, t):
     return all(c.state["tasks"][d]["status"] == COMPLETED for d in t["depends_on"])
@@ -938,6 +1042,8 @@ def unfinished(c, t, reason):
         return c.block(t, reason, FAILED)
     if STOP_FILE.exists():
         return c.block(t, f"{reason}; not continued: {STOP_FILE} present", INTERRUPTED)
+    if not authorized(c, t, "continue"):
+        return c.block(t, f"{DEAUTHORIZED}: not continued ({reason}); lease and work kept")
     c.event(t["id"], "continue", reason=reason, tries=t.get("tries", 1))
     print(f"{t['id']}: continuing ({t.get('tries', 1) + 1}/{t['max_attempts']}): {reason}")
     return begin_impl(c, t, t.get("impl_findings", ""), reason)
@@ -1181,6 +1287,8 @@ def recover_acquire(c, t):
     if slot and STOP_FILE.exists():
         return c.block(t, f"acquired {slot} before a stop; not launched: {STOP_FILE} present, lease kept",
                        INTERRUPTED)
+    if slot and not authorized(c, t, "launch"):
+        return c.block(t, f"{DEAUTHORIZED}: acquired {slot} but not launched; lease kept")
     if slot:
         c.event(t["id"], "acquire_recovered", slot=slot, txn=m["txn"])
         if slot == REVIEW_SLOT:
@@ -1294,10 +1402,24 @@ def schedule(c):
         if any(o.get("starting") for o in tasks.values()):
             break
         if t["status"] == AWAITING_REVIEW and not any(o["status"] == REVIEWING for o in tasks.values()):
+            if not authorized(c, t, "review"):
+                continue
             r = start_review(c, t)
             if r:
                 busy_note = f"{t['id']}: {r}"
             changed |= t["status"] != AWAITING_REVIEW
+    for t in tasks.values():
+        if t["status"] == BLOCKED and (t.get("reason") or "").startswith(DEAUTHORIZED) and t.get("slot") \
+                and authorized(c, t, "resume"):
+            c.event(t["id"], "reauthorized", slot=t["slot"])
+            if t["slot"] == REVIEW_SLOT:
+                try:
+                    begin_review(c, t, c.pr_view(t["pr"])["headRefOid"])
+                except Refused as e:
+                    print(f"{t['id']}: {e}")
+            else:
+                begin_impl(c, t, t.get("impl_findings", ""), t["reason"])
+            changed = True
     for t in tasks.values():
         if t["status"] not in (PENDING, CHANGES_REQUIRED):
             continue
@@ -1314,6 +1436,8 @@ def schedule(c):
             c.save()
             c.event(t["id"], "waiting_on", other=other)
         if other:
+            continue
+        if not authorized(c, t, "implement"):
             continue
         findings = t.get("findings", "") if t["status"] == CHANGES_REQUIRED else ""
         r = start_impl(c, t, findings)

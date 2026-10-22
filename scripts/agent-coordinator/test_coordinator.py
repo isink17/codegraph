@@ -47,8 +47,14 @@ FAKE_GH = textwrap.dedent('''\
         print(f"https://example.invalid/pull/{n}")
     elif a[:2] == ["pr", "view"]:
         p = next(p for p in db["prs"] if p["number"] == int(a[2]))
-        print(json.dumps({"number": p["number"], "state": p["state"], "headRefOid": head(p["head"]),
-                          "headRefName": p["head"], "baseRefName": p["base"], "statusCheckRollup": p["checks"]}))
+        h = p.get("merged_head") or head(p["head"])
+        print(json.dumps({"number": p["number"], "state": p["state"], "headRefOid": h,
+                          "headRefName": p["head"], "baseRefName": p["base"], "statusCheckRollup": p["checks"],
+                          "mergeCommit": {"oid": p["squash"]} if p.get("squash") else None}))
+    elif a[:1] == ["api"] and a[1].endswith("/rulesets/24420032"):
+        if os.path.exists(os.environ.get("FAKE_GH_DOWN", "/nonexistent")):
+            sys.exit("fake gh: api unavailable")
+        print(open(os.environ["FAKE_RULESET"]).read())
     elif a[:2] == ["pr", "update-branch"]:
         import tempfile
         p = next(p for p in db["prs"] if p["number"] == int(a[2]))
@@ -1134,6 +1140,75 @@ class Pool(Fixture):
         stop.unlink()
         self.run_until(lambda: self.status("b") == "awaiting_ci")
 
+    # ------------------------------------------------------------ authorization gate
+
+    def gate(self, *ids, raw=None):
+        g = self.t / "gate.json"
+        g.write_text(raw if raw is not None else json.dumps({"tasks": list(ids)}))
+        self.env["CG_COORD_AUTHORIZED"] = str(g)
+
+    def test_gate_holds_unauthorized_tasks_and_fails_closed(self):
+        self.gate("a")
+        self.plan(self.task("a", commit("a")), self.task("b", commit("b")))
+        self.coord("run", "--once", ok=True)
+        self.assertEqual((self.status("a"), self.status("b")), ("running", "pending"))
+        self.assertIn(("b", "implement"), [(e["task"], e.get("action")) for e in self.events()
+                                            if e["event"] == "deauthorized"])
+        self.gate(raw="{not json")
+        self.run_until(lambda: self.status("a") == "awaiting_review")
+        self.coord("run", "--once")
+        self.assertEqual((self.status("a"), self.status("b")), ("awaiting_review", "pending"))  # nothing reviewed
+        self.gate("a", "b")
+        self.run_until(lambda: self.status("a") == "awaiting_ci" and self.status("b") == "awaiting_ci")
+
+    def test_revoked_task_is_not_continued_and_resumes_when_reauthorized(self):
+        n = self.t / "log/n"
+        agent = sh(f'echo x >>{n}; [ $(wc -l <{n}) -eq 1 ] && exit 0; '
+                   'mkdir -p work && echo x >work/x.txt && git add work && git commit -qm x')
+        self.gate("x")
+        self.plan(self.task("x", agent, max_attempts=3))
+        self.coord("run", "--once", ok=True)
+        self.gate()
+        self.run_until(lambda: self.status("x") == "blocked")
+        t = self.st()["x"]
+        self.assertTrue(t["reason"].startswith("deauthorized"))
+        self.assertIsNotNone(self.lease(t["slot"]))  # work and lease kept
+        self.gate("x")
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        self.assertIn("reauthorized", [e["event"] for e in self.events()])
+
+    def test_missing_review_slot_waits_without_losing_work(self):
+        hidden = self.t / "review-moved"
+        (self.slots / R).rename(hidden)
+        self.plan(self.task("x", commit("x")))
+        self.run_until(lambda: self.status("x") == "awaiting_review")
+        for _ in range(3):
+            self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "awaiting_review")
+        hidden.rename(self.slots / R)
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+
+    def test_validation_has_only_localhost_network(self):
+        import http.server
+        import threading
+        srv = http.server.HTTPServer(("0.0.0.0", 0), http.server.SimpleHTTPRequestHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        port = srv.server_address[1]
+        lan = subprocess.run(["ipconfig", "getifaddr", "en0"], capture_output=True, text=True).stdout.strip()
+        # A remote target the host itself can reach, so a refusal is the sandbox's.
+        remote = next((u for u in ([f"http://{lan}:{port}/"] if lan else []) + ["https://example.com/"]
+                       if subprocess.run(["curl", "-s", "-m", "5", "-o", "/dev/null", u]).returncode == 0), None)
+        if not remote:
+            self.skipTest("no non-localhost target reachable from this host")
+        probe = (f'(curl -s -m 5 -o /dev/null http://127.0.0.1:{port}/ && echo LOCAL-OK; '
+                 f'curl -s -m 5 -o /dev/null {remote} && echo REMOTE-REACHED) >>"$CG_TEST_LOG"; true')
+        self.plan(self.task("x", commit("x"), validate=[probe]))
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        log = self.log.read_text()
+        self.assertIn("LOCAL-OK", log)
+        self.assertNotIn("REMOTE-REACHED", log)
+
     def starts_of(self, tid):
         return [e for e in self.events() if e["event"] == "launched" and e["task"] == tid and e["kind"] == "implement"]
 
@@ -1185,7 +1260,9 @@ class Pool(Fixture):
         no other coordinator's state under the evidence root, no ssh keys."""
         probes = {"keychain": self.t / "home/Library/Keychains/probe", "ssh": self.t / "home/.ssh/id_probe",
                   "evidence": self.t / "home/Projekti/codegraph-evidence/coordinator/tokens/x.token",
-                  "gh": self.t / "home/.config/gh/hosts.yml", "codex": self.t / "home/.codex/auth.json"}
+                  "gh": self.t / "home/.config/gh/hosts.yml", "codex": self.t / "home/.codex/auth.json",
+                  "aws": self.t / "home/.aws/credentials", "history": self.t / "home/.zsh_history",
+                  "other": self.t / "home/Documents/canary.txt", "gitconfig": self.t / "home/.gitconfig"}
         for f in probes.values():
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text("secret")

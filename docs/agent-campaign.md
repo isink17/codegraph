@@ -21,7 +21,7 @@ owner ── authorization.json ──┐                Plane (read; sync comme
         ┌─────────────┼──────────────────┐
    worker-a        worker-b          review slot
    implementer     implementer       reviewer (read-only sandbox)
-   codex/claude    codex/claude      codex/claude, separate process
+   codex           codex             codex, separate process
                       │
      merge authority: merge-gate.sh --merge   or   merge-exception.sh --merge (+ ci-local.sh)
 ```
@@ -85,6 +85,20 @@ and merge rights:
     snapshot, minimal relaxation, restoration and equality check, squash
     verification. The supervisor never touches rulesets itself.
 - `expires`: after this date the file is refused.
+- Every task and its review must use `"agent": "codex"`: only Codex runs in
+  the coordinator's strict sandbox (Claude Code needs the keychain,
+  `command` agents run owner argv).
+- The file is re-read on every pass. The authorized set is the tasks of
+  tickets listed now whose Plane group is open; it is written to
+  `<dir>/coordinator/authorized.json`, the coordinator's gate (see
+  `docs/agent-coordinator.md`). An unreadable, invalid or expired file, or
+  no answer from Plane, authorizes nothing (fail closed): no launch,
+  continuation, review, branch update or merge, while running agents
+  finish. Removing a task records `deauthorized` and stops new work on it;
+  its branch, commits, PR and evidence are kept, and it continues if it is
+  authorized again. The merge step re-reads the file once more right
+  before merging. Plane sync of a merge that already happened is
+  reconciliation and still runs.
 
 `campaign.py propose --dir D CG-N` (PM decomposition) runs one read-only,
 sandboxed Codex process on the ticket's Plane text and writes
@@ -121,16 +135,32 @@ Safety rules:
 - At most `MAX_MERGE_ATTEMPTS` (2) merge attempts per task; failed local CI
   counts as one. A worker busy for local CI is not an attempt.
 - The `--merge` step runs in its own session with its output in its log,
-  and Ctrl-C/SIGTERM wait until it exits, so nothing stops it between
-  relaxing and restoring the ruleset. A `merging` marker is saved before it
-  starts; finding one at start-up (the supervisor was killed) sets `halt`.
-- Merge script exit 3 (ruleset restoration failed), or any other failure
-  after which the PR is not still open at the approved head, sets `halt` in
-  `campaign.json`: the supervisor exits with 1 and refuses to merge on every
-  later run until the owner has verified the PR, ruleset 24420032 and Plane
-  and removed `halt` (and `merging`) from `campaign.json`.
+  and Ctrl-C/SIGTERM wait until it exits. A `merging` marker (PR, head,
+  base) is saved before it starts. Its outcome is never taken from the
+  script's output or from a missing acknowledgement: after the step, and
+  at start-up for a marker a crash, power loss or kill left, the
+  supervisor reconciles from GitHub (`gh pr view --json
+  state,headRefOid,mergeCommit`) and, in exception mode, a read-back of
+  ruleset 24420032 compared with the campaign snapshot. Merged at the
+  approved head with the ruleset intact: recorded and queued for Plane
+  sync (the queue is saved before the sync, so a crash between merge and
+  sync retries the sync, never the merge). Still open at that head with
+  the ruleset intact: nothing happened. Anything else, including an
+  unreadable GitHub or ruleset: `halt`.
+- Merge script exit 3 (ruleset restoration failed) or an uncertain outcome
+  sets `halt` in `campaign.json`: the supervisor exits with 1 and refuses
+  to merge on every later run until the owner has verified the PR, ruleset
+  24420032 and Plane and removed `halt` (and `merging`) from
+  `campaign.json`.
 - A task whose ticket is no longer open in Plane is not merged.
-- ci-local evidence containing symbolic links is rejected.
+- ci-local output is untrusted: it is copied without following links,
+  iteratively, within limits (depth 12, 5000 files, 256 MiB per file,
+  1 GiB in all); `summary.json` must be at most 1 MiB, well-formed and of
+  the expected types. Links or exceeded limits reject the evidence of that
+  head on that base permanently (`ci_rejected`, kept across restarts); an
+  I/O error only fails the attempt. Agent output, Plane and gh responses
+  are parsed with the same bounds; malformed input is never success and
+  never crashes the supervisor.
 - A failed post-merge sync is recorded in `unsynced`; no further merge
   happens until it succeeds. The merge itself is kept.
 - Plane is written only by `plane-sync.sh` (one marked comment per ticket
@@ -156,7 +186,7 @@ neither read nor write `<dir>` (it is passed to the coordinator as
 exception directory or `plane-sync.sh` lies where agents may write
 (`/private/tmp`, `/dev`, `CG_COORD_SANDBOX_WRITABLE`). `ci-local.sh` is
 passed to the sandbox as text because the evidence root is unreadable
-there. Proposals may use only the PM fields with `codex` or `claude`
+there. Proposals may use only the PM fields with `codex`
 agents; a `command` agent is refused.
 
 ## Operating
@@ -170,6 +200,10 @@ D=~/Projekti/codegraph-evidence/20261022-c19
 python3 scripts/agent-coordinator/campaign.py run --dir "$D" --minutes 120
 ```
 
+Agent output is streamed from every run's `output.log`, and the position
+in each is saved (`<dir>/stream-offsets.json`), so a restarted supervisor
+continues where the last one stopped, without loss or repetition; a
+damaged offsets file resumes at the end. The logs stay authoritative.
 Lines are prefixed `[time] [task:kind@slot]` for agent activity (commands
 with exit codes, agent messages), `[coordinator]`, `[pm]`, `[plane]`,
 `[task:ci-local]`, `[task:merge]`. Every byte also stays on disk: agent
@@ -221,21 +255,23 @@ reach the live pool, Plane or GitHub.
 
 ## Limitations
 
-- Single host, macOS only for codex and claude agents.
-- Keep campaign directories under the evidence root: agents cannot read
-  anything there, but a campaign directory elsewhere is readable to other
-  campaigns' agents.
-- Claude Code agents, and the Bash tools they are allowed (for example
-  `go test` running agent-written tests), can read the keychain, where
-  Claude Code keeps its login. Prefer `codex` agents for unattended work.
-- PM decomposition is a proposal; nothing an agent writes becomes
-  authorized work.
-- A Codex agent can read its own login; it cannot read the keychain, ssh or gh
-  credentials, lease tokens or any coordinator or campaign state. Other
-  owner-readable files and the network stay open.
-- `ci-local.sh` runs PR code; tests could forge its evidence files. Review
-  of the code is the guard, as in the manual campaigns. Modules must
-  already be in the Go module cache (sandboxed runs cannot download).
+- Single host, macOS only. Campaigns run Codex agents only.
+- The sandbox is an allow-list for reads, not an inventory of secrets:
+  anything placed inside an allowed directory (the slot, the repository's
+  git directory, tool install prefixes, the Go module cache, `/opt`,
+  `/Library`, `/Applications`, `/private/tmp`) is readable to agents. File
+  metadata is visible everywhere.
+- Codex agents can open TCP connections to port 443 of any host (no
+  host-name allow-list in seatbelt). What they could send is what they
+  can read: the task's code, toolchains, and their own Codex login.
+- A Codex agent can read and use its own login copy.
+- Validation and ci-local have no network beyond localhost: modules must
+  already be in the Go module cache, and tests needing the internet fail.
+- `ci-local.sh` runs PR code; tests could forge its evidence files inside
+  their sandbox. Review of the code is the guard, as in the manual
+  campaigns.
 - Branch updates can conflict; such a PR stays `blocked` for the owner.
 - One merge per pass, one review at a time, two implementers.
 - `halt` and a ci-local lease whose token was lost need the owner.
+- Revocation does not stop an agent already running; it stops what comes
+  after it.
