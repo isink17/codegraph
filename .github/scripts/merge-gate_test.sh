@@ -4,7 +4,7 @@
 set -uo pipefail
 
 script="$(cd "$(dirname "$0")" && pwd)/merge-gate.sh"
-work=$(mktemp -d)
+work=$(mktemp -d "${TMPDIR:-/tmp}/merge-gate-test.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
 failures=0
 
@@ -13,8 +13,9 @@ other=abcdefabcdefabcdefabcdefabcdefabcdefabcd
 
 # The stub answers from environment variables and logs merge calls.
 mkdir "$work/bin"
-cat >"$work/bin/gh" <<'EOF'
-#!/usr/bin/env bash
+# A quoted string, not a here-document: bash 3.2 writes here-documents to /tmp
+# whatever TMPDIR says, and the local CI sandbox does not allow that.
+stub='#!/usr/bin/env bash
 case "$1 $2" in
 "pr view")
 	if [[ "$*" == *mergeCommit* ]]; then echo "${STUB_AFTER:-MERGED fedcba}"; else echo "$STUB_PR"; fi ;;
@@ -23,11 +24,11 @@ case "$1 $2" in
 	# The compare must be against the base the gate was asked for.
 	[[ "$2" == "repos/{owner}/{repo}/compare/${STUB_WANT_BASE:-v2.0}...$STUB_SHA" ]] || { echo "unexpected compare $2" >&2; exit 1; }
 	echo "$STUB_BEHIND" ;;
-"api --paginate") printf '%b' "$STUB_CHECKS" ;;
+"api --paginate") printf '\''%b'\'' "$STUB_CHECKS" ;;
 "api repos/{owner}/{repo}/commits/"*) echo "$STUB_STATUS" ;;
 *) echo "unexpected gh $*" >&2; exit 1 ;;
-esac
-EOF
+esac'
+printf '%s\n' "$stub" >"$work/bin/gh"
 chmod +x "$work/bin/gh"
 
 review_ok() {
